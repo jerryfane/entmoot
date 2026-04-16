@@ -95,22 +95,6 @@ message ids the author has seen for the group at compose time. Genesis messages
 have `parents = []`. Bound keeps message size predictable while preserving
 causal ordering. Peers receiving a message with `len(parents) > 3` reject it.
 
-### 3.4 Topics
-
-Topics use **MQTT-style hierarchical paths**: slash-separated segments, with
-`+` as a single-segment wildcard and `#` as a multi-segment wildcard that may
-only appear as the final segment.
-
-```
-entmoot/security/cve            // concrete
-entmoot/security/+              // matches .../cve, .../hotfix, not .../cve/2026
-entmoot/#                       // matches everything under entmoot
-```
-
-A `Filter` is a set of such patterns (match = any pattern matches). Filter
-encoding on the wire is a JSON array of strings. No content-based filtering in
-v0 — topic membership is authored, not inferred.
-
 ### 3.3 Membership roster
 
 A roster is itself a signed append-only log:
@@ -134,6 +118,22 @@ entirely (there's only one writer). Multi-admin and quorum schemes are a v1
 concern — the upgrade path is to add a `policy` blob that names N admins plus
 a rule (single-sig-any, k-of-n, etc.), plus deterministic tiebreaking
 (lower `node_id` wins on timestamp ties) for conflicting entries.
+
+### 3.4 Topics
+
+Topics use **MQTT-style hierarchical paths**: slash-separated segments, with
+`+` as a single-segment wildcard and `#` as a multi-segment wildcard that may
+only appear as the final segment.
+
+```
+entmoot/security/cve            // concrete
+entmoot/security/+              // matches .../cve, .../hotfix, not .../cve/2026
+entmoot/#                       // matches everything under entmoot
+```
+
+A `Filter` is a set of such patterns (match = any pattern matches). Filter
+encoding on the wire is a JSON array of strings. No content-based filtering in
+v0 — topic membership is authored, not inferred.
 
 ## 4. Wire protocol (draft)
 
@@ -167,7 +167,68 @@ All messages that mutate state are signed by their author with Ed25519 keys
 bound to Pilot node ids. We reuse the replay-protection pattern from Pilot's
 `HandshakeMsg`: 5-minute max age, 30-second future clock skew, hash-set dedupe.
 
-## 5. Go interfaces (the seams for Pilot-networks later)
+## 5. Bootstrap and peer discovery
+
+When a node comes online with a roster for a group, it needs to find at least
+one reachable group peer to start gossiping with. v0 combines three strategies,
+tried in order from most-reliable to least.
+
+### 5.1 Invite bundles (primary)
+
+An **invite bundle** is a small out-of-band blob produced by an existing group
+member (typically the founder) when they add a new member. It is delivered
+out-of-band (copy-paste, QR, messaging) — it is *not* an Entmoot wire message.
+
+```
+Invite
+├── group_id:
+├── founder:         node_id + Ed25519 pubkey  (anchors roster-sig validation)
+├── roster_head:     roster_entry_id + merkle_path  (auth'd snapshot to diff from)
+├── merkle_root:     current group Merkle root
+├── bootstrap_peers: [ {node_id, hostname?} × 3–5 ]   (recently-online members)
+├── issued_at:
+├── issuer:          node_id of member who produced the invite
+└── signature:       Ed25519 over the encoded bundle, signed by issuer
+```
+
+The new node verifies the signature against the issuer's pubkey (which it
+already trusts pairwise via Pilot — that's *why* the issuer was in a position
+to invite), then attempts `:1004` dials against `bootstrap_peers` in order.
+First successful `hello` → start `roster_req` + gossip.
+
+### 5.2 Pilot-trusted peers ∩ roster (secondary)
+
+If no invite is available (e.g., the bundle is stale and all listed peers are
+offline), query the local Pilot daemon:
+
+```go
+trusted, _ := pilotDriver.TrustedPeers()
+candidates := intersect(trusted, group.Roster.ActiveMembers())
+```
+
+Any peer already in our Pilot trust store AND in the group's roster is a
+legitimate bootstrap target. This recovers gracefully from invite staleness
+whenever there's overlap between our existing trust graph and the group.
+
+### 5.3 Founder fallback (tertiary)
+
+The founder's `node_id` is always in the roster (it's the genesis entry).
+If 5.1 and 5.2 fail, dial the founder directly. Relies on the founder being
+online — a single point of failure we accept for v0 because the alternative
+(DHT-style discovery) is out of scope.
+
+### 5.4 What we are NOT doing in v0
+
+- **No DHT crawl** for group peers.
+- **No registry-based group discovery.** Pilot's registry has no concept of
+  groups; we don't add one.
+- **No passive peer advertisement.** A peer coming online does not announce
+  its address to the group; it only responds to dials.
+
+If all three strategies fail, the node retries on a backoff (starting 30 s,
+capped at 10 min) and logs. A human may need to hand over a fresh invite.
+
+## 6. Go interfaces (the seams for Pilot-networks later)
 
 ```go
 // GroupMembership decides who belongs to a group and validates membership
@@ -201,7 +262,7 @@ type MessageStore interface {
 The `Filter` is topic- and metadata-based, not content-based — keepable on
 disk as a serialized subscription record.
 
-## 6. Broadcast: gossip over Pilot streams (v0)
+## 7. Broadcast: gossip over Pilot streams (v0)
 
 No multicast; we fan out by unicast over Pilot. Each peer maintains a
 pseudo-random sample of the group's roster, size ~`log(N) + k`, and pushes
@@ -217,7 +278,7 @@ via `fetch_req`. Classic epidemic gossip, eventually consistent.
 No opinion yet on push vs. pull vs. push-pull. Starting with push-pull for
 robustness; can simplify later.
 
-## 7. Storage and retention
+## 8. Storage and retention
 
 No agent stores the full message history of a large group forever; that's the
 whole point of selective sync. The storage tiers:
@@ -236,7 +297,7 @@ If retention failures start showing up in testing (someone asks for an old
 message everyone's forgotten), we revisit. The omission keeps v0 closer to
 "everyone keeps what they want," which is easier to reason about.
 
-## 8. Merkle completeness proofs
+## 9. Merkle completeness proofs
 
 Every message carries its `parents` hashes; the group maintains a Merkle tree
 over all known message ids in deterministic topological order. The current
@@ -253,7 +314,7 @@ To verify completeness of a filtered view:
 This is close in spirit to certificate-transparency Merkle log proofs and to
 IPFS DAG-CBOR chunking. Not novel; just correctly applied.
 
-## 9. Security posture
+## 10. Security posture
 
 - **Authorship**: every message is Ed25519-signed by its author, verified
   against the roster's current pubkey for that node. Unsigned or wrong-sig
@@ -262,8 +323,17 @@ IPFS DAG-CBOR chunking. Not novel; just correctly applied.
   plus hash dedupe.
 - **Membership**: messages from non-members are dropped before they reach
   application logic.
-- **Denial of service**: v0 has no explicit anti-DoS. Per-peer rate limits and
-  proof-of-work on joins are future concerns.
+- **Denial of service**: v0 ships **per-peer token-bucket rate limits** on
+  every `:1004` connection. Two buckets per peer: a message-rate bucket
+  (default 100 msg/s, burst 200) and a byte-rate bucket (default 1 MiB/s,
+  burst 4 MiB). Exceeding the bucket causes backpressure first (reads stall);
+  sustained violation for >30 s drops the connection and records a
+  soft-penalty on the peer (exponential cooldown before reconnects are
+  accepted, starting 10 s, capped at 1 hour). No per-group or per-topic
+  buckets in v0 — one global pair per connection is enough to contain a
+  misbehaving member. Proof-of-work on joins is a v1+ concern; in v0 the
+  roster gate (non-members can't reach `:1004` in the first place, because
+  Pilot rejects untrusted dials) does most of the work.
 - **Eclipse attacks**: the random-peer pool is intended as the defense.
   Details pending.
 - **Privacy**: group membership and topic filters are observable to peers you
@@ -276,7 +346,7 @@ IPFS DAG-CBOR chunking. Not novel; just correctly applied.
   would sit below the wire layer (encrypt before framing), so adding it
   doesn't break the protocol.
 
-## 10. Resolved for v0
+## 11. Resolved for v0
 
 | # | Question | Decision | Upgrade path |
 |---|---|---|---|
@@ -287,10 +357,12 @@ IPFS DAG-CBOR chunking. Not novel; just correctly applied.
 | 5 | Group encryption | Plaintext + author-sig (transport-encrypted by Pilot) | Shared group key with member-churn rotation; encrypt-before-framing, protocol-transparent |
 | 6 | `parents` rules | Max 3, highest-timestamped seen, genesis = `[]` | If causal depth matters more than size, raise cap or switch to skiplist |
 | 7 | Pilot EventStream bridge | Not in v0 | Post-MVP: Entmoot can publish a digest topic to a peer's `:1002` for legacy consumers |
+| 8 | Peer bootstrap | Invite bundle (primary) → Pilot `TrustedPeers() ∩ roster` → founder fallback | Add DHT-style discovery if invite staleness becomes chronic |
+| 9 | Anti-DoS in v0 | Per-peer token buckets (100 msg/s + 1 MiB/s) + cooldown on sustained abuse | Per-group buckets; proof-of-work on joins; reputation |
 
-All seven were closed in the 2026-04-17 session.
+All nine were closed in the 2026-04-17 session.
 
-## 11. Next steps
+## 12. Next steps
 
 1. Pick a minimum demo: **"two Entmoot peers join a group, exchange three
    messages, a third peer joins and Merkle-verifies completeness."** This is
