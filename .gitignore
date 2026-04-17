@@ -3,3 +3,9 @@
 CLAUDE.md
 
 .DS_Store
+
+# Go build artifacts
+*.test
+coverage.out
+/entmoot
+/entmootd
