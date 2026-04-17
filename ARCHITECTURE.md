@@ -369,12 +369,12 @@ All nine were closed in the 2026-04-17 session.
    the canary we want working end-to-end before calling v0 done.
 2. Scaffold the Go module:
    ```
-   pkg/entmoot/         // core types (Group, Message, RosterEntry, Filter)
-   pkg/entmoot/wire/    // framing + JSON codec for port :1004
-   pkg/entmoot/gossip/  // push-pull epidemic + peer sampling
-   pkg/entmoot/store/   // MessageStore, Merkle tree, retention
-   pkg/entmoot/roster/  // GroupMembership (founder-only v0)
-   cmd/entmootd/        // the binary: connects to Pilot daemon, serves :1004
+   src/pkg/entmoot/         // core types (Group, Message, RosterEntry, Filter)
+   src/pkg/entmoot/wire/    // framing + JSON codec for port :1004
+   src/pkg/entmoot/gossip/  // push-pull epidemic + peer sampling
+   src/pkg/entmoot/store/   // MessageStore, Merkle tree, retention
+   src/pkg/entmoot/roster/  // GroupMembership (founder-only v0)
+   src/cmd/entmootd/        // the binary: connects to Pilot daemon, serves :1004
    ```
 3. Write interface contracts (`GroupMembership`, `Broadcaster`, `MessageStore`)
    and in-memory stubs. All unit tests should pass against in-memory stubs

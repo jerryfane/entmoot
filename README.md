@@ -44,18 +44,20 @@ What works today:
 
 ### Build
 
+All Go sources live under `src/`. Build from there.
+
 ```sh
 # Entmoot itself
-go build ./...
+cd src && go build ./...
 
-# Pilot binaries (for running daemons locally — referenced by the canary)
+# Pilot binaries (for running daemons locally, referenced by the canary)
 cd repos/pilotprotocol && make build && cd -
 ```
 
 ### Run the fast canary (no network)
 
 ```sh
-go test -race -short ./...
+cd src && go test -race -short ./...
 ```
 
 This runs the in-memory canary: three gossipers join a group over a mock
@@ -65,7 +67,7 @@ Finishes in a couple of seconds.
 ### Run the full canary against real Pilot daemons
 
 ```sh
-go test -run TestCanaryPilot -timeout 120s ./test/canary/...
+cd src && go test -run TestCanaryPilot -timeout 120s ./test/canary/...
 ```
 
 Spawns three sandboxed Pilot daemons as subprocesses, establishes trust,
@@ -93,23 +95,27 @@ Defaults write to `~/.entmoot/`.
 ```
 entmoot/
 ├── ARCHITECTURE.md            # authoritative design document
-├── cmd/entmootd/              # CLI binary
-├── pkg/entmoot/               # library packages
-│   ├── canonical/             # deterministic JSON encoding for hashing/signing
-│   ├── clock/                 # injectable clock (System + Fake)
-│   ├── gossip/                # push-only epidemic + bootstrap + transport iface
-│   ├── keystore/              # Ed25519 identity persistence
-│   ├── merkle/                # domain-separated Merkle tree + inclusion proofs
-│   ├── order/                 # topological order over message DAG
-│   ├── ratelimit/             # per-peer token buckets
-│   ├── roster/                # signed membership log
-│   ├── store/                 # message store (Memory + JSONL)
-│   ├── topic/                 # MQTT-style pattern matcher
-│   ├── transport/pilot/       # Pilot `pkg/driver` adapter for gossip
-│   └── wire/                  # framing, codec, replay check, rate check
-├── test/canary/               # end-to-end tests
-├── go.mod                     # requires Pilot via local ./repos/pilotprotocol
-└── repos/                     # (gitignored) vendored Pilot source
+├── docs/                      # design docs (CLI spec, etc.)
+├── paper/                     # LaTeX paper sources
+├── repos/                     # (gitignored) vendored reference repos
+├── notes/                     # (gitignored) scratch notes
+└── src/                       # Go module
+    ├── go.mod                 # requires Pilot via local ../repos/pilotprotocol
+    ├── cmd/entmootd/          # CLI binary
+    ├── pkg/entmoot/           # library packages
+    │   ├── canonical/         # deterministic JSON encoding for hashing/signing
+    │   ├── clock/             # injectable clock (System + Fake)
+    │   ├── gossip/            # push-only epidemic + bootstrap + transport iface
+    │   ├── keystore/          # Ed25519 identity persistence
+    │   ├── merkle/            # domain-separated Merkle tree + inclusion proofs
+    │   ├── order/             # topological order over message DAG
+    │   ├── ratelimit/         # per-peer token buckets
+    │   ├── roster/            # signed membership log
+    │   ├── store/             # message store (Memory + JSONL)
+    │   ├── topic/             # MQTT-style pattern matcher
+    │   ├── transport/pilot/   # Pilot `pkg/driver` adapter for gossip
+    │   └── wire/              # framing, codec, replay check, rate check
+    └── test/canary/           # end-to-end tests
 ```
 
 ## How it works (one paragraph)

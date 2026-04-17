@@ -73,7 +73,8 @@ func findRepoRoot(t *testing.T) string {
 	}
 	dir := cwd
 	for i := 0; i < 10; i++ {
-		goMod := filepath.Join(dir, "go.mod")
+		// Repo root is the directory whose src/go.mod declares the entmoot module.
+		goMod := filepath.Join(dir, "src", "go.mod")
 		if data, err := os.ReadFile(goMod); err == nil {
 			if bytes.Contains(data, []byte("module entmoot")) {
 				return dir
@@ -85,7 +86,7 @@ func findRepoRoot(t *testing.T) string {
 		}
 		dir = parent
 	}
-	t.Fatalf("findRepoRoot: could not locate entmoot module root from %s", cwd)
+	t.Fatalf("findRepoRoot: could not locate entmoot repo root from %s", cwd)
 	return ""
 }
 
@@ -95,7 +96,7 @@ func findRepoRoot(t *testing.T) string {
 func mustExist(t *testing.T, path string) {
 	t.Helper()
 	if _, err := os.Stat(path); err != nil {
-		t.Fatalf("required binary missing: %s (run: make -C repos/pilotprotocol build): %v", path, err)
+		t.Fatalf("required binary missing: %s (run: make -C repos/pilotprotocol build from repo root): %v", path, err)
 	}
 }
 
@@ -349,6 +350,7 @@ func pilotctlPath() string {
 	// dir). Fall back to searching upward like findRepoRoot does.
 	candidates := []string{
 		"repos/pilotprotocol/bin/pilotctl",
+		"../../../repos/pilotprotocol/bin/pilotctl",
 		"../../repos/pilotprotocol/bin/pilotctl",
 		"../repos/pilotprotocol/bin/pilotctl",
 	}

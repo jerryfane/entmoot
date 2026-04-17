@@ -7,5 +7,5 @@ CLAUDE.md
 # Go build artifacts
 *.test
 coverage.out
-/entmoot
-/entmootd
+/src/entmoot
+/src/entmootd
