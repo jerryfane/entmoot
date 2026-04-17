@@ -45,9 +45,9 @@
 \begin{abstract}
 Recent empirical analysis of the Pilot Protocol agent network shows that 626
 autonomous agents can self-organize into a small-world social graph on
-pairwise trust alone~\citep{calin2026emergent}---and yet the protocol
-provides no primitive for group-scale communication: no broadcast, no shared
-topic log, no proof that a subscriber has seen every message in a topic of
+pairwise trust alone~\citep{calin2026emergent}. Yet the protocol provides
+no primitive for group-scale communication: no broadcast, no shared topic
+log, no proof that a subscriber has seen every message in a topic of
 interest. We present \emph{Entmoot}, a Layer-2 protocol that closes this gap.
 It adds multi-party gossip, topic-based subscription, signed group
 membership, and Merkle-verified message completeness on top of Pilot's
@@ -75,15 +75,13 @@ peer. What agents did with those tunnels was their own business.
 The protocol that sustains that network is deliberately narrow. Pilot
 provides an overlay of virtual addresses, reliable encrypted transport,
 NAT traversal, and a pairwise trust store~\citep{pilotprotocol}. It does
-not provide a group primitive. There is no broadcast. There is no shared
-topic log. There is no mechanism for a subscriber to confirm, with
-cryptographic certainty, that it has seen every message in a topic it
-cares about. An agent joining a ``discussion'' of dozens of other agents
-must either establish trust with each participant and fan out $n^{2}$
-connections, or rely on a centralized relay---reintroducing the single
-point of failure the overlay was designed to avoid. The Pilot daemon's
-own \texttt{broadcast} command today returns, verbatim: ``broadcast is
-not available yet --- custom networks are WIP.''
+not provide a group primitive. An agent wishing to address a dozen peers
+at once must either maintain a trust edge with each one (a graph whose
+edge count scales quadratically in the group size) or rely on a
+centralized relay, reintroducing the single point of failure the overlay
+was designed to avoid. The Pilot daemon's own \texttt{broadcast} command
+today returns, verbatim: ``broadcast is not available yet; custom
+networks are WIP.''
 
 This paper presents \emph{Entmoot}, a Layer-2 protocol that adds group
 communication to Pilot without modifying it and without waiting for the
@@ -104,7 +102,7 @@ Our contributions are as follows.
     \item A design for Layer-2 group communication on Pilot that relies
     only on primitives Pilot already provides in v1.7.2. Group membership
     is captured in signed rosters above the transport, not in Pilot's
-    own (currently stubbed) network membership mechanism.
+    own (in-progress) network membership mechanism.
     \item A Go reference implementation, \texttt{entmootd}, comprising
     thirteen packages and roughly three thousand lines of code, including
     framing, replay protection, rate limiting, gossip, Merkle trees, and
@@ -137,7 +135,7 @@ at registration and receives a 48-bit virtual address of the form
 \texttt{N:NNNN.HHHH.LLLL}: a 16-bit network ID and a 32-bit node ID within
 that network. Network~0 is the global backbone; all agents are members of
 it by default. Pilot reserves additional network IDs for purpose-specific
-subgraphs, but as of version 1.7.2 this feature is incomplete.
+subgraphs, but as of version 1.7.2 this feature is still in progress.
 
 Communication is trust-gated. Two nodes must complete a cryptographic
 handshake (port~444) mediated by the registry before they can exchange
@@ -148,11 +146,11 @@ protocol over UDP with X25519 key exchange and AES-256-GCM authenticated
 encryption per tunnel. The registry does not see tunnel payloads; it only
 mediates address allocation, hostname resolution, and the handshake relay.
 
-Critically for us, the registry hides the network endpoint of any node
-that is not flagged as ``public.'' A private node's address can only be
-resolved to a reachable endpoint by another node with an existing trust
-edge. This means a new participant cannot bootstrap into a purely-private
-clique without either an out-of-band introduction or at least one public
+Crucially, the registry hides the network endpoint of any node not
+flagged as ``public.'' A private node's address can only be resolved to
+a reachable endpoint by another node with an existing trust edge. A new
+participant cannot therefore bootstrap into an otherwise-private group
+without either an out-of-band introduction or at least one public
 introducer.
 
 \subsection{Autonomous agent networks}
@@ -225,12 +223,12 @@ in-scope message. The network is fully decentralized; any member can
 act as a gossip relay. Entmoot is built on Pilot's primitives as they
 exist today, without dependence on custom networks.
 
-We explicitly exclude Byzantine consensus on message ordering (Entmoot
+Entmoot does not attempt Byzantine consensus on message ordering; it
 provides eventual consistency with Merkle-verified completeness, not a
-totally ordered log), forward secrecy of group content (transport is
-forward-secret pairwise via Pilot; group content in v0 is author-signed
-plaintext), human-oriented user experience, and replacement of any Pilot
-primitive.
+totally ordered log. Group content in v0 is author-signed plaintext:
+Pilot's transport gives pairwise forward secrecy, but members see each
+other's traffic in the clear. We do not design a human-facing interface,
+and we do not replace any existing Pilot primitive.
 
 \subsection{Data model}
 
@@ -258,18 +256,18 @@ in its \texttt{parents} field. In v0 the group founder is the only
 authorized admin: any entry whose actor is not the founder, or whose
 signature does not verify against the founder's public key, is rejected.
 This reduces the design to a single-writer append-only log and eliminates
-conflict resolution. The upgrade path to multi-admin---a policy blob
-naming $n$ admins plus a quorum rule (e.g., $k$-of-$n$) and a
-deterministic tiebreaker (lower \texttt{node\_id} wins on timestamp
-equality)---is documented but deferred.
+conflict resolution. The upgrade path to multi-admin is documented but
+deferred: a policy blob names $n$ admins with a quorum rule such as
+$k$-of-$n$, and a deterministic tiebreaker where the lower
+\texttt{node\_id} wins on timestamp equality.
 
 \subsection{Wire protocol}
 
 Connections use Pilot's reliable byte streams on a fixed port (we use
-1004). Every message is framed as a 4-byte big-endian length prefix,
-followed by a 1-byte message-type tag, followed by a JSON body. The
-maximum frame is 16\,MiB. JSON keeps the protocol debuggable and
-extensible; a binary codec is a post-v0 consideration.
+1004). Each frame carries a 4-byte big-endian length prefix, a 1-byte
+message-type tag, and a JSON body, with a 16\,MiB cap. JSON keeps the
+protocol debuggable and extensible; a binary codec is a post-v0
+consideration.
 
 The v0 protocol defines eight message types:
 \texttt{hello}, \texttt{roster\_req}, \texttt{roster\_resp},
@@ -300,9 +298,9 @@ tried in order:
     resort, the joiner dials the founder directly.
 \end{enumerate}
 
-We explicitly do not perform DHT-style peer discovery, and we do not
-register groups with Pilot's registry. The out-of-band invite plus
-Pilot's existing trust graph are sufficient to bootstrap.
+Entmoot neither performs DHT-style peer discovery nor registers groups
+with Pilot's registry. The out-of-band invite plus Pilot's existing
+trust graph are sufficient to bootstrap.
 
 \subsection{Gossip}
 
@@ -389,17 +387,17 @@ by hard disconnect; cooldown and soft-penalty schemes are deferred.
 
 Group content is \emph{not} encrypted from other members. Pilot's
 transport encryption protects content from outsiders and relays, but
-any member sees all group traffic it gossips. End-to-end group
-encryption with shared-key rotation on churn is documented as a v1
-concern; the framing is arranged so that encryption can be added
-underneath without breaking protocol compatibility.
+any member sees the plaintext of every message it receives or forwards.
+End-to-end group encryption with shared-key rotation on churn is
+documented as a v1 concern; the framing is arranged so encryption can
+be added underneath without breaking protocol compatibility.
 
 % --- 4. Implementation -------------------------------------------------
 \section{Implementation}
 \label{sec:implementation}
 
-\texttt{entmootd} is implemented in Go~1.25 and compiles against
-Pilot~v1.7.2. The module is split into thirteen packages totalling
+\texttt{entmootd} is implemented in Go (${\geq}1.25.3$, matching Pilot's
+toolchain requirement) and compiles against Pilot~v1.7.2. The module is split into thirteen packages totalling
 roughly three thousand lines of code. Key packages: \texttt{canonical}
 (deterministic JSON encoding used for signing and identifier
 computation), \texttt{merkle} (tree construction and
@@ -443,7 +441,7 @@ address on a \texttt{net.Conn} in an unexported type, so we resolve
 peer node IDs by round-tripping through \texttt{RemoteAddr().String()}
 and \texttt{protocol.ParseSocketAddr}. Second, the IPC response for
 trusted peers uses the JSON key \texttt{"trusted"}, not \texttt{"peers"},
-which was not documented at the time of writing. Third, because the
+which is not documented. Third, because the
 registry hides private nodes' endpoints from non-trusted lookups, at
 least one participant in any bootstrap must be launched with
 Pilot's \texttt{-public} flag; otherwise the handshake request
@@ -462,8 +460,8 @@ variants (Figure~\ref{fig:canary}). The canary flow is identical between
 the two: three gossipers, call them $A$, $B$, and $C$, initialize with a
 shared group whose founder is $A$. $A$ signs \texttt{add} entries for $B$ and $C$
 and replicates the roster to them via the bootstrap flow. Three
-messages are then published---first from $A$, then from $B$, then from
-$A$ again---each with a distinct topic. We poll every 100\,ms for
+messages are then published (first from $A$, then from $B$, then from
+$A$ again), each with a distinct topic. We poll every 100\,ms for
 convergence, defined as all three members reporting the same Merkle
 root and the same message count. A 30-second timeout bounds each
 variant.
@@ -514,17 +512,16 @@ Merkle-root agreement.}
 \label{fig:canary}
 \end{figure}
 
-Both variants pass reliably across repeated runs. In each, all three
-gossipers converge on the same Merkle root after a single push of three
-messages from the founder's random fanout of two peers, followed by
-pull-back \texttt{fetch\_req} exchanges from peers that had seen only
-the hash. The canary therefore demonstrates that at the three-member
-scale, push-only gossip with fanout two reaches global convergence in
-essentially one round of epidemic propagation.
+Both variants pass reliably across repeated runs. Each publish pushes
+its message id to the publisher's two non-self peers; any peer that only
+sees the hash pulls the body back via \texttt{fetch\_req}. At fanout two
+with three members every publish reaches the entire group in a single
+gossip hop, so convergence requires neither anti-entropy nor push-pull.
+All three gossipers end on byte-identical Merkle roots.
 
-We do not, in this paper, present load tests at larger scales or
-quantitative measurements of rate-limit behavior under attack. Those
-are follow-up work, discussed in Section~\ref{sec:future}.
+This paper does not present load tests at larger scales or quantitative
+measurements of rate-limit behavior under attack; both are tracked as
+follow-up work.
 
 % --- 6. Related Work ---------------------------------------------------
 \section{Related Work}
@@ -534,23 +531,21 @@ are follow-up work, discussed in Section~\ref{sec:future}.
 It establishes that self-organizing agent networks of nontrivial size
 exist on Pilot today and that their social structure is analyzable from
 metadata alone under strong content encryption. Entmoot instantiates a
-primitive---group membership with gossip---that the Calin study
+primitive (group membership with gossip) that the Calin study
 explicitly flags as a gap in Pilot's existing surface and a prerequisite
 for the cross-network analyses it proposes as future work.
 
-IPFS~\citep{benet2014ipfs} shares Entmoot's content-addressed design
-and DAG-structured history, but IPFS is oriented toward open
-distribution of immutable blobs and has no notion of group-scope
-membership or of trust-gated participation. Certificate
-Transparency~\citep{laurie2013ct} is a direct influence on the Merkle
-log layer; we adopt its domain-separation convention and the discipline
-of proving inclusion rather than recomputing the whole log. MQTT's
-topic syntax~\citep{mqtt5} survives intact in our filter language, but
-MQTT's semantics are broker-mediated and therefore a poor fit for a
-decentralized overlay. Kademlia~\citep{maymounkov2002kademlia} is
-referenced as a comparison point for structured peer-to-peer overlays;
-Entmoot's v0 deliberately avoids a DHT and relies on pairwise Pilot
-trust for peer discovery.
+IPFS~\citep{benet2014ipfs} shares with Entmoot both content-addressing
+and a DAG-structured history, but it is oriented toward open
+distribution of immutable blobs and has no notion of group scope or
+trust-gated participation. Certificate Transparency~\citep{laurie2013ct}
+directly influences our Merkle log layer: we adopt its domain-separation
+convention and the discipline of proving inclusion rather than
+recomputing the whole log. We reuse MQTT's topic syntax~\citep{mqtt5}
+verbatim, but MQTT's semantics are broker-mediated and a poor fit for a
+decentralized overlay. We cite Kademlia~\citep{maymounkov2002kademlia}
+as a comparison point for structured peer-to-peer overlays; Entmoot's
+v0 avoids a DHT and relies on Pilot's pairwise trust for peer discovery.
 
 Classical multi-agent systems
 literature~\citep{wooldridge2009,shohamleyton2008,dorri2018} provides
@@ -584,8 +579,8 @@ depend on the shape of Pilot's eventual API and on whether network
 membership provides the authorization semantics we need. The
 abstraction is already in place.
 
-More interestingly, Entmoot creates the substrate the empirical
-questions flagged by \citet{calin2026emergent} require:
+Entmoot also creates the substrate the empirical questions flagged by
+\citet{calin2026emergent} require:
 longitudinal analysis of group-membership dynamics, homophily on
 topic filters, and community structure beyond the Pilot backbone.
 A first natural measurement study would be to deploy Entmoot to a
@@ -603,7 +598,7 @@ deliberate, coordinate, and archive shared knowledge. Entmoot closes
 that gap with a Layer-2 protocol that requires only what Pilot already
 provides: encrypted unicast tunnels and a pairwise trust system. A
 reference implementation demonstrates end-to-end convergence of three
-peers on a real Pilot network in under twelve seconds of wall clock.
+peers over real Pilot tunnels in under twelve seconds of wall clock.
 The natural next question is not whether the protocol works, but what
 agents do with it once they have it.
 
