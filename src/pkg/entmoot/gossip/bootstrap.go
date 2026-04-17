@@ -21,10 +21,17 @@ var ErrJoinFailed = errors.New("gossip: join failed: all bootstrap candidates un
 //
 //  1. Verify invite.Signature against invite.Issuer.EntmootPubKey. Return an
 //     error wrapping entmoot.ErrSigInvalid on mismatch; no dial is attempted.
-//  2. Try invite.BootstrapPeers in listed order. First peer that answers
+//  2. If invite.ValidUntil is set (non-zero) and has elapsed relative to
+//     the gossiper's configured clock, return an error wrapping
+//     entmoot.ErrInviteExpired. This
+//     check runs AFTER signature verification so a tampered ValidUntil
+//     cannot be evaluated before its signature is trusted. ValidUntil == 0
+//     is treated as "no expiry asserted" for backwards compatibility with
+//     pre-v1 invite bundles and test fixtures.
+//  3. Try invite.BootstrapPeers in listed order. First peer that answers
 //     RosterReq with applicable entries wins.
-//  3. Fallback: Transport.TrustedPeers() ∩ invite.BootstrapPeers.NodeID.
-//  4. Last resort: dial invite.Founder.PilotNodeID (guaranteed in the
+//  4. Fallback: Transport.TrustedPeers() ∩ invite.BootstrapPeers.NodeID.
+//  5. Last resort: dial invite.Founder.PilotNodeID (guaranteed in the
 //     roster because it was the genesis signer).
 //
 // On success, entries returned by the peer's RosterResp are applied to
@@ -57,6 +64,30 @@ func (g *Gossiper) Join(ctx context.Context, invite *entmoot.Invite) error {
 	}
 	if err := verifyInvite(invite); err != nil {
 		return err
+	}
+
+	// Expiry check runs after signature verification so a tampered
+	// ValidUntil can never short-circuit verification. ValidUntil == 0
+	// means "no expiry asserted" (pre-v1 bundles and test fixtures); any
+	// strictly-positive ValidUntil that has elapsed rejects the invite.
+	if invite.ValidUntil > 0 {
+		now := g.clk.Now().UnixMilli()
+		if now > invite.ValidUntil {
+			return fmt.Errorf("%w: valid_until=%d now=%d",
+				entmoot.ErrInviteExpired, invite.ValidUntil, now)
+		}
+	}
+
+	// Early-return for the "already synced" case. The founder's own
+	// roster already contains the invite's advertised head (by
+	// construction: the founder issued the invite), so there is nothing
+	// to fetch. Without this shortcut, the founder would try to dial
+	// every BootstrapPeer — including peers that have not started yet —
+	// and fail ErrJoinFailed. Any re-invite on a node that is already a
+	// fully-synced member hits the same path.
+	if g.cfg.Roster.Head() == invite.RosterHead &&
+		g.cfg.Roster.IsMember(g.cfg.LocalNode) {
+		return nil
 	}
 
 	// Strategy 1: invite.BootstrapPeers in listed order.

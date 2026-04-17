@@ -141,8 +141,18 @@ func newFixtureWithGenesisOnly(t *testing.T, nodeIDs []entmoot.NodeID, joinerID 
 }
 
 // buildInvite constructs a valid invite signed by the founder, listing the
-// given peers as bootstrap candidates.
+// given peers as bootstrap candidates. ValidUntil defaults to IssuedAt +
+// 24h so that the expiry check in gossip.Join accepts the invite under the
+// fixture's fake clock; tests that need a different lifetime should use
+// buildInviteWithValidUntil.
 func (f *fixture) buildInvite(bootstrap []entmoot.NodeID) *entmoot.Invite {
+	return f.buildInviteWithValidUntil(bootstrap, f.founderTS+24*60*60*1000)
+}
+
+// buildInviteWithValidUntil is buildInvite with an explicit ValidUntil
+// timestamp (unix millis). Passing 0 produces a legacy-style invite with no
+// expiry assertion.
+func (f *fixture) buildInviteWithValidUntil(bootstrap []entmoot.NodeID, validUntil int64) *entmoot.Invite {
 	bps := make([]entmoot.BootstrapPeer, 0, len(bootstrap))
 	for _, n := range bootstrap {
 		bps = append(bps, entmoot.BootstrapPeer{NodeID: n})
@@ -153,6 +163,7 @@ func (f *fixture) buildInvite(bootstrap []entmoot.NodeID) *entmoot.Invite {
 		Issuer:         f.founderInf,
 		BootstrapPeers: bps,
 		IssuedAt:       f.founderTS,
+		ValidUntil:     validUntil,
 	}
 	signing := *inv
 	signing.Signature = nil
@@ -328,5 +339,70 @@ func TestJoinFounderCandidateWhenNotInBootstrap(t *testing.T) {
 	}
 	if !f.nodes[99].rost.IsMember(10) {
 		t.Fatalf("joiner did not learn founder from roster sync")
+	}
+}
+
+// 7. Invite whose ValidUntil has elapsed relative to the gossiper's clock
+// is rejected with an error wrapping entmoot.ErrInviteExpired. The check
+// runs after signature verification, so the invite is correctly signed;
+// only the timestamp is stale.
+func TestJoinExpiredInviteRejected(t *testing.T) {
+	t.Parallel()
+	f := newFixtureWithGenesisOnly(t, []entmoot.NodeID{10, 20, 99}, 99)
+	defer f.closeTransports()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+
+	// ValidUntil one millisecond before IssuedAt — guaranteed in the past
+	// relative to the fixture's fake clock (anchored at f.founderTS).
+	inv := f.buildInviteWithValidUntil([]entmoot.NodeID{10, 20}, f.founderTS-1)
+
+	err := f.nodes[99].gossip.Join(ctx, inv)
+	if !errors.Is(err, entmoot.ErrInviteExpired) {
+		t.Fatalf("expected ErrInviteExpired, got %v", err)
+	}
+}
+
+// 8. Legacy-compat: ValidUntil == 0 means "no expiry asserted" and Join
+// must accept the invite. Pre-v1 bundles and in-tree test fixtures that
+// never set ValidUntil fall into this path.
+func TestJoinValidUntilZeroAccepted(t *testing.T) {
+	t.Parallel()
+	f := newFixtureWithGenesisOnly(t, []entmoot.NodeID{10, 20, 30, 99}, 99)
+	defer f.closeTransports()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = f.nodes[10].gossip.Start(ctx) }()
+
+	inv := f.buildInviteWithValidUntil([]entmoot.NodeID{10, 20, 30}, 0)
+	if err := f.nodes[99].gossip.Join(ctx, inv); err != nil {
+		t.Fatalf("Join: %v", err)
+	}
+	if len(f.nodes[99].rost.Members()) != len(f.nodes[10].rost.Members()) {
+		t.Fatalf("membership sync failed")
+	}
+}
+
+// 9. Positive control: ValidUntil set to a future instant (IssuedAt + 1h)
+// is accepted. Complements TestJoinExpiredInviteRejected by pinning the
+// "fresh invite" side of the expiry boundary.
+func TestJoinFreshInviteAccepted(t *testing.T) {
+	t.Parallel()
+	f := newFixtureWithGenesisOnly(t, []entmoot.NodeID{10, 20, 30, 99}, 99)
+	defer f.closeTransports()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = f.nodes[10].gossip.Start(ctx) }()
+
+	oneHourMs := int64(60 * 60 * 1000)
+	inv := f.buildInviteWithValidUntil([]entmoot.NodeID{10, 20, 30}, f.founderTS+oneHourMs)
+	if err := f.nodes[99].gossip.Join(ctx, inv); err != nil {
+		t.Fatalf("Join: %v", err)
+	}
+	if len(f.nodes[99].rost.Members()) != len(f.nodes[10].rost.Members()) {
+		t.Fatalf("membership sync failed")
 	}
 }

@@ -359,3 +359,15 @@ func TestJSONL(t *testing.T) {
 		return s
 	})
 }
+
+// TestSQLite runs the shared suite against SQLite using a per-subtest TempDir.
+func TestSQLite(t *testing.T) {
+	runStoreSuite(t, func(t *testing.T) MessageStore {
+		s, err := OpenSQLite(t.TempDir())
+		if err != nil {
+			t.Fatalf("OpenSQLite: %v", err)
+		}
+		t.Cleanup(func() { _ = s.Close() })
+		return s
+	})
+}

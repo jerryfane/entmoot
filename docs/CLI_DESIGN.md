@@ -63,13 +63,17 @@ Once implemented, this document becomes the contract for what
 
 ---
 
-## 3. The four commands
+## 3. The five commands
 
 This is the complete agent-facing surface. Global flags are shared
-across all four: `-socket` (Pilot IPC socket, default `/tmp/pilot.sock`),
+across all five: `-socket` (Pilot IPC socket, default `/tmp/pilot.sock`),
 `-identity` (Ed25519 identity file, default `~/.entmoot/identity.json`),
 `-data` (data root, default `~/.entmoot`), `-listen-port` (default
 `1004`), `-log-level` (default `info`).
+
+`join` and (for live mode) `tail` hold a local control socket;
+`publish` dials it. `info` and `query` read SQLite directly and work
+whether or not `join` is running.
 
 ### 3.1 `entmootd join <invite>`
 
@@ -207,9 +211,9 @@ One JSON object:
 
 ### 3.3 `entmootd tail [-topic PATTERN] [-group GID] [-n N]`
 
-**Purpose:** subscribe to live messages. Connects to the control socket,
-streams matching messages to stdout as JSON lines, blocks until stdin
-closes or the caller signals.
+**Purpose:** subscribe to live messages. Emits `-n N` recent messages
+from the SQLite store as backfill, then switches to a live stream from
+the control socket. Blocks until the caller signals or EOF on stdin.
 
 **Signature**
 
@@ -223,9 +227,9 @@ entmootd tail [-topic PATTERN] [-group GID] [-n N]
   Default: `#` (all topics).
 - `-group GID` (optional). Base64 group id. When absent, streams from
   every group joined locally.
-- `-n N` (optional, default `0`). Emit the last N buffered messages
-  before switching to live mode. `-n 0` means live-only; `-n -1` means
-  "all messages currently in memory."
+- `-n N` (optional, default `0`). Emit the last N matching messages
+  from the SQLite store before switching to live mode. `-n 0` means
+  live-only; `-n -1` means "all messages in the store."
 
 **Blocking behavior**
 
@@ -239,6 +243,11 @@ One JSON object per matching message, one per line:
 {"message_id":"<base64>","group_id":"<base64>","author":<uint32>,"topic":["chat"],"content":"hello","timestamp_ms":1713369600000}
 ```
 
+Backfill messages and live messages share the same schema. A single
+message may appear twice on the boundary between backfill and live if
+it was inserted while the replay query was running; consumers dedupe by
+`message_id` if exact-once matters.
+
 **Exit codes**
 
 - `0`: clean exit.
@@ -250,9 +259,9 @@ One JSON object per matching message, one per line:
 **Not included (explicit)**
 
 - No `--since <timestamp>`. Replay from a wall-clock time requires an
-  ordering contract across peers we do not yet have. `-n N` replays
-  buffered messages in the running process's arrival order; that is
-  the only replay story in v1.
+  ordering contract across peers we do not yet have. `-n N` indexes by
+  `timestamp_ms` within the local store, which is the local arrival
+  order, not a global ordering.
 
 ---
 
@@ -297,8 +306,12 @@ A single JSON object on stdout:
 }
 ```
 
-When `running` is `false`, `groups` may still be populated from
-on-disk state, but `merkle_root` may be stale.
+`info` reads SQLite directly rather than going through the control
+socket, so it works whether or not a `join` process is running. When
+there is no running process, `running` is `false` and `merkle_root` is
+`null` for each group (the running process is the authoritative source
+for the live root; on-disk data can compute it but is omitted here to
+make staleness explicit).
 
 **Exit codes**
 
@@ -311,16 +324,139 @@ None.
 
 ---
 
-## 4. Control-socket IPC contract
+### 3.5 `entmootd query -group GID [-author NODEID] [-topic PATTERN] [-since DATE] [-until DATE] [-limit N]`
 
-This is the architectural addition that makes the four-command surface
-coherent. Without it, we would either run two parallel Pilot sessions
-per identity (duplicate subscriptions, split-brain replay state, racing
-roster views) or try to read JSONL via filesystem notifications (races
-the writer, truncated mid-write lines, platform-specific coalescing).
-Both are unacceptable.
+**Purpose:** one-shot historical query against the SQLite store. Agent's
+primary tool for navigating group history: "what did author X say about
+topic Y last week."
 
-### 4.1 Location and permissions
+**Signature**
+
+```
+entmootd query -group GID [-author NODEID] [-topic PATTERN]
+               [-since DATE] [-until DATE] [-limit N]
+```
+
+**Flags**
+
+- `-group GID` (required; optional when exactly one group is joined).
+  Base64 group id.
+- `-author NODEID` (optional). Exact Pilot node id.
+- `-topic PATTERN` (optional). MQTT-style filter (`foo/+`, `foo/#`, etc.).
+- `-since DATE` (optional). RFC3339 timestamp (`2026-03-01T00:00:00Z`)
+  or unix millis. Lower bound, inclusive.
+- `-until DATE` (optional). Same format. Upper bound, exclusive.
+- `-limit N` (optional, default `50`). Maximum messages to return.
+- `-order asc|desc` (optional, default `desc`). Newest or oldest first.
+
+**Blocking behavior**
+
+Exits immediately after the query completes.
+
+**Stdout**
+
+One JSON object per matching message, one per line (same schema as
+`tail`). Ordering respects `-order`.
+
+**Exit codes**
+
+- `0`: success (including zero matches, in which case stdout is empty).
+- `1`: SQLite read error.
+- `3`: named group not joined.
+- `5`: flag validation error.
+
+**Side effects**
+
+None. Reads SQLite with a shared lock (WAL mode); does not block
+writes from the running `join` process.
+
+**Notes**
+
+- Reads SQLite directly, no control socket. `query` works whether or
+  not `join` is running, mirroring `info`.
+- `-topic` patterns use the same MQTT matcher as gossip. SQLite
+  pre-filters candidates by the first literal segment; the Go-side
+  matcher finalizes the pattern check.
+
+---
+
+## 4. Storage backend
+
+v1 replaces v0's JSONL message store with SQLite. This is in-scope for
+v1 (moved up from the ARCHITECTURE.md deferred list) because agents
+navigating group history need indexed queries that JSONL cannot serve
+at any scale.
+
+### 4.1 Layout
+
+One SQLite database per group, at
+`${data}/groups/<base64url(gid)>/messages.sqlite`. Separate files keep
+permissions, backup, and per-group encryption (a v2 concern) clean.
+The roster stays as `roster.jsonl` alongside; the roster is
+append-only, tiny, and easy to read with `cat`, so it doesn't benefit
+from moving.
+
+### 4.2 Schema
+
+```sql
+CREATE TABLE messages (
+  message_id      BLOB PRIMARY KEY,       -- 32 bytes
+  group_id        BLOB NOT NULL,          -- 32 bytes
+  author_node_id  INTEGER NOT NULL,       -- uint32 Pilot node id
+  timestamp_ms    INTEGER NOT NULL,
+  content         BLOB NOT NULL,
+  parents         BLOB NOT NULL,          -- up to 3 × 32-byte ids
+  signature       BLOB NOT NULL,          -- 64-byte Ed25519
+  canonical_bytes BLOB NOT NULL           -- exact wire form for sig verify
+);
+
+CREATE INDEX idx_messages_group_time
+  ON messages(group_id, timestamp_ms DESC);
+CREATE INDEX idx_messages_group_author
+  ON messages(group_id, author_node_id, timestamp_ms DESC);
+
+CREATE TABLE message_topics (
+  message_id BLOB NOT NULL,
+  topic      TEXT NOT NULL,
+  PRIMARY KEY (message_id, topic)
+);
+CREATE INDEX idx_topic_lookup ON message_topics(topic, message_id);
+```
+
+FTS5 (full-text search) and `prune` (retention) are v2; the schema
+above is v1.
+
+### 4.3 Concurrency model
+
+WAL mode. The `join` process writes on every `Put`; `query`, `info`,
+and `tail`'s backfill read with a shared lock. Reads never block
+writes and vice-versa under WAL. No cross-process locking beyond what
+SQLite provides.
+
+### 4.4 Integration with the rest of the system
+
+- `MessageStore` interface (in `src/pkg/entmoot/store/`) gains a new
+  `SQLite` implementation. `Memory` stays for unit tests; `JSONL`
+  stays as a development / debug backend.
+- The gossip layer calls `Put` / `Has` / `Get` unchanged. Topological
+  order for Merkle is computed by `SELECT ... ORDER BY timestamp_ms,
+  author_node_id, message_id`.
+- `canonical_bytes` preserves every message's exact wire form, so
+  signature verification is always possible regardless of future
+  schema changes.
+
+---
+
+## 5. Control-socket IPC contract
+
+This is the architectural addition that makes the five-command surface
+coherent. Without it we would either run two parallel Pilot sessions
+per identity (duplicate subscriptions, split-brain replay state,
+racing roster views) or try to read live state via filesystem
+notifications (races the writer, truncated mid-write lines,
+platform-specific coalescing). Both are unacceptable.
+
+### 5.1 Location and permissions
 
 - Path: `${data}/control.sock` (default `~/.entmoot/control.sock`).
 - Mode: `0600`, same owner as the running process.
@@ -329,46 +465,72 @@ Both are unacceptable.
   listening, it is unlinked and recreated; if a process *is* listening,
   `join` exits 6.
 
-### 4.2 Framing
+### 5.2 Framing
 
-Reuses `src/pkg/entmoot/wire/`:
+The codec lives in a new package, `src/pkg/entmoot/ipc/`. This is
+deliberately separate from `src/pkg/entmoot/wire/` (the peer-facing
+protocol) because the two have different security models: `wire/`
+frames cross encrypted Pilot tunnels to potentially-untrusted peers;
+`ipc/` frames move between cooperating processes on the same host.
+Sharing the framing library would conflate the two.
+
+`ipc/` reuses the same framing shape for familiarity:
 
 ```
 [4-byte big-endian length][1-byte message-type][JSON body]
 ```
 
-with a separate type-number range from the on-wire peer protocol to
-avoid collision. The codec lives in a new package,
-`src/pkg/entmoot/ipc/`, which imports and extends `wire/`.
+with its own type-number namespace.
 
-### 4.3 Message types (v1)
+### 5.3 Message types (v1)
 
 | Type | Direction | Purpose |
 |---|---|---|
 | `publish_req` | client → daemon | author and gossip a message |
-| `publish_resp` | daemon → client | `{message_id, timestamp_ms}` or `{error}` |
-| `tail_subscribe` | client → daemon | open a subscription with filter |
-| `tail_event` | daemon → client | stream message events (one per match) |
-| `tail_replay` | daemon → client | emit a buffered message (before live) |
-| `tail_live` | daemon → client | marker: "from here on, this is live" |
+| `publish_resp` | daemon → client | `{message_id, timestamp_ms}` on success |
+| `tail_subscribe` | client → daemon | open a live subscription with filter |
+| `tail_event` | daemon → client | stream message events (live mode) |
 | `info_req` | client → daemon | request snapshot |
 | `info_resp` | daemon → client | full info JSON |
-| `error` | daemon → client | structured error with code + message |
+| `error` | daemon → client | structured error with code + details |
 
-### 4.4 Connection lifecycle
+(The earlier draft's `tail_replay` and `tail_live` marker are dropped:
+backfill comes from SQLite before `tail` opens the control socket, so
+the IPC stream is only ever live events.)
+
+### 5.4 Error frame format
+
+The `error` frame body is a structured JSON object:
+
+```json
+{"type":"error","code":"GROUP_NOT_FOUND","group_id":"<base64>","message":"..."}
+```
+
+| Code | Meaning | Maps to CLI exit code |
+|---|---|---|
+| `OK` | (not emitted; success uses the specific response frame) | 0 |
+| `INTERNAL` | generic transport / server error | 1 |
+| `NOT_MEMBER` | local node is not in the named group's roster | 2 |
+| `GROUP_NOT_FOUND` | named group is not joined locally | 3 |
+| `INVALID_ARGUMENT` | flag or payload validation failure | 5 |
+
+The client translates `code` to the process exit code.
+
+### 5.5 Connection lifecycle
 
 `publish` and `info` open the socket, send one request, read one
-response, close. `tail` opens, sends `tail_subscribe`, then reads a
-stream of `tail_replay` events, one `tail_live` marker, then
-`tail_event` events indefinitely until the client closes.
+response, close. `tail` (live mode) opens, sends `tail_subscribe`, then
+reads a stream of `tail_event` frames until the client closes.
+Backfill runs before the subscription via SQLite.
 
-Clients (`publish`, `tail`, `info`) probe the socket first. If absent
-or unresponsive within a short timeout (500 ms), they exit 6 with a
-help string: `entmootd: no running join process found; start one with "entmootd join <invite>"`.
+Clients (`publish`, `tail`) probe the socket first. If absent or
+unresponsive within a short timeout (500 ms), they exit 6 with a help
+string: `entmootd: no running join process found; start one with "entmootd join <invite>"`. `info` and `query` skip the probe and go
+straight to SQLite.
 
 ---
 
-## 5. Exit codes
+## 6. Exit codes
 
 Reference table.
 
@@ -391,28 +553,34 @@ Dropped from earlier drafts:
 
 ---
 
-## 6. Migration from v0
+## 7. v0 → v1 changes
 
-What happens to each current command when this design ships.
+v0 had no real users outside development work on the canary, so v1
+makes a clean break: no migration code, no legacy flags, no
+backwards-compatible shims. The data layout changes (JSONL to SQLite)
+and the IPC model changes (independent invocations to control-socket
+routed), and the v0 binary is simply replaced.
 
 | v0 command | Status in v1 |
 |---|---|
-| `run` | **Removed.** Subsumed by `join`, which now both joins and runs. |
-| `group create -name N` | **Kept.** Advanced / founder-only; not part of the agent skill. |
-| `invite create -group ...` | **Kept.** Advanced / founder-only. |
-| `join -invite FILE` | **Changed.** Positional argument, now blocks and runs, accepts URLs. |
-| `publish -group -topic -content` | **Changed.** JSON stdout, talks to running process via control socket, `-group` optional when unambiguous. |
-| `info` | **Changed.** JSON by default (no `--format=text`), reports `running` bool. |
+| `run` | **Removed.** `join` now blocks and runs; there is no separate `run`. |
+| `group create -name N` | **Kept.** Advanced / founder-only; not part of the agent surface. |
+| `invite create -group ...` | **Kept.** Advanced / founder-only. Emits invites with a `ValidUntil` field. |
+| `join -invite FILE` | **Changed.** Positional argument; blocks and runs; accepts URLs. |
+| `publish` | **Changed.** JSON stdout; routes through the control socket; `-group` optional when exactly one group is joined. |
+| `info` | **Changed.** JSON-only output; reads SQLite directly; reports a `running` bool. |
 | `tail` | **New.** |
+| `query` | **New.** |
 
-The net change for developers: `group create` and `invite create`
-behavior is unchanged; everyone else sees JSON instead of human text
-and routes through the control socket. For agents: one command to go
-from install to online, plus a small vocabulary for routine operation.
+For agents: one command to go from install to online, plus a small
+vocabulary for routine operation. For developers: `group create` and
+`invite create` behavior is unchanged in spirit (flag naming may
+tighten); everything else sees JSON-only output and routes through
+the control socket or SQLite.
 
 ---
 
-## 7. Deferred items (with rationale)
+## 8. Deferred items (with rationale)
 
 | Item | Why not in v1 |
 |---|---|
@@ -420,44 +588,33 @@ from install to online, plus a small vocabulary for routine operation.
 | `--detach` / daemon-mode | Agents manage process lifecycle; daemon-mode drags in PID files, log redirection, status subcommands. |
 | `tail --since <timestamp>` | Requires a cross-peer ordering contract we do not have. |
 | Standalone `publish` (no running `join`) | Encourages dual-Pilot-session bugs. Control socket is mandatory. |
+| `entmootd search` (FTS5) | SQLite is already in; FTS5 is a cheap v2 addition once an agent asks for it. |
+| `entmootd stats` | Useful for debugging but not part of the core agent workflow. |
+| `entmootd prune -older-than 90d` | Retention policy needs its own design; v1 keeps everything. |
+| Per-group encryption at rest | Agents own their disk; revisit when group E2E encryption lands. |
 | Install automation (goreleaser, install.sh) | Separate track. |
 | skill.md | Depends on commands existing. |
 | Python SDK / non-Go surface | Out of scope for v1. |
 
 ---
 
-## 8. Open questions for implementation review
+## 9. Resolved decisions (formerly open questions)
 
-These do not block the design approval; they surface the judgement
-calls that the implementation will need to make.
+| # | Question | Decision |
+|---|---|---|
+| 1 | Package location for IPC | `src/pkg/entmoot/ipc/`. Separate from `wire/` because local IPC and peer wire have different security models. |
+| 2 | `tail -n N` replay source | SQLite query against the store. No in-memory replay buffer. |
+| 3 | Invite URL TTL | 24 hours by default. Invite JSON grows a `ValidUntil` field. HTTP responses include `Cache-Control: no-store`. |
+| 4 | Multi-topic publish | Single message with multiple topics. Matches `Message.Topics []string` wire format; atomic operation. |
+| 5 | Group-not-found error via IPC | Structured `error` frame with a `code` field (`GROUP_NOT_FOUND`, etc.) that maps to CLI exit codes. See §5.4 for the frame format and §6 for the exit-code table. |
+| 6 | `info` when no `join` is running | Reads SQLite directly. Reports `running: false` and `merkle_root: null` per group. |
+| 7 | v0 backwards compatibility | Clean removal. v0 had no real users outside development. No migration code, no legacy flags. |
+| 8 | Storage backend | SQLite, one file per group, WAL mode. Formerly deferred in ARCHITECTURE.md; moved in-scope for v1. |
+| 9 | `query` subcommand | Included in v1. Agents need historical indexed access; `search` / `stats` / `prune` deferred to v2. |
 
-1. **Package location for IPC.** Does the control-socket codec live in
-   a new `src/pkg/entmoot/ipc/` package, or as a sub-package of
-   `src/pkg/entmoot/wire/`? Leaning new package (clearer separation
-   between peer wire and local IPC wire).
-2. **`tail -n N` replay source.** Is the last-N-messages buffer
-   maintained in the running process's in-memory store, or read from
-   the on-disk JSONL? In-memory is simpler and avoids re-parsing JSONL,
-   but loses data across restart. Both are defensible; in-memory is
-   the starting point.
-3. **Invite URL TTL.** What default TTL do served invites get, and how
-   is expiration communicated? (The invite bundle already has an
-   `IssuedAt` field; add a `ValidUntil`?)
-4. **Multi-topic publish.** `-topic A,B,C` publishes one message with
-   all three topics, or three messages? Confirm single-message (matches
-   v0 behavior and the `Message.Topics []string` wire field).
-5. **Group-not-found error from `publish` via IPC.** The `join` process
-   knows the full list; `publish` just forwards a request. The IPC
-   error message should be distinguishable from other failures; `error`
-   frame carries a structured code.
-6. **`entmootd info` when no `join` is running.** Should it still open
-   each group's roster from disk to report member counts, or report
-   only identity + list of groups? Leaning "report from disk" since
-   that's what an agent debugging a dead process would want.
-7. **Backwards compatibility with v0 workflow.** Do we keep the v0
-   commands available under a flag (`--legacy run`), or remove cleanly
-   with a short migration note in the release notes? Leaning remove.
+All nine resolved in discussion on 2026-04-17. Implementation can
+proceed against this design without reopening any of them.
 
 ---
 
-*End of design. Implementation proceeds once this document is approved.*
+*End of design. Implementation proceeds against this spec.*

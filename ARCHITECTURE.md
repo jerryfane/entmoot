@@ -186,7 +186,8 @@ Invite
 ├── roster_head:     roster_entry_id + merkle_path  (auth'd snapshot to diff from)
 ├── merkle_root:     current group Merkle root
 ├── bootstrap_peers: [ {node_id, hostname?} × 3–5 ]   (recently-online members)
-├── issued_at:
+├── issued_at:       unix millis, signing time
+├── valid_until:     unix millis, expiration (default 24 h after issued_at)
 ├── issuer:          node_id of member who produced the invite
 └── signature:       Ed25519 over the encoded bundle, signed by issuer
 ```
@@ -296,6 +297,11 @@ whole point of selective sync. The storage tiers:
 If retention failures start showing up in testing (someone asks for an old
 message everyone's forgotten), we revisit. The omission keeps v0 closer to
 "everyone keeps what they want," which is easier to reason about.
+
+**v1 backend is SQLite** (WAL mode, one file per group under
+`${data}/groups/<gid>/messages.sqlite`). v0's JSONL store does not support
+the indexed queries agents need for historical access. See `docs/CLI_DESIGN.md`
+§4 for the full schema and concurrency model.
 
 ## 9. Merkle completeness proofs
 

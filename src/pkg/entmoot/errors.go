@@ -34,3 +34,7 @@ var ErrOversized = errors.New("entmoot: frame exceeds 16 MiB cap")
 // ErrNotMember is returned by the delivery layer when a message is authored
 // by a node that is not a current roster member.
 var ErrNotMember = errors.New("entmoot: author not a group member")
+
+// ErrInviteExpired is returned by gossip.Join when the invite's ValidUntil
+// timestamp is in the past relative to the local clock.
+var ErrInviteExpired = errors.New("entmoot: invite has expired")

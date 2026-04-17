@@ -212,6 +212,12 @@ type Invite struct {
 	BootstrapPeers []BootstrapPeer `json:"bootstrap_peers"`
 	// IssuedAt is the unix-milliseconds timestamp when the invite was produced.
 	IssuedAt int64 `json:"issued_at"`
+	// ValidUntil is the unix-milliseconds timestamp after which the invite
+	// must be rejected by joiners. Zero means "no expiry asserted" and is
+	// only accepted for backwards compatibility with pre-v1 bundles and
+	// test fixtures; real v1 issuers always set it (default IssuedAt + 24h
+	// per docs/CLI_DESIGN.md §9).
+	ValidUntil int64 `json:"valid_until"`
 	// Issuer is the group member that produced this invite (often but not
 	// always the founder).
 	Issuer NodeInfo `json:"issuer"`

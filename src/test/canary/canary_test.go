@@ -135,20 +135,25 @@ func TestCanaryInMemory(t *testing.T) {
 		t.Fatalf("rosterC.Apply add C: %v", err)
 	}
 
-	// ---- Step 5: JSONL message stores per node.
-	storeA, err := store.OpenJSONL(dataA)
+	// ---- Step 5: SQLite message stores per node.
+	//
+	// v1 swaps the library-level canary onto the SQLite backend to catch
+	// SQL-layer bugs independently of the binary canary (which exercises
+	// SQLite via a real daemon). Memory and JSONL remain covered by their
+	// own suite tests in pkg/entmoot/store.
+	storeA, err := store.OpenSQLite(dataA)
 	if err != nil {
-		t.Fatalf("store.OpenJSONL A: %v", err)
+		t.Fatalf("store.OpenSQLite A: %v", err)
 	}
 	t.Cleanup(func() { _ = storeA.Close() })
-	storeB, err := store.OpenJSONL(dataB)
+	storeB, err := store.OpenSQLite(dataB)
 	if err != nil {
-		t.Fatalf("store.OpenJSONL B: %v", err)
+		t.Fatalf("store.OpenSQLite B: %v", err)
 	}
 	t.Cleanup(func() { _ = storeB.Close() })
-	storeC, err := store.OpenJSONL(dataC)
+	storeC, err := store.OpenSQLite(dataC)
 	if err != nil {
-		t.Fatalf("store.OpenJSONL C: %v", err)
+		t.Fatalf("store.OpenSQLite C: %v", err)
 	}
 	t.Cleanup(func() { _ = storeC.Close() })
 
@@ -394,19 +399,19 @@ func TestCanaryPilot(t *testing.T) {
 		t.Fatalf("rosterC.Apply: %v", err)
 	}
 
-	storeA, err := store.OpenJSONL(dataA)
+	storeA, err := store.OpenSQLite(dataA)
 	if err != nil {
-		t.Fatalf("store.OpenJSONL A: %v", err)
+		t.Fatalf("store.OpenSQLite A: %v", err)
 	}
 	t.Cleanup(func() { _ = storeA.Close() })
-	storeB, err := store.OpenJSONL(dataB)
+	storeB, err := store.OpenSQLite(dataB)
 	if err != nil {
-		t.Fatalf("store.OpenJSONL B: %v", err)
+		t.Fatalf("store.OpenSQLite B: %v", err)
 	}
 	t.Cleanup(func() { _ = storeB.Close() })
-	storeC, err := store.OpenJSONL(dataC)
+	storeC, err := store.OpenSQLite(dataC)
 	if err != nil {
-		t.Fatalf("store.OpenJSONL C: %v", err)
+		t.Fatalf("store.OpenSQLite C: %v", err)
 	}
 	t.Cleanup(func() { _ = storeC.Close() })
 
