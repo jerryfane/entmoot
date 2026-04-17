@@ -53,6 +53,20 @@ the shape of the design space, not to freeze implementation choices.
    group only if it already has a Pilot trust edge with at least one group
    member (the introducer). Group-level authorization is layered on top via
    signed roster entries.
+6. **Local control-socket IPC boundary.** v1 introduces a local IPC
+   boundary between the long-running `join` process and the short-lived
+   CLI invocations that operate against it. Exactly one `join` process
+   per host owns the single Pilot connection and is the only writer to
+   the SQLite message store. Short-lived CLI invocations (`publish`,
+   `tail`, `info`, `query`) communicate with the `join` process via a
+   Unix domain socket at `${data}/control.sock` (mode `0600`, same
+   owner). The control-socket codec lives in its own package
+   (`src/pkg/entmoot/ipc/`), deliberately separate from the peer wire
+   codec (`src/pkg/entmoot/wire/`); the two have different security
+   models (IPC is local cooperating processes, wire is encrypted
+   tunnels to potentially-untrusted peers), so the framing libraries do
+   not share a namespace. The full contract (message types, error
+   codes, lifecycle) is documented in `docs/CLI_DESIGN.md` §5.
 
 ## 3. Data model
 

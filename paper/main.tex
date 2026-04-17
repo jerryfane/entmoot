@@ -53,9 +53,11 @@ It adds multi-party gossip, topic-based subscription, signed group
 membership, and Merkle-verified message completeness on top of Pilot's
 existing unicast primitives, without waiting for Pilot's in-progress
 ``custom networks'' feature. We describe the design, a reference Go
-implementation across thirteen packages, and an end-to-end canary test that
+implementation across fourteen packages, and an end-to-end canary test that
 shows three sandboxed Pilot nodes converging to byte-identical Merkle roots
 in under twelve seconds of wall-clock time over real encrypted tunnels.
+Entmoot v1 also ships a one-command installer and an Agent-Skills-format
+skill document, so the protocol is directly consumable by autonomous agents.
 \end{abstract}
 
 % --- 1. Introduction ---------------------------------------------------
@@ -104,13 +106,19 @@ Our contributions are as follows.
     is captured in signed rosters above the transport, not in Pilot's
     own (in-progress) network membership mechanism.
     \item A Go reference implementation, \texttt{entmootd}, comprising
-    thirteen packages and roughly three thousand lines of code, including
+    fourteen packages and roughly three thousand lines of code, including
     framing, replay protection, rate limiting, gossip, Merkle trees, and
-    a Pilot-daemon adapter.
-    \item An end-to-end canary test in which three peers join a group,
-    exchange three signed messages, and converge to byte-identical Merkle
-    roots in approximately twelve seconds of wall clock, over real
-    encrypted Pilot tunnels spawned as subprocesses in the test.
+    a Pilot-daemon adapter, together with an end-to-end canary test in
+    which three peers join a group, exchange three signed messages, and
+    converge to byte-identical Merkle roots in approximately twelve
+    seconds of wall clock, over real encrypted Pilot tunnels spawned as
+    subprocesses in the test.
+    \item An agent-facing CLI surface (\texttt{join}, \texttt{publish},
+    \texttt{tail}, \texttt{info}, \texttt{query}) with local-IPC
+    coordination, a one-command installer (\texttt{install.sh}), and an
+    Agent-Skills-format skill document
+    (\texttt{skills/entmoot/SKILL.md}) that lets OpenClaw-style agents
+    install and operate Entmoot without developer intervention.
 \end{enumerate}
 
 The rest of the paper is organized as follows. Section~\ref{sec:background}
@@ -190,22 +198,29 @@ does not use a DHT in v0.
                      inner sep=3pt, minimum height=6mm},
   box/.style={minimum width=62mm},
 ]
-\node[box, fill=gray!5]  (app)   {Application (agent logic)};
-\node[box, fill=gray!20, below=1mm of app]   (ent)
-     {\textbf{entmootd} on port 1004\\
-      {\scriptsize wire $\cdot$ roster $\cdot$ store $\cdot$ gossip $\cdot$ merkle}};
-\node[box, fill=gray!5, below=1mm of ent]   (ipc)
-     {{\scriptsize Unix IPC socket}};
-\node[box, fill=gray!20, below=1mm of ipc]  (pilot)
+\node[box, fill=gray!5]  (cli)   {CLI clients: \texttt{publish},
+      \texttt{tail}, \texttt{info}, \texttt{query}};
+\node[box, fill=gray!5, below=1mm of cli]  (csock)
+     {{\scriptsize control socket
+       (\texttt{\textasciitilde/.entmoot/control.sock})}};
+\node[box, fill=gray!20, below=1mm of csock]   (ent)
+     {\textbf{entmootd join} on port 1004\\
+      {\scriptsize wire $\cdot$ roster $\cdot$ store $\cdot$ gossip $\cdot$ merkle $\cdot$ ipc}};
+\node[box, fill=gray!5, below=1mm of ent]   (psock)
+     {{\scriptsize Pilot IPC socket}};
+\node[box, fill=gray!20, below=1mm of psock]  (pilot)
      {\textbf{Pilot daemon}\\
       {\scriptsize identity $\cdot$ trust $\cdot$ tunnels $\cdot$ NAT}};
 \node[box, fill=gray!5, below=1mm of pilot] (net)
      {UDP over IP};
 \end{tikzpicture}
-\caption{System stack. Entmoot runs as a user-space sidecar to the Pilot
-daemon: each entmootd reaches its peers by opening a Pilot stream on
-port~1004, with the daemon providing identity, trust, and transport
-encryption.}
+\caption{System stack and multi-process layout. A single long-running
+\texttt{entmootd join} process per host owns the Pilot connection and
+the on-disk state; short-lived CLI clients (\texttt{publish},
+\texttt{tail}, \texttt{info}, \texttt{query}) dial the local control
+socket. Entmoot reaches its peers by opening Pilot streams on
+port~1004, with the Pilot daemon providing identity, trust, and
+transport encryption.}
 \label{fig:architecture}
 \end{figure}
 
@@ -397,27 +412,60 @@ be added underneath without breaking protocol compatibility.
 \label{sec:implementation}
 
 \texttt{entmootd} is implemented in Go (${\geq}1.25.3$, matching Pilot's
-toolchain requirement) and compiles against Pilot~v1.7.2. The module is split into thirteen packages totalling
-roughly three thousand lines of code. Key packages: \texttt{canonical}
-(deterministic JSON encoding used for signing and identifier
-computation), \texttt{merkle} (tree construction and
-positive-inclusion proofs), \texttt{roster} (signed log with the
-founder-only admin rule and a dedicated \texttt{AcceptGenesis} entry
-point for joiners that lack the founder's private key),
-\texttt{store} (in-memory and JSONL backends that share a topological-
-order helper), \texttt{wire} (framing, codec, replay protection),
-\texttt{gossip} (push strategy, peer sampling, and the three-tier
-bootstrap), and \texttt{transport/pilot} (the adapter over Pilot's Go
-driver API).
+toolchain requirement) and compiles against Pilot~v1.7.2. The module is
+split into fourteen packages totalling roughly three thousand lines of
+code. Key packages: \texttt{canonical} (deterministic JSON encoding
+used for signing and identifier computation), \texttt{merkle} (tree
+construction and positive-inclusion proofs), \texttt{roster} (signed
+log with the founder-only admin rule and a dedicated
+\texttt{AcceptGenesis} entry point for joiners that lack the founder's
+private key), \texttt{store} (in-memory, JSONL, and in v1 a SQLite
+backend using WAL mode with one database file per group, sharing a
+topological-order helper), \texttt{wire} (framing, codec, replay
+protection), \texttt{gossip} (push strategy, peer sampling, and the
+three-tier bootstrap), \texttt{transport/pilot} (the adapter over
+Pilot's Go driver API), and \texttt{ipc} (local control-socket codec,
+reusing the framing shape in a separate type namespace so the
+security model of peer-facing wire traffic stays split from
+same-host IPC). See \texttt{docs/CLI\_DESIGN.md} \S4 for the SQLite
+layout and \S5 for the IPC contract.
 
-The binary exposes six subcommands: \texttt{run} starts the long-running
-accept loop; \texttt{group create} produces a new group identifier and
-genesis roster; \texttt{invite create} emits a signed invite bundle;
-\texttt{join} consumes an invite and bootstraps the local roster;
-\texttt{publish} authors, signs, and gossips a message; and
-\texttt{info} prints node identity, public key, and joined groups.
-Default paths follow Pilot's conventions (\texttt{/tmp/pilot.sock} for
-the IPC socket, \texttt{\textasciitilde/.entmoot/} for persistent state).
+The binary exposes a five-command agent-facing surface plus two
+founder-only subcommands. \texttt{join} consumes an invite, binds the
+listen port, opens a local control socket, and enters the accept loop,
+blocking until signalled; \texttt{publish} authors and gossips a
+message; \texttt{tail} streams live messages with optional SQLite
+backfill; \texttt{info} emits a JSON status snapshot; and
+\texttt{query} runs indexed historical lookups against SQLite. The
+founder-only commands \texttt{group create} and \texttt{invite create}
+produce new group identifiers and signed invite bundles respectively.
+Default paths follow Pilot's conventions: \texttt{/tmp/pilot.sock} for
+Pilot IPC, \texttt{\textasciitilde/.entmoot/} for persistent state,
+and \texttt{\textasciitilde/.entmoot/control.sock} for the local
+control socket.
+
+The control-socket IPC model keeps multi-process operation coherent.
+Exactly one \texttt{join} process per host owns the single Pilot
+connection and the SQLite writer for every joined group. Short-lived
+CLI invocations (\texttt{publish}, \texttt{tail} in live mode) dial
+\texttt{\$\{data\}/control.sock}, send one request, and read one or
+more response frames; \texttt{info} and \texttt{query} read SQLite
+directly and work whether or not \texttt{join} is running. This layout
+enforces ``one Pilot session per identity'' and routes every write
+through a single owner, eliminating split-brain replay state and
+conflicting roster views. The \texttt{ipc} package defines the wire
+framing (4-byte length prefix, 1-byte type, JSON body) and a small
+error-code vocabulary that the client translates to process exit
+codes; \texttt{docs/CLI\_DESIGN.md} \S5 pins the full contract.
+
+Agent-facing packaging is the final piece. \texttt{install.sh} fetches
+prebuilt binaries from GitHub Releases with a source-build fallback
+when no release matches the host triple, placing the binary under
+\texttt{\textasciitilde/.entmoot/bin}. \texttt{skills/entmoot/SKILL.md}
+is a declarative Agent-Skills document that agents read to verify
+prerequisites (\texttt{entmootd} and \texttt{pilot-daemon} on
+\texttt{\$PATH}, a reachable Pilot socket), install missing
+components, and drive the five-command surface.
 
 The Pilot adapter implements a small transport interface that gossip
 uses internally:
@@ -455,16 +503,16 @@ rate-limiter's token-bucket primitive.
 \section{Evaluation}
 \label{sec:evaluation}
 
-We evaluate Entmoot with an end-to-end canary test executed in two
-variants (Figure~\ref{fig:canary}). The canary flow is identical between
-the two: three gossipers, call them $A$, $B$, and $C$, initialize with a
-shared group whose founder is $A$. $A$ signs \texttt{add} entries for $B$ and $C$
-and replicates the roster to them via the bootstrap flow. Three
-messages are then published (first from $A$, then from $B$, then from
-$A$ again), each with a distinct topic. We poll every 100\,ms for
-convergence, defined as all three members reporting the same Merkle
-root and the same message count. A 30-second timeout bounds each
-variant.
+We evaluate Entmoot with an end-to-end canary test executed in three
+variants (Figure~\ref{fig:canary}). The canary flow is identical across
+all three: three gossipers, call them $A$, $B$, and $C$, initialize
+with a shared group whose founder is $A$. $A$ signs \texttt{add}
+entries for $B$ and $C$ and replicates the roster to them via the
+bootstrap flow. Three messages are then published (first from $A$,
+then from $B$, then from $A$ again), each with a distinct topic. We
+poll every 100\,ms for convergence, defined as all three members
+reporting the same Merkle root and the same message count. A
+30-second timeout bounds each variant.
 
 The first variant, \texttt{TestCanaryInMemory}, wires gossipers
 together with an in-memory transport implemented as pairs of
@@ -473,10 +521,18 @@ wall clock and exercises the full stack except the Pilot network
 layer. The second variant, \texttt{TestCanaryPilot}, spawns three
 sandboxed Pilot daemons as subprocesses with distinct sockets and
 identity directories, establishes pairwise trust between them, and
-runs the gossipers over real encrypted tunnels. It completes in
-approximately 12 seconds of wall clock. The breakdown is dominated by
-Pilot daemon startup and handshake setup (around 9 seconds combined);
-once tunnels are in place, message convergence takes 1.5\,s.
+runs the gossipers (as library code) over real encrypted tunnels. It
+completes in approximately 12 seconds of wall clock. The breakdown is
+dominated by Pilot daemon startup and handshake setup (around 9
+seconds combined); once tunnels are in place, message convergence
+takes 1.5\,s. The third variant, \texttt{TestCanaryBinary}, spawns
+three real \texttt{entmootd} subprocesses alongside the three Pilot
+daemons and drives them entirely through the v1 CLI surface
+(\texttt{join}, \texttt{publish}, \texttt{tail}, \texttt{query}). It
+completes in approximately 14 seconds of wall clock; it is the only
+variant that exercises the control-socket IPC path and the
+five-command CLI end-to-end, whereas the other two exercise only the
+library layer.
 
 \begin{figure}[t]
 \centering
@@ -560,17 +616,16 @@ that such coordination can later sit on top of.
 \section{Discussion and Future Work}
 \label{sec:future}
 
-Entmoot v0 ships a deliberately narrow subset of the full design. The
-items deferred, with their upgrade paths, are: push-pull gossip (v0 is
+Entmoot v1 ships a deliberately narrow subset of the full design. The
+items deferred, with their upgrade paths, are: push-pull gossip (v1 is
 push-only); near-peer sampling informed by subscriber interest overlap
-(v0 is random-only); cooldown and soft-penalty schemes on rate-limit
-breach (v0 hard-disconnects); DHT-assigned message keepers for
-retention beyond subscriber interest (v0 stores only what each member
-cares about); Merkle absence proofs for filtered subscriber views (v0
+(v1 is random-only); cooldown and soft-penalty schemes on rate-limit
+breach (v1 hard-disconnects); DHT-assigned message keepers for
+retention beyond subscriber interest (v1 stores only what each member
+cares about); Merkle absence proofs for filtered subscriber views (v1
 supports positive-inclusion only); end-to-end group encryption with
-shared-key rotation on churn (v0 is plaintext); multi-admin or
-quorum-based rosters (v0 is founder-only); and SQLite or Bolt
-persistence in place of JSONL files (v0 is append-only JSON lines).
+shared-key rotation on churn (v1 is plaintext); and multi-admin or
+quorum-based rosters (v1 is founder-only).
 
 When Pilot's custom-networks feature ships, the membership interface
 can be backed by network membership instead of our signed roster
@@ -586,7 +641,11 @@ topic filters, and community structure beyond the Pilot backbone.
 A first natural measurement study would be to deploy Entmoot to a
 fraction of the existing Pilot population and observe how rosters
 grow, how gossip fanout behaves under real loads, and how topic
-filters correlate with agents' declared capability tags.
+filters correlate with agents' declared capability tags. The
+Agent-Skills-format skill document shipped alongside the installer
+is the concrete enabler for the question ``what do agents do with it
+once they have it'': it is the interface agents actually install and
+call, rather than a library surface waiting for a developer.
 
 % --- 8. Conclusion -----------------------------------------------------
 \section{Conclusion}
