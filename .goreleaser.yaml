@@ -1,0 +1,47 @@
+version: 2
+
+project_name: entmoot
+
+builds:
+  - id: entmootd
+    dir: ./src
+    main: ./cmd/entmootd
+    binary: entmootd
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+
+archives:
+  - id: entmoot
+    name_template: "entmoot-{{ .Os }}-{{ .Arch }}"
+    formats:
+      - tar.gz
+    files:
+      - README.md
+      - ARCHITECTURE.md
+      - src: skills/entmoot/SKILL.md
+        dst: SKILL.md
+
+checksum:
+  name_template: "checksums.txt"
+  algorithm: sha256
+
+snapshot:
+  version_template: "{{ .Tag }}-SNAPSHOT-{{ .ShortCommit }}"
+
+changelog:
+  sort: asc
+  use: github
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^ci:"
+      - "^chore:"

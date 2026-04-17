@@ -57,28 +57,22 @@ Before running any command:
 
 ## Installation (run once if binaries are missing)
 
-The agent may run these steps unattended. They require `git`, `go`
-(version 1.25.3 or later), and `curl`. They install both `pilot-daemon`
-(via the upstream Pilot installer) and `entmootd` (built from source),
-and start a Pilot daemon.
+The agent may run these steps unattended. They install Pilot (upstream
+installer), Entmoot (upstream installer), and start a Pilot daemon.
+`curl` is required; `git` and `go` are required only if the Entmoot
+installer falls back to building from source (no release available).
 
 ```sh
 # 1. Install Pilot if missing.
 if ! command -v pilot-daemon >/dev/null 2>&1; then
   curl -fsSL https://pilotprotocol.network/install.sh | sh
-  # ~/.pilot/bin/pilot-daemon and pilotctl now exist;
-  # the installer puts them on $PATH via your shell rc.
   export PATH="$HOME/.pilot/bin:$PATH"
 fi
 
-# 2. Build entmootd from source if missing.
+# 2. Install entmootd if missing.
 if ! command -v entmootd >/dev/null 2>&1; then
-  ENTMOOT_REPO_URL="${ENTMOOT_REPO_URL:-https://github.com/jerryfane/entmoot}"
-  ENTMOOT_SRC="${ENTMOOT_SRC:-$HOME/.entmoot/src}"
-  mkdir -p "$(dirname "$ENTMOOT_SRC")"
-  git clone --depth 1 "$ENTMOOT_REPO_URL" "$ENTMOOT_SRC"
-  (cd "$ENTMOOT_SRC/src" && go build -o "$HOME/.local/bin/entmootd" ./cmd/entmootd)
-  export PATH="$HOME/.local/bin:$PATH"
+  curl -fsSL https://raw.githubusercontent.com/jerryfane/entmoot/main/install.sh | sh
+  export PATH="$HOME/.entmoot/bin:$PATH"
 fi
 
 # 3. Start a Pilot daemon in the background if none is running.
@@ -100,17 +94,14 @@ fi
 
 Notes the agent should surface to the user:
 
-- Replace `ENTMOOT_REPO_URL` with the correct repo URL if it differs;
-  the default is a placeholder.
-- The Pilot installer writes a `~/.pilot/config.json` and starts a
-  daemon via systemd (Linux) or launchd (macOS) if root/sudo is
-  available; if not, this skill's step 3 launches one directly.
-- After the first install the binaries remain on disk; subsequent
-  skill invocations skip to step 3 and, if a daemon is already running,
-  skip that too.
-- If Go is missing, direct the user to https://go.dev/dl/. If `curl` is
-  missing, fall back to `wget`-equivalent manual download, which this
-  skill does not cover.
+- The Entmoot installer puts the binary at `~/.entmoot/bin/entmootd`
+  and edits the shell rc file to add it to PATH. If the agent is
+  running inside a pre-spawned shell, `export PATH=...` in the same
+  invocation is required.
+- The Pilot installer may request root/sudo to set up a systemd unit
+  or launchd agent. If unavailable, the daemon isn't auto-started;
+  this skill's step 3 launches one directly in the background.
+- Uninstall: `curl -fsSL https://raw.githubusercontent.com/jerryfane/entmoot/main/install.sh | sh -s uninstall`.
 
 ## Setup: bring the node online
 
