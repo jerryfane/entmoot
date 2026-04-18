@@ -1,11 +1,13 @@
 package canary
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -168,28 +170,46 @@ func TestCanaryBinary(t *testing.T) {
 		t.Fatalf("LoadOrGenerate idA: %v", err)
 	}
 
-	// Open A's roster (already contains the genesis) and append add(B),
-	// add(C) entries signed by the founder.
+	// Open A's roster (already contains the genesis) and append add(B)
+	// via library primitives. add(C) then goes through the v1.0.1
+	// `entmootd roster add` CLI to exercise that entry path too.
 	rosterA, err := roster.OpenJSONL(dataA, gid)
 	if err != nil {
 		t.Fatalf("roster.OpenJSONL A: %v", err)
 	}
 	founderID := a.NodeID
 	infoB := entmoot.NodeInfo{PilotNodeID: b.NodeID, EntmootPubKey: []byte(idB.PublicKey)}
-	infoC := entmoot.NodeInfo{PilotNodeID: c.NodeID, EntmootPubKey: []byte(idC.PublicKey)}
 	nowMs := time.Now().UnixMilli()
 	addB := mkRosterAdd(t, idA, founderID, rosterA.Head(), infoB, nowMs+1)
 	if err := rosterA.Apply(addB); err != nil {
 		t.Fatalf("rosterA.Apply add B: %v", err)
 	}
-	addC := mkRosterAdd(t, idA, founderID, rosterA.Head(), infoC, nowMs+2)
-	if err := rosterA.Apply(addC); err != nil {
-		t.Fatalf("rosterA.Apply add C: %v", err)
-	}
-	// Close before the invite-create subprocess opens it — JSONL is
-	// append-only and safe, but closing avoids holding an unnecessary
-	// file handle.
+	// Close A's roster so the `entmootd roster add` subprocess can acquire
+	// the JSONL append handle.
 	_ = rosterA.Close()
+
+	// Use `entmootd roster add` for peer C. The subcommand binds Pilot
+	// port 1004 transiently, so it must run BEFORE startEntmootdJoin(A)
+	// below (which also binds 1004 for the founder's accept loop).
+	pubkeyC := base64.StdEncoding.EncodeToString([]byte(idC.PublicKey))
+	rosterAddArgs := append(append([]string{}, globalA...),
+		"roster", "add",
+		"-group", gid.String(),
+		"-node", strconv.FormatUint(uint64(c.NodeID), 10),
+		"-pubkey", pubkeyC)
+	addOut, addErr, addCode := runEntmootd(t, entmootdBin, envBase(a.Socket, dataA), rosterAddArgs...)
+	if addCode != 0 {
+		t.Fatalf("roster add C: exit=%d stdout=%s stderr=%s", addCode, addOut, addErr)
+	}
+	var rosterAddResp struct {
+		Members int `json:"members"`
+	}
+	if err := json.Unmarshal([]byte(addOut), &rosterAddResp); err != nil {
+		t.Fatalf("roster add C: parse stdout %q: %v", addOut, err)
+	}
+	if rosterAddResp.Members != 3 {
+		t.Fatalf("roster add C: members=%d, want 3 (founder + B + C)", rosterAddResp.Members)
+	}
 
 	// --- Founder: generate two invite bundles ---
 	//

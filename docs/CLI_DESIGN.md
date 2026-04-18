@@ -571,6 +571,7 @@ routed), and the v0 binary is simply replaced.
 | `info` | **Changed.** JSON-only output; reads SQLite directly; reports a `running` bool. |
 | `tail` | **New.** |
 | `query` | **New.** |
+| `roster add` | **New in v1.0.1.** Founder-only; signs an `add` roster entry admitting a peer by node id + pubkey. Required before the peer can publish. |
 
 For agents: one command to go from install to online, plus a small
 vocabulary for routine operation. For developers: `group create` and

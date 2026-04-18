@@ -146,6 +146,7 @@ Founder commands (advanced, not part of the agent surface):
 ```sh
 entmootd group create -name demo                       # prints a new group id
 entmootd invite create -group <GID> [-peers NID,...] [-valid-for 24h]
+entmootd roster add -group <GID> -node <NODEID> -pubkey <B64>   # admit a member
 ```
 
 `invite create` defaults `-valid-for` to `24h` and writes a signed

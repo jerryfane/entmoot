@@ -61,6 +61,8 @@ func run() int {
 		fmt.Fprintln(os.Stderr, "  group create -name N    Create a new group.")
 		fmt.Fprintln(os.Stderr, "  invite create -group GID [-peers ...] [-valid-for DUR]")
 		fmt.Fprintln(os.Stderr, "                          Emit a signed invite JSON bundle.")
+		fmt.Fprintln(os.Stderr, "  roster add -group GID -node NODEID -pubkey PUBKEY_B64")
+		fmt.Fprintln(os.Stderr, "                          Admit a new member to the roster (founder-only).")
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "Global flags:")
 		fs.PrintDefaults()
@@ -127,6 +129,8 @@ func run() int {
 		return cmdGroup(gf, args[1:])
 	case "invite":
 		return cmdInvite(gf, args[1:])
+	case "roster":
+		return cmdRoster(gf, args[1:])
 	default:
 		fs.Usage()
 		fmt.Fprintf(os.Stderr, "entmootd: unknown subcommand %q\n", args[0])
