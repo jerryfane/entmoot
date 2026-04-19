@@ -47,6 +47,14 @@ const retryTickInterval = 500 * time.Millisecond
 // pattern doesn't turn into a reconciliation storm.
 const reconcileCooldown = 60 * time.Second
 
+// Plumtree GRAFT timeout (v1.0.4). After receiving an IHave advertising
+// an unknown id, wait this long for the body to arrive via eager push
+// (possibly from a different peer) before graft-requesting it. Matches
+// libp2p GossipSub's IWantFollowupTime default (3 s) — short enough that
+// missing messages recover within a human-perceptible window, long
+// enough that transient latency doesn't thrash the spanning tree.
+const graftTimeout = 3 * time.Second
+
 // retryOp distinguishes push and fetch in the pending map key so the same
 // (peer, id) pair can have independent retries in both directions.
 type retryOp uint8
@@ -54,6 +62,12 @@ type retryOp uint8
 const (
 	opPush  retryOp = 1
 	opFetch retryOp = 2
+	// Plumtree control-frame retry ops (v1.0.4). Each follows the same
+	// exponential-backoff schedule as opPush; the executeRetry switch
+	// knows how to rebuild the outbound frame from the retry state.
+	opIHave retryOp = 3
+	opGraft retryOp = 4
+	opPrune retryOp = 5
 )
 
 func (o retryOp) String() string {
@@ -62,6 +76,12 @@ func (o retryOp) String() string {
 		return "push"
 	case opFetch:
 		return "fetch"
+	case opIHave:
+		return "ihave"
+	case opGraft:
+		return "graft"
+	case opPrune:
+		return "prune"
 	default:
 		return "unknown"
 	}
@@ -166,6 +186,38 @@ type Gossiper struct {
 	pendMu          sync.Mutex
 	pending         map[retryKey]*retryState
 	lastReconciled  map[entmoot.NodeID]time.Time
+
+	// Plumtree state (v1.0.4). The broadcast spanning tree is
+	// represented as a partition of Roster.Members() \ {self} into
+	// eagerPushPeers (receive full Gossip frames) and lazyPushPeers
+	// (receive IHave advertisements only). The two sets together cover
+	// every current member; each peer sits in exactly one at a time.
+	//
+	// On Publish, the originator sends full Gossip to eager and IHave
+	// to lazy. On receiving a duplicate Gossip, the receiver sends
+	// Prune to the sender and moves it from eager to lazy; on
+	// receiving IHave for an unknown id, it starts a GraftTimeout
+	// timer and on expiry sends Graft + promotes the IHave sender to
+	// eager. This is the Leitão/Pereira/Rodrigues SRDS 2007 protocol.
+	//
+	// pendingGraft maps (id, sender) → timer so we can cancel the
+	// timer if the body arrives via eager push before GraftTimeout.
+	// Guarded by plumMu. Separate mutex from pendMu to avoid
+	// contention with the retry scheduler (which fires every 500 ms
+	// and iterates pending under pendMu).
+	plumMu          sync.Mutex
+	eagerPushPeers  map[entmoot.NodeID]struct{}
+	lazyPushPeers   map[entmoot.NodeID]struct{}
+	pendingGraft    map[pendingGraftKey]*time.Timer
+}
+
+// pendingGraftKey keys the outstanding GRAFT-timer map: one timer per
+// (message id, IHave sender) pair. Multiple peers can advertise the
+// same id via IHave; we keep a timer per sender so a body arriving
+// from any source cancels all pending timers for that id.
+type pendingGraftKey struct {
+	id     entmoot.MessageID
+	sender entmoot.NodeID
 }
 
 // New constructs a Gossiper. Does not start the accept loop; callers must
@@ -210,7 +262,117 @@ func New(cfg Config) (*Gossiper, error) {
 		fanout:         fanout,
 		pending:        make(map[retryKey]*retryState),
 		lastReconciled: make(map[entmoot.NodeID]time.Time),
+		// Plumtree peer-set maps and pending-graft timer map are
+		// lazily populated. Per paper convention, eagerPushPeers
+		// starts with every current non-self roster member at first
+		// use; duplicates arriving via multiple eager paths self-prune
+		// the tree to the spanning subset.
+		eagerPushPeers: make(map[entmoot.NodeID]struct{}),
+		lazyPushPeers:  make(map[entmoot.NodeID]struct{}),
+		pendingGraft:   make(map[pendingGraftKey]*time.Timer),
 	}, nil
+}
+
+// seedPlumtreeLocked populates eagerPushPeers with every current roster
+// member (excluding self) the first time any Plumtree code path runs.
+// Idempotent thereafter: existing assignments stay put, any newly-added
+// roster members default to eager. Caller must hold plumMu.
+//
+// Kept lazy rather than wired into New so the Gossiper can be
+// constructed before the founder's initial genesis/add entries have been
+// Applied to the roster (the tests and the real daemon both rely on
+// this ordering).
+func (g *Gossiper) seedPlumtreeLocked() {
+	for _, m := range g.cfg.Roster.Members() {
+		if m == g.cfg.LocalNode {
+			continue
+		}
+		_, eager := g.eagerPushPeers[m]
+		_, lazy := g.lazyPushPeers[m]
+		if !eager && !lazy {
+			g.eagerPushPeers[m] = struct{}{}
+		}
+	}
+}
+
+// plumEagerExcept returns a copy of eagerPushPeers with `except`
+// removed, suitable for re-fanout on receive (we never push back to
+// the source). Also seeds the peer maps on first use. Caller must NOT
+// hold plumMu.
+func (g *Gossiper) plumEagerExcept(except entmoot.NodeID) []entmoot.NodeID {
+	g.plumMu.Lock()
+	defer g.plumMu.Unlock()
+	g.seedPlumtreeLocked()
+	out := make([]entmoot.NodeID, 0, len(g.eagerPushPeers))
+	for p := range g.eagerPushPeers {
+		if p == except {
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+// plumLazyExcept mirrors plumEagerExcept for the lazy set.
+func (g *Gossiper) plumLazyExcept(except entmoot.NodeID) []entmoot.NodeID {
+	g.plumMu.Lock()
+	defer g.plumMu.Unlock()
+	g.seedPlumtreeLocked()
+	out := make([]entmoot.NodeID, 0, len(g.lazyPushPeers))
+	for p := range g.lazyPushPeers {
+		if p == except {
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+// plumDemoteToLazy moves `peer` from eagerPushPeers to lazyPushPeers.
+// Called when we receive a duplicate Gossip (PRUNE the sender) or
+// when we receive an explicit Prune. No-op if already lazy.
+func (g *Gossiper) plumDemoteToLazy(peer entmoot.NodeID) {
+	g.plumMu.Lock()
+	defer g.plumMu.Unlock()
+	g.seedPlumtreeLocked()
+	if _, ok := g.eagerPushPeers[peer]; ok {
+		delete(g.eagerPushPeers, peer)
+		g.lazyPushPeers[peer] = struct{}{}
+	}
+}
+
+// plumPromoteToEager moves `peer` from lazyPushPeers to eagerPushPeers.
+// Called when we receive a Graft (they want full pushes) or when a
+// GRAFT timer we scheduled fires (we had to ask for a body, so the
+// sender is a viable eager source). No-op if already eager.
+func (g *Gossiper) plumPromoteToEager(peer entmoot.NodeID) {
+	g.plumMu.Lock()
+	defer g.plumMu.Unlock()
+	g.seedPlumtreeLocked()
+	if _, ok := g.lazyPushPeers[peer]; ok {
+		delete(g.lazyPushPeers, peer)
+		g.eagerPushPeers[peer] = struct{}{}
+	} else if _, ok := g.eagerPushPeers[peer]; !ok {
+		// Unknown peer (e.g. just added to roster but not seeded
+		// yet) — add directly to eager.
+		g.eagerPushPeers[peer] = struct{}{}
+	}
+}
+
+// plumCancelGraftsFor cancels every outstanding GRAFT timer for the
+// given message id, regardless of which peer's IHave triggered it.
+// Called after we've stored the body via any path (eager push, graft
+// response, anti-entropy) — the message is no longer missing so we
+// don't need to ask any other IHave-sender for it.
+func (g *Gossiper) plumCancelGraftsFor(id entmoot.MessageID) {
+	g.plumMu.Lock()
+	defer g.plumMu.Unlock()
+	for k, t := range g.pendingGraft {
+		if k.id == id {
+			t.Stop()
+			delete(g.pendingGraft, k)
+		}
+	}
 }
 
 // Start runs the accept loop. It blocks until ctx is cancelled or the
@@ -301,6 +463,12 @@ func (g *Gossiper) handleConn(ctx context.Context, c net.Conn, remote entmoot.No
 		g.onRangeReq(ctx, c, remote, v)
 	case *wire.Gossip:
 		g.onGossip(ctx, remote, v)
+	case *wire.IHave:
+		g.onIHave(ctx, remote, v)
+	case *wire.Graft:
+		g.onGraft(ctx, remote, v)
+	case *wire.Prune:
+		g.onPrune(remote, v)
 	case *wire.Hello:
 		// v0 drops Hello: Pilot's tunnel already authenticates the remote.
 		// The codec still recognizes the type (kept for future use), so we
@@ -464,6 +632,7 @@ func (g *Gossiper) onGossip(ctx context.Context, remote entmoot.NodeID, gos *wir
 		return
 	}
 
+	pruned := false
 	for _, id := range gos.IDs {
 		has, err := g.cfg.Store.Has(ctx, g.cfg.GroupID, id)
 		if err != nil {
@@ -472,6 +641,25 @@ func (g *Gossiper) onGossip(ctx context.Context, remote entmoot.NodeID, gos *wir
 			continue
 		}
 		if has {
+			// Plumtree (v1.0.4): duplicate eager push from `remote`
+			// means there is a shorter path to us for this message.
+			// Demote `remote` to lazyPushPeers and send exactly one
+			// Prune per duplicate burst so subsequent messages from
+			// that peer arrive as IHave, not full Gossip. The
+			// dedupe is "once per frame" (the pruned flag) because a
+			// single Gossip frame is already one round-trip of
+			// waste; further ids in the same frame don't warrant
+			// additional prunes.
+			if !pruned {
+				g.plumDemoteToLazy(remote)
+				if err := g.sendPrune(ctx, remote); err != nil {
+					g.logger.Debug("gossip: prune",
+						slog.Uint64("peer", uint64(remote)),
+						slog.String("err", err.Error()))
+					g.enqueueRetry(retryKey{peer: remote, id: id, op: opPrune}, nil)
+				}
+				pruned = true
+			}
 			continue
 		}
 		if err := g.fetchFrom(ctx, remote, id); err != nil {
@@ -487,8 +675,215 @@ func (g *Gossiper) onGossip(ctx context.Context, remote entmoot.NodeID, gos *wir
 				slog.Int("attempt", 1),
 				slog.String("err", err.Error()))
 			g.enqueueRetry(retryKey{peer: remote, id: id, op: opFetch}, nil)
+			continue
+		}
+		// Plumtree re-fanout on first-see (v1.0.4). The message just
+		// landed in our local store; forward it to every other peer
+		// so partial-connectivity topologies (where the originator
+		// can't directly reach everyone) still converge. Eager peers
+		// get the full signed Gossip frame; lazy peers get IHave.
+		// Exclude `remote` — they sent us the body and definitely
+		// have it. Also cancel any pending GRAFT timers for this id
+		// since we no longer need to request the body from anyone.
+		g.plumCancelGraftsFor(id)
+		g.refanout(ctx, remote, id)
+	}
+}
+
+// refanout forwards a just-received message to this node's other
+// peers per the Plumtree spanning tree: full Gossip to
+// eagerPushPeers \ {except}, IHave to lazyPushPeers \ {except}.
+// Every send goes through the same retry machinery as the originator's
+// fanout so transient dial failures are re-tried and eventually fall
+// through to anti-entropy reconciliation.
+func (g *Gossiper) refanout(ctx context.Context, except entmoot.NodeID, id entmoot.MessageID) {
+	eager := g.plumEagerExcept(except)
+	lazy := g.plumLazyExcept(except)
+	if len(eager) == 0 && len(lazy) == 0 {
+		return
+	}
+	// Re-sign the Gossip frame with our own identity so recipients
+	// verify against our roster entry, not the originator's. Plumtree
+	// treats the forwarder as the immediate-sender; the message's
+	// internal signature (verified during fetchFrom → store.Put)
+	// attributes authorship separately.
+	frame := &wire.Gossip{
+		GroupID:   g.cfg.GroupID,
+		IDs:       []entmoot.MessageID{id},
+		Timestamp: g.clk.Now().UnixMilli(),
+	}
+	if err := signGossip(frame, g.cfg.Identity); err != nil {
+		g.logger.Warn("gossip: refanout sign",
+			slog.String("id", id.String()),
+			slog.String("err", err.Error()))
+		return
+	}
+	ihave := &wire.IHave{
+		GroupID: g.cfg.GroupID,
+		IDs:     []entmoot.MessageID{id},
+	}
+	g.fanoutPush(ctx, eager, frame, id)
+	g.fanoutIHave(ctx, lazy, ihave, id)
+}
+
+// sendPrune dials peer and writes a single Prune frame.
+func (g *Gossiper) sendPrune(ctx context.Context, peer entmoot.NodeID) error {
+	conn, err := g.cfg.Transport.Dial(ctx, peer)
+	if err != nil {
+		return fmt.Errorf("dial: %w", err)
+	}
+	defer conn.Close()
+	frame := &wire.Prune{GroupID: g.cfg.GroupID}
+	if err := wire.EncodeAndWrite(conn, frame); err != nil {
+		return fmt.Errorf("write prune: %w", err)
+	}
+	return nil
+}
+
+// sendGraft dials peer and writes a Graft frame requesting the bodies
+// for the given ids AND promoting us in the recipient's eagerPushPeers.
+func (g *Gossiper) sendGraft(ctx context.Context, peer entmoot.NodeID, ids []entmoot.MessageID) error {
+	conn, err := g.cfg.Transport.Dial(ctx, peer)
+	if err != nil {
+		return fmt.Errorf("dial: %w", err)
+	}
+	defer conn.Close()
+	frame := &wire.Graft{GroupID: g.cfg.GroupID, IDs: ids}
+	if err := wire.EncodeAndWrite(conn, frame); err != nil {
+		return fmt.Errorf("write graft: %w", err)
+	}
+	return nil
+}
+
+// onIHave handles inbound IHave frames: for each advertised id we do
+// not already have, schedule a GRAFT timer against the IHave sender.
+// If the body arrives via eager push before graftTimeout (from any
+// peer — refanout + multiple originators can race), the timer is
+// cancelled. On expiry, we send a Graft to the sender and promote
+// them into our eagerPushPeers — healing a gap in our tree.
+func (g *Gossiper) onIHave(ctx context.Context, remote entmoot.NodeID, ih *wire.IHave) {
+	if ih.GroupID != g.cfg.GroupID {
+		g.logger.Warn("gossip: ihave for wrong group",
+			slog.Uint64("remote", uint64(remote)),
+			slog.String("got", ih.GroupID.String()))
+		return
+	}
+	for _, id := range ih.IDs {
+		has, err := g.cfg.Store.Has(ctx, g.cfg.GroupID, id)
+		if err != nil {
+			g.logger.Debug("gossip: ihave store.Has", slog.String("err", err.Error()))
+			continue
+		}
+		if has {
+			continue
+		}
+		g.scheduleGraft(id, remote)
+	}
+}
+
+// scheduleGraft arms a timer that fires graftTimeout from now and, if
+// the body is still missing at expiry, sends a Graft to `sender`.
+// Idempotent per (id, sender): a second IHave for the same pair
+// resets the timer.
+func (g *Gossiper) scheduleGraft(id entmoot.MessageID, sender entmoot.NodeID) {
+	g.plumMu.Lock()
+	key := pendingGraftKey{id: id, sender: sender}
+	if existing, ok := g.pendingGraft[key]; ok {
+		existing.Stop()
+	}
+	// Cannot run timer logic under plumMu; arm with a callback that
+	// re-acquires the lock briefly to remove itself before the real
+	// work.
+	t := time.AfterFunc(graftTimeout, func() {
+		g.onGraftTimer(id, sender)
+	})
+	g.pendingGraft[key] = t
+	g.plumMu.Unlock()
+}
+
+// onGraftTimer fires graftTimeout after we received an IHave for a
+// missing id. If the body still has not arrived, send a Graft and
+// promote the IHave sender into eagerPushPeers.
+func (g *Gossiper) onGraftTimer(id entmoot.MessageID, sender entmoot.NodeID) {
+	g.plumMu.Lock()
+	delete(g.pendingGraft, pendingGraftKey{id: id, sender: sender})
+	g.plumMu.Unlock()
+
+	// The context to use for the send. Prefer lifeCtx (set by Start);
+	// fall back to Background() so the timer is safe to fire even if
+	// Start has not yet been called.
+	g.lifeMu.Lock()
+	ctx := g.lifeCtx
+	g.lifeMu.Unlock()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	// Re-check that we still lack the body; a late arrival via eager
+	// push could have filled it after the timer fired but before we
+	// got here.
+	has, err := g.cfg.Store.Has(ctx, g.cfg.GroupID, id)
+	if err == nil && has {
+		return
+	}
+
+	g.plumPromoteToEager(sender)
+	if err := g.sendGraft(ctx, sender, []entmoot.MessageID{id}); err != nil {
+		g.logger.Debug("gossip: graft",
+			slog.Uint64("peer", uint64(sender)),
+			slog.String("id", id.String()),
+			slog.Int("attempt", 1),
+			slog.String("err", err.Error()))
+		g.enqueueRetry(retryKey{peer: sender, id: id, op: opGraft}, nil)
+	}
+}
+
+// onGraft handles inbound Graft frames: promote the sender into
+// eagerPushPeers (they want full pushes) and, for each requested id
+// we have locally, push the full Gossip frame back through the
+// standard eager path. If we don't have an id (it was evicted or
+// never stored), silently drop — the requester will re-discover via
+// a later IHave or anti-entropy reconciliation.
+func (g *Gossiper) onGraft(ctx context.Context, remote entmoot.NodeID, gr *wire.Graft) {
+	if gr.GroupID != g.cfg.GroupID {
+		g.logger.Warn("gossip: graft for wrong group",
+			slog.Uint64("remote", uint64(remote)),
+			slog.String("got", gr.GroupID.String()))
+		return
+	}
+	g.plumPromoteToEager(remote)
+
+	for _, id := range gr.IDs {
+		has, err := g.cfg.Store.Has(ctx, g.cfg.GroupID, id)
+		if err != nil || !has {
+			continue
+		}
+		frame := &wire.Gossip{
+			GroupID:   g.cfg.GroupID,
+			IDs:       []entmoot.MessageID{id},
+			Timestamp: g.clk.Now().UnixMilli(),
+		}
+		if err := signGossip(frame, g.cfg.Identity); err != nil {
+			g.logger.Warn("gossip: graft sign", slog.String("err", err.Error()))
+			continue
+		}
+		if err := g.pushGossip(ctx, remote, frame); err != nil {
+			g.enqueueRetry(retryKey{peer: remote, id: id, op: opPush}, frame)
 		}
 	}
+}
+
+// onPrune handles inbound Prune frames: demote the sender to
+// lazyPushPeers so future messages go as IHave rather than full
+// Gossip. No-op if the sender is already in lazy.
+func (g *Gossiper) onPrune(remote entmoot.NodeID, pr *wire.Prune) {
+	if pr.GroupID != g.cfg.GroupID {
+		g.logger.Warn("gossip: prune for wrong group",
+			slog.Uint64("remote", uint64(remote)),
+			slog.String("got", pr.GroupID.String()))
+		return
+	}
+	g.plumDemoteToLazy(remote)
 }
 
 // fetchFrom opens a fresh connection to peer, sends FetchReq for id, and
@@ -549,8 +944,18 @@ func (g *Gossiper) Publish(ctx context.Context, msg entmoot.Message) error {
 		return fmt.Errorf("gossip: store put: %w", err)
 	}
 
-	peers := g.getPicker().Sample(g.fanout)
-	if len(peers) == 0 {
+	// Plumtree dissemination (v1.0.4). The full Gossip frame goes to
+	// every peer in eagerPushPeers; lazy peers receive only an IHave
+	// advertisement. The split self-heals over time: duplicate
+	// arrivals prune redundant eager edges, IHave-to-lazy pulls graft
+	// peers back to eager when the tree is incomplete. Before v1.0.4
+	// this was a simple random Sample(fanout) push; the new behavior
+	// is a strict superset: if no peers have been pruned yet, the
+	// entire roster sits in eager and everyone gets the full push,
+	// which matches previous behavior when fanout ≥ |members-1|.
+	eager := g.plumEagerExcept(0)
+	lazy := g.plumLazyExcept(0)
+	if len(eager) == 0 && len(lazy) == 0 {
 		return nil
 	}
 
@@ -562,6 +967,11 @@ func (g *Gossiper) Publish(ctx context.Context, msg entmoot.Message) error {
 	}
 	if err := signGossip(frame, g.cfg.Identity); err != nil {
 		return fmt.Errorf("gossip: sign: %w", err)
+	}
+
+	ihave := &wire.IHave{
+		GroupID: g.cfg.GroupID,
+		IDs:     []entmoot.MessageID{msg.ID},
 	}
 
 	// v1.0.3 publish semantics: local-durable accept is the contract.
@@ -582,14 +992,16 @@ func (g *Gossiper) Publish(ctx context.Context, msg entmoot.Message) error {
 	lifeCtx := g.lifeCtx
 	g.lifeMu.Unlock()
 	if lifeCtx == nil {
-		g.fanoutPush(ctx, peers, frame, msg.ID)
+		g.fanoutPush(ctx, eager, frame, msg.ID)
+		g.fanoutIHave(ctx, lazy, ihave, msg.ID)
 		return nil
 	}
 	g.wg.Add(1)
-	go func(peers []entmoot.NodeID, frame *wire.Gossip, id entmoot.MessageID) {
+	go func() {
 		defer g.wg.Done()
-		g.fanoutPush(lifeCtx, peers, frame, id)
-	}(peers, frame, msg.ID)
+		g.fanoutPush(lifeCtx, eager, frame, msg.ID)
+		g.fanoutIHave(lifeCtx, lazy, ihave, msg.ID)
+	}()
 	return nil
 }
 
@@ -607,6 +1019,38 @@ func (g *Gossiper) fanoutPush(ctx context.Context, peers []entmoot.NodeID, frame
 			g.enqueueRetry(retryKey{peer: p, id: id, op: opPush}, frame)
 		}
 	}
+}
+
+// fanoutIHave advertises a message id to a set of lazy peers via
+// Plumtree's IHave frame. Failures go through the same retry scheduler
+// as eager pushes. The frame is a plain unsigned id list — peers that
+// want the body issue a follow-up Graft.
+func (g *Gossiper) fanoutIHave(ctx context.Context, peers []entmoot.NodeID, frame *wire.IHave, id entmoot.MessageID) {
+	for _, p := range peers {
+		if err := g.sendIHave(ctx, p, frame); err != nil {
+			g.logger.Debug("gossip: ihave",
+				slog.Uint64("peer", uint64(p)),
+				slog.String("id", id.String()),
+				slog.Int("attempt", 1),
+				slog.String("err", err.Error()))
+			g.enqueueRetry(retryKey{peer: p, id: id, op: opIHave}, nil)
+		}
+	}
+}
+
+// sendIHave dials the peer and writes a single IHave frame. Fire-and-
+// forget: Plumtree IHave is an advertisement, not a query, so we do not
+// wait for or interpret any response.
+func (g *Gossiper) sendIHave(ctx context.Context, peer entmoot.NodeID, frame *wire.IHave) error {
+	conn, err := g.cfg.Transport.Dial(ctx, peer)
+	if err != nil {
+		return fmt.Errorf("dial: %w", err)
+	}
+	defer conn.Close()
+	if err := wire.EncodeAndWrite(conn, frame); err != nil {
+		return fmt.Errorf("write ihave: %w", err)
+	}
+	return nil
 }
 
 // pushGossip opens a connection to peer, writes the frame, and closes. v0 is
@@ -802,6 +1246,20 @@ func (g *Gossiper) executeRetry(ctx context.Context, key retryKey, state *retryS
 		return g.pushGossip(ctx, key.peer, state.frame)
 	case opFetch:
 		return g.fetchFrom(ctx, key.peer, key.id)
+	case opIHave:
+		// Plumtree IHave is a single-id advertisement; retry re-dials
+		// and re-sends. We don't stash the frame on the retry state
+		// because IHave carries no signature and reconstructing the
+		// single-id frame from the key is trivial.
+		frame := &wire.IHave{
+			GroupID: g.cfg.GroupID,
+			IDs:     []entmoot.MessageID{key.id},
+		}
+		return g.sendIHave(ctx, key.peer, frame)
+	case opGraft:
+		return g.sendGraft(ctx, key.peer, []entmoot.MessageID{key.id})
+	case opPrune:
+		return g.sendPrune(ctx, key.peer)
 	default:
 		return fmt.Errorf("retry: unknown op %d", key.op)
 	}

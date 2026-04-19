@@ -44,6 +44,24 @@ const (
 	// MsgRangeResp carries the ids selected by MsgRangeReq. Bodies are
 	// pulled via subsequent FetchReq cycles.
 	MsgRangeResp MsgType = 0x0A
+	// MsgIHave is a lazy advertisement of message ids the sender has
+	// locally. Used by Plumtree-style dissemination (v1.0.4): rather
+	// than pushing the full Gossip frame to every peer, the originator
+	// eagerly pushes to its eagerPushPeers and sends IHave-only to its
+	// lazyPushPeers. Receivers that lack the advertised id issue a
+	// subsequent Graft to pull it. Unsigned — sender identity comes
+	// from the Pilot tunnel + roster membership check on Accept.
+	MsgIHave MsgType = 0x0B
+	// MsgGraft is a request from a lazy-peer that observed an IHave
+	// for a missing id. It both pulls the body (the responder replies
+	// with a Gossip frame) and promotes the requester into the
+	// responder's eagerPushPeers, healing the broadcast spanning tree.
+	MsgGraft MsgType = 0x0C
+	// MsgPrune tells the receiver "demote me from your eagerPushPeers
+	// to lazyPushPeers — you already delivered a copy of whatever you
+	// were about to send next." Carried as a bare signal per group;
+	// prunes are future-tense and do not affect messages in flight.
+	MsgPrune MsgType = 0x0D
 )
 
 // String returns the human-readable wire name for t, suitable for logs. It
@@ -70,6 +88,12 @@ func (t MsgType) String() string {
 		return "range_req"
 	case MsgRangeResp:
 		return "range_resp"
+	case MsgIHave:
+		return "ihave"
+	case MsgGraft:
+		return "graft"
+	case MsgPrune:
+		return "prune"
 	default:
 		return fmt.Sprintf("unknown(0x%02x)", uint8(t))
 	}
@@ -232,4 +256,41 @@ type RangeResp struct {
 	GroupID entmoot.GroupID `json:"group_id"`
 	// IDs is the list of matching message ids.
 	IDs []entmoot.MessageID `json:"ids"`
+}
+
+// IHave is a lazy message-id advertisement (Plumtree-style). The sender
+// has these ids locally but chose not to eager-push the full Gossip frame
+// — typically because the receiver is on the sender's lazyPushPeers list.
+// Receivers that lack an advertised id respond with a Graft to pull the
+// body and promote the edge back to eager. Unsigned on the wire; sender
+// identity is established by the Pilot tunnel + on-Accept roster check.
+type IHave struct {
+	// GroupID identifies the owning group.
+	GroupID entmoot.GroupID `json:"group_id"`
+	// IDs is the list of message ids the sender has locally.
+	IDs []entmoot.MessageID `json:"ids"`
+}
+
+// Graft requests the full bodies for a set of ids AND promotes the sender
+// into the responder's eagerPushPeers, healing the broadcast spanning
+// tree. Typically sent after receiving an IHave for a missing id and
+// waiting GraftTimeout for it to arrive via eager push. The responder
+// replies with a Gossip frame + triggers a body-fetch handshake (the
+// existing pushGossip path).
+type Graft struct {
+	// GroupID identifies the owning group.
+	GroupID entmoot.GroupID `json:"group_id"`
+	// IDs enumerates the message ids whose bodies the sender wants.
+	IDs []entmoot.MessageID `json:"ids"`
+}
+
+// Prune tells the receiver "demote me from your eagerPushPeers to
+// lazyPushPeers — I already have a copy of whatever you were about to
+// send next, so further full-body pushes are wasted bandwidth." One
+// Prune affects all future eager-push decisions for the group; it does
+// not affect messages already in flight. Counter-paired with Graft for
+// bidirectional tree maintenance.
+type Prune struct {
+	// GroupID identifies the owning group.
+	GroupID entmoot.GroupID `json:"group_id"`
 }

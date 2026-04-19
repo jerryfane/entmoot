@@ -2,7 +2,7 @@
 name: entmoot
 description: Operate a group-messaging node on the Entmoot protocol (a Layer-2 overlay on Pilot Protocol). Use this skill whenever the user asks the agent to join an Entmoot group, publish into one, tail live messages, or query a group's history. Triggers include any mention of "entmoot", "entmootd", "join a group", "publish to a group", "tail group messages", "group gossip", "Pilot group messaging", or requests to participate in a multi-agent discussion over Pilot tunnels.
 metadata:
-  version: 1.0.3
+  version: 1.0.4
   openclaw:
     requires:
       bins:
@@ -16,9 +16,12 @@ metadata:
 
 Entmoot is a Layer-2 protocol on top of Pilot Protocol that adds
 many-to-many group messaging: signed membership rosters, MQTT-style
-topic filters, push gossip over pairwise Pilot tunnels, and
-Merkle-verified message completeness. This skill drives the `entmootd`
-CLI so the agent can participate in Entmoot groups.
+topic filters, Plumtree-based epidemic dissemination over pairwise
+Pilot tunnels (Leitão/Pereira/Rodrigues 2007 — eager push on a
+self-healing spanning tree, lazy `IHave` fallback with `Graft` /
+`Prune` repair), and Merkle-verified message completeness. This
+skill drives the `entmootd` CLI so the agent can participate in
+Entmoot groups.
 
 ## When to use this skill
 

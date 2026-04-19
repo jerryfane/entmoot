@@ -7,6 +7,75 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.4] - 2026-04-20
+
+### Added
+- Plumtree-based dissemination (Leitão/Pereira/Rodrigues, "Epidemic
+  Broadcast Trees", SRDS 2007). Entmoot's gossip is no longer
+  push-only-on-originate: receivers now re-fanout on first-sight,
+  with a self-healing spanning tree maintained via three new
+  control-frame types on ids that never carry a body.
+  - `MsgIHave` (0x0B): lazy advertisement. A publisher eagerly pushes
+    full `Gossip` frames to `eagerPushPeers` and sends `IHave`-only
+    to `lazyPushPeers`.
+  - `MsgGraft` (0x0C): a peer that observed `IHave` for a missing id
+    and did not receive the body via eager push within 3 s (matching
+    libp2p GossipSub's `IWantFollowupTime`) sends `Graft` to pull the
+    body AND be promoted back into the sender's `eagerPushPeers`.
+  - `MsgPrune` (0x0D): a peer that receives a duplicate `Gossip`
+    `Prunes` the sender — demoting it to `lazyPushPeers` so
+    subsequent messages arrive as `IHave`, pruning the redundant
+    full-body edge.
+  - Initial tree shape: all roster members start in
+    `eagerPushPeers`; duplicates self-prune to a spanning subset
+    per-message. No explicit tree construction ceremony required.
+  - All three new types are unsigned — precedent set by `FetchReq`,
+    `RangeReq`, `MerkleReq`. Identity is established at the Pilot
+    tunnel + on-Accept roster check, which is already sufficient.
+
+  **Impact**: in a partial-connectivity topology (e.g. the
+  three-node canary: VPS public, Phobos private, laptop private, no
+  Phobos↔laptop direct edge), a Phobos publish now reaches the
+  laptop with VPS as the re-fanout hop. Before v1.0.4 that message
+  stopped at VPS. At steady state, message-per-broadcast overhead
+  converges from `O(N × fanout)` (naive gossip) toward `O(N)` (one
+  eager push per edge of the spanning tree) — the same efficiency
+  profile as Riak Core, Helium, Solana's gossip, libp2p
+  GossipSub/Episub, and Partisan.
+
+- `eagerPushPeers` / `lazyPushPeers` peer-set maps on `Gossiper`,
+  guarded by a new `plumMu`. Each roster member sits in exactly one
+  set at any time. Seeded lazily on first Plumtree code path so the
+  Gossiper can be constructed before the roster is fully populated
+  (matches existing test + production ordering). Lookup helpers
+  (`plumEagerExcept`, `plumLazyExcept`, `plumPromoteToEager`,
+  `plumDemoteToLazy`, `plumCancelGraftsFor`) keep the mutex
+  discipline contained to a small surface.
+
+- `pendingGraft` map keyed on `(id, sender)` storing the outstanding
+  `time.AfterFunc` timer per `IHave` advertisement. Any arrival of
+  the body via the eager path cancels all pending timers for that
+  id so we never emit a `Graft` for something we already have.
+
+- Retry scheduler extended with three new ops (`opIHave`, `opGraft`,
+  `opPrune`). `executeRetry` rebuilds the outbound frame from the
+  `retryKey` since none of the three control frames carry signed
+  content worth caching. Same exponential-backoff budget as
+  `opPush`; exhausted slots fall through to anti-entropy
+  reconciliation as today.
+
+- `plumtree_test.go`: five new integration tests covering re-fanout
+  in a line graph (A ↔ B ↔ C, A ↛ C), PRUNE on duplicate in a
+  fully-connected mesh, GRAFT on a forced-lazy edge, initial-state
+  eager population, and the basic PRUNE handler unit test. A new
+  `filteringTransport` wrapper lets tests build arbitrary directed
+  dial graphs over the existing `memTransport` hub.
+
+### Changed
+- `skills/entmoot/SKILL.md` metadata bumped to 1.0.4; adds a short
+  "Dissemination: Plumtree (Leitão 2007)" note so agents reading
+  the skill don't misunderstand the group protocol as push-only.
+
 ## [1.0.3] - 2026-04-19
 
 ### Fixed

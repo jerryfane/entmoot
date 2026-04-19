@@ -42,6 +42,12 @@ func Encode(v any) (MsgType, []byte, error) {
 		t = MsgRangeReq
 	case *RangeResp:
 		t = MsgRangeResp
+	case *IHave:
+		t = MsgIHave
+	case *Graft:
+		t = MsgGraft
+	case *Prune:
+		t = MsgPrune
 	default:
 		return 0, nil, fmt.Errorf("wire: encode %T: %w", v, entmoot.ErrUnknownMessage)
 	}
@@ -88,6 +94,12 @@ func Decode(t MsgType, body []byte) (any, error) {
 		return decodeAs[RangeReq](t, body)
 	case MsgRangeResp:
 		return decodeAs[RangeResp](t, body)
+	case MsgIHave:
+		return decodeAs[IHave](t, body)
+	case MsgGraft:
+		return decodeAs[Graft](t, body)
+	case MsgPrune:
+		return decodeAs[Prune](t, body)
 	default:
 		return nil, fmt.Errorf("wire: type 0x%02x: %w", uint8(t), entmoot.ErrUnknownMessage)
 	}
