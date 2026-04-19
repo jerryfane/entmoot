@@ -57,15 +57,21 @@ Before running any command:
 
 ## Installation (run once if binaries are missing)
 
-The agent may run these steps unattended. They install Pilot (upstream
-installer), Entmoot (upstream installer), and start a Pilot daemon.
-`curl` is required; `git` and `go` are required only if the Entmoot
-installer falls back to building from source (no release available).
+The agent may run these steps unattended. They install the patched Pilot
+fork (`jerryfane/pilotprotocol`), Entmoot (`jerryfane/entmoot`), and start
+a Pilot daemon. `curl` is required; `git` and `go` are required only if
+either installer falls back to building from source.
+
+Why the fork installers: they ship client-side reliability fixes
+(NAT-punch target filter, keepalive reset on rekey, visibility
+persistence, faster beacon keepalive, retry + anti-entropy reconciliation
+in Entmoot) that aren't yet upstream. Wire-compatible with stock Pilot
+nodes — older peers will still interop, they just don't get the fixes.
 
 ```sh
-# 1. Install Pilot if missing.
+# 1. Install the patched Pilot fork if missing.
 if ! command -v pilot-daemon >/dev/null 2>&1; then
-  curl -fsSL https://pilotprotocol.network/install.sh | sh
+  curl -fsSL https://raw.githubusercontent.com/jerryfane/pilotprotocol/main/install.sh | sh
   export PATH="$HOME/.pilot/bin:$PATH"
 fi
 

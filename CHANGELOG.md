@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.2] - 2026-04-19
+
+### Changed
+- `install.sh` source-build fallback now clones the patched Pilot fork
+  (`jerryfane/pilotprotocol` main) instead of `TeoSlayer/pilotprotocol`.
+  The "install Pilot separately" helper text and `SKILL.md` onboarding
+  snippet also point at the fork's installer so agents following the
+  documented flow pick up the reliability patches without manual steps.
+
 ### Added
 - Exponential-backoff retry for gossip push and fetch. Transient `Transport.Dial`
   failures are requeued instead of dropped; a new `retryLoop` goroutine drains

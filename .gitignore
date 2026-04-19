@@ -10,3 +10,5 @@ CLAUDE.md
 coverage.out
 /src/entmoot
 /src/entmootd
+# release artifacts built under src/dist/
+/src/dist/

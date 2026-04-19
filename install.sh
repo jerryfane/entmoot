@@ -11,8 +11,11 @@
 #   3. Install entmootd to $HOME/.entmoot/bin and add that dir to PATH
 #      via the user's shell rc file.
 #
-# Does NOT install Pilot Protocol. Pilot is a prerequisite; install it
-# separately with: curl -fsSL https://pilotprotocol.network/install.sh | sh
+# Does NOT install Pilot Protocol. Pilot is a prerequisite; install the
+# matching patched fork with:
+#   curl -fsSL https://raw.githubusercontent.com/jerryfane/pilotprotocol/main/install.sh | sh
+# Installing the upstream pilotprotocol.network version will work wire-wise
+# but lacks the reliability patches these Entmoot releases rely on.
 
 set -eu
 
@@ -95,9 +98,9 @@ if [ -z "$TAG" ]; then
     }
     echo "  Cloning entmoot..."
     git clone --depth 1 "https://github.com/${REPO}.git" "$TMPDIR/src" >/dev/null 2>&1
-    echo "  Cloning Pilot (${PILOT_TAG})..."
-    git clone --depth 1 --branch "${PILOT_TAG}" \
-        https://github.com/TeoSlayer/pilotprotocol.git \
+    echo "  Cloning Pilot fork (jerryfane/pilotprotocol main)..."
+    git clone --depth 1 --branch main \
+        https://github.com/jerryfane/pilotprotocol.git \
         "$TMPDIR/src/repos/pilotprotocol" >/dev/null 2>&1
     echo "  Building entmootd..."
     (cd "$TMPDIR/src/src" && CGO_ENABLED=0 go build -o "$TMPDIR/entmootd" ./cmd/entmootd)
@@ -144,8 +147,8 @@ echo ""
 echo "  # activate the new PATH in this shell:"
 echo "  export PATH=\"${BIN_DIR}:\$PATH\""
 echo ""
-echo "  # install Pilot Protocol (prerequisite, separate):"
-echo "  curl -fsSL https://pilotprotocol.network/install.sh | sh"
+echo "  # install the patched Pilot Protocol (prerequisite, separate):"
+echo "  curl -fsSL https://raw.githubusercontent.com/jerryfane/pilotprotocol/main/install.sh | sh"
 echo ""
 echo "  # verify:"
 echo "  entmootd info"
