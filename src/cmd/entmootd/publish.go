@@ -22,6 +22,7 @@ func cmdPublish(gf *globalFlags, args []string) int {
 	topicFlag := fs.String("topic", "", "comma-separated topics (required)")
 	content := fs.String("content", "", "message content (required)")
 	groupStr := fs.String("group", "", "base64 group id (optional when exactly one group is joined)")
+	timeoutFlag := fs.Duration("timeout", 30*time.Second, "IPC response deadline; raise on slow/flaky networks")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return exitOK
@@ -64,7 +65,13 @@ func cmdPublish(gf *globalFlags, args []string) int {
 		return exitControlUnavail
 	}
 	defer conn.Close()
-	if err := conn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+	// Deadline for the entire publish RPC round-trip. Default 30s — the old
+	// 10s default was tight enough to fire on perfectly healthy publishes
+	// when the daemon was busy gossiping to multiple peers, surfacing a
+	// misleading "publish: read response ... i/o timeout" error while the
+	// message had actually persisted. --timeout lets ops bump it further on
+	// slow networks.
+	if err := conn.SetDeadline(time.Now().Add(*timeoutFlag)); err != nil {
 		slog.Error("publish: set deadline", slog.String("err", err.Error()))
 		return exitTransport
 	}

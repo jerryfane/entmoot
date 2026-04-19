@@ -35,6 +35,15 @@ const (
 	MsgMerkleReq MsgType = 0x07
 	// MsgMerkleResp returns the current Merkle root and message count.
 	MsgMerkleResp MsgType = 0x08
+	// MsgRangeReq requests the list of message ids whose Timestamp falls at
+	// or after a caller-supplied SinceMillis (v1: anti-entropy on peer
+	// reconnect). Added in jerryfane/entmoot fork patch 7. Older daemons
+	// reject it as an unknown message type and the caller silently falls
+	// back to plain push gossip — wire-compatible.
+	MsgRangeReq MsgType = 0x09
+	// MsgRangeResp carries the ids selected by MsgRangeReq. Bodies are
+	// pulled via subsequent FetchReq cycles.
+	MsgRangeResp MsgType = 0x0A
 )
 
 // String returns the human-readable wire name for t, suitable for logs. It
@@ -57,6 +66,10 @@ func (t MsgType) String() string {
 		return "merkle_req"
 	case MsgMerkleResp:
 		return "merkle_resp"
+	case MsgRangeReq:
+		return "range_req"
+	case MsgRangeResp:
+		return "range_resp"
 	default:
 		return fmt.Sprintf("unknown(0x%02x)", uint8(t))
 	}
@@ -196,4 +209,27 @@ type MerkleResp struct {
 	Root MerkleRoot `json:"root"`
 	// MessageCount is the number of message ids that went into Root.
 	MessageCount int `json:"message_count"`
+}
+
+// RangeReq asks a peer for the list of message ids it holds whose
+// Timestamp is greater than or equal to SinceMillis. Added in fork patch 7
+// for anti-entropy on peer reconnect: the initiator compares merkle roots
+// first (MerkleReq / MerkleResp) and only issues a RangeReq if the roots
+// differ. Callers then fetch each returned id via FetchReq.
+type RangeReq struct {
+	// GroupID identifies the owning group.
+	GroupID entmoot.GroupID `json:"group_id"`
+	// SinceMillis is the inclusive lower bound on message Timestamp. 0
+	// means "give me everything the peer has."
+	SinceMillis int64 `json:"since_millis"`
+}
+
+// RangeResp carries the ids selected by RangeReq. Bodies are pulled via
+// subsequent FetchReq cycles so the responder does not have to make a
+// signing decision about bulk payloads.
+type RangeResp struct {
+	// GroupID identifies the owning group.
+	GroupID entmoot.GroupID `json:"group_id"`
+	// IDs is the list of matching message ids.
+	IDs []entmoot.MessageID `json:"ids"`
 }
