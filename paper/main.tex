@@ -143,16 +143,25 @@ at registration and receives a 48-bit virtual address of the form
 \texttt{N:NNNN.HHHH.LLLL}: a 16-bit network ID and a 32-bit node ID within
 that network. Network~0 is the global backbone; all agents are members of
 it by default. Pilot reserves additional network IDs for purpose-specific
-subgraphs, but as of version 1.7.2 this feature is still in progress.
+subgraphs, but as of version~1.8.0-jf.1 this feature is still in progress.
 
 Communication is trust-gated. Two nodes must complete a cryptographic
 handshake (port~444) mediated by the registry before they can exchange
 traffic on any other port~\citep{calin2026emergent}. Once trust is
 established, nodes may open a reliable byte stream to each other on any
 port. Under the hood, Pilot runs a TCP-equivalent reliable-delivery
-protocol over UDP with X25519 key exchange and AES-256-GCM authenticated
-encryption per tunnel. The registry does not see tunnel payloads; it only
-mediates address allocation, hostname resolution, and the handshake relay.
+protocol with X25519 key exchange and AES-256-GCM authenticated
+encryption per tunnel. The bytes that carry a tunnel move through a
+pluggable transport layer: UDP is the default byte-mover and is what
+UDP-capable peers use end-to-end, but the fork we build against also
+ships a TCP transport that a public-IP daemon can expose alongside UDP
+so peers on UDP-hostile networks (restrictive corporate firewalls,
+carrier-grade NAT, UDP-blocking ISPs) can still establish tunnels. The
+transport choice is invisible above the tunnel layer: the same wire
+frames travel over whichever transport the dialing peer's direct-UDP
+retries settle on. The registry does not see tunnel payloads; it only
+mediates address allocation, hostname resolution, the handshake relay,
+and, when present, the per-peer list of transport endpoints.
 
 Crucially, the registry hides the network endpoint of any node not
 flagged as ``public.'' A private node's address can only be resolved to
@@ -160,6 +169,13 @@ a reachable endpoint by another node with an existing trust edge. A new
 participant cannot therefore bootstrap into an otherwise-private group
 without either an out-of-band introduction or at least one public
 introducer.
+
+We build against the \texttt{jerryfane/pilotprotocol} fork at
+v1.8.0-jf.1~\citep{pilotprotocol}, which layers the pluggable transport
+abstraction and a handful of reliability fixes on top of upstream
+v1.7.2; both the abstraction and the fixes are wire-compatible with
+unmodified upstream daemons and are described where relevant in the
+sections that follow.
 
 \subsection{Autonomous agent networks}
 
@@ -284,14 +300,15 @@ message-type tag, and a JSON body, with a 16\,MiB cap. JSON keeps the
 protocol debuggable and extensible; a binary codec is a post-v0
 consideration.
 
-The v0 protocol defines eight message types:
-\texttt{hello}, \texttt{roster\_req}, \texttt{roster\_resp},
-\texttt{gossip}, \texttt{fetch\_req}, \texttt{fetch\_resp},
-\texttt{merkle\_req}, and \texttt{merkle\_resp}. Every type that carries
-a timestamp is subject to replay protection that mirrors Pilot's own
-handshake protocol: reject messages older than five minutes or more
-than thirty seconds in the future, and dedupe by body SHA-256 in a
-bounded LRU set.
+The v0 protocol defined eight message types --- \texttt{hello},
+\texttt{roster\_req}, \texttt{roster\_resp}, \texttt{gossip},
+\texttt{fetch\_req}, \texttt{fetch\_resp}, \texttt{merkle\_req},
+\texttt{merkle\_resp} --- extended in v1.0.2 with two additional types
+\texttt{range\_req} and \texttt{range\_resp} (\S\ref{sec:antientropy}).
+Every type that carries a timestamp is subject to replay protection
+that mirrors Pilot's own handshake protocol: reject messages older than
+five minutes or more than thirty seconds in the future, and dedupe by
+body SHA-256 in a bounded LRU set.
 
 \subsection{Bootstrap}
 
@@ -327,13 +344,135 @@ message pull the body back via \texttt{fetch\_req}; peers that already
 have the message drop the gossip frame. The receiver verifies the
 body's signature against the author's roster entry before storing.
 
-In v0 the gossip strategy is push-only with random-only peer sampling.
-Push-pull synchronization and near-peer (interest-overlap) sampling are
-documented as upgrades but not implemented. For the canary's
-three-member topology with fanout two, push-only is sufficient to reach
-global delivery in one round.
+Push is the fast path: when every gossip recipient is reachable and
+willing, fanout~two suffices for the canary's three-member topology to
+converge in a single round. The slow path, which handles the
+reconnect-missed-gossip case, is described in
+\S\ref{sec:antientropy}. Peer sampling is still random-only in v1.0.2;
+near-peer sampling informed by subscriber interest overlap is a
+documented upgrade, not yet implemented.
+
+In v1.0.2 a transient \texttt{Transport.Dial} failure is no longer fatal
+to a gossip attempt. A small \texttt{retryLoop} goroutine re-queues the
+failed push or fetch at 500\,ms cadence with exponential backoffs
+\texttt{1\,s, 2\,s, 4\,s, 8\,s, 16\,s, 30\,s, 60\,s$\,\times\,$4} --- ten
+attempts over roughly five minutes. Slots that exhaust their retry
+budget log the failure and rely on the anti-entropy path below to recover
+whatever the push missed.
+
+\subsection{Anti-entropy reconciliation}
+\label{sec:antientropy}
+
+Push-only gossip is vulnerable to a specific failure mode: a member that
+is offline when a message is published, and reconnects after the
+fanout~two has decayed, never hears about the message from the push
+path. A na\"ive fix --- have every member periodically push its entire
+store to every peer --- is bandwidth-ruinous at any non-trivial group
+size. Entmoot v1.0.2 takes the reconciliation approach instead.
+
+Reconciliation is triggered by peer reconnect, not by a periodic timer:
+both an inbound \texttt{Accept} and a successful outbound dial invoke
+\texttt{maybeReconcile} on the peer, which is rate-limited to one round
+per peer per 60 seconds. A round proceeds in four steps routed through
+the same retry scheduler the gossip path uses:
+
+\begin{enumerate}
+    \item \textbf{Cheap check.} Request the peer's Merkle root via
+    \texttt{MerkleReq} and compare to the local root. If they match, the
+    two stores are byte-identical under the topological-order rule
+    (\S\ref{sec:merkle}), and the round ends in constant space and one
+    round-trip. This is the common case after a brief disconnect.
+    \item \textbf{Bounded enumeration.} If the roots differ, issue
+    \texttt{RangeReq} with a lower timestamp bound set to the local
+    store's latest message timestamp. The peer answers with
+    \texttt{RangeResp}, a list of message identifiers it holds in that
+    window.
+    \item \textbf{Targeted fetch.} For each id in \texttt{RangeResp} we
+    do not already have, issue an ordinary \texttt{FetchReq}.
+    \item \textbf{Signature-verified store.} Each fetched body is
+    verified against the author's roster entry before it lands in the
+    local store, identical to the push path.
+\end{enumerate}
+
+Timestamp-bounding the range query matters: a reconnecting peer is most
+likely missing only the tail of the message DAG, so the range enumeration
+is cheap. A full-store enumeration remains possible by choosing a zero
+bound but is not used by the automatic path. The two wire types
+\texttt{MsgRangeReq} (0x09) and \texttt{MsgRangeResp} (0x0A) were added
+alongside the existing eight; older peers reject them as unknown types
+and the caller silently falls back to push-only, preserving backward
+compatibility with v1.0.0 peers. Figure~\ref{fig:antientropy} sketches
+the message sequence for a single reconciliation round.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+  font=\footnotesize,
+  lane/.style={draw, rounded corners=1pt, minimum width=20mm,
+               minimum height=5mm, inner sep=2pt, fill=gray!15},
+  note/.style={draw=none, align=left, font=\scriptsize\itshape},
+  msg/.style={-{Latex[length=1.6mm]}, thick},
+  self/.style={-{Latex[length=1.4mm]}, thick, gray!60!black},
+]
+% Lane headers
+\node[lane] (L) at (0, 0)    {local};
+\node[lane] (R) at (3.8, 0)  {remote};
+
+% Lifelines
+\draw[dashed, gray!60] (L.south) -- ++(0, -5.2);
+\draw[dashed, gray!60] (R.south) -- ++(0, -5.2);
+
+% Step 1: MerkleReq -> MerkleResp
+\draw[msg] ($(L.south) + (0, -0.5)$)
+        -- node[above, font=\scriptsize] {\texttt{MerkleReq}}
+           ($(R.south) + (0, -0.5)$);
+\draw[msg] ($(R.south) + (0, -1.0)$)
+        -- node[below, font=\scriptsize] {\texttt{MerkleResp}\,(root)}
+           ($(L.south) + (0, -1.0)$);
+
+% Branch: roots match → done (short-circuit)
+\node[note] at (1.9, -1.6)
+  {if roots match: \textbf{done} (constant space)};
+
+% Step 2: RangeReq -> RangeResp (roots differ)
+\draw[msg] ($(L.south) + (0, -2.25)$)
+        -- node[above, font=\scriptsize]
+           {\texttt{RangeReq}\,(since\,$t_\text{local}$)}
+           ($(R.south) + (0, -2.25)$);
+\draw[msg] ($(R.south) + (0, -2.75)$)
+        -- node[below, font=\scriptsize] {\texttt{RangeResp}\,(ids)}
+           ($(L.south) + (0, -2.75)$);
+
+% Step 3: diff ids (self-loop on local)
+\draw[self, rounded corners=1pt]
+        ($(L.south) + (0, -3.35)$)
+     -- ++(-0.9, 0) -- ++(0, -0.5) -- ++(0.9, 0);
+\node[note, right=1mm] at ($(L.south) + (-2.4, -3.6)$)
+  {local: diff\\missing ids};
+
+% Step 4: FetchReq -> FetchResp (per missing id)
+\draw[msg] ($(L.south) + (0, -4.35)$)
+        -- node[above, font=\scriptsize]
+           {\texttt{FetchReq}\,(id)}
+           ($(R.south) + (0, -4.35)$);
+\draw[msg] ($(R.south) + (0, -4.85)$)
+        -- node[below, font=\scriptsize]
+           {\texttt{FetchResp}\,(body)}
+           ($(L.south) + (0, -4.85)$);
+
+\node[note] at (1.9, -5.4)
+  {repeat per missing id; verify signature};
+\end{tikzpicture}
+\caption{Anti-entropy reconciliation round between two peers. The cheap
+Merkle-root check short-circuits the round in constant space when the
+two stores already agree; only when roots differ does the round pay the
+cost of enumerating the timestamp-bounded range and fetching the
+missing bodies.}
+\label{fig:antientropy}
+\end{figure}
 
 \subsection{Merkle completeness}
+\label{sec:merkle}
 
 Every member maintains a Merkle tree over the set of message identifiers
 in its local store, ordered by the topological order defined over the
@@ -412,7 +551,10 @@ be added underneath without breaking protocol compatibility.
 \label{sec:implementation}
 
 \texttt{entmootd} is implemented in Go (${\geq}1.25.3$, matching Pilot's
-toolchain requirement) and compiles against Pilot~v1.7.2. The module is
+toolchain requirement) and compiles against Pilot~v1.8.0-jf.1 --- the
+\texttt{jerryfane/pilotprotocol} fork of upstream v1.7.2, which adds the
+pluggable transport layer discussed in \S\ref{sec:background} along with
+several reliability fixes we describe below. The module is
 split into fourteen packages totalling roughly three thousand lines of
 code. Key packages: \texttt{canonical} (deterministic JSON encoding
 used for signing and identifier computation), \texttt{merkle} (tree
@@ -493,7 +635,25 @@ which is not documented. Third, because the
 registry hides private nodes' endpoints from non-trusted lookups, at
 least one participant in any bootstrap must be launched with
 Pilot's \texttt{-public} flag; otherwise the handshake request
-cannot be delivered.
+cannot be delivered. Entmoot is otherwise agnostic to which transport
+carries a given Pilot frame: when the dialing peer's direct-UDP retries
+time out and the callee has advertised a TCP endpoint via the registry,
+the Pilot fork falls back to TCP transparently, and the \texttt{net.Conn}
+the adapter hands us is indistinguishable from its UDP equivalent.
+
+A subtlety surfaced by long-running canaries deserves a mention.
+Pilot's encrypted tunnels are rekeyed periodically (at Pilot's
+\texttt{NetworkSync} boundary, on a roughly five-minute cadence). In
+stock v1.7.2 we observed Entmoot tunnels flapping at the rekey
+boundary: in-flight ACKs dropped during the key swap tripped Pilot's
+dead-peer detection on otherwise healthy connections, manifesting at
+the Entmoot layer as intermittent gossip failures. The fix, landed in
+the fork at v1.7.2-jf.2~\citep{pilotprotocol}, installs a rekey
+callback that resets the keepalive counter on every
+\texttt{StateEstablished} connection routed over the rekeying peer
+after the in-flight buffer is flushed. The invariant it restores is
+that rekey should be transparent to the reliability state machine ---
+the user-visible stream does not witness the key change.
 
 Dependencies outside the Pilot module are deliberately minimal:
 Go's standard library plus \texttt{golang.org/x/time/rate} for the
@@ -616,23 +776,31 @@ that such coordination can later sit on top of.
 \section{Discussion and Future Work}
 \label{sec:future}
 
-Entmoot v1 ships a deliberately narrow subset of the full design. The
-items deferred, with their upgrade paths, are: push-pull gossip (v1 is
-push-only); near-peer sampling informed by subscriber interest overlap
-(v1 is random-only); cooldown and soft-penalty schemes on rate-limit
-breach (v1 hard-disconnects); DHT-assigned message keepers for
-retention beyond subscriber interest (v1 stores only what each member
-cares about); Merkle absence proofs for filtered subscriber views (v1
-supports positive-inclusion only); end-to-end group encryption with
-shared-key rotation on churn (v1 is plaintext); and multi-admin or
-quorum-based rosters (v1 is founder-only).
+Entmoot v1 still ships a deliberately narrow subset of the full design.
+The items deferred, with their upgrade paths, are: near-peer sampling
+informed by subscriber interest overlap (v1 is random-only); cooldown
+and soft-penalty schemes on rate-limit breach (v1 hard-disconnects);
+DHT-assigned message keepers for retention beyond subscriber interest
+(v1 stores only what each member cares about); Merkle absence proofs
+for filtered subscriber views (v1 supports positive-inclusion only);
+end-to-end group encryption with shared-key rotation on churn (v1 is
+plaintext); and multi-admin or quorum-based rosters (v1 is
+founder-only). Push-pull gossip, listed as deferred in earlier
+revisions of this paper, is now implemented as the anti-entropy
+reconciliation path (\S\ref{sec:antientropy}).
 
 When Pilot's custom-networks feature ships, the membership interface
 can be backed by network membership instead of our signed roster
 without protocol-level changes. Whether we adopt that backend will
 depend on the shape of Pilot's eventual API and on whether network
 membership provides the authorization semantics we need. The
-abstraction is already in place.
+abstraction is already in place. Separately, Pilot's pluggable
+transport layer~(\S\ref{sec:background}) now lets Entmoot run over
+TCP when a public-IP peer in the group advertises a TCP endpoint ---
+the UDP-hostile-network escape hatch that the Calin study's broader
+deployments would otherwise stumble on. Quantifying the TCP-fallback
+overhead with a dedicated canary variant is a natural follow-up to
+the measurements below.
 
 Entmoot also creates the substrate the empirical questions flagged by
 \citet{calin2026emergent} require:
