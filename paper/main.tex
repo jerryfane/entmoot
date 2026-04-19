@@ -416,51 +416,51 @@ the message sequence for a single reconciliation round.
 ]
 % Lane headers
 \node[lane] (L) at (0, 0)    {local};
-\node[lane] (R) at (3.8, 0)  {remote};
+\node[lane] (R) at (4.2, 0)  {remote};
 
 % Lifelines
-\draw[dashed, gray!60] (L.south) -- ++(0, -5.2);
-\draw[dashed, gray!60] (R.south) -- ++(0, -5.2);
+\draw[dashed, gray!60] (L.south) -- ++(0, -6.8);
+\draw[dashed, gray!60] (R.south) -- ++(0, -6.8);
 
 % Step 1: MerkleReq -> MerkleResp
-\draw[msg] ($(L.south) + (0, -0.5)$)
+\draw[msg] ($(L.south) + (0, -0.6)$)
         -- node[above, font=\scriptsize] {\texttt{MerkleReq}}
-           ($(R.south) + (0, -0.5)$);
-\draw[msg] ($(R.south) + (0, -1.0)$)
-        -- node[below, font=\scriptsize] {\texttt{MerkleResp}\,(root)}
-           ($(L.south) + (0, -1.0)$);
+           ($(R.south) + (0, -0.6)$);
+\draw[msg] ($(R.south) + (0, -1.35)$)
+        -- node[above, font=\scriptsize] {\texttt{MerkleResp}\,(root)}
+           ($(L.south) + (0, -1.35)$);
 
 % Branch: roots match → done (short-circuit)
-\node[note] at (1.9, -1.6)
+\node[note] at (2.1, -2.0)
   {if roots match: \textbf{done} (constant space)};
 
 % Step 2: RangeReq -> RangeResp (roots differ)
-\draw[msg] ($(L.south) + (0, -2.25)$)
+\draw[msg] ($(L.south) + (0, -2.85)$)
         -- node[above, font=\scriptsize]
            {\texttt{RangeReq}\,(since\,$t_\text{local}$)}
-           ($(R.south) + (0, -2.25)$);
-\draw[msg] ($(R.south) + (0, -2.75)$)
-        -- node[below, font=\scriptsize] {\texttt{RangeResp}\,(ids)}
-           ($(L.south) + (0, -2.75)$);
+           ($(R.south) + (0, -2.85)$);
+\draw[msg] ($(R.south) + (0, -3.6)$)
+        -- node[above, font=\scriptsize] {\texttt{RangeResp}\,(ids)}
+           ($(L.south) + (0, -3.6)$);
 
 % Step 3: diff ids (self-loop on local)
 \draw[self, rounded corners=1pt]
-        ($(L.south) + (0, -3.35)$)
-     -- ++(-0.9, 0) -- ++(0, -0.5) -- ++(0.9, 0);
-\node[note, right=1mm] at ($(L.south) + (-2.4, -3.6)$)
-  {local: diff\\missing ids};
+        ($(L.south) + (0, -4.25)$)
+     -- ++(-0.7, 0) -- ++(0, -0.5) -- ++(0.7, 0);
+\node[note, anchor=east] at ($(L.south) + (-0.85, -4.5)$)
+  {local:\\diff ids};
 
 % Step 4: FetchReq -> FetchResp (per missing id)
-\draw[msg] ($(L.south) + (0, -4.35)$)
+\draw[msg] ($(L.south) + (0, -5.35)$)
         -- node[above, font=\scriptsize]
            {\texttt{FetchReq}\,(id)}
-           ($(R.south) + (0, -4.35)$);
-\draw[msg] ($(R.south) + (0, -4.85)$)
-        -- node[below, font=\scriptsize]
+           ($(R.south) + (0, -5.35)$);
+\draw[msg] ($(R.south) + (0, -6.1)$)
+        -- node[above, font=\scriptsize]
            {\texttt{FetchResp}\,(body)}
-           ($(L.south) + (0, -4.85)$);
+           ($(L.south) + (0, -6.1)$);
 
-\node[note] at (1.9, -5.4)
+\node[note] at (2.1, -6.7)
   {repeat per missing id; verify signature};
 \end{tikzpicture}
 \caption{Anti-entropy reconciliation round between two peers. The cheap

@@ -12,3 +12,5 @@ coverage.out
 /src/entmootd
 # release artifacts built under src/dist/
 /src/dist/
+
+.claude/
