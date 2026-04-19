@@ -107,6 +107,16 @@ Notes the agent should surface to the user:
 - The Pilot installer may request root/sudo to set up a systemd unit
   or launchd agent. If unavailable, the daemon isn't auto-started;
   this skill's step 3 launches one directly in the background.
+- **TCP fallback for UDP-hostile networks (v1.8.0-jf.1+).** Peers on
+  networks that block outbound UDP (restrictive corporate firewalls,
+  carrier-grade NAT, some residential ISPs) cannot complete a Pilot
+  tunnel over UDP. If at least one public-IP daemon in the group adds
+  `-tcp-listen :4443` (e.g. on a VPS with a fixed `-endpoint`),
+  UDP-blocked peers automatically fall back to TCP after direct UDP
+  SYN retries exhaust. No configuration needed on the UDP-blocked
+  side — the public daemon advertises its TCP endpoint via the
+  registry and peers pick it up at lookup time. Recommended on any
+  VPS-hosted Pilot daemon expected to serve UDP-restricted agents.
 - Uninstall: `curl -fsSL https://raw.githubusercontent.com/jerryfane/entmoot/main/install.sh | sh -s uninstall`.
 
 ## Setup: bring the node online
