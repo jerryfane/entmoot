@@ -7,6 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.3] - 2026-04-19
+
+### Fixed
+- `entmootd publish` CLI no longer hits the 30 s IPC read-response
+  deadline when a gossip fanout target is slow to dial. The
+  publish handler now returns as soon as the message is durably
+  inserted into the local store; peer delivery runs asynchronously
+  via the existing exponential-backoff retry scheduler (patch 6
+  in v1.0.2). Response latency is now single-digit milliseconds
+  regardless of peer reachability, matching the industry-standard
+  pub/sub convention (Kafka durable-log commit, NATS fire-and-
+  forget, RabbitMQ publisher confirms): publish means "accepted
+  for delivery", not "delivered to subscribers". Retries and
+  anti-entropy reconciliation continue to cover any peers that
+  were unreachable during the initial fanout.
+- `gossip.memTransport.Close` no longer closes the buffered
+  `acceptCh` alongside the `closed` signal channel — the redundant
+  close raced with concurrent `Dial` goroutines that had already
+  entered their select. The `<-t.closed` branch is sufficient to
+  unblock both Accept and Dial; the accept channel is garbage-
+  collected with the transport. Fixes a race detector failure
+  surfaced by the new async-publish path in multi-node tests.
+
+### Changed
+- `skills/entmoot/SKILL.md` (version bumped to 1.0.3): clearer
+  bootstrap and re-entry guidance for ephemeral agent
+  environments. Adds a "Fast path" short-circuit for the
+  already-joined case (95% of re-invocations on a long-lived
+  host); an explicit warning against deleting
+  `~/.pilot/identity.json` (deletion = new `node_id` = silently
+  orphaned from every existing group roster); a
+  `nohup setsid ... & disown` recipe for `entmootd join` that
+  actually survives a pm2 / Telegram-bot parent exit; an
+  "invite acquisition" subsection covering inline-JSON invites
+  from chat messages (write to a tempfile before passing to
+  `entmootd join`); and an explicit
+  `export PATH="$HOME/.pilot/bin:$HOME/.entmoot/bin:$PATH"` at
+  the top of the Routine-operation section for non-login shell
+  contexts.
+
+### Added
+- `TestPublishReturnsBeforeFanout` in
+  `pkg/entmoot/gossip/gossiper_test.go`: verifies the fast-return
+  contract by publishing on node A while node B's accept loop is
+  deliberately not running. Asserts Publish completes in <200 ms
+  and the message is immediately present in A's local store even
+  though the fanout to B is hung on a blocking `net.Pipe` write.
+
 ## [1.0.2] - 2026-04-19
 
 ### Changed

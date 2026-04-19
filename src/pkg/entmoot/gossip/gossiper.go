@@ -146,6 +146,17 @@ type Gossiper struct {
 	// shutdown when its context is cancelled.
 	wg sync.WaitGroup
 
+	// lifeCtx is the gossiper's lifetime context (set by Start). Async
+	// work that outlives a per-request handler — notably publish fanout
+	// now that Publish returns on local-durable accept rather than
+	// blocking on peer delivery — uses this so shutdown cancels it,
+	// but IPC handler teardown does not. nil before Start runs;
+	// publishers that race Start into a pre-started gossiper fall back
+	// to inline fanout in that case. Guarded by lifeMu since tests
+	// may call Start and Publish from concurrent goroutines.
+	lifeMu  sync.Mutex
+	lifeCtx context.Context
+
 	// Retry scheduler (patch 6). pending holds (peer, id, op) slots that
 	// failed their initial attempt and are waiting on an exponential-backoff
 	// re-try cycle. retryLoop drains it. Both pending and lastReconciled are
@@ -208,6 +219,14 @@ func New(cfg Config) (*Gossiper, error) {
 // returns. The returned error is nil on clean shutdown (ctx cancelled or
 // transport closed); it is a wrapped Accept error otherwise.
 func (g *Gossiper) Start(ctx context.Context) error {
+	// Stash the long-lived context so async workers spawned from
+	// per-request entry points (Publish's fanout goroutine) can use
+	// it instead of the request-scoped ctx that dies when the IPC
+	// caller disconnects.
+	g.lifeMu.Lock()
+	g.lifeCtx = ctx
+	g.lifeMu.Unlock()
+
 	// Background workers (patch 6, patch 7). retryLoop drains the
 	// exponential-backoff queue for push/fetch attempts that failed their
 	// initial try. Both live under g.wg so Start's drain on shutdown also
@@ -545,22 +564,49 @@ func (g *Gossiper) Publish(ctx context.Context, msg entmoot.Message) error {
 		return fmt.Errorf("gossip: sign: %w", err)
 	}
 
+	// v1.0.3 publish semantics: local-durable accept is the contract.
+	// Run the fanout asynchronously so the IPC handler returns in
+	// milliseconds instead of blocking on potentially-slow per-peer
+	// dials. Failed pushes still feed the existing retry scheduler
+	// (patch 6). This matches the standard pub/sub convention (Kafka
+	// durable-log commit, NATS fire-and-forget, RabbitMQ publisher
+	// confirms) where publish = "accepted for delivery", not
+	// "delivered to subscribers".
+	//
+	// The async fanout runs under g.lifeCtx so request teardown
+	// doesn't cancel it; g.wg ensures Start's shutdown drain waits
+	// for in-flight fanouts. When lifeCtx is nil (publishing before
+	// Start — rare, mostly tests), fall back to inline fanout so we
+	// don't drop messages on the floor.
+	g.lifeMu.Lock()
+	lifeCtx := g.lifeCtx
+	g.lifeMu.Unlock()
+	if lifeCtx == nil {
+		g.fanoutPush(ctx, peers, frame, msg.ID)
+		return nil
+	}
+	g.wg.Add(1)
+	go func(peers []entmoot.NodeID, frame *wire.Gossip, id entmoot.MessageID) {
+		defer g.wg.Done()
+		g.fanoutPush(lifeCtx, peers, frame, id)
+	}(peers, frame, msg.ID)
+	return nil
+}
+
+// fanoutPush attempts the per-peer push, queuing failures for the
+// retry scheduler. Shared between the synchronous pre-Start fallback
+// path and the async post-Start goroutine.
+func (g *Gossiper) fanoutPush(ctx context.Context, peers []entmoot.NodeID, frame *wire.Gossip, id entmoot.MessageID) {
 	for _, p := range peers {
 		if err := g.pushGossip(ctx, p, frame); err != nil {
-			// Patch 6: queue a retry per peer. Fanout already samples a subset
-			// so a missing sample slot is effectively a push failure too —
-			// but the deterministic way to recover is to retry the targeted
-			// pushes that actually errored. The frame is stashed on the
-			// retry state so re-attempts don't need to re-sign.
 			g.logger.Warn("gossip: push",
 				slog.Uint64("peer", uint64(p)),
-				slog.String("id", msg.ID.String()),
+				slog.String("id", id.String()),
 				slog.Int("attempt", 1),
 				slog.String("err", err.Error()))
-			g.enqueueRetry(retryKey{peer: p, id: msg.ID, op: opPush}, frame)
+			g.enqueueRetry(retryKey{peer: p, id: id, op: opPush}, frame)
 		}
 	}
-	return nil
 }
 
 // pushGossip opens a connection to peer, writes the frame, and closes. v0 is

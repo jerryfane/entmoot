@@ -293,6 +293,53 @@ func TestPublishThreeNodeFanout(t *testing.T) {
 	}
 }
 
+// TestPublishReturnsBeforeFanout asserts the v1.0.3 contract: Publish
+// returns on local-durable accept, not on peer delivery. Peer B's Start
+// loop is intentionally NOT running, so any push to B writes to a
+// net.Pipe whose other side nobody reads — pushGossip would block
+// forever under the pre-v1.0.3 code path. Publish on A must still
+// return fast (target: well under 200ms; the async fanout goroutine
+// stays hung in the background, which is fine — it's isolated from
+// the caller).
+func TestPublishReturnsBeforeFanout(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, []entmoot.NodeID{10, 20})
+	defer f.closeTransports()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Start A only — we need Publish to see g.lifeCtx != nil so it
+	// takes the async path. B's Start is deliberately NOT called, so
+	// B never drains its acceptCh and the net.Pipe write hangs.
+	f.nodes[10].running.Store(true)
+	go func() {
+		defer f.nodes[10].running.Store(false)
+		_ = f.nodes[10].gossip.Start(ctx)
+	}()
+	// Let Start set lifeCtx. Tests are fast; 50ms is comfortable.
+	time.Sleep(50 * time.Millisecond)
+
+	msg := f.buildMessage(10, "fast-return test", 2_000)
+	start := time.Now()
+	if err := f.nodes[10].gossip.Publish(ctx, msg); err != nil {
+		t.Fatalf("Publish on A: %v", err)
+	}
+	elapsed := time.Since(start)
+	if elapsed > 200*time.Millisecond {
+		t.Fatalf("Publish took %v — expected fast return (<200ms) even with hung peer", elapsed)
+	}
+
+	// Local store must have the message immediately.
+	has, err := f.nodes[10].storeM.Has(ctx, f.groupID, msg.ID)
+	if err != nil {
+		t.Fatalf("store.Has: %v", err)
+	}
+	if !has {
+		t.Fatalf("expected A's local store to contain published message after fast return")
+	}
+}
+
 // 4. Publish from a non-member: forge a message with an author that is not
 // in the roster. Publish must reject with entmoot.ErrNotMember.
 func TestPublishNonMemberRejected(t *testing.T) {

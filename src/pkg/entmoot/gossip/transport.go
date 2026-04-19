@@ -192,12 +192,18 @@ func (t *memTransport) TrustedPeers(_ context.Context) ([]entmoot.NodeID, error)
 	return out, nil
 }
 
-// Close implements Transport. Closes the accept channel after marking the
-// transport as closed. Safe to call multiple times.
+// Close implements Transport. Marks the transport as closed by closing
+// t.closed; every Dial/Accept path selects on t.closed so in-flight callers
+// observe the close promptly. Intentionally does NOT close(t.acceptCh) —
+// that would race with concurrent Dial goroutines that have already entered
+// their select and chosen the send branch (Go's race detector flags the
+// send-vs-close even though close-notice usually wins). Leaving acceptCh
+// open lets any straggler send complete harmlessly into the buffered
+// channel, where the item is then garbage-collected with the transport.
+// Safe to call multiple times.
 func (t *memTransport) Close() error {
 	t.closeOnce.Do(func() {
 		close(t.closed)
-		close(t.acceptCh)
 	})
 	return nil
 }
