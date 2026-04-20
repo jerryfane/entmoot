@@ -668,7 +668,8 @@ func (g *Gossiper) onGossip(ctx context.Context, remote entmoot.NodeID, gos *wir
 			// permanently lose the message — the retry loop gives ~5 min of
 			// exponential-backoff attempts before giving up, and patch 7's
 			// reconciliation-on-reconnect catches anything that still slips
-			// through.
+			// through. When the retry later succeeds, fetchFrom itself
+			// drives the Plumtree re-fanout (v1.0.5).
 			g.logger.Warn("gossip: fetch",
 				slog.Uint64("remote", uint64(remote)),
 				slog.String("id", id.String()),
@@ -677,16 +678,10 @@ func (g *Gossiper) onGossip(ctx context.Context, remote entmoot.NodeID, gos *wir
 			g.enqueueRetry(retryKey{peer: remote, id: id, op: opFetch}, nil)
 			continue
 		}
-		// Plumtree re-fanout on first-see (v1.0.4). The message just
-		// landed in our local store; forward it to every other peer
-		// so partial-connectivity topologies (where the originator
-		// can't directly reach everyone) still converge. Eager peers
-		// get the full signed Gossip frame; lazy peers get IHave.
-		// Exclude `remote` — they sent us the body and definitely
-		// have it. Also cancel any pending GRAFT timers for this id
-		// since we no longer need to request the body from anyone.
-		g.plumCancelGraftsFor(id)
-		g.refanout(ctx, remote, id)
+		// Plumtree re-fanout and graft-timer cancellation happen inside
+		// fetchFrom on successful Put (v1.0.5). Centralizing the hook
+		// there means retry-fetch and reconcile-fetch acquisitions also
+		// propagate; prior to v1.0.5 only this gossip-push path did.
 	}
 }
 
@@ -921,6 +916,25 @@ func (g *Gossiper) fetchFrom(ctx context.Context, peer entmoot.NodeID, id entmoo
 	if err := g.cfg.Store.Put(ctx, *resp.Message); err != nil {
 		return fmt.Errorf("store put: %w", err)
 	}
+	// Plumtree "first-seen → forward" rule (v1.0.5). A message we just
+	// acquired is new to our store by construction: every caller of
+	// fetchFrom gates on Store.Has first. Forward it through the spanning
+	// tree regardless of which acquisition path led us here — gossip push
+	// (onGossip), queued retry (executeRetry/opFetch), or anti-entropy
+	// pull (reconcileWith). Previously only onGossip called refanout
+	// afterwards, so messages acquired via retry or reconcile silently
+	// terminated at this node — breaking propagation when, e.g., a hub
+	// acquires an edge-node's message via reconcile (because the edge's
+	// direct push was flaky) and the hub's other edge never hears. This
+	// matches GossipSub v1.0's forwarding rule ("not seen before →
+	// forward to mesh, irrespective of arrival method").
+	//
+	// plumCancelGraftsFor clears any outstanding GRAFT timers for this id
+	// (the body arrived, nothing to graft-request anymore). refanout pushes
+	// to eagerPushPeers \ {peer} and IHave-advertises to lazyPushPeers \
+	// {peer}.
+	g.plumCancelGraftsFor(id)
+	g.refanout(ctx, peer, id)
 	// Successful fetch also implies the peer is reachable; trigger a
 	// cooldown-gated reconcile so anti-entropy catches anything else they
 	// have that we don't (patch 7).

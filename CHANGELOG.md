@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.5] - 2026-04-20
+
+### Fixed
+- Plumtree re-fanout fired only when a message was acquired via the
+  live gossip-push path (`onGossip` → `fetchFrom`). Messages acquired
+  through either of the other two `fetchFrom` call sites —
+  `executeRetry(opFetch)` (retry of an initially-failed fetch) and
+  `reconcileWith` (anti-entropy pull driven by `maybeReconcile`) —
+  were stored locally but never forwarded through the spanning tree.
+  In partial-connectivity topologies this silently broke
+  end-to-end delivery: e.g. a hub that could not receive an edge
+  node's direct push (because the edge's outbound was NATed away)
+  but later pulled the message via reconciliation would never
+  propagate to the hub's other edges.
+
+  Fix: centralise the `plumCancelGraftsFor(id) + refanout(peer, id)`
+  hook inside `fetchFrom` after a successful `Store.Put`. Every
+  acquisition path now triggers the first-seen forwarding step,
+  matching the rule libp2p GossipSub applies ("not seen before →
+  forward to mesh, irrespective of arrival method"), rather than the
+  handler-specific duplication used by the Helium reference Erlang
+  Plumtree. The redundant call in `onGossip` is removed.
+
+  Regression test: `TestPlumtreeRefanoutOnFetchFrom` seeds peer B's
+  store directly (no Gossip push), drives `A.fetchFrom(B, id)`, and
+  asserts C receives the message via A's post-fetch refanout.
+
 ## [1.0.4] - 2026-04-20
 
 ### Added

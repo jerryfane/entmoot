@@ -288,3 +288,55 @@ func TestPlumtreeOnPruneDemotesSender(t *testing.T) {
 		t.Fatalf("expected 20 to be in lazyPushPeers after Prune")
 	}
 }
+
+// TestPlumtreeRefanoutOnFetchFrom is the v1.0.5 regression guard: any
+// acquisition path that flows through fetchFrom (gossip-push, retry,
+// reconcile) must trigger Plumtree re-fanout to our other peers.
+// Before v1.0.5 only onGossip refanned out after a successful fetch;
+// retry-fetch and reconcile-fetch silently swallowed messages, breaking
+// propagation when a hub acquired an edge's message via reconcile.
+//
+// We invoke fetchFrom directly (as reconcileWith and executeRetry both
+// do) and assert the re-fanout arrived at the third node.
+//
+// Topology: fully connected 3-node mesh. A=10, B=20, C=30. We seed B's
+// store with a message authored by B, then call A.fetchFrom(B, id).
+// After fetchFrom returns, refanout must push to C, which should store
+// the message.
+func TestPlumtreeRefanoutOnFetchFrom(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, []entmoot.NodeID{10, 20, 30})
+	defer f.closeTransports()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f.startAll(ctx)
+
+	// Put a B-authored message directly in B's store without
+	// publishing. This simulates the state after reconcileWith has
+	// located the id on peer B via RangeReq: A about to fetchFrom B.
+	msg := f.buildMessage(20, "B-authored, never gossiped", 2_000)
+	if err := f.nodes[20].storeM.Put(ctx, msg); err != nil {
+		t.Fatalf("seed B store: %v", err)
+	}
+
+	// Drive A's fetchFrom directly — mirrors what reconcileWith or
+	// executeRetry(opFetch) would do on the post-1.0.5 code path.
+	if err := f.nodes[10].gossip.fetchFrom(ctx, 20, msg.ID); err != nil {
+		t.Fatalf("fetchFrom on A: %v", err)
+	}
+
+	// A must now have the message locally (Put side-effect).
+	has, _ := f.nodes[10].storeM.Has(ctx, f.groupID, msg.ID)
+	if !has {
+		t.Fatalf("A did not store message after fetchFrom")
+	}
+
+	// And A's refanout must have propagated to C. One A→C eager push
+	// over net.Pipe is sub-millisecond; budget 2 s for scheduler
+	// slack.
+	waitUntil(t, 2*time.Second, "C stores message via A's post-fetch refanout", func() bool {
+		has, _ := f.nodes[30].storeM.Has(ctx, f.groupID, msg.ID)
+		return has
+	})
+}
