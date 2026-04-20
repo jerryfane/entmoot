@@ -22,22 +22,25 @@ import (
 	"entmoot/pkg/entmoot/wire"
 )
 
-// Retry scheduler constants (patch 6). The schedule is ~5 minutes of total
-// effort per (peer, message, op), long enough to cover the typical
-// consumer-NAT flap window while bounded so a permanently-unreachable peer
-// doesn't accumulate unbounded pending state.
-var retryBackoff = []time.Duration{
-	1 * time.Second,
-	2 * time.Second,
-	4 * time.Second,
-	8 * time.Second,
-	16 * time.Second,
-	30 * time.Second,
-	60 * time.Second,
-	60 * time.Second,
-	60 * time.Second,
-	60 * time.Second,
-}
+// Retry backoff parameters (v1.0.7). Previously a deterministic
+// array [1s, 2s, 4s, 8s, 16s, 30s, 60s×4]; now a decorrelated-
+// jitter schedule matching Marc Brooker's AWS pattern (2015).
+// Keeps the same envelope (base 1 s, cap 60 s) while randomising
+// each interval to prevent correlated retry storms — when all
+// nodes share a flakiness window (NAT flap, registry blip) the
+// deterministic schedule synchronised every retry to the same
+// wall-clock moment, so every retry hit the same bad window.
+// Decorrelated jitter is the AWS-blessed formula (Full Jitter is
+// equivalent but needs an attempt counter):
+//     next = min(cap, random(base, prev * 3))
+// Retry budget remains 10 attempts via retryMaxAttempts — a peer
+// that fails 10 straight retries still gets dropped per v1.0.4
+// semantics.
+const (
+	retryBackoffBase = 1 * time.Second
+	retryBackoffCap  = 60 * time.Second
+	retryMaxAttempts = 10
+)
 
 // retryTickInterval is how often retryLoop wakes to check for due retries.
 // 500ms keeps the worst-case scheduling jitter well under the smallest
@@ -67,6 +70,16 @@ const fanoutPerPeerTimeout = 5 * time.Second
 // typical libp2p SetLimit values. (v1.0.6)
 const fanoutMaxConcurrency = 32
 
+// inlineBodyThreshold bounds when Publish / refanout inline the
+// full Message body in a Gossip frame instead of relying on the
+// receiver to fetch it back. 4 KiB covers typical chat and small
+// documents while stopping short of large payloads that would
+// balloon fanout bandwidth — matches 4× the IPFS Bitswap
+// WantHaveReplaceSize default (1 KiB) and aligns with GossipSub /
+// Scuttlebutt / Matrix "inline small, pull large" convention.
+// (v1.0.7)
+const inlineBodyThreshold = 4 * 1024
+
 // dialBackoffBase / dialBackoffCap bound the per-peer exponential
 // dial-backoff cache (v1.0.6 Fix C). Once a dial to peer P fails,
 // subsequent send attempts to P are short-circuited with a synthetic
@@ -80,10 +93,19 @@ const (
 	dialBackoffCap  = 5 * time.Minute
 )
 
-// Reconciliation cooldown (patch 7). Limits how often we fire a full
-// MerkleReq round-trip against any single peer so a chatty connection
-// pattern doesn't turn into a reconciliation storm.
-const reconcileCooldown = 60 * time.Second
+// Reconcile cooldown parameters (v1.0.7). Previously a hard-coded
+// 60 s constant; now a 30 s base with ±20 % multiplicative jitter.
+// Reduced because research (libp2p GossipSub's 1 s heartbeat,
+// Plumtree §3.4 continuous lazy-push) shows 60 s was 1–2 orders
+// of magnitude too slow for failed-push recovery — only bulk
+// Merkle-tree systems (Riak AAE, Cassandra repair) run at the
+// minute scale. The 20 % multiplicative jitter prevents fleet-wide
+// collisions on the cooldown boundary after correlated events
+// (memberlist-style randomStagger).
+const (
+	reconcileCooldownBase   = 30 * time.Second
+	reconcileCooldownJitter = 6 * time.Second // ±20 %
+)
 
 // Plumtree GRAFT timeout (v1.0.4). After receiving an IHave advertising
 // an unknown id, wait this long for the body to arrive via eager push
@@ -136,9 +158,19 @@ type retryKey struct {
 // retryState tracks how many attempts have run and when the next is due.
 // frame is populated only for pushes — fetches re-issue FetchReq from id.
 type retryState struct {
-	attempts int
-	nextAt   time.Time
-	frame    *wire.Gossip
+	attempts    int
+	nextAt      time.Time
+	lastBackoff time.Duration // v1.0.7: feeds nextBackoff(prev); 0 on first failure
+	frame       *wire.Gossip
+}
+
+// reconcileState caches per-peer anti-entropy cooldown bookkeeping.
+// at is when we last fired reconcileWith; cooldown is the jittered
+// window chosen at that firing so a "just under the cooldown" peer
+// doesn't re-probe the boundary every tick (v1.0.7).
+type reconcileState struct {
+	at       time.Time
+	cooldown time.Duration
 }
 
 // defaultFanout is the number of random peers a Publish pushes a new message
@@ -221,9 +253,18 @@ type Gossiper struct {
 	// guarded by pendMu to keep the allocation story simple; the maps are
 	// accessed far less often than the accept loop, so a single mutex is
 	// fine.
-	pendMu          sync.Mutex
-	pending         map[retryKey]*retryState
-	lastReconciled  map[entmoot.NodeID]time.Time
+	pendMu         sync.Mutex
+	pending        map[retryKey]*retryState
+	lastReconciled map[entmoot.NodeID]reconcileState
+
+	// rng is a dedicated *rand.Rand for retry-backoff and cooldown
+	// jitter (v1.0.7 Fix B). Seeded in New from the clock the same
+	// way getPicker seeds its rand source, so Fake-clock tests remain
+	// deterministic. math/rand/v2.Rand is NOT goroutine-safe; access
+	// is serialised under rngMu. Kept separate from getPicker's rand
+	// so peer-sampling determinism isn't entangled with jitter.
+	rngMu sync.Mutex
+	rng   *rand.Rand
 
 	// Plumtree state (v1.0.4). The broadcast spanning tree is
 	// represented as a partition of Roster.Members() \ {self} into
@@ -319,13 +360,19 @@ func New(cfg Config) (*Gossiper, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	// Seed off the clock so Fake-clock tests stay deterministic.
+	// Mirrors the getPicker seeding pattern (same file, below) so
+	// both rand sources advance predictably in tests.
+	seed := clk.Now().UnixNano()
+	rng := rand.New(rand.NewPCG(uint64(seed), uint64(seed>>1)^0x9E3779B97F4A7C15))
 	return &Gossiper{
 		cfg:            cfg,
 		logger:         logger,
 		clk:            clk,
 		fanout:         fanout,
 		pending:        make(map[retryKey]*retryState),
-		lastReconciled: make(map[entmoot.NodeID]time.Time),
+		lastReconciled: make(map[entmoot.NodeID]reconcileState),
+		rng:            rng,
 		// Plumtree peer-set maps and pending-graft timer map are
 		// lazily populated. Per paper convention, eagerPushPeers
 		// starts with every current non-self roster member at first
@@ -826,6 +873,43 @@ func (g *Gossiper) onGossip(ctx context.Context, remote entmoot.NodeID, gos *wir
 			}
 			continue
 		}
+
+		// Inline-body fast path (v1.0.7). Sender may have attached
+		// the full Message. If so, hash-verify against id and store
+		// directly — eliminates the fetchFrom round-trip. Integrity
+		// checks mirror fetchFrom's trio: id==canonical hash, the
+		// Message's own Ed25519 signature verifies against the
+		// author's roster pubkey, and the Store.Put succeeds. Falls
+		// through to the v1.0.6 fetch path on any mismatch/failure.
+		if gos.Body != nil && len(gos.IDs) == 1 && gos.Body.ID == id {
+			msg := *gos.Body
+			if canonical.MessageID(msg) != id {
+				g.logger.Warn("gossip: inline body hash mismatch",
+					slog.Uint64("remote", uint64(remote)),
+					slog.String("id", id.String()))
+				continue
+			}
+			if err := g.verifyMessage(msg); err != nil {
+				g.logger.Warn("gossip: inline body verify",
+					slog.Uint64("remote", uint64(remote)),
+					slog.String("id", id.String()),
+					slog.String("err", err.Error()))
+				continue
+			}
+			if err := g.cfg.Store.Put(ctx, msg); err != nil {
+				g.logger.Warn("gossip: inline body store put",
+					slog.Uint64("remote", uint64(remote)),
+					slog.String("id", id.String()),
+					slog.String("err", err.Error()))
+				continue
+			}
+			// Same post-Put trio as fetchFrom (the v1.0.5 refanout hook).
+			g.plumCancelGraftsFor(id)
+			g.refanout(ctx, remote, id)
+			g.maybeReconcile(ctx, remote)
+			continue
+		}
+
 		if err := g.fetchFrom(ctx, remote, id); err != nil {
 			// Patch 6: queue a retry instead of dropping. Transient Pilot
 			// errors (dial timeout, stream EOF, NAT flap) would otherwise
@@ -870,6 +954,15 @@ func (g *Gossiper) refanout(ctx context.Context, except entmoot.NodeID, id entmo
 		GroupID:   g.cfg.GroupID,
 		IDs:       []entmoot.MessageID{id},
 		Timestamp: g.clk.Now().UnixMilli(),
+	}
+	// v1.0.7: inline the body on refanout so downstream peers skip
+	// the fetchFrom round-trip. Store.Get should succeed because
+	// refanout is only called after Store.Put completes (either
+	// from fetchFrom's success path or from the inline-body accept
+	// path in onGossip). If it fails (message evicted?), drop to
+	// ID-only semantics; downstream will fetch.
+	if msg, err := g.cfg.Store.Get(ctx, g.cfg.GroupID, id); err == nil {
+		maybeInlineBody(frame, msg)
 	}
 	if err := signGossip(frame, g.cfg.Identity); err != nil {
 		g.logger.Warn("gossip: refanout sign",
@@ -1163,6 +1256,11 @@ func (g *Gossiper) Publish(ctx context.Context, msg entmoot.Message) error {
 		IDs:       []entmoot.MessageID{msg.ID},
 		Timestamp: g.clk.Now().UnixMilli(),
 	}
+	// v1.0.7: inline the body so eager-push peers can Store.Put
+	// directly and skip the fetchFrom round-trip. No-op for messages
+	// over inlineBodyThreshold — those still propagate via the
+	// ID-only + fetch path.
+	maybeInlineBody(frame, msg)
 	if err := signGossip(frame, g.cfg.Identity); err != nil {
 		return fmt.Errorf("gossip: sign: %w", err)
 	}
@@ -1366,11 +1464,40 @@ func (g *Gossiper) verifyMessage(msg entmoot.Message) error {
 	return nil
 }
 
-// signGossip canonicalizes frame with Signature zeroed, signs with id, and
-// stores the resulting signature back into frame.
+// maybeInlineBody attaches msg to a single-id Gossip frame when the
+// canonical encoding of msg fits under inlineBodyThreshold. Sets
+// frame.Body on success; no-op if the frame already has multiple
+// ids or the body is too large. The caller must signGossip AFTER
+// this (the Gossiper sig ignores Body, so ordering doesn't matter
+// for correctness — but it's cleaner). (v1.0.7)
+func maybeInlineBody(frame *wire.Gossip, msg entmoot.Message) {
+	if len(frame.IDs) != 1 {
+		return
+	}
+	enc, err := canonical.Encode(msg)
+	if err != nil {
+		return
+	}
+	if len(enc) > inlineBodyThreshold {
+		return
+	}
+	m := msg
+	frame.Body = &m
+}
+
+// signGossip canonicalizes frame with Signature (and v1.0.7 Body)
+// zeroed, signs with id, and stores the resulting signature back into
+// frame. Body is excluded from the signing scope so mixed v1.0.6 /
+// v1.0.7 peers verify each other's signatures unchanged: a v1.0.6
+// sender (no Body) signs as today, a v1.0.7 sender zeroes Body before
+// signing, and both produce the same {GroupID, IDs, Timestamp}
+// envelope. Body integrity is provided independently by (a) the
+// canonical hash of Body matching IDs[0] and (b) the Message's own
+// Ed25519 signature.
 func signGossip(frame *wire.Gossip, id *keystore.Identity) error {
 	signing := *frame
 	signing.Signature = nil
+	signing.Body = nil // v1.0.7: Body is not covered by the Gossiper sig
 	sigInput, err := canonical.Encode(signing)
 	if err != nil {
 		return err
@@ -1380,10 +1507,12 @@ func signGossip(frame *wire.Gossip, id *keystore.Identity) error {
 }
 
 // verifyGossipSig verifies a Gossip frame against pubKey using the canonical
-// encoding of the signing form (Signature zeroed).
+// encoding of the signing form (Signature and Body zeroed — see
+// signGossip for why Body is excluded).
 func verifyGossipSig(frame *wire.Gossip, pubKey []byte) bool {
 	signing := *frame
 	signing.Signature = nil
+	signing.Body = nil // v1.0.7: match signGossip scope
 	sigInput, err := canonical.Encode(signing)
 	if err != nil {
 		return false
@@ -1391,10 +1520,48 @@ func verifyGossipSig(frame *wire.Gossip, pubKey []byte) bool {
 	return keystore.Verify(pubKey, sigInput, frame.Signature)
 }
 
+// nextBackoff returns the next retry delay given the previous
+// delay (or 0 if this is the first failure). Decorrelated jitter:
+//
+//	next = min(cap, random_between(base, prev * 3))
+//
+// prev==0 produces a delay in [base, base+1ns) which rounds to
+// exactly `base` — same behaviour as the old retryBackoff[0] = 1s.
+func (g *Gossiper) nextBackoff(prev time.Duration) time.Duration {
+	g.rngMu.Lock()
+	defer g.rngMu.Unlock()
+	lo := int64(retryBackoffBase)
+	hi := int64(prev) * 3
+	if hi <= lo {
+		hi = lo + 1
+	}
+	span := hi - lo
+	next := time.Duration(lo + g.rng.Int64N(span))
+	if next > retryBackoffCap {
+		next = retryBackoffCap
+	}
+	return next
+}
+
+// jitteredReconcileCooldown returns a cooldown duration drawn
+// uniformly from [Base-Jitter, Base+Jitter). Callers cache the
+// drawn value alongside lastReconciled so a peer that's been
+// "just under" the cooldown doesn't probe the boundary every
+// tick (v1.0.7).
+func (g *Gossiper) jitteredReconcileCooldown() time.Duration {
+	g.rngMu.Lock()
+	defer g.rngMu.Unlock()
+	span := int64(2 * reconcileCooldownJitter)
+	return reconcileCooldownBase - reconcileCooldownJitter +
+		time.Duration(g.rng.Int64N(span))
+}
+
 // enqueueRetry inserts (or refreshes) a pending retry slot for a failed
-// push or fetch. First-attempt failures start at attempts=1 so the next
-// wait uses retryBackoff[1] (2s). frame must be non-nil for opPush and is
-// ignored for opFetch.
+// push or fetch. First-attempt failures start at attempts=1 with
+// lastBackoff=0, so nextBackoff produces a delay near retryBackoffBase
+// on the first wait (matching v1.0.6's retryBackoff[1] ≈ 2s envelope,
+// though individual samples vary under decorrelated jitter). frame
+// must be non-nil for opPush and is ignored for opFetch.
 func (g *Gossiper) enqueueRetry(key retryKey, frame *wire.Gossip) {
 	g.pendMu.Lock()
 	defer g.pendMu.Unlock()
@@ -1408,7 +1575,7 @@ func (g *Gossiper) enqueueRetry(key retryKey, frame *wire.Gossip) {
 			state.frame = frame
 		}
 	}
-	if state.attempts >= len(retryBackoff) {
+	if state.attempts >= retryMaxAttempts {
 		// Budget exhausted. We already warn once when dropping; patch 7
 		// reconcile-on-reconnect is the final recovery path.
 		g.logger.Warn("gossip: retry budget exhausted",
@@ -1418,7 +1585,8 @@ func (g *Gossiper) enqueueRetry(key retryKey, frame *wire.Gossip) {
 		delete(g.pending, key)
 		return
 	}
-	state.nextAt = now.Add(retryBackoff[state.attempts])
+	state.lastBackoff = g.nextBackoff(state.lastBackoff)
+	state.nextAt = now.Add(state.lastBackoff)
 	g.pending[key] = state
 }
 
@@ -1543,11 +1711,14 @@ func (g *Gossiper) maybeReconcile(ctx context.Context, peer entmoot.NodeID) {
 	g.pendMu.Lock()
 	last, ok := g.lastReconciled[peer]
 	now := g.clk.Now()
-	if ok && now.Sub(last) < reconcileCooldown {
+	if ok && now.Sub(last.at) < last.cooldown {
 		g.pendMu.Unlock()
 		return
 	}
-	g.lastReconciled[peer] = now
+	g.lastReconciled[peer] = reconcileState{
+		at:       now,
+		cooldown: g.jitteredReconcileCooldown(),
+	}
 	g.pendMu.Unlock()
 
 	g.wg.Add(1)

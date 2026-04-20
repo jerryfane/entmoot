@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"entmoot/pkg/entmoot"
+	"entmoot/pkg/entmoot/canonical"
 	"entmoot/pkg/entmoot/clock"
 	"entmoot/pkg/entmoot/wire"
 )
@@ -694,4 +695,281 @@ func containsDialBackoff(s string) bool {
 		}
 	}
 	return false
+}
+
+// TestGossipInlineBodySkipsFetch is the v1.0.7 Fix A happy-path guard:
+// when a Gossip frame carries an inline Body, the receiver stores the
+// message without having to dial the sender back for a FetchReq
+// round-trip. We drive onGossip directly with a Publish-shaped frame
+// (A.Publish inlines automatically for small bodies) and assert that
+// the full Publish → onGossip pipeline produces both (a) an inlined
+// Body on the outbound frame and (b) a successful Store.Put on the
+// receiver, all without any B→A dial.
+//
+// Topology: A=10, B=20 (two-node). B's transport is wrapped with an
+// empty allow-set so every B→A Dial is refused with net.ErrClosed
+// — any reliance on fetchFrom would leave B.Has == false forever.
+// The test bypasses B's accept loop (no inbound connection ⇒ no
+// maybeReconcile spurious dial) by feeding the frame straight into
+// onGossip. That isolates the inline-body logic from unrelated
+// reconcile dials.
+func TestGossipInlineBodySkipsFetch(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, []entmoot.NodeID{10, 20}) // A=10, B=20
+	defer f.closeTransports()
+
+	// B can't dial anyone: the allow-set is empty so every Dial
+	// returns net.ErrClosed. This eliminates the v1.0.6 fetch path
+	// entirely — only the inline-body path can deliver.
+	bFilter := newFilteringTransport(20, f.transports[20], nil)
+	f.nodes[20].gossip.cfg.Transport = bFilter
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Suppress the async maybeReconcile that fires after a successful
+	// onGossip body store: seed B's lastReconciled[10] to "just now"
+	// so the cooldown gate short-circuits the spawn before it can
+	// dial A. This isolates the dial-count assertion to purely the
+	// fetch-vs-inline question the test is actually about.
+	bG := f.nodes[20].gossip
+	bG.pendMu.Lock()
+	// v1.0.7: lastReconciled now carries (at, cooldown). Seed a long
+	// cooldown (60 s) so the maybeReconcile gate short-circuits for
+	// the entire duration of the test window regardless of the jitter
+	// value currently drawn by jitteredReconcileCooldown.
+	bG.lastReconciled[10] = reconcileState{at: bG.clk.Now(), cooldown: 60 * time.Second}
+	bG.pendMu.Unlock()
+
+	// Build a small message and the Gossip frame A.Publish would
+	// produce. maybeInlineBody attaches the body because the
+	// canonical encoding is well under inlineBodyThreshold (4 KiB).
+	msg := f.buildMessage(10, "inline me", 2_000)
+	if err := f.nodes[10].storeM.Put(ctx, msg); err != nil {
+		t.Fatalf("seed A store: %v", err)
+	}
+	frame := &wire.Gossip{
+		GroupID:   f.groupID,
+		IDs:       []entmoot.MessageID{msg.ID},
+		Timestamp: 3_000,
+	}
+	maybeInlineBody(frame, msg)
+	if frame.Body == nil {
+		t.Fatalf("maybeInlineBody did not inline a small message (body too large?)")
+	}
+	if err := signGossip(frame, f.nodes[10].id); err != nil {
+		t.Fatalf("signGossip: %v", err)
+	}
+
+	// Deliver directly into B's onGossip (same path handleConn would
+	// invoke after a real Accept). Inline branch should Store.Put and
+	// return; no FetchReq round-trip required.
+	f.nodes[20].gossip.onGossip(ctx, 10, frame)
+
+	has, _ := f.nodes[20].storeM.Has(ctx, f.groupID, msg.ID)
+	if !has {
+		t.Fatalf("B did not store msg after onGossip with inline body")
+	}
+
+	// Load-bearing assertion: B never dialed A. With Fix A the inline
+	// branch accepts the message without touching Transport; without
+	// Fix A, B would have to fetchFrom(A) which in this fixture is
+	// blocked by bFilter but would still bump dialsTo(10).
+	if n := bFilter.dialsTo(10); n != 0 {
+		t.Fatalf("B dialed A %d times; want 0 (inline body should skip fetchFrom)", n)
+	}
+}
+
+// TestGossipInlineBodyHashMismatchRejected is the v1.0.7 Fix A
+// integrity guard: a Gossip frame whose inline Body has an id that
+// matches the advertised id but whose canonical-hashed content
+// hashes to a different value must be rejected on the hash-mismatch
+// branch, not stored. We forge such a frame by constructing a
+// legitimate-looking Body, overwriting Body.ID to point at a
+// different message's id, and verifying the receiver's store stays
+// empty. Using onGossip directly avoids dragging the accept /
+// Transport layer into the integrity-logic assertion.
+//
+// B's transport is filtered with an empty allow-set so a bug where
+// the hash-mismatch path falls through to fetchFrom (instead of
+// `continue`) would fail loudly — B can't dial A — rather than
+// silently pulling the "real" body and masking the regression.
+func TestGossipInlineBodyHashMismatchRejected(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, []entmoot.NodeID{10, 20}) // A=10 sender, B=20 receiver
+	defer f.closeTransports()
+
+	bFilter := newFilteringTransport(20, f.transports[20], nil)
+	f.nodes[20].gossip.cfg.Transport = bFilter
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Two legitimate A-authored messages. We'll advertise real1.ID
+	// and craft a forged Body whose ID field has been overwritten to
+	// real1.ID — so the onGossip precondition `Body.ID == id` holds
+	// — but whose canonical-hashed content still produces real2.ID.
+	real1 := f.buildMessage(10, "real message 1", 2_000)
+	real2 := f.buildMessage(10, "real message 2 — forged body", 3_000)
+	forged := real2
+	forged.ID = real1.ID // lie: claim to be real1, content is real2
+	// Sanity: the forged body's claimed ID should NOT match its
+	// canonical hash, which is exactly the condition the hash-mismatch
+	// branch catches.
+	if canonical.MessageID(forged) == forged.ID {
+		t.Fatalf("test setup bug: forged.ID happens to match canonical hash")
+	}
+
+	frame := &wire.Gossip{
+		GroupID:   f.groupID,
+		IDs:       []entmoot.MessageID{real1.ID},
+		Timestamp: 4_000,
+		Body:      &forged,
+	}
+	if err := signGossip(frame, f.nodes[10].id); err != nil {
+		t.Fatalf("signGossip: %v", err)
+	}
+
+	f.nodes[20].gossip.onGossip(ctx, 10, frame)
+
+	// Neither id should be stored: the advertised id's body was
+	// rejected on hash mismatch and the loop `continue`d, so we did
+	// not fall through to fetchFrom. real2.ID was never advertised,
+	// so it never entered the loop either. No successful B→A dial.
+	if has, _ := f.nodes[20].storeM.Has(ctx, f.groupID, real1.ID); has {
+		t.Fatalf("B stored real1.ID despite inline body hash mismatch")
+	}
+	if has, _ := f.nodes[20].storeM.Has(ctx, f.groupID, real2.ID); has {
+		t.Fatalf("B stored real2.ID from a frame that didn't advertise it")
+	}
+	if n := bFilter.dialsTo(10); n != 0 {
+		t.Fatalf("B dialed A %d times; want 0 (hash mismatch should `continue`, not fall through to fetchFrom)", n)
+	}
+}
+
+// TestGossipInlineBodyBackwardCompat is the v1.0.7 Fix A mixed-version
+// guard: a Gossip frame shaped exactly like v1.0.6 (Body==nil) must
+// still propagate via the fetchFrom path so a v1.0.7 receiver remains
+// wire-compatible with v1.0.6 senders. We simulate an old-style sender
+// by constructing the frame directly with no Body (bypassing Publish
+// and its maybeInlineBody call), then feeding it into B's onGossip.
+// B must then dial A for a FetchReq and store the message.
+func TestGossipInlineBodyBackwardCompat(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, []entmoot.NodeID{10, 20}) // A=10, B=20
+	defer f.closeTransports()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f.startAll(ctx)
+
+	// Seed A's store so a subsequent B→A FetchReq can actually
+	// resolve the body. Published via A.Publish would also inline; we
+	// want to bypass inlining entirely and prove the v1.0.6 shape
+	// still works, so Put directly.
+	msg := f.buildMessage(10, "no inline — v1.0.6 shape", 2_000)
+	if err := f.nodes[10].storeM.Put(ctx, msg); err != nil {
+		t.Fatalf("seed A store: %v", err)
+	}
+
+	// Hand-craft a Gossip frame with Body==nil — the exact shape a
+	// v1.0.6 sender would produce. signGossip's v1.0.7 scope matches
+	// the v1.0.6 scope byte-for-byte when Body is nil, so the
+	// signature an old sender produced would verify identically here.
+	frame := &wire.Gossip{
+		GroupID:   f.groupID,
+		IDs:       []entmoot.MessageID{msg.ID},
+		Timestamp: 3_000,
+	}
+	if err := signGossip(frame, f.nodes[10].id); err != nil {
+		t.Fatalf("signGossip: %v", err)
+	}
+
+	f.nodes[20].gossip.onGossip(ctx, 10, frame)
+
+	// B must have fetched the body via the v1.0.6 path and stored it.
+	waitUntil(t, 2*time.Second, "B stores message via fetchFrom fallback (v1.0.6 shape)", func() bool {
+		has, _ := f.nodes[20].storeM.Has(ctx, f.groupID, msg.ID)
+		return has
+	})
+}
+
+// TestRetryBackoffDecorrelatedJitter drives nextBackoff many times and
+// asserts the decorrelated-jitter envelope: every sample stays within
+// [retryBackoffBase, retryBackoffCap], the distribution is not
+// collapsed to a single value, and successive draws from the same
+// prev diverge — proving the schedule is randomised rather than
+// deterministic (v1.0.7 Fix B).
+func TestRetryBackoffDecorrelatedJitter(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, []entmoot.NodeID{10, 20})
+	g := f.nodes[10].gossip
+
+	const samples = 1000
+	distinctFirst := make(map[time.Duration]struct{}, 8)
+	for i := 0; i < samples; i++ {
+		// prev==0 exercises the first-failure path. Per the formula,
+		// hi=base+1 so next == base exactly; record that it stays
+		// within the envelope regardless.
+		d := g.nextBackoff(0)
+		if d < retryBackoffBase || d > retryBackoffCap {
+			t.Fatalf("nextBackoff(0) out of envelope: %v", d)
+		}
+		distinctFirst[d] = struct{}{}
+	}
+
+	// Drive a growing prev through the cap to sample the "real"
+	// jittered window. prev=20s produces hi=60s, so the draw is
+	// uniform over [1s, 60s).
+	prev := 20 * time.Second
+	distinct := make(map[time.Duration]struct{}, 64)
+	for i := 0; i < samples; i++ {
+		d := g.nextBackoff(prev)
+		if d < retryBackoffBase || d > retryBackoffCap {
+			t.Fatalf("nextBackoff(%v) out of envelope: %v", prev, d)
+		}
+		distinct[d] = struct{}{}
+	}
+	if len(distinct) < 50 {
+		t.Fatalf("expected >=50 distinct values across %d samples, got %d",
+			samples, len(distinct))
+	}
+
+	// Two successive draws from the same prev must differ with
+	// overwhelming probability under a uniform distribution.
+	a := g.nextBackoff(prev)
+	b := g.nextBackoff(prev)
+	if a == b {
+		// Exceedingly unlikely; retry once before failing.
+		a = g.nextBackoff(prev)
+		b = g.nextBackoff(prev)
+		if a == b {
+			t.Fatalf("two successive draws from prev=%v were identical: %v", prev, a)
+		}
+	}
+}
+
+// TestReconcileCooldownJittered confirms jitteredReconcileCooldown
+// produces samples in [Base-Jitter, Base+Jitter) and that the
+// distribution is not collapsed to a single value (v1.0.7 Fix B).
+func TestReconcileCooldownJittered(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, []entmoot.NodeID{10, 20})
+	g := f.nodes[10].gossip
+
+	const samples = 1000
+	lo := reconcileCooldownBase - reconcileCooldownJitter
+	hi := reconcileCooldownBase + reconcileCooldownJitter
+	distinct := make(map[time.Duration]struct{}, 64)
+	for i := 0; i < samples; i++ {
+		d := g.jitteredReconcileCooldown()
+		if d < lo || d >= hi {
+			t.Fatalf("jitteredReconcileCooldown out of [%v,%v): %v", lo, hi, d)
+		}
+		distinct[d] = struct{}{}
+	}
+	if len(distinct) < 50 {
+		t.Fatalf("expected >=50 distinct cooldown values across %d samples, got %d",
+			samples, len(distinct))
+	}
 }

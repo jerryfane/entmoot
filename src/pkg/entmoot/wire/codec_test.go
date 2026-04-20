@@ -128,6 +128,64 @@ func TestRoundTripGossip(t *testing.T) {
 	}
 	msg.Signature = ed25519.Sign(priv, []byte("gossip-sig-input"))
 	roundTrip(t, msg)
+
+	// v1.0.7: Body absent decodes back as a nil Body (the omitempty
+	// path). Explicitly cover this even though the default-gossip case
+	// above already exercises it, so a future tag change to `json:"body"`
+	// (no omitempty) without updating encode/decode is caught loudly.
+	got := roundTrip(t, &Gossip{
+		GroupID:   mustGroupID(0x34),
+		IDs:       []entmoot.MessageID{mustMessageID(0xB1)},
+		Timestamp: 1_700_000_000_201,
+		Signature: ed25519.Sign(priv, []byte("gossip-no-body")),
+	}).(*Gossip)
+	if got.Body != nil {
+		t.Fatalf("Body should decode back as nil when omitted, got %#v", got.Body)
+	}
+}
+
+// TestRoundTripGossipWithBody exercises the v1.0.7 inline-body path:
+// encoding a Gossip frame with a populated Body field must survive
+// EncodeAndWrite + ReadAndDecode round-tripping byte-for-byte, so
+// receivers observe the exact Message the sender inlined.
+func TestRoundTripGossipWithBody(t *testing.T) {
+	_, priv := newKey(t)
+	pub := priv.Public().(ed25519.PublicKey)
+	body := entmoot.Message{
+		GroupID: mustGroupID(0x77),
+		Author: entmoot.NodeInfo{
+			PilotNodeID:   9,
+			EntmootPubKey: pub,
+		},
+		Timestamp: 1_700_000_000_500,
+		Topics:    []string{"entmoot/inline"},
+		Content:   []byte("hello inline"),
+	}
+	body.ID = canonical.MessageID(body)
+	body.Signature = ed25519.Sign(priv, []byte("body-sig-input"))
+
+	msg := &Gossip{
+		GroupID:   body.GroupID,
+		IDs:       []entmoot.MessageID{body.ID},
+		Timestamp: 1_700_000_000_501,
+		Body:      &body,
+	}
+	msg.Signature = ed25519.Sign(priv, []byte("gossip-with-body-sig-input"))
+
+	got := roundTrip(t, msg).(*Gossip)
+	if got.Body == nil {
+		t.Fatalf("Body should not be nil after round-trip")
+	}
+	if got.Body.ID != body.ID {
+		t.Fatalf("Body.ID differs after round-trip: got %s want %s",
+			got.Body.ID, body.ID)
+	}
+	if !bytes.Equal(got.Body.Signature, body.Signature) {
+		t.Fatalf("Body.Signature differs after round-trip")
+	}
+	if !bytes.Equal(got.Body.Content, body.Content) {
+		t.Fatalf("Body.Content differs after round-trip")
+	}
 }
 
 func TestRoundTripFetchReq(t *testing.T) {

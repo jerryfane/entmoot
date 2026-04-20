@@ -7,6 +7,90 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.7] - 2026-04-21
+
+Two-fix bundle attacking the residual ~1.5-minute propagation tail
+observed in live v1.0.6 mesh. Together the fixes bring steady-state
+hop latency from 60–90 s (p99) to ~RTT (happy path) or ~RTT +
+`graftTimeout` (3 s) on flaky peers. Wire-compatible with every
+v1.0.x release — additive `Body` field, additive retry-state field,
+mixed-version peers interoperate unchanged.
+
+### Added
+
+- **Inline message body on eager-push.** `wire.Gossip` gains an
+  optional `Body *entmoot.Message` field. Senders inline the full
+  body when the canonical encoding is ≤ 4 KiB (`inlineBodyThreshold`,
+  matching 4× IPFS Bitswap's `WantHaveReplaceSize` default);
+  receivers hash-verify `Body` against `IDs[0]` and run Ed25519
+  signature verification before `Store.Put`, skipping the
+  `fetchFrom` round-trip entirely. Cuts every gossip hop for small
+  messages from 2 Pilot stream dials to 1.
+
+  Aligns Entmoot with the canonical Plumtree paper (Leitão et al.
+  SRDS 2007, §2.2 — `EagerPush(m, mID, ...)` carries the full
+  body; ID-only is reserved for lazy-push `IHAVE`). Every surveyed
+  production gossip — libp2p GossipSub, Scuttlebutt EBT, Matrix
+  federation, Cassandra digest-phase, IPFS Bitswap — does this.
+
+  Wire-compatibility: the Gossiper signature explicitly excludes
+  `Body` (zeroed before canonical encoding in both `signGossip`
+  and `verifyGossipSig`), so v1.0.6 peers ignoring the new field
+  still verify v1.0.7 frames unchanged. `Body` integrity is
+  provided independently by (a) `canonical.MessageID(Body) == ID`
+  and (b) the Message's own Ed25519 signature — same two checks
+  the v1.0.6 `fetchFrom` path already performs.
+
+- **Decorrelated-jitter retry backoff** (Marc Brooker / AWS 2015).
+  Replaces the deterministic `[1s, 2s, 4s, 8s, 16s, 30s, 60s×4]`
+  schedule with `next = min(cap, random(base, prev*3))`. Retry
+  budget unchanged (10 attempts, same `"gossip: retry budget
+  exhausted"` log). Prevents fleet-wide retry storms when a
+  correlated flakiness event (NAT flap, registry blip) would
+  otherwise synchronise every node's retry to the same wall-clock
+  moments.
+
+- **Jittered reconcile cooldown.** Fixed 60 s → 30 s ±20 %
+  multiplicative jitter (`[24 s, 36 s]`). Cooldown reduced
+  because research consensus (libp2p GossipSub 1 s heartbeat,
+  Plumtree §3.4 continuous lazy-push, Cassandra gossip 1 s) shows
+  60 s was an order of magnitude too slow for failed-push
+  recovery — that number belongs to bulk Merkle-tree anti-entropy
+  (Riak AAE, Cassandra repair), not per-peer reconcile. Jitter
+  prevents fleet-wide collisions on the cooldown boundary
+  (memberlist-style `randomStagger`). Each peer caches its
+  per-invocation jittered value so a peer "just under" the gate
+  doesn't probe the boundary every tick.
+
+### Changed
+
+- `Gossiper` gains a dedicated `*rand.Rand` (seeded from the
+  clock, Fake-clock-friendly for tests) for jitter generation;
+  separated from `getPicker`'s rand to keep peer-sampling
+  determinism independent of jitter.
+- `retryState` gains `lastBackoff time.Duration` feeding
+  `nextBackoff(prev)`.
+- `lastReconciled` map value type becomes `reconcileState{at,
+  cooldown}` so the jittered cooldown picked at reconcile time is
+  cached alongside the timestamp.
+- `retryTickInterval` (500 ms) stays deterministic — the
+  scheduler wheel, not a retry deadline.
+
+### Regression tests
+
+- `TestGossipInlineBodySkipsFetch` — B stores the inlined body
+  without any outbound dial to A.
+- `TestGossipInlineBodyHashMismatchRejected` — forged Body
+  (mismatched hash) is dropped, no silent fetch fallback.
+- `TestGossipInlineBodyBackwardCompat` — v1.0.6-shape frame
+  (`Body == nil`) still propagates via `fetchFrom`.
+- `TestRoundTripGossipWithBody` — wire round-trip with Body
+  populated preserves every field byte-for-byte.
+- `TestRetryBackoffDecorrelatedJitter` — 1000 samples stay within
+  `[base, cap]` with non-trivial spread.
+- `TestReconcileCooldownJittered` — samples stay within ±20 %
+  envelope.
+
 ## [1.0.6] - 2026-04-20
 
 Three-fix bundle targeting the "publish takes ~4 minutes to propagate"

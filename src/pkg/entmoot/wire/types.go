@@ -189,6 +189,17 @@ type Gossip struct {
 	// Timestamp is unix milliseconds at send time; used by B2's replay
 	// window.
 	Timestamp int64 `json:"timestamp"`
+	// Body, if non-nil, carries the full Message for a single-id
+	// Gossip frame (len(IDs)==1 && IDs[0]==Body.ID). Senders inline
+	// when the canonical-encoded message is ≤ inlineBodyThreshold
+	// bytes; receivers hash-verify Body against IDs[0] and skip the
+	// fetchFrom round-trip. Absent / nil Body falls back to the
+	// v1.0.6 fetch path (backward-compatible with old senders).
+	// Not covered by the Gossiper signature — Body integrity is
+	// provided independently by (a) the canonical hash of Body
+	// matching Body.ID and (b) the Message's own Ed25519 signature.
+	// (v1.0.7)
+	Body *entmoot.Message `json:"body,omitempty"`
 	// Signature is Ed25519 over the canonical encoding of the Gossip with
 	// Signature zeroed.
 	Signature []byte `json:"signature"`
