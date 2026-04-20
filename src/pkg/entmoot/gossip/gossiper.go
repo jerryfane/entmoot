@@ -11,6 +11,8 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/sync/errgroup"
+
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/canonical"
 	"entmoot/pkg/entmoot/clock"
@@ -41,6 +43,42 @@ var retryBackoff = []time.Duration{
 // 500ms keeps the worst-case scheduling jitter well under the smallest
 // backoff step (1s).
 const retryTickInterval = 500 * time.Millisecond
+
+// trustedSetTTL bounds how stale the trust oracle may be. Short
+// enough that a just-completed handshake is visible within one
+// retryTickInterval; long enough that a bursty fanout doesn't
+// hammer Pilot IPC per peer per message.
+const trustedSetTTL = 1 * time.Second
+
+// fanoutPerPeerTimeout is the wallclock ceiling for a single
+// push / IHave / retry attempt. Entmoot calls Transport.Dial +
+// EncodeAndWrite within this budget; if Pilot's internal ~32 s
+// SYN-retry cycle hasn't produced a tunnel by this deadline, cut
+// the attempt and let the retry scheduler re-queue. Value covers
+// relay-over-beacon p99 (~600 ms) plus slack. Much shorter than
+// Pilot's internal dial ceiling so a dead peer fails fast into
+// the v1.0.6 per-peer dial-backoff cache (Fix C) instead of
+// head-of-line-blocking healthy peers. (v1.0.6)
+const fanoutPerPeerTimeout = 5 * time.Second
+
+// fanoutMaxConcurrency caps the goroutines we spawn per fanout
+// burst. Irrelevant at N=3 but a cheap guard against accidentally
+// launching thousands of in-flight dials if the roster grows. Mirrors
+// typical libp2p SetLimit values. (v1.0.6)
+const fanoutMaxConcurrency = 32
+
+// dialBackoffBase / dialBackoffCap bound the per-peer exponential
+// dial-backoff cache (v1.0.6 Fix C). Once a dial to peer P fails,
+// subsequent send attempts to P are short-circuited with a synthetic
+// error (no Transport.Dial invocation) until nextAllowed. Successful
+// dial clears the window. Prevents 10 concurrent retry slots from
+// all independently paying Pilot's ~32 s dial tax on a dead peer.
+// Formula: backoff = min(dialBackoffBase * 2^consecutiveFailures, dialBackoffCap).
+// Matches libp2p swarm.DialBackoff (5-minute cap is their default).
+const (
+	dialBackoffBase = 1 * time.Second
+	dialBackoffCap  = 5 * time.Minute
+)
 
 // Reconciliation cooldown (patch 7). Limits how often we fire a full
 // MerkleReq round-trip against any single peer so a chatty connection
@@ -209,6 +247,32 @@ type Gossiper struct {
 	eagerPushPeers  map[entmoot.NodeID]struct{}
 	lazyPushPeers   map[entmoot.NodeID]struct{}
 	pendingGraft    map[pendingGraftKey]*time.Timer
+
+	// Trust-aware reachability cache (v1.0.6). Plumtree peer-set helpers
+	// intersect eager/lazy lists with this set before returning, so the
+	// fanout never wastes a 32-s Pilot dial on a peer we have no trust
+	// pair with. Short TTL trades bursty IPC against reacting to newly-
+	// established handshakes quickly.
+	trustMu        sync.Mutex
+	trustedSnap    map[entmoot.NodeID]struct{}
+	trustedExpires time.Time
+
+	// Dial-backoff cache (v1.0.6 Fix C). canDial consults this before
+	// every Transport.Dial; recordDialFailure / recordDialSuccess
+	// update it around each attempt. Separate mutex from plumMu/pendMu
+	// so the gate is cheap on the hot fanout path even when the retry
+	// scheduler is holding pendMu.
+	dialMu       sync.Mutex
+	dialBackoffs map[entmoot.NodeID]*peerDialState
+}
+
+// peerDialState tracks the per-peer dial-backoff state. nextAllowed
+// gates send attempts; consecutiveFailures drives exponential
+// growth on each fresh failure. Reset entirely on the first
+// successful dial.
+type peerDialState struct {
+	nextAllowed         time.Time
+	consecutiveFailures int
 }
 
 // pendingGraftKey keys the outstanding GRAFT-timer map: one timer per
@@ -270,6 +334,11 @@ func New(cfg Config) (*Gossiper, error) {
 		eagerPushPeers: make(map[entmoot.NodeID]struct{}),
 		lazyPushPeers:  make(map[entmoot.NodeID]struct{}),
 		pendingGraft:   make(map[pendingGraftKey]*time.Timer),
+		// Per-peer dial-backoff cache (v1.0.6 Fix C). Populated lazily
+		// by recordDialFailure on the first failed dial to a given
+		// peer; wiped by recordDialSuccess after any successful dial
+		// clears reachability.
+		dialBackoffs: make(map[entmoot.NodeID]*peerDialState),
 	}, nil
 }
 
@@ -295,11 +364,44 @@ func (g *Gossiper) seedPlumtreeLocked() {
 	}
 }
 
+// trustedSet returns a snapshot of Pilot-trusted peer IDs, cached
+// for trustedSetTTL. On IPC error, returns the most recent
+// successful snapshot; if no snapshot has ever been taken, returns
+// nil to signal "unknown — treat every peer as trusted" so behaviour
+// degrades gracefully to v1.0.5.
+func (g *Gossiper) trustedSet(ctx context.Context) map[entmoot.NodeID]struct{} {
+	g.trustMu.Lock()
+	defer g.trustMu.Unlock()
+	if g.trustedSnap != nil && g.clk.Now().Before(g.trustedExpires) {
+		return g.trustedSnap
+	}
+	peers, err := g.cfg.Transport.TrustedPeers(ctx)
+	if err != nil {
+		g.logger.Debug("gossip: trusted peers query failed",
+			slog.String("err", err.Error()))
+		return g.trustedSnap // may be nil on cold start; callers handle it
+	}
+	fresh := make(map[entmoot.NodeID]struct{}, len(peers))
+	for _, p := range peers {
+		fresh[p] = struct{}{}
+	}
+	g.trustedSnap = fresh
+	g.trustedExpires = g.clk.Now().Add(trustedSetTTL)
+	return fresh
+}
+
 // plumEagerExcept returns a copy of eagerPushPeers with `except`
 // removed, suitable for re-fanout on receive (we never push back to
 // the source). Also seeds the peer maps on first use. Caller must NOT
 // hold plumMu.
-func (g *Gossiper) plumEagerExcept(except entmoot.NodeID) []entmoot.NodeID {
+//
+// v1.0.6: the result is intersected with the Pilot-trusted peer set
+// so fanout never wastes a 32-s dial on a peer we have no trust pair
+// with. If the trust oracle has no cached snapshot yet (cold-start
+// IPC error), the intersection is skipped — behaviour degrades to
+// v1.0.5 (fail-open).
+func (g *Gossiper) plumEagerExcept(ctx context.Context, except entmoot.NodeID) []entmoot.NodeID {
+	trusted := g.trustedSet(ctx)
 	g.plumMu.Lock()
 	defer g.plumMu.Unlock()
 	g.seedPlumtreeLocked()
@@ -308,13 +410,19 @@ func (g *Gossiper) plumEagerExcept(except entmoot.NodeID) []entmoot.NodeID {
 		if p == except {
 			continue
 		}
+		if trusted != nil {
+			if _, ok := trusted[p]; !ok {
+				continue // skip untrusted peer; would dial-timeout anyway
+			}
+		}
 		out = append(out, p)
 	}
 	return out
 }
 
 // plumLazyExcept mirrors plumEagerExcept for the lazy set.
-func (g *Gossiper) plumLazyExcept(except entmoot.NodeID) []entmoot.NodeID {
+func (g *Gossiper) plumLazyExcept(ctx context.Context, except entmoot.NodeID) []entmoot.NodeID {
+	trusted := g.trustedSet(ctx)
 	g.plumMu.Lock()
 	defer g.plumMu.Unlock()
 	g.seedPlumtreeLocked()
@@ -322,6 +430,11 @@ func (g *Gossiper) plumLazyExcept(except entmoot.NodeID) []entmoot.NodeID {
 	for p := range g.lazyPushPeers {
 		if p == except {
 			continue
+		}
+		if trusted != nil {
+			if _, ok := trusted[p]; !ok {
+				continue // skip untrusted peer; would dial-timeout anyway
+			}
 		}
 		out = append(out, p)
 	}
@@ -373,6 +486,57 @@ func (g *Gossiper) plumCancelGraftsFor(id entmoot.MessageID) {
 			delete(g.pendingGraft, k)
 		}
 	}
+}
+
+// canDial reports whether peer P is currently outside its
+// dial-backoff window (v1.0.6 Fix C). Called by every send-path
+// before Transport.Dial; suppressed sends return cheaply without
+// touching the network.
+func (g *Gossiper) canDial(peer entmoot.NodeID) bool {
+	g.dialMu.Lock()
+	defer g.dialMu.Unlock()
+	s, ok := g.dialBackoffs[peer]
+	if !ok {
+		return true
+	}
+	return !g.clk.Now().Before(s.nextAllowed)
+}
+
+// recordDialFailure extends the per-peer backoff window by one
+// exponential step (capped at dialBackoffCap). Call immediately
+// after Transport.Dial returns a non-nil error.
+func (g *Gossiper) recordDialFailure(peer entmoot.NodeID) {
+	g.dialMu.Lock()
+	defer g.dialMu.Unlock()
+	s, ok := g.dialBackoffs[peer]
+	if !ok {
+		s = &peerDialState{}
+		g.dialBackoffs[peer] = s
+	}
+	s.consecutiveFailures++
+	// 2^n growth with overflow guard for n > 30. The saturation
+	// at dialBackoffCap handles the practical case long before
+	// bit overflow matters, but belt-and-braces keeps the math
+	// readable under fuzz tests.
+	shift := s.consecutiveFailures - 1
+	if shift > 30 {
+		shift = 30
+	}
+	window := dialBackoffBase * (1 << shift)
+	if window > dialBackoffCap || window <= 0 {
+		window = dialBackoffCap
+	}
+	s.nextAllowed = g.clk.Now().Add(window)
+}
+
+// recordDialSuccess clears any backoff state for peer P. Called
+// immediately after a successful Transport.Dial (even if the
+// subsequent stream write fails — dial reachability and protocol
+// health are independent, per libp2p's model).
+func (g *Gossiper) recordDialSuccess(peer entmoot.NodeID) {
+	g.dialMu.Lock()
+	defer g.dialMu.Unlock()
+	delete(g.dialBackoffs, peer)
 }
 
 // Start runs the accept loop. It blocks until ctx is cancelled or the
@@ -692,8 +856,8 @@ func (g *Gossiper) onGossip(ctx context.Context, remote entmoot.NodeID, gos *wir
 // fanout so transient dial failures are re-tried and eventually fall
 // through to anti-entropy reconciliation.
 func (g *Gossiper) refanout(ctx context.Context, except entmoot.NodeID, id entmoot.MessageID) {
-	eager := g.plumEagerExcept(except)
-	lazy := g.plumLazyExcept(except)
+	eager := g.plumEagerExcept(ctx, except)
+	lazy := g.plumLazyExcept(ctx, except)
 	if len(eager) == 0 && len(lazy) == 0 {
 		return
 	}
@@ -723,10 +887,18 @@ func (g *Gossiper) refanout(ctx context.Context, except entmoot.NodeID, id entmo
 
 // sendPrune dials peer and writes a single Prune frame.
 func (g *Gossiper) sendPrune(ctx context.Context, peer entmoot.NodeID) error {
+	// v1.0.6 Fix C: short-circuit if peer is in its dial-backoff
+	// window. Synthetic error keeps the retry scheduler's error
+	// shape unchanged.
+	if !g.canDial(peer) {
+		return fmt.Errorf("peer %d in dial-backoff", peer)
+	}
 	conn, err := g.cfg.Transport.Dial(ctx, peer)
 	if err != nil {
+		g.recordDialFailure(peer)
 		return fmt.Errorf("dial: %w", err)
 	}
+	g.recordDialSuccess(peer)
 	defer conn.Close()
 	frame := &wire.Prune{GroupID: g.cfg.GroupID}
 	if err := wire.EncodeAndWrite(conn, frame); err != nil {
@@ -738,10 +910,16 @@ func (g *Gossiper) sendPrune(ctx context.Context, peer entmoot.NodeID) error {
 // sendGraft dials peer and writes a Graft frame requesting the bodies
 // for the given ids AND promoting us in the recipient's eagerPushPeers.
 func (g *Gossiper) sendGraft(ctx context.Context, peer entmoot.NodeID, ids []entmoot.MessageID) error {
+	// v1.0.6 Fix C: short-circuit if peer is in its dial-backoff window.
+	if !g.canDial(peer) {
+		return fmt.Errorf("peer %d in dial-backoff", peer)
+	}
 	conn, err := g.cfg.Transport.Dial(ctx, peer)
 	if err != nil {
+		g.recordDialFailure(peer)
 		return fmt.Errorf("dial: %w", err)
 	}
+	g.recordDialSuccess(peer)
 	defer conn.Close()
 	frame := &wire.Graft{GroupID: g.cfg.GroupID, IDs: ids}
 	if err := wire.EncodeAndWrite(conn, frame); err != nil {
@@ -886,10 +1064,16 @@ func (g *Gossiper) onPrune(remote entmoot.NodeID, pr *wire.Prune) {
 // author's pubkey from the local roster. Returns an error on dial failure,
 // codec failure, NotFound, or signature verification failure.
 func (g *Gossiper) fetchFrom(ctx context.Context, peer entmoot.NodeID, id entmoot.MessageID) error {
+	// v1.0.6 Fix C: short-circuit if peer is in its dial-backoff window.
+	if !g.canDial(peer) {
+		return fmt.Errorf("peer %d in dial-backoff", peer)
+	}
 	conn, err := g.cfg.Transport.Dial(ctx, peer)
 	if err != nil {
+		g.recordDialFailure(peer)
 		return fmt.Errorf("dial %d: %w", peer, err)
 	}
+	g.recordDialSuccess(peer)
 	defer conn.Close()
 
 	req := &wire.FetchReq{GroupID: g.cfg.GroupID, ID: id}
@@ -967,8 +1151,8 @@ func (g *Gossiper) Publish(ctx context.Context, msg entmoot.Message) error {
 	// is a strict superset: if no peers have been pruned yet, the
 	// entire roster sits in eager and everyone gets the full push,
 	// which matches previous behavior when fanout ≥ |members-1|.
-	eager := g.plumEagerExcept(0)
-	lazy := g.plumLazyExcept(0)
+	eager := g.plumEagerExcept(ctx, 0)
+	lazy := g.plumLazyExcept(ctx, 0)
 	if len(eager) == 0 && len(lazy) == 0 {
 		return nil
 	}
@@ -1022,44 +1206,88 @@ func (g *Gossiper) Publish(ctx context.Context, msg entmoot.Message) error {
 // fanoutPush attempts the per-peer push, queuing failures for the
 // retry scheduler. Shared between the synchronous pre-Start fallback
 // path and the async post-Start goroutine.
+//
+// v1.0.6: runs each peer's dial+write in its own goroutine under an
+// errgroup with SetLimit(fanoutMaxConcurrency), and wraps every
+// attempt in a fanoutPerPeerTimeout-bounded context. One stalled peer
+// can no longer head-of-line-block healthy peers, and a dead peer
+// fails fast into the retry scheduler rather than consuming the full
+// Pilot-internal ~32 s dial budget. Gossip is best-effort, so
+// individual failures are logged + queued for retry but never fail
+// the group.
 func (g *Gossiper) fanoutPush(ctx context.Context, peers []entmoot.NodeID, frame *wire.Gossip, id entmoot.MessageID) {
-	for _, p := range peers {
-		if err := g.pushGossip(ctx, p, frame); err != nil {
-			g.logger.Warn("gossip: push",
-				slog.Uint64("peer", uint64(p)),
-				slog.String("id", id.String()),
-				slog.Int("attempt", 1),
-				slog.String("err", err.Error()))
-			g.enqueueRetry(retryKey{peer: p, id: id, op: opPush}, frame)
-		}
+	if len(peers) == 0 {
+		return
 	}
+	var eg errgroup.Group
+	eg.SetLimit(fanoutMaxConcurrency)
+	for _, p := range peers {
+		p := p // capture
+		eg.Go(func() error {
+			dctx, cancel := context.WithTimeout(ctx, fanoutPerPeerTimeout)
+			defer cancel()
+			if err := g.pushGossip(dctx, p, frame); err != nil {
+				g.logger.Warn("gossip: push",
+					slog.Uint64("peer", uint64(p)),
+					slog.String("id", id.String()),
+					slog.Int("attempt", 1),
+					slog.String("err", err.Error()))
+				g.enqueueRetry(retryKey{peer: p, id: id, op: opPush}, frame)
+			}
+			return nil // gossip is best-effort; never fail the group
+		})
+	}
+	_ = eg.Wait()
 }
 
 // fanoutIHave advertises a message id to a set of lazy peers via
 // Plumtree's IHave frame. Failures go through the same retry scheduler
 // as eager pushes. The frame is a plain unsigned id list — peers that
 // want the body issue a follow-up Graft.
+//
+// v1.0.6: identical parallelism / timeout treatment as fanoutPush — one
+// stalled peer cannot block the rest of the lazy set, and each attempt
+// is bounded by fanoutPerPeerTimeout before dropping into the retry
+// scheduler.
 func (g *Gossiper) fanoutIHave(ctx context.Context, peers []entmoot.NodeID, frame *wire.IHave, id entmoot.MessageID) {
-	for _, p := range peers {
-		if err := g.sendIHave(ctx, p, frame); err != nil {
-			g.logger.Debug("gossip: ihave",
-				slog.Uint64("peer", uint64(p)),
-				slog.String("id", id.String()),
-				slog.Int("attempt", 1),
-				slog.String("err", err.Error()))
-			g.enqueueRetry(retryKey{peer: p, id: id, op: opIHave}, nil)
-		}
+	if len(peers) == 0 {
+		return
 	}
+	var eg errgroup.Group
+	eg.SetLimit(fanoutMaxConcurrency)
+	for _, p := range peers {
+		p := p // capture
+		eg.Go(func() error {
+			dctx, cancel := context.WithTimeout(ctx, fanoutPerPeerTimeout)
+			defer cancel()
+			if err := g.sendIHave(dctx, p, frame); err != nil {
+				g.logger.Debug("gossip: ihave",
+					slog.Uint64("peer", uint64(p)),
+					slog.String("id", id.String()),
+					slog.Int("attempt", 1),
+					slog.String("err", err.Error()))
+				g.enqueueRetry(retryKey{peer: p, id: id, op: opIHave}, nil)
+			}
+			return nil // IHave advertisement is best-effort; never fail the group
+		})
+	}
+	_ = eg.Wait()
 }
 
 // sendIHave dials the peer and writes a single IHave frame. Fire-and-
 // forget: Plumtree IHave is an advertisement, not a query, so we do not
 // wait for or interpret any response.
 func (g *Gossiper) sendIHave(ctx context.Context, peer entmoot.NodeID, frame *wire.IHave) error {
+	// v1.0.6 Fix C: short-circuit if peer is in its dial-backoff window.
+	if !g.canDial(peer) {
+		return fmt.Errorf("peer %d in dial-backoff", peer)
+	}
 	conn, err := g.cfg.Transport.Dial(ctx, peer)
 	if err != nil {
+		g.recordDialFailure(peer)
 		return fmt.Errorf("dial: %w", err)
 	}
+	g.recordDialSuccess(peer)
 	defer conn.Close()
 	if err := wire.EncodeAndWrite(conn, frame); err != nil {
 		return fmt.Errorf("write ihave: %w", err)
@@ -1075,10 +1303,16 @@ func (g *Gossiper) sendIHave(ctx context.Context, peer entmoot.NodeID, frame *wi
 // partition. The cooldown gate inside maybeReconcile deduplicates repeat
 // dials so this costs at most one MerkleReq per cooldown window per peer.
 func (g *Gossiper) pushGossip(ctx context.Context, peer entmoot.NodeID, frame *wire.Gossip) error {
+	// v1.0.6 Fix C: short-circuit if peer is in its dial-backoff window.
+	if !g.canDial(peer) {
+		return fmt.Errorf("peer %d in dial-backoff", peer)
+	}
 	conn, err := g.cfg.Transport.Dial(ctx, peer)
 	if err != nil {
+		g.recordDialFailure(peer)
 		return fmt.Errorf("dial: %w", err)
 	}
+	g.recordDialSuccess(peer)
 	defer conn.Close()
 	if err := wire.EncodeAndWrite(conn, frame); err != nil {
 		return fmt.Errorf("write gossip: %w", err)
@@ -1208,6 +1442,14 @@ func (g *Gossiper) retryLoop(ctx context.Context) {
 // mutex, then fires each outside the lock so a slow dial never blocks new
 // inserts. Success removes the entry; failure calls enqueueRetry which
 // bumps the attempt count and schedules the next wait.
+//
+// v1.0.6: the previously-sequential loop over `ready` is now an errgroup
+// bounded by fanoutMaxConcurrency, with each attempt wrapped in a
+// fanoutPerPeerTimeout context so a single dead peer's retry slot cannot
+// stall the rest of the due set. The "only clear if the state we just
+// executed is still the one on record" concurrent-safety pattern moves
+// inside the goroutine — success still clears under pendMu, failure
+// still re-enqueues.
 func (g *Gossiper) drainDueRetries(ctx context.Context) {
 	now := g.clk.Now()
 	type due struct {
@@ -1223,29 +1465,42 @@ func (g *Gossiper) drainDueRetries(ctx context.Context) {
 	}
 	g.pendMu.Unlock()
 
-	for _, d := range ready {
-		// Execute without holding the mutex. Re-enqueue on failure advances
-		// the schedule; success clears the slot.
-		err := g.executeRetry(ctx, d.key, d.state)
-		if err == nil {
-			g.pendMu.Lock()
-			// Only clear if the state we just executed is still the one on
-			// record — a concurrent success elsewhere could have already
-			// replaced or cleared it.
-			if cur, ok := g.pending[d.key]; ok && cur == d.state {
-				delete(g.pending, d.key)
-			}
-			g.pendMu.Unlock()
-			continue
-		}
-		g.logger.Warn("gossip: retry",
-			slog.Uint64("peer", uint64(d.key.peer)),
-			slog.String("id", d.key.id.String()),
-			slog.String("op", d.key.op.String()),
-			slog.Int("attempt", d.state.attempts+1),
-			slog.String("err", err.Error()))
-		g.enqueueRetry(d.key, d.state.frame)
+	if len(ready) == 0 {
+		return
 	}
+
+	var eg errgroup.Group
+	eg.SetLimit(fanoutMaxConcurrency)
+	for _, d := range ready {
+		d := d // capture
+		eg.Go(func() error {
+			dctx, cancel := context.WithTimeout(ctx, fanoutPerPeerTimeout)
+			defer cancel()
+			// Execute without holding the mutex. Re-enqueue on failure advances
+			// the schedule; success clears the slot.
+			err := g.executeRetry(dctx, d.key, d.state)
+			if err == nil {
+				g.pendMu.Lock()
+				// Only clear if the state we just executed is still the one on
+				// record — a concurrent success elsewhere could have already
+				// replaced or cleared it.
+				if cur, ok := g.pending[d.key]; ok && cur == d.state {
+					delete(g.pending, d.key)
+				}
+				g.pendMu.Unlock()
+				return nil
+			}
+			g.logger.Warn("gossip: retry",
+				slog.Uint64("peer", uint64(d.key.peer)),
+				slog.String("id", d.key.id.String()),
+				slog.String("op", d.key.op.String()),
+				slog.Int("attempt", d.state.attempts+1),
+				slog.String("err", err.Error()))
+			g.enqueueRetry(d.key, d.state.frame)
+			return nil // retry failures never fail the group
+		})
+	}
+	_ = eg.Wait()
 }
 
 // executeRetry runs a single pending attempt. Returns nil on success so the
@@ -1366,13 +1621,25 @@ func (g *Gossiper) reconcileWith(ctx context.Context, peer entmoot.NodeID) {
 // peer's root + ok on success, zero + !ok on any error so the caller can
 // abort cleanly.
 func (g *Gossiper) fetchPeerRoot(ctx context.Context, peer entmoot.NodeID) (wire.MerkleRoot, bool) {
+	// v1.0.6 Fix C: short-circuit if peer is in its dial-backoff window.
+	// The debug-log site below swallows the error shape, so emitting the
+	// same "dial for root" line with the synthetic short-circuit error
+	// keeps reconciliation logs consistent with the peer being unreachable.
+	if !g.canDial(peer) {
+		g.logger.Debug("gossip: reconcile: dial for root",
+			slog.Uint64("peer", uint64(peer)),
+			slog.String("err", fmt.Sprintf("peer %d in dial-backoff", peer)))
+		return wire.MerkleRoot{}, false
+	}
 	conn, err := g.cfg.Transport.Dial(ctx, peer)
 	if err != nil {
+		g.recordDialFailure(peer)
 		g.logger.Debug("gossip: reconcile: dial for root",
 			slog.Uint64("peer", uint64(peer)),
 			slog.String("err", err.Error()))
 		return wire.MerkleRoot{}, false
 	}
+	g.recordDialSuccess(peer)
 	defer conn.Close()
 	if err := wire.EncodeAndWrite(conn, &wire.MerkleReq{GroupID: g.cfg.GroupID}); err != nil {
 		g.logger.Debug("gossip: reconcile: write merkle_req",
@@ -1398,10 +1665,16 @@ func (g *Gossiper) fetchPeerRoot(ctx context.Context, peer entmoot.NodeID) (wire
 // sinceMillis. Returns the slice of ids or an error (including
 // ErrUnknownMessage when the peer doesn't understand RangeReq).
 func (g *Gossiper) fetchPeerRange(ctx context.Context, peer entmoot.NodeID, sinceMillis int64) ([]entmoot.MessageID, error) {
+	// v1.0.6 Fix C: short-circuit if peer is in its dial-backoff window.
+	if !g.canDial(peer) {
+		return nil, fmt.Errorf("peer %d in dial-backoff", peer)
+	}
 	conn, err := g.cfg.Transport.Dial(ctx, peer)
 	if err != nil {
+		g.recordDialFailure(peer)
 		return nil, fmt.Errorf("dial: %w", err)
 	}
+	g.recordDialSuccess(peer)
 	defer conn.Close()
 	req := &wire.RangeReq{GroupID: g.cfg.GroupID, SinceMillis: sinceMillis}
 	if err := wire.EncodeAndWrite(conn, req); err != nil {

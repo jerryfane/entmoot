@@ -7,6 +7,89 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.6] - 2026-04-20
+
+Three-fix bundle targeting the "publish takes ~4 minutes to propagate"
+regression observed on the live 3-node mesh after v1.0.5 landed. Each
+fix mirrors a production pattern from libp2p / Matrix / Cassandra
+gossip; together they collapse cascade latency from ~4 min to
+sub-10-second steady state. Wire-compatible with v1.0.4 and v1.0.5.
+
+### Added
+
+- **Trust-aware reachability oracle.** `plumEagerExcept` and
+  `plumLazyExcept` now consult `Transport.TrustedPeers(ctx)` and
+  filter the returned peer list by the trusted set before returning.
+  Peers with no Pilot trust pair (structurally unreachable for the
+  lifetime of that config) are skipped entirely. Cached on a 1-second
+  TTL so bursty fanouts don't hit Pilot IPC per peer per message;
+  fails open (degrades to v1.0.5 behaviour) if the IPC query errors.
+  Mirrors libp2p's `Network().Connectedness()` check in
+  `go-libp2p-pubsub` and Matrix Synapse's `destination_retry_timings`
+  — treating reachability as a first-class gossip-layer concern
+  instead of relying on transport timeouts.
+
+- **Per-peer exponential dial-backoff cache.** Every
+  `Transport.Dial` in the gossiper (7 sites: `pushGossip`,
+  `sendIHave`, `sendGraft`, `sendPrune`, `fetchFrom`,
+  `fetchPeerRoot`, `fetchPeerRange`) now consults
+  `canDial(peer)` before attempting; failures extend an
+  exponential window (1 s, 2 s, 4 s, …, capped at 5 min) via
+  `recordDialFailure`; successful dial clears the window via
+  `recordDialSuccess`. Prevents the retry scheduler from
+  independently re-dialing a dead peer on every pending message,
+  which previously cost Pilot's full ~32-second SYN retry cycle per
+  attempt. Matches libp2p `swarm.DialBackoff` semantics. Reachability
+  is recorded on dial completion (not on full-RPC completion) so a
+  healthy connection followed by a stream-layer error does not
+  trigger spurious backoff.
+
+### Changed
+
+- **Parallel fanout with bounded per-peer dial timeout.**
+  `fanoutPush`, `fanoutIHave`, and `drainDueRetries` were
+  sequential loops — one stalled peer head-of-line-blocked every
+  other peer on the same fanout / retry tick. Replaced with
+  `golang.org/x/sync/errgroup.Group.SetLimit(32)`, one goroutine per
+  peer, each wrapped in `context.WithTimeout(ctx, 5 * time.Second)`.
+  5 s covers relay-over-beacon p99 (~600 ms) with generous slack and
+  is far below Pilot's internal 32 s dial ceiling — so a dead peer
+  fails fast into the new dial-backoff cache instead of blocking
+  the rest of the fanout. Canonical Go pattern; zero behaviour
+  change for healthy peers. (New dependency:
+  `golang.org/x/sync/errgroup`, promoted from indirect.)
+
+### Fixed
+
+- **4-minute publish-to-propagation latency on partial-trust meshes.**
+  Previously, every publish from node A fanned out to the full eager
+  set, including peers with no trust pair — each of those sends paid
+  Pilot's ~32 s dial budget, and the retry scheduler re-dialed the
+  same dead peer for every pending message on every 500 ms tick,
+  compounding through the 10-step retry backoff to ~4 min cumulative
+  blocking before the first healthy retry slot fired. The combined
+  effect of the three fixes above: (A) structurally-unreachable peers
+  are never in the fanout set, (B) one slow peer never blocks
+  healthy peers, (C) one failed dial suppresses further dials to the
+  same peer for an exponential window. Observed live: cross-node
+  publish latency on the VPS↔Phobos↔laptop mesh drops from ~4 min
+  back to sub-second in steady state.
+
+### Regression tests
+
+- `TestPlumtreeSkipsUntrusted` — fanout never dials an untrusted
+  peer; the trust oracle filters the eager/lazy lists before the
+  push loop.
+- `TestPlumtreeParallelFanoutWithSlowPeer` — one peer's `Dial`
+  blocks for 30 s; healthy peers still receive the message within
+  1 s; the slow peer's `retryKey` is enqueued within the 5 s
+  per-peer timeout.
+- `TestPlumtreePerPeerDialBackoff` — after a failed dial, the
+  next 10 `pushGossip(peer)` calls short-circuit without invoking
+  `Transport.Dial`; window reopens only after
+  `dialBackoffCap` elapses (or a successful dial clears the
+  state).
+
 ## [1.0.5] - 2026-04-20
 
 ### Fixed

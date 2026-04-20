@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"entmoot/pkg/entmoot"
+	"entmoot/pkg/entmoot/clock"
 	"entmoot/pkg/entmoot/wire"
 )
 
@@ -17,14 +18,26 @@ import (
 // — so we can prove that receive-side re-fanout (not direct dial) is
 // what delivers a message to a peer the originator cannot reach.
 //
-// Accept, TrustedPeers, and Close pass through unchanged so the inner
-// transport's hub still delivers frames that arrived through permitted
-// dial paths.
+// Accept and Close pass through unchanged so the inner transport's hub
+// still delivers frames that arrived through permitted dial paths.
+// TrustedPeers is filtered by `allowed` as well (v1.0.6): the Fix A
+// trust oracle reads Transport.TrustedPeers, so tests that want to
+// simulate "no trust pair between A and C" need both the Dial gate
+// AND the trust-list gate to agree.
+//
+// slowDial (v1.0.6 Fix B) lets a test inject a per-peer Dial delay so
+// it can simulate Pilot's ~32 s SYN-retry stall without actually
+// consuming wallclock minutes. When slowDial[peer] > 0, Dial sleeps
+// that long (respecting ctx cancellation) before returning — so a
+// fanoutPerPeerTimeout-wrapped context will cancel the dial early
+// exactly like a real stalled peer.
 type filteringTransport struct {
-	local   entmoot.NodeID
-	inner   Transport
-	mu      sync.RWMutex
-	allowed map[entmoot.NodeID]bool
+	local     entmoot.NodeID
+	inner     Transport
+	mu        sync.RWMutex
+	allowed   map[entmoot.NodeID]bool
+	dialCount map[entmoot.NodeID]int
+	slowDial  map[entmoot.NodeID]time.Duration
 }
 
 func newFilteringTransport(local entmoot.NodeID, inner Transport, allowed []entmoot.NodeID) *filteringTransport {
@@ -32,13 +45,37 @@ func newFilteringTransport(local entmoot.NodeID, inner Transport, allowed []entm
 	for _, p := range allowed {
 		allowedSet[p] = true
 	}
-	return &filteringTransport{local: local, inner: inner, allowed: allowedSet}
+	return &filteringTransport{
+		local:     local,
+		inner:     inner,
+		allowed:   allowedSet,
+		dialCount: make(map[entmoot.NodeID]int),
+		slowDial:  make(map[entmoot.NodeID]time.Duration),
+	}
+}
+
+// setSlowDial arranges for subsequent Dial(peer) calls to block for the
+// given duration before resolving. ctx cancellation cuts the wait early,
+// mirroring real Pilot behaviour when a dial context deadline fires.
+func (t *filteringTransport) setSlowDial(peer entmoot.NodeID, d time.Duration) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.slowDial[peer] = d
 }
 
 func (t *filteringTransport) Dial(ctx context.Context, peer entmoot.NodeID) (net.Conn, error) {
-	t.mu.RLock()
+	t.mu.Lock()
 	ok := t.allowed[peer]
-	t.mu.RUnlock()
+	t.dialCount[peer]++
+	delay := t.slowDial[peer]
+	t.mu.Unlock()
+	if delay > 0 {
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 	if !ok {
 		return nil, net.ErrClosed
 	}
@@ -50,10 +87,32 @@ func (t *filteringTransport) Accept(ctx context.Context) (net.Conn, entmoot.Node
 }
 
 func (t *filteringTransport) TrustedPeers(ctx context.Context) ([]entmoot.NodeID, error) {
-	return t.inner.TrustedPeers(ctx)
+	inner, err := t.inner.TrustedPeers(ctx)
+	if err != nil {
+		return nil, err
+	}
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	out := make([]entmoot.NodeID, 0, len(inner))
+	for _, p := range inner {
+		if t.allowed[p] {
+			out = append(out, p)
+		}
+	}
+	return out, nil
 }
 
 func (t *filteringTransport) Close() error { return t.inner.Close() }
+
+// dialsTo returns how many times Dial has been invoked for `peer`,
+// regardless of whether the dial was allowed. Used by Fix A tests to
+// prove the trust oracle short-circuited a would-be dial before the
+// transport ever saw it.
+func (t *filteringTransport) dialsTo(peer entmoot.NodeID) int {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.dialCount[peer]
+}
 
 // wrapFixtureWithFilter replaces each node's transport in the fixture
 // with a filteringTransport. `graph` is an adjacency list: graph[A]
@@ -243,7 +302,7 @@ func TestPlumtreeInitialEagerPopulation(t *testing.T) {
 
 	// seedPlumtreeLocked is called on first plumMu-held access; call
 	// plumEagerExcept with a sentinel to trigger it.
-	got := f.nodes[10].gossip.plumEagerExcept(0)
+	got := f.nodes[10].gossip.plumEagerExcept(context.Background(), 0)
 
 	// A=10; expect 20 and 30 in eager, nothing in lazy.
 	if len(got) != 2 {
@@ -266,7 +325,7 @@ func TestPlumtreeOnPruneDemotesSender(t *testing.T) {
 
 	g := f.nodes[10].gossip
 	// Seed and verify B=20 is in eager.
-	_ = g.plumEagerExcept(0)
+	_ = g.plumEagerExcept(context.Background(), 0)
 	g.plumMu.Lock()
 	if _, ok := g.eagerPushPeers[20]; !ok {
 		g.plumMu.Unlock()
@@ -339,4 +398,300 @@ func TestPlumtreeRefanoutOnFetchFrom(t *testing.T) {
 		has, _ := f.nodes[30].storeM.Has(ctx, f.groupID, msg.ID)
 		return has
 	})
+}
+
+// TestPlumtreeSkipsUntrusted is the v1.0.6 Fix A guard: the Plumtree
+// fanout helpers must not return peers that Pilot reports as
+// untrusted, so the originator never wastes a dial on a peer with no
+// trust pair. The message must still reach the untrusted peer via a
+// trusted hub's refanout — Plumtree's safety property is preserved as
+// long as at least one forwarder has the missing edge.
+//
+// Topology: A=10, B=20, C=30; all three are roster members. A trusts
+// only B (filteringTransport narrows both the Dial gate AND the
+// TrustedPeers result). C is filtered symmetrically — C trusts only
+// B — mirroring the live-mesh laptop↔Phobos scenario where neither
+// edge has a Pilot pair with the other. B is the unfiltered hub so
+// its refanout reaches both. Assert:
+//
+//  1. B receives the message via A's direct eager push.
+//  2. A never invokes Transport.Dial(C) — the trust oracle filters C
+//     out of the eager set before the fanout loop runs, and because
+//     C also cannot dial A, no inbound-connection path wakes up A's
+//     maybeReconcile to dial C either.
+//  3. No retry entry for C is ever enqueued on A.
+//  4. C still receives the message, via B's refanout.
+func TestPlumtreeSkipsUntrusted(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, []entmoot.NodeID{10, 20, 30}) // A=10, B=20, C=30
+	defer f.closeTransports()
+
+	// A trusts only B. C trusts only B. B keeps the default unfiltered
+	// memTransport so its refanout reaches everyone. This mirrors the
+	// live-mesh topology where the two edge nodes lack a Pilot trust
+	// pair and only the hub can bridge them.
+	aFilter := newFilteringTransport(10, f.transports[10], []entmoot.NodeID{20})
+	cFilter := newFilteringTransport(30, f.transports[30], []entmoot.NodeID{20})
+	f.nodes[10].gossip.cfg.Transport = aFilter
+	f.nodes[30].gossip.cfg.Transport = cFilter
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f.startAll(ctx)
+
+	msg := f.buildMessage(10, "trust-aware fanout", 2_000)
+	if err := f.nodes[10].gossip.Publish(ctx, msg); err != nil {
+		t.Fatalf("Publish on A: %v", err)
+	}
+
+	// B receives via A's direct eager push.
+	waitUntil(t, 2*time.Second, "B stores A's message (trusted direct push)", func() bool {
+		has, _ := f.nodes[20].storeM.Has(ctx, f.groupID, msg.ID)
+		return has
+	})
+
+	// C still reaches consistency via B's refanout.
+	waitUntil(t, 2*time.Second, "C stores A's message via B refanout", func() bool {
+		has, _ := f.nodes[30].storeM.Has(ctx, f.groupID, msg.ID)
+		return has
+	})
+
+	// Settle: let the retry loop tick once more than its interval so
+	// any latent dial-to-C attempt would have surfaced by now.
+	time.Sleep(retryTickInterval + 100*time.Millisecond)
+
+	// Core assertion: A never even tried to dial C. Without Fix A, A
+	// would have dialed C once in the initial fanout and ~10 more
+	// times through the retry schedule before giving up.
+	if n := aFilter.dialsTo(30); n != 0 {
+		t.Fatalf("A dialed untrusted peer C %d times; want 0 (trust oracle should have filtered it)", n)
+	}
+
+	// And no retry entry for C should ever have been enqueued on A —
+	// the trust oracle short-circuited before fanoutPush would have
+	// called enqueueRetry.
+	f.nodes[10].gossip.pendMu.Lock()
+	for k := range f.nodes[10].gossip.pending {
+		if k.peer == 30 {
+			f.nodes[10].gossip.pendMu.Unlock()
+			t.Fatalf("A has a pending retry entry for untrusted peer C: key=%+v", k)
+		}
+	}
+	f.nodes[10].gossip.pendMu.Unlock()
+}
+
+// TestPlumtreeParallelFanoutWithSlowPeer is the v1.0.6 Fix B guard: one
+// stalled peer must not head-of-line-block fanout to healthy peers, and
+// every attempt must be bounded by fanoutPerPeerTimeout so a dead peer
+// falls fast into the retry scheduler instead of consuming the full
+// ~32 s Pilot SYN-retry budget.
+//
+// Topology: A=10, B=20, C=30; fully-trusted 3-node mesh. A's transport
+// is wrapped in a filter that allows all dials but makes Dial(C) block
+// for 30 s — far longer than the 5 s per-peer budget.
+//
+// With sequential pre-v1.0.6 fanout, a publish on A would stall for
+// 30 s before B ever saw the message. With parallel fanout + per-peer
+// timeout we assert:
+//
+//  1. B receives the message within ~1 s (its dial runs concurrently
+//     with the stalled C dial, so B is unaffected by A's slow C dial).
+//  2. A's pending map gains a retryKey{peer: 30, id: msg.ID, op: opPush}
+//     entry well before the 30 s injected delay would have elapsed —
+//     proving A's Dial(C) was cancelled by fanoutPerPeerTimeout (5 s)
+//     and the failure was enqueued for retry rather than silently
+//     dropped.
+func TestPlumtreeParallelFanoutWithSlowPeer(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, []entmoot.NodeID{10, 20, 30}) // A=10, B=20, C=30
+	defer f.closeTransports()
+
+	// A's transport is a filter that allows all dials but makes Dial(C)
+	// artificially slow. B and C keep the unfiltered memTransport so
+	// their accept paths and any refanout they do proceed normally.
+	aFilter := newFilteringTransport(10, f.transports[10], []entmoot.NodeID{20, 30})
+	aFilter.setSlowDial(30, 30*time.Second) // well beyond fanoutPerPeerTimeout (5 s)
+	f.nodes[10].gossip.cfg.Transport = aFilter
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f.startAll(ctx)
+
+	msg := f.buildMessage(10, "parallel fanout with slow C", 2_000)
+	publishStart := time.Now()
+	if err := f.nodes[10].gossip.Publish(ctx, msg); err != nil {
+		t.Fatalf("Publish on A: %v", err)
+	}
+
+	// B must receive via A's direct eager push without being blocked by
+	// the stalled Dial(C). Budget 1 s — eager push over net.Pipe is
+	// sub-millisecond; anything beyond that is scheduler slack. Crucial
+	// that this is < fanoutPerPeerTimeout so a regression to sequential
+	// fanout (where Dial(C)'s 30 s stall blocks Dial(B)) fails loudly.
+	waitUntil(t, 1*time.Second, "B stores A's message despite slow C", func() bool {
+		has, _ := f.nodes[20].storeM.Has(ctx, f.groupID, msg.ID)
+		return has
+	})
+	if elapsed := time.Since(publishStart); elapsed > 2*time.Second {
+		t.Fatalf("B delivery took %v; parallel fanout should have delivered in <1s", elapsed)
+	}
+
+	// Wait for the per-peer timeout to expire (5 s) plus slack so the
+	// pushGossip(C) goroutine has definitely returned and bumped the
+	// retry slot. The 6.5 s cap is well under the 30 s injected delay,
+	// so this also implicitly proves the timeout fired — if it hadn't,
+	// the publish fanout would still be in flight and the retry slot
+	// would not yet exist. The retry-slot appearance is the load-
+	// bearing assertion for Fix B: it proves both that Dial(C) was
+	// cancelled at 5 s (not 30 s) AND that the failure fell into the
+	// retry scheduler instead of silently dropping the message.
+	waitUntil(t, 6500*time.Millisecond, "A enqueues retry for slow C after per-peer timeout", func() bool {
+		f.nodes[10].gossip.pendMu.Lock()
+		defer f.nodes[10].gossip.pendMu.Unlock()
+		_, ok := f.nodes[10].gossip.pending[retryKey{peer: 30, id: msg.ID, op: opPush}]
+		return ok
+	})
+}
+
+// TestPlumtreePerPeerDialBackoff is the v1.0.6 Fix C guard: once a
+// dial to peer P fails, subsequent send attempts to P are short-
+// circuited at the gossiper layer (no Transport.Dial invocation)
+// until the exponential backoff window elapses. Prevents the retry
+// scheduler's 10-step exponential schedule from multiplying a single
+// dead peer's ~32 s Pilot dial tax across every pending message.
+//
+// Topology: A=10, B=20, C=30. A's transport is a filteringTransport
+// that allows B only, so every Dial(C) returns net.ErrClosed.
+//
+// The test covers three layers:
+//  1. Direct helper contract — canDial flips false after
+//     recordDialFailure and true after recordDialSuccess.
+//  2. Exponential growth — consecutive failures saturate at
+//     dialBackoffCap and the window doubles as expected.
+//  3. End-to-end — with the fake clock held fixed in the "backoff
+//     window open" state, repeated pushGossip(C) attempts return
+//     the synthetic "in dial-backoff" error without invoking
+//     Transport.Dial. The dial count must stay at exactly 1
+//     (the initial failing attempt) regardless of how many retries
+//     fire.
+func TestPlumtreePerPeerDialBackoff(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, []entmoot.NodeID{10, 20, 30})
+	defer f.closeTransports()
+
+	// A can dial B but not C. The filter's TrustedPeers already
+	// intersects with `allowed`, so Fix A's trust oracle will filter C
+	// out of A's eager fanout list — which means A's Publish() won't
+	// attempt C directly. For this test we bypass the publish path
+	// entirely and drive pushGossip / the helpers directly, which is
+	// exactly the scenario the retry scheduler exercises when a
+	// transient failure has already enqueued a slot that Fix A
+	// couldn't pre-empt.
+	aFilter := newFilteringTransport(10, f.transports[10], []entmoot.NodeID{20})
+	f.nodes[10].gossip.cfg.Transport = aFilter
+
+	aGossip := f.nodes[10].gossip
+	fakeClk, ok := aGossip.clk.(*clock.Fake)
+	if !ok {
+		t.Fatalf("expected fixture to use clock.Fake, got %T", aGossip.clk)
+	}
+	ctx := context.Background()
+
+	// Layer 1: direct helper contract.
+	if !aGossip.canDial(30) {
+		t.Fatalf("canDial(C) should be true before any failure")
+	}
+	aGossip.recordDialFailure(30)
+	if aGossip.canDial(30) {
+		t.Fatalf("canDial(C) should be false immediately after a dial failure")
+	}
+	aGossip.recordDialSuccess(30)
+	if !aGossip.canDial(30) {
+		t.Fatalf("canDial(C) should be true after a dial success clears backoff")
+	}
+
+	// Layer 2: exponential growth. First failure sets a window of
+	// dialBackoffBase; advance by (base - 1 ms) and canDial is still
+	// false, then by another 2 ms and it flips true.
+	aGossip.recordDialFailure(30) // window = base
+	fakeClk.Advance(dialBackoffBase - time.Millisecond)
+	if aGossip.canDial(30) {
+		t.Fatalf("canDial(C) should still be false just before the base window expires")
+	}
+	fakeClk.Advance(2 * time.Millisecond)
+	if !aGossip.canDial(30) {
+		t.Fatalf("canDial(C) should be true once the base window elapses")
+	}
+	// Time passing does not reset consecutiveFailures — only
+	// recordDialSuccess does — so two more failures push
+	// consecutiveFailures to 3 and the window to base*4. Advance by
+	// base*3; still inside the window.
+	aGossip.recordDialFailure(30) // consecutiveFailures=2, window=base*2
+	aGossip.recordDialFailure(30) // consecutiveFailures=3, window=base*4
+	fakeClk.Advance(3 * dialBackoffBase)
+	if aGossip.canDial(30) {
+		t.Fatalf("canDial(C) should still be false within the growing 4*base window")
+	}
+	aGossip.recordDialSuccess(30) // reset for layer 3
+
+	// Layer 3: prove Transport.Dial is NOT invoked while the backoff
+	// window is open. Drive a single direct pushGossip(C) so we see the
+	// real dial path failure, then verify subsequent calls short-circuit.
+
+	// A minimal Gossip frame suffices: pushGossip's canDial gate fires
+	// before any frame encoding, and the underlying Dial is rejected
+	// before EncodeAndWrite ever runs. Contents irrelevant.
+	frame := &wire.Gossip{GroupID: f.groupID}
+
+	// First attempt: hits the real dial path, records failure.
+	if err := aGossip.pushGossip(ctx, 30, frame); err == nil {
+		t.Fatalf("pushGossip(C) should fail; C is disallowed")
+	}
+	if n := aFilter.dialsTo(30); n != 1 {
+		t.Fatalf("after first pushGossip, dialsTo(C) = %d; want 1", n)
+	}
+	// Window is now open (base = 1s); fake clock hasn't moved during
+	// this layer, so subsequent attempts must short-circuit.
+	for i := 0; i < 10; i++ {
+		err := aGossip.pushGossip(ctx, 30, frame)
+		if err == nil {
+			t.Fatalf("pushGossip(C) attempt %d should fail (backoff)", i+2)
+		}
+		// Short-circuit error must NOT be wrapped as "dial: <underlying>";
+		// it must be the synthetic "peer ... in dial-backoff" form. Check
+		// the exact prefix to catch regressions where canDial returns true
+		// but the underlying dial fails again.
+		if got := err.Error(); !containsDialBackoff(got) {
+			t.Fatalf("pushGossip(C) attempt %d error = %q; want dial-backoff sentinel", i+2, got)
+		}
+	}
+	// Critical invariant: dial count must still be 1. All 10 follow-up
+	// pushGossip calls short-circuited without reaching Transport.Dial.
+	if n := aFilter.dialsTo(30); n != 1 {
+		t.Fatalf("dialsTo(C) = %d after 10 short-circuit attempts; want 1", n)
+	}
+
+	// Advance past the backoff window and verify one more attempt DOES
+	// reach Transport.Dial (proving the gate eventually reopens).
+	fakeClk.Advance(2 * dialBackoffCap) // well past any window
+	if err := aGossip.pushGossip(ctx, 30, frame); err == nil {
+		t.Fatalf("pushGossip(C) post-window should still fail via Transport.Dial")
+	}
+	if n := aFilter.dialsTo(30); n != 2 {
+		t.Fatalf("dialsTo(C) = %d after post-window attempt; want 2", n)
+	}
+}
+
+// containsDialBackoff reports whether s contains the synthetic
+// short-circuit marker produced by every Transport.Dial call-site
+// when canDial returns false. Kept as a helper so a rename of the
+// marker only breaks one spot.
+func containsDialBackoff(s string) bool {
+	const marker = "in dial-backoff"
+	for i := 0; i+len(marker) <= len(s); i++ {
+		if s[i:i+len(marker)] == marker {
+			return true
+		}
+	}
+	return false
 }
