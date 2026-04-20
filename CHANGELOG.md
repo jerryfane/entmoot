@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.8] - 2026-04-21
+
+### Fixed
+
+- **Bootstrap self-dial amplification.** An invite's
+  `bootstrap_peers` list included the issuer's own NodeID
+  (every invite minted until today did — the issuer-is-a-peer
+  convention inherited from the v0 roster design). The Gossiper's
+  `Join` path already filtered `LocalNode` before dialing via
+  Pilot, BUT `entmootd invite create` kept emitting the issuer as
+  a bootstrap peer, and Pilot's `ensureTunnel` — reachable
+  through non-Join code paths (ambient registry-driven membership
+  view maintenance, Pilot's own peer-discovery) — would then
+  establish tunnels to the local NodeID. On multi-homed hosts
+  Pilot's "same-LAN peer detected" branch fires both for the
+  docker-bridge LAN entry and the public-IP entry of the local
+  node, establishing multiple duplicate self-tunnels that
+  retransmit into each other — observed live on VPS as a
+  ~5,900 pps self-amplified loop, 210 % CPU on pilot-daemon,
+  saturating its packet buffers and reinflating gossip
+  propagation to minute-scale latencies (masquerading as a
+  v1.0.7 regression when the real fault was at the transport
+  layer).
+
+  Two defense-in-depth fixes:
+  - `entmootd invite create` now excludes the issuer's NodeID
+    from `bootstrap_peers` at mint time. Makes new invites
+    self-documenting. Matches Cassandra's "gossiper
+    `live_endpoints` excludes self by construction" invariant.
+  - Pilot v1.9.0-jf.6 (shipped simultaneously) adds a
+    `protocol.ErrDialToSelf` sentinel at the top of
+    `DialConnection` and `ensureTunnel`. Mirrors
+    go-libp2p-swarm's canonical `ErrDialToSelf` guard:
+    fast-fail with a typed sentinel so caller-side invariant
+    violations are visible rather than masked.
+
+  Legacy invites (like the one live in the current canary group)
+  still parse correctly — the Gossiper's `Join` path already has
+  a self-skip filter at every bootstrap strategy. The new
+  defenses close the remaining paths (non-Join callers of
+  `ensureTunnel`, and future invite mints from any node).
+
 ## [1.0.7] - 2026-04-21
 
 Two-fix bundle attacking the residual ~1.5-minute propagation tail

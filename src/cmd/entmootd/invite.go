@@ -108,8 +108,20 @@ func cmdInviteCreate(gf *globalFlags, args []string) int {
 	if len(peerIDs) == 0 {
 		peerIDs = defaultBootstrapPeers(r, founder.PilotNodeID, 5)
 	}
+	// Exclude the issuer's own NodeID from BootstrapPeers at mint
+	// time (v1.0.8). A receiver that parses an invite containing
+	// self would otherwise hand its own ID to Pilot's DialConnection
+	// during Join. Pilot jf.6 now rejects self-dials with
+	// ErrDialToSelf, but keeping self out of the invite makes new
+	// invites self-documenting and matches Cassandra's "gossiper
+	// live_endpoints excludes self by construction" invariant.
+	// Legacy invites that still contain self are handled by Gossiper
+	// bootstrap's existing self-skip filter.
 	bootstrap := make([]entmoot.BootstrapPeer, 0, len(peerIDs))
 	for _, p := range peerIDs {
+		if p == nodeID {
+			continue
+		}
 		bootstrap = append(bootstrap, entmoot.BootstrapPeer{NodeID: p})
 	}
 
