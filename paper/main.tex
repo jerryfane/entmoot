@@ -150,7 +150,21 @@ at registration and receives a 48-bit virtual address of the form
 \texttt{N:NNNN.HHHH.LLLL}: a 16-bit network ID and a 32-bit node ID within
 that network. Network~0 is the global backbone; all agents are members of
 it by default. Pilot reserves additional network IDs for purpose-specific
-subgraphs, but as of version~1.8.0-jf.1 this feature is still in progress.
+subgraphs; the \emph{Pilot Networks} feature that populates them is in
+early-access release as of this writing. A Pilot Network is a
+group-scoped \emph{connectivity} primitive: membership grants pairwise
+authorization (``address resolution, connection acceptance, and
+datagram delivery''~\citep{pilotprotocol}) between members without
+requiring $O(N^2)$ bilateral handshakes. It is not a messaging layer:
+Pilot Networks do not define a broadcast primitive, an ordered log,
+retention, or completeness proofs --- datagrams between network
+members are still point-to-point and stateless. Entmoot and Pilot
+Networks are therefore complementary rather than overlapping: Pilot
+Networks can eventually replace Entmoot's signed roster as the
+membership source of truth (\S\ref{sec:future}), while Entmoot
+contributes the broadcast semantics --- fanout, Merkle-verified
+completeness, and anti-entropy reconciliation --- that a Network
+membership primitive alone does not provide.
 
 Communication is trust-gated. Two nodes must complete a cryptographic
 handshake (port~444) mediated by the registry before they can exchange
@@ -1086,18 +1100,43 @@ admin rule. Eager-push with lazy
 flagged in earlier drafts: the former ships messages on the happy
 path, the latter heals divergence after partition or slow-start.
 
-When Pilot's custom-networks feature ships, the membership interface
-can be backed by network membership instead of our signed roster
-without protocol-level changes. Whether we adopt that backend will
-depend on the shape of Pilot's eventual API and on whether network
-membership provides the authorization semantics we need. The
-abstraction is already in place. Separately, Pilot's pluggable
-transport layer~(\S\ref{sec:background}) now lets Entmoot run over
-TCP when a public-IP peer in the group advertises a TCP endpoint:
-the UDP-hostile-network escape hatch that the Calin study's broader
-deployments would otherwise stumble on. Quantifying the TCP-fallback
-overhead with a dedicated canary variant is a natural follow-up to
-the measurements below.
+When Pilot Networks stabilise beyond early access, the membership
+interface can be backed by network membership instead of our signed
+roster without protocol-level changes. Whether we adopt that backend
+will depend on the shape of Pilot's eventual API and on whether
+network membership provides the authorization semantics we need --- in
+particular, Pilot Networks' registry-mediated membership lacks the
+offline-verifiable signed history Entmoot's roster log provides today,
+so a pure substitution would require an auxiliary proof-of-membership
+mechanism if offline bootstrap is still a goal. The abstraction is
+already in place on the Entmoot side.
+
+Separately, Pilot's pluggable transport
+layer~(\S\ref{sec:background}) lets Entmoot run over TCP when a
+public-IP peer in the group advertises a TCP endpoint --- the
+UDP-hostile-network escape hatch that the Calin study's broader
+deployments would otherwise stumble on. A deliberate in-production
+test attempting to exercise TCP fallback revealed an orthogonal
+property of the v1.1.0 stack we had not explicitly designed for:
+with an already-established tunnel, a 57-second iptables-induced
+block on outbound UDP between two group members produced \emph{no
+transport switch and no application-visible loss}. The message
+published by the blocked node during the outage was held in the
+local \texttt{yamux} send buffer and delivered to the remote peer
+three seconds after the block lifted, in a single 899-byte burst
+over the restored UDP path. Pilot's reliable in-tunnel stream
+protocol retransmits keepalives indefinitely as long as the tunnel's
+crypto state looks alive; yamux's 30-second keepalive + 10-second
+write-timeout therefore only trips on \emph{new} dials, not on
+buffered traffic over an established session. The practical
+implication is that v1.1.0 gives a graceful-degradation window of
+roughly one minute for UDP micro-outages, below which the
+application observes neither loss nor latency penalty beyond the
+outage duration. Forcing an actual TCP fallback therefore requires
+either a cold-start dial from the blocked peer (e.g., a pilot-daemon
+restart during the block) or a block longer than the buffering
+window; quantifying both with a dedicated canary variant is a
+natural follow-up.
 
 Entmoot also creates the substrate the empirical questions flagged by
 \citet{calin2026emergent} require:
