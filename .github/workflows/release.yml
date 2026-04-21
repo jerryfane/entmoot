@@ -20,10 +20,14 @@ jobs:
       # Pilot source is gitignored from this repo but src/go.mod has a
       # replace directive pointing at ../repos/pilotprotocol. Clone the
       # pinned Pilot tag into that path so GoReleaser can build.
+      # As of Entmoot v1.2.0 we clone the fork at v1.9.0-jf.7 — needed
+      # for the SetPeerEndpoints IPC that transport advertisements
+      # install through. Bump the --branch value here when Pilot ships
+      # a new fork tag that Entmoot starts to depend on.
       - name: Clone Pilot (for src/go.mod replace)
         run: |
-          git clone --depth 1 --branch v1.7.2 \
-            https://github.com/TeoSlayer/pilotprotocol.git \
+          git clone --depth 1 --branch v1.9.0-jf.7 \
+            https://github.com/jerryfane/pilotprotocol.git \
             repos/pilotprotocol
 
       - name: Set up Go
