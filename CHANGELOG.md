@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-04-21
+
+### Changed
+
+- **Persistent multiplexed sessions over Pilot tunnel.** The Pilot
+  transport adapter now maintains one long-lived
+  `hashicorp/yamux` session per peer and multiplexes all gossip
+  streams over it. Prior to v1.1.0 every gossip frame opened a
+  fresh Pilot stream with a full SYN handshake — fast on a healthy
+  tunnel but vulnerable to Pilot's ~32 s dial budget when the
+  stream SYN/ACK silently wedged (observed live: both peers on a
+  node failing simultaneously at the stream-dial layer while the
+  underlying tunnel reported encrypted+authenticated).
+
+  Changes:
+  - `Dial()` now opens a yamux stream on the cached session
+    (0-RTT new-stream after first contact) instead of dialing a
+    fresh Pilot stream.
+  - `Accept()` reads from an internal channel fed by a background
+    loop that accepts inbound Pilot connections, wraps each in a
+    yamux server session, and pumps accepted streams into the
+    channel.
+  - yamux's built-in keepalive (30 s interval, 10 s timeout)
+    detects silently-wedged sessions and closes them; the next
+    `Dial()` opens a fresh session automatically.
+
+  Wire compatibility: Entmoot's frame format is unchanged; yamux
+  multiplexes the same JSON frames over a session. Mixed
+  v1.0.x / v1.1.0 peers do NOT interoperate — v1.0.x expects a
+  raw stream per frame, v1.1.0 expects a yamux session. Upgrade
+  all nodes together.
+
+### Added
+
+- New dep: `github.com/hashicorp/yamux` (BSD-3, used by Consul,
+  Nomad, Vault, libp2p's yamux transport).
+
 ## [1.0.8] - 2026-04-21
 
 ### Fixed
