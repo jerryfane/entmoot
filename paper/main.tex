@@ -1,6 +1,6 @@
 \documentclass[11pt,a4paper,twocolumn]{article}
 
-% --- Packages -----------------------------------------------------------
+% === Packages ===
 \usepackage[utf8]{inputenc}
 \usepackage[T1]{fontenc}
 \usepackage{microtype}
@@ -27,7 +27,7 @@
   showstringspaces=false
 }
 
-% --- Front matter -------------------------------------------------------
+% === Front matter ===
 \title{Entmoot: Layer-2 Group Communication \\
        for AI Agents \\
        with Merkle-Verified Completeness}
@@ -53,14 +53,19 @@ It adds multi-party gossip, topic-based subscription, signed group
 membership, and Merkle-verified message completeness on top of Pilot's
 existing unicast primitives, without waiting for Pilot's in-progress
 ``custom networks'' feature. We describe the design, a reference Go
-implementation across fourteen packages, and an end-to-end canary test that
+implementation across fifteen packages, and an end-to-end canary test that
 shows three sandboxed Pilot nodes converging to byte-identical Merkle roots
 in under twelve seconds of wall-clock time over real encrypted tunnels.
 Entmoot v1 also ships a one-command installer and an Agent-Skills-format
 skill document, so the protocol is directly consumable by autonomous agents.
+Subsequent releases v1.0.4 and v1.1.0 adopt Plumtree-style eager/lazy
+dissemination with IHAVE/GRAFT/PRUNE tree repair, and multiplex gossip
+frames over persistent \texttt{yamux} sessions per peer; together they
+collapse cross-mesh hop latency to sub-second on a live three-peer
+deployment across asymmetric consumer networks.
 \end{abstract}
 
-% --- 1. Introduction ---------------------------------------------------
+% === 1. Introduction ===
 \section{Introduction}
 \label{sec:introduction}
 
@@ -76,7 +81,8 @@ peer. What agents did with those tunnels was their own business.
 
 The protocol that sustains that network is deliberately narrow. Pilot
 provides an overlay of virtual addresses, reliable encrypted transport,
-NAT traversal, and a pairwise trust store~\citep{pilotprotocol}. It does
+NAT traversal~\citep{rfc5128}, and a pairwise trust
+store~\citep{pilotprotocol}. It does
 not provide a group primitive. An agent wishing to address a dozen peers
 at once must either maintain a trust edge with each one (a graph whose
 edge count scales quadratically in the group size) or rely on a
@@ -106,9 +112,10 @@ Our contributions are as follows.
     is captured in signed rosters above the transport, not in Pilot's
     own (in-progress) network membership mechanism.
     \item A Go reference implementation, \texttt{entmootd}, comprising
-    fourteen packages and roughly three thousand lines of code, including
-    framing, replay protection, rate limiting, gossip, Merkle trees, and
-    a Pilot-daemon adapter, together with an end-to-end canary test in
+    fifteen packages and roughly 7,400 lines of non-test Go code
+    (14,000 including tests), including framing, replay protection,
+    rate limiting, gossip, Merkle trees, and a Pilot-daemon adapter,
+    together with an end-to-end canary test in
     which three peers join a group, exchange three signed messages, and
     converge to byte-identical Merkle roots in approximately twelve
     seconds of wall clock, over real encrypted Pilot tunnels spawned as
@@ -131,14 +138,14 @@ Section~\ref{sec:related} surveys related primitives and system work.
 Section~\ref{sec:future} discusses deferred items and future work.
 Section~\ref{sec:conclusion} concludes.
 
-% --- 2. Background -----------------------------------------------------
+% === 2. Background ===
 \section{Background}
 \label{sec:background}
 
 \subsection{Pilot Protocol}
 
 Pilot is an overlay network stack for autonomous agents~\citep{pilotprotocol}.
-Each participating node generates an Ed25519 identity~\citep{bernstein2012ed25519}
+Each participating node generates an Ed25519 identity~\citep{bernstein2012ed25519,rfc8032}
 at registration and receives a 48-bit virtual address of the form
 \texttt{N:NNNN.HHHH.LLLL}: a 16-bit network ID and a 32-bit node ID within
 that network. Network~0 is the global backbone; all agents are members of
@@ -150,8 +157,9 @@ handshake (port~444) mediated by the registry before they can exchange
 traffic on any other port~\citep{calin2026emergent}. Once trust is
 established, nodes may open a reliable byte stream to each other on any
 port. Under the hood, Pilot runs a TCP-equivalent reliable-delivery
-protocol with X25519 key exchange and AES-256-GCM authenticated
-encryption per tunnel. The bytes that carry a tunnel move through a
+protocol with X25519 key exchange~\citep{rfc7748} and AES-256-GCM
+authenticated encryption~\citep{nist80038d} per tunnel, the same
+primitives that underlie WireGuard~\citep{donenfeld2017wireguard}. The bytes that carry a tunnel move through a
 pluggable transport layer: UDP is the default byte-mover and is what
 UDP-capable peers use end-to-end, but the fork we build against also
 ships a TCP transport that a public-IP daemon can expose alongside UDP
@@ -177,9 +185,10 @@ v1.7.2; the abstraction and fixes are wire-compatible with unmodified
 upstream daemons and are described where relevant in the sections
 that follow. The evaluation in~\S\ref{sec:evaluation} was conducted
 against fork release v1.8.0-jf.1. Subsequent releases v1.9.0-jf.2
-through v1.9.0-jf.6 closed latent NAT-drift, relay-routing, and
-self-dial amplification bugs surfaced by live operational
-deployment; the companion evolution
+through v1.9.0-jf.6 closed latent NAT-drift (STUN-style endpoint
+remapping under carrier NAT~\citep{rfc8489}), relay-routing
+(TURN-style beacon fallback~\citep{rfc8656}), and self-dial
+amplification bugs surfaced by live operational deployment; the companion evolution
 paper~\citep{entmootevolution} carries the incident-level
 narrative, and we summarise the Entmoot-visible impact
 in~\S\ref{sec:gossip-optimizations}.
@@ -247,7 +256,7 @@ transport encryption.}
 \label{fig:architecture}
 \end{figure}
 
-% --- 3. Design ---------------------------------------------------------
+% === 3. Design ===
 \section{Design}
 \label{sec:design}
 
@@ -307,10 +316,10 @@ message-type tag, and a JSON body, with a 16\,MiB cap. JSON keeps the
 protocol debuggable and extensible; a binary codec is a post-v0
 consideration.
 
-The v0 protocol defined eight message types --- \texttt{hello},
+The v0 protocol defined eight message types (\texttt{hello},
 \texttt{roster\_req}, \texttt{roster\_resp}, \texttt{gossip},
 \texttt{fetch\_req}, \texttt{fetch\_resp}, \texttt{merkle\_req},
-\texttt{merkle\_resp} --- extended in v1.0.2 with two additional types
+\texttt{merkle\_resp}), extended in v1.0.2 with two additional types
 \texttt{range\_req} and \texttt{range\_resp} (\S\ref{sec:antientropy}),
 and in v1.0.4 with three Plumtree control types \texttt{ihave},
 \texttt{graft}, and \texttt{prune} (\S\ref{sec:gossip-optimizations}).%
@@ -353,7 +362,10 @@ trust graph are sufficient to bootstrap.
 \subsection{Gossip}
 \label{sec:gossip}
 
-Propagation is epidemic. When a member publishes a message, it stores
+Propagation is epidemic in the classical rumour-spreading sense: push
+gossip converges in $O(\log N)$ rounds with high
+probability~\citep{karp2000rumor,demers1987epidemic}. When a member
+publishes a message, it stores
 the message locally and pushes the message \emph{identifier} (not the
 body) to \texttt{min(fanout, $|$members$|-1$)} random peers sampled from
 the roster, excluding itself. Peers that do not already have the
@@ -365,17 +377,21 @@ Push is the fast path: when every gossip recipient is reachable and
 willing, fanout~two suffices for the canary's three-member topology to
 converge in a single round. The slow path, which handles the
 reconnect-missed-gossip case, is described in
-\S\ref{sec:antientropy}. Peer sampling is still random-only in v1.0.2;
-near-peer sampling informed by subscriber interest overlap is a
-documented upgrade, not yet implemented.
+\S\ref{sec:antientropy}. v1.0.2 uses random-only peer sampling; v1.0.4
+replaces this with a Plumtree spanning tree
+(\S\ref{sec:gossip-optimizations}). Near-peer sampling informed by
+subscriber interest overlap remains a documented upgrade, not yet
+implemented.
 
 In v1.0.2 a transient \texttt{Transport.Dial} failure is no longer fatal
 to a gossip attempt. A small \texttt{retryLoop} goroutine re-queues the
 failed push or fetch at 500\,ms cadence with exponential backoffs
-\texttt{1\,s, 2\,s, 4\,s, 8\,s, 16\,s, 30\,s, 60\,s$\,\times\,$4} --- ten
-attempts over roughly five minutes. Slots that exhaust their retry
+\texttt{1\,s, 2\,s, 4\,s, 8\,s, 16\,s, 30\,s, 60\,s$\,\times\,$4} (ten
+attempts over roughly five minutes). Slots that exhaust their retry
 budget log the failure and rely on the anti-entropy path below to recover
-whatever the push missed.
+whatever the push missed. This deterministic schedule is superseded in
+v1.0.7 by decorrelated-jitter backoff
+(\S\ref{sec:gossip-optimizations}).
 
 \subsection{Gossip optimisations (v1.0.5 -- v1.1.0)}
 \label{sec:gossip-optimizations}
@@ -393,7 +409,9 @@ per-release diffs.
 (\S\ref{sec:gossip}) scales as $O(N \log N)$ messages per broadcast
 in steady state but is bandwidth-wasteful once membership exceeds
 the direct-reachability radius. v1.0.4 replaces random fanout with
-a Plumtree~\citep{leitao2007plumtree} spanning-tree construction:
+a Plumtree~\citep{leitao2007plumtree} spanning-tree construction
+over a HyParView~\citep{leitao2007hyparview} peer-sampling
+substrate:
 every peer maintains an eager set (full-body \texttt{gossip})
 and a lazy set (\texttt{ihave} advertisements); receipt of a
 duplicate full-body frame promotes the sender to lazy via
@@ -401,6 +419,56 @@ duplicate full-body frame promotes the sender to lazy via
 message id after a grace interval triggers a \texttt{graft} that
 demotes the sender back to eager. In steady state the spanning
 tree thins to $N-1$ full-body sends per broadcast.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+  font=\footnotesize,
+  lane/.style={draw, rounded corners=1pt, minimum width=13mm,
+               minimum height=5mm, inner sep=2pt, fill=gray!15},
+  note/.style={draw=none, align=center, font=\scriptsize\itshape},
+  msg/.style={-{Latex[length=1.6mm]}, thick},
+  graft/.style={-{Latex[length=1.6mm]}, thick, dashed, gray!60!black},
+]
+\node[lane] (A) at (0, 0)    {$A$};
+\node[lane] (B) at (2.1, 0)  {$B$};
+\node[lane] (C) at (4.2, 0)  {$C$};
+
+\draw[dashed, gray!60] (A.south) -- ++(0, -5.2);
+\draw[dashed, gray!60] (B.south) -- ++(0, -5.2);
+\draw[dashed, gray!60] (C.south) -- ++(0, -5.2);
+
+\draw[msg] ($(A.south) + (0, -0.55)$)
+        -- node[above, font=\scriptsize] {\texttt{gossip}\,(body)}
+           ($(B.south) + (0, -0.55)$);
+\draw[msg] ($(A.south) + (0, -1.3)$)
+        -- node[above, font=\scriptsize] {\texttt{ihave}\,(id)}
+           ($(C.south) + (0, -1.3)$);
+
+\node[note] at (4.2, -2.1)
+  {graft timeout (3\,s)};
+
+\draw[graft] ($(C.south) + (0, -3.1)$)
+        -- node[above, font=\scriptsize] {\texttt{graft}\,(id)}
+           ($(A.south) + (0, -3.1)$);
+\draw[msg] ($(A.south) + (0, -3.85)$)
+        -- node[above, font=\scriptsize]
+           {\texttt{gossip}\,(body); $C$ promoted to eager}
+           ($(C.south) + (0, -3.85)$);
+
+\node[note] at (2.1, -4.75)
+  {\texttt{prune} fires on duplicate arrival;\\demotes the sender to lazy};
+
+\end{tikzpicture}
+\caption{Plumtree spanning-tree repair (v1.0.4). $A$ eager-pushes the
+full message body to $B$ and a lazy \texttt{ihave} advertisement to
+$C$. If the body has not arrived at $C$ within 3~seconds, $C$ sends
+\texttt{graft} to $A$, which replies with the body and promotes $C$
+back into its eager set. Symmetrically, a duplicate \texttt{gossip}
+frame triggers \texttt{prune}, demoting the redundant sender to lazy
+so subsequent messages arrive as \texttt{ihave}-only.}
+\label{fig:plumtree}
+\end{figure}
 
 \paragraph{First-seen forwarding on every acquisition path
 (v1.0.5).} A correctness gap in v1.0.4: re-fanout fired only when
@@ -411,7 +479,9 @@ leaving peers that depended on a chain of partial-connectivity
 hops uncovered. v1.0.5 moves the re-fanout hook into
 \texttt{fetchFrom}, which is the single code path every
 acquisition path funnels through; this matches Plumtree's
-canonical first-seen rule~\citep{leitao2007plumtree}.
+canonical first-seen rule~\citep{leitao2007plumtree} and the same
+rule applied by libp2p
+GossipSub~\citep{vyzovitis2020gossipsub}.
 
 \paragraph{Trust-aware, parallel fanout with per-peer dial-backoff
 (v1.0.6).} The canary exhibited four-minute cross-node
@@ -479,7 +549,7 @@ flowing at the tunnel level. v1.1.0 replaces per-frame stream
 dials with a single long-lived \texttt{yamux}~\citep{%
 hashicorpyamux} session per peer, opened on first contact and
 held for the peer's lifetime. Every subsequent gossip frame is a
-local \texttt{yamux.OpenStream} call --- no SYN, no handshake.
+local \texttt{yamux.OpenStream} call with no SYN and no handshake.
 yamux's built-in keepalive (30-second interval, 10-second
 write-timeout) detects wedged sessions within 40 seconds and
 closes them so the next \texttt{Dial} opens a fresh session
@@ -495,12 +565,14 @@ Push-only gossip (even with the Plumtree-and-optimisations stack of
 \S\ref{sec:gossip-optimizations}) is vulnerable to a specific failure
 mode: a member that is offline when a message is published, and
 reconnects after the push fanout has decayed, never hears about the
-message from the push path. A na\"ive fix --- have every member
-periodically push its entire store to every peer --- is
+message from the push path. A na\"ive fix (have every member
+periodically push its entire store to every peer) is
 bandwidth-ruinous at any non-trivial group size. Entmoot v1.0.2 takes
-the reconciliation approach instead; the semantics described below
-have been stable through v1.1.0 modulo the jittered cooldown
-introduced in v1.0.7.
+the anti-entropy reconciliation approach introduced by Demers et
+al.~\citep{demers1987epidemic} and familiar from Dynamo's Merkle-tree
+repair~\citep{decandia2007dynamo}; the semantics described below have
+been stable through v1.1.0 modulo the jittered cooldown introduced in
+v1.0.7.
 
 Reconciliation is triggered by peer reconnect, not by a periodic timer:
 both an inbound \texttt{Accept} and a successful outbound dial invoke
@@ -690,17 +762,19 @@ a typed \texttt{ErrDialToSelf} sentinel, mirroring
 \texttt{go-libp2p-swarm}'s canonical guard. Either fix alone closes
 the amplification loop; shipped together for defence in depth.
 
-% --- 4. Implementation -------------------------------------------------
+% === 4. Implementation ===
 \section{Implementation}
 \label{sec:implementation}
 
 \texttt{entmootd} is implemented in Go (${\geq}1.25.3$, matching Pilot's
-toolchain requirement) and compiles against Pilot~v1.8.0-jf.1 --- the
-\texttt{jerryfane/pilotprotocol} fork of upstream v1.7.2, which adds the
-pluggable transport layer discussed in \S\ref{sec:background} along with
-several reliability fixes we describe below. The module is
-split into fourteen packages totalling roughly three thousand lines of
-code. Key packages: \texttt{canonical} (deterministic JSON encoding
+toolchain requirement) and compiles against Pilot~v1.8.0-jf.1 or later
+(the \texttt{jerryfane/pilotprotocol} fork of upstream v1.7.2), which adds
+the pluggable transport layer discussed in \S\ref{sec:background} along
+with several reliability fixes; fork releases through v1.9.0-jf.6 are
+integrated as noted in \S\ref{sec:background} and
+\S\ref{sec:gossip-optimizations}. The module is split into fifteen
+packages totalling roughly 7,400 lines of non-test Go code (14,000
+including tests). Key packages: \texttt{canonical} (deterministic JSON encoding
 used for signing and identifier computation), \texttt{merkle} (tree
 construction and positive-inclusion proofs), \texttt{roster} (signed
 log with the founder-only admin rule and a dedicated
@@ -785,6 +859,16 @@ time out and the callee has advertised a TCP endpoint via the registry,
 the Pilot fork falls back to TCP transparently, and the \texttt{net.Conn}
 the adapter hands us is indistinguishable from its UDP equivalent.
 
+One operational footnote is worth flagging for readers who will run
+\texttt{entmootd} or \texttt{pilot-daemon} on recent macOS. Ad-hoc-signed
+Go binaries on macOS~26 (Tahoe) stall at \texttt{\_dyld\_start} on first
+interactive launch until the local \texttt{com.apple.quarantine}
+extended attribute is cleared. The fork's \texttt{install.sh}
+(v1.9.0-jf.2 onward) re-signs the installed binaries with the host's
+ad-hoc identity and runs \texttt{xattr -cr} on the binary directory as
+a post-install step, so the Gatekeeper first-launch gate passes
+without user interaction.
+
 A subtlety surfaced by long-running canaries deserves a mention.
 Pilot's encrypted tunnels are rekeyed periodically (at Pilot's
 \texttt{NetworkSync} boundary, on a roughly five-minute cadence). In
@@ -796,7 +880,7 @@ the fork at v1.7.2-jf.2~\citep{pilotprotocol}, installs a rekey
 callback that resets the keepalive counter on every
 \texttt{StateEstablished} connection routed over the rekeying peer
 after the in-flight buffer is flushed. The invariant it restores is
-that rekey should be transparent to the reliability state machine ---
+that rekey should be transparent to the reliability state machine;
 the user-visible stream does not witness the key change.
 
 Starting at v1.1.0 the Pilot adapter caches one persistent
@@ -818,6 +902,56 @@ long-lived-framed-stream design used by
 \texttt{go-libp2p-pubsub}'s \texttt{comm.go} and by Tailscale
 DERP.
 
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+  font=\footnotesize,
+  peer/.style={draw, circle, minimum size=8mm, inner sep=0.5pt,
+               fill=gray!15},
+  stream/.style={-{Latex[length=1.6mm]}, thick},
+  tunnel/.style={draw, rounded corners=2pt, line width=0.6mm,
+                 gray!55, fill=gray!5},
+  clabel/.style={font=\scriptsize, align=center},
+]
+% Left: v1.0.x (one stream dial per frame)
+\node[peer] (A1) at (0, 0)   {$A$};
+\node[peer] (B1) at (1.6, 0) {$B$};
+\draw[stream] ($(A1.east) + (0, 0.3)$)  -- ($(B1.west) + (0, 0.3)$);
+\draw[stream] ($(A1.east) + (0, 0.1)$)  -- ($(B1.west) + (0, 0.1)$);
+\draw[stream] ($(A1.east) + (0, -0.1)$) -- ($(B1.west) + (0, -0.1)$);
+\draw[stream] ($(A1.east) + (0, -0.3)$) -- ($(B1.west) + (0, -0.3)$);
+\node[clabel] at (0.8, -1.3) {v1.0.x\\one stream dial\\per frame};
+
+% Right: v1.1.0 (one yamux session)
+\node[peer] (A2) at (3.4, 0) {$A$};
+\node[peer] (B2) at (5.6, 0) {$B$};
+% Tunnel envelope, taller so three labelled streams fit inside
+\draw[tunnel] ($(A2.east)+(0.1, 0.8)$) rectangle ($(B2.west)+(-0.1,-0.8)$);
+\draw[stream] ($(A2.east)+(0.15, 0.5)$)
+         -- node[above=-0.3mm, font=\tiny, pos=0.5] {\texttt{gossip}}
+         ($(B2.west)+(-0.15, 0.5)$);
+\draw[stream] ($(A2.east)+(0.15, 0)$)
+         -- node[above=-0.3mm, font=\tiny, pos=0.5] {\texttt{fetch\_req}}
+         ($(B2.west)+(-0.15, 0)$);
+\draw[stream] ($(A2.east)+(0.15,-0.5)$)
+         -- node[above=-0.3mm, font=\tiny, pos=0.5] {\texttt{range\_req}}
+         ($(B2.west)+(-0.15,-0.5)$);
+\node[clabel] at (4.5, -1.3) {v1.1.0\\one yamux session,\\many streams};
+
+\end{tikzpicture}
+\caption{Stream multiplexing change at v1.1.0. Left: every gossip
+frame dialled a fresh Pilot stream, paying a SYN handshake on the
+happy path and the full $\approx$32-second dial budget on silent
+loss. Right: one persistent Pilot stream carries a
+\texttt{yamux}~\citep{hashicorpyamux} session; subsequent
+\texttt{gossip}, \texttt{fetch\_req}, and \texttt{range\_req} frames
+open fresh yamux streams in zero round trips. yamux's built-in
+keepalive (30-second interval, 10-second write-timeout) closes
+silently wedged sessions so the next \texttt{Dial} opens a fresh
+one.}
+\label{fig:yamux}
+\end{figure}
+
 Dependencies outside the Pilot module are deliberately minimal:
 Go's standard library, \texttt{golang.org/x/time/rate} for the
 rate-limiter's token-bucket primitive, \texttt{golang.org/x/%
@@ -825,12 +959,18 @@ sync/errgroup} for v1.0.6's bounded parallel fanout, and
 \texttt{github.com/hashicorp/yamux}~\citep{hashicorpyamux} for
 v1.1.0's session multiplexing.
 
-% --- 5. Evaluation -----------------------------------------------------
+% === 5. Evaluation ===
 \section{Evaluation}
 \label{sec:evaluation}
 
 We evaluate Entmoot with an end-to-end canary test executed in three
-variants (Figure~\ref{fig:canary}). The canary flow is identical across
+variants (Figure~\ref{fig:canary}). The three timings quoted below
+(approximately 1.5~s in-memory, 12~s Pilot library, 14~s Pilot binary)
+were measured against v1.0.4 running on fork release v1.8.0-jf.1;
+\S\ref{sec:gossip-optimizations} discusses subsequent releases that
+change behaviour under partial connectivity without affecting the
+fully-connected three-peer baseline.
+The canary flow is identical across
 all three: three gossipers, call them $A$, $B$, and $C$, initialize
 with a shared group whose founder is $A$. $A$ signs \texttt{add}
 entries for $B$ and $C$ and replicates the roster to them via the
@@ -890,7 +1030,10 @@ library layer.
 id to its random fanout (solid). Peers lacking the body pull it back via
 \texttt{fetch\_req} (dashed). For three peers with fanout~$=2$, a single
 gossip round plus one fetch per peer is sufficient to reach global
-Merkle-root agreement.}
+Merkle-root agreement. This is the v1.0.2 push-then-fetch baseline; v1.0.7
+inlines the full message body in the push frame when the canonical
+encoding is at most 4\,KiB, eliding the fetch round-trip for the common
+case (\S\ref{sec:gossip-optimizations}).}
 \label{fig:canary}
 \end{figure}
 
@@ -906,20 +1049,57 @@ v1.0.4; subsequent releases (\S\ref{sec:gossip-optimizations}) stack
 additively without affecting the fanout-two three-peer ceiling (which
 is already bounded below by Pilot's first-contact handshake) but
 transform the behaviour under partial connectivity and silently
-wedged streams. Live operational telemetry on a three-peer deployment
-with one UAE carrier-grade NAT edge and one Italian residential peer
-measured cross-node propagation dropping from roughly four minutes
-on v1.0.4 --- dominated by sequential Pilot stream dials to
-unreachable eager peers --- to sub-second on v1.1.0 after the
-per-peer yamux session replaces per-frame dials. The companion
-evolution paper~\citep{entmootevolution}~\S6 narrates the five
-releases that closed that gap.
+wedged streams. Live operational telemetry on a three-peer
+deployment of the shape sketched in Figure~\ref{fig:partialcanary},
+with one UAE carrier-grade NAT edge and one Italian residential
+peer, measured cross-node propagation dropping from roughly four
+minutes on v1.0.4 (dominated by sequential Pilot stream dials to
+unreachable eager peers) to sub-second on v1.1.0 after the per-peer
+yamux session replaces per-frame dials. The companion evolution
+paper~\citep{entmootevolution}~\S6 narrates the five releases that
+closed that gap.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+  font=\footnotesize,
+  agent/.style={draw, circle, minimum size=12mm, inner sep=1pt,
+                fill=gray!10, align=center},
+  direct/.style={-, thick},
+  blocked/.style={-, thick, dashed, gray!70!black},
+  refanout/.style={-{Latex[length=1.6mm]}, thick, dashed,
+                   gray!40!black},
+]
+\node[agent] (vps)    at (2.75, 2.0) {VPS\\{\scriptsize public}};
+\node[agent] (phobos) at (0, 0)      {Phobos\\{\scriptsize NATed}};
+\node[agent] (laptop) at (5.5, 0)    {laptop\\{\scriptsize CGN}};
+
+\draw[direct] (phobos) -- (vps);
+\draw[direct] (vps) -- (laptop);
+\draw[blocked] (phobos) -- node[below, font=\scriptsize]
+  {blocked (no direct UDP edge)} (laptop);
+
+\draw[refanout] (phobos) to[bend left=20]
+  node[above left, font=\scriptsize] {publish} (vps);
+\draw[refanout] (vps) to[bend left=20]
+  node[above right, font=\scriptsize] {re-fanout} (laptop);
+\end{tikzpicture}
+\caption{Partial-connectivity canary underlying the live three-peer
+measurements in \S\ref{sec:gossip-optimizations}. VPS is publicly
+reachable; Phobos (Italian residential NAT) and laptop (UAE
+carrier-grade NAT) cannot open a direct tunnel to each other.
+Plumtree's first-seen forwarding rule (v1.0.5) lets a Phobos publish
+reach the laptop with VPS as the re-fanout hop. This is the topology
+on which the v1.0.4 four-minute cross-mesh delay and the
+post-v1.1.0 sub-second steady state were measured.}
+\label{fig:partialcanary}
+\end{figure}
 
 This paper does not present load tests at larger scales or quantitative
 measurements of rate-limit behavior under attack; both are tracked as
 follow-up work.
 
-% --- 6. Related Work ---------------------------------------------------
+% === 6. Related Work ===
 \section{Related Work}
 \label{sec:related}
 
@@ -931,10 +1111,16 @@ primitive (group membership with gossip) that the Calin study
 explicitly flags as a gap in Pilot's existing surface and a prerequisite
 for the cross-network analyses it proposes as future work.
 
-IPFS~\citep{benet2014ipfs} shares with Entmoot both content-addressing
-and a DAG-structured history, but it is oriented toward open
-distribution of immutable blobs and has no notion of group scope or
-trust-gated participation. Certificate Transparency~\citep{laurie2013ct}
+Secure Scuttlebutt~\citep{tarr2019ssb} is the closest published prior
+art: a per-identity append-only signed log disseminated by gossip with
+anti-entropy repair. Entmoot differs in scope (groups of
+trust-gated participants rather than a global pub-sub feed) and in
+integrating natively with Pilot's authenticated transport, but the
+per-identity signed-log primitive and the gossip+anti-entropy split are
+directly analogous. IPFS~\citep{benet2014ipfs} shares with Entmoot both
+content-addressing and a DAG-structured history, but it is oriented
+toward open distribution of immutable blobs and has no notion of group
+scope or trust-gated participation. Certificate Transparency~\citep{laurie2013ct}
 directly influences our Merkle log layer: we adopt its domain-separation
 convention and the discipline of proving inclusion rather than
 recomputing the whole log. We reuse MQTT's topic syntax~\citep{mqtt5}
@@ -952,7 +1138,7 @@ interaction topologies form without a designer. Entmoot is not a
 coordination protocol in that sense; it is a communication substrate
 that such coordination can later sit on top of.
 
-% --- 7. Discussion and Future Work -------------------------------------
+% === 7. Discussion and Future Work ===
 \section{Discussion and Future Work}
 \label{sec:future}
 
@@ -980,7 +1166,7 @@ depend on the shape of Pilot's eventual API and on whether network
 membership provides the authorization semantics we need. The
 abstraction is already in place. Separately, Pilot's pluggable
 transport layer~(\S\ref{sec:background}) now lets Entmoot run over
-TCP when a public-IP peer in the group advertises a TCP endpoint ---
+TCP when a public-IP peer in the group advertises a TCP endpoint:
 the UDP-hostile-network escape hatch that the Calin study's broader
 deployments would otherwise stumble on. Quantifying the TCP-fallback
 overhead with a dedicated canary variant is a natural follow-up to
@@ -999,7 +1185,7 @@ is the concrete enabler for the question ``what do agents do with it
 once they have it'': it is the interface agents actually install and
 call, rather than a library surface waiting for a developer.
 
-% --- 8. Conclusion -----------------------------------------------------
+% === 8. Conclusion ===
 \section{Conclusion}
 \label{sec:conclusion}
 
@@ -1013,7 +1199,7 @@ peers over real Pilot tunnels in under twelve seconds of wall clock.
 The natural next question is not whether the protocol works, but what
 agents do with it once they have it.
 
-% --- Bibliography ------------------------------------------------------
+% === Bibliography ===
 \bibliographystyle{plainnat}
 \bibliography{refs}
 
