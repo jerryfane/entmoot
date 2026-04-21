@@ -105,6 +105,14 @@ func (t *filteringTransport) TrustedPeers(ctx context.Context) ([]entmoot.NodeID
 
 func (t *filteringTransport) Close() error { return t.inner.Close() }
 
+// SetPeerEndpoints implements Transport. Delegates to the inner
+// transport so tests that wire a filter on top of memTransport still
+// observe SetPeerEndpoints calls via memTransport.EndpointsFor.
+// (v1.2.0)
+func (t *filteringTransport) SetPeerEndpoints(ctx context.Context, peer entmoot.NodeID, endpoints []entmoot.NodeEndpoint) error {
+	return t.inner.SetPeerEndpoints(ctx, peer, endpoints)
+}
+
 // dialsTo returns how many times Dial has been invoked for `peer`,
 // regardless of whether the dial was allowed. Used by Fix A tests to
 // prove the trust oracle short-circuited a would-be dial before the

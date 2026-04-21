@@ -340,6 +340,141 @@ func TestEncodeAndWriteReadAndDecodeHello(t *testing.T) {
 	}
 }
 
+// TestRoundTripTransportAd exercises the v1.2.0 transport advertisement
+// payload: every field populated, two endpoints, non-empty signature.
+// The reflect.DeepEqual in roundTrip covers field-by-field equality.
+func TestRoundTripTransportAd(t *testing.T) {
+	pub, priv := newKey(t)
+	msg := &TransportAd{
+		GroupID: mustGroupID(0x99),
+		Author: entmoot.NodeInfo{
+			PilotNodeID:   0xCAFEBABE,
+			EntmootPubKey: pub,
+		},
+		Seq: 42,
+		Endpoints: []entmoot.NodeEndpoint{
+			{Network: "tcp", Addr: "198.51.100.7:4001"},
+			{Network: "udp", Addr: "203.0.113.9:4001"},
+		},
+		IssuedAt: 1_700_000_000_900,
+		NotAfter: 1_700_000_900_000,
+	}
+	msg.Signature = ed25519.Sign(priv, []byte("transport-ad-sig-input"))
+
+	got := roundTrip(t, msg).(*TransportAd)
+	if got.Seq != msg.Seq {
+		t.Fatalf("Seq = %d, want %d", got.Seq, msg.Seq)
+	}
+	if len(got.Endpoints) != 2 {
+		t.Fatalf("Endpoints len = %d, want 2", len(got.Endpoints))
+	}
+	if got.Endpoints[0].Network != "tcp" || got.Endpoints[0].Addr != "198.51.100.7:4001" {
+		t.Fatalf("Endpoints[0] = %+v", got.Endpoints[0])
+	}
+	if got.Endpoints[1].Network != "udp" || got.Endpoints[1].Addr != "203.0.113.9:4001" {
+		t.Fatalf("Endpoints[1] = %+v", got.Endpoints[1])
+	}
+	if !bytes.Equal(got.Signature, msg.Signature) {
+		t.Fatalf("Signature bytes differ after round-trip")
+	}
+	if got.Author.PilotNodeID != msg.Author.PilotNodeID {
+		t.Fatalf("Author.PilotNodeID = %d, want %d",
+			got.Author.PilotNodeID, msg.Author.PilotNodeID)
+	}
+	if !bytes.Equal(got.Author.EntmootPubKey, msg.Author.EntmootPubKey) {
+		t.Fatalf("Author.EntmootPubKey differs")
+	}
+	if got.IssuedAt != msg.IssuedAt || got.NotAfter != msg.NotAfter {
+		t.Fatalf("timestamps differ: got (%d,%d), want (%d,%d)",
+			got.IssuedAt, got.NotAfter, msg.IssuedAt, msg.NotAfter)
+	}
+}
+
+// TestRoundTripTransportSnapshotReq covers the trivial request payload.
+func TestRoundTripTransportSnapshotReq(t *testing.T) {
+	roundTrip(t, &TransportSnapshotReq{GroupID: mustGroupID(0x9A)})
+}
+
+// TestRoundTripTransportSnapshotResp covers 0, 1, and 3 ads in the list,
+// so we catch edge cases around nil vs empty slice serialisation and
+// multi-element round-trips.
+func TestRoundTripTransportSnapshotResp(t *testing.T) {
+	pub, priv := newKey(t)
+	mkAd := func(seq uint64, addr string) TransportAd {
+		ad := TransportAd{
+			GroupID: mustGroupID(0x9B),
+			Author: entmoot.NodeInfo{
+				PilotNodeID:   entmoot.NodeID(seq),
+				EntmootPubKey: pub,
+			},
+			Seq: seq,
+			Endpoints: []entmoot.NodeEndpoint{
+				{Network: "tcp", Addr: addr},
+			},
+			IssuedAt: 1_700_000_001_000 + int64(seq),
+			NotAfter: 1_700_000_901_000 + int64(seq),
+		}
+		ad.Signature = ed25519.Sign(priv, []byte("snapshot-ad-"+addr))
+		return ad
+	}
+
+	// Zero ads: the respondent holds no advertisements for the group.
+	// We send an empty (non-nil) slice and assert it round-trips as
+	// either nil or empty — both are wire-equivalent JSON null/[]. The
+	// reflect.DeepEqual in roundTrip is too strict here since
+	// Unmarshal may produce a nil slice from the empty JSON array.
+	// Exercise the empty path by constructing the slice via nil literal
+	// so sender and receiver agree.
+	var buf bytes.Buffer
+	empty := &TransportSnapshotResp{GroupID: mustGroupID(0x9B)}
+	if err := EncodeAndWrite(&buf, empty); err != nil {
+		t.Fatalf("EncodeAndWrite empty: %v", err)
+	}
+	_, gotEmpty, err := ReadAndDecode(&buf)
+	if err != nil {
+		t.Fatalf("ReadAndDecode empty: %v", err)
+	}
+	gotResp := gotEmpty.(*TransportSnapshotResp)
+	if gotResp.GroupID != empty.GroupID {
+		t.Fatalf("GroupID differs: got %v, want %v", gotResp.GroupID, empty.GroupID)
+	}
+	if len(gotResp.Ads) != 0 {
+		t.Fatalf("empty Ads len = %d, want 0", len(gotResp.Ads))
+	}
+
+	// One ad.
+	one := &TransportSnapshotResp{
+		GroupID: mustGroupID(0x9B),
+		Ads:     []TransportAd{mkAd(1, "198.51.100.1:4001")},
+	}
+	gotOne := roundTrip(t, one).(*TransportSnapshotResp)
+	if len(gotOne.Ads) != 1 {
+		t.Fatalf("one Ads len = %d, want 1", len(gotOne.Ads))
+	}
+
+	// Three ads.
+	three := &TransportSnapshotResp{
+		GroupID: mustGroupID(0x9B),
+		Ads: []TransportAd{
+			mkAd(1, "198.51.100.1:4001"),
+			mkAd(2, "198.51.100.2:4001"),
+			mkAd(3, "198.51.100.3:4001"),
+		},
+	}
+	gotThree := roundTrip(t, three).(*TransportSnapshotResp)
+	if len(gotThree.Ads) != 3 {
+		t.Fatalf("three Ads len = %d, want 3", len(gotThree.Ads))
+	}
+	for i, ad := range gotThree.Ads {
+		if ad.Seq != three.Ads[i].Seq {
+			t.Fatalf("Ads[%d].Seq = %d, want %d", i, ad.Seq, three.Ads[i].Seq)
+		}
+		if !bytes.Equal(ad.Signature, three.Ads[i].Signature) {
+			t.Fatalf("Ads[%d].Signature differs", i)
+		}
+	}
+}
+
 // TestMerkleRootJSONShape verifies that MerkleRoot marshals as a base64
 // string, not Go's default numeric-array form, so the wire shape stays
 // debuggable.

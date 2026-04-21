@@ -62,6 +62,18 @@ const (
 	// were about to send next." Carried as a bare signal per group;
 	// prunes are future-tense and do not affect messages in flight.
 	MsgPrune MsgType = 0x0D
+	// MsgTransportAd is a signed advertisement of a peer's current
+	// transport endpoints, distributed through Entmoot's gossip layer as
+	// an alternative to registry-sourced endpoint discovery. (v1.2.0)
+	MsgTransportAd MsgType = 0x0E
+	// MsgTransportSnapshotReq asks a peer for its current view of every
+	// group member's TransportAd. Used by Join-time newcomers to
+	// populate Pilot's peerTCP map before anti-entropy reconcile begins.
+	// (v1.2.0)
+	MsgTransportSnapshotReq MsgType = 0x0F
+	// MsgTransportSnapshotResp carries every unexpired TransportAd the
+	// responder holds for the group. (v1.2.0)
+	MsgTransportSnapshotResp MsgType = 0x10
 )
 
 // String returns the human-readable wire name for t, suitable for logs. It
@@ -94,6 +106,12 @@ func (t MsgType) String() string {
 		return "graft"
 	case MsgPrune:
 		return "prune"
+	case MsgTransportAd:
+		return "transport_ad"
+	case MsgTransportSnapshotReq:
+		return "transport_snapshot_req"
+	case MsgTransportSnapshotResp:
+		return "transport_snapshot_resp"
 	default:
 		return fmt.Sprintf("unknown(0x%02x)", uint8(t))
 	}
@@ -304,4 +322,52 @@ type Graft struct {
 type Prune struct {
 	// GroupID identifies the owning group.
 	GroupID entmoot.GroupID `json:"group_id"`
+}
+
+// TransportAd is a signed advertisement of a peer's current network
+// endpoints, distributed through Entmoot's gossip layer as an alternative
+// to registry-sourced endpoint discovery. LWW-Register semantics: the
+// highest Seq per (group_id, author) wins, with lexicographic signature
+// tiebreak. Receivers verify via three cheap checks before signature
+// (schema + size, publisher-allowlist, rate limit) — see
+// gossiper.onTransportAd. (v1.2.0)
+type TransportAd struct {
+	// GroupID identifies the owning group.
+	GroupID entmoot.GroupID `json:"group_id"`
+	// Author is the advertising peer's NodeInfo, used to verify Signature
+	// against the peer's Entmoot Ed25519 public key.
+	Author entmoot.NodeInfo `json:"author"`
+	// Seq is a monotonic counter per (GroupID, Author) so receivers can
+	// discard older ads when a newer one arrives out of order.
+	Seq uint64 `json:"seq"`
+	// Endpoints is the set of network endpoints the author claims to
+	// currently listen on.
+	Endpoints []entmoot.NodeEndpoint `json:"endpoints"`
+	// IssuedAt is unix milliseconds at sign time.
+	IssuedAt int64 `json:"issued_at"`
+	// NotAfter is unix milliseconds after which the ad must be treated as
+	// expired by receivers and GC'd from the store.
+	NotAfter int64 `json:"not_after"`
+	// Signature is Ed25519 over the canonical encoding of the TransportAd
+	// with Signature zeroed.
+	Signature []byte `json:"signature,omitempty"`
+}
+
+// TransportSnapshotReq asks a peer for its current view of every group
+// member's transport advertisement. Used by Join-time newcomers to
+// populate Pilot's peerTCP map before anti-entropy reconcile begins.
+// (v1.2.0)
+type TransportSnapshotReq struct {
+	// GroupID identifies the target group.
+	GroupID entmoot.GroupID `json:"group_id"`
+}
+
+// TransportSnapshotResp carries every unexpired TransportAd the responder
+// holds for the group. Response size is O(N_members × ~300 bytes). (v1.2.0)
+type TransportSnapshotResp struct {
+	// GroupID identifies the target group.
+	GroupID entmoot.GroupID `json:"group_id"`
+	// Ads is the responder's current set of unexpired TransportAds for
+	// GroupID, ordered by Author.PilotNodeID for determinism.
+	Ads []TransportAd `json:"ads"`
 }

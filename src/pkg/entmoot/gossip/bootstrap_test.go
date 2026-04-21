@@ -11,6 +11,7 @@ import (
 	"entmoot/pkg/entmoot/canonical"
 	"entmoot/pkg/entmoot/clock"
 	"entmoot/pkg/entmoot/keystore"
+	"entmoot/pkg/entmoot/ratelimit"
 	"entmoot/pkg/entmoot/roster"
 	"entmoot/pkg/entmoot/store"
 )
@@ -164,6 +165,38 @@ func (f *fixture) buildInviteWithValidUntil(bootstrap []entmoot.NodeID, validUnt
 		BootstrapPeers: bps,
 		IssuedAt:       f.founderTS,
 		ValidUntil:     validUntil,
+	}
+	signing := *inv
+	signing.Signature = nil
+	sigInput, err := canonical.Encode(signing)
+	if err != nil {
+		f.t.Fatalf("canonical encode invite: %v", err)
+	}
+	inv.Signature = f.founder.Sign(sigInput)
+	return inv
+}
+
+// buildInviteWithEndpoints produces an invite whose BootstrapPeers
+// entries carry the Endpoints field populated from `eps`. Every peer
+// listed in `bootstrap` receives the same endpoint list — callers
+// that need per-peer variation should assemble the invite manually.
+// (v1.2.0)
+func (f *fixture) buildInviteWithEndpoints(bootstrap []entmoot.NodeID, eps []entmoot.NodeEndpoint) *entmoot.Invite {
+	bps := make([]entmoot.BootstrapPeer, 0, len(bootstrap))
+	for _, n := range bootstrap {
+		bp := entmoot.BootstrapPeer{NodeID: n}
+		if len(eps) > 0 {
+			bp.Endpoints = append([]entmoot.NodeEndpoint(nil), eps...)
+		}
+		bps = append(bps, bp)
+	}
+	inv := &entmoot.Invite{
+		GroupID:        f.groupID,
+		Founder:        f.founderInf,
+		Issuer:         f.founderInf,
+		BootstrapPeers: bps,
+		IssuedAt:       f.founderTS,
+		ValidUntil:     f.founderTS + 24*60*60*1000,
 	}
 	signing := *inv
 	signing.Signature = nil
@@ -404,5 +437,121 @@ func TestJoinFreshInviteAccepted(t *testing.T) {
 	}
 	if len(f.nodes[99].rost.Members()) != len(f.nodes[10].rost.Members()) {
 		t.Fatalf("membership sync failed")
+	}
+}
+
+// 10. v1.2.0: Join pre-seeds Pilot's peerTCP with invite-embedded
+// endpoints before the first tryRosterSync, so the newcomer's very
+// first Dial can use TCP fallback even if UDP is blocked. We assert
+// the joiner's transport recorded a SetPeerEndpoints call for every
+// bootstrap peer listed in the invite with Endpoints populated.
+// Implementation detail: the memTransport records the call in a
+// per-peer map exposed via EndpointsFor; the test reads that map after
+// Join returns so the test does not race the call site.
+func TestJoinPreSeedsInviteEndpoints(t *testing.T) {
+	t.Parallel()
+	f := newFixtureWithGenesisOnly(t, []entmoot.NodeID{10, 20, 30, 99}, 99)
+	defer f.closeTransports()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// Start A's accept loop so RosterReq resolves; the pre-seed path
+	// is reached regardless, but Join returning cleanly makes the
+	// assertion more informative.
+	go func() { _ = f.nodes[10].gossip.Start(ctx) }()
+
+	eps := []entmoot.NodeEndpoint{{Network: "tcp", Addr: "198.51.100.10:4443"}}
+	inv := f.buildInviteWithEndpoints([]entmoot.NodeID{10, 20, 30}, eps)
+	if err := f.nodes[99].gossip.Join(ctx, inv); err != nil {
+		t.Fatalf("Join: %v", err)
+	}
+
+	// memTransport implements SetPeerEndpoints by recording the call
+	// into an internal map keyed on NodeID. Each of A/B/C should have
+	// one recorded entry.
+	joiner, ok := f.transports[99].(*memTransport)
+	if !ok {
+		t.Fatalf("joiner transport is %T, want *memTransport", f.transports[99])
+	}
+	for _, peer := range []entmoot.NodeID{10, 20, 30} {
+		got := joiner.EndpointsFor(peer)
+		if len(got) != 1 {
+			t.Fatalf("peer %d: EndpointsFor returned %d entries, want 1 (eps=%+v)",
+				peer, len(got), got)
+		}
+		if got[0].Network != "tcp" || got[0].Addr != "198.51.100.10:4443" {
+			t.Fatalf("peer %d: EndpointsFor = %+v, want tcp=198.51.100.10:4443", peer, got[0])
+		}
+	}
+
+	// The joiner itself must NOT have been installed (self-skip).
+	if got := joiner.EndpointsFor(99); got != nil {
+		t.Fatalf("joiner (self) installed unexpectedly: %+v", got)
+	}
+}
+
+// 11. v1.2.0: after a successful tryRosterSync, Join issues a
+// TransportSnapshotReq and feeds every returned TransportAd through
+// onTransportAd, which installs endpoints into the joiner's Pilot
+// peerTCP via SetPeerEndpoints. Two-node fixture: A has a locally
+// stored TransportAd (seeded directly so we don't race a background
+// fanout goroutine); C joins using A as bootstrap peer and must end
+// up with A's stored TransportAd in its own store after Join returns.
+func TestJoinPullsTransportSnapshot(t *testing.T) {
+	t.Parallel()
+	f := newFixtureWithGenesisOnly(t, []entmoot.NodeID{10, 99}, 99)
+	defer f.closeTransports()
+
+	// Equip both nodes with a TransportAdStore + rate limiter so A
+	// can answer the snapshot req and C can accept the replies.
+	storeA := newMemTransportAdStore()
+	storeC := newMemTransportAdStore()
+	f.nodes[10].gossip.cfg.TransportAdStore = storeA
+	f.nodes[10].gossip.cfg.RateLimiter = ratelimit.New(ratelimit.DefaultLimits(), f.nodes[10].gossip.clk)
+	f.nodes[99].gossip.cfg.TransportAdStore = storeC
+	f.nodes[99].gossip.cfg.RateLimiter = ratelimit.New(ratelimit.DefaultLimits(), f.nodes[99].gossip.clk)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// Start A's accept loop so both RosterReq and
+	// TransportSnapshotReq resolve.
+	go func() { _ = f.nodes[10].gossip.Start(ctx) }()
+
+	// Seed A's store directly. We deliberately avoid the
+	// publishTransportAd path because it invokes fanoutTransportAd,
+	// which would dial the joiner 99 (whose accept loop never runs
+	// in this test), stalling the test on net.Pipe.Write.
+	aEndpoints := []entmoot.NodeEndpoint{{Network: "tcp", Addr: "198.51.100.10:4443"}}
+	now := f.nodes[10].gossip.clk.Now()
+	ad := f.buildTransportAd(10, 1, aEndpoints, now)
+	if _, err := storeA.PutTransportAd(ctx, ad); err != nil {
+		t.Fatalf("A PutTransportAd: %v", err)
+	}
+
+	// C joins using A as the sole bootstrap peer (no endpoints in the
+	// invite — snapshot pull is the subject under test). Post-Join,
+	// C's store must contain A's TransportAd.
+	inv := f.buildInvite([]entmoot.NodeID{10})
+	if err := f.nodes[99].gossip.Join(ctx, inv); err != nil {
+		t.Fatalf("Join: %v", err)
+	}
+	got, ok := storeC.adFor(f.groupID, 10)
+	if !ok {
+		t.Fatalf("C has no stored TransportAd for A after Join")
+	}
+	if len(got.Endpoints) != 1 || got.Endpoints[0].Addr != "198.51.100.10:4443" {
+		t.Fatalf("C stored ad endpoints = %+v, want tcp=198.51.100.10:4443", got.Endpoints)
+	}
+
+	// The snapshot-pull path routes every ad through onTransportAd,
+	// which calls SetPeerEndpoints on accepted records. Verify C's
+	// transport recorded A's endpoints as a consequence.
+	joiner, ok := f.transports[99].(*memTransport)
+	if !ok {
+		t.Fatalf("joiner transport is %T, want *memTransport", f.transports[99])
+	}
+	gotEps := joiner.EndpointsFor(10)
+	if len(gotEps) != 1 || gotEps[0].Addr != "198.51.100.10:4443" {
+		t.Fatalf("joiner EndpointsFor(A) = %+v, want tcp=198.51.100.10:4443", gotEps)
 	}
 }

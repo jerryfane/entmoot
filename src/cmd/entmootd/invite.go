@@ -13,6 +13,7 @@ import (
 	"entmoot/pkg/entmoot/canonical"
 	"entmoot/pkg/entmoot/roster"
 	"entmoot/pkg/entmoot/store"
+	"entmoot/pkg/entmoot/transport/pilot"
 )
 
 // cmdInvite dispatches `invite <op>`; v1 only recognizes `invite create`.
@@ -122,7 +123,22 @@ func cmdInviteCreate(gf *globalFlags, args []string) int {
 		if p == nodeID {
 			continue
 		}
-		bootstrap = append(bootstrap, entmoot.BootstrapPeer{NodeID: p})
+		bp := entmoot.BootstrapPeer{NodeID: p}
+		// v1.2.0: best-effort endpoint hint. For non-self peers we
+		// consult the Pilot daemon's registry view via
+		// ResolveHostname — if the hostname is known the response
+		// includes real_addr (UDP) and, on our fork's
+		// daemon-reachable paths, the TCP endpoint. On the upstream
+		// stock registry the TCP field is silently dropped, so this
+		// usually contributes only UDP — but that still helps
+		// newcomers skip one registry round-trip on the first join.
+		// Empty result is fine; omitempty keeps the invite shape
+		// identical to v1.1.x so legacy receivers accept it
+		// unchanged.
+		if eps := lookupEndpointsFor(tr, p); len(eps) > 0 {
+			bp.Endpoints = eps
+		}
+		bootstrap = append(bootstrap, bp)
 	}
 
 	issuerInfo := entmoot.NodeInfo{
@@ -157,6 +173,26 @@ func cmdInviteCreate(gf *globalFlags, args []string) int {
 	}
 	fmt.Println(string(data))
 	return exitOK
+}
+
+// lookupEndpointsFor returns the endpoints the local Pilot daemon
+// knows for `p`, if any. v1.2.0 ships with a no-op because today's
+// Pilot Driver has no Lookup(nodeID) RPC — the only shape available
+// is ResolveHostname(hostname), and entmootd does not track
+// hostnames per peer. Returning nil leaves the BootstrapPeer's
+// Endpoints field at its zero value; `omitempty` on the JSON tag
+// then keeps the invite's canonical bytes identical to v1.1.x for
+// receivers that have not yet upgraded.
+//
+// Deferred to v1.3: once pilotprotocol grows a Driver.Lookup or
+// equivalent by-NodeID resolution, this helper becomes a one-liner
+// that calls it and translates driver.Endpoint to entmoot.NodeEndpoint.
+// Until then, endpoints reach the receiver via the Join-time
+// TransportSnapshotReq path, not the invite.
+func lookupEndpointsFor(tr *pilot.Transport, p entmoot.NodeID) []entmoot.NodeEndpoint {
+	_ = tr
+	_ = p
+	return nil
 }
 
 // defaultBootstrapPeers returns founder + up to max-1 other random

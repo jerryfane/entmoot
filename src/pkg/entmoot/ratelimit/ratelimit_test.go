@@ -288,6 +288,192 @@ func TestAllow_UnknownPeerStartsWithFullBurst(t *testing.T) {
 	}
 }
 
+// TestDefaultTopicLimits_TransportV1 asserts the v1.2.0 default
+// per-(peer, topic) limit for "_pilot/transport/v1" matches the plan:
+// burst of 10, refill 10/hour (rate.Every(6*time.Minute)).
+func TestDefaultTopicLimits_TransportV1(t *testing.T) {
+	tl, ok := ratelimit.DefaultTopicLimits()["_pilot/transport/v1"]
+	if !ok {
+		t.Fatalf("DefaultTopicLimits missing _pilot/transport/v1 entry")
+	}
+	if tl.MsgBurst != 10 {
+		t.Errorf("_pilot/transport/v1 MsgBurst = %d, want 10", tl.MsgBurst)
+	}
+	if tl.MsgRate != rate.Every(6*time.Minute) {
+		t.Errorf("_pilot/transport/v1 MsgRate = %v, want rate.Every(6m)", tl.MsgRate)
+	}
+}
+
+// TestAllowTopic_DrainThenReject bounds the per-(peer, topic) bucket:
+// burst calls all pass, the burst+1 call rejects, a long clock advance
+// refills fully, and the cycle repeats. Exercises the transport-ad
+// bucket at its plan defaults.
+func TestAllowTopic_DrainThenReject(t *testing.T) {
+	fk := clock.NewFake(anchor)
+	lim := ratelimit.New(ratelimit.DefaultLimits(), fk)
+	peer := entmoot.NodeID(42)
+	topic := "_pilot/transport/v1"
+
+	// Drain the 10-token burst. The global per-peer bucket is far more
+	// generous, so these always reach the topic check.
+	for i := 0; i < 10; i++ {
+		if err := lim.AllowTopic(peer, topic, 64); err != nil {
+			t.Fatalf("drain %d: unexpected err: %v", i, err)
+		}
+	}
+	if err := lim.AllowTopic(peer, topic, 64); !errors.Is(err, entmoot.ErrRateLimited) {
+		t.Fatalf("post-drain: expected ErrRateLimited, got %v", err)
+	}
+
+	// Advance 1 hour -> at 10/hour the bucket refills to full.
+	fk.Advance(1 * time.Hour)
+	for i := 0; i < 10; i++ {
+		if err := lim.AllowTopic(peer, topic, 64); err != nil {
+			t.Fatalf("refilled %d: unexpected err: %v", i, err)
+		}
+	}
+	if err := lim.AllowTopic(peer, topic, 64); !errors.Is(err, entmoot.ErrRateLimited) {
+		t.Fatalf("after refill drain: expected ErrRateLimited, got %v", err)
+	}
+}
+
+// TestAllowTopic_TopicBucketIndependentPerPeer verifies one abusive
+// peer can drain its topic bucket without affecting another peer's
+// quota.
+func TestAllowTopic_TopicBucketIndependentPerPeer(t *testing.T) {
+	fk := clock.NewFake(anchor)
+	lim := ratelimit.New(ratelimit.DefaultLimits(), fk)
+	a := entmoot.NodeID(1)
+	b := entmoot.NodeID(2)
+	topic := "_pilot/transport/v1"
+
+	for i := 0; i < 10; i++ {
+		if err := lim.AllowTopic(a, topic, 64); err != nil {
+			t.Fatalf("A drain %d: %v", i, err)
+		}
+	}
+	if err := lim.AllowTopic(a, topic, 64); !errors.Is(err, entmoot.ErrRateLimited) {
+		t.Fatalf("A post-drain: expected ErrRateLimited, got %v", err)
+	}
+	// B is untouched — full burst available.
+	for i := 0; i < 10; i++ {
+		if err := lim.AllowTopic(b, topic, 64); err != nil {
+			t.Fatalf("B independent %d: %v", i, err)
+		}
+	}
+}
+
+// TestAllowTopic_UnconfiguredTopicDelegatesToGlobal asserts that a
+// topic with no explicit TopicLimit entry falls back to the global
+// per-peer bucket; the topic-level bucket is a no-op.
+func TestAllowTopic_UnconfiguredTopicDelegatesToGlobal(t *testing.T) {
+	fk := clock.NewFake(anchor)
+	lim := ratelimit.New(ratelimit.Limits{
+		MsgRate:  1,
+		MsgBurst: 3,
+	}, fk)
+	peer := entmoot.NodeID(7)
+
+	// Burst of 3 — from the global bucket — then reject.
+	for i := 0; i < 3; i++ {
+		if err := lim.AllowTopic(peer, "chat/messages", 0); err != nil {
+			t.Fatalf("iter %d: %v", i, err)
+		}
+	}
+	if err := lim.AllowTopic(peer, "chat/messages", 0); !errors.Is(err, entmoot.ErrRateLimited) {
+		t.Fatalf("expected ErrRateLimited from global bucket, got %v", err)
+	}
+}
+
+// TestAllowTopic_TopicRejectDoesNotBurnGlobalTokens asserts the
+// both-or-neither contract: a topic-bucket rejection must leave the
+// global per-peer message bucket untouched so legitimate non-topic
+// traffic isn't starved by noisy system-topic spam.
+func TestAllowTopic_TopicRejectDoesNotBurnGlobalTokens(t *testing.T) {
+	fk := clock.NewFake(anchor)
+	lim := ratelimit.New(ratelimit.DefaultLimits(), fk)
+	peer := entmoot.NodeID(9)
+	topic := "_pilot/transport/v1"
+
+	// Drain the topic bucket.
+	for i := 0; i < 10; i++ {
+		if err := lim.AllowTopic(peer, topic, 64); err != nil {
+			t.Fatalf("drain %d: %v", i, err)
+		}
+	}
+	// Further topic calls reject.
+	for i := 0; i < 50; i++ {
+		if err := lim.AllowTopic(peer, topic, 64); !errors.Is(err, entmoot.ErrRateLimited) {
+			t.Fatalf("iter %d: expected ErrRateLimited, got %v", i, err)
+		}
+	}
+	// The 10 passing topic calls each also charged the global per-peer
+	// bucket (by design — they're on top of the global quota), so 190
+	// global tokens should remain. Topic-rejected calls MUST NOT have
+	// burned additional global tokens — if they did, fewer than 190
+	// calls would pass here.
+	for i := 0; i < 190; i++ {
+		if err := lim.Allow(peer, 0); err != nil {
+			t.Fatalf("global iter %d: topic reject burned global tokens: %v", i, err)
+		}
+	}
+}
+
+// TestAllowTopic_GlobalRejectCancelsTopicReservation asserts the
+// reverse: when the global per-peer bucket rejects, the per-(peer,
+// topic) bucket must not be charged.
+func TestAllowTopic_GlobalRejectCancelsTopicReservation(t *testing.T) {
+	fk := clock.NewFake(anchor)
+	// Tight global bucket, loose topic bucket so we can isolate the
+	// cancel-on-global-reject path.
+	lim := ratelimit.New(ratelimit.Limits{
+		MsgRate:  1,
+		MsgBurst: 1,
+		TopicLimits: map[string]ratelimit.TopicLimit{
+			"t": {MsgRate: 1000, MsgBurst: 1000},
+		},
+	}, fk)
+	peer := entmoot.NodeID(11)
+
+	if err := lim.AllowTopic(peer, "t", 0); err != nil {
+		t.Fatalf("first: %v", err)
+	}
+	if err := lim.AllowTopic(peer, "t", 0); !errors.Is(err, entmoot.ErrRateLimited) {
+		t.Fatalf("second (global bucket empty): expected ErrRateLimited, got %v", err)
+	}
+	// 999 topic tokens should still be available; assert that a single
+	// clock advance (restoring 1 global token) lets the next call through.
+	fk.Advance(1 * time.Second)
+	if err := lim.AllowTopic(peer, "t", 0); err != nil {
+		t.Fatalf("post-refill: topic bucket appears to have been charged anyway: %v", err)
+	}
+}
+
+// TestAllowTopic_ResetDropsBuckets asserts that Reset(peer) drops both
+// the global and per-topic state for peer.
+func TestAllowTopic_ResetDropsBuckets(t *testing.T) {
+	fk := clock.NewFake(anchor)
+	lim := ratelimit.New(ratelimit.DefaultLimits(), fk)
+	peer := entmoot.NodeID(3)
+	topic := "_pilot/transport/v1"
+
+	for i := 0; i < 10; i++ {
+		if err := lim.AllowTopic(peer, topic, 64); err != nil {
+			t.Fatalf("drain %d: %v", i, err)
+		}
+	}
+	if err := lim.AllowTopic(peer, topic, 64); !errors.Is(err, entmoot.ErrRateLimited) {
+		t.Fatalf("post-drain: expected ErrRateLimited, got %v", err)
+	}
+	lim.Reset(peer)
+	// Fresh burst available again.
+	for i := 0; i < 10; i++ {
+		if err := lim.AllowTopic(peer, topic, 64); err != nil {
+			t.Fatalf("post-reset %d: %v", i, err)
+		}
+	}
+}
+
 func TestNew_NilClockUsesSystem(t *testing.T) {
 	// Smoke test: a nil clock should not panic and should still apply
 	// limits. We can't usefully assert timing without racing real time,

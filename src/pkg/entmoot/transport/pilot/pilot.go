@@ -466,6 +466,31 @@ func (t *Transport) TrustedPeers(ctx context.Context) ([]entmoot.NodeID, error) 
 	return out, nil
 }
 
+// SetPeerEndpoints implements gossip.Transport. Forwards the endpoints
+// straight to the Pilot daemon via driver.SetPeerEndpoints so the
+// daemon's peerTCP map gets populated with externally-sourced endpoint
+// hints (e.g. from an accepted Entmoot TransportAd gossip or an
+// invite-embedded list at Join time). Registry-sourced endpoints still
+// take precedence on the Pilot side if both exist. (v1.2.0)
+func (t *Transport) SetPeerEndpoints(ctx context.Context, peer entmoot.NodeID, endpoints []entmoot.NodeEndpoint) error {
+	select {
+	case <-t.closed:
+		return net.ErrClosed
+	default:
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	driverEps := make([]driver.Endpoint, 0, len(endpoints))
+	for _, ep := range endpoints {
+		driverEps = append(driverEps, driver.Endpoint{Network: ep.Network, Addr: ep.Addr})
+	}
+	if err := t.driver.SetPeerEndpoints(uint32(peer), driverEps); err != nil {
+		return fmt.Errorf("pilot: set peer endpoints for %d: %w", peer, err)
+	}
+	return nil
+}
+
 // Close releases the listener, every cached yamux session, and the driver
 // connection. Safe to call multiple times; the first call does the work,
 // subsequent calls return nil.

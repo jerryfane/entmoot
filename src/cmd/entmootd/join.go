@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -21,6 +22,7 @@ import (
 	"entmoot/pkg/entmoot/gossip"
 	"entmoot/pkg/entmoot/ipc"
 	"entmoot/pkg/entmoot/keystore"
+	"entmoot/pkg/entmoot/ratelimit"
 	"entmoot/pkg/entmoot/roster"
 	"entmoot/pkg/entmoot/store"
 	"entmoot/pkg/entmoot/topic"
@@ -31,6 +33,18 @@ import (
 // until the process is signalled.
 func cmdJoin(gf *globalFlags, args []string) int {
 	fs := flag.NewFlagSet("join", flag.ContinueOnError)
+	// v1.2.0: repeatable -advertise-endpoint flag feeds the gossiper's
+	// LocalEndpoints callback. Format: "-advertise-endpoint
+	// tcp=37.27.59.89:4443 -advertise-endpoint udp=37.27.59.89:37736".
+	// Zero flags ships a gossiper with LocalEndpoints=nil, which is the
+	// documented "no change from v1.1.x" behavior — we still accept
+	// inbound TransportAds from other peers, we just don't publish one
+	// of our own. Auto-discovery from Pilot (the pilot-daemon's own
+	// configured listen endpoints) is deferred to v1.3 — the jf.7
+	// driver.Info response does not expose listen addresses today.
+	var advertiseEndpoints endpointFlag
+	fs.Var(&advertiseEndpoints, "advertise-endpoint",
+		"advertise this node's endpoint (network=host:port); repeatable (v1.2.0)")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return exitOK
@@ -113,6 +127,18 @@ func cmdJoin(gf *globalFlags, args []string) int {
 	}
 	defer func() { _ = rlog.Close() }()
 
+	// v1.2.0: snapshot the -advertise-endpoint values once at startup
+	// and serve them from LocalEndpoints. A non-empty slice is what
+	// causes the advertiser loop to publish a TransportAd; an empty
+	// slice causes it to no-op quietly (logged at Debug).
+	localEps := advertiseEndpoints.Snapshot()
+	var localEndpointsFn func() []entmoot.NodeEndpoint
+	if len(localEps) > 0 {
+		localEndpointsFn = func() []entmoot.NodeEndpoint {
+			return append([]entmoot.NodeEndpoint(nil), localEps...)
+		}
+	}
+
 	g, err := gossip.New(gossip.Config{
 		LocalNode: nodeID,
 		Identity:  s.identity,
@@ -121,6 +147,12 @@ func cmdJoin(gf *globalFlags, args []string) int {
 		Transport: tr,
 		GroupID:   invite.GroupID,
 		Logger:    slog.Default(),
+		// v1.2.0 wiring: rawStore (the concrete *store.SQLite)
+		// satisfies the gossip.TransportAdStore interface; notifyStore
+		// is a thin wrapper around it for the message surface only.
+		TransportAdStore: rawStore,
+		RateLimiter:      ratelimit.New(ratelimit.DefaultLimits(), nil),
+		LocalEndpoints:   localEndpointsFn,
 	})
 	if err != nil {
 		slog.Error("join: new gossiper", slog.String("err", err.Error()))
@@ -165,6 +197,33 @@ func cmdJoin(gf *globalFlags, args []string) int {
 			slog.Warn("join: remove control socket", slog.String("err", err.Error()))
 		}
 	}
+
+	// v1.2.0: replay persisted TransportAds into Pilot so peerTCP is
+	// warm before the accept loop begins. Handles the "pilot-daemon
+	// restart but entmootd still up" case and the "entmootd restart
+	// but pilot still up" case symmetrically: on either boot, state
+	// converges from disk. Failures are non-fatal — the ongoing
+	// advertiser/refanout loops rebuild peerTCP within one refresh
+	// cycle if we can't replay now. Own-author ads are skipped
+	// because Pilot doesn't need (and on jf.7 actively rejects) a
+	// self entry in its peerTCP map.
+	replayCtx, replayCancel := context.WithTimeout(rootCtx, 10*time.Second)
+	if ads, err := rawStore.GetAllTransportAds(replayCtx, invite.GroupID, time.Now(), false); err != nil {
+		slog.Warn("join: replay transport ads",
+			slog.String("err", err.Error()))
+	} else {
+		for _, ad := range ads {
+			if ad.Author.PilotNodeID == nodeID {
+				continue
+			}
+			if err := tr.SetPeerEndpoints(replayCtx, ad.Author.PilotNodeID, ad.Endpoints); err != nil {
+				slog.Debug("join: replay endpoint install failed",
+					slog.Uint64("peer", uint64(ad.Author.PilotNodeID)),
+					slog.String("err", err.Error()))
+			}
+		}
+	}
+	replayCancel()
 
 	// Start the gossiper accept loop and the IPC accept loop in
 	// separate goroutines. Wait for both to return before emitting the
@@ -278,6 +337,73 @@ func loadInvite(arg string) (*entmoot.Invite, error) {
 // surface in this file stays minimal.
 func hasPrefix(s, p string) bool {
 	return len(s) >= len(p) && s[:len(p)] == p
+}
+
+// endpointFlag implements flag.Value for a repeatable
+// -advertise-endpoint argument whose value is "network=host:port".
+// Networks are restricted to "tcp" and "udp" (what Pilot's driver
+// understands today). The addr half is parsed with net.SplitHostPort
+// so we catch a malformed value at flag-parse time rather than at
+// advertiser-publish time. (v1.2.0)
+type endpointFlag struct {
+	entries []entmoot.NodeEndpoint
+}
+
+// Set parses one -advertise-endpoint value of the form
+// "network=host:port". Repeated invocations append to the slice.
+// Empty values are rejected so `-advertise-endpoint ""` surfaces at
+// parse time rather than as a silent no-op.
+func (e *endpointFlag) Set(s string) error {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return errors.New("empty -advertise-endpoint")
+	}
+	eq := strings.IndexByte(s, '=')
+	if eq <= 0 || eq == len(s)-1 {
+		return fmt.Errorf("-advertise-endpoint %q: want network=host:port", s)
+	}
+	network := strings.TrimSpace(s[:eq])
+	addr := strings.TrimSpace(s[eq+1:])
+	switch network {
+	case "tcp", "udp":
+	default:
+		return fmt.Errorf("-advertise-endpoint %q: unsupported network %q (want tcp or udp)", s, network)
+	}
+	if _, _, err := net.SplitHostPort(addr); err != nil {
+		return fmt.Errorf("-advertise-endpoint %q: parse addr: %w", s, err)
+	}
+	e.entries = append(e.entries, entmoot.NodeEndpoint{Network: network, Addr: addr})
+	return nil
+}
+
+// String implements flag.Value. Concatenates the parsed entries in
+// the canonical "network=addr" form joined with commas so help text
+// prints something readable for a partially-parsed state.
+func (e *endpointFlag) String() string {
+	if e == nil || len(e.entries) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	for i, ep := range e.entries {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		sb.WriteString(ep.Network)
+		sb.WriteByte('=')
+		sb.WriteString(ep.Addr)
+	}
+	return sb.String()
+}
+
+// Snapshot returns a defensive copy of the parsed entries. The
+// gossiper's LocalEndpoints callback captures this snapshot in a
+// closure so later flag mutations (shouldn't happen, but we're
+// safe-by-default) don't race the advertiser-loop reads.
+func (e *endpointFlag) Snapshot() []entmoot.NodeEndpoint {
+	if e == nil {
+		return nil
+	}
+	return append([]entmoot.NodeEndpoint(nil), e.entries...)
 }
 
 // notifyingStore wraps a MessageStore and publishes newly-stored

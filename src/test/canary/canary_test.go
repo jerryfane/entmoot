@@ -12,6 +12,7 @@ import (
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/gossip"
 	"entmoot/pkg/entmoot/keystore"
+	"entmoot/pkg/entmoot/ratelimit"
 	"entmoot/pkg/entmoot/roster"
 	"entmoot/pkg/entmoot/store"
 	"entmoot/pkg/entmoot/transport/pilot"
@@ -447,26 +448,52 @@ func TestCanaryPilot(t *testing.T) {
 	}
 
 	// ---- Gossipers.
-	newGossiper := func(n entmoot.NodeID, id *keystore.Identity, r *roster.RosterLog, s store.MessageStore, tr *pilot.Transport) *gossip.Gossiper {
+	//
+	// v1.2.0: the canary wires TransportAdStore (the same *store.SQLite
+	// handle used for messages), a ratelimit.Limiter with the default
+	// topic caps, and a static LocalEndpoints closure that announces a
+	// fabricated "tcp" endpoint per node. The endpoints are synthetic
+	// (127.0.0.N:port placeholders — Pilot doesn't try to dial them;
+	// the ads are a pure control-plane test). With the advertiser
+	// enabled on all three nodes, each peer's store should end up
+	// holding two TransportAd rows (one per OTHER peer) shortly after
+	// convergence.
+	adEndpointFor := func(n entmoot.NodeID) []entmoot.NodeEndpoint {
+		// Deterministic, non-overlapping synthetic endpoints so a
+		// test-log diff is readable. Port = 40000 + (nodeID mod 1000)
+		// keeps us inside the valid uint16 range even for large NodeIDs
+		// (Pilot mints random ~66k-ish ids in the canary).
+		port := 40000 + int(n)%1000
+		return []entmoot.NodeEndpoint{
+			{Network: "tcp", Addr: "127.0.0.1:" + itoa(port)},
+		}
+	}
+	newGossiper := func(n entmoot.NodeID, id *keystore.Identity, r *roster.RosterLog, s store.MessageStore, tr *pilot.Transport, tas gossip.TransportAdStore) *gossip.Gossiper {
 		t.Helper()
+		endpoints := adEndpointFor(n)
 		g, err := gossip.New(gossip.Config{
-			LocalNode: n,
-			Identity:  id,
-			Roster:    r,
-			Store:     s,
-			Transport: tr,
-			GroupID:   gid,
-			Fanout:    2,
-			Logger:    logger,
+			LocalNode:        n,
+			Identity:         id,
+			Roster:           r,
+			Store:            s,
+			Transport:        tr,
+			GroupID:          gid,
+			Fanout:            2,
+			Logger:           logger,
+			TransportAdStore: tas,
+			RateLimiter:      ratelimit.New(ratelimit.DefaultLimits(), nil),
+			LocalEndpoints: func() []entmoot.NodeEndpoint {
+				return endpoints
+			},
 		})
 		if err != nil {
 			t.Fatalf("gossip.New for %d: %v", n, err)
 		}
 		return g
 	}
-	gA := newGossiper(a.NodeID, idA, rosterA, storeA, trA)
-	gB := newGossiper(b.NodeID, idB, rosterB, storeB, trB)
-	gC := newGossiper(c.NodeID, idC, rosterC, storeC, trC)
+	gA := newGossiper(a.NodeID, idA, rosterA, storeA, trA, storeA)
+	gB := newGossiper(b.NodeID, idB, rosterB, storeB, trB, storeB)
+	gC := newGossiper(c.NodeID, idC, rosterC, storeC, trC, storeC)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
@@ -531,6 +558,74 @@ func TestCanaryPilot(t *testing.T) {
 				t.Fatalf("store %d content mismatch", n)
 			}
 		}
+	}
+
+	// v1.2.0: assert the TransportAd publish → receive-validate →
+	// store pipeline works end-to-end over a real Pilot tunnel. We
+	// look for each peer having at least one row from a non-self
+	// author (i.e. the ad arrived via gossip, not via the local
+	// advertiser path). With three nodes and a fully-connected
+	// handshake graph this would be two non-self rows per peer; but
+	// the canary's B↔C handshake is best-effort (see the
+	// "handshakeApproveBestEffort" site above) because Pilot's
+	// private-to-private reachability depends on registry-observed
+	// endpoints. When that pair doesn't complete, B and C only ever
+	// receive ads via A, so each has one non-self row (A's). We
+	// accept "at least 1" to match that deployment reality. Two
+	// real-world observations guide the bar:
+	//   - a stale pilot-daemon binary on disk may not implement the
+	//     jf.7 set_peer_endpoints IPC — the install step logs a
+	//     warning but the store path still runs, so this assertion
+	//     remains meaningful even against old daemons.
+	//   - the iptables UDP-block + pilot-daemon-restart TCP-fallback
+	//     drill described in the plan requires root + nft and the
+	//     production deployment runbook; not run here.
+	adStores := map[entmoot.NodeID]*store.SQLite{
+		a.NodeID: storeA, b.NodeID: storeB, c.NodeID: storeC,
+	}
+	adDeadline := time.Now().Add(30 * time.Second)
+	for {
+		allHaveOne := true
+		for self, s := range adStores {
+			adsCtx, adsCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			ads, err := s.GetAllTransportAds(adsCtx, gid, time.Now(), false)
+			adsCancel()
+			if err != nil {
+				t.Fatalf("store %d GetAllTransportAds: %v", self, err)
+			}
+			nonSelf := 0
+			for _, ad := range ads {
+				if ad.Author.PilotNodeID != self {
+					nonSelf++
+				}
+			}
+			if nonSelf < 1 {
+				allHaveOne = false
+				break
+			}
+		}
+		if allHaveOne {
+			logger.Info("pilot canary: every peer received a TransportAd from at least one non-self author")
+			break
+		}
+		if time.Now().After(adDeadline) {
+			for self, s := range adStores {
+				adsCtx, adsCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				ads, _ := s.GetAllTransportAds(adsCtx, gid, time.Now(), false)
+				adsCancel()
+				logger.Warn("pilot canary: transport_ads snapshot at deadline",
+					slog.Uint64("self", uint64(self)),
+					slog.Int("rows", len(ads)))
+				for _, ad := range ads {
+					logger.Warn("  transport_ad row",
+						slog.Uint64("author", uint64(ad.Author.PilotNodeID)),
+						slog.Uint64("seq", ad.Seq),
+						slog.Int("endpoints", len(ad.Endpoints)))
+				}
+			}
+			t.Fatalf("transport_ads did not propagate to every peer within 30s")
+		}
+		time.Sleep(500 * time.Millisecond)
 	}
 }
 

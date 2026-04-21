@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-04-21
+
+### Added
+
+- **Transport-endpoint advertisements** (`_pilot/transport/v1`
+  topic). Each group member publishes a signed `TransportAd`
+  naming their current TCP/UDP endpoints; receivers verify it
+  and install the endpoints into Pilot's `peerTCP` map via the
+  new jf.7 `SetPeerEndpoints` IPC. Gives Entmoot groups
+  peer-to-peer endpoint discovery that works without any
+  central-registry cooperation — critical on our deployment
+  where the upstream registry silently drops the `endpoints`
+  field that Pilot's own multi-transport protocol expects.
+
+  Wire semantics: IPNS-style signed record with a per-author
+  monotonic `Seq` counter. Storage: LWW-Register — at most one
+  row per (`group_id`, `author`) in the new `transport_ads`
+  SQLite table, with lexicographic signature tiebreak on `Seq`
+  ties. A publish of 10,000 ads retains exactly one row;
+  retained state is structurally O(N_members × 1 ad),
+  independent of publish rate.
+
+  Three-layer spam defence in receive order (cheapest-first):
+  schema + 1 KiB size cap, publisher allowlist (a peer may only
+  advertise its own endpoints), per-(topic, author) token
+  bucket via the new `ratelimit.AllowTopic` (10 tokens, refill
+  1/hour for `_pilot/transport/v1` — legitimate publisher needs
+  ~1/week, 1680× headroom).
+
+  Join-time support: invites now carry per-bootstrap-peer
+  endpoint hints (signed by the founder, so authenticated), and
+  the Join flow pulls a `TransportSnapshotReq` from the
+  bootstrap peer immediately after roster sync. The newcomer's
+  `peerTCP` is fully populated before the first post-Join
+  dial — TCP fallback is available on the very first dial of
+  every group member, not only after the next advertiser
+  refresh.
+
+  On entmootd startup, the persistent `transport_ads` table is
+  replayed into Pilot so the `peerTCP` map is warm even if
+  Pilot was restarted while entmootd was up (and vice versa:
+  entmootd restart with Pilot still running converges the map
+  from disk). `entmootd join` gains a repeatable
+  `-advertise-endpoint network=host:port` flag to feed
+  `LocalEndpoints`; auto-discovery from the Pilot daemon's own
+  configured listen endpoints is deferred to v1.3, contingent
+  on a new `driver.Info` field.
+
+  Pairs with Pilot v1.9.0-jf.7.
+
 ## [1.1.0] - 2026-04-21
 
 ### Changed

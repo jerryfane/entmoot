@@ -54,6 +54,14 @@ type Transport interface {
 	// by the bootstrap fallback (ARCHITECTURE §5.2).
 	TrustedPeers(ctx context.Context) ([]entmoot.NodeID, error)
 
+	// SetPeerEndpoints installs externally-sourced transport endpoints for a
+	// peer into the underlying transport's state (e.g., Pilot's peerTCP
+	// map). Called by the gossiper when a verified TransportAd arrives and
+	// when invite-embedded endpoints are parsed at Join time.
+	// Implementations that don't support per-peer endpoint injection (the
+	// in-memory test transport) may no-op. (v1.2.0)
+	SetPeerEndpoints(ctx context.Context, peer entmoot.NodeID, endpoints []entmoot.NodeEndpoint) error
+
 	// Close releases resources. Pending Accepts return an error.
 	Close() error
 }
@@ -69,6 +77,26 @@ type memTransport struct {
 
 	closeOnce sync.Once
 	closed    chan struct{}
+
+	// endpoints records SetPeerEndpoints calls so tests can introspect
+	// "was this peer's set called, and with what endpoints?" via
+	// EndpointsFor. Not consulted by Dial (the hub routes by NodeID
+	// alone); purely observational. (v1.2.0)
+	epMu      sync.Mutex
+	endpoints map[entmoot.NodeID][]entmoot.NodeEndpoint
+}
+
+// EndpointsFor returns the last endpoints slice SetPeerEndpoints was
+// called with for peer, or nil if no such call was made. Test-only
+// helper: production gossip code never reads this.
+func (t *memTransport) EndpointsFor(peer entmoot.NodeID) []entmoot.NodeEndpoint {
+	t.epMu.Lock()
+	defer t.epMu.Unlock()
+	out := t.endpoints[peer]
+	if out == nil {
+		return nil
+	}
+	return append([]entmoot.NodeEndpoint(nil), out...)
 }
 
 // memAcceptItem is what memTransport.acceptCh delivers: the server-side end of
@@ -172,6 +200,29 @@ func (t *memTransport) Accept(ctx context.Context) (net.Conn, entmoot.NodeID, er
 	case <-ctx.Done():
 		return nil, 0, ctx.Err()
 	}
+}
+
+// SetPeerEndpoints implements Transport. The in-memory mock has no
+// equivalent of Pilot's peerTCP map (dials route through the hub on
+// NodeID alone), so the recorded call is kept on t.endpoints for tests
+// that care to introspect, but delivery semantics are unaffected.
+// (v1.2.0)
+func (t *memTransport) SetPeerEndpoints(ctx context.Context, peer entmoot.NodeID, endpoints []entmoot.NodeEndpoint) error {
+	select {
+	case <-t.closed:
+		return net.ErrClosed
+	default:
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	t.epMu.Lock()
+	if t.endpoints == nil {
+		t.endpoints = make(map[entmoot.NodeID][]entmoot.NodeEndpoint)
+	}
+	t.endpoints[peer] = append(t.endpoints[peer][:0:0], endpoints...)
+	t.epMu.Unlock()
+	return nil
 }
 
 // TrustedPeers implements Transport. The mock treats every node in the hub

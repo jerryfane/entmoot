@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"net/url"
@@ -15,9 +16,338 @@ import (
 
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/canonical"
+	"entmoot/pkg/entmoot/wire"
 
 	_ "modernc.org/sqlite"
 )
+
+// mkTransportAd constructs a wire.TransportAd for tests. The signature is
+// a user-controlled blob so tiebreak tests can pin exact bytes; the shape
+// is otherwise production-realistic.
+func mkTransportAd(gid entmoot.GroupID, authorNodeID entmoot.NodeID, seq uint64, issuedMs, notAfterMs int64, sig []byte) wire.TransportAd {
+	return wire.TransportAd{
+		GroupID: gid,
+		Author: entmoot.NodeInfo{
+			PilotNodeID:   authorNodeID,
+			EntmootPubKey: bytes.Repeat([]byte{byte(authorNodeID)}, 32),
+		},
+		Seq: seq,
+		Endpoints: []entmoot.NodeEndpoint{
+			{Network: "tcp", Addr: "198.51.100.1:4001"},
+		},
+		IssuedAt:  issuedMs,
+		NotAfter:  notAfterMs,
+		Signature: sig,
+	}
+}
+
+func TestTransportAdPutAndGet(t *testing.T) {
+	ctx := context.Background()
+	s, err := OpenSQLite(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	gid := randGroupID(t)
+	ad := mkTransportAd(gid, 42, 1, 1_000, 10_000, []byte("sig-v1"))
+
+	replaced, err := s.PutTransportAd(ctx, ad)
+	if err != nil {
+		t.Fatalf("PutTransportAd: %v", err)
+	}
+	if !replaced {
+		t.Fatal("PutTransportAd replaced=false on first insert; want true")
+	}
+
+	got, ok, err := s.GetTransportAd(ctx, gid, 42)
+	if err != nil {
+		t.Fatalf("GetTransportAd: %v", err)
+	}
+	if !ok {
+		t.Fatal("GetTransportAd ok=false after Put")
+	}
+	if got.Seq != ad.Seq {
+		t.Fatalf("Seq = %d, want %d", got.Seq, ad.Seq)
+	}
+	if got.Author.PilotNodeID != ad.Author.PilotNodeID {
+		t.Fatalf("Author.PilotNodeID = %d, want %d",
+			got.Author.PilotNodeID, ad.Author.PilotNodeID)
+	}
+	if got.IssuedAt != ad.IssuedAt || got.NotAfter != ad.NotAfter {
+		t.Fatalf("timestamps (%d,%d), want (%d,%d)",
+			got.IssuedAt, got.NotAfter, ad.IssuedAt, ad.NotAfter)
+	}
+	if !bytes.Equal(got.Signature, ad.Signature) {
+		t.Fatalf("Signature differs: got %x, want %x", got.Signature, ad.Signature)
+	}
+	if len(got.Endpoints) != 1 || got.Endpoints[0] != ad.Endpoints[0] {
+		t.Fatalf("Endpoints = %+v, want %+v", got.Endpoints, ad.Endpoints)
+	}
+}
+
+func TestTransportAdReplaceOnHigherSeq(t *testing.T) {
+	ctx := context.Background()
+	s, err := OpenSQLite(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	gid := randGroupID(t)
+	ad1 := mkTransportAd(gid, 7, 1, 1_000, 10_000, []byte("sig-v1"))
+	ad2 := mkTransportAd(gid, 7, 2, 2_000, 20_000, []byte("sig-v2"))
+
+	if _, err := s.PutTransportAd(ctx, ad1); err != nil {
+		t.Fatalf("Put ad1: %v", err)
+	}
+	replaced, err := s.PutTransportAd(ctx, ad2)
+	if err != nil {
+		t.Fatalf("Put ad2: %v", err)
+	}
+	if !replaced {
+		t.Fatal("replaced=false on higher-seq put; want true")
+	}
+	got, ok, err := s.GetTransportAd(ctx, gid, 7)
+	if err != nil || !ok {
+		t.Fatalf("Get: err=%v ok=%v", err, ok)
+	}
+	if got.Seq != 2 {
+		t.Fatalf("Seq = %d, want 2", got.Seq)
+	}
+	if !bytes.Equal(got.Signature, ad2.Signature) {
+		t.Fatalf("Signature = %x, want %x", got.Signature, ad2.Signature)
+	}
+}
+
+func TestTransportAdRejectLowerSeq(t *testing.T) {
+	ctx := context.Background()
+	s, err := OpenSQLite(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	gid := randGroupID(t)
+	ad2 := mkTransportAd(gid, 7, 2, 2_000, 20_000, []byte("sig-v2"))
+	ad1 := mkTransportAd(gid, 7, 1, 1_000, 10_000, []byte("sig-v1"))
+
+	if _, err := s.PutTransportAd(ctx, ad2); err != nil {
+		t.Fatalf("Put ad2: %v", err)
+	}
+	replaced, err := s.PutTransportAd(ctx, ad1)
+	if err != nil {
+		t.Fatalf("Put ad1: %v", err)
+	}
+	if replaced {
+		t.Fatal("replaced=true on lower-seq put; want false")
+	}
+
+	got, ok, err := s.GetTransportAd(ctx, gid, 7)
+	if err != nil || !ok {
+		t.Fatalf("Get: err=%v ok=%v", err, ok)
+	}
+	if got.Seq != 2 {
+		t.Fatalf("Seq = %d, want 2 (ad2 should have won)", got.Seq)
+	}
+	if !bytes.Equal(got.Signature, ad2.Signature) {
+		t.Fatalf("Signature = %x, want ad2's %x", got.Signature, ad2.Signature)
+	}
+}
+
+func TestTransportAdTiebreakOnSignature(t *testing.T) {
+	ctx := context.Background()
+	s, err := OpenSQLite(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	gid := randGroupID(t)
+	// Same seq, different signature bytes. Lex-greater must win.
+	sigLow := []byte{0x10, 0x00}
+	sigHigh := []byte{0x20, 0x00}
+
+	// Insert low first, then high — high should replace.
+	adLow := mkTransportAd(gid, 7, 5, 5_000, 50_000, sigLow)
+	adHigh := mkTransportAd(gid, 7, 5, 5_000, 50_000, sigHigh)
+
+	if _, err := s.PutTransportAd(ctx, adLow); err != nil {
+		t.Fatalf("Put adLow: %v", err)
+	}
+	replaced, err := s.PutTransportAd(ctx, adHigh)
+	if err != nil {
+		t.Fatalf("Put adHigh: %v", err)
+	}
+	if !replaced {
+		t.Fatal("replaced=false on lex-greater-sig equal-seq put; want true")
+	}
+	got, ok, err := s.GetTransportAd(ctx, gid, 7)
+	if err != nil || !ok {
+		t.Fatalf("Get: err=%v ok=%v", err, ok)
+	}
+	if !bytes.Equal(got.Signature, sigHigh) {
+		t.Fatalf("Signature = %x, want lex-greater %x", got.Signature, sigHigh)
+	}
+
+	// Now put adLow again — must be rejected (lex-smaller-or-equal).
+	replaced, err = s.PutTransportAd(ctx, adLow)
+	if err != nil {
+		t.Fatalf("Put adLow repeat: %v", err)
+	}
+	if replaced {
+		t.Fatal("replaced=true on lex-smaller-sig equal-seq put; want false")
+	}
+	got, _, _ = s.GetTransportAd(ctx, gid, 7)
+	if !bytes.Equal(got.Signature, sigHigh) {
+		t.Fatalf("Signature = %x after reject, want lex-greater still %x",
+			got.Signature, sigHigh)
+	}
+}
+
+func TestTransportAdGCExpired(t *testing.T) {
+	ctx := context.Background()
+	s, err := OpenSQLite(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	gid := randGroupID(t)
+	now := time.UnixMilli(100_000)
+	// Two expired (NotAfter < now), one still valid.
+	ads := []wire.TransportAd{
+		mkTransportAd(gid, 1, 1, 1_000, 50_000, []byte("a")),
+		mkTransportAd(gid, 2, 1, 1_000, 99_999, []byte("b")),
+		mkTransportAd(gid, 3, 1, 1_000, 200_000, []byte("c")),
+	}
+	for _, ad := range ads {
+		if _, err := s.PutTransportAd(ctx, ad); err != nil {
+			t.Fatalf("Put %d: %v", ad.Author.PilotNodeID, err)
+		}
+	}
+
+	n, err := s.GCExpiredTransportAds(ctx, now)
+	if err != nil {
+		t.Fatalf("GCExpiredTransportAds: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("GC returned %d, want 2", n)
+	}
+
+	// Only author 3 should remain.
+	if _, ok, _ := s.GetTransportAd(ctx, gid, 1); ok {
+		t.Fatal("author 1 should have been GC'd")
+	}
+	if _, ok, _ := s.GetTransportAd(ctx, gid, 2); ok {
+		t.Fatal("author 2 should have been GC'd")
+	}
+	if _, ok, _ := s.GetTransportAd(ctx, gid, 3); !ok {
+		t.Fatal("author 3 should have survived GC")
+	}
+}
+
+func TestTransportAdGetAllFilterExpired(t *testing.T) {
+	ctx := context.Background()
+	s, err := OpenSQLite(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	gid := randGroupID(t)
+	now := time.UnixMilli(100_000)
+	ads := []wire.TransportAd{
+		mkTransportAd(gid, 1, 1, 1_000, 50_000, []byte("a")),
+		mkTransportAd(gid, 2, 1, 1_000, 99_999, []byte("b")),
+		mkTransportAd(gid, 3, 1, 1_000, 200_000, []byte("c")),
+	}
+	for _, ad := range ads {
+		if _, err := s.PutTransportAd(ctx, ad); err != nil {
+			t.Fatalf("Put %d: %v", ad.Author.PilotNodeID, err)
+		}
+	}
+
+	got, err := s.GetAllTransportAds(ctx, gid, now, false)
+	if err != nil {
+		t.Fatalf("GetAllTransportAds: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("unexpired count = %d, want 1", len(got))
+	}
+	if got[0].Author.PilotNodeID != 3 {
+		t.Fatalf("surviving author = %d, want 3", got[0].Author.PilotNodeID)
+	}
+
+	// includeExpired=true returns all three, sorted by author_node_id.
+	all, err := s.GetAllTransportAds(ctx, gid, now, true)
+	if err != nil {
+		t.Fatalf("GetAllTransportAds inclExpired: %v", err)
+	}
+	if len(all) != 3 {
+		t.Fatalf("all count = %d, want 3", len(all))
+	}
+	for i, ad := range all {
+		wantID := entmoot.NodeID(i + 1)
+		if ad.Author.PilotNodeID != wantID {
+			t.Fatalf("all[%d].Author = %d, want %d (sort by author)",
+				i, ad.Author.PilotNodeID, wantID)
+		}
+	}
+}
+
+func TestBumpTransportAdSeqMonotonic(t *testing.T) {
+	ctx := context.Background()
+	s, err := OpenSQLite(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	gid := randGroupID(t)
+	for i, want := range []uint64{1, 2, 3} {
+		got, err := s.BumpTransportAdSeq(ctx, gid, 99)
+		if err != nil {
+			t.Fatalf("BumpTransportAdSeq #%d: %v", i, err)
+		}
+		if got != want {
+			t.Fatalf("BumpTransportAdSeq #%d = %d, want %d", i, got, want)
+		}
+	}
+}
+
+func TestBumpTransportAdSeqPersistsAcrossOpen(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+
+	s, err := OpenSQLite(root)
+	if err != nil {
+		t.Fatalf("OpenSQLite #1: %v", err)
+	}
+	gid := randGroupID(t)
+	for i := 0; i < 3; i++ {
+		if _, err := s.BumpTransportAdSeq(ctx, gid, 99); err != nil {
+			t.Fatalf("BumpTransportAdSeq %d: %v", i, err)
+		}
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	s2, err := OpenSQLite(root)
+	if err != nil {
+		t.Fatalf("OpenSQLite #2: %v", err)
+	}
+	t.Cleanup(func() { _ = s2.Close() })
+
+	got, err := s2.BumpTransportAdSeq(ctx, gid, 99)
+	if err != nil {
+		t.Fatalf("BumpTransportAdSeq post-reopen: %v", err)
+	}
+	if got != 4 {
+		t.Fatalf("seq = %d, want 4 (counter should persist across Close)", got)
+	}
+}
 
 // TestSQLiteWALMode verifies that WAL is actually engaged after open by
 // querying PRAGMA journal_mode on the raw database file created for the

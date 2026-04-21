@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"net"
+	"strconv"
 	"sync"
 	"time"
 
@@ -17,6 +18,7 @@ import (
 	"entmoot/pkg/entmoot/canonical"
 	"entmoot/pkg/entmoot/clock"
 	"entmoot/pkg/entmoot/keystore"
+	"entmoot/pkg/entmoot/ratelimit"
 	"entmoot/pkg/entmoot/roster"
 	"entmoot/pkg/entmoot/store"
 	"entmoot/pkg/entmoot/wire"
@@ -178,6 +180,65 @@ type reconcileState struct {
 // real gossip math is O(log N + k) and we'll revisit for v1.
 const defaultFanout = 3
 
+// transportAdTopic is the topic key passed to the rate limiter for inbound
+// TransportAd frames. Namespaced under "_pilot/*" so regular content topics
+// never collide. Kept in gossiper.go because receivers consume it; the
+// advertiser on the publish side uses the same string by contract. (v1.2.0)
+const transportAdTopic = "_pilot/transport/v1"
+
+// transportAdMaxEndpoints bounds the number of (network, addr) pairs one
+// TransportAd can advertise. Matches the plan's 4-entry cap — enough for
+// tcp+udp over IPv4+IPv6 or a couple of relay hints — and keeps the
+// canonical-encoded size inside transportAdMaxBytes with slack. (v1.2.0)
+const transportAdMaxEndpoints = 4
+
+// transportAdMaxBytes caps the canonical-encoded size of a single
+// TransportAd. 1 KiB with 4 endpoints + Ed25519 signature leaves generous
+// headroom; anything larger indicates a malformed or hostile ad. (v1.2.0)
+const transportAdMaxBytes = 1024
+
+// transportAdRefreshInterval is the weekly safety-net tick at which the
+// advertiser re-publishes this node's TransportAd even when no endpoint
+// change was signalled. Chosen shorter than transportAdTTL so an
+// unchanged ad stays retrievable at every receiver across a refresh
+// cycle. (v1.2.0)
+const transportAdRefreshInterval = 6 * 24 * time.Hour
+
+// transportAdTTL is how long an emitted TransportAd stays valid after
+// IssuedAt. Receivers filter expired ads on query; the advertiser
+// refreshes inside the window so an unchanged endpoint set stays
+// continuously advertised. (v1.2.0)
+const transportAdTTL = 7 * 24 * time.Hour
+
+// transportAdGCInterval is how often the advertiser opportunistically
+// triggers store.GCExpiredTransportAds. Piggybacks on the refresh tick
+// so no separate ticker is required; 6 days is dominant. (v1.2.0)
+
+// TransportAdStore is the subset of the message-store surface the
+// gossiper needs to process TransportAd gossip. Implemented by
+// *store.SQLite. Kept as its own interface so the in-memory MessageStore
+// used by unit tests can omit it entirely — the gossiper no-ops every
+// transport-ad code path when TransportAdStore is nil. (v1.2.0)
+type TransportAdStore interface {
+	// PutTransportAd stores ad, applying LWW semantics (seq first, then
+	// lexicographic signature as tiebreak). Returns replaced=true iff the
+	// incoming ad superseded stored state.
+	PutTransportAd(ctx context.Context, ad wire.TransportAd) (bool, error)
+	// GetTransportAd returns the current ad for (groupID, authorNodeID)
+	// or ok=false if none is stored.
+	GetTransportAd(ctx context.Context, groupID entmoot.GroupID, authorNodeID entmoot.NodeID) (wire.TransportAd, bool, error)
+	// GetAllTransportAds returns every stored ad for the group, filtered
+	// by expiry when includeExpired=false. Used to answer
+	// TransportSnapshotReq frames.
+	GetAllTransportAds(ctx context.Context, groupID entmoot.GroupID, now time.Time, includeExpired bool) ([]wire.TransportAd, error)
+	// BumpTransportAdSeq atomically increments and returns this node's
+	// own ad sequence counter for (groupID, authorNodeID).
+	BumpTransportAdSeq(ctx context.Context, groupID entmoot.GroupID, authorNodeID entmoot.NodeID) (uint64, error)
+	// GCExpiredTransportAds deletes every ad whose NotAfter is strictly
+	// before now. Returns the number of rows deleted.
+	GCExpiredTransportAds(ctx context.Context, now time.Time) (int64, error)
+}
+
 // Config parameterizes a Gossiper. Every field except Fanout, Clock, and
 // Logger is required; New returns an error if a required field is nil or
 // zero. Construct one Gossiper per group per process.
@@ -210,6 +271,37 @@ type Config struct {
 	// Logger is used for slog.Warn / slog.Error surfaces. Nil selects
 	// slog.Default().
 	Logger *slog.Logger
+
+	// TransportAdStore is where signed TransportAd records land after
+	// validation and where the advertiser reads back the current seq at
+	// publish time. nil disables the entire v1.2.0 transport-ad code
+	// path — inbound frames are dropped with a debug log, the advertiser
+	// loop never runs, and TransportSnapshotReq is answered "empty".
+	// Production wires this to the same *store.SQLite the message-store
+	// code uses (both sets of tables share one database per group).
+	// (v1.2.0)
+	TransportAdStore TransportAdStore
+
+	// RateLimiter applies the per-(peer, topic) quota on the inbound
+	// TransportAd receive path via AllowTopic. nil disables topic-level
+	// rate limiting (global per-peer limits, if any, still apply via the
+	// wire layer). The v1.2.0 defaults ship tighter than needed for the
+	// transport-ad topic; see ratelimit.DefaultTopicLimits. (v1.2.0)
+	RateLimiter *ratelimit.Limiter
+
+	// LocalEndpoints returns the current transport endpoints of this node.
+	// Called by the advertiser loop at startup, on EndpointsChanged
+	// signal, and on the weekly refresh ticker. Nil (or a func returning
+	// an empty slice) means "don't advertise" — useful for tests or for
+	// nodes that can't reach pilot. (v1.2.0)
+	LocalEndpoints func() []entmoot.NodeEndpoint
+
+	// EndpointsChanged receives a tick whenever LocalEndpoints is known
+	// to have changed (e.g. pilot reports a new TCP listen port).
+	// Non-blocking send recommended; the advertiser loop collapses
+	// bursts. Nil means "no change signal, rely on the weekly refresh
+	// alone". (v1.2.0)
+	EndpointsChanged <-chan struct{}
 }
 
 // Gossiper runs the accept loop, publishes local messages, and fetches
@@ -610,6 +702,19 @@ func (g *Gossiper) Start(ctx context.Context) error {
 		g.retryLoop(ctx)
 	}()
 
+	// Transport-ad advertiser loop (v1.2.0). Publishes this node's own
+	// TransportAd on startup, on EndpointsChanged, and on a weekly
+	// safety-net ticker. Only runs when TransportAdStore and
+	// LocalEndpoints are both configured — otherwise the receive path
+	// still works (for peers that run it) but we emit nothing.
+	if g.cfg.TransportAdStore != nil && g.cfg.LocalEndpoints != nil {
+		g.wg.Add(1)
+		go func() {
+			defer g.wg.Done()
+			g.advertiserLoop(ctx)
+		}()
+	}
+
 	for {
 		conn, remote, err := g.cfg.Transport.Accept(ctx)
 		if err != nil {
@@ -680,6 +785,10 @@ func (g *Gossiper) handleConn(ctx context.Context, c net.Conn, remote entmoot.No
 		g.onGraft(ctx, remote, v)
 	case *wire.Prune:
 		g.onPrune(remote, v)
+	case *wire.TransportAd:
+		g.onTransportAd(ctx, remote, v)
+	case *wire.TransportSnapshotReq:
+		g.onTransportSnapshotReq(ctx, c, remote, v)
 	case *wire.Hello:
 		// v0 drops Hello: Pilot's tunnel already authenticates the remote.
 		// The codec still recognizes the type (kept for future use), so we
@@ -1860,6 +1969,440 @@ func (g *Gossiper) fetchPeerRange(ctx context.Context, peer entmoot.NodeID, sinc
 		return nil, fmt.Errorf("range: unexpected response type")
 	}
 	return resp.IDs, nil
+}
+
+// onTransportAd validates and installs an inbound TransportAd (v1.2.0).
+// Validation is ordered cheapest-first to drop hostile traffic before
+// doing any cryptographic work: schema + size -> publisher allowlist ->
+// roster membership -> per-(peer, topic) rate limit -> signature ->
+// store LWW check -> install + refanout.
+//
+// Failures at each stage are logged at Warn (structural / spam) or
+// Debug (rate-limit / no-op replace) so operators can distinguish an
+// adversary from a legitimate stale repeat. No stage ever drops the
+// connection — a single bad frame is just a single drop.
+func (g *Gossiper) onTransportAd(ctx context.Context, remote entmoot.NodeID, ad *wire.TransportAd) {
+	if g.cfg.TransportAdStore == nil {
+		g.logger.Debug("gossip: transport_ad received but TransportAdStore not configured",
+			slog.Uint64("remote", uint64(remote)))
+		return
+	}
+
+	// 1. Schema + size. Cheapest checks first so a bad frame is
+	// dropped before we touch crypto. GroupID check also guards
+	// against cross-group replay when one peer is in multiple groups.
+	if ad.GroupID != g.cfg.GroupID {
+		g.logger.Warn("gossip: transport_ad for wrong group",
+			slog.Uint64("remote", uint64(remote)),
+			slog.String("got", ad.GroupID.String()))
+		return
+	}
+	nowMs := g.clk.Now().UnixMilli()
+	if ad.IssuedAt <= 0 || ad.NotAfter <= 0 || ad.NotAfter <= ad.IssuedAt {
+		g.logger.Warn("gossip: transport_ad bad timestamps",
+			slog.Uint64("remote", uint64(remote)),
+			slog.Int64("issued_at", ad.IssuedAt),
+			slog.Int64("not_after", ad.NotAfter))
+		return
+	}
+	if ad.NotAfter <= nowMs {
+		g.logger.Warn("gossip: transport_ad already expired",
+			slog.Uint64("remote", uint64(remote)),
+			slog.Int64("not_after", ad.NotAfter),
+			slog.Int64("now", nowMs))
+		return
+	}
+	if len(ad.Endpoints) == 0 || len(ad.Endpoints) > transportAdMaxEndpoints {
+		g.logger.Warn("gossip: transport_ad endpoint count out of range",
+			slog.Uint64("remote", uint64(remote)),
+			slog.Int("count", len(ad.Endpoints)))
+		return
+	}
+	for i, ep := range ad.Endpoints {
+		if err := validateEndpoint(ep); err != nil {
+			g.logger.Warn("gossip: transport_ad endpoint invalid",
+				slog.Uint64("remote", uint64(remote)),
+				slog.Int("idx", i),
+				slog.String("err", err.Error()))
+			return
+		}
+	}
+	signing := *ad
+	signing.Signature = nil
+	sigInput, err := canonical.Encode(signing)
+	if err != nil {
+		g.logger.Warn("gossip: transport_ad canonical encode",
+			slog.Uint64("remote", uint64(remote)),
+			slog.String("err", err.Error()))
+		return
+	}
+	if len(sigInput) > transportAdMaxBytes {
+		g.logger.Warn("gossip: transport_ad exceeds size cap",
+			slog.Uint64("remote", uint64(remote)),
+			slog.Int("bytes", len(sigInput)),
+			slog.Int("cap", transportAdMaxBytes))
+		return
+	}
+
+	// 2. Publisher allowlist (the core structural defence): the peer
+	// sending this frame must be the ad's author. No one advertises
+	// on behalf of anyone else. Cross-author spam is eliminated at 5
+	// LOC. (Legitimate refanout re-signs with the forwarder's
+	// identity at the envelope layer if we ever add one; for now we
+	// publish single-hop and lean on each author's own refanout.)
+	if ad.Author.PilotNodeID != remote {
+		g.logger.Warn("gossip: transport_ad author/sender mismatch",
+			slog.Uint64("remote", uint64(remote)),
+			slog.Uint64("author", uint64(ad.Author.PilotNodeID)))
+		return
+	}
+
+	// 3. Membership.
+	authorInfo, ok := g.cfg.Roster.MemberInfo(ad.Author.PilotNodeID)
+	if !ok {
+		g.logger.Warn("gossip: transport_ad from non-member author",
+			slog.Uint64("remote", uint64(remote)),
+			slog.Uint64("author", uint64(ad.Author.PilotNodeID)))
+		return
+	}
+
+	// 4. Per-(peer, topic) rate limit. Not a disconnect — just a drop.
+	if g.cfg.RateLimiter != nil {
+		if err := g.cfg.RateLimiter.AllowTopic(remote, transportAdTopic, len(sigInput)); err != nil {
+			g.logger.Warn("gossip: transport_ad rate-limited",
+				slog.Uint64("remote", uint64(remote)),
+				slog.String("err", err.Error()))
+			return
+		}
+	}
+
+	// 5. Signature. Reuses the same pattern as verifyMessage: the
+	// roster-stored pubkey wins over whatever the envelope claims.
+	if !keystore.Verify(authorInfo.EntmootPubKey, sigInput, ad.Signature) {
+		g.logger.Warn("gossip: transport_ad signature invalid",
+			slog.Uint64("remote", uint64(remote)),
+			slog.Uint64("author", uint64(ad.Author.PilotNodeID)))
+		return
+	}
+
+	// 6. Seq check + store. PutTransportAd is atomic and handles the
+	// LWW replace-vs-drop decision itself. replaced=false means the
+	// stored ad was equal or newer; nothing to do.
+	replaced, err := g.cfg.TransportAdStore.PutTransportAd(ctx, *ad)
+	if err != nil {
+		g.logger.Warn("gossip: transport_ad store put",
+			slog.Uint64("remote", uint64(remote)),
+			slog.String("err", err.Error()))
+		return
+	}
+	if !replaced {
+		g.logger.Debug("gossip: transport_ad not newer than stored",
+			slog.Uint64("remote", uint64(remote)),
+			slog.Uint64("author", uint64(ad.Author.PilotNodeID)),
+			slog.Uint64("seq", ad.Seq))
+		return
+	}
+
+	// 7. Install into transport + refanout. SetPeerEndpoints is
+	// best-effort (pilot may be restarting); log-and-continue so a
+	// transient IPC hiccup doesn't block the refanout path that lets
+	// the rest of the mesh converge.
+	if err := g.cfg.Transport.SetPeerEndpoints(ctx, ad.Author.PilotNodeID, ad.Endpoints); err != nil {
+		g.logger.Warn("gossip: transport_ad install peer endpoints",
+			slog.Uint64("author", uint64(ad.Author.PilotNodeID)),
+			slog.String("err", err.Error()))
+	} else {
+		g.logger.Debug("gossip: transport_ad installed",
+			slog.Uint64("author", uint64(ad.Author.PilotNodeID)),
+			slog.Uint64("seq", ad.Seq),
+			slog.Int("endpoints", len(ad.Endpoints)))
+	}
+
+	// Refanout to eager peers (Plumtree-style) minus the sender.
+	// Mirrors the v1.0.5 content-message refanout pattern but carries
+	// the MsgTransportAd envelope directly — no IHave/Graft indirection
+	// is warranted for a small replace-on-seq record.
+	g.refanoutTransportAd(ctx, remote, ad)
+}
+
+// refanoutTransportAd pushes ad to every eager peer except `except`.
+// Same best-effort parallelism as fanoutPush — a stalled peer can't
+// head-of-line-block healthy peers, and dial-backoff is respected.
+// Failures are logged at Debug and do NOT feed the retry scheduler:
+// the ad's weekly refresh + per-author receivers calling us on their
+// own schedule makes retry state redundant. (v1.2.0)
+func (g *Gossiper) refanoutTransportAd(ctx context.Context, except entmoot.NodeID, ad *wire.TransportAd) {
+	peers := g.plumEagerExcept(ctx, except)
+	if len(peers) == 0 {
+		return
+	}
+	var eg errgroup.Group
+	eg.SetLimit(fanoutMaxConcurrency)
+	for _, p := range peers {
+		p := p
+		eg.Go(func() error {
+			dctx, cancel := context.WithTimeout(ctx, fanoutPerPeerTimeout)
+			defer cancel()
+			if err := g.sendTransportAd(dctx, p, ad); err != nil {
+				g.logger.Debug("gossip: transport_ad refanout",
+					slog.Uint64("peer", uint64(p)),
+					slog.Uint64("author", uint64(ad.Author.PilotNodeID)),
+					slog.String("err", err.Error()))
+			}
+			return nil
+		})
+	}
+	_ = eg.Wait()
+}
+
+// sendTransportAd dials peer and writes one TransportAd frame. Used
+// both by refanoutTransportAd and the advertiser loop.
+func (g *Gossiper) sendTransportAd(ctx context.Context, peer entmoot.NodeID, ad *wire.TransportAd) error {
+	if !g.canDial(peer) {
+		return fmt.Errorf("peer %d in dial-backoff", peer)
+	}
+	conn, err := g.cfg.Transport.Dial(ctx, peer)
+	if err != nil {
+		g.recordDialFailure(peer)
+		return fmt.Errorf("dial: %w", err)
+	}
+	g.recordDialSuccess(peer)
+	defer conn.Close()
+	if err := wire.EncodeAndWrite(conn, ad); err != nil {
+		return fmt.Errorf("write transport_ad: %w", err)
+	}
+	return nil
+}
+
+// publishTransportAd builds, signs, stores, and fanouts a fresh
+// TransportAd carrying `endpoints` as this node's current network
+// presence. Called by advertiserLoop on startup, on
+// EndpointsChanged, and on the weekly safety-net tick. Errors at the
+// sign / store / install stages are logged and returned so the caller
+// can decide whether to retry on a shorter cycle. (v1.2.0)
+func (g *Gossiper) publishTransportAd(ctx context.Context, endpoints []entmoot.NodeEndpoint) error {
+	if g.cfg.TransportAdStore == nil {
+		return errors.New("publishTransportAd: no TransportAdStore")
+	}
+	if len(endpoints) == 0 {
+		return errors.New("publishTransportAd: empty endpoints")
+	}
+	if len(endpoints) > transportAdMaxEndpoints {
+		return fmt.Errorf("publishTransportAd: too many endpoints (%d > %d)",
+			len(endpoints), transportAdMaxEndpoints)
+	}
+	for i, ep := range endpoints {
+		if err := validateEndpoint(ep); err != nil {
+			return fmt.Errorf("publishTransportAd: endpoint %d: %w", i, err)
+		}
+	}
+
+	seq, err := g.cfg.TransportAdStore.BumpTransportAdSeq(ctx, g.cfg.GroupID, g.cfg.LocalNode)
+	if err != nil {
+		return fmt.Errorf("publishTransportAd: bump seq: %w", err)
+	}
+
+	issuedAt := g.clk.Now().UnixMilli()
+	ad := wire.TransportAd{
+		GroupID: g.cfg.GroupID,
+		Author: entmoot.NodeInfo{
+			PilotNodeID:   g.cfg.LocalNode,
+			EntmootPubKey: g.cfg.Identity.PublicKey,
+		},
+		Seq:       seq,
+		Endpoints: append([]entmoot.NodeEndpoint(nil), endpoints...),
+		IssuedAt:  issuedAt,
+		NotAfter:  g.clk.Now().Add(transportAdTTL).UnixMilli(),
+	}
+	signing := ad
+	signing.Signature = nil
+	sigInput, err := canonical.Encode(signing)
+	if err != nil {
+		return fmt.Errorf("publishTransportAd: canonical encode: %w", err)
+	}
+	if len(sigInput) > transportAdMaxBytes {
+		return fmt.Errorf("publishTransportAd: encoded ad exceeds cap (%d > %d)",
+			len(sigInput), transportAdMaxBytes)
+	}
+	ad.Signature = g.cfg.Identity.Sign(sigInput)
+
+	if _, err := g.cfg.TransportAdStore.PutTransportAd(ctx, ad); err != nil {
+		// Not fatal — a store write miss still leaves us able to
+		// refanout the in-memory ad. Log and continue.
+		g.logger.Warn("gossip: transport_ad publish store put",
+			slog.String("err", err.Error()))
+	}
+
+	// Install locally so the transport's own view is consistent with
+	// what we're telling the rest of the group. For the pilot adapter
+	// this is a no-op for self; for the mem transport it records the
+	// call for test introspection.
+	if err := g.cfg.Transport.SetPeerEndpoints(ctx, g.cfg.LocalNode, ad.Endpoints); err != nil {
+		g.logger.Debug("gossip: transport_ad self install",
+			slog.String("err", err.Error()))
+	}
+
+	// Fanout to every eager peer — except == 0 asks for "all" since 0
+	// is never a valid NodeID in production.
+	g.fanoutTransportAd(ctx, &ad)
+	return nil
+}
+
+// fanoutTransportAd sends ad to every eager peer. Used by the initial
+// advertiser publish (no sender to exclude). Factored out of
+// refanoutTransportAd because the exclusion set differs.
+func (g *Gossiper) fanoutTransportAd(ctx context.Context, ad *wire.TransportAd) {
+	peers := g.plumEagerExcept(ctx, 0)
+	if len(peers) == 0 {
+		return
+	}
+	var eg errgroup.Group
+	eg.SetLimit(fanoutMaxConcurrency)
+	for _, p := range peers {
+		p := p
+		eg.Go(func() error {
+			dctx, cancel := context.WithTimeout(ctx, fanoutPerPeerTimeout)
+			defer cancel()
+			if err := g.sendTransportAd(dctx, p, ad); err != nil {
+				g.logger.Debug("gossip: transport_ad fanout",
+					slog.Uint64("peer", uint64(p)),
+					slog.String("err", err.Error()))
+			}
+			return nil
+		})
+	}
+	_ = eg.Wait()
+}
+
+// advertiserLoop runs for the lifetime of the gossiper. Publishes a
+// TransportAd on startup, on EndpointsChanged signal, and on a weekly
+// refresh ticker. Weekly refresh is a safety-net so receivers can GC
+// expired entries; normal operation publishes only on change. Also
+// opportunistically GCs this node's view of the transport-ad table on
+// each tick so disk doesn't grow unbounded. (v1.2.0)
+func (g *Gossiper) advertiserLoop(ctx context.Context) {
+	// Kick off the initial publish. Don't block the loop if the first
+	// endpoint query returns empty — LocalEndpoints may legitimately
+	// depend on async pilot state.
+	g.tryPublishTransportAd(ctx, "startup")
+
+	var changed <-chan struct{}
+	if g.cfg.EndpointsChanged != nil {
+		changed = g.cfg.EndpointsChanged
+	}
+
+	ticker := time.NewTicker(transportAdRefreshInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case _, ok := <-changed:
+			if !ok {
+				// Config closed the channel; disable the change path
+				// but keep ticking.
+				changed = nil
+				continue
+			}
+			g.tryPublishTransportAd(ctx, "endpoints_changed")
+		case <-ticker.C:
+			g.tryPublishTransportAd(ctx, "refresh")
+			// GC opportunistically on the same cadence to keep the
+			// table bounded at one live row per group member.
+			if g.cfg.TransportAdStore != nil {
+				if n, err := g.cfg.TransportAdStore.GCExpiredTransportAds(ctx, g.clk.Now()); err != nil {
+					g.logger.Debug("gossip: transport_ad gc",
+						slog.String("err", err.Error()))
+				} else if n > 0 {
+					g.logger.Debug("gossip: transport_ad gc removed rows",
+						slog.Int64("rows", n))
+				}
+			}
+		}
+	}
+}
+
+// tryPublishTransportAd is a thin wrapper that queries LocalEndpoints,
+// short-circuits on an empty slice, and logs publish errors at Warn.
+// reason goes into the log so operators can tell a startup publish from
+// a weekly refresh without turning on verbose tracing.
+func (g *Gossiper) tryPublishTransportAd(ctx context.Context, reason string) {
+	if g.cfg.LocalEndpoints == nil {
+		return
+	}
+	eps := g.cfg.LocalEndpoints()
+	if len(eps) == 0 {
+		g.logger.Debug("gossip: transport_ad skip publish (no local endpoints)",
+			slog.String("reason", reason))
+		return
+	}
+	if err := g.publishTransportAd(ctx, eps); err != nil {
+		g.logger.Warn("gossip: transport_ad publish",
+			slog.String("reason", reason),
+			slog.String("err", err.Error()))
+	}
+}
+
+// onTransportSnapshotReq answers a Join-time or catch-up request for
+// the current TransportAd table. Response is a single frame carrying
+// every unexpired ad this peer holds for the group, ordered by author
+// for determinism. (v1.2.0)
+func (g *Gossiper) onTransportSnapshotReq(ctx context.Context, conn net.Conn, remote entmoot.NodeID, req *wire.TransportSnapshotReq) {
+	if req.GroupID != g.cfg.GroupID {
+		g.logger.Warn("gossip: transport_snapshot_req for wrong group",
+			slog.Uint64("remote", uint64(remote)),
+			slog.String("got", req.GroupID.String()))
+		return
+	}
+	if !g.cfg.Roster.IsMember(remote) {
+		g.logger.Warn("gossip: transport_snapshot_req from non-member",
+			slog.Uint64("remote", uint64(remote)))
+		return
+	}
+	resp := &wire.TransportSnapshotResp{GroupID: g.cfg.GroupID}
+	if g.cfg.TransportAdStore != nil {
+		ads, err := g.cfg.TransportAdStore.GetAllTransportAds(ctx, g.cfg.GroupID, g.clk.Now(), false)
+		if err != nil {
+			g.logger.Warn("gossip: transport_snapshot_req get all",
+				slog.Uint64("remote", uint64(remote)),
+				slog.String("err", err.Error()))
+			// Fall through with empty response rather than dropping —
+			// an empty snapshot is a valid answer and keeps the join
+			// path unblocked.
+		} else {
+			resp.Ads = ads
+		}
+	}
+	if err := wire.EncodeAndWrite(conn, resp); err != nil {
+		g.logger.Warn("gossip: write transport_snapshot_resp",
+			slog.Uint64("remote", uint64(remote)),
+			slog.String("err", err.Error()))
+	}
+}
+
+// validateEndpoint rejects malformed (network, addr) pairs. Networks
+// are restricted to the two Pilot knows how to act on ("tcp", "udp");
+// addr must be parseable by net.SplitHostPort. IP-literal hosts are
+// further sanity-checked so a dangling "example" can't masquerade as a
+// valid endpoint. (v1.2.0)
+func validateEndpoint(ep entmoot.NodeEndpoint) error {
+	switch ep.Network {
+	case "tcp", "udp":
+	default:
+		return fmt.Errorf("unsupported network %q", ep.Network)
+	}
+	host, port, err := net.SplitHostPort(ep.Addr)
+	if err != nil {
+		return fmt.Errorf("parse addr %q: %w", ep.Addr, err)
+	}
+	if host == "" {
+		return fmt.Errorf("empty host in %q", ep.Addr)
+	}
+	if p, err := strconv.Atoi(port); err != nil || p <= 0 || p > 65535 {
+		return fmt.Errorf("invalid port in %q", ep.Addr)
+	}
+	return nil
 }
 
 // latestLocalTimestamp returns the maximum Timestamp across all messages we

@@ -90,12 +90,46 @@ func (g *Gossiper) Join(ctx context.Context, invite *entmoot.Invite) error {
 		return nil
 	}
 
+	// v1.2.0: pre-seed the Pilot transport with invite-embedded
+	// endpoints so the first Join dial can use TCP fallback if UDP
+	// is blocked. Invites are signed by the founder, and
+	// verifyInvite above has already verified that signature, so
+	// endpoints carried here are authenticated end-to-end. A bad
+	// SetPeerEndpoints (pilot restarting, IPC hiccup) is
+	// non-fatal — we log at Debug and continue, falling through to
+	// the same Dial path we had in v1.1.x.
+	for _, bp := range invite.BootstrapPeers {
+		if len(bp.Endpoints) == 0 {
+			continue
+		}
+		if bp.NodeID == g.cfg.LocalNode {
+			continue
+		}
+		if err := g.cfg.Transport.SetPeerEndpoints(ctx, bp.NodeID, bp.Endpoints); err != nil {
+			g.logger.Debug("gossip: set invite endpoints",
+				slog.Uint64("peer", uint64(bp.NodeID)),
+				slog.String("err", err.Error()))
+		}
+	}
+
 	// Strategy 1: invite.BootstrapPeers in listed order.
 	for _, bp := range invite.BootstrapPeers {
 		if bp.NodeID == g.cfg.LocalNode {
 			continue
 		}
 		if err := g.tryRosterSync(ctx, bp.NodeID); err == nil {
+			// v1.2.0: snapshot the bootstrap peer's current
+			// transport-ad table. This populates Pilot's peerTCP for
+			// every group member (not just our bootstrap peer) so
+			// TCP fallback is available for the very first dial of
+			// any peer post-Join, not just after the next
+			// anti-entropy cycle. Failures are non-fatal — the
+			// ongoing gossip path will catch up.
+			if err := g.pullTransportSnapshot(ctx, bp.NodeID); err != nil {
+				g.logger.Debug("gossip: transport snapshot",
+					slog.Uint64("peer", uint64(bp.NodeID)),
+					slog.String("err", err.Error()))
+			}
 			return nil
 		} else {
 			g.logger.Warn("gossip: bootstrap peer failed",
@@ -121,6 +155,11 @@ func (g *Gossiper) Join(ctx context.Context, invite *entmoot.Invite) error {
 				continue
 			}
 			if err := g.tryRosterSync(ctx, peer); err == nil {
+				if err := g.pullTransportSnapshot(ctx, peer); err != nil {
+					g.logger.Debug("gossip: transport snapshot",
+						slog.Uint64("peer", uint64(peer)),
+						slog.String("err", err.Error()))
+				}
 				return nil
 			} else {
 				g.logger.Warn("gossip: trusted-intersect peer failed",
@@ -133,6 +172,11 @@ func (g *Gossiper) Join(ctx context.Context, invite *entmoot.Invite) error {
 	// Strategy 3: founder fallback. Skip if the founder is us.
 	if invite.Founder.PilotNodeID != 0 && invite.Founder.PilotNodeID != g.cfg.LocalNode {
 		if err := g.tryRosterSync(ctx, invite.Founder.PilotNodeID); err == nil {
+			if err := g.pullTransportSnapshot(ctx, invite.Founder.PilotNodeID); err != nil {
+				g.logger.Debug("gossip: transport snapshot",
+					slog.Uint64("peer", uint64(invite.Founder.PilotNodeID)),
+					slog.String("err", err.Error()))
+			}
 			return nil
 		} else {
 			g.logger.Warn("gossip: founder fallback failed",
@@ -212,6 +256,51 @@ func (g *Gossiper) applyEntries(entries []entmoot.RosterEntry) error {
 		if err := g.cfg.Roster.Apply(entries[i]); err != nil {
 			return fmt.Errorf("roster sync: apply entry %s: %w", entries[i].ID, err)
 		}
+	}
+	return nil
+}
+
+// pullTransportSnapshot fetches the current unexpired TransportAd table
+// from peer and feeds each entry through onTransportAd, which performs
+// full validation (signature, allowlist, seq LWW, size) and installs the
+// endpoints into Pilot's peerTCP map via SetPeerEndpoints. Used at
+// Join time to warm up the newcomer's peerTCP for every group member
+// the bootstrap peer has seen an ad for, not just the bootstrap peer
+// itself. Errors are returned so the caller can log at Debug and move
+// on — the ongoing gossip path picks up any missing ads within one
+// advertiser refresh cycle. (v1.2.0)
+func (g *Gossiper) pullTransportSnapshot(ctx context.Context, peer entmoot.NodeID) error {
+	conn, err := g.cfg.Transport.Dial(ctx, peer)
+	if err != nil {
+		return fmt.Errorf("dial: %w", err)
+	}
+	defer conn.Close()
+	req := &wire.TransportSnapshotReq{GroupID: g.cfg.GroupID}
+	if err := wire.EncodeAndWrite(conn, req); err != nil {
+		return fmt.Errorf("write transport_snapshot_req: %w", err)
+	}
+	_, payload, err := wire.ReadAndDecode(conn)
+	if err != nil {
+		return fmt.Errorf("read transport_snapshot_resp: %w", err)
+	}
+	resp, ok := payload.(*wire.TransportSnapshotResp)
+	if !ok {
+		return fmt.Errorf("transport snapshot: unexpected response type %T", payload)
+	}
+	if resp.GroupID != g.cfg.GroupID {
+		return fmt.Errorf("transport snapshot: group_id mismatch")
+	}
+	// onTransportAd performs full validation (schema, size, author
+	// allowlist, membership, signature, LWW seq check) before
+	// installing. The `remote` argument is the author of the ad
+	// itself, not the bootstrap peer that delivered the snapshot:
+	// our allowlist invariant is "author == sender", so fabricating
+	// the sender as the ad's author keeps validation identical to
+	// the live-gossip path. A forwarded ad that fails signature
+	// verification drops inside onTransportAd without side effects.
+	for i := range resp.Ads {
+		ad := &resp.Ads[i]
+		g.onTransportAd(ctx, ad.Author.PilotNodeID, ad)
 	}
 	return nil
 }

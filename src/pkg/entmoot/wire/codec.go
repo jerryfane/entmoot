@@ -48,6 +48,12 @@ func Encode(v any) (MsgType, []byte, error) {
 		t = MsgGraft
 	case *Prune:
 		t = MsgPrune
+	case *TransportAd:
+		t = MsgTransportAd
+	case *TransportSnapshotReq:
+		t = MsgTransportSnapshotReq
+	case *TransportSnapshotResp:
+		t = MsgTransportSnapshotResp
 	default:
 		return 0, nil, fmt.Errorf("wire: encode %T: %w", v, entmoot.ErrUnknownMessage)
 	}
@@ -100,6 +106,12 @@ func Decode(t MsgType, body []byte) (any, error) {
 		return decodeAs[Graft](t, body)
 	case MsgPrune:
 		return decodeAs[Prune](t, body)
+	case MsgTransportAd:
+		return decodeAs[TransportAd](t, body)
+	case MsgTransportSnapshotReq:
+		return decodeAs[TransportSnapshotReq](t, body)
+	case MsgTransportSnapshotResp:
+		return decodeAs[TransportSnapshotResp](t, body)
 	default:
 		return nil, fmt.Errorf("wire: type 0x%02x: %w", uint8(t), entmoot.ErrUnknownMessage)
 	}

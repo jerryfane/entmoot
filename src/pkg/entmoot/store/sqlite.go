@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -10,11 +11,13 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/canonical"
 	"entmoot/pkg/entmoot/merkle"
 	"entmoot/pkg/entmoot/order"
+	"entmoot/pkg/entmoot/wire"
 
 	// Register the pure-Go SQLite driver under the name "sqlite".
 	_ "modernc.org/sqlite"
@@ -51,6 +54,35 @@ CREATE TABLE IF NOT EXISTS message_topics (
 
 CREATE INDEX IF NOT EXISTS idx_topic_lookup
   ON message_topics(topic, message_id);
+
+-- transport_ads holds the LWW-Register set of peer transport
+-- advertisements we have received and verified. One row per
+-- (group, author). The canonical column is the full JSON-encoded
+-- wire.TransportAd; decoding it reproduces every field (incl.
+-- Signature) byte-for-byte. (v1.2.0)
+CREATE TABLE IF NOT EXISTS transport_ads (
+  group_id       BLOB NOT NULL,
+  author_node_id INTEGER NOT NULL,
+  seq            INTEGER NOT NULL,
+  canonical      BLOB NOT NULL,
+  issued_at_ms   INTEGER NOT NULL,
+  not_after_ms   INTEGER NOT NULL,
+  signature      BLOB NOT NULL,
+  PRIMARY KEY (group_id, author_node_id)
+);
+CREATE INDEX IF NOT EXISTS idx_transport_ads_expiry
+  ON transport_ads(not_after_ms);
+
+-- transport_ad_seqs persists this node's own most-recent Seq per
+-- (group, author=self) so BumpTransportAdSeq can increment atomically
+-- across daemon restarts. Kept separate from transport_ads because
+-- that table holds rows about OTHER peers' ads. (v1.2.0)
+CREATE TABLE IF NOT EXISTS transport_ad_seqs (
+  group_id       BLOB NOT NULL,
+  author_node_id INTEGER NOT NULL,
+  seq            INTEGER NOT NULL,
+  PRIMARY KEY (group_id, author_node_id)
+);
 `
 
 // SQLite is a MessageStore backed by one SQLite database per group,
@@ -438,4 +470,237 @@ func decodeMessage(canonBytes []byte) (entmoot.Message, error) {
 		return entmoot.Message{}, fmt.Errorf("store: decode canonical: %w", err)
 	}
 	return msg, nil
+}
+
+// PutTransportAd stores a verified transport advertisement, replacing any
+// existing entry for (GroupID, Author) where new.Seq > stored.Seq OR
+// (new.Seq == stored.Seq AND new.Signature lexicographically > stored.Signature).
+// Returns (replaced bool, err) where replaced is true iff the incoming ad
+// was newer than what was stored (or there was no prior entry). A false
+// return with nil err means "we already had an equal-or-newer ad; nothing
+// changed."
+//
+// Uses a single SELECT+DELETE+INSERT transaction for atomicity. SQLite's
+// INSERT ... ON CONFLICT DO UPDATE WHERE cannot express the lex-tiebreak
+// cleanly, so the comparison is done in Go under tx isolation. (v1.2.0)
+func (s *SQLite) PutTransportAd(ctx context.Context, ad wire.TransportAd) (bool, error) {
+	if isZeroGroupID(ad.GroupID) {
+		return false, fmt.Errorf("%w: zero group id", ErrInvalidMessage)
+	}
+
+	encoded, err := json.Marshal(ad)
+	if err != nil {
+		return false, fmt.Errorf("store: marshal transport ad: %w", err)
+	}
+
+	db, err := s.dbFor(ad.GroupID)
+	if err != nil {
+		return false, err
+	}
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("store: begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var (
+		curSeq uint64
+		curSig []byte
+	)
+	row := tx.QueryRowContext(ctx, `
+		SELECT seq, signature FROM transport_ads
+		WHERE group_id = ? AND author_node_id = ?;`,
+		ad.GroupID[:], int64(ad.Author.PilotNodeID),
+	)
+	switch err := row.Scan(&curSeq, &curSig); {
+	case errors.Is(err, sql.ErrNoRows):
+		// No prior row; fall through and insert.
+	case err != nil:
+		return false, fmt.Errorf("store: scan transport ad: %w", err)
+	default:
+		// LWW-Register: keep the existing row iff it's strictly newer, or
+		// equal-seq with a lex-greater-or-equal signature.
+		if curSeq > ad.Seq {
+			return false, nil
+		}
+		if curSeq == ad.Seq {
+			cmp := bytes.Compare(ad.Signature, curSig)
+			if cmp <= 0 {
+				return false, nil
+			}
+		}
+		// Incoming is newer; remove the stale row before re-inserting.
+		if _, err := tx.ExecContext(ctx, `
+			DELETE FROM transport_ads
+			WHERE group_id = ? AND author_node_id = ?;`,
+			ad.GroupID[:], int64(ad.Author.PilotNodeID),
+		); err != nil {
+			return false, fmt.Errorf("store: delete stale transport ad: %w", err)
+		}
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO transport_ads
+		  (group_id, author_node_id, seq, canonical,
+		   issued_at_ms, not_after_ms, signature)
+		VALUES (?, ?, ?, ?, ?, ?, ?);`,
+		ad.GroupID[:],
+		int64(ad.Author.PilotNodeID),
+		int64(ad.Seq),
+		encoded,
+		ad.IssuedAt,
+		ad.NotAfter,
+		notNilBytes(ad.Signature),
+	); err != nil {
+		return false, fmt.Errorf("store: insert transport ad: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("store: commit transport ad: %w", err)
+	}
+	return true, nil
+}
+
+// GetTransportAd returns the current ad for (groupID, authorNodeID), or
+// (TransportAd{}, false, nil) if none exists. Does NOT filter expired —
+// caller decides.
+func (s *SQLite) GetTransportAd(ctx context.Context, groupID entmoot.GroupID, authorNodeID entmoot.NodeID) (wire.TransportAd, bool, error) {
+	db, err := s.dbFor(groupID)
+	if err != nil {
+		return wire.TransportAd{}, false, err
+	}
+	var encoded []byte
+	if err := db.QueryRowContext(ctx, `
+		SELECT canonical FROM transport_ads
+		WHERE group_id = ? AND author_node_id = ?;`,
+		groupID[:], int64(authorNodeID),
+	).Scan(&encoded); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return wire.TransportAd{}, false, nil
+		}
+		return wire.TransportAd{}, false, fmt.Errorf("store: scan transport ad: %w", err)
+	}
+	ad, err := decodeTransportAd(encoded)
+	if err != nil {
+		return wire.TransportAd{}, false, err
+	}
+	return ad, true, nil
+}
+
+// GetAllTransportAds returns every ad currently stored for the group.
+// Expired ads (not_after_ms < now_ms) are excluded iff includeExpired is
+// false (the common case). Used by the TransportSnapshotResp handler.
+// Sorted by author_node_id for determinism. (v1.2.0)
+func (s *SQLite) GetAllTransportAds(ctx context.Context, groupID entmoot.GroupID, now time.Time, includeExpired bool) ([]wire.TransportAd, error) {
+	db, err := s.dbFor(groupID)
+	if err != nil {
+		return nil, err
+	}
+
+	var rows *sql.Rows
+	if includeExpired {
+		rows, err = db.QueryContext(ctx, `
+			SELECT canonical FROM transport_ads
+			WHERE group_id = ?
+			ORDER BY author_node_id;`,
+			groupID[:],
+		)
+	} else {
+		rows, err = db.QueryContext(ctx, `
+			SELECT canonical FROM transport_ads
+			WHERE group_id = ? AND not_after_ms >= ?
+			ORDER BY author_node_id;`,
+			groupID[:], now.UnixMilli(),
+		)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("store: query transport ads: %w", err)
+	}
+	defer rows.Close()
+
+	var out []wire.TransportAd
+	for rows.Next() {
+		var encoded []byte
+		if err := rows.Scan(&encoded); err != nil {
+			return nil, fmt.Errorf("store: scan transport ads: %w", err)
+		}
+		ad, err := decodeTransportAd(encoded)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, ad)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: iterate transport ads: %w", err)
+	}
+	return out, nil
+}
+
+// BumpTransportAdSeq atomically increments this node's own ad sequence
+// counter for (groupID, authorNodeID) and returns the new value. The
+// first call for a given key returns 1. Safe across restarts because
+// the counter is persisted in transport_ad_seqs. (v1.2.0)
+func (s *SQLite) BumpTransportAdSeq(ctx context.Context, groupID entmoot.GroupID, authorNodeID entmoot.NodeID) (uint64, error) {
+	db, err := s.dbFor(groupID)
+	if err != nil {
+		return 0, err
+	}
+	var seq int64
+	if err := db.QueryRowContext(ctx, `
+		INSERT INTO transport_ad_seqs (group_id, author_node_id, seq)
+		VALUES (?, ?, 1)
+		ON CONFLICT(group_id, author_node_id)
+		  DO UPDATE SET seq = seq + 1
+		RETURNING seq;`,
+		groupID[:], int64(authorNodeID),
+	).Scan(&seq); err != nil {
+		return 0, fmt.Errorf("store: bump transport ad seq: %w", err)
+	}
+	return uint64(seq), nil
+}
+
+// GCExpiredTransportAds deletes all ads whose NotAfter is strictly
+// before now. Returns the number of rows deleted. Called
+// opportunistically by the advertiser goroutine (part B), not on the
+// hot receive path. The scan spans every group database currently open
+// — ads in groups whose databases have not been opened in this process
+// lifetime are left alone (they'll be collected the next time the
+// group is accessed). (v1.2.0)
+func (s *SQLite) GCExpiredTransportAds(ctx context.Context, now time.Time) (int64, error) {
+	s.mu.RLock()
+	dbs := make([]*sql.DB, 0, len(s.dbs))
+	for _, db := range s.dbs {
+		dbs = append(dbs, db)
+	}
+	s.mu.RUnlock()
+
+	var total int64
+	nowMs := now.UnixMilli()
+	for _, db := range dbs {
+		res, err := db.ExecContext(ctx, `
+			DELETE FROM transport_ads WHERE not_after_ms < ?;`,
+			nowMs,
+		)
+		if err != nil {
+			return total, fmt.Errorf("store: gc transport ads: %w", err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return total, fmt.Errorf("store: gc transport ads rows: %w", err)
+		}
+		total += n
+	}
+	return total, nil
+}
+
+// decodeTransportAd reconstructs a wire.TransportAd from its stored JSON
+// bytes. Storage is the ground truth; the Signature field round-trips
+// byte-for-byte because JSON's []byte base64 encoding is bijective.
+func decodeTransportAd(encoded []byte) (wire.TransportAd, error) {
+	var ad wire.TransportAd
+	if err := json.Unmarshal(encoded, &ad); err != nil {
+		return wire.TransportAd{}, fmt.Errorf("store: decode transport ad: %w", err)
+	}
+	return ad, nil
 }
