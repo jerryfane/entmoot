@@ -1,0 +1,1201 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[a4paper,margin=1in]{geometry}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{microtype}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{tikz}
+\hypersetup{colorlinks=false, hidelinks}
+
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  breaklines=true,
+  columns=fullflexible,
+  keepspaces=true,
+  frame=none,
+  xleftmargin=1em,
+}
+
+\title{The Shakedown\\
+\large A Companion to the Entmoot Architecture Paper}
+\author{}
+\date{April 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+Between 17 and 21 April 2026 we shipped a dense sequence of
+patch releases across two layered systems: ten Pilot fork releases
+(\texttt{v1.7.2-jf.1} through \texttt{v1.9.0-jf.6}) and nine
+Entmoot releases (\texttt{v1.0.0} through \texttt{v1.1.0}). Every
+patch was driven by a symptom observed on a three-machine live
+demo across three continents: a laptop on a UAE carrier-grade NAT,
+a Raspberry Pi in Italy on Fastweb residential, and a Hetzner VPS
+in Germany. The CHANGELOGs document what changed, but their
+language assumes a reader who already speaks networking. This
+document is the narrative companion: it explains what the words
+mean, what actually went wrong on the wire, and why each fix is
+the canonical one. It is meant for anyone who wants to understand
+the project without first reading RFCs.
+\end{abstract}
+
+\tableofcontents
+\vspace{1em}
+
+\section{What this document is}
+\label{sec:intro}
+
+The Entmoot research paper (\texttt{paper/main.tex}) describes the
+protocol as it is designed. This companion describes what went
+wrong in the first field deployment and how each problem was
+resolved. If the research paper is the blueprint, this is the
+engineer's diary kept while wiring the building.
+
+Two things distinguish this document from the CHANGELOGs:
+
+\begin{itemize}[leftmargin=1.2em]
+    \item It assumes you have never heard of NAT traversal,
+    gossip protocols, or Merkle trees. Section~\ref{sec:mental}
+    sets up the mental model; Section~\ref{sec:glossary} defines
+    every technical term used later.
+    \item It explains each fix in four parts: what the user saw,
+    what was really happening, what we changed, and why that
+    change is the right shape. Each piece of jargon is introduced
+    in context the first time it appears.
+\end{itemize}
+
+If you only read three sections, read Section~\ref{sec:mental} for
+the mental model, Section~\ref{sec:glossary} for vocabulary, and
+Section~\ref{sec:bigpicture} for the shape of what went wrong.
+
+\section{The world before the shakedown}
+\label{sec:mental}
+
+\subsection{Three machines, three layers}
+
+The deployment under test has three participants:
+
+\begin{description}[leftmargin=1.2em]
+    \item[Laptop] A MacBook in the United Arab Emirates, behind a
+    mobile carrier's network. The carrier's equipment rewrites
+    every outbound packet so the laptop has no meaningful
+    ``address'' on the public internet.
+    \item[Phobos] A Raspberry Pi sitting on a residential Italian
+    internet connection. Also behind a home router that rewrites
+    addresses.
+    \item[VPS] A small Linux server rented from Hetzner in
+    Germany. It has a real public IP address that the internet
+    can reach directly.
+\end{description}
+
+Each machine runs two programs that work together:
+
+\begin{description}[leftmargin=1.2em]
+    \item[\texttt{pilot-daemon}] The lower layer. Its job is to
+    open an encrypted pipe to any other Pilot node, identified by
+    a stable numeric address, regardless of which network the
+    other node sits on. Think of it as the post office that
+    figures out the physical route from sender to recipient.
+    \item[\texttt{entmootd join}] The upper layer. Its job is to
+    participate in a group: receive messages that anyone else in
+    the group publishes, and push its own. Think of it as the
+    language the letters are written in, on top of the postal
+    service underneath.
+\end{description}
+
+The line between the two matters. Many of the fixes in this
+document look like problems in the upper layer but were really
+problems in the lower layer percolating upward. See
+Section~\ref{sec:bigpicture}.
+
+\subsection{Five metaphors that are load-bearing}
+
+These stand in for full technical definitions throughout the
+document. The precise definitions are in Section~\ref{sec:glossary}.
+
+\begin{description}[leftmargin=1.2em]
+    \item[NAT is a hotel switchboard.] When you dial out from
+    your hotel room, the switchboard remembers the outbound line
+    and routes any reply back to your room. If the switchboard
+    has no prior record of you calling the outside party, an
+    incoming call cannot reach you. Home routers, mobile
+    carriers, and corporate firewalls all act as switchboards.
+    NAT traversal is the art of getting two switchboards to each
+    open a line at the same moment so voices can flow.
+    \item[Gossip is rumour spreading.] When a node learns
+    something new, it whispers the news to a small random subset
+    of its neighbours. Each of them whispers onward until
+    everyone knows. The mathematics works out: with enough
+    whispering, convergence is fast and robust even if some
+    neighbours are offline.
+    \item[A Merkle root is an inventory total.] Two warehouses
+    can confirm their stock is identical by comparing a single
+    number (the total), rather than listing every box. If the
+    totals match, the inventories are identical; if they differ,
+    the warehouses drill into their records to find the gap.
+    Merkle trees make this check cryptographically strong.
+    \item[A handshake is a mutual nameplate exchange.] Neither
+    side speaks in earnest until both have shown signed
+    identification and exchanged a shared secret. Afterwards
+    their conversation is encrypted with keys only they can
+    derive.
+    \item[A relay is a forwarding post office.] When two hosts
+    cannot reach each other directly, a mutual acquaintance
+    passes letters between them. Slower than direct delivery,
+    but the only option when both sides are behind
+    switchboards that will not cooperate.
+\end{description}
+
+\subsection{The four verbs you will see}
+
+\begin{description}[leftmargin=1.2em]
+    \item[Join.] A machine loads an invite (a signed document
+    that names the group and the current roster) and starts
+    participating. Joining involves contacting at least one
+    existing member, downloading missing history, and announcing
+    itself.
+    \item[Publish.] Author a message, sign it, store it locally,
+    hand it to the gossip layer for dissemination.
+    \item[Tail.] Subscribe to live messages in a group.
+    \item[Query.] Read the local store directly for
+    already-received messages, with filters for author, topic,
+    and time.
+\end{description}
+
+\section{Glossary}
+\label{sec:glossary}
+
+Every term bolded on first use. References point at the
+authoritative source for each concept.
+
+\subsection*{Cryptography and identity}
+
+\begin{description}[leftmargin=1em,style=nextline]
+    \item[\textbf{Ed25519 signature.}]
+    A fast, deterministic digital signature based on elliptic
+    curves. Used to prove a message was written by a specific
+    key. (RFC 8032.)
+    \item[\textbf{X25519 key exchange.}]
+    A procedure that lets two parties derive the same secret
+    without anyone listening being able to learn it. (RFC 7748.)
+    \item[\textbf{AES-256-GCM.}]
+    A symmetric encryption scheme that also detects tampering,
+    used to encrypt messages once X25519 has produced a shared
+    key. (NIST SP 800-38D.)
+    \item[\textbf{Signed append-only log.}]
+    A list of entries that can only grow. Each entry is signed,
+    so nothing can be silently edited after the fact. Entmoot's
+    group roster is one of these. (Certificate Transparency,
+    RFC 9162, uses the same primitive.)
+    \item[\textbf{Handshake / trust pair.}]
+    A one-time mutual authorisation step where two Pilot daemons
+    each approve the other before traffic flows. Without this
+    pair the daemon will reject the other's packets at the front
+    door.
+    \item[\textbf{Rekey.}]
+    Replacing session keys periodically, so a leaked key only
+    compromises a short window of past traffic. (NIST SP 800-57.)
+\end{description}
+
+\subsection*{Gossip and dissemination}
+
+\begin{description}[leftmargin=1em,style=nextline]
+    \item[\textbf{Fanout.}]
+    How many peers a publisher pushes a new message to. Each of
+    those peers may fanout again, so a small fanout per hop
+    still reaches everyone quickly.
+    \item[\textbf{Plumtree (eager + lazy push).}]
+    A gossip design that builds a spanning tree for fast
+    delivery of full message bodies (eager push) and falls back
+    to broadcasting only message IDs on non-tree links (lazy
+    push), to repair gaps cheaply. (Leit\~ao et al., SRDS 2007.)
+    \item[\textbf{IHAVE / GRAFT / PRUNE.}]
+    The three control messages that make Plumtree's tree
+    self-healing. IHAVE says ``I have message X but am not
+    sending it to you''; GRAFT says ``I did not receive X
+    within the timeout, please send it and promote me back onto
+    the eager branch''; PRUNE says ``I already had X via
+    another path, stop sending duplicates, demote me off the
+    eager branch''.
+    \item[\textbf{First-seen forwarding.}]
+    The rule that every node forwards a message exactly the
+    first time it sees it, regardless of which path it arrived
+    on. Duplicates are dropped. (Demers et al., PODC 1987.)
+    \item[\textbf{Anti-entropy reconciliation.}]
+    A background synchronisation round between two peers that
+    compares inventory (Merkle roots), finds the gap, and
+    exchanges the missing messages. Runs when a peer reconnects
+    after a disconnection, and periodically otherwise.
+    Scuttlebutt, Riak, and Cassandra all use variants.
+    \item[\textbf{Retry budget.}]
+    The maximum number of times a transient failure will be
+    retried before giving up. Bounded so that one dead peer
+    cannot cause infinite work. (Google SRE Book, ``Handling
+    Overload''.)
+    \item[\textbf{Decorrelated-jitter backoff.}]
+    A retry-delay formula that picks the next wait randomly
+    between a base and three times the previous wait. Unlike
+    fixed exponential doubling, this prevents many nodes from
+    retrying in lockstep after a shared hiccup. (Marc Brooker,
+    AWS 2015.)
+    \item[\textbf{Dial-backoff cache.}]
+    A per-peer memory of recent failed connection attempts.
+    Further attempts to the same address short-circuit
+    immediately until the window reopens. (go-libp2p
+    \texttt{swarm.DialBackoff}.)
+    \item[\textbf{MQTT topics.}]
+    Slash-separated names for subjects (\texttt{chat/eng/alerts}).
+    Subscribers can use \texttt{+} to match any one segment and
+    \texttt{\#} to match the tail. (MQTT v5 OASIS spec.)
+\end{description}
+
+\subsection*{Addresses, NAT, and relays}
+
+\begin{description}[leftmargin=1em,style=nextline]
+    \item[\textbf{NAT (Network Address Translation).}]
+    A router function that maps many internal addresses to one
+    public one. (RFC 3022.)
+    \item[\textbf{RFC 1918 address.}]
+    An internal-only IPv4 range that is never routable on the
+    public internet: \texttt{10.0.0.0/8}, \texttt{172.16.0.0/12},
+    \texttt{192.168.0.0/16}. If you see one in a network trace
+    it is a sign that the real address has been obscured.
+    \item[\textbf{Carrier-grade NAT (CGN / CGNAT).}]
+    A second layer of NAT applied by the ISP, sharing a small
+    pool of public addresses across many subscribers. Common in
+    mobile and recent residential deployments. (RFC 6598.)
+    \item[\textbf{STUN.}]
+    A short protocol a host can run against a well-known server
+    to learn what public address its NAT currently presents to
+    the outside world. (RFC 8489.)
+    \item[\textbf{NAT hole-punching.}]
+    Two hosts behind NATs send packets toward each other at the
+    same moment so that both NATs open a mapping on each side,
+    letting subsequent traffic flow through. (RFC 5128, \S3.3.)
+    \item[\textbf{Symmetric NAT.}]
+    A NAT that chooses a new external port per destination,
+    which breaks naive hole-punching because the port you
+    learned via STUN is not the port another peer will dial.
+    (RFC 3489, \S5.)
+    \item[\textbf{Relay fallback.}]
+    When two peers cannot reach each other directly, a third
+    host reachable to both forwards packets between them.
+    (TURN, RFC 8656.)
+    \item[\textbf{Registry / rendezvous server.}]
+    The well-known server that every Pilot daemon contacts on
+    startup to announce its current address and look up peers.
+    Pilot uses \texttt{34.71.57.205}.
+    \item[\textbf{Beacon.}]
+    A companion to the registry that handles NAT-punch
+    coordination and relays traffic between peers that need one.
+    \item[\textbf{Keepalive.}]
+    A small periodic packet sent on an otherwise-idle tunnel so
+    the NAT does not forget the mapping. (RFC 1122, \S4.2.3.6.)
+    \item[\textbf{Spurious RST.}]
+    A reset packet that tears down a TCP-like connection without
+    a genuine protocol reason, usually caused by a middlebox or
+    stale NAT state. (RFC 5961.)
+\end{description}
+
+\subsection*{Pilot-specific terms}
+
+\begin{description}[leftmargin=1em,style=nextline]
+    \item[\textbf{Node ID.}]
+    A 32-bit integer Pilot assigns at registration, bound to the
+    daemon's Ed25519 key. The group uses these as stable
+    addresses.
+    \item[\textbf{PILA.}]
+    Pilot's authenticated handshake and key-exchange frame. When
+    a peer cannot decrypt a packet, sending an unsolicited PILA
+    asks the other side to re-handshake.
+    \item[\textbf{Tunnel.}]
+    The encrypted, authenticated channel between two Pilot
+    nodes. Once established, all application traffic flows
+    inside it.
+    \item[\textbf{Stream dial.}]
+    Opening a new logical stream on top of an existing tunnel
+    (analogous to opening a TCP connection to a specific port
+    on an already-reachable host).
+    \item[\textbf{\texttt{ErrDialToSelf}.}]
+    A named error returned when a daemon tries to dial its own
+    Node ID. Mirrors the same guard in \texttt{go-libp2p-swarm}.
+    \item[\textbf{\texttt{viaRelay}.}]
+    A per-peer boolean Pilot tracks to remember whether the
+    latest authenticated packet from that peer arrived directly
+    or via the beacon relay.
+    \item[\textbf{Stream multiplexing (yamux).}]
+    A technique for running many logical streams over one
+    long-lived transport connection, with each stream opening
+    in zero round-trips. Entmoot uses
+    \texttt{hashicorp/yamux} to multiplex gossip frames over a
+    single Pilot tunnel per peer, avoiding a per-frame stream
+    dial. The same library is used by Consul, Nomad, Vault,
+    and libp2p's yamux transport.
+\end{description}
+
+\subsection*{macOS operations}
+
+\begin{description}[leftmargin=1em,style=nextline]
+    \item[\textbf{Ad-hoc code signing.}]
+    Signing a macOS binary with an empty identity (\texttt{-}).
+    The signature is not notarised and carries no chain of
+    trust, but it satisfies the local kernel's check. Go's
+    cross-compiled binaries ship this way by default.
+    \item[\textbf{Gatekeeper.}]
+    The macOS subsystem that decides whether a binary may run.
+    On Tahoe (26.2) an ad-hoc-signed binary downloaded from the
+    internet triggers a stall at \texttt{\_dyld\_start} until
+    Gatekeeper finishes verifying it (which, for a local daemon
+    invocation, never terminates visibly).
+    \item[\textbf{\texttt{xattr -cr}.}]
+    Recursively removes the \texttt{com.apple.quarantine}
+    extended attribute from a directory, which is what Gatekeeper
+    keys its verification on.
+\end{description}
+
+\section{The Pilot fixes, in order}
+\label{sec:pilot}
+
+Pilot's patches came in three clusters:
+\texttt{v1.7.2-jf.1} through \texttt{v1.7.2-jf.3} tightened the
+existing transport. \texttt{v1.8.0-jf.1} and \texttt{v1.9.0-jf.1}
+introduced two new pieces: a pluggable transport layer with a TCP
+fallback, and a gossip-based peer-discovery overlay.
+\texttt{v1.9.0-jf.2} through \texttt{v1.9.0-jf.6} are a tight
+cluster of reliability fixes driven by the three-machine demo.
+
+\subsection{\texttt{v1.7.2-jf.1}: don't punch at private addresses}
+
+\paragraph{What broke.} When the laptop and VPS tried to
+establish a tunnel, a log line appeared on the laptop:
+\begin{lstlisting}
+STUN returned private/unusable IP, discarding
+  stun_addr=10.128.0.12
+\end{lstlisting}
+Shortly after, the tunnel handshake timed out. Packet captures
+showed that both daemons were sending NAT-punch packets toward
+\texttt{10.128.0.12}, which is a private address (see RFC 1918)
+that does not exist on the public internet.
+
+\paragraph{What it actually was.} Pilot's public STUN endpoint
+sits behind a Google Cloud load balancer that rewrites every
+client's source address to a private internal one
+(\texttt{10.128.0.12}). The daemon had a filter that discarded
+that private address when choosing its own advertised endpoint,
+but \emph{the same filter was not applied to the target of
+outgoing NAT-punch packets}. Every daemon was loyally sending
+punch traffic to \texttt{10.128.0.12}, which is nobody's
+computer.
+
+\paragraph{How we fixed it.} \texttt{handlePunchCommand} in
+\texttt{pkg/daemon/tunnel.go} now drops punches whose target
+address is in an RFC 1918, loopback, link-local, or unspecified
+range, logging \texttt{skipping NAT punch to non-routable target}
+and falling through to the existing relay path.
+
+\paragraph{Why the fix is right.} The condition (``is this a
+routable address?'') already existed in the registration path.
+The patch reuses \texttt{isPrivateAddr} symmetrically on the punch
+path. Two filters with the same definition at two ingress points
+is a textbook consistency fix.
+
+\paragraph*{Tag.} \texttt{v1.7.2-jf.1}, commit \texttt{2d4e657}.
+Files: \texttt{pkg/daemon/tunnel.go}.
+
+\subsection{\texttt{v1.7.2-jf.2}: keep the tunnel alive across
+rekeying}
+
+\paragraph{What broke.} Encrypted tunnels dropped every five
+minutes on the dot. Log lines like \texttt{peer marked for relay}
+followed the drop; a new tunnel came back up about thirty
+seconds later.
+
+\paragraph{What it actually was.} Pilot rekeys each tunnel
+periodically (part of the NetworkSync cycle). During the key
+swap, the brief window where neither side knows which key to use
+caused a few application-level ACKs to be dropped. The daemon's
+\emph{dead-peer detector} counted those missed ACKs as silence
+and concluded the peer was unreachable, tearing the tunnel down.
+
+\paragraph{How we fixed it.} \texttt{TunnelManager} now calls a
+new \texttt{notifyRekey} callback after a successful key swap.
+The callback clears the ``unacknowledged keepalives'' counter
+and refreshes \texttt{LastActivity} on every connection routed
+over that peer, so ACKs dropped during the key swap no longer
+contribute to the dead-peer tally.
+
+\paragraph{Why the fix is right.} Dead-peer detection should
+measure liveness across steady state, not across intentional
+reconfigurations. The fix is a straightforward
+acknowledgement-counter reset at the boundary. No
+application-visible change; tunnels simply stop flapping.
+
+\paragraph*{Tag.} \texttt{v1.7.2-jf.2}. Files: \texttt{ports.go},
+\texttt{tunnel.go}, \texttt{daemon.go}.
+
+\subsection{\texttt{v1.7.2-jf.3}: independent beacon keepalive, and
+persistent visibility}
+
+\paragraph{What broke.} Two issues. First, on consumer NATs
+whose UDP idle timeout is 30 to 60 seconds, the Pilot registry
+heartbeat (once every 60 seconds) was sometimes too infrequent
+to keep the mapping to the beacon alive: relay traffic stopped
+flowing between registry ticks. Second, running
+\texttt{pilotctl set-public} (which tells the registry ``yes,
+other peers may see my address'') did not survive a daemon
+restart.
+
+\paragraph{What it actually was.} The heartbeat loop was doing
+double-duty and assumed both the registry and the beacon had
+similar timeout budgets; they do not. Visibility state lived
+only in memory, so the daemon forgot it after a restart.
+
+\paragraph{How we fixed it.} Two additions. A new
+\texttt{beaconKeepaliveLoop} runs on an independent 25-second
+tick so the beacon mapping refreshes well under the strictest
+consumer NAT timeout. \texttt{set-public} and the
+\texttt{-public} launch flag now persist to
+\texttt{\~{}/.pilot/config.json} via a new \texttt{writeConfigKey}
+helper, and the daemon reads the persisted value at startup.
+
+\paragraph{Why the fix is right.} Two different upstream services
+should have two different heartbeat cadences calibrated to their
+respective timeouts. Configuration that the operator set should
+survive a restart. These are standard daemon-design hygiene.
+
+\paragraph*{Tag.} \texttt{v1.7.2-jf.3}. Files: new loop in
+\texttt{daemon.go}; \texttt{cmd/pilotctl/main.go}; also the
+installer redirected to fetch the fork's binaries.
+
+\subsection{\texttt{v1.8.0-jf.1}: pluggable transports and TCP
+fallback}
+
+\paragraph{What broke.} The UAE carrier was observed dropping
+outbound UDP packets to the VPS's port. Pilot's entire wire
+protocol was UDP. No UDP meant no tunnel, full stop.
+
+\paragraph{What it actually was.} The daemon owned a single
+\texttt{*net.UDPConn} as the only way to move bytes. There was
+no mechanism to attempt an alternative protocol if UDP was
+blocked.
+
+\paragraph{How we fixed it.} Introduced a \texttt{Transport}
+interface in a new \texttt{pkg/daemon/transport} package. Added
+\texttt{UDPTransport} (the existing behaviour, refactored) and
+\texttt{TCPTransport} (new: 4-byte big-endian length-prefix
+framing, connection pooling per remote address). The registry
+protocol was extended to carry a list of \texttt{endpoints} per
+peer, one per transport. After direct UDP retries exhaust,
+\texttt{DialConnection} attempts a TCP dial bounded by a
+five-second timeout before falling through to the existing
+relay path.
+
+\paragraph{Why the fix is right.} Treating the byte-movement
+layer as an interface is the canonical pattern for multi-network
+systems (libp2p, Tailscale, QUIC clients). The design preserves
+wire compatibility: daemons running only UDP still exchange
+byte-identical frames with pre-fork versions.
+
+\paragraph*{Tag.} \texttt{v1.8.0-jf.1}. Files: new
+\texttt{pkg/daemon/transport/}, refactored \texttt{tunnel.go} and
+\texttt{daemon.go}, extended \texttt{pkg/registry}.
+
+\subsection{\texttt{v1.9.0-jf.1}: gossip-based peer discovery}
+
+\paragraph{What broke.} The multi-transport endpoint field
+needed to propagate through the registry for peers to learn
+about each others' TCP listeners. The upstream public registry
+does not know about the fork's new field, so the TCP fallback
+was useless against an unmodified registry.
+
+\paragraph{What it actually was.} The reachability half of peer
+information (what addresses you can reach me at) was coupled to
+the identity half (this node ID belongs to this key). Upgrading
+reachability required an upstream cooperation we could not rely
+on.
+
+\paragraph{How we fixed it.} Added \texttt{pkg/daemon/gossip},
+which exchanges \emph{signed} endpoint advertisements
+peer-to-peer over existing encrypted tunnels at a 25-second
+tick. The PILA handshake frame was extended with a trailing
+capability bitmap, so upgraded daemons advertise gossip
+capability without breaking the wire format for unmodified
+upstream daemons (older peers truncate the extra bytes and
+never see them).
+
+\paragraph{Why the fix is right.} Two sources of truth (identity
+anchored in the registry, reachability refreshed peer-to-peer)
+is the same split libp2p's identify protocol and Tailscale's
+coordination server use. Each has the right incentive: the
+registry is a stable root, peer gossip is a fast-changing
+directory.
+
+\paragraph*{Tag.} \texttt{v1.9.0-jf.1}. Files: new
+\texttt{pkg/daemon/gossip/}, \texttt{daemon.go} lifecycle wiring,
+\texttt{pkg/registry} snapshot format.
+
+\subsection{\texttt{v1.9.0-jf.2}: NAT-drift refresh and macOS
+code-sign workaround}
+
+\paragraph{What broke.} Two seemingly unrelated symptoms. On the
+laptop, outbound stream dials over an otherwise-healthy tunnel
+timed out with ``dial timeout'' even though \texttt{pilotctl
+peers} reported the peer as encrypted and authenticated. On the
+same laptop, interactively-launched \texttt{pilotctl info} hung
+indefinitely at \texttt{\_dyld\_start}.
+
+\paragraph{What it actually was.} The laptop's UAE carrier was
+rotating its external source port between rekeys. Pilot cached
+the peer's UDP address on key exchange and never refreshed it
+afterwards, so the VPS kept sending to the stale port. The
+carrier's NAT silently dropped everything to that old port.
+Meanwhile, macOS 26.2 Tahoe's Gatekeeper was stalling every
+interactively-launched ad-hoc-signed Go binary in early dynamic
+loader initialisation.
+
+\paragraph{How we fixed it.} Two changes. The daemon refreshes
+its cached peer endpoint inside \texttt{handleEncrypted} on any
+successful authenticated decrypt (guarded by a read-lock
+pre-check so the write path is not churned). The installer now
+re-signs binaries with the local ad-hoc identity and clears
+\texttt{com.apple.quarantine} extended attributes on macOS,
+which satisfies Gatekeeper's first-launch gate.
+
+\paragraph{Why the fix is right.} The cached endpoint is the
+daemon's latest evidence of reachability; every authenticated
+packet is fresh evidence. The endpoint should track the evidence.
+The macOS workaround is what every cross-compiled Go tool needs
+under Tahoe; adding it to the installer once beats every
+operator discovering it the hard way.
+
+\paragraph*{Tag.} \texttt{v1.9.0-jf.2}. Files: \texttt{tunnel.go},
+\texttt{install.sh}.
+
+\subsection{\texttt{v1.9.0-jf.3}: automatic recovery from
+one-sided restart}
+
+\paragraph{What broke.} When the VPS daemon restarted, its
+in-memory session keys were gone, but the laptop still had the
+old keys and kept sending encrypted traffic. The VPS logged
+\begin{lstlisting}
+encrypted packet from node but no key peer_node_id=45491
+\end{lstlisting}
+forever. The two sides never spontaneously re-handshook. A
+manual daemon restart on the laptop was the only way out.
+
+\paragraph{What it actually was.} The receiving side could tell
+it had no key for a peer, but it had no policy to do anything
+about it. The sending side saw its own keepalive ACKs succeeding
+at the tunnel level and had no way to observe the other side's
+confusion.
+
+\paragraph{How we fixed it.} On any decrypt failure caused by
+missing crypto state, the daemon emits an unsolicited PILA
+(handshake initiation) to the source address of the offending
+frame, rate-limited to once per minute per peer (so a hostile
+sender cannot amplify the mechanism into a reflection attack).
+Recovery completes within 200 to 300 milliseconds of the peer's
+next keepalive.
+
+\paragraph{Why the fix is right.} The fix puts the observation
+and the remediation on the same side: the node that can detect
+the desync is the one that asks for a re-handshake. The
+rate-limit prevents abuse. Equivalent to the ``force rekey on
+decrypt fail'' rule WireGuard applies to its roaming handshake.
+
+\paragraph*{Tag.} \texttt{v1.9.0-jf.3}. Files: \texttt{tunnel.go}
+(\texttt{maybeSendRecoveryPILA}).
+
+\subsection{\texttt{v1.9.0-jf.4}: reply on the path the request
+came in on}
+
+\paragraph{What broke.} Tunnels showed
+\texttt{encrypted=yes auth=yes relay=true} in the peer table, and
+keepalives flowed both ways, but any attempt to open a new
+application-layer stream timed out. This affected every
+VPS-to-laptop dial for the whole day.
+
+\paragraph{What it actually was.} Pilot kept two maps: one of
+direct UDP addresses (\texttt{peers}) and a boolean flag
+(\texttt{relayPeers}) saying whether a peer was reachable via
+relay. The two could disagree across daemons: A's flag could
+say ``via relay'' while B's map still held a stale direct
+address for A. Worse, when a relay frame arrived from an
+unknown peer, the daemon cached the beacon's address as the
+peer's direct address, which then polluted same-LAN detection,
+the freshly-added NAT-drift refresh, and the direct-UDP fallback
+path.
+
+\paragraph{How we fixed it.} Replaced both maps with a single
+\texttt{paths map[uint32]*peerPath}. Each entry records the
+\emph{most recent authenticated ingress path}: either a direct
+UDP address or ``via relay''. Every authenticated decrypt
+updates the entry. Every outbound reply is routed on the same
+path the last request arrived on.
+
+Also: relay round-trip time is two to three times direct, so the
+SYN retransmission budget starts at three seconds when the peer
+is in relay mode (up from one second).
+
+\paragraph{Why the fix is right.} This is the ``reply on
+ingress'' pattern WireGuard uses for roaming, and what Tailscale
+calls ``DERP sticky''. Symmetry between the two daemons falls out
+of each one observing its own ingress traffic, instead of
+requiring both sides to agree on a shared model of the network.
+
+\paragraph*{Tag.} \texttt{v1.9.0-jf.4}. Files: \texttt{tunnel.go},
+\texttt{tunnel\_path\_test.go}.
+
+\subsection{\texttt{v1.9.0-jf.5}: clean up all relay state}
+
+\paragraph{What broke.} A VPS restart on
+\texttt{v1.9.0-jf.4} left relay-only peers in the
+``encrypted packet from no key'' loop indefinitely. The jf.3
+auto-recovery fired, but the unsolicited PILA went out to a
+zero-address placeholder and was dropped silently.
+
+\paragraph{What it actually was.} Several per-peer state
+structures were not fully cleared across \texttt{AddPeer} or
+\texttt{RemovePeer}, so stale values from prior sessions
+poisoned the new session. Also, \texttt{maybeSendRecoveryPILA}
+unconditionally wrote to the direct UDP address, even when the
+triggering frame had arrived via relay.
+
+\paragraph{How we fixed it.} Five small changes, all about
+per-peer hygiene:
+\begin{itemize}[leftmargin=1.2em]
+    \item Recovery PILA now routes through the beacon when the
+    triggering frame arrived via relay.
+    \item \texttt{AddPeer} clears \texttt{viaRelay} so a fresh
+    direct endpoint is authoritative.
+    \item \texttt{RemovePeer} wipes all per-peer state, not
+    just two of the seven structures.
+    \item \texttt{handlePacket} no longer auto-adds a peer under
+    the relay-origin zero-address placeholder.
+    \item \texttt{maybeSendRecoveryPILA} checks the UDP socket
+    is non-nil before writing (defensive guard during startup).
+\end{itemize}
+
+\paragraph{Why the fix is right.} \texttt{RemovePeer} should be
+``reset all per-peer state'', not ``reset some of it''. This is
+WireGuard's \texttt{wg set peer \ldots remove} contract. The
+PILA routing fix matches the same reply-on-ingress principle
+introduced in jf.4, applied to the recovery path.
+
+\paragraph*{Tag.} \texttt{v1.9.0-jf.5}. Files: \texttt{tunnel.go},
+\texttt{daemon.go}.
+
+\subsection{\texttt{v1.9.0-jf.6}: don't dial yourself}
+
+\paragraph{What broke.} Gossip propagation inflated from
+sub-second to minute-scale latencies. The VPS's
+\texttt{pilot-daemon} was burning 210\% CPU (two cores) and
+pushing roughly 5,900 packets per second, most of them looping
+to itself.
+
+\paragraph{What it actually was.} Every Entmoot invite minted to
+that point listed the issuer as a bootstrap peer, including on
+the issuer's own machine. Pilot's \texttt{ensureTunnel} (callable
+from code paths other than the Entmoot bootstrap filter) had no
+guard against dialling the local Node ID. On a multi-homed host
+the ``same-LAN peer detected'' logic then matched both a Docker
+bridge address (\texttt{172.17.0.1}) and the public IP as valid
+local endpoints, so the daemon established multiple duplicate
+self-tunnels, each happily retransmitting into the other.
+
+\paragraph{How we fixed it.} \texttt{ensureTunnel} and
+\texttt{DialConnection} now short-circuit with a typed sentinel
+\texttt{protocol.ErrDialToSelf} when given the local Node ID.
+The invite minter was also fixed (see Entmoot \texttt{v1.0.8}).
+
+\paragraph{Why the fix is right.} \texttt{ErrDialToSelf} is the
+canonical name for this guard (go-libp2p swarm, for one, uses
+the same pattern). Returning a typed sentinel rather than
+silently succeeding makes caller-side invariant violations
+visible. Defence in depth: the fix lands at both the caller (the
+invite minter) and the callee (the daemon), so a future invite
+that happens to include self still cannot cause a storm.
+
+\paragraph*{Tag.} \texttt{v1.9.0-jf.6}. Files: \texttt{daemon.go}.
+
+\section{The Entmoot fixes, in order}
+\label{sec:entmoot}
+
+Entmoot's releases are easier to summarise: each one was driven
+by a symptom on the live demo, and the fixes moved steadily from
+``make push-only gossip reliable'' (v1.0.2, v1.0.3) to
+``implement the canonical gossip design'' (v1.0.4, v1.0.5) to
+``tune it for real networks'' (v1.0.6, v1.0.7, v1.0.8) to
+``remove per-frame transport overhead'' (v1.1.0).
+
+\subsection{\texttt{v1.0.0}: the foundations}
+
+\paragraph*{Not strictly a fix;} this is the shape of v1 that
+the later releases patch. Five points to remember:
+
+\begin{itemize}[leftmargin=1.2em]
+    \item \textbf{SQLite store.} One database per group,
+    write-ahead logging, one database file per group's
+    messages. Replaces the JSONL backend used in pre-v1
+    development.
+    \item \textbf{Control-socket IPC.} A single long-running
+    \texttt{entmootd join} process per host owns the Pilot
+    connection and is the only writer to the store. Short-lived
+    CLI invocations (\texttt{publish}, \texttt{tail},
+    \texttt{info}) reach it through a Unix-domain socket at
+    \texttt{\~{}/.entmoot/control.sock}.
+    \item \textbf{Five-command CLI.} \texttt{join},
+    \texttt{publish}, \texttt{tail}, \texttt{query},
+    \texttt{info}. \texttt{join} is the only blocking one.
+    \item \textbf{Invites with TTL.} A new \texttt{ValidUntil}
+    field in the invite bundle; default 24 hours. Expired
+    invites are rejected.
+    \item \textbf{Installer and skill.}
+    \texttt{install.sh} (prebuilt binary fast path, source fall
+    back) and a \texttt{SKILL.md} for agent-driven installation.
+\end{itemize}
+
+\paragraph*{Tag.} \texttt{v1.0.0}, 17 April 2026.
+
+\subsection{\texttt{v1.0.2}: retries and anti-entropy}
+
+\paragraph{What broke.} Push-only gossip from v1.0.0 dropped any
+message it failed to deliver on the first try. A peer that was
+briefly offline silently missed messages forever; the only
+recovery was a full re-join.
+
+\paragraph{What it actually was.} The design had no concept of
+``try again later'' and no background synchronisation to paper
+over gaps that the push layer missed.
+
+\paragraph{How we fixed it.} Two new mechanisms:
+
+\begin{itemize}[leftmargin=1.2em]
+    \item An exponential-backoff retry loop. Transient push and
+    fetch failures are queued; a \texttt{retryLoop} goroutine
+    drains the pending queue every 500 ms with delays
+    \texttt{1s, 2s, 4s, 8s, 16s, 30s, 60s \(\times\) 4}.
+    Exhausted slots are logged and left to the next mechanism.
+    \item Anti-entropy reconciliation. When a peer reconnects
+    (either as inbound accept or as a successful outbound dial),
+    the side that detects the reconnection starts a round with
+    it: request the peer's Merkle root, compare with local, and
+    if they differ, request the list of message IDs since the
+    local latest timestamp and fetch the missing bodies.
+    Rate-limited to one round per peer per minute.
+\end{itemize}
+
+Two new wire types for the range enumeration:
+\texttt{MsgRangeReq} (\texttt{0x09}) and \texttt{MsgRangeResp}
+(\texttt{0x0A}).
+
+\paragraph{Why the fix is right.} Every production gossip
+system has both a fast path (push with retry) and a slow path
+(anti-entropy). Cassandra, Riak, Scuttlebutt: all pair the two.
+Push handles the common case; anti-entropy is the safety net.
+
+\paragraph*{Tag.} \texttt{v1.0.2}, 19 April 2026.
+
+\subsection{\texttt{v1.0.3}: publish returns immediately}
+
+\paragraph{What broke.} \texttt{entmootd publish} took 30
+seconds to return on every call, and the return always printed
+an IPC read-response timeout, even when the message had been
+stored locally and was propagating normally.
+
+\paragraph{What it actually was.} The publish handler tried to
+deliver the message to all peers synchronously before
+acknowledging the CLI. One slow peer blocked the whole command.
+
+\paragraph{How we fixed it.} The handler now returns as soon as
+the message is durably written to the local store. Peer
+delivery happens asynchronously through the retry scheduler.
+Publish latency drops to single-digit milliseconds regardless of
+peer reachability.
+
+\paragraph{Why the fix is right.} This is the industry-standard
+publish contract. Kafka durable-log commit, NATS fire-and-forget,
+RabbitMQ publisher confirms: ``publish'' means ``accepted for
+delivery'', not ``delivered to every subscriber''. The retry
+scheduler and anti-entropy reconciliation from v1.0.2 already
+carry the delivery guarantee.
+
+\paragraph*{Tag.} \texttt{v1.0.3}, 19 April 2026.
+
+\subsection{\texttt{v1.0.4}: Plumtree}
+
+\paragraph{What broke.} Push-only gossip struggled under
+asymmetric reachability. On the canary, the laptop and Phobos
+had no direct edge: neither could reach the other at the
+transport layer. A message from Phobos reached the VPS but
+never reached the laptop, because Entmoot had no re-forwarding
+step.
+
+\paragraph{What it actually was.} The gossip design was
+``publisher fans out; receivers store and stop''. A partial
+topology guaranteed gaps that only anti-entropy could eventually
+repair, at the cost of up to a minute of delay.
+
+\paragraph{How we fixed it.} Switched to a Plumtree-style
+protocol (Leit\~ao, Pereira, Rodrigues, SRDS 2007).
+
+Each peer sits in exactly one of two sets per message:
+\texttt{eagerPushPeers} (get the full body up front) or
+\texttt{lazyPushPeers} (get only the ID). Three new control
+messages maintain this split:
+
+\begin{itemize}[leftmargin=1.2em]
+    \item \texttt{IHAVE} (\texttt{0x0B}): ``I have message X, but
+    I am sending only the ID''.
+    \item \texttt{GRAFT} (\texttt{0x0C}): ``I heard IHAVE for X,
+    did not receive the body within three seconds, please send
+    it and promote me to your eager set''.
+    \item \texttt{PRUNE} (\texttt{0x0D}): ``I already had X via
+    another path; drop me from your eager set to avoid
+    duplicates''.
+\end{itemize}
+
+Initial state: everyone is eager. Duplicates self-prune into a
+spanning subset per message. On the canary, a Phobos publish now
+reaches the laptop via VPS as the re-fanout hop.
+
+\paragraph{Why the fix is right.} Plumtree is the canonical way
+to build a self-healing broadcast tree. Its overhead at steady
+state is one push per spanning-tree edge, instead of the
+multiplicative explosion of naive gossip. Riak Core, Helium,
+Solana, libp2p GossipSub all use variants.
+
+\paragraph*{Tag.} \texttt{v1.0.4}, 20 April 2026.
+
+\subsection{\texttt{v1.0.5}: re-fanout on every path}
+
+\paragraph{What broke.} After v1.0.4, re-fanout fired only when
+a message arrived via the live push path. Messages acquired via
+retry or anti-entropy reconciliation were stored but not
+forwarded.
+
+\paragraph{What it actually was.} The ``first-seen forwarding''
+rule (forward exactly the first time, regardless of source) was
+implemented in only one of three acquisition call sites. The
+other two silently broke it.
+
+\paragraph{How we fixed it.} Centralised the
+\texttt{plumCancelGraftsFor(id) + refanout(peer, id)} hook
+inside \texttt{fetchFrom} after a successful \texttt{Store.Put}.
+All three call sites inherit it.
+
+\paragraph{Why the fix is right.} The rule libp2p GossipSub
+applies: ``not seen before then forward to mesh, irrespective of
+arrival method''. One place in the code, one behaviour.
+
+\paragraph*{Tag.} \texttt{v1.0.5}, 20 April 2026.
+
+\subsection{\texttt{v1.0.6}: trust-aware fanout, parallel sends,
+dial-backoff}
+
+\paragraph{What broke.} Cross-mesh publish latency regressed to
+about four minutes. Fanout was iterating over every peer
+serially; each dial to an unreachable peer paid Pilot's full
+32-second timeout; and the retry scheduler dialled the same
+dead peer again for every pending message.
+
+\paragraph{What it actually was.} Three independent gaps
+compounded. Fanout did not ask ``is this peer even reachable''
+before attempting. Fanout was sequential so one slow peer
+blocked everyone. There was no backoff memory so the same dead
+peer was dialled over and over.
+
+\paragraph{How we fixed it.} Three coordinated changes:
+
+\begin{itemize}[leftmargin=1.2em]
+    \item \textbf{Trust-aware reachability oracle.} Before
+    building the fanout set, call Pilot's
+    \texttt{TrustedPeers} and filter. Peers with no trust pair
+    (structurally unreachable for the life of this config) are
+    dropped up-front. Cached for one second so bursty fanouts
+    do not ask Pilot per message per peer.
+    \item \textbf{Parallel fanout with per-peer timeout.} One
+    goroutine per peer, each with a five-second
+    \texttt{context.WithTimeout} and a concurrency cap of 32.
+    One slow peer no longer blocks the others.
+    \item \textbf{Per-peer dial-backoff cache.} After one
+    failed dial, further dials short-circuit for an
+    exponentially expanding window (one second, two, four,
+    eight, capped at five minutes). A successful dial clears the
+    window.
+\end{itemize}
+
+Together they collapse cross-mesh latency from roughly four
+minutes back to sub-second.
+
+\paragraph{Why the fix is right.} Each of the three changes is
+the canonical pattern from a mature system: the reachability
+oracle is how libp2p GossipSub treats connectedness; parallel
+fanout is idiomatic Go (\texttt{errgroup} with
+\texttt{SetLimit}); the dial-backoff cache is how
+\texttt{go-libp2p swarm.DialBackoff} works. Together they are
+the standard triptych for making ``don't spend real time on a
+dead peer'' work.
+
+\paragraph*{Tag.} \texttt{v1.0.6}, 20 April 2026.
+
+\subsection{\texttt{v1.0.7}: inline bodies and jittered backoff}
+
+\paragraph{What broke.} Even after v1.0.6, a 1.5-minute
+propagation tail persisted. Each gossip hop paid two separate
+Pilot stream dials: sender's push, receiver's fetch-back for
+the body. And the deterministic retry schedule synchronised
+every node's retries to the same wall-clock moments, so a
+single NAT flap cascaded into many minutes of propagation
+delay.
+
+\paragraph{What it actually was.} The push layer had shipped
+only the message ID, expecting the receiver to pull the body.
+The receiver's pull was a whole new stream dial. And exact
+retry delays made independent nodes retry in lockstep.
+
+\paragraph{How we fixed it.} Two changes:
+
+\begin{itemize}[leftmargin=1.2em]
+    \item \textbf{Inline body on eager push.} Gossip frames for
+    messages smaller than 4 KiB now carry the full body.
+    Receivers hash-verify and store directly, skipping the
+    fetch-back round-trip. This is what the canonical Plumtree
+    paper specified in the first place; every surveyed
+    production gossip (libp2p GossipSub, Scuttlebutt EBT,
+    Matrix federation, Cassandra, IPFS Bitswap) does this.
+    \item \textbf{Decorrelated-jitter retry backoff.} Replaces
+    the fixed schedule with \texttt{next = min(cap,
+    random(base, prev $\times$ 3))}, Marc Brooker's 2015 AWS
+    formula. Same 10-attempt budget, but nodes no longer retry
+    in synchronised waves.
+\end{itemize}
+
+The reconcile cooldown also dropped from 60 seconds to a
+jittered 30 seconds (that range matches what GossipSub and
+Plumtree \S3.4 use for lazy-push cadence, and is an order of
+magnitude more appropriate than what had been in place).
+
+\paragraph{Why the fix is right.} Inline bodies bring Entmoot
+back to what the Plumtree paper actually described; Entmoot's
+earlier ID-only fanout was a non-canonical simplification.
+Decorrelated jitter is the specific, named cure for
+retry-synchronisation cascades, which is exactly what we were
+seeing.
+
+\paragraph*{Tag.} \texttt{v1.0.7}, 21 April 2026.
+
+\subsection{\texttt{v1.0.8}: invites should not include the
+issuer}
+
+\paragraph{What broke.} See the Pilot
+\texttt{v1.9.0-jf.6} entry above: self-amplified packet storm
+on the VPS, 5,900 packets per second, 210\% CPU.
+
+\paragraph{What it actually was.} Every invite minted up to
+that point listed the issuer as a bootstrap peer. When the
+issuer received its own invite through ambient membership
+channels, the Pilot layer happily established self-tunnels.
+
+\paragraph{How we fixed it.} Two defence-in-depth changes:
+
+\begin{itemize}[leftmargin=1.2em]
+    \item \texttt{entmootd invite create} excludes the issuer's
+    Node ID from \texttt{bootstrap\_peers} at mint time.
+    \item Pilot \texttt{v1.9.0-jf.6} adds the
+    \texttt{ErrDialToSelf} sentinel so that any future invite
+    that happens to include self cannot cause a storm.
+\end{itemize}
+
+Legacy invites still work: the \texttt{Gossiper.Join} path
+already has a self-skip filter at every bootstrap strategy. The
+new defences close the remaining holes.
+
+\paragraph{Why the fix is right.} Cassandra's gossiper
+maintains the invariant that \texttt{live\_endpoints} excludes
+self by construction. This is the same invariant, applied at
+mint time. Defence in depth: fix the source, and also fix the
+callee so a future regression cannot amplify.
+
+\paragraph*{Tag.} \texttt{v1.0.8}, 21 April 2026.
+
+\subsection{\texttt{v1.1.0}: one persistent session per peer}
+
+\paragraph{What broke.} Both peers on a node were observed
+failing simultaneously at the Pilot stream-dial layer, even while
+the underlying tunnel reported \texttt{encrypted=yes auth=yes}.
+Each dropped dial cost Pilot's full roughly 32-second timeout
+before gossip could give up and try a retry; with two peers
+wedged in parallel, the accumulated timeouts dominated
+propagation latency.
+
+\paragraph{What it actually was.} Every gossip frame was opening
+a fresh Pilot stream, paying the full SYN handshake per frame.
+On a healthy tunnel that overhead is negligible, but whenever a
+stream SYN/ACK silently wedged (middlebox, NAT timer expiry,
+any of several causes we had chased in the Pilot layer), gossip
+was exposed to the 32-second Pilot dial budget on the new
+stream, even though the tunnel itself was fine.
+
+\paragraph{How we fixed it.} The Pilot transport adapter now
+maintains one long-lived \texttt{hashicorp/yamux} session per
+peer and multiplexes every gossip stream over it. The first
+contact still dials a Pilot stream; subsequent frames open a
+yamux stream on the cached session with no extra handshake
+(zero round-trip new-stream). yamux's built-in keepalive (30-second
+interval, 10-second timeout) detects silently-wedged sessions
+and closes them; the next dial opens a fresh session
+automatically.
+
+Wire compatibility: Entmoot's JSON frame format is unchanged;
+yamux simply multiplexes the same frames over the session.
+Mixed v1.0.x and v1.1.0 peers do \emph{not} interoperate
+(v1.0.x expects a raw stream per frame; v1.1.0 expects a yamux
+session), so every node in a group must upgrade together.
+
+\paragraph{Why the fix is right.} Multiplexed long-lived
+sessions are how every mature stream-based overlay handles the
+per-frame overhead problem: Consul, Nomad, Vault, and libp2p's
+yamux transport all use the same library. Pushing the keepalive
+down into the multiplexer means the gossip layer does not have
+to build its own liveness check for sessions, and silently-wedged
+transports are detected and recovered without any gossip-layer
+plumbing.
+
+\paragraph*{Tag.} \texttt{v1.1.0}, 21 April 2026. Files:
+\texttt{src/pkg/entmoot/transport/pilot/pilot.go},
+new test \texttt{pilot\_yamux\_test.go}, new dependency
+\texttt{github.com/hashicorp/yamux}.
+
+\section{The big picture: how the layers interacted}
+\label{sec:bigpicture}
+
+Many of the bugs documented above \emph{looked like} problems
+in Entmoot but were actually problems in Pilot leaking upward.
+The four-minute propagation delay we chased on and off for two
+days is the best illustration.
+
+Tracing it from the user's perspective back to the wire:
+
+\begin{enumerate}[leftmargin=1.5em]
+    \item A user publishes on the VPS. The CLI returns
+    instantly (v1.0.3), so the user knows the local store has
+    the message, but they can see from the tail on the laptop
+    that the message does not arrive.
+    \item The Entmoot gossip layer on the VPS runs a fanout. At
+    that time the fanout was sequential and had no reachability
+    filter, so it tried every peer serially.
+    \item Each attempt called Pilot's \texttt{DialConnection}.
+    For the laptop peer, the dial landed in a timeout loop
+    because (a) the cached UDP address was stale from NAT drift
+    on the laptop's carrier, and (b) even when the tunnel was
+    \texttt{encrypted=yes auth=yes}, the stream dial timed out
+    because Pilot was reply-routing to a stale direct address
+    instead of the relay path the last authenticated frame
+    arrived on.
+    \item Pilot eventually returned a timeout after about 32
+    seconds. Entmoot queued a retry. The retry loop redialled
+    the same dead peer after a fixed delay, synchronised with
+    every other pending message, and paid another 32 seconds.
+\end{enumerate}
+
+So the four-minute number was the product of one Pilot bug
+(NAT drift refresh, v1.9.0-jf.2; and reply on ingress,
+v1.9.0-jf.4), one Entmoot bug (serial fanout with no
+reachability filter, v1.0.6), and one Entmoot bug compounded by
+a second (deterministic retry schedule without jitter, v1.0.7).
+Every patch peeled one layer off the onion. Only after all of
+them shipped did the latency number come back to sub-second.
+
+The lesson for the architecture paper is that the split between
+layers should be clean enough that operators know where to
+look. Most of our time during this shakedown was spent deciding
+which layer owned a given symptom. After the dust settled the
+rule is simple:
+
+\begin{itemize}[leftmargin=1.2em]
+    \item If \texttt{pilotctl peers} shows a peer as
+    \texttt{encrypted=yes auth=yes} but \texttt{pilotctl ping}
+    still times out, the problem is Pilot.
+    \item If \texttt{pilotctl ping} succeeds but Entmoot fanout
+    does not deliver, the problem is Entmoot.
+\end{itemize}
+
+v1.9.0-jf.4 and v1.0.6 landed in the same day because that is
+when we untangled which was which.
+
+\section{Cheat sheet}
+\label{sec:cheat}
+
+Two tables, one per layer.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}llp{7cm}@{}}
+\toprule
+Version & Date & Summary \\
+\midrule
+v1.7.2-jf.1 & 18 Apr & Skip NAT punch to private addresses. \\
+v1.7.2-jf.2 & 18 Apr & Reset keepalive counter after rekey so tunnels stop flapping every 5 minutes. \\
+v1.7.2-jf.3 & 19 Apr & Independent beacon keepalive (25 s); \texttt{set-public} persists to config. \\
+v1.8.0-jf.1 & 19 Apr & Pluggable transport layer and TCP fallback. \\
+v1.9.0-jf.1 & 19 Apr & Gossip peer-discovery overlay, decoupling reachability from the registry. \\
+v1.9.0-jf.2 & 19 Apr & Refresh cached endpoint on every authenticated decrypt; macOS codesign workaround. \\
+v1.9.0-jf.3 & 19 Apr & Auto-recovery PILA on crypto-state desync. \\
+v1.9.0-jf.4 & 20 Apr & Reply-on-ingress path routing; 3 s SYN retransmit for relay mode. \\
+v1.9.0-jf.5 & 20 Apr & Full per-peer state cleanup across \texttt{AddPeer}/\texttt{RemovePeer}. \\
+v1.9.0-jf.6 & 21 Apr & \texttt{ErrDialToSelf} guard against self-tunnel storm. \\
+\bottomrule
+\end{tabular}
+\caption{Pilot fork release summary.}
+\end{table}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}llp{7cm}@{}}
+\toprule
+Version & Date & Summary \\
+\midrule
+v1.0.0 & 17 Apr & SQLite store, control-socket IPC, five-command CLI, invites with TTL. \\
+v1.0.2 & 19 Apr & Exponential-backoff retry; anti-entropy reconciliation on reconnect. \\
+v1.0.3 & 19 Apr & \texttt{entmootd publish} returns immediately after local store commit. \\
+v1.0.4 & 20 Apr & Plumtree dissemination with IHAVE/GRAFT/PRUNE. \\
+v1.0.5 & 20 Apr & Re-fanout fires on every acquisition path (push, retry, reconcile). \\
+v1.0.6 & 20 Apr & Trust-aware fanout, parallel sends with per-peer timeout, dial-backoff cache. \\
+v1.0.7 & 21 Apr & Inline message body on eager push; decorrelated-jitter retry backoff. \\
+v1.0.8 & 21 Apr & Exclude issuer from \texttt{bootstrap\_peers} at invite mint. \\
+v1.1.0 & 21 Apr & Persistent yamux-multiplexed session per peer; no per-frame Pilot stream dial. \\
+\bottomrule
+\end{tabular}
+\caption{Entmoot release summary.}
+\end{table}
+
+\section*{Appendix A: reading order}
+
+If you only have time for three sections, read
+Section~\ref{sec:mental} (the mental model),
+Section~\ref{sec:glossary} (the glossary), and
+Section~\ref{sec:bigpicture} (how the layers interacted).
+
+If you want to understand what broke on the wire, pick a single
+release from Section~\ref{sec:pilot} or~\ref{sec:entmoot}; each
+subsection is self-contained and uses the same four-part
+template (\emph{what broke}, \emph{what it actually was},
+\emph{how we fixed it}, \emph{why the fix is right}).
+
+The CHANGELOGs in \texttt{CHANGELOG.md} and
+\texttt{repos/pilotprotocol/CHANGELOG.md} are the source of
+truth for the technical claims in this document. The research
+paper (\texttt{paper/main.tex}) is the companion to this
+companion: the design as intended, with this document as the
+field report.
+
+\end{document}
