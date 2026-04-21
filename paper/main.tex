@@ -715,10 +715,12 @@ depth.
 
 \texttt{entmootd} is implemented in Go (${\geq}1.25.3$, matching
 Pilot's toolchain requirement) and compiles against the
-\texttt{jerryfane/pilotprotocol} fork of upstream Pilot v1.7.2,
-which adds the pluggable transport layer discussed in
-\S\ref{sec:background} and the reliability fixes described where
-relevant in this section. The module is split into fifteen
+\texttt{jerryfane/pilotprotocol} fork of upstream Pilot v1.7.2
+at fork tag \texttt{v1.9.0-jf.7}, which adds the pluggable
+transport layer discussed in \S\ref{sec:background}, a new
+\texttt{SetPeerEndpoints} IPC command consumed by the transport-ad
+path described later in this section, and the reliability fixes
+described where relevant. The module is split into fifteen
 packages totalling roughly 7,400 lines of non-test Go code (14,000
 including tests). Key packages: \texttt{canonical} (deterministic JSON encoding
 used for signing and identifier computation), \texttt{merkle} (tree
@@ -799,11 +801,33 @@ which is not documented. Third, because the
 registry hides private nodes' endpoints from non-trusted lookups, at
 least one participant in any bootstrap must be launched with
 Pilot's \texttt{-public} flag; otherwise the handshake request
-cannot be delivered. Entmoot is otherwise agnostic to which transport
-carries a given Pilot frame: when the dialing peer's direct-UDP retries
-time out and the callee has advertised a TCP endpoint via the registry,
-the Pilot fork falls back to TCP transparently, and the \texttt{net.Conn}
-the adapter hands us is indistinguishable from its UDP equivalent.
+cannot be delivered. Entmoot is otherwise agnostic to which transport carries a given
+Pilot frame: on a cold dial, the Pilot fork walks the transport
+stack (direct UDP $\rightarrow$ TCP $\rightarrow$ beacon relay) and
+the \texttt{net.Conn} the adapter hands us is indistinguishable
+across the three cases. One operational discovery shaped this path:
+Pilot's fork-side daemon advertises its TCP endpoint to the central
+registry at registration time, but the upstream stock registry
+silently drops the \texttt{endpoints} field, so peers' lookups never
+see a TCP endpoint and the fallback code path stays operationally
+inert. Rather than deploy a fork-built registry, v1.2.0 distributes
+per-peer TCP endpoints \emph{through Entmoot itself}: each member
+signs a small \texttt{TransportAd} record (monotonic per-author
+sequence, $\le$4 endpoints, 7-day TTL) and gossips it through the
+same Plumtree fanout as content messages. Receivers verify against
+the group roster, store-or-replace under Last-Writer-Wins semantics
+keyed on \texttt{(group, author)}, and install into Pilot's
+\texttt{peerTCP} cache via the new \texttt{SetPeerEndpoints} IPC.
+Three layers of spam defence run in cost order: schema/size
+validation ($\le$1\,KiB), a publisher-allowlist check (sender
+$=$ author), and a per-(peer, topic) token-bucket rate limit;
+only after all three pass does the (more expensive) Ed25519
+signature verification run. Persistent state is bounded at one
+row per \texttt{(group, member)} regardless of publish rate.
+Joiners pre-seed \texttt{peerTCP} two ways: invite-embedded
+endpoints signed end-to-end under the inviter's signature, and a
+\texttt{TransportSnapshotReq} to the bootstrap peer immediately
+after the roster sync completes.
 
 One operational footnote is worth flagging for readers who will
 run \texttt{entmootd} or \texttt{pilot-daemon} on recent macOS.
@@ -1033,6 +1057,29 @@ the laptop with VPS as the re-fanout hop.}
 \label{fig:partialcanary}
 \end{figure}
 
+A separate live measurement targeted the TCP-fallback path the
+transport-ad layer was built to unlock
+(\S\ref{sec:implementation}). On the same three-peer mesh, we
+installed an \texttt{iptables} rule on the Italian peer dropping
+outbound UDP to the public peer on Pilot's listen port, then
+cold-booted that peer's \texttt{pilot-daemon} and \texttt{entmootd}
+under the block. \texttt{entmootd}'s startup replay re-installed
+the peer's \texttt{peerTCP[\,public-peer\,]} entry from the
+persisted \texttt{TransportAd} via the \texttt{SetPeerEndpoints}
+IPC, then the first Entmoot push triggered a fresh Pilot
+\texttt{DialConnection}. The observed sequence: four UDP
+key-exchange attempts over $\approx$3.2\,s, then Pilot logged
+\texttt{peer switched to tcp remote=}\emph{public-peer}\texttt{:4443},
+and the encrypted tunnel re-established with
+\texttt{relay=false} (direct TCP, not beacon) at 7.4\,s from the
+first dial attempt. A \texttt{tcpdump} capture on the public peer
+records the \texttt{SYN} on port \texttt{4443} with 52\,ms RTT
+and full bidirectional data flow on the re-established tunnel.
+The empirical result both (i)~confirms the transport-ad layer
+succeeds at pre-seeding the \texttt{peerTCP} entry without any
+registry mediation and (ii)~puts a concrete figure on the
+cold-dial-to-TCP-tunnel latency under an active UDP block.
+
 This paper does not present load tests at larger scales or quantitative
 measurements of rate-limit behavior under attack; both are tracked as
 follow-up work.
@@ -1113,30 +1160,54 @@ already in place on the Entmoot side.
 
 Separately, Pilot's pluggable transport
 layer~(\S\ref{sec:background}) lets Entmoot run over TCP when a
-public-IP peer in the group advertises a TCP endpoint --- the
+public-IP peer in the group has a known TCP endpoint --- the
 UDP-hostile-network escape hatch that the Calin study's broader
-deployments would otherwise stumble on. A deliberate in-production
-test attempting to exercise TCP fallback revealed an orthogonal
-property of the v1.1.0 stack we had not explicitly designed for:
-with an already-established tunnel, a 57-second iptables-induced
-block on outbound UDP between two group members produced \emph{no
-transport switch and no application-visible loss}. The message
-published by the blocked node during the outage was held in the
-local \texttt{yamux} send buffer and delivered to the remote peer
-three seconds after the block lifted, in a single 899-byte burst
-over the restored UDP path. Pilot's reliable in-tunnel stream
-protocol retransmits keepalives indefinitely as long as the tunnel's
-crypto state looks alive; yamux's 30-second keepalive + 10-second
-write-timeout therefore only trips on \emph{new} dials, not on
-buffered traffic over an established session. The practical
-implication is that v1.1.0 gives a graceful-degradation window of
-roughly one minute for UDP micro-outages, below which the
-application observes neither loss nor latency penalty beyond the
-outage duration. Forcing an actual TCP fallback therefore requires
-either a cold-start dial from the blocked peer (e.g., a pilot-daemon
-restart during the block) or a block longer than the buffering
-window; quantifying both with a dedicated canary variant is a
-natural follow-up.
+deployments would otherwise stumble on. A sequence of live tests
+on the partial-connectivity mesh of Figure~\ref{fig:partialcanary}
+mapped this path's operational envelope. A first attempt, with an
+already-established tunnel, a 57-second \texttt{iptables}-induced
+UDP block, and v1.1.0 binaries, produced \emph{no transport switch
+and no application-visible loss}: the message published by the
+blocked node during the outage was held in the local \texttt{yamux}
+send buffer and delivered three seconds after the block lifted over
+the restored UDP path. Pilot's reliable in-tunnel stream protocol
+retransmits keepalives as long as the tunnel's crypto state looks
+alive, and yamux's 30-second keepalive + 10-second write-timeout
+only trips on \emph{new} dials --- so the stack provides a
+minute-scale graceful-degradation window for UDP micro-outages
+below which the application observes neither loss nor latency
+penalty. Two orthogonal findings then surfaced. First, when the
+same test was re-run against freshly restarted peers to force a
+cold dial, the TCP-fallback code path still did not engage because
+Pilot's \texttt{peerTCP} map was empty: the fork daemon does
+advertise its TCP endpoint to the central registry, but the upstream
+stock registry silently drops the \texttt{endpoints} field, so
+peers' lookups returned only the UDP \texttt{real\_addr}. The fix
+is the transport-ad layer described in~\S\ref{sec:implementation}:
+signed per-peer records gossiped over Entmoot itself install into
+Pilot's \texttt{peerTCP} via the new \texttt{SetPeerEndpoints} IPC,
+routing around the registry without requiring any fork-built
+registry deployment. Second, with \texttt{peerTCP} populated and
+a cold dial, the fallback completed in 7.4\,s
+(\S\ref{sec:evaluation}). A smaller operational detail worth
+recording for future forks: Pilot's current jf.7 daemon binds a
+single \texttt{TCPTransport} object that is both listener and
+dialer, so a CGNAT peer that wants outbound TCP as a fallback must
+also accept \texttt{-tcp-listen}'s auto-advertised endpoint; the
+advertisement is benign only because the stock registry is the one
+component that would otherwise propagate it. A future jf.8 addition
+of a client-only TCP mode would make the flag's intent
+self-consistent. Two further items fall out of the same test
+window. Entmoot's anti-entropy reconciliation fires reactively on
+inbound gossip (\S\ref{sec:antientropy}), not on a background
+ticker, so a partition that ends with no fresh publish leaves a
+historical gap until the next organic message triggers the
+reconcile gate; a 15--30-second background anti-entropy tick is a
+natural addition. And Pilot's tunnel rekey is transparent to its
+own reliability state machine but not to the \texttt{yamux}
+sessions layered above it; a rekey-triggered tear-down signal from
+the driver would let the adapter preemptively rebuild the session
+rather than discover orphaned state on the next \texttt{Dial}.
 
 Entmoot also creates the substrate the empirical questions flagged by
 \citet{calin2026emergent} require:
