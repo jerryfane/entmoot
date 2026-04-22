@@ -483,6 +483,9 @@ func (n *notifyingStore) Range(ctx context.Context, gid entmoot.GroupID, since, 
 func (n *notifyingStore) MerkleRoot(ctx context.Context, gid entmoot.GroupID) ([32]byte, error) {
 	return n.inner.MerkleRoot(ctx, gid)
 }
+func (n *notifyingStore) IterMessageIDsInIDRange(ctx context.Context, gid entmoot.GroupID, loID, hiID entmoot.MessageID) ([]entmoot.MessageID, error) {
+	return n.inner.IterMessageIDsInIDRange(ctx, gid, loID, hiID)
+}
 func (n *notifyingStore) Close() error { return n.inner.Close() }
 
 // ipcServer bundles the state IPC handlers need. All fields are

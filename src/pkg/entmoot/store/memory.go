@@ -1,8 +1,10 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"sort"
 	"sync"
 
 	"entmoot/pkg/entmoot"
@@ -100,6 +102,35 @@ func (s *Memory) Range(_ context.Context, groupID entmoot.GroupID, sinceMillis, 
 	s.mu.RUnlock()
 
 	return topoOrder(candidates)
+}
+
+// IterMessageIDsInIDRange implements MessageStore.IterMessageIDsInIDRange.
+// The bucket is scanned under the read lock; results are sorted after the
+// lock is released.
+func (s *Memory) IterMessageIDsInIDRange(_ context.Context, groupID entmoot.GroupID, loID, hiID entmoot.MessageID) ([]entmoot.MessageID, error) {
+	hiUnbounded := isZeroMessageID(hiID)
+
+	s.mu.RLock()
+	bucket := s.groups[groupID]
+	out := make([]entmoot.MessageID, 0, len(bucket))
+	for id := range bucket {
+		// Lower bound inclusive: id >= lo.
+		if bytes.Compare(id[:], loID[:]) < 0 {
+			continue
+		}
+		// Upper bound exclusive: id < hi (unless hi is the zero sentinel,
+		// which means "unbounded / all 0xFF").
+		if !hiUnbounded && bytes.Compare(id[:], hiID[:]) >= 0 {
+			continue
+		}
+		out = append(out, id)
+	}
+	s.mu.RUnlock()
+
+	sort.Slice(out, func(i, j int) bool {
+		return bytes.Compare(out[i][:], out[j][:]) < 0
+	})
+	return out, nil
 }
 
 // MerkleRoot implements MessageStore.MerkleRoot.

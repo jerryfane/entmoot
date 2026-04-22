@@ -7,6 +7,131 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-04-22
+
+### Fixed
+
+- **Anti-entropy catches gaps anywhere in the log.** The v1.2.0
+  reconcile path used `fetchPeerRange(since = latestLocalTimestamp)`
+  as its gap-recovery query, which could only heal peers that were
+  strictly *ahead* of us — if we held a newer message than the gap
+  we were missing, the range query excluded the gap entirely. Live
+  testing on 2026-04-22 surfaced this when two messages from a peer
+  who had been briefly unreachable never propagated even though
+  Merkle roots clearly differed. v1.2.1 replaces the cursor-based
+  path with Range-Based Set Reconciliation (Meyer, SRDS 2023;
+  arXiv:2212.13567), the same algorithm used by Willow / Earthstar
+  / iroh and by Negentropy (Nostr NIP-77). Bandwidth is proportional
+  to the symmetric difference (not the set size), convergence is
+  O(log N) rounds, and the protocol catches gaps anywhere in the
+  timeline by construction.
+
+### Added
+
+- **Range-Based Set Reconciliation** package
+  (`pkg/entmoot/reconcile`). Greenfield Go implementation of the
+  RBSR state machine with a Negentropy-style 16-byte fingerprint —
+  `SHA-256(count_u64_le || sum_mod_2^256(SHA-256(id)))[:16]` —
+  which is commutative, incrementally computable, and resistant
+  to duplicate-cancellation / Gaussian-elimination attacks that
+  plain XOR fingerprints suffer from. Defaults: leaf threshold
+  16, fanout per round 16, max rounds 10 (safety-net — `WARN` on
+  overflow).
+
+- **`MsgReconcile = 0x11`** wire opcode carrying
+  `{group_id, round, ranges, done}`. The RBSR session holds a
+  yamux stream open across multiple alternating frames until both
+  sides flag `done=true`. This is the first handler in the
+  codebase that keeps a conn alive across frames; the convention
+  is flagged explicitly in `onReconcileReq`.
+
+- **`Transport.SetOnTunnelUp(cb)`** callback surface. Pilot
+  adapter fires the callback after every freshly-established
+  yamux session (outbound and inbound), with panic-recover and
+  goroutine isolation so a slow reconcile dial can't block the
+  transport. In-memory transport fires symmetrically on both
+  sides of each `Dial` / `Accept`. `gossiper.Start` installs
+  `SetOnTunnelUp(func(p){ g.maybeReconcile(ctx, p) })` so every
+  reconnect triggers an immediate cooldown-gated reconcile —
+  directly addressing the Pilot-tunnel-flap pattern observed on
+  2026-04-22 where yamux orphaning across rekeys left stale
+  peers invisible until an organic publish arrived.
+
+- **Background anti-entropy ticker** (`reconcilerLoop`). Picks
+  the least-recently-reconciled roster member each 30 s ±20 %
+  jittered tick, one peer per tick. Skip optimization:
+  `lastKnownPeerRoot[peer]` caches each peer's Merkle root after
+  a successful reconcile; if the local root still matches, the
+  tick is a silent no-op. An idle three-peer mesh costs zero
+  dials per tick at steady state. Bounds worst-case
+  post-partition catch-up latency to one tick interval regardless
+  of whether anyone publishes — the problem that kept two
+  specific messages stuck on VPS for minutes after recovery,
+  because reconcile was reactive-only on inbound gossip.
+
+- **`MessageStore.IterMessageIDsInIDRange`** — new interface
+  method returning message IDs sorted by byte-order in a
+  half-open `[lo, hi)` range. Implemented on Memory, JSONL, and
+  SQLite backends. SQLite uses the auto-generated primary-key
+  index on `message_id` (confirmed via `EXPLAIN QUERY PLAN`).
+  The byte ordering is distinct from — and does not replace —
+  the existing topological ordering used by `MerkleRoot()`; RBSR
+  uses byte order because it aligns with the SQLite PK and makes
+  range splitting arithmetic trivial.
+
+- **Dial-backoff hygiene**: successful inbound Accept from a peer
+  now clears that peer's outbound dial-backoff window
+  (`recordDialSuccess(remote)` at the Accept-success site).
+  Inbound reachability is strong bidirectional-reachability
+  evidence, so a cached outbound-backoff from an earlier failure
+  is almost certainly stale. If the next outbound dial does fail,
+  the backoff re-arms from base.
+
+- **Debug logs at reconcile decision points**: cooldown-gated
+  skips, tick-skips when roots already match, per-round progress
+  (peer, round, outgoing ranges, newly-missing count, done
+  flags). Makes it straightforward to distinguish "no reconcile
+  happened" from "deduplicated" from "converged in N rounds"
+  when tracing operational issues.
+
+### Wire compatibility
+
+- v1.2.1 ↔ v1.2.1: `MsgReconcile` path.
+- v1.2.0 → v1.2.1: legacy peer issues `MsgRangeReq`; v1.2.1
+  retains `onRangeReq` + `onMerkleReq` as compat responders.
+  Pair converges via the v1.2.0 buggy-but-functional path.
+- v1.2.1 → v1.2.0: v1.2.1 issues `MsgReconcile`; v1.2.0 responder
+  sees unknown opcode and drops the stream; v1.2.1 reads EOF,
+  emits `Debug "session ended early (peer may be v1.2.0)"`, and
+  returns without state corruption. Historical gaps between
+  mismatched-version peers do not heal until the whole mesh is
+  upgraded — acceptable for our three-peer deployment; staged
+  upgrades should cycle through in order.
+
+### Internals
+
+- New field `Gossiper.lastKnownPeerRoot map[NodeID]wire.MerkleRoot`
+  guarded by `pendMu`, updated at the end of each successful
+  reconcile.
+- Dead code removed: `fetchPeerRange` and `latestLocalTimestamp`
+  (both superseded by RBSR).
+- `reconcileSessionTimeout = 15 s`, `reconcilerTickBase = 30 s`,
+  `reconcilerTickJitter = 6 s` new constants.
+- `jitteredReconcilerTick()` helper alongside the existing
+  `jitteredReconcileCooldown()`.
+
+### Known
+
+- `test/canary/TestCanaryPilot` intermittently hangs (pre-existing
+  since v1.2.0) on `driver.sendAndWaitTimeout` in the Pilot IPC
+  adapter — the call is not `context.Context`-bounded. Stack
+  trace is entirely in `transport/pilot/*` (untouched by v1.2.1).
+  Fix is a Pilot-fork concern (prospective jf.8): bound the IPC
+  wait with the caller's context. v1.2.1's added OnTunnelUp
+  callback creates more tunnel-establish events in the canary,
+  which slightly increases the flake surface but does not
+  introduce the bug.
+
 ## [1.2.0] - 2026-04-21
 
 ### Added

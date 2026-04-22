@@ -2,6 +2,7 @@ package store
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -11,6 +12,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 
 	"entmoot/pkg/entmoot"
@@ -215,6 +217,35 @@ func (s *JSONL) Range(_ context.Context, groupID entmoot.GroupID, sinceMillis, u
 	s.mu.RUnlock()
 
 	return topoOrder(candidates)
+}
+
+// IterMessageIDsInIDRange implements MessageStore.IterMessageIDsInIDRange.
+// Scans the in-memory index under the read lock, filters by byte-range, and
+// returns byte-sorted ascending. JSONL is test-only, so perf is unimportant.
+func (s *JSONL) IterMessageIDsInIDRange(_ context.Context, groupID entmoot.GroupID, loID, hiID entmoot.MessageID) ([]entmoot.MessageID, error) {
+	hiUnbounded := isZeroMessageID(hiID)
+
+	s.mu.RLock()
+	gs := s.groups[groupID]
+	var out []entmoot.MessageID
+	if gs != nil {
+		out = make([]entmoot.MessageID, 0, len(gs.msgs))
+		for id := range gs.msgs {
+			if bytes.Compare(id[:], loID[:]) < 0 {
+				continue
+			}
+			if !hiUnbounded && bytes.Compare(id[:], hiID[:]) >= 0 {
+				continue
+			}
+			out = append(out, id)
+		}
+	}
+	s.mu.RUnlock()
+
+	sort.Slice(out, func(i, j int) bool {
+		return bytes.Compare(out[i][:], out[j][:]) < 0
+	})
+	return out, nil
 }
 
 // MerkleRoot implements MessageStore.MerkleRoot.

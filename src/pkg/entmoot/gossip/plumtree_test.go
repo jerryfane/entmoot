@@ -113,6 +113,13 @@ func (t *filteringTransport) SetPeerEndpoints(ctx context.Context, peer entmoot.
 	return t.inner.SetPeerEndpoints(ctx, peer, endpoints)
 }
 
+// SetOnTunnelUp implements Transport. Delegates to the inner transport;
+// Plumtree tests don't exercise the callback directly, but the filter
+// still needs to satisfy the interface. (v1.2.1)
+func (t *filteringTransport) SetOnTunnelUp(cb func(peer entmoot.NodeID)) {
+	t.inner.SetOnTunnelUp(cb)
+}
+
 // dialsTo returns how many times Dial has been invoked for `peer`,
 // regardless of whether the dial was allowed. Used by Fix A tests to
 // prove the trust oracle short-circuited a would-be dial before the

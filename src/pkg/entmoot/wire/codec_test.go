@@ -10,6 +10,7 @@ import (
 
 	entmoot "entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/canonical"
+	"entmoot/pkg/entmoot/reconcile"
 )
 
 // mustGroupID returns a GroupID filled with the given byte for test brevity.
@@ -472,6 +473,75 @@ func TestRoundTripTransportSnapshotResp(t *testing.T) {
 		if !bytes.Equal(ad.Signature, three.Ads[i].Signature) {
 			t.Fatalf("Ads[%d].Signature differs", i)
 		}
+	}
+}
+
+// TestRoundTripReconcile covers the v1.2.1 Reconcile payload: a mixed-Kind
+// range list (Empty, Fingerprint with non-zero fingerprint bytes, and
+// IDList with populated IDs) must survive EncodeAndWrite + ReadAndDecode
+// byte-for-byte so peers observe the exact frame the sender emitted.
+func TestRoundTripReconcile(t *testing.T) {
+	var fp reconcile.Fingerprint
+	for i := range fp {
+		fp[i] = byte(0x20 + i)
+	}
+	msg := &Reconcile{
+		GroupID: mustGroupID(0xAA),
+		Round:   3,
+		Done:    false,
+		Ranges: []reconcile.Range{
+			{
+				Lo:   mustMessageID(0x00),
+				Hi:   mustMessageID(0x20),
+				Kind: reconcile.KindEmpty,
+			},
+			{
+				Lo:          mustMessageID(0x20),
+				Hi:          mustMessageID(0x40),
+				Kind:        reconcile.KindFingerprint,
+				Fingerprint: fp,
+			},
+			{
+				Lo:   mustMessageID(0x40),
+				Hi:   mustMessageID(0x60),
+				Kind: reconcile.KindIDList,
+				IDs: []entmoot.MessageID{
+					mustMessageID(0x41),
+					mustMessageID(0x42),
+					mustMessageID(0x43),
+				},
+			},
+			{
+				Lo:          mustMessageID(0x60),
+				Hi:          mustMessageID(0x80),
+				Kind:        reconcile.KindFingerprint,
+				Fingerprint: fp,
+			},
+			{
+				Lo:   mustMessageID(0x80),
+				Hi:   entmoot.MessageID{}, // sentinel: "to max"
+				Kind: reconcile.KindEmpty,
+			},
+		},
+	}
+
+	var buf bytes.Buffer
+	if err := EncodeAndWrite(&buf, msg); err != nil {
+		t.Fatalf("EncodeAndWrite: %v", err)
+	}
+	gotType, payload, err := ReadAndDecode(&buf)
+	if err != nil {
+		t.Fatalf("ReadAndDecode: %v", err)
+	}
+	if gotType != MsgReconcile {
+		t.Fatalf("msg_type = %v, want %v", gotType, MsgReconcile)
+	}
+	got, ok := payload.(*Reconcile)
+	if !ok {
+		t.Fatalf("payload = %T, want *Reconcile", payload)
+	}
+	if !reflect.DeepEqual(got, msg) {
+		t.Fatalf("Reconcile differs after round-trip\n  got:  %#v\n  want: %#v", got, msg)
 	}
 }
 

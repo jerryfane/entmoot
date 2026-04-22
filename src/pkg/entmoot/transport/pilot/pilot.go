@@ -47,6 +47,7 @@ import (
 	"log/slog"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/TeoSlayer/pilotprotocol/pkg/driver"
@@ -138,6 +139,13 @@ type Transport struct {
 	closeOnce sync.Once
 	closed    chan struct{}
 	closeErr  error
+
+	// onTunnelUp holds a func(entmoot.NodeID) — the callback installed
+	// by SetOnTunnelUp. Stored via atomic.Value so the hot paths in
+	// getOrCreateSession / acceptPilotConns can load it without
+	// acquiring any per-transport mutex. An empty Value (no Store yet)
+	// or a stored typed-nil both behave as "no callback". (v1.2.1)
+	onTunnelUp atomic.Value
 }
 
 // Open connects to the Pilot daemon at cfg.SocketPath, discovers the local
@@ -307,10 +315,17 @@ func (t *Transport) getOrCreateSession(ctx context.Context, peer entmoot.NodeID)
 	if existing, ok := t.sessions[peer]; ok && !existing.sess.IsClosed() {
 		t.sessionsMu.Unlock()
 		_ = sess.Close()
+		// Lost the race — the tunnel is not new to us. Do NOT fire
+		// OnTunnelUp; the goroutine that actually installed the
+		// winning session already did (or will). (v1.2.1)
 		return existing.sess, nil
 	}
 	t.sessions[peer] = &yamuxSession{sess: sess}
 	t.sessionsMu.Unlock()
+	// We installed a fresh outbound session. Fire the OnTunnelUp
+	// callback — the gossiper uses this to kick off anti-entropy
+	// reconcile on reconnect (Part D). (v1.2.1)
+	t.fireOnTunnelUp(peer)
 	return sess, nil
 }
 
@@ -368,6 +383,10 @@ func (t *Transport) acceptPilotConns() {
 		t.sessionsMu.Unlock()
 		t.acceptWG.Add(1)
 		go t.pumpInboundStreams(sess, remote)
+		// Session is fully ready for traffic (pump is running). Fire
+		// the OnTunnelUp callback so the gossiper (Part D) can kick
+		// off an anti-entropy reconcile with this peer. (v1.2.1)
+		t.fireOnTunnelUp(remote)
 	}
 }
 
@@ -489,6 +508,44 @@ func (t *Transport) SetPeerEndpoints(ctx context.Context, peer entmoot.NodeID, e
 		return fmt.Errorf("pilot: set peer endpoints for %d: %w", peer, err)
 	}
 	return nil
+}
+
+// SetOnTunnelUp implements gossip.Transport. The callback is stored via
+// atomic.Value for lock-free reads on the hot path (getOrCreateSession /
+// acceptPilotConns). Passing nil clears the callback (stored as a
+// typed-nil so Load never races with Store). Subsequent calls replace
+// any previously-installed callback. (v1.2.1)
+func (t *Transport) SetOnTunnelUp(cb func(peer entmoot.NodeID)) {
+	if cb == nil {
+		t.onTunnelUp.Store((func(entmoot.NodeID))(nil))
+		return
+	}
+	t.onTunnelUp.Store(cb)
+}
+
+// fireOnTunnelUp loads the currently-installed OnTunnelUp callback (if
+// any) and invokes it in a fresh goroutine with a panic recover so a
+// misbehaving callback cannot poison the session-wiring path. Safe to
+// call with no callback installed. (v1.2.1)
+func (t *Transport) fireOnTunnelUp(peer entmoot.NodeID) {
+	raw := t.onTunnelUp.Load()
+	if raw == nil {
+		return
+	}
+	cb, ok := raw.(func(entmoot.NodeID))
+	if !ok || cb == nil {
+		return
+	}
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				t.logger.Warn("pilot transport: OnTunnelUp panic",
+					slog.Any("panic", r),
+					slog.Uint64("peer", uint64(peer)))
+			}
+		}()
+		cb(peer)
+	}()
 }
 
 // Close releases the listener, every cached yamux session, and the driver

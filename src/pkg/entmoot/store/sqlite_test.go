@@ -629,6 +629,100 @@ func TestSQLiteTopologicalOrder(t *testing.T) {
 	}
 }
 
+// TestSQLiteIterMessageIDsInIDRangeUsesIndex asserts that the SQL query
+// backing IterMessageIDsInIDRange is served by an index (the message_id
+// PRIMARY KEY or a (group_id, ...) composite) rather than a full table
+// scan. modernc.org/sqlite reports the auto-generated PK index as
+// "sqlite_autoindex_messages_1"; the composite indexes defined in the
+// schema are named "idx_messages_group_time" and
+// "idx_messages_group_author". Which one the planner picks depends on
+// the table's statistics — with few rows SQLite often prefers whichever
+// index can satisfy the equality first. What this test rejects is
+// "SCAN messages" — i.e. a full table scan ignoring every index.
+func TestSQLiteIterMessageIDsInIDRangeUsesIndex(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	s, err := OpenSQLite(root)
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	// Force the group database open by doing one Put so the file and
+	// schema exist.
+	gid := randGroupID(t)
+	m := mkMsg(t, gid, testAuthor(1, 0xAA), 1_000, "seed")
+	if err := s.Put(ctx, m); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	dbPath := filepath.Join(root, "groups", encodeGroupDirName(gid), "messages.sqlite")
+	// Side handle — we don't want to influence the store's own *sql.DB
+	// connection pool while we introspect plans.
+	side, err := sql.Open("sqlite", "file:"+dbPath)
+	if err != nil {
+		t.Fatalf("sql.Open side: %v", err)
+	}
+	defer side.Close()
+
+	// EXPLAIN QUERY PLAN returns rows of (id, parent, notused, detail).
+	// We only care about detail. Run both the unbounded-hi and bounded-hi
+	// variants used by IterMessageIDsInIDRange.
+	var zeroID entmoot.MessageID
+	queries := []struct {
+		sql  string
+		args []any
+	}{
+		{
+			sql:  `EXPLAIN QUERY PLAN SELECT message_id FROM messages WHERE group_id = ? AND message_id >= ? ORDER BY message_id ASC`,
+			args: []any{gid[:], zeroID[:]},
+		},
+		{
+			sql:  `EXPLAIN QUERY PLAN SELECT message_id FROM messages WHERE group_id = ? AND message_id >= ? AND message_id < ? ORDER BY message_id ASC`,
+			args: []any{gid[:], zeroID[:], bytes.Repeat([]byte{0xFF}, 32)},
+		},
+	}
+
+	for _, q := range queries {
+		rows, err := side.QueryContext(ctx, q.sql, q.args...)
+		if err != nil {
+			t.Fatalf("EXPLAIN QUERY PLAN: %v", err)
+		}
+		var sawIndex bool
+		var details []string
+		for rows.Next() {
+			var id, parent, notused int
+			var detail string
+			if err := rows.Scan(&id, &parent, &notused, &detail); err != nil {
+				rows.Close()
+				t.Fatalf("scan plan row: %v", err)
+			}
+			details = append(details, detail)
+			// Any index-backed SEARCH on `messages` is acceptable: the
+			// PK index (sqlite_autoindex_messages_1) or either of the
+			// composite (group_id, ...) indexes. We reject only
+			// "SCAN messages" — a full table scan.
+			if strings.Contains(detail, "SEARCH messages USING INDEX") ||
+				strings.Contains(detail, "USING PRIMARY KEY") ||
+				strings.Contains(detail, "USING INTEGER PRIMARY KEY") ||
+				strings.Contains(detail, "sqlite_autoindex_messages_1") {
+				sawIndex = true
+			}
+			if strings.HasPrefix(detail, "SCAN messages") {
+				rows.Close()
+				t.Fatalf("query planner chose SCAN on messages, want an index SEARCH:\n  sql: %s\n  detail: %q", q.sql, detail)
+			}
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			t.Fatalf("iter plan rows: %v", err)
+		}
+		if !sawIndex {
+			t.Fatalf("EXPLAIN QUERY PLAN did not reference the message_id PK index for:\n  %s\n  rows=%q", q.sql, details)
+		}
+	}
+}
+
 // TestSQLiteFilePermissions verifies that the created SQLite database file
 // is 0600 (owner-only read/write), matching the layout expected in
 // CLI_DESIGN.md.

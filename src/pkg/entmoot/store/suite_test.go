@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"errors"
+	"sort"
 	"sync"
 	"testing"
 
@@ -297,6 +298,10 @@ func runStoreSuite(t *testing.T, newStore func(t *testing.T) MessageStore) {
 		}
 	})
 
+	t.Run("IterMessageIDsInIDRange", func(t *testing.T) {
+		testIterMessageIDsInIDRange(t, newStore)
+	})
+
 	t.Run("ConcurrentPuts", func(t *testing.T) {
 		s := newStore(t)
 		gid := randGroupID(t)
@@ -341,6 +346,249 @@ func idsOf(msgs []entmoot.Message) []entmoot.MessageID {
 		out[i] = m.ID
 	}
 	return out
+}
+
+// mkMsgWithID constructs a Message with a caller-specified MessageID rather
+// than deriving it from canonical.MessageID. The store does not check that
+// m.ID matches its canonical encoding, so this gives tests precise control
+// over the byte-range keyspace used by IterMessageIDsInIDRange.
+func mkMsgWithID(gid entmoot.GroupID, id entmoot.MessageID, author entmoot.NodeInfo, ts int64, content string) entmoot.Message {
+	return entmoot.Message{
+		ID:        id,
+		GroupID:   gid,
+		Author:    author,
+		Timestamp: ts,
+		Content:   []byte(content),
+	}
+}
+
+// mkID builds a 32-byte MessageID whose first byte is prefix and whose
+// second byte is tag. Remaining bytes are zero. That is enough to place
+// ids at known points in the byte-sort space while keeping every id
+// distinct and non-zero (so the store does not reject them).
+func mkID(prefix, tag byte) entmoot.MessageID {
+	var id entmoot.MessageID
+	id[0] = prefix
+	id[1] = tag
+	return id
+}
+
+// testIterMessageIDsInIDRange exercises the IterMessageIDsInIDRange contract
+// on whichever MessageStore newStore returns. It is invoked from the main
+// suite so all three backends (Memory / JSONL / SQLite) share one test body.
+func testIterMessageIDsInIDRange(t *testing.T, newStore func(t *testing.T) MessageStore) {
+	t.Helper()
+	ctx := context.Background()
+	var zeroID entmoot.MessageID
+	var maxID entmoot.MessageID
+	for i := range maxID {
+		maxID[i] = 0xFF
+	}
+
+	// Ten ids spanning the keyspace. Prefixes intentionally include
+	// 0x00, 0x40, 0x80, 0xC0, 0xFF; the second byte disambiguates pairs
+	// that share a prefix so byte-order is total and well-defined.
+	baseIDs := []entmoot.MessageID{
+		mkID(0x00, 0x01),
+		mkID(0x00, 0x02),
+		mkID(0x10, 0x01),
+		mkID(0x40, 0x01),
+		mkID(0x40, 0x02),
+		mkID(0x80, 0x01),
+		mkID(0xC0, 0x01),
+		mkID(0xC0, 0x02),
+		mkID(0xFE, 0x01),
+		mkID(0xFF, 0x01),
+	}
+
+	// sortedCopy returns baseIDs byte-ascending. baseIDs above is already
+	// constructed in ascending order, but asserting it explicitly would
+	// couple this test to that construction; we sort a fresh copy instead.
+	sortedCopy := func() []entmoot.MessageID {
+		out := append([]entmoot.MessageID(nil), baseIDs...)
+		sort.Slice(out, func(i, j int) bool {
+			return bytes.Compare(out[i][:], out[j][:]) < 0
+		})
+		return out
+	}
+
+	populate := func(t *testing.T, s MessageStore, gid entmoot.GroupID, ids []entmoot.MessageID) {
+		t.Helper()
+		for i, id := range ids {
+			m := mkMsgWithID(gid, id, testAuthor(uint32(i+1), byte(i+1)), int64(1000+i), "c")
+			if err := s.Put(ctx, m); err != nil {
+				t.Fatalf("Put %d: %v", i, err)
+			}
+		}
+	}
+
+	assertEqualIDs := func(t *testing.T, got, want []entmoot.MessageID) {
+		t.Helper()
+		if len(got) != len(want) {
+			t.Fatalf("len got=%d want=%d\ngot=%x\nwant=%x", len(got), len(want), got, want)
+		}
+		for i := range got {
+			if got[i] != want[i] {
+				t.Fatalf("idx %d: got=%x want=%x\nfull got=%x\nfull want=%x",
+					i, got[i], want[i], got, want)
+			}
+		}
+	}
+
+	t.Run("EmptyGroup", func(t *testing.T) {
+		s := newStore(t)
+		gid := randGroupID(t)
+		got, err := s.IterMessageIDsInIDRange(ctx, gid, zeroID, zeroID)
+		if err != nil {
+			t.Fatalf("Iter: %v", err)
+		}
+		if len(got) != 0 {
+			t.Fatalf("empty group returned %d ids (%x), want 0", len(got), got)
+		}
+	})
+
+	t.Run("FullRangeZeroHiUnbounded", func(t *testing.T) {
+		s := newStore(t)
+		gid := randGroupID(t)
+		populate(t, s, gid, baseIDs)
+
+		got, err := s.IterMessageIDsInIDRange(ctx, gid, zeroID, zeroID)
+		if err != nil {
+			t.Fatalf("Iter: %v", err)
+		}
+		assertEqualIDs(t, got, sortedCopy())
+	})
+
+	t.Run("FullRangeExplicitMaxHi", func(t *testing.T) {
+		s := newStore(t)
+		gid := randGroupID(t)
+		populate(t, s, gid, baseIDs)
+
+		// hi == all-0xFF. Since baseIDs includes mkID(0xFF,0x01), and the
+		// upper bound is exclusive, that id must still appear (it is
+		// strictly less than 0xFF..0xFF).
+		got, err := s.IterMessageIDsInIDRange(ctx, gid, zeroID, maxID)
+		if err != nil {
+			t.Fatalf("Iter: %v", err)
+		}
+		assertEqualIDs(t, got, sortedCopy())
+	})
+
+	t.Run("TightRangeExactlyTwo", func(t *testing.T) {
+		s := newStore(t)
+		gid := randGroupID(t)
+		populate(t, s, gid, baseIDs)
+
+		// [0x40..0x02, 0xC0..0x02): contains 0x40-02, 0x80-01, 0xC0-01.
+		// Pick a smaller slice: [0x80..0x01, 0xC0..0x02) contains
+		// 0x80-01 and 0xC0-01. Exactly 2.
+		lo := mkID(0x80, 0x01)
+		hi := mkID(0xC0, 0x02)
+		got, err := s.IterMessageIDsInIDRange(ctx, gid, lo, hi)
+		if err != nil {
+			t.Fatalf("Iter: %v", err)
+		}
+		want := []entmoot.MessageID{mkID(0x80, 0x01), mkID(0xC0, 0x01)}
+		assertEqualIDs(t, got, want)
+	})
+
+	t.Run("LowerBoundInclusive", func(t *testing.T) {
+		s := newStore(t)
+		gid := randGroupID(t)
+		populate(t, s, gid, baseIDs)
+
+		lo := mkID(0x40, 0x01) // exactly equal to one of our ids
+		hi := mkID(0x40, 0x02) // exclusive upper on next id in the sequence
+		got, err := s.IterMessageIDsInIDRange(ctx, gid, lo, hi)
+		if err != nil {
+			t.Fatalf("Iter: %v", err)
+		}
+		want := []entmoot.MessageID{mkID(0x40, 0x01)}
+		assertEqualIDs(t, got, want)
+	})
+
+	t.Run("UpperBoundExclusive", func(t *testing.T) {
+		s := newStore(t)
+		gid := randGroupID(t)
+		populate(t, s, gid, baseIDs)
+
+		// Range ending exactly at 0x80..0x01 must exclude that id.
+		lo := zeroID
+		hi := mkID(0x80, 0x01)
+		got, err := s.IterMessageIDsInIDRange(ctx, gid, lo, hi)
+		if err != nil {
+			t.Fatalf("Iter: %v", err)
+		}
+		// Want all ids strictly less than 0x80..0x01.
+		want := []entmoot.MessageID{
+			mkID(0x00, 0x01),
+			mkID(0x00, 0x02),
+			mkID(0x10, 0x01),
+			mkID(0x40, 0x01),
+			mkID(0x40, 0x02),
+		}
+		assertEqualIDs(t, got, want)
+	})
+
+	t.Run("InsertOrderIndependence", func(t *testing.T) {
+		s := newStore(t)
+		gid := randGroupID(t)
+
+		// Take five of the base ids and insert them in strictly-reversed
+		// byte order; IterMessageIDsInIDRange must still return them
+		// byte-ascending.
+		subset := []entmoot.MessageID{
+			mkID(0x00, 0x01),
+			mkID(0x40, 0x01),
+			mkID(0x80, 0x01),
+			mkID(0xC0, 0x01),
+			mkID(0xFF, 0x01),
+		}
+		reversed := make([]entmoot.MessageID, len(subset))
+		for i, id := range subset {
+			reversed[len(subset)-1-i] = id
+		}
+		populate(t, s, gid, reversed)
+
+		got, err := s.IterMessageIDsInIDRange(ctx, gid, zeroID, zeroID)
+		if err != nil {
+			t.Fatalf("Iter: %v", err)
+		}
+		assertEqualIDs(t, got, subset)
+	})
+
+	t.Run("WrongGroup", func(t *testing.T) {
+		s := newStore(t)
+		gidA := randGroupID(t)
+		gidB := randGroupID(t)
+		populate(t, s, gidA, baseIDs)
+
+		// Different group is completely empty wrt the query.
+		got, err := s.IterMessageIDsInIDRange(ctx, gidB, zeroID, zeroID)
+		if err != nil {
+			t.Fatalf("Iter gidB: %v", err)
+		}
+		if len(got) != 0 {
+			t.Fatalf("wrong-group query returned %d ids, want 0\nids=%x", len(got), got)
+		}
+
+		// Populating gidB with a single distinct id must not leak into
+		// gidA's result and vice-versa.
+		onlyInB := []entmoot.MessageID{mkID(0x20, 0xAA)}
+		populate(t, s, gidB, onlyInB)
+
+		gotA, err := s.IterMessageIDsInIDRange(ctx, gidA, zeroID, zeroID)
+		if err != nil {
+			t.Fatalf("Iter gidA: %v", err)
+		}
+		assertEqualIDs(t, gotA, sortedCopy())
+
+		gotB, err := s.IterMessageIDsInIDRange(ctx, gidB, zeroID, zeroID)
+		if err != nil {
+			t.Fatalf("Iter gidB post-put: %v", err)
+		}
+		assertEqualIDs(t, gotB, onlyInB)
+	})
 }
 
 // TestMemory runs the shared suite against Memory.

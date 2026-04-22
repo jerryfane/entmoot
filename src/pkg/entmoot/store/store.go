@@ -57,6 +57,17 @@ type MessageStore interface {
 	// zero root and a nil error.
 	MerkleRoot(ctx context.Context, groupID entmoot.GroupID) ([32]byte, error)
 
+	// IterMessageIDsInIDRange returns every message ID in the given group
+	// whose 32-byte identifier lies in the half-open range [loID, hiID),
+	// sorted ascending by byte order. If hiID is the zero MessageID, the
+	// upper bound is treated as "unbounded" (equivalent to all 0xFF).
+	//
+	// This is used by the reconcile package for range-based anti-entropy
+	// (Entmoot v1.2.1); it is NOT the same ordering as Range() (which is
+	// topological / timestamp-based). An empty or unknown group returns an
+	// empty slice and a nil error.
+	IterMessageIDsInIDRange(ctx context.Context, groupID entmoot.GroupID, loID, hiID entmoot.MessageID) ([]entmoot.MessageID, error)
+
 	// Close releases any resources held by the store. For Memory this is a
 	// no-op; for JSONL it closes any open file handles.
 	Close() error

@@ -19,6 +19,7 @@ import (
 	"entmoot/pkg/entmoot/clock"
 	"entmoot/pkg/entmoot/keystore"
 	"entmoot/pkg/entmoot/ratelimit"
+	"entmoot/pkg/entmoot/reconcile"
 	"entmoot/pkg/entmoot/roster"
 	"entmoot/pkg/entmoot/store"
 	"entmoot/pkg/entmoot/wire"
@@ -108,6 +109,24 @@ const (
 	reconcileCooldownBase   = 30 * time.Second
 	reconcileCooldownJitter = 6 * time.Second // ±20 %
 )
+
+// Background AE ticker (v1.2.1). Serf-style push-pull: 30 s base with
+// jitter, one least-recently-reconciled peer per tick. The cooldown
+// gate in maybeReconcile dedupes against reactive triggers (push,
+// accept, OnTunnelUp). Skip-when-roots-equal keeps idle meshes quiet.
+const (
+	reconcilerTickBase   = 30 * time.Second
+	reconcilerTickJitter = 6 * time.Second // ±20 %
+)
+
+// reconcileSessionTimeout bounds the wallclock budget of a single RBSR
+// reconciliation session — the full multi-frame exchange between initiator
+// and responder, not per-frame. Anti-entropy against a 10^4-message group
+// converges in O(log diff) rounds; the 15-second envelope covers network
+// round-trip variance plus body-fetch latency for the ids produced by the
+// session. If the session exceeds this budget the initiator tears the
+// connection down and the next reconcileCooldown expiry re-tries. (v1.2.1)
+const reconcileSessionTimeout = 15 * time.Second
 
 // Plumtree GRAFT timeout (v1.0.4). After receiving an IHave advertising
 // an unknown id, wait this long for the body to arrive via eager push
@@ -348,6 +367,13 @@ type Gossiper struct {
 	pendMu         sync.Mutex
 	pending        map[retryKey]*retryState
 	lastReconciled map[entmoot.NodeID]reconcileState
+	// lastKnownPeerRoot caches the Merkle root each peer reported on the
+	// most recent successful reconcile handshake. Phase 7 / Part E
+	// consults it before firing a reconcile to tick-skip peers we already
+	// know we're aligned with. Guarded by pendMu so it shares the same
+	// lock domain as lastReconciled (both are updated at the end of a
+	// reconcile round). (v1.2.1)
+	lastKnownPeerRoot map[entmoot.NodeID]wire.MerkleRoot
 
 	// rng is a dedicated *rand.Rand for retry-backoff and cooldown
 	// jitter (v1.0.7 Fix B). Seeded in New from the clock the same
@@ -462,9 +488,10 @@ func New(cfg Config) (*Gossiper, error) {
 		logger:         logger,
 		clk:            clk,
 		fanout:         fanout,
-		pending:        make(map[retryKey]*retryState),
-		lastReconciled: make(map[entmoot.NodeID]reconcileState),
-		rng:            rng,
+		pending:           make(map[retryKey]*retryState),
+		lastReconciled:    make(map[entmoot.NodeID]reconcileState),
+		lastKnownPeerRoot: make(map[entmoot.NodeID]wire.MerkleRoot),
+		rng:               rng,
 		// Plumtree peer-set maps and pending-graft timer map are
 		// lazily populated. Per paper convention, eagerPushPeers
 		// starts with every current non-self roster member at first
@@ -692,6 +719,29 @@ func (g *Gossiper) Start(ctx context.Context) error {
 	g.lifeCtx = ctx
 	g.lifeMu.Unlock()
 
+	// Install the tunnel-up callback (v1.2.1, Part D): every freshly-
+	// established Pilot session fires this hook, which triggers a
+	// cooldown-gated reconcile against the peer whose tunnel just came
+	// up. The hook is de-duplicated against the reactive triggers
+	// already wired into the accept loop and fetchFrom — maybeReconcile
+	// is async and consults the per-peer cooldown window before firing
+	// reconcileWith — so worst-case cost is one cooldown-check.
+	//
+	// The callback must be cleared BEFORE g.wg.Wait() runs so a late
+	// tunnel-up cannot race its g.wg.Add(1) against the in-flight
+	// Wait — sync.WaitGroup panics on Add-after-done. The clear
+	// happens on every exit path of the accept loop below, not via
+	// defer (defers run AFTER wg.Wait).
+	g.cfg.Transport.SetOnTunnelUp(func(peer entmoot.NodeID) {
+		// Re-check ctx so a stale callback fired during shutdown
+		// after the clear-and-wait window doesn't re-enter
+		// maybeReconcile and spawn a goroutine that outlives Start.
+		if err := ctx.Err(); err != nil {
+			return
+		}
+		g.maybeReconcile(ctx, peer)
+	})
+
 	// Background workers (patch 6, patch 7). retryLoop drains the
 	// exponential-backoff queue for push/fetch attempts that failed their
 	// initial try. Both live under g.wg so Start's drain on shutdown also
@@ -701,6 +751,15 @@ func (g *Gossiper) Start(ctx context.Context) error {
 		defer g.wg.Done()
 		g.retryLoop(ctx)
 	}()
+
+	// Background anti-entropy ticker (v1.2.1, Part E). Picks the
+	// least-recently-reconciled peer each tick and fires a reconcile
+	// against them — unless their cached root matches ours, in which
+	// case the tick is a silent no-op. Paired with the reactive
+	// maybeReconcile triggers so a partitioned peer with no chatty
+	// messages still converges on the next tick after partition heals.
+	g.wg.Add(1)
+	go g.reconcilerLoop(ctx)
 
 	// Transport-ad advertiser loop (v1.2.0). Publishes this node's own
 	// TransportAd on startup, on EndpointsChanged, and on a weekly
@@ -718,8 +777,14 @@ func (g *Gossiper) Start(ctx context.Context) error {
 	for {
 		conn, remote, err := g.cfg.Transport.Accept(ctx)
 		if err != nil {
-			// Accept returning is the signal to shut down: wait for any
-			// in-flight handlers before surfacing.
+			// Accept returning is the signal to shut down. Clear the
+			// OnTunnelUp callback BEFORE wg.Wait so a late tunnel-up
+			// cannot race a fresh g.wg.Add(1) against the in-flight
+			// Wait (sync.WaitGroup panics on that). A callback
+			// fired-but-not-yet-returned is still fine — the
+			// ctx-err re-check inside the closure keeps it from
+			// entering maybeReconcile after shutdown begins. (v1.2.1)
+			g.cfg.Transport.SetOnTunnelUp(nil)
 			g.wg.Wait()
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return nil
@@ -743,6 +808,13 @@ func (g *Gossiper) Start(ctx context.Context) error {
 		// accumulated while we were partitioned gets pulled in. This runs
 		// alongside the handleConn goroutine so the reconcile dial doesn't
 		// block the incoming frame.
+		//
+		// v1.2.1 (Part F): also clear any outbound dial-backoff for this peer.
+		// Inbound reachability is strong bidirectional-reachability evidence,
+		// so a cached backoff window from an earlier outbound failure is
+		// almost certainly stale. If our next outbound dial happens to still
+		// fail, recordDialFailure will re-arm the backoff from base.
+		g.recordDialSuccess(remote)
 		g.maybeReconcile(ctx, remote)
 
 		g.wg.Add(1)
@@ -789,6 +861,12 @@ func (g *Gossiper) handleConn(ctx context.Context, c net.Conn, remote entmoot.No
 		g.onTransportAd(ctx, remote, v)
 	case *wire.TransportSnapshotReq:
 		g.onTransportSnapshotReq(ctx, c, remote, v)
+	case *wire.Reconcile:
+		// Convention-break (v1.2.1): onReconcileReq holds c open for the
+		// full multi-frame RBSR session, unlike every other handler that
+		// does "read one frame, respond, return". The caller's defer
+		// c.Close() still fires when onReconcileReq eventually returns.
+		g.onReconcileReq(ctx, c, remote, v)
 	case *wire.Hello:
 		// v0 drops Hello: Pilot's tunnel already authenticates the remote.
 		// The codec still recognizes the type (kept for future use), so we
@@ -918,6 +996,99 @@ func (g *Gossiper) onRangeReq(ctx context.Context, c net.Conn, remote entmoot.No
 		g.logger.Warn("gossip: write range_resp",
 			slog.Uint64("remote", uint64(remote)),
 			slog.String("err", err.Error()))
+	}
+}
+
+// onReconcileReq drives the responder side of an RBSR session over a
+// single connection. Unlike every other handler, this one holds the conn
+// open across multiple request/response frames — the initiator and
+// responder alternate reconcile.Range frames until both sides observe
+// convergence. The caller (handleConn) must not close c until
+// onReconcileReq returns (either via clean done-both or an error path).
+//
+// This is the only v1.2.1 handler that breaks the "one frame, then
+// close" convention — it's explicit here and in the handleConn dispatch
+// comment. The conn is still owned by handleConn's defer c.Close(),
+// which now fires only after onReconcileReq unwinds.
+func (g *Gossiper) onReconcileReq(ctx context.Context, c net.Conn, remote entmoot.NodeID, req *wire.Reconcile) {
+	if req.GroupID != g.cfg.GroupID {
+		g.logger.Warn("gossip: reconcile: group mismatch",
+			slog.Uint64("remote", uint64(remote)),
+			slog.String("got", req.GroupID.String()))
+		return
+	}
+
+	adapter := &storeAdapter{store: g.cfg.Store, groupID: g.cfg.GroupID}
+	sess := reconcile.NewResponder(reconcile.DefaultConfig(), adapter)
+
+	// Process the frame already received, then loop until both sides
+	// signal Done. The responder trusts its own Session.Done() (not the
+	// peer's Done flag alone) for its termination half.
+	incoming := req.Ranges
+	round := req.Round
+	peerDone := req.Done
+	for {
+		out, _, sessDone, err := sess.Next(ctx, incoming)
+		if err != nil {
+			if errors.Is(err, reconcile.ErrMaxRounds) {
+				g.logger.Warn("gossip: reconcile: max rounds (responder)",
+					slog.Uint64("remote", uint64(remote)),
+					slog.Int("round", int(round)))
+			} else {
+				g.logger.Warn("gossip: reconcile: responder step",
+					slog.Uint64("remote", uint64(remote)),
+					slog.Int("round", int(round)),
+					slog.String("err", err.Error()))
+			}
+			return
+		}
+		myDone := sessDone && len(out) == 0
+		resp := &wire.Reconcile{
+			GroupID: g.cfg.GroupID,
+			Round:   round,
+			Ranges:  out,
+			Done:    myDone,
+		}
+		if err := wire.EncodeAndWrite(c, resp); err != nil {
+			g.logger.Warn("gossip: reconcile: responder write",
+				slog.Uint64("remote", uint64(remote)),
+				slog.Int("round", int(round)),
+				slog.String("err", err.Error()))
+			return
+		}
+		if peerDone && myDone {
+			return
+		}
+
+		// Read the next frame from the initiator.
+		msgType, payload, err := wire.ReadAndDecode(c)
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				// Clean close from the initiator — either they're done
+				// or they observed a fatal error on their side.
+				return
+			}
+			g.logger.Warn("gossip: reconcile: responder read",
+				slog.Uint64("remote", uint64(remote)),
+				slog.Int("round", int(round)),
+				slog.String("err", err.Error()))
+			return
+		}
+		if msgType != wire.MsgReconcile {
+			g.logger.Warn("gossip: reconcile: responder unexpected type",
+				slog.Uint64("remote", uint64(remote)),
+				slog.String("got", msgType.String()))
+			return
+		}
+		next, ok := payload.(*wire.Reconcile)
+		if !ok {
+			g.logger.Warn("gossip: reconcile: responder decode mismatch",
+				slog.Uint64("remote", uint64(remote)))
+			return
+		}
+		incoming = next.Ranges
+		round = next.Round
+		peerDone = next.Done
 	}
 }
 
@@ -1665,6 +1836,159 @@ func (g *Gossiper) jitteredReconcileCooldown() time.Duration {
 		time.Duration(g.rng.Int64N(span))
 }
 
+// jitteredReconcilerTick returns a tick interval drawn uniformly from
+// [reconcilerTickBase - reconcilerTickJitter, reconcilerTickBase + reconcilerTickJitter).
+// Uses the same rng+mutex pattern as jitteredReconcileCooldown. (v1.2.1)
+func (g *Gossiper) jitteredReconcilerTick() time.Duration {
+	g.rngMu.Lock()
+	defer g.rngMu.Unlock()
+	span := int64(2 * reconcilerTickJitter)
+	delta := time.Duration(g.rng.Int64N(span))
+	return reconcilerTickBase - reconcilerTickJitter + delta
+}
+
+// reconcilerLoop runs background anti-entropy (v1.2.1). Each tick picks
+// the least-recently-reconciled roster member (excluding self) and
+// fires maybeReconcile — unless the peer's cached Merkle root already
+// matches ours, in which case the tick is a silent no-op.
+//
+// Interaction with reactive triggers:
+//   - The cooldown gate in maybeReconcile dedupes any overlapping
+//     reactive trigger (e.g., OnTunnelUp firing moments before the tick).
+//   - The skip-when-roots-equal optimization keeps quiescent meshes
+//     silent (no reconcile dial per peer per tick).
+//
+// Uses a plain time.Timer reset each iteration (not time.Ticker) so
+// each tick draws fresh jitter.
+func (g *Gossiper) reconcilerLoop(ctx context.Context) {
+	defer g.wg.Done()
+
+	// Initial delay — one tick before first fire, so startup bootstrap
+	// isn't immediately followed by a background reconcile.
+	t := time.NewTimer(g.jitteredReconcilerTick())
+	defer t.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			g.maybeReconcileTick(ctx)
+			t.Reset(g.jitteredReconcilerTick())
+		}
+	}
+}
+
+// maybeReconcileTick picks one peer and fires (or skips) a reconcile.
+// Factored out for unit-testability; reconcilerLoop is a thin wrapper.
+// (v1.2.1)
+func (g *Gossiper) maybeReconcileTick(ctx context.Context) {
+	peer, ok := g.pickReconcileTickPeer()
+	if !ok {
+		return // no eligible peer
+	}
+
+	// Skip optimization: if peer's cached Merkle root matches ours,
+	// this tick is a no-op.
+	if cached, cachedOK := g.readLastKnownPeerRoot(peer); cachedOK {
+		localRoot, err := g.cfg.Store.MerkleRoot(ctx, g.cfg.GroupID)
+		if err == nil && wire.MerkleRoot(localRoot) == cached {
+			g.logger.Debug("reconcile: tick skip (roots match cache)",
+				slog.Uint64("peer", uint64(peer)))
+			// Still update lastReconciled so this peer moves down in
+			// the least-recently-reconciled ordering — otherwise we'd
+			// keep picking the same peer forever with no work to do.
+			g.markReconcileTickTouched(peer)
+			return
+		}
+	}
+
+	g.maybeReconcile(ctx, peer)
+}
+
+// pickReconcileTickPeer returns the least-recently-reconciled roster
+// member excluding self, or (_, false) if no peer is eligible. Ties
+// are broken deterministically via g.rng under rngMu. (v1.2.1)
+func (g *Gossiper) pickReconcileTickPeer() (entmoot.NodeID, bool) {
+	members := g.cfg.Roster.Members()
+	if len(members) == 0 {
+		return 0, false
+	}
+
+	g.pendMu.Lock()
+	defer g.pendMu.Unlock()
+
+	// Collect candidates with their last-reconciled time (zero = never).
+	type candidate struct {
+		peer entmoot.NodeID
+		when time.Time
+	}
+	cands := make([]candidate, 0, len(members))
+	for _, m := range members {
+		if m == g.cfg.LocalNode {
+			continue
+		}
+		when := time.Time{} // never reconciled
+		if state, ok := g.lastReconciled[m]; ok {
+			when = state.at
+		}
+		cands = append(cands, candidate{peer: m, when: when})
+	}
+	if len(cands) == 0 {
+		return 0, false
+	}
+
+	// Find the minimum "when".
+	var best entmoot.NodeID
+	var bestTime time.Time
+	var bestSet bool
+	for _, c := range cands {
+		if !bestSet || c.when.Before(bestTime) {
+			best = c.peer
+			bestTime = c.when
+			bestSet = true
+		}
+	}
+
+	// Break ties (peers with identical "when", especially multiple
+	// never-reconciled) by picking uniformly at random among the tied
+	// set.
+	var tied []entmoot.NodeID
+	for _, c := range cands {
+		if c.when.Equal(bestTime) {
+			tied = append(tied, c.peer)
+		}
+	}
+	if len(tied) > 1 {
+		g.rngMu.Lock()
+		idx := g.rng.IntN(len(tied))
+		g.rngMu.Unlock()
+		best = tied[idx]
+	}
+	return best, true
+}
+
+// markReconcileTickTouched updates lastReconciled[peer].at to now
+// without changing the cooldown. Used when the tick skips because
+// roots match: we want this peer to move down the
+// least-recently-reconciled queue so the next tick picks a different
+// peer. (v1.2.1)
+func (g *Gossiper) markReconcileTickTouched(peer entmoot.NodeID) {
+	g.pendMu.Lock()
+	defer g.pendMu.Unlock()
+	s, ok := g.lastReconciled[peer]
+	if !ok {
+		// No prior reconcile for this peer. We intentionally leave
+		// cooldown at 0 — we're not calling maybeReconcile after this
+		// marker, so the cooldown value doesn't gate anything. The
+		// next reactive or tick trigger will draw a fresh cooldown
+		// when it fires maybeReconcile.
+		s = reconcileState{}
+	}
+	s.at = g.clk.Now()
+	g.lastReconciled[peer] = s
+}
+
 // enqueueRetry inserts (or refreshes) a pending retry slot for a failed
 // push or fetch. First-attempt failures start at attempts=1 with
 // lastBackoff=0, so nextBackoff produces a delay near retryBackoffBase
@@ -1821,7 +2145,14 @@ func (g *Gossiper) maybeReconcile(ctx context.Context, peer entmoot.NodeID) {
 	last, ok := g.lastReconciled[peer]
 	now := g.clk.Now()
 	if ok && now.Sub(last.at) < last.cooldown {
+		remaining := last.cooldown - now.Sub(last.at)
 		g.pendMu.Unlock()
+		// v1.2.1 (Part F): log cooldown-gated skips at Debug so
+		// operators can distinguish "nothing happened" from "deduped"
+		// when tracing reconcile behaviour against a chatty peer.
+		g.logger.Debug("gossip: reconcile: cooldown skip",
+			slog.Uint64("peer", uint64(peer)),
+			slog.Duration("remaining", remaining))
 		return
 	}
 	g.lastReconciled[peer] = reconcileState{
@@ -1837,57 +2168,191 @@ func (g *Gossiper) maybeReconcile(ctx context.Context, peer entmoot.NodeID) {
 	}()
 }
 
-// reconcileWith runs a round of anti-entropy against peer: compare merkle
-// roots; if they differ, query the peer for message ids it has that we
-// don't, and fetch each. Silently no-ops against older peers that don't
-// understand the Range message.
+// reconcileWith runs a round of RBSR anti-entropy against peer (v1.2.1).
+// The flow:
+//
+//  1. Exchange Merkle roots (cheap, 1 round-trip). If equal, short-circuit
+//     and cache the peer's root so Phase 7 / Part E can tick-skip aligned
+//     peers. This is wire-compatible with v1.2.0 peers that already speak
+//     MsgMerkleReq.
+//
+//  2. If roots differ, open a fresh conn and drive a reconcile.Session as
+//     initiator. Each round is one wire.Reconcile frame; the session runs
+//     up to reconcile.DefaultConfig().MaxRounds before it gives up (which
+//     surfaces as ErrMaxRounds — logged at Warn).
+//
+//  3. Fetch each newly-missing id via the existing fetchFrom machinery.
+//     Failures queue onto the retry scheduler just like every other
+//     fetch path.
+//
+// The whole session (after the initial root exchange) runs under a
+// reconcileSessionTimeout-bounded context so a stuck peer can't pin the
+// connection open forever.
+//
+// Wire-compat: a v1.2.0 peer that doesn't know MsgReconcile will reject
+// the frame in handleConn and close the connection. We detect that via
+// an io.EOF on the first read and return cleanly — state is unchanged
+// and the peer still benefits from the v1.2.0 MerkleReq / RangeReq
+// compat paths that remain installed.
 func (g *Gossiper) reconcileWith(ctx context.Context, peer entmoot.NodeID) {
-	// Step 1: exchange merkle roots so we can short-circuit the common case
-	// where the peer has nothing new.
-	theirRoot, ok := g.fetchPeerRoot(ctx, peer)
+	// Step 1: Merkle root short-circuit. Uses its own conn; returns
+	// early with cached root on match so steady-state anti-entropy
+	// costs a single RTT.
+	peerRoot, ok := g.fetchPeerRoot(ctx, peer)
 	if !ok {
 		return
 	}
-	ourRoot, err := g.cfg.Store.MerkleRoot(ctx, g.cfg.GroupID)
+	localRoot, err := g.cfg.Store.MerkleRoot(ctx, g.cfg.GroupID)
 	if err != nil {
 		g.logger.Warn("gossip: reconcile: local merkle root",
 			slog.Uint64("peer", uint64(peer)),
 			slog.String("err", err.Error()))
 		return
 	}
-	if ourRoot == [32]byte(theirRoot) {
+	if [32]byte(peerRoot) == localRoot {
+		g.rememberPeerRoot(peer, peerRoot)
 		return
 	}
 
-	// Step 2: ask for the peer's message ids since our latest-known
-	// timestamp. A fresh node starts at 0 and pulls the full history.
-	since, err := g.latestLocalTimestamp(ctx)
+	// Step 2: roots differ. Open a fresh conn for the RBSR session.
+	if !g.canDial(peer) {
+		g.logger.Debug("gossip: reconcile: peer in dial-backoff",
+			slog.Uint64("peer", uint64(peer)))
+		return
+	}
+	dctx, cancel := context.WithTimeout(ctx, reconcileSessionTimeout)
+	defer cancel()
+	conn, err := g.cfg.Transport.Dial(dctx, peer)
 	if err != nil {
-		g.logger.Warn("gossip: reconcile: latest timestamp",
+		g.recordDialFailure(peer)
+		g.logger.Warn("gossip: reconcile: dial",
 			slog.Uint64("peer", uint64(peer)),
 			slog.String("err", err.Error()))
 		return
 	}
-	ids, err := g.fetchPeerRange(ctx, peer, since)
+	g.recordDialSuccess(peer)
+	defer conn.Close()
+
+	adapter := &storeAdapter{store: g.cfg.Store, groupID: g.cfg.GroupID}
+	sess, initialRanges, err := reconcile.NewInitiator(reconcile.DefaultConfig(), adapter)
 	if err != nil {
-		// Most likely failure mode: the peer doesn't support Range
-		// (pre-patch-7 build). Log at debug and stop — we can only do
-		// as well as the peer's capabilities allow. The existing push
-		// path will still deliver anything they subsequently publish.
-		g.logger.Debug("gossip: reconcile: range query failed",
+		g.logger.Warn("gossip: reconcile: new initiator",
 			slog.Uint64("peer", uint64(peer)),
 			slog.String("err", err.Error()))
 		return
 	}
 
-	// Step 3: FetchReq each id we don't have. Missing bodies are a normal
-	// intermediate state while retries run, so individual failures are
-	// logged at debug; the retry loop handles them separately.
-	for _, id := range ids {
-		has, hasErr := g.cfg.Store.Has(ctx, g.cfg.GroupID, id)
-		if hasErr != nil {
-			continue
+	// Step 3: alternate Reconcile frames until both sides signal Done.
+	// The initiator's convergence is tracked by sess.Done() AND the
+	// peer's most-recent Done flag — the responder's Session watches
+	// the same state on its side.
+	var missingIDs []entmoot.MessageID
+	round := uint32(0)
+	out := initialRanges
+	// myDone tracks whether our local session has converged. Set on
+	// the outgoing frame so the responder's peerDone gate fires
+	// on the very next round instead of waiting for a separate ack.
+	myDone := false
+	done := false
+	for !done {
+		req := &wire.Reconcile{
+			GroupID: g.cfg.GroupID,
+			Round:   round,
+			Ranges:  out,
+			Done:    myDone,
 		}
+		if err := wire.EncodeAndWrite(conn, req); err != nil {
+			g.logger.Warn("gossip: reconcile: write",
+				slog.Uint64("peer", uint64(peer)),
+				slog.Int("round", int(round)),
+				slog.String("err", err.Error()))
+			return
+		}
+		msgType, payload, err := wire.ReadAndDecode(conn)
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				// v1.2.0 peer that doesn't know MsgReconcile drops the
+				// connection after seeing the unknown opcode. Harmless —
+				// we still have the Merkle-root signal and the push
+				// path for anything the peer subsequently publishes.
+				g.logger.Debug("gossip: reconcile: session ended early (peer may be v1.2.0)",
+					slog.Uint64("peer", uint64(peer)),
+					slog.Int("round", int(round)))
+				return
+			}
+			g.logger.Warn("gossip: reconcile: read",
+				slog.Uint64("peer", uint64(peer)),
+				slog.Int("round", int(round)),
+				slog.String("err", err.Error()))
+			return
+		}
+		if msgType != wire.MsgReconcile {
+			g.logger.Warn("gossip: reconcile: unexpected type",
+				slog.Uint64("peer", uint64(peer)),
+				slog.String("got", msgType.String()))
+			return
+		}
+		resp, ok := payload.(*wire.Reconcile)
+		if !ok {
+			g.logger.Warn("gossip: reconcile: decode mismatch",
+				slog.Uint64("peer", uint64(peer)))
+			return
+		}
+		outgoing, newlyMissing, sessDone, err := sess.Next(dctx, resp.Ranges)
+		if err != nil {
+			if errors.Is(err, reconcile.ErrMaxRounds) {
+				g.logger.Warn("gossip: reconcile: max rounds exceeded",
+					slog.Uint64("peer", uint64(peer)),
+					slog.Int("round", int(round)))
+			} else {
+				g.logger.Warn("gossip: reconcile: session step",
+					slog.Uint64("peer", uint64(peer)),
+					slog.Int("round", int(round)),
+					slog.String("err", err.Error()))
+			}
+			return
+		}
+		missingIDs = append(missingIDs, newlyMissing...)
+		round++
+		out = outgoing
+		myDone = sessDone && len(outgoing) == 0
+		// v1.2.1 (Part F): round-progress Debug log. One line per
+		// round so operators can see the convergence curve when
+		// something looks wrong. Bounded by reconcile.DefaultConfig()
+		// .MaxRounds, so at most ~10 lines per reconcile session.
+		g.logger.Debug("gossip: reconcile: round",
+			slog.Uint64("peer", uint64(peer)),
+			slog.Int("round", int(round)),
+			slog.Int("outgoing_ranges", len(outgoing)),
+			slog.Int("newly_missing", len(newlyMissing)),
+			slog.Int("total_missing", len(missingIDs)),
+			slog.Bool("sess_done", sessDone),
+			slog.Bool("peer_done", resp.Done))
+		// Session terminates when our side has converged AND the peer
+		// just told us theirs has too. Both flags live on separate
+		// sides of the exchange; the peer's Done signal flows in via
+		// resp.Done, ours flows out on the next Write via myDone.
+		done = myDone && resp.Done
+	}
+
+	// Send a final ack so the responder sees our Done=true. The
+	// responder's loop exits only when both sides' Done flags line up,
+	// so without this ack a responder that only matched our
+	// convergence on the same round would sit in Read waiting forever.
+	finalFrame := &wire.Reconcile{
+		GroupID: g.cfg.GroupID,
+		Round:   round,
+		Ranges:  nil,
+		Done:    true,
+	}
+	_ = wire.EncodeAndWrite(conn, finalFrame)
+
+	// Step 4: fulfil newly-discovered missing ids via the existing
+	// fetch path so signature verification, store.Put, Plumtree
+	// refanout, and retry queuing all compose the same way they do
+	// for gossip-push and graft-response acquisitions.
+	for _, id := range missingIDs {
+		has, _ := g.cfg.Store.Has(ctx, g.cfg.GroupID, id)
 		if has {
 			continue
 		}
@@ -1895,6 +2360,34 @@ func (g *Gossiper) reconcileWith(ctx context.Context, peer entmoot.NodeID) {
 			g.enqueueRetry(retryKey{peer: peer, id: id, op: opFetch}, nil)
 		}
 	}
+
+	// Step 5: cache the peer's root. Phase 7 / Part E consults this
+	// before firing reconcileWith — a peer whose cached root matches
+	// our current root is known-aligned and can be skipped.
+	g.rememberPeerRoot(peer, peerRoot)
+	g.logger.Debug("gossip: reconcile: session complete",
+		slog.Uint64("peer", uint64(peer)),
+		slog.Int("rounds", int(round)),
+		slog.Int("missing", len(missingIDs)))
+}
+
+// rememberPeerRoot stashes the peer's most recently observed Merkle root
+// under pendMu. Phase 7 / Part E uses readLastKnownPeerRoot to tick-skip
+// peers whose root equals our current root. (v1.2.1)
+func (g *Gossiper) rememberPeerRoot(peer entmoot.NodeID, root wire.MerkleRoot) {
+	g.pendMu.Lock()
+	g.lastKnownPeerRoot[peer] = root
+	g.pendMu.Unlock()
+}
+
+// readLastKnownPeerRoot returns the most recently observed Merkle root
+// for peer along with ok=true if a root is cached, zero + ok=false
+// otherwise. Exposed for Phase 7 / Part E's tick-skip path. (v1.2.1)
+func (g *Gossiper) readLastKnownPeerRoot(peer entmoot.NodeID) (wire.MerkleRoot, bool) {
+	g.pendMu.Lock()
+	defer g.pendMu.Unlock()
+	r, ok := g.lastKnownPeerRoot[peer]
+	return r, ok
 }
 
 // fetchPeerRoot opens a connection to peer and sends MerkleReq. Returns the
@@ -1939,36 +2432,6 @@ func (g *Gossiper) fetchPeerRoot(ctx context.Context, peer entmoot.NodeID) (wire
 		return wire.MerkleRoot{}, false
 	}
 	return resp.Root, true
-}
-
-// fetchPeerRange asks peer for every message id whose Timestamp >=
-// sinceMillis. Returns the slice of ids or an error (including
-// ErrUnknownMessage when the peer doesn't understand RangeReq).
-func (g *Gossiper) fetchPeerRange(ctx context.Context, peer entmoot.NodeID, sinceMillis int64) ([]entmoot.MessageID, error) {
-	// v1.0.6 Fix C: short-circuit if peer is in its dial-backoff window.
-	if !g.canDial(peer) {
-		return nil, fmt.Errorf("peer %d in dial-backoff", peer)
-	}
-	conn, err := g.cfg.Transport.Dial(ctx, peer)
-	if err != nil {
-		g.recordDialFailure(peer)
-		return nil, fmt.Errorf("dial: %w", err)
-	}
-	g.recordDialSuccess(peer)
-	defer conn.Close()
-	req := &wire.RangeReq{GroupID: g.cfg.GroupID, SinceMillis: sinceMillis}
-	if err := wire.EncodeAndWrite(conn, req); err != nil {
-		return nil, fmt.Errorf("write range_req: %w", err)
-	}
-	_, payload, err := wire.ReadAndDecode(conn)
-	if err != nil {
-		return nil, fmt.Errorf("read range_resp: %w", err)
-	}
-	resp, ok := payload.(*wire.RangeResp)
-	if !ok {
-		return nil, fmt.Errorf("range: unexpected response type")
-	}
-	return resp.IDs, nil
 }
 
 // onTransportAd validates and installs an inbound TransportAd (v1.2.0).
@@ -2405,19 +2868,3 @@ func validateEndpoint(ep entmoot.NodeEndpoint) error {
 	return nil
 }
 
-// latestLocalTimestamp returns the maximum Timestamp across all messages we
-// already hold for the group, or 0 if empty. Used as the `since` parameter
-// in reconciliation range queries so we only pull the tail we're missing.
-func (g *Gossiper) latestLocalTimestamp(ctx context.Context) (int64, error) {
-	msgs, err := g.cfg.Store.Range(ctx, g.cfg.GroupID, 0, 0)
-	if err != nil {
-		return 0, err
-	}
-	var max int64
-	for _, m := range msgs {
-		if m.Timestamp > max {
-			max = m.Timestamp
-		}
-	}
-	return max, nil
-}

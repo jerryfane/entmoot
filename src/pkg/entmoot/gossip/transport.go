@@ -22,8 +22,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"sync"
+	"sync/atomic"
 
 	"entmoot/pkg/entmoot"
 )
@@ -62,6 +64,16 @@ type Transport interface {
 	// in-memory test transport) may no-op. (v1.2.0)
 	SetPeerEndpoints(ctx context.Context, peer entmoot.NodeID, endpoints []entmoot.NodeEndpoint) error
 
+	// SetOnTunnelUp installs a callback fired whenever a fresh tunnel to a
+	// peer becomes usable — either after a successful outbound Dial that
+	// produced a new underlying session, or after an inbound Accept that
+	// brought up a new session. The callback may be invoked concurrently
+	// from multiple goroutines; it MUST NOT block (implementations should
+	// spawn their own goroutine if they need to do non-trivial work).
+	// A subsequent call replaces any previously-installed callback.
+	// Passing nil clears the callback. (v1.2.1)
+	SetOnTunnelUp(cb func(peer entmoot.NodeID))
+
 	// Close releases resources. Pending Accepts return an error.
 	Close() error
 }
@@ -84,6 +96,13 @@ type memTransport struct {
 	// alone); purely observational. (v1.2.0)
 	epMu      sync.Mutex
 	endpoints map[entmoot.NodeID][]entmoot.NodeEndpoint
+
+	// onTunnelUp holds a func(entmoot.NodeID) — the callback installed
+	// by SetOnTunnelUp. Stored via atomic.Value so Dial/Accept can load
+	// it without acquiring any per-transport mutex. An empty Value (no
+	// Store yet) or a stored typed-nil both behave as "no callback".
+	// (v1.2.1)
+	onTunnelUp atomic.Value
 }
 
 // EndpointsFor returns the last endpoints slice SetPeerEndpoints was
@@ -170,6 +189,10 @@ func (t *memTransport) Dial(ctx context.Context, peer entmoot.NodeID) (net.Conn,
 	client, server := net.Pipe()
 	select {
 	case target.acceptCh <- memAcceptItem{conn: server, remote: t.local}:
+		// Fresh pipe is wired; notify our side that a tunnel to peer
+		// just came up. The acceptor side fires its own callback from
+		// Accept. (v1.2.1)
+		t.fireOnTunnelUp(peer)
 		return client, nil
 	case <-ctx.Done():
 		_ = client.Close()
@@ -194,6 +217,9 @@ func (t *memTransport) Accept(ctx context.Context) (net.Conn, entmoot.NodeID, er
 		if !ok {
 			return nil, 0, net.ErrClosed
 		}
+		// Fresh pipe from a peer's Dial just landed; notify our side.
+		// The dialer fires its own callback on the far end. (v1.2.1)
+		t.fireOnTunnelUp(item.remote)
 		return item.conn, item.remote, nil
 	case <-t.closed:
 		return nil, 0, net.ErrClosed
@@ -241,6 +267,42 @@ func (t *memTransport) TrustedPeers(_ context.Context) ([]entmoot.NodeID, error)
 		out = append(out, n)
 	}
 	return out, nil
+}
+
+// SetOnTunnelUp implements Transport. The callback is stored via
+// atomic.Value for lock-free reads on Dial/Accept. Passing nil clears
+// the callback (stored as a typed-nil so Load never races with Store).
+// Subsequent calls replace any previously-installed callback. (v1.2.1)
+func (t *memTransport) SetOnTunnelUp(cb func(peer entmoot.NodeID)) {
+	if cb == nil {
+		t.onTunnelUp.Store((func(entmoot.NodeID))(nil))
+		return
+	}
+	t.onTunnelUp.Store(cb)
+}
+
+// fireOnTunnelUp loads the currently-installed callback (if any) and
+// invokes it in a fresh goroutine with a panic recover. Safe to call
+// with no callback installed. (v1.2.1)
+func (t *memTransport) fireOnTunnelUp(peer entmoot.NodeID) {
+	raw := t.onTunnelUp.Load()
+	if raw == nil {
+		return
+	}
+	cb, ok := raw.(func(entmoot.NodeID))
+	if !ok || cb == nil {
+		return
+	}
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				slog.Warn("mem transport: OnTunnelUp panic",
+					slog.Any("panic", r),
+					slog.Uint64("peer", uint64(peer)))
+			}
+		}()
+		cb(peer)
+	}()
 }
 
 // Close implements Transport. Marks the transport as closed by closing

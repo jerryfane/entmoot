@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	entmoot "entmoot/pkg/entmoot"
+	"entmoot/pkg/entmoot/reconcile"
 )
 
 // MsgType is the 1-byte message type tag in a frame's framing header. Zero
@@ -74,6 +75,11 @@ const (
 	// MsgTransportSnapshotResp carries every unexpired TransportAd the
 	// responder holds for the group. (v1.2.0)
 	MsgTransportSnapshotResp MsgType = 0x10
+	// MsgReconcile carries one frame of the Range-Based Set
+	// Reconciliation state machine for a group's message-id set. Each
+	// peer alternates Reconcile frames, driven by pkg/entmoot/reconcile's
+	// Session. Added in v1.2.1.
+	MsgReconcile MsgType = 0x11
 )
 
 // String returns the human-readable wire name for t, suitable for logs. It
@@ -112,6 +118,8 @@ func (t MsgType) String() string {
 		return "transport_snapshot_req"
 	case MsgTransportSnapshotResp:
 		return "transport_snapshot_resp"
+	case MsgReconcile:
+		return "reconcile"
 	default:
 		return fmt.Sprintf("unknown(0x%02x)", uint8(t))
 	}
@@ -370,4 +378,23 @@ type TransportSnapshotResp struct {
 	// Ads is the responder's current set of unexpired TransportAds for
 	// GroupID, ordered by Author.PilotNodeID for determinism.
 	Ads []TransportAd `json:"ads"`
+}
+
+// Reconcile carries one round of the Range-Based Set Reconciliation
+// exchange for a group's message-id set. The sender fills Ranges with the
+// frames emitted by its reconcile.Session for this step; the receiver
+// feeds the same slice into its own Session.Next call. Done is an
+// advisory flag — the receiver still checks its own Session.Done() after
+// processing. Added in v1.2.1.
+type Reconcile struct {
+	// GroupID identifies the owning group.
+	GroupID entmoot.GroupID `json:"group_id"`
+	// Round is the sender's view of the current step number, starting
+	// at 1 for the initiator's opening frame. Used only for logging and
+	// debugging; the state machine does not trust it for control flow.
+	Round uint32 `json:"round"`
+	// Ranges is the frame emitted by reconcile.Session.Next.
+	Ranges []reconcile.Range `json:"ranges"`
+	// Done is true when the sender's Session has observed convergence.
+	Done bool `json:"done,omitempty"`
 }
