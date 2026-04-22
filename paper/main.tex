@@ -517,40 +517,64 @@ reconciliation approach introduced by Demers et
 al.~\citep{demers1987epidemic} and familiar from Dynamo's
 Merkle-tree repair~\citep{decandia2007dynamo}.
 
-Reconciliation is triggered by peer reconnect, not by a periodic timer:
-both an inbound \texttt{Accept} and a successful outbound dial invoke
-\texttt{maybeReconcile} on the peer, which is rate-limited to one round
-per peer per 60 seconds. A round proceeds in four steps routed through
-the same retry scheduler the gossip path uses:
+Reconciliation fires on three classes of trigger, all routed through
+a single \texttt{maybeReconcile(peer)} entry point with a per-peer
+cooldown that dedupes concurrent calls. The first two are reactive:
+an inbound \texttt{Accept} and a successful outbound dial both invoke
+\texttt{maybeReconcile} on the peer. The third is event-driven: the
+Pilot adapter fires an \texttt{OnTunnelUp} callback on every
+freshly-established yamux session (both outbound and inbound), so a
+reconnect triggers reconciliation within milliseconds. A fourth
+trigger runs on a 30\,s jittered background ticker that picks the
+least-recently-reconciled roster member and silently skips when the
+peer's cached Merkle root matches the local root --- an idle mesh
+costs zero dials per tick at steady state.
+
+A round proceeds in three steps routed through the same retry
+scheduler the gossip path uses:
 
 \begin{enumerate}
     \item \textbf{Cheap check.} Request the peer's Merkle root via
     \texttt{MerkleReq} and compare to the local root. If they match, the
     two stores are byte-identical under the topological-order rule
     (\S\ref{sec:merkle}), and the round ends in constant space and one
-    round-trip. This is the common case after a brief disconnect.
-    \item \textbf{Bounded enumeration.} If the roots differ, issue
-    \texttt{RangeReq} with a lower timestamp bound set to the local
-    store's latest message timestamp. The peer answers with
-    \texttt{RangeResp}, a list of message identifiers it holds in that
-    window.
-    \item \textbf{Targeted fetch.} For each id in \texttt{RangeResp} we
-    do not already have, issue an ordinary \texttt{FetchReq}.
-    \item \textbf{Signature-verified store.} Each fetched body is
-    verified against the author's roster entry before it lands in the
-    local store, identical to the push path.
+    round-trip. The peer's root is cached for the background ticker's
+    skip optimization.
+    \item \textbf{Range-Based Set Reconciliation.} If the roots differ,
+    the local node opens a fresh \texttt{MsgReconcile} stream and runs
+    an RBSR session~\citep{meyer2023rbsr} with the peer. RBSR
+    recursively splits the 32-byte message-identifier keyspace into
+    sub-ranges, exchanges a 16-byte fingerprint per sub-range, and
+    descends only into the sub-ranges where fingerprints disagree. The
+    fingerprint is a Negentropy-style hybrid $\mathrm{SHA\text{-}256}$
+    of the item count concatenated with the modular-256-bit sum of
+    per-identifier hashes, which is commutative (range-splittable)
+    and resistant to the duplicate-cancellation and
+    Gaussian-elimination attacks that plain-XOR fingerprints
+    suffer~\citep{willow2023, negentropyNIP77}. Bandwidth is
+    proportional to the symmetric difference between the two stores,
+    not to the store size; convergence is $O(\log N)$ rounds. Crucially,
+    gaps anywhere in the timeline are discovered by construction ---
+    the algorithm does not depend on a timestamp cursor, so a peer
+    holding a message whose timestamp predates the local node's newest
+    will still surface it.
+    \item \textbf{Targeted fetch and signature-verified store.} For
+    each identifier the RBSR session flags as locally missing, issue
+    an ordinary \texttt{FetchReq}. Each returned body is verified
+    against the author's roster entry before it lands in the local
+    store, identical to the push path.
 \end{enumerate}
 
-Timestamp-bounding the range query matters: a reconnecting peer is
-most likely missing only the tail of the message DAG, so the range
-enumeration is cheap. A full-store enumeration remains possible by
-choosing a zero bound but is not used by the automatic path. The two
-wire types \texttt{MsgRangeReq} (0x09) and \texttt{MsgRangeResp}
-(0x0A) are additive: peers that do not speak them reject the frame
-as an unknown type and the caller silently falls back to push-only,
-preserving backward compatibility with older implementations.
-Figure~\ref{fig:antientropy} sketches the message sequence for a
-single reconciliation round.
+The \texttt{MsgReconcile} stream is the only handler in the
+implementation that keeps a single connection alive across multiple
+wire frames; the session alternates fingerprint-exchange frames until
+both sides emit a \texttt{done} flag. Wire-type
+\texttt{MsgReconcile} (0x11) is additive: peers that do not speak it
+reject the frame as unknown, and the initiator silently falls back
+without state corruption. The legacy \texttt{MsgRangeReq} (0x09) and
+\texttt{MsgRangeResp} (0x0A) handlers remain present for interop with
+pre-v1.2.1 peers. Figure~\ref{fig:antientropy} sketches the message
+sequence for a single reconciliation round.
 
 \begin{figure}[t]
 \centering
@@ -582,13 +606,13 @@ single reconciliation round.
 \node[note] at (2.1, -2.0)
   {if roots match: \textbf{done} (constant space)};
 
-% Step 2: RangeReq -> RangeResp (roots differ)
+% Step 2: Reconcile(ranges) exchange (roots differ) — multi-round RBSR
 \draw[msg] ($(L.south) + (0, -2.85)$)
         -- node[above, font=\scriptsize]
-           {\texttt{RangeReq}\,(since\,$t_\text{local}$)}
+           {\texttt{Reconcile}\,(ranges)}
            ($(R.south) + (0, -2.85)$);
 \draw[msg] ($(R.south) + (0, -3.6)$)
-        -- node[above, font=\scriptsize] {\texttt{RangeResp}\,(ids)}
+        -- node[above, font=\scriptsize] {\texttt{Reconcile}\,(ranges\,\ldots)}
            ($(L.south) + (0, -3.6)$);
 
 % Step 3: diff ids (self-loop on local)
@@ -613,9 +637,13 @@ single reconciliation round.
 \end{tikzpicture}
 \caption{Anti-entropy reconciliation round between two peers. The cheap
 Merkle-root check short-circuits the round in constant space when the
-two stores already agree; only when roots differ does the round pay the
-cost of enumerating the timestamp-bounded range and fetching the
-missing bodies.}
+two stores already agree; only when roots differ does the RBSR
+session exchange fingerprints over recursive sub-ranges of the
+message-identifier keyspace, narrowing on each round to the
+sub-ranges where the two sides disagree. The middle step in practice
+is multi-frame, with both sides alternating \texttt{Reconcile} frames
+until both sides emit \texttt{done}; typical convergence is
+$O(\log N)$ rounds.}
 \label{fig:antientropy}
 \end{figure}
 
@@ -1080,6 +1108,26 @@ succeeds at pre-seeding the \texttt{peerTCP} entry without any
 registry mediation and (ii)~puts a concrete figure on the
 cold-dial-to-TCP-tunnel latency under an active UDP block.
 
+A third live measurement on the day after targeted the RBSR
+anti-entropy path (\S\ref{sec:antientropy}). v1.2.1 binaries deployed
+to all three peers and the same partition shape used for the
+TCP-fallback test was repeated; a brief unreachability window on one
+peer left it holding thirteen messages the public peer had never seen.
+On reconnect, the Pilot-adapter \texttt{OnTunnelUp} callback fired
+a reconciliation $2.1$\,s after the yamux session became usable. The
+RBSR session converged in three rounds with $\texttt{missing}=13$;
+the public peer's store grew from 95 to 108 messages with an exact
+match between the recovered count and the RBSR-reported difference.
+A parallel session between the public peer and the other laptop
+converged in three rounds with $\texttt{missing}=0$, exercising the
+cheapest path (all sub-range fingerprints agree on the first
+descent). No \texttt{session ended early} frames were observed once
+all three peers were on v1.2.1, confirming the wire-compat fallback
+path stayed dormant. The idle-mesh \texttt{tick skip} debug log
+fired after convergence, confirming the cached-root-match
+optimization described in \S\ref{sec:antientropy} --- the background
+ticker remained silent on a quiesced mesh.
+
 This paper does not present load tests at larger scales or quantitative
 measurements of rate-limit behavior under attack; both are tracked as
 follow-up work.
@@ -1197,17 +1245,23 @@ also accept \texttt{-tcp-listen}'s auto-advertised endpoint; the
 advertisement is benign only because the stock registry is the one
 component that would otherwise propagate it. A future jf.8 addition
 of a client-only TCP mode would make the flag's intent
-self-consistent. Two further items fall out of the same test
-window. Entmoot's anti-entropy reconciliation fires reactively on
-inbound gossip (\S\ref{sec:antientropy}), not on a background
-ticker, so a partition that ends with no fresh publish leaves a
-historical gap until the next organic message triggers the
-reconcile gate; a 15--30-second background anti-entropy tick is a
-natural addition. And Pilot's tunnel rekey is transparent to its
-own reliability state machine but not to the \texttt{yamux}
-sessions layered above it; a rekey-triggered tear-down signal from
-the driver would let the adapter preemptively rebuild the session
-rather than discover orphaned state on the next \texttt{Dial}.
+self-consistent. A related Pilot-side item the same test window
+surfaced: the driver's IPC calls are bounded by a hardcoded
+timeout rather than the caller's \texttt{context.Context}, so a
+daemon subprocess that exits mid-IPC can leave the driver blocked
+until the timeout fires; threading context through the driver's
+\texttt{sendAndWaitTimeout} path would let callers abandon
+in-flight calls cleanly, and a session-death supervisor on the
+driver's read loop would propagate daemon exits to all pending
+requests at once. Finally, Pilot's tunnel rekey is transparent to
+its own reliability state machine but not to the \texttt{yamux}
+sessions layered above it; a rekey-triggered tear-down signal
+from the driver would let the adapter preemptively rebuild the
+session rather than discover orphaned state on the next
+\texttt{Dial}. v1.2.1's RBSR anti-entropy path already heals the
+data-plane consequence of an orphaned-session partition within
+one background tick, so this remaining item is an efficiency
+refinement rather than a correctness one.
 
 Entmoot also creates the substrate the empirical questions flagged by
 \citet{calin2026emergent} require:

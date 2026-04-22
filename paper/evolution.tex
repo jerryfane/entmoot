@@ -30,10 +30,10 @@
 
 \begin{abstract}
 \noindent
-Between 17 and 21 April 2026 we shipped a dense sequence of
-patch releases across two layered systems: ten Pilot fork releases
-(\texttt{v1.7.2-jf.1} through \texttt{v1.9.0-jf.6}) and nine
-Entmoot releases (\texttt{v1.0.0} through \texttt{v1.1.0}). Every
+Between 17 and 22 April 2026 we shipped a dense sequence of
+patch releases across two layered systems: eleven Pilot fork releases
+(\texttt{v1.7.2-jf.1} through \texttt{v1.9.0-jf.7}) and eleven
+Entmoot releases (\texttt{v1.0.0} through \texttt{v1.2.1}). Every
 patch was driven by a symptom observed on a three-machine live
 demo across three continents: a laptop on a UAE carrier-grade NAT,
 a Raspberry Pi in Italy on Fastweb residential, and a Hetzner VPS
@@ -1073,6 +1073,158 @@ plumbing.
 new test \texttt{pilot\_yamux\_test.go}, new dependency
 \texttt{github.com/hashicorp/yamux}.
 
+\subsection{\texttt{v1.2.0}: transport-endpoint advertisements
+over Entmoot gossip}
+
+\paragraph{What broke.} A three-peer live test designed to
+exercise Pilot's TCP-fallback transport stack (which would let
+Entmoot keep running when UDP is blocked) showed that the
+fallback code path was operationally inert --- the Pilot daemon's
+multi-transport dialer had a valid TCP path compiled in, but
+\texttt{peerTCP} was always empty at dial time, so the dialer
+always fell through to the beacon-relay path instead.
+
+\paragraph{What it actually was.} Our fork's daemon dutifully
+advertises its TCP endpoint to the central registry at register
+time. The upstream stock registry at \texttt{34.71.57.205:9000}
+silently drops the \texttt{endpoints} field in the register
+frame, so peers' registry lookups return only the UDP
+\texttt{real\_addr}. The field-drop is an upstream bug we cannot
+patch; any attempt to route around it by standing up a
+fork-built registry would force a mesh-wide rebuild every time
+someone on the fork pushed a new tag.
+
+\paragraph{How we fixed it.} We distributed per-peer TCP
+endpoints \emph{through Entmoot itself}. Each member signs a
+small \texttt{TransportAd} record naming its current endpoints
+and gossips it through the existing Plumtree fanout. Receivers
+verify the signature against the roster entry, store-or-replace
+under Last-Writer-Wins semantics keyed on
+\texttt{(group, author)}, and install the endpoints into Pilot's
+\texttt{peerTCP} cache via a new \texttt{SetPeerEndpoints} IPC
+command (Pilot \texttt{v1.9.0-jf.7}). The record is bounded at
+one row per \texttt{(group, member)} regardless of publish rate,
+and three layers of spam defence run in cost order on receive:
+schema-and-size validation ($\le 1$~KiB), publisher allowlist
+(sender \emph{must} equal author), and per-(peer, topic)
+token-bucket rate limit. Only after all three pass does the
+Ed25519 signature verification run. A latent second bug in
+anti-entropy also surfaced during the test but was deferred to
+\texttt{v1.2.1}: \texttt{fetchPeerRange} used
+\texttt{since = latestLocalTimestamp} as its lower bound, so
+gaps older than the local node's newest message were silently
+excluded from the range query.
+
+\paragraph{Why the fix is right.} Routing control-plane state
+through the data-plane gossip channel is a canonical 2020s
+federated-protocol move: Matrix uses signed state events over
+the same federation stream that carries message content;
+IPNS-over-pubsub distributes name pointers over libp2p pubsub
+rather than a separate DHT write path. The LWW +
+publisher-allowlist pattern is the structural spam bound that
+Matrix room ACLs and GossipSub v1.1 peer scoring both converge
+on. Retaining one row per (group, author) keeps storage
+structurally bounded at $O(N)$ in the member count regardless
+of publish rate --- the same invariant IPNS records enforce
+for distributed name pointers.
+
+\paragraph*{Tag.} \texttt{v1.2.0}, 21 April 2026. Files:
+\texttt{src/pkg/entmoot/wire/types.go},
+\texttt{src/pkg/entmoot/store/sqlite.go} (new
+\texttt{transport\_ads} table),
+\texttt{src/pkg/entmoot/gossip/gossiper.go} (new
+\texttt{onTransportAd} handler),
+\texttt{src/pkg/entmoot/transport/pilot/pilot.go} (new
+\texttt{SetPeerEndpoints} call), Pilot
+\texttt{pkg/driver/driver.go} + \texttt{pkg/daemon/ipc.go}.
+
+\subsection{\texttt{v1.2.1}: Range-Based Set Reconciliation,
+background anti-entropy, and tunnel-up trigger}
+
+\paragraph{What broke.} A second live test surfaced the
+anti-entropy bug that \texttt{v1.2.0} had merely postponed. Two
+messages published from one peer (Phobos, Italian residential
+NAT) during a brief reachability outage never propagated to the
+public VPS, even after the VPS's reconcile fired on an unrelated
+fresh message from the same peer. The \texttt{MerkleReq}
+short-circuit correctly reported roots mismatched; the
+subsequent fetch step still couldn't bridge the gap.
+
+\paragraph{What it actually was.} Two orthogonal causes working
+together. The first: \texttt{fetchPeerRange(since = t)} used
+the local node's newest-message timestamp as the range's lower
+bound, so any gap with a timestamp \emph{older} than the local
+newest was excluded from the query. The second: reconciliation
+fired only on inbound gossip events, not on a background timer,
+so a quiet partition with no organic publish traffic could leave
+a gap sitting indefinitely even after both sides reconnected.
+
+\paragraph{How we fixed it.} Three changes landed together. The
+reconcile algorithm moved from the timestamp-cursor fetch to
+Range-Based Set Reconciliation (RBSR). RBSR recursively splits
+the 32-byte message-identifier keyspace into sub-ranges,
+exchanges a 16-byte fingerprint per sub-range, and descends only
+where fingerprints disagree. Bandwidth is proportional to the
+symmetric difference, convergence is $O(\log N)$ rounds, and
+gaps anywhere in the timeline are found by construction. The
+Pilot-transport adapter gained a \texttt{SetOnTunnelUp(cb)}
+callback that fires \texttt{maybeReconcile} within milliseconds
+of every newly-established yamux session (outbound and inbound
+both). And a background \texttt{reconcilerLoop} goroutine ticks
+every 30\,s $\pm\,20\%$ jitter, picks the least-recently-
+reconciled roster member, and silently skips when the peer's
+cached Merkle root still matches local --- an idle mesh pays
+zero dials per tick at steady state.
+
+\paragraph{Why the fix is right.} RBSR is the canonical 2020s
+set-diff algorithm; Willow, Earthstar, and iroh all adopt it,
+as does the Nostr Negentropy protocol (NIP-77). The 30\,s
+background ticker
+matches Serf's \texttt{PushPullInterval} default for LAN
+gossip, chosen for exactly this ``partition healed but no
+organic publish'' scenario. Tunnel-up event triggers match
+Secure Scuttlebutt's Epidemic Broadcast Trees
+on-connect handshake and Automerge sync's
+have-heads-on-connect pattern; tying anti-entropy to
+connection events, not just timers, lets a flaky network
+converge as fast as its reconnects allow. Wire-compatibility
+with \texttt{v1.2.0} peers is preserved: the legacy
+\texttt{MsgRangeReq} and \texttt{MsgRangeResp} handlers stay
+active, and a \texttt{v1.2.1} initiator that encounters a
+\texttt{v1.2.0} responder observes an \texttt{EOF} and falls
+back silently.
+
+\paragraph*{Live field verification (2026-04-22).} Re-running
+the original bug pattern on the live three-peer mesh with all
+peers on \texttt{v1.2.1}: VPS $\leftrightarrow$ laptop converged
+in three RBSR rounds with \texttt{missing}~$=0$. VPS
+$\leftrightarrow$ Phobos, after Phobos cold-restarted its Pilot
+daemon to clear the pre-existing tunnel wedge, converged in
+three rounds with \texttt{missing}~$=13$ (Phobos had
+accumulated thirteen messages across partition events); the
+VPS store grew from 95 to 108 messages, an exact match on the
+RBSR-reported difference. The \texttt{OnTunnelUp} callback
+fired 2.1\,s after the yamux session became usable. Zero
+\texttt{session ended early} frames were observed, confirming
+the wire-compat fallback stayed dormant once the whole mesh was
+on \texttt{v1.2.1}. After convergence, the idle-mesh
+\texttt{tick skip (roots match cache)} debug log fired on the
+background ticker, confirming the cached-root-match
+optimization kept the quiescent mesh silent.
+
+\paragraph*{Tag.} \texttt{v1.2.1}, 22 April 2026. Files: new
+package \texttt{src/pkg/entmoot/reconcile/} (the RBSR state
+machine), \texttt{src/pkg/entmoot/wire/types.go} (new
+\texttt{MsgReconcile} opcode),
+\texttt{src/pkg/entmoot/gossip/gossiper.go} (rewritten
+\texttt{reconcileWith}, new \texttt{onReconcileReq} and
+\texttt{reconcilerLoop}),
+\texttt{src/pkg/entmoot/gossip/transport.go} +
+\texttt{src/pkg/entmoot/transport/pilot/pilot.go}
+(\texttt{SetOnTunnelUp}),
+\texttt{src/pkg/entmoot/store/\{store,memory,sqlite,jsonl\}.go}
+(new \texttt{IterMessageIDsInIDRange}). No Pilot change.
+
 \section{The big picture: how the layers interacted}
 \label{sec:bigpicture}
 
@@ -1152,6 +1304,7 @@ v1.9.0-jf.3 & 19 Apr & Auto-recovery PILA on crypto-state desync. \\
 v1.9.0-jf.4 & 20 Apr & Reply-on-ingress path routing; 3 s SYN retransmit for relay mode. \\
 v1.9.0-jf.5 & 20 Apr & Full per-peer state cleanup across \texttt{AddPeer}/\texttt{RemovePeer}. \\
 v1.9.0-jf.6 & 21 Apr & \texttt{ErrDialToSelf} guard against self-tunnel storm. \\
+v1.9.0-jf.7 & 21 Apr & New \texttt{SetPeerEndpoints} IPC command: Entmoot installs per-peer TCP endpoints into \texttt{peerTCP} without registry mediation. \\
 \bottomrule
 \end{tabular}
 \caption{Pilot fork release summary.}
@@ -1173,9 +1326,11 @@ v1.0.6 & 20 Apr & Trust-aware fanout, parallel sends with per-peer timeout, dial
 v1.0.7 & 21 Apr & Inline message body on eager push; decorrelated-jitter retry backoff. \\
 v1.0.8 & 21 Apr & Exclude issuer from \texttt{bootstrap\_peers} at invite mint. \\
 v1.1.0 & 21 Apr & Persistent yamux-multiplexed session per peer; no per-frame Pilot stream dial. \\
+v1.2.0 & 21 Apr & Signed \texttt{TransportAd} records gossiped through Entmoot; Pilot \texttt{SetPeerEndpoints} IPC makes TCP fallback actually reachable. \\
+v1.2.1 & 22 Apr & Range-Based Set Reconciliation; background AE ticker; \texttt{OnTunnelUp} callback; gap-reconcile bug fixed. \\
 \bottomrule
 \end{tabular}
-\caption{Entmoot release summary.}
+\caption{Entmoot release summary (through 22 April 2026).}
 \end{table}
 
 \section*{Appendix A: reading order}
