@@ -7,6 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-04-23
+
+### Changed
+
+- **License: Apache License 2.0.** Entmoot previously had no declared
+  license. Establishing one required decoupling the binary from its
+  only copyleft dependency; see below.
+
+- **IPC to `pilot-daemon` is now an in-tree client.** Entmoot no
+  longer imports `github.com/TeoSlayer/pilotprotocol/pkg/driver`.
+  In its place, a new package
+  `pkg/entmoot/transport/pilot/ipcclient` provides an independent
+  Go implementation of the Pilot IPC wire protocol, written from
+  Pilot's public specification
+  (`pilotprotocol/docs/SPEC.md`). Runtime behavior is unchanged —
+  `entmootd` still speaks the same Unix-socket wire protocol to
+  the same `pilot-daemon` process. The rewrite removes Pilot's
+  AGPL-3.0 source from Entmoot's compiled binary, freeing Entmoot
+  to adopt its own license.
+
+### Added
+
+- **`pkg/entmoot/transport/pilot/ipcclient`** — 9 files (~1500 LOC)
+  implementing the framing, opcodes, demuxer, connection,
+  listener, driver, and type surface needed by Entmoot's Pilot
+  transport adapter. Covered by unit tests, a demuxer-correctness
+  suite, and an in-process fake-daemon integration test. The
+  package documents every clarification that went beyond SPEC.md
+  (AcceptedConn port prefix; TrustedPeers as a Handshake
+  sub-command; SetPeerEndpoints TLV layout and daemon limits;
+  Error frame encoding; Recv-before-register race handling).
+
+- **`pkg/entmoot/transport/pilot/addr.go`** — local `Addr` and
+  `ParseSocketAddr` types replacing the former
+  `pilotprotocol/pkg/protocol` import. Matches the Pilot
+  socket-address string format for wire compatibility.
+
+- **`LICENSE`, `NOTICE`, `CONTRIBUTING.md`** at the repository
+  root. `CONTRIBUTING.md` establishes a Developer Certificate of
+  Origin requirement for future contributions.
+
+### Removed
+
+- **`github.com/TeoSlayer/pilotprotocol` go-module dependency.**
+  Both the `require` entry and the `replace` directive are gone;
+  `go mod graph | grep pilotprotocol` is empty.
+
+### Wire compatibility
+
+No changes to any wire-format emitted on the network. Entmoot
+v1.3.0 is drop-in compatible with all earlier v1.x peers and with
+`pilot-daemon` v1.9.0-jf.7. Upgrading a single node in a mesh does
+not require coordinated upgrades.
+
 ## [1.2.1] - 2026-04-22
 
 ### Fixed

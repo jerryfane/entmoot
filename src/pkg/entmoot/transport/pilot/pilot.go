@@ -2,10 +2,12 @@
 // Protocol daemon.
 //
 // The adapter connects to a locally-running Pilot daemon over its Unix IPC
-// socket (see github.com/TeoSlayer/pilotprotocol/pkg/driver), binds a listener
-// on a well-known port (typically :1004 for Entmoot), and wraps driver.DialAddr
-// / driver.Listener / driver.TrustedPeers into the small Transport surface the
-// gossip package depends on.
+// socket using the in-tree ipcclient package (an independent implementation
+// of Pilot's documented IPC wire protocol — see
+// pkg/entmoot/transport/pilot/ipcclient and SPEC.md §6), binds a listener on a
+// well-known port (typically :1004 for Entmoot), and wraps ipcclient.DialAddr /
+// ipcclient.Listener / ipcclient.TrustedPeers into the small Transport surface
+// the gossip package depends on.
 //
 // # Persistent multiplexed sessions (v1.1.0+)
 //
@@ -50,17 +52,16 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/TeoSlayer/pilotprotocol/pkg/driver"
-	"github.com/TeoSlayer/pilotprotocol/pkg/protocol"
 	"github.com/hashicorp/yamux"
 
 	"entmoot/pkg/entmoot"
+	"entmoot/pkg/entmoot/transport/pilot/ipcclient"
 )
 
 // Config parameterizes a Pilot-backed Transport.
 type Config struct {
 	// SocketPath is the Unix-domain IPC socket of the Pilot daemon. An empty
-	// string selects driver.DefaultSocketPath ("/tmp/pilot.sock").
+	// string selects ipcclient.DefaultSocketPath ("/tmp/pilot.sock").
 	SocketPath string
 
 	// ListenPort is the Pilot port Entmoot binds for inbound gossip
@@ -97,16 +98,17 @@ type inboundStream struct {
 // Transport implements gossip.Transport over a live Pilot daemon.
 //
 // Construction via Open is what actually talks to the daemon: it issues
-// driver.Connect, driver.Info (to discover the local node id), and
-// driver.Listen. After Open returns, a background goroutine accepts inbound
-// Pilot connections and wraps each in a yamux server session; outbound Dials
-// get-or-create a yamux client session per peer and open a new stream on it.
+// ipcclient.Connect, ipcclient.Driver.Info (to discover the local node id), and
+// ipcclient.Driver.Listen. After Open returns, a background goroutine accepts
+// inbound Pilot connections and wraps each in a yamux server session; outbound
+// Dials get-or-create a yamux client session per peer and open a new stream on
+// it.
 type Transport struct {
 	cfg    Config
 	logger *slog.Logger
 
-	driver   *driver.Driver
-	listener *driver.Listener
+	driver   *ipcclient.Driver
+	listener *ipcclient.Listener
 	nodeID   entmoot.NodeID
 
 	// sessionsMu guards sessions AND inboundSessions.
@@ -149,8 +151,8 @@ type Transport struct {
 }
 
 // Open connects to the Pilot daemon at cfg.SocketPath, discovers the local
-// node id via driver.Info, and binds a listener on cfg.ListenPort. The
-// returned Transport is ready to Dial / Accept immediately.
+// node id via ipcclient.Driver.Info, and binds a listener on cfg.ListenPort.
+// The returned Transport is ready to Dial / Accept immediately.
 //
 // On any failure mid-way (e.g. bind fails after connect), previously-acquired
 // resources are released before returning.
@@ -160,12 +162,17 @@ func Open(cfg Config) (*Transport, error) {
 		logger = slog.Default()
 	}
 
-	d, err := driver.Connect(cfg.SocketPath)
+	d, err := ipcclient.Connect(cfg.SocketPath)
 	if err != nil {
 		return nil, fmt.Errorf("pilot: connect %q: %w", cfg.SocketPath, err)
 	}
 
-	info, err := d.Info()
+	// Open is synchronous on callers' expectation; a background context
+	// scoped to the brief Info/Listen exchanges is the right fit. Pilot's
+	// IPC is local and responses arrive in milliseconds.
+	openCtx := context.Background()
+
+	info, err := d.Info(openCtx)
 	if err != nil {
 		_ = d.Close()
 		return nil, fmt.Errorf("pilot: info: %w", err)
@@ -176,7 +183,7 @@ func Open(cfg Config) (*Transport, error) {
 		return nil, fmt.Errorf("pilot: info: %w", err)
 	}
 
-	ln, err := d.Listen(cfg.ListenPort)
+	ln, err := d.Listen(openCtx, cfg.ListenPort)
 	if err != nil {
 		_ = d.Close()
 		return nil, fmt.Errorf("pilot: listen :%d: %w", cfg.ListenPort, err)
@@ -202,11 +209,11 @@ func (t *Transport) NodeID() entmoot.NodeID {
 	return t.nodeID
 }
 
-// Driver returns the underlying *driver.Driver. Exposed so subcommands like
+// Driver returns the underlying *ipcclient.Driver. Exposed so subcommands like
 // `info` can query daemon state (hostname, address) without re-dialing the
 // socket. Callers MUST NOT Close the returned driver; call Transport.Close
 // instead.
-func (t *Transport) Driver() *driver.Driver {
+func (t *Transport) Driver() *ipcclient.Driver {
 	return t.driver
 }
 
@@ -266,19 +273,19 @@ func (t *Transport) getOrCreateSession(ctx context.Context, peer entmoot.NodeID)
 	// Not in map or closed — release lock before the slow dial.
 	t.sessionsMu.Unlock()
 
-	addr := protocol.Addr{Network: t.cfg.Network, Node: uint32(peer)}
+	addr := Addr{Network: t.cfg.Network, Node: uint32(peer)}
 
 	type dialResult struct {
-		conn *driver.Conn
+		conn *ipcclient.Conn
 		err  error
 	}
 	resultCh := make(chan dialResult, 1)
 	go func() {
-		c, err := t.driver.DialAddr(addr, t.cfg.ListenPort)
+		c, err := t.driver.DialAddr(ctx, addr, t.cfg.ListenPort)
 		resultCh <- dialResult{conn: c, err: err}
 	}()
 
-	var pilotConn *driver.Conn
+	var pilotConn *ipcclient.Conn
 	select {
 	case r := <-resultCh:
 		if r.err != nil {
@@ -346,12 +353,22 @@ func (t *Transport) dropSession(peer entmoot.NodeID, sess *yamux.Session) {
 // RemoteAddr, wraps the conn in a yamux server session, and spawns a pump
 // goroutine to fan that session's accepted streams into inboundStreams.
 //
-// Exits on listener error; Close() closes the listener, which unblocks the
-// Accept with a closed-listener error that we detect via the t.closed gate.
+// Exits on listener error; Close() closes the listener and cancels acceptCtx,
+// which unblocks Accept via ctx.Done() regardless of whether a listener-level
+// close propagated in time.
 func (t *Transport) acceptPilotConns() {
 	defer t.acceptWG.Done()
+	// Derive a context that fires when t.closed closes so a blocked
+	// listener.Accept unwinds deterministically on Transport.Close —
+	// the ipcclient Accept honours context cancellation directly.
+	acceptCtx, acceptCancel := context.WithCancel(context.Background())
+	go func() {
+		<-t.closed
+		acceptCancel()
+	}()
+	defer acceptCancel()
 	for {
-		pilotConn, err := t.listener.Accept()
+		pilotConn, err := t.listener.Accept(acceptCtx)
 		if err != nil {
 			select {
 			case <-t.closed:
@@ -442,13 +459,11 @@ func (t *Transport) TrustedPeers(ctx context.Context) ([]entmoot.NodeID, error) 
 		return nil, net.ErrClosed
 	default:
 	}
-	// driver.TrustedPeers has no context parameter; ctx is respected only as
-	// a pre-call fast path. Pilot IPC is synchronous and short.
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 
-	resp, err := t.driver.TrustedPeers()
+	resp, err := t.driver.TrustedPeers(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("pilot: trusted peers: %w", err)
 	}
@@ -500,11 +515,11 @@ func (t *Transport) SetPeerEndpoints(ctx context.Context, peer entmoot.NodeID, e
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	driverEps := make([]driver.Endpoint, 0, len(endpoints))
+	ipcEps := make([]ipcclient.Endpoint, 0, len(endpoints))
 	for _, ep := range endpoints {
-		driverEps = append(driverEps, driver.Endpoint{Network: ep.Network, Addr: ep.Addr})
+		ipcEps = append(ipcEps, ipcclient.Endpoint{Network: ep.Network, Addr: ep.Addr})
 	}
-	if err := t.driver.SetPeerEndpoints(uint32(peer), driverEps); err != nil {
+	if err := t.driver.SetPeerEndpoints(ctx, uint32(peer), ipcEps); err != nil {
 		return fmt.Errorf("pilot: set peer endpoints for %d: %w", peer, err)
 	}
 	return nil
@@ -627,41 +642,36 @@ func extractNodeID(info map[string]interface{}) (entmoot.NodeID, error) {
 	return entmoot.NodeID(uint32(f)), nil
 }
 
-// remoteNodeID pulls the Pilot node id off an accepted conn. driver.Conn
-// renders RemoteAddr() as a pilotAddr whose String() is
-// "N:NNNN.HHHH.LLLL:PORT"; we parse that with protocol.ParseSocketAddr
-// rather than reflecting on an unexported type.
+// remoteNodeID pulls the Pilot node id off an accepted conn.
+// ipcclient.Conn's RemoteAddr().String() renders as "N:NNNN.HHHH.LLLL:PORT";
+// we parse that with ParseSocketAddr (from addr.go in this package)
+// rather than reflecting on the ipcclient struct.
 func remoteNodeID(c net.Conn) (entmoot.NodeID, error) {
 	addr := c.RemoteAddr()
 	if addr == nil {
 		return 0, errors.New("nil RemoteAddr")
 	}
-	sa, err := protocol.ParseSocketAddr(addr.String())
+	sa, err := ParseSocketAddr(addr.String())
 	if err != nil {
 		return 0, fmt.Errorf("parse %q: %w", addr.String(), err)
 	}
 	return entmoot.NodeID(sa.Addr.Node), nil
 }
 
-// unblockableConn wraps a pilot driver.Conn so that Close() propagates all
-// the way down to any blocked Read() call. Pilot's driver.Conn.Close()
-// sends a cmdClose to the daemon and unregisters the receive channel, but
-// it does NOT close the local recv channel (see
-// repos/pilotprotocol/pkg/driver/ipc.go:unregisterRecvCh — it just
-// delete()s from the map without close()ing the chan). Any goroutine
-// sitting in driver.Conn.Read blocks on `<-c.recvCh` forever.
+// unblockableConn wraps an ipcclient.Conn so that Close() propagates all the
+// way down to any blocked Read() call. The in-tree ipcclient already closes
+// the recv channel on Close so a blocked Read returns io.EOF, which makes
+// this wrapper less load-bearing than it was against the upstream driver —
+// but we keep the pattern for defence-in-depth: a past-time read deadline
+// unblocks a Read that has already picked up the channel-closed signal's
+// opposite race, and is a no-op otherwise.
 //
 // yamux.Session.Close() calls the underlying conn's Close() and then waits
 // for its recvLoop goroutine to exit. If the recvLoop is stuck on a blocked
 // Read, Session.Close hangs forever — and with it, the Transport.Close
-// that waits on every session. Observed live as a 10-minute test-timeout
-// hang in the canary, well after gossip convergence had already succeeded.
-//
-// Fix: wrap the conn so Close() first pushes a past-time read deadline
-// (driver.Conn honours SetReadDeadline via a deadline channel that IS
-// closed, so the blocked Read unblocks with ErrDeadlineExceeded), and
-// then calls the real Close(). This is a pure-Entmoot-side workaround
-// for a driver-level bug that arguably should be fixed upstream too. (v1.1.0)
+// that waits on every session. The deadline push is cheap insurance
+// against any edge case where the ipcclient's channel-close signal and
+// the yamux recvLoop's read state race in an unexpected direction. (v1.3.0)
 type unblockableConn struct {
 	net.Conn
 }

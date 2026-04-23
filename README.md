@@ -270,4 +270,13 @@ packages ship with at least one happy-path and one failure-path test.
 
 ## License
 
-Not yet chosen.
+Entmoot is licensed under the [Apache License 2.0](./LICENSE).
+
+Entmoot is an independent project. It interacts with the
+[Pilot Protocol](https://github.com/TeoSlayer/pilotprotocol) daemon
+over an IPC wire protocol but does not incorporate Pilot Protocol
+source code. The IPC client (`pkg/entmoot/transport/pilot/ipcclient`)
+is an original implementation written from Pilot's public specification.
+
+Contributions follow a Developer Certificate of Origin — see
+[CONTRIBUTING.md](./CONTRIBUTING.md).
