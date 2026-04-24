@@ -40,6 +40,28 @@ type Info struct {
 	// omit the field; new daemons without a TURN provider also
 	// omit it. In both cases the decoded value is "". (v1.4.0)
 	TURNEndpoint string `json:"turn_endpoint,omitempty"`
+
+	// OutboundTURNOnly mirrors pilot-daemon's -outbound-turn-only
+	// flag (v1.9.0-jf.11a). True when the local pilot-daemon has
+	// been told to route EVERY outbound tunnel frame through its
+	// TURN allocation (RFC 8828 Mode 3 / WebRTC
+	// iceTransportPolicy='relay' semantic). Entmoot's -hide-ip
+	// startup check queries this to warn when app-layer hide-ip is
+	// set but the underlying pilot-daemon isn't in outbound-turn-
+	// only mode (incomplete privacy). Pre-jf.11a daemons decode as
+	// false. (v1.4.3)
+	OutboundTURNOnly bool `json:"outbound_turn_only,omitempty"`
+
+	// NoRegistryEndpoint mirrors pilot-daemon's
+	// -no-registry-endpoint flag (v1.9.0-jf.10). True when the
+	// local pilot-daemon registers identity only — no UDP/TCP/LAN
+	// endpoint upload, so registry.Lookup returns "endpoint
+	// unknown" for this node. Entmoot's -hide-ip startup check
+	// queries this to warn when app-layer hide-ip is set but the
+	// underlying pilot-daemon still publishes an endpoint to the
+	// registry (registry-level IP leak). Pre-jf.10 daemons decode
+	// as false. (v1.4.3)
+	NoRegistryEndpoint bool `json:"no_registry_endpoint,omitempty"`
 }
 
 // Addr is a Pilot virtual address: a 16-bit network ID paired with a

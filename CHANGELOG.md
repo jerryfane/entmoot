@@ -7,6 +7,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.3] - 2026-04-24
+
+Companion release to pilot-daemon v1.9.0-jf.11a. Surfaces
+Entmoot's app-layer `-hide-ip` flag's relationship with the
+newly-composable Pilot-layer privacy flags (`-turn-provider`,
+`-no-registry-endpoint`, `-outbound-turn-only`) so operators can
+see at startup whether their local pilot-daemon actually delivers
+the privacy posture the app-layer flag asks for.
+
+### Added
+
+- **`pkg/entmoot/transport/pilot/ipcclient.Info`** grows
+  `OutboundTURNOnly bool` and `NoRegistryEndpoint bool` fields
+  (both `omitempty`). Mirrors pilot-daemon v1.9.0-jf.11a's
+  `DaemonInfo` extension. Pre-jf.11a daemons decode the fields as
+  `false`; no wire change.
+
+- **`entmootd -hide-ip` startup check.** When `-hide-ip` is set,
+  the daemon's join path now queries the local pilot-daemon's
+  `Info()` at startup and compares:
+  - Pilot has `TURNEndpoint != ""` (i.e. `-turn-provider` is set
+    and the initial TURN allocation succeeded)?
+  - Pilot has `OutboundTURNOnly = true` (i.e. outbound traffic
+    routes through TURN; RFC 8828 Mode 3)?
+  - Pilot has `NoRegistryEndpoint = true` (i.e. registry.Lookup
+    returns "endpoint unknown")?
+
+  Any missing piece produces a `slog.Warn` naming the specific
+  leak channel that remains open and pointing at pilot-daemon's
+  `-hide-ip` preset as the one-flag remedy. All three present
+  produces a single `slog.Info` confirming full hide-ip posture.
+
+  This closes a class of silent mis-configuration where an
+  operator sets `entmootd -hide-ip` alone, sees no errors, and
+  believes they're private — while pilot-daemon is still
+  publishing their IP to the registry or routing traffic
+  direct-outbound. The check is best-effort: if the Info IPC
+  call fails (slow daemon, older daemon without the new fields,
+  etc.), we log at Debug and proceed normally — never block
+  startup.
+
+### Wire compatibility
+
+- **No wire changes at the Entmoot layer.** Transport-ad format
+  is unchanged; group/roster/message wire formats are unchanged;
+  IPC framing is unchanged. The only new thing on the IPC wire
+  is two `omitempty` JSON fields in `InfoOK` responses, which
+  pre-v1.4.3 Entmoots decode-and-ignore anyway because the
+  untyped `Driver.Info()` path doesn't project them into any
+  typed Go struct.
+- **Pre-jf.11a pilot-daemons**: the new typed fields decode as
+  `false`, which causes the startup check to warn about missing
+  `OutboundTURNOnly` and `NoRegistryEndpoint`. That's the
+  correct behaviour — pre-jf.11a daemons really don't have those
+  flags, so the warning accurately describes the privacy gap.
+- **v1.4.3 ↔ v1.4.2 / v1.4.1 / v1.4.0** all interop cleanly at
+  the gossip layer; this release is additive and behavioral-
+  change-free except for the new startup log lines under
+  `-hide-ip`.
+
+### Dependencies
+
+- **No new dependencies.** Go standard library only.
+
 ## [1.4.2] - 2026-04-24
 
 ### Changed

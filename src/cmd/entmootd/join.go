@@ -26,7 +26,64 @@ import (
 	"entmoot/pkg/entmoot/roster"
 	"entmoot/pkg/entmoot/store"
 	"entmoot/pkg/entmoot/topic"
+	"entmoot/pkg/entmoot/transport/pilot/ipcclient"
 )
+
+// warnIfPilotNotFullyHideIP queries the local pilot-daemon's Info and
+// logs a WARN-level message naming every privacy gap between Entmoot's
+// -hide-ip (gossip-layer IP suppression) and Pilot's three privacy
+// flags (-turn-provider, -outbound-turn-only, -no-registry-endpoint).
+// Best-effort: IPC failures degrade to a Debug log so startup isn't
+// blocked when the daemon is slow to respond.
+//
+// Entmoot's -hide-ip alone suppresses endpoints in transport-ads; it
+// can't prevent registry leaks (pilot-daemon publishes the real IP)
+// or outbound source-IP leaks (pilot-daemon dials peers direct). This
+// cross-layer check surfaces those gaps loudly at startup so the
+// operator knows whether they're actually achieving the privacy
+// posture they asked for.
+//
+// Added in Entmoot v1.4.3, matches pilot-daemon v1.9.0-jf.11a.
+func warnIfPilotNotFullyHideIP(d *ipcclient.Driver) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	info, err := d.InfoStruct(ctx)
+	if err != nil {
+		slog.Debug("hide-ip check: could not query pilot Info",
+			slog.String("err", err.Error()))
+		return
+	}
+	var issues []string
+	if info.TURNEndpoint == "" {
+		issues = append(issues, "pilot-daemon has no TURN allocation "+
+			"(set pilot-daemon -turn-provider=cloudflare or "+
+			"-turn-provider=static; without it, Entmoot hide-ip "+
+			"publishes empty transport-ads and the peer is unreachable)")
+	}
+	if !info.OutboundTURNOnly {
+		issues = append(issues, "pilot-daemon not in outbound-turn-only "+
+			"mode (outbound tunnel frames may reveal source IP to "+
+			"peers direct; set pilot-daemon -outbound-turn-only)")
+	}
+	if !info.NoRegistryEndpoint {
+		issues = append(issues, "pilot-daemon still publishes endpoint "+
+			"to registry (peers can registry.Lookup your IP; set "+
+			"pilot-daemon -no-registry-endpoint)")
+	}
+	if len(issues) > 0 {
+		slog.Warn("entmootd -hide-ip is only partially supported by the "+
+			"local pilot-daemon; app-layer IP suppression is incomplete",
+			slog.Any("missing", issues),
+			slog.String("remedy", "run pilot-daemon with -hide-ip "+
+				"(preset for -no-registry-endpoint + -outbound-turn-only; "+
+				"requires -turn-provider) or set the sub-flags "+
+				"individually"))
+	} else {
+		slog.Info("entmootd -hide-ip configuration verified: " +
+			"pilot-daemon is in full hide-ip mode " +
+			"(turn-provider + outbound-turn-only + no-registry-endpoint)")
+	}
+}
 
 // cmdJoin is the blocking top-level command. It reads or fetches an
 // invite, applies it, opens the control socket, and serves IPC traffic
@@ -108,6 +165,17 @@ func cmdJoin(gf *globalFlags, args []string) int {
 	}
 	defer tr.Close()
 	nodeID := tr.NodeID()
+
+	// v1.4.3: when -hide-ip is set, verify the local pilot-daemon is
+	// in full hide-ip mode (turn-provider + outbound-turn-only +
+	// no-registry-endpoint). Entmoot's -hide-ip hides IP at the
+	// gossip layer only; without matching pilot-daemon flags, peers
+	// can still learn our IP via registry.Lookup or direct outbound
+	// source-IP leaks. Best-effort: failures to query Info() don't
+	// block startup, just log at Debug.
+	if gf.hideIP {
+		warnIfPilotNotFullyHideIP(tr.Driver())
+	}
 
 	rawStore, err := store.OpenSQLite(s.dataDir)
 	if err != nil {
