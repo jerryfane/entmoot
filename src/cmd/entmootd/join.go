@@ -195,17 +195,54 @@ func cmdJoin(gf *globalFlags, args []string) int {
 	}
 	defer func() { _ = rlog.Close() }()
 
-	// v1.2.0: snapshot the -advertise-endpoint values once at startup
-	// and serve them from LocalEndpoints. A non-empty slice is what
-	// causes the advertiser loop to publish a TransportAd; an empty
-	// slice causes it to no-op quietly (logged at Debug).
-	localEps := advertiseEndpoints.Snapshot()
-	var localEndpointsFn func() []entmoot.NodeEndpoint
-	if len(localEps) > 0 {
-		localEndpointsFn = func() []entmoot.NodeEndpoint {
-			return append([]entmoot.NodeEndpoint(nil), localEps...)
+	// Establish the signal-bound root context before anything starts
+	// long-running goroutines (v1.4.4's TURN-endpoint poller is the
+	// first). Previously this was set up just before gossiper.Join;
+	// the poller needs it earlier so its lifetime tracks the daemon's.
+	rootCtx, cancel := signal.NotifyContext(context.Background(),
+		os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
+	// v1.2.0: snapshot the -advertise-endpoint values once at startup.
+	// v1.4.4: merge a live-polled TURN endpoint from pilot-daemon on
+	// top of the CLI snapshot, so Cloudflare allocation port rotation
+	// (port changes on restart or credential refresh) gets observed
+	// and re-advertised within ~30 s. Without this poller, LocalEndpoints
+	// returns a fixed CLI snapshot; remote peers keep using the stale
+	// TURN relay addr in their cached transport_ad and their outbound
+	// frames get silently dropped by Cloudflare's edge.
+	cliEps := advertiseEndpoints.Snapshot()
+	turnPoller := newTURNEndpointPoller(tr.Driver(), turnEndpointPollInterval)
+	// Prime the poller synchronously so the advertiser's startup
+	// publish sees the current TURN addr on the very first call to
+	// LocalEndpoints. Failure degrades to empty — the ticker will
+	// pick it up on the next 30 s boundary.
+	turnPoller.pollOnce(rootCtx)
+
+	localEndpointsFn := func() []entmoot.NodeEndpoint {
+		out := make([]entmoot.NodeEndpoint, 0, len(cliEps)+1)
+		// Carry non-TURN CLI entries (tcp=, udp=) verbatim.
+		for _, e := range cliEps {
+			if e.Network != "turn" {
+				out = append(out, e)
+			}
 		}
+		// Prefer the live-polled TURN addr. Fall back to any turn=
+		// CLI entries if the poller has no value yet (e.g. the
+		// startup poll failed and the ticker hasn't fired).
+		if live := turnPoller.CurrentTURN(); live != "" {
+			out = append(out, entmoot.NodeEndpoint{Network: "turn", Addr: live})
+		} else {
+			for _, e := range cliEps {
+				if e.Network == "turn" {
+					out = append(out, e)
+				}
+			}
+		}
+		return out
 	}
+	// Background polling runs for the lifetime of the daemon.
+	go turnPoller.Run(rootCtx)
 
 	g, err := gossip.New(gossip.Config{
 		LocalNode: nodeID,
@@ -221,6 +258,10 @@ func cmdJoin(gf *globalFlags, args []string) int {
 		TransportAdStore: rawStore,
 		RateLimiter:      ratelimit.New(ratelimit.DefaultLimits(), nil),
 		LocalEndpoints:   localEndpointsFn,
+		// v1.4.4: wire the TURN-rotation signal so the advertiser
+		// re-publishes immediately on change instead of waiting for
+		// the 6-day safety-net refresh.
+		EndpointsChanged: turnPoller.Changed(),
 		// v1.4.0: when set, the advertiser publishes only turn
 		// endpoints from LocalEndpoints and drops UDP/TCP entries,
 		// or emits an empty ad + warning when no TURN endpoint
@@ -231,10 +272,6 @@ func cmdJoin(gf *globalFlags, args []string) int {
 		slog.Error("join: new gossiper", slog.String("err", err.Error()))
 		return exitTransport
 	}
-
-	rootCtx, cancel := signal.NotifyContext(context.Background(),
-		os.Interrupt, syscall.SIGTERM)
-	defer cancel()
 
 	// Run Join with a bounded deadline so an unreachable peer set fails
 	// loudly rather than hanging the process before the control socket

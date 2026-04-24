@@ -7,6 +7,75 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.4] - 2026-04-25
+
+Detect Cloudflare TURN allocation rotation and re-publish the
+transport-ad immediately, instead of letting peers run on the
+6-day safety-net refresh interval.
+
+### Fixed
+
+- **TURN-rotation propagation gap.** `entmootd`'s `LocalEndpoints`
+  callback was a one-time snapshot of the `-advertise-endpoint` CLI
+  flags, never refreshed. When pilot-daemon's TURN allocation
+  rotated (port changes on restart or credential refresh — typical
+  laptop or churned-credential scenarios with `-turn-provider=
+  cloudflare`), the gossip advertiser kept publishing the stale
+  CLI snapshot. Remote peers retained the stale TURN relay address
+  in their cached transport_ad and their outbound frames silently
+  dropped at Cloudflare's anycast edge.
+
+  Live evidence 2026-04-25 from phobos<->laptop: phobos cached
+  `104.30.149.4:20414` (laptop's previous allocation); laptop's
+  current allocation was `:9587`. Phobos's `peer switched to
+  turn-relay remote=:20414` log fired at every dial and traffic
+  silently went into a dead TURN allocation. New transport_ad was
+  never emitted because Entmoot had no way to detect the
+  rotation.
+
+  Fix: `entmootd` now polls `pilot-daemon.Info().TURNEndpoint`
+  every 30 s, compares to the last-published value, and signals
+  the gossip advertiser via `gossip.Config.EndpointsChanged` on
+  any change. The advertiser's `LocalEndpoints` callback merges
+  the live-polled TURN address on top of the static CLI snapshot
+  (CLI `turn=` entries become a fallback for the cold start
+  before the first poll completes). Rotation is observed and
+  re-advertised within 30 s + transport_ad fanout latency
+  (typically <1 s); peers receive the fresh TURN relay addr via
+  the standard last-writer-wins on transport_ad sequence.
+
+  Privacy-preserving by construction: the poller only reads from
+  the local pilot-daemon over its existing IPC socket; no
+  additional network footprint, no leak surface added.
+
+### Tests
+
+- `cmd/entmootd/turn_endpoint_poller_test.go`:
+  - `TestTURNEndpointPoller_DetectsRotationAndSignals` — same
+    value → no signal; rotated value → CurrentTURN updates and
+    Changed receives a tick.
+  - `TestTURNEndpointPoller_ErrorPreservesPreviousValue` —
+    transient pilot IPC errors do NOT clobber the cached TURN
+    addr (otherwise a single hiccup would withdraw the
+    advertisement).
+  - `TestTURNEndpointPoller_SignalCoalesces` — buffered-1 channel
+    collapses bursts; the advertiser re-reads LocalEndpoints
+    freshly each tick anyway, so the coalescing is correct
+    behavior, not a lost signal.
+  - `TestTURNEndpointPoller_RunStopsOnContextCancel` — clean
+    shutdown on root-context cancel; no goroutine leak.
+
+### Compat
+
+No wire changes. No new flags. The CLI snapshot of
+`-advertise-endpoint` is still consulted — non-TURN entries
+(`tcp=`, `udp=`) pass through unchanged, and `turn=` entries are
+preserved as a cold-start fallback if the first IPC poll fails.
+Daemons running pilot-daemon < v1.9.0-jf.8 (no TURN field in
+Info) decode `TURNEndpoint=""` and the poller treats them
+exactly like a non-TURN configuration: empty live value, fall
+back to CLI flags.
+
 ## [1.4.3] - 2026-04-24
 
 Companion release to pilot-daemon v1.9.0-jf.11a. Surfaces
