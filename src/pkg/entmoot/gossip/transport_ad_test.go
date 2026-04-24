@@ -257,11 +257,21 @@ func TestTransportAdSpamBoundedByReplace(t *testing.T) {
 	}
 }
 
-// TestTransportAdRejectCrossAuthor delivers a frame on a connection
-// from A but with Author=B. The publisher-allowlist check at step 2
-// must drop it before any signature work happens, so B's ad must NOT
-// replace A's slot.
-func TestTransportAdRejectCrossAuthor(t *testing.T) {
+// TestTransportAdRefanoutFromNonAuthorAccepted covers the v1.4.2
+// behaviour change: a trusted mesh peer may forward a legitimately-
+// signed ad from another author, and the receiver installs it.
+//
+// Before v1.4.2, onTransportAd rejected any frame whose sender was
+// not the ad's author ("single-hop only"). That turned refanout into
+// a structural no-op and broke transport-ad propagation whenever the
+// author couldn't direct-dial the receiver (CGNAT + same-LAN false
+// positives). v1.4.2 replaces the author=sender gate with a
+// trusted-sender gate; signature + membership + LWW remain the
+// integrity floor.
+//
+// Scenario: author A (=10) signs an ad. Forwarder B (=20) presents
+// the signed ad to receiver C (=30) with sender=B. C must install.
+func TestTransportAdRefanoutFromNonAuthorAccepted(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t, []entmoot.NodeID{10, 20, 30})
 	defer f.closeTransports()
@@ -270,18 +280,33 @@ func TestTransportAdRejectCrossAuthor(t *testing.T) {
 
 	ctx := context.Background()
 	now := f.nodes[10].gossip.clk.Now()
-	endpoints := []entmoot.NodeEndpoint{{Network: "tcp", Addr: "198.51.100.2:4001"}}
-	// Ad claims Author=B (=20) but is delivered "from" A (=10).
-	ad := f.buildTransportAd(20, 1, endpoints, now)
-	f.nodes[30].gossip.onTransportAd(ctx, 10 /* sender */, &ad)
+	endpoints := []entmoot.NodeEndpoint{{Network: "turn", Addr: "198.51.100.1:4001"}}
+	// Ad authored AND signed by A (=10).
+	ad := f.buildTransportAd(10, 1, endpoints, now)
+	// Pre-arm a dial-failure on C→A so the post-install refanout
+	// trips dial-backoff quickly instead of blocking on a pipe.Write
+	// to a not-listening A. The refanout itself isn't what this test
+	// is asserting; we just want onTransportAd to finish.
+	f.nodes[30].gossip.recordDialFailure(10)
+	// Delivered to C (=30) "from" B (=20). Under v1.4.1 this would be
+	// rejected at the author/sender mismatch check; under v1.4.2 the
+	// trusted-sender gate accepts B and the signature check accepts
+	// A's signed payload.
+	f.nodes[30].gossip.onTransportAd(ctx, 20 /* sender=forwarder */, &ad)
 
-	// Nothing stored at C — the allowlist drop fires before any
-	// roster/crypto work.
-	if _, ok := stores[30].adFor(f.groupID, 20); ok {
-		t.Fatalf("C stored an ad delivered with mismatched sender/author")
+	// C stores the ad under author=A (=10), not under B.
+	got, ok := stores[30].adFor(f.groupID, 10)
+	if !ok {
+		t.Fatalf("C did not store forwarded ad from non-author sender")
 	}
-	if got := stores[30].putCallCount(); got != 0 {
-		t.Fatalf("PutTransportAd called %d times on cross-author frame; want 0", got)
+	if got.Author.PilotNodeID != 10 {
+		t.Fatalf("stored ad author = %d, want 10", got.Author.PilotNodeID)
+	}
+	if got.Seq != 1 {
+		t.Fatalf("stored ad seq = %d, want 1", got.Seq)
+	}
+	if got := stores[30].putCallCount(); got != 1 {
+		t.Fatalf("PutTransportAd call count = %d, want 1", got)
 	}
 }
 

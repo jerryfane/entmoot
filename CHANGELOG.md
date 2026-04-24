@@ -7,6 +7,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.2] - 2026-04-24
+
+### Changed
+
+- **Relaxed `onTransportAd` sender gate so trusted mesh peers can
+  forward signed ads.** Before v1.4.2, the receive path at
+  `gossiper.go:2711` rejected any frame whose `remote` (IPC-level
+  sender) wasn't the ad's `Author.PilotNodeID`. The explicit intent
+  was "single-hop" delivery, which turned `refanoutTransportAd`
+  into a structural no-op: any intermediate relayer's forwarded
+  frame was dropped downstream. Live evidence on 2026-04-24
+  (asymmetric-TURN test via Pilot v1.9.0-jf.9): laptop couldn't
+  direct-dial phobos (same-LAN false-positive #85 + CGNAT),
+  the VPS received laptop's ad and refanouted to phobos, and
+  phobos dropped the frame at this gate. End-to-end propagation
+  was blocked despite both peers being reachable via the VPS.
+
+  v1.4.2 replaces the author=sender gate with a trusted-sender
+  gate via a new `isTrustedSender(ctx, remote)` helper backed by
+  the existing `trustedSet(ctx)` cache. Log level drops from
+  `Warn` to `Debug`; a non-trusted sender is routine (trust churn,
+  trust-auto-approve race) and doesn't warrant operator attention.
+
+  The downstream defenses are unchanged — **signature verification
+  against the author's roster-recorded pubkey, roster-membership
+  check on the author, per-(peer, topic) rate limit, and LWW on
+  seq via `PutTransportAd`**. The signature remains the integrity
+  root: any tampering with the ad body invalidates the signature
+  and the receiver still drops. This is the standard gossip-
+  network design (Bitcoin, IPFS, Gnutella): forwarders are
+  trusted to relay but not to fabricate.
+
+  Fail-open on cold-start (`trustedSet` returns nil before the
+  first IPC snapshot lands) matches `plumEagerExcept`'s existing
+  precedent; during the ~seconds-long warmup the downstream
+  signature + membership checks still gate inbound ads.
+
+### Operational impact
+
+- **Hide-ip peers become reachable via any shared mesh hub.** A
+  hide-ip peer whose direct-dial path to another peer is blocked
+  (NAT, CGNAT, same-LAN false-positive, transient tunnel state)
+  can now still have its transport-ad propagate through any third
+  peer both sides can reach. For the current deployment, this
+  enables phobos to install laptop's TURN endpoint via the VPS
+  as a relay, which in turn lets phobos engage Pilot jf.9's
+  `turn-relay` transport.
+
+### Wire compatibility
+
+- **No wire-format changes.** A v1.4.2 forwarder refanouting to a
+  v1.4.1 receiver still gets dropped by the v1.4.1 receive-side
+  author=sender gate; only upgrading both endpoints unlocks full
+  multi-hop. A v1.4.1 publisher fanning out to a v1.4.2 receiver
+  is accepted (the receiver's relaxed gate doesn't care which
+  version the sender runs).
+
+### Dependencies
+
+- **No new dependencies.** Go standard library only.
+
 ## [1.4.1] - 2026-04-24
 
 ### Fixed

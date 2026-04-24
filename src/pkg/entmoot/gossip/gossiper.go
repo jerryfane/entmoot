@@ -605,6 +605,25 @@ func (g *Gossiper) trustedSet(ctx context.Context) map[entmoot.NodeID]struct{} {
 	return fresh
 }
 
+// isTrustedSender reports whether remote is in Pilot's current
+// trust-peer set. Reuses trustedSet's cached snapshot so a
+// receive-path call doesn't trigger extra IPC RTTs.
+//
+// v1.4.2: returns true on cold-start (nil snapshot) to match
+// plumEagerExcept's fail-open precedent. Downstream signature +
+// roster-membership checks remain the hard integrity floor, so the
+// cold-start window is harmless — at worst, an unknown sender's
+// properly-signed ad from a valid roster author is accepted, same
+// as if the author had sent it directly.
+func (g *Gossiper) isTrustedSender(ctx context.Context, remote entmoot.NodeID) bool {
+	trusted := g.trustedSet(ctx)
+	if trusted == nil {
+		return true // cold-start: fail-open, see doc comment.
+	}
+	_, ok := trusted[remote]
+	return ok
+}
+
 // plumEagerExcept returns a copy of eagerPushPeers with `except`
 // removed, suitable for re-fanout on receive (we never push back to
 // the source). Also seeds the peer maps on first use. Caller must NOT
@@ -2708,14 +2727,27 @@ func (g *Gossiper) onTransportAd(ctx context.Context, remote entmoot.NodeID, ad 
 		return
 	}
 
-	// 2. Publisher allowlist (the core structural defence): the peer
-	// sending this frame must be the ad's author. No one advertises
-	// on behalf of anyone else. Cross-author spam is eliminated at 5
-	// LOC. (Legitimate refanout re-signs with the forwarder's
-	// identity at the envelope layer if we ever add one; for now we
-	// publish single-hop and lean on each author's own refanout.)
-	if ad.Author.PilotNodeID != remote {
-		g.logger.Warn("gossip: transport_ad author/sender mismatch",
+	// 2. Sender gate (v1.4.2). The forwarder must be a Pilot-trusted
+	// peer. Authenticity of the ad itself comes from the author's
+	// signature (step 5) and the roster-membership check (step 3);
+	// any trusted mesh member may legitimately forward a signed ad.
+	// Standard gossip-network design — signatures provide integrity,
+	// trust handshakes provide sender authentication, membership +
+	// LWW + rate-limit defeat spam and replay.
+	//
+	// v1.4.0-v1.4.1 required ad.Author.PilotNodeID == remote here
+	// ("single-hop"). That turned refanoutTransportAd into a
+	// structural no-op: any relayer's forwarded frame was rejected
+	// by the receiver, so an ad could only reach peers that could
+	// direct-dial the author. Multi-hop is needed for NATted peer
+	// pairs that can't direct-dial each other (CGNAT + same-LAN
+	// false positives) but share a reachable mesh hub.
+	//
+	// Fail-open on cold-start IPC snapshot matches plumEagerExcept's
+	// precedent. Downstream signature + membership remain the hard
+	// integrity floor.
+	if !g.isTrustedSender(ctx, remote) {
+		g.logger.Debug("gossip: transport_ad from untrusted sender",
 			slog.Uint64("remote", uint64(remote)),
 			slog.Uint64("author", uint64(ad.Author.PilotNodeID)))
 		return
