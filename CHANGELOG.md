@@ -7,6 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.1] - 2026-04-24
+
+### Fixed
+
+- **Transport-ad fanout no longer silently drops the ad on first-attempt
+  direct-dial failure.** Before v1.4.1, both the publisher-side
+  `fanoutTransportAd` and the receiver-side `refanoutTransportAd` called
+  `Transport.Dial` exactly once per peer per burst and log-and-dropped
+  on any error — so a NAT flap, a same-LAN colliding-subnet
+  false-positive, a stale tunnel, or any other transient dial failure
+  lost the ad until the author's next weekly refresh. Live evidence on
+  2026-04-24: laptop's `-hide-ip` ad (Pilot v1.9.0-jf.9 asymmetric TURN
+  test) reached the VPS but never reached phobos because the VPS's
+  refanout dial to phobos timed out while phobos's tunnel was mid-
+  switch to relay, and the VPS then dropped the ad. End-to-end jf.9
+  couldn't be exercised until the ad propagated, so the live test was
+  blocked.
+
+  Fix: fanout / refanout failures now feed the existing message-retry
+  scheduler. Dial failures enqueue a retry entry keyed on (peer,
+  author); the same scheduler goroutine and decorrelated-jitter backoff
+  (~200 ms → ~50 s, inherited from v1.0.7) that already covered message
+  pushes now also re-attempt transport-ad sends. Retries cap at **6
+  attempts** (independent of the 10-attempt message cap) with a
+  **5-minute wall-clock ceiling**, and short-circuit via
+  `TransportAdStore.GetTransportAd` before re-dialling if a newer seq
+  from the same author is already stored locally — so a superseded ad
+  never re-wastes a dial. Terminal failures log at `Debug` (weekly
+  refresh re-seeds convergence; no operator action needed). `gossiper.go`
+  scheduler is extended in place via a new `opTransportAd` retry op;
+  the old log-and-drop comment about "weekly refresh makes retry state
+  redundant" is removed — live evidence disproves it.
+
+### Limitations
+
+- **Retry state is in-memory only.** If `entmootd` restarts before a
+  queued ad retry has fired, the retry is lost. Same behaviour as the
+  pre-existing message retry scheduler; durable retry is out of scope
+  for v1.4.1 and scheduled for v1.4.2 alongside transport-ad RBSR
+  anti-entropy.
+
+### Wire compatibility
+
+- **No wire-format changes.** `TransportAd`, `Gossip`, and every other
+  frame is byte-for-byte identical to v1.4.0. A v1.4.1 publisher
+  retrying a fanout to a v1.4.0 (or earlier) receiver sees the same
+  receive path light up as today — the retry is invisible to the
+  remote. A v1.4.0 publisher hitting a transient failure continues to
+  drop-on-first-try; only the upgraded side benefits.
+
+### Dependencies
+
+- **No new dependencies.** Go standard library only; no module graph
+  changes.
+
 ## [1.4.0] - 2026-04-24
 
 ### Added

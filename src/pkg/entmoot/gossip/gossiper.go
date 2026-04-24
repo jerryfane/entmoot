@@ -45,6 +45,20 @@ const (
 	retryMaxAttempts = 10
 )
 
+// Transport-ad retry caps (v1.4.1). A separate budget from
+// retryMaxAttempts because ads are comparatively scarce, authoritative
+// records — six attempts across the decorrelated-jitter schedule is
+// plenty for a transient NAT flap, but retrying 10× an already-
+// superseded ad would just waste dials. The wall-clock ceiling is the
+// independent termination condition: no matter how many attempts have
+// run, stop re-dialling five minutes after the original fanout
+// failure. Matches the envelope of dialBackoffCap so a once-dead peer
+// can't keep an ad retry ping-ponging forever. (v1.4.1)
+const (
+	adRetryMaxAttempts    = 6
+	adRetryWallClockLimit = 5 * time.Minute
+)
+
 // retryTickInterval is how often retryLoop wakes to check for due retries.
 // 500ms keeps the worst-case scheduling jitter well under the smallest
 // backoff step (1s).
@@ -149,6 +163,14 @@ const (
 	opIHave retryOp = 3
 	opGraft retryOp = 4
 	opPrune retryOp = 5
+	// Transport-ad fanout retry op (v1.4.1). Mirrors opPush semantics —
+	// same scheduler goroutine, same decorrelated-jitter backoff — but
+	// carries a signed *wire.TransportAd in retryState.ad instead of a
+	// Gossip frame. The author / seq fields on retryKey make the slot
+	// key unique per (peer, author) and let executeRetry short-circuit
+	// superseded ads via TransportAdStore.GetTransportAd before dialling.
+	// See enqueueAdRetry.
+	opTransportAd retryOp = 6
 )
 
 func (o retryOp) String() string {
@@ -163,26 +185,42 @@ func (o retryOp) String() string {
 		return "graft"
 	case opPrune:
 		return "prune"
+	case opTransportAd:
+		return "transport_ad"
 	default:
 		return "unknown"
 	}
 }
 
 // retryKey identifies a single pending retry slot. One slot per
-// (peer, message, direction).
+// (peer, message, direction) for message-typed retries; for
+// opTransportAd the slot is keyed on (peer, author) and `id` is
+// zero. At most one transport-ad retry per (peer, author) is in
+// flight at a time — a newer ad for the same author replaces the
+// previous entry in enqueueAdRetry. (v1.4.1 extends this struct
+// with `author` for opTransportAd; all other ops leave it zero.)
 type retryKey struct {
-	peer entmoot.NodeID
-	id   entmoot.MessageID
-	op   retryOp
+	peer   entmoot.NodeID
+	id     entmoot.MessageID
+	author entmoot.NodeID
+	op     retryOp
 }
 
 // retryState tracks how many attempts have run and when the next is due.
 // frame is populated only for pushes — fetches re-issue FetchReq from id.
+// For opTransportAd: ad holds the signed TransportAd to retransmit, seq
+// is the ad's sequence number (checked against the store's current seq
+// before each retry to drop superseded entries), and firstTry is when
+// the very first fanout attempt failed so drainDueRetries can enforce
+// adRetryWallClockLimit regardless of the jitter envelope. (v1.4.1)
 type retryState struct {
 	attempts    int
 	nextAt      time.Time
 	lastBackoff time.Duration // v1.0.7: feeds nextBackoff(prev); 0 on first failure
 	frame       *wire.Gossip
+	ad          *wire.TransportAd
+	seq         uint64
+	firstTry    time.Time
 }
 
 // reconcileState caches per-peer anti-entropy cooldown bookkeeping.
@@ -2000,6 +2038,82 @@ func (g *Gossiper) markReconcileTickTouched(peer entmoot.NodeID) {
 	g.lastReconciled[peer] = s
 }
 
+// enqueueAdRetry inserts (or refreshes) a pending retry slot for a
+// failed transport-ad fanout. Approach 1 (the discriminator approach
+// from the v1.4.1 plan): shares the existing retry scheduler with
+// opPush / opIHave / opGraft / opPrune, keyed on (peer, author) with
+// op=opTransportAd. The same drainDueRetries goroutine handles both
+// schedules; executeRetry dispatches on key.op.
+//
+// Semantics that differ from enqueueRetry:
+//
+//   - Retry cap is adRetryMaxAttempts (6), not retryMaxAttempts (10).
+//     Six attempts across the decorrelated-jitter envelope (~2 s →
+//     ~50 s) is ample for a transient NAT flap while bounding the
+//     cost of a persistently-unreachable peer.
+//   - A wall-clock ceiling (adRetryWallClockLimit, 5 min) terminates
+//     retries regardless of attempt count so a clock-skewed backoff
+//     can't hold an entry past the point of usefulness.
+//   - A newer ad from the same author supersedes the pending slot
+//     (we overwrite ad + seq + firstTry). Stale ad retries are also
+//     short-circuited at drain time via TransportAdStore.GetTransportAd
+//     before redialling — see drainDueRetries.
+//   - Terminal exhaustion is logged at Debug, not Warn, because the
+//     ad's own weekly refresh + the receiver's anti-entropy paths
+//     re-seed convergence; this failure is typically non-fatal.
+//
+// ad must be non-nil. Callers (fanoutTransportAd, refanoutTransportAd)
+// invoke enqueueAdRetry once on each dial/send failure, after the
+// existing Debug log that records the failure. (v1.4.1)
+func (g *Gossiper) enqueueAdRetry(peerID entmoot.NodeID, ad *wire.TransportAd) {
+	if ad == nil {
+		return
+	}
+	g.pendMu.Lock()
+	defer g.pendMu.Unlock()
+	now := g.clk.Now()
+	key := retryKey{peer: peerID, author: ad.Author.PilotNodeID, op: opTransportAd}
+	state, ok := g.pending[key]
+	if !ok {
+		state = &retryState{attempts: 1, ad: ad, seq: ad.Seq, firstTry: now}
+	} else {
+		// Refresh the stored ad on every enqueue so a newer seq from
+		// the same author displaces the stale retry. A lower seq
+		// never wins here: the receiver-side LWW guard drops the
+		// retry at drain time even if we kept it.
+		if ad.Seq >= state.seq {
+			state.ad = ad
+			state.seq = ad.Seq
+		}
+		state.attempts++
+	}
+	if state.attempts > adRetryMaxAttempts {
+		g.logger.Debug("gossip: transport_ad retry budget exhausted",
+			slog.Uint64("peer", uint64(key.peer)),
+			slog.Uint64("author", uint64(key.author)),
+			slog.Uint64("seq", state.seq),
+			slog.Int("attempts", state.attempts))
+		delete(g.pending, key)
+		return
+	}
+	// Wall-clock ceiling: if we've been retrying for more than
+	// adRetryWallClockLimit since the first failure, give up. Belt-
+	// and-braces termination in case a skewed backoff envelope keeps
+	// us in flight past the point of usefulness.
+	if !state.firstTry.IsZero() && now.Sub(state.firstTry) > adRetryWallClockLimit {
+		g.logger.Debug("gossip: transport_ad retry wall-clock ceiling hit",
+			slog.Uint64("peer", uint64(key.peer)),
+			slog.Uint64("author", uint64(key.author)),
+			slog.Uint64("seq", state.seq),
+			slog.Duration("elapsed", now.Sub(state.firstTry)))
+		delete(g.pending, key)
+		return
+	}
+	state.lastBackoff = g.nextBackoff(state.lastBackoff)
+	state.nextAt = now.Add(state.lastBackoff)
+	g.pending[key] = state
+}
+
 // enqueueRetry inserts (or refreshes) a pending retry slot for a failed
 // push or fetch. First-attempt failures start at attempts=1 with
 // lastBackoff=0, so nextBackoff produces a delay near retryBackoffBase
@@ -2088,6 +2202,39 @@ func (g *Gossiper) drainDueRetries(ctx context.Context) {
 		eg.Go(func() error {
 			dctx, cancel := context.WithTimeout(ctx, fanoutPerPeerTimeout)
 			defer cancel()
+			// v1.4.1: transport-ad retries short-circuit if the local
+			// store has seen a newer seq for the same author since we
+			// queued. Superseded ads never need to be re-sent — the
+			// newer ad's own fanout (or its retry) covers the peer.
+			if d.key.op == opTransportAd {
+				if g.adSuperseded(dctx, d.key, d.state) {
+					g.pendMu.Lock()
+					if cur, ok := g.pending[d.key]; ok && cur == d.state {
+						delete(g.pending, d.key)
+					}
+					g.pendMu.Unlock()
+					g.logger.Debug("gossip: transport_ad retry superseded",
+						slog.Uint64("peer", uint64(d.key.peer)),
+						slog.Uint64("author", uint64(d.key.author)),
+						slog.Uint64("seq", d.state.seq))
+					return nil
+				}
+				// Wall-clock termination: enforce adRetryWallClockLimit
+				// at drain time too so a slow backoff envelope can't
+				// leave us re-dialling after the ceiling.
+				if !d.state.firstTry.IsZero() && g.clk.Now().Sub(d.state.firstTry) > adRetryWallClockLimit {
+					g.pendMu.Lock()
+					if cur, ok := g.pending[d.key]; ok && cur == d.state {
+						delete(g.pending, d.key)
+					}
+					g.pendMu.Unlock()
+					g.logger.Debug("gossip: transport_ad retry wall-clock ceiling hit",
+						slog.Uint64("peer", uint64(d.key.peer)),
+						slog.Uint64("author", uint64(d.key.author)),
+						slog.Uint64("seq", d.state.seq))
+					return nil
+				}
+			}
 			// Execute without holding the mutex. Re-enqueue on failure advances
 			// the schedule; success clears the slot.
 			err := g.executeRetry(dctx, d.key, d.state)
@@ -2102,6 +2249,21 @@ func (g *Gossiper) drainDueRetries(ctx context.Context) {
 				g.pendMu.Unlock()
 				return nil
 			}
+			if d.key.op == opTransportAd {
+				// Debug rather than Warn: ad fanout failures are
+				// non-fatal — the receiver's own weekly refresh + the
+				// anti-entropy paths re-seed convergence. Noisy Warn
+				// logs on every transient NAT flap would drown
+				// operators.
+				g.logger.Debug("gossip: transport_ad retry",
+					slog.Uint64("peer", uint64(d.key.peer)),
+					slog.Uint64("author", uint64(d.key.author)),
+					slog.Uint64("seq", d.state.seq),
+					slog.Int("attempt", d.state.attempts+1),
+					slog.String("err", err.Error()))
+				g.enqueueAdRetry(d.key.peer, d.state.ad)
+				return nil
+			}
 			g.logger.Warn("gossip: retry",
 				slog.Uint64("peer", uint64(d.key.peer)),
 				slog.String("id", d.key.id.String()),
@@ -2113,6 +2275,25 @@ func (g *Gossiper) drainDueRetries(ctx context.Context) {
 		})
 	}
 	_ = eg.Wait()
+}
+
+// adSuperseded reports whether the local TransportAdStore holds an ad
+// for (ad author) whose Seq is strictly greater than the retry's seq.
+// Used by drainDueRetries to drop retries whose ad has already been
+// replaced by a NEWER fanout from the same author. Equal-seq is NOT
+// superseded — the retry's very own ad was written to the store at
+// publish time, so `cur.Seq == state.seq` is the expected self-match
+// and must not cancel the retry. TransportAdStore == nil means "no
+// state to consult, carry on". (v1.4.1)
+func (g *Gossiper) adSuperseded(ctx context.Context, key retryKey, state *retryState) bool {
+	if g.cfg.TransportAdStore == nil {
+		return false
+	}
+	cur, ok, err := g.cfg.TransportAdStore.GetTransportAd(ctx, g.cfg.GroupID, key.author)
+	if err != nil || !ok {
+		return false
+	}
+	return cur.Seq > state.seq
 }
 
 // executeRetry runs a single pending attempt. Returns nil on success so the
@@ -2141,6 +2322,15 @@ func (g *Gossiper) executeRetry(ctx context.Context, key retryKey, state *retryS
 		return g.sendGraft(ctx, key.peer, []entmoot.MessageID{key.id})
 	case opPrune:
 		return g.sendPrune(ctx, key.peer)
+	case opTransportAd:
+		// v1.4.1: re-dial the peer and send the cached signed ad.
+		// The ad pointer lives on retryState so we skip re-signing;
+		// supersession was already checked in drainDueRetries before
+		// dispatching here.
+		if state.ad == nil {
+			return fmt.Errorf("retry: transport_ad missing ad")
+		}
+		return g.sendTransportAd(ctx, key.peer, state.ad)
 	default:
 		return fmt.Errorf("retry: unknown op %d", key.op)
 	}
@@ -2602,9 +2792,12 @@ func (g *Gossiper) onTransportAd(ctx context.Context, remote entmoot.NodeID, ad 
 // refanoutTransportAd pushes ad to every eager peer except `except`.
 // Same best-effort parallelism as fanoutPush — a stalled peer can't
 // head-of-line-block healthy peers, and dial-backoff is respected.
-// Failures are logged at Debug and do NOT feed the retry scheduler:
-// the ad's weekly refresh + per-author receivers calling us on their
-// own schedule makes retry state redundant. (v1.2.0)
+// Failures feed enqueueAdRetry so transient direct-dial errors
+// (e.g. a peer that's mid-switch to relay, a colliding RFC1918 dial)
+// no longer lose the ad silently. (v1.4.1: live evidence showed the
+// previous log-and-drop policy dropped ads on first-attempt failure
+// and relied solely on the weekly refresh to heal; that made peers
+// effectively unreachable for the week-long window.)
 func (g *Gossiper) refanoutTransportAd(ctx context.Context, except entmoot.NodeID, ad *wire.TransportAd) {
 	peers := g.plumEagerExcept(ctx, except)
 	if len(peers) == 0 {
@@ -2622,6 +2815,7 @@ func (g *Gossiper) refanoutTransportAd(ctx context.Context, except entmoot.NodeI
 					slog.Uint64("peer", uint64(p)),
 					slog.Uint64("author", uint64(ad.Author.PilotNodeID)),
 					slog.String("err", err.Error()))
+				g.enqueueAdRetry(p, ad)
 			}
 			return nil
 		})
@@ -2725,6 +2919,12 @@ func (g *Gossiper) publishTransportAd(ctx context.Context, endpoints []entmoot.N
 // fanoutTransportAd sends ad to every eager peer. Used by the initial
 // advertiser publish (no sender to exclude). Factored out of
 // refanoutTransportAd because the exclusion set differs.
+//
+// v1.4.1: failures feed enqueueAdRetry so transport-ads survive
+// transient direct-dial failure the same way message fanouts have
+// since v1.0.4. Previously this path log-and-dropped, which produced
+// the 2026-04-24 live outage where laptop's -hide-ip ad never reached
+// phobos after the first fanout attempt hit "no route to host".
 func (g *Gossiper) fanoutTransportAd(ctx context.Context, ad *wire.TransportAd) {
 	peers := g.plumEagerExcept(ctx, 0)
 	if len(peers) == 0 {
@@ -2741,6 +2941,7 @@ func (g *Gossiper) fanoutTransportAd(ctx context.Context, ad *wire.TransportAd) 
 				g.logger.Debug("gossip: transport_ad fanout",
 					slog.Uint64("peer", uint64(p)),
 					slog.String("err", err.Error()))
+				g.enqueueAdRetry(p, ad)
 			}
 			return nil
 		})
