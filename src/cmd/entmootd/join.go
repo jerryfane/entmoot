@@ -153,6 +153,11 @@ func cmdJoin(gf *globalFlags, args []string) int {
 		TransportAdStore: rawStore,
 		RateLimiter:      ratelimit.New(ratelimit.DefaultLimits(), nil),
 		LocalEndpoints:   localEndpointsFn,
+		// v1.4.0: when set, the advertiser publishes only turn
+		// endpoints from LocalEndpoints and drops UDP/TCP entries,
+		// or emits an empty ad + warning when no TURN endpoint
+		// exists. See gossip.Config.HideIP for the rationale.
+		HideIP: gf.hideIP,
 	})
 	if err != nil {
 		slog.Error("join: new gossiper", slog.String("err", err.Error()))
@@ -341,10 +346,10 @@ func hasPrefix(s, p string) bool {
 
 // endpointFlag implements flag.Value for a repeatable
 // -advertise-endpoint argument whose value is "network=host:port".
-// Networks are restricted to "tcp" and "udp" (what Pilot's driver
-// understands today). The addr half is parsed with net.SplitHostPort
-// so we catch a malformed value at flag-parse time rather than at
-// advertiser-publish time. (v1.2.0)
+// Networks are restricted to "tcp", "udp", and "turn" (what Pilot's
+// driver understands today; "turn" added in v1.4.0 / jf.8). The addr
+// half is parsed with net.SplitHostPort so we catch a malformed value
+// at flag-parse time rather than at advertiser-publish time. (v1.2.0)
 type endpointFlag struct {
 	entries []entmoot.NodeEndpoint
 }
@@ -365,9 +370,9 @@ func (e *endpointFlag) Set(s string) error {
 	network := strings.TrimSpace(s[:eq])
 	addr := strings.TrimSpace(s[eq+1:])
 	switch network {
-	case "tcp", "udp":
+	case "tcp", "udp", "turn":
 	default:
-		return fmt.Errorf("-advertise-endpoint %q: unsupported network %q (want tcp or udp)", s, network)
+		return fmt.Errorf("-advertise-endpoint %q: unsupported network %q (want tcp, udp, or turn)", s, network)
 	}
 	if _, _, err := net.SplitHostPort(addr); err != nil {
 		return fmt.Errorf("-advertise-endpoint %q: parse addr: %w", s, err)

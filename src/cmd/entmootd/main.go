@@ -34,6 +34,13 @@ type globalFlags struct {
 	data       string
 	listenPort uint
 	logLevel   string
+	// hideIP (v1.4.0) toggles the gossiper's transport-ad advertiser
+	// into relay-only mode: UDP/TCP endpoints from Pilot are
+	// suppressed and only the TURN relay endpoint is published.
+	// Defaults to false (normal advertisement). Only join honours it
+	// today — other subcommands are read-only. See the HideIP
+	// comment on gossip.Config for semantics and jf.8+ requirement.
+	hideIP bool
 }
 
 func main() {
@@ -74,6 +81,8 @@ func run() int {
 	fs.StringVar(&gf.data, "data", "~/.entmoot", "Entmoot data root")
 	fs.UintVar(&gf.listenPort, "listen-port", 1004, "Entmoot listen port")
 	fs.StringVar(&gf.logLevel, "log-level", "info", "slog level: debug|info|warn|error")
+	fs.BoolVar(&gf.hideIP, "hide-ip", false,
+		"suppress UDP/TCP endpoint advertisement; publish only TURN relay (v1.4.0; requires pilot-daemon v1.9.0-jf.8+)")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		if errors.Is(err, flag.ErrHelp) {

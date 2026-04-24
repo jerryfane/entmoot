@@ -321,6 +321,17 @@ type Config struct {
 	// bursts. Nil means "no change signal, rely on the weekly refresh
 	// alone". (v1.2.0)
 	EndpointsChanged <-chan struct{}
+
+	// HideIP, when true, instructs the advertiser loop to suppress
+	// every UDP / TCP endpoint from the published TransportAd and
+	// publish only a TURN relay entry (if one is available via
+	// LocalEndpoints). If HideIP is set AND no TURN endpoint is
+	// present, the advertiser emits NOTHING and logs a warning —
+	// the node is unreachable until a relay is configured. This
+	// opt-in mode trades availability for IP-address privacy and
+	// requires pilot-daemon v1.9.0-jf.8+ with a TURN provider for
+	// any useful reachability. (v1.4.0)
+	HideIP bool
 }
 
 // Gossiper runs the accept loop, publishes local messages, and fetches
@@ -2787,14 +2798,31 @@ func (g *Gossiper) advertiserLoop(ctx context.Context) {
 }
 
 // tryPublishTransportAd is a thin wrapper that queries LocalEndpoints,
-// short-circuits on an empty slice, and logs publish errors at Warn.
-// reason goes into the log so operators can tell a startup publish from
-// a weekly refresh without turning on verbose tracing.
+// applies the HideIP filter, short-circuits on an empty resulting
+// slice, and logs publish errors at Warn. reason goes into the log so
+// operators can tell a startup publish from a weekly refresh without
+// turning on verbose tracing.
+//
+// HideIP path (v1.4.0): when cfg.HideIP is true, only entries whose
+// Network is "turn" are published — UDP/TCP entries are stripped.
+// If no TURN entry is present after the filter, the ad is NOT
+// published (empty publish would fail validateEndpoint upstream) and
+// a Warn is emitted so the operator sees the misconfiguration —
+// hide-IP with no relay leaves this peer unreachable by design
+// rather than silently falling back to IP advertisement.
 func (g *Gossiper) tryPublishTransportAd(ctx context.Context, reason string) {
 	if g.cfg.LocalEndpoints == nil {
 		return
 	}
 	eps := g.cfg.LocalEndpoints()
+	if g.cfg.HideIP {
+		eps = filterTurnOnly(eps)
+		if len(eps) == 0 {
+			g.logger.Warn("gossip: hide-ip set but no TURN relay available; peer will be unreachable",
+				slog.String("reason", reason))
+			return
+		}
+	}
 	if len(eps) == 0 {
 		g.logger.Debug("gossip: transport_ad skip publish (no local endpoints)",
 			slog.String("reason", reason))
@@ -2805,6 +2833,21 @@ func (g *Gossiper) tryPublishTransportAd(ctx context.Context, reason string) {
 			slog.String("reason", reason),
 			slog.String("err", err.Error()))
 	}
+}
+
+// filterTurnOnly returns the subset of eps whose Network is "turn".
+// Used by the HideIP advertiser path to strip UDP/TCP entries before
+// publishing. Preserves input order. Never returns a nil slice
+// allocated from the caller's slice — always a fresh allocation so
+// the caller's slice is untouched. (v1.4.0)
+func filterTurnOnly(eps []entmoot.NodeEndpoint) []entmoot.NodeEndpoint {
+	out := make([]entmoot.NodeEndpoint, 0, len(eps))
+	for _, ep := range eps {
+		if ep.Network == "turn" {
+			out = append(out, ep)
+		}
+	}
+	return out
 }
 
 // onTransportSnapshotReq answers a Join-time or catch-up request for
@@ -2845,13 +2888,15 @@ func (g *Gossiper) onTransportSnapshotReq(ctx context.Context, conn net.Conn, re
 }
 
 // validateEndpoint rejects malformed (network, addr) pairs. Networks
-// are restricted to the two Pilot knows how to act on ("tcp", "udp");
-// addr must be parseable by net.SplitHostPort. IP-literal hosts are
-// further sanity-checked so a dangling "example" can't masquerade as a
-// valid endpoint. (v1.2.0)
+// are restricted to the three Pilot knows how to act on ("tcp",
+// "udp", "turn"); addr must be parseable by net.SplitHostPort.
+// IP-literal hosts are further sanity-checked so a dangling "example"
+// can't masquerade as a valid endpoint. "turn" was added in Entmoot
+// v1.4.0 / pilot-daemon v1.9.0-jf.8 as the relay-advertising
+// network string. (v1.2.0, v1.4.0)
 func validateEndpoint(ep entmoot.NodeEndpoint) error {
 	switch ep.Network {
-	case "tcp", "udp":
+	case "tcp", "udp", "turn":
 	default:
 		return fmt.Errorf("unsupported network %q", ep.Network)
 	}

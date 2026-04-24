@@ -7,12 +7,39 @@ import (
 )
 
 // Endpoint describes one transport endpoint for a peer. Network is a
-// short identifier like "tcp" or "udp"; Addr is a "host:port" string
-// the daemon will resolve on its own side. The daemon imposes limits
-// of 16 bytes on Network and 255 bytes on Addr.
+// short identifier like "tcp", "udp", or "turn"; Addr is a "host:port"
+// string the daemon will resolve on its own side. The daemon imposes
+// limits of 16 bytes on Network and 255 bytes on Addr. "turn" was
+// added in Entmoot v1.4.0 / pilot-daemon v1.9.0-jf.8 — earlier
+// daemons reject the string at SetPeerEndpoints time. (v1.4.0)
 type Endpoint struct {
 	Network string
 	Addr    string
+}
+
+// Info is the typed shape of the daemon's InfoOK JSON body.
+// Driver.Info continues to return the untyped map for callers that
+// need flexibility (e.g. Pilot adds fields faster than we can roll
+// Entmoot); Driver.InfoStruct returns this typed form for callers
+// that want compile-time field access.
+//
+// Backwards-compat: every field is annotated `omitempty`, so a jf.7
+// daemon that omits `turn_endpoint` decodes cleanly into an Info
+// with TURNEndpoint="". Downstream callers treat the empty string
+// as "no TURN relay available". (v1.4.0)
+type Info struct {
+	// NodeID is the daemon's Pilot node id. Present on every
+	// version of the daemon's InfoOK reply.
+	NodeID uint32 `json:"node_id,omitempty"`
+	// Hostname is the daemon's reported hostname. Best-effort;
+	// unused by Entmoot but surfaced for debugging.
+	Hostname string `json:"hostname,omitempty"`
+	// TURNEndpoint is the daemon's advertised TURN relay
+	// "host:port" for this node, if one was configured at daemon
+	// start. Added in pilot-daemon v1.9.0-jf.8. Older daemons
+	// omit the field; new daemons without a TURN provider also
+	// omit it. In both cases the decoded value is "". (v1.4.0)
+	TURNEndpoint string `json:"turn_endpoint,omitempty"`
 }
 
 // Addr is a Pilot virtual address: a 16-bit network ID paired with a

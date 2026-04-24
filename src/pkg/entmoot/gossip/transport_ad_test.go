@@ -343,6 +343,38 @@ func TestTransportAdInstallCallsTransport(t *testing.T) {
 	})
 }
 
+// TestTransportAdInstallRoundTripsTurnEndpoint verifies the receive-side
+// TURN path (v1.4.0): a published ad containing a "turn" network string
+// is dispatched through onTransportAd to the Transport's SetPeerEndpoints
+// call unmodified. The gossiper does not interpret the network string —
+// it's Pilot's SetPeerEndpoints handler that routes "turn" entries to
+// AddPeerTURNEndpoint. The mock transport just records every call, so
+// this test confirms we don't accidentally filter "turn" out of the
+// receive path.
+func TestTransportAdInstallRoundTripsTurnEndpoint(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, []entmoot.NodeID{10, 20})
+	defer f.closeTransports()
+
+	// A advertises exactly one TURN endpoint (simulating a hide-IP peer).
+	eps := map[entmoot.NodeID][]entmoot.NodeEndpoint{
+		10: {{Network: "turn", Addr: "relay.example.test:3478"}},
+	}
+	installTransportAdStores(t, f, eps)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f.startAll(ctx)
+
+	bTransport := f.transports[20].(*memTransport)
+	waitUntil(t, 2*time.Second, "B transport records A's TURN endpoint", func() bool {
+		got := bTransport.EndpointsFor(10)
+		return len(got) == 1 &&
+			got[0].Network == "turn" &&
+			got[0].Addr == "relay.example.test:3478"
+	})
+}
+
 // TestTransportAdRateLimited exercises the per-(peer, topic) bucket.
 // We deliver 20 valid ads very quickly from A; B's transport-ad bucket
 // has a 10-token burst, so 10 pass and 10 reject. The stored seq must

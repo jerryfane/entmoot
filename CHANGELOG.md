@@ -7,6 +7,78 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-04-24
+
+### Added
+
+- **`-hide-ip` global flag on `entmootd`.** Opt-in, default `false`.
+  When set on a node that invokes `entmootd join`, the gossiper's
+  transport-ad advertiser suppresses every UDP/TCP endpoint coming
+  out of Pilot and publishes only the TURN relay entry from
+  `Info.TURNEndpoint`. With no TURN relay available, the advertiser
+  emits **no ad at all** and logs a `Warn` — the node becomes
+  unreachable until a relay is configured. This is deliberate:
+  silently falling back to IP advertisement would defeat the
+  privacy goal the flag exists for. Requires `pilot-daemon
+  v1.9.0-jf.8+` for any useful reachability; earlier daemons do
+  not expose `turn_endpoint` in Info.
+
+- **`pkg/entmoot/transport/pilot/ipcclient.Info`** typed struct.
+  Replaces the previous map-keyed access pattern for callers that
+  want compile-time field access. The existing `Driver.Info`
+  method (returning `map[string]interface{}`) is unchanged for
+  backwards-compat; a new `Driver.InfoStruct` returns the typed
+  `Info`. The struct's `TURNEndpoint string \`json:"turn_endpoint,omitempty"\``
+  field decodes to `""` when talking to jf.7 daemons (which omit
+  the key) or to jf.8 daemons without a TURN provider configured.
+
+- **`turn` accepted as a transport-ad network string** on both the
+  advertiser path (`-advertise-endpoint turn=relay:3478` at
+  `entmootd join`) and the validator (`validateEndpoint` in the
+  gossiper). The wire format itself is unchanged — `NodeEndpoint.Network`
+  has always been a free-form short string; v1.4.0 just widens the
+  set of strings Entmoot produces.
+
+### Wire compatibility
+
+- **Transport-ad frame format is unchanged.** A v1.0+ receiver
+  decoding a `TransportAd{Endpoints: [{Network:"turn", Addr:...}]}`
+  sees a well-formed payload and hands it through
+  `Transport.SetPeerEndpoints` unmodified. Old daemons will reject
+  the `"turn"` network string at the Pilot IPC layer; new daemons
+  (`pilot-daemon v1.9.0-jf.8+`) route it to `AddPeerTURNEndpoint`.
+  No coordinated upgrade is required — a v1.4.0 peer broadcasting
+  a TURN ad to a v1.3.0 peer just sees its new-daemon peer install
+  the endpoint on the remote side.
+
+- **`Info.TURNEndpoint` is `omitempty` on both ends.** jf.7 daemons
+  never set it; v1.4.0 decodes the absence as `""` and behaves
+  exactly as it did in v1.3.0.
+
+- **A v1.4.0 gossiper with `-hide-ip` becomes unreachable until the
+  local pilot-daemon is upgraded to jf.8+** (the daemon must be
+  able to both advertise a TURN endpoint and route inbound TURN
+  traffic). This is the expected upgrade path, not a regression:
+  the flag is opt-in.
+
+### Behaviour
+
+- When `-hide-ip` is set AND no TURN endpoint is available, the
+  advertiser emits a `slog.Warn` of the form `"hide-ip set but no
+  TURN relay available; peer will be unreachable"` and skips the
+  publish. Operators must see this in log tailing to understand
+  why their peer is offline.
+
+- When `-hide-ip` is set AND a TURN endpoint is available, the
+  advertiser publishes a single-entry ad with `Network="turn"`
+  and drops UDP/TCP entries in the same callback-returned slice.
+
+- When `-hide-ip` is unset (the default), behaviour is identical
+  to v1.3.0: every endpoint the `-advertise-endpoint` flag was
+  fed is published as-is. The TURN network string is supported on
+  this path too, so an operator who wants UDP+TCP+TURN all
+  advertised can pass all three.
+
 ## [1.3.0] - 2026-04-23
 
 ### Changed

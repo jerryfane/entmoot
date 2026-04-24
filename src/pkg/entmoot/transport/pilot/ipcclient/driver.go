@@ -450,6 +450,29 @@ func (d *Driver) Info(ctx context.Context) (map[string]interface{}, error) {
 	return out, nil
 }
 
+// InfoStruct issues an Info (0x0D) command and returns the InfoOK
+// JSON body decoded into the typed Info struct. Added in v1.4.0 so
+// callers that need the TURNEndpoint field (or any other typed
+// access) can avoid the string-keyed map shape. Forward-compat:
+// unknown fields on the daemon side are silently dropped by
+// encoding/json. Backwards-compat: a jf.7 daemon that omits
+// turn_endpoint decodes into Info{TURNEndpoint: ""}.
+func (d *Driver) InfoStruct(ctx context.Context) (Info, error) {
+	frame := []byte{byte(opInfo)}
+	resp, err := d.sendAndWait(ctx, frame, opInfoOK)
+	if err != nil {
+		return Info{}, fmt.Errorf("ipcclient: info: %w", err)
+	}
+	if len(resp) == 0 {
+		return Info{}, nil
+	}
+	var out Info
+	if err := json.Unmarshal(resp, &out); err != nil {
+		return Info{}, fmt.Errorf("ipcclient: info: decode: %w", err)
+	}
+	return out, nil
+}
+
 // Listen binds a virtual port. A requested port of 0 asks the daemon
 // to pick one from the ephemeral range; Listener.Port reports the
 // bound value. The returned Listener is registered with the driver's
