@@ -21,6 +21,13 @@ var ErrClosed = errors.New("ipcclient: closed")
 // caller tear down the session.
 var ErrShortResponse = errors.New("ipcclient: truncated daemon response")
 
+// ErrSubscribeUnsupported is returned by Driver.Subscribe when the
+// connected pilot daemon doesn't recognise the opSubscribe opcode
+// (i.e. predates v1.9.0-jf.11b). Callers should branch on this with
+// errors.Is and fall back to legacy polling for the desired state.
+// (v1.5.0)
+var ErrSubscribeUnsupported = errors.New("ipcclient: subscribe: pilot daemon does not support pub/sub (pre-jf.11b)")
+
 // IPCError wraps an Error (0x0A) response from the daemon. The Code
 // field is the 2-byte error code from the wire frame; Message is the
 // UTF-8 tail. The textual Error() output is the message alone for

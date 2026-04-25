@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"sync"
+	"time"
 )
 
 // DefaultSocketPath is the Unix-domain socket Pilot's daemon listens
@@ -51,6 +53,16 @@ type Driver struct {
 	// listenersMu guards listeners.
 	listenersMu sync.RWMutex
 	listeners   map[uint16]*Listener
+
+	// subsMu guards topicSubs. topicSubs maps a topic name to the
+	// Subscriptions registered for it. Notify frames pushed by
+	// pilot are routed via topicSubs and bypass the request-reply
+	// `pending` FIFO entirely (server-pushed, same model as
+	// opAcceptedConn). A topic can have multiple Subscriptions if
+	// the application Subscribed more than once to the same topic;
+	// every Subscription receives every Notification. (v1.5.0)
+	subsMu    sync.Mutex
+	topicSubs map[string][]*Subscription
 
 	// pendingMu guards pending and pendingSeq. pending is a SINGLE
 	// global FIFO of in-flight commands ordered by issue time
@@ -130,6 +142,7 @@ func Connect(socketPath string) (*Driver, error) {
 		conns:       make(map[uint32]*pilotConn),
 		pendingRecv: make(map[uint32][][]byte),
 		listeners:   make(map[uint16]*Listener),
+		topicSubs:   make(map[string][]*Subscription),
 		closedCh:    make(chan struct{}),
 		demuxDone:   make(chan struct{}),
 	}
@@ -168,6 +181,26 @@ func (d *Driver) Close() error {
 		}
 		d.pending = nil
 		d.pendingMu.Unlock()
+
+		// v1.5.0: close every Subscription so callers blocked on
+		// Events() see the channel close (== EOF on the topic). We
+		// don't try to send Unsubscribe here — pilot's connection
+		// is also tearing down.
+		d.subsMu.Lock()
+		closing := make([]*Subscription, 0)
+		for _, subs := range d.topicSubs {
+			closing = append(closing, subs...)
+		}
+		d.topicSubs = make(map[string][]*Subscription)
+		d.subsMu.Unlock()
+		for _, sub := range closing {
+			sub.closeMu.Lock()
+			if !sub.closed {
+				sub.closed = true
+				close(sub.eventCh)
+			}
+			sub.closeMu.Unlock()
+		}
 
 		// Close every conn's recv channel so any blocked Read returns
 		// io.EOF — it would otherwise block on the channel forever.
@@ -329,6 +362,16 @@ func (d *Driver) demux() {
 				msg = string(payload[2:])
 			}
 			d.deliverError(&IPCError{Code: code, Message: msg})
+		case opNotify:
+			// v1.5.0 / pilot jf.11b: server-pushed state-change
+			// notification. Payload:
+			//   [topic_len:uint16][topic][payload_len:uint32][payload]
+			// Notify frames bypass the request-reply pending FIFO
+			// entirely — they're routed via topicSubs to whichever
+			// Subscriptions are registered for the topic.
+			if topic, body, ok := parseNotifyPayload(payload); ok {
+				d.routeNotify(topic, body)
+			}
 		case opCloseOK:
 			// Daemon-initiated close confirmation. Payload: [4B conn_id].
 			// We mirror the app-initiated-close bookkeeping: close the
@@ -511,6 +554,162 @@ func (d *Driver) InfoStruct(ctx context.Context) (Info, error) {
 		return Info{}, fmt.Errorf("ipcclient: info: decode: %w", err)
 	}
 	return out, nil
+}
+
+// Subscribe registers a topic listener with pilot. Returns the
+// initial-state snapshot delivered in opSubscribeOK plus a
+// Subscription whose Events() channel receives subsequent opNotify
+// frames. The Subscription must be closed when no longer needed.
+//
+// Backwards compat: pilot < v1.9.0-jf.11b doesn't know opSubscribe
+// and replies with an opError carrying "unknown command: 0x30".
+// Callers (e.g. the entmootd TURN-rotation poller) should detect
+// this with errors.Is(err, ErrSubscribeUnsupported) and fall back
+// to polling.
+//
+// (v1.5.0)
+func (d *Driver) Subscribe(ctx context.Context, topic string) ([]byte, *Subscription, error) {
+	if topic == "" {
+		return nil, nil, fmt.Errorf("ipcclient: subscribe: empty topic")
+	}
+	if len(topic) > 0xFFFF {
+		return nil, nil, fmt.Errorf("ipcclient: subscribe: topic too long (%d bytes; max 65535)", len(topic))
+	}
+
+	// Pre-register the Subscription BEFORE writing the frame, so a
+	// Notify pushed by pilot between SubscribeOK delivery and our
+	// returning the Subscription is still routed correctly. (Mirror
+	// of pilot-side register-before-reply ordering.)
+	sub := &Subscription{
+		drv:     d,
+		topic:   topic,
+		eventCh: make(chan Notification, subscriptionBufferSize),
+	}
+	d.subsMu.Lock()
+	d.topicSubs[topic] = append(d.topicSubs[topic], sub)
+	d.subsMu.Unlock()
+
+	frame := make([]byte, 1+2+len(topic))
+	frame[0] = byte(opSubscribe)
+	binary.BigEndian.PutUint16(frame[1:3], uint16(len(topic)))
+	copy(frame[3:], topic)
+
+	resp, err := d.sendAndWait(ctx, frame, opSubscribeOK)
+	if err != nil {
+		// Unwind the pre-registration on any error path.
+		d.unregisterSubscription(sub)
+		// Detect "unknown command" so callers can fall back. Pilot
+		// sends an opError with code=1 message "unknown command: 0x30"
+		// when the daemon predates jf.11b.
+		if isUnknownCommandError(err, opSubscribe) {
+			return nil, nil, fmt.Errorf("%w: %v", ErrSubscribeUnsupported, err)
+		}
+		return nil, nil, fmt.Errorf("ipcclient: subscribe: %w", err)
+	}
+	gotTopic, snapshot, ok := parseNotifyPayload(resp)
+	if !ok || gotTopic != topic {
+		d.unregisterSubscription(sub)
+		return nil, nil, fmt.Errorf("ipcclient: subscribe: malformed SubscribeOK")
+	}
+	return snapshot, sub, nil
+}
+
+// sendUnsubscribe issues an opUnsubscribe + waits for opUnsubscribeOK.
+// Best-effort; called from Subscription.Close. (v1.5.0)
+func (d *Driver) sendUnsubscribe(topic string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	frame := make([]byte, 1+2+len(topic))
+	frame[0] = byte(opUnsubscribe)
+	binary.BigEndian.PutUint16(frame[1:3], uint16(len(topic)))
+	copy(frame[3:], topic)
+	_, err := d.sendAndWait(ctx, frame, opUnsubscribeOK)
+	return err
+}
+
+// unregisterSubscription removes sub from topicSubs. Idempotent.
+// (v1.5.0)
+func (d *Driver) unregisterSubscription(sub *Subscription) {
+	d.subsMu.Lock()
+	defer d.subsMu.Unlock()
+	subs := d.topicSubs[sub.topic]
+	for i, s := range subs {
+		if s == sub {
+			d.topicSubs[sub.topic] = append(subs[:i], subs[i+1:]...)
+			break
+		}
+	}
+	if len(d.topicSubs[sub.topic]) == 0 {
+		delete(d.topicSubs, sub.topic)
+	}
+}
+
+// routeNotify hands a parsed Notify frame to every Subscription
+// registered for the topic. Each Subscription gets a defensively
+// copied payload so the demuxer's frame buffer can be reused.
+// (v1.5.0)
+func (d *Driver) routeNotify(topic string, payload []byte) {
+	d.subsMu.Lock()
+	subs := append([]*Subscription(nil), d.topicSubs[topic]...)
+	d.subsMu.Unlock()
+	if len(subs) == 0 {
+		return
+	}
+	cp := make([]byte, len(payload))
+	copy(cp, payload)
+	n := Notification{Topic: topic, Payload: cp}
+	for _, sub := range subs {
+		sub.deliverNotification(n)
+	}
+}
+
+// parseNotifyPayload decodes the wire format shared by opSubscribeOK
+// and opNotify: [topic_len:uint16][topic][payload_len:uint32][payload].
+// Returns ok=false on any structural mismatch. (v1.5.0)
+func parseNotifyPayload(payload []byte) (topic string, body []byte, ok bool) {
+	if len(payload) < 2+4 {
+		return "", nil, false
+	}
+	tn := binary.BigEndian.Uint16(payload[0:2])
+	if int(tn) > len(payload)-2-4 {
+		return "", nil, false
+	}
+	topic = string(payload[2 : 2+tn])
+	pn := binary.BigEndian.Uint32(payload[2+tn : 2+int(tn)+4])
+	if int(pn) > len(payload)-int(2+tn)-4 {
+		return "", nil, false
+	}
+	body = payload[2+int(tn)+4 : 2+int(tn)+4+int(pn)]
+	return topic, body, true
+}
+
+// isUnknownCommandError returns true when err is an *IPCError whose
+// message indicates the daemon doesn't recognise op. Used by
+// Subscribe to surface ErrSubscribeUnsupported so callers can fall
+// back to legacy polling. (v1.5.0)
+func isUnknownCommandError(err error, op Opcode) bool {
+	if err == nil {
+		return false
+	}
+	var ipcErr *IPCError
+	for e := err; e != nil; {
+		if cast, ok := e.(*IPCError); ok {
+			ipcErr = cast
+			break
+		}
+		type unwrapper interface{ Unwrap() error }
+		u, ok := e.(unwrapper)
+		if !ok {
+			break
+		}
+		e = u.Unwrap()
+	}
+	if ipcErr == nil {
+		return false
+	}
+	// Pilot's sendError emits "unknown command: 0x%02X" for unknown opcodes.
+	want := fmt.Sprintf("unknown command: 0x%02X", byte(op))
+	return strings.Contains(ipcErr.Message, want)
 }
 
 // Listen binds a virtual port. A requested port of 0 asks the daemon

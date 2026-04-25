@@ -7,6 +7,118 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-04-25
+
+Replaces the v1.4.4 polling pattern for TURN-rotation detection
+with a true push notification, using pilot v1.9.0-jf.11b's new
+Subscribe / Notify IPC primitives. Steady-state IPC traffic for
+TURN-rotation detection drops from one Info query every 30 s
+(~2,880/day) to **zero**.
+
+### Added
+
+- **`ipcclient.Driver.Subscribe(ctx, topic)`** — issues
+  `opSubscribe` and returns the initial-state snapshot from
+  `opSubscribeOK` plus a `*Subscription` whose `Events()` channel
+  receives subsequent `opNotify` frames. The Subscription must be
+  closed when no longer needed.
+- **`ipcclient.Subscription`** — typed handle with `Topic()`,
+  `Events() <-chan Notification`, and `Close() error`. Buffered
+  channel (cap 16) with drop-oldest overflow semantics so a slow
+  consumer cannot wedge the demuxer goroutine. The events channel
+  closes on `Subscription.Close()` OR on driver shutdown.
+- **`ipcclient.Notification`** — `{Topic, Payload}` event delivered
+  to `Subscription.Events()`. Topic identifies the producer;
+  Payload is opaque bytes whose encoding is the topic's
+  responsibility (TURN uses UTF-8 host:port).
+- **`ipcclient.ErrSubscribeUnsupported`** — sentinel returned by
+  `Driver.Subscribe` when the connected pilot daemon doesn't
+  understand `opSubscribe` (i.e. predates jf.11b). Callers branch
+  on this with `errors.Is` and fall back to polling.
+- **Five new opcodes** in `pkg/entmoot/transport/pilot/ipcclient/opcodes.go`:
+  `opSubscribe` (0x30), `opSubscribeOK` (0x31), `opUnsubscribe`
+  (0x32), `opUnsubscribeOK` (0x33), `opNotify` (0x34). Match
+  pilot's wire definitions.
+
+### Changed
+
+- **`cmd/entmootd/turn_endpoint_poller.go` Run() rewritten.**
+  External API (`CurrentTURN`, `Changed`, `pollOnce`) unchanged
+  so `cmd/entmootd/join.go`'s wiring to
+  `gossip.Config.LocalEndpoints` and
+  `gossip.Config.EndpointsChanged` is untouched. Run now:
+  1. Tries `Driver.Subscribe(ctx, "turn_endpoint")` first.
+  2. On success, blocks on the Subscription's events channel and
+     applies each opNotify payload via `applyTURN`. **Zero
+     polling traffic.**
+  3. On `ErrSubscribeUnsupported` (pre-jf.11b pilot), logs an
+     INFO line and falls back to the v1.4.x 30 s polling loop —
+     mixed-version meshes continue to work.
+  4. On other Subscribe error, logs WARN and falls back to
+     polling.
+
+### Behaviour
+
+- **Detection latency drops from 30 s (worst case) to ~1 ms.**
+  Pilot fires `PublishTopic("turn_endpoint", newAddr)` from the
+  TURN transport's Allocate / rotate path; entmoot's demuxer
+  routes the Notify to the Subscription's channel; the poller's
+  `applyTURN` signals `gossip.Config.EndpointsChanged`; the
+  advertiser re-publishes the transport_ad on the next tick.
+- **Pilot's serial-IPC handler is no longer a constraint** for
+  TURN-rotation detection. Notify frames bypass the
+  request-reply queue (server-pushed, same model as
+  opAcceptedConn / opRecv), so a slow gossip Dial in flight
+  doesn't delay rotation events.
+- **Subscribe register-then-reply ordering preserved.**
+  `Driver.Subscribe` adds the Subscription to `topicSubs`
+  BEFORE writing the opSubscribe frame, so an opNotify pushed by
+  pilot between SubscribeOK and the test code returning the
+  Subscription is still routed correctly.
+
+### Tests
+
+- `pkg/entmoot/transport/pilot/ipcclient/subscribe_test.go`
+  (new):
+  - `TestSubscribe_RoundTripDeliversInitialAndNotify` — happy
+    path: SubscribeOK with snapshot, then two Notify pushes.
+  - `TestSubscribe_FallsBackOnUnknownCommand` — pilot returns
+    `unknown command: 0x30` → Subscribe returns
+    `ErrSubscribeUnsupported`; topicSubs is unwound.
+  - `TestSubscribe_BufferOverflowDropsOldest` — 3× buffer-cap
+    Notify pushes, oldest dropped, recent values preserved.
+  - `TestSubscribe_CloseStopsDelivery` — Close prevents further
+    delivery; idempotent re-close.
+  - `TestParseNotifyPayload` — table-driven decoder coverage
+    (well-formed / truncated / overlong / empty-payload).
+  - `TestRouteNotify_FansOutToMultipleSubscriptions` —
+    multi-Subscription fanout per topic.
+  - `TestSubscribe_ConcurrentSafe` — 10× concurrent
+    Subscribe/Close + routeNotify under -race.
+- All existing tests still pass under -race, including the
+  v1.4.6 cross-opcode error-routing regression guard.
+
+### Compat
+
+- **Mixed-version mesh works without a flag day.** Entmoot
+  v1.5.0 against pilot < jf.11b → falls back to v1.4.x polling.
+  Entmoot v1.4.x against pilot jf.11b → keeps polling (wasteful
+  but not broken). All four version pairs interoperate.
+- **No wire-format changes to existing opcodes.** Five new
+  opcodes only, in the previously-unused 0x30-0x34 range.
+- **External API of `turnEndpointPoller` unchanged** so
+  `cmd/entmootd/join.go` is untouched.
+
+### Out of scope (deferred)
+
+- Other topics (peer trust, tunnel up/down, registry health). The
+  Subscribe primitive is generic; pilot side just adds a new
+  topic + emit site. Track per topic.
+- Re-subscribe on pilot reconnect. If pilot restarts, entmoot's
+  driver disconnects; the existing IPC auto-reconnect work
+  (task #45) needs to also re-issue Subscribe. Track explicitly.
+- `entmootctl subs list` diagnostic command. Nice-to-have.
+
 ## [1.4.6] - 2026-04-25
 
 Fix a latent IPC error-routing bug surfaced by v1.4.4's

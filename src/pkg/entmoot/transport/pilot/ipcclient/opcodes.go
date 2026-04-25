@@ -26,6 +26,21 @@ const (
 	opHandshakeOK       Opcode = 0x10
 	opSetPeerEndpoints  Opcode = 0x25
 	opSetPeerEndpointsOK Opcode = 0x26
+
+	// v1.5.0 / pilot v1.9.0-jf.11b: pub/sub state-change push
+	// primitives. opNotify is server-initiated and bypasses the
+	// request-reply pending FIFO (same model as opAcceptedConn /
+	// opRecv). Subscribe replies carry a current-state snapshot so
+	// the subscriber learns the value the same instant pilot has
+	// it, without waiting for the next change-driven Notify.
+	//   Subscribe / Unsubscribe payload: [topic_len:uint16][topic]
+	//   SubscribeOK / Notify payload:   [topic_len:uint16][topic]
+	//                                    [payload_len:uint32][payload]
+	opSubscribe     Opcode = 0x30
+	opSubscribeOK   Opcode = 0x31
+	opUnsubscribe   Opcode = 0x32
+	opUnsubscribeOK Opcode = 0x33
+	opNotify        Opcode = 0x34
 )
 
 // Handshake sub-command byte values. The Handshake opcode (0x0F) takes
