@@ -7,6 +7,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.6] - 2026-04-25
+
+Fix a latent IPC error-routing bug surfaced by v1.4.4's
+TURN-endpoint poller. Pre-fix, when multiple opcodes had
+concurrent in-flight commands, the daemon's untagged Error
+frames could be delivered to the wrong waiter — Pilot's
+`dial timeout` errors were landing on Info callers, making
+TURN-rotation polling appear permanently broken even when
+the underlying IPC was healthy.
+
+### Fixed
+
+- **`Driver.deliverError` no longer mis-routes errors across
+  concurrent opcodes.** Live evidence 2026-04-25 from VPS:
+  every TURN-endpoint poll on phobos AND VPS failed with
+  errors like `ipcclient: info: ipcclient: daemon: dial
+  timeout` — the InfoStruct call is logically incapable of
+  producing a `dial timeout` error, so the error was
+  obviously routed from a concurrent gossip Dial call.
+
+  Root cause: pre-fix the pending-reply book was a per-opcode
+  map; `deliverError` walked the map (Go map iteration is
+  randomised) and picked the head of a non-empty queue. Pilot's
+  Error frame (`0x0A`) carries no correlation back to the
+  command that caused it, so the routing decision was
+  effectively a coin flip whenever two opcodes had waiters.
+
+  Fix: replaced the per-opcode `map[Opcode][]chan` with a
+  single global FIFO `[]pendingEntry`. Successful replies
+  still match by opcode (linear scan, queue is shallow);
+  Error frames pop the head, which is FIFO-correct because
+  Pilot replies in command-issue order on a single socket.
+
+- **Behaviour pre-v1.4.4 was OK by accident.** Entmoot used to
+  issue IPC commands serially, so at most one opcode had a
+  waiter at a time and the broken `deliverError` happened to
+  pick the right one. v1.4.4's poller broke that invariant by
+  running InfoStruct concurrently with the gossip layer's
+  Dial/Send/Listen. v1.4.6 corrects the routing for any future
+  concurrent IPC use too.
+
+### Tests
+
+- `pkg/entmoot/transport/pilot/ipcclient/error_routing_test.go`:
+  - `TestErrorRouting_FIFOAcrossOpcodes` — issues Bind then
+    Info concurrently; mock daemon replies with Error+InfoOK;
+    asserts Bind (the FIRST issuer) gets the Error and Info
+    succeeds. Pre-fix this would fail intermittently; post-fix
+    it's deterministic.
+  - `TestErrorRouting_OnlyOnePending` — single-pending case
+    still works, guarding against a regression where the FIFO
+    refactor might break the simpler path.
+
+### Compat
+
+No wire changes. Drop-in patch — both v1.4.4 and v1.4.5 had the
+same routing bug; anyone on v1.4.4+ should upgrade. Pilot daemon
+is unchanged; the daemon's untagged Error frame remains a known
+protocol limitation that we work around client-side. A proper
+correlation-tag fix would require a Pilot wire change (track
+upstream).
+
 ## [1.4.5] - 2026-04-25
 
 Hotfix on top of v1.4.4: the TURN-endpoint polling loop's 3 s

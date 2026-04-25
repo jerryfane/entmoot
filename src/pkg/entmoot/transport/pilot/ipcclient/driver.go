@@ -52,11 +52,31 @@ type Driver struct {
 	listenersMu sync.RWMutex
 	listeners   map[uint16]*Listener
 
-	// pendingMu guards pending. pending is a per-response-opcode FIFO
-	// of reply channels: the demuxer pops the head when a response of
-	// the matching opcode arrives and delivers the payload.
-	pendingMu sync.Mutex
-	pending   map[Opcode][]chan pendingReply
+	// pendingMu guards pending and pendingSeq. pending is a SINGLE
+	// global FIFO of in-flight commands ordered by issue time
+	// (v1.4.6). Each entry carries its expected response opcode so
+	// successful replies still match by opcode (deliverPending walks
+	// the slice and picks the first entry whose op matches), while
+	// untagged Error frames route to the oldest entry regardless of
+	// opcode (deliverError pops index 0).
+	//
+	// Why a global FIFO instead of a per-opcode map: the daemon's
+	// Error frame carries no correlation back to the command that
+	// caused it (just code+message), so when multiple opcodes have
+	// concurrent waiters — which v1.4.4's TURN-endpoint poller
+	// introduced by running InfoStruct alongside gossip Dial/Send —
+	// a per-opcode map can only "guess" which waiter to deliver the
+	// error to, and Go map iteration is randomised, so the guess is
+	// arbitrary. The result was Info calls receiving Pilot's
+	// "dial timeout" errors and vice versa. Live evidence
+	// 2026-04-25: every poll on phobos failed at 3 s with errors
+	// like `ipcclient: info: ipcclient: daemon: dial timeout`.
+	// FIFO ordering matches the daemon's actual reply order on a
+	// single socket (replies come in command-issue order), so an
+	// untagged Error always belongs to the head-of-queue.
+	pendingMu  sync.Mutex
+	pending    []pendingEntry
+	pendingSeq uint64 // monotonic, debug only
 
 	// closeOnce + closedCh serialize shutdown.
 	closeOnce sync.Once
@@ -79,6 +99,21 @@ type pendingReply struct {
 	err     error
 }
 
+// pendingEntry tracks one in-flight command in the Driver's global
+// FIFO. The expected response opcode is recorded so deliverPending
+// can match successful replies by opcode (via a linear scan — the
+// queue is rarely deeper than a handful of entries), while the
+// FIFO ordering itself lets deliverError route untagged Error
+// frames to the oldest in-flight command regardless of opcode.
+//
+// seq is informational; ordering is implicit in slice index.
+// (v1.4.6)
+type pendingEntry struct {
+	op  Opcode
+	ch  chan pendingReply
+	seq uint64
+}
+
 // Connect dials the Unix-domain socket at socketPath and starts the
 // demuxer goroutine. If socketPath is empty, DefaultSocketPath is used.
 func Connect(socketPath string) (*Driver, error) {
@@ -95,7 +130,6 @@ func Connect(socketPath string) (*Driver, error) {
 		conns:       make(map[uint32]*pilotConn),
 		pendingRecv: make(map[uint32][][]byte),
 		listeners:   make(map[uint16]*Listener),
-		pending:     make(map[Opcode][]chan pendingReply),
 		closedCh:    make(chan struct{}),
 		demuxDone:   make(chan struct{}),
 	}
@@ -126,15 +160,13 @@ func (d *Driver) Close() error {
 		// Fail every pending reply so command goroutines don't block
 		// forever.
 		d.pendingMu.Lock()
-		for op, chs := range d.pending {
-			for _, ch := range chs {
-				select {
-				case ch <- pendingReply{err: ErrClosed}:
-				default:
-				}
+		for _, e := range d.pending {
+			select {
+			case e.ch <- pendingReply{err: ErrClosed}:
+			default:
 			}
-			delete(d.pending, op)
 		}
+		d.pending = nil
 		d.pendingMu.Unlock()
 
 		// Close every conn's recv channel so any blocked Read returns
@@ -331,15 +363,26 @@ func (d *Driver) demux() {
 // that shouldn't happen in practice (we only wait for opcodes we know
 // are replies to commands we issued) but we defend against it rather
 // than leak a goroutine.
+//
+// v1.4.6: walks the global FIFO and picks the first entry whose op
+// matches. The queue is rarely deeper than a handful, so the linear
+// scan is cheap; the upside is that error-routing in deliverError
+// can be FIFO-correct across all opcodes.
 func (d *Driver) deliverPending(op Opcode, payload []byte, err error) {
 	d.pendingMu.Lock()
-	chs := d.pending[op]
-	if len(chs) == 0 {
+	idx := -1
+	for i, e := range d.pending {
+		if e.op == op {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
 		d.pendingMu.Unlock()
 		return
 	}
-	ch := chs[0]
-	d.pending[op] = chs[1:]
+	ch := d.pending[idx].ch
+	d.pending = append(d.pending[:idx], d.pending[idx+1:]...)
 	d.pendingMu.Unlock()
 	select {
 	case ch <- pendingReply{payload: payload, err: err}:
@@ -348,32 +391,26 @@ func (d *Driver) deliverPending(op Opcode, payload []byte, err error) {
 	}
 }
 
-// deliverError hands an IPCError to the oldest pending command across
-// all opcodes. See the Error branch in demux for the ordering
-// rationale. Does nothing if no commands are pending.
+// deliverError hands an IPCError to the oldest in-flight command,
+// regardless of opcode. The daemon's Error frame (0x0A) is untagged —
+// it carries no correlation ID back to the command that caused it —
+// so we route by FIFO order, which matches the daemon's actual reply
+// order on a single socket. Does nothing if no commands are pending.
+//
+// v1.4.6: pre-fix, this picked from a randomised map iteration over
+// per-opcode queues, which mis-routed errors when concurrent
+// opcodes had waiters (the bug v1.4.4's poller surfaced).
 func (d *Driver) deliverError(ipcErr *IPCError) {
 	d.pendingMu.Lock()
-	// Find the pending opcode with the oldest in-flight command. We
-	// approximate "oldest" by scanning all non-empty queues and taking
-	// any head — since Entmoot issues commands synchronously, at most
-	// one opcode has a waiter, so this is unambiguous in practice.
-	var pickedOp Opcode
-	var picked chan pendingReply
-	for op, chs := range d.pending {
-		if len(chs) > 0 {
-			pickedOp = op
-			picked = chs[0]
-			d.pending[op] = chs[1:]
-			break
-		}
-	}
-	d.pendingMu.Unlock()
-	if picked == nil {
+	if len(d.pending) == 0 {
+		d.pendingMu.Unlock()
 		return
 	}
-	_ = pickedOp
+	ch := d.pending[0].ch
+	d.pending = d.pending[1:]
+	d.pendingMu.Unlock()
 	select {
-	case picked <- pendingReply{err: ipcErr}:
+	case ch <- pendingReply{err: ipcErr}:
 	default:
 	}
 }
@@ -391,9 +428,11 @@ func (d *Driver) sendAndWait(ctx context.Context, frame []byte, want Opcode) ([]
 	ch := make(chan pendingReply, 1)
 
 	// Register before write, so if the daemon replies instantly the
-	// demuxer finds us waiting.
+	// demuxer finds us waiting. v1.4.6: enrolled in a single global
+	// FIFO so error-routing is correct across concurrent opcodes.
 	d.pendingMu.Lock()
-	d.pending[want] = append(d.pending[want], ch)
+	d.pendingSeq++
+	d.pending = append(d.pending, pendingEntry{op: want, ch: ch, seq: d.pendingSeq})
 	d.pendingMu.Unlock()
 
 	if err := d.writeFrame(frame); err != nil {
@@ -419,13 +458,14 @@ func (d *Driver) sendAndWait(ctx context.Context, frame []byte, want Opcode) ([]
 // removePending removes ch from the pending queue for op, if still
 // present. Called by sendAndWait on cancellation/close to prevent a
 // late reply from wedging the demuxer on a full channel.
+//
+// v1.4.6: walks the global FIFO and removes by (op, ch) match.
 func (d *Driver) removePending(op Opcode, ch chan pendingReply) {
 	d.pendingMu.Lock()
 	defer d.pendingMu.Unlock()
-	chs := d.pending[op]
-	for i, c := range chs {
-		if c == ch {
-			d.pending[op] = append(chs[:i], chs[i+1:]...)
+	for i, e := range d.pending {
+		if e.op == op && e.ch == ch {
+			d.pending = append(d.pending[:i], d.pending[i+1:]...)
 			return
 		}
 	}
