@@ -28,10 +28,21 @@ import (
 const turnEndpointPollInterval = 30 * time.Second
 
 // turnEndpointPollTimeout bounds how long we wait for a single pilot
-// Info reply before giving up on a poll. Much shorter than
-// turnEndpointPollInterval so a stuck IPC doesn't cause pollOnce to
-// outlive its interval window.
-const turnEndpointPollTimeout = 3 * time.Second
+// Info reply before giving up on a poll. Sized at half the interval
+// so a stuck IPC can't cause pollOnce to outlive its window.
+//
+// 15 s is intentionally generous: pilot's Info handler aggregates
+// uptime/peers/connections into a single JSON blob, and on
+// low-power ARM boxes (Raspberry-Pi-class hardware) the
+// serialization cost can spike well above 3 s under concurrent
+// IPC load (gossip fanout retries, transport_ad publishes).
+// v1.4.4's 3 s budget was tuned on x86_64 and produced 100 %
+// failure rate on phobos (live evidence 2026-04-25: three
+// successive polls timed out at exactly 3 s, while a manual
+// `pilotctl info` over a separate connection returned in <1 s).
+//
+// (v1.4.5)
+const turnEndpointPollTimeout = 15 * time.Second
 
 // turnEndpointFetcher returns the current TURN relay address as
 // reported by the local pilot-daemon's Info IPC. Abstracted as a
@@ -108,7 +119,13 @@ func (p *turnEndpointPoller) pollOnce(ctx context.Context) bool {
 	defer cancel()
 	turn, err := p.fetch(qctx)
 	if err != nil {
-		slog.Debug("turn-endpoint poll: pilot Info query failed",
+		// v1.4.5: bumped from Debug to Warn. Failed polls mean TURN
+		// rotation detection is offline; without this signal the
+		// operator has no visibility unless they're already running
+		// at -log-level=debug. One log per poll interval (30 s) is
+		// not noisy.
+		slog.Warn("turn-endpoint poll: pilot Info query failed; "+
+			"TURN rotation detection paused for this cycle",
 			slog.String("err", err.Error()))
 		return false
 	}

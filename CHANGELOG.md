@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.5] - 2026-04-25
+
+Hotfix on top of v1.4.4: the TURN-endpoint polling loop's 3 s
+timeout was too tight on low-power ARM hardware, causing 100 %
+poll failures and effectively disabling rotation detection.
+
+### Fixed
+
+- **Poll timeout bumped from 3 s to 15 s.** Live evidence
+  2026-04-25 from phobos (Raspberry-Pi-class ARM box): three
+  successive polls timed out at exactly 3 s, while a manual
+  `pilotctl info` over a separate IPC connection returned in
+  under 1 s. Pilot's Info handler aggregates uptime / peers /
+  connections / ports into a single JSON marshal; on
+  low-power ARM the serialization cost spikes well above 3 s
+  under concurrent IPC load (gossip fanout retries,
+  transport_ad publishes). v1.4.4's tuning was x86-only.
+  15 s = half the 30 s poll interval, so a stuck IPC can't
+  cause overlapping polls.
+
+- **Poll failures log at WARN, not Debug.** Failed polls mean
+  TURN rotation detection is offline for that cycle; without a
+  WARN-level log the operator has no visibility unless already
+  running at `-log-level=debug` (which phobos happened to be).
+  One log per poll interval is bounded — not noisy. Manual
+  pilotctl Info still works in parallel; only the polling
+  goroutine's bound is too short.
+
+### Compat
+
+No wire changes. No new fields. Pure constant + log-level tweak.
+Drop-in replacement for v1.4.4 — anyone already on v1.4.4 should
+upgrade; the polling feature was effectively dead-on-arrival on
+ARM-class hardware.
+
 ## [1.4.4] - 2026-04-25
 
 Detect Cloudflare TURN allocation rotation and re-publish the
