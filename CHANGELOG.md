@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.2] - 2026-04-26
+
+### Fixed
+
+- **Reconcile now recovers from stale Pilot/yamux sessions.** Entmoot
+  treats EOF/timeout/closed-stream errors before an expected
+  request/response frame as stale-session failures, asks transports
+  that support it to evict the cached per-peer session, and retries
+  once on a fresh session.
+- **RBSR EOF is no longer a false-success path.** If a reconcile
+  session ends before the expected response, the attempt fails, gets a
+  short failure backoff instead of the normal success cooldown, and
+  falls back once to legacy `RangeReq{SinceMillis:0}` recovery.
+
+### Tests
+
+- Added stale-session retry coverage for Merkle root exchange and
+  full-range fallback coverage for fetching peer-only message IDs.
+
 ## [1.5.1] - 2026-04-26
 
 ### Fixed

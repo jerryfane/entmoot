@@ -122,8 +122,9 @@ const (
 // collisions on the cooldown boundary after correlated events
 // (memberlist-style randomStagger).
 const (
-	reconcileCooldownBase   = 30 * time.Second
-	reconcileCooldownJitter = 6 * time.Second // ±20 %
+	reconcileCooldownBase    = 30 * time.Second
+	reconcileCooldownJitter  = 6 * time.Second // ±20 %
+	reconcileFailureCooldown = 5 * time.Second
 )
 
 // Background AE ticker (v1.2.1). Serf-style push-pull: 30 s base with
@@ -415,9 +416,11 @@ type Gossiper struct {
 	// guarded by pendMu to keep the allocation story simple; the maps are
 	// accessed far less often than the accept loop, so a single mutex is
 	// fine.
-	pendMu         sync.Mutex
-	pending        map[retryKey]*retryState
-	lastReconciled map[entmoot.NodeID]reconcileState
+	pendMu            sync.Mutex
+	pending           map[retryKey]*retryState
+	lastReconciled    map[entmoot.NodeID]reconcileState
+	reconcileInFlight map[entmoot.NodeID]struct{}
+	reconcileFailures map[entmoot.NodeID]reconcileState
 	// lastKnownPeerRoot caches the Merkle root each peer reported on the
 	// most recent successful reconcile handshake. Phase 7 / Part E
 	// consults it before firing a reconcile to tick-skip peers we already
@@ -541,6 +544,8 @@ func New(cfg Config) (*Gossiper, error) {
 		fanout:            fanout,
 		pending:           make(map[retryKey]*retryState),
 		lastReconciled:    make(map[entmoot.NodeID]reconcileState),
+		reconcileInFlight: make(map[entmoot.NodeID]struct{}),
+		reconcileFailures: make(map[entmoot.NodeID]reconcileState),
 		lastKnownPeerRoot: make(map[entmoot.NodeID]wire.MerkleRoot),
 		rng:               rng,
 		// Plumtree peer-set maps and pending-graft timer map are
@@ -773,6 +778,90 @@ func (g *Gossiper) recordDialSuccess(peer entmoot.NodeID) {
 	g.dialMu.Lock()
 	defer g.dialMu.Unlock()
 	delete(g.dialBackoffs, peer)
+}
+
+func isRetryableStreamError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
+func setConnDeadlineFromContext(ctx context.Context, conn net.Conn) {
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(deadline)
+	}
+}
+
+func (g *Gossiper) dropPeerSession(peer entmoot.NodeID, op string, cause error) bool {
+	dropper, ok := g.cfg.Transport.(PeerSessionDropper)
+	if !ok {
+		return false
+	}
+	dropped := dropper.DropPeerSession(peer)
+	if dropped {
+		g.logger.Debug("gossip: dropped cached peer session",
+			slog.Uint64("peer", uint64(peer)),
+			slog.String("op", op),
+			slog.String("err", cause.Error()))
+	}
+	return dropped
+}
+
+func (g *Gossiper) requestResponse(ctx context.Context, peer entmoot.NodeID, req any, expected wire.MsgType, op string) (any, error) {
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		if !g.canDial(peer) {
+			return nil, fmt.Errorf("peer %d in dial-backoff", peer)
+		}
+		conn, err := g.cfg.Transport.Dial(ctx, peer)
+		if err != nil {
+			g.recordDialFailure(peer)
+			return nil, fmt.Errorf("%s: dial %d: %w", op, peer, err)
+		}
+		setConnDeadlineFromContext(ctx, conn)
+
+		err = wire.EncodeAndWrite(conn, req)
+		if err != nil {
+			_ = conn.Close()
+			lastErr = fmt.Errorf("%s: write: %w", op, err)
+			if attempt == 0 && isRetryableStreamError(err) {
+				g.dropPeerSession(peer, op, err)
+				continue
+			}
+			return nil, lastErr
+		}
+
+		msgType, payload, err := wire.ReadAndDecode(conn)
+		_ = conn.Close()
+		if err != nil {
+			lastErr = fmt.Errorf("%s: read: %w", op, err)
+			if attempt == 0 && isRetryableStreamError(err) {
+				g.dropPeerSession(peer, op, err)
+				continue
+			}
+			if isRetryableStreamError(err) {
+				g.recordDialFailure(peer)
+			}
+			return nil, lastErr
+		}
+		if msgType != expected {
+			return nil, fmt.Errorf("%s: unexpected response type %s", op, msgType.String())
+		}
+		g.recordDialSuccess(peer)
+		return payload, nil
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("%s: exhausted retry budget", op)
+	}
+	return nil, lastErr
 }
 
 // Start runs the accept loop. It blocks until ctx is cancelled or the
@@ -1529,25 +1618,10 @@ func (g *Gossiper) onPrune(remote entmoot.NodeID, pr *wire.Prune) {
 // author's pubkey from the local roster. Returns an error on dial failure,
 // codec failure, NotFound, or signature verification failure.
 func (g *Gossiper) fetchFrom(ctx context.Context, peer entmoot.NodeID, id entmoot.MessageID) error {
-	// v1.0.6 Fix C: short-circuit if peer is in its dial-backoff window.
-	if !g.canDial(peer) {
-		return fmt.Errorf("peer %d in dial-backoff", peer)
-	}
-	conn, err := g.cfg.Transport.Dial(ctx, peer)
-	if err != nil {
-		g.recordDialFailure(peer)
-		return fmt.Errorf("dial %d: %w", peer, err)
-	}
-	g.recordDialSuccess(peer)
-	defer conn.Close()
-
 	req := &wire.FetchReq{GroupID: g.cfg.GroupID, ID: id}
-	if err := wire.EncodeAndWrite(conn, req); err != nil {
-		return fmt.Errorf("write fetch_req: %w", err)
-	}
-	_, payload, err := wire.ReadAndDecode(conn)
+	payload, err := g.requestResponse(ctx, peer, req, wire.MsgFetchResp, "fetch_req")
 	if err != nil {
-		return fmt.Errorf("read fetch_resp: %w", err)
+		return err
 	}
 	resp, ok := payload.(*wire.FetchResp)
 	if !ok {
@@ -2407,8 +2481,22 @@ func (g *Gossiper) executeRetry(ctx context.Context, key retryKey, state *retryS
 // chatty patches.
 func (g *Gossiper) maybeReconcile(ctx context.Context, peer entmoot.NodeID) {
 	g.pendMu.Lock()
-	last, ok := g.lastReconciled[peer]
 	now := g.clk.Now()
+	if _, ok := g.reconcileInFlight[peer]; ok {
+		g.pendMu.Unlock()
+		g.logger.Debug("gossip: reconcile: in-flight skip",
+			slog.Uint64("peer", uint64(peer)))
+		return
+	}
+	if failed, ok := g.reconcileFailures[peer]; ok && now.Sub(failed.at) < failed.cooldown {
+		remaining := failed.cooldown - now.Sub(failed.at)
+		g.pendMu.Unlock()
+		g.logger.Debug("gossip: reconcile: failure backoff skip",
+			slog.Uint64("peer", uint64(peer)),
+			slog.Duration("remaining", remaining))
+		return
+	}
+	last, ok := g.lastReconciled[peer]
 	if ok && now.Sub(last.at) < last.cooldown {
 		remaining := last.cooldown - now.Sub(last.at)
 		g.pendMu.Unlock()
@@ -2420,70 +2508,99 @@ func (g *Gossiper) maybeReconcile(ctx context.Context, peer entmoot.NodeID) {
 			slog.Duration("remaining", remaining))
 		return
 	}
-	g.lastReconciled[peer] = reconcileState{
-		at:       now,
-		cooldown: g.jitteredReconcileCooldown(),
-	}
+	g.reconcileInFlight[peer] = struct{}{}
 	g.pendMu.Unlock()
 
 	g.wg.Add(1)
 	go func() {
 		defer g.wg.Done()
-		g.reconcileWith(ctx, peer)
+		g.finishReconcile(peer, g.reconcileWith(ctx, peer))
 	}()
 }
 
+func (g *Gossiper) finishReconcile(peer entmoot.NodeID, success bool) {
+	g.pendMu.Lock()
+	defer g.pendMu.Unlock()
+	delete(g.reconcileInFlight, peer)
+	now := g.clk.Now()
+	if success {
+		g.lastReconciled[peer] = reconcileState{
+			at:       now,
+			cooldown: g.jitteredReconcileCooldown(),
+		}
+		delete(g.reconcileFailures, peer)
+		return
+	}
+	g.reconcileFailures[peer] = reconcileState{
+		at:       now,
+		cooldown: reconcileFailureCooldown,
+	}
+}
+
 // reconcileWith runs a round of RBSR anti-entropy against peer (v1.2.1).
-// The flow:
-//
-//  1. Exchange Merkle roots (cheap, 1 round-trip). If equal, short-circuit
-//     and cache the peer's root so Phase 7 / Part E can tick-skip aligned
-//     peers. This is wire-compatible with v1.2.0 peers that already speak
-//     MsgMerkleReq.
-//
-//  2. If roots differ, open a fresh conn and drive a reconcile.Session as
-//     initiator. Each round is one wire.Reconcile frame; the session runs
-//     up to reconcile.DefaultConfig().MaxRounds before it gives up (which
-//     surfaces as ErrMaxRounds — logged at Warn).
-//
-//  3. Fetch each newly-missing id via the existing fetchFrom machinery.
-//     Failures queue onto the retry scheduler just like every other
-//     fetch path.
-//
-// The whole session (after the initial root exchange) runs under a
-// reconcileSessionTimeout-bounded context so a stuck peer can't pin the
-// connection open forever.
-//
-// Wire-compat: a v1.2.0 peer that doesn't know MsgReconcile will reject
-// the frame in handleConn and close the connection. We detect that via
-// an io.EOF on the first read and return cleanly — state is unchanged
-// and the peer still benefits from the v1.2.0 MerkleReq / RangeReq
-// compat paths that remain installed.
-func (g *Gossiper) reconcileWith(ctx context.Context, peer entmoot.NodeID) {
+// It returns true only after the peer root check or RBSR/fallback exchange
+// completed, so failed attempts get a short retry backoff instead of the
+// normal success cooldown.
+func (g *Gossiper) reconcileWith(ctx context.Context, peer entmoot.NodeID) bool {
 	// Step 1: Merkle root short-circuit. Uses its own conn; returns
 	// early with cached root on match so steady-state anti-entropy
 	// costs a single RTT.
-	peerRoot, ok := g.fetchPeerRoot(ctx, peer)
+	rootCtx, rootCancel := context.WithTimeout(ctx, reconcileSessionTimeout)
+	defer rootCancel()
+	peerRoot, ok := g.fetchPeerRoot(rootCtx, peer)
 	if !ok {
-		return
+		return false
 	}
 	localRoot, err := g.cfg.Store.MerkleRoot(ctx, g.cfg.GroupID)
 	if err != nil {
 		g.logger.Warn("gossip: reconcile: local merkle root",
 			slog.Uint64("peer", uint64(peer)),
 			slog.String("err", err.Error()))
-		return
+		return false
 	}
 	if [32]byte(peerRoot) == localRoot {
 		g.rememberPeerRoot(peer, peerRoot)
-		return
+		return true
 	}
 
-	// Step 2: roots differ. Open a fresh conn for the RBSR session.
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		missingIDs, rounds, err := g.runReconcileSession(ctx, peer)
+		if err == nil {
+			// Fulfil newly-discovered missing ids via the existing fetch path
+			// so signature verification, store.Put, Plumtree refanout, and
+			// retry queuing all compose the same way they do for gossip-push
+			// and graft-response acquisitions.
+			fetchCtx, fetchCancel := context.WithTimeout(ctx, reconcileSessionTimeout)
+			g.fetchMissingFrom(fetchCtx, peer, missingIDs)
+			fetchCancel()
+			g.rememberPeerRoot(peer, peerRoot)
+			g.logger.Debug("gossip: reconcile: session complete",
+				slog.Uint64("peer", uint64(peer)),
+				slog.Int("rounds", int(rounds)),
+				slog.Int("missing", len(missingIDs)))
+			return true
+		}
+		lastErr = err
+		if attempt == 0 && isRetryableStreamError(err) {
+			g.dropPeerSession(peer, "reconcile", err)
+			continue
+		}
+		break
+	}
+	if lastErr != nil {
+		g.logger.Warn("gossip: reconcile: session failed",
+			slog.Uint64("peer", uint64(peer)),
+			slog.String("err", lastErr.Error()))
+	}
+	return g.fetchFullRangeFallback(ctx, peer, peerRoot)
+}
+
+func (g *Gossiper) runReconcileSession(ctx context.Context, peer entmoot.NodeID) ([]entmoot.MessageID, uint32, error) {
 	if !g.canDial(peer) {
 		g.logger.Debug("gossip: reconcile: peer in dial-backoff",
 			slog.Uint64("peer", uint64(peer)))
-		return
+		return nil, 0, fmt.Errorf("peer %d in dial-backoff", peer)
 	}
 	dctx, cancel := context.WithTimeout(ctx, reconcileSessionTimeout)
 	defer cancel()
@@ -2493,10 +2610,10 @@ func (g *Gossiper) reconcileWith(ctx context.Context, peer entmoot.NodeID) {
 		g.logger.Warn("gossip: reconcile: dial",
 			slog.Uint64("peer", uint64(peer)),
 			slog.String("err", err.Error()))
-		return
+		return nil, 0, err
 	}
-	g.recordDialSuccess(peer)
 	defer conn.Close()
+	setConnDeadlineFromContext(dctx, conn)
 
 	adapter := &storeAdapter{store: g.cfg.Store, groupID: g.cfg.GroupID}
 	sess, initialRanges, err := reconcile.NewInitiator(reconcile.DefaultConfig(), adapter)
@@ -2504,7 +2621,7 @@ func (g *Gossiper) reconcileWith(ctx context.Context, peer entmoot.NodeID) {
 		g.logger.Warn("gossip: reconcile: new initiator",
 			slog.Uint64("peer", uint64(peer)),
 			slog.String("err", err.Error()))
-		return
+		return nil, 0, err
 	}
 
 	// Step 3: alternate Reconcile frames until both sides signal Done.
@@ -2519,6 +2636,7 @@ func (g *Gossiper) reconcileWith(ctx context.Context, peer entmoot.NodeID) {
 	// on the very next round instead of waiting for a separate ack.
 	myDone := false
 	done := false
+	sawResponse := false
 	for !done {
 		req := &wire.Reconcile{
 			GroupID: g.cfg.GroupID,
@@ -2531,38 +2649,31 @@ func (g *Gossiper) reconcileWith(ctx context.Context, peer entmoot.NodeID) {
 				slog.Uint64("peer", uint64(peer)),
 				slog.Int("round", int(round)),
 				slog.String("err", err.Error()))
-			return
+			return nil, round, err
 		}
 		msgType, payload, err := wire.ReadAndDecode(conn)
 		if err != nil {
-			if errors.Is(err, io.EOF) {
-				// v1.2.0 peer that doesn't know MsgReconcile drops the
-				// connection after seeing the unknown opcode. Harmless —
-				// we still have the Merkle-root signal and the push
-				// path for anything the peer subsequently publishes.
-				g.logger.Debug("gossip: reconcile: session ended early (peer may be v1.2.0)",
-					slog.Uint64("peer", uint64(peer)),
-					slog.Int("round", int(round)),
-					slog.Int("missing", len(missingIDs)))
-				return
-			}
 			g.logger.Warn("gossip: reconcile: read",
 				slog.Uint64("peer", uint64(peer)),
 				slog.Int("round", int(round)),
 				slog.String("err", err.Error()))
-			return
+			return nil, round, err
+		}
+		if !sawResponse {
+			g.recordDialSuccess(peer)
+			sawResponse = true
 		}
 		if msgType != wire.MsgReconcile {
 			g.logger.Warn("gossip: reconcile: unexpected type",
 				slog.Uint64("peer", uint64(peer)),
 				slog.String("got", msgType.String()))
-			return
+			return nil, round, fmt.Errorf("unexpected response type %s", msgType.String())
 		}
 		resp, ok := payload.(*wire.Reconcile)
 		if !ok {
 			g.logger.Warn("gossip: reconcile: decode mismatch",
 				slog.Uint64("peer", uint64(peer)))
-			return
+			return nil, round, fmt.Errorf("decode mismatch")
 		}
 		outgoing, newlyMissing, sessDone, err := sess.Next(dctx, resp.Ranges)
 		if err != nil {
@@ -2576,7 +2687,7 @@ func (g *Gossiper) reconcileWith(ctx context.Context, peer entmoot.NodeID) {
 					slog.Int("round", int(round)),
 					slog.String("err", err.Error()))
 			}
-			return
+			return nil, round, err
 		}
 		missingIDs = append(missingIDs, newlyMissing...)
 		round++
@@ -2612,21 +2723,44 @@ func (g *Gossiper) reconcileWith(ctx context.Context, peer entmoot.NodeID) {
 		Done:    true,
 	}
 	_ = wire.EncodeAndWrite(conn, finalFrame)
+	return missingIDs, round, nil
+}
 
-	// Step 4: fulfil newly-discovered missing ids via the existing
-	// fetch path so signature verification, store.Put, Plumtree
-	// refanout, and retry queuing all compose the same way they do
-	// for gossip-push and graft-response acquisitions.
-	g.fetchMissingFrom(ctx, peer, missingIDs)
-
-	// Step 5: cache the peer's root. Phase 7 / Part E consults this
-	// before firing reconcileWith — a peer whose cached root matches
-	// our current root is known-aligned and can be skipped.
-	g.rememberPeerRoot(peer, peerRoot)
-	g.logger.Debug("gossip: reconcile: session complete",
-		slog.Uint64("peer", uint64(peer)),
-		slog.Int("rounds", int(round)),
-		slog.Int("missing", len(missingIDs)))
+func (g *Gossiper) fetchFullRangeFallback(ctx context.Context, peer entmoot.NodeID, peerRoot wire.MerkleRoot) bool {
+	fctx, cancel := context.WithTimeout(ctx, reconcileSessionTimeout)
+	defer cancel()
+	payload, err := g.requestResponse(fctx, peer, &wire.RangeReq{GroupID: g.cfg.GroupID, SinceMillis: 0}, wire.MsgRangeResp, "range_req")
+	if err != nil {
+		g.logger.Warn("gossip: reconcile: full-range fallback failed",
+			slog.Uint64("peer", uint64(peer)),
+			slog.String("err", err.Error()))
+		return false
+	}
+	resp, ok := payload.(*wire.RangeResp)
+	if !ok {
+		g.logger.Warn("gossip: reconcile: full-range fallback decode mismatch",
+			slog.Uint64("peer", uint64(peer)))
+		return false
+	}
+	g.fetchMissingFrom(fctx, peer, resp.IDs)
+	localRoot, err := g.cfg.Store.MerkleRoot(fctx, g.cfg.GroupID)
+	if err == nil && [32]byte(peerRoot) == localRoot {
+		g.rememberPeerRoot(peer, peerRoot)
+		g.logger.Debug("gossip: reconcile: full-range fallback complete",
+			slog.Uint64("peer", uint64(peer)),
+			slog.Int("ids", len(resp.IDs)))
+		return true
+	}
+	if err != nil {
+		g.logger.Warn("gossip: reconcile: full-range fallback local merkle root",
+			slog.Uint64("peer", uint64(peer)),
+			slog.String("err", err.Error()))
+	} else {
+		g.logger.Debug("gossip: reconcile: full-range fallback root still differs",
+			slog.Uint64("peer", uint64(peer)),
+			slog.Int("ids", len(resp.IDs)))
+	}
+	return false
 }
 
 // rememberPeerRoot stashes the peer's most recently observed Merkle root
@@ -2652,35 +2786,9 @@ func (g *Gossiper) readLastKnownPeerRoot(peer entmoot.NodeID) (wire.MerkleRoot, 
 // peer's root + ok on success, zero + !ok on any error so the caller can
 // abort cleanly.
 func (g *Gossiper) fetchPeerRoot(ctx context.Context, peer entmoot.NodeID) (wire.MerkleRoot, bool) {
-	// v1.0.6 Fix C: short-circuit if peer is in its dial-backoff window.
-	// The debug-log site below swallows the error shape, so emitting the
-	// same "dial for root" line with the synthetic short-circuit error
-	// keeps reconciliation logs consistent with the peer being unreachable.
-	if !g.canDial(peer) {
-		g.logger.Debug("gossip: reconcile: dial for root",
-			slog.Uint64("peer", uint64(peer)),
-			slog.String("err", fmt.Sprintf("peer %d in dial-backoff", peer)))
-		return wire.MerkleRoot{}, false
-	}
-	conn, err := g.cfg.Transport.Dial(ctx, peer)
+	payload, err := g.requestResponse(ctx, peer, &wire.MerkleReq{GroupID: g.cfg.GroupID}, wire.MsgMerkleResp, "merkle_req")
 	if err != nil {
-		g.recordDialFailure(peer)
 		g.logger.Debug("gossip: reconcile: dial for root",
-			slog.Uint64("peer", uint64(peer)),
-			slog.String("err", err.Error()))
-		return wire.MerkleRoot{}, false
-	}
-	g.recordDialSuccess(peer)
-	defer conn.Close()
-	if err := wire.EncodeAndWrite(conn, &wire.MerkleReq{GroupID: g.cfg.GroupID}); err != nil {
-		g.logger.Debug("gossip: reconcile: write merkle_req",
-			slog.Uint64("peer", uint64(peer)),
-			slog.String("err", err.Error()))
-		return wire.MerkleRoot{}, false
-	}
-	_, payload, err := wire.ReadAndDecode(conn)
-	if err != nil {
-		g.logger.Debug("gossip: reconcile: read merkle_resp",
 			slog.Uint64("peer", uint64(peer)),
 			slog.String("err", err.Error()))
 		return wire.MerkleRoot{}, false

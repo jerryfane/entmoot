@@ -78,6 +78,14 @@ type Transport interface {
 	Close() error
 }
 
+// PeerSessionDropper is an optional Transport extension for adapters that
+// cache outbound per-peer sessions below Dial. A request/response stream can
+// fail after Dial succeeds when the cached session is stale; callers use this
+// hook to evict that session so the next Dial constructs a fresh one.
+type PeerSessionDropper interface {
+	DropPeerSession(peer entmoot.NodeID) bool
+}
+
 // memTransport is the in-memory Transport implementation. One memTransport per
 // participating NodeID; all of them share a single memHub which routes dials
 // into the target's accept queue.

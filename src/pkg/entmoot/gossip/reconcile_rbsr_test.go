@@ -452,14 +452,13 @@ func (t *droppingReconcileTransport) Accept(ctx context.Context) (net.Conn, entm
 	return &droppingReconcileConn{Conn: c}, remote, nil
 }
 
-// TestReconcileViaRBSR_PeerReturnsUnknownOpcode exercises wire-compat
-// when the responder doesn't understand MsgReconcile. We simulate a
-// v1.2.0-era peer by wrapping B's transport so its accept side drops
-// any connection whose first frame is MsgReconcile (as a v1.2.0
-// handleConn would: the switch falls through to the default branch
-// and the caller closes the conn). A must observe read error / EOF,
-// log the "session ended early" Debug, and return without corrupting
-// its own state.
+// TestReconcileViaRBSR_PeerReturnsUnknownOpcode exercises the compatibility
+// fallback when the responder doesn't understand MsgReconcile. We simulate a
+// v1.2.0-era peer by wrapping B's transport so its accept side drops any
+// connection whose first frame is MsgReconcile (as a v1.2.0 handleConn would:
+// the switch falls through to the default branch and the caller closes the
+// conn). A must observe read error / EOF, then fall back to the legacy
+// RangeReq/FetchReq path.
 func TestReconcileViaRBSR_PeerReturnsUnknownOpcode(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t, []entmoot.NodeID{10, 20})
@@ -477,6 +476,7 @@ func TestReconcileViaRBSR_PeerReturnsUnknownOpcode(t *testing.T) {
 	// Seed A with 5 messages and B with a disjoint set of 5 so roots
 	// differ and A actually tries to drive the reconcile past the
 	// MerkleRoot short-circuit.
+	var bOnly []entmoot.Message
 	for i := 0; i < 5; i++ {
 		mA := f.buildMessage(10, fmt.Sprintf("A-%d", i), int64(2_000+i))
 		if err := f.nodes[10].storeM.Put(ctx, mA); err != nil {
@@ -486,12 +486,7 @@ func TestReconcileViaRBSR_PeerReturnsUnknownOpcode(t *testing.T) {
 		if err := f.nodes[20].storeM.Put(ctx, mB); err != nil {
 			t.Fatalf("seed B: %v", err)
 		}
-	}
-
-	// Record A's pre-reconcile root so we can assert non-corruption.
-	rootABefore, err := f.nodes[10].storeM.MerkleRoot(ctx, f.groupID)
-	if err != nil {
-		t.Fatalf("A MerkleRoot: %v", err)
+		bOnly = append(bOnly, mB)
 	}
 
 	f.startAll(ctx)
@@ -511,23 +506,21 @@ func TestReconcileViaRBSR_PeerReturnsUnknownOpcode(t *testing.T) {
 	delete(aG.lastReconciled, 20)
 	aG.pendMu.Unlock()
 
-	// Drive the reconcile. Expected: A sends MerkleReq (B answers
-	// fine), A detects root mismatch, opens fresh conn, sends
-	// MsgReconcile frame → dropping-responder closes the conn → A
-	// reads EOF → logs Debug and returns. A's store is unchanged.
+	// Drive the reconcile. Expected: A sends MerkleReq (B answers fine),
+	// A detects root mismatch, opens fresh conn, sends MsgReconcile frame,
+	// the dropping responder closes the conn, and A falls back to RangeReq
+	// + FetchReq to acquire B's IDs.
 	aG.maybeReconcile(ctx, 20)
 
-	// Give the async reconcile ample time to fail and return.
-	time.Sleep(500 * time.Millisecond)
-
-	rootAAfter, err := f.nodes[10].storeM.MerkleRoot(ctx, f.groupID)
-	if err != nil {
-		t.Fatalf("A MerkleRoot post: %v", err)
-	}
-	if !bytes.Equal(rootABefore[:], rootAAfter[:]) {
-		t.Fatalf("A's Merkle root changed after failed reconcile: before=%x after=%x",
-			rootABefore, rootAAfter)
-	}
+	waitUntil(t, 3*time.Second, "A fetches B's legacy range IDs", func() bool {
+		for _, msg := range bOnly {
+			has, _ := f.nodes[10].storeM.Has(ctx, f.groupID, msg.ID)
+			if !has {
+				return false
+			}
+		}
+		return true
+	})
 }
 
 // TestReconcileTunnelUpTrigger asserts that a fresh memTransport Dial

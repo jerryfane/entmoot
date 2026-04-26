@@ -348,6 +348,23 @@ func (t *Transport) dropSession(peer entmoot.NodeID, sess *yamux.Session) {
 	_ = sess.Close()
 }
 
+// DropPeerSession implements gossip.PeerSessionDropper. It evicts and closes
+// any cached outbound yamux session for peer so the next Dial starts with a
+// fresh Pilot tunnel/session instead of reusing a stale multiplexed stream.
+func (t *Transport) DropPeerSession(peer entmoot.NodeID) bool {
+	t.sessionsMu.Lock()
+	entry, ok := t.sessions[peer]
+	if ok {
+		delete(t.sessions, peer)
+	}
+	t.sessionsMu.Unlock()
+	if !ok {
+		return false
+	}
+	_ = entry.sess.Close()
+	return true
+}
+
 // acceptPilotConns runs for the lifetime of the Transport. It accepts raw
 // inbound Pilot connections, extracts the remote NodeID from the driver's
 // RemoteAddr, wraps the conn in a yamux server session, and spawns a pump
