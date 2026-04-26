@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.5] - 2026-04-27
+
+### Fixed
+
+- **Pilot IPC close races no longer strand yamux sessions.** The embedded
+  Pilot IPC client now remembers `CloseOK` frames that arrive before a freshly
+  dialed or accepted conn is registered. Registration drains any pending data
+  and then closes the conn, so yamux/reconcile observes EOF immediately instead
+  of caching a dead port-1004 stream until timeout.
+
 ## [1.5.4] - 2026-04-27
 
 ### Fixed

@@ -35,7 +35,7 @@ type Driver struct {
 	// socket and the daemon would desync.
 	writeMu sync.Mutex
 
-	// connsMu guards conns and pendingRecv; it is distinct from
+	// connsMu guards conns, pendingRecv, and pendingClose; it is distinct from
 	// writeMu because the demuxer has to route Recv frames while
 	// Write goroutines are busy emitting Send frames.
 	connsMu sync.Mutex
@@ -49,6 +49,11 @@ type Driver struct {
 	// Entries are drained into the conn's own channel when
 	// registerConn fires.
 	pendingRecv map[uint32][][]byte
+	// pendingClose remembers CloseOK frames that arrive in the same
+	// DialOK/AcceptedConn race window. Without it, a peer that accepts
+	// and closes immediately can leave the caller with a registered conn
+	// whose recv channel never closes.
+	pendingClose map[uint32]struct{}
 
 	// listenersMu guards listeners.
 	listenersMu sync.RWMutex
@@ -137,14 +142,15 @@ func Connect(socketPath string) (*Driver, error) {
 		return nil, fmt.Errorf("ipcclient: dial %q: %w", socketPath, err)
 	}
 	d := &Driver{
-		socketPath:  socketPath,
-		conn:        c,
-		conns:       make(map[uint32]*pilotConn),
-		pendingRecv: make(map[uint32][][]byte),
-		listeners:   make(map[uint16]*Listener),
-		topicSubs:   make(map[string][]*Subscription),
-		closedCh:    make(chan struct{}),
-		demuxDone:   make(chan struct{}),
+		socketPath:   socketPath,
+		conn:         c,
+		conns:        make(map[uint32]*pilotConn),
+		pendingRecv:  make(map[uint32][][]byte),
+		pendingClose: make(map[uint32]struct{}),
+		listeners:    make(map[uint16]*Listener),
+		topicSubs:    make(map[string][]*Subscription),
+		closedCh:     make(chan struct{}),
+		demuxDone:    make(chan struct{}),
 	}
 	go d.demux()
 	return d, nil
@@ -212,6 +218,9 @@ func (d *Driver) Close() error {
 		for id := range d.pendingRecv {
 			delete(d.pendingRecv, id)
 		}
+		for id := range d.pendingClose {
+			delete(d.pendingClose, id)
+		}
 		d.connsMu.Unlock()
 
 		// Close each listener so any blocked Accept returns ErrClosed.
@@ -246,12 +255,19 @@ func (d *Driver) writeFrame(payload []byte) error {
 // worrying about dropped early data.
 func (d *Driver) registerConn(id uint32, c *pilotConn) {
 	d.connsMu.Lock()
-	d.conns[id] = c
 	pending := d.pendingRecv[id]
 	delete(d.pendingRecv, id)
+	_, closed := d.pendingClose[id]
+	delete(d.pendingClose, id)
+	if !closed {
+		d.conns[id] = c
+	}
 	d.connsMu.Unlock()
 	for _, data := range pending {
 		c.pushRecv(data)
+	}
+	if closed {
+		c.closeRecv()
 	}
 }
 
@@ -262,6 +278,7 @@ func (d *Driver) unregisterConn(id uint32) {
 	d.connsMu.Lock()
 	delete(d.conns, id)
 	delete(d.pendingRecv, id)
+	delete(d.pendingClose, id)
 	d.connsMu.Unlock()
 }
 
@@ -382,6 +399,8 @@ func (d *Driver) demux() {
 				c, ok := d.conns[id]
 				if ok {
 					delete(d.conns, id)
+				} else {
+					d.pendingClose[id] = struct{}{}
 				}
 				d.connsMu.Unlock()
 				if ok {
