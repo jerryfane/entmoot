@@ -651,10 +651,10 @@ func (t *Transport) Close() error {
 }
 
 // yamuxConfig returns a *yamux.Config with library defaults for keepalive
-// (30 s interval, 10 s write timeout, enabled) and with library logging
-// suppressed by routing its output to io.Discard. Entmoot already emits
-// transport surfaces through slog; duplicating yamux's stderr output in
-// every daemon would be noisy.
+// (30 s interval, 10 s write timeout, enabled), bounded stream open/close
+// lifetimes, and library logging suppressed by routing its output to
+// io.Discard. Entmoot already emits transport surfaces through slog;
+// duplicating yamux's stderr output in every daemon would be noisy.
 //
 // yamux validates that exactly one of Logger/LogOutput is non-nil — setting
 // LogOutput to io.Discard satisfies that invariant without producing output.
@@ -662,6 +662,8 @@ func yamuxConfig(_ *slog.Logger) *yamux.Config {
 	cfg := yamux.DefaultConfig()
 	cfg.Logger = nil
 	cfg.LogOutput = io.Discard
+	cfg.StreamOpenTimeout = 10 * time.Second
+	cfg.StreamCloseTimeout = 5 * time.Second
 	return cfg
 }
 

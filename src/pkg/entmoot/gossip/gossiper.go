@@ -839,6 +839,10 @@ func shouldDropPeerSessionAfterStreamError(err error, attempt int) bool {
 	return attempt > 0 && isRetryableStreamError(err)
 }
 
+func shouldDropPeerSessionAfterResponseReadError(err error) bool {
+	return isRetryableStreamError(err)
+}
+
 func isLocalContextError(ctx context.Context, err error) bool {
 	if err == nil {
 		return false
@@ -877,31 +881,31 @@ func (g *Gossiper) requestResponse(ctx context.Context, peer entmoot.NodeID, req
 func (g *Gossiper) requestResponseWithAttemptTimeout(ctx context.Context, peer entmoot.NodeID, req any, expected wire.MsgType, op string, attemptTimeout time.Duration) (any, error) {
 	var lastErr error
 	for attempt := 0; attempt < 2; attempt++ {
+		if !g.canDial(peer) {
+			return nil, fmt.Errorf("peer %d in dial-backoff", peer)
+		}
+		conn, err := g.cfg.Transport.Dial(ctx, peer)
+		if err != nil {
+			lastErr = fmt.Errorf("%s: dial %d: %w", op, peer, err)
+			if attempt == 0 && (isRetryableStreamError(err) || isLocalContextError(ctx, err)) && (attemptTimeout > 0 || ctx.Err() == nil) {
+				continue
+			}
+			g.recordDialFailureUnlessLocal(ctx, peer, err)
+			return nil, lastErr
+		}
 		attemptCtx := ctx
 		var cancel context.CancelFunc
 		if attemptTimeout > 0 {
 			attemptCtx, cancel = context.WithTimeout(ctx, attemptTimeout)
-		}
-		if cancel != nil {
-			defer cancel()
-		}
-		if !g.canDial(peer) {
-			return nil, fmt.Errorf("peer %d in dial-backoff", peer)
-		}
-		conn, err := g.cfg.Transport.Dial(attemptCtx, peer)
-		if err != nil {
-			lastErr = fmt.Errorf("%s: dial %d: %w", op, peer, err)
-			if attempt == 0 && (isRetryableStreamError(err) || isLocalContextError(attemptCtx, err)) && (attemptTimeout > 0 || ctx.Err() == nil) {
-				continue
-			}
-			g.recordDialFailureUnlessLocal(attemptCtx, peer, err)
-			return nil, lastErr
 		}
 		setConnDeadlineFromContext(attemptCtx, conn)
 
 		err = wire.EncodeAndWrite(conn, req)
 		if err != nil {
 			_ = conn.Close()
+			if cancel != nil {
+				cancel()
+			}
 			lastErr = fmt.Errorf("%s: write: %w", op, err)
 			if attempt == 0 && isRetryableStreamError(err) && (attemptTimeout > 0 || ctx.Err() == nil) {
 				if shouldDropPeerSessionAfterStreamError(err, attempt) {
@@ -917,15 +921,18 @@ func (g *Gossiper) requestResponseWithAttemptTimeout(ctx context.Context, peer e
 
 		msgType, payload, err := wire.ReadAndDecode(conn)
 		_ = conn.Close()
+		if cancel != nil {
+			cancel()
+		}
 		if err != nil {
 			lastErr = fmt.Errorf("%s: read: %w", op, err)
 			if attempt == 0 && isRetryableStreamError(err) && (attemptTimeout > 0 || ctx.Err() == nil) {
-				if shouldDropPeerSessionAfterStreamError(err, attempt) {
+				if shouldDropPeerSessionAfterResponseReadError(err) {
 					g.dropPeerSession(peer, op, err)
 				}
 				continue
 			}
-			if isRetryableStreamError(err) && shouldDropPeerSessionAfterStreamError(err, attempt) {
+			if shouldDropPeerSessionAfterResponseReadError(err) {
 				g.dropPeerSession(peer, op, err)
 			}
 			if isRetryableStreamError(err) {
@@ -2676,17 +2683,17 @@ func (g *Gossiper) runReconcileSession(ctx context.Context, peer entmoot.NodeID)
 			slog.Uint64("peer", uint64(peer)))
 		return nil, 0, fmt.Errorf("peer %d in dial-backoff", peer)
 	}
-	dctx, cancel := context.WithTimeout(ctx, reconcileSessionTimeout)
-	defer cancel()
-	conn, err := g.cfg.Transport.Dial(dctx, peer)
+	conn, err := g.cfg.Transport.Dial(ctx, peer)
 	if err != nil {
-		g.recordDialFailureUnlessLocal(dctx, peer, err)
+		g.recordDialFailureUnlessLocal(ctx, peer, err)
 		g.logger.Warn("gossip: reconcile: dial",
 			slog.Uint64("peer", uint64(peer)),
 			slog.String("err", err.Error()))
 		return nil, 0, err
 	}
 	defer conn.Close()
+	dctx, cancel := context.WithTimeout(ctx, reconcileSessionTimeout)
+	defer cancel()
 	setConnDeadlineFromContext(dctx, conn)
 
 	adapter := &storeAdapter{store: g.cfg.Store, groupID: g.cfg.GroupID}

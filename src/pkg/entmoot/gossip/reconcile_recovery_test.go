@@ -16,13 +16,21 @@ import (
 )
 
 type scriptedTransport struct {
-	mu       sync.Mutex
-	handlers []func(net.Conn)
-	dials    int
-	drops    int
+	mu        sync.Mutex
+	handlers  []func(net.Conn)
+	dials     int
+	drops     int
+	dialDelay time.Duration
 }
 
 func (t *scriptedTransport) Dial(ctx context.Context, peer entmoot.NodeID) (net.Conn, error) {
+	if t.dialDelay > 0 {
+		select {
+		case <-time.After(t.dialDelay):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 	t.mu.Lock()
 	t.dials++
 	if len(t.handlers) == 0 {
@@ -145,7 +153,7 @@ func TestFetchPeerRootDropsSessionAndRetriesOnEOF(t *testing.T) {
 	}
 }
 
-func TestFetchPeerRootRetriesReadDeadlineWithFreshAttemptContext(t *testing.T) {
+func TestFetchPeerRootDropsSessionOnFirstReadDeadline(t *testing.T) {
 	t.Parallel()
 
 	var gid entmoot.GroupID
@@ -181,8 +189,45 @@ func TestFetchPeerRootRetriesReadDeadlineWithFreshAttemptContext(t *testing.T) {
 	if dials != 2 {
 		t.Fatalf("dials = %d, want 2", dials)
 	}
+	if drops != 1 {
+		t.Fatalf("drops = %d, want 1 for first read deadline", drops)
+	}
+}
+
+func TestRequestResponseDialBudgetDoesNotUseAttemptTimeout(t *testing.T) {
+	t.Parallel()
+
+	var gid entmoot.GroupID
+	gid[0] = 1
+	var root wire.MerkleRoot
+	root[0] = 123
+	tr := &scriptedTransport{
+		dialDelay: 30 * time.Millisecond,
+		handlers: []func(net.Conn){
+			respondAfterRequest(&wire.MerkleResp{GroupID: gid, Root: root}),
+		},
+	}
+	g := newScriptedRecoveryGossiper(gid, tr)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	payload, err := g.requestResponseWithAttemptTimeout(ctx, 20, &wire.MerkleReq{GroupID: gid}, wire.MsgMerkleResp, "merkle_req", 10*time.Millisecond)
+	if err != nil {
+		t.Fatalf("requestResponseWithAttemptTimeout failed: %v", err)
+	}
+	resp, ok := payload.(*wire.MerkleResp)
+	if !ok {
+		t.Fatalf("payload type = %T, want *wire.MerkleResp", payload)
+	}
+	if resp.Root != root {
+		t.Fatalf("root mismatch: got %x want %x", resp.Root, root)
+	}
+	dials, drops := tr.counts()
+	if dials != 1 {
+		t.Fatalf("dials = %d, want 1", dials)
+	}
 	if drops != 0 {
-		t.Fatalf("drops = %d, want 0 for first read deadline", drops)
+		t.Fatalf("drops = %d, want 0", drops)
 	}
 }
 

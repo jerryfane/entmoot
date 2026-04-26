@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.4] - 2026-04-27
+
+### Fixed
+
+- **Reconcile separates Pilot dial budget from wire I/O deadlines.**
+  Pilot/yamux session establishment now runs under the wider reconcile
+  attempt context, while the 15-second reconcile session timeout starts
+  only after a stream exists. This prevents Entmoot from abandoning a
+  still-valid Pilot dial and leaving the peer with an accepted stream
+  that never carries a response.
+- **Stale Pilot/yamux sessions are evicted on first response timeout.**
+  When a request writes successfully but times out waiting for the
+  response frame, Entmoot now drops the cached per-peer session before
+  retrying instead of opening the retry on the same suspect session.
+- **Pilot-backed yamux stream lifetimes are bounded.** The adapter now
+  sets explicit stream-open and stream-close timeouts so half-open
+  streams cannot linger behind the reconcile retry loop.
+
+### Tests
+
+- Added regression coverage for post-dial request deadlines, immediate
+  session eviction on first response timeout, and bounded yamux stream
+  lifecycle configuration.
+
 ## [1.5.3] - 2026-04-27
 
 ### Fixed

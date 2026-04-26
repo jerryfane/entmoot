@@ -1,6 +1,7 @@
 package pilot
 
 import (
+	"io"
 	"log/slog"
 	"sync/atomic"
 	"testing"
@@ -130,6 +131,24 @@ func TestPilotTransport_RaceLostDoesNotFire(t *testing.T) {
 	tr.fireOnTunnelUp(42)
 	waitFor(t, 1*time.Second, func() bool { return count.Load() == 1 },
 		"sanity fire after race-lost simulation")
+}
+
+func TestYamuxConfigBoundsStreamLifecycle(t *testing.T) {
+	t.Parallel()
+
+	cfg := yamuxConfig(slog.Default())
+	if cfg.StreamOpenTimeout != 10*time.Second {
+		t.Fatalf("StreamOpenTimeout = %s, want 10s", cfg.StreamOpenTimeout)
+	}
+	if cfg.StreamCloseTimeout != 5*time.Second {
+		t.Fatalf("StreamCloseTimeout = %s, want 5s", cfg.StreamCloseTimeout)
+	}
+	if cfg.Logger != nil {
+		t.Fatalf("Logger = %v, want nil", cfg.Logger)
+	}
+	if cfg.LogOutput != io.Discard {
+		t.Fatalf("LogOutput = %T, want io.Discard", cfg.LogOutput)
+	}
 }
 
 // waitFor polls cond every 10 ms until it returns true or the budget
