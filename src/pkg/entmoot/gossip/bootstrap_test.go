@@ -555,3 +555,49 @@ func TestJoinPullsTransportSnapshot(t *testing.T) {
 		t.Fatalf("joiner EndpointsFor(A) = %+v, want tcp=198.51.100.10:4443", gotEps)
 	}
 }
+
+func TestJoinPullsForwardedThirdPartyTransportSnapshot(t *testing.T) {
+	t.Parallel()
+	f := newFixtureWithGenesisOnly(t, []entmoot.NodeID{10, 20, 99}, 99)
+	defer f.closeTransports()
+
+	storeA := newMemTransportAdStore()
+	storeC := newMemTransportAdStore()
+	f.nodes[10].gossip.cfg.TransportAdStore = storeA
+	f.nodes[10].gossip.cfg.RateLimiter = ratelimit.New(ratelimit.DefaultLimits(), f.nodes[10].gossip.clk)
+	f.nodes[99].gossip.cfg.TransportAdStore = storeC
+	f.nodes[99].gossip.cfg.RateLimiter = ratelimit.New(ratelimit.DefaultLimits(), f.nodes[99].gossip.clk)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = f.nodes[10].gossip.Start(ctx) }()
+
+	thirdPartyEndpoints := []entmoot.NodeEndpoint{{Network: "turn", Addr: "104.30.148.100:26905"}}
+	now := f.nodes[20].gossip.clk.Now()
+	ad := f.buildTransportAd(20, 1, thirdPartyEndpoints, now)
+	if _, err := storeA.PutTransportAd(ctx, ad); err != nil {
+		t.Fatalf("A PutTransportAd for B: %v", err)
+	}
+	// The assertion is snapshot validation/install, not refanout. Avoid a
+	// slow best-effort dial to B, whose accept loop is intentionally idle.
+	f.nodes[99].gossip.recordDialFailure(20)
+
+	inv := f.buildInvite([]entmoot.NodeID{10})
+	if err := f.nodes[99].gossip.Join(ctx, inv); err != nil {
+		t.Fatalf("Join: %v", err)
+	}
+
+	got, ok := storeC.adFor(f.groupID, 20)
+	if !ok {
+		t.Fatalf("C has no stored TransportAd for third-party author B after Join")
+	}
+	if len(got.Endpoints) != 1 || got.Endpoints[0].Addr != "104.30.148.100:26905" {
+		t.Fatalf("C stored third-party endpoints = %+v, want turn=104.30.148.100:26905", got.Endpoints)
+	}
+
+	joiner := f.transports[99].(*memTransport)
+	gotEps := joiner.EndpointsFor(20)
+	if len(gotEps) != 1 || gotEps[0].Network != "turn" || gotEps[0].Addr != "104.30.148.100:26905" {
+		t.Fatalf("joiner EndpointsFor(B) = %+v, want turn=104.30.148.100:26905", gotEps)
+	}
+}

@@ -556,6 +556,9 @@ func (t *Transport) SetPeerEndpoints(ctx context.Context, peer entmoot.NodeID, e
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if peer == t.nodeID {
+		return nil
+	}
 	ipcEps := make([]ipcclient.Endpoint, 0, len(endpoints))
 	for _, ep := range endpoints {
 		ipcEps = append(ipcEps, ipcclient.Endpoint{Network: ep.Network, Addr: ep.Addr})

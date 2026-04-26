@@ -2937,6 +2937,13 @@ func (g *Gossiper) onTransportAd(ctx context.Context, remote entmoot.NodeID, ad 
 			return
 		}
 	}
+	if ad.Author.PilotNodeID == g.cfg.LocalNode {
+		g.logger.Debug("gossip: transport_ad self-authored inbound ignored",
+			slog.Uint64("remote", uint64(remote)),
+			slog.Uint64("author", uint64(ad.Author.PilotNodeID)),
+			slog.Uint64("seq", ad.Seq))
+		return
+	}
 	signing := *ad
 	signing.Signature = nil
 	sigInput, err := canonical.Encode(signing)
@@ -3144,15 +3151,6 @@ func (g *Gossiper) publishTransportAd(ctx context.Context, endpoints []entmoot.N
 		// Not fatal — a store write miss still leaves us able to
 		// refanout the in-memory ad. Log and continue.
 		g.logger.Warn("gossip: transport_ad publish store put",
-			slog.String("err", err.Error()))
-	}
-
-	// Install locally so the transport's own view is consistent with
-	// what we're telling the rest of the group. For the pilot adapter
-	// this is a no-op for self; for the mem transport it records the
-	// call for test introspection.
-	if err := g.cfg.Transport.SetPeerEndpoints(ctx, g.cfg.LocalNode, ad.Endpoints); err != nil {
-		g.logger.Debug("gossip: transport_ad self install",
 			slog.String("err", err.Error()))
 	}
 

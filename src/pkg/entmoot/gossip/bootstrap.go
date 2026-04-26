@@ -290,17 +290,13 @@ func (g *Gossiper) pullTransportSnapshot(ctx context.Context, peer entmoot.NodeI
 	if resp.GroupID != g.cfg.GroupID {
 		return fmt.Errorf("transport snapshot: group_id mismatch")
 	}
-	// onTransportAd performs full validation (schema, size, author
-	// allowlist, membership, signature, LWW seq check) before
-	// installing. The `remote` argument is the author of the ad
-	// itself, not the bootstrap peer that delivered the snapshot:
-	// our allowlist invariant is "author == sender", so fabricating
-	// the sender as the ad's author keeps validation identical to
-	// the live-gossip path. A forwarded ad that fails signature
-	// verification drops inside onTransportAd without side effects.
+	// onTransportAd performs full validation (schema, size, trusted
+	// forwarder, membership, signature, LWW seq check) before installing.
+	// The `remote` argument is the snapshot peer that delivered the table;
+	// authenticity of each ad comes from the author's signature.
 	for i := range resp.Ads {
 		ad := &resp.Ads[i]
-		g.onTransportAd(ctx, ad.Author.PilotNodeID, ad)
+		g.onTransportAd(ctx, peer, ad)
 	}
 	return nil
 }

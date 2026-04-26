@@ -30,7 +30,7 @@ type memTransportAdStore struct {
 }
 
 type memAdKey struct {
-	gid   entmoot.GroupID
+	gid    entmoot.GroupID
 	nodeID entmoot.NodeID
 }
 
@@ -368,6 +368,55 @@ func TestTransportAdInstallCallsTransport(t *testing.T) {
 	})
 }
 
+func TestPublishTransportAdDoesNotInstallSelfEndpoint(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, []entmoot.NodeID{10})
+	defer f.closeTransports()
+
+	stores := installTransportAdStores(t, f, nil)
+
+	ctx := context.Background()
+	if err := f.nodes[10].gossip.publishTransportAd(ctx, []entmoot.NodeEndpoint{
+		{Network: "turn", Addr: "104.30.150.206:23549"},
+	}); err != nil {
+		t.Fatalf("publishTransportAd: %v", err)
+	}
+	if _, ok := stores[10].adFor(f.groupID, 10); !ok {
+		t.Fatalf("local store has no self-authored ad after publish")
+	}
+
+	tr := f.transports[10].(*memTransport)
+	if got := tr.EndpointsFor(10); got != nil {
+		t.Fatalf("self endpoint installed into transport: %+v", got)
+	}
+}
+
+func TestTransportAdSelfAuthoredInboundIgnored(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, []entmoot.NodeID{10, 20})
+	defer f.closeTransports()
+
+	stores := installTransportAdStores(t, f, nil)
+
+	ctx := context.Background()
+	now := f.nodes[10].gossip.clk.Now()
+	ad := f.buildTransportAd(10, 1,
+		[]entmoot.NodeEndpoint{{Network: "turn", Addr: "104.30.150.206:23549"}}, now)
+
+	f.nodes[10].gossip.onTransportAd(ctx, 20, &ad)
+
+	if _, ok := stores[10].adFor(f.groupID, 10); ok {
+		t.Fatalf("self-authored inbound ad was stored; want ignored")
+	}
+	if got := stores[10].putCallCount(); got != 0 {
+		t.Fatalf("PutTransportAd call count = %d, want 0", got)
+	}
+	tr := f.transports[10].(*memTransport)
+	if got := tr.EndpointsFor(10); got != nil {
+		t.Fatalf("self-authored inbound ad installed endpoint: %+v", got)
+	}
+}
+
 // TestTransportAdInstallRoundTripsTurnEndpoint verifies the receive-side
 // TURN path (v1.4.0): a published ad containing a "turn" network string
 // is dispatched through onTransportAd to the Transport's SetPeerEndpoints
@@ -624,4 +673,3 @@ func TestTransportAdRejectBadSignature(t *testing.T) {
 		t.Fatalf("bad-signature ad was stored; want drop")
 	}
 }
-

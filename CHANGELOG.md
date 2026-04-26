@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.6] - 2026-04-27
+
+### Fixed
+
+- **Transport ads no longer feed self endpoints back into Pilot.** Local
+  publishes skip self-install, inbound self-authored ads are ignored before
+  store/install, and the Pilot adapter treats `SetPeerEndpoints(self, ...)` as
+  a no-op.
+- **Bootstrap transport snapshots now preserve the actual forwarding sender.**
+  Snapshot ads are validated as forwarded by the snapshot peer rather than as
+  if every author directly sent its own ad, so endpoint warming works for
+  third-party ads returned by a trusted bootstrap peer.
+
 ## [1.5.5] - 2026-04-27
 
 ### Fixed
