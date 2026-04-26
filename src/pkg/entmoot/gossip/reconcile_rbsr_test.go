@@ -333,6 +333,83 @@ func TestReconcileViaRBSR_GapInMiddle(t *testing.T) {
 	})
 }
 
+// TestReconcileViaRBSR_ResponderFetchesInitiatorExtras covers the symmetric
+// half of RBSR body recovery: when the initiator has messages the responder
+// lacks, the responder must retain newlyMissing ids from sess.Next and fetch
+// those bodies after the reconcile exchange.
+func TestReconcileViaRBSR_ResponderFetchesInitiatorExtras(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, []entmoot.NodeID{10, 20})
+	defer f.closeTransports()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	base := make([]entmoot.Message, 0, 10)
+	for i := 0; i < 10; i++ {
+		base = append(base, f.buildMessage(10, fmt.Sprintf("base-%d", i), int64(4_000+i)))
+	}
+	extras := []entmoot.Message{
+		f.buildMessage(10, "initiator-extra-0", 3_900),
+		f.buildMessage(10, "initiator-extra-1", 3_901),
+	}
+
+	for _, m := range base {
+		if err := f.nodes[10].storeM.Put(ctx, m); err != nil {
+			t.Fatalf("seed A base: %v", err)
+		}
+		if err := f.nodes[20].storeM.Put(ctx, m); err != nil {
+			t.Fatalf("seed B base: %v", err)
+		}
+	}
+	for _, m := range extras {
+		if err := f.nodes[10].storeM.Put(ctx, m); err != nil {
+			t.Fatalf("seed A extra: %v", err)
+		}
+	}
+
+	rootA, _ := f.nodes[10].storeM.MerkleRoot(ctx, f.groupID)
+	rootB, _ := f.nodes[20].storeM.MerkleRoot(ctx, f.groupID)
+	if bytes.Equal(rootA[:], rootB[:]) {
+		t.Fatalf("pre-reconcile roots should differ; test seeding is broken")
+	}
+
+	f.startAll(ctx)
+	time.Sleep(100 * time.Millisecond)
+
+	// Suppress B's reactive initiator path so the only way B can acquire
+	// A's extras is by fetching newlyMissing ids learned while B is the
+	// responder to A's reconcile session.
+	bG := f.nodes[20].gossip
+	bG.pendMu.Lock()
+	bG.lastReconciled[10] = reconcileState{
+		at:       time.Now().Add(24 * time.Hour),
+		cooldown: 24 * time.Hour,
+	}
+	bG.pendMu.Unlock()
+
+	aG := f.nodes[10].gossip
+	aG.pendMu.Lock()
+	delete(aG.lastReconciled, 20)
+	aG.pendMu.Unlock()
+
+	aG.maybeReconcile(ctx, 20)
+
+	for _, extra := range extras {
+		extra := extra
+		waitUntil(t, 5*time.Second, fmt.Sprintf("B fetches initiator extra %x", extra.ID[:4]), func() bool {
+			has, _ := f.nodes[20].storeM.Has(ctx, f.groupID, extra.ID)
+			return has
+		})
+	}
+
+	waitUntil(t, 2*time.Second, "A and B Merkle roots converge after responder fetch", func() bool {
+		ra, _ := f.nodes[10].storeM.MerkleRoot(ctx, f.groupID)
+		rb, _ := f.nodes[20].storeM.MerkleRoot(ctx, f.groupID)
+		return bytes.Equal(ra[:], rb[:])
+	})
+}
+
 // silentReconcileTransport wraps memTransport and rejects inbound
 // MsgReconcile frames by closing the connection immediately — the
 // wire-compat regression test for "peer that doesn't understand
@@ -422,7 +499,14 @@ func TestReconcileViaRBSR_PeerReturnsUnknownOpcode(t *testing.T) {
 	// Clear any startup-reconcile cooldown so the forced call below
 	// actually fires.
 	aG := f.nodes[10].gossip
+	bG := f.nodes[20].gossip
 	time.Sleep(100 * time.Millisecond)
+	bG.pendMu.Lock()
+	bG.lastReconciled[10] = reconcileState{
+		at:       time.Now().Add(24 * time.Hour),
+		cooldown: 24 * time.Hour,
+	}
+	bG.pendMu.Unlock()
 	aG.pendMu.Lock()
 	delete(aG.lastReconciled, 20)
 	aG.pendMu.Unlock()

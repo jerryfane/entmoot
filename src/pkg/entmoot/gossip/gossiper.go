@@ -35,7 +35,9 @@ import (
 // wall-clock moment, so every retry hit the same bad window.
 // Decorrelated jitter is the AWS-blessed formula (Full Jitter is
 // equivalent but needs an attempt counter):
-//     next = min(cap, random(base, prev * 3))
+//
+//	next = min(cap, random(base, prev * 3))
+//
 // Retry budget remains 10 attempts via retryMaxAttempts — a peer
 // that fails 10 straight retries still gets dropped per v1.0.4
 // semantics.
@@ -451,10 +453,10 @@ type Gossiper struct {
 	// Guarded by plumMu. Separate mutex from pendMu to avoid
 	// contention with the retry scheduler (which fires every 500 ms
 	// and iterates pending under pendMu).
-	plumMu          sync.Mutex
-	eagerPushPeers  map[entmoot.NodeID]struct{}
-	lazyPushPeers   map[entmoot.NodeID]struct{}
-	pendingGraft    map[pendingGraftKey]*time.Timer
+	plumMu         sync.Mutex
+	eagerPushPeers map[entmoot.NodeID]struct{}
+	lazyPushPeers  map[entmoot.NodeID]struct{}
+	pendingGraft   map[pendingGraftKey]*time.Timer
 
 	// Trust-aware reachability cache (v1.0.6). Plumtree peer-set helpers
 	// intersect eager/lazy lists with this set before returning, so the
@@ -533,10 +535,10 @@ func New(cfg Config) (*Gossiper, error) {
 	seed := clk.Now().UnixNano()
 	rng := rand.New(rand.NewPCG(uint64(seed), uint64(seed>>1)^0x9E3779B97F4A7C15))
 	return &Gossiper{
-		cfg:            cfg,
-		logger:         logger,
-		clk:            clk,
-		fanout:         fanout,
+		cfg:               cfg,
+		logger:            logger,
+		clk:               clk,
+		fanout:            fanout,
 		pending:           make(map[retryKey]*retryState),
 		lastReconciled:    make(map[entmoot.NodeID]reconcileState),
 		lastKnownPeerRoot: make(map[entmoot.NodeID]wire.MerkleRoot),
@@ -1095,8 +1097,9 @@ func (g *Gossiper) onReconcileReq(ctx context.Context, c net.Conn, remote entmoo
 	incoming := req.Ranges
 	round := req.Round
 	peerDone := req.Done
+	var missingIDs []entmoot.MessageID
 	for {
-		out, _, sessDone, err := sess.Next(ctx, incoming)
+		out, newlyMissing, sessDone, err := sess.Next(ctx, incoming)
 		if err != nil {
 			if errors.Is(err, reconcile.ErrMaxRounds) {
 				g.logger.Warn("gossip: reconcile: max rounds (responder)",
@@ -1110,7 +1113,16 @@ func (g *Gossiper) onReconcileReq(ctx context.Context, c net.Conn, remote entmoo
 			}
 			return
 		}
+		missingIDs = append(missingIDs, newlyMissing...)
 		myDone := sessDone && len(out) == 0
+		g.logger.Debug("gossip: reconcile: responder round",
+			slog.Uint64("remote", uint64(remote)),
+			slog.Int("round", int(round)),
+			slog.Int("outgoing_ranges", len(out)),
+			slog.Int("newly_missing", len(newlyMissing)),
+			slog.Int("total_missing", len(missingIDs)),
+			slog.Bool("sess_done", sessDone),
+			slog.Bool("peer_done", peerDone))
 		resp := &wire.Reconcile{
 			GroupID: g.cfg.GroupID,
 			Round:   round,
@@ -1125,6 +1137,11 @@ func (g *Gossiper) onReconcileReq(ctx context.Context, c net.Conn, remote entmoo
 			return
 		}
 		if peerDone && myDone {
+			g.fetchMissingFrom(ctx, remote, missingIDs)
+			g.logger.Debug("gossip: reconcile: responder complete",
+				slog.Uint64("remote", uint64(remote)),
+				slog.Int("round", int(round)),
+				slog.Int("missing", len(missingIDs)))
 			return
 		}
 
@@ -1134,6 +1151,13 @@ func (g *Gossiper) onReconcileReq(ctx context.Context, c net.Conn, remote entmoo
 			if errors.Is(err, io.EOF) {
 				// Clean close from the initiator — either they're done
 				// or they observed a fatal error on their side.
+				if len(missingIDs) > 0 {
+					g.fetchMissingFrom(ctx, remote, missingIDs)
+					g.logger.Debug("gossip: reconcile: responder fetched after eof",
+						slog.Uint64("remote", uint64(remote)),
+						slog.Int("round", int(round)),
+						slog.Int("missing", len(missingIDs)))
+				}
 				return
 			}
 			g.logger.Warn("gossip: reconcile: responder read",
@@ -1565,6 +1589,27 @@ func (g *Gossiper) fetchFrom(ctx context.Context, peer entmoot.NodeID, id entmoo
 	// have that we don't (patch 7).
 	g.maybeReconcile(ctx, peer)
 	return nil
+}
+
+// fetchMissingFrom fulfils ids learned during anti-entropy with the same
+// body-fetch path used by gossip push and retry. Reconcile sessions exchange
+// only IDs; both initiator and responder must pull bodies after discovering
+// the peer has messages local storage lacks.
+func (g *Gossiper) fetchMissingFrom(ctx context.Context, peer entmoot.NodeID, ids []entmoot.MessageID) {
+	seen := make(map[entmoot.MessageID]struct{}, len(ids))
+	for _, id := range ids {
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		has, _ := g.cfg.Store.Has(ctx, g.cfg.GroupID, id)
+		if has {
+			continue
+		}
+		if ferr := g.fetchFrom(ctx, peer, id); ferr != nil {
+			g.enqueueRetry(retryKey{peer: peer, id: id, op: opFetch}, nil)
+		}
+	}
 }
 
 // Publish validates, stores, and gossips a new local message. The message
@@ -2497,7 +2542,8 @@ func (g *Gossiper) reconcileWith(ctx context.Context, peer entmoot.NodeID) {
 				// path for anything the peer subsequently publishes.
 				g.logger.Debug("gossip: reconcile: session ended early (peer may be v1.2.0)",
 					slog.Uint64("peer", uint64(peer)),
-					slog.Int("round", int(round)))
+					slog.Int("round", int(round)),
+					slog.Int("missing", len(missingIDs)))
 				return
 			}
 			g.logger.Warn("gossip: reconcile: read",
@@ -2571,15 +2617,7 @@ func (g *Gossiper) reconcileWith(ctx context.Context, peer entmoot.NodeID) {
 	// fetch path so signature verification, store.Put, Plumtree
 	// refanout, and retry queuing all compose the same way they do
 	// for gossip-push and graft-response acquisitions.
-	for _, id := range missingIDs {
-		has, _ := g.cfg.Store.Has(ctx, g.cfg.GroupID, id)
-		if has {
-			continue
-		}
-		if ferr := g.fetchFrom(ctx, peer, id); ferr != nil {
-			g.enqueueRetry(retryKey{peer: peer, id: id, op: opFetch}, nil)
-		}
-	}
+	g.fetchMissingFrom(ctx, peer, missingIDs)
 
 	// Step 5: cache the peer's root. Phase 7 / Part E consults this
 	// before firing reconcileWith — a peer whose cached root matches
@@ -3145,4 +3183,3 @@ func validateEndpoint(ep entmoot.NodeEndpoint) error {
 	}
 	return nil
 }
-

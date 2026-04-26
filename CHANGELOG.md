@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.1] - 2026-04-26
+
+### Fixed
+
+- **RBSR responder body recovery is now symmetric.** The responder
+  side of `MsgReconcile` now retains `newlyMissing` message IDs
+  learned during reconciliation and fetches those message bodies from
+  the initiator. Previously only the initiator fetched discovered
+  missing IDs, so a peer that learned "I am missing messages" while
+  acting as responder could complete the ID exchange without ever
+  pulling the bodies.
+- **Shared anti-entropy fetch helper.** Initiator and responder now
+  use the same `fetchMissingFrom` path, preserving existing
+  signature verification, `Store.Put`, Plumtree refanout, and retry
+  scheduling behavior.
+
+### Diagnostics
+
+- Added responder-side debug logs for RBSR round progress,
+  responder completion, and EOF-after-discovery fetches. These make
+  future `session ended early` cases distinguishable from successful
+  responder-side body pulls.
+
+### Tests
+
+- Added `TestReconcileViaRBSR_ResponderFetchesInitiatorExtras`, a
+  regression test where the initiator has messages the responder
+  lacks and the responder's separate initiator path is suppressed.
+  This proves the responder itself fetches bodies discovered during
+  the RBSR exchange.
+
 ## [1.5.0] - 2026-04-25
 
 Replaces the v1.4.4 polling pattern for TURN-rotation detection
