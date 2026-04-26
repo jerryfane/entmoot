@@ -9,6 +9,7 @@ import (
 	"math/rand/v2"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -126,6 +127,14 @@ const (
 	reconcileCooldownJitter  = 6 * time.Second // ±20 %
 	reconcileFailureCooldown = 5 * time.Second
 )
+
+// reconcileAttemptTimeout bounds one complete anti-entropy attempt,
+// including the Merkle root probe, RBSR exchange, fallback range scan,
+// and any body fetches. Individual stream request/response attempts
+// still use reconcileSessionTimeout; this wider envelope exists so
+// reactive reconcile work can detach from short push/fanout contexts
+// without becoming unbounded background work.
+const reconcileAttemptTimeout = 90 * time.Second
 
 // Background AE ticker (v1.2.1). Serf-style push-pull: 30 s base with
 // jitter, one least-recently-reconciled peer per tick. The cooldown
@@ -770,10 +779,16 @@ func (g *Gossiper) recordDialFailure(peer entmoot.NodeID) {
 	s.nextAllowed = g.clk.Now().Add(window)
 }
 
-// recordDialSuccess clears any backoff state for peer P. Called
-// immediately after a successful Transport.Dial (even if the
-// subsequent stream write fails — dial reachability and protocol
-// health are independent, per libp2p's model).
+func (g *Gossiper) recordDialFailureUnlessLocal(ctx context.Context, peer entmoot.NodeID, err error) {
+	if isLocalContextError(ctx, err) {
+		return
+	}
+	g.recordDialFailure(peer)
+}
+
+// recordDialSuccess clears any backoff state for peer P. Request/response
+// paths call it after a full response arrives; one-way control-frame paths
+// call it after the frame write succeeds.
 func (g *Gossiper) recordDialSuccess(peer entmoot.NodeID) {
 	g.dialMu.Lock()
 	defer g.dialMu.Unlock()
@@ -786,12 +801,52 @@ func isRetryableStreamError(err error) bool {
 	}
 	if errors.Is(err, io.EOF) ||
 		errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, io.ErrClosedPipe) ||
 		errors.Is(err, net.ErrClosed) ||
 		errors.Is(err, context.DeadlineExceeded) {
 		return true
 	}
+	errText := strings.ToLower(err.Error())
+	if strings.Contains(errText, "closed pipe") ||
+		strings.Contains(errText, "use of closed network connection") ||
+		strings.Contains(errText, "session shutdown") {
+		return true
+	}
 	var netErr net.Error
 	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
+func isStaleSessionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, io.ErrClosedPipe) ||
+		errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	errText := strings.ToLower(err.Error())
+	return strings.Contains(errText, "closed pipe") ||
+		strings.Contains(errText, "use of closed network connection") ||
+		strings.Contains(errText, "session shutdown")
+}
+
+func shouldDropPeerSessionAfterStreamError(err error, attempt int) bool {
+	if isStaleSessionError(err) {
+		return true
+	}
+	return attempt > 0 && isRetryableStreamError(err)
+}
+
+func isLocalContextError(ctx context.Context, err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) {
+		return true
+	}
+	return ctx.Err() != nil && errors.Is(err, context.DeadlineExceeded)
 }
 
 func setConnDeadlineFromContext(ctx context.Context, conn net.Conn) {
@@ -816,25 +871,46 @@ func (g *Gossiper) dropPeerSession(peer entmoot.NodeID, op string, cause error) 
 }
 
 func (g *Gossiper) requestResponse(ctx context.Context, peer entmoot.NodeID, req any, expected wire.MsgType, op string) (any, error) {
+	return g.requestResponseWithAttemptTimeout(ctx, peer, req, expected, op, 0)
+}
+
+func (g *Gossiper) requestResponseWithAttemptTimeout(ctx context.Context, peer entmoot.NodeID, req any, expected wire.MsgType, op string, attemptTimeout time.Duration) (any, error) {
 	var lastErr error
 	for attempt := 0; attempt < 2; attempt++ {
+		attemptCtx := ctx
+		var cancel context.CancelFunc
+		if attemptTimeout > 0 {
+			attemptCtx, cancel = context.WithTimeout(ctx, attemptTimeout)
+		}
+		if cancel != nil {
+			defer cancel()
+		}
 		if !g.canDial(peer) {
 			return nil, fmt.Errorf("peer %d in dial-backoff", peer)
 		}
-		conn, err := g.cfg.Transport.Dial(ctx, peer)
+		conn, err := g.cfg.Transport.Dial(attemptCtx, peer)
 		if err != nil {
-			g.recordDialFailure(peer)
-			return nil, fmt.Errorf("%s: dial %d: %w", op, peer, err)
+			lastErr = fmt.Errorf("%s: dial %d: %w", op, peer, err)
+			if attempt == 0 && (isRetryableStreamError(err) || isLocalContextError(attemptCtx, err)) && (attemptTimeout > 0 || ctx.Err() == nil) {
+				continue
+			}
+			g.recordDialFailureUnlessLocal(attemptCtx, peer, err)
+			return nil, lastErr
 		}
-		setConnDeadlineFromContext(ctx, conn)
+		setConnDeadlineFromContext(attemptCtx, conn)
 
 		err = wire.EncodeAndWrite(conn, req)
 		if err != nil {
 			_ = conn.Close()
 			lastErr = fmt.Errorf("%s: write: %w", op, err)
-			if attempt == 0 && isRetryableStreamError(err) {
-				g.dropPeerSession(peer, op, err)
+			if attempt == 0 && isRetryableStreamError(err) && (attemptTimeout > 0 || ctx.Err() == nil) {
+				if shouldDropPeerSessionAfterStreamError(err, attempt) {
+					g.dropPeerSession(peer, op, err)
+				}
 				continue
+			}
+			if isRetryableStreamError(err) && shouldDropPeerSessionAfterStreamError(err, attempt) {
+				g.dropPeerSession(peer, op, err)
 			}
 			return nil, lastErr
 		}
@@ -843,12 +919,17 @@ func (g *Gossiper) requestResponse(ctx context.Context, peer entmoot.NodeID, req
 		_ = conn.Close()
 		if err != nil {
 			lastErr = fmt.Errorf("%s: read: %w", op, err)
-			if attempt == 0 && isRetryableStreamError(err) {
-				g.dropPeerSession(peer, op, err)
+			if attempt == 0 && isRetryableStreamError(err) && (attemptTimeout > 0 || ctx.Err() == nil) {
+				if shouldDropPeerSessionAfterStreamError(err, attempt) {
+					g.dropPeerSession(peer, op, err)
+				}
 				continue
 			}
+			if isRetryableStreamError(err) && shouldDropPeerSessionAfterStreamError(err, attempt) {
+				g.dropPeerSession(peer, op, err)
+			}
 			if isRetryableStreamError(err) {
-				g.recordDialFailure(peer)
+				g.recordDialFailureUnlessLocal(attemptCtx, peer, err)
 			}
 			return nil, lastErr
 		}
@@ -862,6 +943,45 @@ func (g *Gossiper) requestResponse(ctx context.Context, peer entmoot.NodeID, req
 		lastErr = fmt.Errorf("%s: exhausted retry budget", op)
 	}
 	return nil, lastErr
+}
+
+func (g *Gossiper) dialAndWrite(ctx context.Context, peer entmoot.NodeID, frame any, op string) error {
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		if !g.canDial(peer) {
+			return fmt.Errorf("peer %d in dial-backoff", peer)
+		}
+		conn, err := g.cfg.Transport.Dial(ctx, peer)
+		if err != nil {
+			g.recordDialFailureUnlessLocal(ctx, peer, err)
+			return fmt.Errorf("dial: %w", err)
+		}
+		setConnDeadlineFromContext(ctx, conn)
+		err = wire.EncodeAndWrite(conn, frame)
+		_ = conn.Close()
+		if err == nil {
+			g.recordDialSuccess(peer)
+			return nil
+		}
+		lastErr = fmt.Errorf("write %s: %w", op, err)
+		if attempt == 0 && isRetryableStreamError(err) && ctx.Err() == nil {
+			if shouldDropPeerSessionAfterStreamError(err, attempt) {
+				g.dropPeerSession(peer, op, err)
+			}
+			continue
+		}
+		if isRetryableStreamError(err) && shouldDropPeerSessionAfterStreamError(err, attempt) {
+			g.dropPeerSession(peer, op, err)
+		}
+		if isRetryableStreamError(err) {
+			g.recordDialFailureUnlessLocal(ctx, peer, err)
+		}
+		return lastErr
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("write %s: exhausted retry budget", op)
+	}
+	return lastErr
 }
 
 // Start runs the accept loop. It blocks until ctx is cancelled or the
@@ -1090,8 +1210,10 @@ func (g *Gossiper) onFetchReq(ctx context.Context, c net.Conn, remote entmoot.No
 	}
 }
 
-// onMerkleReq responds with the current Merkle root plus the number of
-// messages in the local store for this group.
+// onMerkleReq responds with the current Merkle root. MessageCount is
+// intentionally left at zero: reconcile uses the root only, and counting by
+// scanning the full store made this hot-path probe look like transport
+// failure on slower peers.
 func (g *Gossiper) onMerkleReq(ctx context.Context, c net.Conn, remote entmoot.NodeID, req *wire.MerkleReq) {
 	if req.GroupID != g.cfg.GroupID {
 		g.logger.Warn("gossip: merkle_req for wrong group",
@@ -1106,19 +1228,9 @@ func (g *Gossiper) onMerkleReq(ctx context.Context, c net.Conn, remote entmoot.N
 			slog.String("err", err.Error()))
 		return
 	}
-	// Count via Range with the widest possible window. v0's Range uses
-	// [sinceMillis, untilMillis) with untilMillis=0 meaning no upper bound.
-	msgs, err := g.cfg.Store.Range(ctx, req.GroupID, 0, 0)
-	if err != nil {
-		g.logger.Warn("gossip: range for count",
-			slog.Uint64("remote", uint64(remote)),
-			slog.String("err", err.Error()))
-		return
-	}
 	resp := &wire.MerkleResp{
-		GroupID:      g.cfg.GroupID,
-		Root:         wire.MerkleRoot(root),
-		MessageCount: len(msgs),
+		GroupID: g.cfg.GroupID,
+		Root:    wire.MerkleRoot(root),
 	}
 	if err := wire.EncodeAndWrite(c, resp); err != nil {
 		g.logger.Warn("gossip: write merkle_resp",
@@ -1441,45 +1553,15 @@ func (g *Gossiper) refanout(ctx context.Context, except entmoot.NodeID, id entmo
 
 // sendPrune dials peer and writes a single Prune frame.
 func (g *Gossiper) sendPrune(ctx context.Context, peer entmoot.NodeID) error {
-	// v1.0.6 Fix C: short-circuit if peer is in its dial-backoff
-	// window. Synthetic error keeps the retry scheduler's error
-	// shape unchanged.
-	if !g.canDial(peer) {
-		return fmt.Errorf("peer %d in dial-backoff", peer)
-	}
-	conn, err := g.cfg.Transport.Dial(ctx, peer)
-	if err != nil {
-		g.recordDialFailure(peer)
-		return fmt.Errorf("dial: %w", err)
-	}
-	g.recordDialSuccess(peer)
-	defer conn.Close()
 	frame := &wire.Prune{GroupID: g.cfg.GroupID}
-	if err := wire.EncodeAndWrite(conn, frame); err != nil {
-		return fmt.Errorf("write prune: %w", err)
-	}
-	return nil
+	return g.dialAndWrite(ctx, peer, frame, "prune")
 }
 
 // sendGraft dials peer and writes a Graft frame requesting the bodies
 // for the given ids AND promoting us in the recipient's eagerPushPeers.
 func (g *Gossiper) sendGraft(ctx context.Context, peer entmoot.NodeID, ids []entmoot.MessageID) error {
-	// v1.0.6 Fix C: short-circuit if peer is in its dial-backoff window.
-	if !g.canDial(peer) {
-		return fmt.Errorf("peer %d in dial-backoff", peer)
-	}
-	conn, err := g.cfg.Transport.Dial(ctx, peer)
-	if err != nil {
-		g.recordDialFailure(peer)
-		return fmt.Errorf("dial: %w", err)
-	}
-	g.recordDialSuccess(peer)
-	defer conn.Close()
 	frame := &wire.Graft{GroupID: g.cfg.GroupID, IDs: ids}
-	if err := wire.EncodeAndWrite(conn, frame); err != nil {
-		return fmt.Errorf("write graft: %w", err)
-	}
-	return nil
+	return g.dialAndWrite(ctx, peer, frame, "graft")
 }
 
 // onIHave handles inbound IHave frames: for each advertised id we do
@@ -1843,21 +1925,7 @@ func (g *Gossiper) fanoutIHave(ctx context.Context, peers []entmoot.NodeID, fram
 // forget: Plumtree IHave is an advertisement, not a query, so we do not
 // wait for or interpret any response.
 func (g *Gossiper) sendIHave(ctx context.Context, peer entmoot.NodeID, frame *wire.IHave) error {
-	// v1.0.6 Fix C: short-circuit if peer is in its dial-backoff window.
-	if !g.canDial(peer) {
-		return fmt.Errorf("peer %d in dial-backoff", peer)
-	}
-	conn, err := g.cfg.Transport.Dial(ctx, peer)
-	if err != nil {
-		g.recordDialFailure(peer)
-		return fmt.Errorf("dial: %w", err)
-	}
-	g.recordDialSuccess(peer)
-	defer conn.Close()
-	if err := wire.EncodeAndWrite(conn, frame); err != nil {
-		return fmt.Errorf("write ihave: %w", err)
-	}
-	return nil
+	return g.dialAndWrite(ctx, peer, frame, "ihave")
 }
 
 // pushGossip opens a connection to peer, writes the frame, and closes. v0 is
@@ -1868,19 +1936,8 @@ func (g *Gossiper) sendIHave(ctx context.Context, peer entmoot.NodeID, frame *wi
 // partition. The cooldown gate inside maybeReconcile deduplicates repeat
 // dials so this costs at most one MerkleReq per cooldown window per peer.
 func (g *Gossiper) pushGossip(ctx context.Context, peer entmoot.NodeID, frame *wire.Gossip) error {
-	// v1.0.6 Fix C: short-circuit if peer is in its dial-backoff window.
-	if !g.canDial(peer) {
-		return fmt.Errorf("peer %d in dial-backoff", peer)
-	}
-	conn, err := g.cfg.Transport.Dial(ctx, peer)
-	if err != nil {
-		g.recordDialFailure(peer)
-		return fmt.Errorf("dial: %w", err)
-	}
-	g.recordDialSuccess(peer)
-	defer conn.Close()
-	if err := wire.EncodeAndWrite(conn, frame); err != nil {
-		return fmt.Errorf("write gossip: %w", err)
+	if err := g.dialAndWrite(ctx, peer, frame, "gossip"); err != nil {
+		return err
 	}
 	g.maybeReconcile(ctx, peer)
 	return nil
@@ -2480,6 +2537,13 @@ func (g *Gossiper) executeRetry(ctx context.Context, key retryKey, state *retryS
 // state looks fresh, without turning into a reconciliation storm during
 // chatty patches.
 func (g *Gossiper) maybeReconcile(ctx context.Context, peer entmoot.NodeID) {
+	parent := g.reconcileParentContext(ctx)
+	if err := parent.Err(); err != nil {
+		g.logger.Debug("gossip: reconcile: context closed skip",
+			slog.Uint64("peer", uint64(peer)),
+			slog.String("err", err.Error()))
+		return
+	}
 	g.pendMu.Lock()
 	now := g.clk.Now()
 	if _, ok := g.reconcileInFlight[peer]; ok {
@@ -2514,8 +2578,20 @@ func (g *Gossiper) maybeReconcile(ctx context.Context, peer entmoot.NodeID) {
 	g.wg.Add(1)
 	go func() {
 		defer g.wg.Done()
-		g.finishReconcile(peer, g.reconcileWith(ctx, peer))
+		attemptCtx, cancel := context.WithTimeout(parent, reconcileAttemptTimeout)
+		defer cancel()
+		g.finishReconcile(peer, g.reconcileWith(attemptCtx, peer))
 	}()
+}
+
+func (g *Gossiper) reconcileParentContext(fallback context.Context) context.Context {
+	g.lifeMu.Lock()
+	lifeCtx := g.lifeCtx
+	g.lifeMu.Unlock()
+	if lifeCtx != nil {
+		return lifeCtx
+	}
+	return fallback
 }
 
 func (g *Gossiper) finishReconcile(peer entmoot.NodeID, success bool) {
@@ -2545,9 +2621,7 @@ func (g *Gossiper) reconcileWith(ctx context.Context, peer entmoot.NodeID) bool 
 	// Step 1: Merkle root short-circuit. Uses its own conn; returns
 	// early with cached root on match so steady-state anti-entropy
 	// costs a single RTT.
-	rootCtx, rootCancel := context.WithTimeout(ctx, reconcileSessionTimeout)
-	defer rootCancel()
-	peerRoot, ok := g.fetchPeerRoot(rootCtx, peer)
+	peerRoot, ok := g.fetchPeerRoot(ctx, peer)
 	if !ok {
 		return false
 	}
@@ -2606,7 +2680,7 @@ func (g *Gossiper) runReconcileSession(ctx context.Context, peer entmoot.NodeID)
 	defer cancel()
 	conn, err := g.cfg.Transport.Dial(dctx, peer)
 	if err != nil {
-		g.recordDialFailure(peer)
+		g.recordDialFailureUnlessLocal(dctx, peer, err)
 		g.logger.Warn("gossip: reconcile: dial",
 			slog.Uint64("peer", uint64(peer)),
 			slog.String("err", err.Error()))
@@ -2727,9 +2801,7 @@ func (g *Gossiper) runReconcileSession(ctx context.Context, peer entmoot.NodeID)
 }
 
 func (g *Gossiper) fetchFullRangeFallback(ctx context.Context, peer entmoot.NodeID, peerRoot wire.MerkleRoot) bool {
-	fctx, cancel := context.WithTimeout(ctx, reconcileSessionTimeout)
-	defer cancel()
-	payload, err := g.requestResponse(fctx, peer, &wire.RangeReq{GroupID: g.cfg.GroupID, SinceMillis: 0}, wire.MsgRangeResp, "range_req")
+	payload, err := g.requestResponseWithAttemptTimeout(ctx, peer, &wire.RangeReq{GroupID: g.cfg.GroupID, SinceMillis: 0}, wire.MsgRangeResp, "range_req", reconcileSessionTimeout)
 	if err != nil {
 		g.logger.Warn("gossip: reconcile: full-range fallback failed",
 			slog.Uint64("peer", uint64(peer)),
@@ -2742,6 +2814,8 @@ func (g *Gossiper) fetchFullRangeFallback(ctx context.Context, peer entmoot.Node
 			slog.Uint64("peer", uint64(peer)))
 		return false
 	}
+	fctx, cancel := context.WithTimeout(ctx, reconcileSessionTimeout)
+	defer cancel()
 	g.fetchMissingFrom(fctx, peer, resp.IDs)
 	localRoot, err := g.cfg.Store.MerkleRoot(fctx, g.cfg.GroupID)
 	if err == nil && [32]byte(peerRoot) == localRoot {
@@ -2786,7 +2860,7 @@ func (g *Gossiper) readLastKnownPeerRoot(peer entmoot.NodeID) (wire.MerkleRoot, 
 // peer's root + ok on success, zero + !ok on any error so the caller can
 // abort cleanly.
 func (g *Gossiper) fetchPeerRoot(ctx context.Context, peer entmoot.NodeID) (wire.MerkleRoot, bool) {
-	payload, err := g.requestResponse(ctx, peer, &wire.MerkleReq{GroupID: g.cfg.GroupID}, wire.MsgMerkleResp, "merkle_req")
+	payload, err := g.requestResponseWithAttemptTimeout(ctx, peer, &wire.MerkleReq{GroupID: g.cfg.GroupID}, wire.MsgMerkleResp, "merkle_req", reconcileSessionTimeout)
 	if err != nil {
 		g.logger.Debug("gossip: reconcile: dial for root",
 			slog.Uint64("peer", uint64(peer)),
@@ -3004,20 +3078,7 @@ func (g *Gossiper) refanoutTransportAd(ctx context.Context, except entmoot.NodeI
 // sendTransportAd dials peer and writes one TransportAd frame. Used
 // both by refanoutTransportAd and the advertiser loop.
 func (g *Gossiper) sendTransportAd(ctx context.Context, peer entmoot.NodeID, ad *wire.TransportAd) error {
-	if !g.canDial(peer) {
-		return fmt.Errorf("peer %d in dial-backoff", peer)
-	}
-	conn, err := g.cfg.Transport.Dial(ctx, peer)
-	if err != nil {
-		g.recordDialFailure(peer)
-		return fmt.Errorf("dial: %w", err)
-	}
-	g.recordDialSuccess(peer)
-	defer conn.Close()
-	if err := wire.EncodeAndWrite(conn, ad); err != nil {
-		return fmt.Errorf("write transport_ad: %w", err)
-	}
-	return nil
+	return g.dialAndWrite(ctx, peer, ad, "transport_ad")
 }
 
 // publishTransportAd builds, signs, stores, and fanouts a fresh

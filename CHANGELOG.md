@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.3] - 2026-04-27
+
+### Fixed
+
+- **Reconcile no longer inherits short-lived push contexts.** Async
+  anti-entropy work now runs under Entmoot's lifetime context with its
+  own bounded attempt deadline, so a successful push cannot spawn a
+  reconcile attempt that immediately fails under an already-canceled
+  fanout context.
+- **Pilot/yamux session recovery is less destructive and more complete.**
+  Request/response retries get fresh per-attempt deadlines, local
+  cancellation no longer poisons dial backoff, one-way control frames
+  evict stale cached sessions on retryable write failures, and the
+  Pilot transport adapter drains late DialOK results so daemon-level
+  port-1004 conns are not orphaned after Entmoot request timeouts.
+- **Merkle root probes avoid full-store scans.** `MerkleResp` no
+  longer populates `MessageCount` by calling `Range(0,0)` on the hot
+  reconcile path; reconciliation only depends on the root.
+
+### Tests
+
+- Added regression coverage for fresh per-attempt reconcile deadlines,
+  canceled-trigger reconcile startup, local cancellation backoff
+  suppression, stale one-way write recovery, and late Pilot dial cleanup.
+
 ## [1.5.2] - 2026-04-26
 
 ### Fixed

@@ -176,6 +176,17 @@ func (f *fixture) startAll(ctx context.Context) {
 			_ = ns.gossip.Start(ctx)
 		}()
 	}
+	waitUntil(f.t, time.Second, "gossip start contexts installed", func() bool {
+		for _, ns := range f.nodes {
+			ns.gossip.lifeMu.Lock()
+			lifeCtx := ns.gossip.lifeCtx
+			ns.gossip.lifeMu.Unlock()
+			if lifeCtx == nil {
+				return false
+			}
+		}
+		return true
+	})
 }
 
 // closeTransports closes every transport.
@@ -525,8 +536,8 @@ func TestMerkleReq(t *testing.T) {
 	if rootA.Root != rootB.Root {
 		t.Fatalf("same messages yielded different roots: %x vs %x", rootA.Root, rootB.Root)
 	}
-	if rootA.MessageCount != 2 {
-		t.Fatalf("expected MessageCount=2, got %d", rootA.MessageCount)
+	if rootA.MessageCount != 0 {
+		t.Fatalf("expected MessageCount=0 on hot-path MerkleResp, got %d", rootA.MessageCount)
 	}
 
 	// Diverge B: add a third message only on B. Roots must now differ.

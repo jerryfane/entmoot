@@ -58,6 +58,8 @@ import (
 	"entmoot/pkg/entmoot/transport/pilot/ipcclient"
 )
 
+const pilotSessionDialTimeout = 45 * time.Second
+
 // Config parameterizes a Pilot-backed Transport.
 type Config struct {
 	// SocketPath is the Unix-domain IPC socket of the Pilot daemon. An empty
@@ -110,6 +112,7 @@ type Transport struct {
 	driver   *ipcclient.Driver
 	listener *ipcclient.Listener
 	nodeID   entmoot.NodeID
+	dialAddr func(context.Context, Addr, uint16) (*ipcclient.Conn, error)
 
 	// sessionsMu guards sessions AND inboundSessions.
 	sessionsMu sync.Mutex
@@ -195,6 +198,7 @@ func Open(cfg Config) (*Transport, error) {
 		driver:         d,
 		listener:       ln,
 		nodeID:         nid,
+		dialAddr:       d.DialAddr,
 		closed:         make(chan struct{}),
 		sessions:       make(map[entmoot.NodeID]*yamuxSession),
 		inboundStreams: make(chan inboundStream, 64),
@@ -221,12 +225,13 @@ func (t *Transport) Driver() *ipcclient.Driver {
 // cached yamux session for peer (dialing a fresh Pilot tunnel + establishing
 // a new yamux session the first time we talk to that peer).
 //
-// Honoring ctx: the first-contact dial blocks on driver.DialAddr, which is
-// itself an IPC request/response Pilot cannot externally cancel. A watcher
-// goroutine drains the in-flight result and closes any resulting Conn so
-// resources do not leak if ctx fires. Subsequent dials on an already-open
-// session are local-only (yamux OpenStream is an in-process SYN on top of
-// the existing tunnel) and ignore ctx.
+// Honoring ctx: callers may use short request deadlines, but the first-contact
+// daemon DialAddr exchange can legitimately complete after that deadline. The
+// adapter keeps the IPC waiter alive under an internal bounded context so a
+// late DialOK is consumed and any late conn is closed instead of becoming an
+// orphaned daemon-level connection that Entmoot cannot use. Subsequent dials
+// on an already-open session are local-only (yamux OpenStream is an in-process
+// SYN on top of the existing tunnel) and ignore ctx.
 //
 // If the cached session has died between lookup and OpenStream — common
 // after the keepalive timeout fires on a silently-wedged tunnel — the dead
@@ -279,15 +284,31 @@ func (t *Transport) getOrCreateSession(ctx context.Context, peer entmoot.NodeID)
 		conn *ipcclient.Conn
 		err  error
 	}
+	dialCtx, dialCancel := context.WithTimeout(context.Background(), pilotSessionDialTimeout)
+	doneWatchingDialCtx := make(chan struct{})
+	go func() {
+		defer close(doneWatchingDialCtx)
+		select {
+		case <-t.closed:
+			dialCancel()
+		case <-dialCtx.Done():
+		}
+	}()
 	resultCh := make(chan dialResult, 1)
 	go func() {
-		c, err := t.driver.DialAddr(ctx, addr, t.cfg.ListenPort)
+		dialAddr := t.dialAddr
+		if dialAddr == nil {
+			dialAddr = t.driver.DialAddr
+		}
+		c, err := dialAddr(dialCtx, addr, t.cfg.ListenPort)
 		resultCh <- dialResult{conn: c, err: err}
 	}()
 
 	var pilotConn *ipcclient.Conn
 	select {
 	case r := <-resultCh:
+		dialCancel()
+		<-doneWatchingDialCtx
 		if r.err != nil {
 			return nil, fmt.Errorf("pilot: dial %s:%d: %w", addr, t.cfg.ListenPort, r.err)
 		}
@@ -295,12 +316,15 @@ func (t *Transport) getOrCreateSession(ctx context.Context, peer entmoot.NodeID)
 	case <-ctx.Done():
 		go func() {
 			r := <-resultCh
+			dialCancel()
 			if r.conn != nil {
 				_ = r.conn.Close()
 			}
 		}()
 		return nil, fmt.Errorf("pilot: dial %s:%d: %w", addr, t.cfg.ListenPort, ctx.Err())
 	case <-t.closed:
+		dialCancel()
+		<-doneWatchingDialCtx
 		go func() {
 			r := <-resultCh
 			if r.conn != nil {
