@@ -351,6 +351,58 @@ func TestPublishReturnsBeforeFanout(t *testing.T) {
 	}
 }
 
+// TestPublishReturnsBeforeTrustedPeerLookup asserts the stricter publish
+// contract introduced for service/mobile clients: local durable accept must not
+// wait on Pilot trust IPC. The trust oracle is only a fanout optimization, so a
+// stuck TrustedPeers call must not make the CLI report failure after the store
+// has already accepted the message.
+func TestPublishReturnsBeforeTrustedPeerLookup(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, []entmoot.NodeID{10, 20})
+	defer f.closeTransports()
+
+	f.nodes[10].gossip.cfg.Transport = blockingTrustedPeersTransport{
+		Transport: f.transports[10],
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	f.nodes[10].running.Store(true)
+	go func() {
+		defer f.nodes[10].running.Store(false)
+		_ = f.nodes[10].gossip.Start(ctx)
+	}()
+	time.Sleep(50 * time.Millisecond)
+
+	msg := f.buildMessage(10, "fast-return despite stuck trust IPC", 2_000)
+	start := time.Now()
+	if err := f.nodes[10].gossip.Publish(ctx, msg); err != nil {
+		t.Fatalf("Publish on A: %v", err)
+	}
+	elapsed := time.Since(start)
+	if elapsed > 200*time.Millisecond {
+		t.Fatalf("Publish took %v — expected fast return (<200ms) even with blocked TrustedPeers", elapsed)
+	}
+
+	has, err := f.nodes[10].storeM.Has(ctx, f.groupID, msg.ID)
+	if err != nil {
+		t.Fatalf("store.Has: %v", err)
+	}
+	if !has {
+		t.Fatalf("expected A's local store to contain published message after fast return")
+	}
+}
+
+type blockingTrustedPeersTransport struct {
+	Transport
+}
+
+func (t blockingTrustedPeersTransport) TrustedPeers(ctx context.Context) ([]entmoot.NodeID, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
 // 4. Publish from a non-member: forge a message with an author that is not
 // in the roster. Publish must reject with entmoot.ErrNotMember.
 func TestPublishNonMemberRejected(t *testing.T) {

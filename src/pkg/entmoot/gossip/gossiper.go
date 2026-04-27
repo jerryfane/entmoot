@@ -73,6 +73,11 @@ const retryTickInterval = 500 * time.Millisecond
 // hammer Pilot IPC per peer per message.
 const trustedSetTTL = 1 * time.Second
 
+// trustedSetLookupTimeout bounds Pilot trust oracle queries. Trust filtering
+// is a fanout optimization; it must not hold publish acceptance or background
+// fanout goroutines hostage when Pilot IPC is wedged.
+const trustedSetLookupTimeout = 500 * time.Millisecond
+
 // fanoutPerPeerTimeout is the wallclock ceiling for a single
 // push / IHave / retry attempt. Entmoot calls Transport.Dial +
 // EncodeAndWrite within this budget; if Pilot's internal ~32 s
@@ -610,7 +615,9 @@ func (g *Gossiper) trustedSet(ctx context.Context) map[entmoot.NodeID]struct{} {
 	if g.trustedSnap != nil && g.clk.Now().Before(g.trustedExpires) {
 		return g.trustedSnap
 	}
-	peers, err := g.cfg.Transport.TrustedPeers(ctx)
+	qctx, cancel := context.WithTimeout(ctx, trustedSetLookupTimeout)
+	defer cancel()
+	peers, err := g.cfg.Transport.TrustedPeers(qctx)
 	if err != nil {
 		g.logger.Debug("gossip: trusted peers query failed",
 			slog.String("err", err.Error()))
@@ -1767,41 +1774,6 @@ func (g *Gossiper) Publish(ctx context.Context, msg entmoot.Message) error {
 		return fmt.Errorf("gossip: store put: %w", err)
 	}
 
-	// Plumtree dissemination (v1.0.4). The full Gossip frame goes to
-	// every peer in eagerPushPeers; lazy peers receive only an IHave
-	// advertisement. The split self-heals over time: duplicate
-	// arrivals prune redundant eager edges, IHave-to-lazy pulls graft
-	// peers back to eager when the tree is incomplete. Before v1.0.4
-	// this was a simple random Sample(fanout) push; the new behavior
-	// is a strict superset: if no peers have been pruned yet, the
-	// entire roster sits in eager and everyone gets the full push,
-	// which matches previous behavior when fanout ≥ |members-1|.
-	eager := g.plumEagerExcept(ctx, 0)
-	lazy := g.plumLazyExcept(ctx, 0)
-	if len(eager) == 0 && len(lazy) == 0 {
-		return nil
-	}
-
-	// Build a signed Gossip frame once; reuse across fan-out targets.
-	frame := &wire.Gossip{
-		GroupID:   g.cfg.GroupID,
-		IDs:       []entmoot.MessageID{msg.ID},
-		Timestamp: g.clk.Now().UnixMilli(),
-	}
-	// v1.0.7: inline the body so eager-push peers can Store.Put
-	// directly and skip the fetchFrom round-trip. No-op for messages
-	// over inlineBodyThreshold — those still propagate via the
-	// ID-only + fetch path.
-	maybeInlineBody(frame, msg)
-	if err := signGossip(frame, g.cfg.Identity); err != nil {
-		return fmt.Errorf("gossip: sign: %w", err)
-	}
-
-	ihave := &wire.IHave{
-		GroupID: g.cfg.GroupID,
-		IDs:     []entmoot.MessageID{msg.ID},
-	}
-
 	// v1.0.3 publish semantics: local-durable accept is the contract.
 	// Run the fanout asynchronously so the IPC handler returns in
 	// milliseconds instead of blocking on potentially-slow per-peer
@@ -1820,17 +1792,52 @@ func (g *Gossiper) Publish(ctx context.Context, msg entmoot.Message) error {
 	lifeCtx := g.lifeCtx
 	g.lifeMu.Unlock()
 	if lifeCtx == nil {
-		g.fanoutPush(ctx, eager, frame, msg.ID)
-		g.fanoutIHave(ctx, lazy, ihave, msg.ID)
+		g.fanoutPublishedMessage(ctx, msg)
 		return nil
 	}
 	g.wg.Add(1)
 	go func() {
 		defer g.wg.Done()
-		g.fanoutPush(lifeCtx, eager, frame, msg.ID)
-		g.fanoutIHave(lifeCtx, lazy, ihave, msg.ID)
+		g.fanoutPublishedMessage(lifeCtx, msg)
 	}()
 	return nil
+}
+
+// fanoutPublishedMessage performs all best-effort peer-delivery work for a
+// locally accepted publish. It intentionally owns peer-set selection, trust
+// filtering, frame construction, and retry enqueue so Publish can return
+// immediately after local durable store.
+func (g *Gossiper) fanoutPublishedMessage(ctx context.Context, msg entmoot.Message) {
+	// Plumtree dissemination (v1.0.4). The full Gossip frame goes to
+	// every peer in eagerPushPeers; lazy peers receive only an IHave
+	// advertisement. The split self-heals over time: duplicate
+	// arrivals prune redundant eager edges, IHave-to-lazy pulls graft
+	// peers back to eager when the tree is incomplete.
+	eager := g.plumEagerExcept(ctx, 0)
+	lazy := g.plumLazyExcept(ctx, 0)
+	if len(eager) == 0 && len(lazy) == 0 {
+		return
+	}
+
+	frame := &wire.Gossip{
+		GroupID:   g.cfg.GroupID,
+		IDs:       []entmoot.MessageID{msg.ID},
+		Timestamp: g.clk.Now().UnixMilli(),
+	}
+	maybeInlineBody(frame, msg)
+	if err := signGossip(frame, g.cfg.Identity); err != nil {
+		g.logger.Warn("gossip: publish fanout sign",
+			slog.String("id", msg.ID.String()),
+			slog.String("err", err.Error()))
+		return
+	}
+
+	ihave := &wire.IHave{
+		GroupID: g.cfg.GroupID,
+		IDs:     []entmoot.MessageID{msg.ID},
+	}
+	g.fanoutPush(ctx, eager, frame, msg.ID)
+	g.fanoutIHave(ctx, lazy, ihave, msg.ID)
 }
 
 // fanoutPush attempts the per-peer push, queuing failures for the

@@ -39,6 +39,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Publish responses no longer wait on Pilot trust IPC.** Local publish
+  success now returns after validation and durable store accept; Plumtree
+  peer selection, trust filtering, frame construction, and fanout all run
+  behind the async delivery boundary. A wedged `TrustedPeers` query can no
+  longer make the CLI report an i/o timeout after the message already landed.
 - **IPC client tests use short Unix socket paths on macOS.** Test daemons now
   bind sockets under `/tmp` instead of `t.TempDir()` paths under
   `/var/folders`, avoiding Darwin `sockaddr_un` path-length failures in the
