@@ -18,6 +18,7 @@ import (
 type scriptedTransport struct {
 	mu        sync.Mutex
 	handlers  []func(net.Conn)
+	dialErrs  []error
 	dials     int
 	drops     int
 	dialDelay time.Duration
@@ -33,6 +34,12 @@ func (t *scriptedTransport) Dial(ctx context.Context, peer entmoot.NodeID) (net.
 	}
 	t.mu.Lock()
 	t.dials++
+	if len(t.dialErrs) > 0 {
+		err := t.dialErrs[0]
+		t.dialErrs = t.dialErrs[1:]
+		t.mu.Unlock()
+		return nil, err
+	}
 	if len(t.handlers) == 0 {
 		t.mu.Unlock()
 		return nil, fmt.Errorf("no scripted dial handler for %d", peer)
@@ -122,6 +129,21 @@ func newScriptedRecoveryGossiper(gid entmoot.GroupID, tr Transport) *Gossiper {
 	}
 }
 
+func TestPilotConnectionNotFoundIsStaleRetryableStreamError(t *testing.T) {
+	t.Parallel()
+
+	err := fmt.Errorf("pilot open stream: connection not found")
+	if !isRetryableStreamError(err) {
+		t.Fatal("connection not found was not classified as retryable")
+	}
+	if !isStaleSessionError(err) {
+		t.Fatal("connection not found was not classified as stale-session")
+	}
+	if !shouldDropPeerSessionAfterStreamError(err, 0) {
+		t.Fatal("connection not found did not request cached session drop")
+	}
+}
+
 func TestFetchPeerRootDropsSessionAndRetriesOnEOF(t *testing.T) {
 	t.Parallel()
 
@@ -150,6 +172,40 @@ func TestFetchPeerRootDropsSessionAndRetriesOnEOF(t *testing.T) {
 	}
 	if drops != 1 {
 		t.Fatalf("drops = %d, want 1", drops)
+	}
+}
+
+func TestFetchPeerRootDropsSessionAndRetriesPilotConnectionNotFoundDial(t *testing.T) {
+	t.Parallel()
+
+	var gid entmoot.GroupID
+	gid[0] = 1
+	var root wire.MerkleRoot
+	root[0] = 77
+	tr := &scriptedTransport{
+		dialErrs: []error{fmt.Errorf("pilot open stream: connection not found")},
+		handlers: []func(net.Conn){
+			respondAfterRequest(&wire.MerkleResp{GroupID: gid, Root: root, MessageCount: 1}),
+		},
+	}
+	g := newScriptedRecoveryGossiper(gid, tr)
+
+	got, ok := g.fetchPeerRoot(context.Background(), 20)
+	if !ok {
+		t.Fatalf("fetchPeerRoot failed after stale Pilot session retry")
+	}
+	if got != root {
+		t.Fatalf("root mismatch: got %x want %x", got, root)
+	}
+	dials, drops := tr.counts()
+	if dials != 2 {
+		t.Fatalf("dials = %d, want 2", dials)
+	}
+	if drops != 1 {
+		t.Fatalf("drops = %d, want 1", drops)
+	}
+	if !g.canDial(20) {
+		t.Fatal("stale Pilot connection error armed dial backoff")
 	}
 }
 

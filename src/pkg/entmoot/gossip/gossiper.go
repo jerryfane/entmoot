@@ -809,7 +809,8 @@ func isRetryableStreamError(err error) bool {
 	errText := strings.ToLower(err.Error())
 	if strings.Contains(errText, "closed pipe") ||
 		strings.Contains(errText, "use of closed network connection") ||
-		strings.Contains(errText, "session shutdown") {
+		strings.Contains(errText, "session shutdown") ||
+		strings.Contains(errText, "connection not found") {
 		return true
 	}
 	var netErr net.Error
@@ -829,7 +830,12 @@ func isStaleSessionError(err error) bool {
 	errText := strings.ToLower(err.Error())
 	return strings.Contains(errText, "closed pipe") ||
 		strings.Contains(errText, "use of closed network connection") ||
-		strings.Contains(errText, "session shutdown")
+		strings.Contains(errText, "session shutdown") ||
+		strings.Contains(errText, "connection not found")
+}
+
+func isPilotConnectionNotFoundError(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "connection not found")
 }
 
 func shouldDropPeerSessionAfterStreamError(err error, attempt int) bool {
@@ -887,10 +893,15 @@ func (g *Gossiper) requestResponseWithAttemptTimeout(ctx context.Context, peer e
 		conn, err := g.cfg.Transport.Dial(ctx, peer)
 		if err != nil {
 			lastErr = fmt.Errorf("%s: dial %d: %w", op, peer, err)
+			if isPilotConnectionNotFoundError(err) {
+				g.dropPeerSession(peer, op, err)
+			}
 			if attempt == 0 && (isRetryableStreamError(err) || isLocalContextError(ctx, err)) && (attemptTimeout > 0 || ctx.Err() == nil) {
 				continue
 			}
-			g.recordDialFailureUnlessLocal(ctx, peer, err)
+			if !isPilotConnectionNotFoundError(err) {
+				g.recordDialFailureUnlessLocal(ctx, peer, err)
+			}
 			return nil, lastErr
 		}
 		attemptCtx := ctx
@@ -960,8 +971,17 @@ func (g *Gossiper) dialAndWrite(ctx context.Context, peer entmoot.NodeID, frame 
 		}
 		conn, err := g.cfg.Transport.Dial(ctx, peer)
 		if err != nil {
-			g.recordDialFailureUnlessLocal(ctx, peer, err)
-			return fmt.Errorf("dial: %w", err)
+			lastErr = fmt.Errorf("dial: %w", err)
+			if isPilotConnectionNotFoundError(err) {
+				g.dropPeerSession(peer, op, err)
+			}
+			if attempt == 0 && isPilotConnectionNotFoundError(err) && ctx.Err() == nil {
+				continue
+			}
+			if !isPilotConnectionNotFoundError(err) {
+				g.recordDialFailureUnlessLocal(ctx, peer, err)
+			}
+			return lastErr
 		}
 		setConnDeadlineFromContext(ctx, conn)
 		err = wire.EncodeAndWrite(conn, frame)

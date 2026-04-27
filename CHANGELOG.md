@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Reconcile retries stale Pilot stream IDs without poisoning dial backoff.**
+  Pilot `connection not found` errors are now treated like stale cached stream
+  failures: Entmoot drops the cached peer session, retries once on a fresh
+  session, and avoids arming the per-peer dial-backoff for this recoverable
+  local session state.
+
 ## [1.5.6] - 2026-04-27
 
 ### Fixed
