@@ -41,6 +41,8 @@ type globalFlags struct {
 	// today — other subcommands are read-only. See the HideIP
 	// comment on gossip.Config for semantics and jf.8+ requirement.
 	hideIP bool
+
+	traceGossipTransport bool
 }
 
 func main() {
@@ -83,6 +85,8 @@ func run() int {
 	fs.StringVar(&gf.logLevel, "log-level", "info", "slog level: debug|info|warn|error")
 	fs.BoolVar(&gf.hideIP, "hide-ip", false,
 		"suppress UDP/TCP endpoint advertisement; publish only TURN relay (v1.4.0; requires pilot-daemon v1.9.0-jf.8+)")
+	fs.BoolVar(&gf.traceGossipTransport, "trace-gossip-transport", false,
+		"emit verbose Pilot/yamux gossip transport lifecycle traces")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		if errors.Is(err, flag.ErrHelp) {

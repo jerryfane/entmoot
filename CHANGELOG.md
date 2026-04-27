@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.9] - 2026-04-27
+
+### Added
+
+- **Pilot gossip transport trace mode.** `entmootd` now accepts
+  `-trace-gossip-transport`, which emits explicit Pilot/yamux session lifecycle
+  events with peer id, role, generation, state transitions, and active stream
+  counts for debugging port-1004 convergence.
+
+### Changed
+
+- **Pilot-backed yamux sessions now have an explicit lifecycle manager.**
+  Outbound and inbound sessions are tracked with generation ids, active stream
+  counts, and states. `DropPeerSession` now drains with yamux `GoAway()` before
+  closing instead of tearing down active streams immediately.
+- **Listener close now releases the daemon-side Pilot port.** The embedded
+  Pilot IPC client sends the new `Unbind` command when closing a listener, so
+  Entmoot restarts can reclaim port 1004 without waiting for IPC disconnect
+  cleanup.
+
+### Fixed
+
+- **Stale Pilot stream errors are now typed.** Dynamic daemon messages such as
+  `connection 123 not found` unwrap to retryable IPC sentinel errors, avoiding
+  brittle text-only matching in reconcile retry decisions.
+
+### Tests
+
+- Added regression coverage for drain-preserving session drops and typed stale
+  Pilot IPC error classification.
+
 ## [1.5.8] - 2026-04-27
 
 ### Fixed

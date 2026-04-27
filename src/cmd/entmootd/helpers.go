@@ -254,9 +254,10 @@ func encodeBase64(b []byte) string {
 // helper so the Config is consistent.
 func openPilot(gf *globalFlags) (*pilot.Transport, error) {
 	return pilot.Open(pilot.Config{
-		SocketPath: gf.socket,
-		ListenPort: uint16(gf.listenPort),
-		Logger:     slog.Default(),
+		SocketPath:           gf.socket,
+		ListenPort:           uint16(gf.listenPort),
+		Logger:               slog.Default(),
+		TraceGossipTransport: gf.traceGossipTransport,
 	})
 }
 

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"time"
 )
 
 // Listener is a bound Pilot port. Each Accept pulls the next incoming
@@ -114,11 +115,17 @@ func (l *Listener) Addr() net.Addr {
 // demuxer map. Any Accept blocked at the moment of Close returns
 // ErrClosed.
 func (l *Listener) Close() error {
+	var err error
 	l.closeOnce.Do(func() {
 		close(l.closed)
 		l.drv.unregisterListener(l.port)
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if unbindErr := l.drv.Unbind(ctx, l.port); unbindErr != nil {
+			err = unbindErr
+		}
 	})
-	return nil
+	return err
 }
 
 // buildConnFromPayload consumes an AcceptedConn frame payload (minus

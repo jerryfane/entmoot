@@ -78,15 +78,10 @@ type Config struct {
 	// responses, close races, and similar non-fatal conditions. Nil selects
 	// slog.Default().
 	Logger *slog.Logger
-}
 
-// yamuxSession wraps a *yamux.Session for storage in the per-peer session
-// map. The `once` guard reserves space for any future single-shot teardown
-// logic we want to associate with an individual session (currently unused;
-// Session.Close is itself idempotent).
-type yamuxSession struct {
-	sess *yamux.Session
-	once sync.Once
+	// TraceGossipTransport enables high-volume lifecycle logs for the Pilot
+	// yamux adapter. It is intended for operational debugging only.
+	TraceGossipTransport bool
 }
 
 // inboundStream is one accepted yamux stream plus the NodeID of the peer
@@ -114,22 +109,7 @@ type Transport struct {
 	nodeID   entmoot.NodeID
 	dialAddr func(context.Context, Addr, uint16) (*ipcclient.Conn, error)
 
-	// sessionsMu guards sessions AND inboundSessions.
-	sessionsMu sync.Mutex
-	// sessions holds outbound (client) yamux sessions keyed by peer. Entries
-	// are lazily created by getOrCreateSession and evicted by dropSession
-	// when a session's streams start failing.
-	sessions map[entmoot.NodeID]*yamuxSession
-	// inboundSessions tracks every yamux server session created by
-	// acceptPilotConns so Close() can tear them down. Without this,
-	// pumpInboundStreams sits blocked on sess.AcceptStream forever after
-	// Close() — the listener closing doesn't affect already-accepted
-	// sessions, and the gossiper's per-connection cleanup never reaches
-	// those sessions because they're "anonymous" from Entmoot's point of
-	// view. Slice (not map) because inbound sessions are keyed by the
-	// (remote, session-generation) pair which we don't bother tracking;
-	// Close just iterates everything.
-	inboundSessions []*yamux.Session
+	sessions *sessionManager
 
 	// inboundStreams fans accepted yamux streams from every inbound session
 	// into one channel that Accept() reads from. Buffered so bursty peers do
@@ -200,7 +180,7 @@ func Open(cfg Config) (*Transport, error) {
 		nodeID:         nid,
 		dialAddr:       d.DialAddr,
 		closed:         make(chan struct{}),
-		sessions:       make(map[entmoot.NodeID]*yamuxSession),
+		sessions:       newSessionManager(logger, cfg.TraceGossipTransport),
 		inboundStreams: make(chan inboundStream, 64),
 	}
 	t.acceptWG.Add(1)
@@ -248,15 +228,15 @@ func (t *Transport) Dial(ctx context.Context, peer entmoot.NodeID) (net.Conn, er
 	if err != nil {
 		return nil, err
 	}
-	stream, err := sess.OpenStream()
+	stream, err := sess.openStream()
 	if err != nil {
-		// Session died between lookup and open — drop it and retry once.
+		// Session died between lookup and open — drain it and retry once.
 		t.dropSession(peer, sess)
 		sess, err = t.getOrCreateSession(ctx, peer)
 		if err != nil {
 			return nil, err
 		}
-		stream, err = sess.OpenStream()
+		stream, err = sess.openStream()
 		if err != nil {
 			return nil, fmt.Errorf("pilot: open stream to %d: %w", peer, err)
 		}
@@ -265,18 +245,14 @@ func (t *Transport) Dial(ctx context.Context, peer entmoot.NodeID) (net.Conn, er
 }
 
 // getOrCreateSession returns the cached yamux client session for peer,
-// establishing a new one if the map has no live entry. The slow path
-// (driver.DialAddr + yamux.Client) runs with sessionsMu released so other
+// establishing a new one if the manager has no live entry. The slow path
+// (driver.DialAddr + yamux.Client) runs outside the manager lock so other
 // peers do not block on an in-flight dial; on reinsertion we double-check
 // for a racing goroutine's winning entry and drop ours if found.
-func (t *Transport) getOrCreateSession(ctx context.Context, peer entmoot.NodeID) (*yamux.Session, error) {
-	t.sessionsMu.Lock()
-	if entry, ok := t.sessions[peer]; ok && !entry.sess.IsClosed() {
-		t.sessionsMu.Unlock()
-		return entry.sess, nil
+func (t *Transport) getOrCreateSession(ctx context.Context, peer entmoot.NodeID) (*managedSession, error) {
+	if entry, ok := t.sessions.getOutbound(peer); ok {
+		return entry, nil
 	}
-	// Not in map or closed — release lock before the slow dial.
-	t.sessionsMu.Unlock()
 
 	addr := Addr{Network: t.cfg.Network, Node: uint32(peer)}
 
@@ -342,51 +318,33 @@ func (t *Transport) getOrCreateSession(ctx context.Context, peer entmoot.NodeID)
 
 	// Install in map. Race: another goroutine may have inserted while we
 	// dialed — if so, close ours and use theirs.
-	t.sessionsMu.Lock()
-	if existing, ok := t.sessions[peer]; ok && !existing.sess.IsClosed() {
-		t.sessionsMu.Unlock()
+	entry, installed := t.sessions.installOutbound(peer, sess)
+	if !installed {
 		_ = sess.Close()
 		// Lost the race — the tunnel is not new to us. Do NOT fire
 		// OnTunnelUp; the goroutine that actually installed the
 		// winning session already did (or will). (v1.2.1)
-		return existing.sess, nil
+		return entry, nil
 	}
-	t.sessions[peer] = &yamuxSession{sess: sess}
-	t.sessionsMu.Unlock()
 	// We installed a fresh outbound session. Fire the OnTunnelUp
 	// callback — the gossiper uses this to kick off anti-entropy
 	// reconcile on reconnect (Part D). (v1.2.1)
 	t.fireOnTunnelUp(peer)
-	return sess, nil
+	return entry, nil
 }
 
 // dropSession evicts entry for peer from the session map if it matches sess
-// (i.e. nobody has already raced in a replacement), then closes sess. Safe
-// to call on an already-closed session; yamux.Session.Close is idempotent.
-func (t *Transport) dropSession(peer entmoot.NodeID, sess *yamux.Session) {
-	t.sessionsMu.Lock()
-	if entry, ok := t.sessions[peer]; ok && entry.sess == sess {
-		delete(t.sessions, peer)
-	}
-	t.sessionsMu.Unlock()
-	_ = sess.Close()
+// (i.e. nobody has already raced in a replacement), then drains it. Existing
+// streams are allowed to finish; new streams will use the next fresh session.
+func (t *Transport) dropSession(peer entmoot.NodeID, sess *managedSession) {
+	t.sessions.drainOutbound(peer, sess, "stream error")
 }
 
-// DropPeerSession implements gossip.PeerSessionDropper. It evicts and closes
+// DropPeerSession implements gossip.PeerSessionDropper. It evicts and drains
 // any cached outbound yamux session for peer so the next Dial starts with a
 // fresh Pilot tunnel/session instead of reusing a stale multiplexed stream.
 func (t *Transport) DropPeerSession(peer entmoot.NodeID) bool {
-	t.sessionsMu.Lock()
-	entry, ok := t.sessions[peer]
-	if ok {
-		delete(t.sessions, peer)
-	}
-	t.sessionsMu.Unlock()
-	if !ok {
-		return false
-	}
-	_ = entry.sess.Close()
-	return true
+	return t.sessions.drainOutbound(peer, nil, "drop peer session")
 }
 
 // acceptPilotConns runs for the lifetime of the Transport. It accepts raw
@@ -433,14 +391,9 @@ func (t *Transport) acceptPilotConns() {
 			_ = pilotConn.Close()
 			continue
 		}
-		// Track the inbound session so Close() can tear it down. Without
-		// this, pumpInboundStreams blocks on sess.AcceptStream forever
-		// and Close's acceptWG.Wait hangs indefinitely.
-		t.sessionsMu.Lock()
-		t.inboundSessions = append(t.inboundSessions, sess)
-		t.sessionsMu.Unlock()
+		entry := t.sessions.addInbound(remote, sess)
 		t.acceptWG.Add(1)
-		go t.pumpInboundStreams(sess, remote)
+		go t.pumpInboundStreams(entry)
 		// Session is fully ready for traffic (pump is running). Fire
 		// the OnTunnelUp callback so the gossiper (Part D) can kick
 		// off an anti-entropy reconcile with this peer. (v1.2.1)
@@ -453,20 +406,24 @@ func (t *Transport) acceptPilotConns() {
 // session dies (EOF, keepalive timeout, caller Close) or the Transport
 // closes; in either case the next Dial from the remote peer will establish
 // a fresh session.
-func (t *Transport) pumpInboundStreams(sess *yamux.Session, remote entmoot.NodeID) {
+func (t *Transport) pumpInboundStreams(sess *managedSession) {
 	defer t.acceptWG.Done()
-	defer sess.Close()
+	defer sess.closeNow("accept loop ended")
 	for {
-		stream, err := sess.AcceptStream()
+		stream, err := sess.sess.AcceptStream()
 		if err != nil {
 			// session died (EOF, keepalive timeout, etc). Caller will
 			// re-dial on next gossip frame.
 			return
 		}
+		tracked, ok := sess.wrapAcceptedStream(stream)
+		if !ok {
+			return
+		}
 		select {
-		case t.inboundStreams <- inboundStream{conn: stream, peer: remote}:
+		case t.inboundStreams <- inboundStream{conn: tracked, peer: sess.peer}:
 		case <-t.closed:
-			_ = stream.Close()
+			_ = tracked.Close()
 			return
 		}
 	}
@@ -623,25 +580,7 @@ func (t *Transport) Close() error {
 				t.closeErr = err
 			}
 		}
-		// Close every yamux session — outbound (cached in sessions) AND
-		// inbound (tracked in inboundSessions). Closing a session wakes up
-		// both its sendLoop/recvLoop and any goroutine blocked on
-		// AcceptStream/OpenStream so pumpInboundStreams and the retry-side
-		// Dial wake up and exit. Closing ONLY the listener (as an earlier
-		// version did) did not propagate down — already-accepted sessions
-		// kept their recvLoops alive, pumpInboundStreams kept blocking on
-		// AcceptStream, and acceptWG.Wait hung forever.
-		t.sessionsMu.Lock()
-		for peer, entry := range t.sessions {
-			_ = entry.sess.Close()
-			delete(t.sessions, peer)
-		}
-		inbound := t.inboundSessions
-		t.inboundSessions = nil
-		t.sessionsMu.Unlock()
-		for _, sess := range inbound {
-			_ = sess.Close()
-		}
+		t.sessions.closeAll("transport close")
 		// Wait for acceptPilotConns + every pumpInboundStreams to return.
 		t.acceptWG.Wait()
 		if t.driver != nil {

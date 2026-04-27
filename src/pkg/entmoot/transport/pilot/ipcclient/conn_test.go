@@ -590,6 +590,9 @@ func TestListenerCloseUnblocksAccept(t *testing.T) {
 		_, _ = srv.readFrame()
 		resp := []byte{byte(opBindOK), 0, 1}
 		srv.writeFrame(resp)
+		_, _ = srv.readFrame()
+		resp = []byte{byte(opUnbindOK), 0, 1}
+		srv.writeFrame(resp)
 	}()
 
 	ln, err := drv.Listen(context.Background(), 1)

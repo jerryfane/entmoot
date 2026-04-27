@@ -23,6 +23,7 @@ import (
 	"entmoot/pkg/entmoot/reconcile"
 	"entmoot/pkg/entmoot/roster"
 	"entmoot/pkg/entmoot/store"
+	"entmoot/pkg/entmoot/transport/pilot/ipcclient"
 	"entmoot/pkg/entmoot/wire"
 )
 
@@ -837,6 +838,11 @@ func isStaleSessionError(err error) bool {
 func isPilotStaleStreamError(err error) bool {
 	if err == nil {
 		return false
+	}
+	if errors.Is(err, ipcclient.ErrConnectionNotFound) ||
+		errors.Is(err, ipcclient.ErrConnectionNotEstablished) ||
+		errors.Is(err, ipcclient.ErrConnectionClosing) {
+		return true
 	}
 	errText := strings.ToLower(err.Error())
 	return strings.Contains(errText, "connection not found") ||

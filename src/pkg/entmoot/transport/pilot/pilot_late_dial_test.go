@@ -7,7 +7,6 @@ import (
 	"testing"
 	"time"
 
-	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/transport/pilot/ipcclient"
 )
 
@@ -20,7 +19,7 @@ func TestGetOrCreateSessionKeepsInternalDialContextAfterCallerCancel(t *testing.
 	tp := &Transport{
 		cfg:      Config{ListenPort: 1004},
 		closed:   make(chan struct{}),
-		sessions: make(map[entmoot.NodeID]*yamuxSession),
+		sessions: newSessionManager(nil, false),
 		dialAddr: func(ctx context.Context, addr Addr, port uint16) (*ipcclient.Conn, error) {
 			close(started)
 			<-callerReturned

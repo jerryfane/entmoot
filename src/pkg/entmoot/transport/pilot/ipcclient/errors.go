@@ -3,6 +3,8 @@ package ipcclient
 import (
 	"errors"
 	"fmt"
+	"regexp"
+	"strings"
 )
 
 // ErrFrameTooLarge is returned when a frame's declared or actual size
@@ -28,6 +30,20 @@ var ErrShortResponse = errors.New("ipcclient: truncated daemon response")
 // (v1.5.0)
 var ErrSubscribeUnsupported = errors.New("ipcclient: subscribe: pilot daemon does not support pub/sub (pre-jf.11b)")
 
+var (
+	// ErrConnectionNotFound identifies daemon errors for a stream id that no
+	// longer exists. It is retryable by dropping the cached yamux session.
+	ErrConnectionNotFound = errors.New("ipcclient: pilot connection not found")
+
+	// ErrConnectionNotEstablished identifies writes issued before Pilot has
+	// completed the stream handshake. It is retryable with a fresh session.
+	ErrConnectionNotEstablished = errors.New("ipcclient: pilot connection not established")
+
+	// ErrConnectionClosing identifies writes racing a stream teardown. It is
+	// retryable by dropping the cached yamux session.
+	ErrConnectionClosing = errors.New("ipcclient: pilot connection closing")
+)
+
 // IPCError wraps an Error (0x0A) response from the daemon. The Code
 // field is the 2-byte error code from the wire frame; Message is the
 // UTF-8 tail. The textual Error() output is the message alone for
@@ -45,3 +61,19 @@ func (e *IPCError) Error() string {
 	}
 	return fmt.Sprintf("ipcclient: daemon: %s", e.Message)
 }
+
+func (e *IPCError) Unwrap() error {
+	msg := strings.ToLower(e.Message)
+	switch {
+	case connectionNotFoundRE.MatchString(msg):
+		return ErrConnectionNotFound
+	case strings.Contains(msg, "connection not established"):
+		return ErrConnectionNotEstablished
+	case strings.Contains(msg, "connection closing"):
+		return ErrConnectionClosing
+	default:
+		return nil
+	}
+}
+
+var connectionNotFoundRE = regexp.MustCompile(`connection( \d+)? not found`)

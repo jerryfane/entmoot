@@ -780,6 +780,23 @@ func (d *Driver) Listen(ctx context.Context, port uint16) (*Listener, error) {
 	return l, nil
 }
 
+func (d *Driver) Unbind(ctx context.Context, port uint16) error {
+	frame := make([]byte, 3)
+	frame[0] = byte(opUnbind)
+	binary.BigEndian.PutUint16(frame[1:3], port)
+	resp, err := d.sendAndWait(ctx, frame, opUnbindOK)
+	if err != nil {
+		if isUnknownCommandError(err, opUnbind) {
+			return nil
+		}
+		return fmt.Errorf("ipcclient: unbind :%d: %w", port, err)
+	}
+	if len(resp) < 2 {
+		return fmt.Errorf("ipcclient: unbind :%d: %w", port, ErrShortResponse)
+	}
+	return nil
+}
+
 // DialAddr opens a stream connection to dst:remotePort. On success the
 // returned Conn is registered with the demuxer so incoming Recv frames
 // are delivered immediately.

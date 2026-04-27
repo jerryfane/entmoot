@@ -10,22 +10,24 @@ package ipcclient
 type Opcode byte
 
 const (
-	opBind              Opcode = 0x01
-	opBindOK            Opcode = 0x02
-	opDial              Opcode = 0x03
-	opDialOK            Opcode = 0x04
-	opAcceptedConn      Opcode = 0x05
-	opSend              Opcode = 0x06
-	opRecv              Opcode = 0x07
-	opClose             Opcode = 0x08
-	opCloseOK           Opcode = 0x09
-	opError             Opcode = 0x0A
-	opInfo              Opcode = 0x0D
-	opInfoOK            Opcode = 0x0E
-	opHandshake         Opcode = 0x0F
-	opHandshakeOK       Opcode = 0x10
-	opSetPeerEndpoints  Opcode = 0x25
+	opBind               Opcode = 0x01
+	opBindOK             Opcode = 0x02
+	opDial               Opcode = 0x03
+	opDialOK             Opcode = 0x04
+	opAcceptedConn       Opcode = 0x05
+	opSend               Opcode = 0x06
+	opRecv               Opcode = 0x07
+	opClose              Opcode = 0x08
+	opCloseOK            Opcode = 0x09
+	opError              Opcode = 0x0A
+	opInfo               Opcode = 0x0D
+	opInfoOK             Opcode = 0x0E
+	opHandshake          Opcode = 0x0F
+	opHandshakeOK        Opcode = 0x10
+	opSetPeerEndpoints   Opcode = 0x25
 	opSetPeerEndpointsOK Opcode = 0x26
+	opUnbind             Opcode = 0x27
+	opUnbindOK           Opcode = 0x28
 
 	// v1.5.0 / pilot v1.9.0-jf.11b: pub/sub state-change push
 	// primitives. opNotify is server-initiated and bypasses the
