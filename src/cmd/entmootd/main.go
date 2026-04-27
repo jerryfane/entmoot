@@ -1,6 +1,6 @@
 // Command entmootd is the Entmoot v1 daemon + CLI. A single binary that
-// exposes five agent-facing subcommands (join, publish, tail, info, query)
-// plus two founder-facing subcommands (group create, invite create). The
+// exposes agent-facing subcommands (join, publish, tail, info, query, mailbox)
+// plus founder-facing subcommands (group create, invite create). The
 // join subcommand owns a blocking accept loop and a control-socket IPC
 // server; all agent commands other than join/publish/tail are direct SQLite
 // readers and work whether or not a join process is running.
@@ -70,6 +70,8 @@ func run() int {
 		fmt.Fprintln(os.Stderr, "                          SQLite backfill + live subscription from the control socket.")
 		fmt.Fprintln(os.Stderr, "  info                    Print a JSON snapshot (reads SQLite directly).")
 		fmt.Fprintln(os.Stderr, "  query -group GID [...]  Historical SQLite query with JSON-line output.")
+		fmt.Fprintln(os.Stderr, "  mailbox <pull|ack|cursor>")
+		fmt.Fprintln(os.Stderr, "                          Local ESP mailbox sync cursor commands.")
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "Founder subcommands:")
 		fmt.Fprintln(os.Stderr, "  group create -name N    Create a new group.")
@@ -151,6 +153,8 @@ func run() int {
 		return cmdInfo(gf, args[1:])
 	case "query":
 		return cmdQuery(gf, args[1:])
+	case "mailbox":
+		return cmdMailbox(gf, args[1:])
 	case "group":
 		return cmdGroup(gf, args[1:])
 	case "invite":

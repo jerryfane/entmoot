@@ -17,6 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   abstraction plus SQLite-backed cursor persistence at
   `<data-dir>/mailbox.sqlite`, so an Entmoot Service Provider can restart
   without redelivering already-acknowledged mobile sync messages.
+- **Local ESP mailbox CLI.** Added `entmootd mailbox pull`, `ack`, and
+  `cursor` so operators can exercise the durable mailbox cursor path
+  against production SQLite state before an HTTP/APNs bridge exists.
 - **Message ingest event hook.** The daemon's notifying store now emits a
   local `message_ingested` event alongside existing IPC tail fan-out,
   giving future APNs/webhook bridges a stable integration point.

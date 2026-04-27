@@ -98,6 +98,28 @@ func decodeGroupID(s string) (entmoot.GroupID, error) {
 	return gid, nil
 }
 
+// decodeMessageID parses the base64 representation of a MessageID. Accepts
+// both std and raw-std encodings so users can paste either.
+func decodeMessageID(s string) (entmoot.MessageID, error) {
+	var id entmoot.MessageID
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return id, errors.New("empty message id")
+	}
+	raw, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		raw, err = base64.RawStdEncoding.DecodeString(s)
+		if err != nil {
+			return id, fmt.Errorf("message id: %w", err)
+		}
+	}
+	if len(raw) != 32 {
+		return id, fmt.Errorf("message id: expected 32 bytes, got %d", len(raw))
+	}
+	copy(id[:], raw)
+	return id, nil
+}
+
 // parsePeerList parses "123,456,789" into a slice of NodeIDs. Empty string
 // yields nil with no error. Whitespace around entries is trimmed.
 func parsePeerList(s string) ([]entmoot.NodeID, error) {

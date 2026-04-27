@@ -120,7 +120,7 @@ before running. Both are skipped under `-short` or when
 
 ### Use the binary
 
-`entmootd` is the single binary. The agent-facing surface is five
+`entmootd` is the single binary. The agent-facing surface is six
 commands; all emit JSON on stdout.
 
 ```sh
@@ -130,11 +130,14 @@ entmootd tail [-topic PATTERN] [-group GID] [-n N]
 entmootd info
 entmootd query -group GID [-author NODEID] [-topic PATTERN] \
                [-since DATE] [-until DATE] [-limit N] [-order asc|desc]
+entmootd mailbox pull -client CLIENT [-group GID] [-limit N]
+entmootd mailbox ack -client CLIENT -message MESSAGE_ID [-group GID]
+entmootd mailbox cursor -client CLIENT [-group GID]
 ```
 
 `join` blocks and owns the control socket; `publish` and `tail` (live
-mode) dial it. `info` and `query` read SQLite directly and work whether
-or not a `join` process is running.
+mode) dial it. `info`, `query`, and `mailbox` read SQLite directly and
+work whether or not a `join` process is running.
 
 Sample one-line JSON shapes on stdout:
 
@@ -231,6 +234,9 @@ ESP mailbox cursors are local service state, not consensus state. The
 service peers can use the default in-memory store, while durable ESP
 deployments can use `OpenSQLiteCursorStore(<data-dir>)`, which stores
 cursors in `<data-dir>/mailbox.sqlite` and survives process restarts.
+The same durable cursor path is exposed locally through
+`entmootd mailbox pull|ack|cursor`, giving ESP operators a production
+smoke-test surface before an HTTP/APNs bridge exists.
 
 ## Deferred from v1
 

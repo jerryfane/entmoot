@@ -195,7 +195,16 @@ func parseTimeBound(s string) (int64, error) {
 // emitMessageJSON prints one JSON object representing m to stdout with
 // a trailing newline. Schema matches CLI_DESIGN §3.3 / §3.5.
 func emitMessageJSON(m entmoot.Message) error {
-	out := map[string]any{
+	data, err := json.Marshal(messageJSON(m))
+	if err != nil {
+		return err
+	}
+	fmt.Println(string(data))
+	return nil
+}
+
+func messageJSON(m entmoot.Message) map[string]any {
+	return map[string]any{
 		"message_id":   m.ID,
 		"group_id":     m.GroupID,
 		"author":       uint32(m.Author.PilotNodeID),
@@ -203,12 +212,6 @@ func emitMessageJSON(m entmoot.Message) error {
 		"content":      string(m.Content),
 		"timestamp_ms": m.Timestamp,
 	}
-	data, err := json.Marshal(out)
-	if err != nil {
-		return err
-	}
-	fmt.Println(string(data))
-	return nil
 }
 
 // normTopics returns topics unchanged when non-nil, or an empty slice

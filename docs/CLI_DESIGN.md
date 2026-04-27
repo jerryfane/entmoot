@@ -380,6 +380,68 @@ writes from the running `join` process.
 
 ---
 
+### 3.6 `entmootd mailbox <pull|ack|cursor>`
+
+**Purpose:** local Entmoot Service Provider mailbox cursor operations
+for intermittent clients. Reads messages from SQLite and persists
+per-client cursors in `<data>/mailbox.sqlite`. Does not require Pilot,
+the control socket, or a running `join` process.
+
+**Signatures**
+
+```
+entmootd mailbox pull -client CLIENT [-group GID] [-limit N]
+entmootd mailbox ack -client CLIENT -message MESSAGE_ID [-group GID]
+entmootd mailbox cursor -client CLIENT [-group GID]
+```
+
+**Flags**
+
+- `-client CLIENT` (required). Stable mailbox client id.
+- `-group GID` (optional; required when two or more groups are joined
+  locally). Base64 group id.
+- `-limit N` (`pull` only, default `50`). Maximum unread messages to
+  return. `0` means no limit.
+- `-message MESSAGE_ID` (`ack` only, required). Base64 message id that
+  must already exist in the local store.
+
+**Stdout**
+
+`pull` emits one JSON envelope:
+
+```json
+{"client_id":"ios-1","group_id":"<base64>","count":1,"has_more":false,"next_cursor":{"message_id":"<base64>","timestamp_ms":1713369600000},"messages":[{"message_id":"<base64>","group_id":"<base64>","author":41545,"topic":["chat"],"content":"hello","timestamp_ms":1713369600000}]}
+```
+
+`ack` emits the acknowledged cursor:
+
+```json
+{"client_id":"ios-1","group_id":"<base64>","message_id":"<base64>","timestamp_ms":1713369600000,"cursor":{"message_id":"<base64>","timestamp_ms":1713369600000}}
+```
+
+`cursor` emits current cursor state and unread count:
+
+```json
+{"client_id":"ios-1","group_id":"<base64>","cursor":{"message_id":"<base64>","timestamp_ms":1713369600000},"unread":0}
+```
+
+**Exit codes**
+
+- `0`: success.
+- `1`: SQLite or local cursor-store error.
+- `3`: named group not joined.
+- `5`: flag validation error, unknown message id, or ambiguous group
+  with no `-group`.
+
+**Side effects**
+
+- `pull` and `cursor` do not advance cursors. They may create
+  `<data>/mailbox.sqlite` if it does not exist yet.
+- `ack` writes only local ESP cursor state in `<data>/mailbox.sqlite`.
+  It does not mutate Entmoot messages, gossip, or consensus state.
+
+---
+
 ## 4. Storage backend
 
 v1 replaces v0's JSONL message store with SQLite. This is in-scope for
