@@ -780,7 +780,7 @@ func (g *Gossiper) recordDialFailure(peer entmoot.NodeID) {
 }
 
 func (g *Gossiper) recordDialFailureUnlessLocal(ctx context.Context, peer entmoot.NodeID, err error) {
-	if isLocalContextError(ctx, err) {
+	if isLocalContextError(ctx, err) || isPilotStaleStreamError(err) {
 		return
 	}
 	g.recordDialFailure(peer)
@@ -810,7 +810,7 @@ func isRetryableStreamError(err error) bool {
 	if strings.Contains(errText, "closed pipe") ||
 		strings.Contains(errText, "use of closed network connection") ||
 		strings.Contains(errText, "session shutdown") ||
-		strings.Contains(errText, "connection not found") {
+		isPilotStaleStreamError(err) {
 		return true
 	}
 	var netErr net.Error
@@ -831,11 +831,17 @@ func isStaleSessionError(err error) bool {
 	return strings.Contains(errText, "closed pipe") ||
 		strings.Contains(errText, "use of closed network connection") ||
 		strings.Contains(errText, "session shutdown") ||
-		strings.Contains(errText, "connection not found")
+		isPilotStaleStreamError(err)
 }
 
-func isPilotConnectionNotFoundError(err error) bool {
-	return err != nil && strings.Contains(strings.ToLower(err.Error()), "connection not found")
+func isPilotStaleStreamError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errText := strings.ToLower(err.Error())
+	return strings.Contains(errText, "connection not found") ||
+		strings.Contains(errText, "connection not established") ||
+		strings.Contains(errText, "connection closing")
 }
 
 func shouldDropPeerSessionAfterStreamError(err error, attempt int) bool {
@@ -893,13 +899,13 @@ func (g *Gossiper) requestResponseWithAttemptTimeout(ctx context.Context, peer e
 		conn, err := g.cfg.Transport.Dial(ctx, peer)
 		if err != nil {
 			lastErr = fmt.Errorf("%s: dial %d: %w", op, peer, err)
-			if isPilotConnectionNotFoundError(err) {
+			if isPilotStaleStreamError(err) {
 				g.dropPeerSession(peer, op, err)
 			}
 			if attempt == 0 && (isRetryableStreamError(err) || isLocalContextError(ctx, err)) && (attemptTimeout > 0 || ctx.Err() == nil) {
 				continue
 			}
-			if !isPilotConnectionNotFoundError(err) {
+			if !isPilotStaleStreamError(err) {
 				g.recordDialFailureUnlessLocal(ctx, peer, err)
 			}
 			return nil, lastErr
@@ -972,13 +978,13 @@ func (g *Gossiper) dialAndWrite(ctx context.Context, peer entmoot.NodeID, frame 
 		conn, err := g.cfg.Transport.Dial(ctx, peer)
 		if err != nil {
 			lastErr = fmt.Errorf("dial: %w", err)
-			if isPilotConnectionNotFoundError(err) {
+			if isPilotStaleStreamError(err) {
 				g.dropPeerSession(peer, op, err)
 			}
-			if attempt == 0 && isPilotConnectionNotFoundError(err) && ctx.Err() == nil {
+			if attempt == 0 && isPilotStaleStreamError(err) && ctx.Err() == nil {
 				continue
 			}
-			if !isPilotConnectionNotFoundError(err) {
+			if !isPilotStaleStreamError(err) {
 				g.recordDialFailureUnlessLocal(ctx, peer, err)
 			}
 			return lastErr

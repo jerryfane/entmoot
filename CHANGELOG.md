@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.8] - 2026-04-27
+
 ### Fixed
 
 - **Reconcile retries stale Pilot stream IDs without poisoning dial backoff.**
@@ -14,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   failures: Entmoot drops the cached peer session, retries once on a fresh
   session, and avoids arming the per-peer dial-backoff for this recoverable
   local session state.
+- **Reconcile retries Pilot streams that close during dial establishment.**
+  Pilot `connection closing` and `connection not established` errors are now
+  treated as stale local stream/session state, so Entmoot drops the cached
+  peer session and retries without poisoning per-peer dial backoff.
 
 ## [1.5.6] - 2026-04-27
 
