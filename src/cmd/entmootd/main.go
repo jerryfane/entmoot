@@ -47,6 +47,7 @@ type globalFlags struct {
 	hideIP bool
 
 	traceGossipTransport bool
+	traceReconcile       bool
 }
 
 func main() {
@@ -97,6 +98,8 @@ func run() int {
 		"suppress UDP/TCP endpoint advertisement; publish only TURN relay (v1.4.0; requires pilot-daemon v1.9.0-jf.8+)")
 	fs.BoolVar(&gf.traceGossipTransport, "trace-gossip-transport", false,
 		"emit verbose Pilot/yamux gossip transport lifecycle traces")
+	fs.BoolVar(&gf.traceReconcile, "trace-reconcile", false,
+		"emit verbose reconcile lifecycle traces")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		if errors.Is(err, flag.ErrHelp) {

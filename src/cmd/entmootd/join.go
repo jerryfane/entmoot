@@ -266,7 +266,8 @@ func cmdJoin(gf *globalFlags, args []string) int {
 		// endpoints from LocalEndpoints and drops UDP/TCP entries,
 		// or emits an empty ad + warning when no TURN endpoint
 		// exists. See gossip.Config.HideIP for the rationale.
-		HideIP: gf.hideIP,
+		HideIP:         gf.hideIP,
+		TraceReconcile: gf.traceReconcile,
 	})
 	if err != nil {
 		slog.Error("join: new gossiper", slog.String("err", err.Error()))

@@ -22,6 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   asks transports to classify adapter-specific stream failures, keeping retry
   and backoff policy in gossip while moving Pilot IPC/yamux error details out
   of the generic gossiper.
+- **Reconcile tracing is explicit and opt-in.** `entmootd` now accepts
+  `-trace-reconcile`, which emits structured anti-entropy lifecycle events for
+  trigger gating, Merkle root checks, RBSR rounds, fallback recovery, and body
+  fetch results.
 
 ### Fixed
 
