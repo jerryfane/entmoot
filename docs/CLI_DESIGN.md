@@ -442,6 +442,79 @@ entmootd mailbox cursor -client CLIENT [-group GID]
 
 ---
 
+### 3.7 `entmootd esp serve`
+
+**Purpose:** local Entmoot Service Provider HTTP bridge for intermittent
+mobile clients. Exposes the same durable mailbox cursor operations as
+`entmootd mailbox`, but through a token-gated HTTP API suitable for a
+local reverse proxy, app backend, or APNs/webhook bridge. Reads messages
+from SQLite and persists per-client cursors in `<data>/mailbox.sqlite`.
+Does not require Pilot, the control socket, or a running `join` process.
+
+**Signature**
+
+```
+ENTMOOT_ESP_TOKEN=... entmootd esp serve [-addr 127.0.0.1:8087] [-token TOKEN] [-allow-non-loopback]
+```
+
+**Flags**
+
+- `-addr HOST:PORT` (default `127.0.0.1:8087`). HTTP listen address.
+- `-token TOKEN` (optional). Bearer token. If omitted, the command reads
+  `ENTMOOT_ESP_TOKEN`.
+- `-allow-non-loopback` (default `false`). Allows binding to a non-loopback
+  interface. Without this flag, `0.0.0.0`, `:PORT`, and public IP binds
+  are rejected.
+
+**HTTP API**
+
+- `GET /healthz`
+  - No auth. Returns `{"status":"ok"}`.
+- `GET /v1/mailbox/pull?client_id=CLIENT&group_id=GID&limit=N`
+  - Requires `Authorization: Bearer <token>`.
+  - `group_id` is required. HTTP clients do not inherit CLI group
+    auto-disambiguation.
+  - Response body matches `entmootd mailbox pull`.
+- `POST /v1/mailbox/ack`
+  - Requires `Authorization: Bearer <token>`.
+  - Body:
+
+    ```json
+    {"client_id":"ios-1","group_id":"<base64>","message_id":"<base64>"}
+    ```
+
+  - Response body matches `entmootd mailbox ack`.
+- `GET /v1/mailbox/cursor?client_id=CLIENT&group_id=GID`
+  - Requires `Authorization: Bearer <token>`.
+  - Response body matches `entmootd mailbox cursor`.
+
+**Errors**
+
+Errors are JSON envelopes:
+
+```json
+{"error":{"code":"bad_request","message":"client_id is required"}}
+```
+
+- `401`: missing or invalid bearer token. Includes
+  `WWW-Authenticate: Bearer`.
+- `400`: malformed request, missing fields, invalid id, or unknown
+  message id.
+- `404`: group not joined locally, or unknown route.
+- `500`: SQLite, cursor-store, or local group lookup failure.
+
+**Side effects**
+
+- `pull` and `cursor` do not advance cursors. They may create
+  `<data>/mailbox.sqlite` if it does not exist yet.
+- `ack` writes only local ESP cursor state in `<data>/mailbox.sqlite`.
+  It does not mutate Entmoot messages, gossip, or consensus state.
+- The bridge is intentionally mailbox/sync only. It does not publish
+  phone-authored messages, hold signing keys, send APNs, or decide
+  Pilot routing.
+
+---
+
 ## 4. Storage backend
 
 v1 replaces v0's JSONL message store with SQLite. This is in-scope for

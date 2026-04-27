@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -61,27 +60,9 @@ func cmdMailboxPull(gf *globalFlags, args []string) int {
 	}
 	defer resources.close()
 
-	fetchLimit := *limit
-	if fetchLimit > 0 {
-		fetchLimit++
-	}
-	msgs, next, err := resources.service.MessagesSince(ctx, resources.groupID, *clientID, mailbox.Cursor{}, fetchLimit)
+	out, err := resources.service.Pull(ctx, resources.groupID, *clientID, *limit)
 	if err != nil {
 		return mailboxError("mailbox pull", err)
-	}
-	hasMore := false
-	if *limit > 0 && len(msgs) > *limit {
-		hasMore = true
-		msgs = msgs[:*limit]
-		next = cursorFromPulledMessages(resources.currentCursor(ctx, *clientID), msgs)
-	}
-	out := map[string]any{
-		"client_id":   *clientID,
-		"group_id":    resources.groupID,
-		"count":       len(msgs),
-		"has_more":    hasMore,
-		"next_cursor": next,
-		"messages":    messagesJSON(msgs),
 	}
 	if err := emitJSON(out); err != nil {
 		slog.Error("mailbox pull: marshal", slog.String("err", err.Error()))
@@ -123,25 +104,13 @@ func cmdMailboxAck(gf *globalFlags, args []string) int {
 	}
 	defer resources.close()
 
-	msg, err := resources.store.Get(ctx, resources.groupID, messageID)
+	out, err := resources.service.AckMessage(ctx, resources.groupID, *clientID, messageID)
 	if errors.Is(err, store.ErrNotFound) {
 		fmt.Fprintf(os.Stderr, "mailbox ack: message %s not found\n", messageID)
 		return exitInvalidArgument
 	}
 	if err != nil {
-		slog.Error("mailbox ack: get message", slog.String("err", err.Error()))
-		return exitTransport
-	}
-	cursor := mailbox.Cursor{MessageID: msg.ID, TimestampMS: msg.Timestamp}
-	if err := resources.service.AckCursorContext(ctx, resources.groupID, *clientID, cursor); err != nil {
 		return mailboxError("mailbox ack", err)
-	}
-	out := map[string]any{
-		"client_id":    *clientID,
-		"group_id":     resources.groupID,
-		"message_id":   msg.ID,
-		"timestamp_ms": msg.Timestamp,
-		"cursor":       cursor,
 	}
 	if err := emitJSON(out); err != nil {
 		slog.Error("mailbox ack: marshal", slog.String("err", err.Error()))
@@ -173,19 +142,9 @@ func cmdMailboxCursor(gf *globalFlags, args []string) int {
 	}
 	defer resources.close()
 
-	cursor, err := resources.service.CursorContext(ctx, resources.groupID, *clientID)
+	out, err := resources.service.CursorStatus(ctx, resources.groupID, *clientID)
 	if err != nil {
 		return mailboxError("mailbox cursor", err)
-	}
-	unread, err := resources.service.UnreadCount(ctx, resources.groupID, *clientID)
-	if err != nil {
-		return mailboxError("mailbox cursor", err)
-	}
-	out := map[string]any{
-		"client_id": *clientID,
-		"group_id":  resources.groupID,
-		"cursor":    cursor,
-		"unread":    unread,
 	}
 	if err := emitJSON(out); err != nil {
 		slog.Error("mailbox cursor: marshal", slog.String("err", err.Error()))
@@ -267,33 +226,6 @@ func openMailboxResources(gf *globalFlags, groupStr string) (*mailboxResources, 
 func (r *mailboxResources) close() {
 	_ = r.cursorStore.Close()
 	_ = r.store.Close()
-}
-
-func (r *mailboxResources) currentCursor(ctx context.Context, clientID string) mailbox.Cursor {
-	cursor, err := r.service.CursorContext(ctx, r.groupID, clientID)
-	if err != nil {
-		return mailbox.Cursor{}
-	}
-	return cursor
-}
-
-func cursorFromPulledMessages(fallback mailbox.Cursor, msgs []entmoot.Message) mailbox.Cursor {
-	if len(msgs) == 0 {
-		return fallback
-	}
-	last := msgs[len(msgs)-1]
-	return mailbox.Cursor{MessageID: last.ID, TimestampMS: last.Timestamp}
-}
-
-func messagesJSON(msgs []entmoot.Message) []map[string]any {
-	if msgs == nil {
-		return []map[string]any{}
-	}
-	out := make([]map[string]any, 0, len(msgs))
-	for _, msg := range msgs {
-		out = append(out, messageJSON(msg))
-	}
-	return out
 }
 
 func emitJSON(v any) error {

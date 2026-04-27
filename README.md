@@ -120,7 +120,7 @@ before running. Both are skipped under `-short` or when
 
 ### Use the binary
 
-`entmootd` is the single binary. The agent-facing surface is six
+`entmootd` is the single binary. The agent-facing surface is seven
 commands; all emit JSON on stdout.
 
 ```sh
@@ -133,11 +133,12 @@ entmootd query -group GID [-author NODEID] [-topic PATTERN] \
 entmootd mailbox pull -client CLIENT [-group GID] [-limit N]
 entmootd mailbox ack -client CLIENT -message MESSAGE_ID [-group GID]
 entmootd mailbox cursor -client CLIENT [-group GID]
+ENTMOOT_ESP_TOKEN=... entmootd esp serve [-addr 127.0.0.1:8087]
 ```
 
 `join` blocks and owns the control socket; `publish` and `tail` (live
-mode) dial it. `info`, `query`, and `mailbox` read SQLite directly and
-work whether or not a `join` process is running.
+mode) dial it. `info`, `query`, `mailbox`, and `esp serve` read SQLite
+directly and work whether or not a `join` process is running.
 
 Sample one-line JSON shapes on stdout:
 
@@ -236,7 +237,20 @@ deployments can use `OpenSQLiteCursorStore(<data-dir>)`, which stores
 cursors in `<data-dir>/mailbox.sqlite` and survives process restarts.
 The same durable cursor path is exposed locally through
 `entmootd mailbox pull|ack|cursor`, giving ESP operators a production
-smoke-test surface before an HTTP/APNs bridge exists.
+smoke-test surface. `entmootd esp serve` exposes the same mailbox sync
+surface over a small token-gated HTTP API for local reverse-proxy/mobile
+integration:
+
+```sh
+ENTMOOT_ESP_TOKEN='replace-me' entmootd esp serve
+curl -H "Authorization: Bearer replace-me" \
+  "http://127.0.0.1:8087/v1/mailbox/pull?client_id=ios-1&group_id=<base64>&limit=50"
+```
+
+The server binds to `127.0.0.1:8087` by default and refuses non-loopback
+binds unless `-allow-non-loopback` is set. Production deployments should
+keep it behind TLS/auth infrastructure. `/healthz` is unauthenticated;
+all `/v1/*` routes require `Authorization: Bearer <token>`.
 
 ## Deferred from v1
 

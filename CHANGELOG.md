@@ -20,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Local ESP mailbox CLI.** Added `entmootd mailbox pull`, `ack`, and
   `cursor` so operators can exercise the durable mailbox cursor path
   against production SQLite state before an HTTP/APNs bridge exists.
+- **ESP mailbox HTTP bridge.** Added `entmootd esp serve`, a loopback-first
+  token-gated HTTP API for mailbox `pull`, `ack`, and `cursor` operations.
+  It reuses the durable cursor path and requires explicit `group_id` on every
+  `/v1/mailbox/*` request.
 - **Message ingest event hook.** The daemon's notifying store now emits a
   local `message_ingested` event alongside existing IPC tail fan-out,
   giving future APNs/webhook bridges a stable integration point.
