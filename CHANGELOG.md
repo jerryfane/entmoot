@@ -16,6 +16,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Local operations helpers.** Added scripts for waiting on `pilotctl info`
   readiness and printing a local mesh verification snapshot after restarts.
 
+### Changed
+
+- **Pilot/yamux stale-session classification is transport-owned.** Gossip now
+  asks transports to classify adapter-specific stream failures, keeping retry
+  and backoff policy in gossip while moving Pilot IPC/yamux error details out
+  of the generic gossiper.
+
 ### Fixed
 
 - **IPC client tests use short Unix socket paths on macOS.** Test daemons now

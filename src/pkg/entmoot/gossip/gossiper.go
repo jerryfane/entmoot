@@ -9,7 +9,6 @@ import (
 	"math/rand/v2"
 	"net"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -23,7 +22,6 @@ import (
 	"entmoot/pkg/entmoot/reconcile"
 	"entmoot/pkg/entmoot/roster"
 	"entmoot/pkg/entmoot/store"
-	"entmoot/pkg/entmoot/transport/pilot/ipcclient"
 	"entmoot/pkg/entmoot/wire"
 )
 
@@ -780,13 +778,6 @@ func (g *Gossiper) recordDialFailure(peer entmoot.NodeID) {
 	s.nextAllowed = g.clk.Now().Add(window)
 }
 
-func (g *Gossiper) recordDialFailureUnlessLocal(ctx context.Context, peer entmoot.NodeID, err error) {
-	if isLocalContextError(ctx, err) || isPilotStaleStreamError(err) {
-		return
-	}
-	g.recordDialFailure(peer)
-}
-
 // recordDialSuccess clears any backoff state for peer P. Request/response
 // paths call it after a full response arrives; one-way control-frame paths
 // call it after the frame write succeeds.
@@ -794,81 +785,6 @@ func (g *Gossiper) recordDialSuccess(peer entmoot.NodeID) {
 	g.dialMu.Lock()
 	defer g.dialMu.Unlock()
 	delete(g.dialBackoffs, peer)
-}
-
-func isRetryableStreamError(err error) bool {
-	if err == nil {
-		return false
-	}
-	if errors.Is(err, io.EOF) ||
-		errors.Is(err, io.ErrUnexpectedEOF) ||
-		errors.Is(err, io.ErrClosedPipe) ||
-		errors.Is(err, net.ErrClosed) ||
-		errors.Is(err, context.DeadlineExceeded) {
-		return true
-	}
-	errText := strings.ToLower(err.Error())
-	if strings.Contains(errText, "closed pipe") ||
-		strings.Contains(errText, "use of closed network connection") ||
-		strings.Contains(errText, "session shutdown") ||
-		isPilotStaleStreamError(err) {
-		return true
-	}
-	var netErr net.Error
-	return errors.As(err, &netErr) && netErr.Timeout()
-}
-
-func isStaleSessionError(err error) bool {
-	if err == nil {
-		return false
-	}
-	if errors.Is(err, io.EOF) ||
-		errors.Is(err, io.ErrUnexpectedEOF) ||
-		errors.Is(err, io.ErrClosedPipe) ||
-		errors.Is(err, net.ErrClosed) {
-		return true
-	}
-	errText := strings.ToLower(err.Error())
-	return strings.Contains(errText, "closed pipe") ||
-		strings.Contains(errText, "use of closed network connection") ||
-		strings.Contains(errText, "session shutdown") ||
-		isPilotStaleStreamError(err)
-}
-
-func isPilotStaleStreamError(err error) bool {
-	if err == nil {
-		return false
-	}
-	if errors.Is(err, ipcclient.ErrConnectionNotFound) ||
-		errors.Is(err, ipcclient.ErrConnectionNotEstablished) ||
-		errors.Is(err, ipcclient.ErrConnectionClosing) {
-		return true
-	}
-	errText := strings.ToLower(err.Error())
-	return strings.Contains(errText, "connection not found") ||
-		strings.Contains(errText, "connection not established") ||
-		strings.Contains(errText, "connection closing")
-}
-
-func shouldDropPeerSessionAfterStreamError(err error, attempt int) bool {
-	if isStaleSessionError(err) {
-		return true
-	}
-	return attempt > 0 && isRetryableStreamError(err)
-}
-
-func shouldDropPeerSessionAfterResponseReadError(err error) bool {
-	return isRetryableStreamError(err)
-}
-
-func isLocalContextError(ctx context.Context, err error) bool {
-	if err == nil {
-		return false
-	}
-	if errors.Is(err, context.Canceled) {
-		return true
-	}
-	return ctx.Err() != nil && errors.Is(err, context.DeadlineExceeded)
 }
 
 func setConnDeadlineFromContext(ctx context.Context, conn net.Conn) {
@@ -904,15 +820,17 @@ func (g *Gossiper) requestResponseWithAttemptTimeout(ctx context.Context, peer e
 		}
 		conn, err := g.cfg.Transport.Dial(ctx, peer)
 		if err != nil {
+			classification := g.classifyStreamError(ctx, err)
+			transportClassification := g.classifyTransportStreamError(err)
 			lastErr = fmt.Errorf("%s: dial %d: %w", op, peer, err)
-			if isPilotStaleStreamError(err) {
+			if transportClassification.StaleSession {
 				g.dropPeerSession(peer, op, err)
 			}
-			if attempt == 0 && (isRetryableStreamError(err) || isLocalContextError(ctx, err)) && (attemptTimeout > 0 || ctx.Err() == nil) {
+			if shouldRetryStreamFailure(classification, attempt, ctx, attemptTimeout) {
 				continue
 			}
-			if !isPilotStaleStreamError(err) {
-				g.recordDialFailureUnlessLocal(ctx, peer, err)
+			if shouldRecordDialFailureAfterDialError(classification, transportClassification) {
+				g.recordDialFailure(peer)
 			}
 			return nil, lastErr
 		}
@@ -925,18 +843,19 @@ func (g *Gossiper) requestResponseWithAttemptTimeout(ctx context.Context, peer e
 
 		err = wire.EncodeAndWrite(conn, req)
 		if err != nil {
+			classification := g.classifyStreamError(attemptCtx, err)
 			_ = conn.Close()
 			if cancel != nil {
 				cancel()
 			}
 			lastErr = fmt.Errorf("%s: write: %w", op, err)
-			if attempt == 0 && isRetryableStreamError(err) && (attemptTimeout > 0 || ctx.Err() == nil) {
-				if shouldDropPeerSessionAfterStreamError(err, attempt) {
+			if shouldRetryStreamFailure(classification, attempt, ctx, attemptTimeout) {
+				if shouldDropPeerSessionAfterStreamFailure(classification, attempt) {
 					g.dropPeerSession(peer, op, err)
 				}
 				continue
 			}
-			if isRetryableStreamError(err) && shouldDropPeerSessionAfterStreamError(err, attempt) {
+			if classification.Retryable && shouldDropPeerSessionAfterStreamFailure(classification, attempt) {
 				g.dropPeerSession(peer, op, err)
 			}
 			return nil, lastErr
@@ -948,18 +867,19 @@ func (g *Gossiper) requestResponseWithAttemptTimeout(ctx context.Context, peer e
 			cancel()
 		}
 		if err != nil {
+			classification := g.classifyStreamError(attemptCtx, err)
 			lastErr = fmt.Errorf("%s: read: %w", op, err)
-			if attempt == 0 && isRetryableStreamError(err) && (attemptTimeout > 0 || ctx.Err() == nil) {
-				if shouldDropPeerSessionAfterResponseReadError(err) {
+			if shouldRetryStreamFailure(classification, attempt, ctx, attemptTimeout) {
+				if shouldDropPeerSessionAfterResponseFailure(classification) {
 					g.dropPeerSession(peer, op, err)
 				}
 				continue
 			}
-			if shouldDropPeerSessionAfterResponseReadError(err) {
+			if shouldDropPeerSessionAfterResponseFailure(classification) {
 				g.dropPeerSession(peer, op, err)
 			}
-			if isRetryableStreamError(err) {
-				g.recordDialFailureUnlessLocal(attemptCtx, peer, err)
+			if classification.Retryable && shouldRecordDialFailure(classification) {
+				g.recordDialFailure(peer)
 			}
 			return nil, lastErr
 		}
@@ -983,15 +903,17 @@ func (g *Gossiper) dialAndWrite(ctx context.Context, peer entmoot.NodeID, frame 
 		}
 		conn, err := g.cfg.Transport.Dial(ctx, peer)
 		if err != nil {
+			classification := g.classifyStreamError(ctx, err)
+			transportClassification := g.classifyTransportStreamError(err)
 			lastErr = fmt.Errorf("dial: %w", err)
-			if isPilotStaleStreamError(err) {
+			if transportClassification.StaleSession {
 				g.dropPeerSession(peer, op, err)
 			}
-			if attempt == 0 && isPilotStaleStreamError(err) && ctx.Err() == nil {
+			if attempt == 0 && transportClassification.StaleSession && ctx.Err() == nil {
 				continue
 			}
-			if !isPilotStaleStreamError(err) {
-				g.recordDialFailureUnlessLocal(ctx, peer, err)
+			if shouldRecordDialFailureAfterDialError(classification, transportClassification) {
+				g.recordDialFailure(peer)
 			}
 			return lastErr
 		}
@@ -1003,17 +925,18 @@ func (g *Gossiper) dialAndWrite(ctx context.Context, peer entmoot.NodeID, frame 
 			return nil
 		}
 		lastErr = fmt.Errorf("write %s: %w", op, err)
-		if attempt == 0 && isRetryableStreamError(err) && ctx.Err() == nil {
-			if shouldDropPeerSessionAfterStreamError(err, attempt) {
+		classification := g.classifyStreamError(ctx, err)
+		if shouldRetryStreamFailure(classification, attempt, ctx, 0) {
+			if shouldDropPeerSessionAfterStreamFailure(classification, attempt) {
 				g.dropPeerSession(peer, op, err)
 			}
 			continue
 		}
-		if isRetryableStreamError(err) && shouldDropPeerSessionAfterStreamError(err, attempt) {
+		if classification.Retryable && shouldDropPeerSessionAfterStreamFailure(classification, attempt) {
 			g.dropPeerSession(peer, op, err)
 		}
-		if isRetryableStreamError(err) {
-			g.recordDialFailureUnlessLocal(ctx, peer, err)
+		if classification.Retryable && shouldRecordDialFailure(classification) {
+			g.recordDialFailure(peer)
 		}
 		return lastErr
 	}
@@ -2695,7 +2618,8 @@ func (g *Gossiper) reconcileWith(ctx context.Context, peer entmoot.NodeID) bool 
 			return true
 		}
 		lastErr = err
-		if attempt == 0 && isRetryableStreamError(err) {
+		classification := g.classifyStreamError(ctx, err)
+		if attempt == 0 && classification.Retryable {
 			g.dropPeerSession(peer, "reconcile", err)
 			continue
 		}
@@ -2717,7 +2641,9 @@ func (g *Gossiper) runReconcileSession(ctx context.Context, peer entmoot.NodeID)
 	}
 	conn, err := g.cfg.Transport.Dial(ctx, peer)
 	if err != nil {
-		g.recordDialFailureUnlessLocal(ctx, peer, err)
+		if shouldRecordDialFailureAfterDialError(g.classifyStreamError(ctx, err), g.classifyTransportStreamError(err)) {
+			g.recordDialFailure(peer)
+		}
 		g.logger.Warn("gossip: reconcile: dial",
 			slog.Uint64("peer", uint64(peer)),
 			slog.String("err", err.Error()))

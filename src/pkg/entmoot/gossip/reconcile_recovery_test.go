@@ -24,6 +24,14 @@ type scriptedTransport struct {
 	dialDelay time.Duration
 }
 
+type staleClassifyingTransport struct {
+	scriptedTransport
+}
+
+func (t *staleClassifyingTransport) ClassifyStreamError(err error) StreamErrorClassification {
+	return StreamErrorClassification{Retryable: true, StaleSession: true}
+}
+
 func (t *scriptedTransport) Dial(ctx context.Context, peer entmoot.NodeID) (net.Conn, error) {
 	if t.dialDelay > 0 {
 		select {
@@ -129,24 +137,21 @@ func newScriptedRecoveryGossiper(gid entmoot.GroupID, tr Transport) *Gossiper {
 	}
 }
 
-func TestPilotStaleStreamErrorsAreRetryable(t *testing.T) {
+func TestTransportClassifiedStaleStreamErrorsAreRetryable(t *testing.T) {
 	t.Parallel()
 
-	for _, errText := range []string{
-		"pilot open stream: connection not found",
-		"pilot open stream: connection closing",
-		"pilot open stream: send: connection not established",
-	} {
-		err := fmt.Errorf("%s", errText)
-		if !isRetryableStreamError(err) {
-			t.Fatalf("%q was not classified as retryable", errText)
-		}
-		if !isStaleSessionError(err) {
-			t.Fatalf("%q was not classified as stale-session", errText)
-		}
-		if !shouldDropPeerSessionAfterStreamError(err, 0) {
-			t.Fatalf("%q did not request cached session drop", errText)
-		}
+	var gid entmoot.GroupID
+	g := newScriptedRecoveryGossiper(gid, &staleClassifyingTransport{})
+	err := fmt.Errorf("transport-specific stale stream")
+	classification := g.classifyStreamError(context.Background(), err)
+	if !classification.Retryable {
+		t.Fatal("transport-classified stale stream was not retryable")
+	}
+	if !classification.StaleSession {
+		t.Fatal("transport-classified stale stream was not stale-session")
+	}
+	if !shouldDropPeerSessionAfterStreamFailure(classification, 0) {
+		t.Fatal("transport-classified stale stream did not request cached session drop")
 	}
 }
 
@@ -188,12 +193,12 @@ func TestFetchPeerRootDropsSessionAndRetriesPilotConnectionNotFoundDial(t *testi
 	gid[0] = 1
 	var root wire.MerkleRoot
 	root[0] = 77
-	tr := &scriptedTransport{
+	tr := &staleClassifyingTransport{scriptedTransport: scriptedTransport{
 		dialErrs: []error{fmt.Errorf("pilot open stream: connection not found")},
 		handlers: []func(net.Conn){
 			respondAfterRequest(&wire.MerkleResp{GroupID: gid, Root: root, MessageCount: 1}),
 		},
-	}
+	}}
 	g := newScriptedRecoveryGossiper(gid, tr)
 
 	got, ok := g.fetchPeerRoot(context.Background(), 20)
@@ -222,12 +227,12 @@ func TestFetchPeerRootRetriesPilotConnectionClosingDial(t *testing.T) {
 	gid[0] = 1
 	var root wire.MerkleRoot
 	root[0] = 78
-	tr := &scriptedTransport{
+	tr := &staleClassifyingTransport{scriptedTransport: scriptedTransport{
 		dialErrs: []error{fmt.Errorf("pilot open stream: connection closing")},
 		handlers: []func(net.Conn){
 			respondAfterRequest(&wire.MerkleResp{GroupID: gid, Root: root, MessageCount: 1}),
 		},
-	}
+	}}
 	g := newScriptedRecoveryGossiper(gid, tr)
 
 	got, ok := g.fetchPeerRoot(context.Background(), 20)

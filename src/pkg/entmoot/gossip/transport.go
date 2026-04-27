@@ -86,6 +86,23 @@ type PeerSessionDropper interface {
 	DropPeerSession(peer entmoot.NodeID) bool
 }
 
+// StreamErrorClassification lets transports describe whether an error came
+// from stale stream/session state. Gossip owns retry/backoff policy; transport
+// adapters own interpretation of their protocol-specific errors.
+type StreamErrorClassification struct {
+	Retryable    bool
+	StaleSession bool
+	Timeout      bool
+	LocalContext bool
+}
+
+// StreamErrorClassifier is an optional Transport extension for adapters whose
+// stream errors have transport-specific meaning. Generic net/io errors are
+// still classified by gossip as a fallback.
+type StreamErrorClassifier interface {
+	ClassifyStreamError(err error) StreamErrorClassification
+}
+
 // memTransport is the in-memory Transport implementation. One memTransport per
 // participating NodeID; all of them share a single memHub which routes dials
 // into the target's accept queue.
