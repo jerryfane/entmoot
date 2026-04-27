@@ -1,14 +1,15 @@
-// Package mailbox provides service-peer sync cursors over an Entmoot store.
+// Package mailbox provides ESP/service-peer sync cursors over an Entmoot store.
 //
-// It is a local index for mobile/service clients. It does not change Entmoot
-// consensus, message ordering, gossip, or reconciliation.
+// ESP means Entmoot Service Provider: an always-on service peer that can sync,
+// notify, and relay already-signed messages for mobile/intermittent clients.
+// Mailbox state is local ESP state. It does not change Entmoot consensus,
+// message ordering, gossip, or reconciliation.
 package mailbox
 
 import (
 	"context"
 	"errors"
 	"fmt"
-	"sync"
 	"time"
 
 	"entmoot/pkg/entmoot"
@@ -25,32 +26,40 @@ type Cursor struct {
 	TimestampMS int64             `json:"timestamp_ms"`
 }
 
+// CursorStore persists per-client mailbox cursors.
+type CursorStore interface {
+	GetCursor(ctx context.Context, groupID entmoot.GroupID, clientID string) (Cursor, error)
+	AckCursor(ctx context.Context, groupID entmoot.GroupID, clientID string, cursor Cursor) (bool, error)
+	Close() error
+}
+
 // Service tracks per-client cursors over an existing MessageStore.
 type Service struct {
-	store store.MessageStore
-	sink  events.Sink
-
-	mu      sync.RWMutex
-	cursors map[key]Cursor
+	store   store.MessageStore
+	cursors CursorStore
+	sink    events.Sink
 }
 
-type key struct {
-	group  entmoot.GroupID
-	client string
-}
-
-// New returns a mailbox service backed by st.
+// New returns a mailbox service backed by st and an in-memory cursor store.
 func New(st store.MessageStore, sink events.Sink) (*Service, error) {
+	return NewWithCursorStore(st, NewMemoryCursorStore(), sink)
+}
+
+// NewWithCursorStore returns a mailbox service backed by st and cursors.
+func NewWithCursorStore(st store.MessageStore, cursors CursorStore, sink events.Sink) (*Service, error) {
 	if st == nil {
 		return nil, errors.New("mailbox: nil store")
+	}
+	if cursors == nil {
+		return nil, errors.New("mailbox: nil cursor store")
 	}
 	if sink == nil {
 		sink = events.NopSink{}
 	}
 	return &Service{
 		store:   st,
+		cursors: cursors,
 		sink:    sink,
-		cursors: make(map[key]Cursor),
 	}, nil
 }
 
@@ -61,7 +70,11 @@ func (s *Service) MessagesSince(ctx context.Context, groupID entmoot.GroupID, cl
 		return nil, Cursor{}, ErrInvalidClient
 	}
 	if cursor == (Cursor{}) {
-		cursor = s.Cursor(groupID, clientID)
+		var err error
+		cursor, err = s.CursorContext(ctx, groupID, clientID)
+		if err != nil {
+			return nil, Cursor{}, err
+		}
 	}
 	all, err := s.store.Range(ctx, groupID, 0, 0)
 	if err != nil {
@@ -70,16 +83,19 @@ func (s *Service) MessagesSince(ctx context.Context, groupID entmoot.GroupID, cl
 
 	start := 0
 	if cursor.MessageID != (entmoot.MessageID{}) {
+		found := false
 		for i, m := range all {
 			if m.ID == cursor.MessageID {
 				start = i + 1
+				found = true
 				break
 			}
 		}
-	} else if cursor.TimestampMS > 0 {
-		for start < len(all) && all[start].Timestamp <= cursor.TimestampMS {
-			start++
+		if !found && cursor.TimestampMS > 0 {
+			start = afterTimestamp(all, cursor.TimestampMS)
 		}
+	} else if cursor.TimestampMS > 0 {
+		start = afterTimestamp(all, cursor.TimestampMS)
 	}
 	if start > len(all) {
 		start = len(all)
@@ -95,34 +111,47 @@ func (s *Service) MessagesSince(ctx context.Context, groupID entmoot.GroupID, cl
 // AckCursor advances the stored cursor for a client and group. Replaying the
 // same or an older cursor is idempotent.
 func (s *Service) AckCursor(groupID entmoot.GroupID, clientID string, cursor Cursor) error {
+	return s.AckCursorContext(context.Background(), groupID, clientID, cursor)
+}
+
+// AckCursorContext advances the stored cursor with caller-controlled
+// cancellation. Replaying the same or an older cursor is idempotent.
+func (s *Service) AckCursorContext(ctx context.Context, groupID entmoot.GroupID, clientID string, cursor Cursor) error {
 	if clientID == "" {
 		return ErrInvalidClient
 	}
 	if cursor == (Cursor{}) {
 		return nil
 	}
-	k := key{group: groupID, client: clientID}
-	s.mu.Lock()
-	cur := s.cursors[k]
-	if cursorAfter(cursor, cur) {
-		s.cursors[k] = cursor
+	advanced, err := s.cursors.AckCursor(ctx, groupID, clientID, cursor)
+	if err != nil {
+		return err
 	}
-	s.mu.Unlock()
-	s.sink.Emit(events.Event{
-		Type:      events.TypeMailboxCursorAdvanced,
-		GroupID:   groupID,
-		MessageID: cursor.MessageID,
-		ClientID:  clientID,
-		At:        time.Now(),
-	})
+	if advanced {
+		s.sink.Emit(events.Event{
+			Type:      events.TypeMailboxCursorAdvanced,
+			GroupID:   groupID,
+			MessageID: cursor.MessageID,
+			ClientID:  clientID,
+			At:        time.Now(),
+		})
+	}
 	return nil
 }
 
 // Cursor returns the stored cursor for clientID in groupID.
 func (s *Service) Cursor(groupID entmoot.GroupID, clientID string) Cursor {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.cursors[key{group: groupID, client: clientID}]
+	cursor, _ := s.CursorContext(context.Background(), groupID, clientID)
+	return cursor
+}
+
+// CursorContext returns the stored cursor for clientID in groupID with
+// caller-controlled cancellation.
+func (s *Service) CursorContext(ctx context.Context, groupID entmoot.GroupID, clientID string) (Cursor, error) {
+	if clientID == "" {
+		return Cursor{}, ErrInvalidClient
+	}
+	return s.cursors.GetCursor(ctx, groupID, clientID)
 }
 
 // UnreadCount returns the number of messages after the stored cursor.
@@ -140,6 +169,14 @@ func cursorFromMessages(fallback Cursor, msgs []entmoot.Message) Cursor {
 	}
 	last := msgs[len(msgs)-1]
 	return Cursor{MessageID: last.ID, TimestampMS: last.Timestamp}
+}
+
+func afterTimestamp(msgs []entmoot.Message, timestampMS int64) int {
+	start := 0
+	for start < len(msgs) && msgs[start].Timestamp <= timestampMS {
+		start++
+	}
+	return start
 }
 
 func cursorAfter(a, b Cursor) bool {

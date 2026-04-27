@@ -54,9 +54,14 @@ func TestMobileServiceExternalSignerMailboxFlow(t *testing.T) {
 
 	st := store.NewMemory()
 	defer func() { _ = st.Close() }()
-	mbox, err := mailbox.New(st, bus)
+	cursorDir := t.TempDir()
+	cursorStore, err := mailbox.OpenSQLiteCursorStore(cursorDir)
 	if err != nil {
-		t.Fatalf("mailbox.New: %v", err)
+		t.Fatalf("OpenSQLiteCursorStore: %v", err)
+	}
+	mbox, err := mailbox.NewWithCursorStore(st, cursorStore, bus)
+	if err != nil {
+		t.Fatalf("mailbox.NewWithCursorStore: %v", err)
 	}
 
 	externalSigner, err := signing.NewExternalSigner(author, func(_ context.Context, payload []byte) ([]byte, error) {
@@ -121,6 +126,26 @@ func TestMobileServiceExternalSignerMailboxFlow(t *testing.T) {
 	}
 	if unread != 0 {
 		t.Fatalf("UnreadCount after ack = %d, want 0", unread)
+	}
+
+	if err := cursorStore.Close(); err != nil {
+		t.Fatalf("cursorStore.Close: %v", err)
+	}
+	cursorStore, err = mailbox.OpenSQLiteCursorStore(cursorDir)
+	if err != nil {
+		t.Fatalf("OpenSQLiteCursorStore reopen: %v", err)
+	}
+	defer func() { _ = cursorStore.Close() }()
+	mbox, err = mailbox.NewWithCursorStore(st, cursorStore, bus)
+	if err != nil {
+		t.Fatalf("mailbox.NewWithCursorStore after reopen: %v", err)
+	}
+	unread, err = mbox.UnreadCount(ctx, gid, clientID)
+	if err != nil {
+		t.Fatalf("UnreadCount after cursor reopen: %v", err)
+	}
+	if unread != 0 {
+		t.Fatalf("UnreadCount after cursor reopen = %d, want 0", unread)
 	}
 }
 

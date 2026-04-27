@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   delegation, mailbox cursor, and local event packages so an always-on
   Entmoot peer can later act as a mobile keeper without making iOS run
   `entmootd` or `pilot-daemon`.
+- **Durable ESP mailbox cursors.** Added a `mailbox.CursorStore`
+  abstraction plus SQLite-backed cursor persistence at
+  `<data-dir>/mailbox.sqlite`, so an Entmoot Service Provider can restart
+  without redelivering already-acknowledged mobile sync messages.
 - **Message ingest event hook.** The daemon's notifying store now emits a
   local `message_ingested` event alongside existing IPC tail fan-out,
   giving future APNs/webhook bridges a stable integration point.
@@ -36,6 +40,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Local publishing uses the signer abstraction.** Existing keystore-backed
   publishes keep the same wire format, but the signing path now shares the
   same verification code used by future external/phone-held signers.
+- **Mailbox cursors are storage-backed.** `mailbox.Service` now delegates
+  cursor state to a pluggable store. The default constructor remains
+  in-memory for compatibility; ESP deployments can opt into SQLite.
 
 ### Fixed
 

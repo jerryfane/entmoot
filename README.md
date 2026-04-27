@@ -36,6 +36,9 @@ What works today:
   replay protection (5 min / 30 s window + sha256 dedupe).
 - SQLite message store by default (one DB per group, WAL mode, pure-Go
   via `modernc.org/sqlite`). JSONL kept as a dev/debug backend.
+- Entmoot Service Provider (ESP) primitives for future mobile clients:
+  external signing, scoped service delegation, local ingest events, and
+  durable mailbox cursors for foreground sync.
 - Five-command agent CLI surface (`join`, `publish`, `tail`, `info`,
   `query`) with control-socket IPC at `~/.entmoot/control.sock`.
 - Three canary variants pass end-to-end: in-memory library
@@ -213,6 +216,21 @@ See [`ARCHITECTURE.md`](./ARCHITECTURE.md) for the full spec (data
 model, wire format, bootstrap flow, security posture, resolved-for-v1
 decisions) and [`docs/CLI_DESIGN.md`](./docs/CLI_DESIGN.md) for the
 full command and IPC contract.
+
+## Entmoot Service Providers
+
+An Entmoot Service Provider (ESP) is an always-on service peer that can
+support intermittent mobile clients without holding their signing keys.
+The phone can keep the author identity and sign messages externally,
+while the ESP runs normal Entmoot/Pilot infrastructure, syncs already
+signed messages, emits local notification hooks, and tracks per-client
+mailbox cursors.
+
+ESP mailbox cursors are local service state, not consensus state. The
+`mailbox` package exposes a pluggable `CursorStore`: tests and ephemeral
+service peers can use the default in-memory store, while durable ESP
+deployments can use `OpenSQLiteCursorStore(<data-dir>)`, which stores
+cursors in `<data-dir>/mailbox.sqlite` and survives process restarts.
 
 ## Deferred from v1
 
