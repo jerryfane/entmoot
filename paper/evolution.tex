@@ -30,14 +30,14 @@
 
 \begin{abstract}
 \noindent
-Between 17 and 22 April 2026 we shipped a dense sequence of
-patch releases across two layered systems: eleven Pilot fork releases
-(\texttt{v1.7.2-jf.1} through \texttt{v1.9.0-jf.7}) and eleven
-Entmoot releases (\texttt{v1.0.0} through \texttt{v1.2.1}). Every
-patch was driven by a symptom observed on a three-machine live
-demo across three continents: a laptop on a UAE carrier-grade NAT,
-a Raspberry Pi in Italy on Fastweb residential, and a Hetzner VPS
-in Germany. The CHANGELOGs document what changed, but their
+Between 17 and 27 April 2026 we shipped a dense sequence of
+patch releases across two layered systems: the Pilot fork moved from
+\texttt{v1.7.2-jf.1} to \texttt{v1.9.0-jf.15.21}, and Entmoot moved
+from \texttt{v1.0.0} to \texttt{v1.5.10}. Every patch was
+driven by a symptom observed on a three-machine live demo across
+three continents: a laptop on a UAE carrier-grade NAT, a Raspberry Pi
+in Italy on Fastweb residential, and a Hetzner VPS in Germany. The
+CHANGELOGs document what changed, but their
 language assumes a reader who already speaks networking. This
 document is the narrative companion: it explains what the words
 mean, what actually went wrong on the wire, and why each fix is
@@ -1225,6 +1225,164 @@ machine), \texttt{src/pkg/entmoot/wire/types.go} (new
 \texttt{src/pkg/entmoot/store/\{store,memory,sqlite,jsonl\}.go}
 (new \texttt{IterMessageIDsInIDRange}). No Pilot change.
 
+\section{The second shakedown: hide-IP, TURN, and port 1004}
+\label{sec:secondshakedown}
+
+The first shakedown ended with normal-mode gossip converging. The
+second began when we asked a harder question: can the laptop hide its
+real address and still participate in the mesh? That moved the problem
+from ordinary NAT traversal to strict TURN-mediated operation. In
+normal Pilot mode a peer may try direct UDP, TCP, beacon relay, cached
+connections, and peer TURN endpoints. In strict
+\texttt{-outbound-turn-only} mode the rule is different: every
+outbound peer packet must leave through the local node's own TURN
+allocation, and if that path cannot send, Pilot must fail closed rather
+than leak the real address.
+
+\subsection{Pilot \texttt{jf.8}--\texttt{jf.11b}: TURN and push
+rotation}
+
+\paragraph{What broke.} The laptop could publish a TURN address, but
+the rest of the mesh kept learning stale relay ports after Pilot
+restarts or Cloudflare allocation rotations. Entmoot's first
+implementation polled \texttt{pilotctl info} every 30 seconds and
+republished when the address changed. That worked, but it was both
+slow and wasteful: the common case is no rotation.
+
+\paragraph{What it actually was.} TURN relay addresses are state, not
+configuration. They are assigned by the provider and can rotate under
+the daemon. Treating them like a static \texttt{-advertise-endpoint}
+value left peers pinned to dead allocations.
+
+\paragraph{How we fixed it.} Pilot \texttt{jf.8} added TURN client
+support and credential providers. The \texttt{jf.11a} series added the
+privacy posture flags and \texttt{Info} fields that let Entmoot verify
+\texttt{-hide-ip}. Pilot \texttt{jf.11b} added IPC
+\texttt{Subscribe}/\texttt{Notify} and a \texttt{turn\_endpoint} topic.
+Entmoot \texttt{v1.4.0} added \texttt{-hide-ip} transport ads, and
+\texttt{v1.5.0} replaced steady-state polling with a single
+subscription. Old Pilot daemons still fall back to the 30-second poller.
+
+\paragraph{Why the fix is right.} The application layer needs to
+publish current reachability, but it should not have to poll a local
+daemon forever. Push turns a rare state change into a rare IPC event.
+It also makes the privacy check explicit: Entmoot can suppress
+advertised addresses, but only Pilot can prevent outbound source-IP
+leaks.
+
+\subsection{Pilot \texttt{jf.12}--\texttt{jf.15.7}: rendezvous and
+bilateral TURN}
+
+\paragraph{What broke.} Once all three machines ran TURN-aware builds,
+the next deadlock was subtler. VPS knew the laptop's new TURN
+allocation, but the laptop had not installed the reciprocal permission
+for the VPS allocation. Packets left one side and disappeared at the
+other side's TURN permission check. Because UDP send APIs report only
+local send success, both daemons could appear healthy while no bytes
+arrived.
+
+\paragraph{What it actually was.} TURN permissions are bilateral and
+allocation-local. Installing a peer's endpoint once is not enough: a
+local allocation rotation can erase the permission, and a peer rotation
+can make a cached permission stale. The push path itself depends on the
+data path, so it cannot be the only recovery mechanism.
+
+\paragraph{How we fixed it.} Pilot \texttt{jf.14} introduced a small
+Pkarr-style rendezvous service for signed TURN endpoint records;
+\texttt{jf.14.2} added refresh and stale-cache eviction;
+\texttt{jf.15.3} installed reciprocal \texttt{CreatePermission} state
+when peer TURN endpoints are installed; \texttt{jf.15.4} made the
+rendezvous lookup fire in strict TURN-only mode; \texttt{jf.15.6}
+allowed recovery PILA to fire for TURN-delivered frames whose observed
+remote address is not a direct UDP endpoint; and \texttt{jf.15.7}
+added periodic peer re-lookup so a data-path break does not prevent
+endpoint refresh. Entmoot's role in this phase was to keep publishing
+current transport ads, replay persisted ads at startup, and expose
+enough trace signal to separate discovery failure from transport
+failure.
+
+\paragraph{Why the fix is right.} Rendezvous is discovery, not routing.
+It gives each Pilot daemon the fresh endpoint material needed to
+install permissions and evict stale cached connections. The actual
+route decision remains in Pilot, where \texttt{-outbound-turn-only} can
+win deterministically over direct UDP, TCP, beacon relay, and peer-TURN
+preferences.
+
+\subsection{Entmoot \texttt{v1.5.1}--\texttt{v1.5.10}: stale streams
+and reconcile recovery}
+
+\paragraph{What broke.} After Pilot peers finally reached
+\texttt{encrypted=yes auth=yes}, Entmoot still failed to converge.
+VPS could open or attempt streams to laptop port~1004, but reconcile
+sessions ended early, timed out, or retried through the same dead
+yamux/Pilot stream. Store counts diverged even though the underlying
+mesh was alive.
+
+\paragraph{What it actually was.} Several bugs stacked in the same
+symptom. The responder side of RBSR could learn that it was missing
+message IDs but fail to fetch the bodies. Short push contexts leaked
+into background reconcile attempts. Request/response deadlines started
+too early, before Pilot stream establishment completed. Stale
+connection IDs from the Pilot IPC layer looked like generic dial
+failures, which poisoned Entmoot's backoff instead of evicting the
+cached session. Finally, closing or closing-soon Pilot streams could be
+accepted into yamux and reused until higher-level timeouts fired.
+
+\paragraph{How we fixed it.} Entmoot \texttt{v1.5.1} made responder
+RBSR fetch symmetric. \texttt{v1.5.2} through \texttt{v1.5.4} split
+reconcile attempt lifetimes from push lifetimes, separated Pilot dial
+budget from wire I/O deadlines, and evicted stale sessions on response
+timeouts. \texttt{v1.5.5} preserved early Pilot IPC close frames so a
+freshly registered connection observes EOF immediately. \texttt{v1.5.6}
+fixed transport-ad self-install and forwarded snapshot validation.
+\texttt{v1.5.8} retried stale Pilot stream IDs without poisoning
+dial-backoff. \texttt{v1.5.9} introduced an explicit Pilot/yamux
+session lifecycle manager with generation ids, draining, active-stream
+counts, and a \texttt{-trace-gossip-transport} mode. \texttt{v1.5.10}
+added \texttt{-trace-reconcile}, Pilot readiness waiting at startup,
+and transport-owned stream error classification.
+
+\paragraph{Why the fix is right.} Reconcile is a correctness path, not
+a best-effort push. It must treat ``the cached stream died'' as a local
+session repair event, not as proof that the peer is unreachable. The
+current split is the useful one: gossip owns retry policy and
+anti-entropy semantics; the Pilot adapter owns IPC/yamux-specific error
+classification and session lifecycle.
+
+\subsection{Pilot \texttt{jf.15.8}--\texttt{jf.15.21}: the stream
+layer becomes explicit}
+
+\paragraph{What broke.} The last visible symptom was the famous
+\texttt{:1004} timeout. Small frames could pass, but large reconcile
+responses stalled, retransmitted until max retry, and reset. Other
+failures came from accepting half-open streams before the final ACK,
+from stale daemon-side stream ids, or from listener ports that survived
+an Entmoot restart.
+
+\paragraph{What it actually was.} TURN routing had become mostly
+correct; the remaining bugs were in Pilot's virtual stream layer. The
+old implementation mixed SYN/SYN-ACK/ACK, port listener dispatch, IPC
+accept, retransmit state, TIME\_WAIT cleanup, and send errors in one
+large path. That made symptoms look like Entmoot reconcile bugs even
+when the failed invariant was lower-level stream lifecycle.
+
+\paragraph{How we fixed it.} Pilot added \texttt{-trace-streams},
+explicit stream transition/removal logs, listener \texttt{Unbind}, a
+passive-open rule that exposes accepted streams only after the final
+ACK, stale passive-handshake reaping, 1024-byte stream segments so UDP
+and TURN paths do not rely on IP fragmentation, centralized TURN route
+policy, and connection-scoped IPC close reporting for send failures.
+The latest Entmoot code consumes those signals through typed stream
+classification rather than brittle string matching.
+
+\paragraph{Why the fix is right.} A stream must not disappear without a
+reason log, and an accepted stream must already be usable. Once Pilot
+made those lifecycle rules explicit, Entmoot's remaining job became
+ordinary anti-entropy: drop stale sessions, retry once on a fresh
+stream, and fetch the missing bodies. That is why the final deployment
+could converge all three stores after the Pilot transport layer went
+green.
+
 \section{The big picture: how the layers interacted}
 \label{sec:bigpicture}
 
@@ -1282,6 +1440,14 @@ rule is simple:
 v1.9.0-jf.4 and v1.0.6 landed in the same day because that is
 when we untangled which was which.
 
+The second shakedown refined the rule. If Pilot peers are not
+encrypted and authenticated, the failure is still below Entmoot. If
+they are authenticated but port~1004 dials time out, first inspect
+Pilot stream traces: the bug may be in virtual-stream lifecycle even
+though it manifests as an Entmoot reconcile timeout. Only once
+\texttt{pilotctl ping} and stream traces are clean should the focus
+move to RBSR, store filtering, or gossip retry policy.
+
 \section{Cheat sheet}
 \label{sec:cheat}
 
@@ -1305,9 +1471,14 @@ v1.9.0-jf.4 & 20 Apr & Reply-on-ingress path routing; 3 s SYN retransmit for rel
 v1.9.0-jf.5 & 20 Apr & Full per-peer state cleanup across \texttt{AddPeer}/\texttt{RemovePeer}. \\
 v1.9.0-jf.6 & 21 Apr & \texttt{ErrDialToSelf} guard against self-tunnel storm. \\
 v1.9.0-jf.7 & 21 Apr & New \texttt{SetPeerEndpoints} IPC command: Entmoot installs per-peer TCP endpoints into \texttt{peerTCP} without registry mediation. \\
+v1.9.0-jf.8--jf.11b & 24--25 Apr & TURN client support, hide-IP posture flags, no-registry endpoint mode, outbound-turn-only semantics, and IPC \texttt{Subscribe}/\texttt{Notify} for TURN rotation. \\
+v1.9.0-jf.12--jf.14.2 & 25--26 Apr & Handshake reply routing, keepalives, rendezvous endpoint publish/refresh, and stale endpoint eviction. \\
+v1.9.0-jf.15--jf.15.7 & 26 Apr & TURN allocation self-heal, permission refresh diagnostics, bilateral \texttt{CreatePermission}, recovery PILA through TURN, and periodic peer rendezvous re-lookup. \\
+v1.9.0-jf.15.8--jf.15.13 & 26--27 Apr & Preserve TURN ingress, close stale IPC stream conns, recover fatal TURN allocation failures, centralize TURN route policy, and prefer own relay in strict TURN-only mode. \\
+v1.9.0-jf.15.14--jf.15.21 & 27 Apr & Stream lifecycle tracing, listener \texttt{Unbind}, 1024-byte stream segments, passive-open ACK gating, stale handshake reaping, rendezvous 429 retry, and connection-scoped IPC send failures. \\
 \bottomrule
 \end{tabular}
-\caption{Pilot fork release summary.}
+\caption{Pilot fork release summary through the \texttt{v1.9.0-jf.15} line.}
 \end{table}
 
 \begin{table}[h]
@@ -1328,9 +1499,15 @@ v1.0.8 & 21 Apr & Exclude issuer from \texttt{bootstrap\_peers} at invite mint. 
 v1.1.0 & 21 Apr & Persistent yamux-multiplexed session per peer; no per-frame Pilot stream dial. \\
 v1.2.0 & 21 Apr & Signed \texttt{TransportAd} records gossiped through Entmoot; Pilot \texttt{SetPeerEndpoints} IPC makes TCP fallback actually reachable. \\
 v1.2.1 & 22 Apr & Range-Based Set Reconciliation; background AE ticker; \texttt{OnTunnelUp} callback; gap-reconcile bug fixed. \\
+v1.3.0 & 25 Apr & Apache-2.0 licensing boundary and independent Pilot IPC client. \\
+v1.4.0--v1.4.6 & 25 Apr & Hide-IP transport ads, TURN endpoint publication, cross-layer privacy warnings, TURN polling fallback, and IPC error routing hardening. \\
+v1.5.0 & 25 Apr & Pilot \texttt{Subscribe}/\texttt{Notify} support; TURN rotation becomes push-driven with polling only as fallback. \\
+v1.5.1--v1.5.4 & 26--27 Apr & Responder-side RBSR body fetch, stale-session recovery, separate dial/I/O deadlines, and post-timeout session eviction. \\
+v1.5.5--v1.5.8 & 27 Apr & Preserve early Pilot IPC closes, ignore self transport ads, validate forwarded snapshots, and retry stale Pilot stream IDs without poisoning dial-backoff. \\
+v1.5.9--v1.5.10 & 27 Apr & Explicit Pilot/yamux session lifecycle manager, transport trace mode, Pilot readiness wait, reconcile trace mode, and transport-owned stream error classification. \\
 \bottomrule
 \end{tabular}
-\caption{Entmoot release summary (through 22 April 2026).}
+\caption{Entmoot release summary through \texttt{v1.5.10}.}
 \end{table}
 
 \section*{Appendix A: reading order}
