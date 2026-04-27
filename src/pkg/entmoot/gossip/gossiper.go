@@ -21,6 +21,7 @@ import (
 	"entmoot/pkg/entmoot/ratelimit"
 	"entmoot/pkg/entmoot/reconcile"
 	"entmoot/pkg/entmoot/roster"
+	"entmoot/pkg/entmoot/signing"
 	"entmoot/pkg/entmoot/store"
 	"entmoot/pkg/entmoot/wire"
 )
@@ -1954,20 +1955,7 @@ func (g *Gossiper) verifyMessage(msg entmoot.Message) error {
 	// The roster's stored pubkey wins over whatever the message carries in
 	// Author.EntmootPubKey: a forged message could put a valid-looking key
 	// in the author slot and sign with its matching private key.
-	signing := msg
-	signing.ID = entmoot.MessageID{}
-	signing.Signature = nil
-	sigInput, err := canonical.Encode(signing)
-	if err != nil {
-		return fmt.Errorf("gossip: canonical encode: %w", err)
-	}
-	if !keystore.Verify(author.EntmootPubKey, sigInput, msg.Signature) {
-		return fmt.Errorf("%w: message %s", entmoot.ErrSigInvalid, msg.ID)
-	}
-	if canonical.MessageID(msg) != msg.ID {
-		return fmt.Errorf("gossip: message id does not match canonical hash")
-	}
-	return nil
+	return signing.VerifyMessage(msg, author)
 }
 
 // maybeInlineBody attaches msg to a single-id Gossip frame when the

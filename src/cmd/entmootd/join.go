@@ -18,12 +18,13 @@ import (
 	"time"
 
 	"entmoot/pkg/entmoot"
-	"entmoot/pkg/entmoot/canonical"
+	"entmoot/pkg/entmoot/events"
 	"entmoot/pkg/entmoot/gossip"
 	"entmoot/pkg/entmoot/ipc"
 	"entmoot/pkg/entmoot/keystore"
 	"entmoot/pkg/entmoot/ratelimit"
 	"entmoot/pkg/entmoot/roster"
+	"entmoot/pkg/entmoot/signing"
 	"entmoot/pkg/entmoot/store"
 	"entmoot/pkg/entmoot/topic"
 	"entmoot/pkg/entmoot/transport/pilot/ipcclient"
@@ -184,9 +185,11 @@ func cmdJoin(gf *globalFlags, args []string) int {
 	}
 	defer func() { _ = rawStore.Close() }()
 
-	// Wrap the store so IPC tail subscribers see new messages as they
-	// land. The gossip/publish path writes through this wrapper.
-	notifyStore := newNotifyingStore(rawStore)
+	// Wrap the store so IPC tail subscribers and service integrations see
+	// new messages as they land. The gossip/publish path writes through this
+	// wrapper.
+	serviceEvents := events.NewBus()
+	notifyStore := newNotifyingStore(rawStore, serviceEvents)
 
 	rlog, err := roster.OpenJSONL(s.dataDir, invite.GroupID)
 	if err != nil {
@@ -524,15 +527,20 @@ func (e *endpointFlag) Snapshot() []entmoot.NodeEndpoint {
 // store packages need to grow a subscribe method.
 type notifyingStore struct {
 	inner store.MessageStore
+	sink  events.Sink
 
 	mu     sync.Mutex
 	subs   map[int]chan<- entmoot.Message
 	nextID int
 }
 
-func newNotifyingStore(inner store.MessageStore) *notifyingStore {
+func newNotifyingStore(inner store.MessageStore, sink events.Sink) *notifyingStore {
+	if sink == nil {
+		sink = events.NopSink{}
+	}
 	return &notifyingStore{
 		inner: inner,
+		sink:  sink,
 		subs:  make(map[int]chan<- entmoot.Message),
 	}
 }
@@ -578,6 +586,13 @@ func (n *notifyingStore) Put(ctx context.Context, m entmoot.Message) error {
 	if err := n.inner.Put(ctx, m); err != nil {
 		return err
 	}
+	n.sink.Emit(events.Event{
+		Type:      events.TypeMessageIngested,
+		GroupID:   m.GroupID,
+		MessageID: m.ID,
+		PeerID:    m.Author.PilotNodeID,
+		At:        time.Now(),
+	})
 	n.broadcast(m)
 	return nil
 }
@@ -761,21 +776,24 @@ func (s *ipcServer) handlePublish(ctx context.Context, c net.Conn, req *ipc.Publ
 		}
 	}
 
-	// Compute ID, then sign, then put the ID back in.
-	msg.ID = canonical.MessageID(msg)
-	signing := msg
-	signing.ID = entmoot.MessageID{}
-	signing.Signature = nil
-	sigInput, err := canonical.Encode(signing)
+	signer, err := signing.NewLocalSigner(author, s.identity)
 	if err != nil {
 		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
 			Type:    "error",
 			Code:    ipc.CodeInternal,
-			Message: "canonical encode: " + err.Error(),
+			Message: "local signer: " + err.Error(),
 		})
 		return
 	}
-	msg.Signature = s.identity.Sign(sigInput)
+	msg, err = signing.SignMessage(ctx, signer, msg)
+	if err != nil {
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
+			Type:    "error",
+			Code:    ipc.CodeInternal,
+			Message: "sign message: " + err.Error(),
+		})
+		return
+	}
 
 	if err := s.gossiper.Publish(ctx, msg); err != nil {
 		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{

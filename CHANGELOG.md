@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Mobile service-peer infrastructure primitives.** Added signer,
+  delegation, mailbox cursor, and local event packages so an always-on
+  Entmoot peer can later act as a mobile keeper without making iOS run
+  `entmootd` or `pilot-daemon`.
+- **Message ingest event hook.** The daemon's notifying store now emits a
+  local `message_ingested` event alongside existing IPC tail fan-out,
+  giving future APNs/webhook bridges a stable integration point.
 - **Entmoot join waits for Pilot readiness.** `entmootd join` now retries the
   local Pilot IPC open/listen path with bounded jittered backoff before
   failing startup, avoiding service-ordering races where Entmoot launches while
@@ -26,6 +33,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `-trace-reconcile`, which emits structured anti-entropy lifecycle events for
   trigger gating, Merkle root checks, RBSR rounds, fallback recovery, and body
   fetch results.
+- **Local publishing uses the signer abstraction.** Existing keystore-backed
+  publishes keep the same wire format, but the signing path now shares the
+  same verification code used by future external/phone-held signers.
 
 ### Fixed
 
