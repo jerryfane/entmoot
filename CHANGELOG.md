@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Entmoot join waits for Pilot readiness.** `entmootd join` now retries the
+  local Pilot IPC open/listen path with bounded jittered backoff before
+  failing startup, avoiding service-ordering races where Entmoot launches while
+  `pilot-daemon` is still creating `/tmp/pilot.sock`.
+- **Local operations helpers.** Added scripts for waiting on `pilotctl info`
+  readiness and printing a local mesh verification snapshot after restarts.
+
+### Fixed
+
+- **IPC client tests use short Unix socket paths on macOS.** Test daemons now
+  bind sockets under `/tmp` instead of `t.TempDir()` paths under
+  `/var/folders`, avoiding Darwin `sockaddr_un` path-length failures in the
+  default `go test ./...` run.
+
 ## [1.5.9] - 2026-04-27
 
 ### Added

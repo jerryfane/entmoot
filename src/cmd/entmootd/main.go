@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"time"
 )
 
 // Exit codes per CLI_DESIGN §6.
@@ -29,11 +30,14 @@ const (
 // globalFlags is the set of flags shared by every subcommand. Populated by
 // the top-level FlagSet before dispatch.
 type globalFlags struct {
-	socket     string
-	identity   string
-	data       string
-	listenPort uint
-	logLevel   string
+	socket             string
+	identity           string
+	data               string
+	listenPort         uint
+	logLevel           string
+	pilotWaitTimeout   time.Duration
+	pilotWaitBaseDelay time.Duration
+	pilotWaitMaxDelay  time.Duration
 	// hideIP (v1.4.0) toggles the gossiper's transport-ad advertiser
 	// into relay-only mode: UDP/TCP endpoints from Pilot are
 	// suppressed and only the TURN relay endpoint is published.
@@ -83,6 +87,12 @@ func run() int {
 	fs.StringVar(&gf.data, "data", "~/.entmoot", "Entmoot data root")
 	fs.UintVar(&gf.listenPort, "listen-port", 1004, "Entmoot listen port")
 	fs.StringVar(&gf.logLevel, "log-level", "info", "slog level: debug|info|warn|error")
+	fs.DurationVar(&gf.pilotWaitTimeout, "pilot-wait-timeout", 45*time.Second,
+		"maximum time join waits for pilot-daemon IPC/listen readiness; 0 disables waiting")
+	fs.DurationVar(&gf.pilotWaitBaseDelay, "pilot-wait-base-delay", 250*time.Millisecond,
+		"initial retry delay while waiting for pilot-daemon readiness")
+	fs.DurationVar(&gf.pilotWaitMaxDelay, "pilot-wait-max-delay", 3*time.Second,
+		"maximum retry delay while waiting for pilot-daemon readiness")
 	fs.BoolVar(&gf.hideIP, "hide-ip", false,
 		"suppress UDP/TCP endpoint advertisement; publish only TURN relay (v1.4.0; requires pilot-daemon v1.9.0-jf.8+)")
 	fs.BoolVar(&gf.traceGossipTransport, "trace-gossip-transport", false,

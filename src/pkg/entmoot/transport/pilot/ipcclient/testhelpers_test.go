@@ -4,10 +4,25 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 )
+
+// newTestSocketPath returns a Unix socket path short enough for macOS.
+// t.TempDir() lives under /var/folders/... on Darwin and can exceed the
+// sockaddr_un limit once the randomized test directory suffix is added.
+func newTestSocketPath(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("/tmp", "entmoot-ipc-")
+	if err != nil {
+		t.Fatalf("mkdir temp socket dir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return filepath.Join(dir, "p.sock")
+}
 
 // mockServer is a tiny helper that listens on a Unix socket, accepts
 // one connection (the client the Driver dials), and exposes readFrame

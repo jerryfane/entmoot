@@ -158,7 +158,7 @@ func cmdJoin(gf *globalFlags, args []string) int {
 		}
 	}
 
-	tr, err := openPilot(gf)
+	tr, err := openPilotForJoin(gf)
 	if err != nil {
 		slog.Error("join: pilot", slog.String("err", err.Error()))
 		return exitTransport

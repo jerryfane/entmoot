@@ -6,8 +6,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
-	"os"
-	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -21,8 +19,7 @@ import (
 // The caller MUST defer cleanup() which closes both ends deterministically.
 func newTestDriver(t *testing.T) (drv *Driver, srv *mockServer, cleanup func()) {
 	t.Helper()
-	dir := t.TempDir()
-	sock := filepath.Join(dir, "pilot.sock")
+	sock := newTestSocketPath(t)
 
 	srv = newMockServer(t, sock)
 	d, err := Connect(sock)
@@ -34,7 +31,6 @@ func newTestDriver(t *testing.T) (drv *Driver, srv *mockServer, cleanup func()) 
 	cleanup = func() {
 		_ = drv.Close()
 		srv.Close()
-		_ = os.Remove(sock)
 	}
 	return drv, srv, cleanup
 }

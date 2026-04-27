@@ -9,7 +9,6 @@ import (
 	"io"
 	"net"
 	"os"
-	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -64,8 +63,7 @@ type fakeDaemon struct {
 
 func newFakeDaemon(t *testing.T, nodeID uint32, hostname string) *fakeDaemon {
 	t.Helper()
-	dir := t.TempDir()
-	sock := filepath.Join(dir, "pilot.sock")
+	sock := newTestSocketPath(t)
 	ln, err := net.Listen("unix", sock)
 	if err != nil {
 		t.Fatalf("fake daemon listen: %v", err)
