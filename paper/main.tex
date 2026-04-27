@@ -285,9 +285,15 @@ Figure~\ref{fig:architecture} shows where Entmoot sits in the stack.
 Entmoot aims to provide many-to-many communication with selective
 synchronization: each member stores only messages matching its topic
 filter, yet can prove cryptographically that it has not missed any
-in-scope message. The network is fully decentralized; any member can
-act as a gossip relay. Entmoot is built on Pilot's primitives as they
-exist today, without dependence on custom networks.
+in-scope message. The group data plane is decentralized: any member
+can act as a gossip relay, no member is a distinguished broker, and
+message integrity, roster validity, Merkle roots, and anti-entropy
+repair are verified locally. Some lower-layer reachability mechanisms
+are less decentralized. In particular, Pilot's current TURN rendezvous
+service is an optional endpoint-discovery service for strict hide-IP
+operation, not an Entmoot message relay or a trust root. Entmoot is
+built on Pilot's primitives as they exist today, without dependence on
+custom networks.
 
 Entmoot does not attempt Byzantine consensus on message ordering; it
 provides eventual consistency with Merkle-verified completeness, not a
@@ -882,6 +888,61 @@ store-or-replace under Last-Writer-Wins semantics keyed on
 \texttt{Subscribe}/\texttt{Notify} path so relay rotation is pushed
 immediately; older Pilot daemons fall back to the legacy 30-second
 \texttt{Info} poller.
+
+\subsection{Rendezvous tradeoffs}
+\label{sec:rendezvous}
+
+The strict hide-IP configuration introduces one intentional
+centralization point below Entmoot: Pilot's rendezvous service. A
+hide-IP node with \texttt{-no-registry-endpoint} deliberately withholds
+its public endpoint from the Pilot registry, and a node whose data path
+is already broken cannot rely on Entmoot transport ads to publish the
+fresh TURN address that would repair that same data path. Rendezvous
+fills that gap with a small availability service: each node publishes a
+signed \texttt{NodeID -> TURN endpoint} record, and peers lookup that
+record when cold-dial fallback, periodic peer refresh, or endpoint
+rotation requires fresh reachability material.
+
+The rendezvous service is not a relay. It does not carry Entmoot
+messages, Pilot stream frames, RBSR fingerprints, or yamux traffic. It
+does not choose routes: Pilot's route policy still decides whether
+normal-mode traffic uses direct UDP, TCP, beacon relay, cached
+connections, peer TURN, or whether strict \texttt{-outbound-turn-only}
+traffic must fail closed through the local node's own TURN allocation.
+It also is not an integrity authority. Endpoint records are signed by
+the node identity and verified locally by the requester, so a
+compromised rendezvous server can withhold, delay, replay within the
+record validity window, or rate-limit records, but it cannot forge a
+valid endpoint for another node without that node's signing key.
+
+The reliability tradeoff is therefore availability, not correctness.
+If rendezvous is down, already-established Pilot tunnels continue, and
+Entmoot gossip, tail, publish, query, and anti-entropy continue over
+any healthy path. Cached TURN endpoints may continue working until the
+peer or local TURN allocation rotates. Normal-mode peers that still
+have direct UDP, TCP, beacon relay, registry endpoints, or Entmoot
+transport-ad state can keep connecting without rendezvous. What
+degrades is the hard case rendezvous was built for: cold-start or
+post-rotation recovery between strict hide-IP peers when the registry
+does not publish real endpoints and the Entmoot gossip path is not yet
+healthy enough to deliver a fresh transport ad. In that case
+convergence may stall until rendezvous returns, another endpoint
+channel refreshes state, or an operator restarts/reseeds the peers.
+
+The privacy tradeoff is metadata exposure. The service never sees group
+content or encrypted tunnel payloads, but its operator can observe
+which Pilot node IDs are publishing, their current TURN relay
+addresses, approximate update cadence, and coarse liveness. This is
+strictly less sensitive than publishing the node's real IP to the
+registry, but it is still centralized metadata. A natural next step is
+to make discovery multi-backend: keep the same signed record format,
+publish to the current HTTPS rendezvous, Entmoot's gossip cache, static
+operator-provided seeds, and a Pkarr/DHT-style backend, then race
+lookups across all configured backends and accept the newest valid
+non-expired signed record. That would turn today's rendezvous server
+from a single availability dependency into one discovery source among
+several.
+
 Three layers of spam defence run in cost order: schema/size
 validation ($\le$1\,KiB), a publisher-allowlist check (sender
 $=$ author), and a per-(peer, topic) token-bucket rate limit;
@@ -1271,12 +1332,13 @@ part of the current design.
 
 The remaining transport-oriented work is therefore narrower. The
 current implementation is operationally correct on the three-peer mesh,
-but it still lacks large-scale measurements under many simultaneous
-TURN rotations and many groups per host. The trace modes added in
-\texttt{v1.5.x} make that measurement practical: future experiments can
-record whether failures are route selection, Pilot stream lifecycle,
-yamux session reuse, or RBSR body transfer without instrumenting a
-custom binary.
+but rendezvous remains centralized availability infrastructure
+(\S\ref{sec:rendezvous}), and we still lack large-scale measurements
+under many simultaneous TURN rotations and many groups per host. The
+trace modes added in \texttt{v1.5.x} make that measurement practical:
+future experiments can record whether failures are endpoint discovery,
+route selection, Pilot stream lifecycle, yamux session reuse, or RBSR
+body transfer without instrumenting a custom binary.
 
 Entmoot also creates the substrate the empirical questions flagged by
 \citet{calin2026emergent} require:
