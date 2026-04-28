@@ -45,16 +45,21 @@ type GroupCatalog interface {
 
 // SignRequest is durable ESP-local state for phone-held signing workflows.
 type SignRequest struct {
-	ID          string          `json:"id"`
-	DeviceID    string          `json:"device_id,omitempty"`
-	Kind        string          `json:"kind"`
-	Status      string          `json:"status"`
-	GroupID     entmoot.GroupID `json:"group_id,omitempty"`
-	Payload     json.RawMessage `json:"payload,omitempty"`
-	Signature   string          `json:"signature,omitempty"`
-	CreatedAtMS int64           `json:"created_at_ms"`
-	UpdatedAtMS int64           `json:"updated_at_ms"`
-	ExpiresAtMS int64           `json:"expires_at_ms,omitempty"`
+	ID                   string          `json:"id"`
+	DeviceID             string          `json:"device_id,omitempty"`
+	Kind                 string          `json:"kind"`
+	Status               string          `json:"status"`
+	GroupID              entmoot.GroupID `json:"group_id,omitempty"`
+	Payload              json.RawMessage `json:"payload,omitempty"`
+	CanonicalType        string          `json:"canonical_type,omitempty"`
+	SignatureAlgorithm   string          `json:"signature_algorithm,omitempty"`
+	SigningPayload       string          `json:"signing_payload,omitempty"`
+	SigningPayloadSHA256 string          `json:"signing_payload_sha256,omitempty"`
+	Signature            string          `json:"signature,omitempty"`
+	PublishResult        *PublishResult  `json:"publish_result,omitempty"`
+	CreatedAtMS          int64           `json:"created_at_ms"`
+	UpdatedAtMS          int64           `json:"updated_at_ms"`
+	ExpiresAtMS          int64           `json:"expires_at_ms,omitempty"`
 }
 
 // NotificationPreferences are ESP-local device notification settings.
@@ -77,7 +82,7 @@ type StateStore interface {
 	CreateSignRequest(context.Context, SignRequest) (SignRequest, error)
 	ListSignRequests(context.Context, string) ([]SignRequest, error)
 	GetSignRequest(context.Context, string) (SignRequest, bool, error)
-	CompleteSignRequest(context.Context, string, string) (SignRequest, error)
+	CompleteSignRequest(context.Context, string, string, *PublishResult) (SignRequest, error)
 	RejectSignRequest(context.Context, string) (SignRequest, error)
 	UpsertPushToken(context.Context, string, string, string) (DeviceState, error)
 	GetDeviceState(context.Context, string) (DeviceState, error)
@@ -128,6 +133,9 @@ func (s *MemoryStateStore) CreateSignRequest(_ context.Context, req SignRequest)
 	if req.ExpiresAtMS == 0 {
 		req.ExpiresAtMS = time.UnixMilli(now).Add(defaultSignRequestTTL).UnixMilli()
 	}
+	if err := ensureSignRequestSigningFields(&req); err != nil {
+		return SignRequest{}, err
+	}
 	s.requests[req.ID] = cloneSignRequest(req)
 	return cloneSignRequest(req), nil
 }
@@ -152,7 +160,7 @@ func (s *MemoryStateStore) GetSignRequest(_ context.Context, id string) (SignReq
 	return cloneSignRequest(req), ok, nil
 }
 
-func (s *MemoryStateStore) CompleteSignRequest(_ context.Context, id, signature string) (SignRequest, error) {
+func (s *MemoryStateStore) CompleteSignRequest(_ context.Context, id, signature string, publishResult *PublishResult) (SignRequest, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	req, ok := s.requests[id]
@@ -161,6 +169,7 @@ func (s *MemoryStateStore) CompleteSignRequest(_ context.Context, id, signature 
 	}
 	req.Status = signRequestCompleted
 	req.Signature = signature
+	req.PublishResult = clonePublishResultPtr(publishResult)
 	req.UpdatedAtMS = s.nowMS()
 	s.requests[id] = req
 	return cloneSignRequest(req), nil
@@ -243,7 +252,12 @@ CREATE TABLE IF NOT EXISTS sign_requests (
   status        TEXT NOT NULL,
   group_id      BLOB,
   payload       BLOB NOT NULL,
+  canonical_type TEXT NOT NULL DEFAULT '',
+  signature_algorithm TEXT NOT NULL DEFAULT '',
+  signing_payload TEXT NOT NULL DEFAULT '',
+  signing_payload_sha256 TEXT NOT NULL DEFAULT '',
   signature     TEXT NOT NULL DEFAULT '',
+  publish_result BLOB,
   created_at_ms INTEGER NOT NULL,
   updated_at_ms INTEGER NOT NULL,
   expires_at_ms INTEGER NOT NULL DEFAULT 0
@@ -289,6 +303,10 @@ func OpenSQLiteStateStore(dataDir string) (*SQLiteStateStore, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("esphttp: apply state schema: %w", err)
 	}
+	if err := migrateSQLiteState(db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	return &SQLiteStateStore{db: db}, nil
 }
 
@@ -310,6 +328,9 @@ func (s *SQLiteStateStore) CreateSignRequest(ctx context.Context, req SignReques
 	if req.ExpiresAtMS == 0 {
 		req.ExpiresAtMS = time.UnixMilli(now).Add(defaultSignRequestTTL).UnixMilli()
 	}
+	if err := ensureSignRequestSigningFields(&req); err != nil {
+		return SignRequest{}, err
+	}
 	var groupBytes []byte
 	if req.GroupID != (entmoot.GroupID{}) {
 		groupBytes = req.GroupID[:]
@@ -318,11 +339,21 @@ func (s *SQLiteStateStore) CreateSignRequest(ctx context.Context, req SignReques
 	if payload == nil {
 		payload = []byte("{}")
 	}
+	var publishResult []byte
+	if req.PublishResult != nil {
+		var err error
+		publishResult, err = json.Marshal(req.PublishResult)
+		if err != nil {
+			return SignRequest{}, fmt.Errorf("esphttp: marshal publish result: %w", err)
+		}
+	}
 	if _, err := s.db.ExecContext(ctx, `
 INSERT INTO sign_requests
-  (id, device_id, kind, status, group_id, payload, signature, created_at_ms, updated_at_ms, expires_at_ms)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		req.ID, req.DeviceID, req.Kind, req.Status, groupBytes, payload, req.Signature,
+  (id, device_id, kind, status, group_id, payload, canonical_type, signature_algorithm, signing_payload,
+   signing_payload_sha256, signature, publish_result, created_at_ms, updated_at_ms, expires_at_ms)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		req.ID, req.DeviceID, req.Kind, req.Status, groupBytes, payload, req.CanonicalType,
+		req.SignatureAlgorithm, req.SigningPayload, req.SigningPayloadSHA256, req.Signature, publishResult,
 		req.CreatedAtMS, req.UpdatedAtMS, req.ExpiresAtMS); err != nil {
 		return SignRequest{}, fmt.Errorf("esphttp: create sign request: %w", err)
 	}
@@ -330,7 +361,8 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 }
 
 func (s *SQLiteStateStore) ListSignRequests(ctx context.Context, deviceID string) ([]SignRequest, error) {
-	query := `SELECT id, device_id, kind, status, group_id, payload, signature, created_at_ms, updated_at_ms, expires_at_ms
+	query := `SELECT id, device_id, kind, status, group_id, payload, canonical_type, signature_algorithm, signing_payload,
+signing_payload_sha256, signature, publish_result, created_at_ms, updated_at_ms, expires_at_ms
 FROM sign_requests`
 	args := []interface{}{}
 	if deviceID != "" {
@@ -355,7 +387,8 @@ FROM sign_requests`
 }
 
 func (s *SQLiteStateStore) GetSignRequest(ctx context.Context, id string) (SignRequest, bool, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, device_id, kind, status, group_id, payload, signature, created_at_ms, updated_at_ms, expires_at_ms
+	row := s.db.QueryRowContext(ctx, `SELECT id, device_id, kind, status, group_id, payload, canonical_type, signature_algorithm, signing_payload,
+signing_payload_sha256, signature, publish_result, created_at_ms, updated_at_ms, expires_at_ms
 FROM sign_requests WHERE id = ?`, id)
 	req, err := scanSignRequest(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -364,9 +397,17 @@ FROM sign_requests WHERE id = ?`, id)
 	return req, err == nil, err
 }
 
-func (s *SQLiteStateStore) CompleteSignRequest(ctx context.Context, id, signature string) (SignRequest, error) {
-	if _, err := s.db.ExecContext(ctx, `UPDATE sign_requests SET status = ?, signature = ?, updated_at_ms = ? WHERE id = ?`,
-		signRequestCompleted, signature, time.Now().UnixMilli(), id); err != nil {
+func (s *SQLiteStateStore) CompleteSignRequest(ctx context.Context, id, signature string, publishResult *PublishResult) (SignRequest, error) {
+	var publishResultJSON []byte
+	if publishResult != nil {
+		var err error
+		publishResultJSON, err = json.Marshal(publishResult)
+		if err != nil {
+			return SignRequest{}, fmt.Errorf("esphttp: marshal publish result: %w", err)
+		}
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE sign_requests SET status = ?, signature = ?, publish_result = ?, updated_at_ms = ? WHERE id = ?`,
+		signRequestCompleted, signature, publishResultJSON, time.Now().UnixMilli(), id); err != nil {
 		return SignRequest{}, fmt.Errorf("esphttp: complete sign request: %w", err)
 	}
 	req, ok, err := s.GetSignRequest(ctx, id)
@@ -464,6 +505,47 @@ ON CONFLICT(device_id) DO UPDATE SET
 	return nil
 }
 
+func migrateSQLiteState(db *sql.DB) error {
+	rows, err := db.Query(`PRAGMA table_info(sign_requests)`)
+	if err != nil {
+		return fmt.Errorf("esphttp: inspect state schema: %w", err)
+	}
+	defer rows.Close()
+	cols := make(map[string]bool)
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notNull int
+		var defaultValue interface{}
+		var pk int
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+			return fmt.Errorf("esphttp: scan state schema: %w", err)
+		}
+		cols[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("esphttp: inspect state schema: %w", err)
+	}
+	for _, stmt := range []struct {
+		name string
+		sql  string
+	}{
+		{"canonical_type", `ALTER TABLE sign_requests ADD COLUMN canonical_type TEXT NOT NULL DEFAULT ''`},
+		{"signature_algorithm", `ALTER TABLE sign_requests ADD COLUMN signature_algorithm TEXT NOT NULL DEFAULT ''`},
+		{"signing_payload", `ALTER TABLE sign_requests ADD COLUMN signing_payload TEXT NOT NULL DEFAULT ''`},
+		{"signing_payload_sha256", `ALTER TABLE sign_requests ADD COLUMN signing_payload_sha256 TEXT NOT NULL DEFAULT ''`},
+		{"publish_result", `ALTER TABLE sign_requests ADD COLUMN publish_result BLOB`},
+	} {
+		if cols[stmt.name] {
+			continue
+		}
+		if _, err := db.Exec(stmt.sql); err != nil {
+			return fmt.Errorf("esphttp: migrate state schema add %s: %w", stmt.name, err)
+		}
+	}
+	return nil
+}
+
 type signRequestScanner interface {
 	Scan(...interface{}) error
 }
@@ -472,20 +554,38 @@ func scanSignRequest(row signRequestScanner) (SignRequest, error) {
 	var req SignRequest
 	var groupBytes []byte
 	var payload []byte
+	var publishResult []byte
 	if err := row.Scan(&req.ID, &req.DeviceID, &req.Kind, &req.Status, &groupBytes, &payload,
-		&req.Signature, &req.CreatedAtMS, &req.UpdatedAtMS, &req.ExpiresAtMS); err != nil {
+		&req.CanonicalType, &req.SignatureAlgorithm, &req.SigningPayload, &req.SigningPayloadSHA256,
+		&req.Signature, &publishResult, &req.CreatedAtMS, &req.UpdatedAtMS, &req.ExpiresAtMS); err != nil {
 		return SignRequest{}, err
 	}
 	if len(groupBytes) == len(req.GroupID) {
 		copy(req.GroupID[:], groupBytes)
 	}
 	req.Payload = append(json.RawMessage(nil), payload...)
+	if len(publishResult) > 0 {
+		var result PublishResult
+		if err := json.Unmarshal(publishResult, &result); err != nil {
+			return SignRequest{}, fmt.Errorf("esphttp: parse publish result: %w", err)
+		}
+		req.PublishResult = &result
+	}
 	return req, nil
 }
 
 func cloneSignRequest(req SignRequest) SignRequest {
 	req.Payload = append(json.RawMessage(nil), req.Payload...)
+	req.PublishResult = clonePublishResultPtr(req.PublishResult)
 	return req
+}
+
+func clonePublishResultPtr(in *PublishResult) *PublishResult {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	return &out
 }
 
 func normalizePrefs(prefs NotificationPreferences) NotificationPreferences {

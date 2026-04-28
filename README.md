@@ -319,6 +319,27 @@ creation, invite acceptance, invite creation, and unsigned message drafts
 return ESP sign requests so a phone-held key can authorize the operation
 before the ESP relays it.
 
+Executable ESP sign requests expose canonical signing metadata. For
+`message_publish`, the returned sign request includes `signing_payload`
+(base64 canonical Entmoot message signing bytes) and
+`signing_payload_sha256`; the phone base64-decodes `signing_payload`, signs
+those bytes with its author key, then completes the request with both the
+`signature` and matching `signing_payload_sha256`. The ESP verifies the digest
+guard and signature, then forwards the completed message through signed
+publish. The older `payload` field remains useful for draft/debug display, but
+it is not signing material.
+
+```sh
+curl -H "Authorization: Bearer replace-me" \
+  -H "Content-Type: application/json" \
+  -d '{"author":{"pilot_node_id":45491,"entmoot_pubkey":"<base64-ed25519-pubkey>"},"topics":["chat"],"content":"aGVsbG8="}' \
+  "http://127.0.0.1:8087/v1/groups/<base64>/messages"
+curl -H "Authorization: Bearer replace-me" \
+  -H "Content-Type: application/json" \
+  -d '{"signature":"<base64-ed25519-signature>","signing_payload_sha256":"<sha256>"}' \
+  "http://127.0.0.1:8087/v1/sign-requests/<id>/complete"
+```
+
 For manual smoke tests, write the onboarded private key to a local `0600`
 file and ask the CLI to produce request headers:
 

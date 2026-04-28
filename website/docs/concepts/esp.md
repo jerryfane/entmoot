@@ -24,3 +24,16 @@ group creation drafts, invite acceptance, or message drafts, become ESP-local
 sign requests. The phone signs the canonical operation payload and returns the
 signature; the ESP can then relay the authorized operation through the normal
 Entmoot path.
+
+Executable sign requests include the signing bytes explicitly. For
+`message_publish`, the ESP returns both a draft/debug `payload` and canonical
+signing metadata: `signing_payload` contains base64-encoded Entmoot message
+signing bytes, and `signing_payload_sha256` binds the completion to that exact
+request. The phone signs the base64-decoded `signing_payload`, completes the
+request with `signature` and `signing_payload_sha256`, and the ESP verifies and
+forwards the message through signed publish. Clients must not treat `payload`
+as signing material.
+
+```json
+{"signature":"<base64 ed25519 signature>","signing_payload_sha256":"<sha256 from sign request>"}
+```

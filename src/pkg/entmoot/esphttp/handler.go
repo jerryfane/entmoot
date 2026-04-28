@@ -22,7 +22,9 @@ import (
 	"time"
 
 	"entmoot/pkg/entmoot"
+	"entmoot/pkg/entmoot/canonical"
 	"entmoot/pkg/entmoot/mailbox"
+	"entmoot/pkg/entmoot/signing"
 	"entmoot/pkg/entmoot/store"
 )
 
@@ -481,7 +483,12 @@ func (h *Handler) handleGroupMessagePublish(w http.ResponseWriter, r *http.Reque
 		h.writePublishResult(w, result, err)
 		return
 	}
-	h.createSignRequest(w, r, "message_publish", groupID, body)
+	var draft messagePublishDraft
+	if err := json.Unmarshal(body, &draft); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", fmt.Sprintf("invalid message draft: %v", err))
+		return
+	}
+	h.createMessagePublishSignRequest(w, r, groupID, draft)
 }
 
 func (h *Handler) handleInviteAccept(w http.ResponseWriter, r *http.Request) {
@@ -538,8 +545,7 @@ func (h *Handler) handleSignRequestSubroute(w http.ResponseWriter, r *http.Reque
 			methodNotAllowed(w, http.MethodPost)
 			return true
 		}
-		req, err := h.state.RejectSignRequest(r.Context(), id)
-		h.writeSignRequestMutation(w, req, err)
+		h.handleRejectSignRequest(w, r, id)
 	default:
 		writeError(w, http.StatusNotFound, "not_found", "not found")
 	}
@@ -548,16 +554,75 @@ func (h *Handler) handleSignRequestSubroute(w http.ResponseWriter, r *http.Reque
 
 func (h *Handler) handleCompleteSignRequest(w http.ResponseWriter, r *http.Request, id string) {
 	var body struct {
-		Signature string `json:"signature"`
+		Signature            string `json:"signature"`
+		SigningPayloadSHA256 string `json:"signing_payload_sha256"`
 	}
 	if _, ok := decodeRawBody(w, r, 1<<20, &body); !ok {
 		return
 	}
-	if strings.TrimSpace(body.Signature) == "" {
+	signatureText := strings.TrimSpace(body.Signature)
+	if signatureText == "" {
 		writeError(w, http.StatusBadRequest, "bad_request", "signature is required")
 		return
 	}
-	req, err := h.state.CompleteSignRequest(r.Context(), id, strings.TrimSpace(body.Signature))
+	req, ok, err := h.state.GetSignRequest(r.Context(), id)
+	if err != nil {
+		h.writeSignRequestMutation(w, SignRequest{}, err)
+		return
+	}
+	if !ok {
+		h.writeSignRequestMutation(w, SignRequest{}, sql.ErrNoRows)
+		return
+	}
+	if !h.signRequestVisible(w, r, req) {
+		return
+	}
+	if !h.checkSignRequestPending(w, req) {
+		return
+	}
+	gotDigest := strings.TrimSpace(body.SigningPayloadSHA256)
+	if req.Kind == signRequestKindMessagePublish && gotDigest == "" {
+		writeError(w, http.StatusBadRequest, "bad_request", "signing_payload_sha256 is required")
+		return
+	}
+	if gotDigest != "" && gotDigest != req.SigningPayloadSHA256 {
+		writeError(w, http.StatusBadRequest, "signing_payload_mismatch", "signing payload digest does not match sign request")
+		return
+	}
+	sig, err := base64.StdEncoding.DecodeString(signatureText)
+	if err != nil || len(sig) != ed25519.SignatureSize {
+		writeError(w, http.StatusBadRequest, "bad_request", "signature must be a base64 Ed25519 signature")
+		return
+	}
+	var publishResult *PublishResult
+	if req.Kind == signRequestKindMessagePublish {
+		result, ok := h.completeMessagePublishSignRequest(w, r, req, sig)
+		if !ok {
+			return
+		}
+		publishResult = &result
+	}
+	req, err = h.state.CompleteSignRequest(r.Context(), id, signatureText, publishResult)
+	h.writeSignRequestMutation(w, req, err)
+}
+
+func (h *Handler) handleRejectSignRequest(w http.ResponseWriter, r *http.Request, id string) {
+	req, ok, err := h.state.GetSignRequest(r.Context(), id)
+	if err != nil {
+		h.writeSignRequestMutation(w, SignRequest{}, err)
+		return
+	}
+	if !ok {
+		h.writeSignRequestMutation(w, SignRequest{}, sql.ErrNoRows)
+		return
+	}
+	if !h.signRequestVisible(w, r, req) {
+		return
+	}
+	if !h.checkSignRequestPending(w, req) {
+		return
+	}
+	req, err = h.state.RejectSignRequest(r.Context(), id)
 	h.writeSignRequestMutation(w, req, err)
 }
 
@@ -1041,6 +1106,55 @@ func (h *Handler) createSignRequest(w http.ResponseWriter, r *http.Request, kind
 	writeJSON(w, http.StatusAccepted, map[string]any{"sign_request": req})
 }
 
+func (h *Handler) createMessagePublishSignRequest(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID, draft messagePublishDraft) {
+	auth, _ := r.Context().Value(authContextKey{}).(authContext)
+	if !h.checkDeviceGroup(w, r, groupID) {
+		return
+	}
+	req, err := buildMessagePublishSignRequest(deviceIDForRequest(auth), groupID, draft, h.clock().UnixMilli())
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+	req, err = h.state.CreateSignRequest(r.Context(), req)
+	if err != nil {
+		h.logger.Error("esphttp: create message publish sign request", slog.String("err", err.Error()))
+		writeError(w, http.StatusInternalServerError, "internal_error", "sign request creation failed")
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{"sign_request": req})
+}
+
+func (h *Handler) completeMessagePublishSignRequest(w http.ResponseWriter, r *http.Request, req SignRequest, signature []byte) (PublishResult, bool) {
+	if h.publisher == nil {
+		writeError(w, http.StatusServiceUnavailable, "join_unavailable", "no running join publisher configured")
+		return PublishResult{}, false
+	}
+	var payload messagePublishPayload
+	if err := json.Unmarshal(req.Payload, &payload); err != nil {
+		h.logger.Error("esphttp: parse message publish sign request", slog.String("err", err.Error()))
+		writeError(w, http.StatusInternalServerError, "internal_error", "sign request payload is invalid")
+		return PublishResult{}, false
+	}
+	msg := payload.Message
+	if msg.GroupID != req.GroupID {
+		writeError(w, http.StatusBadRequest, "bad_request", "sign request message group does not match request group")
+		return PublishResult{}, false
+	}
+	msg.ID = canonical.MessageID(msg)
+	msg.Signature = append([]byte(nil), signature...)
+	if err := signing.VerifyMessage(msg, msg.Author); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_signature", err.Error())
+		return PublishResult{}, false
+	}
+	result, err := h.publisher.PublishSigned(r.Context(), msg)
+	if err != nil {
+		h.writePublishResult(w, result, err)
+		return PublishResult{}, false
+	}
+	return result, true
+}
+
 func (h *Handler) writeSignRequestLookup(w http.ResponseWriter, r *http.Request, req SignRequest, ok bool, err error) {
 	if err != nil {
 		h.logger.Error("esphttp: get sign request", slog.String("err", err.Error()))
@@ -1068,6 +1182,18 @@ func (h *Handler) writeSignRequestMutation(w http.ResponseWriter, req SignReques
 	}
 	h.logger.Error("esphttp: mutate sign request", slog.String("err", err.Error()))
 	writeError(w, http.StatusInternalServerError, "internal_error", "sign request update failed")
+}
+
+func (h *Handler) checkSignRequestPending(w http.ResponseWriter, req SignRequest) bool {
+	if req.Status != signRequestPending {
+		writeError(w, http.StatusConflict, "sign_request_not_pending", "sign request is not pending")
+		return false
+	}
+	if req.ExpiresAtMS > 0 && !time.UnixMilli(req.ExpiresAtMS).After(h.clock()) {
+		writeError(w, http.StatusConflict, "sign_request_expired", "sign request has expired")
+		return false
+	}
+	return true
 }
 
 func (h *Handler) signRequestVisible(w http.ResponseWriter, r *http.Request, req SignRequest) bool {

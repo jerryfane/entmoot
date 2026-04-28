@@ -641,6 +641,16 @@ require the requested `client_id` to be listed for that device.
   - If the body contains `{"message": ...}` with a fully signed Entmoot
     message, forwards it like `POST /v1/messages`.
   - Otherwise creates a `message_publish` sign request from the draft body.
+    The sign request exposes canonical signing metadata for the exact message
+    the phone must authorize:
+
+    ```json
+    {"sign_request":{"id":"<id>","kind":"message_publish","group_id":"<base64>","payload":{"message":{"group_id":"<base64>","author":{"pilot_node_id":45491,"entmoot_pubkey":"<base64-ed25519-pubkey>"},"timestamp":1777392000000,"topics":["chat"],"content":"aGVsbG8="}},"signing_payload":"<base64 canonical message signing bytes>","signing_payload_sha256":"<sha256>","status":"pending"}}
+    ```
+
+  - `payload` is draft/debug material for display and retry context. It is not
+    the signing payload. The phone base64-decodes `signing_payload` and signs
+    those bytes with the Entmoot author key.
 - `GET /v1/mailbox/pull?client_id=CLIENT&group_id=GID&limit=N`
   - Requires ESP auth.
   - `group_id` is required. HTTP clients do not inherit CLI group
@@ -679,8 +689,19 @@ require the requested `client_id` to be listed for that device.
 - `GET /v1/sign-requests/{id}`
   - Returns one sign request.
 - `POST /v1/sign-requests/{id}/complete`
-  - Body: `{"signature":"<base64>"}`. Marks the request complete. Follow-up
-    protocol-specific execution is intentionally separate.
+  - Body:
+
+    ```json
+    {"signature":"<base64>","signing_payload_sha256":"<sha256>"}
+    ```
+
+  - For executable `message_publish` requests, the ESP requires
+    `signing_payload_sha256` to match the pending request, verifies the
+    signature over the base64-decoded `signing_payload`, builds the signed
+    Entmoot message, and forwards it through the same signed-publish path as
+    `POST /v1/messages`.
+  - For non-executable request kinds, completion records the signature and
+    leaves follow-up protocol-specific execution separate.
 - `POST /v1/sign-requests/{id}/reject`
   - Marks the request rejected.
 - `GET /v1/devices/current`

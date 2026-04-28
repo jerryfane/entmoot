@@ -13,6 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   status inspection, group/member reads, group/invite/message sign-request
   creation, device push-token registration, notification preferences, and
   durable ESP-local state in `<data>/esp.sqlite`.
+- **Executable ESP message-publish sign requests.** `message_publish` sign
+  requests now expose canonical `signing_payload` metadata, phones sign the
+  base64-decoded bytes, and completion verifies `signature` plus
+  `signing_payload_sha256` before forwarding the signed message through the
+  local publish path. Draft `payload` remains display/debug material only.
 - **Docusaurus documentation site.** Added a docs website under `website/`
   with Getting Started, Concepts, CLI, Operations, Architecture, and Reference
   sections, plus GitHub Pages deployment.

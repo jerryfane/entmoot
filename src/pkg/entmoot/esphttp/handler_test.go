@@ -17,6 +17,7 @@ import (
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/canonical"
 	"entmoot/pkg/entmoot/mailbox"
+	"entmoot/pkg/entmoot/signing"
 	"entmoot/pkg/entmoot/store"
 )
 
@@ -277,10 +278,94 @@ func TestHandlerMobileGroupsAndSignRequests(t *testing.T) {
 	}
 
 	completed := doJSONRequest[SignRequest](t, handler, http.MethodPost, "/v1/sign-requests/"+created.SignRequest.ID+"/complete", map[string]any{
-		"signature": base64.StdEncoding.EncodeToString([]byte("sig")),
+		"signature": base64.StdEncoding.EncodeToString(make([]byte, ed25519.SignatureSize)),
 	}, http.StatusOK)
 	if completed.Status != signRequestCompleted {
 		t.Fatalf("completed status = %q, want %q", completed.Status, signRequestCompleted)
+	}
+}
+
+func TestHandlerMessagePublishSignRequestExecutes(t *testing.T) {
+	gid := testGroupID(1)
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	publisher := &fakePublisher{}
+	handler := testMobileHandlerWithPublisher(t, gid, publisher, func() time.Time { return time.UnixMilli(1_234_000) })
+
+	created := doJSONRequest[struct {
+		SignRequest SignRequest `json:"sign_request"`
+	}](t, handler, http.MethodPost, "/v1/groups/"+gid.String()+"/messages", map[string]any{
+		"author": entmoot.NodeInfo{
+			PilotNodeID:   45491,
+			EntmootPubKey: pub,
+		},
+		"topics":  []string{"chat"},
+		"content": []byte("hello from phone"),
+	}, http.StatusAccepted)
+	req := created.SignRequest
+	if req.Kind != signRequestKindMessagePublish || req.CanonicalType != canonicalTypeMessageV1 ||
+		req.SignatureAlgorithm != signatureAlgorithmEd25519 || req.SigningPayload == "" || req.SigningPayloadSHA256 == "" {
+		t.Fatalf("sign request metadata = %+v", req)
+	}
+	signingPayload, err := base64.StdEncoding.DecodeString(req.SigningPayload)
+	if err != nil {
+		t.Fatalf("decode signing payload: %v", err)
+	}
+	var payload messagePublishPayload
+	if err := json.Unmarshal(req.Payload, &payload); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+	wantSigningPayload, err := signing.MessageSigningBytes(payload.Message)
+	if err != nil {
+		t.Fatalf("MessageSigningBytes: %v", err)
+	}
+	if !bytes.Equal(signingPayload, wantSigningPayload) {
+		t.Fatalf("signing payload mismatch\n got %q\nwant %q", signingPayload, wantSigningPayload)
+	}
+	sig := ed25519.Sign(priv, signingPayload)
+	completed := doJSONRequest[SignRequest](t, handler, http.MethodPost, "/v1/sign-requests/"+req.ID+"/complete", map[string]any{
+		"signature":              base64.StdEncoding.EncodeToString(sig),
+		"signing_payload_sha256": req.SigningPayloadSHA256,
+	}, http.StatusOK)
+	if completed.Status != signRequestCompleted || completed.PublishResult == nil {
+		t.Fatalf("completed sign request = %+v", completed)
+	}
+	if completed.PublishResult.MessageID != publisher.got.ID {
+		t.Fatalf("publish result message id = %s, want %s", completed.PublishResult.MessageID, publisher.got.ID)
+	}
+	if publisher.got.ID != canonical.MessageID(publisher.got) {
+		t.Fatalf("publisher got non-canonical message id")
+	}
+	if err := signing.VerifyMessage(publisher.got, publisher.got.Author); err != nil {
+		t.Fatalf("publisher got unverifiable message: %v", err)
+	}
+}
+
+func TestHandlerMessagePublishSignRequestRejectsDigestMismatch(t *testing.T) {
+	gid := testGroupID(1)
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	handler := testMobileHandlerWithPublisher(t, gid, &fakePublisher{}, func() time.Time { return time.UnixMilli(1_234_000) })
+	created := doJSONRequest[struct {
+		SignRequest SignRequest `json:"sign_request"`
+	}](t, handler, http.MethodPost, "/v1/groups/"+gid.String()+"/messages", map[string]any{
+		"author": entmoot.NodeInfo{PilotNodeID: 45491, EntmootPubKey: pub},
+		"topics": []string{"chat"},
+	}, http.StatusAccepted)
+	signingPayload, err := base64.StdEncoding.DecodeString(created.SignRequest.SigningPayload)
+	if err != nil {
+		t.Fatalf("decode signing payload: %v", err)
+	}
+	errResp := doJSONRequest[errorEnvelope](t, handler, http.MethodPost, "/v1/sign-requests/"+created.SignRequest.ID+"/complete", map[string]any{
+		"signature":              base64.StdEncoding.EncodeToString(ed25519.Sign(priv, signingPayload)),
+		"signing_payload_sha256": base64.StdEncoding.EncodeToString([]byte("wrong")),
+	}, http.StatusBadRequest)
+	if errResp.Error.Code != "signing_payload_mismatch" {
+		t.Fatalf("error code = %q, want signing_payload_mismatch", errResp.Error.Code)
 	}
 }
 
@@ -462,6 +547,16 @@ func testHandlerWithPublisher(t *testing.T, gid entmoot.GroupID, publisher Publi
 
 func testMobileHandler(t *testing.T, gid entmoot.GroupID, reg *DeviceRegistry, catalog GroupCatalog, clock func() time.Time) http.Handler {
 	t.Helper()
+	return testMobileHandlerFull(t, gid, reg, catalog, clock, nil, NewMemoryStateStore())
+}
+
+func testMobileHandlerWithPublisher(t *testing.T, gid entmoot.GroupID, publisher Publisher, clock func() time.Time) http.Handler {
+	t.Helper()
+	return testMobileHandlerFull(t, gid, nil, nil, clock, publisher, NewMemoryStateStore())
+}
+
+func testMobileHandlerFull(t *testing.T, gid entmoot.GroupID, reg *DeviceRegistry, catalog GroupCatalog, clock func() time.Time, publisher Publisher, state StateStore) http.Handler {
+	t.Helper()
 	st := store.NewMemory()
 	for _, msg := range []entmoot.Message{testMessage(gid, 1, "first")} {
 		if err := st.Put(context.Background(), msg); err != nil {
@@ -480,13 +575,14 @@ func testMobileHandler(t *testing.T, gid entmoot.GroupID, reg *DeviceRegistry, c
 		clock = time.Now
 	}
 	handler, err := NewHandler(Config{
-		Token:    "secret",
-		AuthMode: mode,
-		Devices:  reg,
-		Service:  svc,
-		State:    NewMemoryStateStore(),
-		Groups:   catalog,
-		Clock:    clock,
+		Token:     "secret",
+		AuthMode:  mode,
+		Devices:   reg,
+		Service:   svc,
+		Publisher: publisher,
+		State:     state,
+		Groups:    catalog,
+		Clock:     clock,
 		GroupExists: func(_ context.Context, got entmoot.GroupID) (bool, error) {
 			return got == gid, nil
 		},
@@ -534,6 +630,15 @@ func (p *fakePublisher) PublishSigned(_ context.Context, msg entmoot.Message) (P
 	p.got = msg
 	if p.err != nil {
 		return PublishResult{}, p.err
+	}
+	if p.result.Status == "" {
+		return PublishResult{
+			Status:      "accepted",
+			MessageID:   msg.ID,
+			GroupID:     msg.GroupID,
+			Author:      msg.Author.PilotNodeID,
+			TimestampMS: msg.Timestamp,
+		}, nil
 	}
 	return p.result, nil
 }
