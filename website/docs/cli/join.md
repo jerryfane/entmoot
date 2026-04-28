@@ -3,11 +3,12 @@ title: join
 ---
 
 ```sh
-entmootd join <invite>
+entmootd join <invite> [invite...]
 ```
 
-`join` validates the invite, opens the Pilot listener, starts the local control
-socket, loads persistent state, and blocks while participating in the group.
+`join` validates each invite, opens one shared Pilot listener, starts the local
+control socket, loads persistent state, and blocks while participating in every
+joined group session.
 
 Useful flags:
 
@@ -19,4 +20,3 @@ Useful flags:
 ```
 
 Use a service manager for production.
-

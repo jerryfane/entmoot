@@ -19,10 +19,8 @@ import (
 
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/events"
-	"entmoot/pkg/entmoot/gossip"
 	"entmoot/pkg/entmoot/ipc"
 	"entmoot/pkg/entmoot/keystore"
-	"entmoot/pkg/entmoot/ratelimit"
 	"entmoot/pkg/entmoot/roster"
 	"entmoot/pkg/entmoot/signing"
 	"entmoot/pkg/entmoot/store"
@@ -114,27 +112,25 @@ func cmdJoin(gf *globalFlags, args []string) int {
 		fmt.Fprintln(os.Stderr, "join: missing invite (file path or http(s) URL)")
 		return exitInvalidArgument
 	}
-	if len(rest) > 1 {
-		fmt.Fprintln(os.Stderr, "join: too many positional arguments")
-		return exitInvalidArgument
-	}
-	inviteArg := rest[0]
-
-	invite, err := loadInvite(inviteArg)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "join: invite: %v\n", err)
-		// A local-parse failure (bad file, bad JSON, expired ValidUntil)
-		// is INVALID_ARGUMENT per CLI_DESIGN §3.1. A network-fetch
-		// failure is a transport error (exit 1).
-		if errors.Is(err, errFetchFailed) {
-			return exitTransport
-		}
-		if errors.Is(err, entmoot.ErrInviteExpired) ||
-			errors.Is(err, entmoot.ErrSigInvalid) ||
-			errors.Is(err, errInviteMalformed) {
+	invites := make([]*entmoot.Invite, 0, len(rest))
+	for _, inviteArg := range rest {
+		invite, err := loadInvite(inviteArg)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "join: invite %s: %v\n", inviteArg, err)
+			// A local-parse failure (bad file, bad JSON, expired ValidUntil)
+			// is INVALID_ARGUMENT per CLI_DESIGN §3.1. A network-fetch
+			// failure is a transport error (exit 1).
+			if errors.Is(err, errFetchFailed) {
+				return exitTransport
+			}
+			if errors.Is(err, entmoot.ErrInviteExpired) ||
+				errors.Is(err, entmoot.ErrSigInvalid) ||
+				errors.Is(err, errInviteMalformed) {
+				return exitInvalidArgument
+			}
 			return exitInvalidArgument
 		}
-		return exitInvalidArgument
+		invites = append(invites, invite)
 	}
 
 	s, err := setup(gf)
@@ -191,13 +187,6 @@ func cmdJoin(gf *globalFlags, args []string) int {
 	serviceEvents := events.NewBus()
 	notifyStore := newNotifyingStore(rawStore, serviceEvents)
 
-	rlog, err := roster.OpenJSONL(s.dataDir, invite.GroupID)
-	if err != nil {
-		slog.Error("join: open roster", slog.String("err", err.Error()))
-		return exitTransport
-	}
-	defer func() { _ = rlog.Close() }()
-
 	// Establish the signal-bound root context before anything starts
 	// long-running goroutines (v1.4.4's TURN-endpoint poller is the
 	// first). Previously this was set up just before gossiper.Join;
@@ -247,51 +236,37 @@ func cmdJoin(gf *globalFlags, args []string) int {
 	// Background polling runs for the lifetime of the daemon.
 	go turnPoller.Run(rootCtx)
 
-	g, err := gossip.New(gossip.Config{
-		LocalNode: nodeID,
-		Identity:  s.identity,
-		Roster:    rlog,
-		Store:     notifyStore,
-		Transport: tr,
-		GroupID:   invite.GroupID,
-		Logger:    slog.Default(),
-		// v1.2.0 wiring: rawStore (the concrete *store.SQLite)
-		// satisfies the gossip.TransportAdStore interface; notifyStore
-		// is a thin wrapper around it for the message surface only.
-		TransportAdStore: rawStore,
-		RateLimiter:      ratelimit.New(ratelimit.DefaultLimits(), nil),
+	runtime, err := newGroupRuntime(groupRuntimeConfig{
+		NodeID:           nodeID,
+		Identity:         s.identity,
+		DataDir:          s.dataDir,
+		Store:            rawStore,
+		Notify:           notifyStore,
+		Transport:        tr,
 		LocalEndpoints:   localEndpointsFn,
-		// v1.4.4: wire the TURN-rotation signal so the advertiser
-		// re-publishes immediately on change instead of waiting for
-		// the 6-day safety-net refresh.
 		EndpointsChanged: turnPoller.Changed(),
-		// v1.4.0: when set, the advertiser publishes only turn
-		// endpoints from LocalEndpoints and drops UDP/TCP entries,
-		// or emits an empty ad + warning when no TURN endpoint
-		// exists. See gossip.Config.HideIP for the rationale.
-		HideIP:         gf.hideIP,
-		TraceReconcile: gf.traceReconcile,
+		HideIP:           gf.hideIP,
+		TraceReconcile:   gf.traceReconcile,
+		Logger:           slog.Default(),
 	})
 	if err != nil {
-		slog.Error("join: new gossiper", slog.String("err", err.Error()))
+		slog.Error("join: new group runtime", slog.String("err", err.Error()))
 		return exitTransport
 	}
 
-	// Run Join with a bounded deadline so an unreachable peer set fails
-	// loudly rather than hanging the process before the control socket
-	// is even up.
-	joinCtx, joinCancel := context.WithTimeout(rootCtx, 30*time.Second)
-	err = g.Join(joinCtx, invite)
-	joinCancel()
-	if err != nil {
-		// Expired / bad-sig invite surfaces as INVALID_ARGUMENT here
-		// too (Join re-verifies signature and ValidUntil).
-		if errors.Is(err, entmoot.ErrInviteExpired) || errors.Is(err, entmoot.ErrSigInvalid) {
-			fmt.Fprintf(os.Stderr, "join: %v\n", err)
-			return exitInvalidArgument
+	for _, invite := range invites {
+		if _, _, err := runtime.AddInvite(rootCtx, *invite); err != nil {
+			// Expired / bad-sig invite surfaces as INVALID_ARGUMENT here
+			// too (Join re-verifies signature and ValidUntil).
+			if errors.Is(err, entmoot.ErrInviteExpired) || errors.Is(err, entmoot.ErrSigInvalid) {
+				fmt.Fprintf(os.Stderr, "join: %v\n", err)
+				runtime.Close()
+				return exitInvalidArgument
+			}
+			slog.Error("join: add group", slog.String("group_id", invite.GroupID.String()), slog.String("err", err.Error()))
+			runtime.Close()
+			return exitTransport
 		}
-		slog.Error("join: gossiper.Join", slog.String("err", err.Error()))
-		return exitTransport
 	}
 
 	// Bind the control socket with 0600 permissions. net.Listen uses
@@ -299,6 +274,7 @@ func cmdJoin(gf *globalFlags, args []string) int {
 	listener, err := net.Listen("unix", sockPath)
 	if err != nil {
 		slog.Error("join: listen control socket", slog.String("err", err.Error()))
+		runtime.Close()
 		return exitTransport
 	}
 	if err := os.Chmod(sockPath, 0o600); err != nil {
@@ -312,42 +288,15 @@ func cmdJoin(gf *globalFlags, args []string) int {
 		}
 	}
 
-	// v1.2.0: replay persisted TransportAds into Pilot so peerTCP is
-	// warm before the accept loop begins. Handles the "pilot-daemon
-	// restart but entmootd still up" case and the "entmootd restart
-	// but pilot still up" case symmetrically: on either boot, state
-	// converges from disk. Failures are non-fatal — the ongoing
-	// advertiser/refanout loops rebuild peerTCP within one refresh
-	// cycle if we can't replay now. Own-author ads are skipped
-	// because Pilot doesn't need (and on jf.7 actively rejects) a
-	// self entry in its peerTCP map.
-	replayCtx, replayCancel := context.WithTimeout(rootCtx, 10*time.Second)
-	if ads, err := rawStore.GetAllTransportAds(replayCtx, invite.GroupID, time.Now(), false); err != nil {
-		slog.Warn("join: replay transport ads",
-			slog.String("err", err.Error()))
-	} else {
-		for _, ad := range ads {
-			if ad.Author.PilotNodeID == nodeID {
-				continue
-			}
-			if err := tr.SetPeerEndpoints(replayCtx, ad.Author.PilotNodeID, ad.Endpoints); err != nil {
-				slog.Debug("join: replay endpoint install failed",
-					slog.Uint64("peer", uint64(ad.Author.PilotNodeID)),
-					slog.String("err", err.Error()))
-			}
-		}
-	}
-	replayCancel()
-
-	// Start the gossiper accept loop and the IPC accept loop in
-	// separate goroutines. Wait for both to return before emitting the
-	// final shutdown log and removing the control socket.
+	// Start the shared transport demux and the IPC accept loop in separate
+	// goroutines. Each group session has already started its own gossiper
+	// workers inside runtime.AddInvite.
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		if err := g.Start(rootCtx); err != nil {
-			slog.Warn("join: gossiper stopped", slog.String("err", err.Error()))
+		if err := runtime.Start(rootCtx); err != nil {
+			slog.Warn("join: group runtime stopped", slog.String("err", err.Error()))
 		}
 	}()
 
@@ -357,9 +306,7 @@ func cmdJoin(gf *globalFlags, args []string) int {
 		identity:   s.identity,
 		dataDir:    s.dataDir,
 		listenPort: uint16(gf.listenPort),
-		gossiper:   g,
-		roster:     rlog,
-		groupID:    invite.GroupID,
+		runtime:    runtime,
 		store:      rawStore,
 		notify:     notifyStore,
 	}
@@ -375,10 +322,18 @@ func cmdJoin(gf *globalFlags, args []string) int {
 	}()
 
 	// Emit the one-line "joined" event on stdout.
+	groups := runtime.ActiveGroupIDs()
+	members := 0
+	for _, gid := range groups {
+		if sess, ok := runtime.Get(gid); ok {
+			members += len(sess.roster.Members())
+		}
+	}
 	joinedEvent := map[string]any{
 		"event":          "joined",
-		"group_id":       invite.GroupID,
-		"members":        len(rlog.Members()),
+		"group_id":       groups[0],
+		"group_ids":      groups,
+		"members":        members,
 		"listen_port":    gf.listenPort,
 		"control_socket": sockPath,
 	}
@@ -388,6 +343,7 @@ func cmdJoin(gf *globalFlags, args []string) int {
 
 	// Block until a signal fires and all goroutines unwind.
 	<-rootCtx.Done()
+	runtime.Close()
 	wg.Wait()
 
 	// WAL checkpoint + DB close is handled by rawStore.Close in the
@@ -622,9 +578,7 @@ type ipcServer struct {
 	identity   *keystore.Identity
 	dataDir    string
 	listenPort uint16
-	gossiper   *gossip.Gossiper
-	roster     *roster.RosterLog
-	groupID    entmoot.GroupID
+	runtime    *groupRuntime
 	store      *store.SQLite
 	notify     *notifyingStore
 }
@@ -682,6 +636,8 @@ func (s *ipcServer) handleConn(ctx context.Context, c net.Conn) {
 		s.handlePublish(ctx, c, v)
 	case *ipc.SignedPublishReq:
 		s.handleSignedPublish(ctx, c, v)
+	case *ipc.JoinGroupReq:
+		s.handleJoinGroup(ctx, c, v)
 	case *ipc.InfoReq:
 		s.handleInfo(ctx, c)
 	case *ipc.TailSubscribe:
@@ -704,7 +660,8 @@ func (s *ipcServer) handleConn(ctx context.Context, c net.Conn) {
 func (s *ipcServer) handleSignedPublish(ctx context.Context, c net.Conn, req *ipc.SignedPublishReq) {
 	msg := req.Message
 	gid := msg.GroupID
-	if gid != s.groupID {
+	sess, ok := s.runtime.Get(gid)
+	if !ok {
 		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
 			Type:    "error",
 			Code:    ipc.CodeGroupNotFound,
@@ -713,7 +670,7 @@ func (s *ipcServer) handleSignedPublish(ctx context.Context, c net.Conn, req *ip
 		})
 		return
 	}
-	if err := s.gossiper.Publish(ctx, msg); err != nil {
+	if err := sess.gossip.Publish(ctx, msg); err != nil {
 		code := ipc.CodeInternal
 		switch {
 		case errors.Is(err, entmoot.ErrNotMember):
@@ -742,15 +699,16 @@ func (s *ipcServer) handleSignedPublish(ctx context.Context, c net.Conn, req *ip
 // Content as a full Message, and gossips it. Emits PublishResp on
 // success or a structured ErrorFrame on failure.
 func (s *ipcServer) handlePublish(ctx context.Context, c net.Conn, req *ipc.PublishReq) {
-	// Resolve group: the daemon only serves its own groupID in v1
-	// (single-group per join process). nil means "the single group we
-	// know"; any explicit value must match.
-	gid := s.groupID
-	if req.GroupID != nil && *req.GroupID != s.groupID {
+	gid, ok := s.resolvePublishGroup(c, req.GroupID)
+	if !ok {
+		return
+	}
+	sess, ok := s.runtime.Get(gid)
+	if !ok {
 		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
 			Type:    "error",
 			Code:    ipc.CodeGroupNotFound,
-			GroupID: req.GroupID,
+			GroupID: &gid,
 			Message: "group not joined",
 		})
 		return
@@ -776,7 +734,7 @@ func (s *ipcServer) handlePublish(ctx context.Context, c net.Conn, req *ipc.Publ
 			return
 		}
 	}
-	if !s.roster.IsMember(s.nodeID) {
+	if !sess.roster.IsMember(s.nodeID) {
 		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
 			Type:    "error",
 			Code:    ipc.CodeNotMember,
@@ -794,7 +752,7 @@ func (s *ipcServer) handlePublish(ctx context.Context, c net.Conn, req *ipc.Publ
 		PilotNodeID:   s.nodeID,
 		EntmootPubKey: s.identity.PublicKey,
 	}
-	if info, ok := s.roster.MemberInfo(s.nodeID); ok {
+	if info, ok := sess.roster.MemberInfo(s.nodeID); ok {
 		author = info
 	}
 
@@ -837,7 +795,7 @@ func (s *ipcServer) handlePublish(ctx context.Context, c net.Conn, req *ipc.Publ
 		return
 	}
 
-	if err := s.gossiper.Publish(ctx, msg); err != nil {
+	if err := sess.gossip.Publish(ctx, msg); err != nil {
 		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
 			Type:    "error",
 			Code:    ipc.CodeInternal,
@@ -853,9 +811,63 @@ func (s *ipcServer) handlePublish(ctx context.Context, c net.Conn, req *ipc.Publ
 	})
 }
 
+func (s *ipcServer) resolvePublishGroup(c net.Conn, requested *entmoot.GroupID) (entmoot.GroupID, bool) {
+	if requested != nil {
+		return *requested, true
+	}
+	gid, ok := s.runtime.SingleGroup()
+	if ok {
+		return gid, true
+	}
+	code := ipc.CodeInvalidArgument
+	message := "group_id is required when multiple groups are active"
+	if s.runtime.Count() == 0 {
+		code = ipc.CodeGroupNotFound
+		message = "no active groups"
+	}
+	_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
+		Type:    "error",
+		Code:    code,
+		Message: message,
+	})
+	return entmoot.GroupID{}, false
+}
+
+func (s *ipcServer) handleJoinGroup(ctx context.Context, c net.Conn, req *ipc.JoinGroupReq) {
+	sess, created, err := s.runtime.AddInvite(ctx, req.Invite)
+	if err != nil {
+		code := ipc.CodeInternal
+		if errors.Is(err, entmoot.ErrInviteExpired) || errors.Is(err, entmoot.ErrSigInvalid) {
+			code = ipc.CodeInvalidArgument
+		}
+		gid := req.Invite.GroupID
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
+			Type:    "error",
+			Code:    code,
+			GroupID: &gid,
+			Message: "join group: " + err.Error(),
+		})
+		return
+	}
+	status := "already_joined"
+	if created {
+		status = "joined"
+	}
+	_ = ipc.EncodeAndWrite(c, &ipc.JoinGroupResp{
+		Status:  status,
+		GroupID: sess.groupID,
+		Members: len(sess.roster.Members()),
+	})
+}
+
 // handleInfo assembles a full InfoResp snapshot from live state.
 func (s *ipcServer) handleInfo(ctx context.Context, c net.Conn) {
-	pub, _ := pubkeyFromRoster(s.roster, s.nodeID, s.identity.PublicKey)
+	pub := append([]byte(nil), s.identity.PublicKey...)
+	if gid, ok := s.runtime.SingleGroup(); ok {
+		if sess, ok := s.runtime.Get(gid); ok {
+			pub, _ = pubkeyFromRoster(sess.roster, s.nodeID, s.identity.PublicKey)
+		}
+	}
 
 	// Enumerate <dataDir>/groups/* for consistency with the standalone
 	// info command, but the authoritative group is always s.groupID
@@ -874,8 +886,8 @@ func (s *ipcServer) handleInfo(ctx context.Context, c net.Conn) {
 	groups := make([]ipc.GroupInfo, 0, len(gids))
 	for _, gid := range gids {
 		members := 0
-		if gid == s.groupID {
-			members = len(s.roster.Members())
+		if sess, ok := s.runtime.Get(gid); ok {
+			members = len(sess.roster.Members())
 		} else {
 			// For groups outside the daemon's active roster, peek at
 			// the roster file directly.
@@ -938,14 +950,16 @@ func (s *ipcServer) handleTail(ctx context.Context, c net.Conn, sub *ipc.TailSub
 		})
 		return
 	}
-	if sub.GroupID != nil && *sub.GroupID != s.groupID {
-		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
-			Type:    "error",
-			Code:    ipc.CodeGroupNotFound,
-			GroupID: sub.GroupID,
-			Message: "group not joined",
-		})
-		return
+	if sub.GroupID != nil {
+		if _, ok := s.runtime.Get(*sub.GroupID); !ok {
+			_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
+				Type:    "error",
+				Code:    ipc.CodeGroupNotFound,
+				GroupID: sub.GroupID,
+				Message: "group not joined",
+			})
+			return
+		}
 	}
 
 	ch := make(chan entmoot.Message, 32)

@@ -206,7 +206,7 @@ func TestMsgTypeString(t *testing.T) {
 	}
 	// A byte inside the ipc namespace (0x10..0x1F) that is not
 	// registered must also be reported as unknown.
-	if got := MsgType(0x18).String(); got != "unknown(0x18)" {
-		t.Errorf("0x18 String() = %q", got)
+	if got := MsgType(0x1A).String(); got != "unknown(0x1a)" {
+		t.Errorf("0x1A String() = %q", got)
 	}
 }

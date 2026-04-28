@@ -9,9 +9,9 @@ group layer: signed rosters, topic-aware gossip, durable message storage,
 Merkle roots for convergence checks, and reconciliation when peers diverge.
 
 The current implementation is the `entmootd` binary. One long-running
-`entmootd join` process owns the Pilot listener and local SQLite writer. Short
-CLI commands publish, query, tail, and inspect state through local IPC or
-direct SQLite reads.
+`entmootd join` process owns the Pilot listener, local SQLite writer, and one
+group session per joined group. Short CLI commands publish, query, tail, and
+inspect state through local IPC or direct SQLite reads.
 
 Use these docs for practical operation. The formal papers remain available in
 [Papers](reference/papers.md).

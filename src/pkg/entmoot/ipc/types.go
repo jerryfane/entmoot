@@ -40,6 +40,11 @@ const (
 	// MsgSignedPublishResp acknowledges acceptance of an already-signed
 	// message. Fanout remains asynchronous, matching PublishResp semantics.
 	MsgSignedPublishResp MsgType = 0x17
+	// MsgJoinGroupReq asks the running daemon to add a group session from a
+	// signed invite without starting a second entmootd process.
+	MsgJoinGroupReq MsgType = 0x18
+	// MsgJoinGroupResp acknowledges that a group session exists.
+	MsgJoinGroupResp MsgType = 0x19
 	// MsgError carries a structured error frame. 0x1F is chosen as the
 	// last slot in the 0x10..0x1F namespace so it's easy to spot.
 	MsgError MsgType = 0x1F
@@ -65,6 +70,10 @@ func (t MsgType) String() string {
 		return "signed_publish_req"
 	case MsgSignedPublishResp:
 		return "signed_publish_resp"
+	case MsgJoinGroupReq:
+		return "join_group_req"
+	case MsgJoinGroupResp:
+		return "join_group_resp"
 	case MsgError:
 		return "error"
 	default:
@@ -117,6 +126,19 @@ type SignedPublishResp struct {
 	GroupID     entmoot.GroupID   `json:"group_id"`
 	Author      entmoot.NodeID    `json:"author"`
 	TimestampMS int64             `json:"timestamp_ms"`
+}
+
+// JoinGroupReq carries a signed invite to the running daemon. The daemon
+// verifies and joins through the same gossip bootstrap path as startup join.
+type JoinGroupReq struct {
+	Invite entmoot.Invite `json:"invite"`
+}
+
+// JoinGroupResp reports the active session created or found for JoinGroupReq.
+type JoinGroupResp struct {
+	Status  string          `json:"status"`
+	GroupID entmoot.GroupID `json:"group_id"`
+	Members int             `json:"members"`
 }
 
 // TailSubscribe opens a live message stream. GroupID is optional (nil

@@ -79,10 +79,20 @@ func TestESPDeviceSignedPublishThroughControlSocket(t *testing.T) {
 		nodeID:   author.PilotNodeID,
 		identity: authorID,
 		dataDir:  dataDir,
-		gossiper: g,
-		roster:   rost,
-		groupID:  gid,
-		store:    st,
+		runtime: &groupRuntime{
+			nodeID:   author.PilotNodeID,
+			identity: authorID,
+			dataDir:  dataDir,
+			store:    st,
+			sessions: map[entmoot.GroupID]*groupSession{
+				gid: {
+					groupID: gid,
+					roster:  rost,
+					gossip:  g,
+				},
+			},
+		},
+		store: st,
 	}
 	go srv.acceptLoop(ctx, l)
 

@@ -112,6 +112,26 @@ func TestRoundTripSignedPublishReqResp(t *testing.T) {
 	})
 }
 
+func TestRoundTripJoinGroupReqResp(t *testing.T) {
+	gid := mustGroupID(0x24)
+	roundTrip(t, &JoinGroupReq{
+		Invite: entmoot.Invite{
+			GroupID: gid,
+			Founder: entmoot.NodeInfo{
+				PilotNodeID:   45491,
+				EntmootPubKey: []byte("founder-key"),
+			},
+			IssuedAt:   1_700_000_000_000,
+			ValidUntil: 1_700_086_400_000,
+		},
+	})
+	roundTrip(t, &JoinGroupResp{
+		Status:  "joined",
+		GroupID: gid,
+		Members: 3,
+	})
+}
+
 func TestRoundTripTailSubscribeAll(t *testing.T) {
 	roundTrip(t, &TailSubscribe{})
 }
@@ -237,9 +257,9 @@ func TestEncodeUnknownType(t *testing.T) {
 }
 
 // TestDecodeUnknownType exercises bytes outside the ipc namespace
-// (0x00, 0xFF) and an unused byte inside the namespace (0x18).
+// (0x00, 0xFF) and an unused byte inside the namespace (0x1A).
 func TestDecodeUnknownType(t *testing.T) {
-	for _, b := range []MsgType{0x00, 0x09, 0x18, 0x20, 0xFF} {
+	for _, b := range []MsgType{0x00, 0x09, 0x1A, 0x20, 0xFF} {
 		_, err := Decode(b, []byte(`{}`))
 		if !errors.Is(err, ErrUnknownMessage) {
 			t.Errorf("Decode(0x%02x) err = %v, want ErrUnknownMessage", uint8(b), err)
@@ -253,6 +273,7 @@ func TestDecodeMalformedJSON(t *testing.T) {
 	types := []MsgType{
 		MsgPublishReq, MsgPublishResp,
 		MsgSignedPublishReq, MsgSignedPublishResp,
+		MsgJoinGroupReq, MsgJoinGroupResp,
 		MsgTailSubscribe, MsgTailEvent,
 		MsgInfoResp, MsgError,
 	}

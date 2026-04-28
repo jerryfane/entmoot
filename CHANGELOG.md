@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.20] - 2026-04-29
+
 ### Added
 
 - **Expanded ESP mobile API.** Added mobile-facing ESP routes for session and
@@ -22,6 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with no-op and APNs providers, idempotency support for mobile mutations,
   APNs push-token hygiene, `esp device rotate-key`, and stable disabled-device
   error reporting without adding APNs/mobile logic to Entmoot core.
+- **Multi-group join runtime foundation.** `entmootd join` now hosts group
+  sessions behind one shared Pilot transport, routes IPC publish/tail/info by
+  `group_id`, and adds local `join_group_req` IPC plumbing for future
+  executable ESP invite acceptance.
 - **Docusaurus documentation site.** Added a docs website under `website/`
   with Getting Started, Concepts, CLI, Operations, Architecture, and Reference
   sections, plus GitHub Pages deployment.

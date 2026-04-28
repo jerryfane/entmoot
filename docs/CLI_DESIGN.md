@@ -75,22 +75,22 @@ across all five: `-socket` (Pilot IPC socket, default `/tmp/pilot.sock`),
 `publish` dials it. `info` and `query` read SQLite directly and work
 whether or not `join` is running.
 
-### 3.1 `entmootd join <invite>`
+### 3.1 `entmootd join <invite> [invite...]`
 
 **Purpose:** the *only* command that brings an agent online. Reads or
-generates identity, opens Pilot, applies the invite to a local roster,
-binds the listen port, opens the control socket, and enters the accept
-loop. Blocks until SIGINT or SIGTERM.
+generates identity, opens Pilot, applies one or more invites to local
+rosters, binds the listen port, opens the control socket, and enters the
+accept loop. Blocks until SIGINT or SIGTERM.
 
 **Signature**
 
 ```
-entmootd join <invite>
+entmootd join <invite> [invite...]
 ```
 
 **Argument**
 
-- `<invite>` is either:
+- Each `<invite>` is either:
   - a file path (`./my-invite.json`, `/tmp/invite.json`), or
   - an `http(s)://` URL that returns the invite JSON body with a
     documented short TTL (e.g., 5 minutes). The fetch is performed
@@ -115,7 +115,7 @@ On successful join, one JSON object on stdout immediately before the
 accept loop begins:
 
 ```json
-{"event":"joined","group_id":"<base64>","members":42,"listen_port":1004,"control_socket":"/home/user/.entmoot/control.sock"}
+{"event":"joined","group_id":"<first-base64>","group_ids":["<base64>"],"members":42,"listen_port":1004,"control_socket":"/home/user/.entmoot/control.sock"}
 ```
 
 While the accept loop runs, `join` writes nothing further to stdout.
@@ -161,7 +161,8 @@ slog continues to go to stderr at the configured log level.
 
 **Purpose:** author, sign, and gossip a single message into a group.
 Talks to the running `join` via the control socket; the running process
-performs the actual signed publish through its single Pilot connection.
+performs the actual signed publish through its single shared Pilot
+connection and routes by `group_id`.
 
 **Signature**
 
@@ -888,6 +889,8 @@ with its own type-number namespace.
 | `tail_event` | daemon → client | stream message events (live mode) |
 | `info_req` | client → daemon | request snapshot |
 | `info_resp` | daemon → client | full info JSON |
+| `join_group_req` | client → daemon | add a group session from a signed invite |
+| `join_group_resp` | daemon → client | `{status, group_id, members}` on success |
 | `error` | daemon → client | structured error with code + details |
 
 (The earlier draft's `tail_replay` and `tail_live` marker are dropped:
@@ -914,10 +917,10 @@ The client translates `code` to the process exit code.
 
 ### 5.5 Connection lifecycle
 
-`publish` and `info` open the socket, send one request, read one
-response, close. `tail` (live mode) opens, sends `tail_subscribe`, then
-reads a stream of `tail_event` frames until the client closes.
-Backfill runs before the subscription via SQLite.
+`publish`, `join_group_req`, and `info` open the socket, send one
+request, read one response, close. `tail` (live mode) opens, sends
+`tail_subscribe`, then reads a stream of `tail_event` frames until the
+client closes. Backfill runs before the subscription via SQLite.
 
 Clients (`publish`, `tail`) probe the socket first. If absent or
 unresponsive within a short timeout (500 ms), they exit 6 with a help
