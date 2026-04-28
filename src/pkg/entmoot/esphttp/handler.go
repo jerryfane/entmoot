@@ -8,6 +8,7 @@ import (
 	"crypto/ed25519"
 	"crypto/sha256"
 	"crypto/subtle"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -36,6 +37,8 @@ type Config struct {
 	Clock       func() time.Time
 	Service     *mailbox.Service
 	Publisher   Publisher
+	State       StateStore
+	Groups      GroupCatalog
 	GroupExists GroupExistsFunc
 	Logger      *slog.Logger
 }
@@ -153,6 +156,8 @@ type Handler struct {
 	clock       func() time.Time
 	service     *mailbox.Service
 	publisher   Publisher
+	state       StateStore
+	groups      GroupCatalog
 	groupExists GroupExistsFunc
 	logger      *slog.Logger
 }
@@ -177,6 +182,10 @@ func NewHandler(cfg Config) (*Handler, error) {
 	if cfg.Service == nil {
 		return nil, errors.New("esphttp: mailbox service is required")
 	}
+	state := cfg.State
+	if state == nil {
+		state = NewMemoryStateStore()
+	}
 	clock := cfg.Clock
 	if clock == nil {
 		clock = time.Now
@@ -197,6 +206,8 @@ func NewHandler(cfg Config) (*Handler, error) {
 		clock:       clock,
 		service:     cfg.Service,
 		publisher:   cfg.Publisher,
+		state:       state,
+		groups:      cfg.Groups,
 		groupExists: groupExists,
 		logger:      logger,
 	}, nil
@@ -229,9 +240,427 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleCursor(w, r)
 	case "/v1/messages":
 		h.handleMessagePublish(w, r)
+	case "/v1/session":
+		h.handleSession(w, r)
+	case "/v1/status":
+		h.handleStatus(w, r)
+	case "/v1/groups":
+		h.handleGroups(w, r)
+	case "/v1/invites/accept":
+		h.handleInviteAccept(w, r)
+	case "/v1/sign-requests":
+		h.handleSignRequests(w, r)
+	case "/v1/devices/current":
+		h.handleCurrentDevice(w, r)
+	case "/v1/devices/current/push-token":
+		h.handlePushToken(w, r)
+	case "/v1/notifications/preferences":
+		h.handleNotificationPreferences(w, r)
+	case "/v1/notifications/test":
+		h.handleNotificationTest(w, r)
+	default:
+		if h.handleGroupSubroute(w, r) {
+			return
+		}
+		if h.handleSignRequestSubroute(w, r) {
+			return
+		}
+		writeError(w, http.StatusNotFound, "not_found", "not found")
+	}
+}
+
+func (h *Handler) handleSession(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w, http.MethodGet)
+		return
+	}
+	auth, _ := r.Context().Value(authContextKey{}).(authContext)
+	resp := map[string]any{
+		"authenticated": true,
+		"auth_mode":     h.authMode,
+	}
+	if auth.device != nil {
+		resp["device"] = deviceView(*auth.device)
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (h *Handler) handleStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w, http.MethodGet)
+		return
+	}
+	groups := 0
+	if h.groups != nil {
+		if list, err := h.groups.ListGroups(r.Context()); err == nil {
+			groups = len(list)
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":          "ok",
+		"auth_mode":       h.authMode,
+		"groups":          groups,
+		"mailbox_enabled": h.service != nil,
+		"publisher":       h.publisher != nil,
+	})
+}
+
+func (h *Handler) handleGroups(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		h.handleListGroups(w, r)
+	case http.MethodPost:
+		h.createSignRequestFromHTTP(w, r, "group_create", entmoot.GroupID{})
+	default:
+		methodNotAllowed(w, http.MethodGet+", "+http.MethodPost)
+	}
+}
+
+func (h *Handler) handleListGroups(w http.ResponseWriter, r *http.Request) {
+	if h.groups == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"groups": []GroupSummary{}})
+		return
+	}
+	groups, err := h.groups.ListGroups(r.Context())
+	if err != nil {
+		h.logger.Error("esphttp: list groups", slog.String("err", err.Error()))
+		writeError(w, http.StatusInternalServerError, "internal_error", "group listing failed")
+		return
+	}
+	auth, _ := r.Context().Value(authContextKey{}).(authContext)
+	if auth.device != nil {
+		filtered := groups[:0]
+		for _, g := range groups {
+			if deviceAllowsGroup(*auth.device, g.GroupID) {
+				filtered = append(filtered, g)
+			}
+		}
+		groups = filtered
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"groups": groups})
+}
+
+func (h *Handler) handleGroupSubroute(w http.ResponseWriter, r *http.Request) bool {
+	const prefix = "/v1/groups/"
+	if !strings.HasPrefix(r.URL.Path, prefix) {
+		return false
+	}
+	rest := strings.TrimPrefix(r.URL.Path, prefix)
+	rawGroup, suffix, _ := strings.Cut(rest, "/")
+	groupID, err := decodeGroupID(rawGroup)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return true
+	}
+	if ok := h.checkGroup(w, r, groupID); !ok {
+		return true
+	}
+	switch suffix {
+	case "":
+		switch r.Method {
+		case http.MethodGet:
+			h.handleGetGroup(w, r, groupID)
+		case http.MethodPatch:
+			h.createSignRequestFromHTTP(w, r, "group_update", groupID)
+		default:
+			methodNotAllowed(w, http.MethodGet+", "+http.MethodPatch)
+		}
+	case "members":
+		if r.Method != http.MethodGet {
+			methodNotAllowed(w, http.MethodGet)
+			return true
+		}
+		h.handleListMembers(w, r, groupID)
+	case "invites":
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w, http.MethodPost)
+			return true
+		}
+		h.createSignRequestFromHTTP(w, r, "invite_create", groupID)
+	case "messages":
+		switch r.Method {
+		case http.MethodGet:
+			h.handleGroupMessages(w, r, groupID)
+		case http.MethodPost:
+			h.handleGroupMessagePublish(w, r, groupID)
+		default:
+			methodNotAllowed(w, http.MethodGet+", "+http.MethodPost)
+		}
+	case "mailbox":
+		if r.Method != http.MethodGet {
+			methodNotAllowed(w, http.MethodGet)
+			return true
+		}
+		h.handleGroupMessages(w, r, groupID)
 	default:
 		writeError(w, http.StatusNotFound, "not_found", "not found")
 	}
+	return true
+}
+
+func (h *Handler) handleGetGroup(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID) {
+	if h.groups == nil {
+		writeError(w, http.StatusNotFound, "group_not_found", "group not joined")
+		return
+	}
+	group, ok, err := h.groups.GetGroup(r.Context(), groupID)
+	if err != nil {
+		h.logger.Error("esphttp: get group", slog.String("err", err.Error()))
+		writeError(w, http.StatusInternalServerError, "internal_error", "group lookup failed")
+		return
+	}
+	if !ok {
+		writeError(w, http.StatusNotFound, "group_not_found", "group not joined")
+		return
+	}
+	writeJSON(w, http.StatusOK, group)
+}
+
+func (h *Handler) handleListMembers(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID) {
+	if h.groups == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"members": []MemberSummary{}})
+		return
+	}
+	members, err := h.groups.ListMembers(r.Context(), groupID)
+	if err != nil {
+		h.logger.Error("esphttp: list members", slog.String("err", err.Error()))
+		writeError(w, http.StatusInternalServerError, "internal_error", "member listing failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"members": members})
+}
+
+func (h *Handler) handleGroupMessages(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID) {
+	clientID := strings.TrimSpace(r.URL.Query().Get("client_id"))
+	if clientID == "" {
+		if auth, _ := r.Context().Value(authContextKey{}).(authContext); auth.device != nil {
+			clientID = auth.device.ID
+		}
+	}
+	if clientID == "" {
+		writeError(w, http.StatusBadRequest, "bad_request", "client_id is required")
+		return
+	}
+	if !h.checkDeviceClient(w, r, groupID, clientID) {
+		return
+	}
+	limit := 50
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 0 {
+			writeError(w, http.StatusBadRequest, "bad_request", "limit must be a non-negative integer")
+			return
+		}
+		limit = n
+	}
+	result, err := h.service.Pull(r.Context(), groupID, clientID, limit)
+	h.writeMailboxResult(w, "group messages", result, err)
+}
+
+func (h *Handler) handleGroupMessagePublish(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID) {
+	var raw map[string]json.RawMessage
+	body, ok := decodeRawBody(w, r, 16<<20, &raw)
+	if !ok {
+		return
+	}
+	if msgRaw, hasMessage := raw["message"]; hasMessage {
+		if h.publisher == nil {
+			writeError(w, http.StatusServiceUnavailable, "join_unavailable", "no running join publisher configured")
+			return
+		}
+		var msg entmoot.Message
+		if err := json.Unmarshal(msgRaw, &msg); err != nil {
+			writeError(w, http.StatusBadRequest, "bad_request", fmt.Sprintf("invalid message: %v", err))
+			return
+		}
+		if msg.GroupID != groupID {
+			writeError(w, http.StatusBadRequest, "bad_request", "message.group_id does not match URL group_id")
+			return
+		}
+		result, err := h.publisher.PublishSigned(r.Context(), msg)
+		h.writePublishResult(w, result, err)
+		return
+	}
+	h.createSignRequest(w, r, "message_publish", groupID, body)
+}
+
+func (h *Handler) handleInviteAccept(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w, http.MethodPost)
+		return
+	}
+	h.createSignRequestFromHTTP(w, r, "invite_accept", entmoot.GroupID{})
+}
+
+func (h *Handler) handleSignRequests(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w, http.MethodGet)
+		return
+	}
+	auth, _ := r.Context().Value(authContextKey{}).(authContext)
+	requests, err := h.state.ListSignRequests(r.Context(), deviceIDForRequest(auth))
+	if err != nil {
+		h.logger.Error("esphttp: list sign requests", slog.String("err", err.Error()))
+		writeError(w, http.StatusInternalServerError, "internal_error", "sign request listing failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"sign_requests": requests})
+}
+
+func (h *Handler) handleSignRequestSubroute(w http.ResponseWriter, r *http.Request) bool {
+	const prefix = "/v1/sign-requests/"
+	if !strings.HasPrefix(r.URL.Path, prefix) {
+		return false
+	}
+	rest := strings.TrimPrefix(r.URL.Path, prefix)
+	id, suffix, _ := strings.Cut(rest, "/")
+	id = strings.TrimSpace(id)
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "bad_request", "sign request id is required")
+		return true
+	}
+	switch suffix {
+	case "":
+		if r.Method != http.MethodGet {
+			methodNotAllowed(w, http.MethodGet)
+			return true
+		}
+		req, ok, err := h.state.GetSignRequest(r.Context(), id)
+		h.writeSignRequestLookup(w, r, req, ok, err)
+	case "complete":
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w, http.MethodPost)
+			return true
+		}
+		h.handleCompleteSignRequest(w, r, id)
+	case "reject":
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w, http.MethodPost)
+			return true
+		}
+		req, err := h.state.RejectSignRequest(r.Context(), id)
+		h.writeSignRequestMutation(w, req, err)
+	default:
+		writeError(w, http.StatusNotFound, "not_found", "not found")
+	}
+	return true
+}
+
+func (h *Handler) handleCompleteSignRequest(w http.ResponseWriter, r *http.Request, id string) {
+	var body struct {
+		Signature string `json:"signature"`
+	}
+	if _, ok := decodeRawBody(w, r, 1<<20, &body); !ok {
+		return
+	}
+	if strings.TrimSpace(body.Signature) == "" {
+		writeError(w, http.StatusBadRequest, "bad_request", "signature is required")
+		return
+	}
+	req, err := h.state.CompleteSignRequest(r.Context(), id, strings.TrimSpace(body.Signature))
+	h.writeSignRequestMutation(w, req, err)
+}
+
+func (h *Handler) handleCurrentDevice(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w, http.MethodGet)
+		return
+	}
+	auth, _ := r.Context().Value(authContextKey{}).(authContext)
+	if auth.device == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"device": nil, "auth_mode": h.authMode})
+		return
+	}
+	state, err := h.state.GetDeviceState(r.Context(), auth.device.ID)
+	if err != nil {
+		h.logger.Error("esphttp: get device state", slog.String("err", err.Error()))
+		writeError(w, http.StatusInternalServerError, "internal_error", "device lookup failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"device": deviceView(*auth.device), "state": state})
+}
+
+func (h *Handler) handlePushToken(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPut {
+		methodNotAllowed(w, http.MethodPut)
+		return
+	}
+	auth, _ := r.Context().Value(authContextKey{}).(authContext)
+	if auth.device == nil {
+		writeError(w, http.StatusForbidden, "forbidden", "device auth is required")
+		return
+	}
+	var body struct {
+		Platform string `json:"platform"`
+		Token    string `json:"token"`
+	}
+	if _, ok := decodeRawBody(w, r, 1<<20, &body); !ok {
+		return
+	}
+	if strings.TrimSpace(body.Token) == "" {
+		writeError(w, http.StatusBadRequest, "bad_request", "token is required")
+		return
+	}
+	platform := strings.TrimSpace(body.Platform)
+	if platform == "" {
+		platform = "apns"
+	}
+	state, err := h.state.UpsertPushToken(r.Context(), auth.device.ID, platform, strings.TrimSpace(body.Token))
+	if err != nil {
+		h.logger.Error("esphttp: update push token", slog.String("err", err.Error()))
+		writeError(w, http.StatusInternalServerError, "internal_error", "push token update failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, state)
+}
+
+func (h *Handler) handleNotificationPreferences(w http.ResponseWriter, r *http.Request) {
+	auth, _ := r.Context().Value(authContextKey{}).(authContext)
+	if auth.device == nil {
+		writeError(w, http.StatusForbidden, "forbidden", "device auth is required")
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		state, err := h.state.GetDeviceState(r.Context(), auth.device.ID)
+		if err != nil {
+			h.logger.Error("esphttp: get notification preferences", slog.String("err", err.Error()))
+			writeError(w, http.StatusInternalServerError, "internal_error", "notification preference lookup failed")
+			return
+		}
+		writeJSON(w, http.StatusOK, state.NotificationPreferences)
+	case http.MethodPatch:
+		var prefs NotificationPreferences
+		if _, ok := decodeRawBody(w, r, 1<<20, &prefs); !ok {
+			return
+		}
+		state, err := h.state.PatchNotificationPreferences(r.Context(), auth.device.ID, prefs)
+		if err != nil {
+			h.logger.Error("esphttp: patch notification preferences", slog.String("err", err.Error()))
+			writeError(w, http.StatusInternalServerError, "internal_error", "notification preference update failed")
+			return
+		}
+		writeJSON(w, http.StatusOK, state.NotificationPreferences)
+	default:
+		methodNotAllowed(w, http.MethodGet+", "+http.MethodPatch)
+	}
+}
+
+func (h *Handler) handleNotificationTest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w, http.MethodPost)
+		return
+	}
+	auth, _ := r.Context().Value(authContextKey{}).(authContext)
+	if auth.device == nil {
+		writeError(w, http.StatusForbidden, "forbidden", "device auth is required")
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"status":    "queued",
+		"device_id": auth.device.ID,
+		"note":      "push delivery is provider-specific; ESP recorded the wakeup request",
+	})
 }
 
 func (h *Handler) handlePull(w http.ResponseWriter, r *http.Request) {
@@ -576,6 +1005,126 @@ func (h *Handler) checkDeviceClient(w http.ResponseWriter, r *http.Request, grou
 	}
 	writeError(w, http.StatusForbidden, "forbidden", "device is not authorized for client_id")
 	return false
+}
+
+func (h *Handler) createSignRequestFromHTTP(w http.ResponseWriter, r *http.Request, kind string, groupID entmoot.GroupID) {
+	var payload json.RawMessage
+	body, ok := decodeRawBody(w, r, 16<<20, &payload)
+	if !ok {
+		return
+	}
+	if len(payload) == 0 || string(payload) == "null" {
+		body = []byte("{}")
+	}
+	h.createSignRequest(w, r, kind, groupID, body)
+}
+
+func (h *Handler) createSignRequest(w http.ResponseWriter, r *http.Request, kind string, groupID entmoot.GroupID, payload []byte) {
+	auth, _ := r.Context().Value(authContextKey{}).(authContext)
+	if groupID != (entmoot.GroupID{}) && !h.checkDeviceGroup(w, r, groupID) {
+		return
+	}
+	if len(payload) == 0 {
+		payload = []byte("{}")
+	}
+	req, err := h.state.CreateSignRequest(r.Context(), SignRequest{
+		DeviceID: deviceIDForRequest(auth),
+		Kind:     kind,
+		GroupID:  groupID,
+		Payload:  append(json.RawMessage(nil), payload...),
+	})
+	if err != nil {
+		h.logger.Error("esphttp: create sign request", slog.String("err", err.Error()))
+		writeError(w, http.StatusInternalServerError, "internal_error", "sign request creation failed")
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{"sign_request": req})
+}
+
+func (h *Handler) writeSignRequestLookup(w http.ResponseWriter, r *http.Request, req SignRequest, ok bool, err error) {
+	if err != nil {
+		h.logger.Error("esphttp: get sign request", slog.String("err", err.Error()))
+		writeError(w, http.StatusInternalServerError, "internal_error", "sign request lookup failed")
+		return
+	}
+	if !ok {
+		writeError(w, http.StatusNotFound, "sign_request_not_found", "sign request not found")
+		return
+	}
+	if !h.signRequestVisible(w, r, req) {
+		return
+	}
+	writeJSON(w, http.StatusOK, req)
+}
+
+func (h *Handler) writeSignRequestMutation(w http.ResponseWriter, req SignRequest, err error) {
+	if err == nil {
+		writeJSON(w, http.StatusOK, req)
+		return
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "sign_request_not_found", "sign request not found")
+		return
+	}
+	h.logger.Error("esphttp: mutate sign request", slog.String("err", err.Error()))
+	writeError(w, http.StatusInternalServerError, "internal_error", "sign request update failed")
+}
+
+func (h *Handler) signRequestVisible(w http.ResponseWriter, r *http.Request, req SignRequest) bool {
+	auth, _ := r.Context().Value(authContextKey{}).(authContext)
+	if auth.device == nil {
+		return true
+	}
+	if req.DeviceID != "" && req.DeviceID != auth.device.ID {
+		writeError(w, http.StatusForbidden, "forbidden", "device is not authorized for sign request")
+		return false
+	}
+	if req.GroupID != (entmoot.GroupID{}) && !deviceAllowsGroup(*auth.device, req.GroupID) {
+		writeError(w, http.StatusForbidden, "forbidden", "device is not authorized for group")
+		return false
+	}
+	return true
+}
+
+func decodeRawBody(w http.ResponseWriter, r *http.Request, maxBytes int64, dst any) ([]byte, bool) {
+	data, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBytes))
+	if err != nil {
+		writeError(w, http.StatusRequestEntityTooLarge, "request_too_large", "request body too large")
+		return nil, false
+	}
+	if len(bytes.TrimSpace(data)) == 0 {
+		data = []byte("{}")
+	}
+	if dst != nil {
+		dec := json.NewDecoder(bytes.NewReader(data))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(dst); err != nil {
+			writeError(w, http.StatusBadRequest, "bad_request", fmt.Sprintf("invalid JSON body: %v", err))
+			return nil, false
+		}
+	}
+	return data, true
+}
+
+func deviceAllowsGroup(device Device, groupID entmoot.GroupID) bool {
+	for _, allowed := range device.Groups {
+		if allowed == groupID {
+			return true
+		}
+	}
+	return false
+}
+
+func deviceView(device Device) map[string]any {
+	groups := make([]entmoot.GroupID, 0, len(device.Groups))
+	groups = append(groups, device.Groups...)
+	clients := append([]string(nil), device.ClientIDs...)
+	return map[string]any{
+		"id":         device.ID,
+		"groups":     groups,
+		"client_ids": clients,
+		"disabled":   device.Disabled,
+	}
 }
 
 type nonceCache struct {

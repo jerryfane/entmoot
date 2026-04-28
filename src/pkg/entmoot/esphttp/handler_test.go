@@ -231,6 +231,106 @@ func TestHandlerDeviceAuth(t *testing.T) {
 	}
 }
 
+func TestHandlerMobileGroupsAndSignRequests(t *testing.T) {
+	gid := testGroupID(1)
+	catalog := fakeCatalog{
+		groups: []GroupSummary{{GroupID: gid, Members: 2}},
+		members: []MemberSummary{{
+			NodeID:        45491,
+			EntmootPubKey: base64.StdEncoding.EncodeToString([]byte("pub")),
+			Founder:       true,
+		}},
+	}
+	handler := testMobileHandler(t, gid, nil, &catalog, nil)
+
+	groups := doJSONRequest[struct {
+		Groups []GroupSummary `json:"groups"`
+	}](t, handler, http.MethodGet, "/v1/groups", nil, http.StatusOK)
+	if len(groups.Groups) != 1 || groups.Groups[0].GroupID != gid {
+		t.Fatalf("groups = %+v, want %s", groups, gid)
+	}
+
+	group := doJSONRequest[GroupSummary](t, handler, http.MethodGet, "/v1/groups/"+gid.String(), nil, http.StatusOK)
+	if group.GroupID != gid || group.Members != 2 {
+		t.Fatalf("group = %+v, want gid/members", group)
+	}
+
+	members := doJSONRequest[struct {
+		Members []MemberSummary `json:"members"`
+	}](t, handler, http.MethodGet, "/v1/groups/"+gid.String()+"/members", nil, http.StatusOK)
+	if len(members.Members) != 1 || members.Members[0].NodeID != 45491 {
+		t.Fatalf("members = %+v, want founder", members)
+	}
+
+	created := doJSONRequest[struct {
+		SignRequest SignRequest `json:"sign_request"`
+	}](t, handler, http.MethodPost, "/v1/groups", map[string]any{"name": "mobile group"}, http.StatusAccepted)
+	if created.SignRequest.Kind != "group_create" || created.SignRequest.Status != signRequestPending {
+		t.Fatalf("sign request = %+v, want group_create pending", created.SignRequest)
+	}
+
+	list := doJSONRequest[struct {
+		SignRequests []SignRequest `json:"sign_requests"`
+	}](t, handler, http.MethodGet, "/v1/sign-requests", nil, http.StatusOK)
+	if len(list.SignRequests) != 1 || list.SignRequests[0].ID != created.SignRequest.ID {
+		t.Fatalf("sign request list = %+v, want created request", list)
+	}
+
+	completed := doJSONRequest[SignRequest](t, handler, http.MethodPost, "/v1/sign-requests/"+created.SignRequest.ID+"/complete", map[string]any{
+		"signature": base64.StdEncoding.EncodeToString([]byte("sig")),
+	}, http.StatusOK)
+	if completed.Status != signRequestCompleted {
+		t.Fatalf("completed status = %q, want %q", completed.Status, signRequestCompleted)
+	}
+}
+
+func TestHandlerDeviceStateAndNotifications(t *testing.T) {
+	gid := testGroupID(1)
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	reg, err := NewDeviceRegistry([]Device{{
+		ID:        "ios-1-device",
+		PublicKey: priv.Public().(ed25519.PublicKey),
+		Groups:    []entmoot.GroupID{gid},
+		ClientIDs: []string{"ios-1-device"},
+	}})
+	if err != nil {
+		t.Fatalf("NewDeviceRegistry: %v", err)
+	}
+	handler := testMobileHandler(t, gid, reg, nil, func() time.Time { return time.UnixMilli(1_000_000) })
+
+	state := doSignedJSONRequest[DeviceState](t, handler, priv, http.MethodPut, "/v1/devices/current/push-token", map[string]any{
+		"platform": "apns",
+		"token":    "token-1",
+	}, http.StatusOK, 1_000_000, "push-1")
+	if state.PushToken != "token-1" || state.PushPlatform != "apns" {
+		t.Fatalf("device state = %+v, want APNs token", state)
+	}
+
+	prefs := doSignedJSONRequest[NotificationPreferences](t, handler, priv, http.MethodPatch, "/v1/notifications/preferences", NotificationPreferences{
+		Enabled: true,
+		Topics:  []string{"ops/#"},
+	}, http.StatusOK, 1_000_000, "prefs-1")
+	if !prefs.Enabled || len(prefs.Topics) != 1 || prefs.Topics[0] != "ops/#" {
+		t.Fatalf("prefs = %+v, want patched topics", prefs)
+	}
+
+	current := doSignedJSONRequest[struct {
+		Device map[string]any `json:"device"`
+		State  DeviceState    `json:"state"`
+	}](t, handler, priv, http.MethodGet, "/v1/devices/current", nil, http.StatusOK, 1_000_000, "current-1")
+	if current.State.PushToken != "token-1" {
+		t.Fatalf("current state = %+v, want persisted push token", current.State)
+	}
+
+	queued := doSignedJSONRequest[map[string]any](t, handler, priv, http.MethodPost, "/v1/notifications/test", nil, http.StatusAccepted, 1_000_000, "test-1")
+	if queued["status"] != "queued" {
+		t.Fatalf("notification test = %+v, want queued", queued)
+	}
+}
+
 func TestHandlerDualAuthAcceptsBearerAndDevice(t *testing.T) {
 	gid := testGroupID(1)
 	_, priv, err := ed25519.GenerateKey(rand.Reader)
@@ -360,6 +460,43 @@ func testHandlerWithPublisher(t *testing.T, gid entmoot.GroupID, publisher Publi
 	return handler
 }
 
+func testMobileHandler(t *testing.T, gid entmoot.GroupID, reg *DeviceRegistry, catalog GroupCatalog, clock func() time.Time) http.Handler {
+	t.Helper()
+	st := store.NewMemory()
+	for _, msg := range []entmoot.Message{testMessage(gid, 1, "first")} {
+		if err := st.Put(context.Background(), msg); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+	}
+	svc, err := mailbox.New(st, nil)
+	if err != nil {
+		t.Fatalf("mailbox.New: %v", err)
+	}
+	mode := AuthModeBearer
+	if reg != nil {
+		mode = AuthModeDevice
+	}
+	if clock == nil {
+		clock = time.Now
+	}
+	handler, err := NewHandler(Config{
+		Token:    "secret",
+		AuthMode: mode,
+		Devices:  reg,
+		Service:  svc,
+		State:    NewMemoryStateStore(),
+		Groups:   catalog,
+		Clock:    clock,
+		GroupExists: func(_ context.Context, got entmoot.GroupID) (bool, error) {
+			return got == gid, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewHandler: %v", err)
+	}
+	return handler
+}
+
 func testDeviceHandler(t *testing.T, gid entmoot.GroupID, reg *DeviceRegistry, now time.Time) http.Handler {
 	t.Helper()
 	st := store.NewMemory()
@@ -455,6 +592,21 @@ func signedDeviceRequest(t *testing.T, priv ed25519.PrivateKey, method, path str
 	return req
 }
 
+func doSignedJSONRequest[T any](t *testing.T, handler http.Handler, priv ed25519.PrivateKey, method, path string, body any, wantStatus int, timestampMillis int64, nonce string) T {
+	t.Helper()
+	req := signedDeviceRequest(t, priv, method, path, body, timestampMillis, nonce)
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+	if resp.Code != wantStatus {
+		t.Fatalf("%s %s status = %d, want %d\nbody=%s", method, path, resp.Code, wantStatus, resp.Body.String())
+	}
+	var out T
+	if err := json.Unmarshal(resp.Body.Bytes(), &out); err != nil {
+		t.Fatalf("Unmarshal response: %v\n%s", err, resp.Body.String())
+	}
+	return out
+}
+
 func testMessage(gid entmoot.GroupID, ts int64, content string) entmoot.Message {
 	msg := entmoot.Message{
 		GroupID:   gid,
@@ -471,4 +623,26 @@ func testGroupID(seed byte) entmoot.GroupID {
 	var gid entmoot.GroupID
 	gid[0] = seed
 	return gid
+}
+
+type fakeCatalog struct {
+	groups  []GroupSummary
+	members []MemberSummary
+}
+
+func (c *fakeCatalog) ListGroups(context.Context) ([]GroupSummary, error) {
+	return append([]GroupSummary(nil), c.groups...), nil
+}
+
+func (c *fakeCatalog) GetGroup(_ context.Context, gid entmoot.GroupID) (GroupSummary, bool, error) {
+	for _, group := range c.groups {
+		if group.GroupID == gid {
+			return group, true, nil
+		}
+	}
+	return GroupSummary{}, false, nil
+}
+
+func (c *fakeCatalog) ListMembers(context.Context, entmoot.GroupID) ([]MemberSummary, error) {
+	return append([]MemberSummary(nil), c.members...), nil
 }

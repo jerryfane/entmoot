@@ -126,6 +126,8 @@ func runESPServe(gf *globalFlags, cfg espServeConfig) int {
 		Devices:     devices,
 		Service:     resources.service,
 		Publisher:   controlSocketSignedPublisher{socketPath: controlSocketPath(gf.data), timeout: 30 * time.Second},
+		State:       resources.espState,
+		Groups:      localGroupCatalog{dataDir: gf.data},
 		GroupExists: espGroupExists(gf.data),
 		Logger:      slog.Default(),
 	})
@@ -228,6 +230,7 @@ func publishHTTPError(frame *ipc.ErrorFrame) error {
 type mailboxServiceResources struct {
 	store       store.MessageStore
 	cursorStore mailbox.CursorStore
+	espState    esphttp.StateStore
 	service     *mailbox.Service
 }
 
@@ -244,16 +247,24 @@ func openMailboxServiceResources(gf *globalFlags) (*mailboxServiceResources, err
 		_ = st.Close()
 		return nil, fmt.Errorf("open cursor store: %w", err)
 	}
+	espState, err := esphttp.OpenSQLiteStateStore(gf.data)
+	if err != nil {
+		_ = cursors.Close()
+		_ = st.Close()
+		return nil, fmt.Errorf("open ESP state store: %w", err)
+	}
 	svc, err := mailbox.NewWithCursorStore(st, cursors, nil)
 	if err != nil {
+		_ = espState.Close()
 		_ = cursors.Close()
 		_ = st.Close()
 		return nil, fmt.Errorf("create service: %w", err)
 	}
-	return &mailboxServiceResources{store: st, cursorStore: cursors, service: svc}, nil
+	return &mailboxServiceResources{store: st, cursorStore: cursors, espState: espState, service: svc}, nil
 }
 
 func (r *mailboxServiceResources) close() {
+	_ = r.espState.Close()
 	_ = r.cursorStore.Close()
 	_ = r.store.Close()
 }

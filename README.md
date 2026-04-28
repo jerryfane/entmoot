@@ -249,12 +249,12 @@ deployments can use `OpenSQLiteCursorStore(<data-dir>)`, which stores
 cursors in `<data-dir>/mailbox.sqlite` and survives process restarts.
 The same durable cursor path is exposed locally through
 `entmootd mailbox pull|ack|cursor`, giving ESP operators a production
-smoke-test surface. `entmootd esp serve` exposes the same mailbox sync
-surface over a small authenticated HTTP API for local reverse-proxy/mobile
-integration. The same bridge also accepts phone-signed messages and
-forwards them to the running `join` daemon for verification, durable
-storage, and normal gossip fanout; the ESP never signs on the phone's
-behalf.
+smoke-test surface. `entmootd esp serve` exposes that mailbox sync surface,
+device/session state, group/member read APIs, sign-request queues, push-token
+registration, and phone-signed publish forwarding over a small authenticated
+HTTP API for local reverse-proxy/mobile integration. ESP-local mobile state is
+stored in `<data-dir>/esp.sqlite`; mailbox cursors remain in
+`<data-dir>/mailbox.sqlite`. The ESP never signs on the phone's behalf.
 
 ```sh
 ENTMOOT_ESP_TOKEN='replace-me' entmootd esp serve
@@ -264,6 +264,12 @@ curl -H "Authorization: Bearer replace-me" \
   -H "Content-Type: application/json" \
   -d '{"message":{...full signed Entmoot message...}}' \
   "http://127.0.0.1:8087/v1/messages"
+curl -H "Authorization: Bearer replace-me" \
+  "http://127.0.0.1:8087/v1/groups"
+curl -H "Authorization: Bearer replace-me" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"mobile-created group"}' \
+  "http://127.0.0.1:8087/v1/groups" # returns a sign_request
 ```
 
 The server binds to `127.0.0.1:8087` by default and refuses non-loopback
@@ -308,7 +314,10 @@ with the device Ed25519 key and send the signature in
 `X-Entmoot-Signature` alongside `X-Entmoot-Device-ID`,
 `X-Entmoot-Timestamp-Ms`, and `X-Entmoot-Nonce`. Mailbox read/cursor routes
 work without a running `join` process; signed publish requires `join`
-because gossip fanout and roster verification are owned by the daemon.
+because gossip fanout and roster verification are owned by the daemon. Group
+creation, invite acceptance, invite creation, and unsigned message drafts
+return ESP sign requests so a phone-held key can authorize the operation
+before the ESP relays it.
 
 For manual smoke tests, write the onboarded private key to a local `0600`
 file and ask the CLI to produce request headers:

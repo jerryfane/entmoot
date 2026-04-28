@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Expanded ESP mobile API.** Added mobile-facing ESP routes for session and
+  status inspection, group/member reads, group/invite/message sign-request
+  creation, device push-token registration, notification preferences, and
+  durable ESP-local state in `<data>/esp.sqlite`.
 - **Docusaurus documentation site.** Added a docs website under `website/`
   with Getting Started, Concepts, CLI, Operations, Architecture, and Reference
   sections, plus GitHub Pages deployment.

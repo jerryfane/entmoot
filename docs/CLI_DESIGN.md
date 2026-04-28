@@ -493,8 +493,9 @@ entmootd mailbox cursor -client CLIENT [-group GID]
 mobile clients. Exposes the same durable mailbox cursor operations as
 `entmootd mailbox`, but through an authenticated HTTP API suitable for a
 local reverse proxy, app backend, or APNs/webhook bridge. Reads messages
-from SQLite and persists per-client cursors in `<data>/mailbox.sqlite`.
-Mailbox reads do not require Pilot, the control socket, or a running `join`
+from SQLite, persists per-client cursors in `<data>/mailbox.sqlite`, and
+persists ESP-local mobile service state in `<data>/esp.sqlite`. Mailbox and
+group-read APIs do not require Pilot, the control socket, or a running `join`
 process. Signed publish requires a running `join` process because the daemon
 owns roster verification, durable accept, and gossip fanout.
 
@@ -611,6 +612,35 @@ require the requested `client_id` to be listed for that device.
 
 - `GET /healthz`
   - No auth. Returns `{"status":"ok"}`.
+- `GET /v1/session`
+  - Returns the authenticated session and, for device auth, the current
+    registered device projection.
+- `GET /v1/status`
+  - Returns ESP health, auth mode, group count, mailbox availability, and
+    whether signed publish forwarding is configured.
+- `GET /v1/groups`
+  - Lists locally joined groups. Device auth filters the result to groups
+    authorized in the device registry.
+- `POST /v1/groups`
+  - Creates a `group_create` sign request. The ESP does not silently create
+    a signed group on behalf of the phone.
+- `GET /v1/groups/{group_id}`
+  - Returns local group metadata, member count, and roster head.
+- `PATCH /v1/groups/{group_id}`
+  - Creates a `group_update` sign request.
+- `GET /v1/groups/{group_id}/members`
+  - Lists current roster members with their Entmoot public keys.
+- `POST /v1/groups/{group_id}/invites`
+  - Creates an `invite_create` sign request.
+- `POST /v1/invites/accept`
+  - Creates an `invite_accept` sign request.
+- `GET /v1/groups/{group_id}/messages?client_id=CLIENT&limit=N`
+  - Group-scoped alias for mailbox pull. Device-auth clients may omit
+    `client_id`; the device id is used.
+- `POST /v1/groups/{group_id}/messages`
+  - If the body contains `{"message": ...}` with a fully signed Entmoot
+    message, forwards it like `POST /v1/messages`.
+  - Otherwise creates a `message_publish` sign request from the draft body.
 - `GET /v1/mailbox/pull?client_id=CLIENT&group_id=GID&limit=N`
   - Requires ESP auth.
   - `group_id` is required. HTTP clients do not inherit CLI group
@@ -644,6 +674,26 @@ require the requested `client_id` to be listed for that device.
     ```json
     {"status":"accepted","message_id":"<base64>","group_id":"<base64>","author":45491,"timestamp_ms":1713369600000}
     ```
+- `GET /v1/sign-requests`
+  - Lists pending/completed/rejected sign requests visible to the device.
+- `GET /v1/sign-requests/{id}`
+  - Returns one sign request.
+- `POST /v1/sign-requests/{id}/complete`
+  - Body: `{"signature":"<base64>"}`. Marks the request complete. Follow-up
+    protocol-specific execution is intentionally separate.
+- `POST /v1/sign-requests/{id}/reject`
+  - Marks the request rejected.
+- `GET /v1/devices/current`
+  - Returns the current device registry projection and ESP-local state.
+- `PUT /v1/devices/current/push-token`
+  - Device-auth only. Body: `{"platform":"apns","token":"..."}`.
+- `GET /v1/notifications/preferences`
+  - Device-auth only. Returns ESP-local notification preferences.
+- `PATCH /v1/notifications/preferences`
+  - Device-auth only. Body: `{"enabled":true,"topics":["ops/#"]}`.
+- `POST /v1/notifications/test`
+  - Device-auth only. Records a provider-neutral test wakeup request and
+    returns `202 Accepted`.
 
 **Errors**
 
@@ -673,6 +723,8 @@ Errors are JSON envelopes:
 - `POST /v1/messages` mutates Entmoot state only after the running daemon
   accepts the already-signed message. It does not hold signing keys, select
   parents, rewrite timestamps, send APNs, or decide Pilot routing.
+- Sign-request, push-token, and notification-preference routes mutate only
+  ESP-local state in `<data>/esp.sqlite`.
 
 ---
 
