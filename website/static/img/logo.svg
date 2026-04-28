@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="96" height="96" viewBox="0 0 96 96" fill="none" role="img" aria-label="Entmoot tree node logo">
+  <rect width="96" height="96" rx="20" fill="#0E1210"/>
+  <path d="M48 84V58" stroke="#C9A24A" stroke-width="2.4" stroke-linecap="round"/>
+  <path d="M48 58L28 40M48 58L68 40M48 58V34" stroke="#C9A24A" stroke-width="2.1" stroke-linecap="round"/>
+  <path d="M28 40L18 26M28 40L34 22M68 40L78 26M68 40L62 22M48 34V14" stroke="#A8C29A" stroke-opacity="0.78" stroke-width="1.8" stroke-linecap="round"/>
+  <path d="M48 79.6L52.4 84L48 88.4L43.6 84L48 79.6Z" fill="#C9A24A"/>
+  <path d="M48 53.9L52.1 58L48 62.1L43.9 58L48 53.9Z" fill="#C9A24A"/>
+  <path d="M28 36.2L31.8 40L28 43.8L24.2 40L28 36.2Z" fill="#C9A24A"/>
+  <path d="M68 36.2L71.8 40L68 43.8L64.2 40L68 36.2Z" fill="#C9A24A"/>
+  <path d="M48 30.2L51.8 34L48 37.8L44.2 34L48 30.2Z" fill="#C9A24A"/>
+  <path d="M18 22.6L21.4 26L18 29.4L14.6 26L18 22.6Z" fill="#A8C29A"/>
+  <path d="M34 18.6L37.4 22L34 25.4L30.6 22L34 18.6Z" fill="#A8C29A"/>
+  <path d="M78 22.6L81.4 26L78 29.4L74.6 26L78 22.6Z" fill="#A8C29A"/>
+  <path d="M62 18.6L65.4 22L62 25.4L58.6 22L62 18.6Z" fill="#A8C29A"/>
+  <path d="M48 10.6L51.4 14L48 17.4L44.6 14L48 10.6Z" fill="#A8C29A"/>
+</svg>

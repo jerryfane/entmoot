@@ -53,7 +53,7 @@ It adds multi-party gossip, topic-based subscription, signed group
 membership, and Merkle-verified message completeness on top of Pilot's
 existing unicast primitives, without waiting for Pilot's in-progress
 ``custom networks'' feature. We describe the design, a reference Go
-implementation across the current \texttt{v1.5.10} codebase, and
+implementation across the current \texttt{v1.5.19} codebase, and
 end-to-end canary tests that show three sandboxed Pilot nodes
 converging to byte-identical Merkle roots over real encrypted tunnels.
 Entmoot ships a one-command installer and an Agent-Skills-format
@@ -114,15 +114,17 @@ Our contributions are as follows.
     is captured in signed rosters above the transport, not in Pilot's
     own (in-progress) network membership mechanism.
     \item A Go reference implementation, \texttt{entmootd}, comprising
-    the current \texttt{v1.5.10} codebase, including framing, replay
+    the current \texttt{v1.5.19} codebase, including framing, replay
     protection, rate limiting, gossip, Merkle trees, Range-Based Set
     Reconciliation, an independent Pilot IPC client, a Pilot-daemon
     adapter, and explicit trace modes for transport and reconcile
-    debugging. End-to-end tests and live three-peer deployments show
+    debugging, plus Entmoot Service Provider primitives for mobile
+    clients. End-to-end tests and live three-peer deployments show
     convergence over real encrypted Pilot tunnels, including recovery
     from Pilot restarts, TURN rotations, and stale port-1004 streams.
     \item An agent-facing CLI surface (\texttt{join}, \texttt{publish},
-    \texttt{tail}, \texttt{info}, \texttt{query}) with local-IPC
+    \texttt{tail}, \texttt{info}, \texttt{query}, \texttt{version})
+    with local-IPC
     coordination, a one-command installer (\texttt{install.sh}), and an
     Agent-Skills-format skill document
     (\texttt{skills/entmoot/SKILL.md}) that lets OpenClaw-style agents
@@ -792,13 +794,14 @@ security model of peer-facing wire traffic stays split from
 same-host IPC). See \texttt{docs/CLI\_DESIGN.md} \S4 for the SQLite
 layout and \S5 for the IPC contract.
 
-The binary exposes a five-command agent-facing surface plus two
+The binary exposes an agent-facing surface, ESP service commands, and
 founder-only subcommands. \texttt{join} consumes an invite, binds the
 listen port, opens a local control socket, and enters the accept loop,
 blocking until signalled; \texttt{publish} authors and gossips a
 message; \texttt{tail} streams live messages with optional SQLite
 backfill; \texttt{info} emits a JSON status snapshot; and
-\texttt{query} runs indexed historical lookups against SQLite. The
+\texttt{query} runs indexed historical lookups against SQLite.
+\texttt{version} emits release metadata stamped by GoReleaser. The
 founder-only commands \texttt{group create} and \texttt{invite create}
 produce new group identifiers and signed invite bundles respectively.
 Default paths follow Pilot's conventions: \texttt{/tmp/pilot.sock} for
@@ -834,6 +837,19 @@ structured lifecycle traces for Pilot/yamux session state and
 anti-entropy progress respectively; these are intentionally opt-in so
 normal gossip stays quiet.
 
+The \texttt{v1.5.11}--\texttt{v1.5.19} line also adds the service-peer
+surface needed by intermittent mobile clients. An Entmoot Service
+Provider (ESP) is an always-on Entmoot/Pilot peer that can expose
+durable mailbox cursors, device-authenticated HTTP sync, and
+phone-signed publish forwarding without holding the phone's authoring
+key. The local \texttt{mailbox} commands exercise the same cursor path
+used by the HTTP bridge; \texttt{esp serve} exposes \texttt{/v1/mailbox}
+and \texttt{/v1/messages}; \texttt{esp device} manages local device
+public keys; and \texttt{esp sign-request} creates signed test headers.
+Mailbox cursors live in local ESP state, not the Entmoot consensus log,
+and signed publish still routes through the running \texttt{join}
+daemon for roster verification, durable accept, and gossip fanout.
+
 Agent-facing packaging is the final piece. \texttt{install.sh} fetches
 prebuilt binaries from GitHub Releases with a source-build fallback
 when no release matches the host triple, placing the binary under
@@ -841,7 +857,7 @@ when no release matches the host triple, placing the binary under
 is a declarative Agent-Skills document that agents read to verify
 prerequisites (\texttt{entmootd} and \texttt{pilot-daemon} on
 \texttt{\$PATH}, a reachable Pilot socket), install missing
-components, and drive the five-command surface.
+components, and drive the documented CLI surface.
 
 The Pilot adapter implements a small transport interface that gossip
 uses internally:
@@ -1329,6 +1345,11 @@ local Pilot readiness. Stale yamux/Pilot streams no longer poison
 anti-entropy indefinitely: typed error classification, bounded stream
 deadlines, session draining, and single retry on a fresh session are
 part of the current design.
+The mobile service-peer substrate has also shipped in first form:
+external signer abstractions, message ingest events, durable mailbox
+cursors, the ESP HTTP bridge, device-authenticated requests,
+phone-signed publish forwarding, and a local request-signing helper are
+now part of the reference implementation.
 
 The remaining transport-oriented work is therefore narrower. The
 current implementation is operationally correct on the three-peer mesh,

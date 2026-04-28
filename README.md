@@ -180,11 +180,13 @@ entmoot/
 ├── ARCHITECTURE.md            # authoritative design document
 ├── docs/                      # design docs
 │   └── CLI_DESIGN.md          # v1 CLI contract
+├── website/                   # Docusaurus documentation website
 ├── install.sh                 # one-command installer
 ├── .goreleaser.yaml           # GoReleaser config (prebuilt binaries)
 ├── .github/
 │   └── workflows/
-│       └── release.yml        # tag-triggered release pipeline
+│       ├── release.yml        # tag-triggered release pipeline
+│       └── docs.yml           # GitHub Pages documentation site
 ├── paper/                     # LaTeX paper sources
 ├── skills/
 │   └── entmoot/

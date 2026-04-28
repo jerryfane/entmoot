@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Docusaurus documentation site.** Added a docs website under `website/`
+  with Getting Started, Concepts, CLI, Operations, Architecture, and Reference
+  sections, plus GitHub Pages deployment.
+- **Paper refresh.** Updated the main and evolution LaTeX papers through
+  `v1.5.19`, including ESP/mobile service-peer primitives and release
+  metadata.
+
 ### Changed
 
 ### Fixed

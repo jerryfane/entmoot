@@ -33,7 +33,7 @@
 Between 17 and 27 April 2026 we shipped a dense sequence of
 patch releases across two layered systems: the Pilot fork moved from
 \texttt{v1.7.2-jf.1} to \texttt{v1.9.0-jf.15.21}, and Entmoot moved
-from \texttt{v1.0.0} to \texttt{v1.5.10}. Every patch was
+from \texttt{v1.0.0} to \texttt{v1.5.19}. Every patch was
 driven by a symptom observed on a three-machine live demo across
 three continents: a laptop on a UAE carrier-grade NAT, a Raspberry Pi
 in Italy on Fastweb residential, and a Hetzner VPS in Germany. The
@@ -1383,6 +1383,47 @@ stream, and fetch the missing bodies. That is why the final deployment
 could converge all three stores after the Pilot transport layer went
 green.
 
+\subsection{Entmoot \texttt{v1.5.11}--\texttt{v1.5.19}: mobile service
+peer primitives and release observability}
+
+\paragraph{What broke.} After the transport and reconcile paths were
+green, the next question was not another packet bug. It was product
+shape: an iOS app cannot be expected to run a full always-on
+\texttt{pilot-daemon} plus \texttt{entmootd join} process in the
+background. We needed the infrastructure for an always-on service peer
+that can help intermittent clients catch up and publish without taking
+custody of their signing keys.
+
+\paragraph{What it actually was.} The existing group protocol already
+stored and reconciled messages, but it lacked first-class service-peer
+interfaces. There was no durable per-client mailbox cursor, no HTTP
+sync surface, no local device registry, no request-signature helper,
+and no explicit release metadata command to inventory which binary a
+peer was actually running.
+
+\paragraph{How we fixed it.} Entmoot \texttt{v1.5.11} introduced the
+signer abstraction, message-ingest events, and mobile service-peer
+building blocks. \texttt{v1.5.12} moved publish success fully behind
+the durable local accept boundary so trust IPC stalls do not make a
+stored message look failed. \texttt{v1.5.13} added durable SQLite
+mailbox cursors. \texttt{v1.5.14} exposed those cursors through local
+\texttt{mailbox} CLI commands. \texttt{v1.5.15} added the loopback-first
+ESP HTTP bridge. \texttt{v1.5.16} added phone-signed publish forwarding.
+\texttt{v1.5.17} added device-authenticated HTTP requests and a local
+device registry. \texttt{v1.5.18} added operator CLI helpers for device
+onboarding and request signing. \texttt{v1.5.19} added
+\texttt{entmootd version} so release verification no longer depends on
+guessing which binary a service manager launched.
+
+\paragraph{Why the fix is right.} The phone should hold the phone's
+identity; the service peer should hold infrastructure. That mirrors the
+operational lesson from Lightning-style mobile systems without copying
+their protocol: keep the always-on node available, keep authoring keys
+off the server when desired, and make sync explicit and durable. The
+ESP path does not change Entmoot's consensus state; it packages the
+existing store, roster validation, and gossip fanout into interfaces an
+intermittent client can safely use.
+
 \section{The big picture: how the layers interacted}
 \label{sec:bigpicture}
 
@@ -1505,9 +1546,12 @@ v1.5.0 & 25 Apr & Pilot \texttt{Subscribe}/\texttt{Notify} support; TURN rotatio
 v1.5.1--v1.5.4 & 26--27 Apr & Responder-side RBSR body fetch, stale-session recovery, separate dial/I/O deadlines, and post-timeout session eviction. \\
 v1.5.5--v1.5.8 & 27 Apr & Preserve early Pilot IPC closes, ignore self transport ads, validate forwarded snapshots, and retry stale Pilot stream IDs without poisoning dial-backoff. \\
 v1.5.9--v1.5.10 & 27 Apr & Explicit Pilot/yamux session lifecycle manager, transport trace mode, Pilot readiness wait, reconcile trace mode, and transport-owned stream error classification. \\
+v1.5.11--v1.5.12 & 28 Apr & Mobile service-peer primitives, signer abstraction, ingest events, and publish success after durable local accept. \\
+v1.5.13--v1.5.16 & 27--28 Apr & Durable mailbox cursors, local mailbox CLI, ESP HTTP bridge, and phone-signed publish forwarding. \\
+v1.5.17--v1.5.19 & 28 Apr & ESP device-auth registry, request-signing helper, and \texttt{entmootd version} release metadata. \\
 \bottomrule
 \end{tabular}
-\caption{Entmoot release summary through \texttt{v1.5.10}.}
+\caption{Entmoot release summary through \texttt{v1.5.19}.}
 \end{table}
 
 \section*{Appendix A: reading order}
