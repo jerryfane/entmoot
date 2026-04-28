@@ -40,6 +40,7 @@ type Config struct {
 	Clock       func() time.Time
 	Service     *mailbox.Service
 	Publisher   Publisher
+	Operations  OperationExecutor
 	Notifier    espnotify.Notifier
 	State       StateStore
 	Groups      GroupCatalog
@@ -80,6 +81,7 @@ type Device struct {
 // DeviceRegistry is the in-memory authorization projection loaded by ESP
 // deployments from local configuration.
 type DeviceRegistry struct {
+	mu      sync.RWMutex
 	Devices []Device
 	byID    map[string]Device
 }
@@ -120,8 +122,112 @@ func (r *DeviceRegistry) lookup(id string) (Device, bool) {
 	if r == nil {
 		return Device{}, false
 	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	d, ok := r.byID[strings.TrimSpace(id)]
-	return d, ok
+	return cloneDevice(d), ok
+}
+
+// Snapshot returns a deep copy of the registry suitable for serialization or
+// copy-on-write updates.
+func (r *DeviceRegistry) Snapshot() []Device {
+	if r == nil {
+		return nil
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return cloneDevices(r.Devices)
+}
+
+// Replace atomically swaps the registry contents with a validated replacement.
+func (r *DeviceRegistry) Replace(next *DeviceRegistry) {
+	if r == nil || next == nil {
+		return
+	}
+	nextDevices := next.Snapshot()
+	nextByID := make(map[string]Device, len(nextDevices))
+	for _, d := range nextDevices {
+		nextByID[d.ID] = cloneDevice(d)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.Devices = nextDevices
+	r.byID = nextByID
+}
+
+// WithGroupGranted returns a validated registry copy with gid granted to
+// deviceID. The returned bool is false when the grant was already present.
+func (r *DeviceRegistry) WithGroupGranted(deviceID string, gid entmoot.GroupID) (*DeviceRegistry, bool, error) {
+	return r.withDeviceGroup(deviceID, gid, true)
+}
+
+// WithGroupRevoked returns a validated registry copy with gid removed from
+// deviceID. The returned bool is false when there was nothing to remove.
+func (r *DeviceRegistry) WithGroupRevoked(deviceID string, gid entmoot.GroupID) (*DeviceRegistry, bool, error) {
+	return r.withDeviceGroup(deviceID, gid, false)
+}
+
+func (r *DeviceRegistry) withDeviceGroup(deviceID string, gid entmoot.GroupID, grant bool) (*DeviceRegistry, bool, error) {
+	if r == nil {
+		return nil, false, errors.New("esphttp: device registry is not configured")
+	}
+	deviceID = strings.TrimSpace(deviceID)
+	if deviceID == "" {
+		return nil, false, errors.New("esphttp: device id is required")
+	}
+	devices := r.Snapshot()
+	changed := false
+	found := false
+	for i := range devices {
+		if devices[i].ID != deviceID {
+			continue
+		}
+		found = true
+		idx := -1
+		for j, existing := range devices[i].Groups {
+			if existing == gid {
+				idx = j
+				break
+			}
+		}
+		if grant {
+			if idx >= 0 {
+				break
+			}
+			devices[i].Groups = append(devices[i].Groups, gid)
+			changed = true
+			break
+		}
+		if idx < 0 {
+			break
+		}
+		devices[i].Groups = append(devices[i].Groups[:idx], devices[i].Groups[idx+1:]...)
+		changed = true
+		break
+	}
+	if !found {
+		return nil, false, fmt.Errorf("esphttp: device %q not found", deviceID)
+	}
+	next, err := NewDeviceRegistry(devices)
+	if err != nil {
+		return nil, false, err
+	}
+	return next, changed, nil
+}
+
+func cloneDevices(devices []Device) []Device {
+	out := make([]Device, len(devices))
+	for i, d := range devices {
+		out[i] = cloneDevice(d)
+	}
+	return out
+}
+
+func cloneDevice(d Device) Device {
+	d.PublicKey = append(ed25519.PublicKey(nil), d.PublicKey...)
+	d.Groups = append([]entmoot.GroupID(nil), d.Groups...)
+	d.ClientIDs = append([]string(nil), d.ClientIDs...)
+	return d
 }
 
 // Publisher submits already-signed messages to the running Entmoot daemon.
@@ -162,6 +268,7 @@ type Handler struct {
 	clock       func() time.Time
 	service     *mailbox.Service
 	publisher   Publisher
+	operations  OperationExecutor
 	notifier    espnotify.Notifier
 	state       StateStore
 	groups      GroupCatalog
@@ -213,6 +320,7 @@ func NewHandler(cfg Config) (*Handler, error) {
 		clock:       clock,
 		service:     cfg.Service,
 		publisher:   cfg.Publisher,
+		operations:  cfg.Operations,
 		notifier:    cfg.Notifier,
 		state:       state,
 		groups:      cfg.Groups,
@@ -599,7 +707,8 @@ func (h *Handler) handleCompleteSignRequest(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	gotDigest := strings.TrimSpace(body.SigningPayloadSHA256)
-	if req.Kind == signRequestKindMessagePublish && gotDigest == "" {
+	executeOperation := executableOperationKind(req.Kind)
+	if signRequestRequiresPayloadDigest(req.Kind) && gotDigest == "" {
 		writeError(w, http.StatusBadRequest, "bad_request", "signing_payload_sha256 is required")
 		return
 	}
@@ -613,15 +722,30 @@ func (h *Handler) handleCompleteSignRequest(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	var publishResult *PublishResult
+	var operationResult json.RawMessage
 	if req.Kind == signRequestKindMessagePublish {
 		result, ok := h.completeMessagePublishSignRequest(w, r, req, sig)
 		if !ok {
 			return
 		}
 		publishResult = &result
+		operationResult = marshalOperationResult(w, result)
+		if operationResult == nil {
+			return
+		}
+	} else if executeOperation {
+		result, ok := h.completeExecutableSignRequest(w, r, req, sig)
+		if !ok {
+			return
+		}
+		operationResult = result
 	}
-	req, err = h.state.CompleteSignRequest(r.Context(), id, signatureText, publishResult)
+	req, err = h.state.CompleteSignRequest(r.Context(), id, signatureText, publishResult, operationResult)
 	h.writeSignRequestMutation(w, req, err)
+}
+
+func signRequestRequiresPayloadDigest(kind string) bool {
+	return kind == signRequestKindMessagePublish || executableOperationKind(kind)
 }
 
 func (h *Handler) handleRejectSignRequest(w http.ResponseWriter, r *http.Request, id string) {
@@ -1144,6 +1268,10 @@ func (h *Handler) createSignRequestFromHTTP(w http.ResponseWriter, r *http.Reque
 
 func (h *Handler) createSignRequest(w http.ResponseWriter, r *http.Request, kind string, groupID entmoot.GroupID, payload []byte) {
 	auth, _ := r.Context().Value(authContextKey{}).(authContext)
+	if executableOperationKind(kind) && auth.device == nil {
+		writeError(w, http.StatusForbidden, "device_signature_required", "operation requires a registered device signature")
+		return
+	}
 	if groupID != (entmoot.GroupID{}) && !h.checkDeviceGroup(w, r, groupID) {
 		return
 	}
@@ -1240,6 +1368,67 @@ func (h *Handler) completeMessagePublishSignRequest(w http.ResponseWriter, r *ht
 		return PublishResult{}, false
 	}
 	return result, true
+}
+
+func (h *Handler) completeExecutableSignRequest(w http.ResponseWriter, r *http.Request, req SignRequest, signature []byte) (json.RawMessage, bool) {
+	if h.operations == nil {
+		writeError(w, http.StatusServiceUnavailable, "operation_unavailable", "no operation executor configured")
+		return nil, false
+	}
+	if !h.verifyOperationSignature(w, req, signature) {
+		return nil, false
+	}
+	result, err := h.operations.ExecuteSignRequest(r.Context(), req, signature)
+	if err != nil {
+		var opErr *OperationError
+		if errors.As(err, &opErr) {
+			writeError(w, opErr.HTTPStatus, opErr.Code, opErr.Message)
+			return nil, false
+		}
+		h.logger.Error("esphttp: execute sign request", slog.String("kind", req.Kind), slog.String("err", err.Error()))
+		writeError(w, http.StatusInternalServerError, "internal_error", "operation execution failed")
+		return nil, false
+	}
+	if len(result) == 0 {
+		result = json.RawMessage(`{}`)
+	}
+	return append(json.RawMessage(nil), result...), true
+}
+
+func (h *Handler) verifyOperationSignature(w http.ResponseWriter, req SignRequest, signature []byte) bool {
+	if req.DeviceID == "" {
+		writeError(w, http.StatusForbidden, "device_signature_required", "operation requires a registered device signature")
+		return false
+	}
+	if h.devices == nil {
+		writeError(w, http.StatusForbidden, "forbidden", "device signature cannot be verified")
+		return false
+	}
+	device, ok := h.devices.lookup(req.DeviceID)
+	if !ok {
+		writeError(w, http.StatusForbidden, "forbidden", "sign request device is not registered")
+		return false
+	}
+	signingPayload, err := base64.StdEncoding.DecodeString(req.SigningPayload)
+	if err != nil {
+		h.logger.Error("esphttp: decode operation signing payload", slog.String("err", err.Error()))
+		writeError(w, http.StatusInternalServerError, "internal_error", "sign request signing payload is invalid")
+		return false
+	}
+	if !ed25519.Verify(device.PublicKey, signingPayload, signature) {
+		writeError(w, http.StatusBadRequest, "invalid_signature", "operation signature does not verify")
+		return false
+	}
+	return true
+}
+
+func marshalOperationResult(w http.ResponseWriter, result any) json.RawMessage {
+	data, err := json.Marshal(result)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "operation result encoding failed")
+		return nil
+	}
+	return append(json.RawMessage(nil), data...)
 }
 
 func (h *Handler) writeSignRequestLookup(w http.ResponseWriter, r *http.Request, req SignRequest, ok bool, err error) {

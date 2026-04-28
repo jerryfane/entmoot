@@ -73,7 +73,7 @@ func SaveDeviceRegistry(path string, reg *DeviceRegistry) error {
 	}
 	// Re-validate before serializing so callers cannot persist malformed in-memory
 	// entries constructed outside LoadDeviceRegistry.
-	validated, err := NewDeviceRegistry(reg.Devices)
+	validated, err := NewDeviceRegistry(reg.Snapshot())
 	if err != nil {
 		return err
 	}
@@ -127,8 +127,9 @@ func DeviceRegistryDocumentFromRegistry(reg *DeviceRegistry) DeviceRegistryDocum
 	if reg == nil {
 		return DeviceRegistryDocument{Devices: []DeviceRecord{}}
 	}
-	devices := make([]DeviceRecord, 0, len(reg.Devices))
-	for _, d := range reg.Devices {
+	snapshot := reg.Snapshot()
+	devices := make([]DeviceRecord, 0, len(snapshot))
+	for _, d := range snapshot {
 		groups := make([]string, 0, len(d.Groups))
 		for _, gid := range d.Groups {
 			groups = append(groups, gid.String())

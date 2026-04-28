@@ -143,8 +143,14 @@ func runESPServe(gf *globalFlags, cfg espServeConfig) int {
 		return exitTransport
 	}
 	defer resources.close()
+	setupRes, err := setup(gf)
+	if err != nil {
+		slog.Error("esp serve: setup", slog.String("err", err.Error()))
+		return exitTransport
+	}
 
 	var devices *esphttp.DeviceRegistry
+	deviceRegistryPath := ""
 	if cfg.authMode == string(esphttp.AuthModeDevice) || cfg.authMode == string(esphttp.AuthModeDual) {
 		path := cfg.deviceKeysPath
 		if path == "" {
@@ -160,22 +166,36 @@ func runESPServe(gf *globalFlags, cfg espServeConfig) int {
 			slog.Error("esp serve: load device registry", slog.String("err", err.Error()))
 			return exitInvalidArgument
 		}
+		deviceRegistryPath = path
 	}
 	notifier, err := buildESPNotifier(cfg)
 	if err != nil {
 		slog.Error("esp serve: create notifier", slog.String("err", err.Error()))
 		return exitInvalidArgument
 	}
+	metadataStore, _ := resources.espState.(esphttp.GroupMetadataStore)
+	var deviceGroups deviceGroupAuthorizer
+	if devices != nil {
+		deviceGroups = &fileBackedDeviceGroupAuthorizer{path: deviceRegistryPath, registry: devices}
+	}
 
 	handler, err := esphttp.NewHandler(esphttp.Config{
-		Token:       cfg.token,
-		AuthMode:    esphttp.AuthMode(cfg.authMode),
-		Devices:     devices,
-		Service:     resources.service,
-		Publisher:   controlSocketSignedPublisher{socketPath: controlSocketPath(gf.data), timeout: 30 * time.Second},
+		Token:     cfg.token,
+		AuthMode:  esphttp.AuthMode(cfg.authMode),
+		Devices:   devices,
+		Service:   resources.service,
+		Publisher: controlSocketSignedPublisher{socketPath: controlSocketPath(gf.data), timeout: 30 * time.Second},
+		Operations: espOperationExecutor{
+			dataDir:       gf.data,
+			identity:      setupRes.identity,
+			socketPath:    controlSocketPath(gf.data),
+			timeout:       30 * time.Second,
+			metadataStore: metadataStore,
+			deviceGroups:  deviceGroups,
+		},
 		Notifier:    notifier,
 		State:       resources.espState,
-		Groups:      localGroupCatalog{dataDir: gf.data},
+		Groups:      localGroupCatalog{dataDir: gf.data, metadata: metadataStore},
 		GroupExists: espGroupExists(gf.data),
 		Logger:      slog.Default(),
 	})

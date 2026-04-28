@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Executable ESP group and invite operations.** ESP sign-request completion
+  can now execute `group_create`, `group_update`, `invite_create`, and
+  `invite_accept` when `esp serve` is wired to a running `join` daemon. Results
+  are stored generically on the sign request as `result`, while
+  `message_publish` keeps the existing `publish_result` compatibility field.
+- **ESP-local group metadata.** `group_update` now persists app-facing group
+  metadata in `<data>/esp.sqlite` and group list/get responses include the
+  stored metadata.
+
 ## [1.5.20] - 2026-04-29
 
 ### Added

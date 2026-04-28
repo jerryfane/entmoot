@@ -296,25 +296,16 @@ func TestHandlerMobileGroupsAndSignRequests(t *testing.T) {
 		t.Fatalf("members = %+v, want founder", members)
 	}
 
-	created := doJSONRequest[struct {
-		SignRequest SignRequest `json:"sign_request"`
-	}](t, handler, http.MethodPost, "/v1/groups", map[string]any{"name": "mobile group"}, http.StatusAccepted)
-	if created.SignRequest.Kind != "group_create" || created.SignRequest.Status != signRequestPending {
-		t.Fatalf("sign request = %+v, want group_create pending", created.SignRequest)
+	createErr := doJSONRequest[errorEnvelope](t, handler, http.MethodPost, "/v1/groups", map[string]any{"name": "mobile group"}, http.StatusForbidden)
+	if createErr.Error.Code != "device_signature_required" {
+		t.Fatalf("error code = %q, want device_signature_required", createErr.Error.Code)
 	}
 
 	list := doJSONRequest[struct {
 		SignRequests []SignRequest `json:"sign_requests"`
 	}](t, handler, http.MethodGet, "/v1/sign-requests", nil, http.StatusOK)
-	if len(list.SignRequests) != 1 || list.SignRequests[0].ID != created.SignRequest.ID {
-		t.Fatalf("sign request list = %+v, want created request", list)
-	}
-
-	completed := doJSONRequest[SignRequest](t, handler, http.MethodPost, "/v1/sign-requests/"+created.SignRequest.ID+"/complete", map[string]any{
-		"signature": base64.StdEncoding.EncodeToString(make([]byte, ed25519.SignatureSize)),
-	}, http.StatusOK)
-	if completed.Status != signRequestCompleted {
-		t.Fatalf("completed status = %q, want %q", completed.Status, signRequestCompleted)
+	if len(list.SignRequests) != 0 {
+		t.Fatalf("sign request list = %+v, want empty after rejected group_create", list)
 	}
 }
 
@@ -428,6 +419,241 @@ func TestHandlerIdempotencyReplaysSignRequestCreation(t *testing.T) {
 	}, map[string]string{idempotencyHeader: "idem-1"}, http.StatusConflict)
 	if errResp.Error.Code != "idempotency_conflict" {
 		t.Fatalf("error code = %q, want idempotency_conflict", errResp.Error.Code)
+	}
+}
+
+func TestHandlerExecutableOperationSignRequestExecutes(t *testing.T) {
+	gid := testGroupID(1)
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	reg, err := NewDeviceRegistry([]Device{{
+		ID:        "ios-1-device",
+		PublicKey: pub,
+		Groups:    []entmoot.GroupID{gid},
+		ClientIDs: []string{"ios-1"},
+	}})
+	if err != nil {
+		t.Fatalf("NewDeviceRegistry: %v", err)
+	}
+	op := &fakeOperationExecutor{result: json.RawMessage(`{"status":"updated"}`)}
+	handler := testMobileHandlerFull(t, gid, reg, &fakeCatalog{groups: []GroupSummary{{GroupID: gid}}}, func() time.Time {
+		return time.UnixMilli(1_234_000)
+	}, nil, NewMemoryStateStore(), nil)
+	handler.(*Handler).operations = op
+
+	created := doSignedJSONRequest[struct {
+		SignRequest SignRequest `json:"sign_request"`
+	}](t, handler, priv, http.MethodPatch, "/v1/groups/"+gid.String(), map[string]any{"name": "ops"}, http.StatusAccepted, 1_234_000, "nonce-create")
+	req := created.SignRequest
+	if req.Kind != signRequestKindGroupUpdate || req.SigningPayload == "" || req.SigningPayloadSHA256 == "" {
+		t.Fatalf("sign request = %+v", req)
+	}
+	signingPayload, err := base64.StdEncoding.DecodeString(req.SigningPayload)
+	if err != nil {
+		t.Fatalf("Decode signing payload: %v", err)
+	}
+	sig := ed25519.Sign(priv, signingPayload)
+	completed := doSignedJSONRequest[SignRequest](t, handler, priv, http.MethodPost, "/v1/sign-requests/"+req.ID+"/complete", map[string]any{
+		"signature":              base64.StdEncoding.EncodeToString(sig),
+		"signing_payload_sha256": req.SigningPayloadSHA256,
+	}, http.StatusOK, 1_235_000, "nonce-complete")
+	if completed.Status != signRequestCompleted || string(completed.OperationResult) != `{"status":"updated"}` {
+		t.Fatalf("completed = %+v", completed)
+	}
+	if op.req.ID != req.ID || !bytes.Equal(op.signature, sig) {
+		t.Fatalf("executor got req=%+v sig_len=%d", op.req, len(op.signature))
+	}
+}
+
+func TestHandlerExecutableOperationRejectsBearerCreatedRequest(t *testing.T) {
+	gid := testGroupID(1)
+	op := &fakeOperationExecutor{result: json.RawMessage(`{"status":"updated"}`)}
+	state := NewMemoryStateStore()
+	seeded, err := state.CreateSignRequest(context.Background(), SignRequest{
+		Kind:    signRequestKindGroupUpdate,
+		GroupID: gid,
+		Payload: json.RawMessage(`{"name":"ops"}`),
+	})
+	if err != nil {
+		t.Fatalf("CreateSignRequest: %v", err)
+	}
+	handler := testMobileHandlerFull(t, gid, nil, &fakeCatalog{groups: []GroupSummary{{GroupID: gid}}}, func() time.Time {
+		return time.UnixMilli(1_234_000)
+	}, nil, state, nil)
+	handler.(*Handler).operations = op
+
+	errResp := doJSONRequest[errorEnvelope](t, handler, http.MethodPost, "/v1/sign-requests/"+seeded.ID+"/complete", map[string]any{
+		"signature":              base64.StdEncoding.EncodeToString(make([]byte, ed25519.SignatureSize)),
+		"signing_payload_sha256": seeded.SigningPayloadSHA256,
+	}, http.StatusForbidden)
+	if errResp.Error.Code != "device_signature_required" {
+		t.Fatalf("error code = %q, want device_signature_required", errResp.Error.Code)
+	}
+	if op.req.ID != "" {
+		t.Fatalf("executor ran for bearer-created operation: %+v", op.req)
+	}
+}
+
+func TestHandlerExecutableOperationRejectsMissingExecutor(t *testing.T) {
+	gid := testGroupID(1)
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	reg, err := NewDeviceRegistry([]Device{{
+		ID:        "ios-1-device",
+		PublicKey: pub,
+		Groups:    []entmoot.GroupID{gid},
+		ClientIDs: []string{"ios-1"},
+	}})
+	if err != nil {
+		t.Fatalf("NewDeviceRegistry: %v", err)
+	}
+	state := NewMemoryStateStore()
+	handler := testMobileHandlerFull(t, gid, reg, &fakeCatalog{groups: []GroupSummary{{GroupID: gid}}}, func() time.Time {
+		return time.UnixMilli(1_234_000)
+	}, nil, state, nil)
+
+	created := doSignedJSONRequest[struct {
+		SignRequest SignRequest `json:"sign_request"`
+	}](t, handler, priv, http.MethodPatch, "/v1/groups/"+gid.String(), map[string]any{"name": "ops"}, http.StatusAccepted, 1_234_000, "nonce-create")
+	req := created.SignRequest
+	signingPayload, err := base64.StdEncoding.DecodeString(req.SigningPayload)
+	if err != nil {
+		t.Fatalf("Decode signing payload: %v", err)
+	}
+	errResp := doSignedJSONRequest[errorEnvelope](t, handler, priv, http.MethodPost, "/v1/sign-requests/"+req.ID+"/complete", map[string]any{
+		"signature":              base64.StdEncoding.EncodeToString(ed25519.Sign(priv, signingPayload)),
+		"signing_payload_sha256": req.SigningPayloadSHA256,
+	}, http.StatusServiceUnavailable, 1_235_000, "nonce-complete")
+	if errResp.Error.Code != "operation_unavailable" {
+		t.Fatalf("error code = %q, want operation_unavailable", errResp.Error.Code)
+	}
+	stored, ok, err := state.GetSignRequest(context.Background(), req.ID)
+	if err != nil || !ok {
+		t.Fatalf("GetSignRequest ok=%v err=%v", ok, err)
+	}
+	if stored.Status != signRequestPending {
+		t.Fatalf("stored status = %q, want pending", stored.Status)
+	}
+}
+
+func TestHandlerExecutableOperationRequiresDigestWithoutExecutor(t *testing.T) {
+	gid := testGroupID(1)
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	reg, err := NewDeviceRegistry([]Device{{
+		ID:        "ios-1-device",
+		PublicKey: pub,
+		Groups:    []entmoot.GroupID{gid},
+		ClientIDs: []string{"ios-1"},
+	}})
+	if err != nil {
+		t.Fatalf("NewDeviceRegistry: %v", err)
+	}
+	handler := testMobileHandlerFull(t, gid, reg, &fakeCatalog{groups: []GroupSummary{{GroupID: gid}}}, func() time.Time {
+		return time.UnixMilli(1_234_000)
+	}, nil, NewMemoryStateStore(), nil)
+
+	created := doSignedJSONRequest[struct {
+		SignRequest SignRequest `json:"sign_request"`
+	}](t, handler, priv, http.MethodPatch, "/v1/groups/"+gid.String(), map[string]any{"name": "ops"}, http.StatusAccepted, 1_234_000, "nonce-create")
+	signingPayload, err := base64.StdEncoding.DecodeString(created.SignRequest.SigningPayload)
+	if err != nil {
+		t.Fatalf("Decode signing payload: %v", err)
+	}
+	errResp := doSignedJSONRequest[errorEnvelope](t, handler, priv, http.MethodPost, "/v1/sign-requests/"+created.SignRequest.ID+"/complete", map[string]any{
+		"signature": base64.StdEncoding.EncodeToString(ed25519.Sign(priv, signingPayload)),
+	}, http.StatusBadRequest, 1_235_000, "nonce-complete")
+	if errResp.Error.Code != "bad_request" {
+		t.Fatalf("error code = %q, want bad_request", errResp.Error.Code)
+	}
+}
+
+func TestHandlerExecutableOperationRejectsInvalidSignature(t *testing.T) {
+	gid := testGroupID(1)
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	_, wrongPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey wrong: %v", err)
+	}
+	reg, err := NewDeviceRegistry([]Device{{
+		ID:        "ios-1-device",
+		PublicKey: pub,
+		Groups:    []entmoot.GroupID{gid},
+		ClientIDs: []string{"ios-1"},
+	}})
+	if err != nil {
+		t.Fatalf("NewDeviceRegistry: %v", err)
+	}
+	op := &fakeOperationExecutor{result: json.RawMessage(`{"status":"updated"}`)}
+	handler := testMobileHandlerFull(t, gid, reg, &fakeCatalog{groups: []GroupSummary{{GroupID: gid}}}, func() time.Time {
+		return time.UnixMilli(1_234_000)
+	}, nil, NewMemoryStateStore(), nil)
+	handler.(*Handler).operations = op
+
+	created := doSignedJSONRequest[struct {
+		SignRequest SignRequest `json:"sign_request"`
+	}](t, handler, priv, http.MethodPatch, "/v1/groups/"+gid.String(), map[string]any{"name": "ops"}, http.StatusAccepted, 1_234_000, "nonce-create")
+	signingPayload, err := base64.StdEncoding.DecodeString(created.SignRequest.SigningPayload)
+	if err != nil {
+		t.Fatalf("Decode signing payload: %v", err)
+	}
+	errResp := doSignedJSONRequest[errorEnvelope](t, handler, priv, http.MethodPost, "/v1/sign-requests/"+created.SignRequest.ID+"/complete", map[string]any{
+		"signature":              base64.StdEncoding.EncodeToString(ed25519.Sign(wrongPriv, signingPayload)),
+		"signing_payload_sha256": created.SignRequest.SigningPayloadSHA256,
+	}, http.StatusBadRequest, 1_235_000, "nonce-complete")
+	if errResp.Error.Code != "invalid_signature" {
+		t.Fatalf("error code = %q, want invalid_signature", errResp.Error.Code)
+	}
+	if op.req.ID != "" {
+		t.Fatalf("executor ran for invalid signature: %+v", op.req)
+	}
+}
+
+func TestHandlerDualAuthBearerCannotCreateExecutableOperation(t *testing.T) {
+	gid := testGroupID(1)
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	reg, err := NewDeviceRegistry([]Device{{
+		ID:        "ios-1-device",
+		PublicKey: priv.Public().(ed25519.PublicKey),
+		Groups:    []entmoot.GroupID{gid},
+		ClientIDs: []string{"ios-1"},
+	}})
+	if err != nil {
+		t.Fatalf("NewDeviceRegistry: %v", err)
+	}
+	st := store.NewMemory()
+	svc, err := mailbox.New(st, nil)
+	if err != nil {
+		t.Fatalf("mailbox.New: %v", err)
+	}
+	handler, err := NewHandler(Config{
+		Token:    "secret",
+		AuthMode: AuthModeDual,
+		Devices:  reg,
+		Service:  svc,
+		Groups:   &fakeCatalog{groups: []GroupSummary{{GroupID: gid}}},
+		GroupExists: func(_ context.Context, got entmoot.GroupID) (bool, error) {
+			return got == gid, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewHandler: %v", err)
+	}
+	errResp := doJSONRequest[errorEnvelope](t, handler, http.MethodPost, "/v1/groups", map[string]any{"name": "ops"}, http.StatusForbidden)
+	if errResp.Error.Code != "device_signature_required" {
+		t.Fatalf("error code = %q, want device_signature_required", errResp.Error.Code)
 	}
 }
 
@@ -723,6 +949,22 @@ type fakePublisher struct {
 	result PublishResult
 	err    error
 	got    entmoot.Message
+}
+
+type fakeOperationExecutor struct {
+	result    json.RawMessage
+	err       error
+	req       SignRequest
+	signature []byte
+}
+
+func (e *fakeOperationExecutor) ExecuteSignRequest(_ context.Context, req SignRequest, signature []byte) (json.RawMessage, error) {
+	e.req = req
+	e.signature = append([]byte(nil), signature...)
+	if e.err != nil {
+		return nil, e.err
+	}
+	return append(json.RawMessage(nil), e.result...), nil
 }
 
 type fakeNotifier struct {

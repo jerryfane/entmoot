@@ -54,6 +54,16 @@ Entmoot message signing bytes. Complete the request with the returned
 `signing_payload_sha256` plus the author `signature`; the ESP verifies both and
 forwards the resulting message through signed publish.
 
+`group_create`, `group_update`, `invite_create`, and `invite_accept` are also
+executable when `esp serve` is connected to a running `join` daemon. Device
+sign requests verify the completion signature with the registered device key.
+Completion stores the operation response in `result`; `message_publish` also
+keeps `publish_result` for compatibility. If the ESP has no operation executor
+configured, executable operation completion fails with `operation_unavailable`.
+
+Group updates are ESP-local display metadata. They do not mutate Entmoot's
+roster protocol.
+
 Create a message draft sign request:
 
 ```http

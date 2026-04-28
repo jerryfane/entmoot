@@ -7,6 +7,8 @@ import (
 	"net/url"
 	"path/filepath"
 	"testing"
+
+	"entmoot/pkg/entmoot"
 )
 
 func TestSQLiteStateStorePersistsMobileState(t *testing.T) {
@@ -118,4 +120,54 @@ CREATE TABLE esp_devices_state (
 		req.SigningPayload == "" || req.SigningPayloadSHA256 == "" {
 		t.Fatalf("migrated sign request metadata = %+v", req)
 	}
+}
+
+func TestGroupMetadataStoresRejectNonObjectJSON(t *testing.T) {
+	ctx := context.Background()
+	gid := testMobileGroupID(7)
+	stores := []struct {
+		name  string
+		store GroupMetadataStore
+		close func()
+	}{
+		{name: "memory", store: NewMemoryStateStore()},
+	}
+	sqlite, err := OpenSQLiteStateStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenSQLiteStateStore: %v", err)
+	}
+	stores = append(stores, struct {
+		name  string
+		store GroupMetadataStore
+		close func()
+	}{name: "sqlite", store: sqlite, close: func() { _ = sqlite.Close() }})
+
+	for _, tc := range stores {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.close != nil {
+				defer tc.close()
+			}
+			if err := tc.store.SetGroupMetadata(ctx, gid, json.RawMessage(`{"name":"ops"}`)); err != nil {
+				t.Fatalf("SetGroupMetadata object: %v", err)
+			}
+			for _, raw := range []json.RawMessage{
+				json.RawMessage(`[]`),
+				json.RawMessage(`"name"`),
+				json.RawMessage(`null`),
+				json.RawMessage(`true`),
+				json.RawMessage(`123`),
+				json.RawMessage(`{`),
+			} {
+				if err := tc.store.SetGroupMetadata(ctx, gid, raw); err == nil {
+					t.Fatalf("SetGroupMetadata(%s) succeeded, want error", raw)
+				}
+			}
+		})
+	}
+}
+
+func testMobileGroupID(seed byte) entmoot.GroupID {
+	var gid entmoot.GroupID
+	gid[0] = seed
+	return gid
 }

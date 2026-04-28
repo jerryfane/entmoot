@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"log/slog"
 
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/esphttp"
@@ -9,7 +11,8 @@ import (
 )
 
 type localGroupCatalog struct {
-	dataDir string
+	dataDir  string
+	metadata esphttp.GroupMetadataStore
 }
 
 func (c localGroupCatalog) ListGroups(_ context.Context) ([]esphttp.GroupSummary, error) {
@@ -40,11 +43,34 @@ func (c localGroupCatalog) GetGroup(_ context.Context, gid entmoot.GroupID) (esp
 	if len(members) == 0 {
 		return esphttp.GroupSummary{}, false, nil
 	}
-	return esphttp.GroupSummary{
+	group := esphttp.GroupSummary{
 		GroupID:    gid,
 		Members:    len(members),
 		RosterHead: r.Head(),
-	}, true, nil
+	}
+	if c.metadata != nil {
+		if raw, ok, err := c.metadata.GetGroupMetadata(context.Background(), gid); err != nil {
+			return esphttp.GroupSummary{}, false, err
+		} else if ok && len(raw) > 0 {
+			var meta map[string]interface{}
+			if err := json.Unmarshal(raw, &meta); err != nil {
+				slog.Warn("esp group metadata ignored: invalid JSON object",
+					slog.String("group_id", gid.String()),
+					slog.String("err", err.Error()))
+				return group, true, nil
+			}
+			if meta == nil {
+				slog.Warn("esp group metadata ignored: non-object JSON",
+					slog.String("group_id", gid.String()))
+				return group, true, nil
+			}
+			group.Metadata = meta
+			if name, ok := meta["name"].(string); ok {
+				group.Name = name
+			}
+		}
+	}
+	return group, true, nil
 }
 
 func (c localGroupCatalog) ListMembers(_ context.Context, gid entmoot.GroupID) ([]esphttp.MemberSummary, error) {

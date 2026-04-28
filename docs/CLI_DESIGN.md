@@ -623,21 +623,28 @@ require the requested `client_id` to be listed for that device.
   - Lists locally joined groups. Device auth filters the result to groups
     authorized in the device registry.
 - `POST /v1/groups`
-  - Creates a `group_create` sign request. The ESP does not silently create
-    a signed group on behalf of the phone.
+  - Creates a `group_create` sign request. When completed with a valid
+    signature and `esp serve` is connected to a running `join` daemon, the ESP
+    creates a local group, activates it through the daemon, and stores optional
+    ESP-local display metadata.
   - Supports `Idempotency-Key`.
 - `GET /v1/groups/{group_id}`
   - Returns local group metadata, member count, and roster head.
 - `PATCH /v1/groups/{group_id}`
-  - Creates a `group_update` sign request.
+  - Creates a `group_update` sign request. Completion stores ESP-local
+    metadata for app display; it does not mutate Entmoot's roster protocol.
   - Supports `Idempotency-Key`.
 - `GET /v1/groups/{group_id}/members`
   - Lists current roster members with their Entmoot public keys.
 - `POST /v1/groups/{group_id}/invites`
-  - Creates an `invite_create` sign request.
+  - Creates an `invite_create` sign request. Completion returns a signed
+    invite produced by the always-on Entmoot peer after the phone/device
+    authorizes the operation.
   - Supports `Idempotency-Key`.
 - `POST /v1/invites/accept`
-  - Creates an `invite_accept` sign request.
+  - Creates an `invite_accept` sign request. Completion forwards the signed
+    invite through `join_group_req` so the running daemon joins or reuses the
+    group session.
   - Supports `Idempotency-Key`.
 - `GET /v1/groups/{group_id}/messages?client_id=CLIENT&limit=N`
   - Group-scoped alias for mailbox pull. Device-auth clients may omit
@@ -703,13 +710,18 @@ require the requested `client_id` to be listed for that device.
     {"signature":"<base64>","signing_payload_sha256":"<sha256>"}
     ```
 
-  - For executable `message_publish` requests, the ESP requires
-    `signing_payload_sha256` to match the pending request, verifies the
-    signature over the base64-decoded `signing_payload`, builds the signed
-    Entmoot message, and forwards it through the same signed-publish path as
-    `POST /v1/messages`.
-  - For non-executable request kinds, completion records the signature and
-    leaves follow-up protocol-specific execution separate.
+  - For executable requests, the ESP requires `signing_payload_sha256` to
+    match the pending request and verifies the signature over the
+    base64-decoded `signing_payload`. Device-auth sign requests verify this
+    operation signature with the registered device key.
+  - `message_publish` builds a signed Entmoot message and forwards it through
+    the same signed-publish path as `POST /v1/messages`.
+  - `group_create`, `group_update`, `invite_create`, and `invite_accept`
+    execute through the ESP operation executor configured by `esp serve`.
+    Completion stores the generic operation response in `result`; message
+    publish also keeps `publish_result` for compatibility.
+  - If no operation executor is configured, executable non-message request
+    completion fails with `operation_unavailable`.
   - Supports `Idempotency-Key`.
 - `POST /v1/sign-requests/{id}/reject`
   - Marks the request rejected.

@@ -43,6 +43,13 @@ type GroupCatalog interface {
 	ListMembers(context.Context, entmoot.GroupID) ([]MemberSummary, error)
 }
 
+// GroupMetadataStore persists ESP-local group display metadata.
+type GroupMetadataStore interface {
+	GetGroupMetadata(context.Context, entmoot.GroupID) (json.RawMessage, bool, error)
+	SetGroupMetadata(context.Context, entmoot.GroupID, json.RawMessage) error
+	DeleteGroupMetadata(context.Context, entmoot.GroupID) error
+}
+
 // SignRequest is durable ESP-local state for phone-held signing workflows.
 type SignRequest struct {
 	ID                   string          `json:"id"`
@@ -57,6 +64,7 @@ type SignRequest struct {
 	SigningPayloadSHA256 string          `json:"signing_payload_sha256,omitempty"`
 	Signature            string          `json:"signature,omitempty"`
 	PublishResult        *PublishResult  `json:"publish_result,omitempty"`
+	OperationResult      json.RawMessage `json:"result,omitempty"`
 	CreatedAtMS          int64           `json:"created_at_ms"`
 	UpdatedAtMS          int64           `json:"updated_at_ms"`
 	ExpiresAtMS          int64           `json:"expires_at_ms,omitempty"`
@@ -94,7 +102,7 @@ type StateStore interface {
 	CreateSignRequest(context.Context, SignRequest) (SignRequest, error)
 	ListSignRequests(context.Context, string) ([]SignRequest, error)
 	GetSignRequest(context.Context, string) (SignRequest, bool, error)
-	CompleteSignRequest(context.Context, string, string, *PublishResult) (SignRequest, error)
+	CompleteSignRequest(context.Context, string, string, *PublishResult, json.RawMessage) (SignRequest, error)
 	RejectSignRequest(context.Context, string) (SignRequest, error)
 	UpsertPushToken(context.Context, string, string, string) (DeviceState, error)
 	ClearPushToken(context.Context, string) (DeviceState, error)
@@ -119,6 +127,7 @@ type MemoryStateStore struct {
 	requests map[string]SignRequest
 	devices  map[string]DeviceState
 	idem     map[string]IdempotencyRecord
+	groups   map[entmoot.GroupID]json.RawMessage
 	clock    func() time.Time
 }
 
@@ -127,6 +136,7 @@ func NewMemoryStateStore() *MemoryStateStore {
 		requests: make(map[string]SignRequest),
 		devices:  make(map[string]DeviceState),
 		idem:     make(map[string]IdempotencyRecord),
+		groups:   make(map[entmoot.GroupID]json.RawMessage),
 		clock:    time.Now,
 	}
 }
@@ -178,7 +188,7 @@ func (s *MemoryStateStore) GetSignRequest(_ context.Context, id string) (SignReq
 	return cloneSignRequest(req), ok, nil
 }
 
-func (s *MemoryStateStore) CompleteSignRequest(_ context.Context, id, signature string, publishResult *PublishResult) (SignRequest, error) {
+func (s *MemoryStateStore) CompleteSignRequest(_ context.Context, id, signature string, publishResult *PublishResult, operationResult json.RawMessage) (SignRequest, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	req, ok := s.requests[id]
@@ -188,6 +198,7 @@ func (s *MemoryStateStore) CompleteSignRequest(_ context.Context, id, signature 
 	req.Status = signRequestCompleted
 	req.Signature = signature
 	req.PublishResult = clonePublishResultPtr(publishResult)
+	req.OperationResult = append(json.RawMessage(nil), operationResult...)
 	req.UpdatedAtMS = s.nowMS()
 	s.requests[id] = req
 	return cloneSignRequest(req), nil
@@ -271,6 +282,31 @@ func (s *MemoryStateStore) SaveIdempotencyRecord(_ context.Context, rec Idempote
 	return nil
 }
 
+func (s *MemoryStateStore) GetGroupMetadata(_ context.Context, groupID entmoot.GroupID) (json.RawMessage, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	meta, ok := s.groups[groupID]
+	return append(json.RawMessage(nil), meta...), ok, nil
+}
+
+func (s *MemoryStateStore) SetGroupMetadata(_ context.Context, groupID entmoot.GroupID, metadata json.RawMessage) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	metadata, err := NormalizeGroupMetadata(metadata)
+	if err != nil {
+		return err
+	}
+	s.groups[groupID] = append(json.RawMessage(nil), metadata...)
+	return nil
+}
+
+func (s *MemoryStateStore) DeleteGroupMetadata(_ context.Context, groupID entmoot.GroupID) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.groups, groupID)
+	return nil
+}
+
 func (s *MemoryStateStore) Close() error {
 	return nil
 }
@@ -312,6 +348,7 @@ CREATE TABLE IF NOT EXISTS sign_requests (
   signing_payload_sha256 TEXT NOT NULL DEFAULT '',
   signature     TEXT NOT NULL DEFAULT '',
   publish_result BLOB,
+  operation_result BLOB,
   created_at_ms INTEGER NOT NULL,
   updated_at_ms INTEGER NOT NULL,
   expires_at_ms INTEGER NOT NULL DEFAULT 0
@@ -338,6 +375,12 @@ CREATE TABLE IF NOT EXISTS esp_idempotency (
   updated_at_ms INTEGER NOT NULL,
   expires_at_ms INTEGER NOT NULL,
   PRIMARY KEY(scope, key)
+);
+
+CREATE TABLE IF NOT EXISTS esp_group_metadata (
+  group_id      BLOB PRIMARY KEY,
+  metadata      BLOB NOT NULL,
+  updated_at_ms INTEGER NOT NULL
 );
 `
 
@@ -413,13 +456,14 @@ func (s *SQLiteStateStore) CreateSignRequest(ctx context.Context, req SignReques
 			return SignRequest{}, fmt.Errorf("esphttp: marshal publish result: %w", err)
 		}
 	}
+	operationResult := []byte(req.OperationResult)
 	if _, err := s.db.ExecContext(ctx, `
 INSERT INTO sign_requests
   (id, device_id, kind, status, group_id, payload, canonical_type, signature_algorithm, signing_payload,
-   signing_payload_sha256, signature, publish_result, created_at_ms, updated_at_ms, expires_at_ms)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+   signing_payload_sha256, signature, publish_result, operation_result, created_at_ms, updated_at_ms, expires_at_ms)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		req.ID, req.DeviceID, req.Kind, req.Status, groupBytes, payload, req.CanonicalType,
-		req.SignatureAlgorithm, req.SigningPayload, req.SigningPayloadSHA256, req.Signature, publishResult,
+		req.SignatureAlgorithm, req.SigningPayload, req.SigningPayloadSHA256, req.Signature, publishResult, operationResult,
 		req.CreatedAtMS, req.UpdatedAtMS, req.ExpiresAtMS); err != nil {
 		return SignRequest{}, fmt.Errorf("esphttp: create sign request: %w", err)
 	}
@@ -428,7 +472,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 
 func (s *SQLiteStateStore) ListSignRequests(ctx context.Context, deviceID string) ([]SignRequest, error) {
 	query := `SELECT id, device_id, kind, status, group_id, payload, canonical_type, signature_algorithm, signing_payload,
-signing_payload_sha256, signature, publish_result, created_at_ms, updated_at_ms, expires_at_ms
+signing_payload_sha256, signature, publish_result, operation_result, created_at_ms, updated_at_ms, expires_at_ms
 FROM sign_requests`
 	args := []interface{}{}
 	if deviceID != "" {
@@ -454,7 +498,7 @@ FROM sign_requests`
 
 func (s *SQLiteStateStore) GetSignRequest(ctx context.Context, id string) (SignRequest, bool, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT id, device_id, kind, status, group_id, payload, canonical_type, signature_algorithm, signing_payload,
-signing_payload_sha256, signature, publish_result, created_at_ms, updated_at_ms, expires_at_ms
+signing_payload_sha256, signature, publish_result, operation_result, created_at_ms, updated_at_ms, expires_at_ms
 FROM sign_requests WHERE id = ?`, id)
 	req, err := scanSignRequest(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -463,7 +507,7 @@ FROM sign_requests WHERE id = ?`, id)
 	return req, err == nil, err
 }
 
-func (s *SQLiteStateStore) CompleteSignRequest(ctx context.Context, id, signature string, publishResult *PublishResult) (SignRequest, error) {
+func (s *SQLiteStateStore) CompleteSignRequest(ctx context.Context, id, signature string, publishResult *PublishResult, operationResult json.RawMessage) (SignRequest, error) {
 	var publishResultJSON []byte
 	if publishResult != nil {
 		var err error
@@ -472,8 +516,8 @@ func (s *SQLiteStateStore) CompleteSignRequest(ctx context.Context, id, signatur
 			return SignRequest{}, fmt.Errorf("esphttp: marshal publish result: %w", err)
 		}
 	}
-	if _, err := s.db.ExecContext(ctx, `UPDATE sign_requests SET status = ?, signature = ?, publish_result = ?, updated_at_ms = ? WHERE id = ?`,
-		signRequestCompleted, signature, publishResultJSON, time.Now().UnixMilli(), id); err != nil {
+	if _, err := s.db.ExecContext(ctx, `UPDATE sign_requests SET status = ?, signature = ?, publish_result = ?, operation_result = ?, updated_at_ms = ? WHERE id = ?`,
+		signRequestCompleted, signature, publishResultJSON, []byte(operationResult), time.Now().UnixMilli(), id); err != nil {
 		return SignRequest{}, fmt.Errorf("esphttp: complete sign request: %w", err)
 	}
 	req, ok, err := s.GetSignRequest(ctx, id)
@@ -596,6 +640,42 @@ ON CONFLICT(scope, key) DO UPDATE SET
 	return nil
 }
 
+func (s *SQLiteStateStore) GetGroupMetadata(ctx context.Context, groupID entmoot.GroupID) (json.RawMessage, bool, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT metadata FROM esp_group_metadata WHERE group_id = ?`, groupID[:])
+	var metadata []byte
+	if err := row.Scan(&metadata); errors.Is(err, sql.ErrNoRows) {
+		return nil, false, nil
+	} else if err != nil {
+		return nil, false, fmt.Errorf("esphttp: get group metadata: %w", err)
+	}
+	return append(json.RawMessage(nil), metadata...), true, nil
+}
+
+func (s *SQLiteStateStore) SetGroupMetadata(ctx context.Context, groupID entmoot.GroupID, metadata json.RawMessage) error {
+	metadata, err := NormalizeGroupMetadata(metadata)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `
+INSERT INTO esp_group_metadata (group_id, metadata, updated_at_ms)
+VALUES (?, ?, ?)
+ON CONFLICT(group_id) DO UPDATE SET
+  metadata = excluded.metadata,
+  updated_at_ms = excluded.updated_at_ms`,
+		groupID[:], []byte(metadata), time.Now().UnixMilli())
+	if err != nil {
+		return fmt.Errorf("esphttp: set group metadata: %w", err)
+	}
+	return nil
+}
+
+func (s *SQLiteStateStore) DeleteGroupMetadata(ctx context.Context, groupID entmoot.GroupID) error {
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM esp_group_metadata WHERE group_id = ?`, groupID[:]); err != nil {
+		return fmt.Errorf("esphttp: delete group metadata: %w", err)
+	}
+	return nil
+}
+
 func (s *SQLiteStateStore) Close() error {
 	if _, err := s.db.Exec("PRAGMA wal_checkpoint(TRUNCATE);"); err != nil {
 		return fmt.Errorf("esphttp: state wal_checkpoint: %w", err)
@@ -653,6 +733,7 @@ func migrateSQLiteState(db *sql.DB) error {
 		{"signing_payload", `ALTER TABLE sign_requests ADD COLUMN signing_payload TEXT NOT NULL DEFAULT ''`},
 		{"signing_payload_sha256", `ALTER TABLE sign_requests ADD COLUMN signing_payload_sha256 TEXT NOT NULL DEFAULT ''`},
 		{"publish_result", `ALTER TABLE sign_requests ADD COLUMN publish_result BLOB`},
+		{"operation_result", `ALTER TABLE sign_requests ADD COLUMN operation_result BLOB`},
 	} {
 		if cols[stmt.name] {
 			continue
@@ -673,9 +754,10 @@ func scanSignRequest(row signRequestScanner) (SignRequest, error) {
 	var groupBytes []byte
 	var payload []byte
 	var publishResult []byte
+	var operationResult []byte
 	if err := row.Scan(&req.ID, &req.DeviceID, &req.Kind, &req.Status, &groupBytes, &payload,
 		&req.CanonicalType, &req.SignatureAlgorithm, &req.SigningPayload, &req.SigningPayloadSHA256,
-		&req.Signature, &publishResult, &req.CreatedAtMS, &req.UpdatedAtMS, &req.ExpiresAtMS); err != nil {
+		&req.Signature, &publishResult, &operationResult, &req.CreatedAtMS, &req.UpdatedAtMS, &req.ExpiresAtMS); err != nil {
 		return SignRequest{}, err
 	}
 	if len(groupBytes) == len(req.GroupID) {
@@ -689,12 +771,14 @@ func scanSignRequest(row signRequestScanner) (SignRequest, error) {
 		}
 		req.PublishResult = &result
 	}
+	req.OperationResult = append(json.RawMessage(nil), operationResult...)
 	return req, nil
 }
 
 func cloneSignRequest(req SignRequest) SignRequest {
 	req.Payload = append(json.RawMessage(nil), req.Payload...)
 	req.PublishResult = clonePublishResultPtr(req.PublishResult)
+	req.OperationResult = append(json.RawMessage(nil), req.OperationResult...)
 	return req
 }
 
