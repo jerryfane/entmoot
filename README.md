@@ -139,12 +139,15 @@ entmootd esp device list [-device-keys PATH]
 entmootd esp device add -id ID -pubkey PUBKEY -group GID [-client CLIENT]...
 entmootd esp device onboard -id ID -group GID [-client CLIENT]...
 entmootd esp device enable|disable|remove -id ID [-device-keys PATH]
+entmootd esp sign-request -device ID -private-key-file PATH \
+  -method METHOD -path PATH_WITH_QUERY [-body BODY_FILE]
 ```
 
 `join` blocks and owns the control socket; `publish` and `tail` (live
 mode) dial it. `info`, `query`, `mailbox`, `esp serve`, and
-`esp device` read SQLite or local JSON directly and work whether or not a
-`join` process is running.
+`esp device` read SQLite or local JSON directly. `esp sign-request` is a
+local signing helper for ESP device-auth smoke tests. These work whether or
+not a `join` process is running.
 
 Sample one-line JSON shapes on stdout:
 
@@ -303,6 +306,17 @@ with the device Ed25519 key and send the signature in
 `X-Entmoot-Timestamp-Ms`, and `X-Entmoot-Nonce`. Mailbox read/cursor routes
 work without a running `join` process; signed publish requires `join`
 because gossip fanout and roster verification are owned by the daemon.
+
+For manual smoke tests, write the onboarded private key to a local `0600`
+file and ask the CLI to produce request headers:
+
+```sh
+entmootd esp sign-request \
+  -device ios-1-device \
+  -private-key-file ./ios-1-device.key \
+  -method GET \
+  -path '/v1/mailbox/pull?client_id=ios-1&group_id=<base64 group id>'
+```
 
 ## Deferred from v1
 

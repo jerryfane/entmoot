@@ -39,6 +39,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `<data>/esp-devices.json` atomically without hand-editing JSON, with an
   onboarding helper that prints a generated device private key once while
   storing only the public key.
+- **ESP request signing helper.** Added `entmootd esp sign-request` to emit
+  valid device-auth `X-Entmoot-*` headers for local ESP HTTP smoke tests.
 - **Message ingest event hook.** The daemon's notifying store now emits a
   local `message_ingested` event alongside existing IPC tail fan-out,
   giving future APNs/webhook bridges a stable integration point.

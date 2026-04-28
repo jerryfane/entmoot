@@ -116,6 +116,10 @@ func TestESPDeviceSignedPublishThroughControlSocket(t *testing.T) {
 		t.Fatalf("Decode onboard private key: %v", err)
 	}
 	devicePriv := ed25519.PrivateKey(privBytes)
+	deviceKeyPath := filepath.Join(dataDir, "ios-1-device.key")
+	if err := os.WriteFile(deviceKeyPath, []byte(onboarding.PrivateKey+"\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile device key: %v", err)
+	}
 	regPath := filepath.Join(dataDir, "esp-devices.json")
 	info, err := os.Stat(regPath)
 	if err != nil {
@@ -176,7 +180,9 @@ func TestESPDeviceSignedPublishThroughControlSocket(t *testing.T) {
 		t.Fatalf("stored content = %q, want %q", got.Content, msg.Content)
 	}
 
-	resp = doESPDeviceRequest(t, httpSrv.URL, devicePriv, http.MethodGet, "/v1/mailbox/pull?client_id=ios-1&group_id="+gid.String(), nil, 1_000_000, "pull-1")
+	pullPath := "/v1/mailbox/pull?client_id=ios-1&group_id=" + gid.String()
+	headers := signedESPHeadersFromCLI(t, deviceKeyPath, http.MethodGet, pullPath, "", 1_000_000, "pull-1")
+	resp = doESPRequestWithHeaders(t, httpSrv.URL, http.MethodGet, pullPath, nil, headers)
 	if resp.StatusCode != http.StatusOK {
 		data, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
@@ -207,6 +213,60 @@ func TestESPDeviceSignedPublishThroughControlSocket(t *testing.T) {
 		t.Fatalf("replay status = %d, want 401 body=%s", replay.StatusCode, data)
 	}
 	replay.Body.Close()
+}
+
+func signedESPHeadersFromCLI(t *testing.T, keyPath, method, path, bodyPath string, timestampMillis int64, nonce string) map[string]string {
+	t.Helper()
+	args := []string{
+		"sign-request",
+		"-device", "ios-1-device",
+		"-private-key-file", keyPath,
+		"-method", method,
+		"-path", path,
+		"-timestamp-ms", strconv.FormatInt(timestampMillis, 10),
+		"-nonce", nonce,
+	}
+	if bodyPath != "" {
+		args = append(args, "-body", bodyPath)
+	}
+	code, out, stderr := captureCommandOutput(t, func() int {
+		return cmdESP(&globalFlags{}, args)
+	})
+	if code != exitOK {
+		t.Fatalf("esp sign-request exit = %d stderr=%s", code, stderr)
+	}
+	var signed espSignRequestOutput
+	if err := json.Unmarshal([]byte(out), &signed); err != nil {
+		t.Fatalf("Unmarshal sign-request output %q: %v", out, err)
+	}
+	return signed.Headers
+}
+
+func doESPRequestWithHeaders(t *testing.T, baseURL string, method, path string, body any, headers map[string]string) *http.Response {
+	t.Helper()
+	var data []byte
+	if body != nil {
+		var err error
+		data, err = json.Marshal(body)
+		if err != nil {
+			t.Fatalf("Marshal body: %v", err)
+		}
+	}
+	req, err := http.NewRequest(method, baseURL+path, bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Do request: %v", err)
+	}
+	return resp
 }
 
 func doESPDeviceRequest(t *testing.T, baseURL string, priv ed25519.PrivateKey, method, path string, body any, timestampMillis int64, nonce string) *http.Response {

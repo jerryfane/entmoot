@@ -511,6 +511,26 @@ public key in the registry, and prints the private key once on stdout for
 development/operator handoff. Production phone-held identity should generate
 keys on the client and use `add` to import only the public key.
 
+For manual ESP device-auth smoke tests, `entmootd esp sign-request` signs one
+HTTP request and prints the headers to send:
+
+```sh
+entmootd esp sign-request \
+  -device ios-1-device \
+  -private-key-file ./ios-1-device.key \
+  -method GET \
+  -path '/v1/mailbox/pull?client_id=ios-1&group_id=<base64-group-id>' \
+  [-body request.json] \
+  [-timestamp-ms 1713369600000] \
+  [-nonce NONCE] \
+  [-show-input]
+```
+
+The helper reads the private key from a file rather than a flag to avoid
+shell-history and process-list exposure. If omitted, timestamp and nonce are
+generated locally. The helper does not contact the ESP server; it only emits
+JSON containing `X-Entmoot-*` headers.
+
 ```json
 {
   "devices": [
