@@ -14,6 +14,7 @@ import (
 
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/esphttp"
+	"entmoot/pkg/entmoot/ipc"
 	"entmoot/pkg/entmoot/mailbox"
 	"entmoot/pkg/entmoot/store"
 )
@@ -89,6 +90,7 @@ func runESPServe(gf *globalFlags, cfg espServeConfig) int {
 	handler, err := esphttp.NewHandler(esphttp.Config{
 		Token:       cfg.token,
 		Service:     resources.service,
+		Publisher:   controlSocketSignedPublisher{socketPath: controlSocketPath(gf.data), timeout: 30 * time.Second},
 		GroupExists: espGroupExists(gf.data),
 		Logger:      slog.Default(),
 	})
@@ -108,6 +110,84 @@ func runESPServe(gf *globalFlags, cfg espServeConfig) int {
 		return exitTransport
 	}
 	return exitOK
+}
+
+type controlSocketSignedPublisher struct {
+	socketPath string
+	timeout    time.Duration
+}
+
+func (p controlSocketSignedPublisher) PublishSigned(ctx context.Context, msg entmoot.Message) (esphttp.PublishResult, error) {
+	timeout := p.timeout
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	dialCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer cancel()
+	var dialer net.Dialer
+	conn, err := dialer.DialContext(dialCtx, "unix", p.socketPath)
+	if err != nil {
+		return esphttp.PublishResult{}, &esphttp.PublishError{
+			HTTPStatus: http.StatusServiceUnavailable,
+			Code:       "join_unavailable",
+			Message:    noJoinHelp,
+		}
+	}
+	defer conn.Close()
+	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+		return esphttp.PublishResult{}, err
+	}
+	if err := ipc.EncodeAndWrite(conn, &ipc.SignedPublishReq{Message: msg}); err != nil {
+		return esphttp.PublishResult{}, err
+	}
+	_, payload, err := ipc.ReadAndDecode(conn)
+	if err != nil {
+		return esphttp.PublishResult{}, err
+	}
+	switch v := payload.(type) {
+	case *ipc.SignedPublishResp:
+		return esphttp.PublishResult{
+			Status:      v.Status,
+			MessageID:   v.MessageID,
+			GroupID:     v.GroupID,
+			Author:      v.Author,
+			TimestampMS: v.TimestampMS,
+		}, nil
+	case *ipc.ErrorFrame:
+		return esphttp.PublishResult{}, publishHTTPError(v)
+	default:
+		return esphttp.PublishResult{}, fmt.Errorf("unexpected signed publish response %T", payload)
+	}
+}
+
+func publishHTTPError(frame *ipc.ErrorFrame) error {
+	if frame == nil {
+		return &esphttp.PublishError{
+			HTTPStatus: http.StatusInternalServerError,
+			Code:       "internal_error",
+			Message:    "signed publish failed",
+		}
+	}
+	status := http.StatusInternalServerError
+	code := "internal_error"
+	switch frame.Code {
+	case ipc.CodeInvalidArgument:
+		status = http.StatusBadRequest
+		code = "bad_request"
+	case ipc.CodeNotMember:
+		status = http.StatusForbidden
+		code = "not_member"
+	case ipc.CodeGroupNotFound:
+		status = http.StatusNotFound
+		code = "group_not_found"
+	case ipc.CodeInternal:
+		status = http.StatusInternalServerError
+	}
+	return &esphttp.PublishError{
+		HTTPStatus: status,
+		Code:       code,
+		Message:    frame.Message,
+	}
 }
 
 type mailboxServiceResources struct {

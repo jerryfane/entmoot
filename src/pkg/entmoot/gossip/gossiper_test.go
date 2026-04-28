@@ -438,6 +438,19 @@ func TestPublishNonMemberRejected(t *testing.T) {
 	}
 }
 
+func TestPublishCanonicalIDMismatchRejected(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, []entmoot.NodeID{10, 20})
+	defer f.closeTransports()
+
+	msg := f.buildMessage(10, "signed but wrong id", 2_000)
+	msg.ID[0] ^= 0xff
+	err := f.nodes[10].gossip.Publish(context.Background(), msg)
+	if !errors.Is(err, entmoot.ErrSigInvalid) {
+		t.Fatalf("Publish canonical ID mismatch: got %v, want ErrSigInvalid", err)
+	}
+}
+
 // 5. FetchReq for unknown id returns FetchResp{NotFound: true}.
 func TestFetchReqUnknown(t *testing.T) {
 	t.Parallel()

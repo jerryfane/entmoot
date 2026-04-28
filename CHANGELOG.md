@@ -24,6 +24,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   token-gated HTTP API for mailbox `pull`, `ack`, and `cursor` operations.
   It reuses the durable cursor path and requires explicit `group_id` on every
   `/v1/mailbox/*` request.
+- **ESP phone-signed publish bridge.** Added `POST /v1/messages` plus a
+  signed-publish IPC frame so mobile clients can submit already-signed Entmoot
+  messages through an ESP. The running `join` daemon still performs roster
+  verification, canonical ID/signature checks, durable accept, and gossip
+  fanout; the ESP never holds the phone's signing key.
 - **Message ingest event hook.** The daemon's notifying store now emits a
   local `message_ingested` event alongside existing IPC tail fan-out,
   giving future APNs/webhook bridges a stable integration point.

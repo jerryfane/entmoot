@@ -239,18 +239,28 @@ The same durable cursor path is exposed locally through
 `entmootd mailbox pull|ack|cursor`, giving ESP operators a production
 smoke-test surface. `entmootd esp serve` exposes the same mailbox sync
 surface over a small token-gated HTTP API for local reverse-proxy/mobile
-integration:
+integration. The same bridge also accepts phone-signed messages and
+forwards them to the running `join` daemon for verification, durable
+storage, and normal gossip fanout; the ESP never signs on the phone's
+behalf.
 
 ```sh
 ENTMOOT_ESP_TOKEN='replace-me' entmootd esp serve
 curl -H "Authorization: Bearer replace-me" \
   "http://127.0.0.1:8087/v1/mailbox/pull?client_id=ios-1&group_id=<base64>&limit=50"
+curl -H "Authorization: Bearer replace-me" \
+  -H "Content-Type: application/json" \
+  -d '{"message":{...full signed Entmoot message...}}' \
+  "http://127.0.0.1:8087/v1/messages"
 ```
 
 The server binds to `127.0.0.1:8087` by default and refuses non-loopback
 binds unless `-allow-non-loopback` is set. Production deployments should
 keep it behind TLS/auth infrastructure. `/healthz` is unauthenticated;
-all `/v1/*` routes require `Authorization: Bearer <token>`.
+all `/v1/*` routes require `Authorization: Bearer <token>`. Mailbox
+read/cursor routes work without a running `join` process; signed publish
+requires `join` because gossip fanout and roster verification are owned
+by the daemon.
 
 ## Deferred from v1
 

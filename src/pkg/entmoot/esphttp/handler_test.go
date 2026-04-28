@@ -97,6 +97,95 @@ func TestHandlerHealthzDoesNotRequireAuth(t *testing.T) {
 	}
 }
 
+func TestHandlerSignedPublish(t *testing.T) {
+	gid := testGroupID(1)
+	msg := testMessage(gid, 3, "phone signed")
+	publisher := &fakePublisher{
+		result: PublishResult{
+			Status:      "accepted",
+			MessageID:   msg.ID,
+			GroupID:     gid,
+			Author:      msg.Author.PilotNodeID,
+			TimestampMS: msg.Timestamp,
+		},
+	}
+	handler := testHandlerWithPublisher(t, gid, publisher)
+
+	result := doJSONRequest[PublishResult](t, handler, http.MethodPost, "/v1/messages", map[string]any{
+		"message": msg,
+	}, http.StatusAccepted)
+	if result.MessageID != msg.ID || result.GroupID != gid || result.Author != msg.Author.PilotNodeID {
+		t.Fatalf("publish result = %+v, want accepted message metadata", result)
+	}
+	if publisher.got.ID != msg.ID {
+		t.Fatalf("publisher got message %s, want %s", publisher.got.ID, msg.ID)
+	}
+}
+
+func TestHandlerSignedPublishErrors(t *testing.T) {
+	gid := testGroupID(1)
+	msg := testMessage(gid, 3, "phone signed")
+
+	for _, tc := range []struct {
+		name       string
+		err        error
+		wantStatus int
+		wantCode   string
+	}{
+		{
+			name: "bad_request",
+			err: &PublishError{
+				HTTPStatus: http.StatusBadRequest,
+				Code:       "bad_request",
+				Message:    "invalid signature",
+			},
+			wantStatus: http.StatusBadRequest,
+			wantCode:   "bad_request",
+		},
+		{
+			name: "not_member",
+			err: &PublishError{
+				HTTPStatus: http.StatusForbidden,
+				Code:       "not_member",
+				Message:    "author not a member",
+			},
+			wantStatus: http.StatusForbidden,
+			wantCode:   "not_member",
+		},
+		{
+			name: "join_unavailable",
+			err: &PublishError{
+				HTTPStatus: http.StatusServiceUnavailable,
+				Code:       "join_unavailable",
+				Message:    "no join",
+			},
+			wantStatus: http.StatusServiceUnavailable,
+			wantCode:   "join_unavailable",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			handler := testHandlerWithPublisher(t, gid, &fakePublisher{err: tc.err})
+			errResp := doJSONRequest[errorEnvelope](t, handler, http.MethodPost, "/v1/messages", map[string]any{
+				"message": msg,
+			}, tc.wantStatus)
+			if errResp.Error.Code != tc.wantCode {
+				t.Fatalf("error code = %q, want %q", errResp.Error.Code, tc.wantCode)
+			}
+		})
+	}
+}
+
+func TestHandlerSignedPublishWithoutPublisher(t *testing.T) {
+	gid, _, handler := testHandler(t)
+	msg := testMessage(gid, 3, "phone signed")
+	errResp := doJSONRequest[errorEnvelope](t, handler, http.MethodPost, "/v1/messages", map[string]any{
+		"message": msg,
+	}, http.StatusServiceUnavailable)
+	if errResp.Error.Code != "join_unavailable" {
+		t.Fatalf("error code = %q, want join_unavailable", errResp.Error.Code)
+	}
+}
+
 func testHandler(t *testing.T) (entmoot.GroupID, []entmoot.Message, http.Handler) {
 	t.Helper()
 	gid := testGroupID(1)
@@ -125,6 +214,41 @@ func testHandler(t *testing.T) (entmoot.GroupID, []entmoot.Message, http.Handler
 		t.Fatalf("NewHandler: %v", err)
 	}
 	return gid, msgs, handler
+}
+
+func testHandlerWithPublisher(t *testing.T, gid entmoot.GroupID, publisher Publisher) http.Handler {
+	t.Helper()
+	st := store.NewMemory()
+	svc, err := mailbox.New(st, nil)
+	if err != nil {
+		t.Fatalf("mailbox.New: %v", err)
+	}
+	handler, err := NewHandler(Config{
+		Token:     "secret",
+		Service:   svc,
+		Publisher: publisher,
+		GroupExists: func(_ context.Context, got entmoot.GroupID) (bool, error) {
+			return got == gid, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewHandler: %v", err)
+	}
+	return handler
+}
+
+type fakePublisher struct {
+	result PublishResult
+	err    error
+	got    entmoot.Message
+}
+
+func (p *fakePublisher) PublishSigned(_ context.Context, msg entmoot.Message) (PublishResult, error) {
+	p.got = msg
+	if p.err != nil {
+		return PublishResult{}, p.err
+	}
+	return p.result, nil
 }
 
 func doJSONRequest[T any](t *testing.T, handler http.Handler, method, path string, body any, wantStatus int) T {

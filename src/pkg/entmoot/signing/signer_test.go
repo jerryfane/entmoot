@@ -3,6 +3,7 @@ package signing
 import (
 	"context"
 	"crypto/ed25519"
+	"errors"
 	"testing"
 
 	"entmoot/pkg/entmoot"
@@ -69,6 +70,34 @@ func TestExternalSignerAllowsPhoneHeldIdentity(t *testing.T) {
 	msg.Content[0] ^= 0xff
 	if err := VerifyMessage(msg, author); err == nil {
 		t.Fatalf("VerifyMessage accepted tampered content")
+	}
+}
+
+func TestVerifyMessageCanonicalIDMismatchWrapsSigInvalid(t *testing.T) {
+	id, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	author := entmoot.NodeInfo{PilotNodeID: 45491, EntmootPubKey: id.PublicKey}
+	signer, err := NewExternalSigner(author, func(_ context.Context, payload []byte) ([]byte, error) {
+		return id.Sign(payload), nil
+	})
+	if err != nil {
+		t.Fatalf("NewExternalSigner: %v", err)
+	}
+	msg, err := signer.SignMessage(context.Background(), entmoot.Message{
+		GroupID:   groupID(2),
+		Timestamp: 2000,
+		Topics:    []string{"mobile/inbox"},
+		Content:   []byte("signed off-device"),
+	})
+	if err != nil {
+		t.Fatalf("SignMessage: %v", err)
+	}
+	msg.ID[0] ^= 0xff
+	err = VerifyMessage(msg, author)
+	if !errors.Is(err, entmoot.ErrSigInvalid) {
+		t.Fatalf("VerifyMessage err = %v, want ErrSigInvalid", err)
 	}
 }
 

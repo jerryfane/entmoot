@@ -116,7 +116,7 @@ func VerifyMessage(msg entmoot.Message, author entmoot.NodeInfo) error {
 		return fmt.Errorf("%w: message %s", entmoot.ErrSigInvalid, msg.ID)
 	}
 	if canonical.MessageID(msg) != msg.ID {
-		return fmt.Errorf("signing: message id does not match canonical hash")
+		return fmt.Errorf("%w: message id does not match canonical hash", entmoot.ErrSigInvalid)
 	}
 	return nil
 }

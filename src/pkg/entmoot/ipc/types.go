@@ -34,6 +34,12 @@ const (
 	MsgInfoReq MsgType = 0x14
 	// MsgInfoResp returns the snapshot requested by MsgInfoReq.
 	MsgInfoResp MsgType = 0x15
+	// MsgSignedPublishReq carries an already-signed message to the daemon for
+	// verification, durable persistence, and gossip fanout.
+	MsgSignedPublishReq MsgType = 0x16
+	// MsgSignedPublishResp acknowledges acceptance of an already-signed
+	// message. Fanout remains asynchronous, matching PublishResp semantics.
+	MsgSignedPublishResp MsgType = 0x17
 	// MsgError carries a structured error frame. 0x1F is chosen as the
 	// last slot in the 0x10..0x1F namespace so it's easy to spot.
 	MsgError MsgType = 0x1F
@@ -55,6 +61,10 @@ func (t MsgType) String() string {
 		return "info_req"
 	case MsgInfoResp:
 		return "info_resp"
+	case MsgSignedPublishReq:
+		return "signed_publish_req"
+	case MsgSignedPublishResp:
+		return "signed_publish_resp"
 	case MsgError:
 		return "error"
 	default:
@@ -91,6 +101,22 @@ type PublishResp struct {
 	// TimestampMS is the daemon's unix-milliseconds timestamp at signing
 	// time.
 	TimestampMS int64 `json:"timestamp_ms"`
+}
+
+// SignedPublishReq carries a fully-authored and signed message from a client
+// that holds its own Entmoot signing key. The daemon verifies roster
+// membership, signature, and canonical id before accepting it.
+type SignedPublishReq struct {
+	Message entmoot.Message `json:"message"`
+}
+
+// SignedPublishResp acknowledges a successfully accepted signed message.
+type SignedPublishResp struct {
+	Status      string            `json:"status"`
+	MessageID   entmoot.MessageID `json:"message_id"`
+	GroupID     entmoot.GroupID   `json:"group_id"`
+	Author      entmoot.NodeID    `json:"author"`
+	TimestampMS int64             `json:"timestamp_ms"`
 }
 
 // TailSubscribe opens a live message stream. GroupID is optional (nil

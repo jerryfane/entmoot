@@ -449,7 +449,9 @@ mobile clients. Exposes the same durable mailbox cursor operations as
 `entmootd mailbox`, but through a token-gated HTTP API suitable for a
 local reverse proxy, app backend, or APNs/webhook bridge. Reads messages
 from SQLite and persists per-client cursors in `<data>/mailbox.sqlite`.
-Does not require Pilot, the control socket, or a running `join` process.
+Mailbox reads do not require Pilot, the control socket, or a running `join`
+process. Signed publish requires a running `join` process because the daemon
+owns roster verification, durable accept, and gossip fanout.
 
 **Signature**
 
@@ -487,6 +489,22 @@ ENTMOOT_ESP_TOKEN=... entmootd esp serve [-addr 127.0.0.1:8087] [-token TOKEN] [
 - `GET /v1/mailbox/cursor?client_id=CLIENT&group_id=GID`
   - Requires `Authorization: Bearer <token>`.
   - Response body matches `entmootd mailbox cursor`.
+- `POST /v1/messages`
+  - Requires `Authorization: Bearer <token>`.
+  - Body contains a full already-signed Entmoot message:
+
+    ```json
+    {"message":{"id":"<base64>","group_id":"<base64>","author":{"pilot_node_id":45491,"entmoot_pubkey":"<base64>"},"timestamp":1713369600000,"topics":["chat"],"content":"<base64>","signature":"<base64>"}}
+    ```
+
+  - The ESP forwards the message to the running `join` daemon. The daemon
+    verifies current roster membership, signature, canonical message id,
+    then persists and gossips it through the normal publish path.
+  - Success returns `202 Accepted`:
+
+    ```json
+    {"status":"accepted","message_id":"<base64>","group_id":"<base64>","author":45491,"timestamp_ms":1713369600000}
+    ```
 
 **Errors**
 
@@ -499,8 +517,12 @@ Errors are JSON envelopes:
 - `401`: missing or invalid bearer token. Includes
   `WWW-Authenticate: Bearer`.
 - `400`: malformed request, missing fields, invalid id, or unknown
-  message id.
+- `400`: malformed request, missing fields, invalid id, unknown message id,
+  or invalid signed message.
+- `403`: signed publish author is not a current roster member.
 - `404`: group not joined locally, or unknown route.
+- `503`: signed publish requested while the `join` daemon/control socket is
+  unavailable.
 - `500`: SQLite, cursor-store, or local group lookup failure.
 
 **Side effects**
@@ -509,9 +531,9 @@ Errors are JSON envelopes:
   `<data>/mailbox.sqlite` if it does not exist yet.
 - `ack` writes only local ESP cursor state in `<data>/mailbox.sqlite`.
   It does not mutate Entmoot messages, gossip, or consensus state.
-- The bridge is intentionally mailbox/sync only. It does not publish
-  phone-authored messages, hold signing keys, send APNs, or decide
-  Pilot routing.
+- `POST /v1/messages` mutates Entmoot state only after the running daemon
+  accepts the already-signed message. It does not hold signing keys, select
+  parents, rewrite timestamps, send APNs, or decide Pilot routing.
 
 ---
 

@@ -26,14 +26,45 @@ type GroupExistsFunc func(context.Context, entmoot.GroupID) (bool, error)
 type Config struct {
 	Token       string
 	Service     *mailbox.Service
+	Publisher   Publisher
 	GroupExists GroupExistsFunc
 	Logger      *slog.Logger
+}
+
+// Publisher submits already-signed messages to the running Entmoot daemon.
+type Publisher interface {
+	PublishSigned(context.Context, entmoot.Message) (PublishResult, error)
+}
+
+// PublishResult is the HTTP response for an accepted phone-signed message.
+type PublishResult struct {
+	Status      string            `json:"status"`
+	MessageID   entmoot.MessageID `json:"message_id"`
+	GroupID     entmoot.GroupID   `json:"group_id"`
+	Author      entmoot.NodeID    `json:"author"`
+	TimestampMS int64             `json:"timestamp_ms"`
+}
+
+// PublishError lets publisher implementations request stable HTTP error
+// mapping without coupling esphttp to a concrete IPC client.
+type PublishError struct {
+	HTTPStatus int
+	Code       string
+	Message    string
+}
+
+func (e *PublishError) Error() string {
+	if e == nil {
+		return ""
+	}
+	return e.Message
 }
 
 // Handler serves the ESP mailbox API.
 type Handler struct {
 	token       string
 	service     *mailbox.Service
+	publisher   Publisher
 	groupExists GroupExistsFunc
 	logger      *slog.Logger
 }
@@ -57,6 +88,7 @@ func NewHandler(cfg Config) (*Handler, error) {
 	return &Handler{
 		token:       cfg.Token,
 		service:     cfg.Service,
+		publisher:   cfg.Publisher,
 		groupExists: groupExists,
 		logger:      logger,
 	}, nil
@@ -87,6 +119,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleAck(w, r)
 	case "/v1/mailbox/cursor":
 		h.handleCursor(w, r)
+	case "/v1/messages":
+		h.handleMessagePublish(w, r)
 	default:
 		writeError(w, http.StatusNotFound, "not_found", "not found")
 	}
@@ -172,6 +206,48 @@ func (h *Handler) handleCursor(w http.ResponseWriter, r *http.Request) {
 	h.writeMailboxResult(w, "mailbox cursor", result, err)
 }
 
+func (h *Handler) handleMessagePublish(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w, http.MethodPost)
+		return
+	}
+	if h.publisher == nil {
+		writeError(w, http.StatusServiceUnavailable, "join_unavailable", "no running join publisher configured")
+		return
+	}
+	var req struct {
+		Message entmoot.Message `json:"message"`
+	}
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<20))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", fmt.Sprintf("invalid JSON body: %v", err))
+		return
+	}
+	if req.Message.ID == (entmoot.MessageID{}) &&
+		req.Message.GroupID == (entmoot.GroupID{}) &&
+		req.Message.Author.PilotNodeID == 0 &&
+		len(req.Message.Author.EntmootPubKey) == 0 &&
+		req.Message.Timestamp == 0 &&
+		len(req.Message.Topics) == 0 &&
+		len(req.Message.Content) == 0 &&
+		len(req.Message.Parents) == 0 &&
+		len(req.Message.References) == 0 &&
+		len(req.Message.Signature) == 0 {
+		writeError(w, http.StatusBadRequest, "bad_request", "message is required")
+		return
+	}
+	if req.Message.GroupID == (entmoot.GroupID{}) {
+		writeError(w, http.StatusBadRequest, "bad_request", "message.group_id is required")
+		return
+	}
+	if ok := h.checkGroup(w, r, req.Message.GroupID); !ok {
+		return
+	}
+	result, err := h.publisher.PublishSigned(r.Context(), req.Message)
+	h.writePublishResult(w, result, err)
+}
+
 func (h *Handler) requireGroup(w http.ResponseWriter, r *http.Request) (entmoot.GroupID, bool) {
 	raw := strings.TrimSpace(r.URL.Query().Get("group_id"))
 	if raw == "" {
@@ -198,6 +274,24 @@ func (h *Handler) checkGroup(w http.ResponseWriter, r *http.Request, groupID ent
 		return false
 	}
 	return true
+}
+
+func (h *Handler) writePublishResult(w http.ResponseWriter, result PublishResult, err error) {
+	if err == nil {
+		writeJSON(w, http.StatusAccepted, result)
+		return
+	}
+	var pubErr *PublishError
+	if errors.As(err, &pubErr) && pubErr != nil {
+		status := pubErr.HTTPStatus
+		if status == 0 {
+			status = http.StatusInternalServerError
+		}
+		writeError(w, status, pubErr.Code, pubErr.Message)
+		return
+	}
+	h.logger.Error("esphttp: signed publish", slog.String("err", err.Error()))
+	writeError(w, http.StatusInternalServerError, "internal_error", "signed publish failed")
 }
 
 func (h *Handler) writeMailboxResult(w http.ResponseWriter, op string, result any, err error) {

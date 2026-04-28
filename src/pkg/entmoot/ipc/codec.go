@@ -11,8 +11,8 @@ import (
 // body to WriteFrame, or use EncodeAndWrite for the combined path.
 //
 // Supported payloads (pointers only): *PublishReq, *PublishResp,
-// *TailSubscribe, *TailEvent, *InfoReq, *InfoResp, *ErrorFrame. Anything
-// else returns ErrUnknownMessage.
+// *SignedPublishReq, *SignedPublishResp, *TailSubscribe, *TailEvent, *InfoReq,
+// *InfoResp, *ErrorFrame. Anything else returns ErrUnknownMessage.
 //
 // As a convenience, Encode fills in ErrorFrame.Type = "error" when the
 // caller left it empty. The wire shape is defined to always carry that
@@ -24,6 +24,10 @@ func Encode(v any) (MsgType, []byte, error) {
 		t = MsgPublishReq
 	case *PublishResp:
 		t = MsgPublishResp
+	case *SignedPublishReq:
+		t = MsgSignedPublishReq
+	case *SignedPublishResp:
+		t = MsgSignedPublishResp
 	case *TailSubscribe:
 		t = MsgTailSubscribe
 	case *TailEvent:
@@ -65,6 +69,10 @@ func Decode(t MsgType, body []byte) (any, error) {
 		return decodeAs[PublishReq](t, body)
 	case MsgPublishResp:
 		return decodeAs[PublishResp](t, body)
+	case MsgSignedPublishReq:
+		return decodeAs[SignedPublishReq](t, body)
+	case MsgSignedPublishResp:
+		return decodeAs[SignedPublishResp](t, body)
 	case MsgTailSubscribe:
 		return decodeAs[TailSubscribe](t, body)
 	case MsgTailEvent:

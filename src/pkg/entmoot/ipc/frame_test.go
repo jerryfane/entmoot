@@ -183,13 +183,15 @@ func TestPartialWritesViaPipe(t *testing.T) {
 // constant and the unknown-fallback.
 func TestMsgTypeString(t *testing.T) {
 	cases := map[MsgType]string{
-		MsgPublishReq:    "publish_req",
-		MsgPublishResp:   "publish_resp",
-		MsgTailSubscribe: "tail_subscribe",
-		MsgTailEvent:     "tail_event",
-		MsgInfoReq:       "info_req",
-		MsgInfoResp:      "info_resp",
-		MsgError:         "error",
+		MsgPublishReq:        "publish_req",
+		MsgPublishResp:       "publish_resp",
+		MsgSignedPublishReq:  "signed_publish_req",
+		MsgSignedPublishResp: "signed_publish_resp",
+		MsgTailSubscribe:     "tail_subscribe",
+		MsgTailEvent:         "tail_event",
+		MsgInfoReq:           "info_req",
+		MsgInfoResp:          "info_resp",
+		MsgError:             "error",
 	}
 	for tt, want := range cases {
 		if got := tt.String(); got != want {
@@ -204,7 +206,7 @@ func TestMsgTypeString(t *testing.T) {
 	}
 	// A byte inside the ipc namespace (0x10..0x1F) that is not
 	// registered must also be reported as unknown.
-	if got := MsgType(0x16).String(); got != "unknown(0x16)" {
-		t.Errorf("0x16 String() = %q", got)
+	if got := MsgType(0x18).String(); got != "unknown(0x18)" {
+		t.Errorf("0x18 String() = %q", got)
 	}
 }

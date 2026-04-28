@@ -680,6 +680,8 @@ func (s *ipcServer) handleConn(ctx context.Context, c net.Conn) {
 	switch v := payload.(type) {
 	case *ipc.PublishReq:
 		s.handlePublish(ctx, c, v)
+	case *ipc.SignedPublishReq:
+		s.handleSignedPublish(ctx, c, v)
 	case *ipc.InfoReq:
 		s.handleInfo(ctx, c)
 	case *ipc.TailSubscribe:
@@ -694,6 +696,46 @@ func (s *ipcServer) handleConn(ctx context.Context, c net.Conn) {
 			Message: fmt.Sprintf("unexpected ipc type %s", t),
 		})
 	}
+}
+
+// handleSignedPublish accepts a message whose author already signed it. This
+// is the ESP/mobile write path: the daemon owns durable storage and gossip
+// fanout, but does not hold the author's signing key.
+func (s *ipcServer) handleSignedPublish(ctx context.Context, c net.Conn, req *ipc.SignedPublishReq) {
+	msg := req.Message
+	gid := msg.GroupID
+	if gid != s.groupID {
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
+			Type:    "error",
+			Code:    ipc.CodeGroupNotFound,
+			GroupID: &gid,
+			Message: "group not joined",
+		})
+		return
+	}
+	if err := s.gossiper.Publish(ctx, msg); err != nil {
+		code := ipc.CodeInternal
+		switch {
+		case errors.Is(err, entmoot.ErrNotMember):
+			code = ipc.CodeNotMember
+		case errors.Is(err, entmoot.ErrSigInvalid):
+			code = ipc.CodeInvalidArgument
+		}
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
+			Type:    "error",
+			Code:    code,
+			GroupID: &gid,
+			Message: "signed publish: " + err.Error(),
+		})
+		return
+	}
+	_ = ipc.EncodeAndWrite(c, &ipc.SignedPublishResp{
+		Status:      "accepted",
+		MessageID:   msg.ID,
+		GroupID:     gid,
+		Author:      msg.Author.PilotNodeID,
+		TimestampMS: msg.Timestamp,
+	})
 }
 
 // handlePublish resolves the target group, signs the supplied Topics+
