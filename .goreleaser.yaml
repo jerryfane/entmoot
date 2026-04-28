@@ -17,6 +17,9 @@ builds:
       - arm64
     ldflags:
       - -s -w
+      - -X main.version={{ .Tag }}
+      - -X main.commit={{ .Commit }}
+      - -X main.date={{ .Date }}
 
 archives:
   - id: entmoot

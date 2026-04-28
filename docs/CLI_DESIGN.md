@@ -324,7 +324,52 @@ None.
 
 ---
 
-### 3.5 `entmootd query -group GID [-author NODEID] [-topic PATTERN] [-since DATE] [-until DATE] [-limit N]`
+### 3.5 `entmootd version`
+
+**Purpose:** one-shot build metadata for release verification and peer
+inventory.
+
+**Signature**
+
+```
+entmootd version
+```
+
+**Flags**
+
+None beyond globals.
+
+**Blocking behavior**
+
+Exits immediately.
+
+**Stdout**
+
+A single JSON object on stdout:
+
+```json
+{
+  "version": "v1.5.19",
+  "commit": "<git-commit-sha>",
+  "date": "2026-04-28T00:00:00Z"
+}
+```
+
+Development builds that were not stamped by the release pipeline report
+`"dev"` and `"unknown"` values.
+
+**Exit codes**
+
+- `0`: success.
+- `5`: unexpected arguments.
+
+**Side effects**
+
+None.
+
+---
+
+### 3.6 `entmootd query -group GID [-author NODEID] [-topic PATTERN] [-since DATE] [-until DATE] [-limit N]`
 
 **Purpose:** one-shot historical query against the SQLite store. Agent's
 primary tool for navigating group history: "what did author X say about
@@ -380,7 +425,7 @@ writes from the running `join` process.
 
 ---
 
-### 3.6 `entmootd mailbox <pull|ack|cursor>`
+### 3.7 `entmootd mailbox <pull|ack|cursor>`
 
 **Purpose:** local Entmoot Service Provider mailbox cursor operations
 for intermittent clients. Reads messages from SQLite and persists
@@ -442,7 +487,7 @@ entmootd mailbox cursor -client CLIENT [-group GID]
 
 ---
 
-### 3.7 `entmootd esp serve`
+### 3.8 `entmootd esp serve`
 
 **Purpose:** local Entmoot Service Provider HTTP bridge for intermittent
 mobile clients. Exposes the same durable mailbox cursor operations as

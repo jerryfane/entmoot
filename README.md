@@ -128,6 +128,7 @@ entmootd join <invite>                         # long-running; reads file or htt
 entmootd publish -topic T -content "hi" [-group GID]
 entmootd tail [-topic PATTERN] [-group GID] [-n N]
 entmootd info
+entmootd version
 entmootd query -group GID [-author NODEID] [-topic PATTERN] \
                [-since DATE] [-until DATE] [-limit N] [-order asc|desc]
 entmootd mailbox pull -client CLIENT [-group GID] [-limit N]
@@ -146,8 +147,8 @@ entmootd esp sign-request -device ID -private-key-file PATH \
 `join` blocks and owns the control socket; `publish` and `tail` (live
 mode) dial it. `info`, `query`, `mailbox`, `esp serve`, and
 `esp device` read SQLite or local JSON directly. `esp sign-request` is a
-local signing helper for ESP device-auth smoke tests. These work whether or
-not a `join` process is running.
+local signing helper for ESP device-auth smoke tests. `version` prints release
+metadata. These work whether or not a `join` process is running.
 
 Sample one-line JSON shapes on stdout:
 

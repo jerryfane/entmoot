@@ -13,6 +13,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+## [1.5.19] - 2026-04-28
+
+### Added
+
+- **Build metadata command.** Added `entmootd version`, with release builds
+  stamped by GoReleaser using the tag, commit, and build date.
+
 ## [1.5.18] - 2026-04-28
 
 ### Added

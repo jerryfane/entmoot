@@ -79,9 +79,10 @@ peers, and changelog stay aligned.
 7. Verify every peer reports:
 
    ```sh
+   entmootd version
    entmootd info
    entmootd query --limit 1000 | wc -l
    ```
 
-   Message counts and Merkle roots should match across laptop, VPS, and
-   phobos before considering the release complete.
+   Versions, message counts, and Merkle roots should match across laptop,
+   VPS, and phobos before considering the release complete.

@@ -1,6 +1,6 @@
 // Command entmootd is the Entmoot v1 daemon + CLI. A single binary that
 // exposes agent-facing subcommands (join, publish, tail, info, query, mailbox,
-// esp)
+// esp, version)
 // plus founder-facing subcommands (group create, invite create). The
 // join subcommand owns a blocking accept loop and a control-socket IPC
 // server; all agent commands other than join/publish/tail are direct SQLite
@@ -76,6 +76,7 @@ func run() int {
 		fmt.Fprintln(os.Stderr, "  esp serve               Serve the local ESP mailbox HTTP API.")
 		fmt.Fprintln(os.Stderr, "  esp device <cmd>        Manage the local ESP device registry.")
 		fmt.Fprintln(os.Stderr, "  esp sign-request        Sign one ESP device-auth HTTP request.")
+		fmt.Fprintln(os.Stderr, "  version                 Print build metadata as JSON.")
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "Founder subcommands:")
 		fmt.Fprintln(os.Stderr, "  group create -name N    Create a new group.")
@@ -161,6 +162,8 @@ func run() int {
 		return cmdMailbox(gf, args[1:])
 	case "esp":
 		return cmdESP(gf, args[1:])
+	case "version":
+		return cmdVersion(gf, args[1:])
 	case "group":
 		return cmdGroup(gf, args[1:])
 	case "invite":
