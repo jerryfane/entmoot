@@ -48,3 +48,40 @@ scripts/verify-mesh-node.sh
 The helper prints a local Pilot/Entmoot snapshot: peer auth, Pilot info,
 Entmoot message count, and recent transport/reconcile log lines. It does not
 perform SSH or modify state.
+
+## Release Checklist
+
+Use this checklist for every Entmoot tag so the GitHub release, deployed
+peers, and changelog stay aligned.
+
+1. Move completed `CHANGELOG.md` entries out of `[Unreleased]` into a dated
+   release section.
+2. Run the local test suite:
+
+   ```sh
+   cd src
+   go test ./... -count=1
+   ```
+
+3. Commit the implementation and release-bookkeeping changes.
+4. Tag and push:
+
+   ```sh
+   git tag vX.Y.Z
+   git push origin main
+   git push origin vX.Y.Z
+   ```
+
+5. Verify the tag-triggered GitHub release succeeds and the expected
+   darwin/linux amd64/arm64 archives are uploaded.
+6. Update each peer from the released tag or source checkout, then restart in
+   the standard order: Pilot first only when needed, then Entmoot.
+7. Verify every peer reports:
+
+   ```sh
+   entmootd info
+   entmootd query --limit 1000 | wc -l
+   ```
+
+   Message counts and Merkle roots should match across laptop, VPS, and
+   phobos before considering the release complete.

@@ -9,76 +9,109 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Mobile service-peer infrastructure primitives.** Added signer,
-  delegation, mailbox cursor, and local event packages so an always-on
-  Entmoot peer can later act as a mobile keeper without making iOS run
-  `entmootd` or `pilot-daemon`.
-- **Durable ESP mailbox cursors.** Added a `mailbox.CursorStore`
-  abstraction plus SQLite-backed cursor persistence at
-  `<data-dir>/mailbox.sqlite`, so an Entmoot Service Provider can restart
-  without redelivering already-acknowledged mobile sync messages.
-- **Local ESP mailbox CLI.** Added `entmootd mailbox pull`, `ack`, and
-  `cursor` so operators can exercise the durable mailbox cursor path
-  against production SQLite state before an HTTP/APNs bridge exists.
-- **ESP mailbox HTTP bridge.** Added `entmootd esp serve`, a loopback-first
-  token-gated HTTP API for mailbox `pull`, `ack`, and `cursor` operations.
-  It reuses the durable cursor path and requires explicit `group_id` on every
-  `/v1/mailbox/*` request.
-- **ESP phone-signed publish bridge.** Added `POST /v1/messages` plus a
-  signed-publish IPC frame so mobile clients can submit already-signed Entmoot
-  messages through an ESP. The running `join` daemon still performs roster
-  verification, canonical ID/signature checks, durable accept, and gossip
-  fanout; the ESP never holds the phone's signing key.
+### Changed
+
+### Fixed
+
+## [1.5.18] - 2026-04-28
+
+### Added
+
+- **ESP device registry CLI.** Added `entmootd esp device
+  <list|add|onboard|enable|disable|remove>` so operators can manage
+  `<data>/esp-devices.json` atomically without hand-editing JSON. `onboard`
+  prints a generated device private key once while storing only the public key.
+- **ESP request signing helper.** Added `entmootd esp sign-request` to emit
+  valid device-auth `X-Entmoot-*` headers for local ESP HTTP smoke tests.
+
+## [1.5.17] - 2026-04-28
+
+### Added
+
 - **ESP device request signatures.** Added opt-in `entmootd esp serve
   -auth-mode=device|dual` support with a local `esp-devices.json` registry,
   Ed25519 request signatures, timestamp/nonce replay protection, and
   per-device group/client authorization for mailbox and signed-publish HTTP
   routes.
-- **ESP device registry CLI.** Added `entmootd esp device
-  <list|add|onboard|enable|disable|remove>` so operators can manage
-  `<data>/esp-devices.json` atomically without hand-editing JSON, with an
-  onboarding helper that prints a generated device private key once while
-  storing only the public key.
-- **ESP request signing helper.** Added `entmootd esp sign-request` to emit
-  valid device-auth `X-Entmoot-*` headers for local ESP HTTP smoke tests.
-- **Message ingest event hook.** The daemon's notifying store now emits a
-  local `message_ingested` event alongside existing IPC tail fan-out,
-  giving future APNs/webhook bridges a stable integration point.
-- **Entmoot join waits for Pilot readiness.** `entmootd join` now retries the
-  local Pilot IPC open/listen path with bounded jittered backoff before
-  failing startup, avoiding service-ordering races where Entmoot launches while
-  `pilot-daemon` is still creating `/tmp/pilot.sock`.
-- **Local operations helpers.** Added scripts for waiting on `pilotctl info`
-  readiness and printing a local mesh verification snapshot after restarts.
+
+## [1.5.16] - 2026-04-28
+
+### Added
+
+- **ESP phone-signed publish bridge.** Added `POST /v1/messages` plus a
+  signed-publish IPC frame so mobile clients can submit already-signed Entmoot
+  messages through an ESP. The running `join` daemon still performs roster
+  verification, canonical ID/signature checks, durable accept, and gossip
+  fanout; the ESP never holds the phone's signing key.
+
+## [1.5.15] - 2026-04-27
+
+### Added
+
+- **ESP mailbox HTTP bridge.** Added `entmootd esp serve`, a loopback-first
+  token-gated HTTP API for mailbox `pull`, `ack`, and `cursor` operations.
+  It reuses the durable cursor path and requires explicit `group_id` on every
+  `/v1/mailbox/*` request.
+
+## [1.5.14] - 2026-04-27
+
+### Added
+
+- **Local ESP mailbox CLI.** Added `entmootd mailbox pull`, `ack`, and
+  `cursor` so operators can exercise the durable mailbox cursor path against
+  production SQLite state before an HTTP/APNs bridge exists.
+
+## [1.5.13] - 2026-04-28
+
+### Added
+
+- **Durable ESP mailbox cursors.** Added a `mailbox.CursorStore` abstraction
+  plus SQLite-backed cursor persistence at `<data-dir>/mailbox.sqlite`, so an
+  Entmoot Service Provider can restart without redelivering
+  already-acknowledged mobile sync messages.
 
 ### Changed
 
-- **Pilot/yamux stale-session classification is transport-owned.** Gossip now
-  asks transports to classify adapter-specific stream failures, keeping retry
-  and backoff policy in gossip while moving Pilot IPC/yamux error details out
-  of the generic gossiper.
-- **Reconcile tracing is explicit and opt-in.** `entmootd` now accepts
-  `-trace-reconcile`, which emits structured anti-entropy lifecycle events for
-  trigger gating, Merkle root checks, RBSR rounds, fallback recovery, and body
-  fetch results.
-- **Local publishing uses the signer abstraction.** Existing keystore-backed
-  publishes keep the same wire format, but the signing path now shares the
-  same verification code used by future external/phone-held signers.
 - **Mailbox cursors are storage-backed.** `mailbox.Service` now delegates
-  cursor state to a pluggable store. The default constructor remains
-  in-memory for compatibility; ESP deployments can opt into SQLite.
+  cursor state to a pluggable store. The default constructor remains in-memory
+  for compatibility; ESP deployments can opt into SQLite.
+
+## [1.5.12] - 2026-04-28
 
 ### Fixed
 
 - **Publish responses no longer wait on Pilot trust IPC.** Local publish
-  success now returns after validation and durable store accept; Plumtree
-  peer selection, trust filtering, frame construction, and fanout all run
-  behind the async delivery boundary. A wedged `TrustedPeers` query can no
-  longer make the CLI report an i/o timeout after the message already landed.
-- **IPC client tests use short Unix socket paths on macOS.** Test daemons now
-  bind sockets under `/tmp` instead of `t.TempDir()` paths under
-  `/var/folders`, avoiding Darwin `sockaddr_un` path-length failures in the
-  default `go test ./...` run.
+  success now returns after validation and durable store accept; Plumtree peer
+  selection, trust filtering, frame construction, and fanout all run behind the
+  async delivery boundary. A wedged `TrustedPeers` query can no longer make the
+  CLI report an i/o timeout after the message already landed.
+
+## [1.5.11] - 2026-04-28
+
+### Added
+
+- **Mobile service-peer infrastructure primitives.** Added signer,
+  delegation, mailbox cursor, and local event packages so an always-on Entmoot
+  peer can later act as a mobile keeper without making iOS run `entmootd` or
+  `pilot-daemon`.
+- **Message ingest event hook.** The daemon's notifying store now emits a
+  local `message_ingested` event alongside existing IPC tail fan-out, giving
+  future APNs/webhook bridges a stable integration point.
+
+### Changed
+
+- **Local publishing uses the signer abstraction.** Existing keystore-backed
+  publishes keep the same wire format, but the signing path now shares the
+  same verification code used by future external/phone-held signers.
+
+## [1.5.10] - 2026-04-28
+
+### Added
+
+- **Reconcile tracing is explicit and opt-in.** `entmootd` now accepts
+  `-trace-reconcile`, which emits structured anti-entropy lifecycle events for
+  trigger gating, Merkle root checks, RBSR rounds, fallback recovery, and body
+  fetch results.
 
 ## [1.5.9] - 2026-04-27
 
