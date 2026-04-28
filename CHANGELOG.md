@@ -34,6 +34,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Ed25519 request signatures, timestamp/nonce replay protection, and
   per-device group/client authorization for mailbox and signed-publish HTTP
   routes.
+- **ESP device registry CLI.** Added `entmootd esp device
+  <list|add|onboard|enable|disable|remove>` so operators can manage
+  `<data>/esp-devices.json` atomically without hand-editing JSON, with an
+  onboarding helper that prints a generated device private key once while
+  storing only the public key.
 - **Message ingest event hook.** The daemon's notifying store now emits a
   local `message_ingested` event alongside existing IPC tail fan-out,
   giving future APNs/webhook bridges a stable integration point.

@@ -120,8 +120,8 @@ before running. Both are skipped under `-short` or when
 
 ### Use the binary
 
-`entmootd` is the single binary. The agent-facing surface is seven
-commands; all emit JSON on stdout.
+`entmootd` is the single binary. The agent-facing commands emit JSON on
+stdout.
 
 ```sh
 entmootd join <invite>                         # long-running; reads file or http(s) URL
@@ -135,11 +135,16 @@ entmootd mailbox ack -client CLIENT -message MESSAGE_ID [-group GID]
 entmootd mailbox cursor -client CLIENT [-group GID]
 ENTMOOT_ESP_TOKEN=... entmootd esp serve [-addr 127.0.0.1:8087] \
   [-auth-mode bearer|device|dual] [-device-keys PATH]
+entmootd esp device list [-device-keys PATH]
+entmootd esp device add -id ID -pubkey PUBKEY -group GID [-client CLIENT]...
+entmootd esp device onboard -id ID -group GID [-client CLIENT]...
+entmootd esp device enable|disable|remove -id ID [-device-keys PATH]
 ```
 
 `join` blocks and owns the control socket; `publish` and `tail` (live
-mode) dial it. `info`, `query`, `mailbox`, and `esp serve` read SQLite
-directly and work whether or not a `join` process is running.
+mode) dial it. `info`, `query`, `mailbox`, `esp serve`, and
+`esp device` read SQLite or local JSON directly and work whether or not a
+`join` process is running.
 
 Sample one-line JSON shapes on stdout:
 
@@ -262,9 +267,34 @@ all `/v1/*` routes require ESP auth. The default is bearer-token auth for
 compatibility. Production mobile deployments should use `-auth-mode=device`
 or `-auth-mode=dual` with a local device registry:
 
+```sh
+# Production/import path: the phone generates the private key and gives the
+# operator only the public key.
+entmootd esp device add \
+  -id ios-1-device \
+  -pubkey '<base64 ed25519 public key>' \
+  -group '<base64 group id>' \
+  -client ios-1
+
+# Development/onboarding path: generate a test device keypair and print the
+# private key once on stdout. The registry still stores only the public key.
+entmootd esp device onboard \
+  -id ios-1-device \
+  -group '<base64 group id>' \
+  -client ios-1
+```
+
 ```json
 {"devices":[{"id":"ios-1","public_key":"<base64 ed25519 pubkey>","groups":["<base64 group id>"],"client_ids":["ios-1"]}]}
 ```
+
+The registry defaults to `<data>/esp-devices.json`; pass `-device-keys PATH`
+to manage a different file. `disable` is the preferred temporary revocation
+tool because it preserves the device entry for audit/rollback; `remove`
+hard-deletes the local entry. `onboard` prints a generated private key once
+for development/operator handoff, but never stores it in the ESP registry.
+For production iOS custody, the phone/client side should generate and retain
+its own private key and use `esp device add` to import only the public key.
 
 Device-authenticated requests sign
 `ENTMOOT-ESP-AUTH-V1\nMETHOD\nPATH?QUERY\nTIMESTAMP_MS\nNONCE\nBASE64_SHA256_BODY`

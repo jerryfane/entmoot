@@ -74,6 +74,7 @@ func run() int {
 		fmt.Fprintln(os.Stderr, "  mailbox <pull|ack|cursor>")
 		fmt.Fprintln(os.Stderr, "                          Local ESP mailbox sync cursor commands.")
 		fmt.Fprintln(os.Stderr, "  esp serve               Serve the local ESP mailbox HTTP API.")
+		fmt.Fprintln(os.Stderr, "  esp device <cmd>        Manage the local ESP device registry.")
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "Founder subcommands:")
 		fmt.Fprintln(os.Stderr, "  group create -name N    Create a new group.")

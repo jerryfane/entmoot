@@ -22,12 +22,14 @@ import (
 
 func cmdESP(gf *globalFlags, args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "esp: expected serve")
+		fmt.Fprintln(os.Stderr, "esp: expected serve or device")
 		return exitInvalidArgument
 	}
 	switch args[0] {
 	case "serve":
 		return cmdESPServe(gf, args[1:])
+	case "device":
+		return cmdESPDevice(gf, args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "esp: unknown subcommand %q\n", args[0])
 		return exitInvalidArgument

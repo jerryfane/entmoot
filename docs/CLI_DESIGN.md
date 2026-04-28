@@ -478,6 +478,39 @@ ENTMOOT_ESP_TOKEN=... entmootd esp serve [-addr 127.0.0.1:8087] [-token TOKEN] \
 
 **Device registry**
 
+Operators should manage the local registry with `entmootd esp device` rather
+than hand-editing JSON:
+
+```sh
+entmootd esp device list [-device-keys PATH]
+entmootd esp device add \
+  -id ios-1-device \
+  -pubkey <base64-ed25519-public-key> \
+  -group <base64-group-id> \
+  [-client ios-1]... \
+  [-disabled] \
+  [-device-keys PATH]
+entmootd esp device onboard \
+  -id ios-1-device \
+  -group <base64-group-id> \
+  [-client ios-1]... \
+  [-disabled] \
+  [-device-keys PATH]
+entmootd esp device enable -id ios-1-device [-device-keys PATH]
+entmootd esp device disable -id ios-1-device [-device-keys PATH]
+entmootd esp device remove -id ios-1-device [-device-keys PATH]
+```
+
+`-device-keys` defaults to `<data>/esp-devices.json`, matching
+`esp serve`. `add` fails if the device id already exists. If no `-client`
+flag is supplied, the device id is also used as the default mailbox client
+id. `disable` is reversible and preferred for temporary revocation; `remove`
+hard-deletes the local entry. Mutations write the registry atomically with a
+0600 file mode. `onboard` generates an Ed25519 keypair, stores only the
+public key in the registry, and prints the private key once on stdout for
+development/operator handoff. Production phone-held identity should generate
+keys on the client and use `add` to import only the public key.
+
 ```json
 {
   "devices": [

@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
-	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"io"
@@ -97,18 +96,37 @@ func TestESPDeviceSignedPublishThroughControlSocket(t *testing.T) {
 		t.Fatalf("mailbox.NewWithCursorStore: %v", err)
 	}
 
-	_, devicePriv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("Generate device key: %v", err)
+	code, out, stderr := captureCommandOutput(t, func() int {
+		return cmdESP(&globalFlags{data: dataDir}, []string{
+			"device", "onboard",
+			"-id", "ios-1-device",
+			"-group", gid.String(),
+			"-client", "ios-1",
+		})
+	})
+	if code != exitOK {
+		t.Fatalf("esp device onboard exit = %d stderr=%s", code, stderr)
 	}
-	reg, err := esphttp.NewDeviceRegistry([]esphttp.Device{{
-		ID:        "ios-1-device",
-		PublicKey: devicePriv.Public().(ed25519.PublicKey),
-		Groups:    []entmoot.GroupID{gid},
-		ClientIDs: []string{"ios-1"},
-	}})
+	var onboarding espDeviceOnboardOutput
+	if err := json.Unmarshal([]byte(out), &onboarding); err != nil {
+		t.Fatalf("Unmarshal onboard output %q: %v", out, err)
+	}
+	privBytes, err := base64.StdEncoding.DecodeString(onboarding.PrivateKey)
 	if err != nil {
-		t.Fatalf("NewDeviceRegistry: %v", err)
+		t.Fatalf("Decode onboard private key: %v", err)
+	}
+	devicePriv := ed25519.PrivateKey(privBytes)
+	regPath := filepath.Join(dataDir, "esp-devices.json")
+	info, err := os.Stat(regPath)
+	if err != nil {
+		t.Fatalf("Stat device registry: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("device registry mode = %v, want 0600", got)
+	}
+	reg, err := esphttp.LoadDeviceRegistry(regPath)
+	if err != nil {
+		t.Fatalf("LoadDeviceRegistry: %v", err)
 	}
 	now := time.UnixMilli(1_000_000)
 	handler, err := esphttp.NewHandler(esphttp.Config{

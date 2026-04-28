@@ -86,6 +86,12 @@ func NewDeviceRegistry(devices []Device) (*DeviceRegistry, error) {
 		if d.ID == "" {
 			return nil, errors.New("esphttp: device id is required")
 		}
+		for j := range d.ClientIDs {
+			d.ClientIDs[j] = strings.TrimSpace(d.ClientIDs[j])
+			if d.ClientIDs[j] == "" {
+				return nil, fmt.Errorf("esphttp: device %q client id is required", d.ID)
+			}
+		}
 		if len(d.PublicKey) != ed25519.PublicKeySize {
 			return nil, fmt.Errorf("esphttp: device %q public key length %d", d.ID, len(d.PublicKey))
 		}
