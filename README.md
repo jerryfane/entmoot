@@ -133,7 +133,8 @@ entmootd query -group GID [-author NODEID] [-topic PATTERN] \
 entmootd mailbox pull -client CLIENT [-group GID] [-limit N]
 entmootd mailbox ack -client CLIENT -message MESSAGE_ID [-group GID]
 entmootd mailbox cursor -client CLIENT [-group GID]
-ENTMOOT_ESP_TOKEN=... entmootd esp serve [-addr 127.0.0.1:8087]
+ENTMOOT_ESP_TOKEN=... entmootd esp serve [-addr 127.0.0.1:8087] \
+  [-auth-mode bearer|device|dual] [-device-keys PATH]
 ```
 
 `join` blocks and owns the control socket; `publish` and `tail` (live
@@ -238,7 +239,7 @@ cursors in `<data-dir>/mailbox.sqlite` and survives process restarts.
 The same durable cursor path is exposed locally through
 `entmootd mailbox pull|ack|cursor`, giving ESP operators a production
 smoke-test surface. `entmootd esp serve` exposes the same mailbox sync
-surface over a small token-gated HTTP API for local reverse-proxy/mobile
+surface over a small authenticated HTTP API for local reverse-proxy/mobile
 integration. The same bridge also accepts phone-signed messages and
 forwards them to the running `join` daemon for verification, durable
 storage, and normal gossip fanout; the ESP never signs on the phone's
@@ -257,10 +258,21 @@ curl -H "Authorization: Bearer replace-me" \
 The server binds to `127.0.0.1:8087` by default and refuses non-loopback
 binds unless `-allow-non-loopback` is set. Production deployments should
 keep it behind TLS/auth infrastructure. `/healthz` is unauthenticated;
-all `/v1/*` routes require `Authorization: Bearer <token>`. Mailbox
-read/cursor routes work without a running `join` process; signed publish
-requires `join` because gossip fanout and roster verification are owned
-by the daemon.
+all `/v1/*` routes require ESP auth. The default is bearer-token auth for
+compatibility. Production mobile deployments should use `-auth-mode=device`
+or `-auth-mode=dual` with a local device registry:
+
+```json
+{"devices":[{"id":"ios-1","public_key":"<base64 ed25519 pubkey>","groups":["<base64 group id>"],"client_ids":["ios-1"]}]}
+```
+
+Device-authenticated requests sign
+`ENTMOOT-ESP-AUTH-V1\nMETHOD\nPATH?QUERY\nTIMESTAMP_MS\nNONCE\nBASE64_SHA256_BODY`
+with the device Ed25519 key and send the signature in
+`X-Entmoot-Signature` alongside `X-Entmoot-Device-ID`,
+`X-Entmoot-Timestamp-Ms`, and `X-Entmoot-Nonce`. Mailbox read/cursor routes
+work without a running `join` process; signed publish requires `join`
+because gossip fanout and roster verification are owned by the daemon.
 
 ## Deferred from v1
 

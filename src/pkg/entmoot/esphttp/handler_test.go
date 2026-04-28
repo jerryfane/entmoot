@@ -3,10 +3,16 @@ package esphttp
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"strconv"
 	"testing"
+	"time"
 
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/canonical"
@@ -186,6 +192,123 @@ func TestHandlerSignedPublishWithoutPublisher(t *testing.T) {
 	}
 }
 
+func TestHandlerDeviceAuth(t *testing.T) {
+	gid := testGroupID(1)
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	reg, err := NewDeviceRegistry([]Device{{
+		ID:        "ios-1-device",
+		PublicKey: priv.Public().(ed25519.PublicKey),
+		Groups:    []entmoot.GroupID{gid},
+		ClientIDs: []string{"ios-1"},
+	}})
+	if err != nil {
+		t.Fatalf("NewDeviceRegistry: %v", err)
+	}
+	handler := testDeviceHandler(t, gid, reg, time.UnixMilli(1_000_000))
+
+	req := signedDeviceRequest(t, priv, http.MethodGet, "/v1/mailbox/pull?client_id=ios-1&group_id="+gid.String(), nil, 1_000_000, "nonce-1")
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("device signed pull status = %d, want 200 body=%s", resp.Code, resp.Body.String())
+	}
+
+	replay := signedDeviceRequest(t, priv, http.MethodGet, "/v1/mailbox/pull?client_id=ios-1&group_id="+gid.String(), nil, 1_000_000, "nonce-1")
+	resp = httptest.NewRecorder()
+	handler.ServeHTTP(resp, replay)
+	if resp.Code != http.StatusUnauthorized {
+		t.Fatalf("replay status = %d, want 401", resp.Code)
+	}
+
+	badClient := signedDeviceRequest(t, priv, http.MethodGet, "/v1/mailbox/pull?client_id=other&group_id="+gid.String(), nil, 1_000_000, "nonce-2")
+	resp = httptest.NewRecorder()
+	handler.ServeHTTP(resp, badClient)
+	if resp.Code != http.StatusForbidden {
+		t.Fatalf("bad client status = %d, want 403 body=%s", resp.Code, resp.Body.String())
+	}
+}
+
+func TestHandlerDualAuthAcceptsBearerAndDevice(t *testing.T) {
+	gid := testGroupID(1)
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	reg, err := NewDeviceRegistry([]Device{{
+		ID:        "ios-1-device",
+		PublicKey: priv.Public().(ed25519.PublicKey),
+		Groups:    []entmoot.GroupID{gid},
+		ClientIDs: []string{"ios-1"},
+	}})
+	if err != nil {
+		t.Fatalf("NewDeviceRegistry: %v", err)
+	}
+	st := store.NewMemory()
+	if err := st.Put(context.Background(), testMessage(gid, 1, "first")); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	svc, err := mailbox.New(st, nil)
+	if err != nil {
+		t.Fatalf("mailbox.New: %v", err)
+	}
+	handler, err := NewHandler(Config{
+		Token:    "secret",
+		AuthMode: AuthModeDual,
+		Devices:  reg,
+		Service:  svc,
+		Clock:    func() time.Time { return time.UnixMilli(1_000_000) },
+		GroupExists: func(_ context.Context, got entmoot.GroupID) (bool, error) {
+			return got == gid, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewHandler: %v", err)
+	}
+	doJSONRequest[mailbox.PullResult](t, handler, http.MethodGet, "/v1/mailbox/pull?client_id=any-bearer-client&group_id="+gid.String(), nil, http.StatusOK)
+
+	req := signedDeviceRequest(t, priv, http.MethodGet, "/v1/mailbox/pull?client_id=ios-1&group_id="+gid.String(), nil, 1_000_000, "nonce-1")
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("device signed pull status = %d, want 200 body=%s", resp.Code, resp.Body.String())
+	}
+}
+
+func TestLoadDeviceRegistry(t *testing.T) {
+	gid := testGroupID(1)
+	pub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	path := t.TempDir() + "/devices.json"
+	body := map[string]any{
+		"devices": []map[string]any{{
+			"id":         "ios-1-device",
+			"public_key": base64.StdEncoding.EncodeToString(pub),
+			"groups":     []string{gid.String()},
+			"client_ids": []string{"ios-1"},
+		}},
+	}
+	data, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	reg, err := LoadDeviceRegistry(path)
+	if err != nil {
+		t.Fatalf("LoadDeviceRegistry: %v", err)
+	}
+	d, ok := reg.lookup("ios-1-device")
+	if !ok || len(d.Groups) != 1 || d.Groups[0] != gid || len(d.ClientIDs) != 1 || d.ClientIDs[0] != "ios-1" {
+		t.Fatalf("loaded device = %+v ok=%v", d, ok)
+	}
+}
+
 func testHandler(t *testing.T) (entmoot.GroupID, []entmoot.Message, http.Handler) {
 	t.Helper()
 	gid := testGroupID(1)
@@ -227,6 +350,33 @@ func testHandlerWithPublisher(t *testing.T, gid entmoot.GroupID, publisher Publi
 		Token:     "secret",
 		Service:   svc,
 		Publisher: publisher,
+		GroupExists: func(_ context.Context, got entmoot.GroupID) (bool, error) {
+			return got == gid, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewHandler: %v", err)
+	}
+	return handler
+}
+
+func testDeviceHandler(t *testing.T, gid entmoot.GroupID, reg *DeviceRegistry, now time.Time) http.Handler {
+	t.Helper()
+	st := store.NewMemory()
+	for _, msg := range []entmoot.Message{testMessage(gid, 1, "first")} {
+		if err := st.Put(context.Background(), msg); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+	}
+	svc, err := mailbox.New(st, nil)
+	if err != nil {
+		t.Fatalf("mailbox.New: %v", err)
+	}
+	handler, err := NewHandler(Config{
+		AuthMode: AuthModeDevice,
+		Devices:  reg,
+		Service:  svc,
+		Clock:    func() time.Time { return now },
 		GroupExists: func(_ context.Context, got entmoot.GroupID) (bool, error) {
 			return got == gid, nil
 		},
@@ -282,6 +432,26 @@ func authedRequest(method, path string, body *bytes.Reader) *http.Request {
 	}
 	req := httptest.NewRequest(method, path, body)
 	req.Header.Set("Authorization", "Bearer secret")
+	return req
+}
+
+func signedDeviceRequest(t *testing.T, priv ed25519.PrivateKey, method, path string, body any, timestampMillis int64, nonce string) *http.Request {
+	t.Helper()
+	var data []byte
+	if body != nil {
+		var err error
+		data, err = json.Marshal(body)
+		if err != nil {
+			t.Fatalf("Marshal request body: %v", err)
+		}
+	}
+	req := httptest.NewRequest(method, path, bytes.NewReader(data))
+	input := DeviceSigningInput(method, req.URL.RequestURI(), timestampMillis, nonce, data)
+	sig := ed25519.Sign(priv, []byte(input))
+	req.Header.Set(deviceIDHeader, "ios-1-device")
+	req.Header.Set(timestampHeader, strconv.FormatInt(timestampMillis, 10))
+	req.Header.Set(nonceHeader, nonce)
+	req.Header.Set(signatureHeader, base64.StdEncoding.EncodeToString(sig))
 	return req
 }
 

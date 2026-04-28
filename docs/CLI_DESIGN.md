@@ -446,7 +446,7 @@ entmootd mailbox cursor -client CLIENT [-group GID]
 
 **Purpose:** local Entmoot Service Provider HTTP bridge for intermittent
 mobile clients. Exposes the same durable mailbox cursor operations as
-`entmootd mailbox`, but through a token-gated HTTP API suitable for a
+`entmootd mailbox`, but through an authenticated HTTP API suitable for a
 local reverse proxy, app backend, or APNs/webhook bridge. Reads messages
 from SQLite and persists per-client cursors in `<data>/mailbox.sqlite`.
 Mailbox reads do not require Pilot, the control socket, or a running `join`
@@ -456,29 +456,70 @@ owns roster verification, durable accept, and gossip fanout.
 **Signature**
 
 ```
-ENTMOOT_ESP_TOKEN=... entmootd esp serve [-addr 127.0.0.1:8087] [-token TOKEN] [-allow-non-loopback]
+ENTMOOT_ESP_TOKEN=... entmootd esp serve [-addr 127.0.0.1:8087] [-token TOKEN] \
+  [-auth-mode bearer|device|dual] [-device-keys PATH] [-allow-non-loopback]
 ```
 
 **Flags**
 
 - `-addr HOST:PORT` (default `127.0.0.1:8087`). HTTP listen address.
+- `-auth-mode bearer|device|dual` (default `bearer`). `bearer` keeps the
+  existing shared-token behavior. `device` requires Ed25519 request
+  signatures from registered ESP devices. `dual` accepts either mode during
+  rollout.
 - `-token TOKEN` (optional). Bearer token. If omitted, the command reads
-  `ENTMOOT_ESP_TOKEN`.
+  `ENTMOOT_ESP_TOKEN`. Required for `bearer` and `dual`; ignored by pure
+  `device` mode.
+- `-device-keys PATH` (optional). JSON registry for device auth. Defaults to
+  `<data>/esp-devices.json` when `-auth-mode=device|dual`.
 - `-allow-non-loopback` (default `false`). Allows binding to a non-loopback
   interface. Without this flag, `0.0.0.0`, `:PORT`, and public IP binds
   are rejected.
+
+**Device registry**
+
+```json
+{
+  "devices": [
+    {
+      "id": "ios-1-device",
+      "public_key": "<base64 ed25519 public key>",
+      "groups": ["<base64 group id>"],
+      "client_ids": ["ios-1"],
+      "disabled": false
+    }
+  ]
+}
+```
+
+Device auth signs this exact string with the device Ed25519 key:
+
+```text
+ENTMOOT-ESP-AUTH-V1
+<HTTP_METHOD>
+<PATH_WITH_RAW_QUERY>
+<TIMESTAMP_MS>
+<NONCE>
+<BASE64_SHA256_BODY>
+```
+
+The request sends `X-Entmoot-Device-ID`, `X-Entmoot-Timestamp-Ms`,
+`X-Entmoot-Nonce`, and `X-Entmoot-Signature`. Timestamps outside a five
+minute window are rejected. Nonces are one-use per ESP process. Registered
+devices must be authorized for the requested group; mailbox routes also
+require the requested `client_id` to be listed for that device.
 
 **HTTP API**
 
 - `GET /healthz`
   - No auth. Returns `{"status":"ok"}`.
 - `GET /v1/mailbox/pull?client_id=CLIENT&group_id=GID&limit=N`
-  - Requires `Authorization: Bearer <token>`.
+  - Requires ESP auth.
   - `group_id` is required. HTTP clients do not inherit CLI group
     auto-disambiguation.
   - Response body matches `entmootd mailbox pull`.
 - `POST /v1/mailbox/ack`
-  - Requires `Authorization: Bearer <token>`.
+  - Requires ESP auth.
   - Body:
 
     ```json
@@ -487,10 +528,10 @@ ENTMOOT_ESP_TOKEN=... entmootd esp serve [-addr 127.0.0.1:8087] [-token TOKEN] [
 
   - Response body matches `entmootd mailbox ack`.
 - `GET /v1/mailbox/cursor?client_id=CLIENT&group_id=GID`
-  - Requires `Authorization: Bearer <token>`.
+  - Requires ESP auth.
   - Response body matches `entmootd mailbox cursor`.
 - `POST /v1/messages`
-  - Requires `Authorization: Bearer <token>`.
+  - Requires ESP auth.
   - Body contains a full already-signed Entmoot message:
 
     ```json
@@ -514,12 +555,12 @@ Errors are JSON envelopes:
 {"error":{"code":"bad_request","message":"client_id is required"}}
 ```
 
-- `401`: missing or invalid bearer token. Includes
-  `WWW-Authenticate: Bearer`.
-- `400`: malformed request, missing fields, invalid id, or unknown
+- `401`: missing or invalid ESP auth, stale timestamp, invalid signature, or
+  replayed nonce. Bearer-capable modes include `WWW-Authenticate: Bearer`.
 - `400`: malformed request, missing fields, invalid id, unknown message id,
   or invalid signed message.
-- `403`: signed publish author is not a current roster member.
+- `403`: device lacks group/client authorization, or signed publish author is
+  not a current roster member.
 - `404`: group not joined locally, or unknown route.
 - `503`: signed publish requested while the `join` daemon/control socket is
   unavailable.

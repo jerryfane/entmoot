@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -36,6 +37,8 @@ func cmdESP(gf *globalFlags, args []string) int {
 type espServeConfig struct {
 	addr             string
 	token            string
+	authMode         string
+	deviceKeysPath   string
 	allowNonLoopback bool
 }
 
@@ -55,7 +58,9 @@ func parseESPServeConfig(args []string) (espServeConfig, int, bool) {
 	fs := flag.NewFlagSet("esp serve", flag.ContinueOnError)
 	cfg := espServeConfig{}
 	fs.StringVar(&cfg.addr, "addr", "127.0.0.1:8087", "HTTP listen address")
+	fs.StringVar(&cfg.authMode, "auth-mode", string(esphttp.AuthModeBearer), "auth mode: bearer, device, or dual")
 	fs.StringVar(&cfg.token, "token", "", "bearer token (defaults to ENTMOOT_ESP_TOKEN)")
+	fs.StringVar(&cfg.deviceKeysPath, "device-keys", "", "ESP device registry JSON path (default: <data>/esp-devices.json)")
 	fs.BoolVar(&cfg.allowNonLoopback, "allow-non-loopback", false, "allow binding to a non-loopback interface")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -70,7 +75,13 @@ func parseESPServeConfig(args []string) (espServeConfig, int, bool) {
 }
 
 func validateESPServeConfig(cfg espServeConfig) error {
-	if cfg.token == "" {
+	mode := esphttp.AuthMode(cfg.authMode)
+	switch mode {
+	case esphttp.AuthModeBearer, esphttp.AuthModeDevice, esphttp.AuthModeDual:
+	default:
+		return fmt.Errorf("unknown -auth-mode %q", cfg.authMode)
+	}
+	if (mode == esphttp.AuthModeBearer || mode == esphttp.AuthModeDual) && cfg.token == "" {
 		return errors.New("-token or ENTMOOT_ESP_TOKEN is required")
 	}
 	if !cfg.allowNonLoopback && !addrIsLoopback(cfg.addr) {
@@ -87,8 +98,28 @@ func runESPServe(gf *globalFlags, cfg espServeConfig) int {
 	}
 	defer resources.close()
 
+	var devices *esphttp.DeviceRegistry
+	if cfg.authMode == string(esphttp.AuthModeDevice) || cfg.authMode == string(esphttp.AuthModeDual) {
+		path := cfg.deviceKeysPath
+		if path == "" {
+			path = filepath.Join(gf.data, "esp-devices.json")
+		}
+		path, err = expandHome(path)
+		if err != nil {
+			slog.Error("esp serve: device registry path", slog.String("err", err.Error()))
+			return exitInvalidArgument
+		}
+		devices, err = esphttp.LoadDeviceRegistry(path)
+		if err != nil {
+			slog.Error("esp serve: load device registry", slog.String("err", err.Error()))
+			return exitInvalidArgument
+		}
+	}
+
 	handler, err := esphttp.NewHandler(esphttp.Config{
 		Token:       cfg.token,
+		AuthMode:    esphttp.AuthMode(cfg.authMode),
+		Devices:     devices,
 		Service:     resources.service,
 		Publisher:   controlSocketSignedPublisher{socketPath: controlSocketPath(gf.data), timeout: 30 * time.Second},
 		GroupExists: espGroupExists(gf.data),

@@ -29,6 +29,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   messages through an ESP. The running `join` daemon still performs roster
   verification, canonical ID/signature checks, durable accept, and gossip
   fanout; the ESP never holds the phone's signing key.
+- **ESP device request signatures.** Added opt-in `entmootd esp serve
+  -auth-mode=device|dual` support with a local `esp-devices.json` registry,
+  Ed25519 request signatures, timestamp/nonce replay protection, and
+  per-device group/client authorization for mailbox and signed-publish HTTP
+  routes.
 - **Message ingest event hook.** The daemon's notifying store now emits a
   local `message_ingested` event alongside existing IPC tail fan-out,
   giving future APNs/webhook bridges a stable integration point.

@@ -16,6 +16,31 @@ func TestESPServeConfigRequiresToken(t *testing.T) {
 	}
 }
 
+func TestESPServeConfigDeviceModeDoesNotRequireToken(t *testing.T) {
+	t.Setenv("ENTMOOT_ESP_TOKEN", "")
+	cfg, code, ok := parseESPServeConfig([]string{"-auth-mode", "device"})
+	if !ok || code != exitOK {
+		t.Fatalf("parseESPServeConfig ok/code = %v/%d, want true/%d", ok, code, exitOK)
+	}
+	if cfg.authMode != "device" {
+		t.Fatalf("authMode = %q, want device", cfg.authMode)
+	}
+	if err := validateESPServeConfig(cfg); err != nil {
+		t.Fatalf("validateESPServeConfig: %v", err)
+	}
+}
+
+func TestESPServeConfigDualModeRequiresToken(t *testing.T) {
+	t.Setenv("ENTMOOT_ESP_TOKEN", "")
+	cfg, code, ok := parseESPServeConfig([]string{"-auth-mode", "dual"})
+	if !ok || code != exitOK {
+		t.Fatalf("parseESPServeConfig ok/code = %v/%d, want true/%d", ok, code, exitOK)
+	}
+	if err := validateESPServeConfig(cfg); err == nil {
+		t.Fatal("validateESPServeConfig succeeded for dual mode without token")
+	}
+}
+
 func TestESPServeConfigUsesEnvToken(t *testing.T) {
 	t.Setenv("ENTMOOT_ESP_TOKEN", "env-secret")
 	cfg, code, ok := parseESPServeConfig(nil)
