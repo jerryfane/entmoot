@@ -23,6 +23,7 @@ import (
 
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/canonical"
+	"entmoot/pkg/entmoot/espnotify"
 	"entmoot/pkg/entmoot/mailbox"
 	"entmoot/pkg/entmoot/signing"
 	"entmoot/pkg/entmoot/store"
@@ -39,6 +40,7 @@ type Config struct {
 	Clock       func() time.Time
 	Service     *mailbox.Service
 	Publisher   Publisher
+	Notifier    espnotify.Notifier
 	State       StateStore
 	Groups      GroupCatalog
 	GroupExists GroupExistsFunc
@@ -56,12 +58,14 @@ const (
 
 const (
 	deviceIDHeader    = "X-Entmoot-Device-ID"
+	idempotencyHeader = "Idempotency-Key"
 	timestampHeader   = "X-Entmoot-Timestamp-Ms"
 	nonceHeader       = "X-Entmoot-Nonce"
 	signatureHeader   = "X-Entmoot-Signature"
 	deviceAuthVersion = "ENTMOOT-ESP-AUTH-V1"
 	deviceAuthSkew    = 5 * time.Minute
 	maxAuthBodyBytes  = 16 << 20
+	maxListLimit      = 200
 )
 
 // Device describes one ESP client device authorized to use this service.
@@ -158,6 +162,7 @@ type Handler struct {
 	clock       func() time.Time
 	service     *mailbox.Service
 	publisher   Publisher
+	notifier    espnotify.Notifier
 	state       StateStore
 	groups      GroupCatalog
 	groupExists GroupExistsFunc
@@ -208,6 +213,7 @@ func NewHandler(cfg Config) (*Handler, error) {
 		clock:       clock,
 		service:     cfg.Service,
 		publisher:   cfg.Publisher,
+		notifier:    cfg.Notifier,
 		state:       state,
 		groups:      cfg.Groups,
 		groupExists: groupExists,
@@ -312,7 +318,9 @@ func (h *Handler) handleGroups(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		h.handleListGroups(w, r)
 	case http.MethodPost:
-		h.createSignRequestFromHTTP(w, r, "group_create", entmoot.GroupID{})
+		h.withIdempotency(w, r, "group_create", func(w http.ResponseWriter, r *http.Request) {
+			h.createSignRequestFromHTTP(w, r, "group_create", entmoot.GroupID{})
+		})
 	default:
 		methodNotAllowed(w, http.MethodGet+", "+http.MethodPost)
 	}
@@ -363,7 +371,9 @@ func (h *Handler) handleGroupSubroute(w http.ResponseWriter, r *http.Request) bo
 		case http.MethodGet:
 			h.handleGetGroup(w, r, groupID)
 		case http.MethodPatch:
-			h.createSignRequestFromHTTP(w, r, "group_update", groupID)
+			h.withIdempotency(w, r, "group_update:"+groupID.String(), func(w http.ResponseWriter, r *http.Request) {
+				h.createSignRequestFromHTTP(w, r, "group_update", groupID)
+			})
 		default:
 			methodNotAllowed(w, http.MethodGet+", "+http.MethodPatch)
 		}
@@ -378,13 +388,17 @@ func (h *Handler) handleGroupSubroute(w http.ResponseWriter, r *http.Request) bo
 			methodNotAllowed(w, http.MethodPost)
 			return true
 		}
-		h.createSignRequestFromHTTP(w, r, "invite_create", groupID)
+		h.withIdempotency(w, r, "invite_create:"+groupID.String(), func(w http.ResponseWriter, r *http.Request) {
+			h.createSignRequestFromHTTP(w, r, "invite_create", groupID)
+		})
 	case "messages":
 		switch r.Method {
 		case http.MethodGet:
 			h.handleGroupMessages(w, r, groupID)
 		case http.MethodPost:
-			h.handleGroupMessagePublish(w, r, groupID)
+			h.withIdempotency(w, r, "message_publish:"+groupID.String(), func(w http.ResponseWriter, r *http.Request) {
+				h.handleGroupMessagePublish(w, r, groupID)
+			})
 		default:
 			methodNotAllowed(w, http.MethodGet+", "+http.MethodPost)
 		}
@@ -449,8 +463,8 @@ func (h *Handler) handleGroupMessages(w http.ResponseWriter, r *http.Request, gr
 	limit := 50
 	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
 		n, err := strconv.Atoi(raw)
-		if err != nil || n < 0 {
-			writeError(w, http.StatusBadRequest, "bad_request", "limit must be a non-negative integer")
+		if err != nil || n < 0 || n > maxListLimit {
+			writeError(w, http.StatusBadRequest, "bad_request", fmt.Sprintf("limit must be between 0 and %d", maxListLimit))
 			return
 		}
 		limit = n
@@ -496,7 +510,9 @@ func (h *Handler) handleInviteAccept(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w, http.MethodPost)
 		return
 	}
-	h.createSignRequestFromHTTP(w, r, "invite_accept", entmoot.GroupID{})
+	h.withIdempotency(w, r, "invite_accept", func(w http.ResponseWriter, r *http.Request) {
+		h.createSignRequestFromHTTP(w, r, "invite_accept", entmoot.GroupID{})
+	})
 }
 
 func (h *Handler) handleSignRequests(w http.ResponseWriter, r *http.Request) {
@@ -539,7 +555,9 @@ func (h *Handler) handleSignRequestSubroute(w http.ResponseWriter, r *http.Reque
 			methodNotAllowed(w, http.MethodPost)
 			return true
 		}
-		h.handleCompleteSignRequest(w, r, id)
+		h.withIdempotency(w, r, "sign_request_complete:"+id, func(w http.ResponseWriter, r *http.Request) {
+			h.handleCompleteSignRequest(w, r, id)
+		})
 	case "reject":
 		if r.Method != http.MethodPost {
 			methodNotAllowed(w, http.MethodPost)
@@ -650,6 +668,10 @@ func (h *Handler) handlePushToken(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w, http.MethodPut)
 		return
 	}
+	h.withIdempotency(w, r, "push_token:"+deviceIDForRequest(authFromContext(r)), h.handlePushTokenMutation)
+}
+
+func (h *Handler) handlePushTokenMutation(w http.ResponseWriter, r *http.Request) {
 	auth, _ := r.Context().Value(authContextKey{}).(authContext)
 	if auth.device == nil {
 		writeError(w, http.StatusForbidden, "forbidden", "device auth is required")
@@ -721,10 +743,42 @@ func (h *Handler) handleNotificationTest(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusForbidden, "forbidden", "device auth is required")
 		return
 	}
+	state, err := h.state.GetDeviceState(r.Context(), auth.device.ID)
+	if err != nil {
+		h.logger.Error("esphttp: notification test state", slog.String("err", err.Error()))
+		writeError(w, http.StatusInternalServerError, "internal_error", "device lookup failed")
+		return
+	}
+	if state.PushToken == "" {
+		writeError(w, http.StatusBadRequest, "push_token_missing", "device has no registered push token")
+		return
+	}
+	notifier := h.notifier
+	if notifier == nil {
+		notifier = espnotify.NoopNotifier{}
+	}
+	result, err := notifier.SendWakeup(r.Context(), espnotify.DeviceTarget{
+		DeviceID: state.DeviceID,
+		Platform: state.PushPlatform,
+		Token:    state.PushToken,
+	}, espnotify.WakeupEvent{Type: espnotify.EventNotificationTest, Reason: "operator_test"})
+	if err != nil {
+		if espnotify.IsInvalidToken(err) {
+			_, _ = h.state.ClearPushToken(r.Context(), auth.device.ID)
+		}
+		status := http.StatusBadGateway
+		code := "provider_unavailable"
+		if espnotify.IsRetryable(err) {
+			status = http.StatusServiceUnavailable
+			code = "retry_later"
+		}
+		writeError(w, status, code, err.Error())
+		return
+	}
 	writeJSON(w, http.StatusAccepted, map[string]any{
-		"status":    "queued",
-		"device_id": auth.device.ID,
-		"note":      "push delivery is provider-specific; ESP recorded the wakeup request",
+		"status":      result.Status,
+		"device_id":   auth.device.ID,
+		"provider_id": result.ProviderID,
 	})
 }
 
@@ -748,8 +802,8 @@ func (h *Handler) handlePull(w http.ResponseWriter, r *http.Request) {
 	limit := 50
 	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
 		n, err := strconv.Atoi(raw)
-		if err != nil || n < 0 {
-			writeError(w, http.StatusBadRequest, "bad_request", "limit must be a non-negative integer")
+		if err != nil || n < 0 || n > maxListLimit {
+			writeError(w, http.StatusBadRequest, "bad_request", fmt.Sprintf("limit must be between 0 and %d", maxListLimit))
 			return
 		}
 		limit = n
@@ -989,8 +1043,12 @@ func (h *Handler) authorizedDevice(w http.ResponseWriter, r *http.Request, body 
 		return authContext{}, false
 	}
 	device, ok := h.devices.lookup(deviceID)
-	if !ok || device.Disabled {
-		writeError(w, http.StatusUnauthorized, "unauthorized", "unknown or disabled device")
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized", "unknown device")
+		return authContext{}, false
+	}
+	if device.Disabled {
+		writeError(w, http.StatusForbidden, "device_disabled", "device is disabled")
 		return authContext{}, false
 	}
 	tsRaw := strings.TrimSpace(r.Header.Get(timestampHeader))
@@ -1103,6 +1161,7 @@ func (h *Handler) createSignRequest(w http.ResponseWriter, r *http.Request, kind
 		writeError(w, http.StatusInternalServerError, "internal_error", "sign request creation failed")
 		return
 	}
+	h.notifyDeviceSignRequest(r.Context(), req)
 	writeJSON(w, http.StatusAccepted, map[string]any{"sign_request": req})
 }
 
@@ -1122,7 +1181,35 @@ func (h *Handler) createMessagePublishSignRequest(w http.ResponseWriter, r *http
 		writeError(w, http.StatusInternalServerError, "internal_error", "sign request creation failed")
 		return
 	}
+	h.notifyDeviceSignRequest(r.Context(), req)
 	writeJSON(w, http.StatusAccepted, map[string]any{"sign_request": req})
+}
+
+func (h *Handler) notifyDeviceSignRequest(ctx context.Context, req SignRequest) {
+	if h.notifier == nil || req.DeviceID == "" {
+		return
+	}
+	state, err := h.state.GetDeviceState(ctx, req.DeviceID)
+	if err != nil || state.PushToken == "" || !state.NotificationPreferences.Enabled {
+		return
+	}
+	result, err := h.notifier.SendWakeup(ctx, espnotify.DeviceTarget{
+		DeviceID: state.DeviceID,
+		Platform: state.PushPlatform,
+		Token:    state.PushToken,
+	}, espnotify.WakeupEvent{
+		Type:    espnotify.EventSignRequest,
+		GroupID: req.GroupID.String(),
+		Reason:  req.Kind,
+	})
+	if err != nil {
+		if espnotify.IsInvalidToken(err) {
+			_, _ = h.state.ClearPushToken(ctx, req.DeviceID)
+		}
+		h.logger.Warn("esphttp: sign request wakeup failed", slog.String("device_id", req.DeviceID), slog.String("err", err.Error()))
+		return
+	}
+	h.logger.Debug("esphttp: sign request wakeup sent", slog.String("device_id", req.DeviceID), slog.String("status", result.Status))
 }
 
 func (h *Handler) completeMessagePublishSignRequest(w http.ResponseWriter, r *http.Request, req SignRequest, signature []byte) (PublishResult, bool) {
@@ -1212,6 +1299,57 @@ func (h *Handler) signRequestVisible(w http.ResponseWriter, r *http.Request, req
 	return true
 }
 
+func (h *Handler) withIdempotency(w http.ResponseWriter, r *http.Request, scope string, next func(http.ResponseWriter, *http.Request)) {
+	key := strings.TrimSpace(r.Header.Get(idempotencyHeader))
+	if key == "" {
+		next(w, r)
+		return
+	}
+	if len(key) > 256 {
+		writeError(w, http.StatusBadRequest, "bad_request", "Idempotency-Key is too long")
+		return
+	}
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxAuthBodyBytes))
+	if err != nil {
+		writeError(w, http.StatusRequestEntityTooLarge, "request_too_large", "request body too large")
+		return
+	}
+	_ = r.Body.Close()
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	sum := sha256.Sum256(body)
+	bodyHash := base64.StdEncoding.EncodeToString(sum[:])
+	rec, ok, err := h.state.GetIdempotencyRecord(r.Context(), scope, key)
+	if err != nil {
+		h.logger.Error("esphttp: idempotency lookup", slog.String("err", err.Error()))
+		writeError(w, http.StatusInternalServerError, "internal_error", "idempotency lookup failed")
+		return
+	}
+	if ok {
+		if rec.RequestHash != bodyHash {
+			writeError(w, http.StatusConflict, "idempotency_conflict", "Idempotency-Key was already used with a different request body")
+			return
+		}
+		writeStoredJSON(w, rec.StatusCode, rec.Response)
+		return
+	}
+	recorder := newCaptureResponseWriter()
+	next(recorder, r)
+	response := recorder.body.Bytes()
+	if len(response) == 0 {
+		response = []byte("{}")
+	}
+	if err := h.state.SaveIdempotencyRecord(r.Context(), IdempotencyRecord{
+		Scope:       scope,
+		Key:         key,
+		RequestHash: bodyHash,
+		StatusCode:  recorder.statusCode(),
+		Response:    append(json.RawMessage(nil), response...),
+	}); err != nil {
+		h.logger.Warn("esphttp: idempotency save failed", slog.String("err", err.Error()))
+	}
+	copyCapturedResponse(w, recorder)
+}
+
 func decodeRawBody(w http.ResponseWriter, r *http.Request, maxBytes int64, dst any) ([]byte, bool) {
 	data, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBytes))
 	if err != nil {
@@ -1241,6 +1379,11 @@ func deviceAllowsGroup(device Device, groupID entmoot.GroupID) bool {
 	return false
 }
 
+func authFromContext(r *http.Request) authContext {
+	auth, _ := r.Context().Value(authContextKey{}).(authContext)
+	return auth
+}
+
 func deviceView(device Device) map[string]any {
 	groups := make([]entmoot.GroupID, 0, len(device.Groups))
 	groups = append(groups, device.Groups...)
@@ -1251,6 +1394,59 @@ func deviceView(device Device) map[string]any {
 		"client_ids": clients,
 		"disabled":   device.Disabled,
 	}
+}
+
+type captureResponseWriter struct {
+	header http.Header
+	body   bytes.Buffer
+	status int
+}
+
+func newCaptureResponseWriter() *captureResponseWriter {
+	return &captureResponseWriter{header: make(http.Header)}
+}
+
+func (w *captureResponseWriter) Header() http.Header {
+	return w.header
+}
+
+func (w *captureResponseWriter) WriteHeader(status int) {
+	if w.status == 0 {
+		w.status = status
+	}
+}
+
+func (w *captureResponseWriter) Write(data []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	return w.body.Write(data)
+}
+
+func (w *captureResponseWriter) statusCode() int {
+	if w.status == 0 {
+		return http.StatusOK
+	}
+	return w.status
+}
+
+func copyCapturedResponse(dst http.ResponseWriter, src *captureResponseWriter) {
+	for k, values := range src.header {
+		for _, v := range values {
+			dst.Header().Add(k, v)
+		}
+	}
+	dst.WriteHeader(src.statusCode())
+	_, _ = dst.Write(src.body.Bytes())
+}
+
+func writeStoredJSON(w http.ResponseWriter, status int, body []byte) {
+	if status == 0 {
+		status = http.StatusOK
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_, _ = w.Write(body)
 }
 
 type nonceCache struct {

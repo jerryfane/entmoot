@@ -294,6 +294,12 @@ entmootd esp device onboard \
   -id ios-1-device \
   -group '<base64 group id>' \
   -client ios-1
+
+# Rotate only the ESP API device-auth key. This does not recover or replace
+# the phone-held Entmoot author key.
+entmootd esp device rotate-key \
+  -id ios-1-device \
+  -pubkey '<new base64 ed25519 public key>'
 ```
 
 ```json
@@ -318,6 +324,28 @@ because gossip fanout and roster verification are owned by the daemon. Group
 creation, invite acceptance, invite creation, and unsigned message drafts
 return ESP sign requests so a phone-held key can authorize the operation
 before the ESP relays it.
+
+Mobile clients should send `Idempotency-Key` on mutating ESP requests such as
+sign-request creation, sign-request completion, and push-token update. The ESP
+stores the request body hash and original JSON response in `esp.sqlite`: a
+repeat with the same key and body replays the first response; the same key
+with a different body returns `idempotency_conflict`.
+
+APNs delivery is optional and isolated to ESP. Without APNs config,
+`esp serve` uses a no-op notifier for development. To send real background
+wakeups, provide all APNs settings through flags or environment variables:
+
+```sh
+ENTMOOT_APNS_TEAM_ID='TEAMID' \
+ENTMOOT_APNS_KEY_ID='KEYID' \
+ENTMOOT_APNS_TOPIC='com.example.app' \
+ENTMOOT_APNS_KEY='~/AuthKey_KEYID.p8' \
+entmootd esp serve -auth-mode=device
+```
+
+Use `-apns-sandbox` or `ENTMOOT_APNS_SANDBOX=true` for development builds.
+APNs pushes are background wakeups only: no message content is placed in the
+push payload; the app wakes and syncs through the ESP mailbox API.
 
 Executable ESP sign requests expose canonical signing metadata. For
 `message_publish`, the returned sign request includes `signing_payload`

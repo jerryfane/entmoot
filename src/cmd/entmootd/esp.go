@@ -15,6 +15,7 @@ import (
 
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/esphttp"
+	"entmoot/pkg/entmoot/espnotify"
 	"entmoot/pkg/entmoot/ipc"
 	"entmoot/pkg/entmoot/mailbox"
 	"entmoot/pkg/entmoot/store"
@@ -44,6 +45,11 @@ type espServeConfig struct {
 	authMode         string
 	deviceKeysPath   string
 	allowNonLoopback bool
+	apnsTeamID       string
+	apnsKeyID        string
+	apnsTopic        string
+	apnsKeyPath      string
+	apnsSandbox      bool
 }
 
 func cmdESPServe(gf *globalFlags, args []string) int {
@@ -66,6 +72,11 @@ func parseESPServeConfig(args []string) (espServeConfig, int, bool) {
 	fs.StringVar(&cfg.token, "token", "", "bearer token (defaults to ENTMOOT_ESP_TOKEN)")
 	fs.StringVar(&cfg.deviceKeysPath, "device-keys", "", "ESP device registry JSON path (default: <data>/esp-devices.json)")
 	fs.BoolVar(&cfg.allowNonLoopback, "allow-non-loopback", false, "allow binding to a non-loopback interface")
+	fs.StringVar(&cfg.apnsTeamID, "apns-team-id", "", "Apple Developer Team ID (defaults to ENTMOOT_APNS_TEAM_ID)")
+	fs.StringVar(&cfg.apnsKeyID, "apns-key-id", "", "Apple APNs key id (defaults to ENTMOOT_APNS_KEY_ID)")
+	fs.StringVar(&cfg.apnsTopic, "apns-topic", "", "Apple APNs topic/bundle id (defaults to ENTMOOT_APNS_TOPIC)")
+	fs.StringVar(&cfg.apnsKeyPath, "apns-key", "", "Apple APNs .p8 key path (defaults to ENTMOOT_APNS_KEY)")
+	fs.BoolVar(&cfg.apnsSandbox, "apns-sandbox", false, "send APNs requests to the sandbox endpoint")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return cfg, exitOK, false
@@ -74,6 +85,21 @@ func parseESPServeConfig(args []string) (espServeConfig, int, bool) {
 	}
 	if cfg.token == "" {
 		cfg.token = os.Getenv("ENTMOOT_ESP_TOKEN")
+	}
+	if cfg.apnsTeamID == "" {
+		cfg.apnsTeamID = os.Getenv("ENTMOOT_APNS_TEAM_ID")
+	}
+	if cfg.apnsKeyID == "" {
+		cfg.apnsKeyID = os.Getenv("ENTMOOT_APNS_KEY_ID")
+	}
+	if cfg.apnsTopic == "" {
+		cfg.apnsTopic = os.Getenv("ENTMOOT_APNS_TOPIC")
+	}
+	if cfg.apnsKeyPath == "" {
+		cfg.apnsKeyPath = os.Getenv("ENTMOOT_APNS_KEY")
+	}
+	if v := strings.ToLower(strings.TrimSpace(os.Getenv("ENTMOOT_APNS_SANDBOX"))); v == "1" || v == "true" || v == "yes" {
+		cfg.apnsSandbox = true
 	}
 	return cfg, exitOK, true
 }
@@ -90,6 +116,22 @@ func validateESPServeConfig(cfg espServeConfig) error {
 	}
 	if !cfg.allowNonLoopback && !addrIsLoopback(cfg.addr) {
 		return fmt.Errorf("-addr %s is not loopback; pass -allow-non-loopback only behind TLS/auth infrastructure", cfg.addr)
+	}
+	if err := validateAPNsConfig(cfg); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateAPNsConfig(cfg espServeConfig) error {
+	set := 0
+	for _, v := range []string{cfg.apnsTeamID, cfg.apnsKeyID, cfg.apnsTopic, cfg.apnsKeyPath} {
+		if strings.TrimSpace(v) != "" {
+			set++
+		}
+	}
+	if set != 0 && set != 4 {
+		return errors.New("APNs config requires all of -apns-team-id, -apns-key-id, -apns-topic, and -apns-key")
 	}
 	return nil
 }
@@ -119,6 +161,11 @@ func runESPServe(gf *globalFlags, cfg espServeConfig) int {
 			return exitInvalidArgument
 		}
 	}
+	notifier, err := buildESPNotifier(cfg)
+	if err != nil {
+		slog.Error("esp serve: create notifier", slog.String("err", err.Error()))
+		return exitInvalidArgument
+	}
 
 	handler, err := esphttp.NewHandler(esphttp.Config{
 		Token:       cfg.token,
@@ -126,6 +173,7 @@ func runESPServe(gf *globalFlags, cfg espServeConfig) int {
 		Devices:     devices,
 		Service:     resources.service,
 		Publisher:   controlSocketSignedPublisher{socketPath: controlSocketPath(gf.data), timeout: 30 * time.Second},
+		Notifier:    notifier,
 		State:       resources.espState,
 		Groups:      localGroupCatalog{dataDir: gf.data},
 		GroupExists: espGroupExists(gf.data),
@@ -147,6 +195,27 @@ func runESPServe(gf *globalFlags, cfg espServeConfig) int {
 		return exitTransport
 	}
 	return exitOK
+}
+
+func buildESPNotifier(cfg espServeConfig) (espnotify.Notifier, error) {
+	if strings.TrimSpace(cfg.apnsTeamID) == "" {
+		return espnotify.NoopNotifier{}, nil
+	}
+	endpoint := espnotify.APNsProductionEndpoint
+	if cfg.apnsSandbox {
+		endpoint = espnotify.APNsSandboxEndpoint
+	}
+	keyPath, err := expandHome(cfg.apnsKeyPath)
+	if err != nil {
+		return nil, err
+	}
+	return espnotify.NewAPNsNotifier(espnotify.APNsConfig{
+		TeamID:   cfg.apnsTeamID,
+		KeyID:    cfg.apnsKeyID,
+		Topic:    cfg.apnsTopic,
+		KeyPath:  keyPath,
+		Endpoint: endpoint,
+	})
 }
 
 type controlSocketSignedPublisher struct {

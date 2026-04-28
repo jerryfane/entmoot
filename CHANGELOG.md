@@ -18,6 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   base64-decoded bytes, and completion verifies `signature` plus
   `signing_payload_sha256` before forwarding the signed message through the
   local publish path. Draft `payload` remains display/debug material only.
+- **Composable ESP mobile infrastructure.** Added an ESP-only notifier layer
+  with no-op and APNs providers, idempotency support for mobile mutations,
+  APNs push-token hygiene, `esp device rotate-key`, and stable disabled-device
+  error reporting without adding APNs/mobile logic to Entmoot core.
 - **Docusaurus documentation site.** Added a docs website under `website/`
   with Getting Started, Concepts, CLI, Operations, Architecture, and Reference
   sections, plus GitHub Pages deployment.

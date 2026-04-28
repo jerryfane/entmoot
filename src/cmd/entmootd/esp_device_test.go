@@ -70,6 +70,23 @@ func TestESPDeviceCLIAddListDisableEnableRemove(t *testing.T) {
 		t.Fatalf("enable output = %+v", doc.Devices[0])
 	}
 
+	newPub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey rotate: %v", err)
+	}
+	newPubStr := base64.StdEncoding.EncodeToString(newPub)
+	code, out, stderr = captureCommandOutput(t, func() int {
+		return cmdESP(gf, []string{"device", "rotate-key", "-id", "ios-1", "-pubkey", newPubStr})
+	})
+	if code != exitOK {
+		t.Fatalf("rotate-key exit = %d stderr=%s", code, stderr)
+	}
+	doc = mustDecodeDeviceRegistryOutput(t, out)
+	if doc.Devices[0].PublicKey != newPubStr || doc.Devices[0].Groups[0] != gid.String() ||
+		doc.Devices[0].ClientIDs[0] != "ios-1" || doc.Devices[0].Disabled {
+		t.Fatalf("rotate-key output = %+v", doc.Devices[0])
+	}
+
 	code, out, stderr = captureCommandOutput(t, func() int {
 		return cmdESP(gf, []string{"device", "list"})
 	})

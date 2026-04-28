@@ -55,6 +55,37 @@ func TestESPServeConfigUsesEnvToken(t *testing.T) {
 	}
 }
 
+func TestESPServeConfigLoadsAPNsEnv(t *testing.T) {
+	t.Setenv("ENTMOOT_ESP_TOKEN", "secret")
+	t.Setenv("ENTMOOT_APNS_TEAM_ID", "TEAM")
+	t.Setenv("ENTMOOT_APNS_KEY_ID", "KEY")
+	t.Setenv("ENTMOOT_APNS_TOPIC", "app.bundle")
+	t.Setenv("ENTMOOT_APNS_KEY", "~/AuthKey_TEST.p8")
+	t.Setenv("ENTMOOT_APNS_SANDBOX", "true")
+	cfg, code, ok := parseESPServeConfig(nil)
+	if !ok || code != exitOK {
+		t.Fatalf("parseESPServeConfig ok/code = %v/%d, want true/%d", ok, code, exitOK)
+	}
+	if cfg.apnsTeamID != "TEAM" || cfg.apnsKeyID != "KEY" || cfg.apnsTopic != "app.bundle" ||
+		cfg.apnsKeyPath != "~/AuthKey_TEST.p8" || !cfg.apnsSandbox {
+		t.Fatalf("APNs cfg = %+v", cfg)
+	}
+	if err := validateESPServeConfig(cfg); err != nil {
+		t.Fatalf("validateESPServeConfig: %v", err)
+	}
+}
+
+func TestESPServeConfigRejectsPartialAPNs(t *testing.T) {
+	t.Setenv("ENTMOOT_ESP_TOKEN", "secret")
+	cfg, code, ok := parseESPServeConfig([]string{"-apns-team-id", "TEAM"})
+	if !ok || code != exitOK {
+		t.Fatalf("parseESPServeConfig ok/code = %v/%d, want true/%d", ok, code, exitOK)
+	}
+	if err := validateESPServeConfig(cfg); err == nil {
+		t.Fatal("validateESPServeConfig succeeded for partial APNs config")
+	}
+}
+
 func TestESPServeConfigRejectsNonLoopbackByDefault(t *testing.T) {
 	t.Setenv("ENTMOOT_ESP_TOKEN", "")
 	cfg, code, ok := parseESPServeConfig([]string{"-token", "secret", "-addr", "0.0.0.0:8087"})

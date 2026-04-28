@@ -41,6 +41,12 @@ Authentication modes:
 Device-authenticated requests sign method, path with query, timestamp, nonce,
 and body hash.
 
+Mutating ESP routes that create or complete sign requests, or update the
+current device push token, accept `Idempotency-Key`. The ESP stores the request
+body hash and original JSON response in `esp.sqlite`: repeat with the same key
+and body replays the first response; same key with a different body returns
+`idempotency_conflict`.
+
 Sign requests expose canonical signing metadata when the ESP can execute the
 result. For `message_publish`, `payload` is only the draft/debug request body;
 the phone must base64-decode `signing_payload` and sign those canonical
@@ -72,4 +78,7 @@ Complete it:
 Mailbox cursors are stored in `mailbox.sqlite`. Mobile service state such as
 sign requests, push tokens, and notification preferences is stored in
 `esp.sqlite`. Push routes are provider-neutral wakeup plumbing; APNs delivery
-belongs behind the ESP service boundary.
+belongs behind the ESP service boundary. APNs is configured on `esp serve`
+with Team ID, Key ID, bundle topic, `.p8` key path, and optional sandbox mode.
+Push payloads are background wakeups only; message content stays in mailbox
+sync.

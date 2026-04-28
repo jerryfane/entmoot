@@ -624,19 +624,24 @@ require the requested `client_id` to be listed for that device.
 - `POST /v1/groups`
   - Creates a `group_create` sign request. The ESP does not silently create
     a signed group on behalf of the phone.
+  - Supports `Idempotency-Key`.
 - `GET /v1/groups/{group_id}`
   - Returns local group metadata, member count, and roster head.
 - `PATCH /v1/groups/{group_id}`
   - Creates a `group_update` sign request.
+  - Supports `Idempotency-Key`.
 - `GET /v1/groups/{group_id}/members`
   - Lists current roster members with their Entmoot public keys.
 - `POST /v1/groups/{group_id}/invites`
   - Creates an `invite_create` sign request.
+  - Supports `Idempotency-Key`.
 - `POST /v1/invites/accept`
   - Creates an `invite_accept` sign request.
+  - Supports `Idempotency-Key`.
 - `GET /v1/groups/{group_id}/messages?client_id=CLIENT&limit=N`
   - Group-scoped alias for mailbox pull. Device-auth clients may omit
     `client_id`; the device id is used.
+  - `limit` must be between `0` and `200`.
 - `POST /v1/groups/{group_id}/messages`
   - If the body contains `{"message": ...}` with a fully signed Entmoot
     message, forwards it like `POST /v1/messages`.
@@ -651,10 +656,12 @@ require the requested `client_id` to be listed for that device.
   - `payload` is draft/debug material for display and retry context. It is not
     the signing payload. The phone base64-decodes `signing_payload` and signs
     those bytes with the Entmoot author key.
+  - Supports `Idempotency-Key`.
 - `GET /v1/mailbox/pull?client_id=CLIENT&group_id=GID&limit=N`
   - Requires ESP auth.
   - `group_id` is required. HTTP clients do not inherit CLI group
     auto-disambiguation.
+  - `limit` must be between `0` and `200`.
   - Response body matches `entmootd mailbox pull`.
 - `POST /v1/mailbox/ack`
   - Requires ESP auth.
@@ -702,19 +709,39 @@ require the requested `client_id` to be listed for that device.
     `POST /v1/messages`.
   - For non-executable request kinds, completion records the signature and
     leaves follow-up protocol-specific execution separate.
+  - Supports `Idempotency-Key`.
 - `POST /v1/sign-requests/{id}/reject`
   - Marks the request rejected.
 - `GET /v1/devices/current`
   - Returns the current device registry projection and ESP-local state.
 - `PUT /v1/devices/current/push-token`
   - Device-auth only. Body: `{"platform":"apns","token":"..."}`.
+  - Supports `Idempotency-Key`.
 - `GET /v1/notifications/preferences`
   - Device-auth only. Returns ESP-local notification preferences.
 - `PATCH /v1/notifications/preferences`
   - Device-auth only. Body: `{"enabled":true,"topics":["ops/#"]}`.
 - `POST /v1/notifications/test`
-  - Device-auth only. Records a provider-neutral test wakeup request and
-    returns `202 Accepted`.
+  - Device-auth only. Sends a provider-neutral test wakeup request through the
+    configured notifier and returns `202 Accepted` on delivery/queueing.
+
+Mutating ESP routes that support `Idempotency-Key` persist the request body
+hash and first JSON response in `<data>/esp.sqlite`. Repeating the same key
+and body replays the original response; repeating the same key with a
+different body returns `idempotency_conflict`.
+
+APNs is configured only on `esp serve`; it is not part of Entmoot core:
+
+```sh
+entmootd esp serve \
+  -apns-team-id TEAMID \
+  -apns-key-id KEYID \
+  -apns-topic com.example.app \
+  -apns-key ~/AuthKey_KEYID.p8
+```
+
+Use `-apns-sandbox` for development builds. If APNs is not configured, ESP
+uses the no-op notifier.
 
 **Errors**
 

@@ -16,6 +16,7 @@ import (
 
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/canonical"
+	"entmoot/pkg/entmoot/espnotify"
 	"entmoot/pkg/entmoot/mailbox"
 	"entmoot/pkg/entmoot/signing"
 	"entmoot/pkg/entmoot/store"
@@ -232,6 +233,38 @@ func TestHandlerDeviceAuth(t *testing.T) {
 	}
 }
 
+func TestHandlerDisabledDeviceAuth(t *testing.T) {
+	gid := testGroupID(1)
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	reg, err := NewDeviceRegistry([]Device{{
+		ID:        "ios-1-device",
+		PublicKey: priv.Public().(ed25519.PublicKey),
+		Groups:    []entmoot.GroupID{gid},
+		ClientIDs: []string{"ios-1"},
+		Disabled:  true,
+	}})
+	if err != nil {
+		t.Fatalf("NewDeviceRegistry: %v", err)
+	}
+	handler := testDeviceHandler(t, gid, reg, time.UnixMilli(1_000_000))
+	req := signedDeviceRequest(t, priv, http.MethodGet, "/v1/mailbox/pull?client_id=ios-1&group_id="+gid.String(), nil, 1_000_000, "nonce-1")
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+	if resp.Code != http.StatusForbidden {
+		t.Fatalf("disabled device status = %d, want 403 body=%s", resp.Code, resp.Body.String())
+	}
+	var errResp errorEnvelope
+	if err := json.Unmarshal(resp.Body.Bytes(), &errResp); err != nil {
+		t.Fatalf("Unmarshal error: %v", err)
+	}
+	if errResp.Error.Code != "device_disabled" {
+		t.Fatalf("error code = %q, want device_disabled", errResp.Error.Code)
+	}
+}
+
 func TestHandlerMobileGroupsAndSignRequests(t *testing.T) {
 	gid := testGroupID(1)
 	catalog := fakeCatalog{
@@ -366,6 +399,71 @@ func TestHandlerMessagePublishSignRequestRejectsDigestMismatch(t *testing.T) {
 	}, http.StatusBadRequest)
 	if errResp.Error.Code != "signing_payload_mismatch" {
 		t.Fatalf("error code = %q, want signing_payload_mismatch", errResp.Error.Code)
+	}
+}
+
+func TestHandlerIdempotencyReplaysSignRequestCreation(t *testing.T) {
+	gid := testGroupID(1)
+	pub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	handler := testMobileHandlerWithPublisher(t, gid, &fakePublisher{}, func() time.Time { return time.UnixMilli(1_234_000) })
+	body := map[string]any{
+		"author": entmoot.NodeInfo{PilotNodeID: 45491, EntmootPubKey: pub},
+		"topics": []string{"chat"},
+	}
+	first := doJSONRequestWithHeaders[struct {
+		SignRequest SignRequest `json:"sign_request"`
+	}](t, handler, http.MethodPost, "/v1/groups/"+gid.String()+"/messages", body, map[string]string{idempotencyHeader: "idem-1"}, http.StatusAccepted)
+	second := doJSONRequestWithHeaders[struct {
+		SignRequest SignRequest `json:"sign_request"`
+	}](t, handler, http.MethodPost, "/v1/groups/"+gid.String()+"/messages", body, map[string]string{idempotencyHeader: "idem-1"}, http.StatusAccepted)
+	if first.SignRequest.ID == "" || first.SignRequest.ID != second.SignRequest.ID {
+		t.Fatalf("idempotency replay ids = %q/%q", first.SignRequest.ID, second.SignRequest.ID)
+	}
+	errResp := doJSONRequestWithHeaders[errorEnvelope](t, handler, http.MethodPost, "/v1/groups/"+gid.String()+"/messages", map[string]any{
+		"author": entmoot.NodeInfo{PilotNodeID: 45491, EntmootPubKey: pub},
+		"topics": []string{"different"},
+	}, map[string]string{idempotencyHeader: "idem-1"}, http.StatusConflict)
+	if errResp.Error.Code != "idempotency_conflict" {
+		t.Fatalf("error code = %q, want idempotency_conflict", errResp.Error.Code)
+	}
+}
+
+func TestHandlerNotificationTestClearsInvalidToken(t *testing.T) {
+	gid := testGroupID(1)
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	reg, err := NewDeviceRegistry([]Device{{
+		ID:        "ios-1-device",
+		PublicKey: priv.Public().(ed25519.PublicKey),
+		Groups:    []entmoot.GroupID{gid},
+		ClientIDs: []string{"ios-1-device"},
+	}})
+	if err != nil {
+		t.Fatalf("NewDeviceRegistry: %v", err)
+	}
+	state := NewMemoryStateStore()
+	handler := testMobileHandlerFull(t, gid, reg, nil, func() time.Time { return time.UnixMilli(1_000_000) }, nil, state, fakeNotifier{
+		err: &espnotify.DeliveryError{Code: "BadDeviceToken", Message: "bad token", InvalidToken: true},
+	})
+	doSignedJSONRequest[DeviceState](t, handler, priv, http.MethodPut, "/v1/devices/current/push-token", map[string]any{
+		"platform": "apns",
+		"token":    "bad-token",
+	}, http.StatusOK, 1_000_000, "push-1")
+	errResp := doSignedJSONRequest[errorEnvelope](t, handler, priv, http.MethodPost, "/v1/notifications/test", nil, http.StatusBadGateway, 1_000_000, "test-1")
+	if errResp.Error.Code != "provider_unavailable" {
+		t.Fatalf("error code = %q, want provider_unavailable", errResp.Error.Code)
+	}
+	got, err := state.GetDeviceState(context.Background(), "ios-1-device")
+	if err != nil {
+		t.Fatalf("GetDeviceState: %v", err)
+	}
+	if got.PushToken != "" {
+		t.Fatalf("push token = %q, want cleared", got.PushToken)
 	}
 }
 
@@ -547,15 +645,15 @@ func testHandlerWithPublisher(t *testing.T, gid entmoot.GroupID, publisher Publi
 
 func testMobileHandler(t *testing.T, gid entmoot.GroupID, reg *DeviceRegistry, catalog GroupCatalog, clock func() time.Time) http.Handler {
 	t.Helper()
-	return testMobileHandlerFull(t, gid, reg, catalog, clock, nil, NewMemoryStateStore())
+	return testMobileHandlerFull(t, gid, reg, catalog, clock, nil, NewMemoryStateStore(), nil)
 }
 
 func testMobileHandlerWithPublisher(t *testing.T, gid entmoot.GroupID, publisher Publisher, clock func() time.Time) http.Handler {
 	t.Helper()
-	return testMobileHandlerFull(t, gid, nil, nil, clock, publisher, NewMemoryStateStore())
+	return testMobileHandlerFull(t, gid, nil, nil, clock, publisher, NewMemoryStateStore(), nil)
 }
 
-func testMobileHandlerFull(t *testing.T, gid entmoot.GroupID, reg *DeviceRegistry, catalog GroupCatalog, clock func() time.Time, publisher Publisher, state StateStore) http.Handler {
+func testMobileHandlerFull(t *testing.T, gid entmoot.GroupID, reg *DeviceRegistry, catalog GroupCatalog, clock func() time.Time, publisher Publisher, state StateStore, notifier espnotify.Notifier) http.Handler {
 	t.Helper()
 	st := store.NewMemory()
 	for _, msg := range []entmoot.Message{testMessage(gid, 1, "first")} {
@@ -580,6 +678,7 @@ func testMobileHandlerFull(t *testing.T, gid entmoot.GroupID, reg *DeviceRegistr
 		Devices:   reg,
 		Service:   svc,
 		Publisher: publisher,
+		Notifier:  notifier,
 		State:     state,
 		Groups:    catalog,
 		Clock:     clock,
@@ -626,6 +725,23 @@ type fakePublisher struct {
 	got    entmoot.Message
 }
 
+type fakeNotifier struct {
+	result espnotify.DeliveryResult
+	err    error
+	got    espnotify.WakeupEvent
+}
+
+func (n fakeNotifier) SendWakeup(_ context.Context, _ espnotify.DeviceTarget, event espnotify.WakeupEvent) (espnotify.DeliveryResult, error) {
+	n.got = event
+	if n.err != nil {
+		return espnotify.DeliveryResult{}, n.err
+	}
+	if n.result.Status == "" {
+		return espnotify.DeliveryResult{Status: "sent"}, nil
+	}
+	return n.result, nil
+}
+
 func (p *fakePublisher) PublishSigned(_ context.Context, msg entmoot.Message) (PublishResult, error) {
 	p.got = msg
 	if p.err != nil {
@@ -645,6 +761,11 @@ func (p *fakePublisher) PublishSigned(_ context.Context, msg entmoot.Message) (P
 
 func doJSONRequest[T any](t *testing.T, handler http.Handler, method, path string, body any, wantStatus int) T {
 	t.Helper()
+	return doJSONRequestWithHeaders[T](t, handler, method, path, body, nil, wantStatus)
+}
+
+func doJSONRequestWithHeaders[T any](t *testing.T, handler http.Handler, method, path string, body any, headers map[string]string, wantStatus int) T {
+	t.Helper()
 	var reader *bytes.Reader
 	if body == nil {
 		reader = bytes.NewReader(nil)
@@ -657,6 +778,9 @@ func doJSONRequest[T any](t *testing.T, handler http.Handler, method, path strin
 	}
 	resp := httptest.NewRecorder()
 	req := authedRequest(method, path, reader)
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
 	handler.ServeHTTP(resp, req)
 	if resp.Code != wantStatus {
 		t.Fatalf("%s %s status = %d, want %d\nbody=%s", method, path, resp.Code, wantStatus, resp.Body.String())

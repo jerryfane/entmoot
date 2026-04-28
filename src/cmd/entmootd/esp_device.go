@@ -15,7 +15,7 @@ import (
 
 func cmdESPDevice(gf *globalFlags, args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "esp device: expected list, add, onboard, enable, disable, or remove")
+		fmt.Fprintln(os.Stderr, "esp device: expected list, add, onboard, rotate-key, enable, disable, or remove")
 		return exitInvalidArgument
 	}
 	switch args[0] {
@@ -25,6 +25,8 @@ func cmdESPDevice(gf *globalFlags, args []string) int {
 		return cmdESPDeviceAdd(gf, args[1:])
 	case "onboard":
 		return cmdESPDeviceOnboard(gf, args[1:])
+	case "rotate-key":
+		return cmdESPDeviceRotateKey(gf, args[1:])
 	case "enable":
 		return cmdESPDeviceSetDisabled(gf, args[1:], false)
 	case "disable":
@@ -35,6 +37,55 @@ func cmdESPDevice(gf *globalFlags, args []string) int {
 		fmt.Fprintf(os.Stderr, "esp device: unknown subcommand %q\n", args[0])
 		return exitInvalidArgument
 	}
+}
+
+func cmdESPDeviceRotateKey(gf *globalFlags, args []string) int {
+	fs := flag.NewFlagSet("esp device rotate-key", flag.ContinueOnError)
+	id := fs.String("id", "", "device id")
+	pubkey := fs.String("pubkey", "", "new base64 Ed25519 public key")
+	path := fs.String("device-keys", "", "ESP device registry JSON path (default: <data>/esp-devices.json)")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return exitOK
+		}
+		return exitInvalidArgument
+	}
+	if *id == "" {
+		fmt.Fprintln(os.Stderr, "esp device rotate-key: -id is required")
+		return exitInvalidArgument
+	}
+	if *pubkey == "" {
+		fmt.Fprintln(os.Stderr, "esp device rotate-key: -pubkey is required")
+		return exitInvalidArgument
+	}
+	reg, code, ok := loadESPDeviceRegistryForCLI(gf, *path)
+	if !ok {
+		return code
+	}
+	devices := append([]esphttp.Device(nil), reg.Devices...)
+	found := false
+	for i := range devices {
+		if devices[i].ID == *id {
+			pub, err := base64.StdEncoding.DecodeString(*pubkey)
+			if err != nil || len(pub) != ed25519.PublicKeySize {
+				fmt.Fprintf(os.Stderr, "esp device rotate-key: invalid -pubkey\n")
+				return exitInvalidArgument
+			}
+			devices[i].PublicKey = append(ed25519.PublicKey(nil), pub...)
+			found = true
+			break
+		}
+	}
+	if !found {
+		fmt.Fprintf(os.Stderr, "esp device rotate-key: device %q not found\n", *id)
+		return exitInvalidArgument
+	}
+	next, err := esphttp.NewDeviceRegistry(devices)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "esp device rotate-key: %v\n", err)
+		return exitInvalidArgument
+	}
+	return saveAndEmitESPDeviceRegistry(gf, *path, next, "esp device rotate-key")
 }
 
 func cmdESPDeviceList(gf *globalFlags, args []string) int {

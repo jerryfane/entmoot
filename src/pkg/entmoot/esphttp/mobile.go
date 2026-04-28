@@ -77,6 +77,18 @@ type DeviceState struct {
 	UpdatedAtMS             int64                   `json:"updated_at_ms"`
 }
 
+// IdempotencyRecord stores one completed ESP HTTP mutation response.
+type IdempotencyRecord struct {
+	Scope       string          `json:"scope"`
+	Key         string          `json:"key"`
+	RequestHash string          `json:"request_hash"`
+	StatusCode  int             `json:"status_code"`
+	Response    json.RawMessage `json:"response"`
+	CreatedAtMS int64           `json:"created_at_ms"`
+	UpdatedAtMS int64           `json:"updated_at_ms"`
+	ExpiresAtMS int64           `json:"expires_at_ms"`
+}
+
 // StateStore persists ESP-local mobile service state.
 type StateStore interface {
 	CreateSignRequest(context.Context, SignRequest) (SignRequest, error)
@@ -85,8 +97,11 @@ type StateStore interface {
 	CompleteSignRequest(context.Context, string, string, *PublishResult) (SignRequest, error)
 	RejectSignRequest(context.Context, string) (SignRequest, error)
 	UpsertPushToken(context.Context, string, string, string) (DeviceState, error)
+	ClearPushToken(context.Context, string) (DeviceState, error)
 	GetDeviceState(context.Context, string) (DeviceState, error)
 	PatchNotificationPreferences(context.Context, string, NotificationPreferences) (DeviceState, error)
+	GetIdempotencyRecord(context.Context, string, string) (IdempotencyRecord, bool, error)
+	SaveIdempotencyRecord(context.Context, IdempotencyRecord) error
 	Close() error
 }
 
@@ -95,6 +110,7 @@ const (
 	signRequestCompleted  = "completed"
 	signRequestRejected   = "rejected"
 	defaultSignRequestTTL = 15 * time.Minute
+	defaultIdempotencyTTL = 24 * time.Hour
 )
 
 // MemoryStateStore is useful for tests and dev-mode ESP handlers.
@@ -102,6 +118,7 @@ type MemoryStateStore struct {
 	mu       sync.Mutex
 	requests map[string]SignRequest
 	devices  map[string]DeviceState
+	idem     map[string]IdempotencyRecord
 	clock    func() time.Time
 }
 
@@ -109,6 +126,7 @@ func NewMemoryStateStore() *MemoryStateStore {
 	return &MemoryStateStore{
 		requests: make(map[string]SignRequest),
 		devices:  make(map[string]DeviceState),
+		idem:     make(map[string]IdempotencyRecord),
 		clock:    time.Now,
 	}
 }
@@ -199,6 +217,17 @@ func (s *MemoryStateStore) UpsertPushToken(_ context.Context, deviceID, platform
 	return state, nil
 }
 
+func (s *MemoryStateStore) ClearPushToken(_ context.Context, deviceID string) (DeviceState, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state := s.deviceStateLocked(deviceID)
+	state.PushPlatform = ""
+	state.PushToken = ""
+	state.UpdatedAtMS = s.nowMS()
+	s.devices[deviceID] = state
+	return state, nil
+}
+
 func (s *MemoryStateStore) GetDeviceState(_ context.Context, deviceID string) (DeviceState, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -215,6 +244,31 @@ func (s *MemoryStateStore) PatchNotificationPreferences(_ context.Context, devic
 	state.UpdatedAtMS = s.nowMS()
 	s.devices[deviceID] = state
 	return state, nil
+}
+
+func (s *MemoryStateStore) GetIdempotencyRecord(_ context.Context, scope, key string) (IdempotencyRecord, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rec, ok := s.idem[idempotencyMapKey(scope, key)]
+	if !ok || (rec.ExpiresAtMS > 0 && rec.ExpiresAtMS <= s.nowMS()) {
+		return IdempotencyRecord{}, false, nil
+	}
+	return cloneIdempotencyRecord(rec), true, nil
+}
+
+func (s *MemoryStateStore) SaveIdempotencyRecord(_ context.Context, rec IdempotencyRecord) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := s.nowMS()
+	if rec.CreatedAtMS == 0 {
+		rec.CreatedAtMS = now
+	}
+	rec.UpdatedAtMS = now
+	if rec.ExpiresAtMS == 0 {
+		rec.ExpiresAtMS = time.UnixMilli(now).Add(defaultIdempotencyTTL).UnixMilli()
+	}
+	s.idem[idempotencyMapKey(rec.Scope, rec.Key)] = cloneIdempotencyRecord(rec)
+	return nil
 }
 
 func (s *MemoryStateStore) Close() error {
@@ -272,6 +326,18 @@ CREATE TABLE IF NOT EXISTS esp_devices_state (
   push_token    TEXT NOT NULL DEFAULT '',
   prefs         BLOB NOT NULL,
   updated_at_ms INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS esp_idempotency (
+  scope         TEXT NOT NULL,
+  key           TEXT NOT NULL,
+  request_hash  TEXT NOT NULL,
+  status_code   INTEGER NOT NULL,
+  response      BLOB NOT NULL,
+  created_at_ms INTEGER NOT NULL,
+  updated_at_ms INTEGER NOT NULL,
+  expires_at_ms INTEGER NOT NULL,
+  PRIMARY KEY(scope, key)
 );
 `
 
@@ -449,6 +515,20 @@ func (s *SQLiteStateStore) UpsertPushToken(ctx context.Context, deviceID, platfo
 	return state, nil
 }
 
+func (s *SQLiteStateStore) ClearPushToken(ctx context.Context, deviceID string) (DeviceState, error) {
+	state, err := s.GetDeviceState(ctx, deviceID)
+	if err != nil {
+		return DeviceState{}, err
+	}
+	state.PushPlatform = ""
+	state.PushToken = ""
+	state.UpdatedAtMS = time.Now().UnixMilli()
+	if err := s.saveDeviceState(ctx, state); err != nil {
+		return DeviceState{}, err
+	}
+	return state, nil
+}
+
 func (s *SQLiteStateStore) GetDeviceState(ctx context.Context, deviceID string) (DeviceState, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT device_id, push_platform, push_token, prefs, updated_at_ms FROM esp_devices_state WHERE device_id = ?`, deviceID)
 	var state DeviceState
@@ -476,6 +556,44 @@ func (s *SQLiteStateStore) PatchNotificationPreferences(ctx context.Context, dev
 		return DeviceState{}, err
 	}
 	return state, nil
+}
+
+func (s *SQLiteStateStore) GetIdempotencyRecord(ctx context.Context, scope, key string) (IdempotencyRecord, bool, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT scope, key, request_hash, status_code, response, created_at_ms, updated_at_ms, expires_at_ms
+FROM esp_idempotency WHERE scope = ? AND key = ? AND expires_at_ms > ?`, scope, key, time.Now().UnixMilli())
+	var rec IdempotencyRecord
+	var response []byte
+	if err := row.Scan(&rec.Scope, &rec.Key, &rec.RequestHash, &rec.StatusCode, &response, &rec.CreatedAtMS, &rec.UpdatedAtMS, &rec.ExpiresAtMS); errors.Is(err, sql.ErrNoRows) {
+		return IdempotencyRecord{}, false, nil
+	} else if err != nil {
+		return IdempotencyRecord{}, false, fmt.Errorf("esphttp: get idempotency record: %w", err)
+	}
+	rec.Response = append(json.RawMessage(nil), response...)
+	return rec, true, nil
+}
+
+func (s *SQLiteStateStore) SaveIdempotencyRecord(ctx context.Context, rec IdempotencyRecord) error {
+	now := time.Now().UnixMilli()
+	if rec.CreatedAtMS == 0 {
+		rec.CreatedAtMS = now
+	}
+	rec.UpdatedAtMS = now
+	if rec.ExpiresAtMS == 0 {
+		rec.ExpiresAtMS = time.UnixMilli(now).Add(defaultIdempotencyTTL).UnixMilli()
+	}
+	if _, err := s.db.ExecContext(ctx, `
+INSERT INTO esp_idempotency (scope, key, request_hash, status_code, response, created_at_ms, updated_at_ms, expires_at_ms)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(scope, key) DO UPDATE SET
+  request_hash = excluded.request_hash,
+  status_code = excluded.status_code,
+  response = excluded.response,
+  updated_at_ms = excluded.updated_at_ms,
+  expires_at_ms = excluded.expires_at_ms`,
+		rec.Scope, rec.Key, rec.RequestHash, rec.StatusCode, []byte(rec.Response), rec.CreatedAtMS, rec.UpdatedAtMS, rec.ExpiresAtMS); err != nil {
+		return fmt.Errorf("esphttp: save idempotency record: %w", err)
+	}
+	return nil
 }
 
 func (s *SQLiteStateStore) Close() error {
@@ -586,6 +704,15 @@ func clonePublishResultPtr(in *PublishResult) *PublishResult {
 	}
 	out := *in
 	return &out
+}
+
+func cloneIdempotencyRecord(rec IdempotencyRecord) IdempotencyRecord {
+	rec.Response = append(json.RawMessage(nil), rec.Response...)
+	return rec
+}
+
+func idempotencyMapKey(scope, key string) string {
+	return scope + "\x00" + key
 }
 
 func normalizePrefs(prefs NotificationPreferences) NotificationPreferences {
