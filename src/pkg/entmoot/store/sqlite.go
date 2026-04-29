@@ -89,6 +89,29 @@ CREATE TABLE IF NOT EXISTS transport_ad_seqs (
   seq            INTEGER NOT NULL,
   PRIMARY KEY (group_id, author_node_id)
 );
+
+-- member_profile_ads holds signed display-profile advertisements, one
+-- latest row per (group, author). These are app-facing hints only; roster
+-- identity remains node_id + Entmoot pubkey.
+CREATE TABLE IF NOT EXISTS member_profile_ads (
+  group_id       BLOB NOT NULL,
+  author_node_id INTEGER NOT NULL,
+  seq            INTEGER NOT NULL,
+  canonical      BLOB NOT NULL,
+  issued_at_ms   INTEGER NOT NULL,
+  not_after_ms   INTEGER NOT NULL,
+  signature      BLOB NOT NULL,
+  PRIMARY KEY (group_id, author_node_id)
+);
+CREATE INDEX IF NOT EXISTS idx_member_profile_ads_expiry
+  ON member_profile_ads(not_after_ms);
+
+CREATE TABLE IF NOT EXISTS member_profile_ad_seqs (
+  group_id       BLOB NOT NULL,
+  author_node_id INTEGER NOT NULL,
+  seq            INTEGER NOT NULL,
+  PRIMARY KEY (group_id, author_node_id)
+);
 `
 
 // SQLite is a MessageStore backed by one SQLite database per group,
@@ -798,6 +821,210 @@ func decodeTransportAd(encoded []byte) (wire.TransportAd, error) {
 	var ad wire.TransportAd
 	if err := json.Unmarshal(encoded, &ad); err != nil {
 		return wire.TransportAd{}, fmt.Errorf("store: decode transport ad: %w", err)
+	}
+	return ad, nil
+}
+
+// PutMemberProfileAd stores a verified member profile advertisement, replacing
+// older entries with the same LWW rule as TransportAd.
+func (s *SQLite) PutMemberProfileAd(ctx context.Context, ad wire.MemberProfileAd) (bool, error) {
+	if isZeroGroupID(ad.GroupID) {
+		return false, fmt.Errorf("%w: zero group id", ErrInvalidMessage)
+	}
+	encoded, err := json.Marshal(ad)
+	if err != nil {
+		return false, fmt.Errorf("store: marshal member profile ad: %w", err)
+	}
+	db, err := s.dbFor(ad.GroupID)
+	if err != nil {
+		return false, err
+	}
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("store: begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var (
+		curSeq       uint64
+		curSig       []byte
+		curCanonical []byte
+	)
+	row := tx.QueryRowContext(ctx, `
+		SELECT seq, signature, canonical FROM member_profile_ads
+		WHERE group_id = ? AND author_node_id = ?;`,
+		ad.GroupID[:], int64(ad.Author.PilotNodeID),
+	)
+	switch err := row.Scan(&curSeq, &curSig, &curCanonical); {
+	case errors.Is(err, sql.ErrNoRows):
+	case err != nil:
+		return false, fmt.Errorf("store: scan member profile ad: %w", err)
+	default:
+		curAd, err := decodeMemberProfileAd(curCanonical)
+		if err != nil {
+			return false, err
+		}
+		if bytes.Equal(curAd.Author.EntmootPubKey, ad.Author.EntmootPubKey) {
+			if curSeq > ad.Seq {
+				return false, nil
+			}
+			if curSeq == ad.Seq && bytes.Compare(ad.Signature, curSig) <= 0 {
+				return false, nil
+			}
+		}
+		if _, err := tx.ExecContext(ctx, `
+			DELETE FROM member_profile_ads
+			WHERE group_id = ? AND author_node_id = ?;`,
+			ad.GroupID[:], int64(ad.Author.PilotNodeID),
+		); err != nil {
+			return false, fmt.Errorf("store: delete stale member profile ad: %w", err)
+		}
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO member_profile_ads
+		  (group_id, author_node_id, seq, canonical,
+		   issued_at_ms, not_after_ms, signature)
+		VALUES (?, ?, ?, ?, ?, ?, ?);`,
+		ad.GroupID[:],
+		int64(ad.Author.PilotNodeID),
+		int64(ad.Seq),
+		encoded,
+		ad.IssuedAt,
+		ad.NotAfter,
+		notNilBytes(ad.Signature),
+	); err != nil {
+		return false, fmt.Errorf("store: insert member profile ad: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("store: commit member profile ad: %w", err)
+	}
+	return true, nil
+}
+
+// GetMemberProfileAd returns the latest member profile ad for a group member.
+func (s *SQLite) GetMemberProfileAd(ctx context.Context, groupID entmoot.GroupID, authorNodeID entmoot.NodeID, now time.Time) (wire.MemberProfileAd, bool, error) {
+	db, err := s.dbFor(groupID)
+	if err != nil {
+		return wire.MemberProfileAd{}, false, err
+	}
+	var encoded []byte
+	if err := db.QueryRowContext(ctx, `
+		SELECT canonical FROM member_profile_ads
+		WHERE group_id = ? AND author_node_id = ? AND not_after_ms >= ?;`,
+		groupID[:], int64(authorNodeID), now.UnixMilli(),
+	).Scan(&encoded); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return wire.MemberProfileAd{}, false, nil
+		}
+		return wire.MemberProfileAd{}, false, fmt.Errorf("store: scan member profile ad: %w", err)
+	}
+	ad, err := decodeMemberProfileAd(encoded)
+	if err != nil {
+		return wire.MemberProfileAd{}, false, err
+	}
+	return ad, true, nil
+}
+
+// GetAllMemberProfileAds returns every profile ad currently stored for the
+// group. Expired ads are excluded iff includeExpired is false.
+func (s *SQLite) GetAllMemberProfileAds(ctx context.Context, groupID entmoot.GroupID, now time.Time, includeExpired bool) ([]wire.MemberProfileAd, error) {
+	db, err := s.dbFor(groupID)
+	if err != nil {
+		return nil, err
+	}
+
+	var rows *sql.Rows
+	if includeExpired {
+		rows, err = db.QueryContext(ctx, `
+			SELECT canonical FROM member_profile_ads
+			WHERE group_id = ?
+			ORDER BY author_node_id;`,
+			groupID[:],
+		)
+	} else {
+		rows, err = db.QueryContext(ctx, `
+			SELECT canonical FROM member_profile_ads
+			WHERE group_id = ? AND not_after_ms >= ?
+			ORDER BY author_node_id;`,
+			groupID[:], now.UnixMilli(),
+		)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("store: query member profile ads: %w", err)
+	}
+	defer rows.Close()
+
+	var out []wire.MemberProfileAd
+	for rows.Next() {
+		var encoded []byte
+		if err := rows.Scan(&encoded); err != nil {
+			return nil, fmt.Errorf("store: scan member profile ads: %w", err)
+		}
+		ad, err := decodeMemberProfileAd(encoded)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, ad)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: iterate member profile ads: %w", err)
+	}
+	return out, nil
+}
+
+// BumpMemberProfileAdSeq atomically increments the local profile sequence.
+func (s *SQLite) BumpMemberProfileAdSeq(ctx context.Context, groupID entmoot.GroupID, authorNodeID entmoot.NodeID) (uint64, error) {
+	db, err := s.dbFor(groupID)
+	if err != nil {
+		return 0, err
+	}
+	var seq int64
+	if err := db.QueryRowContext(ctx, `
+		INSERT INTO member_profile_ad_seqs (group_id, author_node_id, seq)
+		VALUES (?, ?, 1)
+		ON CONFLICT(group_id, author_node_id)
+		  DO UPDATE SET seq = seq + 1
+		RETURNING seq;`,
+		groupID[:], int64(authorNodeID),
+	).Scan(&seq); err != nil {
+		return 0, fmt.Errorf("store: bump member profile ad seq: %w", err)
+	}
+	return uint64(seq), nil
+}
+
+// GCExpiredMemberProfileAds deletes expired profile ads from open group DBs.
+func (s *SQLite) GCExpiredMemberProfileAds(ctx context.Context, now time.Time) (int64, error) {
+	s.mu.RLock()
+	dbs := make([]*sql.DB, 0, len(s.dbs))
+	for _, db := range s.dbs {
+		dbs = append(dbs, db)
+	}
+	s.mu.RUnlock()
+
+	var total int64
+	nowMs := now.UnixMilli()
+	for _, db := range dbs {
+		res, err := db.ExecContext(ctx, `
+			DELETE FROM member_profile_ads WHERE not_after_ms < ?;`,
+			nowMs,
+		)
+		if err != nil {
+			return total, fmt.Errorf("store: gc member profile ads: %w", err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return total, fmt.Errorf("store: gc member profile ads rows: %w", err)
+		}
+		total += n
+	}
+	return total, nil
+}
+
+func decodeMemberProfileAd(encoded []byte) (wire.MemberProfileAd, error) {
+	var ad wire.MemberProfileAd
+	if err := json.Unmarshal(encoded, &ad); err != nil {
+		return wire.MemberProfileAd{}, fmt.Errorf("store: decode member profile ad: %w", err)
 	}
 	return ad, nil
 }

@@ -41,6 +41,27 @@ func mkTransportAd(gid entmoot.GroupID, authorNodeID entmoot.NodeID, seq uint64,
 	}
 }
 
+func mkMemberProfileAd(gid entmoot.GroupID, authorNodeID entmoot.NodeID, seq uint64, hostname string, issuedMs, notAfterMs int64, sig []byte) wire.MemberProfileAd {
+	return wire.MemberProfileAd{
+		GroupID: gid,
+		Author: entmoot.NodeInfo{
+			PilotNodeID:   authorNodeID,
+			EntmootPubKey: bytes.Repeat([]byte{byte(authorNodeID)}, 32),
+		},
+		Seq:       seq,
+		Hostname:  hostname,
+		IssuedAt:  issuedMs,
+		NotAfter:  notAfterMs,
+		Signature: sig,
+	}
+}
+
+func mkMemberProfileAdWithKey(gid entmoot.GroupID, authorNodeID entmoot.NodeID, pubKey []byte, seq uint64, hostname string, issuedMs, notAfterMs int64, sig []byte) wire.MemberProfileAd {
+	ad := mkMemberProfileAd(gid, authorNodeID, seq, hostname, issuedMs, notAfterMs, sig)
+	ad.Author.EntmootPubKey = append([]byte(nil), pubKey...)
+	return ad
+}
+
 func TestTransportAdPutAndGet(t *testing.T) {
 	ctx := context.Background()
 	s, err := OpenSQLite(t.TempDir())
@@ -346,6 +367,187 @@ func TestBumpTransportAdSeqPersistsAcrossOpen(t *testing.T) {
 	}
 	if got != 4 {
 		t.Fatalf("seq = %d, want 4 (counter should persist across Close)", got)
+	}
+}
+
+func TestMemberProfileAdPutAndGet(t *testing.T) {
+	ctx := context.Background()
+	s, err := OpenSQLite(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	gid := randGroupID(t)
+	ad := mkMemberProfileAd(gid, 42, 1, "mars.local", 1_000, 10_000, []byte("sig-v1"))
+
+	replaced, err := s.PutMemberProfileAd(ctx, ad)
+	if err != nil {
+		t.Fatalf("PutMemberProfileAd: %v", err)
+	}
+	if !replaced {
+		t.Fatal("PutMemberProfileAd replaced=false on first insert; want true")
+	}
+
+	got, ok, err := s.GetMemberProfileAd(ctx, gid, 42, time.UnixMilli(2_000))
+	if err != nil {
+		t.Fatalf("GetMemberProfileAd: %v", err)
+	}
+	if !ok {
+		t.Fatal("GetMemberProfileAd ok=false after Put")
+	}
+	if got.Hostname != ad.Hostname || got.Seq != ad.Seq {
+		t.Fatalf("profile ad = %+v, want hostname=%q seq=%d", got, ad.Hostname, ad.Seq)
+	}
+	if !bytes.Equal(got.Signature, ad.Signature) {
+		t.Fatalf("Signature differs: got %x, want %x", got.Signature, ad.Signature)
+	}
+}
+
+func TestMemberProfileAdReplaceOnHigherSeq(t *testing.T) {
+	ctx := context.Background()
+	s, err := OpenSQLite(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	gid := randGroupID(t)
+	ad1 := mkMemberProfileAd(gid, 7, 1, "old.local", 1_000, 10_000, []byte("sig-v1"))
+	ad2 := mkMemberProfileAd(gid, 7, 2, "new.local", 2_000, 20_000, []byte("sig-v2"))
+	if _, err := s.PutMemberProfileAd(ctx, ad1); err != nil {
+		t.Fatalf("Put ad1: %v", err)
+	}
+	replaced, err := s.PutMemberProfileAd(ctx, ad2)
+	if err != nil {
+		t.Fatalf("Put ad2: %v", err)
+	}
+	if !replaced {
+		t.Fatal("replaced=false on higher-seq put; want true")
+	}
+	got, ok, err := s.GetMemberProfileAd(ctx, gid, 7, time.UnixMilli(3_000))
+	if err != nil || !ok {
+		t.Fatalf("Get: err=%v ok=%v", err, ok)
+	}
+	if got.Hostname != "new.local" || got.Seq != 2 {
+		t.Fatalf("profile ad = %+v, want new.local seq=2", got)
+	}
+}
+
+func TestMemberProfileAdReplacedIdentityBeatsHigherStaleSeq(t *testing.T) {
+	ctx := context.Background()
+	s, err := OpenSQLite(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	gid := randGroupID(t)
+	oldKey := bytes.Repeat([]byte{0xA1}, 32)
+	newKey := bytes.Repeat([]byte{0xB2}, 32)
+	oldAd := mkMemberProfileAdWithKey(gid, 7, oldKey, 99, "old.local", 1_000, 10_000, []byte("sig-old"))
+	newAd := mkMemberProfileAdWithKey(gid, 7, newKey, 1, "new.local", 2_000, 20_000, []byte("sig-new"))
+	if _, err := s.PutMemberProfileAd(ctx, oldAd); err != nil {
+		t.Fatalf("Put oldAd: %v", err)
+	}
+	replaced, err := s.PutMemberProfileAd(ctx, newAd)
+	if err != nil {
+		t.Fatalf("Put newAd: %v", err)
+	}
+	if !replaced {
+		t.Fatal("replaced=false for new identity with lower seq; want true")
+	}
+	got, ok, err := s.GetMemberProfileAd(ctx, gid, 7, time.UnixMilli(3_000))
+	if err != nil || !ok {
+		t.Fatalf("Get: err=%v ok=%v", err, ok)
+	}
+	if got.Hostname != "new.local" || got.Seq != 1 || !bytes.Equal(got.Author.EntmootPubKey, newKey) {
+		t.Fatalf("profile ad = %+v, want new identity new.local seq=1", got)
+	}
+}
+
+func TestMemberProfileAdRejectLowerSeqForSameIdentity(t *testing.T) {
+	ctx := context.Background()
+	s, err := OpenSQLite(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	gid := randGroupID(t)
+	key := bytes.Repeat([]byte{0xA1}, 32)
+	highAd := mkMemberProfileAdWithKey(gid, 7, key, 2, "high.local", 2_000, 20_000, []byte("sig-high"))
+	lowAd := mkMemberProfileAdWithKey(gid, 7, key, 1, "low.local", 1_000, 10_000, []byte("sig-low"))
+	if _, err := s.PutMemberProfileAd(ctx, highAd); err != nil {
+		t.Fatalf("Put highAd: %v", err)
+	}
+	replaced, err := s.PutMemberProfileAd(ctx, lowAd)
+	if err != nil {
+		t.Fatalf("Put lowAd: %v", err)
+	}
+	if replaced {
+		t.Fatal("replaced=true for same identity lower seq; want false")
+	}
+	got, ok, err := s.GetMemberProfileAd(ctx, gid, 7, time.UnixMilli(3_000))
+	if err != nil || !ok {
+		t.Fatalf("Get: err=%v ok=%v", err, ok)
+	}
+	if got.Hostname != "high.local" || got.Seq != 2 {
+		t.Fatalf("profile ad = %+v, want high.local seq=2", got)
+	}
+}
+
+func TestMemberProfileAdFiltersExpired(t *testing.T) {
+	ctx := context.Background()
+	s, err := OpenSQLite(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	gid := randGroupID(t)
+	ad := mkMemberProfileAd(gid, 42, 1, "expired.local", 1_000, 10_000, []byte("sig-v1"))
+	if _, err := s.PutMemberProfileAd(ctx, ad); err != nil {
+		t.Fatalf("PutMemberProfileAd: %v", err)
+	}
+	if _, ok, err := s.GetMemberProfileAd(ctx, gid, 42, time.UnixMilli(10_001)); err != nil || ok {
+		t.Fatalf("GetMemberProfileAd expired: ok=%v err=%v, want ok=false nil", ok, err)
+	}
+}
+
+func TestGetAllMemberProfileAdsFiltersExpiredAndOrdersByAuthor(t *testing.T) {
+	ctx := context.Background()
+	s, err := OpenSQLite(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	gid := randGroupID(t)
+	ads := []wire.MemberProfileAd{
+		mkMemberProfileAd(gid, 20, 1, "twenty.local", 1_000, 20_000, []byte("b")),
+		mkMemberProfileAd(gid, 10, 1, "ten.local", 1_000, 20_000, []byte("a")),
+		mkMemberProfileAd(gid, 30, 1, "expired.local", 1_000, 5_000, []byte("c")),
+	}
+	for _, ad := range ads {
+		if _, err := s.PutMemberProfileAd(ctx, ad); err != nil {
+			t.Fatalf("PutMemberProfileAd: %v", err)
+		}
+	}
+	now := time.UnixMilli(10_000)
+	got, err := s.GetAllMemberProfileAds(ctx, gid, now, false)
+	if err != nil {
+		t.Fatalf("GetAllMemberProfileAds: %v", err)
+	}
+	if len(got) != 2 || got[0].Author.PilotNodeID != 10 || got[1].Author.PilotNodeID != 20 {
+		t.Fatalf("GetAllMemberProfileAds = %+v, want authors [10 20]", got)
+	}
+	all, err := s.GetAllMemberProfileAds(ctx, gid, now, true)
+	if err != nil {
+		t.Fatalf("GetAllMemberProfileAds includeExpired: %v", err)
+	}
+	if len(all) != 3 || all[0].Author.PilotNodeID != 10 || all[1].Author.PilotNodeID != 20 || all[2].Author.PilotNodeID != 30 {
+		t.Fatalf("GetAllMemberProfileAds includeExpired = %+v, want authors [10 20 30]", all)
 	}
 }
 

@@ -95,15 +95,17 @@ func DefaultLimits() Limits {
 	}
 }
 
-// DefaultTopicLimits returns the v1.2.0 per-(peer, topic) defaults for
-// system topics. Currently only "_pilot/transport/v1" — transport-ad
-// gossip: 10-token burst refilled at 1/6-minute (10/hour). A legitimate
-// publisher emits roughly 1/week (weekly safety-net refresh); the
-// default leaves 1680x headroom before rate-limiting kicks in, so only
-// genuinely abusive peers hit the cap.
+// DefaultTopicLimits returns the per-(peer, topic) defaults for rare
+// signed system topics. Each topic gets a 10-token burst refilled at
+// 1/6-minute (10/hour), leaving generous headroom for legitimate weekly
+// refresh/change traffic while bounding signature-verification abuse.
 func DefaultTopicLimits() map[string]TopicLimit {
 	return map[string]TopicLimit{
 		"_pilot/transport/v1": {
+			MsgRate:  rate.Every(6 * time.Minute),
+			MsgBurst: 10,
+		},
+		"_pilot/profile/v1": {
 			MsgRate:  rate.Every(6 * time.Minute),
 			MsgBurst: 10,
 		},

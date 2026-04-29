@@ -108,6 +108,59 @@ func TestGroupMuxRoutesByFirstFrameGroup(t *testing.T) {
 	expectNoTunnelUp(t, tunnelA, "groupA")
 }
 
+func TestGroupMuxRoutesMemberProfileFramesByGroup(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	base := newRuntimeFakeTransport()
+	mux := newGroupMuxTransport(base, nil)
+	gidA := testRuntimeGroupID(0xA1)
+	gidB := testRuntimeGroupID(0xB2)
+	groupA, _ := mux.Group(gidA)
+	groupB, _ := mux.Group(gidB)
+	tunnelA := make(chan entmoot.NodeID, 1)
+	tunnelB := make(chan entmoot.NodeID, 1)
+	groupA.SetOnTunnelUp(func(peer entmoot.NodeID) { tunnelA <- peer })
+	groupB.SetOnTunnelUp(func(peer entmoot.NodeID) { tunnelB <- peer })
+	go func() { _ = mux.AcceptLoop(ctx) }()
+
+	for name, payload := range map[string]any{
+		"ad":   &wire.MemberProfileAd{GroupID: gidB},
+		"req":  &wire.MemberProfileSnapshotReq{GroupID: gidB},
+		"resp": &wire.MemberProfileSnapshotResp{GroupID: gidB},
+	} {
+		client, server := net.Pipe()
+		base.acceptCh <- runtimeAccept{conn: server, remote: 45981}
+		go func() {
+			_ = wire.EncodeAndWrite(client, payload)
+		}()
+
+		acceptCtx, acceptCancel := context.WithTimeout(ctx, time.Second)
+		gotConn, remote, err := groupB.Accept(acceptCtx)
+		acceptCancel()
+		if err != nil {
+			_ = client.Close()
+			t.Fatalf("%s: groupB.Accept: %v", name, err)
+		}
+		if remote != 45981 {
+			_ = gotConn.Close()
+			_ = client.Close()
+			t.Fatalf("%s: remote = %d, want 45981", name, remote)
+		}
+		_, gotPayload, err := wire.ReadAndDecode(gotConn)
+		_ = gotConn.Close()
+		_ = client.Close()
+		if err != nil {
+			t.Fatalf("%s: ReadAndDecode: %v", name, err)
+		}
+		if gotGroupID, ok := mux.groupForPayload(gotPayload); !ok || gotGroupID != gidB {
+			t.Fatalf("%s: payload = %#v, want routable gidB", name, gotPayload)
+		}
+		expectTunnelUp(t, tunnelB, 45981, "groupB")
+		expectNoTunnelUp(t, tunnelA, "groupA")
+	}
+}
+
 func TestGroupMuxDoesNotFireTunnelUpBeforeFirstFrame(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

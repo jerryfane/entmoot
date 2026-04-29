@@ -233,6 +233,21 @@ func cmdJoin(gf *globalFlags, args []string) int {
 		}
 		return out
 	}
+	localHostnameFn := func() (string, bool) {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		info, err := tr.Driver().InfoStruct(ctx)
+		if err != nil {
+			slog.Debug("join: local pilot hostname lookup failed",
+				slog.String("err", err.Error()))
+			return "", false
+		}
+		hostname, ok := normalizeLocalPilotHostname(info.Hostname)
+		if !ok {
+			slog.Debug("join: local pilot hostname unavailable")
+		}
+		return hostname, ok
+	}
 	// Background polling runs for the lifetime of the daemon.
 	go turnPoller.Run(rootCtx)
 
@@ -244,6 +259,7 @@ func cmdJoin(gf *globalFlags, args []string) int {
 		Notify:           notifyStore,
 		Transport:        tr,
 		LocalEndpoints:   localEndpointsFn,
+		LocalHostname:    localHostnameFn,
 		EndpointsChanged: turnPoller.Changed(),
 		HideIP:           gf.hideIP,
 		TraceReconcile:   gf.traceReconcile,
@@ -1000,4 +1016,12 @@ func (s *ipcServer) handleTail(ctx context.Context, c net.Conn, sub *ipc.TailSub
 			}
 		}
 	}
+}
+
+func normalizeLocalPilotHostname(hostname string) (string, bool) {
+	hostname = strings.TrimSpace(hostname)
+	if hostname == "" {
+		return "", false
+	}
+	return hostname, true
 }

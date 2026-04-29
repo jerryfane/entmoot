@@ -1,6 +1,7 @@
 package gossip
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -188,6 +189,9 @@ const (
 	// superseded ads via TransportAdStore.GetTransportAd before dialling.
 	// See enqueueAdRetry.
 	opTransportAd retryOp = 6
+	// Member-profile fanout retry op. Same scheduling/cap semantics as
+	// opTransportAd, but carries retryState.profileAd.
+	opMemberProfileAd retryOp = 7
 )
 
 func (o retryOp) String() string {
@@ -204,6 +208,8 @@ func (o retryOp) String() string {
 		return "prune"
 	case opTransportAd:
 		return "transport_ad"
+	case opMemberProfileAd:
+		return "member_profile_ad"
 	default:
 		return "unknown"
 	}
@@ -236,6 +242,7 @@ type retryState struct {
 	lastBackoff time.Duration // v1.0.7: feeds nextBackoff(prev); 0 on first failure
 	frame       *wire.Gossip
 	ad          *wire.TransportAd
+	profileAd   *wire.MemberProfileAd
 	seq         uint64
 	firstTry    time.Time
 }
@@ -259,6 +266,7 @@ const defaultFanout = 3
 // never collide. Kept in gossiper.go because receivers consume it; the
 // advertiser on the publish side uses the same string by contract. (v1.2.0)
 const transportAdTopic = "_pilot/transport/v1"
+const memberProfileTopic = "_pilot/profile/v1"
 
 // transportAdMaxEndpoints bounds the number of (network, addr) pairs one
 // TransportAd can advertise. Matches the plan's 4-entry cap — enough for
@@ -283,6 +291,11 @@ const transportAdRefreshInterval = 6 * 24 * time.Hour
 // refreshes inside the window so an unchanged endpoint set stays
 // continuously advertised. (v1.2.0)
 const transportAdTTL = 7 * 24 * time.Hour
+
+const memberProfileRefreshInterval = 6 * 24 * time.Hour
+const memberProfilePollInterval = 30 * time.Second
+const memberProfileTTL = 7 * 24 * time.Hour
+const memberProfileMaxBytes = 1024
 
 // transportAdGCInterval is how often the advertiser opportunistically
 // triggers store.GCExpiredTransportAds. Piggybacks on the refresh tick
@@ -311,6 +324,16 @@ type TransportAdStore interface {
 	// GCExpiredTransportAds deletes every ad whose NotAfter is strictly
 	// before now. Returns the number of rows deleted.
 	GCExpiredTransportAds(ctx context.Context, now time.Time) (int64, error)
+}
+
+// MemberProfileStore is the persistence surface for signed app-facing member
+// profile advertisements.
+type MemberProfileStore interface {
+	PutMemberProfileAd(ctx context.Context, ad wire.MemberProfileAd) (bool, error)
+	GetMemberProfileAd(ctx context.Context, groupID entmoot.GroupID, authorNodeID entmoot.NodeID, now time.Time) (wire.MemberProfileAd, bool, error)
+	GetAllMemberProfileAds(ctx context.Context, groupID entmoot.GroupID, now time.Time, includeExpired bool) ([]wire.MemberProfileAd, error)
+	BumpMemberProfileAdSeq(ctx context.Context, groupID entmoot.GroupID, authorNodeID entmoot.NodeID) (uint64, error)
+	GCExpiredMemberProfileAds(ctx context.Context, now time.Time) (int64, error)
 }
 
 // Config parameterizes a Gossiper. Every field except Fanout, Clock, and
@@ -356,6 +379,10 @@ type Config struct {
 	// (v1.2.0)
 	TransportAdStore TransportAdStore
 
+	// MemberProfileStore stores signed display-profile ads. nil disables
+	// member-profile publish/receive without affecting core gossip.
+	MemberProfileStore MemberProfileStore
+
 	// RateLimiter applies the per-(peer, topic) quota on the inbound
 	// TransportAd receive path via AllowTopic. nil disables topic-level
 	// rate limiting (global per-peer limits, if any, still apply via the
@@ -369,6 +396,11 @@ type Config struct {
 	// an empty slice) means "don't advertise" — useful for tests or for
 	// nodes that can't reach pilot. (v1.2.0)
 	LocalEndpoints func() []entmoot.NodeEndpoint
+
+	// LocalHostname returns this node's current Pilot hostname for display
+	// advertisement and whether the lookup succeeded. Empty with ok=true
+	// means "intentionally no hostname"; ok=false skips publishing.
+	LocalHostname func() (string, bool)
 
 	// EndpointsChanged receives a tick whenever LocalEndpoints is known
 	// to have changed (e.g. pilot reports a new TCP listen port).
@@ -1055,6 +1087,14 @@ func (g *Gossiper) Start(ctx context.Context) error {
 		}()
 	}
 
+	if g.cfg.MemberProfileStore != nil && g.cfg.LocalHostname != nil {
+		g.wg.Add(1)
+		go func() {
+			defer g.wg.Done()
+			g.memberProfileLoop(ctx)
+		}()
+	}
+
 	for {
 		conn, remote, err := g.cfg.Transport.Accept(ctx)
 		if err != nil {
@@ -1140,6 +1180,10 @@ func (g *Gossiper) handleConn(ctx context.Context, c net.Conn, remote entmoot.No
 		g.onPrune(remote, v)
 	case *wire.TransportAd:
 		g.onTransportAd(ctx, remote, v)
+	case *wire.MemberProfileAd:
+		g.onMemberProfileAd(ctx, remote, v)
+	case *wire.MemberProfileSnapshotReq:
+		g.onMemberProfileSnapshotReq(ctx, c, remote, v)
 	case *wire.TransportSnapshotReq:
 		g.onTransportSnapshotReq(ctx, c, remote, v)
 	case *wire.Reconcile:
@@ -2311,6 +2355,47 @@ func (g *Gossiper) enqueueAdRetry(peerID entmoot.NodeID, ad *wire.TransportAd) {
 	g.pending[key] = state
 }
 
+func (g *Gossiper) enqueueMemberProfileRetry(peerID entmoot.NodeID, ad *wire.MemberProfileAd) {
+	if ad == nil {
+		return
+	}
+	g.pendMu.Lock()
+	defer g.pendMu.Unlock()
+	now := g.clk.Now()
+	key := retryKey{peer: peerID, author: ad.Author.PilotNodeID, op: opMemberProfileAd}
+	state, ok := g.pending[key]
+	if !ok {
+		state = &retryState{attempts: 1, profileAd: ad, seq: ad.Seq, firstTry: now}
+	} else {
+		if ad.Seq >= state.seq {
+			state.profileAd = ad
+			state.seq = ad.Seq
+		}
+		state.attempts++
+	}
+	if state.attempts > adRetryMaxAttempts {
+		g.logger.Debug("gossip: member_profile_ad retry budget exhausted",
+			slog.Uint64("peer", uint64(key.peer)),
+			slog.Uint64("author", uint64(key.author)),
+			slog.Uint64("seq", state.seq),
+			slog.Int("attempts", state.attempts))
+		delete(g.pending, key)
+		return
+	}
+	if !state.firstTry.IsZero() && now.Sub(state.firstTry) > adRetryWallClockLimit {
+		g.logger.Debug("gossip: member_profile_ad retry wall-clock ceiling hit",
+			slog.Uint64("peer", uint64(key.peer)),
+			slog.Uint64("author", uint64(key.author)),
+			slog.Uint64("seq", state.seq),
+			slog.Duration("elapsed", now.Sub(state.firstTry)))
+		delete(g.pending, key)
+		return
+	}
+	state.lastBackoff = g.nextBackoff(state.lastBackoff)
+	state.nextAt = now.Add(state.lastBackoff)
+	g.pending[key] = state
+}
+
 // enqueueRetry inserts (or refreshes) a pending retry slot for a failed
 // push or fetch. First-attempt failures start at attempts=1 with
 // lastBackoff=0, so nextBackoff produces a delay near retryBackoffBase
@@ -2399,20 +2484,21 @@ func (g *Gossiper) drainDueRetries(ctx context.Context) {
 		eg.Go(func() error {
 			dctx, cancel := context.WithTimeout(ctx, g.fanoutAttemptBudget())
 			defer cancel()
-			// v1.4.1: transport-ad retries short-circuit if the local
+			// Signed system-record retries short-circuit if the local
 			// store has seen a newer seq for the same author since we
 			// queued. Superseded ads never need to be re-sent — the
 			// newer ad's own fanout (or its retry) covers the peer.
-			if d.key.op == opTransportAd {
-				if g.adSuperseded(dctx, d.key, d.state) {
+			if d.key.op == opTransportAd || d.key.op == opMemberProfileAd {
+				if g.retrySuperseded(dctx, d.key, d.state) {
 					g.pendMu.Lock()
 					if cur, ok := g.pending[d.key]; ok && cur == d.state {
 						delete(g.pending, d.key)
 					}
 					g.pendMu.Unlock()
-					g.logger.Debug("gossip: transport_ad retry superseded",
+					g.logger.Debug("gossip: system record retry superseded",
 						slog.Uint64("peer", uint64(d.key.peer)),
 						slog.Uint64("author", uint64(d.key.author)),
+						slog.String("op", d.key.op.String()),
 						slog.Uint64("seq", d.state.seq))
 					return nil
 				}
@@ -2425,9 +2511,10 @@ func (g *Gossiper) drainDueRetries(ctx context.Context) {
 						delete(g.pending, d.key)
 					}
 					g.pendMu.Unlock()
-					g.logger.Debug("gossip: transport_ad retry wall-clock ceiling hit",
+					g.logger.Debug("gossip: system record retry wall-clock ceiling hit",
 						slog.Uint64("peer", uint64(d.key.peer)),
 						slog.Uint64("author", uint64(d.key.author)),
+						slog.String("op", d.key.op.String()),
 						slog.Uint64("seq", d.state.seq))
 					return nil
 				}
@@ -2461,6 +2548,16 @@ func (g *Gossiper) drainDueRetries(ctx context.Context) {
 				g.enqueueAdRetry(d.key.peer, d.state.ad)
 				return nil
 			}
+			if d.key.op == opMemberProfileAd {
+				g.logger.Debug("gossip: member_profile_ad retry",
+					slog.Uint64("peer", uint64(d.key.peer)),
+					slog.Uint64("author", uint64(d.key.author)),
+					slog.Uint64("seq", d.state.seq),
+					slog.Int("attempt", d.state.attempts+1),
+					slog.String("err", err.Error()))
+				g.enqueueMemberProfileRetry(d.key.peer, d.state.profileAd)
+				return nil
+			}
 			g.logger.Warn("gossip: retry",
 				slog.Uint64("peer", uint64(d.key.peer)),
 				slog.String("id", d.key.id.String()),
@@ -2491,6 +2588,28 @@ func (g *Gossiper) adSuperseded(ctx context.Context, key retryKey, state *retryS
 		return false
 	}
 	return cur.Seq > state.seq
+}
+
+func (g *Gossiper) memberProfileSuperseded(ctx context.Context, key retryKey, state *retryState) bool {
+	if g.cfg.MemberProfileStore == nil {
+		return false
+	}
+	cur, ok, err := g.cfg.MemberProfileStore.GetMemberProfileAd(ctx, g.cfg.GroupID, key.author, g.clk.Now())
+	if err != nil || !ok {
+		return false
+	}
+	return cur.Seq > state.seq
+}
+
+func (g *Gossiper) retrySuperseded(ctx context.Context, key retryKey, state *retryState) bool {
+	switch key.op {
+	case opTransportAd:
+		return g.adSuperseded(ctx, key, state)
+	case opMemberProfileAd:
+		return g.memberProfileSuperseded(ctx, key, state)
+	default:
+		return false
+	}
 }
 
 // executeRetry runs a single pending attempt. Returns nil on success so the
@@ -2528,6 +2647,11 @@ func (g *Gossiper) executeRetry(ctx context.Context, key retryKey, state *retryS
 			return fmt.Errorf("retry: transport_ad missing ad")
 		}
 		return g.sendTransportAd(ctx, key.peer, state.ad)
+	case opMemberProfileAd:
+		if state.profileAd == nil {
+			return fmt.Errorf("retry: member_profile_ad missing ad")
+		}
+		return g.sendMemberProfileAd(ctx, key.peer, state.profileAd)
 	default:
 		return fmt.Errorf("retry: unknown op %d", key.op)
 	}
@@ -3153,6 +3277,103 @@ func (g *Gossiper) onTransportAd(ctx context.Context, remote entmoot.NodeID, ad 
 	g.refanoutTransportAd(ctx, remote, ad)
 }
 
+func (g *Gossiper) onMemberProfileAd(ctx context.Context, remote entmoot.NodeID, ad *wire.MemberProfileAd) {
+	g.ingestMemberProfileAd(ctx, remote, ad, true)
+}
+
+func (g *Gossiper) ingestMemberProfileAd(ctx context.Context, remote entmoot.NodeID, ad *wire.MemberProfileAd, enforceRateLimit bool) {
+	if g.cfg.MemberProfileStore == nil {
+		g.logger.Debug("gossip: member_profile_ad received but MemberProfileStore not configured",
+			slog.Uint64("remote", uint64(remote)))
+		return
+	}
+	if ad.GroupID != g.cfg.GroupID {
+		g.logger.Warn("gossip: member_profile_ad for wrong group",
+			slog.Uint64("remote", uint64(remote)),
+			slog.String("got", ad.GroupID.String()))
+		return
+	}
+	nowMs := g.clk.Now().UnixMilli()
+	if ad.IssuedAt <= 0 || ad.NotAfter <= 0 || ad.NotAfter <= ad.IssuedAt || ad.NotAfter <= nowMs {
+		g.logger.Warn("gossip: member_profile_ad bad timestamps",
+			slog.Uint64("remote", uint64(remote)),
+			slog.Int64("issued_at", ad.IssuedAt),
+			slog.Int64("not_after", ad.NotAfter))
+		return
+	}
+	if ad.Author.PilotNodeID == g.cfg.LocalNode {
+		g.logger.Debug("gossip: member_profile_ad self-authored inbound ignored",
+			slog.Uint64("remote", uint64(remote)),
+			slog.Uint64("author", uint64(ad.Author.PilotNodeID)),
+			slog.Uint64("seq", ad.Seq))
+		return
+	}
+	if err := validateMemberHostname(ad.Hostname); err != nil {
+		g.logger.Warn("gossip: member_profile_ad hostname invalid",
+			slog.Uint64("remote", uint64(remote)),
+			slog.String("err", err.Error()))
+		return
+	}
+	signing := *ad
+	signing.Signature = nil
+	sigInput, err := canonical.Encode(signing)
+	if err != nil {
+		g.logger.Warn("gossip: member_profile_ad canonical encode",
+			slog.Uint64("remote", uint64(remote)),
+			slog.String("err", err.Error()))
+		return
+	}
+	if len(sigInput) > memberProfileMaxBytes {
+		g.logger.Warn("gossip: member_profile_ad exceeds size cap",
+			slog.Uint64("remote", uint64(remote)),
+			slog.Int("bytes", len(sigInput)),
+			slog.Int("cap", memberProfileMaxBytes))
+		return
+	}
+	if !g.isTrustedSender(ctx, remote) {
+		g.logger.Debug("gossip: member_profile_ad from untrusted sender",
+			slog.Uint64("remote", uint64(remote)),
+			slog.Uint64("author", uint64(ad.Author.PilotNodeID)))
+		return
+	}
+	authorInfo, ok := g.cfg.Roster.MemberInfo(ad.Author.PilotNodeID)
+	if !ok {
+		g.logger.Warn("gossip: member_profile_ad from non-member author",
+			slog.Uint64("remote", uint64(remote)),
+			slog.Uint64("author", uint64(ad.Author.PilotNodeID)))
+		return
+	}
+	if enforceRateLimit && g.cfg.RateLimiter != nil {
+		if err := g.cfg.RateLimiter.AllowTopic(remote, memberProfileTopic, len(sigInput)); err != nil {
+			g.logger.Warn("gossip: member_profile_ad rate-limited",
+				slog.Uint64("remote", uint64(remote)),
+				slog.String("err", err.Error()))
+			return
+		}
+	}
+	if !keystore.Verify(authorInfo.EntmootPubKey, sigInput, ad.Signature) {
+		g.logger.Warn("gossip: member_profile_ad signature invalid",
+			slog.Uint64("remote", uint64(remote)),
+			slog.Uint64("author", uint64(ad.Author.PilotNodeID)))
+		return
+	}
+	replaced, err := g.cfg.MemberProfileStore.PutMemberProfileAd(ctx, *ad)
+	if err != nil {
+		g.logger.Warn("gossip: member_profile_ad store put",
+			slog.Uint64("remote", uint64(remote)),
+			slog.String("err", err.Error()))
+		return
+	}
+	if !replaced {
+		g.logger.Debug("gossip: member_profile_ad not newer than stored",
+			slog.Uint64("remote", uint64(remote)),
+			slog.Uint64("author", uint64(ad.Author.PilotNodeID)),
+			slog.Uint64("seq", ad.Seq))
+		return
+	}
+	g.refanoutMemberProfileAd(ctx, remote, ad)
+}
+
 // refanoutTransportAd pushes ad to every eager peer except `except`.
 // Same best-effort parallelism as fanoutPush — a stalled peer can't
 // head-of-line-block healthy peers, and dial-backoff is respected.
@@ -3291,6 +3512,82 @@ func (g *Gossiper) fanoutTransportAd(ctx context.Context, ad *wire.TransportAd) 
 	_ = eg.Wait()
 }
 
+func (g *Gossiper) sendMemberProfileAd(ctx context.Context, peer entmoot.NodeID, ad *wire.MemberProfileAd) error {
+	return g.dialAndWrite(ctx, peer, ad, "member_profile_ad")
+}
+
+func (g *Gossiper) publishMemberProfileAd(ctx context.Context, hostname string) error {
+	if g.cfg.MemberProfileStore == nil {
+		return errors.New("publishMemberProfileAd: no MemberProfileStore")
+	}
+	if err := validateMemberHostname(hostname); err != nil {
+		return err
+	}
+	seq, err := g.cfg.MemberProfileStore.BumpMemberProfileAdSeq(ctx, g.cfg.GroupID, g.cfg.LocalNode)
+	if err != nil {
+		return fmt.Errorf("publishMemberProfileAd: bump seq: %w", err)
+	}
+	issuedAt := g.clk.Now().UnixMilli()
+	ad := wire.MemberProfileAd{
+		GroupID: g.cfg.GroupID,
+		Author: entmoot.NodeInfo{
+			PilotNodeID:   g.cfg.LocalNode,
+			EntmootPubKey: g.cfg.Identity.PublicKey,
+		},
+		Seq:      seq,
+		Hostname: hostname,
+		IssuedAt: issuedAt,
+		NotAfter: g.clk.Now().Add(memberProfileTTL).UnixMilli(),
+	}
+	signing := ad
+	signing.Signature = nil
+	sigInput, err := canonical.Encode(signing)
+	if err != nil {
+		return fmt.Errorf("publishMemberProfileAd: canonical encode: %w", err)
+	}
+	if len(sigInput) > memberProfileMaxBytes {
+		return fmt.Errorf("publishMemberProfileAd: encoded ad exceeds cap (%d > %d)",
+			len(sigInput), memberProfileMaxBytes)
+	}
+	ad.Signature = g.cfg.Identity.Sign(sigInput)
+
+	if _, err := g.cfg.MemberProfileStore.PutMemberProfileAd(ctx, ad); err != nil {
+		g.logger.Warn("gossip: member_profile_ad publish store put",
+			slog.String("err", err.Error()))
+	}
+	g.fanoutMemberProfileAd(ctx, &ad)
+	return nil
+}
+
+func (g *Gossiper) fanoutMemberProfileAd(ctx context.Context, ad *wire.MemberProfileAd) {
+	g.refanoutMemberProfileAd(ctx, 0, ad)
+}
+
+func (g *Gossiper) refanoutMemberProfileAd(ctx context.Context, except entmoot.NodeID, ad *wire.MemberProfileAd) {
+	peers := g.plumEagerExcept(ctx, except)
+	if len(peers) == 0 {
+		return
+	}
+	var eg errgroup.Group
+	eg.SetLimit(fanoutMaxConcurrency)
+	for _, p := range peers {
+		p := p
+		eg.Go(func() error {
+			dctx, cancel := context.WithTimeout(ctx, g.fanoutAttemptBudget())
+			defer cancel()
+			if err := g.sendMemberProfileAd(dctx, p, ad); err != nil {
+				g.logger.Debug("gossip: member_profile_ad fanout",
+					slog.Uint64("peer", uint64(p)),
+					slog.Uint64("author", uint64(ad.Author.PilotNodeID)),
+					slog.String("err", err.Error()))
+				g.enqueueMemberProfileRetry(p, ad)
+			}
+			return nil
+		})
+	}
+	_ = eg.Wait()
+}
+
 // advertiserLoop runs for the lifetime of the gossiper. Publishes a
 // TransportAd on startup, on EndpointsChanged signal, and on a weekly
 // refresh ticker. Weekly refresh is a safety-net so receivers can GC
@@ -3338,6 +3635,93 @@ func (g *Gossiper) advertiserLoop(ctx context.Context) {
 			}
 		}
 	}
+}
+
+func (g *Gossiper) memberProfileLoop(ctx context.Context) {
+	state := memberProfilePublishState{}
+	g.tryPublishMemberProfileAd(ctx, "startup", true, &state)
+
+	poll := time.NewTicker(memberProfilePollInterval)
+	defer poll.Stop()
+	refresh := time.NewTicker(memberProfileRefreshInterval)
+	defer refresh.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-poll.C:
+			g.tryPublishMemberProfileAd(ctx, "hostname_poll", false, &state)
+		case <-refresh.C:
+			g.tryPublishMemberProfileAd(ctx, "refresh", true, &state)
+			if g.cfg.MemberProfileStore != nil {
+				if n, err := g.cfg.MemberProfileStore.GCExpiredMemberProfileAds(ctx, g.clk.Now()); err != nil {
+					g.logger.Debug("gossip: member_profile_ad gc",
+						slog.String("err", err.Error()))
+				} else if n > 0 {
+					g.logger.Debug("gossip: member_profile_ad gc removed rows",
+						slog.Int64("rows", n))
+				}
+			}
+		}
+	}
+}
+
+type memberProfilePublishState struct {
+	lastPublishedHostname string
+	republishPending      bool
+}
+
+func (g *Gossiper) tryPublishMemberProfileAd(ctx context.Context, reason string, force bool, state *memberProfilePublishState) {
+	if g.cfg.LocalHostname == nil {
+		return
+	}
+	hostname, ok := g.cfg.LocalHostname()
+	if !ok {
+		g.logger.Debug("gossip: member_profile_ad skip publish (hostname lookup unavailable)",
+			slog.String("reason", reason))
+		if force && state != nil {
+			state.republishPending = true
+		}
+		return
+	}
+	if err := validateMemberHostname(hostname); err != nil {
+		g.logger.Warn("gossip: member_profile_ad skip invalid local hostname",
+			slog.String("reason", reason),
+			slog.String("err", err.Error()))
+		if force && state != nil {
+			state.republishPending = true
+		}
+		return
+	}
+	if !force && state != nil && !state.republishPending && hostname == state.lastPublishedHostname {
+		return
+	}
+	if err := g.publishMemberProfileAd(ctx, hostname); err != nil {
+		g.logger.Warn("gossip: member_profile_ad publish",
+			slog.String("reason", reason),
+			slog.String("err", err.Error()))
+		if force && state != nil {
+			state.republishPending = true
+		}
+		return
+	}
+	if state != nil {
+		state.lastPublishedHostname = hostname
+		state.republishPending = false
+	}
+}
+
+func validateMemberHostname(hostname string) error {
+	if len(hostname) > 255 {
+		return fmt.Errorf("hostname too long (%d > 255)", len(hostname))
+	}
+	for _, r := range hostname {
+		if r < 0x20 || r == 0x7f {
+			return fmt.Errorf("hostname contains control character")
+		}
+	}
+	return nil
 }
 
 // tryPublishTransportAd is a thin wrapper that queries LocalEndpoints,
@@ -3428,6 +3812,53 @@ func (g *Gossiper) onTransportSnapshotReq(ctx context.Context, conn net.Conn, re
 			slog.Uint64("remote", uint64(remote)),
 			slog.String("err", err.Error()))
 	}
+}
+
+func (g *Gossiper) onMemberProfileSnapshotReq(ctx context.Context, conn net.Conn, remote entmoot.NodeID, req *wire.MemberProfileSnapshotReq) {
+	if req.GroupID != g.cfg.GroupID {
+		g.logger.Warn("gossip: member_profile_snapshot_req for wrong group",
+			slog.Uint64("remote", uint64(remote)),
+			slog.String("got", req.GroupID.String()))
+		return
+	}
+	if !g.cfg.Roster.IsMember(remote) {
+		g.logger.Warn("gossip: member_profile_snapshot_req from non-member",
+			slog.Uint64("remote", uint64(remote)))
+		return
+	}
+	resp := &wire.MemberProfileSnapshotResp{GroupID: g.cfg.GroupID}
+	if g.cfg.MemberProfileStore != nil {
+		profiles, err := g.cfg.MemberProfileStore.GetAllMemberProfileAds(ctx, g.cfg.GroupID, g.clk.Now(), false)
+		if err != nil {
+			g.logger.Warn("gossip: member_profile_snapshot_req get all",
+				slog.Uint64("remote", uint64(remote)),
+				slog.String("err", err.Error()))
+		} else {
+			resp.Profiles = filterCurrentMemberProfiles(g.cfg.Roster, profiles)
+		}
+	}
+	if err := wire.EncodeAndWrite(conn, resp); err != nil {
+		g.logger.Warn("gossip: write member_profile_snapshot_resp",
+			slog.Uint64("remote", uint64(remote)),
+			slog.String("err", err.Error()))
+	}
+}
+
+func filterCurrentMemberProfiles(r *roster.RosterLog, profiles []wire.MemberProfileAd) []wire.MemberProfileAd {
+	out := profiles[:0]
+	for _, ad := range profiles {
+		info, ok := r.MemberInfo(ad.Author.PilotNodeID)
+		if !ok || !memberProfileMatchesRosterInfo(ad, info) {
+			continue
+		}
+		out = append(out, ad)
+	}
+	return out
+}
+
+func memberProfileMatchesRosterInfo(ad wire.MemberProfileAd, info entmoot.NodeInfo) bool {
+	return ad.Author.PilotNodeID == info.PilotNodeID &&
+		bytes.Equal(ad.Author.EntmootPubKey, info.EntmootPubKey)
 }
 
 // validateEndpoint rejects malformed (network, addr) pairs. Networks

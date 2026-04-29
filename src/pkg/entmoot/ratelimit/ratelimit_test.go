@@ -304,6 +304,19 @@ func TestDefaultTopicLimits_TransportV1(t *testing.T) {
 	}
 }
 
+func TestDefaultTopicLimits_ProfileV1(t *testing.T) {
+	tl, ok := ratelimit.DefaultTopicLimits()["_pilot/profile/v1"]
+	if !ok {
+		t.Fatalf("DefaultTopicLimits missing _pilot/profile/v1 entry")
+	}
+	if tl.MsgBurst != 10 {
+		t.Errorf("_pilot/profile/v1 MsgBurst = %d, want 10", tl.MsgBurst)
+	}
+	if tl.MsgRate != rate.Every(6*time.Minute) {
+		t.Errorf("_pilot/profile/v1 MsgRate = %v, want rate.Every(6m)", tl.MsgRate)
+	}
+}
+
 // TestAllowTopic_DrainThenReject bounds the per-(peer, topic) bucket:
 // burst calls all pass, the burst+1 call rejects, a long clock advance
 // refills fully, and the cycle repeats. Exercises the transport-ad
@@ -326,6 +339,32 @@ func TestAllowTopic_DrainThenReject(t *testing.T) {
 	}
 
 	// Advance 1 hour -> at 10/hour the bucket refills to full.
+	fk.Advance(1 * time.Hour)
+	for i := 0; i < 10; i++ {
+		if err := lim.AllowTopic(peer, topic, 64); err != nil {
+			t.Fatalf("refilled %d: unexpected err: %v", i, err)
+		}
+	}
+	if err := lim.AllowTopic(peer, topic, 64); !errors.Is(err, entmoot.ErrRateLimited) {
+		t.Fatalf("after refill drain: expected ErrRateLimited, got %v", err)
+	}
+}
+
+func TestAllowTopic_ProfileDrainThenReject(t *testing.T) {
+	fk := clock.NewFake(anchor)
+	lim := ratelimit.New(ratelimit.DefaultLimits(), fk)
+	peer := entmoot.NodeID(42)
+	topic := "_pilot/profile/v1"
+
+	for i := 0; i < 10; i++ {
+		if err := lim.AllowTopic(peer, topic, 64); err != nil {
+			t.Fatalf("drain %d: unexpected err: %v", i, err)
+		}
+	}
+	if err := lim.AllowTopic(peer, topic, 64); !errors.Is(err, entmoot.ErrRateLimited) {
+		t.Fatalf("post-drain: expected ErrRateLimited, got %v", err)
+	}
+
 	fk.Advance(1 * time.Hour)
 	for i := 0; i < 10; i++ {
 		if err := lim.AllowTopic(peer, topic, 64); err != nil {

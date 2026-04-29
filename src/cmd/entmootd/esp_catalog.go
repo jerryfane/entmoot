@@ -1,28 +1,36 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"log/slog"
+	"time"
 
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/esphttp"
 	"entmoot/pkg/entmoot/roster"
+	"entmoot/pkg/entmoot/wire"
 )
+
+type memberProfileReader interface {
+	GetMemberProfileAd(context.Context, entmoot.GroupID, entmoot.NodeID, time.Time) (wire.MemberProfileAd, bool, error)
+}
 
 type localGroupCatalog struct {
 	dataDir  string
 	metadata esphttp.GroupMetadataStore
+	profiles memberProfileReader
 }
 
-func (c localGroupCatalog) ListGroups(_ context.Context) ([]esphttp.GroupSummary, error) {
+func (c localGroupCatalog) ListGroups(ctx context.Context) ([]esphttp.GroupSummary, error) {
 	gids, err := listGroupIDs(c.dataDir, nil)
 	if err != nil {
 		return nil, err
 	}
 	out := make([]esphttp.GroupSummary, 0, len(gids))
 	for _, gid := range gids {
-		group, ok, err := c.GetGroup(context.Background(), gid)
+		group, ok, err := c.GetGroup(ctx, gid)
 		if err != nil {
 			return nil, err
 		}
@@ -33,7 +41,7 @@ func (c localGroupCatalog) ListGroups(_ context.Context) ([]esphttp.GroupSummary
 	return out, nil
 }
 
-func (c localGroupCatalog) GetGroup(_ context.Context, gid entmoot.GroupID) (esphttp.GroupSummary, bool, error) {
+func (c localGroupCatalog) GetGroup(ctx context.Context, gid entmoot.GroupID) (esphttp.GroupSummary, bool, error) {
 	r, err := roster.OpenJSONL(c.dataDir, gid)
 	if err != nil {
 		return esphttp.GroupSummary{}, false, err
@@ -49,7 +57,7 @@ func (c localGroupCatalog) GetGroup(_ context.Context, gid entmoot.GroupID) (esp
 		RosterHead: r.Head(),
 	}
 	if c.metadata != nil {
-		if raw, ok, err := c.metadata.GetGroupMetadata(context.Background(), gid); err != nil {
+		if raw, ok, err := c.metadata.GetGroupMetadata(ctx, gid); err != nil {
 			return esphttp.GroupSummary{}, false, err
 		} else if ok && len(raw) > 0 {
 			var meta map[string]interface{}
@@ -68,12 +76,16 @@ func (c localGroupCatalog) GetGroup(_ context.Context, gid entmoot.GroupID) (esp
 			if name, ok := meta["name"].(string); ok {
 				group.Name = name
 			}
+			if description, ok := meta["description"].(string); ok {
+				group.Description = description
+			}
+			group.Tags = metadataTags(meta["tags"])
 		}
 	}
 	return group, true, nil
 }
 
-func (c localGroupCatalog) ListMembers(_ context.Context, gid entmoot.GroupID) ([]esphttp.MemberSummary, error) {
+func (c localGroupCatalog) ListMembers(ctx context.Context, gid entmoot.GroupID) ([]esphttp.MemberSummary, error) {
 	r, err := roster.OpenJSONL(c.dataDir, gid)
 	if err != nil {
 		return nil, err
@@ -87,11 +99,50 @@ func (c localGroupCatalog) ListMembers(_ context.Context, gid entmoot.GroupID) (
 		if !ok {
 			continue
 		}
-		out = append(out, esphttp.MemberSummary{
+		member := esphttp.MemberSummary{
 			NodeID:        nodeID,
 			EntmootPubKey: encodeBase64(info.EntmootPubKey),
 			Founder:       founder.PilotNodeID == nodeID,
-		})
+		}
+		if c.profiles != nil {
+			ad, ok, err := c.profiles.GetMemberProfileAd(ctx, gid, nodeID, time.Now())
+			if err != nil {
+				slog.Warn("esp group member profile ignored",
+					slog.String("group_id", gid.String()),
+					slog.Uint64("node_id", uint64(nodeID)),
+					slog.String("err", err.Error()))
+			} else if ok {
+				if memberProfileMatchesRosterInfo(ad, info) {
+					member.Hostname = ad.Hostname
+				} else {
+					slog.Debug("esp group member profile ignored: identity mismatch",
+						slog.String("group_id", gid.String()),
+						slog.Uint64("node_id", uint64(nodeID)))
+				}
+			}
+		}
+		out = append(out, member)
 	}
 	return out, nil
+}
+
+func memberProfileMatchesRosterInfo(ad wire.MemberProfileAd, info entmoot.NodeInfo) bool {
+	return ad.Author.PilotNodeID == info.PilotNodeID &&
+		bytes.Equal(ad.Author.EntmootPubKey, info.EntmootPubKey)
+}
+
+func metadataTags(v any) []string {
+	raw, ok := v.([]interface{})
+	if !ok {
+		return nil
+	}
+	tags := make([]string, 0, len(raw))
+	for _, item := range raw {
+		tag, ok := item.(string)
+		if !ok {
+			return nil
+		}
+		tags = append(tags, tag)
+	}
+	return tags
 }

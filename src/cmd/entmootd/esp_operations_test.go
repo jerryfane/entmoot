@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -18,6 +19,7 @@ import (
 	"entmoot/pkg/entmoot/ipc"
 	"entmoot/pkg/entmoot/keystore"
 	"entmoot/pkg/entmoot/roster"
+	"entmoot/pkg/entmoot/wire"
 )
 
 func TestESPOperationUpdateGroupRejectsNonObjectMetadata(t *testing.T) {
@@ -88,6 +90,105 @@ func TestLocalGroupCatalogIgnoresBadStoredMetadata(t *testing.T) {
 	}
 }
 
+func TestLocalGroupCatalogProjectsDisplayMetadataAndHostname(t *testing.T) {
+	dataDir := t.TempDir()
+	gid := testESPGroupID(3)
+	id, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	rlog, err := roster.OpenJSONL(dataDir, gid)
+	if err != nil {
+		t.Fatalf("OpenJSONL: %v", err)
+	}
+	defer rlog.Close()
+	info := entmoot.NodeInfo{PilotNodeID: 45491, EntmootPubKey: append([]byte(nil), id.PublicKey...)}
+	if err := rlog.Genesis(id, info, 1_000); err != nil {
+		t.Fatalf("Genesis: %v", err)
+	}
+	catalog := localGroupCatalog{
+		dataDir:  dataDir,
+		metadata: rawGroupMetadataStore{raw: json.RawMessage(`{"name":"Agents","description":"Ops room","tags":["infra","ios"]}`)},
+		profiles: fakeMemberProfileReader{ads: map[entmoot.NodeID]wire.MemberProfileAd{
+			45491: {
+				GroupID:  gid,
+				Author:   info,
+				Seq:      1,
+				Hostname: "mars.local",
+				IssuedAt: 1_000,
+				NotAfter: time.Now().Add(time.Hour).UnixMilli(),
+			},
+		}},
+	}
+	group, ok, err := catalog.GetGroup(context.Background(), gid)
+	if err != nil {
+		t.Fatalf("GetGroup: %v", err)
+	}
+	if !ok {
+		t.Fatal("GetGroup ok = false, want true")
+	}
+	if group.Name != "Agents" || group.Description != "Ops room" {
+		t.Fatalf("group display fields = name=%q description=%q", group.Name, group.Description)
+	}
+	if len(group.Tags) != 2 || group.Tags[0] != "infra" || group.Tags[1] != "ios" {
+		t.Fatalf("group.Tags = %#v, want infra/ios", group.Tags)
+	}
+	members, err := catalog.ListMembers(context.Background(), gid)
+	if err != nil {
+		t.Fatalf("ListMembers: %v", err)
+	}
+	if len(members) != 1 || members[0].Hostname != "mars.local" {
+		t.Fatalf("members = %+v, want hostname mars.local", members)
+	}
+}
+
+func TestLocalGroupCatalogIgnoresStaleMemberProfileIdentity(t *testing.T) {
+	dataDir := t.TempDir()
+	gid := testESPGroupID(4)
+	currentID, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate current: %v", err)
+	}
+	oldID, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate old: %v", err)
+	}
+	rlog, err := roster.OpenJSONL(dataDir, gid)
+	if err != nil {
+		t.Fatalf("OpenJSONL: %v", err)
+	}
+	defer rlog.Close()
+	info := entmoot.NodeInfo{PilotNodeID: 45491, EntmootPubKey: append([]byte(nil), currentID.PublicKey...)}
+	if err := rlog.Genesis(currentID, info, 1_000); err != nil {
+		t.Fatalf("Genesis: %v", err)
+	}
+	staleInfo := entmoot.NodeInfo{PilotNodeID: 45491, EntmootPubKey: append([]byte(nil), oldID.PublicKey...)}
+	catalog := localGroupCatalog{
+		dataDir: dataDir,
+		profiles: fakeMemberProfileReader{ads: map[entmoot.NodeID]wire.MemberProfileAd{
+			45491: {
+				GroupID:  gid,
+				Author:   staleInfo,
+				Seq:      1,
+				Hostname: "old-host.local",
+				IssuedAt: 1_000,
+				NotAfter: time.Now().Add(time.Hour).UnixMilli(),
+			},
+		}},
+	}
+
+	members, err := catalog.ListMembers(context.Background(), gid)
+	if err != nil {
+		t.Fatalf("ListMembers: %v", err)
+	}
+	if len(members) != 1 {
+		t.Fatalf("len(members) = %d, want 1", len(members))
+	}
+	if members[0].Hostname != "" {
+		t.Fatalf("members[0].Hostname = %q, want empty for stale profile identity", members[0].Hostname)
+	}
+}
+
 func TestESPCreateGroupUsesDeterministicID(t *testing.T) {
 	req := esphttp.SignRequest{ID: "req-1", SigningPayloadSHA256: "payload-digest"}
 	a, err := groupIDForCreateRequest(req)
@@ -107,6 +208,62 @@ func TestESPCreateGroupUsesDeterministicID(t *testing.T) {
 	}
 	if c == a {
 		t.Fatalf("different request IDs produced same group ID %s", a)
+	}
+}
+
+func TestNormalizeGroupMetadataMergesDisplayFields(t *testing.T) {
+	raw, err := normalizeGroupMetadata(groupCreatePayload{
+		Name:        "Agents",
+		Description: "Ops room",
+		Tags:        []string{" infra ", "ios", "infra", ""},
+		Metadata:    json.RawMessage(`{"color":"green","name":"old"}`),
+	})
+	if err != nil {
+		t.Fatalf("normalizeGroupMetadata: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if got["name"] != "Agents" || got["description"] != "Ops room" || got["color"] != "green" {
+		t.Fatalf("metadata = %#v, want merged display fields", got)
+	}
+	tags, ok := got["tags"].([]any)
+	if !ok || len(tags) != 2 || tags[0] != "infra" || tags[1] != "ios" {
+		t.Fatalf("tags = %#v, want [infra ios]", got["tags"])
+	}
+}
+
+func TestNormalizeGroupMetadataPreservesJSONNumbers(t *testing.T) {
+	raw, err := normalizeGroupMetadata(groupCreatePayload{
+		Name: "Agents",
+		Metadata: json.RawMessage(`{
+			"large": 9007199254740993,
+			"precise": 1.234567890123456789,
+			"nested": {"seq": 12345678901234567890}
+		}`),
+	})
+	if err != nil {
+		t.Fatalf("normalizeGroupMetadata: %v", err)
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var got map[string]any
+	if err := dec.Decode(&got); err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if got["name"] != "Agents" {
+		t.Fatalf("name = %v, want Agents", got["name"])
+	}
+	if got["large"].(json.Number).String() != "9007199254740993" {
+		t.Fatalf("large = %v, want exact integer literal", got["large"])
+	}
+	if got["precise"].(json.Number).String() != "1.234567890123456789" {
+		t.Fatalf("precise = %v, want exact decimal literal", got["precise"])
+	}
+	nested := got["nested"].(map[string]any)
+	if nested["seq"].(json.Number).String() != "12345678901234567890" {
+		t.Fatalf("nested.seq = %v, want exact integer literal", nested["seq"])
 	}
 }
 
@@ -323,6 +480,15 @@ func (s rawGroupMetadataStore) SetGroupMetadata(context.Context, entmoot.GroupID
 
 func (s rawGroupMetadataStore) DeleteGroupMetadata(context.Context, entmoot.GroupID) error {
 	return nil
+}
+
+type fakeMemberProfileReader struct {
+	ads map[entmoot.NodeID]wire.MemberProfileAd
+}
+
+func (r fakeMemberProfileReader) GetMemberProfileAd(_ context.Context, _ entmoot.GroupID, nodeID entmoot.NodeID, _ time.Time) (wire.MemberProfileAd, bool, error) {
+	ad, ok := r.ads[nodeID]
+	return ad, ok, nil
 }
 
 func testESPGroupID(seed byte) entmoot.GroupID {

@@ -118,18 +118,7 @@ func (g *Gossiper) Join(ctx context.Context, invite *entmoot.Invite) error {
 			continue
 		}
 		if err := g.tryRosterSync(ctx, bp.NodeID); err == nil {
-			// v1.2.0: snapshot the bootstrap peer's current
-			// transport-ad table. This populates Pilot's peerTCP for
-			// every group member (not just our bootstrap peer) so
-			// TCP fallback is available for the very first dial of
-			// any peer post-Join, not just after the next
-			// anti-entropy cycle. Failures are non-fatal — the
-			// ongoing gossip path will catch up.
-			if err := g.pullTransportSnapshot(ctx, bp.NodeID); err != nil {
-				g.logger.Debug("gossip: transport snapshot",
-					slog.Uint64("peer", uint64(bp.NodeID)),
-					slog.String("err", err.Error()))
-			}
+			g.pullJoinSnapshots(ctx, bp.NodeID)
 			return nil
 		} else {
 			g.logger.Warn("gossip: bootstrap peer failed",
@@ -155,11 +144,7 @@ func (g *Gossiper) Join(ctx context.Context, invite *entmoot.Invite) error {
 				continue
 			}
 			if err := g.tryRosterSync(ctx, peer); err == nil {
-				if err := g.pullTransportSnapshot(ctx, peer); err != nil {
-					g.logger.Debug("gossip: transport snapshot",
-						slog.Uint64("peer", uint64(peer)),
-						slog.String("err", err.Error()))
-				}
+				g.pullJoinSnapshots(ctx, peer)
 				return nil
 			} else {
 				g.logger.Warn("gossip: trusted-intersect peer failed",
@@ -172,11 +157,7 @@ func (g *Gossiper) Join(ctx context.Context, invite *entmoot.Invite) error {
 	// Strategy 3: founder fallback. Skip if the founder is us.
 	if invite.Founder.PilotNodeID != 0 && invite.Founder.PilotNodeID != g.cfg.LocalNode {
 		if err := g.tryRosterSync(ctx, invite.Founder.PilotNodeID); err == nil {
-			if err := g.pullTransportSnapshot(ctx, invite.Founder.PilotNodeID); err != nil {
-				g.logger.Debug("gossip: transport snapshot",
-					slog.Uint64("peer", uint64(invite.Founder.PilotNodeID)),
-					slog.String("err", err.Error()))
-			}
+			g.pullJoinSnapshots(ctx, invite.Founder.PilotNodeID)
 			return nil
 		} else {
 			g.logger.Warn("gossip: founder fallback failed",
@@ -186,6 +167,22 @@ func (g *Gossiper) Join(ctx context.Context, invite *entmoot.Invite) error {
 	}
 
 	return ErrJoinFailed
+}
+
+func (g *Gossiper) pullJoinSnapshots(ctx context.Context, peer entmoot.NodeID) {
+	// v1.2.0: snapshot the bootstrap peer's current transport-ad table.
+	// This populates Pilot's peerTCP for every group member, not just
+	// the bootstrap peer. Failures are non-fatal; ongoing gossip catches up.
+	if err := g.pullTransportSnapshot(ctx, peer); err != nil {
+		g.logger.Debug("gossip: transport snapshot",
+			slog.Uint64("peer", uint64(peer)),
+			slog.String("err", err.Error()))
+	}
+	if err := g.pullMemberProfileSnapshot(ctx, peer); err != nil {
+		g.logger.Debug("gossip: member profile snapshot",
+			slog.Uint64("peer", uint64(peer)),
+			slog.String("err", err.Error()))
+	}
 }
 
 // tryRosterSync dials peer, sends RosterReq, reads RosterResp, and applies
@@ -297,6 +294,43 @@ func (g *Gossiper) pullTransportSnapshot(ctx context.Context, peer entmoot.NodeI
 	for i := range resp.Ads {
 		ad := &resp.Ads[i]
 		g.onTransportAd(ctx, peer, ad)
+	}
+	return nil
+}
+
+// pullMemberProfileSnapshot fetches the current unexpired MemberProfileAd table
+// from peer and feeds each entry through the shared profile ingest path so
+// validation and LWW replacement stay centralized. Snapshot entries bypass the
+// live-gossip topic bucket: the snapshot response is already one bounded
+// request/response interaction, and charging every member would truncate
+// larger groups at the default profile-topic burst.
+func (g *Gossiper) pullMemberProfileSnapshot(ctx context.Context, peer entmoot.NodeID) error {
+	if g.cfg.MemberProfileStore == nil {
+		return nil
+	}
+	conn, err := g.cfg.Transport.Dial(ctx, peer)
+	if err != nil {
+		return fmt.Errorf("dial: %w", err)
+	}
+	defer conn.Close()
+	req := &wire.MemberProfileSnapshotReq{GroupID: g.cfg.GroupID}
+	if err := wire.EncodeAndWrite(conn, req); err != nil {
+		return fmt.Errorf("write member_profile_snapshot_req: %w", err)
+	}
+	_, payload, err := wire.ReadAndDecode(conn)
+	if err != nil {
+		return fmt.Errorf("read member_profile_snapshot_resp: %w", err)
+	}
+	resp, ok := payload.(*wire.MemberProfileSnapshotResp)
+	if !ok {
+		return fmt.Errorf("member profile snapshot: unexpected response type %T", payload)
+	}
+	if resp.GroupID != g.cfg.GroupID {
+		return fmt.Errorf("member profile snapshot: group_id mismatch")
+	}
+	for i := range resp.Profiles {
+		ad := &resp.Profiles[i]
+		g.ingestMemberProfileAd(ctx, peer, ad, false)
 	}
 	return nil
 }

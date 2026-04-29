@@ -625,20 +625,27 @@ require the requested `client_id` to be listed for that device.
 - `GET /v1/groups`
   - Lists locally joined groups. Device auth filters the result to groups
     authorized in the device registry.
+  - Each group may include ESP-local display fields: `name`, `description`,
+    `tags`, plus the raw `metadata` object for forward-compatible app data.
 - `POST /v1/groups`
   - Creates a `group_create` sign request. When completed with a valid
     signature and `esp serve` is connected to a running `join` daemon, the ESP
     creates a local group, activates it through the daemon, and stores optional
-    ESP-local display metadata.
+    ESP-local display metadata. Top-level `name`, `description`, and `tags`
+    are folded into the metadata object.
   - Supports `Idempotency-Key`.
 - `GET /v1/groups/{group_id}`
-  - Returns local group metadata, member count, and roster head.
+  - Returns local group metadata, app-facing `name`/`description`/`tags`,
+    member count, and roster head.
 - `PATCH /v1/groups/{group_id}`
   - Creates a `group_update` sign request. Completion stores ESP-local
     metadata for app display; it does not mutate Entmoot's roster protocol.
   - Supports `Idempotency-Key`.
 - `GET /v1/groups/{group_id}/members`
-  - Lists current roster members with their Entmoot public keys.
+  - Lists current roster members with their Entmoot public keys and, when the
+    member has published one, the latest signed Pilot hostname.
+  - Hostnames are learned through signed member-profile gossip and bootstrap
+    snapshots; they are display hints, not roster identity.
 - `POST /v1/groups/{group_id}/invites`
   - Creates an `invite_create` sign request. Completion returns a signed
     invite produced by the always-on Entmoot peer after the phone/device

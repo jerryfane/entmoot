@@ -184,6 +184,7 @@ func runESPServe(gf *globalFlags, cfg espServeConfig) int {
 		return exitInvalidArgument
 	}
 	metadataStore, _ := resources.espState.(esphttp.GroupMetadataStore)
+	profileStore, _ := resources.store.(*store.SQLite)
 	var deviceGroups deviceGroupAuthorizer
 	if devices != nil {
 		deviceGroups = &fileBackedDeviceGroupAuthorizer{path: deviceRegistryPath, registry: devices}
@@ -205,7 +206,7 @@ func runESPServe(gf *globalFlags, cfg espServeConfig) int {
 		},
 		Notifier:    notifier,
 		State:       resources.espState,
-		Groups:      localGroupCatalog{dataDir: gf.data, metadata: metadataStore},
+		Groups:      localGroupCatalog{dataDir: gf.data, metadata: metadataStore, profiles: profileStore},
 		GroupExists: espGroupExists(gf.data),
 		Logger:      slog.Default(),
 	})

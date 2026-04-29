@@ -391,6 +391,70 @@ func TestRoundTripTransportAd(t *testing.T) {
 	}
 }
 
+func TestRoundTripMemberProfileAd(t *testing.T) {
+	pub, priv := newKey(t)
+	msg := &MemberProfileAd{
+		GroupID: mustGroupID(0x98),
+		Author: entmoot.NodeInfo{
+			PilotNodeID:   0xB1B3,
+			EntmootPubKey: pub,
+		},
+		Seq:      7,
+		Hostname: "mars.local",
+		IssuedAt: 1_700_000_010_000,
+		NotAfter: 1_700_100_010_000,
+	}
+	msg.Signature = ed25519.Sign(priv, []byte("member-profile-ad-sig-input"))
+
+	got := roundTrip(t, msg).(*MemberProfileAd)
+	if got.Hostname != msg.Hostname {
+		t.Fatalf("Hostname = %q, want %q", got.Hostname, msg.Hostname)
+	}
+	if got.Seq != msg.Seq {
+		t.Fatalf("Seq = %d, want %d", got.Seq, msg.Seq)
+	}
+	if !bytes.Equal(got.Signature, msg.Signature) {
+		t.Fatalf("Signature bytes differ after round-trip")
+	}
+}
+
+func TestRoundTripMemberProfileSnapshotReq(t *testing.T) {
+	roundTrip(t, &MemberProfileSnapshotReq{GroupID: mustGroupID(0x9C)})
+}
+
+func TestRoundTripMemberProfileSnapshotResp(t *testing.T) {
+	pub, priv := newKey(t)
+	mkProfile := func(seq uint64, hostname string) MemberProfileAd {
+		ad := MemberProfileAd{
+			GroupID: mustGroupID(0x9D),
+			Author: entmoot.NodeInfo{
+				PilotNodeID:   entmoot.NodeID(seq),
+				EntmootPubKey: pub,
+			},
+			Seq:      seq,
+			Hostname: hostname,
+			IssuedAt: 1_700_000_001_000 + int64(seq),
+			NotAfter: 1_700_000_901_000 + int64(seq),
+		}
+		ad.Signature = ed25519.Sign(priv, []byte("profile-ad-"+hostname))
+		return ad
+	}
+
+	roundTrip(t, &MemberProfileSnapshotResp{GroupID: mustGroupID(0x9D)})
+	roundTrip(t, &MemberProfileSnapshotResp{
+		GroupID:  mustGroupID(0x9D),
+		Profiles: []MemberProfileAd{mkProfile(1, "mars.local")},
+	})
+	roundTrip(t, &MemberProfileSnapshotResp{
+		GroupID: mustGroupID(0x9D),
+		Profiles: []MemberProfileAd{
+			mkProfile(1, "mars.local"),
+			mkProfile(2, "vps.local"),
+			mkProfile(3, "phobos.local"),
+		},
+	})
+}
+
 // TestRoundTripTransportSnapshotReq covers the trivial request payload.
 func TestRoundTripTransportSnapshotReq(t *testing.T) {
 	roundTrip(t, &TransportSnapshotReq{GroupID: mustGroupID(0x9A)})

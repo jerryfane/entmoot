@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Pilot hostname-aware member profiles.** Entmoot now signs and gossips each
+  node's local Pilot hostname as group-scoped member profile metadata, and ESP
+  member APIs expose the latest live hostname without adding registry lookups.
+  New joiners also pull a signed member-profile snapshot during bootstrap so
+  existing hostnames appear promptly instead of waiting for the refresh cycle.
+- **ESP group display fields.** Group creation and metadata updates can carry
+  app-facing `description` and `tags`; group list/get responses project those
+  fields alongside the existing metadata object.
+
 ## [1.5.25] - 2026-04-29
 
 ### Fixed

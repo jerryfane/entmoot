@@ -80,6 +80,17 @@ const (
 	// peer alternates Reconcile frames, driven by pkg/entmoot/reconcile's
 	// Session. Added in v1.2.1.
 	MsgReconcile MsgType = 0x11
+	// MsgMemberProfileAd is a signed display-profile advertisement for a
+	// roster member. It carries mutable, non-authoritative app-facing
+	// metadata such as the node's Pilot hostname.
+	MsgMemberProfileAd MsgType = 0x12
+	// MsgMemberProfileSnapshotReq asks a peer for its current view of every
+	// group member's MemberProfileAd. Used by Join-time newcomers to
+	// populate app-facing display metadata promptly.
+	MsgMemberProfileSnapshotReq MsgType = 0x13
+	// MsgMemberProfileSnapshotResp carries every unexpired MemberProfileAd
+	// the responder holds for the group.
+	MsgMemberProfileSnapshotResp MsgType = 0x14
 )
 
 // String returns the human-readable wire name for t, suitable for logs. It
@@ -120,6 +131,12 @@ func (t MsgType) String() string {
 		return "transport_snapshot_resp"
 	case MsgReconcile:
 		return "reconcile"
+	case MsgMemberProfileAd:
+		return "member_profile_ad"
+	case MsgMemberProfileSnapshotReq:
+		return "member_profile_snapshot_req"
+	case MsgMemberProfileSnapshotResp:
+		return "member_profile_snapshot_resp"
 	default:
 		return fmt.Sprintf("unknown(0x%02x)", uint8(t))
 	}
@@ -361,6 +378,21 @@ type TransportAd struct {
 	Signature []byte `json:"signature,omitempty"`
 }
 
+// MemberProfileAd is a signed advertisement of mutable display metadata for a
+// roster member. The Author remains the authority for verification; Hostname
+// is display-only and typically mirrors the node's local Pilot hostname.
+type MemberProfileAd struct {
+	GroupID entmoot.GroupID  `json:"group_id"`
+	Author  entmoot.NodeInfo `json:"author"`
+	Seq     uint64           `json:"seq"`
+
+	Hostname string `json:"hostname,omitempty"`
+
+	IssuedAt  int64  `json:"issued_at"`
+	NotAfter  int64  `json:"not_after"`
+	Signature []byte `json:"signature,omitempty"`
+}
+
 // TransportSnapshotReq asks a peer for its current view of every group
 // member's transport advertisement. Used by Join-time newcomers to
 // populate Pilot's peerTCP map before anti-entropy reconcile begins.
@@ -378,6 +410,23 @@ type TransportSnapshotResp struct {
 	// Ads is the responder's current set of unexpired TransportAds for
 	// GroupID, ordered by Author.PilotNodeID for determinism.
 	Ads []TransportAd `json:"ads"`
+}
+
+// MemberProfileSnapshotReq asks a peer for its current view of every group
+// member's display profile advertisement.
+type MemberProfileSnapshotReq struct {
+	// GroupID identifies the target group.
+	GroupID entmoot.GroupID `json:"group_id"`
+}
+
+// MemberProfileSnapshotResp carries every unexpired MemberProfileAd the
+// responder holds for the group, ordered by Author.PilotNodeID for
+// determinism.
+type MemberProfileSnapshotResp struct {
+	// GroupID identifies the target group.
+	GroupID entmoot.GroupID `json:"group_id"`
+	// Profiles is the responder's current set of unexpired profile ads.
+	Profiles []MemberProfileAd `json:"profiles"`
 }
 
 // Reconcile carries one round of the Range-Based Set Reconciliation

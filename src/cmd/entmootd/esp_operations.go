@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"entmoot/pkg/entmoot"
@@ -33,8 +34,10 @@ type espOperationExecutor struct {
 }
 
 type groupCreatePayload struct {
-	Name     string          `json:"name,omitempty"`
-	Metadata json.RawMessage `json:"metadata,omitempty"`
+	Name        string          `json:"name,omitempty"`
+	Description string          `json:"description,omitempty"`
+	Tags        []string        `json:"tags,omitempty"`
+	Metadata    json.RawMessage `json:"metadata,omitempty"`
 }
 
 type inviteCreatePayload struct {
@@ -410,20 +413,60 @@ func signInvite(identity *keystore.Identity, invite *entmoot.Invite) error {
 }
 
 func normalizeGroupMetadata(payload groupCreatePayload) (json.RawMessage, error) {
+	meta := make(map[string]any)
 	if len(payload.Metadata) > 0 && json.Valid(payload.Metadata) {
-		return esphttp.NormalizeGroupMetadata(payload.Metadata)
-	}
-	if len(payload.Metadata) > 0 {
+		var err error
+		meta, err = decodeGroupMetadataObject(payload.Metadata)
+		if err != nil {
+			return nil, fmt.Errorf("esphttp: group metadata must be a JSON object")
+		}
+	} else if len(payload.Metadata) > 0 {
 		return nil, fmt.Errorf("esphttp: group metadata must be a JSON object")
 	}
-	if payload.Name == "" {
-		return esphttp.NormalizeGroupMetadata(nil)
+	if payload.Name != "" {
+		meta["name"] = payload.Name
 	}
-	data, err := json.Marshal(map[string]string{"name": payload.Name})
+	if payload.Description != "" {
+		meta["description"] = payload.Description
+	}
+	if len(payload.Tags) > 0 {
+		meta["tags"] = normalizeGroupTags(payload.Tags)
+	}
+	data, err := json.Marshal(meta)
 	if err != nil {
 		return nil, err
 	}
 	return esphttp.NormalizeGroupMetadata(data)
+}
+
+func decodeGroupMetadataObject(metadata json.RawMessage) (map[string]any, error) {
+	dec := json.NewDecoder(bytes.NewReader(metadata))
+	dec.UseNumber()
+	var meta map[string]any
+	if err := dec.Decode(&meta); err != nil {
+		return nil, err
+	}
+	if meta == nil {
+		return nil, fmt.Errorf("non-object metadata")
+	}
+	return meta, nil
+}
+
+func normalizeGroupTags(tags []string) []string {
+	out := make([]string, 0, len(tags))
+	seen := make(map[string]struct{}, len(tags))
+	for _, tag := range tags {
+		tag = strings.TrimSpace(tag)
+		if tag == "" {
+			continue
+		}
+		if _, ok := seen[tag]; ok {
+			continue
+		}
+		seen[tag] = struct{}{}
+		out = append(out, tag)
+	}
+	return out
 }
 
 func groupIDForCreateRequest(req esphttp.SignRequest) (entmoot.GroupID, error) {

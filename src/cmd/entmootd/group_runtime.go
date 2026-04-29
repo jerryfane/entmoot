@@ -31,6 +31,7 @@ type groupRuntimeConfig struct {
 	Notify           *notifyingStore
 	Transport        gossip.Transport
 	LocalEndpoints   func() []entmoot.NodeEndpoint
+	LocalHostname    func() (string, bool)
 	EndpointsChanged <-chan struct{}
 	HideIP           bool
 	TraceReconcile   bool
@@ -44,6 +45,7 @@ type groupRuntime struct {
 	store          *store.SQLite
 	notify         *notifyingStore
 	localEndpoints func() []entmoot.NodeEndpoint
+	localHostname  func() (string, bool)
 	endpointFanout *endpointChangeFanout
 	hideIP         bool
 	traceReconcile bool
@@ -178,6 +180,7 @@ func newGroupRuntime(cfg groupRuntimeConfig) (*groupRuntime, error) {
 		store:          cfg.Store,
 		notify:         cfg.Notify,
 		localEndpoints: cfg.LocalEndpoints,
+		localHostname:  cfg.LocalHostname,
 		endpointFanout: endpointFanout,
 		hideIP:         cfg.HideIP,
 		traceReconcile: cfg.TraceReconcile,
@@ -251,19 +254,21 @@ func (r *groupRuntime) AddInvite(ctx context.Context, invite entmoot.Invite) (*g
 		return nil, false, fmt.Errorf("open roster: %w", err)
 	}
 	g, err := gossip.New(gossip.Config{
-		LocalNode:        r.nodeID,
-		Identity:         r.identity,
-		Roster:           rlog,
-		Store:            r.notify,
-		Transport:        groupTransport,
-		GroupID:          invite.GroupID,
-		Logger:           r.logger,
-		TransportAdStore: r.store,
-		RateLimiter:      ratelimit.New(ratelimit.DefaultLimits(), nil),
-		LocalEndpoints:   r.localEndpoints,
-		EndpointsChanged: endpointsChanged,
-		HideIP:           r.hideIP,
-		TraceReconcile:   r.traceReconcile,
+		LocalNode:          r.nodeID,
+		Identity:           r.identity,
+		Roster:             rlog,
+		Store:              r.notify,
+		Transport:          groupTransport,
+		GroupID:            invite.GroupID,
+		Logger:             r.logger,
+		TransportAdStore:   r.store,
+		MemberProfileStore: r.store,
+		RateLimiter:        ratelimit.New(ratelimit.DefaultLimits(), nil),
+		LocalEndpoints:     r.localEndpoints,
+		LocalHostname:      r.localHostname,
+		EndpointsChanged:   endpointsChanged,
+		HideIP:             r.hideIP,
+		TraceReconcile:     r.traceReconcile,
 	})
 	if err != nil {
 		_ = rlog.Close()
@@ -575,9 +580,15 @@ func (m *groupMuxTransport) groupForPayload(payload any) (entmoot.GroupID, bool)
 		return v.GroupID, true
 	case *wire.TransportAd:
 		return v.GroupID, true
+	case *wire.MemberProfileAd:
+		return v.GroupID, true
 	case *wire.TransportSnapshotReq:
 		return v.GroupID, true
 	case *wire.TransportSnapshotResp:
+		return v.GroupID, true
+	case *wire.MemberProfileSnapshotReq:
+		return v.GroupID, true
+	case *wire.MemberProfileSnapshotResp:
 		return v.GroupID, true
 	case *wire.Reconcile:
 		return v.GroupID, true

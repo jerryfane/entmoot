@@ -22,11 +22,13 @@ import (
 
 // GroupSummary is the mobile/API projection for one locally served group.
 type GroupSummary struct {
-	GroupID    entmoot.GroupID        `json:"group_id"`
-	Name       string                 `json:"name,omitempty"`
-	Members    int                    `json:"members,omitempty"`
-	RosterHead entmoot.RosterEntryID  `json:"roster_head,omitempty"`
-	Metadata   map[string]interface{} `json:"metadata,omitempty"`
+	GroupID     entmoot.GroupID        `json:"group_id"`
+	Name        string                 `json:"name,omitempty"`
+	Description string                 `json:"description,omitempty"`
+	Tags        []string               `json:"tags,omitempty"`
+	Members     int                    `json:"members,omitempty"`
+	RosterHead  entmoot.RosterEntryID  `json:"roster_head,omitempty"`
+	Metadata    map[string]interface{} `json:"metadata,omitempty"`
 }
 
 // MemberSummary is the mobile/API projection for one group member.
@@ -34,6 +36,7 @@ type MemberSummary struct {
 	NodeID        entmoot.NodeID `json:"node_id"`
 	EntmootPubKey string         `json:"entmoot_pubkey"`
 	Founder       bool           `json:"founder,omitempty"`
+	Hostname      string         `json:"hostname,omitempty"`
 }
 
 // GroupCatalog reads local group/roster state for mobile API requests.
