@@ -105,8 +105,8 @@ func TestErrorRouting_FIFOAcrossOpcodes(t *testing.T) {
 	select {
 	case err := <-bindResult:
 		if err == nil {
-			t.Fatalf("Bind succeeded; want error (the daemon's "+
-				"Error frame was the FIRST reply and Bind was the "+
+			t.Fatalf("Bind succeeded; want error (the daemon's " +
+				"Error frame was the FIRST reply and Bind was the " +
 				"FIRST issuer — FIFO routing must hand the error to Bind)")
 		}
 		var ipcErr *IPCError
@@ -118,7 +118,7 @@ func TestErrorRouting_FIFOAcrossOpcodes(t *testing.T) {
 				ipcErr.Message)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatalf("Bind never returned; pre-fix it could be wedged "+
+		t.Fatalf("Bind never returned; pre-fix it could be wedged " +
 			"if deliverError sent the IPCError to the Info waiter instead")
 	}
 

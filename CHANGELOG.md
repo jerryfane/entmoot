@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Pilot transport now uses raw Pilot streams.** Entmoot no longer keeps a
+  long-lived yamux session cache above Pilot; each gossip/reconcile interaction
+  opens one Pilot stream and closes it when done. This removes stale `conn_id`
+  reuse failure modes and requires upgrading all peers together.
+
+### Fixed
+
+- **Stale Pilot connection invalidation.** A daemon `CloseOK(conn_id)` now
+  closes the local IPC connection state so later writes fail retryably instead
+  of silently sending on a dead Pilot stream.
+- **Pilot IPC write deadline handling.** Raw Pilot stream writes now honor
+  in-flight write deadline updates and close the IPC driver after timed-out
+  length-prefixed writes to avoid desynchronizing the shared daemon socket.
+
 ## [1.5.21] - 2026-04-29
 
 ### Added

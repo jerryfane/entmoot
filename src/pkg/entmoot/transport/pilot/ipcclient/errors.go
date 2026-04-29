@@ -32,7 +32,7 @@ var ErrSubscribeUnsupported = errors.New("ipcclient: subscribe: pilot daemon doe
 
 var (
 	// ErrConnectionNotFound identifies daemon errors for a stream id that no
-	// longer exists. It is retryable by dropping the cached yamux session.
+	// longer exists. It is retryable by opening a fresh Pilot stream.
 	ErrConnectionNotFound = errors.New("ipcclient: pilot connection not found")
 
 	// ErrConnectionNotEstablished identifies writes issued before Pilot has
@@ -40,7 +40,7 @@ var (
 	ErrConnectionNotEstablished = errors.New("ipcclient: pilot connection not established")
 
 	// ErrConnectionClosing identifies writes racing a stream teardown. It is
-	// retryable by dropping the cached yamux session.
+	// retryable by opening a fresh Pilot stream.
 	ErrConnectionClosing = errors.New("ipcclient: pilot connection closing")
 )
 

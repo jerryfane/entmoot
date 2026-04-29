@@ -6,6 +6,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"net"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -211,6 +213,210 @@ func TestDriverDialAddrAndWrite(t *testing.T) {
 	}
 }
 
+func TestConnSetDeadlineAffectsWrites(t *testing.T) {
+	t.Parallel()
+	drv, peer, cleanup := newPipeWriteDeadlineTestDriver(t)
+	defer cleanup()
+
+	c := newConn(drv, 1, SocketAddr{}, SocketAddr{})
+	if err := c.SetDeadline(time.Now().Add(50 * time.Millisecond)); err != nil {
+		t.Fatalf("SetDeadline: %v", err)
+	}
+
+	start := time.Now()
+	_, err := c.Write([]byte("blocked"))
+	if !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("Write err = %v, want deadline exceeded", err)
+	}
+	if elapsed := time.Since(start); elapsed < 20*time.Millisecond {
+		t.Fatalf("Write returned before the deadline could block: %v", elapsed)
+	}
+
+	_ = peer.Close()
+}
+
+func TestConnSetWriteDeadlineUnblocksBlockedWrite(t *testing.T) {
+	t.Parallel()
+	drv, peer, cleanup := newPipeWriteDeadlineTestDriver(t)
+	defer cleanup()
+
+	c := newConn(drv, 1, SocketAddr{}, SocketAddr{})
+	if err := c.SetWriteDeadline(time.Now().Add(50 * time.Millisecond)); err != nil {
+		t.Fatalf("SetWriteDeadline: %v", err)
+	}
+
+	start := time.Now()
+	_, err := c.Write([]byte("blocked"))
+	if !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("Write err = %v, want deadline exceeded", err)
+	}
+	if elapsed := time.Since(start); elapsed < 20*time.Millisecond {
+		t.Fatalf("Write returned before the deadline could block: %v", elapsed)
+	}
+
+	_ = peer.Close()
+}
+
+func TestConnSetWriteDeadlineFromAnotherGoroutineUnblocksInFlightWrite(t *testing.T) {
+	t.Parallel()
+	drv, _, cleanup := newPipeWriteDeadlineTestDriver(t)
+	defer cleanup()
+
+	c := newConn(drv, 1, SocketAddr{}, SocketAddr{})
+	writeDone := startConnWrite(t, c, []byte("blocked"))
+	requireWriteStillBlocked(t, writeDone, 50*time.Millisecond)
+
+	setDone := make(chan error, 1)
+	go func() {
+		setDone <- c.SetWriteDeadline(time.Now())
+	}()
+	requireNoAsyncErr(t, "SetWriteDeadline", setDone)
+	requireDeadlineWriteAndClosedDriver(t, drv, writeDone)
+}
+
+func TestConnSetDeadlineFromAnotherGoroutineUnblocksInFlightWrite(t *testing.T) {
+	t.Parallel()
+	drv, _, cleanup := newPipeWriteDeadlineTestDriver(t)
+	defer cleanup()
+
+	c := newConn(drv, 1, SocketAddr{}, SocketAddr{})
+	writeDone := startConnWrite(t, c, []byte("blocked"))
+	requireWriteStillBlocked(t, writeDone, 50*time.Millisecond)
+
+	setDone := make(chan error, 1)
+	go func() {
+		setDone <- c.SetDeadline(time.Now())
+	}()
+	requireNoAsyncErr(t, "SetDeadline", setDone)
+	requireDeadlineWriteAndClosedDriver(t, drv, writeDone)
+}
+
+func TestConnSetWriteDeadlineOnDifferentConnDoesNotUnblockInFlightWrite(t *testing.T) {
+	t.Parallel()
+	drv, _, cleanup := newPipeWriteDeadlineTestDriver(t)
+	defer cleanup()
+
+	active := newConn(drv, 1, SocketAddr{}, SocketAddr{})
+	other := newConn(drv, 2, SocketAddr{}, SocketAddr{})
+	writeDone := startConnWrite(t, active, []byte("blocked"))
+	requireWriteStillBlocked(t, writeDone, 50*time.Millisecond)
+
+	setDone := make(chan error, 1)
+	go func() {
+		setDone <- other.SetWriteDeadline(time.Now())
+	}()
+	requireNoAsyncErr(t, "SetWriteDeadline(other)", setDone)
+	requireWriteStillBlocked(t, writeDone, 100*time.Millisecond)
+
+	select {
+	case <-drv.closedCh:
+		t.Fatal("different conn's write deadline closed the driver")
+	default:
+	}
+
+	setActiveDone := make(chan error, 1)
+	go func() {
+		setActiveDone <- active.SetWriteDeadline(time.Now())
+	}()
+	requireNoAsyncErr(t, "SetWriteDeadline(active)", setActiveDone)
+	requireDeadlineWriteAndClosedDriver(t, drv, writeDone)
+}
+
+func TestConnWriteDeadlineClosesDriverAfterTimedOutWrite(t *testing.T) {
+	t.Parallel()
+	drv, _, cleanup := newPipeWriteDeadlineTestDriver(t)
+	defer cleanup()
+
+	c := newConn(drv, 1, SocketAddr{}, SocketAddr{})
+	if err := c.SetWriteDeadline(time.Now().Add(30 * time.Millisecond)); err != nil {
+		t.Fatalf("SetWriteDeadline: %v", err)
+	}
+	if _, err := c.Write([]byte("blocked")); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("timed Write err = %v, want deadline exceeded", err)
+	}
+
+	select {
+	case <-drv.closedCh:
+	case <-time.After(time.Second):
+		t.Fatal("driver did not close after timed-out write")
+	}
+
+	if err := drv.writeFrame([]byte{byte(opInfo)}); !errors.Is(err, ErrClosed) {
+		t.Fatalf("driver command write after timed conn write = %v, want ErrClosed", err)
+	}
+}
+
+func TestConnWriteDeadlineClearedAfterSuccessfulWrite(t *testing.T) {
+	t.Parallel()
+	drv, peer, cleanup := newPipeWriteDeadlineTestDriver(t)
+	defer cleanup()
+
+	c := newConn(drv, 1, SocketAddr{}, SocketAddr{})
+	if err := c.SetWriteDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("SetWriteDeadline: %v", err)
+	}
+
+	readSendDone := make(chan error, 1)
+	go func() {
+		frame, err := readFrame(peer)
+		if err != nil {
+			readSendDone <- err
+			return
+		}
+		if Opcode(frame[0]) != opSend {
+			readSendDone <- errors.New("unexpected send frame")
+			return
+		}
+		if gotID := binary.BigEndian.Uint32(frame[1:5]); gotID != 1 {
+			readSendDone <- errors.New("unexpected send conn id")
+			return
+		}
+		if got := string(frame[5:]); got != "ok" {
+			readSendDone <- errors.New("unexpected send payload")
+			return
+		}
+		readSendDone <- nil
+	}()
+
+	if n, err := c.Write([]byte("ok")); err != nil || n != 2 {
+		t.Fatalf("Write = %d, %v; want 2, nil", n, err)
+	}
+	select {
+	case err := <-readSendDone:
+		if err != nil {
+			t.Fatalf("read send frame: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("server did not receive send frame")
+	}
+
+	readCommandDone := make(chan error, 1)
+	go func() {
+		frame, err := readFrame(peer)
+		if err != nil {
+			readCommandDone <- err
+			return
+		}
+		if len(frame) != 1 || Opcode(frame[0]) != opInfo {
+			readCommandDone <- errors.New("unexpected command frame")
+			return
+		}
+		readCommandDone <- nil
+	}()
+
+	if err := drv.writeFrame([]byte{byte(opInfo)}); err != nil {
+		t.Fatalf("driver command write after successful conn write: %v", err)
+	}
+	select {
+	case err := <-readCommandDone:
+		if err != nil {
+			t.Fatalf("read command frame: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("server did not receive command frame")
+	}
+}
+
 // TestDriverSetPeerEndpointsTLVShape checks the TLV payload the client
 // emits — a wire-format regression here would silently desync the
 // daemon's endpoint map.
@@ -272,6 +478,80 @@ func TestDriverSetPeerEndpointsTLVShape(t *testing.T) {
 	}
 	if err := drv.SetPeerEndpoints(context.Background(), 7, eps); err != nil {
 		t.Fatalf("SetPeerEndpoints: %v", err)
+	}
+}
+
+func newPipeWriteDeadlineTestDriver(t *testing.T) (*Driver, net.Conn, func()) {
+	t.Helper()
+	client, peer := net.Pipe()
+	demuxDone := make(chan struct{})
+	close(demuxDone)
+	drv := &Driver{
+		conn:      client,
+		closedCh:  make(chan struct{}),
+		demuxDone: demuxDone,
+	}
+	cleanup := func() {
+		_ = drv.Close()
+		_ = peer.Close()
+	}
+	return drv, peer, cleanup
+}
+
+type connWriteResult struct {
+	n   int
+	err error
+}
+
+func startConnWrite(t *testing.T, c *Conn, p []byte) <-chan connWriteResult {
+	t.Helper()
+	done := make(chan connWriteResult, 1)
+	go func() {
+		n, err := c.Write(p)
+		done <- connWriteResult{n: n, err: err}
+	}()
+	return done
+}
+
+func requireWriteStillBlocked(t *testing.T, done <-chan connWriteResult, d time.Duration) {
+	t.Helper()
+	select {
+	case got := <-done:
+		t.Fatalf("Write returned before deadline update: n=%d err=%v", got.n, got.err)
+	case <-time.After(d):
+	}
+}
+
+func requireNoAsyncErr(t *testing.T, name string, done <-chan error) {
+	t.Helper()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("%s did not return", name)
+	}
+}
+
+func requireDeadlineWriteAndClosedDriver(t *testing.T, drv *Driver, done <-chan connWriteResult) {
+	t.Helper()
+	select {
+	case got := <-done:
+		if got.n != 0 {
+			t.Fatalf("Write n = %d, want 0", got.n)
+		}
+		if !errors.Is(got.err, os.ErrDeadlineExceeded) {
+			t.Fatalf("Write err = %v, want deadline exceeded", got.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Write did not unblock after deadline update")
+	}
+
+	select {
+	case <-drv.closedCh:
+	case <-time.After(time.Second):
+		t.Fatal("driver did not close after timed-out write")
 	}
 }
 
@@ -571,6 +851,97 @@ func TestConnCloseIdempotent(t *testing.T) {
 	if !errors.Is(err, io.EOF) {
 		t.Fatalf("Read after Close = %v, want io.EOF", err)
 	}
+}
+
+func TestConnCloseOKActiveClosesReadAndWrite(t *testing.T) {
+	t.Parallel()
+	drv, srv, cleanup := newTestDriver(t)
+	defer cleanup()
+
+	const connID uint32 = 0x12345678
+	c := newConn(drv, connID, SocketAddr{}, SocketAddr{})
+	drv.registerConn(connID, c)
+
+	readDone := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 1)
+		_, err := c.Read(buf)
+		readDone <- err
+	}()
+
+	srv.writeFrame(closeOKFrame(connID))
+
+	select {
+	case err := <-readDone:
+		if !errors.Is(err, io.EOF) {
+			t.Fatalf("Read err = %v, want io.EOF", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Read did not unblock after CloseOK")
+	}
+
+	if _, err := c.Write([]byte("stale")); !errors.Is(err, ErrClosed) {
+		t.Fatalf("Write err = %v, want ErrClosed", err)
+	}
+}
+
+func TestConnCloseOKOnlyClosesMatchingConn(t *testing.T) {
+	t.Parallel()
+	drv, srv, cleanup := newTestDriver(t)
+	defer cleanup()
+
+	const closedID uint32 = 0xA1
+	const openID uint32 = 0xB2
+	closedConn := newConn(drv, closedID, SocketAddr{}, SocketAddr{})
+	openConn := newConn(drv, openID, SocketAddr{}, SocketAddr{})
+	drv.registerConn(closedID, closedConn)
+	drv.registerConn(openID, openConn)
+
+	readDone := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 1)
+		_, err := closedConn.Read(buf)
+		readDone <- err
+	}()
+
+	srv.writeFrame(closeOKFrame(closedID))
+
+	select {
+	case err := <-readDone:
+		if !errors.Is(err, io.EOF) {
+			t.Fatalf("closed conn Read err = %v, want io.EOF", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("closed conn Read did not unblock after CloseOK")
+	}
+
+	if _, err := closedConn.Write([]byte("stale")); !errors.Is(err, ErrClosed) {
+		t.Fatalf("closed conn Write err = %v, want ErrClosed", err)
+	}
+	if n, err := openConn.Write([]byte("still-open")); err != nil || n != len("still-open") {
+		t.Fatalf("open conn Write = %d, %v; want full write, nil", n, err)
+	}
+
+	frame, err := srv.readFrame()
+	if err != nil {
+		t.Fatalf("server readFrame: %v", err)
+	}
+	if Opcode(frame[0]) != opSend {
+		t.Fatalf("server opcode = %x, want opSend", frame[0])
+	}
+	if gotID := binary.BigEndian.Uint32(frame[1:5]); gotID != openID {
+		t.Fatalf("server Send conn_id = %x, want %x", gotID, openID)
+	}
+	if got := string(frame[5:]); got != "still-open" {
+		t.Fatalf("server Send payload = %q, want still-open", got)
+	}
+}
+
+func closeOKFrame(id uint32) []byte {
+	frame := make([]byte, 5)
+	frame[0] = byte(opCloseOK)
+	binary.BigEndian.PutUint32(frame[1:5], id)
+	return frame
 }
 
 // TestListenerCloseUnblocksAccept covers the symmetric contract on

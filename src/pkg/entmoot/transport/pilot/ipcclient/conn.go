@@ -12,8 +12,8 @@ import (
 
 // Conn is one application-level virtual connection multiplexed on the
 // IPC socket, identified by a 32-bit conn_id assigned by the daemon.
-// Conn implements net.Conn so it drops into callers (yamux, the
-// gossip transport adapter) that expect that interface.
+// Conn implements net.Conn so it drops into callers such as the gossip
+// transport adapter.
 //
 // Reads pull bytes from an internal channel that the Driver's demuxer
 // goroutine fills with the bodies of Recv (0x07) frames for this
@@ -23,11 +23,11 @@ import (
 // subsequent Recv frames the daemon might emit before its own teardown
 // are silently dropped.
 type pilotConn struct {
-	id       uint32
-	local    SocketAddr
-	remote   SocketAddr
-	drv      *Driver
-	network  string // "pilot", the net.Addr network name
+	id      uint32
+	local   SocketAddr
+	remote  SocketAddr
+	drv     *Driver
+	network string // "pilot", the net.Addr network name
 
 	// recvCh receives payloads from Recv frames for this conn_id. The
 	// demuxer owns the send side; Close closes it (exactly once) to
@@ -46,9 +46,10 @@ type pilotConn struct {
 	readMu sync.Mutex
 
 	// stateMu guards closed + deadline fields.
-	stateMu      sync.Mutex
-	closed       bool
-	readDeadline time.Time
+	stateMu       sync.Mutex
+	closed        bool
+	readDeadline  time.Time
+	writeDeadline time.Time
 	// deadlineCh is closed when readDeadline is updated, so a Read
 	// already blocked on the previous deadline can re-evaluate.
 	deadlineCh chan struct{}
@@ -102,6 +103,17 @@ func (c *pilotConn) closeRecv() {
 	c.recvClose.Do(func() {
 		close(c.recvCh)
 	})
+}
+
+// closeLocal marks this conn closed without sending a Close frame to
+// the daemon. It is used when the daemon has already told us the conn
+// is gone, so future writes fail locally instead of emitting stale
+// Send frames.
+func (c *pilotConn) closeLocal() {
+	c.stateMu.Lock()
+	c.closed = true
+	c.stateMu.Unlock()
+	c.closeRecv()
 }
 
 // Read satisfies net.Conn.Read. Returns io.EOF after Close or a
@@ -183,7 +195,7 @@ func (c *pilotConn) Write(p []byte) (int, error) {
 		frame[0] = byte(opSend)
 		binary.BigEndian.PutUint32(frame[1:5], c.id)
 		copy(frame[5:], chunk)
-		if err := c.drv.writeFrame(frame); err != nil {
+		if err := c.drv.writeFrameWithDeadline(c, frame); err != nil {
 			if total > 0 {
 				return total, err
 			}
@@ -211,7 +223,7 @@ func (c *pilotConn) Close() error {
 	// Unregister first so any Recv frame still in flight after the
 	// daemon receives our Close is dropped rather than queued on a
 	// now-unowned channel.
-	c.drv.unregisterConn(c.id)
+	c.drv.unregisterConnForLocalClose(c.id)
 
 	frame := make([]byte, 5)
 	frame[0] = byte(opClose)
@@ -234,12 +246,16 @@ func (c *pilotConn) LocalAddr() net.Addr { return netAddr{sa: c.local, net: c.ne
 // RemoteAddr satisfies net.Conn.RemoteAddr.
 func (c *pilotConn) RemoteAddr() net.Addr { return netAddr{sa: c.remote, net: c.network} }
 
-// SetDeadline sets only the read deadline; writes are issued through
-// the shared IPC socket and cannot honor a per-conn deadline without
-// affecting every other multiplexed conn. This matches Pilot's
-// upstream observable contract.
+// SetDeadline sets both the read and write deadlines.
 func (c *pilotConn) SetDeadline(t time.Time) error {
-	return c.SetReadDeadline(t)
+	c.stateMu.Lock()
+	c.readDeadline = t
+	c.writeDeadline = t
+	prev := c.deadlineCh
+	c.deadlineCh = make(chan struct{})
+	c.stateMu.Unlock()
+	close(prev) // wake any Read blocked on the old deadline ch
+	return c.drv.applyActiveWriteDeadline(c, t)
 }
 
 // SetReadDeadline sets a future deadline for Read. A past-time
@@ -254,8 +270,20 @@ func (c *pilotConn) SetReadDeadline(t time.Time) error {
 	return nil
 }
 
-// SetWriteDeadline is a no-op. See SetDeadline comment.
-func (c *pilotConn) SetWriteDeadline(time.Time) error { return nil }
+// SetWriteDeadline sets a future deadline for Write. A past-time
+// deadline makes the next Write fail with os.ErrDeadlineExceeded.
+func (c *pilotConn) SetWriteDeadline(t time.Time) error {
+	c.stateMu.Lock()
+	c.writeDeadline = t
+	c.stateMu.Unlock()
+	return c.drv.applyActiveWriteDeadline(c, t)
+}
+
+func (c *pilotConn) currentWriteDeadline() time.Time {
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+	return c.writeDeadline
+}
 
 // netAddr is a net.Addr implementation backed by a Pilot SocketAddr.
 type netAddr struct {

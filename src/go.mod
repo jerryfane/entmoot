@@ -4,7 +4,6 @@ go 1.26.2
 
 require (
 	github.com/grandcat/zeroconf v1.0.0
-	github.com/hashicorp/yamux v0.1.2
 	golang.org/x/sync v0.20.0
 	golang.org/x/time v0.15.0
 	modernc.org/sqlite v1.48.0

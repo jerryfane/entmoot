@@ -105,7 +105,7 @@ func run() int {
 	fs.BoolVar(&gf.hideIP, "hide-ip", false,
 		"suppress UDP/TCP endpoint advertisement; publish only TURN relay (v1.4.0; requires pilot-daemon v1.9.0-jf.8+)")
 	fs.BoolVar(&gf.traceGossipTransport, "trace-gossip-transport", false,
-		"emit verbose Pilot/yamux gossip transport lifecycle traces")
+		"emit verbose Pilot gossip transport lifecycle traces")
 	fs.BoolVar(&gf.traceReconcile, "trace-reconcile", false,
 		"emit verbose reconcile lifecycle traces")
 

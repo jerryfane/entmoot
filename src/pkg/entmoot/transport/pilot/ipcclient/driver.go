@@ -34,9 +34,14 @@ type Driver struct {
 	// Without this, concurrent writes would interleave bytes on the
 	// socket and the daemon would desync.
 	writeMu sync.Mutex
+	// activeWriteMu guards activeWriteConn. It is intentionally separate from
+	// writeMu so SetWriteDeadline can update a blocked write in progress
+	// without waiting for that blocked write to release writeMu.
+	activeWriteMu   sync.Mutex
+	activeWriteConn *pilotConn
 
-	// connsMu guards conns, pendingRecv, and pendingClose; it is distinct from
-	// writeMu because the demuxer has to route Recv frames while
+	// connsMu guards conns, pendingRecv, pendingClose, and localClose; it is
+	// distinct from writeMu because the demuxer has to route Recv frames while
 	// Write goroutines are busy emitting Send frames.
 	connsMu sync.Mutex
 	conns   map[uint32]*pilotConn
@@ -54,6 +59,11 @@ type Driver struct {
 	// and closes immediately can leave the caller with a registered conn
 	// whose recv channel never closes.
 	pendingClose map[uint32]struct{}
+	// localClose remembers conn_ids that this process closed locally and
+	// unregistered before the daemon's CloseOK acknowledgement arrived.
+	// Those CloseOK frames must not be treated as pre-registration closes
+	// for a future conn that reuses the same id.
+	localClose map[uint32]struct{}
 
 	// listenersMu guards listeners.
 	listenersMu sync.RWMutex
@@ -147,6 +157,7 @@ func Connect(socketPath string) (*Driver, error) {
 		conns:        make(map[uint32]*pilotConn),
 		pendingRecv:  make(map[uint32][][]byte),
 		pendingClose: make(map[uint32]struct{}),
+		localClose:   make(map[uint32]struct{}),
 		listeners:    make(map[uint16]*Listener),
 		topicSubs:    make(map[string][]*Subscription),
 		closedCh:     make(chan struct{}),
@@ -221,6 +232,9 @@ func (d *Driver) Close() error {
 		for id := range d.pendingClose {
 			delete(d.pendingClose, id)
 		}
+		for id := range d.localClose {
+			delete(d.localClose, id)
+		}
 		d.connsMu.Unlock()
 
 		// Close each listener so any blocked Accept returns ErrClosed.
@@ -247,6 +261,64 @@ func (d *Driver) writeFrame(payload []byte) error {
 	return writeFrame(d.conn, payload)
 }
 
+// writeFrameWithDeadline serializes one Conn.Write frame while applying that
+// Conn's write deadline to the shared socket. Deadline changes on the same Conn
+// are also applied while the write is blocked; changes on other Conns are not.
+func (d *Driver) writeFrameWithDeadline(c *pilotConn, payload []byte) error {
+	select {
+	case <-d.closedCh:
+		return ErrClosed
+	default:
+	}
+	d.writeMu.Lock()
+	defer d.writeMu.Unlock()
+
+	if err := d.beginActiveWriteConn(c); err != nil {
+		return err
+	}
+	err := writeFrame(d.conn, payload)
+	d.endActiveWriteConn(c)
+	if err != nil {
+		// A deadline/error can occur after the kernel accepted only part of
+		// the length-prefixed frame. Once that happens, the shared IPC stream
+		// may be desynchronized, so continuing on the same socket is unsafe.
+		_ = d.Close()
+		return err
+	}
+	clearErr := d.conn.SetWriteDeadline(time.Time{})
+	return clearErr
+}
+
+func (d *Driver) beginActiveWriteConn(c *pilotConn) error {
+	d.activeWriteMu.Lock()
+	defer d.activeWriteMu.Unlock()
+	d.activeWriteConn = c
+	if err := d.conn.SetWriteDeadline(c.currentWriteDeadline()); err != nil {
+		if d.activeWriteConn == c {
+			d.activeWriteConn = nil
+		}
+		return err
+	}
+	return nil
+}
+
+func (d *Driver) endActiveWriteConn(c *pilotConn) {
+	d.activeWriteMu.Lock()
+	if d.activeWriteConn == c {
+		d.activeWriteConn = nil
+	}
+	d.activeWriteMu.Unlock()
+}
+
+func (d *Driver) applyActiveWriteDeadline(c *pilotConn, deadline time.Time) error {
+	d.activeWriteMu.Lock()
+	defer d.activeWriteMu.Unlock()
+	if d.activeWriteConn != c {
+		return nil
+	}
+	return d.conn.SetWriteDeadline(deadline)
+}
+
 // registerConn adds a conn to the routing map so the demuxer delivers
 // its Recv frames. Called by DialAddr (after DialOK) and Listener's
 // accept path. If any Recv frames were buffered while the conn_id was
@@ -267,18 +339,35 @@ func (d *Driver) registerConn(id uint32, c *pilotConn) {
 		c.pushRecv(data)
 	}
 	if closed {
-		c.closeRecv()
+		c.closeLocal()
 	}
 }
 
 // unregisterConn removes a conn from the routing map. Called by
-// Conn.Close; later Recv frames for that conn_id (shouldn't happen
-// but defensively) are dropped by the demuxer.
+// internal paths that abandon a conn without sending Close. Later Recv
+// frames for that conn_id (shouldn't happen but defensively) are dropped
+// by the demuxer.
 func (d *Driver) unregisterConn(id uint32) {
 	d.connsMu.Lock()
 	delete(d.conns, id)
 	delete(d.pendingRecv, id)
 	delete(d.pendingClose, id)
+	d.connsMu.Unlock()
+}
+
+// unregisterConnForLocalClose removes a conn from the routing map after
+// Conn.Close has sent or is about to send Close. The daemon should reply
+// with CloseOK; when that ack arrives, the demuxer consumes it from
+// localClose instead of recording a pending pre-registration close.
+func (d *Driver) unregisterConnForLocalClose(id uint32) {
+	d.connsMu.Lock()
+	delete(d.conns, id)
+	delete(d.pendingRecv, id)
+	delete(d.pendingClose, id)
+	if d.localClose == nil {
+		d.localClose = make(map[uint32]struct{})
+	}
+	d.localClose[id] = struct{}{}
 	d.connsMu.Unlock()
 }
 
@@ -333,17 +422,18 @@ func (d *Driver) demux() {
 			d.connsMu.Lock()
 			c, ok := d.conns[id]
 			if !ok {
-				// Unknown conn_id — may be a conn we just dialed
-				// whose registerConn hasn't run yet, or a conn we
-				// already closed. Buffer the data so a pending
-				// register call will drain it. If nothing ever
-				// registers, the buffer will be freed when the
-				// driver closes (which frees the whole map).
-				// Copy the data since the demuxer reuses the
-				// underlying slice.
-				cp := make([]byte, len(data))
-				copy(cp, data)
-				d.pendingRecv[id] = append(d.pendingRecv[id], cp)
+				if _, local := d.localClose[id]; !local {
+					// Unknown conn_id — may be a conn we just dialed
+					// whose registerConn hasn't run yet. Buffer the data
+					// so a pending register call will drain it. If
+					// nothing ever registers, the buffer will be freed
+					// when the driver closes (which frees the whole map).
+					// Copy the data since the demuxer reuses the
+					// underlying slice.
+					cp := make([]byte, len(data))
+					copy(cp, data)
+					d.pendingRecv[id] = append(d.pendingRecv[id], cp)
+				}
 			}
 			d.connsMu.Unlock()
 			if ok {
@@ -399,12 +489,15 @@ func (d *Driver) demux() {
 				c, ok := d.conns[id]
 				if ok {
 					delete(d.conns, id)
+				} else if _, local := d.localClose[id]; local {
+					delete(d.localClose, id)
+					delete(d.pendingRecv, id)
 				} else {
 					d.pendingClose[id] = struct{}{}
 				}
 				d.connsMu.Unlock()
 				if ok {
-					c.closeRecv()
+					c.closeLocal()
 				}
 			}
 			// Also deliver to any pending command that waits on
