@@ -589,6 +589,14 @@ func (m *groupMuxTransport) Dial(ctx context.Context, peer entmoot.NodeID) (net.
 	return m.base.Dial(ctx, peer)
 }
 
+func (m *groupMuxTransport) DialBudget() time.Duration {
+	provider, ok := m.base.(gossip.DialBudgetProvider)
+	if !ok {
+		return 0
+	}
+	return provider.DialBudget()
+}
+
 func (m *groupMuxTransport) TrustedPeers(ctx context.Context) ([]entmoot.NodeID, error) {
 	return m.base.TrustedPeers(ctx)
 }
@@ -599,6 +607,22 @@ func (m *groupMuxTransport) SetPeerEndpoints(ctx context.Context, peer entmoot.N
 
 func (m *groupMuxTransport) SetOnTunnelUp(cb func(peer entmoot.NodeID)) {
 	_ = cb
+}
+
+func (m *groupMuxTransport) DropPeerSession(peer entmoot.NodeID) bool {
+	dropper, ok := m.base.(gossip.PeerSessionDropper)
+	if !ok {
+		return false
+	}
+	return dropper.DropPeerSession(peer)
+}
+
+func (m *groupMuxTransport) ClassifyStreamError(err error) gossip.StreamErrorClassification {
+	classifier, ok := m.base.(gossip.StreamErrorClassifier)
+	if !ok {
+		return gossip.StreamErrorClassification{}
+	}
+	return classifier.ClassifyStreamError(err)
 }
 
 func (m *groupMuxTransport) Close() error {
@@ -654,6 +678,10 @@ func (t *groupTransport) Dial(ctx context.Context, peer entmoot.NodeID) (net.Con
 	return conn, nil
 }
 
+func (t *groupTransport) DialBudget() time.Duration {
+	return t.parent.DialBudget()
+}
+
 func (t *groupTransport) Accept(ctx context.Context) (net.Conn, entmoot.NodeID, error) {
 	select {
 	case item := <-t.acceptCh:
@@ -673,6 +701,14 @@ func (t *groupTransport) SetPeerEndpoints(ctx context.Context, peer entmoot.Node
 
 func (t *groupTransport) SetOnTunnelUp(cb func(peer entmoot.NodeID)) {
 	t.parent.setGroupCallback(t.groupID, cb)
+}
+
+func (t *groupTransport) DropPeerSession(peer entmoot.NodeID) bool {
+	return t.parent.DropPeerSession(peer)
+}
+
+func (t *groupTransport) ClassifyStreamError(err error) gossip.StreamErrorClassification {
+	return t.parent.ClassifyStreamError(err)
 }
 
 func (t *groupTransport) Close() error {

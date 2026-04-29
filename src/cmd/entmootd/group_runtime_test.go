@@ -167,6 +167,29 @@ func TestGroupTransportOutboundDialFailureDoesNotFireTunnelUp(t *testing.T) {
 	expectNoTunnelUp(t, tunnelB, "groupB")
 }
 
+func TestGroupTransportForwardsOptionalTransportCapabilities(t *testing.T) {
+	base := newRuntimeFakeTransport()
+	base.dialBudget = 47 * time.Second
+	base.dropPeerSession = true
+	base.classification = gossip.StreamErrorClassification{
+		Retryable: true,
+		Timeout:   true,
+	}
+	mux := newGroupMuxTransport(base, nil)
+	group, _ := mux.Group(testRuntimeGroupID(0xB2))
+
+	if got := group.DialBudget(); got != base.dialBudget {
+		t.Fatalf("DialBudget = %v, want %v", got, base.dialBudget)
+	}
+	if !group.DropPeerSession(45981) {
+		t.Fatal("DropPeerSession = false, want true")
+	}
+	got := group.ClassifyStreamError(errors.New("dial timeout"))
+	if got != base.classification {
+		t.Fatalf("ClassifyStreamError = %+v, want %+v", got, base.classification)
+	}
+}
+
 func TestGroupRuntimeConcurrentDuplicateJoinKeepsMuxGroup(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -433,10 +456,13 @@ type runtimeAccept struct {
 }
 
 type runtimeFakeTransport struct {
-	acceptCh chan runtimeAccept
-	closed   chan struct{}
-	dialConn net.Conn
-	dialErr  error
+	acceptCh        chan runtimeAccept
+	closed          chan struct{}
+	dialConn        net.Conn
+	dialErr         error
+	dialBudget      time.Duration
+	dropPeerSession bool
+	classification  gossip.StreamErrorClassification
 }
 
 func newRuntimeFakeTransport() *runtimeFakeTransport {
@@ -476,6 +502,18 @@ func (t *runtimeFakeTransport) SetPeerEndpoints(context.Context, entmoot.NodeID,
 }
 
 func (t *runtimeFakeTransport) SetOnTunnelUp(func(entmoot.NodeID)) {}
+
+func (t *runtimeFakeTransport) DialBudget() time.Duration {
+	return t.dialBudget
+}
+
+func (t *runtimeFakeTransport) DropPeerSession(entmoot.NodeID) bool {
+	return t.dropPeerSession
+}
+
+func (t *runtimeFakeTransport) ClassifyStreamError(error) gossip.StreamErrorClassification {
+	return t.classification
+}
 
 func (t *runtimeFakeTransport) Close() error {
 	select {

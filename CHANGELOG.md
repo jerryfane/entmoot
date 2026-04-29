@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.25] - 2026-04-29
+
+### Fixed
+
+- **Multi-group Pilot transport capability forwarding.** The group-mux
+  transport now forwards Pilot's dial budget, stale-session dropper, and stream
+  error classifier to each group session. This lets the deployed multi-group
+  runtime use the Pilot-aware fanout budget from `v1.5.24` instead of falling
+  back to the old 15 second one-way dial timeout.
+
 ## [1.5.24] - 2026-04-29
 
 ### Changed
