@@ -101,6 +101,27 @@ func TestESPServeConfigRejectsNonLoopbackByDefault(t *testing.T) {
 	}
 }
 
+func TestESPServeConfigBonjourName(t *testing.T) {
+	t.Setenv("ENTMOOT_ESP_TOKEN", "secret")
+	cfg, code, ok := parseESPServeConfig([]string{"-bonjour-name", "Jerry ESP"})
+	if !ok || code != exitOK {
+		t.Fatalf("parseESPServeConfig ok/code = %v/%d, want true/%d", ok, code, exitOK)
+	}
+	if cfg.bonjourName != "Jerry ESP" {
+		t.Fatalf("bonjourName = %q, want Jerry ESP", cfg.bonjourName)
+	}
+	if err := validateESPServeConfig(cfg); err != nil {
+		t.Fatalf("validateESPServeConfig: %v", err)
+	}
+	port, err := espServePort(cfg.addr)
+	if err != nil {
+		t.Fatalf("espServePort: %v", err)
+	}
+	if port != 8087 {
+		t.Fatalf("port = %d, want 8087", port)
+	}
+}
+
 func TestAddrIsLoopback(t *testing.T) {
 	for _, addr := range []string{"127.0.0.1:8087", "[::1]:8087", "localhost:8087"} {
 		if !addrIsLoopback(addr) {

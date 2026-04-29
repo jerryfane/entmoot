@@ -9,8 +9,10 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -306,6 +308,32 @@ func TestHandlerMobileGroupsAndSignRequests(t *testing.T) {
 	}](t, handler, http.MethodGet, "/v1/sign-requests", nil, http.StatusOK)
 	if len(list.SignRequests) != 0 {
 		t.Fatalf("sign request list = %+v, want empty after rejected group_create", list)
+	}
+}
+
+func TestHandlerGroupSubrouteEscapedSlashInGroupID(t *testing.T) {
+	gid := testGroupIDWithSlash()
+	if !strings.Contains(gid.String(), "/") {
+		t.Fatalf("test group id %q does not contain slash", gid.String())
+	}
+	catalog := &recordingCatalog{
+		fakeCatalog: fakeCatalog{
+			members: []MemberSummary{{NodeID: 45491}},
+		},
+	}
+	handler := testMobileHandler(t, gid, nil, catalog, nil)
+
+	members := doJSONRequest[struct {
+		Members []MemberSummary `json:"members"`
+	}](t, handler, http.MethodGet, "/v1/groups/"+url.PathEscape(gid.String())+"/members", nil, http.StatusOK)
+	if len(members.Members) != 1 || members.Members[0].NodeID != 45491 {
+		t.Fatalf("members = %+v, want escaped group member", members)
+	}
+	if catalog.listMembersCalls != 1 {
+		t.Fatalf("ListMembers calls = %d, want 1", catalog.listMembersCalls)
+	}
+	if catalog.listMembersGroup != gid {
+		t.Fatalf("ListMembers group = %s, want %s", catalog.listMembersGroup, gid)
 	}
 }
 
@@ -1096,6 +1124,12 @@ func testGroupID(seed byte) entmoot.GroupID {
 	return gid
 }
 
+func testGroupIDWithSlash() entmoot.GroupID {
+	var gid entmoot.GroupID
+	gid[0] = 0xff
+	return gid
+}
+
 type fakeCatalog struct {
 	groups  []GroupSummary
 	members []MemberSummary
@@ -1116,4 +1150,16 @@ func (c *fakeCatalog) GetGroup(_ context.Context, gid entmoot.GroupID) (GroupSum
 
 func (c *fakeCatalog) ListMembers(context.Context, entmoot.GroupID) ([]MemberSummary, error) {
 	return append([]MemberSummary(nil), c.members...), nil
+}
+
+type recordingCatalog struct {
+	fakeCatalog
+	listMembersCalls int
+	listMembersGroup entmoot.GroupID
+}
+
+func (c *recordingCatalog) ListMembers(ctx context.Context, gid entmoot.GroupID) ([]MemberSummary, error) {
+	c.listMembersCalls++
+	c.listMembersGroup = gid
+	return c.fakeCatalog.ListMembers(ctx, gid)
 }

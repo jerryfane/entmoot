@@ -504,7 +504,8 @@ owns roster verification, durable accept, and gossip fanout.
 
 ```
 ENTMOOT_ESP_TOKEN=... entmootd esp serve [-addr 127.0.0.1:8087] [-token TOKEN] \
-  [-auth-mode bearer|device|dual] [-device-keys PATH] [-allow-non-loopback]
+  [-auth-mode bearer|device|dual] [-device-keys PATH] [-allow-non-loopback] \
+  [-bonjour-name NAME]
 ```
 
 **Flags**
@@ -522,6 +523,8 @@ ENTMOOT_ESP_TOKEN=... entmootd esp serve [-addr 127.0.0.1:8087] [-token TOKEN] \
 - `-allow-non-loopback` (default `false`). Allows binding to a non-loopback
   interface. Without this flag, `0.0.0.0`, `:PORT`, and public IP binds
   are rejected.
+- `-bonjour-name NAME` (optional). Advertises the HTTP endpoint as
+  `_entmoot-esp._tcp` over Bonjour/mDNS for local iOS development.
 
 **Device registry**
 

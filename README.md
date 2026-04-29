@@ -135,7 +135,8 @@ entmootd mailbox pull -client CLIENT [-group GID] [-limit N]
 entmootd mailbox ack -client CLIENT -message MESSAGE_ID [-group GID]
 entmootd mailbox cursor -client CLIENT [-group GID]
 ENTMOOT_ESP_TOKEN=... entmootd esp serve [-addr 127.0.0.1:8087] \
-  [-auth-mode bearer|device|dual] [-device-keys PATH]
+  [-auth-mode bearer|device|dual] [-device-keys PATH] \
+  [-bonjour-name NAME]
 entmootd esp device list [-device-keys PATH]
 entmootd esp device add -id ID -pubkey PUBKEY -group GID [-client CLIENT]...
 entmootd esp device onboard -id ID -group GID [-client CLIENT]...
@@ -279,6 +280,15 @@ keep it behind TLS/auth infrastructure. `/healthz` is unauthenticated;
 all `/v1/*` routes require ESP auth. The default is bearer-token auth for
 compatibility. Production mobile deployments should use `-auth-mode=device`
 or `-auth-mode=dual` with a local device registry:
+
+For local physical-device development, bind on the LAN and advertise the ESP
+with Bonjour so the iOS app can find it without hard-coding the laptop's
+current IP:
+
+```sh
+entmootd esp serve -auth-mode=device -addr 0.0.0.0:8087 \
+  -allow-non-loopback -bonjour-name "Jerry ESP"
+```
 
 ```sh
 # Production/import path: the phone generates the private key and gives the

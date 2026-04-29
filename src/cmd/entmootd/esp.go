@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -19,6 +20,8 @@ import (
 	"entmoot/pkg/entmoot/ipc"
 	"entmoot/pkg/entmoot/mailbox"
 	"entmoot/pkg/entmoot/store"
+
+	"github.com/grandcat/zeroconf"
 )
 
 func cmdESP(gf *globalFlags, args []string) int {
@@ -50,6 +53,7 @@ type espServeConfig struct {
 	apnsTopic        string
 	apnsKeyPath      string
 	apnsSandbox      bool
+	bonjourName      string
 }
 
 func cmdESPServe(gf *globalFlags, args []string) int {
@@ -77,6 +81,7 @@ func parseESPServeConfig(args []string) (espServeConfig, int, bool) {
 	fs.StringVar(&cfg.apnsTopic, "apns-topic", "", "Apple APNs topic/bundle id (defaults to ENTMOOT_APNS_TOPIC)")
 	fs.StringVar(&cfg.apnsKeyPath, "apns-key", "", "Apple APNs .p8 key path (defaults to ENTMOOT_APNS_KEY)")
 	fs.BoolVar(&cfg.apnsSandbox, "apns-sandbox", false, "send APNs requests to the sandbox endpoint")
+	fs.StringVar(&cfg.bonjourName, "bonjour-name", "", "advertise ESP over Bonjour/mDNS with this instance name")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return cfg, exitOK, false
@@ -116,6 +121,11 @@ func validateESPServeConfig(cfg espServeConfig) error {
 	}
 	if !cfg.allowNonLoopback && !addrIsLoopback(cfg.addr) {
 		return fmt.Errorf("-addr %s is not loopback; pass -allow-non-loopback only behind TLS/auth infrastructure", cfg.addr)
+	}
+	if strings.TrimSpace(cfg.bonjourName) != "" {
+		if _, err := espServePort(cfg.addr); err != nil {
+			return fmt.Errorf("-bonjour-name requires a TCP port in -addr: %w", err)
+		}
 	}
 	if err := validateAPNsConfig(cfg); err != nil {
 		return err
@@ -209,6 +219,12 @@ func runESPServe(gf *globalFlags, cfg espServeConfig) int {
 		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
+	if closer, err := registerESPBonjour(cfg); err != nil {
+		slog.Error("esp serve: register Bonjour", slog.String("err", err.Error()))
+		return exitTransport
+	} else if closer != nil {
+		defer closer.Shutdown()
+	}
 	slog.Info("esp serve: listening", slog.String("addr", cfg.addr))
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		slog.Error("esp serve: http server", slog.String("err", err.Error()))
@@ -236,6 +252,44 @@ func buildESPNotifier(cfg espServeConfig) (espnotify.Notifier, error) {
 		KeyPath:  keyPath,
 		Endpoint: endpoint,
 	})
+}
+
+func registerESPBonjour(cfg espServeConfig) (*zeroconf.Server, error) {
+	name := strings.TrimSpace(cfg.bonjourName)
+	if name == "" {
+		return nil, nil
+	}
+	port, err := espServePort(cfg.addr)
+	if err != nil {
+		return nil, err
+	}
+	server, err := zeroconf.Register(name, "_entmoot-esp._tcp", "local.", port, []string{
+		"path=/",
+		"auth_mode=" + cfg.authMode,
+	}, nil)
+	if err != nil {
+		return nil, err
+	}
+	slog.Info("esp serve: Bonjour advertised",
+		slog.String("name", name),
+		slog.String("service", "_entmoot-esp._tcp"),
+		slog.Int("port", port))
+	return server, nil
+}
+
+func espServePort(addr string) (int, error) {
+	_, portText, err := net.SplitHostPort(addr)
+	if err != nil {
+		return 0, err
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		return 0, err
+	}
+	if port <= 0 || port > 65535 {
+		return 0, fmt.Errorf("port %d out of range", port)
+	}
+	return port, nil
 }
 
 type controlSocketSignedPublisher struct {

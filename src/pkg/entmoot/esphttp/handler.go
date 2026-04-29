@@ -16,6 +16,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -460,11 +461,17 @@ func (h *Handler) handleListGroups(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleGroupSubroute(w http.ResponseWriter, r *http.Request) bool {
 	const prefix = "/v1/groups/"
-	if !strings.HasPrefix(r.URL.Path, prefix) {
+	escapedPath := r.URL.EscapedPath()
+	if !strings.HasPrefix(escapedPath, prefix) {
 		return false
 	}
-	rest := strings.TrimPrefix(r.URL.Path, prefix)
-	rawGroup, suffix, _ := strings.Cut(rest, "/")
+	rest := strings.TrimPrefix(escapedPath, prefix)
+	escapedGroup, suffix, _ := strings.Cut(rest, "/")
+	rawGroup, err := url.PathUnescape(escapedGroup)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return true
+	}
 	groupID, err := decodeGroupID(rawGroup)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
