@@ -26,12 +26,11 @@ import (
 // simulate "no trust pair between A and C" need both the Dial gate
 // AND the trust-list gate to agree.
 //
-// slowDial (v1.0.6 Fix B) lets a test inject a per-peer Dial delay so
-// it can simulate Pilot's ~32 s SYN-retry stall without actually
-// consuming wallclock minutes. When slowDial[peer] > 0, Dial sleeps
-// that long (respecting ctx cancellation) before returning — so a
-// fanoutAttemptTimeout-wrapped context will cancel the dial early
-// exactly like a real stalled peer.
+// slowDial (v1.0.6 Fix B) lets a test inject a per-peer Dial delay so it can
+// simulate a long transport setup stall without actually consuming wallclock
+// minutes. When slowDial[peer] > 0, Dial sleeps that long (respecting ctx
+// cancellation) before returning — so the default fanout attempt budget will
+// cancel the dial early exactly like a real stalled peer.
 type filteringTransport struct {
 	local     entmoot.NodeID
 	inner     Transport
@@ -497,10 +496,9 @@ func TestPlumtreeSkipsUntrusted(t *testing.T) {
 }
 
 // TestPlumtreeParallelFanoutWithSlowPeer is the v1.0.6 Fix B guard: one
-// stalled peer must not head-of-line-block fanout to healthy peers, and
-// every attempt must be bounded by fanoutAttemptTimeout so a dead peer
-// falls fast into the retry scheduler instead of consuming the full
-// ~32 s Pilot SYN-retry budget.
+// stalled peer must not head-of-line-block fanout to healthy peers, and every
+// attempt must be bounded so a dead peer falls into the retry scheduler instead
+// of consuming an unbounded transport dial budget.
 //
 // Topology: A=10, B=20, C=30; fully-trusted 3-node mesh. A's transport
 // is wrapped in a filter that allows all dials but makes Dial(C) block
@@ -514,9 +512,8 @@ func TestPlumtreeSkipsUntrusted(t *testing.T) {
 //     with the stalled C dial, so B is unaffected by A's slow C dial).
 //  2. A's pending map gains a retryKey{peer: 30, id: msg.ID, op: opPush}
 //     entry well before the 30 s injected delay would have elapsed —
-//     proving A's Dial(C) was cancelled by fanoutAttemptTimeout
-//     and the failure was enqueued for retry rather than silently
-//     dropped.
+//     proving A's Dial(C) was cancelled by the fanout attempt budget and the
+//     failure was enqueued for retry rather than silently dropped.
 func TestPlumtreeParallelFanoutWithSlowPeer(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t, []entmoot.NodeID{10, 20, 30}) // A=10, B=20, C=30
@@ -574,7 +571,7 @@ func TestPlumtreeParallelFanoutWithSlowPeer(t *testing.T) {
 // circuited at the gossiper layer (no Transport.Dial invocation)
 // until the exponential backoff window elapses. Prevents the retry
 // scheduler's 10-step exponential schedule from multiplying a single
-// dead peer's ~32 s Pilot dial tax across every pending message.
+// dead peer's full transport dial tax across every pending message.
 //
 // Topology: A=10, B=20, C=30. A's transport is a filteringTransport
 // that allows B only, so every Dial(C) returns net.ErrClosed.

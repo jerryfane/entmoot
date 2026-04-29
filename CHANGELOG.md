@@ -7,12 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.24] - 2026-04-29
+
 ### Changed
 
 - **Pilot transport now uses raw Pilot streams.** Entmoot no longer keeps a
   long-lived yamux session cache above Pilot; each gossip/reconcile interaction
   opens one Pilot stream and closes it when done. This removes stale `conn_id`
   reuse failure modes and requires upgrading all peers together.
+- **Pilot-aware fanout dial budgets.** One-way gossip, IHave, retry, and
+  TransportAd fanout now use the transport's advertised dial budget before
+  applying a separate short write deadline. Pilot-backed peers get enough time
+  to complete TURN/NAT recovery without delivering empty late streams.
 
 ### Fixed
 

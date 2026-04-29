@@ -465,6 +465,7 @@ func (t *scriptedWriteTransport) counts() (dials, drops int) {
 type deadlineBudgetTransport struct {
 	mu            sync.Mutex
 	minDialBudget time.Duration
+	dialBudget    time.Duration
 	dials         int
 	writes        int
 	writeDeadline time.Time
@@ -494,6 +495,7 @@ func (t *deadlineBudgetTransport) SetPeerEndpoints(ctx context.Context, peer ent
 	return nil
 }
 
+func (t *deadlineBudgetTransport) DialBudget() time.Duration                  { return t.dialBudget }
 func (t *deadlineBudgetTransport) SetOnTunnelUp(cb func(peer entmoot.NodeID)) {}
 func (t *deadlineBudgetTransport) Close() error                               { return nil }
 
@@ -551,7 +553,10 @@ func TestFanoutPushUsesLongDialBudgetAndFreshWriteBudget(t *testing.T) {
 
 	var gid entmoot.GroupID
 	gid[0] = 1
-	tr := &deadlineBudgetTransport{minDialBudget: 10 * time.Second}
+	tr := &deadlineBudgetTransport{
+		minDialBudget: 25 * time.Second,
+		dialBudget:    30 * time.Second,
+	}
 	g := newScriptedRecoveryGossiper(gid, tr)
 
 	g.fanoutPush(context.Background(), []entmoot.NodeID{20}, &wire.Gossip{GroupID: gid}, entmoot.MessageID{})

@@ -50,8 +50,15 @@ import (
 
 const (
 	pilotStreamDialTimeout       = 45 * time.Second
+	pilotStreamDialSlack         = 2 * time.Second
 	pilotMaxConcurrentPeerDials  = 2
 	pilotTraceTransportEventName = "pilot transport trace"
+)
+
+var (
+	ErrDialLimiterTimeout = errors.New("pilot: dial limiter timeout")
+	ErrDialCallerTimeout  = errors.New("pilot: dial caller timeout")
+	ErrDaemonDialTimeout  = errors.New("pilot: daemon dial timeout")
 )
 
 // Config parameterizes a Pilot-backed Transport.
@@ -184,6 +191,13 @@ func (t *Transport) NodeID() entmoot.NodeID {
 	return t.nodeID
 }
 
+// DialBudget implements gossip.DialBudgetProvider. Pilot may need the full
+// daemon dial window to recover TURN/NAT state before the first Entmoot frame
+// can be written; callers should apply a separate write deadline after Dial.
+func (t *Transport) DialBudget() time.Duration {
+	return pilotStreamDialTimeout + pilotStreamDialSlack
+}
+
 // Driver returns the underlying *ipcclient.Driver. Exposed so subcommands like
 // `info` can query daemon state (hostname, address) without re-dialing the
 // socket. Callers MUST NOT Close the returned driver; call Transport.Close
@@ -208,6 +222,9 @@ func (t *Transport) Dial(ctx context.Context, peer entmoot.NodeID) (net.Conn, er
 
 	slot, err := t.limits.acquireSlot(ctx, peer, t.closed)
 	if err != nil {
+		if ctx.Err() != nil && errors.Is(err, ctx.Err()) {
+			return nil, fmt.Errorf("%w: %w", ErrDialLimiterTimeout, err)
+		}
 		return nil, err
 	}
 
@@ -262,6 +279,9 @@ func (t *Transport) dialPilotStream(ctx context.Context, peer entmoot.NodeID, sl
 		dialCancel()
 		<-doneWatchingDialCtx
 		if r.err != nil {
+			if errors.Is(r.err, context.DeadlineExceeded) && dialCtx.Err() != nil {
+				return nil, true, fmt.Errorf("%w: pilot: dial %s:%d: %w", ErrDaemonDialTimeout, addr, t.cfg.ListenPort, r.err)
+			}
 			return nil, true, fmt.Errorf("pilot: dial %s:%d: %w", addr, t.cfg.ListenPort, r.err)
 		}
 		pilotConn = r.conn
@@ -274,7 +294,7 @@ func (t *Transport) dialPilotStream(ctx context.Context, peer entmoot.NodeID, sl
 			}
 			slot.Release()
 		}()
-		return nil, false, fmt.Errorf("pilot: dial %s:%d: %w", addr, t.cfg.ListenPort, ctx.Err())
+		return nil, false, fmt.Errorf("%w: pilot: dial %s:%d: %w", ErrDialCallerTimeout, addr, t.cfg.ListenPort, ctx.Err())
 	case <-t.closed:
 		dialCancel()
 		<-doneWatchingDialCtx

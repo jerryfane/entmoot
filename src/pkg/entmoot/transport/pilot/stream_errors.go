@@ -19,6 +19,18 @@ func ClassifyStreamError(err error) gossip.StreamErrorClassification {
 		return gossip.StreamErrorClassification{}
 	}
 	switch {
+	case errors.Is(err, ErrDialLimiterTimeout),
+		errors.Is(err, ErrDialCallerTimeout):
+		return gossip.StreamErrorClassification{
+			Retryable:    true,
+			Timeout:      true,
+			LocalContext: true,
+		}
+	case errors.Is(err, ErrDaemonDialTimeout):
+		return gossip.StreamErrorClassification{
+			Retryable: true,
+			Timeout:   true,
+		}
 	case errors.Is(err, ipcclient.ErrClosed),
 		errors.Is(err, ipcclient.ErrConnectionNotFound),
 		errors.Is(err, ipcclient.ErrConnectionNotEstablished),

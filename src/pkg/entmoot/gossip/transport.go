@@ -26,6 +26,7 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"entmoot/pkg/entmoot"
 )
@@ -76,6 +77,14 @@ type Transport interface {
 
 	// Close releases resources. Pending Accepts return an error.
 	Close() error
+}
+
+// DialBudgetProvider is an optional Transport extension for transports whose
+// stream setup can legitimately take longer than gossip's default one-way
+// fanout budget. Gossip still applies a separate write deadline after Dial
+// succeeds.
+type DialBudgetProvider interface {
+	DialBudget() time.Duration
 }
 
 // PeerSessionDropper is an optional Transport extension for adapters that
