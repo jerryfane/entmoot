@@ -233,6 +233,20 @@ func TestHandlerDeviceAuth(t *testing.T) {
 	if resp.Code != http.StatusForbidden {
 		t.Fatalf("bad client status = %d, want 403 body=%s", resp.Code, resp.Body.String())
 	}
+
+	history := signedDeviceRequest(t, priv, http.MethodGet, "/v1/groups/"+gid.String()+"/history?client_id=ios-1&limit=1", nil, 1_000_000, "nonce-3")
+	resp = httptest.NewRecorder()
+	handler.ServeHTTP(resp, history)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("history status = %d, want 200 body=%s", resp.Code, resp.Body.String())
+	}
+
+	badHistoryClient := signedDeviceRequest(t, priv, http.MethodGet, "/v1/groups/"+gid.String()+"/history?client_id=other&limit=1", nil, 1_000_000, "nonce-4")
+	resp = httptest.NewRecorder()
+	handler.ServeHTTP(resp, badHistoryClient)
+	if resp.Code != http.StatusForbidden {
+		t.Fatalf("bad history client status = %d, want 403 body=%s", resp.Code, resp.Body.String())
+	}
 }
 
 func TestHandlerDisabledDeviceAuth(t *testing.T) {
@@ -334,6 +348,68 @@ func TestHandlerGroupSubrouteEscapedSlashInGroupID(t *testing.T) {
 	}
 	if catalog.listMembersGroup != gid {
 		t.Fatalf("ListMembers group = %s, want %s", catalog.listMembersGroup, gid)
+	}
+}
+
+func TestHandlerGroupHistoryReturnsLatestWithoutAdvancingCursor(t *testing.T) {
+	gid := testGroupID(1)
+	st := store.NewMemory()
+	for _, msg := range []entmoot.Message{
+		testMessage(gid, 1, "first"),
+		testMessage(gid, 2, "second"),
+		testMessage(gid, 3, "third"),
+	} {
+		if err := st.Put(context.Background(), msg); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+	}
+	svc, err := mailbox.New(st, nil)
+	if err != nil {
+		t.Fatalf("mailbox.New: %v", err)
+	}
+	if err := svc.AckCursorContext(context.Background(), gid, "ios-1", mailbox.Cursor{
+		MessageID:   testMessage(gid, 2, "second").ID,
+		TimestampMS: 2,
+	}); err != nil {
+		t.Fatalf("AckCursorContext: %v", err)
+	}
+	handler, err := NewHandler(Config{
+		Token:   "secret",
+		Service: svc,
+		GroupExists: func(_ context.Context, got entmoot.GroupID) (bool, error) {
+			return got == gid, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewHandler: %v", err)
+	}
+
+	history := doJSONRequest[mailbox.HistoryResult](t, handler, http.MethodGet, "/v1/groups/"+gid.String()+"/history?client_id=ios-1&limit=2", nil, http.StatusOK)
+	if history.Count != 2 || len(history.Messages) != 2 {
+		t.Fatalf("history count/messages = %d/%d, want 2/2", history.Count, len(history.Messages))
+	}
+	if history.Messages[0].Content != "second" || history.Messages[1].Content != "third" {
+		t.Fatalf("history contents = %q, %q; want second, third", history.Messages[0].Content, history.Messages[1].Content)
+	}
+	cursor, err := svc.CursorStatus(context.Background(), gid, "ios-1")
+	if err != nil {
+		t.Fatalf("CursorStatus: %v", err)
+	}
+	if cursor.Cursor.TimestampMS != 2 {
+		t.Fatalf("cursor timestamp = %d, want unchanged 2", cursor.Cursor.TimestampMS)
+	}
+}
+
+func TestHandlerGroupHistoryRejectsLimitZero(t *testing.T) {
+	gid := testGroupID(1)
+	handler := testMobileHandler(t, gid, nil, nil, nil)
+
+	errResp := doJSONRequest[errorEnvelope](t, handler, http.MethodGet, "/v1/groups/"+gid.String()+"/history?client_id=ios-1&limit=0", nil, http.StatusBadRequest)
+	if errResp.Error.Code != "bad_request" {
+		t.Fatalf("error code = %q, want bad_request", errResp.Error.Code)
+	}
+	if !strings.Contains(errResp.Error.Message, "between 1 and") {
+		t.Fatalf("error message = %q, want limit range", errResp.Error.Message)
 	}
 }
 

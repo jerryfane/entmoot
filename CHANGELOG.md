@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.21] - 2026-04-29
+
 ### Added
 
 - **Executable ESP group and invite operations.** ESP sign-request completion
@@ -17,6 +19,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **ESP-local group metadata.** `group_update` now persists app-facing group
   metadata in `<data>/esp.sqlite` and group list/get responses include the
   stored metadata.
+- **ESP latest-history endpoint.** Added read-only
+  `GET /v1/groups/{group_id}/history` for mobile timeline bootstrap without
+  advancing mailbox cursors.
+
+### Changed
+
+- **Bounded ESP history reads.** The latest-history path now reads only the
+  requested recent page through a store-level `Latest` query instead of
+  materializing full group history before trimming.
 
 ## [1.5.20] - 2026-04-29
 

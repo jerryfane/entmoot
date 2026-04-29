@@ -52,6 +52,12 @@ type MessageStore interface {
 	// contains message values, not ids.
 	Range(ctx context.Context, groupID entmoot.GroupID, sinceMillis, untilMillis int64) ([]entmoot.Message, error)
 
+	// Latest returns at most limit recent messages in groupID. The recency
+	// window is selected by descending (Timestamp, Author.PilotNodeID, ID), then
+	// returned in topological order within that bounded window. A limit <= 0
+	// returns an empty slice.
+	Latest(ctx context.Context, groupID entmoot.GroupID, limit int) ([]entmoot.Message, error)
+
 	// MerkleRoot returns the Merkle root (pkg/entmoot/merkle) over every
 	// message in the group, ordered topologically. An empty group returns the
 	// zero root and a nil error.

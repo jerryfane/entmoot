@@ -562,6 +562,9 @@ func (n *notifyingStore) Has(ctx context.Context, gid entmoot.GroupID, id entmoo
 func (n *notifyingStore) Range(ctx context.Context, gid entmoot.GroupID, since, until int64) ([]entmoot.Message, error) {
 	return n.inner.Range(ctx, gid, since, until)
 }
+func (n *notifyingStore) Latest(ctx context.Context, gid entmoot.GroupID, limit int) ([]entmoot.Message, error) {
+	return n.inner.Latest(ctx, gid, limit)
+}
 func (n *notifyingStore) MerkleRoot(ctx context.Context, gid entmoot.GroupID) ([32]byte, error) {
 	return n.inner.MerkleRoot(ctx, gid)
 }

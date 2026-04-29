@@ -28,6 +28,14 @@ type PullResult struct {
 	Messages   []SyncMessage   `json:"messages"`
 }
 
+// HistoryResult is returned by read-only latest-message APIs. It does not
+// include or update a per-client cursor.
+type HistoryResult struct {
+	GroupID  entmoot.GroupID `json:"group_id"`
+	Count    int             `json:"count"`
+	Messages []SyncMessage   `json:"messages"`
+}
+
 // AckResult is returned after advancing a mailbox cursor to a message.
 type AckResult struct {
 	ClientID    string            `json:"client_id"`
@@ -76,6 +84,28 @@ func (s *Service) Pull(ctx context.Context, groupID entmoot.GroupID, clientID st
 		HasMore:    hasMore,
 		NextCursor: next,
 		Messages:   MessagesView(msgs),
+	}, nil
+}
+
+// History returns the most recent messages in groupID without reading or
+// advancing any mailbox cursor. Results are returned oldest-to-newest so
+// clients can render them as a conversation.
+func (s *Service) History(ctx context.Context, groupID entmoot.GroupID, limit int) (HistoryResult, error) {
+	if limit <= 0 {
+		return HistoryResult{
+			GroupID:  groupID,
+			Count:    0,
+			Messages: MessagesView(nil),
+		}, nil
+	}
+	msgs, err := s.store.Latest(ctx, groupID, limit)
+	if err != nil {
+		return HistoryResult{}, err
+	}
+	return HistoryResult{
+		GroupID:  groupID,
+		Count:    len(msgs),
+		Messages: MessagesView(msgs),
 	}, nil
 }
 

@@ -43,6 +43,12 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS idx_messages_group_time
   ON messages(group_id, timestamp_ms DESC);
 
+CREATE INDEX IF NOT EXISTS idx_messages_group_latest
+  ON messages(group_id, timestamp_ms DESC, author_node_id DESC, message_id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_messages_group_id_range
+  ON messages(group_id, message_id ASC);
+
 CREATE INDEX IF NOT EXISTS idx_messages_group_author
   ON messages(group_id, author_node_id, timestamp_ms DESC);
 
@@ -307,6 +313,47 @@ func (s *SQLite) Range(ctx context.Context, groupID entmoot.GroupID, sinceMillis
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("store: range iterate: %w", err)
+	}
+
+	return topoOrder(candidates)
+}
+
+// Latest implements MessageStore.Latest.
+func (s *SQLite) Latest(ctx context.Context, groupID entmoot.GroupID, limit int) ([]entmoot.Message, error) {
+	if limit <= 0 {
+		return []entmoot.Message{}, nil
+	}
+	db, err := s.dbFor(groupID)
+	if err != nil {
+		return nil, err
+	}
+
+	rows, err := db.QueryContext(ctx, `
+		SELECT canonical_bytes FROM messages
+		WHERE group_id = ?
+		ORDER BY timestamp_ms DESC, author_node_id DESC, message_id DESC
+		LIMIT ?;`,
+		groupID[:], limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("store: latest query: %w", err)
+	}
+	defer rows.Close()
+
+	candidates := make([]entmoot.Message, 0, limit)
+	for rows.Next() {
+		var canonBytes []byte
+		if err := rows.Scan(&canonBytes); err != nil {
+			return nil, fmt.Errorf("store: latest scan: %w", err)
+		}
+		msg, err := decodeMessage(canonBytes)
+		if err != nil {
+			return nil, err
+		}
+		candidates = append(candidates, msg)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: latest iterate: %w", err)
 	}
 
 	return topoOrder(candidates)

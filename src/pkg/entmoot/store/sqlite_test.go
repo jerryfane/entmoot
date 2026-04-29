@@ -631,14 +631,13 @@ func TestSQLiteTopologicalOrder(t *testing.T) {
 
 // TestSQLiteIterMessageIDsInIDRangeUsesIndex asserts that the SQL query
 // backing IterMessageIDsInIDRange is served by an index (the message_id
-// PRIMARY KEY or a (group_id, ...) composite) rather than a full table
+// PRIMARY KEY or a (group_id, message_id) composite) rather than a full table
 // scan. modernc.org/sqlite reports the auto-generated PK index as
 // "sqlite_autoindex_messages_1"; the composite indexes defined in the
-// schema are named "idx_messages_group_time" and
-// "idx_messages_group_author". Which one the planner picks depends on
+// schema include "idx_messages_group_id_range". Which one the planner picks depends on
 // the table's statistics — with few rows SQLite often prefers whichever
 // index can satisfy the equality first. What this test rejects is
-// "SCAN messages" — i.e. a full table scan ignoring every index.
+// "SCAN messages" or temp ORDER BY work.
 func TestSQLiteIterMessageIDsInIDRangeUsesIndex(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
@@ -703,14 +702,15 @@ func TestSQLiteIterMessageIDsInIDRangeUsesIndex(t *testing.T) {
 			// composite (group_id, ...) indexes. We reject only
 			// "SCAN messages" — a full table scan.
 			if strings.Contains(detail, "SEARCH messages USING INDEX") ||
+				strings.Contains(detail, "SEARCH messages USING COVERING INDEX") ||
 				strings.Contains(detail, "USING PRIMARY KEY") ||
 				strings.Contains(detail, "USING INTEGER PRIMARY KEY") ||
 				strings.Contains(detail, "sqlite_autoindex_messages_1") {
 				sawIndex = true
 			}
-			if strings.HasPrefix(detail, "SCAN messages") {
+			if strings.HasPrefix(detail, "SCAN messages") || strings.Contains(detail, "USE TEMP B-TREE") {
 				rows.Close()
-				t.Fatalf("query planner chose SCAN on messages, want an index SEARCH:\n  sql: %s\n  detail: %q", q.sql, detail)
+				t.Fatalf("query planner chose unbounded work, want an index SEARCH without temp order:\n  sql: %s\n  detail: %q", q.sql, detail)
 			}
 		}
 		rows.Close()
@@ -718,8 +718,69 @@ func TestSQLiteIterMessageIDsInIDRangeUsesIndex(t *testing.T) {
 			t.Fatalf("iter plan rows: %v", err)
 		}
 		if !sawIndex {
-			t.Fatalf("EXPLAIN QUERY PLAN did not reference the message_id PK index for:\n  %s\n  rows=%q", q.sql, details)
+			t.Fatalf("EXPLAIN QUERY PLAN did not reference an index for:\n  %s\n  rows=%q", q.sql, details)
 		}
+	}
+}
+
+func TestSQLiteLatestUsesBoundedIndexOrder(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	s, err := OpenSQLite(root)
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	gid := randGroupID(t)
+	for i := 0; i < 3; i++ {
+		m := mkMsg(t, gid, testAuthor(uint32(i+1), byte(i+1)), int64(1_000+i), "seed")
+		if err := s.Put(ctx, m); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+	}
+
+	dbPath := filepath.Join(root, "groups", encodeGroupDirName(gid), "messages.sqlite")
+	side, err := sql.Open("sqlite", "file:"+dbPath)
+	if err != nil {
+		t.Fatalf("sql.Open side: %v", err)
+	}
+	defer side.Close()
+
+	rows, err := side.QueryContext(ctx, `
+		EXPLAIN QUERY PLAN
+		SELECT canonical_bytes FROM messages
+		WHERE group_id = ?
+		ORDER BY timestamp_ms DESC, author_node_id DESC, message_id DESC
+		LIMIT ?;`,
+		gid[:], 1,
+	)
+	if err != nil {
+		t.Fatalf("EXPLAIN QUERY PLAN: %v", err)
+	}
+	defer rows.Close()
+
+	var sawLatestIndex bool
+	var details []string
+	for rows.Next() {
+		var id, parent, notused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &notused, &detail); err != nil {
+			t.Fatalf("scan plan row: %v", err)
+		}
+		details = append(details, detail)
+		if strings.Contains(detail, "idx_messages_group_latest") {
+			sawLatestIndex = true
+		}
+		if strings.HasPrefix(detail, "SCAN messages") || strings.Contains(detail, "USE TEMP B-TREE") {
+			t.Fatalf("latest query planner used unbounded work:\n  detail: %q\n  rows=%q", detail, details)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("latest plan rows: %v", err)
+	}
+	if !sawLatestIndex {
+		t.Fatalf("EXPLAIN QUERY PLAN did not reference idx_messages_group_latest; rows=%q", details)
 	}
 }
 

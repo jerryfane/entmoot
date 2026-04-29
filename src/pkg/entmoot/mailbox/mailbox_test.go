@@ -60,6 +60,67 @@ func TestMessagesSinceRejectsEmptyClient(t *testing.T) {
 	}
 }
 
+func TestHistoryLimitZeroReturnsEmptyPage(t *testing.T) {
+	ctx := context.Background()
+	st := store.NewMemory()
+	gid := groupID(1)
+	for i := 1; i <= 3; i++ {
+		if err := st.Put(ctx, message(gid, int64(i))); err != nil {
+			t.Fatalf("Put %d: %v", i, err)
+		}
+	}
+	svc, err := New(st, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	history, err := svc.History(ctx, gid, 0)
+	if err != nil {
+		t.Fatalf("History: %v", err)
+	}
+	if history.Count != 0 || len(history.Messages) != 0 {
+		t.Fatalf("history count/messages = %d/%d, want empty page", history.Count, len(history.Messages))
+	}
+}
+
+func TestHistoryReturnsLatestTopologicalPage(t *testing.T) {
+	ctx := context.Background()
+	st := store.NewMemory()
+	gid := groupID(1)
+	parent := message(gid, 100)
+	parent.Content = []byte("parent")
+	parent.ID = canonical.MessageID(parent)
+	child := message(gid, 50)
+	child.Content = []byte("child")
+	child.Parents = []entmoot.MessageID{parent.ID}
+	child.ID = canonical.MessageID(child)
+	for _, msg := range []entmoot.Message{child, parent} {
+		if err := st.Put(ctx, msg); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+	}
+	svc, err := New(st, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	history, err := svc.History(ctx, gid, 2)
+	if err != nil {
+		t.Fatalf("History: %v", err)
+	}
+	if got := []string{history.Messages[0].Content, history.Messages[1].Content}; got[0] != "parent" || got[1] != "child" {
+		t.Fatalf("history contents = %q, want parent, child", got)
+	}
+
+	history, err = svc.History(ctx, gid, 1)
+	if err != nil {
+		t.Fatalf("History limited: %v", err)
+	}
+	if history.Count != 1 || history.Messages[0].Content != "parent" {
+		t.Fatalf("limited history = %+v, want parent", history.Messages)
+	}
+}
+
 func TestMemoryCursorStoreIsMonotonic(t *testing.T) {
 	ctx := context.Background()
 	cursors := NewMemoryCursorStore()

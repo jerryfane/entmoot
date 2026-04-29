@@ -234,6 +234,58 @@ func runStoreSuite(t *testing.T, newStore func(t *testing.T) MessageStore) {
 		}
 	})
 
+	t.Run("LatestBoundedByTimestamp", func(t *testing.T) {
+		s := newStore(t)
+		gid := randGroupID(t)
+		m1 := mkMsg(t, gid, testAuthor(1, 0x01), 10, "old")
+		m2 := mkMsg(t, gid, testAuthor(1, 0x01), 20, "middle")
+		m3 := mkMsg(t, gid, testAuthor(1, 0x01), 30, "new")
+		for _, m := range []entmoot.Message{m3, m1, m2} {
+			if err := s.Put(ctx, m); err != nil {
+				t.Fatalf("Put: %v", err)
+			}
+		}
+
+		got, err := s.Latest(ctx, gid, 2)
+		if err != nil {
+			t.Fatalf("Latest: %v", err)
+		}
+		if len(got) != 2 || got[0].ID != m2.ID || got[1].ID != m3.ID {
+			t.Fatalf("Latest got %v, want middle,new", idsOf(got))
+		}
+
+		got, err = s.Latest(ctx, gid, 0)
+		if err != nil {
+			t.Fatalf("Latest zero: %v", err)
+		}
+		if len(got) != 0 {
+			t.Fatalf("Latest zero len = %d, want 0", len(got))
+		}
+	})
+
+	t.Run("LatestTopologicalWithinSelectedPage", func(t *testing.T) {
+		s := newStore(t)
+		gid := randGroupID(t)
+		parent := mkMsg(t, gid, testAuthor(1, 0x01), 100, "parent")
+		child := mkMsg(t, gid, testAuthor(1, 0x01), 50, "child")
+		child.Parents = []entmoot.MessageID{parent.ID}
+		child.ID = canonical.MessageID(child)
+		old := mkMsg(t, gid, testAuthor(1, 0x01), 10, "old")
+		for _, m := range []entmoot.Message{child, old, parent} {
+			if err := s.Put(ctx, m); err != nil {
+				t.Fatalf("Put: %v", err)
+			}
+		}
+
+		got, err := s.Latest(ctx, gid, 2)
+		if err != nil {
+			t.Fatalf("Latest: %v", err)
+		}
+		if len(got) != 2 || got[0].ID != parent.ID || got[1].ID != child.ID {
+			t.Fatalf("Latest topological page got %v, want parent,child", idsOf(got))
+		}
+	})
+
 	t.Run("EmptyGroupMerkleRoot", func(t *testing.T) {
 		s := newStore(t)
 		gid := randGroupID(t)

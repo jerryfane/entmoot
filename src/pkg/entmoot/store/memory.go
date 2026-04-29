@@ -104,6 +104,22 @@ func (s *Memory) Range(_ context.Context, groupID entmoot.GroupID, sinceMillis, 
 	return topoOrder(candidates)
 }
 
+// Latest implements MessageStore.Latest.
+func (s *Memory) Latest(_ context.Context, groupID entmoot.GroupID, limit int) ([]entmoot.Message, error) {
+	if limit <= 0 {
+		return []entmoot.Message{}, nil
+	}
+	s.mu.RLock()
+	bucket := s.groups[groupID]
+	candidates := make([]entmoot.Message, 0, len(bucket))
+	for _, m := range bucket {
+		candidates = append(candidates, m)
+	}
+	s.mu.RUnlock()
+
+	return latestMessages(candidates, limit)
+}
+
 // IterMessageIDsInIDRange implements MessageStore.IterMessageIDsInIDRange.
 // The bucket is scanned under the read lock; results are sorted after the
 // lock is released.
@@ -173,6 +189,25 @@ func topoOrder(msgs []entmoot.Message) ([]entmoot.Message, error) {
 		}
 	}
 	return out, nil
+}
+
+func latestMessages(msgs []entmoot.Message, limit int) ([]entmoot.Message, error) {
+	if limit <= 0 || len(msgs) == 0 {
+		return []entmoot.Message{}, nil
+	}
+	sort.Slice(msgs, func(i, j int) bool {
+		if msgs[i].Timestamp != msgs[j].Timestamp {
+			return msgs[i].Timestamp > msgs[j].Timestamp
+		}
+		if msgs[i].Author.PilotNodeID != msgs[j].Author.PilotNodeID {
+			return msgs[i].Author.PilotNodeID > msgs[j].Author.PilotNodeID
+		}
+		return bytes.Compare(msgs[i].ID[:], msgs[j].ID[:]) > 0
+	})
+	if len(msgs) > limit {
+		msgs = msgs[:limit]
+	}
+	return topoOrder(msgs)
 }
 
 // merkleRootOf returns the Merkle root over msgs in topological order. An

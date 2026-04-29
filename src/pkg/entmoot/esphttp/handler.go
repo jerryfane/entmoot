@@ -517,6 +517,12 @@ func (h *Handler) handleGroupSubroute(w http.ResponseWriter, r *http.Request) bo
 		default:
 			methodNotAllowed(w, http.MethodGet+", "+http.MethodPost)
 		}
+	case "history":
+		if r.Method != http.MethodGet {
+			methodNotAllowed(w, http.MethodGet)
+			return true
+		}
+		h.handleGroupHistory(w, r, groupID)
 	case "mailbox":
 		if r.Method != http.MethodGet {
 			methodNotAllowed(w, http.MethodGet)
@@ -586,6 +592,33 @@ func (h *Handler) handleGroupMessages(w http.ResponseWriter, r *http.Request, gr
 	}
 	result, err := h.service.Pull(r.Context(), groupID, clientID, limit)
 	h.writeMailboxResult(w, "group messages", result, err)
+}
+
+func (h *Handler) handleGroupHistory(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID) {
+	clientID := strings.TrimSpace(r.URL.Query().Get("client_id"))
+	if clientID == "" {
+		if auth, _ := r.Context().Value(authContextKey{}).(authContext); auth.device != nil {
+			clientID = auth.device.ID
+		}
+	}
+	if clientID == "" {
+		writeError(w, http.StatusBadRequest, "bad_request", "client_id is required")
+		return
+	}
+	if !h.checkDeviceClient(w, r, groupID, clientID) {
+		return
+	}
+	limit := 50
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 || n > maxListLimit {
+			writeError(w, http.StatusBadRequest, "bad_request", fmt.Sprintf("limit must be between 1 and %d", maxListLimit))
+			return
+		}
+		limit = n
+	}
+	result, err := h.service.History(r.Context(), groupID, limit)
+	h.writeMailboxResult(w, "group history", result, err)
 }
 
 func (h *Handler) handleGroupMessagePublish(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID) {
