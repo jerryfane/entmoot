@@ -78,16 +78,15 @@ const trustedSetTTL = 1 * time.Second
 // fanout goroutines hostage when Pilot IPC is wedged.
 const trustedSetLookupTimeout = 500 * time.Millisecond
 
-// fanoutPerPeerTimeout is the wallclock ceiling for a single
-// push / IHave / retry attempt. Entmoot calls Transport.Dial +
-// EncodeAndWrite within this budget; if Pilot's internal ~32 s
-// SYN-retry cycle hasn't produced a tunnel by this deadline, cut
-// the attempt and let the retry scheduler re-queue. Value covers
-// relay-over-beacon p99 (~600 ms) plus slack. Much shorter than
-// Pilot's internal dial ceiling so a dead peer fails fast into
-// the v1.0.6 per-peer dial-backoff cache (Fix C) instead of
-// head-of-line-blocking healthy peers. (v1.0.6)
-const fanoutPerPeerTimeout = 5 * time.Second
+// One-way fanout attempts split stream opening from the first-frame write.
+// Pilot stream setup can legitimately take several seconds on TURN/NAT paths;
+// once Dial succeeds, the Entmoot frame must get a fresh write budget instead
+// of inheriting an already-spent dial deadline.
+const (
+	fanoutDialTimeout    = 15 * time.Second
+	fanoutWriteTimeout   = 5 * time.Second
+	fanoutAttemptTimeout = fanoutDialTimeout + fanoutWriteTimeout + time.Second
+)
 
 // fanoutMaxConcurrency caps the goroutines we spawn per fanout
 // burst. Irrelevant at N=3 but a cheap guard against accidentally
@@ -805,6 +804,12 @@ func setConnDeadlineFromContext(ctx context.Context, conn net.Conn) {
 	}
 }
 
+func setConnWriteDeadlineFromContext(ctx context.Context, conn net.Conn) {
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = conn.SetWriteDeadline(deadline)
+	}
+}
+
 func (g *Gossiper) dropPeerSession(peer entmoot.NodeID, op string, cause error) bool {
 	dropper, ok := g.cfg.Transport.(PeerSessionDropper)
 	if !ok {
@@ -913,10 +918,12 @@ func (g *Gossiper) dialAndWrite(ctx context.Context, peer entmoot.NodeID, frame 
 		if !g.canDial(peer) {
 			return fmt.Errorf("peer %d in dial-backoff", peer)
 		}
-		conn, err := g.cfg.Transport.Dial(ctx, peer)
+		dialCtx, dialCancel := context.WithTimeout(ctx, fanoutDialTimeout)
+		conn, err := g.cfg.Transport.Dial(dialCtx, peer)
 		if err != nil {
-			classification := g.classifyStreamError(ctx, err)
+			classification := g.classifyStreamError(dialCtx, err)
 			transportClassification := g.classifyTransportStreamError(err)
+			dialCancel()
 			lastErr = fmt.Errorf("dial: %w", err)
 			if transportClassification.StaleSession {
 				g.dropPeerSession(peer, op, err)
@@ -929,15 +936,19 @@ func (g *Gossiper) dialAndWrite(ctx context.Context, peer entmoot.NodeID, frame 
 			}
 			return lastErr
 		}
-		setConnDeadlineFromContext(ctx, conn)
+		dialCancel()
+		writeCtx, writeCancel := context.WithTimeout(ctx, fanoutWriteTimeout)
+		setConnWriteDeadlineFromContext(writeCtx, conn)
 		err = wire.EncodeAndWrite(conn, frame)
 		_ = conn.Close()
 		if err == nil {
+			writeCancel()
 			g.recordDialSuccess(peer)
 			return nil
 		}
 		lastErr = fmt.Errorf("write %s: %w", op, err)
-		classification := g.classifyStreamError(ctx, err)
+		classification := g.classifyStreamError(writeCtx, err)
+		writeCancel()
 		if shouldRetryStreamFailure(classification, attempt, ctx, 0) {
 			if shouldDropPeerSessionAfterStreamFailure(classification, attempt) {
 				g.dropPeerSession(peer, op, err)
@@ -1846,7 +1857,7 @@ func (g *Gossiper) fanoutPublishedMessage(ctx context.Context, msg entmoot.Messa
 //
 // v1.0.6: runs each peer's dial+write in its own goroutine under an
 // errgroup with SetLimit(fanoutMaxConcurrency), and wraps every
-// attempt in a fanoutPerPeerTimeout-bounded context. One stalled peer
+// attempt in a fanoutAttemptTimeout-bounded context. One stalled peer
 // can no longer head-of-line-block healthy peers, and a dead peer
 // fails fast into the retry scheduler rather than consuming the full
 // Pilot-internal ~32 s dial budget. Gossip is best-effort, so
@@ -1861,7 +1872,7 @@ func (g *Gossiper) fanoutPush(ctx context.Context, peers []entmoot.NodeID, frame
 	for _, p := range peers {
 		p := p // capture
 		eg.Go(func() error {
-			dctx, cancel := context.WithTimeout(ctx, fanoutPerPeerTimeout)
+			dctx, cancel := context.WithTimeout(ctx, fanoutAttemptTimeout)
 			defer cancel()
 			if err := g.pushGossip(dctx, p, frame); err != nil {
 				g.logger.Warn("gossip: push",
@@ -1884,7 +1895,7 @@ func (g *Gossiper) fanoutPush(ctx context.Context, peers []entmoot.NodeID, frame
 //
 // v1.0.6: identical parallelism / timeout treatment as fanoutPush — one
 // stalled peer cannot block the rest of the lazy set, and each attempt
-// is bounded by fanoutPerPeerTimeout before dropping into the retry
+// is bounded by fanoutAttemptTimeout before dropping into the retry
 // scheduler.
 func (g *Gossiper) fanoutIHave(ctx context.Context, peers []entmoot.NodeID, frame *wire.IHave, id entmoot.MessageID) {
 	if len(peers) == 0 {
@@ -1895,7 +1906,7 @@ func (g *Gossiper) fanoutIHave(ctx context.Context, peers []entmoot.NodeID, fram
 	for _, p := range peers {
 		p := p // capture
 		eg.Go(func() error {
-			dctx, cancel := context.WithTimeout(ctx, fanoutPerPeerTimeout)
+			dctx, cancel := context.WithTimeout(ctx, fanoutAttemptTimeout)
 			defer cancel()
 			if err := g.sendIHave(dctx, p, frame); err != nil {
 				g.logger.Debug("gossip: ihave",
@@ -2343,7 +2354,7 @@ func (g *Gossiper) retryLoop(ctx context.Context) {
 //
 // v1.0.6: the previously-sequential loop over `ready` is now an errgroup
 // bounded by fanoutMaxConcurrency, with each attempt wrapped in a
-// fanoutPerPeerTimeout context so a single dead peer's retry slot cannot
+// fanoutAttemptTimeout context so a single dead peer's retry slot cannot
 // stall the rest of the due set. The "only clear if the state we just
 // executed is still the one on record" concurrent-safety pattern moves
 // inside the goroutine — success still clears under pendMu, failure
@@ -2372,7 +2383,7 @@ func (g *Gossiper) drainDueRetries(ctx context.Context) {
 	for _, d := range ready {
 		d := d // capture
 		eg.Go(func() error {
-			dctx, cancel := context.WithTimeout(ctx, fanoutPerPeerTimeout)
+			dctx, cancel := context.WithTimeout(ctx, fanoutAttemptTimeout)
 			defer cancel()
 			// v1.4.1: transport-ad retries short-circuit if the local
 			// store has seen a newer seq for the same author since we
@@ -3147,7 +3158,7 @@ func (g *Gossiper) refanoutTransportAd(ctx context.Context, except entmoot.NodeI
 	for _, p := range peers {
 		p := p
 		eg.Go(func() error {
-			dctx, cancel := context.WithTimeout(ctx, fanoutPerPeerTimeout)
+			dctx, cancel := context.WithTimeout(ctx, fanoutAttemptTimeout)
 			defer cancel()
 			if err := g.sendTransportAd(dctx, p, ad); err != nil {
 				g.logger.Debug("gossip: transport_ad refanout",
@@ -3252,7 +3263,7 @@ func (g *Gossiper) fanoutTransportAd(ctx context.Context, ad *wire.TransportAd) 
 	for _, p := range peers {
 		p := p
 		eg.Go(func() error {
-			dctx, cancel := context.WithTimeout(ctx, fanoutPerPeerTimeout)
+			dctx, cancel := context.WithTimeout(ctx, fanoutAttemptTimeout)
 			defer cancel()
 			if err := g.sendTransportAd(dctx, p, ad); err != nil {
 				g.logger.Debug("gossip: transport_ad fanout",

@@ -417,6 +417,57 @@ func TestConnWriteDeadlineClearedAfterSuccessfulWrite(t *testing.T) {
 	}
 }
 
+func TestConnClearingReadDeadlineKeepsBlockedReadAlive(t *testing.T) {
+	t.Parallel()
+	drv := newPendingCloseTestDriver()
+	c := newConn(drv, 1, SocketAddr{}, SocketAddr{})
+
+	if err := c.SetReadDeadline(time.Now().Add(30 * time.Millisecond)); err != nil {
+		t.Fatalf("SetReadDeadline: %v", err)
+	}
+	readDone := startConnRead(t, c)
+	time.Sleep(10 * time.Millisecond)
+	if err := c.SetReadDeadline(time.Time{}); err != nil {
+		t.Fatalf("clear SetReadDeadline: %v", err)
+	}
+	requireReadStillBlocked(t, readDone, 60*time.Millisecond)
+
+	c.pushRecv([]byte("ok"))
+	requireReadResult(t, readDone, "ok", nil)
+}
+
+func TestConnExtendingReadDeadlineKeepsBlockedReadAlive(t *testing.T) {
+	t.Parallel()
+	drv := newPendingCloseTestDriver()
+	c := newConn(drv, 1, SocketAddr{}, SocketAddr{})
+
+	if err := c.SetReadDeadline(time.Now().Add(30 * time.Millisecond)); err != nil {
+		t.Fatalf("SetReadDeadline: %v", err)
+	}
+	readDone := startConnRead(t, c)
+	time.Sleep(10 * time.Millisecond)
+	if err := c.SetReadDeadline(time.Now().Add(200 * time.Millisecond)); err != nil {
+		t.Fatalf("extend SetReadDeadline: %v", err)
+	}
+	requireReadStillBlocked(t, readDone, 60*time.Millisecond)
+
+	c.pushRecv([]byte("ok"))
+	requireReadResult(t, readDone, "ok", nil)
+}
+
+func TestConnPastReadDeadlineUnblocksBlockedRead(t *testing.T) {
+	t.Parallel()
+	drv := newPendingCloseTestDriver()
+	c := newConn(drv, 1, SocketAddr{}, SocketAddr{})
+
+	readDone := startConnRead(t, c)
+	requireReadStillBlocked(t, readDone, 20*time.Millisecond)
+	if err := c.SetReadDeadline(time.Now()); err != nil {
+		t.Fatalf("SetReadDeadline(now): %v", err)
+	}
+	requireReadResult(t, readDone, "", os.ErrDeadlineExceeded)
+}
+
 // TestDriverSetPeerEndpointsTLVShape checks the TLV payload the client
 // emits — a wire-format regression here would silently desync the
 // daemon's endpoint map.
@@ -503,6 +554,12 @@ type connWriteResult struct {
 	err error
 }
 
+type connReadResult struct {
+	n    int
+	data string
+	err  error
+}
+
 func startConnWrite(t *testing.T, c *Conn, p []byte) <-chan connWriteResult {
 	t.Helper()
 	done := make(chan connWriteResult, 1)
@@ -552,6 +609,44 @@ func requireDeadlineWriteAndClosedDriver(t *testing.T, drv *Driver, done <-chan 
 	case <-drv.closedCh:
 	case <-time.After(time.Second):
 		t.Fatal("driver did not close after timed-out write")
+	}
+}
+
+func startConnRead(t *testing.T, c *Conn) <-chan connReadResult {
+	t.Helper()
+	done := make(chan connReadResult, 1)
+	go func() {
+		buf := make([]byte, 16)
+		n, err := c.Read(buf)
+		done <- connReadResult{n: n, data: string(buf[:n]), err: err}
+	}()
+	return done
+}
+
+func requireReadStillBlocked(t *testing.T, done <-chan connReadResult, d time.Duration) {
+	t.Helper()
+	select {
+	case got := <-done:
+		t.Fatalf("Read returned early: n=%d data=%q err=%v", got.n, got.data, got.err)
+	case <-time.After(d):
+	}
+}
+
+func requireReadResult(t *testing.T, done <-chan connReadResult, wantData string, wantErr error) {
+	t.Helper()
+	select {
+	case got := <-done:
+		if wantErr != nil {
+			if !errors.Is(got.err, wantErr) {
+				t.Fatalf("Read err = %v, want %v", got.err, wantErr)
+			}
+			return
+		}
+		if got.err != nil || got.data != wantData {
+			t.Fatalf("Read = %q, %v; want %q, nil", got.data, got.err, wantData)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Read did not return")
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"os"
 	"sort"
 	"sync"
 	"time"
@@ -418,7 +419,6 @@ func newGroupMuxTransport(base gossip.Transport, logger *slog.Logger) *groupMuxT
 		groups: make(map[entmoot.GroupID]*groupTransport),
 		cbs:    make(map[entmoot.GroupID]func(entmoot.NodeID)),
 	}
-	base.SetOnTunnelUp(m.fireTunnelUp)
 	return m
 }
 
@@ -465,11 +465,14 @@ func (m *groupMuxTransport) AcceptLoop(ctx context.Context) error {
 }
 
 func (m *groupMuxTransport) routeConn(ctx context.Context, conn net.Conn, remote entmoot.NodeID) {
-	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	start := time.Now()
+	_ = conn.SetReadDeadline(start.Add(5 * time.Second))
 	t, body, err := wire.ReadFrame(conn)
 	if err != nil {
 		m.logger.Warn("group mux: read first frame",
 			slog.Uint64("remote", uint64(remote)),
+			slog.Duration("elapsed", time.Since(start)),
+			slog.String("phase", classifyFirstFrameReadError(err)),
 			slog.String("err", err.Error()))
 		_ = conn.Close()
 		return
@@ -480,6 +483,7 @@ func (m *groupMuxTransport) routeConn(ctx context.Context, conn net.Conn, remote
 		m.logger.Warn("group mux: decode first frame",
 			slog.Uint64("remote", uint64(remote)),
 			slog.String("type", t.String()),
+			slog.Duration("elapsed", time.Since(start)),
 			slog.String("err", err.Error()))
 		_ = conn.Close()
 		return
@@ -488,6 +492,7 @@ func (m *groupMuxTransport) routeConn(ctx context.Context, conn net.Conn, remote
 	if !ok {
 		m.logger.Warn("group mux: first frame has no routable group",
 			slog.Uint64("remote", uint64(remote)),
+			slog.Duration("elapsed", time.Since(start)),
 			slog.String("type", t.String()))
 		_ = conn.Close()
 		return
@@ -497,6 +502,7 @@ func (m *groupMuxTransport) routeConn(ctx context.Context, conn net.Conn, remote
 		m.logger.Warn("group mux: no active group for inbound frame",
 			slog.Uint64("remote", uint64(remote)),
 			slog.String("group_id", groupID.String()),
+			slog.Duration("elapsed", time.Since(start)),
 			slog.String("type", t.String()))
 		_ = conn.Close()
 		return
@@ -507,9 +513,23 @@ func (m *groupMuxTransport) routeConn(ctx context.Context, conn net.Conn, remote
 	}
 	select {
 	case tr.acceptCh <- muxAccept{conn: wrapped, remote: remote}:
+		m.fireTunnelUpForGroup(groupID, remote)
 	case <-ctx.Done():
 		_ = wrapped.Close()
 	}
+}
+
+func classifyFirstFrameReadError(err error) string {
+	if err == nil {
+		return "ok"
+	}
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		return "timeout"
+	}
+	if errors.Is(err, io.EOF) {
+		return "eof"
+	}
+	return "read"
 }
 
 func (m *groupMuxTransport) lookupGroup(groupID entmoot.GroupID) (*groupTransport, bool) {
@@ -595,15 +615,22 @@ func (m *groupMuxTransport) setGroupCallback(groupID entmoot.GroupID, cb func(en
 	m.cbs[groupID] = cb
 }
 
-func (m *groupMuxTransport) fireTunnelUp(peer entmoot.NodeID) {
+func (m *groupMuxTransport) fireTunnelUpForGroup(groupID entmoot.GroupID, peer entmoot.NodeID) {
 	m.mu.RLock()
-	callbacks := make([]func(entmoot.NodeID), 0, len(m.cbs))
-	for _, cb := range m.cbs {
-		callbacks = append(callbacks, cb)
-	}
+	cb := m.cbs[groupID]
 	m.mu.RUnlock()
-	for _, cb := range callbacks {
-		cb(peer)
+	if cb != nil {
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					m.logger.Warn("group mux: tunnel-up callback panic",
+						slog.Any("panic", r),
+						slog.String("group_id", groupID.String()),
+						slog.Uint64("peer", uint64(peer)))
+				}
+			}()
+			cb(peer)
+		}()
 	}
 }
 
@@ -619,7 +646,12 @@ type muxAccept struct {
 }
 
 func (t *groupTransport) Dial(ctx context.Context, peer entmoot.NodeID) (net.Conn, error) {
-	return t.parent.Dial(ctx, peer)
+	conn, err := t.parent.Dial(ctx, peer)
+	if err != nil {
+		return nil, err
+	}
+	t.parent.fireTunnelUpForGroup(t.groupID, peer)
+	return conn, nil
 }
 
 func (t *groupTransport) Accept(ctx context.Context) (net.Conn, entmoot.NodeID, error) {

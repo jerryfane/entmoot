@@ -133,38 +133,52 @@ func (c *pilotConn) Read(p []byte) (int, error) {
 		return n, nil
 	}
 
-	c.stateMu.Lock()
-	dl := c.readDeadline
-	dch := c.deadlineCh
-	c.stateMu.Unlock()
+	for {
+		c.stateMu.Lock()
+		dl := c.readDeadline
+		dch := c.deadlineCh
+		c.stateMu.Unlock()
 
-	if !dl.IsZero() && !time.Now().Before(dl) {
-		return 0, os.ErrDeadlineExceeded
-	}
-
-	var timer <-chan time.Time
-	if !dl.IsZero() {
-		t := time.NewTimer(time.Until(dl))
-		defer t.Stop()
-		timer = t.C
-	}
-
-	select {
-	case data, ok := <-c.recvCh:
-		if !ok {
-			return 0, io.EOF
+		if !dl.IsZero() && !time.Now().Before(dl) {
+			return 0, os.ErrDeadlineExceeded
 		}
-		n := copy(p, data)
-		if n < len(data) {
-			c.recvBuf = data[n:]
+
+		var timer *time.Timer
+		var timerCh <-chan time.Time
+		if !dl.IsZero() {
+			timer = time.NewTimer(time.Until(dl))
+			timerCh = timer.C
 		}
-		return n, nil
-	case <-timer:
-		return 0, os.ErrDeadlineExceeded
-	case <-dch:
-		return 0, os.ErrDeadlineExceeded
-	case <-c.drv.closedCh:
-		return 0, ErrClosed
+
+		select {
+		case data, ok := <-c.recvCh:
+			if timer != nil {
+				timer.Stop()
+			}
+			if !ok {
+				return 0, io.EOF
+			}
+			n := copy(p, data)
+			if n < len(data) {
+				c.recvBuf = data[n:]
+			}
+			return n, nil
+		case <-timerCh:
+			return 0, os.ErrDeadlineExceeded
+		case <-dch:
+			if timer != nil {
+				timer.Stop()
+			}
+			// A deadline update is not necessarily an expired deadline. Re-check
+			// current state so clearing/extending a deadline preserves net.Conn
+			// semantics for blocked readers.
+			continue
+		case <-c.drv.closedCh:
+			if timer != nil {
+				timer.Stop()
+			}
+			return 0, ErrClosed
+		}
 	}
 }
 

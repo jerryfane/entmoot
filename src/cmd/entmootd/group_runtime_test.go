@@ -71,8 +71,12 @@ func TestGroupMuxRoutesByFirstFrameGroup(t *testing.T) {
 	mux := newGroupMuxTransport(base, nil)
 	gidA := testRuntimeGroupID(0xA1)
 	gidB := testRuntimeGroupID(0xB2)
-	_, _ = mux.Group(gidA)
+	groupA, _ := mux.Group(gidA)
 	groupB, _ := mux.Group(gidB)
+	tunnelA := make(chan entmoot.NodeID, 1)
+	tunnelB := make(chan entmoot.NodeID, 1)
+	groupA.SetOnTunnelUp(func(peer entmoot.NodeID) { tunnelA <- peer })
+	groupB.SetOnTunnelUp(func(peer entmoot.NodeID) { tunnelB <- peer })
 	go func() { _ = mux.AcceptLoop(ctx) }()
 
 	client, server := net.Pipe()
@@ -100,6 +104,67 @@ func TestGroupMuxRoutesByFirstFrameGroup(t *testing.T) {
 	if !ok || req.GroupID != gidB {
 		t.Fatalf("payload = %#v, want MerkleReq for gidB", payload)
 	}
+	expectTunnelUp(t, tunnelB, 45981, "groupB")
+	expectNoTunnelUp(t, tunnelA, "groupA")
+}
+
+func TestGroupMuxDoesNotFireTunnelUpBeforeFirstFrame(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	base := newRuntimeFakeTransport()
+	mux := newGroupMuxTransport(base, nil)
+	groupB, _ := mux.Group(testRuntimeGroupID(0xB2))
+	tunnelB := make(chan entmoot.NodeID, 1)
+	groupB.SetOnTunnelUp(func(peer entmoot.NodeID) { tunnelB <- peer })
+	go func() { _ = mux.AcceptLoop(ctx) }()
+
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+	base.acceptCh <- runtimeAccept{conn: server, remote: 45981}
+
+	expectNoTunnelUp(t, tunnelB, "groupB")
+}
+
+func TestGroupTransportOutboundDialFiresOnlyItsGroupTunnelUp(t *testing.T) {
+	ctx := context.Background()
+
+	base := newRuntimeFakeTransport()
+	mux := newGroupMuxTransport(base, nil)
+	groupA, _ := mux.Group(testRuntimeGroupID(0xA1))
+	groupB, _ := mux.Group(testRuntimeGroupID(0xB2))
+	tunnelA := make(chan entmoot.NodeID, 1)
+	tunnelB := make(chan entmoot.NodeID, 1)
+	groupA.SetOnTunnelUp(func(peer entmoot.NodeID) { tunnelA <- peer })
+	groupB.SetOnTunnelUp(func(peer entmoot.NodeID) { tunnelB <- peer })
+
+	base.dialConn = &bufferConn{}
+	conn, err := groupB.Dial(ctx, 45981)
+	if err != nil {
+		t.Fatalf("groupB.Dial: %v", err)
+	}
+	defer conn.Close()
+
+	expectTunnelUp(t, tunnelB, 45981, "groupB")
+	expectNoTunnelUp(t, tunnelA, "groupA")
+}
+
+func TestGroupTransportOutboundDialFailureDoesNotFireTunnelUp(t *testing.T) {
+	ctx := context.Background()
+
+	base := newRuntimeFakeTransport()
+	mux := newGroupMuxTransport(base, nil)
+	groupB, _ := mux.Group(testRuntimeGroupID(0xB2))
+	tunnelB := make(chan entmoot.NodeID, 1)
+	groupB.SetOnTunnelUp(func(peer entmoot.NodeID) { tunnelB <- peer })
+
+	base.dialErr = errors.New("dial failed")
+	if _, err := groupB.Dial(ctx, 45981); err == nil {
+		t.Fatal("groupB.Dial succeeded, want error")
+	}
+
+	expectNoTunnelUp(t, tunnelB, "groupB")
 }
 
 func TestGroupRuntimeConcurrentDuplicateJoinKeepsMuxGroup(t *testing.T) {
@@ -298,6 +363,27 @@ func expectNoEndpointTick(t *testing.T, ch <-chan struct{}, name string) {
 	}
 }
 
+func expectTunnelUp(t *testing.T, ch <-chan entmoot.NodeID, want entmoot.NodeID, name string) {
+	t.Helper()
+	select {
+	case got := <-ch:
+		if got != want {
+			t.Fatalf("%s tunnel peer = %d, want %d", name, got, want)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("%s did not receive tunnel-up", name)
+	}
+}
+
+func expectNoTunnelUp(t *testing.T, ch <-chan entmoot.NodeID, name string) {
+	t.Helper()
+	select {
+	case got := <-ch:
+		t.Fatalf("%s received unexpected tunnel-up from %d", name, got)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
 func selfInvite(t *testing.T, dataDir string, st *store.SQLite, identity *keystore.Identity, nodeID entmoot.NodeID, gid entmoot.GroupID) entmoot.Invite {
 	t.Helper()
 	r, err := roster.OpenJSONL(dataDir, gid)
@@ -349,6 +435,8 @@ type runtimeAccept struct {
 type runtimeFakeTransport struct {
 	acceptCh chan runtimeAccept
 	closed   chan struct{}
+	dialConn net.Conn
+	dialErr  error
 }
 
 func newRuntimeFakeTransport() *runtimeFakeTransport {
@@ -359,6 +447,12 @@ func newRuntimeFakeTransport() *runtimeFakeTransport {
 }
 
 func (t *runtimeFakeTransport) Dial(context.Context, entmoot.NodeID) (net.Conn, error) {
+	if t.dialErr != nil {
+		return nil, t.dialErr
+	}
+	if t.dialConn != nil {
+		return t.dialConn, nil
+	}
 	return nil, errors.New("dial not implemented")
 }
 

@@ -30,7 +30,7 @@ import (
 // it can simulate Pilot's ~32 s SYN-retry stall without actually
 // consuming wallclock minutes. When slowDial[peer] > 0, Dial sleeps
 // that long (respecting ctx cancellation) before returning — so a
-// fanoutPerPeerTimeout-wrapped context will cancel the dial early
+// fanoutAttemptTimeout-wrapped context will cancel the dial early
 // exactly like a real stalled peer.
 type filteringTransport struct {
 	local     entmoot.NodeID
@@ -498,13 +498,13 @@ func TestPlumtreeSkipsUntrusted(t *testing.T) {
 
 // TestPlumtreeParallelFanoutWithSlowPeer is the v1.0.6 Fix B guard: one
 // stalled peer must not head-of-line-block fanout to healthy peers, and
-// every attempt must be bounded by fanoutPerPeerTimeout so a dead peer
+// every attempt must be bounded by fanoutAttemptTimeout so a dead peer
 // falls fast into the retry scheduler instead of consuming the full
 // ~32 s Pilot SYN-retry budget.
 //
 // Topology: A=10, B=20, C=30; fully-trusted 3-node mesh. A's transport
 // is wrapped in a filter that allows all dials but makes Dial(C) block
-// for 30 s — far longer than the 5 s per-peer budget.
+// for 30 s — far longer than the per-peer attempt budget.
 //
 // With sequential pre-v1.0.6 fanout, a publish on A would stall for
 // 30 s before B ever saw the message. With parallel fanout + per-peer
@@ -514,7 +514,7 @@ func TestPlumtreeSkipsUntrusted(t *testing.T) {
 //     with the stalled C dial, so B is unaffected by A's slow C dial).
 //  2. A's pending map gains a retryKey{peer: 30, id: msg.ID, op: opPush}
 //     entry well before the 30 s injected delay would have elapsed —
-//     proving A's Dial(C) was cancelled by fanoutPerPeerTimeout (5 s)
+//     proving A's Dial(C) was cancelled by fanoutAttemptTimeout
 //     and the failure was enqueued for retry rather than silently
 //     dropped.
 func TestPlumtreeParallelFanoutWithSlowPeer(t *testing.T) {
@@ -526,7 +526,7 @@ func TestPlumtreeParallelFanoutWithSlowPeer(t *testing.T) {
 	// artificially slow. B and C keep the unfiltered memTransport so
 	// their accept paths and any refanout they do proceed normally.
 	aFilter := newFilteringTransport(10, f.transports[10], []entmoot.NodeID{20, 30})
-	aFilter.setSlowDial(30, 30*time.Second) // well beyond fanoutPerPeerTimeout (5 s)
+	aFilter.setSlowDial(30, 30*time.Second) // well beyond fanoutAttemptTimeout
 	f.nodes[10].gossip.cfg.Transport = aFilter
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -542,7 +542,7 @@ func TestPlumtreeParallelFanoutWithSlowPeer(t *testing.T) {
 	// B must receive via A's direct eager push without being blocked by
 	// the stalled Dial(C). Budget 1 s — eager push over net.Pipe is
 	// sub-millisecond; anything beyond that is scheduler slack. Crucial
-	// that this is < fanoutPerPeerTimeout so a regression to sequential
+	// that this is < fanoutAttemptTimeout so a regression to sequential
 	// fanout (where Dial(C)'s 30 s stall blocks Dial(B)) fails loudly.
 	waitUntil(t, 1*time.Second, "B stores A's message despite slow C", func() bool {
 		has, _ := f.nodes[20].storeM.Has(ctx, f.groupID, msg.ID)
@@ -552,16 +552,16 @@ func TestPlumtreeParallelFanoutWithSlowPeer(t *testing.T) {
 		t.Fatalf("B delivery took %v; parallel fanout should have delivered in <1s", elapsed)
 	}
 
-	// Wait for the per-peer timeout to expire (5 s) plus slack so the
+	// Wait for the per-peer timeout to expire plus slack so the
 	// pushGossip(C) goroutine has definitely returned and bumped the
-	// retry slot. The 6.5 s cap is well under the 30 s injected delay,
+	// retry slot. The cap is well under the 30 s injected delay,
 	// so this also implicitly proves the timeout fired — if it hadn't,
 	// the publish fanout would still be in flight and the retry slot
 	// would not yet exist. The retry-slot appearance is the load-
 	// bearing assertion for Fix B: it proves both that Dial(C) was
-	// cancelled at 5 s (not 30 s) AND that the failure fell into the
+	// cancelled before the full 30 s stall AND that the failure fell into the
 	// retry scheduler instead of silently dropping the message.
-	waitUntil(t, 6500*time.Millisecond, "A enqueues retry for slow C after per-peer timeout", func() bool {
+	waitUntil(t, fanoutAttemptTimeout+2*time.Second, "A enqueues retry for slow C after per-peer timeout", func() bool {
 		f.nodes[10].gossip.pendMu.Lock()
 		defer f.nodes[10].gossip.pendMu.Unlock()
 		_, ok := f.nodes[10].gossip.pending[retryKey{peer: 30, id: msg.ID, op: opPush}]

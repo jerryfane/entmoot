@@ -462,6 +462,64 @@ func (t *scriptedWriteTransport) counts() (dials, drops int) {
 	return t.dials, t.drops
 }
 
+type deadlineBudgetTransport struct {
+	mu            sync.Mutex
+	minDialBudget time.Duration
+	dials         int
+	writes        int
+	writeDeadline time.Time
+}
+
+func (t *deadlineBudgetTransport) Dial(ctx context.Context, peer entmoot.NodeID) (net.Conn, error) {
+	t.mu.Lock()
+	t.dials++
+	t.mu.Unlock()
+	deadline, ok := ctx.Deadline()
+	if !ok || time.Until(deadline) < t.minDialBudget {
+		return nil, context.DeadlineExceeded
+	}
+	return &deadlineBudgetConn{owner: t}, nil
+}
+
+func (t *deadlineBudgetTransport) Accept(ctx context.Context) (net.Conn, entmoot.NodeID, error) {
+	<-ctx.Done()
+	return nil, 0, ctx.Err()
+}
+
+func (t *deadlineBudgetTransport) TrustedPeers(ctx context.Context) ([]entmoot.NodeID, error) {
+	return nil, nil
+}
+
+func (t *deadlineBudgetTransport) SetPeerEndpoints(ctx context.Context, peer entmoot.NodeID, endpoints []entmoot.NodeEndpoint) error {
+	return nil
+}
+
+func (t *deadlineBudgetTransport) SetOnTunnelUp(cb func(peer entmoot.NodeID)) {}
+func (t *deadlineBudgetTransport) Close() error                               { return nil }
+
+type deadlineBudgetConn struct {
+	owner *deadlineBudgetTransport
+}
+
+func (c *deadlineBudgetConn) Read(b []byte) (int, error) { return 0, io.EOF }
+func (c *deadlineBudgetConn) Write(b []byte) (int, error) {
+	c.owner.mu.Lock()
+	defer c.owner.mu.Unlock()
+	c.owner.writes++
+	return len(b), nil
+}
+func (c *deadlineBudgetConn) Close() error                    { return nil }
+func (c *deadlineBudgetConn) LocalAddr() net.Addr             { return staticAddr("local") }
+func (c *deadlineBudgetConn) RemoteAddr() net.Addr            { return staticAddr("remote") }
+func (c *deadlineBudgetConn) SetDeadline(time.Time) error     { return nil }
+func (c *deadlineBudgetConn) SetReadDeadline(time.Time) error { return nil }
+func (c *deadlineBudgetConn) SetWriteDeadline(deadline time.Time) error {
+	c.owner.mu.Lock()
+	defer c.owner.mu.Unlock()
+	c.owner.writeDeadline = deadline
+	return nil
+}
+
 func TestOneWaySendDropsStaleSessionAndRetriesWrite(t *testing.T) {
 	t.Parallel()
 
@@ -485,6 +543,32 @@ func TestOneWaySendDropsStaleSessionAndRetriesWrite(t *testing.T) {
 	}
 	if drops != 1 {
 		t.Fatalf("drops = %d, want 1", drops)
+	}
+}
+
+func TestFanoutPushUsesLongDialBudgetAndFreshWriteBudget(t *testing.T) {
+	t.Parallel()
+
+	var gid entmoot.GroupID
+	gid[0] = 1
+	tr := &deadlineBudgetTransport{minDialBudget: 10 * time.Second}
+	g := newScriptedRecoveryGossiper(gid, tr)
+
+	g.fanoutPush(context.Background(), []entmoot.NodeID{20}, &wire.Gossip{GroupID: gid}, entmoot.MessageID{})
+
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	if tr.dials != 1 {
+		t.Fatalf("dials = %d, want 1", tr.dials)
+	}
+	if tr.writes != 1 {
+		t.Fatalf("writes = %d, want 1", tr.writes)
+	}
+	if tr.writeDeadline.IsZero() {
+		t.Fatal("write deadline was not set")
+	}
+	if until := time.Until(tr.writeDeadline); until < 4*time.Second {
+		t.Fatalf("write deadline budget = %v, want roughly %v", until, fanoutWriteTimeout)
 	}
 }
 
