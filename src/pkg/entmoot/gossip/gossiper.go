@@ -151,6 +151,17 @@ const (
 	reconcilerTickJitter = 6 * time.Second // ±20 %
 )
 
+// Member-profile snapshots are the anti-entropy repair path for app-facing
+// display metadata. Live MemberProfileAd fanout is best-effort; this periodic
+// pull makes hostnames converge after missed fanout or transient dial-backoff.
+const (
+	memberProfileSnapshotTickBase      = 5 * time.Minute
+	memberProfileSnapshotTickJitter    = 1 * time.Minute
+	memberProfileSnapshotMinInterval   = 2 * time.Minute
+	memberProfileSnapshotSweepBatch    = 4
+	memberProfileSnapshotMaxConcurrent = 2
+)
+
 // reconcileSessionTimeout bounds the wallclock budget of a single RBSR
 // reconciliation session — the full multi-frame exchange between initiator
 // and responder, not per-frame. Anti-entropy against a 10^4-message group
@@ -466,11 +477,15 @@ type Gossiper struct {
 	// guarded by pendMu to keep the allocation story simple; the maps are
 	// accessed far less often than the accept loop, so a single mutex is
 	// fine.
-	pendMu            sync.Mutex
-	pending           map[retryKey]*retryState
-	lastReconciled    map[entmoot.NodeID]reconcileState
-	reconcileInFlight map[entmoot.NodeID]struct{}
-	reconcileFailures map[entmoot.NodeID]reconcileState
+	pendMu             sync.Mutex
+	pending            map[retryKey]*retryState
+	lastReconciled     map[entmoot.NodeID]reconcileState
+	reconcileInFlight  map[entmoot.NodeID]struct{}
+	reconcileFailures  map[entmoot.NodeID]reconcileState
+	profilePulls       map[entmoot.NodeID]struct{}
+	profilePullLast    map[entmoot.NodeID]time.Time
+	profileSweepCursor int
+	profilePullSlots   chan struct{}
 	// lastKnownPeerRoot caches the Merkle root each peer reported on the
 	// most recent successful reconcile handshake. Phase 7 / Part E
 	// consults it before firing a reconcile to tick-skip peers we already
@@ -596,6 +611,9 @@ func New(cfg Config) (*Gossiper, error) {
 		lastReconciled:    make(map[entmoot.NodeID]reconcileState),
 		reconcileInFlight: make(map[entmoot.NodeID]struct{}),
 		reconcileFailures: make(map[entmoot.NodeID]reconcileState),
+		profilePulls:      make(map[entmoot.NodeID]struct{}),
+		profilePullLast:   make(map[entmoot.NodeID]time.Time),
+		profilePullSlots:  make(chan struct{}, memberProfileSnapshotMaxConcurrent),
 		lastKnownPeerRoot: make(map[entmoot.NodeID]wire.MerkleRoot),
 		rng:               rng,
 		// Plumtree peer-set maps and pending-graft timer map are
@@ -1093,6 +1111,10 @@ func (g *Gossiper) Start(ctx context.Context) error {
 			defer g.wg.Done()
 			g.memberProfileLoop(ctx)
 		}()
+	}
+	if g.cfg.MemberProfileStore != nil {
+		g.wg.Add(1)
+		go g.memberProfileSnapshotLoop(ctx)
 	}
 
 	for {
@@ -2137,6 +2159,14 @@ func (g *Gossiper) jitteredReconcilerTick() time.Duration {
 	return reconcilerTickBase - reconcilerTickJitter + delta
 }
 
+func (g *Gossiper) jitteredMemberProfileSnapshotTick() time.Duration {
+	g.rngMu.Lock()
+	defer g.rngMu.Unlock()
+	span := int64(2 * memberProfileSnapshotTickJitter)
+	delta := time.Duration(g.rng.Int64N(span))
+	return memberProfileSnapshotTickBase - memberProfileSnapshotTickJitter + delta
+}
+
 // reconcilerLoop runs background anti-entropy (v1.2.1). Each tick picks
 // the least-recently-reconciled roster member (excluding self) and
 // fires maybeReconcile — unless the peer's cached Merkle root already
@@ -2721,6 +2751,9 @@ func (g *Gossiper) maybeReconcile(ctx context.Context, peer entmoot.NodeID) {
 		success := g.reconcileWith(attemptCtx, peer)
 		g.traceReconcile(peer, "attempt_done", slog.Bool("success", success), since(start))
 		g.finishReconcile(peer, success)
+		if success {
+			g.scheduleMemberProfileSnapshotPull(parent, peer, "reconcile_success")
+		}
 	}()
 }
 
@@ -3371,6 +3404,11 @@ func (g *Gossiper) ingestMemberProfileAd(ctx context.Context, remote entmoot.Nod
 			slog.Uint64("seq", ad.Seq))
 		return
 	}
+	g.logger.Debug("gossip: member_profile_ad ingested",
+		slog.Uint64("remote", uint64(remote)),
+		slog.Uint64("author", uint64(ad.Author.PilotNodeID)),
+		slog.Uint64("seq", ad.Seq),
+		slog.String("hostname", ad.Hostname))
 	g.refanoutMemberProfileAd(ctx, remote, ad)
 }
 
@@ -3665,6 +3703,127 @@ func (g *Gossiper) memberProfileLoop(ctx context.Context) {
 			}
 		}
 	}
+}
+
+func (g *Gossiper) memberProfileSnapshotLoop(ctx context.Context) {
+	defer g.wg.Done()
+
+	t := time.NewTimer(g.jitteredMemberProfileSnapshotTick())
+	defer t.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			g.scheduleMemberProfileSnapshotSweep(ctx, "periodic")
+			t.Reset(g.jitteredMemberProfileSnapshotTick())
+		}
+	}
+}
+
+func (g *Gossiper) scheduleMemberProfileSnapshotSweep(ctx context.Context, reason string) int {
+	members := g.cfg.Roster.Members()
+	if len(members) == 0 {
+		return 0
+	}
+
+	g.pendMu.Lock()
+	start := g.profileSweepCursor % len(members)
+	g.pendMu.Unlock()
+
+	scheduled := 0
+	visited := 0
+	for visited < len(members) && scheduled < memberProfileSnapshotSweepBatch {
+		idx := (start + visited) % len(members)
+		visited++
+		if g.scheduleMemberProfileSnapshotPull(ctx, members[idx], reason) {
+			scheduled++
+		}
+	}
+
+	g.pendMu.Lock()
+	g.profileSweepCursor = (start + visited) % len(members)
+	g.pendMu.Unlock()
+	return scheduled
+}
+
+func (g *Gossiper) scheduleMemberProfileSnapshotPull(ctx context.Context, peer entmoot.NodeID, reason string) bool {
+	if g.cfg.MemberProfileStore == nil || peer == 0 || peer == g.cfg.LocalNode {
+		return false
+	}
+	if !g.cfg.Roster.IsMember(peer) {
+		return false
+	}
+	parent := g.reconcileParentContext(ctx)
+	if err := parent.Err(); err != nil {
+		return false
+	}
+
+	g.pendMu.Lock()
+	if _, ok := g.profilePulls[peer]; ok {
+		g.pendMu.Unlock()
+		g.logger.Debug("gossip: member_profile_snapshot pull skip",
+			slog.Uint64("peer", uint64(peer)),
+			slog.String("reason", reason),
+			slog.String("phase", "in_flight"))
+		return false
+	}
+	now := g.clk.Now()
+	if last, ok := g.profilePullLast[peer]; ok && now.Sub(last) < memberProfileSnapshotMinInterval {
+		remaining := memberProfileSnapshotMinInterval - now.Sub(last)
+		g.pendMu.Unlock()
+		g.logger.Debug("gossip: member_profile_snapshot pull skip",
+			slog.Uint64("peer", uint64(peer)),
+			slog.String("reason", reason),
+			slog.String("phase", "cooldown"),
+			slog.Duration("remaining", remaining))
+		return false
+	}
+	g.profilePulls[peer] = struct{}{}
+	g.profilePullLast[peer] = now
+	g.pendMu.Unlock()
+
+	g.wg.Add(1)
+	go func() {
+		defer g.wg.Done()
+		defer func() {
+			g.pendMu.Lock()
+			delete(g.profilePulls, peer)
+			g.pendMu.Unlock()
+		}()
+
+		pullCtx, cancel := context.WithTimeout(parent, g.fanoutAttemptBudget())
+		defer cancel()
+
+		select {
+		case g.profilePullSlots <- struct{}{}:
+			defer func() { <-g.profilePullSlots }()
+		case <-pullCtx.Done():
+			g.logger.Debug("gossip: member_profile_snapshot pull failed",
+				slog.Uint64("peer", uint64(peer)),
+				slog.String("reason", reason),
+				slog.String("err", pullCtx.Err().Error()))
+			return
+		}
+
+		g.logger.Debug("gossip: member_profile_snapshot pull start",
+			slog.Uint64("peer", uint64(peer)),
+			slog.String("reason", reason))
+		count, err := g.pullMemberProfileSnapshot(pullCtx, peer)
+		if err != nil {
+			g.logger.Debug("gossip: member_profile_snapshot pull failed",
+				slog.Uint64("peer", uint64(peer)),
+				slog.String("reason", reason),
+				slog.String("err", err.Error()))
+			return
+		}
+		g.logger.Debug("gossip: member_profile_snapshot pull success",
+			slog.Uint64("peer", uint64(peer)),
+			slog.String("reason", reason),
+			slog.Int("count", count))
+	}()
+	return true
 }
 
 type memberProfilePublishState struct {

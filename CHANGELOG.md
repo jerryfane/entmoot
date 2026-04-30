@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.27] - 2026-04-30
+
+### Fixed
+
+- **Durable member-profile convergence.** Member profile snapshots now repair
+  missed hostname fanout after successful reconcile and through a bounded
+  periodic sweep, so ESP member lists can recover display names like `phobos`
+  instead of falling back to `node-<id>` without creating snapshot storms.
+- **Isolated Pilot hostname lookup.** Entmoot now queries local Pilot hostname
+  over a short-lived IPC connection, avoiding starvation behind long-running
+  gossip stream commands on the shared transport driver.
+
 ## [1.5.26] - 2026-04-30
 
 ### Added

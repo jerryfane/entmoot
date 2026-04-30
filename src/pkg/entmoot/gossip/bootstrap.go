@@ -178,7 +178,7 @@ func (g *Gossiper) pullJoinSnapshots(ctx context.Context, peer entmoot.NodeID) {
 			slog.Uint64("peer", uint64(peer)),
 			slog.String("err", err.Error()))
 	}
-	if err := g.pullMemberProfileSnapshot(ctx, peer); err != nil {
+	if _, err := g.pullMemberProfileSnapshot(ctx, peer); err != nil {
 		g.logger.Debug("gossip: member profile snapshot",
 			slog.Uint64("peer", uint64(peer)),
 			slog.String("err", err.Error()))
@@ -304,35 +304,37 @@ func (g *Gossiper) pullTransportSnapshot(ctx context.Context, peer entmoot.NodeI
 // live-gossip topic bucket: the snapshot response is already one bounded
 // request/response interaction, and charging every member would truncate
 // larger groups at the default profile-topic burst.
-func (g *Gossiper) pullMemberProfileSnapshot(ctx context.Context, peer entmoot.NodeID) error {
+func (g *Gossiper) pullMemberProfileSnapshot(ctx context.Context, peer entmoot.NodeID) (int, error) {
 	if g.cfg.MemberProfileStore == nil {
-		return nil
+		return 0, nil
 	}
 	conn, err := g.cfg.Transport.Dial(ctx, peer)
 	if err != nil {
-		return fmt.Errorf("dial: %w", err)
+		return 0, fmt.Errorf("dial: %w", err)
 	}
 	defer conn.Close()
+	setConnDeadlineFromContext(ctx, conn)
 	req := &wire.MemberProfileSnapshotReq{GroupID: g.cfg.GroupID}
 	if err := wire.EncodeAndWrite(conn, req); err != nil {
-		return fmt.Errorf("write member_profile_snapshot_req: %w", err)
+		return 0, fmt.Errorf("write member_profile_snapshot_req: %w", err)
 	}
 	_, payload, err := wire.ReadAndDecode(conn)
 	if err != nil {
-		return fmt.Errorf("read member_profile_snapshot_resp: %w", err)
+		return 0, fmt.Errorf("read member_profile_snapshot_resp: %w", err)
 	}
 	resp, ok := payload.(*wire.MemberProfileSnapshotResp)
 	if !ok {
-		return fmt.Errorf("member profile snapshot: unexpected response type %T", payload)
+		return 0, fmt.Errorf("member profile snapshot: unexpected response type %T", payload)
 	}
 	if resp.GroupID != g.cfg.GroupID {
-		return fmt.Errorf("member profile snapshot: group_id mismatch")
+		return 0, fmt.Errorf("member profile snapshot: group_id mismatch")
 	}
 	for i := range resp.Profiles {
 		ad := &resp.Profiles[i]
 		g.ingestMemberProfileAd(ctx, peer, ad, false)
 	}
-	return nil
+	g.recordDialSuccess(peer)
+	return len(resp.Profiles), nil
 }
 
 // verifyInvite checks invite.Signature against invite.Issuer.EntmootPubKey

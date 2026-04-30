@@ -2,6 +2,8 @@ package gossip
 
 import (
 	"context"
+	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -231,6 +233,127 @@ func TestMemberProfileAdRetryOnFanoutFailure(t *testing.T) {
 	}
 }
 
+func TestMemberProfileSnapshotRepairAfterMissedFanout(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f := newFixture(t, []entmoot.NodeID{10, 20})
+	defer f.closeTransports()
+
+	storeA, err := store.OpenSQLite(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenSQLite A: %v", err)
+	}
+	t.Cleanup(func() { _ = storeA.Close() })
+	storeB, err := store.OpenSQLite(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenSQLite B: %v", err)
+	}
+	t.Cleanup(func() { _ = storeB.Close() })
+	f.nodes[10].gossip.cfg.MemberProfileStore = storeA
+	f.nodes[20].gossip.cfg.MemberProfileStore = storeB
+
+	ad := f.buildMemberProfileAd(10, 1, "mars.local", f.nodes[10].gossip.clk.Now())
+	if _, err := storeA.PutMemberProfileAd(ctx, ad); err != nil {
+		t.Fatalf("PutMemberProfileAd: %v", err)
+	}
+
+	go func() { _ = f.nodes[10].gossip.Start(ctx) }()
+	f.nodes[20].gossip.scheduleMemberProfileSnapshotPull(ctx, 10, "test")
+
+	waitUntil(t, 2*time.Second, "B repairs A member profile from snapshot", func() bool {
+		got, ok, err := storeB.GetMemberProfileAd(ctx, f.groupID, 10, f.nodes[20].gossip.clk.Now())
+		return err == nil && ok && got.Hostname == "mars.local"
+	})
+}
+
+func TestMemberProfileTunnelUpDoesNotScheduleSnapshotPull(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f := newFixture(t, []entmoot.NodeID{10, 20})
+	defer f.closeTransports()
+
+	s, err := store.OpenSQLite(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	tr := newTunnelCallbackCaptureTransport()
+	f.nodes[10].gossip.cfg.Transport = tr
+	f.nodes[10].gossip.cfg.MemberProfileStore = s
+	go func() { _ = f.nodes[10].gossip.Start(ctx) }()
+
+	var cb func(entmoot.NodeID)
+	waitUntil(t, time.Second, "tunnel callback installed", func() bool {
+		cb = tr.callback()
+		return cb != nil
+	})
+	cb(20)
+	time.Sleep(100 * time.Millisecond)
+
+	f.nodes[10].gossip.pendMu.Lock()
+	pulls := len(f.nodes[10].gossip.profilePulls)
+	last := len(f.nodes[10].gossip.profilePullLast)
+	f.nodes[10].gossip.pendMu.Unlock()
+	if pulls != 0 || last != 0 {
+		t.Fatalf("tunnel-up scheduled profile pulls: in_flight=%d last=%d", pulls, last)
+	}
+}
+
+func TestMemberProfileSnapshotPullCooldownSuppressesRepeats(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	f := newFixture(t, []entmoot.NodeID{10, 20})
+	defer f.closeTransports()
+
+	s, err := store.OpenSQLite(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	g := f.nodes[10].gossip
+	g.cfg.MemberProfileStore = s
+
+	if !g.scheduleMemberProfileSnapshotPull(ctx, 20, "test") {
+		t.Fatal("first snapshot pull was not scheduled")
+	}
+	waitUntil(t, time.Second, "first snapshot pull leaves in-flight set", func() bool {
+		g.pendMu.Lock()
+		defer g.pendMu.Unlock()
+		_, ok := g.profilePulls[20]
+		return !ok
+	})
+	if g.scheduleMemberProfileSnapshotPull(context.Background(), 20, "test") {
+		t.Fatal("second snapshot pull scheduled inside cooldown")
+	}
+}
+
+func TestMemberProfileSnapshotSweepIsBatchedAndConcurrencyLimited(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	nodeIDs := []entmoot.NodeID{10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20}
+	f := newFixture(t, nodeIDs)
+	defer f.closeTransports()
+
+	s, err := store.OpenSQLite(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	g := f.nodes[10].gossip
+	g.cfg.MemberProfileStore = s
+
+	if scheduled := g.scheduleMemberProfileSnapshotSweep(ctx, "test"); scheduled != memberProfileSnapshotSweepBatch {
+		t.Fatalf("scheduled = %d, want %d", scheduled, memberProfileSnapshotSweepBatch)
+	}
+	waitUntil(t, time.Second, "snapshot pulls enter slots", func() bool {
+		return len(g.profilePullSlots) == memberProfileSnapshotMaxConcurrent
+	})
+	if got := len(g.profilePullSlots); got > memberProfileSnapshotMaxConcurrent {
+		t.Fatalf("active profile pulls = %d, cap = %d", got, memberProfileSnapshotMaxConcurrent)
+	}
+}
+
 func TestMemberProfileAdRetrySupersededByNewerProfile(t *testing.T) {
 	ctx := context.Background()
 	f := newFixture(t, []entmoot.NodeID{10, 20})
@@ -310,7 +433,7 @@ func TestMemberProfileSnapshotBypassesPerEntryTopicLimit(t *testing.T) {
 	}
 
 	go func() { _ = f.nodes[10].gossip.Start(ctx) }()
-	if err := f.nodes[20].gossip.pullMemberProfileSnapshot(ctx, 10); err != nil {
+	if _, err := f.nodes[20].gossip.pullMemberProfileSnapshot(ctx, 10); err != nil {
 		t.Fatalf("pullMemberProfileSnapshot: %v", err)
 	}
 
@@ -490,6 +613,56 @@ func buildMemberProfileAdForIdentity(t *testing.T, groupID entmoot.GroupID, id *
 	}
 	ad.Signature = id.Sign(sigInput)
 	return ad
+}
+
+type tunnelCallbackCaptureTransport struct {
+	mu   sync.Mutex
+	cb   func(entmoot.NodeID)
+	once sync.Once
+	ch   chan struct{}
+}
+
+func newTunnelCallbackCaptureTransport() *tunnelCallbackCaptureTransport {
+	return &tunnelCallbackCaptureTransport{ch: make(chan struct{})}
+}
+
+func (t *tunnelCallbackCaptureTransport) Dial(context.Context, entmoot.NodeID) (net.Conn, error) {
+	return nil, net.ErrClosed
+}
+
+func (t *tunnelCallbackCaptureTransport) Accept(ctx context.Context) (net.Conn, entmoot.NodeID, error) {
+	<-ctx.Done()
+	return nil, 0, ctx.Err()
+}
+
+func (t *tunnelCallbackCaptureTransport) TrustedPeers(context.Context) ([]entmoot.NodeID, error) {
+	return nil, nil
+}
+
+func (t *tunnelCallbackCaptureTransport) SetPeerEndpoints(context.Context, entmoot.NodeID, []entmoot.NodeEndpoint) error {
+	return nil
+}
+
+func (t *tunnelCallbackCaptureTransport) SetOnTunnelUp(cb func(entmoot.NodeID)) {
+	t.mu.Lock()
+	t.cb = cb
+	t.mu.Unlock()
+	t.once.Do(func() { close(t.ch) })
+}
+
+func (t *tunnelCallbackCaptureTransport) Close() error {
+	return nil
+}
+
+func (t *tunnelCallbackCaptureTransport) callback() func(entmoot.NodeID) {
+	select {
+	case <-t.ch:
+	default:
+		return nil
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.cb
 }
 
 func memberProfileRetryState(g *Gossiper, peer, author entmoot.NodeID) (*retryState, bool) {

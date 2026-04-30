@@ -84,6 +84,30 @@ func warnIfPilotNotFullyHideIP(d *ipcclient.Driver) {
 	}
 }
 
+func localPilotHostname(socketPath, command string) (string, bool) {
+	drv, err := ipcclient.Connect(socketPath)
+	if err != nil {
+		slog.Debug(command+": local pilot hostname lookup failed",
+			slog.String("err", err.Error()))
+		return "", false
+	}
+	defer func() { _ = drv.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	info, err := drv.InfoStruct(ctx)
+	if err != nil {
+		slog.Debug(command+": local pilot hostname lookup failed",
+			slog.String("err", err.Error()))
+		return "", false
+	}
+	hostname, ok := normalizeLocalPilotHostname(info.Hostname)
+	if !ok {
+		slog.Debug(command + ": local pilot hostname unavailable")
+	}
+	return hostname, ok
+}
+
 // cmdJoin is the blocking top-level command. It reads or fetches an
 // invite, applies it, opens the control socket, and serves IPC traffic
 // until the process is signalled.
@@ -278,19 +302,7 @@ func runGroupDaemon(gf *globalFlags, opts groupDaemonOptions) int {
 		return out
 	}
 	localHostnameFn := func() (string, bool) {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		info, err := tr.Driver().InfoStruct(ctx)
-		if err != nil {
-			slog.Debug(opts.command+": local pilot hostname lookup failed",
-				slog.String("err", err.Error()))
-			return "", false
-		}
-		hostname, ok := normalizeLocalPilotHostname(info.Hostname)
-		if !ok {
-			slog.Debug(opts.command + ": local pilot hostname unavailable")
-		}
-		return hostname, ok
+		return localPilotHostname(gf.socket, opts.command)
 	}
 	// Background polling runs for the lifetime of the daemon.
 	go turnPoller.Run(rootCtx)
