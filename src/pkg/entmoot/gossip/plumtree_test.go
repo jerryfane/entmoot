@@ -906,6 +906,58 @@ func TestGossipInlineBodyBackwardCompat(t *testing.T) {
 	})
 }
 
+// TestInboundGossipClearsBackoffBeforeFetch guards the accept-loop ordering:
+// a verified inbound frame must clear stale dial backoff before handleConn
+// dispatches it. Non-inlined Gossip immediately dials the sender for FetchReq;
+// if backoff is cleared only after handleConn returns, that fetch is skipped.
+func TestInboundGossipClearsBackoffBeforeFetch(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, []entmoot.NodeID{10, 20}) // A=10, B=20
+	defer f.closeTransports()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f.startAll(ctx)
+
+	msg := f.buildMessage(10, "inbound clears stale backoff before fetch", 2_000)
+	if err := f.nodes[10].storeM.Put(ctx, msg); err != nil {
+		t.Fatalf("seed A store: %v", err)
+	}
+
+	frame := &wire.Gossip{
+		GroupID:   f.groupID,
+		IDs:       []entmoot.MessageID{msg.ID},
+		Timestamp: 3_000,
+	}
+	if err := signGossip(frame, f.nodes[10].id); err != nil {
+		t.Fatalf("signGossip: %v", err)
+	}
+
+	bGossip := f.nodes[20].gossip
+	bGossip.recordDialFailure(10)
+	if bGossip.canDial(10) {
+		t.Fatalf("B should be in dial backoff for A before inbound frame")
+	}
+
+	conn, err := f.transports[10].Dial(ctx, 20)
+	if err != nil {
+		t.Fatalf("A dial B: %v", err)
+	}
+	if err := wire.EncodeAndWrite(conn, frame); err != nil {
+		_ = conn.Close()
+		t.Fatalf("write inbound gossip: %v", err)
+	}
+	_ = conn.Close()
+
+	waitUntil(t, 2*time.Second, "B fetches message despite stale pre-existing backoff", func() bool {
+		has, _ := f.nodes[20].storeM.Has(ctx, f.groupID, msg.ID)
+		return has
+	})
+	if !bGossip.canDial(10) {
+		t.Fatalf("inbound verified frame should clear stale dial backoff")
+	}
+}
+
 // TestRetryBackoffDecorrelatedJitter drives nextBackoff many times and
 // asserts the decorrelated-jitter envelope: every sample stays within
 // [retryBackoffBase, retryBackoffCap], the distribution is not

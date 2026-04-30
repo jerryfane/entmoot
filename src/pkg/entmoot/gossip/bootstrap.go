@@ -308,19 +308,10 @@ func (g *Gossiper) pullMemberProfileSnapshot(ctx context.Context, peer entmoot.N
 	if g.cfg.MemberProfileStore == nil {
 		return 0, nil
 	}
-	conn, err := g.cfg.Transport.Dial(ctx, peer)
-	if err != nil {
-		return 0, fmt.Errorf("dial: %w", err)
-	}
-	defer conn.Close()
-	setConnDeadlineFromContext(ctx, conn)
 	req := &wire.MemberProfileSnapshotReq{GroupID: g.cfg.GroupID}
-	if err := wire.EncodeAndWrite(conn, req); err != nil {
-		return 0, fmt.Errorf("write member_profile_snapshot_req: %w", err)
-	}
-	_, payload, err := wire.ReadAndDecode(conn)
+	payload, err := g.requestResponseWithAttemptTimeout(ctx, peer, req, wire.MsgMemberProfileSnapshotResp, "member_profile_snapshot_req", largeFrameResponseTimeout)
 	if err != nil {
-		return 0, fmt.Errorf("read member_profile_snapshot_resp: %w", err)
+		return 0, err
 	}
 	resp, ok := payload.(*wire.MemberProfileSnapshotResp)
 	if !ok {
@@ -333,7 +324,6 @@ func (g *Gossiper) pullMemberProfileSnapshot(ctx context.Context, peer entmoot.N
 		ad := &resp.Profiles[i]
 		g.ingestMemberProfileAd(ctx, peer, ad, false)
 	}
-	g.recordDialSuccess(peer)
 	return len(resp.Profiles), nil
 }
 

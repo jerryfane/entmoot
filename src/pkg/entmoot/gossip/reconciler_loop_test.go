@@ -27,10 +27,10 @@ type partitionableTransport struct {
 	dialCount atomic.Int64
 
 	mu         sync.Mutex
-	partOut    bool                         // block outbound (Dial)
-	partIn     bool                         // block inbound (Accept)
-	blocked    map[entmoot.NodeID]struct{}  // when partOut, only these peers are blocked (empty = all)
-	acceptGate chan struct{}                // closed when partIn flips to false
+	partOut    bool                        // block outbound (Dial)
+	partIn     bool                        // block inbound (Accept)
+	blocked    map[entmoot.NodeID]struct{} // when partOut, only these peers are blocked (empty = all)
+	acceptGate chan struct{}               // closed when partIn flips to false
 }
 
 func newPartitionableTransport(inner Transport) *partitionableTransport {
@@ -151,8 +151,8 @@ func (t *partitionableTransport) dials() int64 {
 // TestReconcilerLoop_NoPublishConverges is THE v1.2.1 canary: a peer that
 // misses messages while partitioned must converge via the background AE
 // tick even when NO new publishes happen after partition heal. Before
-// Phase 7 this scenario leaked forever — reactive triggers (push,
-// OnTunnelUp) need a new event to fire, and an idle mesh has none.
+// Phase 7 this scenario leaked forever — reactive triggers such as push or
+// handled inbound frames need a new event to fire, and an idle mesh has none.
 func TestReconcilerLoop_NoPublishConverges(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t, []entmoot.NodeID{10, 20, 30}) // A=10, B=20, C=30
@@ -343,10 +343,8 @@ func TestReconcilerLoop_TickSkipOnEqualRoots(t *testing.T) {
 
 	aG := f.nodes[10].gossip
 
-	// Drive a reconcile A → B so A caches B's root. The startup
-	// OnTunnelUp callback would do this eventually, but we want a
-	// deterministic start: clear any cooldown, call maybeReconcile
-	// directly, and wait for the cache to populate.
+	// Drive a reconcile A → B so A caches B's root. Use an explicit
+	// call for a deterministic start, then wait for the cache to populate.
 	aG.pendMu.Lock()
 	delete(aG.lastReconciled, 20)
 	aG.pendMu.Unlock()
@@ -371,9 +369,8 @@ func TestReconcilerLoop_TickSkipOnEqualRoots(t *testing.T) {
 		t.Fatalf("A's cached B-root should match A's local root at steady state: cached=%x local=%x", cached[:], localRoot[:])
 	}
 
-	// Record the baseline dial count — this captures any startup
-	// reconciles (OnTunnelUp callback firing after the first inbound
-	// from B's side, plus our explicit maybeReconcile call above).
+	// Record the baseline dial count — this captures startup activity plus
+	// our explicit maybeReconcile call above.
 	// The assertion below is "post-baseline ticks add zero dials."
 	baseline := counter.get()
 
@@ -391,10 +388,6 @@ func TestReconcilerLoop_TickSkipOnEqualRoots(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		aG.maybeReconcileTick(ctx)
 	}
-
-	// Give any in-flight (shouldn't be any) goroutines a moment to
-	// run so a stray dial has a chance to show up.
-	time.Sleep(100 * time.Millisecond)
 
 	// Core assertion: dial count has not grown past the baseline. A
 	// non-skipping implementation would add at least 10 dials (one

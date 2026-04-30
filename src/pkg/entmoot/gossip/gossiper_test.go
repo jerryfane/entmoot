@@ -616,6 +616,84 @@ func TestMerkleReq(t *testing.T) {
 	}
 }
 
+func TestInboundReconcileWaitsForOneShotResponse(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, []entmoot.NodeID{10, 20})
+	defer f.closeTransports()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	base := f.nodes[20].storeM
+	f.nodes[20].storeM = &blockingMerkleStore{
+		MessageStore: base,
+		entered:      entered,
+		release:      release,
+	}
+	f.nodes[20].gossip.cfg.Store = f.nodes[20].storeM
+	f.startAll(ctx)
+
+	aG := f.nodes[20].gossip
+	aG.pendMu.Lock()
+	delete(aG.lastReconciled, 10)
+	aG.pendMu.Unlock()
+
+	conn, err := f.transports[10].Dial(ctx, 20)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer conn.Close()
+	if err := wire.EncodeAndWrite(conn, &wire.MerkleReq{GroupID: f.groupID}); err != nil {
+		t.Fatalf("write merkle_req: %v", err)
+	}
+
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("MerkleRoot was not called")
+	}
+
+	aG.pendMu.Lock()
+	_, reconciledBeforeResponse := aG.lastReconciled[10]
+	aG.pendMu.Unlock()
+	if reconciledBeforeResponse {
+		t.Fatal("inbound reconcile fired before one-shot response completed")
+	}
+
+	close(release)
+	if _, _, err := wire.ReadAndDecode(conn); err != nil {
+		t.Fatalf("read merkle_resp: %v", err)
+	}
+	waitUntil(t, 2*time.Second, "reconcile fires after one-shot response", func() bool {
+		aG.pendMu.Lock()
+		defer aG.pendMu.Unlock()
+		_, ok := aG.lastReconciled[10]
+		return ok
+	})
+}
+
+type blockingMerkleStore struct {
+	store.MessageStore
+	entered chan struct{}
+	release chan struct{}
+
+	enteredOnce atomic.Bool
+}
+
+func (s *blockingMerkleStore) MerkleRoot(ctx context.Context, groupID entmoot.GroupID) ([32]byte, error) {
+	if s.enteredOnce.CompareAndSwap(false, true) {
+		close(s.entered)
+	}
+	select {
+	case <-s.release:
+	case <-ctx.Done():
+		return [32]byte{}, ctx.Err()
+	}
+	return s.MessageStore.MerkleRoot(ctx, groupID)
+}
+
 // requestMerkle issues a MerkleReq from fromNode to toNode via their shared
 // transport and returns the decoded MerkleResp.
 func (f *fixture) requestMerkle(ctx context.Context, fromNode, toNode entmoot.NodeID) *wire.MerkleResp {

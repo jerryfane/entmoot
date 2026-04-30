@@ -14,18 +14,15 @@ import (
 	"entmoot/pkg/entmoot/wire"
 )
 
-// dialCountingTransport wraps a Transport and counts Dial / SetOnTunnelUp
-// invocations so reconcile-RBSR tests can assert on behaviour that's
-// otherwise invisible from the message-store surface. Every method
-// delegates to the inner transport (so hub routing remains intact) while
-// bumping local counters under a mutex.
+// dialCountingTransport wraps a Transport so reconcile-RBSR tests can assert
+// on behaviour that's otherwise invisible from the message-store surface.
+// Every method delegates to the inner transport so hub routing remains intact.
 type dialCountingTransport struct {
 	inner Transport
 
 	mu             sync.Mutex
 	fetchReqCount  int
 	reconcileCount int
-	tunnelUpCB     func(entmoot.NodeID)
 }
 
 func newDialCountingTransport(inner Transport) *dialCountingTransport {
@@ -49,9 +46,6 @@ func (t *dialCountingTransport) SetPeerEndpoints(ctx context.Context, peer entmo
 }
 
 func (t *dialCountingTransport) SetOnTunnelUp(cb func(peer entmoot.NodeID)) {
-	t.mu.Lock()
-	t.tunnelUpCB = cb
-	t.mu.Unlock()
 	t.inner.SetOnTunnelUp(cb)
 }
 
@@ -166,21 +160,14 @@ func TestReconcileViaRBSR_NoDiff(t *testing.T) {
 	}
 
 	f.startAll(ctx)
-	// Drain the OnTunnelUp-triggered reconciles from startup so we
-	// measure only the one we explicitly drive below. A short sleep
-	// lets any in-flight async maybeReconcile goroutine settle; then
-	// we clear the fetch counter.
-	time.Sleep(200 * time.Millisecond)
 
-	// Clear the counter — any startup reconciles have now landed and
-	// we want to observe only the explicit call below.
+	// Clear the counter so we observe only the explicit reconcile below.
 	counter.mu.Lock()
 	counter.count = 0
 	counter.mu.Unlock()
 
 	// Force the per-peer cooldown to an expired state so maybeReconcile
-	// actually fires. A's prior reconciles (from OnTunnelUp) may have
-	// populated lastReconciled.
+	// actually fires.
 	aG := f.nodes[10].gossip
 	aG.pendMu.Lock()
 	delete(aG.lastReconciled, 20)
@@ -523,12 +510,12 @@ func TestReconcileViaRBSR_PeerReturnsUnknownOpcode(t *testing.T) {
 	})
 }
 
-// TestReconcileTunnelUpTrigger asserts that a fresh memTransport Dial
-// fires the OnTunnelUp callback exactly once, and that the callback
-// routes into maybeReconcile (visible as an entry appearing in
-// lastReconciled). We use a fresh fixture with no prior state, dial
-// once, and confirm lastReconciled[peer] got populated.
-func TestReconcileTunnelUpTrigger(t *testing.T) {
+// TestReconcileOneWayWriteTrigger asserts that a successful one-way outbound
+// gossip stream routes into maybeReconcile (visible as an entry appearing in
+// lastReconciled). Gossiper intentionally no longer uses Transport.OnTunnelUp
+// for this because Pilot can fire that callback before an inbound stream is
+// owned by the accept loop.
+func TestReconcileOneWayWriteTrigger(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t, []entmoot.NodeID{10, 20})
 	defer f.closeTransports()
@@ -544,18 +531,14 @@ func TestReconcileTunnelUpTrigger(t *testing.T) {
 	delete(aG.lastReconciled, 20)
 	aG.pendMu.Unlock()
 
-	// Fresh Dial from A → B. memTransport.Dial fires OnTunnelUp on
-	// the caller side; Accept fires it on the server side.
-	conn, err := f.transports[10].Dial(ctx, 20)
-	if err != nil {
-		t.Fatalf("Dial: %v", err)
+	if err := aG.sendIHave(ctx, 20, &wire.IHave{GroupID: f.groupID}); err != nil {
+		t.Fatalf("sendIHave: %v", err)
 	}
-	defer conn.Close()
 
 	// Expect A's lastReconciled[20] to appear within a short window.
-	// The callback runs in a goroutine and maybeReconcile is async —
+	// The write trigger calls maybeReconcile asynchronously —
 	// give scheduler + cooldown-record plenty of slack.
-	waitUntil(t, 2*time.Second, "A.lastReconciled[20] populated by tunnel-up callback", func() bool {
+	waitUntil(t, 2*time.Second, "A.lastReconciled[20] populated by one-way write", func() bool {
 		aG.pendMu.Lock()
 		defer aG.pendMu.Unlock()
 		_, ok := aG.lastReconciled[20]
@@ -568,20 +551,18 @@ func TestReconcileTunnelUpTrigger(t *testing.T) {
 	firstAt := aG.lastReconciled[20].at
 	aG.pendMu.Unlock()
 
-	// Dial again immediately. OnTunnelUp fires again, but
-	// maybeReconcile's cooldown gate MUST suppress the second
-	// reconcile — Part C's contract is "callback on every new tunnel,
-	// dedupe in the gossiper."
-	conn2, err := f.transports[10].Dial(ctx, 20)
-	if err != nil {
-		t.Fatalf("Dial 2: %v", err)
+	// Send again immediately. The one-way write succeeds again, but
+	// maybeReconcile's cooldown gate MUST suppress the second reconcile.
+	if err := aG.sendIHave(ctx, 20, &wire.IHave{GroupID: f.groupID}); err != nil {
+		t.Fatalf("sendIHave 2: %v", err)
 	}
-	defer conn2.Close()
 
-	// Wait a little longer than the callback would need; then assert
-	// lastReconciled[20].at is unchanged — the cooldown gate
-	// prevented a second reconcile from updating the timestamp.
-	time.Sleep(300 * time.Millisecond)
+	waitUntil(t, 2*time.Second, "second one-way write completes", func() bool {
+		aG.pendMu.Lock()
+		defer aG.pendMu.Unlock()
+		_, inFlight := aG.reconcileInFlight[20]
+		return !inFlight
+	})
 	aG.pendMu.Lock()
 	secondAt := aG.lastReconciled[20].at
 	aG.pendMu.Unlock()

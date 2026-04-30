@@ -5,7 +5,16 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.5.28] - 2026-04-30
+
+### Fixed
+
+- **Bounded Entmoot request/response streams.** Inbound one-shot gossip
+  requests now use explicit read/write deadlines and defer reactive reconcile
+  until after the response handler returns, reducing `:1004` stalls where a
+  peer accepted a stream but the caller timed out waiting for the first
+  response frame. Member-profile snapshot pulls now use the shared bounded
+  request/response helper.
 
 ## [1.5.27] - 2026-04-30
 

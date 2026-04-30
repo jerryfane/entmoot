@@ -136,16 +136,15 @@ const (
 
 // reconcileAttemptTimeout bounds one complete anti-entropy attempt,
 // including the Merkle root probe, RBSR exchange, fallback range scan,
-// and any body fetches. Individual stream request/response attempts
-// still use reconcileSessionTimeout; this wider envelope exists so
-// reactive reconcile work can detach from short push/fanout contexts
-// without becoming unbounded background work.
+// and any body fetches. This wider envelope exists so reactive reconcile
+// work can detach from short push/fanout contexts without becoming
+// unbounded background work.
 const reconcileAttemptTimeout = 90 * time.Second
 
 // Background AE ticker (v1.2.1). Serf-style push-pull: 30 s base with
 // jitter, one least-recently-reconciled peer per tick. The cooldown
 // gate in maybeReconcile dedupes against reactive triggers (push,
-// accept, OnTunnelUp). Skip-when-roots-equal keeps idle meshes quiet.
+// fetch, accept). Skip-when-roots-equal keeps idle meshes quiet.
 const (
 	reconcilerTickBase   = 30 * time.Second
 	reconcilerTickJitter = 6 * time.Second // ±20 %
@@ -162,14 +161,21 @@ const (
 	memberProfileSnapshotMaxConcurrent = 2
 )
 
+const inboundFirstFrameTimeout = 5 * time.Second
+
 // reconcileSessionTimeout bounds the wallclock budget of a single RBSR
-// reconciliation session — the full multi-frame exchange between initiator
-// and responder, not per-frame. Anti-entropy against a 10^4-message group
-// converges in O(log diff) rounds; the 15-second envelope covers network
-// round-trip variance plus body-fetch latency for the ids produced by the
-// session. If the session exceeds this budget the initiator tears the
-// connection down and the next reconcileCooldown expiry re-tries. (v1.2.1)
+// reconciliation control session — the full multi-frame exchange between
+// initiator and responder, not per-frame. Large responses such as FetchResp
+// and snapshots use largeFrameResponseTimeout because they can carry frames
+// near the wire cap.
+// If the control session exceeds this budget the initiator tears the
+// connection down and the next reconcileCooldown expiry retries. (v1.2.1)
 const reconcileSessionTimeout = 15 * time.Second
+
+// largeFrameResponseTimeout bounds a single large response transfer. FetchResp
+// can carry a full message body, and snapshot responses can carry O(N) profile
+// or transport ads; none should inherit the shorter reconcile control timeout.
+const largeFrameResponseTimeout = reconcileAttemptTimeout
 
 // Plumtree GRAFT timeout (v1.0.4). After receiving an IHave advertising
 // an unknown id, wait this long for the body to arrive via eager push
@@ -861,6 +867,45 @@ func setConnWriteDeadlineFromContext(ctx context.Context, conn net.Conn) {
 	}
 }
 
+func clearConnReadDeadline(conn net.Conn) {
+	_ = conn.SetReadDeadline(time.Time{})
+}
+
+func clearConnWriteDeadline(conn net.Conn) {
+	_ = conn.SetWriteDeadline(time.Time{})
+}
+
+func (g *Gossiper) inboundOneShotContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, reconcileSessionTimeout)
+}
+
+func (g *Gossiper) inboundLargeFrameResponseContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, largeFrameResponseTimeout)
+}
+
+func (g *Gossiper) writeOneShotResponse(ctx context.Context, conn net.Conn, remote entmoot.NodeID, op string, resp any) error {
+	start := time.Now()
+	setConnWriteDeadlineFromContext(ctx, conn)
+	defer clearConnWriteDeadline(conn)
+	g.logger.Debug("gossip: response write start",
+		slog.Uint64("remote", uint64(remote)),
+		slog.String("op", op))
+	err := wire.EncodeAndWrite(conn, resp)
+	if err != nil {
+		g.logger.Warn("gossip: response write failed",
+			slog.Uint64("remote", uint64(remote)),
+			slog.String("op", op),
+			slog.Duration("duration", time.Since(start)),
+			slog.String("err", err.Error()))
+		return err
+	}
+	g.logger.Debug("gossip: response write done",
+		slog.Uint64("remote", uint64(remote)),
+		slog.String("op", op),
+		slog.Duration("duration", time.Since(start)))
+	return nil
+}
+
 func (g *Gossiper) fanoutDialBudget() time.Duration {
 	provider, ok := g.cfg.Transport.(DialBudgetProvider)
 	if !ok {
@@ -1011,6 +1056,7 @@ func (g *Gossiper) dialAndWrite(ctx context.Context, peer entmoot.NodeID, frame 
 		if err == nil {
 			writeCancel()
 			g.recordDialSuccess(peer)
+			g.maybeReconcile(ctx, peer)
 			return nil
 		}
 		lastErr = fmt.Errorf("write %s: %w", op, err)
@@ -1049,29 +1095,6 @@ func (g *Gossiper) Start(ctx context.Context) error {
 	g.lifeMu.Lock()
 	g.lifeCtx = ctx
 	g.lifeMu.Unlock()
-
-	// Install the tunnel-up callback (v1.2.1, Part D): every freshly-
-	// established Pilot session fires this hook, which triggers a
-	// cooldown-gated reconcile against the peer whose tunnel just came
-	// up. The hook is de-duplicated against the reactive triggers
-	// already wired into the accept loop and fetchFrom — maybeReconcile
-	// is async and consults the per-peer cooldown window before firing
-	// reconcileWith — so worst-case cost is one cooldown-check.
-	//
-	// The callback must be cleared BEFORE g.wg.Wait() runs so a late
-	// tunnel-up cannot race its g.wg.Add(1) against the in-flight
-	// Wait — sync.WaitGroup panics on Add-after-done. The clear
-	// happens on every exit path of the accept loop below, not via
-	// defer (defers run AFTER wg.Wait).
-	g.cfg.Transport.SetOnTunnelUp(func(peer entmoot.NodeID) {
-		// Re-check ctx so a stale callback fired during shutdown
-		// after the clear-and-wait window doesn't re-enter
-		// maybeReconcile and spawn a goroutine that outlives Start.
-		if err := ctx.Err(); err != nil {
-			return
-		}
-		g.maybeReconcile(ctx, peer)
-	})
 
 	// Background workers (patch 6, patch 7). retryLoop drains the
 	// exponential-backoff queue for push/fetch attempts that failed their
@@ -1120,14 +1143,6 @@ func (g *Gossiper) Start(ctx context.Context) error {
 	for {
 		conn, remote, err := g.cfg.Transport.Accept(ctx)
 		if err != nil {
-			// Accept returning is the signal to shut down. Clear the
-			// OnTunnelUp callback BEFORE wg.Wait so a late tunnel-up
-			// cannot race a fresh g.wg.Add(1) against the in-flight
-			// Wait (sync.WaitGroup panics on that). A callback
-			// fired-but-not-yet-returned is still fine — the
-			// ctx-err re-check inside the closure keeps it from
-			// entering maybeReconcile after shutdown begins. (v1.2.1)
-			g.cfg.Transport.SetOnTunnelUp(nil)
 			g.wg.Wait()
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return nil
@@ -1145,26 +1160,21 @@ func (g *Gossiper) Start(ctx context.Context) error {
 			_ = conn.Close()
 			continue
 		}
-		// Patch 7: an inbound connection from a roster-verified peer is the
-		// most reliable signal we have that the peer is reachable again. Fire
-		// an async reconciliation (rate-limited per peer) so any state they
-		// accumulated while we were partitioned gets pulled in. This runs
-		// alongside the handleConn goroutine so the reconcile dial doesn't
-		// block the incoming frame.
-		//
-		// v1.2.1 (Part F): also clear any outbound dial-backoff for this peer.
-		// Inbound reachability is strong bidirectional-reachability evidence,
-		// so a cached backoff window from an earlier outbound failure is
-		// almost certainly stale. If our next outbound dial happens to still
-		// fail, recordDialFailure will re-arm the backoff from base.
+		// An inbound frame from a roster-verified peer is the most reliable
+		// signal we have that the peer is reachable again. Clear stale dial
+		// backoff before dispatch so handlers that need to dial the sender
+		// during processing (e.g. FetchReq after non-inlined Gossip) are not
+		// blocked by old failures. Reconcile remains deferred below so it does
+		// not contend with request/response handlers while the caller waits.
 		g.recordDialSuccess(remote)
-		g.maybeReconcile(ctx, remote)
-
 		g.wg.Add(1)
 		go func(c net.Conn, r entmoot.NodeID) {
 			defer g.wg.Done()
 			defer c.Close()
-			g.handleConn(ctx, c, r)
+			processed := g.handleConn(ctx, c, r)
+			if processed {
+				g.maybeReconcile(ctx, r)
+			}
 		}(conn, remote)
 	}
 }
@@ -1172,26 +1182,41 @@ func (g *Gossiper) Start(ctx context.Context) error {
 // handleConn reads one frame from c and dispatches on type. v0 is stateless
 // per connection: exactly one request-response, then close. Errors are
 // logged and the connection is dropped (hard-disconnect per the plan).
-func (g *Gossiper) handleConn(ctx context.Context, c net.Conn, remote entmoot.NodeID) {
+func (g *Gossiper) handleConn(ctx context.Context, c net.Conn, remote entmoot.NodeID) bool {
+	start := time.Now()
+	_ = c.SetReadDeadline(start.Add(inboundFirstFrameTimeout))
 	t, payload, err := wire.ReadAndDecode(c)
+	clearConnReadDeadline(c)
 	if err != nil {
 		if errors.Is(err, io.EOF) {
-			return
+			return false
 		}
 		g.logger.Warn("gossip: read frame",
 			slog.Uint64("remote", uint64(remote)),
+			slog.Duration("elapsed", time.Since(start)),
 			slog.String("err", err.Error()))
-		return
+		return false
 	}
+	g.logger.Debug("gossip: inbound frame",
+		slog.Uint64("remote", uint64(remote)),
+		slog.String("type", t.String()))
 	switch v := payload.(type) {
 	case *wire.RosterReq:
-		g.onRosterReq(c, remote, v)
+		reqCtx, cancel := g.inboundOneShotContext(ctx)
+		defer cancel()
+		g.onRosterReq(reqCtx, c, remote, v)
 	case *wire.FetchReq:
-		g.onFetchReq(ctx, c, remote, v)
+		reqCtx, cancel := g.inboundLargeFrameResponseContext(ctx)
+		defer cancel()
+		g.onFetchReq(reqCtx, c, remote, v)
 	case *wire.MerkleReq:
-		g.onMerkleReq(ctx, c, remote, v)
+		reqCtx, cancel := g.inboundOneShotContext(ctx)
+		defer cancel()
+		g.onMerkleReq(reqCtx, c, remote, v)
 	case *wire.RangeReq:
-		g.onRangeReq(ctx, c, remote, v)
+		reqCtx, cancel := g.inboundOneShotContext(ctx)
+		defer cancel()
+		g.onRangeReq(reqCtx, c, remote, v)
 	case *wire.Gossip:
 		g.onGossip(ctx, remote, v)
 	case *wire.IHave:
@@ -1205,9 +1230,13 @@ func (g *Gossiper) handleConn(ctx context.Context, c net.Conn, remote entmoot.No
 	case *wire.MemberProfileAd:
 		g.onMemberProfileAd(ctx, remote, v)
 	case *wire.MemberProfileSnapshotReq:
-		g.onMemberProfileSnapshotReq(ctx, c, remote, v)
+		reqCtx, cancel := g.inboundLargeFrameResponseContext(ctx)
+		defer cancel()
+		g.onMemberProfileSnapshotReq(reqCtx, c, remote, v)
 	case *wire.TransportSnapshotReq:
-		g.onTransportSnapshotReq(ctx, c, remote, v)
+		reqCtx, cancel := g.inboundLargeFrameResponseContext(ctx)
+		defer cancel()
+		g.onTransportSnapshotReq(reqCtx, c, remote, v)
 	case *wire.Reconcile:
 		// Convention-break (v1.2.1): onReconcileReq holds c open for the
 		// full multi-frame RBSR session, unlike every other handler that
@@ -1225,11 +1254,12 @@ func (g *Gossiper) handleConn(ctx context.Context, c net.Conn, remote entmoot.No
 			slog.Uint64("remote", uint64(remote)),
 			slog.String("type", t.String()))
 	}
+	return true
 }
 
 // onRosterReq responds with the full roster entries. SinceHead is accepted
 // but ignored (v0 responders always return the full log).
-func (g *Gossiper) onRosterReq(c net.Conn, remote entmoot.NodeID, req *wire.RosterReq) {
+func (g *Gossiper) onRosterReq(ctx context.Context, c net.Conn, remote entmoot.NodeID, req *wire.RosterReq) {
 	if req.GroupID != g.cfg.GroupID {
 		g.logger.Warn("gossip: roster_req for wrong group",
 			slog.Uint64("remote", uint64(remote)),
@@ -1240,11 +1270,7 @@ func (g *Gossiper) onRosterReq(c net.Conn, remote entmoot.NodeID, req *wire.Rost
 		GroupID: g.cfg.GroupID,
 		Entries: g.cfg.Roster.Entries(),
 	}
-	if err := wire.EncodeAndWrite(c, resp); err != nil {
-		g.logger.Warn("gossip: write roster_resp",
-			slog.Uint64("remote", uint64(remote)),
-			slog.String("err", err.Error()))
-	}
+	_ = g.writeOneShotResponse(ctx, c, remote, "roster_resp", resp)
 }
 
 // onFetchReq looks up the requested id in the local store and responds with
@@ -1271,11 +1297,7 @@ func (g *Gossiper) onFetchReq(ctx context.Context, c net.Conn, remote entmoot.No
 		m := msg
 		resp.Message = &m
 	}
-	if err := wire.EncodeAndWrite(c, resp); err != nil {
-		g.logger.Warn("gossip: write fetch_resp",
-			slog.Uint64("remote", uint64(remote)),
-			slog.String("err", err.Error()))
-	}
+	_ = g.writeOneShotResponse(ctx, c, remote, "fetch_resp", resp)
 }
 
 // onMerkleReq responds with the current Merkle root. MessageCount is
@@ -1300,11 +1322,7 @@ func (g *Gossiper) onMerkleReq(ctx context.Context, c net.Conn, remote entmoot.N
 		GroupID: g.cfg.GroupID,
 		Root:    wire.MerkleRoot(root),
 	}
-	if err := wire.EncodeAndWrite(c, resp); err != nil {
-		g.logger.Warn("gossip: write merkle_resp",
-			slog.Uint64("remote", uint64(remote)),
-			slog.String("err", err.Error()))
-	}
+	_ = g.writeOneShotResponse(ctx, c, remote, "merkle_resp", resp)
 }
 
 // onRangeReq responds with the message ids we hold in this group whose
@@ -1331,11 +1349,7 @@ func (g *Gossiper) onRangeReq(ctx context.Context, c net.Conn, remote entmoot.No
 		ids = append(ids, m.ID)
 	}
 	resp := &wire.RangeResp{GroupID: g.cfg.GroupID, IDs: ids}
-	if err := wire.EncodeAndWrite(c, resp); err != nil {
-		g.logger.Warn("gossip: write range_resp",
-			slog.Uint64("remote", uint64(remote)),
-			slog.String("err", err.Error()))
-	}
+	_ = g.writeOneShotResponse(ctx, c, remote, "range_resp", resp)
 }
 
 // onReconcileReq drives the responder side of an RBSR session over a
@@ -1769,7 +1783,7 @@ func (g *Gossiper) onPrune(remote entmoot.NodeID, pr *wire.Prune) {
 // codec failure, NotFound, or signature verification failure.
 func (g *Gossiper) fetchFrom(ctx context.Context, peer entmoot.NodeID, id entmoot.MessageID) error {
 	req := &wire.FetchReq{GroupID: g.cfg.GroupID, ID: id}
-	payload, err := g.requestResponse(ctx, peer, req, wire.MsgFetchResp, "fetch_req")
+	payload, err := g.requestResponseWithAttemptTimeout(ctx, peer, req, wire.MsgFetchResp, "fetch_req", largeFrameResponseTimeout)
 	if err != nil {
 		return err
 	}
@@ -2012,15 +2026,13 @@ func (g *Gossiper) sendIHave(ctx context.Context, peer entmoot.NodeID, frame *wi
 // pushGossip opens a connection to peer, writes the frame, and closes. v0 is
 // stateless: we never expect a response to a gossip push.
 //
-// A successful dial also fires maybeReconcile (patch 7): a peer we can talk
-// to via outbound is a peer that may have state we missed during a
-// partition. The cooldown gate inside maybeReconcile deduplicates repeat
+// dialAndWrite handles the successful-outbound reachability trigger for
+// one-way frames. The cooldown gate inside maybeReconcile deduplicates repeat
 // dials so this costs at most one MerkleReq per cooldown window per peer.
 func (g *Gossiper) pushGossip(ctx context.Context, peer entmoot.NodeID, frame *wire.Gossip) error {
 	if err := g.dialAndWrite(ctx, peer, frame, "gossip"); err != nil {
 		return err
 	}
-	g.maybeReconcile(ctx, peer)
 	return nil
 }
 
@@ -2174,7 +2186,7 @@ func (g *Gossiper) jitteredMemberProfileSnapshotTick() time.Duration {
 //
 // Interaction with reactive triggers:
 //   - The cooldown gate in maybeReconcile dedupes any overlapping
-//     reactive trigger (e.g., OnTunnelUp firing moments before the tick).
+//     reactive trigger (e.g., a push or inbound request moments before the tick).
 //   - The skip-when-roots-equal optimization keeps quiescent meshes
 //     silent (no reconcile dial per peer per tick).
 //
@@ -2688,8 +2700,8 @@ func (g *Gossiper) executeRetry(ctx context.Context, key retryKey, state *retryS
 }
 
 // maybeReconcile fires reconcileWith in a goroutine iff the per-peer
-// cooldown has elapsed. Trigger sites call this on new inbound connections
-// and successful outbound dials so anti-entropy happens whenever tunnel
+// cooldown has elapsed. Trigger sites call this after handled inbound frames
+// and successful outbound one-way writes so anti-entropy happens whenever tunnel
 // state looks fresh, without turning into a reconciliation storm during
 // chatty patches.
 func (g *Gossiper) maybeReconcile(ctx context.Context, peer entmoot.NodeID) {
@@ -2828,7 +2840,7 @@ func (g *Gossiper) reconcileWith(ctx context.Context, peer entmoot.NodeID) bool 
 			// so signature verification, store.Put, Plumtree refanout, and
 			// retry queuing all compose the same way they do for gossip-push
 			// and graft-response acquisitions.
-			fetchCtx, fetchCancel := context.WithTimeout(ctx, reconcileSessionTimeout)
+			fetchCtx, fetchCancel := context.WithTimeout(ctx, largeFrameResponseTimeout)
 			g.fetchMissingFrom(fetchCtx, peer, missingIDs)
 			fetchCancel()
 			g.rememberPeerRoot(peer, peerRoot)
@@ -3058,7 +3070,7 @@ func (g *Gossiper) fetchFullRangeFallback(ctx context.Context, peer entmoot.Node
 			slog.Uint64("peer", uint64(peer)))
 		return false
 	}
-	fctx, cancel := context.WithTimeout(ctx, reconcileSessionTimeout)
+	fctx, cancel := context.WithTimeout(ctx, largeFrameResponseTimeout)
 	defer cancel()
 	g.fetchMissingFrom(fctx, peer, resp.IDs)
 	localRoot, err := g.cfg.Store.MerkleRoot(fctx, g.cfg.GroupID)
@@ -3793,19 +3805,22 @@ func (g *Gossiper) scheduleMemberProfileSnapshotPull(ctx context.Context, peer e
 			g.pendMu.Unlock()
 		}()
 
-		pullCtx, cancel := context.WithTimeout(parent, g.fanoutAttemptBudget())
-		defer cancel()
+		slotCtx, slotCancel := context.WithTimeout(parent, g.fanoutAttemptBudget())
+		defer slotCancel()
 
 		select {
 		case g.profilePullSlots <- struct{}{}:
 			defer func() { <-g.profilePullSlots }()
-		case <-pullCtx.Done():
+		case <-slotCtx.Done():
 			g.logger.Debug("gossip: member_profile_snapshot pull failed",
 				slog.Uint64("peer", uint64(peer)),
 				slog.String("reason", reason),
-				slog.String("err", pullCtx.Err().Error()))
+				slog.String("err", slotCtx.Err().Error()))
 			return
 		}
+
+		pullCtx, pullCancel := context.WithTimeout(parent, largeFrameResponseTimeout)
+		defer pullCancel()
 
 		g.logger.Debug("gossip: member_profile_snapshot pull start",
 			slog.Uint64("peer", uint64(peer)),
@@ -3966,11 +3981,7 @@ func (g *Gossiper) onTransportSnapshotReq(ctx context.Context, conn net.Conn, re
 			resp.Ads = ads
 		}
 	}
-	if err := wire.EncodeAndWrite(conn, resp); err != nil {
-		g.logger.Warn("gossip: write transport_snapshot_resp",
-			slog.Uint64("remote", uint64(remote)),
-			slog.String("err", err.Error()))
-	}
+	_ = g.writeOneShotResponse(ctx, conn, remote, "transport_snapshot_resp", resp)
 }
 
 func (g *Gossiper) onMemberProfileSnapshotReq(ctx context.Context, conn net.Conn, remote entmoot.NodeID, req *wire.MemberProfileSnapshotReq) {
@@ -3996,11 +4007,7 @@ func (g *Gossiper) onMemberProfileSnapshotReq(ctx context.Context, conn net.Conn
 			resp.Profiles = filterCurrentMemberProfiles(g.cfg.Roster, profiles)
 		}
 	}
-	if err := wire.EncodeAndWrite(conn, resp); err != nil {
-		g.logger.Warn("gossip: write member_profile_snapshot_resp",
-			slog.Uint64("remote", uint64(remote)),
-			slog.String("err", err.Error()))
-	}
+	_ = g.writeOneShotResponse(ctx, conn, remote, "member_profile_snapshot_resp", resp)
 }
 
 func filterCurrentMemberProfiles(r *roster.RosterLog, profiles []wire.MemberProfileAd) []wire.MemberProfileAd {

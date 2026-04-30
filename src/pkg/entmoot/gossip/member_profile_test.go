@@ -266,7 +266,7 @@ func TestMemberProfileSnapshotRepairAfterMissedFanout(t *testing.T) {
 	})
 }
 
-func TestMemberProfileTunnelUpDoesNotScheduleSnapshotPull(t *testing.T) {
+func TestMemberProfileDoesNotInstallTunnelUpCallback(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	f := newFixture(t, []entmoot.NodeID{10, 20})
@@ -283,20 +283,17 @@ func TestMemberProfileTunnelUpDoesNotScheduleSnapshotPull(t *testing.T) {
 	f.nodes[10].gossip.cfg.MemberProfileStore = s
 	go func() { _ = f.nodes[10].gossip.Start(ctx) }()
 
-	var cb func(entmoot.NodeID)
-	waitUntil(t, time.Second, "tunnel callback installed", func() bool {
-		cb = tr.callback()
-		return cb != nil
-	})
-	cb(20)
 	time.Sleep(100 * time.Millisecond)
+	if cb := tr.callback(); cb != nil {
+		t.Fatal("gossiper installed a tunnel-up callback; reactive reconcile must be accept/write owned")
+	}
 
 	f.nodes[10].gossip.pendMu.Lock()
 	pulls := len(f.nodes[10].gossip.profilePulls)
 	last := len(f.nodes[10].gossip.profilePullLast)
 	f.nodes[10].gossip.pendMu.Unlock()
 	if pulls != 0 || last != 0 {
-		t.Fatalf("tunnel-up scheduled profile pulls: in_flight=%d last=%d", pulls, last)
+		t.Fatalf("unexpected profile pulls: in_flight=%d last=%d", pulls, last)
 	}
 }
 

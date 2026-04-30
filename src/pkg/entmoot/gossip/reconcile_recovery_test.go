@@ -12,6 +12,7 @@ import (
 
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/clock"
+	"entmoot/pkg/entmoot/store"
 	"entmoot/pkg/entmoot/wire"
 )
 
@@ -522,6 +523,62 @@ func (c *deadlineBudgetConn) SetWriteDeadline(deadline time.Time) error {
 	return nil
 }
 
+type recordingWriteDeadlineConn struct {
+	writeDeadline time.Time
+	writes        int
+}
+
+func (c *recordingWriteDeadlineConn) Read(b []byte) (int, error) { return 0, io.EOF }
+func (c *recordingWriteDeadlineConn) Write(b []byte) (int, error) {
+	c.writes++
+	return len(b), nil
+}
+func (c *recordingWriteDeadlineConn) Close() error                    { return nil }
+func (c *recordingWriteDeadlineConn) LocalAddr() net.Addr             { return staticAddr("local") }
+func (c *recordingWriteDeadlineConn) RemoteAddr() net.Addr            { return staticAddr("remote") }
+func (c *recordingWriteDeadlineConn) SetDeadline(time.Time) error     { return nil }
+func (c *recordingWriteDeadlineConn) SetReadDeadline(time.Time) error { return nil }
+func (c *recordingWriteDeadlineConn) SetWriteDeadline(deadline time.Time) error {
+	if !deadline.IsZero() {
+		c.writeDeadline = deadline
+	}
+	return nil
+}
+
+type recordingDeadlineTransport struct {
+	scriptedTransport
+	mu       sync.Mutex
+	deadline time.Time
+}
+
+func (t *recordingDeadlineTransport) Dial(ctx context.Context, peer entmoot.NodeID) (net.Conn, error) {
+	conn, err := t.scriptedTransport.Dial(ctx, peer)
+	if err != nil {
+		return nil, err
+	}
+	return &recordingDeadlineConn{Conn: conn, owner: t}, nil
+}
+
+func (t *recordingDeadlineTransport) deadlineSnapshot() time.Time {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.deadline
+}
+
+type recordingDeadlineConn struct {
+	net.Conn
+	owner *recordingDeadlineTransport
+}
+
+func (c *recordingDeadlineConn) SetDeadline(deadline time.Time) error {
+	c.owner.mu.Lock()
+	if !deadline.IsZero() {
+		c.owner.deadline = deadline
+	}
+	c.owner.mu.Unlock()
+	return c.Conn.SetDeadline(deadline)
+}
+
 func TestOneWaySendDropsStaleSessionAndRetriesWrite(t *testing.T) {
 	t.Parallel()
 
@@ -574,6 +631,208 @@ func TestFanoutPushUsesLongDialBudgetAndFreshWriteBudget(t *testing.T) {
 	}
 	if until := time.Until(tr.writeDeadline); until < 4*time.Second {
 		t.Fatalf("write deadline budget = %v, want roughly %v", until, fanoutWriteTimeout)
+	}
+}
+
+func TestInboundFetchResponseUsesLargeFrameWriteBudget(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, []entmoot.NodeID{10, 20})
+	defer f.closeTransports()
+
+	ctx := context.Background()
+	msg := f.buildMessage(10, "fetch body deadline", 2_000)
+	if err := f.nodes[10].storeM.Put(ctx, msg); err != nil {
+		t.Fatalf("seed message: %v", err)
+	}
+
+	conn := &recordingWriteDeadlineConn{}
+	req := &wire.FetchReq{GroupID: f.groupID, ID: msg.ID}
+	reqCtx, cancel := f.nodes[10].gossip.inboundLargeFrameResponseContext(ctx)
+	defer cancel()
+	f.nodes[10].gossip.onFetchReq(reqCtx, conn, 20, req)
+
+	if conn.writes != 1 {
+		t.Fatalf("writes = %d, want 1", conn.writes)
+	}
+	if conn.writeDeadline.IsZero() {
+		t.Fatal("fetch response write deadline was not set")
+	}
+	if until := time.Until(conn.writeDeadline); until <= reconcileSessionTimeout {
+		t.Fatalf("fetch response write budget = %v, want > %v", until, reconcileSessionTimeout)
+	}
+}
+
+func TestInboundMemberProfileSnapshotResponseUsesLargeFrameWriteBudget(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, []entmoot.NodeID{10, 20})
+	defer f.closeTransports()
+
+	ctx := context.Background()
+	conn := &recordingWriteDeadlineConn{}
+	req := &wire.MemberProfileSnapshotReq{GroupID: f.groupID}
+	reqCtx, cancel := f.nodes[10].gossip.inboundLargeFrameResponseContext(ctx)
+	defer cancel()
+	f.nodes[10].gossip.onMemberProfileSnapshotReq(reqCtx, conn, 20, req)
+
+	if conn.writes != 1 {
+		t.Fatalf("writes = %d, want 1", conn.writes)
+	}
+	if conn.writeDeadline.IsZero() {
+		t.Fatal("member profile snapshot response write deadline was not set")
+	}
+	if until := time.Until(conn.writeDeadline); until <= reconcileSessionTimeout {
+		t.Fatalf("member profile snapshot response write budget = %v, want > %v", until, reconcileSessionTimeout)
+	}
+}
+
+func TestInboundTransportSnapshotResponseUsesLargeFrameWriteBudget(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, []entmoot.NodeID{10, 20})
+	defer f.closeTransports()
+
+	ctx := context.Background()
+	conn := &recordingWriteDeadlineConn{}
+	req := &wire.TransportSnapshotReq{GroupID: f.groupID}
+	reqCtx, cancel := f.nodes[10].gossip.inboundLargeFrameResponseContext(ctx)
+	defer cancel()
+	f.nodes[10].gossip.onTransportSnapshotReq(reqCtx, conn, 20, req)
+
+	if conn.writes != 1 {
+		t.Fatalf("writes = %d, want 1", conn.writes)
+	}
+	if conn.writeDeadline.IsZero() {
+		t.Fatal("transport snapshot response write deadline was not set")
+	}
+	if until := time.Until(conn.writeDeadline); until <= reconcileSessionTimeout {
+		t.Fatalf("transport snapshot response write budget = %v, want > %v", until, reconcileSessionTimeout)
+	}
+}
+
+func TestInboundMerkleResponseUsesControlWriteBudget(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, []entmoot.NodeID{10, 20})
+	defer f.closeTransports()
+
+	ctx := context.Background()
+	conn := &recordingWriteDeadlineConn{}
+	req := &wire.MerkleReq{GroupID: f.groupID}
+	reqCtx, cancel := f.nodes[10].gossip.inboundOneShotContext(ctx)
+	defer cancel()
+	f.nodes[10].gossip.onMerkleReq(reqCtx, conn, 20, req)
+
+	if conn.writes != 1 {
+		t.Fatalf("writes = %d, want 1", conn.writes)
+	}
+	if conn.writeDeadline.IsZero() {
+		t.Fatal("merkle response write deadline was not set")
+	}
+	until := time.Until(conn.writeDeadline)
+	if until <= 0 || until > reconcileSessionTimeout+time.Second {
+		t.Fatalf("merkle response write budget = %v, want roughly %v", until, reconcileSessionTimeout)
+	}
+}
+
+func TestFetchFromUsesLargeFrameAttemptBudget(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, []entmoot.NodeID{10, 20})
+	defer f.closeTransports()
+
+	ctx := context.Background()
+	msg := f.buildMessage(10, "fetch body requester deadline", 2_000)
+	tr := &recordingDeadlineTransport{
+		scriptedTransport: scriptedTransport{
+			handlers: []func(net.Conn){
+				respondAfterRequest(&wire.FetchResp{GroupID: f.groupID, ID: msg.ID, Message: &msg}),
+			},
+		},
+	}
+	f.nodes[20].gossip.cfg.Transport = tr
+
+	if err := f.nodes[20].gossip.fetchFrom(ctx, 10, msg.ID); err != nil {
+		t.Fatalf("fetchFrom failed: %v", err)
+	}
+	deadline := tr.deadlineSnapshot()
+	if deadline.IsZero() {
+		t.Fatal("fetch request deadline was not set")
+	}
+	if until := time.Until(deadline); until <= reconcileSessionTimeout {
+		t.Fatalf("fetch request budget = %v, want > %v", until, reconcileSessionTimeout)
+	}
+}
+
+func TestPullMemberProfileSnapshotUsesLargeFrameAttemptBudget(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, []entmoot.NodeID{10, 20})
+	defer f.closeTransports()
+
+	ctx := context.Background()
+	profileStore, err := store.OpenSQLite(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	t.Cleanup(func() { _ = profileStore.Close() })
+
+	tr := &recordingDeadlineTransport{
+		scriptedTransport: scriptedTransport{
+			handlers: []func(net.Conn){
+				respondAfterRequest(&wire.MemberProfileSnapshotResp{GroupID: f.groupID}),
+			},
+		},
+	}
+	g := f.nodes[20].gossip
+	g.cfg.Transport = tr
+	g.cfg.MemberProfileStore = profileStore
+
+	if _, err := g.pullMemberProfileSnapshot(ctx, 10); err != nil {
+		t.Fatalf("pullMemberProfileSnapshot failed: %v", err)
+	}
+	deadline := tr.deadlineSnapshot()
+	if deadline.IsZero() {
+		t.Fatal("member profile snapshot request deadline was not set")
+	}
+	if until := time.Until(deadline); until <= reconcileSessionTimeout {
+		t.Fatalf("member profile snapshot request budget = %v, want > %v", until, reconcileSessionTimeout)
+	}
+}
+
+func TestScheduledMemberProfileSnapshotUsesLargeFrameAttemptBudget(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, []entmoot.NodeID{10, 20})
+	defer f.closeTransports()
+
+	ctx := context.Background()
+	profileStore, err := store.OpenSQLite(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	t.Cleanup(func() { _ = profileStore.Close() })
+
+	tr := &recordingDeadlineTransport{
+		scriptedTransport: scriptedTransport{
+			handlers: []func(net.Conn){
+				respondAfterRequest(&wire.MemberProfileSnapshotResp{GroupID: f.groupID}),
+			},
+		},
+	}
+	g := f.nodes[20].gossip
+	g.cfg.Transport = tr
+	g.cfg.MemberProfileStore = profileStore
+
+	if !g.scheduleMemberProfileSnapshotPull(ctx, 10, "test") {
+		t.Fatal("snapshot pull was not scheduled")
+	}
+	waitUntil(t, time.Second, "scheduled member profile snapshot records deadline", func() bool {
+		return !tr.deadlineSnapshot().IsZero()
+	})
+	waitUntil(t, time.Second, "scheduled member profile snapshot leaves in-flight set", func() bool {
+		g.pendMu.Lock()
+		defer g.pendMu.Unlock()
+		_, ok := g.profilePulls[10]
+		return !ok
+	})
+	deadline := tr.deadlineSnapshot()
+	if until := time.Until(deadline); until <= g.fanoutAttemptBudget() {
+		t.Fatalf("scheduled member profile snapshot budget = %v, want > fanout budget %v", until, g.fanoutAttemptBudget())
 	}
 }
 
