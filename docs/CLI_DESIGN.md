@@ -570,14 +570,24 @@ entmootd esp device add \
   -id ios-1-device \
   -pubkey <base64-ed25519-public-key> \
   -group <base64-group-id> \
+  [-admin-group <base64-group-id>]... \
   [-client ios-1]... \
   [-disabled] \
   [-device-keys PATH]
 entmootd esp device onboard \
   -id ios-1-device \
   -group <base64-group-id> \
+  [-admin-group <base64-group-id>]... \
   [-client ios-1]... \
   [-disabled] \
+  [-device-keys PATH]
+entmootd esp device grant -id ios-1-device \
+  [-group <base64-group-id>]... \
+  [-admin-group <base64-group-id>]... \
+  [-device-keys PATH]
+entmootd esp device revoke -id ios-1-device \
+  [-group <base64-group-id>]... \
+  [-admin-group <base64-group-id>]... \
   [-device-keys PATH]
 entmootd esp device enable -id ios-1-device [-device-keys PATH]
 entmootd esp device disable -id ios-1-device [-device-keys PATH]
@@ -587,12 +597,16 @@ entmootd esp device remove -id ios-1-device [-device-keys PATH]
 `-device-keys` defaults to `<data>/esp-devices.json`, matching
 `esp serve`. `add` fails if the device id already exists. If no `-client`
 flag is supplied, the device id is also used as the default mailbox client
-id. `disable` is reversible and preferred for temporary revocation; `remove`
-hard-deletes the local entry. Mutations write the registry atomically with a
-0600 file mode. `onboard` generates an Ed25519 keypair, stores only the
-public key in the registry, and prints the private key once on stdout for
-development/operator handoff. Production phone-held identity should generate
-keys on the client and use `add` to import only the public key.
+id. `groups` grant regular group access; `admin_groups` separately grant
+permission to create group metadata updates and invites. `group_create`
+completion grants both regular and admin access to the creating device, while
+`invite_accept` grants only regular access. `disable` is reversible and
+preferred for temporary revocation; `remove` hard-deletes the local entry.
+Mutations write the registry atomically with a 0600 file mode. `onboard`
+generates an Ed25519 keypair, stores only the public key in the registry, and
+prints the private key once on stdout for development/operator handoff.
+Production phone-held identity should generate keys on the client and use
+`add` to import only the public key.
 
 For manual ESP device-auth smoke tests, `entmootd esp sign-request` signs one
 HTTP request and prints the headers to send:
@@ -621,6 +635,7 @@ JSON containing `X-Entmoot-*` headers.
       "id": "ios-1-device",
       "public_key": "<base64 ed25519 public key>",
       "groups": ["<base64 group id>"],
+      "admin_groups": ["<base64 group id>"],
       "client_ids": ["ios-1"],
       "disabled": false
     }
@@ -673,6 +688,8 @@ require the requested `client_id` to be listed for that device.
 - `PATCH /v1/groups/{group_id}`
   - Creates a `group_update` sign request. Completion stores ESP-local
     metadata for app display; it does not mutate Entmoot's roster protocol.
+    Device-auth callers must have the group in both `groups` and
+    `admin_groups`; admin access is checked again at completion.
   - Supports `Idempotency-Key`.
 - `GET /v1/groups/{group_id}/members`
   - Lists current roster members with their Entmoot public keys and, when the
@@ -682,7 +699,8 @@ require the requested `client_id` to be listed for that device.
 - `POST /v1/groups/{group_id}/invites`
   - Creates an `invite_create` sign request. Completion returns a signed
     invite produced by the always-on Entmoot peer after the phone/device
-    authorizes the operation.
+    authorizes the operation. Device-auth callers must have the group in both
+    `groups` and `admin_groups`; admin access is checked again at completion.
   - Supports `Idempotency-Key`.
 - `POST /v1/invites/accept`
   - Creates an `invite_accept` sign request. Completion forwards the signed

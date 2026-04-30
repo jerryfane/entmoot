@@ -72,11 +72,12 @@ const (
 
 // Device describes one ESP client device authorized to use this service.
 type Device struct {
-	ID        string
-	PublicKey ed25519.PublicKey
-	Groups    []entmoot.GroupID
-	ClientIDs []string
-	Disabled  bool
+	ID          string
+	PublicKey   ed25519.PublicKey
+	Groups      []entmoot.GroupID
+	AdminGroups []entmoot.GroupID
+	ClientIDs   []string
+	Disabled    bool
 }
 
 // DeviceRegistry is the in-memory authorization projection loaded by ESP
@@ -112,6 +113,7 @@ func NewDeviceRegistry(devices []Device) (*DeviceRegistry, error) {
 		}
 		d.PublicKey = append(ed25519.PublicKey(nil), d.PublicKey...)
 		d.Groups = append([]entmoot.GroupID(nil), d.Groups...)
+		d.AdminGroups = append([]entmoot.GroupID(nil), d.AdminGroups...)
 		d.ClientIDs = append([]string(nil), d.ClientIDs...)
 		reg.Devices[i] = d
 		reg.byID[d.ID] = d
@@ -168,6 +170,19 @@ func (r *DeviceRegistry) WithGroupRevoked(deviceID string, gid entmoot.GroupID) 
 	return r.withDeviceGroup(deviceID, gid, false)
 }
 
+// WithAdminGroupGranted returns a validated registry copy with gid granted as
+// an admin-managed group to deviceID. Admin implies management privileges, not
+// message access by itself.
+func (r *DeviceRegistry) WithAdminGroupGranted(deviceID string, gid entmoot.GroupID) (*DeviceRegistry, bool, error) {
+	return r.withDeviceAdminGroup(deviceID, gid, true)
+}
+
+// WithAdminGroupRevoked returns a validated registry copy with gid removed
+// from the admin-managed group set for deviceID.
+func (r *DeviceRegistry) WithAdminGroupRevoked(deviceID string, gid entmoot.GroupID) (*DeviceRegistry, bool, error) {
+	return r.withDeviceAdminGroup(deviceID, gid, false)
+}
+
 func (r *DeviceRegistry) withDeviceGroup(deviceID string, gid entmoot.GroupID, grant bool) (*DeviceRegistry, bool, error) {
 	if r == nil {
 		return nil, false, errors.New("esphttp: device registry is not configured")
@@ -216,6 +231,54 @@ func (r *DeviceRegistry) withDeviceGroup(deviceID string, gid entmoot.GroupID, g
 	return next, changed, nil
 }
 
+func (r *DeviceRegistry) withDeviceAdminGroup(deviceID string, gid entmoot.GroupID, grant bool) (*DeviceRegistry, bool, error) {
+	if r == nil {
+		return nil, false, errors.New("esphttp: device registry is not configured")
+	}
+	deviceID = strings.TrimSpace(deviceID)
+	if deviceID == "" {
+		return nil, false, errors.New("esphttp: device id is required")
+	}
+	devices := r.Snapshot()
+	changed := false
+	found := false
+	for i := range devices {
+		if devices[i].ID != deviceID {
+			continue
+		}
+		found = true
+		idx := -1
+		for j, existing := range devices[i].AdminGroups {
+			if existing == gid {
+				idx = j
+				break
+			}
+		}
+		if grant {
+			if idx >= 0 {
+				break
+			}
+			devices[i].AdminGroups = append(devices[i].AdminGroups, gid)
+			changed = true
+			break
+		}
+		if idx < 0 {
+			break
+		}
+		devices[i].AdminGroups = append(devices[i].AdminGroups[:idx], devices[i].AdminGroups[idx+1:]...)
+		changed = true
+		break
+	}
+	if !found {
+		return nil, false, fmt.Errorf("esphttp: device %q not found", deviceID)
+	}
+	next, err := NewDeviceRegistry(devices)
+	if err != nil {
+		return nil, false, err
+	}
+	return next, changed, nil
+}
+
 func cloneDevices(devices []Device) []Device {
 	out := make([]Device, len(devices))
 	for i, d := range devices {
@@ -227,6 +290,7 @@ func cloneDevices(devices []Device) []Device {
 func cloneDevice(d Device) Device {
 	d.PublicKey = append(ed25519.PublicKey(nil), d.PublicKey...)
 	d.Groups = append([]entmoot.GroupID(nil), d.Groups...)
+	d.AdminGroups = append([]entmoot.GroupID(nil), d.AdminGroups...)
 	d.ClientIDs = append([]string(nil), d.ClientIDs...)
 	return d
 }
@@ -1268,12 +1332,22 @@ func (h *Handler) checkDeviceGroup(w http.ResponseWriter, r *http.Request, group
 	if auth.device == nil {
 		return true
 	}
-	for _, allowed := range auth.device.Groups {
-		if allowed == groupID {
-			return true
-		}
+	if deviceAllowsGroup(*auth.device, groupID) {
+		return true
 	}
 	writeError(w, http.StatusForbidden, "forbidden", "device is not authorized for group")
+	return false
+}
+
+func (h *Handler) checkDeviceGroupAdmin(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID) bool {
+	auth, _ := r.Context().Value(authContextKey{}).(authContext)
+	if auth.device == nil {
+		return true
+	}
+	if deviceCanAdminGroup(*auth.device, groupID) {
+		return true
+	}
+	writeError(w, http.StatusForbidden, "forbidden", "device is not authorized to manage group")
 	return false
 }
 
@@ -1313,6 +1387,9 @@ func (h *Handler) createSignRequest(w http.ResponseWriter, r *http.Request, kind
 		return
 	}
 	if groupID != (entmoot.GroupID{}) && !h.checkDeviceGroup(w, r, groupID) {
+		return
+	}
+	if groupID != (entmoot.GroupID{}) && requiresGroupAdmin(kind) && !h.checkDeviceGroupAdmin(w, r, groupID) {
 		return
 	}
 	if len(payload) == 0 {
@@ -1415,6 +1492,9 @@ func (h *Handler) completeExecutableSignRequest(w http.ResponseWriter, r *http.R
 		writeError(w, http.StatusServiceUnavailable, "operation_unavailable", "no operation executor configured")
 		return nil, false
 	}
+	if !h.checkSignRequestAdmin(w, req) {
+		return nil, false
+	}
 	if !h.verifyOperationSignature(w, req, signature) {
 		return nil, false
 	}
@@ -1433,6 +1513,30 @@ func (h *Handler) completeExecutableSignRequest(w http.ResponseWriter, r *http.R
 		result = json.RawMessage(`{}`)
 	}
 	return append(json.RawMessage(nil), result...), true
+}
+
+func (h *Handler) checkSignRequestAdmin(w http.ResponseWriter, req SignRequest) bool {
+	if !requiresGroupAdmin(req.Kind) || req.GroupID == (entmoot.GroupID{}) {
+		return true
+	}
+	if req.DeviceID == "" {
+		writeError(w, http.StatusForbidden, "device_signature_required", "operation requires a registered device signature")
+		return false
+	}
+	if h.devices == nil {
+		writeError(w, http.StatusForbidden, "forbidden", "device admin rights cannot be verified")
+		return false
+	}
+	device, ok := h.devices.lookup(req.DeviceID)
+	if !ok {
+		writeError(w, http.StatusForbidden, "forbidden", "sign request device is not registered")
+		return false
+	}
+	if deviceCanAdminGroup(device, req.GroupID) {
+		return true
+	}
+	writeError(w, http.StatusForbidden, "forbidden", "device is not authorized to manage group")
+	return false
 }
 
 func (h *Handler) verifyOperationSignature(w http.ResponseWriter, req SignRequest, signature []byte) bool {
@@ -1608,6 +1712,15 @@ func deviceAllowsGroup(device Device, groupID entmoot.GroupID) bool {
 	return false
 }
 
+func deviceCanAdminGroup(device Device, groupID entmoot.GroupID) bool {
+	for _, allowed := range device.AdminGroups {
+		if allowed == groupID {
+			return true
+		}
+	}
+	return false
+}
+
 func authFromContext(r *http.Request) authContext {
 	auth, _ := r.Context().Value(authContextKey{}).(authContext)
 	return auth
@@ -1616,12 +1729,15 @@ func authFromContext(r *http.Request) authContext {
 func deviceView(device Device) map[string]any {
 	groups := make([]entmoot.GroupID, 0, len(device.Groups))
 	groups = append(groups, device.Groups...)
+	adminGroups := make([]entmoot.GroupID, 0, len(device.AdminGroups))
+	adminGroups = append(adminGroups, device.AdminGroups...)
 	clients := append([]string(nil), device.ClientIDs...)
 	return map[string]any{
-		"id":         device.ID,
-		"groups":     groups,
-		"client_ids": clients,
-		"disabled":   device.Disabled,
+		"id":           device.ID,
+		"groups":       groups,
+		"admin_groups": adminGroups,
+		"client_ids":   clients,
+		"disabled":     device.Disabled,
 	}
 }
 

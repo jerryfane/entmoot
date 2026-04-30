@@ -10,12 +10,13 @@ import (
 	"os"
 	"path/filepath"
 
+	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/esphttp"
 )
 
 func cmdESPDevice(gf *globalFlags, args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "esp device: expected list, add, onboard, rotate-key, enable, disable, or remove")
+		fmt.Fprintln(os.Stderr, "esp device: expected list, add, onboard, rotate-key, grant, revoke, grant-admin, revoke-admin, enable, disable, or remove")
 		return exitInvalidArgument
 	}
 	switch args[0] {
@@ -27,6 +28,14 @@ func cmdESPDevice(gf *globalFlags, args []string) int {
 		return cmdESPDeviceOnboard(gf, args[1:])
 	case "rotate-key":
 		return cmdESPDeviceRotateKey(gf, args[1:])
+	case "grant":
+		return cmdESPDeviceGrant(gf, args[1:], true)
+	case "revoke":
+		return cmdESPDeviceGrant(gf, args[1:], false)
+	case "grant-admin":
+		return cmdESPDeviceSetAdminGroup(gf, args[1:], true)
+	case "revoke-admin":
+		return cmdESPDeviceSetAdminGroup(gf, args[1:], false)
 	case "enable":
 		return cmdESPDeviceSetDisabled(gf, args[1:], false)
 	case "disable":
@@ -115,8 +124,10 @@ func cmdESPDeviceAdd(gf *globalFlags, args []string) int {
 	disabled := fs.Bool("disabled", false, "create the device disabled")
 	path := fs.String("device-keys", "", "ESP device registry JSON path (default: <data>/esp-devices.json)")
 	var groups repeatedStringFlag
+	var adminGroups repeatedStringFlag
 	var clients repeatedStringFlag
 	fs.Var(&groups, "group", "base64 group id; may be repeated")
+	fs.Var(&adminGroups, "admin-group", "base64 group id this device may manage; may be repeated")
 	fs.Var(&clients, "client", "authorized mailbox client id; may be repeated")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -150,11 +161,12 @@ func cmdESPDeviceAdd(gf *globalFlags, args []string) int {
 		}
 	}
 	device, err := esphttp.DeviceFromRecord(esphttp.DeviceRecord{
-		ID:        *id,
-		PublicKey: *pubkey,
-		Groups:    append([]string(nil), groups...),
-		ClientIDs: append([]string(nil), clients...),
-		Disabled:  *disabled,
+		ID:          *id,
+		PublicKey:   *pubkey,
+		Groups:      append([]string(nil), groups...),
+		AdminGroups: append([]string(nil), adminGroups...),
+		ClientIDs:   append([]string(nil), clients...),
+		Disabled:    *disabled,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "esp device add: %v\n", err)
@@ -181,8 +193,10 @@ func cmdESPDeviceOnboard(gf *globalFlags, args []string) int {
 	disabled := fs.Bool("disabled", false, "create the device disabled")
 	path := fs.String("device-keys", "", "ESP device registry JSON path (default: <data>/esp-devices.json)")
 	var groups repeatedStringFlag
+	var adminGroups repeatedStringFlag
 	var clients repeatedStringFlag
 	fs.Var(&groups, "group", "base64 group id; may be repeated")
+	fs.Var(&adminGroups, "admin-group", "base64 group id this device may manage; may be repeated")
 	fs.Var(&clients, "client", "authorized mailbox client id; may be repeated")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -207,11 +221,12 @@ func cmdESPDeviceOnboard(gf *globalFlags, args []string) int {
 		return exitTransport
 	}
 	record := esphttp.DeviceRecord{
-		ID:        *id,
-		PublicKey: base64.StdEncoding.EncodeToString(pub),
-		Groups:    append([]string(nil), groups...),
-		ClientIDs: append([]string(nil), clients...),
-		Disabled:  *disabled,
+		ID:          *id,
+		PublicKey:   base64.StdEncoding.EncodeToString(pub),
+		Groups:      append([]string(nil), groups...),
+		AdminGroups: append([]string(nil), adminGroups...),
+		ClientIDs:   append([]string(nil), clients...),
+		Disabled:    *disabled,
 	}
 	device, err := esphttp.DeviceFromRecord(record)
 	if err != nil {
@@ -256,6 +271,79 @@ func cmdESPDeviceOnboard(gf *globalFlags, args []string) int {
 		return exitTransport
 	}
 	return exitOK
+}
+
+func cmdESPDeviceGrant(gf *globalFlags, args []string, grant bool) int {
+	name := "grant"
+	if !grant {
+		name = "revoke"
+	}
+	fs := flag.NewFlagSet("esp device "+name, flag.ContinueOnError)
+	id := fs.String("id", "", "device id")
+	path := fs.String("device-keys", "", "ESP device registry JSON path (default: <data>/esp-devices.json)")
+	var groups repeatedStringFlag
+	var adminGroups repeatedStringFlag
+	fs.Var(&groups, "group", "base64 group id; may be repeated")
+	fs.Var(&adminGroups, "admin-group", "base64 group id this device may manage; may be repeated")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return exitOK
+		}
+		return exitInvalidArgument
+	}
+	if *id == "" {
+		fmt.Fprintf(os.Stderr, "esp device %s: -id is required\n", name)
+		return exitInvalidArgument
+	}
+	if len(groups) == 0 && len(adminGroups) == 0 {
+		fmt.Fprintf(os.Stderr, "esp device %s: at least one -group or -admin-group is required\n", name)
+		return exitInvalidArgument
+	}
+	reg, code, ok := loadESPDeviceRegistryForCLI(gf, *path)
+	if !ok {
+		return code
+	}
+	next, err := updateESPDeviceGroups(reg, *id, groups, adminGroups, grant)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "esp device %s: %v\n", name, err)
+		return exitInvalidArgument
+	}
+	return saveAndEmitESPDeviceRegistry(gf, *path, next, "esp device "+name)
+}
+
+func cmdESPDeviceSetAdminGroup(gf *globalFlags, args []string, grant bool) int {
+	name := "grant-admin"
+	if !grant {
+		name = "revoke-admin"
+	}
+	fs := flag.NewFlagSet("esp device "+name, flag.ContinueOnError)
+	id := fs.String("id", "", "device id")
+	group := fs.String("group", "", "base64 group id this device may manage")
+	path := fs.String("device-keys", "", "ESP device registry JSON path (default: <data>/esp-devices.json)")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return exitOK
+		}
+		return exitInvalidArgument
+	}
+	if *id == "" {
+		fmt.Fprintf(os.Stderr, "esp device %s: -id is required\n", name)
+		return exitInvalidArgument
+	}
+	if *group == "" {
+		fmt.Fprintf(os.Stderr, "esp device %s: -group is required\n", name)
+		return exitInvalidArgument
+	}
+	reg, code, ok := loadESPDeviceRegistryForCLI(gf, *path)
+	if !ok {
+		return code
+	}
+	next, err := updateESPDeviceGroups(reg, *id, nil, repeatedStringFlag{*group}, grant)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "esp device %s: %v\n", name, err)
+		return exitInvalidArgument
+	}
+	return saveAndEmitESPDeviceRegistry(gf, *path, next, "esp device "+name)
 }
 
 func cmdESPDeviceSetDisabled(gf *globalFlags, args []string, disabled bool) int {
@@ -338,6 +426,53 @@ func cmdESPDeviceRemove(gf *globalFlags, args []string) int {
 		return exitInvalidArgument
 	}
 	return saveAndEmitESPDeviceRegistry(gf, *path, next, "esp device remove")
+}
+
+func updateESPDeviceGroups(reg *esphttp.DeviceRegistry, deviceID string, groups, adminGroups repeatedStringFlag, grant bool) (*esphttp.DeviceRegistry, error) {
+	next := reg
+	var err error
+	for _, raw := range groups {
+		gid, parseErr := parseESPDeviceGroupID(raw)
+		if parseErr != nil {
+			return nil, fmt.Errorf("invalid -group: %w", parseErr)
+		}
+		if grant {
+			next, _, err = next.WithGroupGranted(deviceID, gid)
+		} else {
+			next, _, err = next.WithGroupRevoked(deviceID, gid)
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+	for _, raw := range adminGroups {
+		gid, parseErr := parseESPDeviceGroupID(raw)
+		if parseErr != nil {
+			return nil, fmt.Errorf("invalid -admin-group: %w", parseErr)
+		}
+		if grant {
+			next, _, err = next.WithAdminGroupGranted(deviceID, gid)
+		} else {
+			next, _, err = next.WithAdminGroupRevoked(deviceID, gid)
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+	return next, nil
+}
+
+func parseESPDeviceGroupID(raw string) (entmoot.GroupID, error) {
+	var gid entmoot.GroupID
+	decoded, err := base64.StdEncoding.DecodeString(raw)
+	if err != nil {
+		return gid, err
+	}
+	if len(decoded) != len(gid) {
+		return gid, fmt.Errorf("group id length %d", len(decoded))
+	}
+	copy(gid[:], decoded)
+	return gid, nil
 }
 
 func loadESPDeviceRegistryForCLI(gf *globalFlags, rawPath string) (*esphttp.DeviceRegistry, int, bool) {

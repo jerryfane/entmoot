@@ -21,11 +21,12 @@ type DeviceRegistryDocument struct {
 
 // DeviceRecord is one serializable ESP device registry entry.
 type DeviceRecord struct {
-	ID        string   `json:"id"`
-	PublicKey string   `json:"public_key"`
-	Groups    []string `json:"groups"`
-	ClientIDs []string `json:"client_ids"`
-	Disabled  bool     `json:"disabled"`
+	ID          string   `json:"id"`
+	PublicKey   string   `json:"public_key"`
+	Groups      []string `json:"groups"`
+	AdminGroups []string `json:"admin_groups"`
+	ClientIDs   []string `json:"client_ids"`
+	Disabled    bool     `json:"disabled"`
 }
 
 // LoadDeviceRegistryOrEmpty reads path, returning an empty registry when the
@@ -134,12 +135,17 @@ func DeviceRegistryDocumentFromRegistry(reg *DeviceRegistry) DeviceRegistryDocum
 		for _, gid := range d.Groups {
 			groups = append(groups, gid.String())
 		}
+		adminGroups := make([]string, 0, len(d.AdminGroups))
+		for _, gid := range d.AdminGroups {
+			adminGroups = append(adminGroups, gid.String())
+		}
 		devices = append(devices, DeviceRecord{
-			ID:        d.ID,
-			PublicKey: base64.StdEncoding.EncodeToString(d.PublicKey),
-			Groups:    groups,
-			ClientIDs: append([]string(nil), d.ClientIDs...),
-			Disabled:  d.Disabled,
+			ID:          d.ID,
+			PublicKey:   base64.StdEncoding.EncodeToString(d.PublicKey),
+			Groups:      groups,
+			AdminGroups: adminGroups,
+			ClientIDs:   append([]string(nil), d.ClientIDs...),
+			Disabled:    d.Disabled,
 		})
 	}
 	return DeviceRegistryDocument{Devices: devices}
@@ -166,6 +172,14 @@ func DeviceFromRecord(in DeviceRecord) (Device, error) {
 		}
 		groups = append(groups, gid)
 	}
+	adminGroups := make([]entmoot.GroupID, 0, len(in.AdminGroups))
+	for _, rawGroup := range in.AdminGroups {
+		gid, err := decodeGroupID(strings.TrimSpace(rawGroup))
+		if err != nil {
+			return Device{}, fmt.Errorf("esphttp: device %q admin group: %w", id, err)
+		}
+		adminGroups = append(adminGroups, gid)
+	}
 	clients := make([]string, 0, len(in.ClientIDs))
 	for _, clientID := range in.ClientIDs {
 		clientID = strings.TrimSpace(clientID)
@@ -175,11 +189,12 @@ func DeviceFromRecord(in DeviceRecord) (Device, error) {
 		clients = append(clients, clientID)
 	}
 	return Device{
-		ID:        id,
-		PublicKey: append(ed25519.PublicKey(nil), pub...),
-		Groups:    groups,
-		ClientIDs: clients,
-		Disabled:  in.Disabled,
+		ID:          id,
+		PublicKey:   append(ed25519.PublicKey(nil), pub...),
+		Groups:      groups,
+		AdminGroups: adminGroups,
+		ClientIDs:   clients,
+		Disabled:    in.Disabled,
 	}, nil
 }
 

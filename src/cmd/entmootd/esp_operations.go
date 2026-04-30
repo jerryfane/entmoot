@@ -134,6 +134,7 @@ func (e espOperationExecutor) createGroup(ctx context.Context, req esphttp.SignR
 	var previousMetadata json.RawMessage
 	metadataHadPrevious := false
 	deviceGroupGranted := false
+	deviceAdminGroupGranted := false
 	var st *store.SQLite
 	var rlog *roster.RosterLog
 	defer func() {
@@ -162,6 +163,11 @@ func (e espOperationExecutor) createGroup(ctx context.Context, req esphttp.SignR
 				slog.Warn("esp group_create rollback: revoke device group failed", slog.String("group_id", gid.String()), slog.String("device_id", req.DeviceID), slog.String("err", err.Error()))
 			}
 		}
+		if deviceAdminGroupGranted && e.deviceGroups != nil {
+			if err := e.deviceGroups.RevokeDeviceAdminGroup(context.Background(), req.DeviceID, gid); err != nil {
+				slog.Warn("esp group_create rollback: revoke device admin group failed", slog.String("group_id", gid.String()), slog.String("device_id", req.DeviceID), slog.String("err", err.Error()))
+			}
+		}
 		if !groupPreexisted {
 			if err := os.RemoveAll(groupPath); err != nil {
 				slog.Warn("esp group_create rollback: remove group dir failed", slog.String("group_id", gid.String()), slog.String("path", groupPath), slog.String("err", err.Error()))
@@ -174,6 +180,11 @@ func (e espOperationExecutor) createGroup(ctx context.Context, req esphttp.SignR
 			return nil, err
 		}
 		deviceGroupGranted = changed
+		changed, err = e.grantDeviceAdminGroup(ctx, req.DeviceID, gid)
+		if err != nil {
+			return nil, err
+		}
+		deviceAdminGroupGranted = changed
 	}
 	st, err = store.OpenSQLite(e.dataDir)
 	if err != nil {
@@ -489,6 +500,20 @@ func (e espOperationExecutor) grantDeviceGroupIfNeeded(ctx context.Context, devi
 	}
 	_, err := e.grantDeviceGroup(ctx, deviceID, gid)
 	return err
+}
+
+func (e espOperationExecutor) grantDeviceAdminGroup(ctx context.Context, deviceID string, gid entmoot.GroupID) (bool, error) {
+	if deviceID == "" {
+		return false, nil
+	}
+	if e.deviceGroups == nil {
+		return false, &esphttp.OperationError{HTTPStatus: http.StatusServiceUnavailable, Code: "device_registry_unavailable", Message: "device registry is not configured"}
+	}
+	changed, err := e.deviceGroups.GrantDeviceAdminGroup(ctx, deviceID, gid)
+	if err != nil {
+		return false, err
+	}
+	return changed, nil
 }
 
 func (e espOperationExecutor) grantDeviceGroup(ctx context.Context, deviceID string, gid entmoot.GroupID) (bool, error) {

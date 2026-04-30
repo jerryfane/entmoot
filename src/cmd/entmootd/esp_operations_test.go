@@ -278,13 +278,16 @@ func TestESPCreateGroupRollsBackLocalStateOnJoinFailure(t *testing.T) {
 	stop := serveESPGroupCreateIPC(t, sock, id.PublicKey, false)
 	defer stop()
 	metadata := esphttp.NewMemoryStateStore()
+	reg, regPath := testDeviceRegistry(t)
 	req := testGroupCreateRequest("req-rollback")
+	req.DeviceID = "ios-1"
 	exec := espOperationExecutor{
 		dataDir:       dataDir,
 		identity:      id,
 		socketPath:    sock,
 		timeout:       time.Second,
 		metadataStore: metadata,
+		deviceGroups:  &fileBackedDeviceGroupAuthorizer{path: regPath, registry: reg},
 	}
 	gid, err := groupIDForCreateRequest(req)
 	if err != nil {
@@ -303,6 +306,14 @@ func TestESPCreateGroupRollsBackLocalStateOnJoinFailure(t *testing.T) {
 		t.Fatalf("GetGroupMetadata: %v", err)
 	} else if ok {
 		t.Fatal("metadata still present after rollback")
+	}
+	loaded, err := esphttp.LoadDeviceRegistry(regPath)
+	if err != nil {
+		t.Fatalf("LoadDeviceRegistry: %v", err)
+	}
+	devices := loaded.Snapshot()
+	if len(devices) != 1 || len(devices[0].Groups) != 0 || len(devices[0].AdminGroups) != 0 {
+		t.Fatalf("devices after rollback = %+v, want no regular or admin grants", devices)
 	}
 }
 
@@ -362,6 +373,9 @@ func TestESPCreateGroupGrantsCreatingDevice(t *testing.T) {
 	device := devices[0]
 	if len(device.Groups) != 1 || device.Groups[0] != result.GroupID {
 		t.Fatalf("device groups = %v, want [%s]", device.Groups, result.GroupID)
+	}
+	if len(device.AdminGroups) != 1 || device.AdminGroups[0] != result.GroupID {
+		t.Fatalf("device admin groups = %v, want [%s]", device.AdminGroups, result.GroupID)
 	}
 }
 
@@ -550,6 +564,9 @@ func assertDeviceGroups(t *testing.T, regPath string, want entmoot.GroupID) {
 	device := devices[0]
 	if len(device.Groups) != 1 || device.Groups[0] != want {
 		t.Fatalf("device groups = %v, want [%s]", device.Groups, want)
+	}
+	if len(device.AdminGroups) != 0 {
+		t.Fatalf("device admin groups = %v, want none", device.AdminGroups)
 	}
 }
 

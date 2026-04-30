@@ -16,6 +16,8 @@ import (
 func TestESPDeviceCLIAddListDisableEnableRemove(t *testing.T) {
 	gf := &globalFlags{data: t.TempDir()}
 	gid := mailboxTestGroupID(7)
+	adminGID := mailboxTestGroupID(11)
+	extraGID := mailboxTestGroupID(12)
 	pub, _, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatalf("GenerateKey: %v", err)
@@ -28,6 +30,7 @@ func TestESPDeviceCLIAddListDisableEnableRemove(t *testing.T) {
 			"-id", "ios-1",
 			"-pubkey", pubStr,
 			"-group", gid.String(),
+			"-admin-group", adminGID.String(),
 		})
 	})
 	if code != exitOK {
@@ -37,6 +40,7 @@ func TestESPDeviceCLIAddListDisableEnableRemove(t *testing.T) {
 	if len(doc.Devices) != 1 || doc.Devices[0].ID != "ios-1" || doc.Devices[0].PublicKey != pubStr ||
 		len(doc.Devices[0].ClientIDs) != 1 || doc.Devices[0].ClientIDs[0] != "ios-1" ||
 		len(doc.Devices[0].Groups) != 1 || doc.Devices[0].Groups[0] != gid.String() ||
+		len(doc.Devices[0].AdminGroups) != 1 || doc.Devices[0].AdminGroups[0] != adminGID.String() ||
 		doc.Devices[0].Disabled {
 		t.Fatalf("add output = %+v", doc.Devices)
 	}
@@ -83,8 +87,33 @@ func TestESPDeviceCLIAddListDisableEnableRemove(t *testing.T) {
 	}
 	doc = mustDecodeDeviceRegistryOutput(t, out)
 	if doc.Devices[0].PublicKey != newPubStr || doc.Devices[0].Groups[0] != gid.String() ||
+		doc.Devices[0].AdminGroups[0] != adminGID.String() ||
 		doc.Devices[0].ClientIDs[0] != "ios-1" || doc.Devices[0].Disabled {
 		t.Fatalf("rotate-key output = %+v", doc.Devices[0])
+	}
+
+	code, out, stderr = captureCommandOutput(t, func() int {
+		return cmdESP(gf, []string{"device", "grant", "-id", "ios-1", "-group", extraGID.String(), "-admin-group", extraGID.String()})
+	})
+	if code != exitOK {
+		t.Fatalf("grant exit = %d stderr=%s", code, stderr)
+	}
+	doc = mustDecodeDeviceRegistryOutput(t, out)
+	if len(doc.Devices[0].Groups) != 2 || doc.Devices[0].Groups[1] != extraGID.String() ||
+		len(doc.Devices[0].AdminGroups) != 2 || doc.Devices[0].AdminGroups[1] != extraGID.String() {
+		t.Fatalf("grant output = %+v", doc.Devices[0])
+	}
+
+	code, out, stderr = captureCommandOutput(t, func() int {
+		return cmdESP(gf, []string{"device", "revoke", "-id", "ios-1", "-group", extraGID.String(), "-admin-group", extraGID.String()})
+	})
+	if code != exitOK {
+		t.Fatalf("revoke exit = %d stderr=%s", code, stderr)
+	}
+	doc = mustDecodeDeviceRegistryOutput(t, out)
+	if len(doc.Devices[0].Groups) != 1 || doc.Devices[0].Groups[0] != gid.String() ||
+		len(doc.Devices[0].AdminGroups) != 1 || doc.Devices[0].AdminGroups[0] != adminGID.String() {
+		t.Fatalf("revoke output = %+v", doc.Devices[0])
 	}
 
 	code, out, stderr = captureCommandOutput(t, func() int {
@@ -170,12 +199,14 @@ func TestESPDeviceCLIUsesExplicitRegistryPath(t *testing.T) {
 func TestESPDeviceCLIOnboardGeneratesKeyAndStoresPublicOnly(t *testing.T) {
 	gf := &globalFlags{data: t.TempDir()}
 	gid := mailboxTestGroupID(9)
+	adminGID := mailboxTestGroupID(13)
 
 	code, out, stderr := captureCommandOutput(t, func() int {
 		return cmdESP(gf, []string{
 			"device", "onboard",
 			"-id", "ios-1-device",
 			"-group", gid.String(),
+			"-admin-group", adminGID.String(),
 			"-client", "ios-1",
 		})
 	})
@@ -199,7 +230,8 @@ func TestESPDeviceCLIOnboardGeneratesKeyAndStoresPublicOnly(t *testing.T) {
 	}
 	if onboarding.Device.ID != "ios-1-device" || len(onboarding.Device.ClientIDs) != 1 ||
 		onboarding.Device.ClientIDs[0] != "ios-1" || len(onboarding.Device.Groups) != 1 ||
-		onboarding.Device.Groups[0] != gid.String() || onboarding.Device.Disabled {
+		onboarding.Device.Groups[0] != gid.String() || len(onboarding.Device.AdminGroups) != 1 ||
+		onboarding.Device.AdminGroups[0] != adminGID.String() || onboarding.Device.Disabled {
 		t.Fatalf("onboard device = %+v", onboarding.Device)
 	}
 

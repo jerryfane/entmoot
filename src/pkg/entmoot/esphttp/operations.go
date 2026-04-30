@@ -50,3 +50,13 @@ func executableOperationKind(kind string) bool {
 		return false
 	}
 }
+
+func requiresGroupAdmin(kind string) bool {
+	switch kind {
+	case signRequestKindGroupUpdate,
+		signRequestKindInviteCreate:
+		return true
+	default:
+		return false
+	}
+}

@@ -203,10 +203,11 @@ func TestHandlerDeviceAuth(t *testing.T) {
 		t.Fatalf("GenerateKey: %v", err)
 	}
 	reg, err := NewDeviceRegistry([]Device{{
-		ID:        "ios-1-device",
-		PublicKey: priv.Public().(ed25519.PublicKey),
-		Groups:    []entmoot.GroupID{gid},
-		ClientIDs: []string{"ios-1"},
+		ID:          "ios-1-device",
+		PublicKey:   priv.Public().(ed25519.PublicKey),
+		Groups:      []entmoot.GroupID{gid},
+		AdminGroups: []entmoot.GroupID{gid},
+		ClientIDs:   []string{"ios-1"},
 	}})
 	if err != nil {
 		t.Fatalf("NewDeviceRegistry: %v", err)
@@ -256,11 +257,12 @@ func TestHandlerDisabledDeviceAuth(t *testing.T) {
 		t.Fatalf("GenerateKey: %v", err)
 	}
 	reg, err := NewDeviceRegistry([]Device{{
-		ID:        "ios-1-device",
-		PublicKey: priv.Public().(ed25519.PublicKey),
-		Groups:    []entmoot.GroupID{gid},
-		ClientIDs: []string{"ios-1"},
-		Disabled:  true,
+		ID:          "ios-1-device",
+		PublicKey:   priv.Public().(ed25519.PublicKey),
+		Groups:      []entmoot.GroupID{gid},
+		AdminGroups: []entmoot.GroupID{gid},
+		ClientIDs:   []string{"ios-1"},
+		Disabled:    true,
 	}})
 	if err != nil {
 		t.Fatalf("NewDeviceRegistry: %v", err)
@@ -533,10 +535,11 @@ func TestHandlerExecutableOperationSignRequestExecutes(t *testing.T) {
 		t.Fatalf("GenerateKey: %v", err)
 	}
 	reg, err := NewDeviceRegistry([]Device{{
-		ID:        "ios-1-device",
-		PublicKey: pub,
-		Groups:    []entmoot.GroupID{gid},
-		ClientIDs: []string{"ios-1"},
+		ID:          "ios-1-device",
+		PublicKey:   pub,
+		Groups:      []entmoot.GroupID{gid},
+		AdminGroups: []entmoot.GroupID{gid},
+		ClientIDs:   []string{"ios-1"},
 	}})
 	if err != nil {
 		t.Fatalf("NewDeviceRegistry: %v", err)
@@ -568,6 +571,86 @@ func TestHandlerExecutableOperationSignRequestExecutes(t *testing.T) {
 	}
 	if op.req.ID != req.ID || !bytes.Equal(op.signature, sig) {
 		t.Fatalf("executor got req=%+v sig_len=%d", op.req, len(op.signature))
+	}
+}
+
+func TestHandlerAdminOperationsRequireAdminAtCreation(t *testing.T) {
+	gid := testGroupID(1)
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	reg, err := NewDeviceRegistry([]Device{{
+		ID:        "ios-1-device",
+		PublicKey: pub,
+		Groups:    []entmoot.GroupID{gid},
+		ClientIDs: []string{"ios-1"},
+	}})
+	if err != nil {
+		t.Fatalf("NewDeviceRegistry: %v", err)
+	}
+	handler := testMobileHandlerFull(t, gid, reg, &fakeCatalog{groups: []GroupSummary{{GroupID: gid}}}, func() time.Time {
+		return time.UnixMilli(1_234_000)
+	}, nil, NewMemoryStateStore(), nil)
+
+	updateErr := doSignedJSONRequest[errorEnvelope](t, handler, priv, http.MethodPatch, "/v1/groups/"+gid.String(), map[string]any{"name": "ops"}, http.StatusForbidden, 1_234_000, "nonce-update")
+	if updateErr.Error.Code != "forbidden" {
+		t.Fatalf("group_update code = %q, want forbidden", updateErr.Error.Code)
+	}
+	inviteErr := doSignedJSONRequest[errorEnvelope](t, handler, priv, http.MethodPost, "/v1/groups/"+gid.String()+"/invites", map[string]any{}, http.StatusForbidden, 1_235_000, "nonce-invite")
+	if inviteErr.Error.Code != "forbidden" {
+		t.Fatalf("invite_create code = %q, want forbidden", inviteErr.Error.Code)
+	}
+}
+
+func TestHandlerAdminOperationRechecksAdminAtCompletion(t *testing.T) {
+	gid := testGroupID(1)
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	reg, err := NewDeviceRegistry([]Device{{
+		ID:          "ios-1-device",
+		PublicKey:   pub,
+		Groups:      []entmoot.GroupID{gid},
+		AdminGroups: []entmoot.GroupID{gid},
+		ClientIDs:   []string{"ios-1"},
+	}})
+	if err != nil {
+		t.Fatalf("NewDeviceRegistry: %v", err)
+	}
+	op := &fakeOperationExecutor{result: json.RawMessage(`{"status":"updated"}`)}
+	handler := testMobileHandlerFull(t, gid, reg, &fakeCatalog{groups: []GroupSummary{{GroupID: gid}}}, func() time.Time {
+		return time.UnixMilli(1_234_000)
+	}, nil, NewMemoryStateStore(), nil)
+	handler.(*Handler).operations = op
+
+	created := doSignedJSONRequest[struct {
+		SignRequest SignRequest `json:"sign_request"`
+	}](t, handler, priv, http.MethodPatch, "/v1/groups/"+gid.String(), map[string]any{"name": "ops"}, http.StatusAccepted, 1_234_000, "nonce-create")
+	signingPayload, err := base64.StdEncoding.DecodeString(created.SignRequest.SigningPayload)
+	if err != nil {
+		t.Fatalf("Decode signing payload: %v", err)
+	}
+	withoutAdmin, err := NewDeviceRegistry([]Device{{
+		ID:        "ios-1-device",
+		PublicKey: pub,
+		Groups:    []entmoot.GroupID{gid},
+		ClientIDs: []string{"ios-1"},
+	}})
+	if err != nil {
+		t.Fatalf("NewDeviceRegistry without admin: %v", err)
+	}
+	reg.Replace(withoutAdmin)
+	errResp := doSignedJSONRequest[errorEnvelope](t, handler, priv, http.MethodPost, "/v1/sign-requests/"+created.SignRequest.ID+"/complete", map[string]any{
+		"signature":              base64.StdEncoding.EncodeToString(ed25519.Sign(priv, signingPayload)),
+		"signing_payload_sha256": created.SignRequest.SigningPayloadSHA256,
+	}, http.StatusForbidden, 1_235_000, "nonce-complete")
+	if errResp.Error.Code != "forbidden" {
+		t.Fatalf("error code = %q, want forbidden", errResp.Error.Code)
+	}
+	if op.req.ID != "" {
+		t.Fatalf("executor ran without admin rights: %+v", op.req)
 	}
 }
 
@@ -607,10 +690,11 @@ func TestHandlerExecutableOperationRejectsMissingExecutor(t *testing.T) {
 		t.Fatalf("GenerateKey: %v", err)
 	}
 	reg, err := NewDeviceRegistry([]Device{{
-		ID:        "ios-1-device",
-		PublicKey: pub,
-		Groups:    []entmoot.GroupID{gid},
-		ClientIDs: []string{"ios-1"},
+		ID:          "ios-1-device",
+		PublicKey:   pub,
+		Groups:      []entmoot.GroupID{gid},
+		AdminGroups: []entmoot.GroupID{gid},
+		ClientIDs:   []string{"ios-1"},
 	}})
 	if err != nil {
 		t.Fatalf("NewDeviceRegistry: %v", err)
@@ -651,10 +735,11 @@ func TestHandlerExecutableOperationRequiresDigestWithoutExecutor(t *testing.T) {
 		t.Fatalf("GenerateKey: %v", err)
 	}
 	reg, err := NewDeviceRegistry([]Device{{
-		ID:        "ios-1-device",
-		PublicKey: pub,
-		Groups:    []entmoot.GroupID{gid},
-		ClientIDs: []string{"ios-1"},
+		ID:          "ios-1-device",
+		PublicKey:   pub,
+		Groups:      []entmoot.GroupID{gid},
+		AdminGroups: []entmoot.GroupID{gid},
+		ClientIDs:   []string{"ios-1"},
 	}})
 	if err != nil {
 		t.Fatalf("NewDeviceRegistry: %v", err)
@@ -689,10 +774,11 @@ func TestHandlerExecutableOperationRejectsInvalidSignature(t *testing.T) {
 		t.Fatalf("GenerateKey wrong: %v", err)
 	}
 	reg, err := NewDeviceRegistry([]Device{{
-		ID:        "ios-1-device",
-		PublicKey: pub,
-		Groups:    []entmoot.GroupID{gid},
-		ClientIDs: []string{"ios-1"},
+		ID:          "ios-1-device",
+		PublicKey:   pub,
+		Groups:      []entmoot.GroupID{gid},
+		AdminGroups: []entmoot.GroupID{gid},
+		ClientIDs:   []string{"ios-1"},
 	}})
 	if err != nil {
 		t.Fatalf("NewDeviceRegistry: %v", err)
@@ -729,10 +815,11 @@ func TestHandlerDualAuthBearerCannotCreateExecutableOperation(t *testing.T) {
 		t.Fatalf("GenerateKey: %v", err)
 	}
 	reg, err := NewDeviceRegistry([]Device{{
-		ID:        "ios-1-device",
-		PublicKey: priv.Public().(ed25519.PublicKey),
-		Groups:    []entmoot.GroupID{gid},
-		ClientIDs: []string{"ios-1"},
+		ID:          "ios-1-device",
+		PublicKey:   priv.Public().(ed25519.PublicKey),
+		Groups:      []entmoot.GroupID{gid},
+		AdminGroups: []entmoot.GroupID{gid},
+		ClientIDs:   []string{"ios-1"},
 	}})
 	if err != nil {
 		t.Fatalf("NewDeviceRegistry: %v", err)
@@ -768,10 +855,11 @@ func TestHandlerNotificationTestClearsInvalidToken(t *testing.T) {
 		t.Fatalf("GenerateKey: %v", err)
 	}
 	reg, err := NewDeviceRegistry([]Device{{
-		ID:        "ios-1-device",
-		PublicKey: priv.Public().(ed25519.PublicKey),
-		Groups:    []entmoot.GroupID{gid},
-		ClientIDs: []string{"ios-1-device"},
+		ID:          "ios-1-device",
+		PublicKey:   priv.Public().(ed25519.PublicKey),
+		Groups:      []entmoot.GroupID{gid},
+		AdminGroups: []entmoot.GroupID{gid},
+		ClientIDs:   []string{"ios-1-device"},
 	}})
 	if err != nil {
 		t.Fatalf("NewDeviceRegistry: %v", err)
@@ -804,10 +892,11 @@ func TestHandlerDeviceStateAndNotifications(t *testing.T) {
 		t.Fatalf("GenerateKey: %v", err)
 	}
 	reg, err := NewDeviceRegistry([]Device{{
-		ID:        "ios-1-device",
-		PublicKey: priv.Public().(ed25519.PublicKey),
-		Groups:    []entmoot.GroupID{gid},
-		ClientIDs: []string{"ios-1-device"},
+		ID:          "ios-1-device",
+		PublicKey:   priv.Public().(ed25519.PublicKey),
+		Groups:      []entmoot.GroupID{gid},
+		AdminGroups: []entmoot.GroupID{gid},
+		ClientIDs:   []string{"ios-1-device"},
 	}})
 	if err != nil {
 		t.Fatalf("NewDeviceRegistry: %v", err)
@@ -851,10 +940,11 @@ func TestHandlerDualAuthAcceptsBearerAndDevice(t *testing.T) {
 		t.Fatalf("GenerateKey: %v", err)
 	}
 	reg, err := NewDeviceRegistry([]Device{{
-		ID:        "ios-1-device",
-		PublicKey: priv.Public().(ed25519.PublicKey),
-		Groups:    []entmoot.GroupID{gid},
-		ClientIDs: []string{"ios-1"},
+		ID:          "ios-1-device",
+		PublicKey:   priv.Public().(ed25519.PublicKey),
+		Groups:      []entmoot.GroupID{gid},
+		AdminGroups: []entmoot.GroupID{gid},
+		ClientIDs:   []string{"ios-1"},
 	}})
 	if err != nil {
 		t.Fatalf("NewDeviceRegistry: %v", err)
