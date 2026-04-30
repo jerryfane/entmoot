@@ -53,15 +53,16 @@ It adds multi-party gossip, topic-based subscription, signed group
 membership, and Merkle-verified message completeness on top of Pilot's
 existing unicast primitives, without waiting for Pilot's in-progress
 ``custom networks'' feature. We describe the design, a reference Go
-implementation across the current \texttt{v1.5.19} codebase, and
+implementation across the current \texttt{v1.5.25} codebase plus the
+unreleased member-profile work, and
 end-to-end canary tests that show three sandboxed Pilot nodes
 converging to byte-identical Merkle roots over real encrypted tunnels.
 Entmoot ships a one-command installer and an Agent-Skills-format
 skill document, so the protocol is directly consumable by autonomous
 agents. Dissemination follows a Plumtree-style eager/lazy spanning
 tree with IHAVE/GRAFT/PRUNE repair; anti-entropy uses Range-Based Set
-Reconciliation; and gossip frames are multiplexed over managed
-\texttt{yamux} sessions per peer. The live three-peer deployment that
+Reconciliation; and gossip frames run as short-lived Pilot streams
+with explicit per-peer dial budgets. The live three-peer deployment that
 motivated the implementation now runs through TURN rotation, Pilot
 restart, and stale-stream recovery while preserving convergence across
 asymmetric consumer networks.
@@ -114,12 +115,14 @@ Our contributions are as follows.
     is captured in signed rosters above the transport, not in Pilot's
     own (in-progress) network membership mechanism.
     \item A Go reference implementation, \texttt{entmootd}, comprising
-    the current \texttt{v1.5.19} codebase, including framing, replay
+    the current \texttt{v1.5.25} codebase plus the unreleased
+    member-profile work, including framing, replay
     protection, rate limiting, gossip, Merkle trees, Range-Based Set
     Reconciliation, an independent Pilot IPC client, a Pilot-daemon
     adapter, and explicit trace modes for transport and reconcile
     debugging, plus Entmoot Service Provider primitives for mobile
-    clients. End-to-end tests and live three-peer deployments show
+    clients and hostname-aware member profiles for app display.
+    End-to-end tests and live three-peer deployments show
     convergence over real encrypted Pilot tunnels, including recovery
     from Pilot restarts, TURN rotations, and stale port-1004 streams.
     \item An agent-facing CLI surface (\texttt{join}, \texttt{publish},
@@ -343,22 +346,23 @@ message-type tag, and a JSON body, with a 16\,MiB cap. JSON keeps the
 protocol debuggable and extensible; a binary codec is documented as
 future work.
 
-The protocol defines thirteen message types: eight for the core
+The protocol defines twenty message types: eight for the core
 data plane (\texttt{hello}, \texttt{roster\_req},
 \texttt{roster\_resp}, \texttt{gossip}, \texttt{fetch\_req},
 \texttt{fetch\_resp}, \texttt{merkle\_req}, \texttt{merkle\_resp}),
 two for anti-entropy reconciliation (\texttt{range\_req},
-\texttt{range\_resp}; \S\ref{sec:antientropy}), and three for
+\texttt{range\_resp}; \S\ref{sec:antientropy}), three for
 Plumtree tree repair (\texttt{ihave}, \texttt{graft},
-\texttt{prune}; \S\ref{sec:gossip}).%
+\texttt{prune}; \S\ref{sec:gossip}), three for transport endpoint
+advertisement and snapshots, one for Range-Based Set Reconciliation,
+and three for member-profile advertisement and snapshots.%
 \footnote{The \texttt{gossip} frame carries an optional inline
 message body, used when the canonical-encoded \texttt{Message} is at
 most 4\,KiB; the receiver hash-verifies the body against the
-advertised id before storing. All frames between two peers are
-multiplexed over a single per-peer
-\texttt{yamux}~\citep{hashicorpyamux} session opened on top of
-Pilot's stream; yamux framing is invisible above the transport
-adapter (\S\ref{sec:implementation}).}
+advertised id before storing. Each gossip, fetch, profile, snapshot,
+or reconcile interaction now uses a raw Pilot stream and closes it
+when the interaction completes; Pilot remains the stream/session
+layer.}
 Every type that carries a timestamp is subject to replay protection
 that mirrors Pilot's own handshake protocol: reject messages older than
 five minutes or more than thirty seconds in the future, and dedupe by
@@ -503,12 +507,11 @@ when its canonical encoding is at most 4\,KiB (matching IPFS
 Bitswap's default \texttt{WantHaveReplaceSize} threshold), so
 the receiver hash-verifies the body and stores directly without
 a \texttt{fetch\_req}/\texttt{fetch\_resp} round-trip; larger
-messages still pull the body. Separately, all gossip streams
-between two peers are multiplexed over a single long-lived
-\texttt{yamux}~\citep{hashicorpyamux} session opened on top of
-the Pilot tunnel, so opening a new stream is a zero-round-trip
-local call; \S\ref{sec:implementation} covers the adapter
-implementation.
+messages still pull the body. Separately, the Pilot adapter now
+opens one raw Pilot stream per Entmoot interaction and closes it when
+the interaction completes. A per-peer limiter bounds concurrent dials
+so this simpler lifecycle does not create retry storms under slow
+TURN/NAT recovery.
 
 Push is the fast path. When every gossip recipient is reachable
 and willing, fanout~two suffices for a three-member topology to
@@ -537,7 +540,7 @@ cooldown that dedupes concurrent calls. The first two are reactive:
 an inbound \texttt{Accept} and a successful outbound dial both invoke
 \texttt{maybeReconcile} on the peer. The third is event-driven: the
 Pilot adapter fires an \texttt{OnTunnelUp} callback on every
-freshly-established yamux session (both outbound and inbound), so a
+freshly-established Pilot stream (both outbound and inbound), so a
 reconnect triggers reconciliation within milliseconds. A fourth
 trigger runs on a 30\,s jittered background ticker that picks the
 least-recently-reconciled roster member and silently skips when the
@@ -592,9 +595,9 @@ sequence for a single reconciliation round.
 
 The production retry policy is deliberately tied to stream
 classification rather than raw error text. EOF, closed-pipe, stale
-Pilot connection ids, and typed Pilot/yamux stale-session errors cause
-Entmoot to drop the cached peer session and retry once on a fresh
-session without poisoning the per-peer dial-backoff cache. Local
+Pilot connection ids, and typed stale-stream errors cause
+Entmoot to close the failed raw stream and retry once on a fresh
+Pilot stream without poisoning the per-peer dial-backoff cache. Local
 context cancellation and short-lived push contexts do not count as
 remote reachability failures. Pilot stream establishment runs under
 the wider reconcile attempt budget, while the wire I/O deadline starts
@@ -833,22 +836,29 @@ not also running with the matching privacy posture
 (\texttt{-turn-provider}, \texttt{-outbound-turn-only}, and
 \texttt{-no-registry-endpoint}). Two verbose modes,
 \texttt{-trace-gossip-transport} and \texttt{-trace-reconcile}, emit
-structured lifecycle traces for Pilot/yamux session state and
+structured lifecycle traces for Pilot stream/session state and
 anti-entropy progress respectively; these are intentionally opt-in so
 normal gossip stays quiet.
 
-The \texttt{v1.5.11}--\texttt{v1.5.19} line also adds the service-peer
+The \texttt{v1.5.11}--\texttt{v1.5.25} line also adds the service-peer
 surface needed by intermittent mobile clients. An Entmoot Service
 Provider (ESP) is an always-on Entmoot/Pilot peer that can expose
 durable mailbox cursors, device-authenticated HTTP sync, and
 phone-signed publish forwarding without holding the phone's authoring
 key. The local \texttt{mailbox} commands exercise the same cursor path
-used by the HTTP bridge; \texttt{esp serve} exposes \texttt{/v1/mailbox}
-and \texttt{/v1/messages}; \texttt{esp device} manages local device
-public keys; and \texttt{esp sign-request} creates signed test headers.
-Mailbox cursors live in local ESP state, not the Entmoot consensus log,
-and signed publish still routes through the running \texttt{join}
+used by the HTTP bridge; \texttt{esp serve} exposes mailbox sync,
+cursor-neutral latest-history reads, group/member inspection, group
+and invite sign requests, and phone-signed publish; \texttt{esp device}
+manages local device public keys; and \texttt{esp sign-request}
+creates signed test headers. Mailbox cursors, device state,
+idempotency records, and group display metadata live in local ESP
+state, not the Entmoot consensus log. Signed publish and executable
+group/invite operations still route through the running \texttt{join}
 daemon for roster verification, durable accept, and gossip fanout.
+Member display names are learned through signed member-profile gossip:
+each node signs its current Pilot hostname as group-scoped metadata,
+and ESP member APIs expose it only while the advertised Entmoot key
+matches the current roster entry.
 
 Agent-facing packaging is the final piece. \texttt{install.sh} fetches
 prebuilt binaries from GitHub Releases with a source-build fallback
@@ -905,6 +915,16 @@ store-or-replace under Last-Writer-Wins semantics keyed on
 immediately; older Pilot daemons fall back to the legacy 30-second
 \texttt{Info} poller.
 
+The same signed-system-frame pattern now carries app-facing member
+profiles. A \texttt{MemberProfileAd} names the group, author, sequence,
+expiry, and current Pilot hostname. Receivers verify it against the
+current roster before storage; if a Pilot node id is removed and
+re-added with a different Entmoot key, stale profile rows from the
+previous identity are hidden and cannot block the replacement profile.
+Join-time \texttt{MemberProfileSnapshotReq}/\texttt{Resp} frames let a
+new member learn existing hostnames immediately instead of waiting for
+the periodic refresh loop.
+
 \subsection{Rendezvous tradeoffs}
 \label{sec:rendezvous}
 
@@ -920,7 +940,7 @@ record when cold-dial fallback, periodic peer refresh, or endpoint
 rotation requires fresh reachability material.
 
 The rendezvous service is not a relay. It does not carry Entmoot
-messages, Pilot stream frames, RBSR fingerprints, or yamux traffic. It
+messages, Pilot stream frames, or RBSR fingerprints. It
 does not choose routes: Pilot's route policy still decides whether
 normal-mode traffic uses direct UDP, TCP, beacon relay, cached
 connections, peer TURN, or whether strict \texttt{-outbound-turn-only}
@@ -993,24 +1013,21 @@ invariant it restores is that rekey should be transparent to the
 reliability state machine; the user-visible stream does not
 witness the key change.
 
-The Pilot adapter caches one persistent
-\texttt{yamux}~\citep{hashicorpyamux} session per peer and opens
-a new yamux stream on that session for every gossip frame. A
-first \texttt{Dial} to a given peer pays one Pilot stream dial
-plus the yamux handshake; every subsequent \texttt{Dial} returns
-a fresh stream with a local \texttt{OpenStream} call. The current
-adapter wraps those sessions in an explicit lifecycle manager:
-outbound and inbound sessions carry generation ids, active-stream
-counts, and states (\texttt{active}, \texttt{draining},
-\texttt{closed}). Dropping a suspect peer session sends yamux
-\texttt{GoAway} and drains active streams for a bounded window before
-closing, so a reconcile retry gets a fresh session without tearing down
-unrelated streams mid-frame. A small \texttt{unblockableConn} shim
-wraps Pilot's \texttt{driver.Conn} so that \texttt{Close} propagates a
-past-time read deadline ahead of the underlying close; without this,
-\texttt{yamux.Session.Close} can hang waiting for its \texttt{recvLoop}
-to exit. This pattern mirrors the long-lived-framed-stream design used
-by \texttt{go-libp2p-pubsub}'s \texttt{comm.go} and by Tailscale DERP.
+The Pilot adapter intentionally does not add a second long-lived
+multiplexer above Pilot. A \texttt{Dial} opens one raw Pilot stream for
+one Entmoot interaction; the caller writes the frame or request/response
+session and closes the stream when done. This follows the same shape as
+request/response protocols in libp2p-based systems: one stream per
+interaction, explicit close or reset, and bounded concurrency. Entmoot
+therefore relies on Pilot for stream identity and reachability, while
+the adapter owns only per-peer dial limiting, deadline propagation, and
+typed stale-stream classification.
+
+The current IPC client also treats write deadlines as connection-health
+signals. If a length-prefixed write to the shared Pilot daemon socket
+times out, the driver closes the IPC connection rather than appending
+later frames after a partial write. That fail-closed rule avoids
+desynchronising the local daemon protocol under backpressure.
 
 \begin{figure}[t]
 \centering
@@ -1023,20 +1040,19 @@ by \texttt{go-libp2p-pubsub}'s \texttt{comm.go} and by Tailscale DERP.
                  gray!55, fill=gray!5},
   clabel/.style={font=\scriptsize, align=center},
 ]
-% Left: naive one-stream-dial-per-frame
+% Left: long-lived app multiplexer
 \node[peer] (A1) at (0, 0)   {$A$};
 \node[peer] (B1) at (1.6, 0) {$B$};
+\draw[tunnel] ($(A1.east)+(0.1, 0.8)$) rectangle ($(B1.west)+(-0.1,-0.8)$);
 \draw[stream] ($(A1.east) + (0, 0.3)$)  -- ($(B1.west) + (0, 0.3)$);
 \draw[stream] ($(A1.east) + (0, 0.1)$)  -- ($(B1.west) + (0, 0.1)$);
 \draw[stream] ($(A1.east) + (0, -0.1)$) -- ($(B1.west) + (0, -0.1)$);
 \draw[stream] ($(A1.east) + (0, -0.3)$) -- ($(B1.west) + (0, -0.3)$);
-\node[clabel] at (0.8, -1.3) {naive\\one stream dial\\per frame};
+\node[clabel] at (0.8, -1.3) {old design\\one cached app\\multiplexer};
 
-% Right: one yamux session
+% Right: raw Pilot streams
 \node[peer] (A2) at (3.4, 0) {$A$};
 \node[peer] (B2) at (5.6, 0) {$B$};
-% Tunnel envelope, taller so three labelled streams fit inside
-\draw[tunnel] ($(A2.east)+(0.1, 0.8)$) rectangle ($(B2.west)+(-0.1,-0.8)$);
 \draw[stream] ($(A2.east)+(0.15, 0.5)$)
          -- node[above=-0.3mm, font=\tiny, pos=0.5] {\texttt{gossip}}
          ($(B2.west)+(-0.15, 0.5)$);
@@ -1046,30 +1062,24 @@ by \texttt{go-libp2p-pubsub}'s \texttt{comm.go} and by Tailscale DERP.
 \draw[stream] ($(A2.east)+(0.15,-0.5)$)
          -- node[above=-0.3mm, font=\tiny, pos=0.5] {\texttt{range\_req}}
          ($(B2.west)+(-0.15,-0.5)$);
-\node[clabel] at (4.5, -1.3) {Entmoot\\one yamux session,\\many streams};
+\node[clabel] at (4.5, -1.3) {current design\\one Pilot stream\\per interaction};
 
 \end{tikzpicture}
-\caption{Stream multiplexing in the Pilot adapter. A naive
-adapter would dial a fresh Pilot stream per gossip frame,
-paying a SYN handshake on the happy path and the full
-$\approx$32-second dial budget on silent loss. Entmoot instead
-carries every gossip stream over a single persistent
-\texttt{yamux}~\citep{hashicorpyamux} session opened on top of
-the Pilot tunnel; subsequent \texttt{gossip}, \texttt{fetch\_req},
-and \texttt{range\_req} frames open fresh yamux streams in zero
-round trips. yamux's built-in keepalive (30-second interval,
-10-second write-timeout) closes silently-wedged sessions so the
-next \texttt{Dial} opens a fresh one.}
-\label{fig:yamux}
+\caption{Current Pilot adapter stream lifecycle. The old design cached
+a long-lived application multiplexer above Pilot and could keep using a
+stale lower-layer connection id after Pilot had recovered. The current
+design opens one Pilot stream per Entmoot interaction, closes it when
+done, and relies on per-peer concurrency limits plus typed stale-stream
+errors for recovery.}
+\label{fig:pilotstreams}
 \end{figure}
 
 Dependencies outside the Pilot module are deliberately minimal:
 Go's standard library, \texttt{golang.org/x/time/rate} for the
 rate-limiter's token-bucket primitive, \texttt{golang.org/x/%
 sync/errgroup} for the bounded parallel fanout
-(\S\ref{sec:gossip}), and
-\texttt{github.com/hashicorp/yamux}~\citep{hashicorpyamux} for
-per-peer session multiplexing.
+(\S\ref{sec:gossip}), and \texttt{modernc.org/sqlite} for the pure-Go
+SQLite backend.
 
 % === 5. Evaluation ===
 \section{Evaluation}
@@ -1227,7 +1237,7 @@ to all three peers and the same partition shape used for the
 TCP-fallback test was repeated; a brief unreachability window on one
 peer left it holding thirteen messages the public peer had never seen.
 On reconnect, the Pilot-adapter \texttt{OnTunnelUp} callback fired
-a reconciliation $2.1$\,s after the yamux session became usable. The
+a reconciliation $2.1$\,s after the Pilot stream path became usable. The
 RBSR session converged in three rounds with $\texttt{missing}=13$;
 the public peer's store grew from 95 to 108 messages with an exact
 match between the recovered count and the RBSR-reported difference.
@@ -1245,7 +1255,7 @@ The later \texttt{v1.5.x} deployment repeated the same three-peer
 experiment under the stricter hide-IP/TURN posture. That run surfaced a
 different failure class: Pilot reachability recovered first, but
 Entmoot reconciliation still stalled on port~1004 because cached
-yamux/Pilot streams could outlive the usable lower-layer stream state
+application stream state could outlive the usable lower-layer stream state
 and because large virtual-stream segments relied on fragmentation over
 TURN paths. The final deployed stack combined Pilot's rendezvous
 refresh, bilateral TURN permission refresh, recovery PILA, explicit
@@ -1341,15 +1351,17 @@ TURN endpoints through Pilot IPC. TURN rotation detection no longer
 requires steady-state polling against modern Pilot daemons:
 \texttt{Subscribe}/\texttt{Notify} pushes the change. Pilot restart
 ordering no longer requires manual sleeps: \texttt{join} waits for
-local Pilot readiness. Stale yamux/Pilot streams no longer poison
+local Pilot readiness. Stale Entmoot-over-Pilot stream state no longer poisons
 anti-entropy indefinitely: typed error classification, bounded stream
-deadlines, session draining, and single retry on a fresh session are
+deadlines, raw stream close, and single retry on a fresh stream are
 part of the current design.
 The mobile service-peer substrate has also shipped in first form:
 external signer abstractions, message ingest events, durable mailbox
 cursors, the ESP HTTP bridge, device-authenticated requests,
-phone-signed publish forwarding, and a local request-signing helper are
-now part of the reference implementation.
+phone-signed publish forwarding, executable group/invite sign requests,
+bounded latest-history reads, group display metadata, member hostname
+profiles, and a local request-signing helper are now part of the
+reference implementation.
 
 The remaining transport-oriented work is therefore narrower. The
 current implementation is operationally correct on the three-peer mesh,
@@ -1358,7 +1370,7 @@ but rendezvous remains centralized availability infrastructure
 under many simultaneous TURN rotations and many groups per host. The
 trace modes added in \texttt{v1.5.x} make that measurement practical:
 future experiments can record whether failures are endpoint discovery,
-route selection, Pilot stream lifecycle, yamux session reuse, or RBSR
+route selection, Pilot stream lifecycle, stale raw-stream state, or RBSR
 body transfer without instrumenting a custom binary.
 
 Entmoot also creates the substrate the empirical questions flagged by

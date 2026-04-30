@@ -15,6 +15,7 @@ PATCH /v1/groups/{group_id}
 GET  /v1/groups/{group_id}/members
 POST /v1/groups/{group_id}/invites
 POST /v1/invites/accept
+GET  /v1/groups/{group_id}/history
 GET  /v1/groups/{group_id}/messages
 POST /v1/groups/{group_id}/messages
 GET  /v1/mailbox/pull
@@ -64,6 +65,16 @@ configured, executable operation completion fails with `operation_unavailable`.
 Group updates are ESP-local display metadata. They do not mutate Entmoot's
 roster protocol.
 
+Group list/get responses may include `name`, `description`, `tags`, and an
+opaque JSON `metadata` object. `name`, `description`, and `tags` are projected
+from metadata for app convenience; clients should treat the raw metadata object
+as forward-compatible app data.
+
+Member list responses may include `hostname`. Hostnames are learned from signed
+member-profile gossip scoped to the group and are display hints only. The ESP
+only exposes a profile when the profile author's Entmoot key still matches the
+current roster entry for that Pilot node id.
+
 Create a message draft sign request:
 
 ```http
@@ -84,6 +95,16 @@ Complete it:
 ```json
 {"signature":"<base64 ed25519 signature>","signing_payload_sha256":"<sha256>"}
 ```
+
+Read the latest group history without advancing a mailbox cursor:
+
+```http
+GET /v1/groups/<group_id>/history?client_id=ios-1&limit=50
+```
+
+`limit` must be between 1 and 200. Device-auth clients may omit `client_id`;
+the device id is used. The response shape matches mailbox pull, but the read is
+stateless and cursor-neutral.
 
 Mailbox cursors are stored in `mailbox.sqlite`. Mobile service state such as
 sign requests, push tokens, and notification preferences is stored in

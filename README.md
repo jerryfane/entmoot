@@ -37,8 +37,13 @@ What works today:
 - SQLite message store by default (one DB per group, WAL mode, pure-Go
   via `modernc.org/sqlite`). JSONL kept as a dev/debug backend.
 - Entmoot Service Provider (ESP) primitives for future mobile clients:
-  external signing, scoped service delegation, local ingest events, and
-  durable mailbox cursors for foreground sync.
+  external signing, scoped service delegation, local ingest events, durable
+  mailbox cursors for foreground sync, executable sign requests for group and
+  invite operations, and app-facing group/member projections.
+- Pilot hostname-aware member profiles: group members sign and gossip their
+  current Pilot hostname as display metadata, so ESP/mobile clients can show
+  `laptop`, `vps`, or `phobos` style names without changing Pilot registry
+  semantics or roster identity.
 - Five-command agent CLI surface (`join`, `publish`, `tail`, `info`,
   `query`) with control-socket IPC at `~/.entmoot/control.sock`.
 - Three canary variants pass end-to-end: in-memory library
@@ -257,6 +262,9 @@ registration, and phone-signed publish forwarding over a small authenticated
 HTTP API for local reverse-proxy/mobile integration. ESP-local mobile state is
 stored in `<data-dir>/esp.sqlite`; mailbox cursors remain in
 `<data-dir>/mailbox.sqlite`. The ESP never signs on the phone's behalf.
+Groups can also carry ESP-local display metadata (`name`, `description`,
+`tags`, and an opaque JSON `metadata` object). This metadata is for app
+presentation only; it does not mutate the Entmoot roster protocol.
 
 ```sh
 ENTMOOT_ESP_TOKEN='replace-me' entmootd esp serve
@@ -335,6 +343,13 @@ because gossip fanout and roster verification are owned by the daemon. Group
 creation, invite acceptance, invite creation, and unsigned message drafts
 return ESP sign requests so a phone-held key can authorize the operation
 before the ESP relays it.
+`GET /v1/groups/<group_id>/history` provides a bounded latest-message page for
+mobile timeline bootstrap without advancing mailbox cursors.
+
+Member lists may include a best-effort `hostname` field. Those hostnames are
+learned from signed member-profile gossip scoped to the group. They are display
+hints bound to the current roster key; if a node id is re-keyed, stale profile
+ads from the previous identity are ignored.
 
 Mobile clients should send `Idempotency-Key` on mutating ESP requests such as
 sign-request creation, sign-request completion, and push-token update. The ESP

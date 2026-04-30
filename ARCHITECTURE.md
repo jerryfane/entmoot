@@ -149,6 +149,19 @@ A `Filter` is a set of such patterns (match = any pattern matches). Filter
 encoding on the wire is a JSON array of strings. No content-based filtering in
 v0 — topic membership is authored, not inferred.
 
+### 3.5 App-facing group and member metadata
+
+Group display metadata (`name`, `description`, `tags`, and an opaque JSON
+`metadata` object) is ESP-local service state, not consensus state. It exists
+so mobile and dashboard clients can render a group without changing roster
+semantics. Roster identity remains the group id plus the signed membership log.
+
+Member display names come from Pilot hostname-aware member profiles. Each
+member may sign a group-scoped `MemberProfileAd` containing its current Pilot
+hostname. Peers verify the ad against the current roster key before storing or
+exposing it; if a Pilot node id is removed and re-added with a different
+Entmoot key, profile ads from the replaced identity are ignored.
+
 ## 4. Wire protocol (draft)
 
 Connections are plain Pilot streams to a peer's `:1004`. Framing:
@@ -176,10 +189,20 @@ Message types (v0):
 | `fetch_resp` | ← peer | message body |
 | `merkle_req` | → peer | request Merkle proof for a topic filter + range |
 | `merkle_resp` | ← peer | proof + list of in-range ids |
+| `range_req` / `range_resp` | ↔ peer | legacy timestamp-range anti-entropy |
+| `ihave` / `graft` / `prune` | ↔ peer | Plumtree lazy/eager gossip repair |
+| `transport_ad` | → peer | signed Pilot TCP/TURN endpoint advertisement |
+| `transport_snapshot_req` / `transport_snapshot_resp` | ↔ peer | join-time endpoint snapshot |
+| `reconcile` | ↔ peer | range-based set reconciliation frames |
+| `member_profile_ad` | → peer | signed app-facing member profile metadata |
+| `member_profile_snapshot_req` / `member_profile_snapshot_resp` | ↔ peer | join-time member profile snapshot |
 
 All messages that mutate state are signed by their author with Ed25519 keys
 bound to Pilot node ids. We reuse the replay-protection pattern from Pilot's
 `HandshakeMsg`: 5-minute max age, 30-second future clock skew, hash-set dedupe.
+Transport and member-profile system frames are also signed and roster-checked,
+but they do not mutate consensus state: they update local reachability or
+display metadata caches.
 
 ## 5. Bootstrap and peer discovery
 
