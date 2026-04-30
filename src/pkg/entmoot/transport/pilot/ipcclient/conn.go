@@ -35,7 +35,9 @@ type pilotConn struct {
 	recvCh chan []byte
 	// recvClose guards the channel-close so Close is idempotent even
 	// if the daemon independently sends a peer-close indication.
-	recvClose sync.Once
+	recvClose   sync.Once
+	closeNotify sync.Once
+	closeCh     chan struct{}
 	// recvBuf holds leftover bytes from the previous Recv frame when
 	// the caller's Read buffer was too small to consume it all.
 	recvBuf []byte
@@ -44,15 +46,21 @@ type pilotConn struct {
 	// Conn.Read is not safe for concurrent use but we want a
 	// single caller pattern to behave deterministically.
 	readMu sync.Mutex
-
+	// writeMu serializes concurrent Write calls for this Conn. The daemon
+	// preserves byte order by Send frame order, so chunked writes and their
+	// send-result waiters must not interleave across goroutines.
+	writeMu sync.Mutex
 	// stateMu guards closed + deadline fields.
 	stateMu       sync.Mutex
 	closed        bool
 	readDeadline  time.Time
 	writeDeadline time.Time
-	// deadlineCh is closed when readDeadline is updated, so a Read
+	// readDeadlineCh is closed when readDeadline is updated, so a Read
 	// already blocked on the previous deadline can re-evaluate.
-	deadlineCh chan struct{}
+	readDeadlineCh chan struct{}
+	// writeDeadlineCh is closed when writeDeadline is updated, so a Write
+	// blocked waiting for a send-result can re-evaluate.
+	writeDeadlineCh chan struct{}
 }
 
 // newConn builds a Conn in the not-yet-closed state with a fresh recv
@@ -61,13 +69,15 @@ type pilotConn struct {
 // the user so no Recv frame is missed.
 func newConn(drv *Driver, id uint32, local, remote SocketAddr) *pilotConn {
 	return &pilotConn{
-		id:         id,
-		local:      local,
-		remote:     remote,
-		drv:        drv,
-		network:    "pilot",
-		recvCh:     make(chan []byte, 256),
-		deadlineCh: make(chan struct{}),
+		id:              id,
+		local:           local,
+		remote:          remote,
+		drv:             drv,
+		network:         "pilot",
+		recvCh:          make(chan []byte, 256),
+		closeCh:         make(chan struct{}),
+		readDeadlineCh:  make(chan struct{}),
+		writeDeadlineCh: make(chan struct{}),
 	}
 }
 
@@ -105,6 +115,12 @@ func (c *pilotConn) closeRecv() {
 	})
 }
 
+func (c *pilotConn) notifyClosed() {
+	c.closeNotify.Do(func() {
+		close(c.closeCh)
+	})
+}
+
 // closeLocal marks this conn closed without sending a Close frame to
 // the daemon. It is used when the daemon has already told us the conn
 // is gone, so future writes fail locally instead of emitting stale
@@ -113,6 +129,7 @@ func (c *pilotConn) closeLocal() {
 	c.stateMu.Lock()
 	c.closed = true
 	c.stateMu.Unlock()
+	c.notifyClosed()
 	c.closeRecv()
 }
 
@@ -136,7 +153,7 @@ func (c *pilotConn) Read(p []byte) (int, error) {
 	for {
 		c.stateMu.Lock()
 		dl := c.readDeadline
-		dch := c.deadlineCh
+		dch := c.readDeadlineCh
 		c.stateMu.Unlock()
 
 		if !dl.IsZero() && !time.Now().Before(dl) {
@@ -187,6 +204,9 @@ func (c *pilotConn) Read(p []byte) (int, error) {
 // minus the 5-byte header), the write is split across multiple Send
 // frames — the daemon reassembles them by conn_id in arrival order.
 func (c *pilotConn) Write(p []byte) (int, error) {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+
 	c.stateMu.Lock()
 	if c.closed {
 		c.stateMu.Unlock()
@@ -205,11 +225,27 @@ func (c *pilotConn) Write(p []byte) (int, error) {
 		if len(chunk) > perFrame {
 			chunk = chunk[:perFrame]
 		}
-		frame := make([]byte, 1+4+len(chunk))
-		frame[0] = byte(opSend)
+		sendID := c.drv.nextTrackedSendID()
+		frame := make([]byte, 1+4+8+len(chunk))
+		frame[0] = byte(opSendTracked)
 		binary.BigEndian.PutUint32(frame[1:5], c.id)
-		copy(frame[5:], chunk)
+		binary.BigEndian.PutUint64(frame[5:13], sendID)
+		copy(frame[13:], chunk)
+		resultCh, err := c.drv.registerSendResultWaiter(c.id, sendID)
+		if err != nil {
+			if total > 0 {
+				return total, err
+			}
+			return 0, err
+		}
 		if err := c.drv.writeFrameWithDeadline(c, frame); err != nil {
+			c.drv.removeSendResultWaiter(c.id, sendID, resultCh)
+			if total > 0 {
+				return total, err
+			}
+			return 0, err
+		}
+		if err := c.waitSendResult(resultCh); err != nil {
 			if total > 0 {
 				return total, err
 			}
@@ -219,6 +255,88 @@ func (c *pilotConn) Write(p []byte) (int, error) {
 		p = p[len(chunk):]
 	}
 	return total, nil
+}
+
+func (c *pilotConn) waitSendResult(ch chan sendResult) error {
+	for {
+		if result, ok := receiveSendResult(ch); ok {
+			return result.err
+		}
+
+		c.stateMu.Lock()
+		deadline := c.writeDeadline
+		deadlineCh := c.writeDeadlineCh
+		closed := c.closed
+		c.stateMu.Unlock()
+		if closed {
+			c.drv.removeSendResultWaiterForConn(c.id, ch)
+			return ErrClosed
+		}
+
+		var timer *time.Timer
+		var timerCh <-chan time.Time
+		if !deadline.IsZero() {
+			d := time.Until(deadline)
+			if d <= 0 {
+				c.drv.removeSendResultWaiterForConn(c.id, ch)
+				return os.ErrDeadlineExceeded
+			}
+			timer = time.NewTimer(d)
+			timerCh = timer.C
+		}
+
+		select {
+		case result := <-ch:
+			if timer != nil {
+				timer.Stop()
+			}
+			return result.err
+		case <-timerCh:
+			c.drv.removeSendResultWaiterForConn(c.id, ch)
+			return os.ErrDeadlineExceeded
+		case <-deadlineCh:
+			if timer != nil {
+				timer.Stop()
+			}
+			continue
+		case <-c.closeCh:
+			if timer != nil {
+				timer.Stop()
+			}
+			if result, ok := receiveSendResult(ch); ok {
+				return result.err
+			}
+			c.drv.removeSendResultWaiterForConn(c.id, ch)
+			return ErrClosed
+		case <-c.drv.closedCh:
+			if timer != nil {
+				timer.Stop()
+			}
+			if result, ok := receiveSendResult(ch); ok {
+				return result.err
+			}
+			c.drv.removeSendResultWaiterForConn(c.id, ch)
+			return ErrClosed
+		case <-c.drv.demuxDone:
+			if timer != nil {
+				timer.Stop()
+			}
+			if result, ok := receiveSendResult(ch); ok {
+				return result.err
+			}
+			c.drv.removeSendResultWaiterForConn(c.id, ch)
+			return ErrClosed
+		}
+	}
+}
+
+func receiveSendResult(ch chan sendResult) (sendResult, bool) {
+	select {
+	case result := <-ch:
+		return result, true
+	default:
+		return sendResult{}, false
+	}
 }
 
 // Close satisfies net.Conn.Close. Sends a Close frame to the daemon
@@ -233,6 +351,7 @@ func (c *pilotConn) Close() error {
 	}
 	c.closed = true
 	c.stateMu.Unlock()
+	c.notifyClosed()
 
 	// Unregister first so any Recv frame still in flight after the
 	// daemon receives our Close is dropped rather than queued on a
@@ -265,10 +384,13 @@ func (c *pilotConn) SetDeadline(t time.Time) error {
 	c.stateMu.Lock()
 	c.readDeadline = t
 	c.writeDeadline = t
-	prev := c.deadlineCh
-	c.deadlineCh = make(chan struct{})
+	prevRead := c.readDeadlineCh
+	prevWrite := c.writeDeadlineCh
+	c.readDeadlineCh = make(chan struct{})
+	c.writeDeadlineCh = make(chan struct{})
 	c.stateMu.Unlock()
-	close(prev) // wake any Read blocked on the old deadline ch
+	close(prevRead)
+	close(prevWrite)
 	return c.drv.applyActiveWriteDeadline(c, t)
 }
 
@@ -277,8 +399,8 @@ func (c *pilotConn) SetDeadline(t time.Time) error {
 func (c *pilotConn) SetReadDeadline(t time.Time) error {
 	c.stateMu.Lock()
 	c.readDeadline = t
-	prev := c.deadlineCh
-	c.deadlineCh = make(chan struct{})
+	prev := c.readDeadlineCh
+	c.readDeadlineCh = make(chan struct{})
 	c.stateMu.Unlock()
 	close(prev) // wake any Read blocked on the old deadline ch
 	return nil
@@ -289,7 +411,10 @@ func (c *pilotConn) SetReadDeadline(t time.Time) error {
 func (c *pilotConn) SetWriteDeadline(t time.Time) error {
 	c.stateMu.Lock()
 	c.writeDeadline = t
+	prev := c.writeDeadlineCh
+	c.writeDeadlineCh = make(chan struct{})
 	c.stateMu.Unlock()
+	close(prev)
 	return c.drv.applyActiveWriteDeadline(c, t)
 }
 

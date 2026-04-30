@@ -34,7 +34,8 @@ func ClassifyStreamError(err error) gossip.StreamErrorClassification {
 	case errors.Is(err, ipcclient.ErrClosed),
 		errors.Is(err, ipcclient.ErrConnectionNotFound),
 		errors.Is(err, ipcclient.ErrConnectionNotEstablished),
-		errors.Is(err, ipcclient.ErrConnectionClosing):
+		errors.Is(err, ipcclient.ErrConnectionClosing),
+		errors.Is(err, ipcclient.ErrSendFailed):
 		return gossip.StreamErrorClassification{
 			Retryable:    true,
 			StaleSession: true,

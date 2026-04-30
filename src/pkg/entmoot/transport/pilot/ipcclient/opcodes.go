@@ -38,11 +38,22 @@ const (
 	//   Subscribe / Unsubscribe payload: [topic_len:uint16][topic]
 	//   SubscribeOK / Notify payload:   [topic_len:uint16][topic]
 	//                                    [payload_len:uint32][payload]
-	opSubscribe     Opcode = 0x30
-	opSubscribeOK   Opcode = 0x31
-	opUnsubscribe   Opcode = 0x32
-	opUnsubscribeOK Opcode = 0x33
-	opNotify        Opcode = 0x34
+	opSubscribe         Opcode = 0x30
+	opSubscribeOK       Opcode = 0x31
+	opUnsubscribe       Opcode = 0x32
+	opUnsubscribeOK     Opcode = 0x33
+	opNotify            Opcode = 0x34
+	opSendResult        Opcode = 0x35
+	opSendTracked       Opcode = 0x36
+	opSendTrackedResult Opcode = 0x37
+)
+
+const (
+	sendResultOK uint16 = iota
+	sendResultConnectionNotFound
+	sendResultConnectionNotEstablished
+	sendResultConnectionClosing
+	sendResultFailed
 )
 
 // Handshake sub-command byte values. The Handshake opcode (0x0F) takes

@@ -5,6 +5,20 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [1.5.29] - 2026-04-30
+
+### Changed
+
+- **Pilot stream writes are now strict.** Entmoot requires Pilot daemons that
+  advertise `stream_send_result_v2` and waits for tracked daemon-level send
+  acknowledgements on every Pilot-backed stream write. Missing or
+  non-established Pilot connections now surface as retryable stale-stream errors
+  instead of later appearing as generic read timeouts, and concurrent writes no
+  longer share FIFO acknowledgement state or reuse send IDs after Pilot
+  connection ID reuse.
+
 ## [1.5.28] - 2026-04-30
 
 ### Fixed

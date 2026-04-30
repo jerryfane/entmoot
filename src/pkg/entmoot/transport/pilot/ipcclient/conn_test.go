@@ -186,16 +186,18 @@ func TestDriverDialAddrAndWrite(t *testing.T) {
 		if err != nil {
 			return
 		}
-		if Opcode(frame[0]) != opSend {
+		if Opcode(frame[0]) != opSendTracked {
 			t.Errorf("server got %x, want Send", frame[0])
 			return
 		}
-		if gotID := binary.BigEndian.Uint32(frame[1:5]); gotID != connID {
+		gotID, sendID, body := trackedSendParts(frame)
+		if gotID != connID {
 			t.Errorf("Send conn_id = %x, want %x", gotID, connID)
 		}
-		if !bytes.Equal(frame[5:], []byte("ping")) {
-			t.Errorf("Send payload = %q, want %q", frame[5:], "ping")
+		if !bytes.Equal(body, []byte("ping")) {
+			t.Errorf("Send payload = %q, want %q", body, "ping")
 		}
+		srv.writeSendResult(connID, sendID, sendResultOK, "")
 	}()
 
 	c, err := drv.DialAddr(context.Background(), Addr{Network: 0, Node: 42}, 1000)
@@ -211,6 +213,315 @@ func TestDriverDialAddrAndWrite(t *testing.T) {
 	if n != 4 {
 		t.Fatalf("Write n = %d, want 4", n)
 	}
+}
+
+func TestConnWriteReturnsSendResultErrors(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		code uint16
+		want error
+	}{
+		{name: "missing", code: sendResultConnectionNotFound, want: ErrConnectionNotFound},
+		{name: "not-established", code: sendResultConnectionNotEstablished, want: ErrConnectionNotEstablished},
+		{name: "closing", code: sendResultConnectionClosing, want: ErrConnectionClosing},
+		{name: "failed", code: sendResultFailed, want: ErrSendFailed},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			drv, srv, cleanup := newTestDriver(t)
+			defer cleanup()
+			const connID uint32 = 0x10203040
+			c := newConn(drv, connID, SocketAddr{}, SocketAddr{})
+			drv.registerConn(connID, c)
+			defer c.Close()
+
+			done := make(chan error, 1)
+			go func() {
+				frame, err := srv.readFrame()
+				if err != nil {
+					done <- err
+					return
+				}
+				if Opcode(frame[0]) != opSendTracked {
+					done <- errors.New("unexpected send opcode")
+					return
+				}
+				gotID, sendID, _ := trackedSendParts(frame)
+				srv.writeSendResult(gotID, sendID, tt.code, "synthetic send result")
+				done <- nil
+			}()
+
+			_, err := c.Write([]byte("payload"))
+			if !errors.Is(err, tt.want) {
+				t.Fatalf("Write err = %v, want %v", err, tt.want)
+			}
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatalf("server: %v", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("server did not finish")
+			}
+		})
+	}
+}
+
+func TestConnWriteSerializesConcurrentSendResults(t *testing.T) {
+	t.Parallel()
+	drv, srv, cleanup := newTestDriver(t)
+	defer cleanup()
+
+	const connID uint32 = 0x10203040
+	c := newConn(drv, connID, SocketAddr{}, SocketAddr{})
+	drv.registerConn(connID, c)
+	defer c.Close()
+
+	firstDone := startConnWrite(t, c, []byte("first"))
+	frame, err := srv.readFrame()
+	if err != nil {
+		t.Fatalf("server read first frame: %v", err)
+	}
+	if Opcode(frame[0]) != opSendTracked {
+		t.Fatalf("first opcode = %x, want opSendTracked", frame[0])
+	}
+	gotID, firstSendID, body := trackedSendParts(frame)
+	if gotID != connID || string(body) != "first" {
+		t.Fatalf("first send = conn %x body %q; want conn %x body first", gotID, body, connID)
+	}
+
+	secondDone := startConnWrite(t, c, []byte("second"))
+	requireWriteStillBlocked(t, secondDone, 30*time.Millisecond)
+
+	serverConn := srv.getConn()
+	if serverConn == nil {
+		t.Fatal("mock server has no connection")
+	}
+	if err := serverConn.SetReadDeadline(time.Now().Add(50 * time.Millisecond)); err != nil {
+		t.Fatalf("SetReadDeadline(server): %v", err)
+	}
+	if frame, err := srv.readFrame(); err == nil {
+		t.Fatalf("second frame arrived before first send-result: %x", frame)
+	}
+	if err := serverConn.SetReadDeadline(time.Time{}); err != nil {
+		t.Fatalf("clear server read deadline: %v", err)
+	}
+
+	srv.writeSendResult(connID, firstSendID, sendResultOK, "")
+	requireSuccessfulWrite(t, firstDone, len("first"))
+
+	frame, err = srv.readFrame()
+	if err != nil {
+		t.Fatalf("server read second frame: %v", err)
+	}
+	if Opcode(frame[0]) != opSendTracked {
+		t.Fatalf("second opcode = %x, want opSendTracked", frame[0])
+	}
+	gotID, secondSendID, body := trackedSendParts(frame)
+	if gotID != connID || string(body) != "second" {
+		t.Fatalf("second send = conn %x body %q; want conn %x body second", gotID, body, connID)
+	}
+	srv.writeSendResult(connID, secondSendID, sendResultOK, "")
+	requireSuccessfulWrite(t, secondDone, len("second"))
+}
+
+func TestConnSetWriteDeadlineWakesSendResultWait(t *testing.T) {
+	t.Parallel()
+	drv, srv, cleanup := newTestDriver(t)
+	defer cleanup()
+
+	const connID uint32 = 0x10203040
+	c := newConn(drv, connID, SocketAddr{}, SocketAddr{})
+	drv.registerConn(connID, c)
+	defer c.Close()
+
+	writeDone := startConnWrite(t, c, []byte("first"))
+	frame, err := srv.readFrame()
+	if err != nil {
+		t.Fatalf("server read first frame: %v", err)
+	}
+	gotID, firstSendID, body := trackedSendParts(frame)
+	if Opcode(frame[0]) != opSendTracked || gotID != connID || string(body) != "first" {
+		t.Fatalf("first send frame = opcode %x conn %x body %q", frame[0], gotID, body)
+	}
+	requireWriteStillBlocked(t, writeDone, 30*time.Millisecond)
+
+	if err := c.SetWriteDeadline(time.Now()); err != nil {
+		t.Fatalf("SetWriteDeadline: %v", err)
+	}
+	requireDeadlineWrite(t, writeDone)
+	select {
+	case <-drv.closedCh:
+		t.Fatal("send-result wait timeout closed the driver")
+	default:
+	}
+
+	// A late result for the timed-out send_id must be ignored, not delivered
+	// to the next write on the same conn_id.
+	srv.writeSendResult(connID, firstSendID, sendResultOK, "")
+	if err := c.SetWriteDeadline(time.Time{}); err != nil {
+		t.Fatalf("clear write deadline: %v", err)
+	}
+	nextDone := startConnWrite(t, c, []byte("second"))
+	frame, err = srv.readFrame()
+	if err != nil {
+		t.Fatalf("server read second frame: %v", err)
+	}
+	gotID, secondSendID, body := trackedSendParts(frame)
+	if Opcode(frame[0]) != opSendTracked || gotID != connID || string(body) != "second" {
+		t.Fatalf("second send frame = opcode %x conn %x body %q", frame[0], gotID, body)
+	}
+	srv.writeSendResult(connID, secondSendID, sendResultOK, "")
+	requireSuccessfulWrite(t, nextDone, len("second"))
+}
+
+func TestConnReusedConnIDDoesNotReuseSendID(t *testing.T) {
+	t.Parallel()
+	drv, srv, cleanup := newTestDriver(t)
+	defer cleanup()
+
+	const connID uint32 = 0x10203040
+	oldConn := newConn(drv, connID, SocketAddr{}, SocketAddr{})
+	drv.registerConn(connID, oldConn)
+
+	oldDone := startConnWrite(t, oldConn, []byte("old"))
+	frame, err := srv.readFrame()
+	if err != nil {
+		t.Fatalf("server read old frame: %v", err)
+	}
+	gotID, oldSendID, body := trackedSendParts(frame)
+	if Opcode(frame[0]) != opSendTracked || gotID != connID || string(body) != "old" {
+		t.Fatalf("old send frame = opcode %x conn %x body %q", frame[0], gotID, body)
+	}
+	if err := oldConn.SetWriteDeadline(time.Now()); err != nil {
+		t.Fatalf("old SetWriteDeadline: %v", err)
+	}
+	requireDeadlineWrite(t, oldDone)
+	drv.unregisterConn(connID)
+	oldConn.closeLocal()
+
+	freshConn := newConn(drv, connID, SocketAddr{}, SocketAddr{})
+	drv.registerConn(connID, freshConn)
+	defer freshConn.Close()
+
+	newDone := startConnWrite(t, freshConn, []byte("new"))
+	frame, err = srv.readFrame()
+	if err != nil {
+		t.Fatalf("server read new frame: %v", err)
+	}
+	gotID, newSendID, body := trackedSendParts(frame)
+	if Opcode(frame[0]) != opSendTracked || gotID != connID || string(body) != "new" {
+		t.Fatalf("new send frame = opcode %x conn %x body %q", frame[0], gotID, body)
+	}
+	if newSendID == oldSendID {
+		t.Fatalf("reused conn_id reused send_id %d", newSendID)
+	}
+
+	srv.writeSendResult(connID, oldSendID, sendResultConnectionNotFound, "stale result")
+	requireWriteStillBlocked(t, newDone, 30*time.Millisecond)
+	srv.writeSendResult(connID, newSendID, sendResultOK, "")
+	requireSuccessfulWrite(t, newDone, len("new"))
+}
+
+func TestConnWriteWakesWhenDemuxExitsBeforeSendResult(t *testing.T) {
+	t.Parallel()
+	drv, srv, cleanup := newTestDriver(t)
+	defer cleanup()
+
+	const connID uint32 = 0x10203040
+	c := newConn(drv, connID, SocketAddr{}, SocketAddr{})
+	drv.registerConn(connID, c)
+	defer c.Close()
+
+	writeDone := startConnWrite(t, c, []byte("first"))
+	frame, err := srv.readFrame()
+	if err != nil {
+		t.Fatalf("server read first frame: %v", err)
+	}
+	gotID, _, body := trackedSendParts(frame)
+	if Opcode(frame[0]) != opSendTracked || gotID != connID || string(body) != "first" {
+		t.Fatalf("first send frame = opcode %x conn %x body %q", frame[0], gotID, body)
+	}
+
+	serverConn := srv.getConn()
+	if serverConn == nil {
+		t.Fatal("mock server has no connection")
+	}
+	if err := serverConn.Close(); err != nil {
+		t.Fatalf("server close: %v", err)
+	}
+	requireClosedWrite(t, writeDone)
+
+	secondDone := startConnWrite(t, c, []byte("second"))
+	requireFailedWrite(t, secondDone)
+}
+
+func TestConnWriteAfterDemuxExitFailsBeforeRegisteringWaiter(t *testing.T) {
+	t.Parallel()
+	drv, cleanup := newPostDemuxTestDriver(t)
+	defer cleanup()
+
+	const connID uint32 = 0x10203040
+	c := newConn(drv, connID, SocketAddr{}, SocketAddr{})
+
+	n, err := c.Write([]byte("post-demux"))
+	if n != 0 {
+		t.Fatalf("Write n = %d, want 0", n)
+	}
+	if !errors.Is(err, ErrClosed) {
+		t.Fatalf("Write err = %v, want ErrClosed", err)
+	}
+
+	drv.sendResultsMu.Lock()
+	waiters := len(drv.sendResults)
+	drv.sendResultsMu.Unlock()
+	if waiters != 0 {
+		t.Fatalf("post-demux Write registered %d send-result waiters", waiters)
+	}
+}
+
+func TestConnWaitSendResultPrefersAckOverDemuxDone(t *testing.T) {
+	t.Parallel()
+	drv, cleanup := newPostDemuxTestDriver(t)
+	defer cleanup()
+
+	c := newConn(drv, 1, SocketAddr{}, SocketAddr{})
+	ch := make(chan sendResult, 1)
+	ch <- sendResult{code: sendResultOK}
+
+	if err := c.waitSendResult(ch); err != nil {
+		t.Fatalf("waitSendResult err = %v, want nil", err)
+	}
+}
+
+func TestConnWritePrefersAckOverDaemonClose(t *testing.T) {
+	t.Parallel()
+	drv, srv, cleanup := newTestDriver(t)
+	defer cleanup()
+
+	const connID uint32 = 0x10203040
+	c := newConn(drv, connID, SocketAddr{}, SocketAddr{})
+	drv.registerConn(connID, c)
+	defer c.Close()
+
+	writeDone := startConnWrite(t, c, []byte("ack-then-close"))
+	frame, err := srv.readFrame()
+	if err != nil {
+		t.Fatalf("server read send: %v", err)
+	}
+	gotID, sendID, body := trackedSendParts(frame)
+	if Opcode(frame[0]) != opSendTracked || gotID != connID || string(body) != "ack-then-close" {
+		t.Fatalf("send frame = opcode %x conn %x body %q", frame[0], gotID, body)
+	}
+	srv.writeSendResult(connID, sendID, sendResultOK, "")
+	if serverConn := srv.getConn(); serverConn != nil {
+		_ = serverConn.Close()
+	}
+
+	requireSuccessfulWrite(t, writeDone, len("ack-then-close"))
 }
 
 func TestConnSetDeadlineAffectsWrites(t *testing.T) {
@@ -363,18 +674,20 @@ func TestConnWriteDeadlineClearedAfterSuccessfulWrite(t *testing.T) {
 			readSendDone <- err
 			return
 		}
-		if Opcode(frame[0]) != opSend {
+		if Opcode(frame[0]) != opSendTracked {
 			readSendDone <- errors.New("unexpected send frame")
 			return
 		}
-		if gotID := binary.BigEndian.Uint32(frame[1:5]); gotID != 1 {
+		gotID, sendID, body := trackedSendParts(frame)
+		if gotID != 1 {
 			readSendDone <- errors.New("unexpected send conn id")
 			return
 		}
-		if got := string(frame[5:]); got != "ok" {
+		if got := string(body); got != "ok" {
 			readSendDone <- errors.New("unexpected send payload")
 			return
 		}
+		drv.routeSendResult(sendResultPayload(1, sendID, sendResultOK, ""))
 		readSendDone <- nil
 	}()
 
@@ -536,17 +849,38 @@ func newPipeWriteDeadlineTestDriver(t *testing.T) (*Driver, net.Conn, func()) {
 	t.Helper()
 	client, peer := net.Pipe()
 	demuxDone := make(chan struct{})
-	close(demuxDone)
 	drv := &Driver{
 		conn:      client,
 		closedCh:  make(chan struct{}),
 		demuxDone: demuxDone,
 	}
+	go func() {
+		<-drv.closedCh
+		close(demuxDone)
+	}()
 	cleanup := func() {
 		_ = drv.Close()
 		_ = peer.Close()
 	}
 	return drv, peer, cleanup
+}
+
+func newPostDemuxTestDriver(t *testing.T) (*Driver, func()) {
+	t.Helper()
+	client, peer := net.Pipe()
+	demuxDone := make(chan struct{})
+	close(demuxDone)
+	drv := &Driver{
+		conn:        client,
+		closedCh:    make(chan struct{}),
+		demuxDone:   demuxDone,
+		sendResults: make(map[sendResultKey]chan sendResult),
+	}
+	cleanup := func() {
+		_ = client.Close()
+		_ = peer.Close()
+	}
+	return drv, cleanup
 }
 
 type connWriteResult struct {
@@ -591,7 +925,19 @@ func requireNoAsyncErr(t *testing.T, name string, done <-chan error) {
 	}
 }
 
-func requireDeadlineWriteAndClosedDriver(t *testing.T, drv *Driver, done <-chan connWriteResult) {
+func requireSuccessfulWrite(t *testing.T, done <-chan connWriteResult, wantN int) {
+	t.Helper()
+	select {
+	case got := <-done:
+		if got.n != wantN || got.err != nil {
+			t.Fatalf("Write = %d, %v; want %d, nil", got.n, got.err, wantN)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Write did not complete")
+	}
+}
+
+func requireDeadlineWrite(t *testing.T, done <-chan connWriteResult) {
 	t.Helper()
 	select {
 	case got := <-done:
@@ -604,6 +950,41 @@ func requireDeadlineWriteAndClosedDriver(t *testing.T, drv *Driver, done <-chan 
 	case <-time.After(time.Second):
 		t.Fatal("Write did not unblock after deadline update")
 	}
+}
+
+func requireClosedWrite(t *testing.T, done <-chan connWriteResult) {
+	t.Helper()
+	select {
+	case got := <-done:
+		if got.n != 0 {
+			t.Fatalf("Write n = %d, want 0", got.n)
+		}
+		if !errors.Is(got.err, ErrClosed) {
+			t.Fatalf("Write err = %v, want ErrClosed", got.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Write did not unblock after demux exit")
+	}
+}
+
+func requireFailedWrite(t *testing.T, done <-chan connWriteResult) {
+	t.Helper()
+	select {
+	case got := <-done:
+		if got.n != 0 {
+			t.Fatalf("Write n = %d, want 0", got.n)
+		}
+		if got.err == nil {
+			t.Fatal("Write err = nil, want failure")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Write did not fail")
+	}
+}
+
+func requireDeadlineWriteAndClosedDriver(t *testing.T, drv *Driver, done <-chan connWriteResult) {
+	t.Helper()
+	requireDeadlineWrite(t, done)
 
 	select {
 	case <-drv.closedCh:
@@ -761,6 +1142,46 @@ func TestDriverCloseUnblocksPendingCommand(t *testing.T) {
 	}
 }
 
+func TestDriverInfoPrefersReplyOverDaemonClose(t *testing.T) {
+	t.Parallel()
+	drv, srv, cleanup := newTestDriver(t)
+	defer cleanup()
+
+	done := make(chan struct{}, 1)
+	go func() {
+		frame, err := srv.readFrame()
+		if err != nil {
+			t.Errorf("server read Info: %v", err)
+			close(done)
+			return
+		}
+		if len(frame) != 1 || Opcode(frame[0]) != opInfo {
+			t.Errorf("server got frame %x, want Info", frame)
+			close(done)
+			return
+		}
+		body := []byte(`{"node_id": 42, "hostname": "alice"}`)
+		srv.writeFrame(append([]byte{byte(opInfoOK)}, body...))
+		if serverConn := srv.getConn(); serverConn != nil {
+			_ = serverConn.Close()
+		}
+		close(done)
+	}()
+
+	info, err := drv.Info(context.Background())
+	if err != nil {
+		t.Fatalf("Info after reply-then-close: %v", err)
+	}
+	if nid, _ := info["node_id"].(float64); nid != 42 {
+		t.Fatalf("Info node_id = %v, want 42", info["node_id"])
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("server did not finish")
+	}
+}
+
 // TestDriverCtxCancelUnblocksPendingCommand checks the symmetric case:
 // a cancelled context on sendAndWait unwinds the call with ctx.Err(),
 // not a hang.
@@ -824,6 +1245,10 @@ func TestConnConcurrentWrites(t *testing.T) {
 				readErr <- err
 				return
 			}
+			if len(frame) >= 13 && Opcode(frame[0]) == opSendTracked {
+				connID, sendID, _ := trackedSendParts(frame)
+				srv.writeSendResult(connID, sendID, sendResultOK, "")
+			}
 			frames <- frame
 		}
 		readErr <- nil
@@ -858,15 +1283,16 @@ func TestConnConcurrentWrites(t *testing.T) {
 	got := make(map[string]int)
 	close(frames)
 	for frame := range frames {
-		if Opcode(frame[0]) != opSend {
+		if Opcode(frame[0]) != opSendTracked {
 			t.Errorf("non-Send frame observed: opcode=%x", frame[0])
 			continue
 		}
-		if gotID := binary.BigEndian.Uint32(frame[1:5]); gotID != connID {
+		gotID, _, body := trackedSendParts(frame)
+		if gotID != connID {
 			t.Errorf("Send conn_id = %x, want %x", gotID, connID)
 			continue
 		}
-		got[string(frame[5:])]++
+		got[string(body)]++
 	}
 	observed := 0
 	for payload, n := range got {
@@ -1013,22 +1439,34 @@ func TestConnCloseOKOnlyClosesMatchingConn(t *testing.T) {
 	if _, err := closedConn.Write([]byte("stale")); !errors.Is(err, ErrClosed) {
 		t.Fatalf("closed conn Write err = %v, want ErrClosed", err)
 	}
+	sendDone := make(chan struct{})
+	go func() {
+		frame, err := srv.readFrame()
+		if err != nil {
+			t.Errorf("server readFrame: %v", err)
+			close(sendDone)
+			return
+		}
+		if Opcode(frame[0]) != opSendTracked {
+			t.Errorf("server opcode = %x, want opSend", frame[0])
+		}
+		gotID, sendID, body := trackedSendParts(frame)
+		if gotID != openID {
+			t.Errorf("server Send conn_id = %x, want %x", gotID, openID)
+		}
+		if got := string(body); got != "still-open" {
+			t.Errorf("server Send payload = %q, want still-open", got)
+		}
+		srv.writeSendResult(openID, sendID, sendResultOK, "")
+		close(sendDone)
+	}()
 	if n, err := openConn.Write([]byte("still-open")); err != nil || n != len("still-open") {
 		t.Fatalf("open conn Write = %d, %v; want full write, nil", n, err)
 	}
-
-	frame, err := srv.readFrame()
-	if err != nil {
-		t.Fatalf("server readFrame: %v", err)
-	}
-	if Opcode(frame[0]) != opSend {
-		t.Fatalf("server opcode = %x, want opSend", frame[0])
-	}
-	if gotID := binary.BigEndian.Uint32(frame[1:5]); gotID != openID {
-		t.Fatalf("server Send conn_id = %x, want %x", gotID, openID)
-	}
-	if got := string(frame[5:]); got != "still-open" {
-		t.Fatalf("server Send payload = %q, want still-open", got)
+	select {
+	case <-sendDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("server did not consume open send")
 	}
 }
 

@@ -16,6 +16,7 @@ func TestClassifyStreamErrorPilotStaleSession(t *testing.T) {
 		ipcclient.ErrConnectionNotFound,
 		fmt.Errorf("wrapped: %w", ipcclient.ErrConnectionNotEstablished),
 		fmt.Errorf("wrapped: %w", ipcclient.ErrConnectionClosing),
+		fmt.Errorf("wrapped: %w", ipcclient.ErrSendFailed),
 	}
 	for _, err := range tests {
 		err := err

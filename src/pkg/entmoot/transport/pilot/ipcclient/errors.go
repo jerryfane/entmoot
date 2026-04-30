@@ -42,6 +42,10 @@ var (
 	// ErrConnectionClosing identifies writes racing a stream teardown. It is
 	// retryable by opening a fresh Pilot stream.
 	ErrConnectionClosing = errors.New("ipcclient: pilot connection closing")
+
+	// ErrSendFailed identifies daemon-side stream send failures that are
+	// not one of the known stale-connection states.
+	ErrSendFailed = errors.New("ipcclient: pilot send failed")
 )
 
 // IPCError wraps an Error (0x0A) response from the daemon. The Code

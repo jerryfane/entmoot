@@ -207,7 +207,7 @@ func TestPilotTransport_InboundAcceptFiresOnTunnelUp(t *testing.T) {
 			serverDone <- io.ErrUnexpectedEOF
 			return
 		}
-		srv.writeFrame(append([]byte{0x0E}, []byte(`{"node_id":777}`)...))
+		srv.writeFrame(append([]byte{0x0E}, []byte(`{"node_id":777,"capabilities":["stream_send_result_v2"]}`)...))
 
 		if frame, err := srv.readFrame(); err != nil {
 			serverDone <- err

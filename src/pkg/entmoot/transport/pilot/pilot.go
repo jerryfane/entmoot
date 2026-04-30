@@ -56,9 +56,10 @@ const (
 )
 
 var (
-	ErrDialLimiterTimeout = errors.New("pilot: dial limiter timeout")
-	ErrDialCallerTimeout  = errors.New("pilot: dial caller timeout")
-	ErrDaemonDialTimeout  = errors.New("pilot: daemon dial timeout")
+	ErrDialLimiterTimeout        = errors.New("pilot: dial limiter timeout")
+	ErrDialCallerTimeout         = errors.New("pilot: dial caller timeout")
+	ErrDaemonDialTimeout         = errors.New("pilot: daemon dial timeout")
+	ErrRequiredCapabilityMissing = errors.New("pilot: daemon missing required capability")
 )
 
 // Config parameterizes a Pilot-backed Transport.
@@ -153,15 +154,18 @@ func Open(cfg Config) (*Transport, error) {
 	// IPC is local and responses arrive in milliseconds.
 	openCtx := context.Background()
 
-	info, err := d.Info(openCtx)
+	info, err := d.InfoStruct(openCtx)
 	if err != nil {
 		_ = d.Close()
 		return nil, fmt.Errorf("pilot: info: %w", err)
 	}
-	nid, err := extractNodeID(info)
-	if err != nil {
+	if info.NodeID == 0 {
 		_ = d.Close()
-		return nil, fmt.Errorf("pilot: info: %w", err)
+		return nil, fmt.Errorf("pilot: info: missing node_id")
+	}
+	if !hasPilotCapability(info, "stream_send_result_v2") {
+		_ = d.Close()
+		return nil, fmt.Errorf("%w: stream_send_result_v2", ErrRequiredCapabilityMissing)
 	}
 
 	ln, err := d.Listen(openCtx, cfg.ListenPort)
@@ -175,7 +179,7 @@ func Open(cfg Config) (*Transport, error) {
 		logger:         logger,
 		driver:         d,
 		listener:       ln,
-		nodeID:         nid,
+		nodeID:         entmoot.NodeID(info.NodeID),
 		dialAddr:       d.DialAddr,
 		closed:         make(chan struct{}),
 		limits:         newPeerDialLimiter(pilotMaxConcurrentPeerDials),
@@ -548,6 +552,15 @@ func extractNodeID(info map[string]interface{}) (entmoot.NodeID, error) {
 		return 0, fmt.Errorf("node_id %v out of uint32 range", f)
 	}
 	return entmoot.NodeID(uint32(f)), nil
+}
+
+func hasPilotCapability(info ipcclient.Info, want string) bool {
+	for _, cap := range info.Capabilities {
+		if cap == want {
+			return true
+		}
+	}
+	return false
 }
 
 // remoteNodeID pulls the Pilot node id off an accepted conn.

@@ -62,6 +62,10 @@ type Info struct {
 	// registry (registry-level IP leak). Pre-jf.10 daemons decode
 	// as false. (v1.4.3)
 	NoRegistryEndpoint bool `json:"no_registry_endpoint,omitempty"`
+
+	// Capabilities advertises daemon IPC/application features. Entmoot
+	// requires stream_send_result_v2 for strict tracked stream-send semantics.
+	Capabilities []string `json:"capabilities,omitempty"`
 }
 
 // Addr is a Pilot virtual address: a 16-bit network ID paired with a

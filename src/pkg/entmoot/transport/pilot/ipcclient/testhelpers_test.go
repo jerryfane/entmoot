@@ -1,6 +1,7 @@
 package ipcclient
 
 import (
+	"encoding/binary"
 	"errors"
 	"io"
 	"net"
@@ -119,6 +120,40 @@ func (s *mockServer) writeFrame(payload []byte) {
 	if err := writeFrame(c, payload); err != nil && !errors.Is(err, net.ErrClosed) {
 		s.t.Logf("mock writeFrame: %v", err)
 	}
+}
+
+func (s *mockServer) writeSendResult(connID uint32, sendID uint64, code uint16, msg string) {
+	body := sendResultPayload(connID, sendID, code, msg)
+	payload := make([]byte, 1+len(body))
+	payload[0] = byte(opSendTrackedResult)
+	copy(payload[1:], body)
+	s.writeFrame(payload)
+}
+
+func writeSendResult(w io.Writer, connID uint32, sendID uint64, code uint16, msg string) error {
+	body := sendResultPayload(connID, sendID, code, msg)
+	payload := make([]byte, 1+len(body))
+	payload[0] = byte(opSendTrackedResult)
+	copy(payload[1:], body)
+	return writeFrame(w, payload)
+}
+
+func sendResultPayload(connID uint32, sendID uint64, code uint16, msg string) []byte {
+	payload := make([]byte, 4+8+2+len(msg))
+	binary.BigEndian.PutUint32(payload[0:4], connID)
+	binary.BigEndian.PutUint64(payload[4:12], sendID)
+	binary.BigEndian.PutUint16(payload[12:14], code)
+	copy(payload[14:], msg)
+	return payload
+}
+
+func trackedSendParts(frame []byte) (uint32, uint64, []byte) {
+	if len(frame) < 13 {
+		return 0, 0, nil
+	}
+	connID := binary.BigEndian.Uint32(frame[1:5])
+	sendID := binary.BigEndian.Uint64(frame[5:13])
+	return connID, sendID, frame[13:]
 }
 
 // Close tears down the mock server.

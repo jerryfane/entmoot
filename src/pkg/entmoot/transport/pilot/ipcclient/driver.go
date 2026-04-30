@@ -65,6 +65,13 @@ type Driver struct {
 	// for a future conn that reuses the same id.
 	localClose map[uint32]struct{}
 
+	// sendResults routes tracked send-result acknowledgements back to
+	// Conn.Write callers by conn_id + driver-lifetime send_id.
+	sendResultsMu sync.Mutex
+	sendResults   map[sendResultKey]chan sendResult
+	sendIDMu      sync.Mutex
+	nextSendID    uint64
+
 	// listenersMu guards listeners.
 	listenersMu sync.RWMutex
 	listeners   map[uint16]*Listener
@@ -141,6 +148,12 @@ type pendingEntry struct {
 	seq uint64
 }
 
+type sendResult struct {
+	code    uint16
+	message string
+	err     error
+}
+
 // Connect dials the Unix-domain socket at socketPath and starts the
 // demuxer goroutine. If socketPath is empty, DefaultSocketPath is used.
 func Connect(socketPath string) (*Driver, error) {
@@ -158,6 +171,7 @@ func Connect(socketPath string) (*Driver, error) {
 		pendingRecv:  make(map[uint32][][]byte),
 		pendingClose: make(map[uint32]struct{}),
 		localClose:   make(map[uint32]struct{}),
+		sendResults:  make(map[sendResultKey]chan sendResult),
 		listeners:    make(map[uint16]*Listener),
 		topicSubs:    make(map[string][]*Subscription),
 		closedCh:     make(chan struct{}),
@@ -198,6 +212,8 @@ func (d *Driver) Close() error {
 		}
 		d.pending = nil
 		d.pendingMu.Unlock()
+
+		d.failSendResults(ErrClosed)
 
 		// v1.5.0: close every Subscription so callers blocked on
 		// Events() see the channel close (== EOF on the topic). We
@@ -251,13 +267,14 @@ func (d *Driver) Close() error {
 // writeFrame serializes a single outbound frame onto the socket. Used
 // by Conn.Write, Conn.Close, and the command-issuing paths.
 func (d *Driver) writeFrame(payload []byte) error {
-	select {
-	case <-d.closedCh:
-		return ErrClosed
-	default:
+	if err := d.driverDoneErr(); err != nil {
+		return err
 	}
 	d.writeMu.Lock()
 	defer d.writeMu.Unlock()
+	if err := d.driverDoneErr(); err != nil {
+		return err
+	}
 	return writeFrame(d.conn, payload)
 }
 
@@ -265,13 +282,14 @@ func (d *Driver) writeFrame(payload []byte) error {
 // Conn's write deadline to the shared socket. Deadline changes on the same Conn
 // are also applied while the write is blocked; changes on other Conns are not.
 func (d *Driver) writeFrameWithDeadline(c *pilotConn, payload []byte) error {
-	select {
-	case <-d.closedCh:
-		return ErrClosed
-	default:
+	if err := d.driverDoneErr(); err != nil {
+		return err
 	}
 	d.writeMu.Lock()
 	defer d.writeMu.Unlock()
+	if err := d.driverDoneErr(); err != nil {
+		return err
+	}
 
 	if err := d.beginActiveWriteConn(c); err != nil {
 		return err
@@ -317,6 +335,20 @@ func (d *Driver) applyActiveWriteDeadline(c *pilotConn, deadline time.Time) erro
 		return nil
 	}
 	return d.conn.SetWriteDeadline(deadline)
+}
+
+func (d *Driver) driverDoneErr() error {
+	select {
+	case <-d.closedCh:
+		return ErrClosed
+	default:
+	}
+	select {
+	case <-d.demuxDone:
+		return ErrClosed
+	default:
+		return nil
+	}
 }
 
 // registerConn adds a conn to the routing map so the demuxer delivers
@@ -394,7 +426,10 @@ func (d *Driver) unregisterListener(port uint16) {
 // readFrame returns io.EOF (daemon closed) or any other error (socket
 // broken or driver.Close closed the conn).
 func (d *Driver) demux() {
-	defer close(d.demuxDone)
+	defer func() {
+		d.failSendResults(ErrClosed)
+		close(d.demuxDone)
+	}()
 	for {
 		frame, err := readFrame(d.conn)
 		if err != nil {
@@ -504,6 +539,8 @@ func (d *Driver) demux() {
 			// opCloseOK (none in this package today, but spec
 			// compliance).
 			d.deliverPending(op, payload, nil)
+		case opSendTrackedResult:
+			d.routeSendResult(payload)
 		default:
 			// Everything else is a command response (BindOK, DialOK,
 			// InfoOK, HandshakeOK, SetPeerEndpointsOK, ...) — route
@@ -570,15 +607,122 @@ func (d *Driver) deliverError(ipcErr *IPCError) {
 	}
 }
 
+type sendResultKey struct {
+	connID uint32
+	sendID uint64
+}
+
+func (d *Driver) nextTrackedSendID() uint64 {
+	d.sendIDMu.Lock()
+	defer d.sendIDMu.Unlock()
+	d.nextSendID++
+	if d.nextSendID == 0 {
+		d.nextSendID = 1
+	}
+	return d.nextSendID
+}
+
+func (d *Driver) registerSendResultWaiter(connID uint32, sendID uint64) (chan sendResult, error) {
+	if err := d.driverDoneErr(); err != nil {
+		return nil, err
+	}
+	ch := make(chan sendResult, 1)
+	d.sendResultsMu.Lock()
+	defer d.sendResultsMu.Unlock()
+	if err := d.driverDoneErr(); err != nil {
+		return nil, err
+	}
+	if d.sendResults == nil {
+		d.sendResults = make(map[sendResultKey]chan sendResult)
+	}
+	d.sendResults[sendResultKey{connID: connID, sendID: sendID}] = ch
+	return ch, nil
+}
+
+func (d *Driver) removeSendResultWaiter(connID uint32, sendID uint64, ch chan sendResult) {
+	d.sendResultsMu.Lock()
+	defer d.sendResultsMu.Unlock()
+	key := sendResultKey{connID: connID, sendID: sendID}
+	if d.sendResults[key] == ch {
+		delete(d.sendResults, key)
+	}
+}
+
+func (d *Driver) removeSendResultWaiterForConn(connID uint32, ch chan sendResult) {
+	d.sendResultsMu.Lock()
+	defer d.sendResultsMu.Unlock()
+	for key, candidate := range d.sendResults {
+		if key.connID == connID && candidate == ch {
+			delete(d.sendResults, key)
+			return
+		}
+	}
+}
+
+func (d *Driver) failSendResults(err error) {
+	d.sendResultsMu.Lock()
+	defer d.sendResultsMu.Unlock()
+	for key, ch := range d.sendResults {
+		select {
+		case ch <- sendResult{err: err}:
+		default:
+		}
+		delete(d.sendResults, key)
+	}
+}
+
+func (d *Driver) routeSendResult(payload []byte) {
+	if len(payload) < 14 {
+		return
+	}
+	connID := binary.BigEndian.Uint32(payload[0:4])
+	sendID := binary.BigEndian.Uint64(payload[4:12])
+	code := binary.BigEndian.Uint16(payload[12:14])
+	msg := string(payload[14:])
+	result := sendResult{code: code, message: msg, err: sendResultError(code, msg)}
+
+	d.sendResultsMu.Lock()
+	key := sendResultKey{connID: connID, sendID: sendID}
+	ch, ok := d.sendResults[key]
+	if !ok {
+		d.sendResultsMu.Unlock()
+		return
+	}
+	delete(d.sendResults, key)
+	d.sendResultsMu.Unlock()
+
+	select {
+	case ch <- result:
+	default:
+	}
+}
+
+func sendResultError(code uint16, msg string) error {
+	if code == sendResultOK {
+		return nil
+	}
+	if msg == "" {
+		msg = "send failed"
+	}
+	switch code {
+	case sendResultConnectionNotFound:
+		return fmt.Errorf("%w: %s", ErrConnectionNotFound, msg)
+	case sendResultConnectionNotEstablished:
+		return fmt.Errorf("%w: %s", ErrConnectionNotEstablished, msg)
+	case sendResultConnectionClosing:
+		return fmt.Errorf("%w: %s", ErrConnectionClosing, msg)
+	default:
+		return fmt.Errorf("%w: %s", ErrSendFailed, msg)
+	}
+}
+
 // sendAndWait emits a command frame and blocks until the matching
 // response opcode arrives, ctx is cancelled, or the driver closes.
 // If the daemon sends an Error frame while this command is in flight,
 // it is returned as an *IPCError.
 func (d *Driver) sendAndWait(ctx context.Context, frame []byte, want Opcode) ([]byte, error) {
-	select {
-	case <-d.closedCh:
-		return nil, ErrClosed
-	default:
+	if err := d.driverDoneErr(); err != nil {
+		return nil, err
 	}
 	ch := make(chan pendingReply, 1)
 
@@ -586,6 +730,10 @@ func (d *Driver) sendAndWait(ctx context.Context, frame []byte, want Opcode) ([]
 	// demuxer finds us waiting. v1.4.6: enrolled in a single global
 	// FIFO so error-routing is correct across concurrent opcodes.
 	d.pendingMu.Lock()
+	if err := d.driverDoneErr(); err != nil {
+		d.pendingMu.Unlock()
+		return nil, err
+	}
 	d.pendingSeq++
 	d.pending = append(d.pending, pendingEntry{op: want, ch: ch, seq: d.pendingSeq})
 	d.pendingMu.Unlock()
@@ -595,6 +743,13 @@ func (d *Driver) sendAndWait(ctx context.Context, frame []byte, want Opcode) ([]
 		return nil, err
 	}
 
+	if r, ok := receivePendingReply(ch); ok {
+		if r.err != nil {
+			return nil, r.err
+		}
+		return r.payload, nil
+	}
+
 	select {
 	case r := <-ch:
 		if r.err != nil {
@@ -602,11 +757,41 @@ func (d *Driver) sendAndWait(ctx context.Context, frame []byte, want Opcode) ([]
 		}
 		return r.payload, nil
 	case <-ctx.Done():
+		if r, ok := receivePendingReply(ch); ok {
+			if r.err != nil {
+				return nil, r.err
+			}
+			return r.payload, nil
+		}
 		d.removePending(want, ch)
 		return nil, ctx.Err()
 	case <-d.closedCh:
+		if r, ok := receivePendingReply(ch); ok {
+			if r.err != nil {
+				return nil, r.err
+			}
+			return r.payload, nil
+		}
 		d.removePending(want, ch)
 		return nil, ErrClosed
+	case <-d.demuxDone:
+		if r, ok := receivePendingReply(ch); ok {
+			if r.err != nil {
+				return nil, r.err
+			}
+			return r.payload, nil
+		}
+		d.removePending(want, ch)
+		return nil, ErrClosed
+	}
+}
+
+func receivePendingReply(ch chan pendingReply) (pendingReply, bool) {
+	select {
+	case r := <-ch:
+		return r, true
+	default:
+		return pendingReply{}, false
 	}
 }
 

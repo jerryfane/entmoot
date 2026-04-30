@@ -187,14 +187,19 @@ func (d *fakeDaemon) serve(t *testing.T, conn net.Conn) {
 			binary.BigEndian.PutUint32(resp[:], id)
 			_ = sendFrame(opDialOK, resp[:])
 
-		case opSend:
+		case opSendTracked:
 			d.sendCount.Add(1)
 			// Echo the bytes back as a Recv frame on the same conn.
-			if len(payload) < 4 {
+			if len(payload) < 12 {
 				continue
 			}
-			echo := make([]byte, len(payload))
-			copy(echo, payload) // [4B conn_id][data]
+			connID := binary.BigEndian.Uint32(payload[0:4])
+			sendID := binary.BigEndian.Uint64(payload[4:12])
+			result := sendResultPayload(connID, sendID, sendResultOK, "")
+			_ = sendFrame(opSendTrackedResult, result)
+			echo := make([]byte, 4+len(payload[12:]))
+			binary.BigEndian.PutUint32(echo[0:4], connID)
+			copy(echo[4:], payload[12:]) // [4B conn_id][data]
 			_ = sendFrame(opRecv, echo)
 
 		case opClose:

@@ -87,22 +87,34 @@ func TestConnIDCanRegisterAfterLocalCloseOK(t *testing.T) {
 
 	nextConn := newConn(drv, connID, SocketAddr{}, SocketAddr{})
 	drv.registerConn(connID, nextConn)
+	sendDone := make(chan struct{})
+	go func() {
+		frame, err := srv.readFrame()
+		if err != nil {
+			t.Errorf("server readFrame: %v", err)
+			close(sendDone)
+			return
+		}
+		if Opcode(frame[0]) != opSendTracked {
+			t.Errorf("server opcode = %x, want opSend", frame[0])
+		}
+		gotID, sendID, body := trackedSendParts(frame)
+		if gotID != connID {
+			t.Errorf("server Send conn_id = %x, want %x", gotID, connID)
+		}
+		if got := string(body); got != "reused" {
+			t.Errorf("server Send payload = %q, want reused", got)
+		}
+		srv.writeSendResult(connID, sendID, sendResultOK, "")
+		close(sendDone)
+	}()
 	if n, err := nextConn.Write([]byte("reused")); err != nil || n != len("reused") {
 		t.Fatalf("reused conn Write = %d, %v; want full write, nil", n, err)
 	}
-
-	frame, err := srv.readFrame()
-	if err != nil {
-		t.Fatalf("server readFrame: %v", err)
-	}
-	if Opcode(frame[0]) != opSend {
-		t.Fatalf("server opcode = %x, want opSend", frame[0])
-	}
-	if gotID := binary.BigEndian.Uint32(frame[1:5]); gotID != connID {
-		t.Fatalf("server Send conn_id = %x, want %x", gotID, connID)
-	}
-	if got := string(frame[5:]); got != "reused" {
-		t.Fatalf("server Send payload = %q, want reused", got)
+	select {
+	case <-sendDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("server did not consume reused send")
 	}
 }
 
