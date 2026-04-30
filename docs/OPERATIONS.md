@@ -3,7 +3,7 @@
 ## Pilot and Entmoot Restart Order
 
 Restart Pilot first, wait until its local IPC is usable, then restart
-Entmoot. Entmoot `join` also waits for Pilot readiness by default, but the
+Entmoot. Entmoot `serve` also waits for Pilot readiness by default, but the
 explicit wait helper keeps manual upgrades easier to inspect.
 
 ```sh
@@ -13,7 +13,7 @@ pkill -f pilot-daemon
 scripts/wait-pilot-ready.sh --timeout 45
 
 pkill entmootd
-# restart entmootd with the existing join command and invite
+# restart entmootd with the existing service manager; it should run entmootd serve
 ```
 
 On macOS LaunchAgents, use the same ordering:
@@ -26,8 +26,8 @@ launchctl kickstart -k gui/$(id -u)/org.entmoot.entmootd
 
 ## Entmoot Pilot Wait Flags
 
-`entmootd join` waits for the configured Pilot socket, `Info`, and `Listen`
-to succeed before continuing startup.
+`entmootd join` and `entmootd serve` wait for the configured Pilot socket,
+`Info`, and `Listen` to succeed before continuing startup.
 
 - `-pilot-wait-timeout=45s`: maximum readiness wait. Set `0s` to restore the
   old single-attempt behavior.

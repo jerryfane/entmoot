@@ -18,6 +18,9 @@ Common global flags:
 -trace-reconcile
 ```
 
-The normal production shape is one long-running `join` process plus short
-commands for publish/query/tail/info.
+The normal production shape is:
 
+1. Run `entmootd join <invite>` once to apply a signed invite.
+2. Run one long-running `entmootd serve` process for restarts and steady-state
+   gossip.
+3. Use short commands for publish/query/tail/info.

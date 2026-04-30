@@ -11,7 +11,7 @@ The mobile architecture follows an ESP model:
 - The ESP exposes app-facing group/member projections for mobile UI.
 
 This avoids requiring iOS to run a full always-on `pilot-daemon` and
-`entmootd join` process. Push notifications or app backends can wake the phone,
+`entmootd serve` process. Push notifications or app backends can wake the phone,
 but Entmoot itself remains the group protocol and store.
 
 The ESP projection is deliberately non-authoritative. Group display fields

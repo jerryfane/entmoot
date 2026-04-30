@@ -23,6 +23,18 @@ import (
 	"entmoot/pkg/entmoot/wire"
 )
 
+var (
+	errLocalGroupNotMember        = errors.New("local node is not a current group member")
+	errLocalGroupIdentityMismatch = errors.New("local identity does not match group roster member")
+)
+
+type groupDiskState struct {
+	groupDir          string
+	rosterPath        string
+	groupDirExisted   bool
+	rosterFileExisted bool
+}
+
 type groupRuntimeConfig struct {
 	NodeID           entmoot.NodeID
 	Identity         *keystore.Identity
@@ -209,7 +221,17 @@ func (r *groupRuntime) Start(ctx context.Context) error {
 }
 
 func (r *groupRuntime) AddInvite(ctx context.Context, invite entmoot.Invite) (*groupSession, bool, error) {
-	groupID := invite.GroupID
+	bootstrap := func(joinCtx context.Context, g *gossip.Gossiper) error {
+		return g.Join(joinCtx, &invite)
+	}
+	return r.addGroup(ctx, invite.GroupID, bootstrap)
+}
+
+func (r *groupRuntime) AddLocalGroup(ctx context.Context, groupID entmoot.GroupID) (*groupSession, bool, error) {
+	return r.addGroup(ctx, groupID, nil)
+}
+
+func (r *groupRuntime) addGroup(ctx context.Context, groupID entmoot.GroupID, bootstrap func(context.Context, *gossip.Gossiper) error) (*groupSession, bool, error) {
 	var joinDone chan struct{}
 	for {
 		r.mu.Lock()
@@ -248,10 +270,18 @@ func (r *groupRuntime) AddInvite(ctx context.Context, invite entmoot.Invite) (*g
 			r.mux.RemoveGroup(groupID)
 		}
 	}
+	diskState := snapshotGroupDiskState(r.dataDir, groupID)
 	rlog, err := roster.OpenJSONL(r.dataDir, groupID)
 	if err != nil {
 		cleanupGroup()
 		return nil, false, fmt.Errorf("open roster: %w", err)
+	}
+	if bootstrap == nil {
+		if err := r.validateLocalMembership(rlog); err != nil {
+			_ = rlog.Close()
+			cleanupGroup()
+			return nil, false, err
+		}
 	}
 	g, err := gossip.New(gossip.Config{
 		LocalNode:          r.nodeID,
@@ -259,7 +289,7 @@ func (r *groupRuntime) AddInvite(ctx context.Context, invite entmoot.Invite) (*g
 		Roster:             rlog,
 		Store:              r.notify,
 		Transport:          groupTransport,
-		GroupID:            invite.GroupID,
+		GroupID:            groupID,
 		Logger:             r.logger,
 		TransportAdStore:   r.store,
 		MemberProfileStore: r.store,
@@ -276,13 +306,22 @@ func (r *groupRuntime) AddInvite(ctx context.Context, invite entmoot.Invite) (*g
 		return nil, false, fmt.Errorf("new gossiper: %w", err)
 	}
 
-	joinCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	err = g.Join(joinCtx, &invite)
-	cancel()
-	if err != nil {
-		_ = rlog.Close()
-		cleanupGroup()
-		return nil, false, err
+	if bootstrap != nil {
+		joinCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		err = bootstrap(joinCtx, g)
+		cancel()
+		if err != nil {
+			_ = rlog.Close()
+			rollbackCreatedGroupState(diskState, r.logger)
+			cleanupGroup()
+			return nil, false, err
+		}
+		if err := r.validateLocalMembership(rlog); err != nil {
+			_ = rlog.Close()
+			rollbackCreatedGroupState(diskState, r.logger)
+			cleanupGroup()
+			return nil, false, err
+		}
 	}
 	r.replayTransportAds(ctx, groupID)
 
@@ -310,12 +349,62 @@ func (r *groupRuntime) AddInvite(ctx context.Context, invite entmoot.Invite) (*g
 	go func() {
 		defer r.wg.Done()
 		if err := g.Start(sessCtx); err != nil {
-			r.logger.Warn("join: group gossiper stopped",
-				slog.String("group_id", invite.GroupID.String()),
+			r.logger.Warn("group runtime: group gossiper stopped",
+				slog.String("group_id", groupID.String()),
 				slog.String("err", err.Error()))
 		}
 	}()
 	return sess, true, nil
+}
+
+func (r *groupRuntime) validateLocalMembership(rlog *roster.RosterLog) error {
+	info, ok := rlog.MemberInfo(r.nodeID)
+	if !ok {
+		return errLocalGroupNotMember
+	}
+	if !bytes.Equal(info.EntmootPubKey, r.identity.PublicKey) {
+		return errLocalGroupIdentityMismatch
+	}
+	return nil
+}
+
+func snapshotGroupDiskState(dataDir string, groupID entmoot.GroupID) groupDiskState {
+	state := groupDiskState{
+		groupDir:   groupDirPath(dataDir, groupID),
+		rosterPath: groupRosterPath(dataDir, groupID),
+	}
+	if info, err := os.Stat(state.groupDir); err == nil && info.IsDir() {
+		state.groupDirExisted = true
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		state.groupDirExisted = true
+	}
+	if info, err := os.Stat(state.rosterPath); err == nil && !info.IsDir() {
+		state.rosterFileExisted = true
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		state.rosterFileExisted = true
+	}
+	return state
+}
+
+func rollbackCreatedGroupState(state groupDiskState, logger *slog.Logger) {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	if !state.groupDirExisted {
+		if err := os.RemoveAll(state.groupDir); err != nil {
+			logger.Warn("join: rollback created group dir",
+				slog.String("path", state.groupDir),
+				slog.String("err", err.Error()))
+		}
+		return
+	}
+	if !state.rosterFileExisted {
+		if err := os.Remove(state.rosterPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			logger.Warn("join: rollback created roster",
+				slog.String("path", state.rosterPath),
+				slog.String("err", err.Error()))
+		}
+	}
 }
 
 func (r *groupRuntime) subscribeEndpointChanges() (<-chan struct{}, func()) {

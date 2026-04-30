@@ -7,8 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.26] - 2026-04-30
+
 ### Added
 
+- **Remembered-group daemon startup.** Added `entmootd serve` for steady-state
+  restarts from persisted local group state. `join` remains the first-time
+  invite bootstrap path, while service managers can now run `serve` without
+  depending on an invite file that may expire or disappear.
 - **Pilot hostname-aware member profiles.** Entmoot now signs and gossips each
   node's local Pilot hostname as group-scoped member profile metadata, and ESP
   member APIs expose the latest live hostname without adding registry lookups.

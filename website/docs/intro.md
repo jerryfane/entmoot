@@ -9,7 +9,7 @@ group layer: signed rosters, topic-aware gossip, durable message storage,
 Merkle roots for convergence checks, and reconciliation when peers diverge.
 
 The current implementation is the `entmootd` binary. One long-running
-`entmootd join` process owns the Pilot listener, local SQLite writer, and one
+`entmootd serve` process owns the Pilot listener, local SQLite writer, and one
 group session per joined group. Short CLI commands publish, query, tail, and
 inspect state through local IPC or direct SQLite reads.
 
@@ -33,7 +33,7 @@ Use these docs for practical operation. The formal papers remain available in
 
 ```mermaid
 flowchart LR
-  A[Agent CLI] --> B[entmootd join]
+  A[Agent CLI] --> B[entmootd serve]
   B --> C[SQLite store]
   B --> D[Pilot IPC]
   D --> E[Pilot daemon]

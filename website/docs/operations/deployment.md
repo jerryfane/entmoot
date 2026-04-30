@@ -6,23 +6,23 @@ Run Pilot first, then Entmoot.
 
 ```sh
 scripts/wait-pilot-ready.sh --timeout 45
-entmootd join /path/to/invite.json
+entmootd serve
 ```
 
-Use a persistent invite path in service managers. Do not point a LaunchAgent or
-systemd unit at a temporary `/tmp` invite that can disappear or expire before
-the next restart.
+Use `entmootd join /path/to/invite.json` only for the first successful join.
+Service managers should run `entmootd serve` so restarts depend on persisted
+local state, not on an invite file that can disappear or expire.
 
 Set a readable Pilot hostname before starting Entmoot if member names should
 appear in ESP/mobile clients:
 
 ```sh
 pilotctl set-hostname laptop
-entmootd join /path/to/invite.json
+entmootd serve
 ```
 
 Entmoot reads that hostname from Pilot and republishes it as signed member
-profile metadata. Changing the hostname later is safe; the join process will
+profile metadata. Changing the hostname later is safe; the serve process will
 republish the new profile.
 
 For strict hide-IP operation, keep flags aligned across layers:
@@ -32,4 +32,4 @@ For strict hide-IP operation, keep flags aligned across layers:
 - Entmoot should publish signed TURN transport ads and subscribe to Pilot TURN
   endpoint changes.
 
-One host should run one `join` process per Entmoot identity.
+One host should run one `serve` process per Entmoot identity.

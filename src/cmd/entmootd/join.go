@@ -133,31 +133,75 @@ func cmdJoin(gf *globalFlags, args []string) int {
 		invites = append(invites, invite)
 	}
 
+	return runGroupDaemon(gf, groupDaemonOptions{
+		command:            "join",
+		event:              "joined",
+		advertiseEndpoints: advertiseEndpoints,
+		loadGroups: func(ctx context.Context, runtime *groupRuntime) (int, error) {
+			for _, invite := range invites {
+				if _, _, err := runtime.AddInvite(ctx, *invite); err != nil {
+					code := classifyJoinAddInviteError(err)
+					if code == exitInvalidArgument {
+						return code, err
+					}
+					return code, fmt.Errorf("add group %s: %w", invite.GroupID.String(), err)
+				}
+			}
+			return exitOK, nil
+		},
+	})
+}
+
+func classifyJoinAddInviteError(err error) int {
+	switch {
+	case errors.Is(err, entmoot.ErrInviteExpired), errors.Is(err, entmoot.ErrSigInvalid):
+		return exitInvalidArgument
+	case errors.Is(err, errLocalGroupNotMember), errors.Is(err, errLocalGroupIdentityMismatch):
+		return exitNotMember
+	default:
+		return exitTransport
+	}
+}
+
+type groupDaemonOptions struct {
+	command            string
+	event              string
+	advertiseEndpoints endpointFlag
+	loadGroups         func(context.Context, *groupRuntime) (int, error)
+}
+
+func runGroupDaemon(gf *globalFlags, opts groupDaemonOptions) int {
+	if opts.command == "" {
+		opts.command = "daemon"
+	}
+	if opts.event == "" {
+		opts.event = "started"
+	}
 	s, err := setup(gf)
 	if err != nil {
-		slog.Error("join: setup", slog.String("err", err.Error()))
+		slog.Error(opts.command+": setup", slog.String("err", err.Error()))
 		return exitTransport
 	}
 
-	// Early-check the control socket: if another join is already live,
+	// Early-check the control socket: if another daemon is already live,
 	// exit 6 before we touch Pilot.
 	sockPath := controlSocketPath(s.dataDir)
 	if controlSocketAlive(sockPath, 200*time.Millisecond) {
-		fmt.Fprintf(os.Stderr, "join: another join is already running at %s\n", sockPath)
+		fmt.Fprintf(os.Stderr, "%s: another entmoot daemon is already running at %s\n", opts.command, sockPath)
 		return exitControlUnavail
 	}
 	// Stale socket left behind by a previous crash: unlink so we can
 	// bind. If a process is listening we'd have taken the branch above.
 	if _, err := os.Stat(sockPath); err == nil {
 		if err := os.Remove(sockPath); err != nil {
-			fmt.Fprintf(os.Stderr, "join: remove stale socket: %v\n", err)
+			fmt.Fprintf(os.Stderr, "%s: remove stale socket: %v\n", opts.command, err)
 			return exitTransport
 		}
 	}
 
 	tr, err := openPilotForJoin(gf)
 	if err != nil {
-		slog.Error("join: pilot", slog.String("err", err.Error()))
+		slog.Error(opts.command+": pilot", slog.String("err", err.Error()))
 		return exitTransport
 	}
 	defer tr.Close()
@@ -176,7 +220,7 @@ func cmdJoin(gf *globalFlags, args []string) int {
 
 	rawStore, err := store.OpenSQLite(s.dataDir)
 	if err != nil {
-		slog.Error("join: open store", slog.String("err", err.Error()))
+		slog.Error(opts.command+": open store", slog.String("err", err.Error()))
 		return exitTransport
 	}
 	defer func() { _ = rawStore.Close() }()
@@ -203,7 +247,7 @@ func cmdJoin(gf *globalFlags, args []string) int {
 	// returns a fixed CLI snapshot; remote peers keep using the stale
 	// TURN relay addr in their cached transport_ad and their outbound
 	// frames get silently dropped by Cloudflare's edge.
-	cliEps := advertiseEndpoints.Snapshot()
+	cliEps := opts.advertiseEndpoints.Snapshot()
 	turnPoller := newTURNEndpointPoller(tr.Driver(), turnEndpointPollInterval)
 	// Prime the poller synchronously so the advertiser's startup
 	// publish sees the current TURN addr on the very first call to
@@ -238,13 +282,13 @@ func cmdJoin(gf *globalFlags, args []string) int {
 		defer cancel()
 		info, err := tr.Driver().InfoStruct(ctx)
 		if err != nil {
-			slog.Debug("join: local pilot hostname lookup failed",
+			slog.Debug(opts.command+": local pilot hostname lookup failed",
 				slog.String("err", err.Error()))
 			return "", false
 		}
 		hostname, ok := normalizeLocalPilotHostname(info.Hostname)
 		if !ok {
-			slog.Debug("join: local pilot hostname unavailable")
+			slog.Debug(opts.command + ": local pilot hostname unavailable")
 		}
 		return hostname, ok
 	}
@@ -266,41 +310,46 @@ func cmdJoin(gf *globalFlags, args []string) int {
 		Logger:           slog.Default(),
 	})
 	if err != nil {
-		slog.Error("join: new group runtime", slog.String("err", err.Error()))
+		slog.Error(opts.command+": new group runtime", slog.String("err", err.Error()))
 		return exitTransport
 	}
 
-	for _, invite := range invites {
-		if _, _, err := runtime.AddInvite(rootCtx, *invite); err != nil {
-			// Expired / bad-sig invite surfaces as INVALID_ARGUMENT here
-			// too (Join re-verifies signature and ValidUntil).
-			if errors.Is(err, entmoot.ErrInviteExpired) || errors.Is(err, entmoot.ErrSigInvalid) {
-				fmt.Fprintf(os.Stderr, "join: %v\n", err)
-				runtime.Close()
-				return exitInvalidArgument
-			}
-			slog.Error("join: add group", slog.String("group_id", invite.GroupID.String()), slog.String("err", err.Error()))
-			runtime.Close()
-			return exitTransport
+	if opts.loadGroups == nil {
+		runtime.Close()
+		fmt.Fprintf(os.Stderr, "%s: no group loader configured\n", opts.command)
+		return exitInvalidArgument
+	}
+	if code, err := opts.loadGroups(rootCtx, runtime); err != nil {
+		if code == exitInvalidArgument || code == exitNotMember || code == exitGroupNotFound {
+			fmt.Fprintf(os.Stderr, "%s: %v\n", opts.command, err)
+		} else {
+			slog.Error(opts.command+": load groups", slog.String("err", err.Error()))
 		}
+		runtime.Close()
+		return code
+	}
+	if runtime.Count() == 0 {
+		runtime.Close()
+		fmt.Fprintf(os.Stderr, "%s: no active groups\n", opts.command)
+		return exitGroupNotFound
 	}
 
 	// Bind the control socket with 0600 permissions. net.Listen uses
 	// the process umask, so explicitly chmod afterwards.
 	listener, err := net.Listen("unix", sockPath)
 	if err != nil {
-		slog.Error("join: listen control socket", slog.String("err", err.Error()))
+		slog.Error(opts.command+": listen control socket", slog.String("err", err.Error()))
 		runtime.Close()
 		return exitTransport
 	}
 	if err := os.Chmod(sockPath, 0o600); err != nil {
-		slog.Warn("join: chmod control socket", slog.String("err", err.Error()))
+		slog.Warn(opts.command+": chmod control socket", slog.String("err", err.Error()))
 	}
 	// Ensure the socket file is removed on every return path, even
 	// panics / Close errors.
 	removeSocket := func() {
 		if err := os.Remove(sockPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-			slog.Warn("join: remove control socket", slog.String("err", err.Error()))
+			slog.Warn(opts.command+": remove control socket", slog.String("err", err.Error()))
 		}
 	}
 
@@ -312,7 +361,7 @@ func cmdJoin(gf *globalFlags, args []string) int {
 	go func() {
 		defer wg.Done()
 		if err := runtime.Start(rootCtx); err != nil {
-			slog.Warn("join: group runtime stopped", slog.String("err", err.Error()))
+			slog.Warn(opts.command+": group runtime stopped", slog.String("err", err.Error()))
 		}
 	}()
 
@@ -346,7 +395,7 @@ func cmdJoin(gf *globalFlags, args []string) int {
 		}
 	}
 	joinedEvent := map[string]any{
-		"event":          "joined",
+		"event":          opts.event,
 		"group_id":       groups[0],
 		"group_ids":      groups,
 		"members":        members,

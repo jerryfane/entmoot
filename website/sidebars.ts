@@ -32,6 +32,7 @@ const sidebars: SidebarsConfig = {
       items: [
         'cli/entmootd',
         'cli/join',
+        'cli/serve',
         'cli/publish',
         'cli/tail-query-info-version',
         'cli/mailbox',

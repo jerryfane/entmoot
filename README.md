@@ -129,7 +129,8 @@ before running. Both are skipped under `-short` or when
 stdout.
 
 ```sh
-entmootd join <invite> [invite...]             # long-running; reads file or http(s) URL
+entmootd join <invite> [invite...]             # first-time/bootstrap join
+entmootd serve [-group GID...]                 # long-running; restarts joined groups from disk
 entmootd publish -topic T -content "hi" [-group GID]
 entmootd tail [-topic PATTERN] [-group GID] [-n N]
 entmootd info
@@ -150,17 +151,18 @@ entmootd esp sign-request -device ID -private-key-file PATH \
   -method METHOD -path PATH_WITH_QUERY [-body BODY_FILE]
 ```
 
-`join` blocks, owns the control socket, and can host multiple group
-sessions over one shared Pilot transport; `publish` and `tail` (live
+`join` applies new invites. `serve` blocks, owns the control socket, and can
+host multiple persisted group sessions over one shared Pilot transport;
+`publish` and `tail` (live
 mode) dial it. `info`, `query`, `mailbox`, `esp serve`, and
 `esp device` read SQLite or local JSON directly. `esp sign-request` is a
 local signing helper for ESP device-auth smoke tests. `version` prints release
-metadata. These work whether or not a `join` process is running.
+metadata. These work whether or not a daemon process is running.
 
 Sample one-line JSON shapes on stdout:
 
 ```json
-{"event":"joined","group_id":"<first-base64>","group_ids":["<base64>"],"members":3,"listen_port":1004,"control_socket":"/home/user/.entmoot/control.sock"}
+{"event":"serving","group_id":"<first-base64>","group_ids":["<base64>"],"members":3,"listen_port":1004,"control_socket":"/home/user/.entmoot/control.sock"}
 {"message_id":"<base64>","group_id":"<base64>","topic":["chat"],"author":41545,"timestamp_ms":1713369600000}
 {"running":true,"pilot_node_id":41545,"entmoot_pubkey":"<base64>","listen_port":1004,"data_dir":"/home/user/.entmoot","groups":[{"group_id":"<base64>","members":3,"messages":12,"merkle_root":"<base64>"}]}
 ```
@@ -224,9 +226,9 @@ entmoot/
 
 A group is 32 random bytes of identity plus a signed append-only roster.
 Messages are author-signed, reference up to three parents to form a DAG,
-and carry a list of MQTT-style topics. `entmootd join` on each member
-opens a listener on port 1004 through its local Pilot daemon and holds
-a per-host control socket at `~/.entmoot/control.sock` through which
+and carry a list of MQTT-style topics. `entmootd join` applies a signed invite
+once; `entmootd serve` opens a listener on port 1004 through its local Pilot
+daemon and holds a per-host control socket at `~/.entmoot/control.sock` through which
 `publish` and `tail` clients route their requests. When you publish, we
 sign the message, store it in SQLite, and push its id (just the hash) to
 a random sample of roster peers. Peers that don't have the body fetch

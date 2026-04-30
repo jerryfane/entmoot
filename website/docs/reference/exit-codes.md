@@ -10,8 +10,7 @@ Common exit codes:
 2 local identity is not a member
 3 group not found
 5 invalid arguments
-6 control socket unavailable or another join process owns the data root
+6 control socket unavailable or another Entmoot daemon owns the data root
 ```
 
 Command-specific details live in the CLI design document.
-

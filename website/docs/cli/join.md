@@ -10,6 +10,10 @@ entmootd join <invite> [invite...]
 control socket, loads persistent state, and blocks while participating in every
 joined group session.
 
+For production restarts, prefer `entmootd serve` after the first successful
+join. `serve` loads persisted groups from disk and does not need the original
+invite file.
+
 Useful flags:
 
 ```sh

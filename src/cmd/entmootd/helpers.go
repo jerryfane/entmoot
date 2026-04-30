@@ -168,6 +168,10 @@ func groupsDir(dataRoot string) string {
 	return filepath.Join(dataRoot, "groups")
 }
 
+func groupRosterPath(dataRoot string, gid entmoot.GroupID) string {
+	return filepath.Join(groupDirPath(dataRoot, gid), "roster.jsonl")
+}
+
 // controlSocketPath returns the canonical control-socket path under the
 // given data root.
 func controlSocketPath(dataRoot string) string {

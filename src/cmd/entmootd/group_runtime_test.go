@@ -5,6 +5,8 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -60,6 +62,278 @@ func TestGroupRuntimeAddsMultipleSelfGroups(t *testing.T) {
 	}
 	if _, ok := rt.SingleGroup(); ok {
 		t.Fatal("SingleGroup returned ok with two active groups")
+	}
+}
+
+func TestGroupRuntimeAddLocalGroupStartsPersistedGroup(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	dataDir := t.TempDir()
+	identity, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate identity: %v", err)
+	}
+	st, err := store.OpenSQLite(dataDir)
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	defer st.Close()
+	rt, err := newGroupRuntime(groupRuntimeConfig{
+		NodeID:    45491,
+		Identity:  identity,
+		DataDir:   dataDir,
+		Store:     st,
+		Notify:    newNotifyingStore(st, events.NewBus()),
+		Transport: newRuntimeFakeTransport(),
+	})
+	if err != nil {
+		t.Fatalf("newGroupRuntime: %v", err)
+	}
+	defer rt.Close()
+
+	gid := testRuntimeGroupID(0xA3)
+	_ = selfInvite(t, dataDir, st, identity, 45491, gid)
+	if _, created, err := rt.AddLocalGroup(ctx, gid); err != nil || !created {
+		t.Fatalf("AddLocalGroup created/err = %v/%v, want true/nil", created, err)
+	}
+	if rt.Count() != 1 {
+		t.Fatalf("Count = %d, want 1", rt.Count())
+	}
+}
+
+func TestGroupRuntimeAddLocalGroupRejectsNonMember(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	identity, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate identity: %v", err)
+	}
+	st, err := store.OpenSQLite(dataDir)
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	defer st.Close()
+	rt, err := newGroupRuntime(groupRuntimeConfig{
+		NodeID:    45491,
+		Identity:  identity,
+		DataDir:   dataDir,
+		Store:     st,
+		Notify:    newNotifyingStore(st, events.NewBus()),
+		Transport: newRuntimeFakeTransport(),
+	})
+	if err != nil {
+		t.Fatalf("newGroupRuntime: %v", err)
+	}
+	defer rt.Close()
+
+	gid := testRuntimeGroupID(0xA4)
+	_ = selfInvite(t, dataDir, st, identity, 99999, gid)
+	if _, _, err := rt.AddLocalGroup(ctx, gid); !errors.Is(err, errLocalGroupNotMember) {
+		t.Fatalf("AddLocalGroup err = %v, want errLocalGroupNotMember", err)
+	}
+}
+
+func TestGroupRuntimeAddLocalGroupRejectsIdentityMismatch(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	runtimeIdentity, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate runtime identity: %v", err)
+	}
+	rosterIdentity, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate roster identity: %v", err)
+	}
+	st, err := store.OpenSQLite(dataDir)
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	defer st.Close()
+	rt, err := newGroupRuntime(groupRuntimeConfig{
+		NodeID:    45491,
+		Identity:  runtimeIdentity,
+		DataDir:   dataDir,
+		Store:     st,
+		Notify:    newNotifyingStore(st, events.NewBus()),
+		Transport: newRuntimeFakeTransport(),
+	})
+	if err != nil {
+		t.Fatalf("newGroupRuntime: %v", err)
+	}
+	defer rt.Close()
+
+	gid := testRuntimeGroupID(0xA5)
+	_ = selfInvite(t, dataDir, st, rosterIdentity, 45491, gid)
+	if _, _, err := rt.AddLocalGroup(ctx, gid); !errors.Is(err, errLocalGroupIdentityMismatch) {
+		t.Fatalf("AddLocalGroup err = %v, want errLocalGroupIdentityMismatch", err)
+	}
+}
+
+func TestGroupRuntimeRejectedJoinRollsBackNewGroupDir(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	runtimeIdentity, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate runtime identity: %v", err)
+	}
+	rosterIdentity, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate roster identity: %v", err)
+	}
+	st, err := store.OpenSQLite(dataDir)
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	defer st.Close()
+	rt, err := newGroupRuntime(groupRuntimeConfig{
+		NodeID:    45491,
+		Identity:  runtimeIdentity,
+		DataDir:   dataDir,
+		Store:     st,
+		Notify:    newNotifyingStore(st, events.NewBus()),
+		Transport: newRuntimeFakeTransport(),
+	})
+	if err != nil {
+		t.Fatalf("newGroupRuntime: %v", err)
+	}
+	defer rt.Close()
+
+	gid := testRuntimeGroupID(0xA9)
+	if _, _, err := rt.addGroup(ctx, gid, persistForeignRosterBootstrap(t, dataDir, rosterIdentity, 99999, gid)); !errors.Is(err, errLocalGroupNotMember) {
+		t.Fatalf("addGroup err = %v, want errLocalGroupNotMember", err)
+	}
+	if _, err := os.Stat(groupDirPath(dataDir, gid)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("group dir still exists after rejected join: %v", err)
+	}
+	gids, err := selectServeGroupIDs(dataDir, nil, nil)
+	if !errors.Is(err, errServeNoGroups) {
+		t.Fatalf("selectServeGroupIDs err = %v, gids = %v; want errServeNoGroups", err, gids)
+	}
+}
+
+func TestGroupRuntimeRejectedJoinPreservesExistingGroupDir(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	runtimeIdentity, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate runtime identity: %v", err)
+	}
+	rosterIdentity, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate roster identity: %v", err)
+	}
+	st, err := store.OpenSQLite(dataDir)
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	defer st.Close()
+	rt, err := newGroupRuntime(groupRuntimeConfig{
+		NodeID:    45491,
+		Identity:  runtimeIdentity,
+		DataDir:   dataDir,
+		Store:     st,
+		Notify:    newNotifyingStore(st, events.NewBus()),
+		Transport: newRuntimeFakeTransport(),
+	})
+	if err != nil {
+		t.Fatalf("newGroupRuntime: %v", err)
+	}
+	defer rt.Close()
+
+	gid := testRuntimeGroupID(0xAA)
+	groupDir := groupDirPath(dataDir, gid)
+	if err := os.MkdirAll(groupDir, 0o700); err != nil {
+		t.Fatalf("mkdir group dir: %v", err)
+	}
+	sentinel := filepath.Join(groupDir, "sentinel")
+	if err := os.WriteFile(sentinel, []byte("keep"), 0o600); err != nil {
+		t.Fatalf("write sentinel: %v", err)
+	}
+	if _, _, err := rt.addGroup(ctx, gid, persistForeignRosterBootstrap(t, dataDir, rosterIdentity, 99999, gid)); !errors.Is(err, errLocalGroupNotMember) {
+		t.Fatalf("addGroup err = %v, want errLocalGroupNotMember", err)
+	}
+	if _, err := os.Stat(sentinel); err != nil {
+		t.Fatalf("sentinel was not preserved: %v", err)
+	}
+	if _, err := os.Stat(groupRosterPath(dataDir, gid)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("created roster still exists after rejected join: %v", err)
+	}
+}
+
+func TestSelectServeGroupIDsFiltersGroupsWithoutRoster(t *testing.T) {
+	dataDir := t.TempDir()
+	identity, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate identity: %v", err)
+	}
+	st, err := store.OpenSQLite(dataDir)
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	defer st.Close()
+	valid := testRuntimeGroupID(0xA6)
+	missingRoster := testRuntimeGroupID(0xA7)
+	_ = selfInvite(t, dataDir, st, identity, 45491, valid)
+	if err := os.MkdirAll(groupDirPath(dataDir, missingRoster), 0o700); err != nil {
+		t.Fatalf("mkdir missing roster group: %v", err)
+	}
+
+	gids, err := selectServeGroupIDs(dataDir, nil, nil)
+	if err != nil {
+		t.Fatalf("selectServeGroupIDs: %v", err)
+	}
+	if len(gids) != 1 || gids[0] != valid {
+		t.Fatalf("gids = %v, want [%s]", gids, valid.String())
+	}
+}
+
+func TestSelectServeGroupIDsRequiresSelectedRoster(t *testing.T) {
+	dataDir := t.TempDir()
+	missing := testRuntimeGroupID(0xA8)
+	if _, err := selectServeGroupIDs(dataDir, []string{missing.String()}, nil); !errors.Is(err, errServeGroupMissing) {
+		t.Fatalf("selectServeGroupIDs err = %v, want errServeGroupMissing", err)
+	}
+}
+
+func TestSelectServeGroupIDsRejectsMalformedSelectedGroup(t *testing.T) {
+	if _, err := selectServeGroupIDs(t.TempDir(), []string{"not-a-group-id"}, nil); !errors.Is(err, errServeInvalidGroupID) {
+		t.Fatalf("selectServeGroupIDs err = %v, want errServeInvalidGroupID", err)
+	}
+}
+
+func TestCmdServeMalformedGroupReturnsInvalidArgumentBeforePilotSetup(t *testing.T) {
+	if code := cmdServe(&globalFlags{}, []string{"-group", "not-a-group-id"}); code != exitInvalidArgument {
+		t.Fatalf("cmdServe code = %d, want %d", code, exitInvalidArgument)
+	}
+}
+
+func TestCmdServeNoGroupsReturnsGroupNotFoundBeforePilotSetup(t *testing.T) {
+	code := cmdServe(&globalFlags{
+		data:   t.TempDir(),
+		socket: filepath.Join(t.TempDir(), "missing-pilot.sock"),
+	}, nil)
+	if code != exitGroupNotFound {
+		t.Fatalf("cmdServe code = %d, want %d", code, exitGroupNotFound)
+	}
+}
+
+func TestCmdServeMissingSelectedGroupReturnsGroupNotFoundBeforePilotSetup(t *testing.T) {
+	missing := testRuntimeGroupID(0xAB)
+	code := cmdServe(&globalFlags{
+		data:   t.TempDir(),
+		socket: filepath.Join(t.TempDir(), "missing-pilot.sock"),
+	}, []string{"-group", missing.String()})
+	if code != exitGroupNotFound {
+		t.Fatalf("cmdServe code = %d, want %d", code, exitGroupNotFound)
+	}
+}
+
+func TestClassifyJoinAddInviteMembershipFailures(t *testing.T) {
+	for _, err := range []error{errLocalGroupNotMember, errLocalGroupIdentityMismatch} {
+		if code := classifyJoinAddInviteError(err); code != exitNotMember {
+			t.Fatalf("classifyJoinAddInviteError(%v) = %d, want %d", err, code, exitNotMember)
+		}
 	}
 }
 
@@ -493,6 +767,19 @@ func selfInvite(t *testing.T, dataDir string, st *store.SQLite, identity *keysto
 	}
 	invite.Signature = identity.Sign(sigInput)
 	return invite
+}
+
+func persistForeignRosterBootstrap(t *testing.T, dataDir string, identity *keystore.Identity, nodeID entmoot.NodeID, gid entmoot.GroupID) func(context.Context, *gossip.Gossiper) error {
+	t.Helper()
+	return func(context.Context, *gossip.Gossiper) error {
+		r, err := roster.OpenJSONL(dataDir, gid)
+		if err != nil {
+			return err
+		}
+		defer r.Close()
+		info := entmoot.NodeInfo{PilotNodeID: nodeID, EntmootPubKey: append([]byte(nil), identity.PublicKey...)}
+		return r.Genesis(identity, info, time.Now().UnixMilli())
+	}
 }
 
 func testRuntimeGroupID(fill byte) entmoot.GroupID {

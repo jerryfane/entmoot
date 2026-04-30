@@ -1,10 +1,10 @@
 // Command entmootd is the Entmoot v1 daemon + CLI. A single binary that
-// exposes agent-facing subcommands (join, publish, tail, info, query, mailbox,
-// esp, version)
+// exposes agent-facing subcommands (join, serve, publish, tail, info, query,
+// mailbox, esp, version)
 // plus founder-facing subcommands (group create, invite create). The
-// join subcommand owns a blocking accept loop and a control-socket IPC
-// server; all agent commands other than join/publish/tail are direct SQLite
-// readers and work whether or not a join process is running.
+// join and serve subcommands own a blocking accept loop and a control-socket
+// IPC server; all agent commands other than join/serve/publish/tail are direct
+// SQLite readers and work whether or not a daemon process is running.
 //
 // See docs/CLI_DESIGN.md for the authoritative spec.
 package main
@@ -65,7 +65,9 @@ func run() int {
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "Agent subcommands:")
 		fmt.Fprintln(os.Stderr, "  join <invite> [invite...]")
-		fmt.Fprintln(os.Stderr, "                          Block, run group sessions, and serve the control socket.")
+		fmt.Fprintln(os.Stderr, "                          First-time/bootstrap join from signed invite(s).")
+		fmt.Fprintln(os.Stderr, "  serve [-group GID...]")
+		fmt.Fprintln(os.Stderr, "                          Restart joined groups from persistent local state.")
 		fmt.Fprintln(os.Stderr, "  publish -topic T -content S [-group GID]")
 		fmt.Fprintln(os.Stderr, "                          Author and gossip a message via the control socket.")
 		fmt.Fprintln(os.Stderr, "  tail [-topic PAT] [-group GID] [-n N]")
@@ -151,6 +153,8 @@ func run() int {
 	switch args[0] {
 	case "join":
 		return cmdJoin(gf, args[1:])
+	case "serve":
+		return cmdServe(gf, args[1:])
 	case "publish":
 		return cmdPublish(gf, args[1:])
 	case "tail":

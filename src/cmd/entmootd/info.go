@@ -38,7 +38,7 @@ func cmdInfo(gf *globalFlags, args []string) int {
 	resp := ipc.InfoResp{
 		// PilotNodeID is not known without dialing Pilot; leave zero
 		// when info is run standalone. CLI_DESIGN §3.4 says info reads
-		// SQLite directly and works without a running join; we therefore
+		// SQLite directly and works without a running daemon; we therefore
 		// do not open Pilot here.
 		PilotNodeID:   0,
 		EntmootPubKey: s.identity.PublicKey,
@@ -122,7 +122,7 @@ func cmdInfo(gf *globalFlags, args []string) int {
 	return exitOK
 }
 
-// infoOverIPC dials the running join's control socket, sends info_req,
+// infoOverIPC dials the running daemon's control socket, sends info_req,
 // and decodes the response.
 func infoOverIPC(sockPath string) (*ipc.InfoResp, error) {
 	conn, err := net.DialTimeout("unix", sockPath, 500*time.Millisecond)

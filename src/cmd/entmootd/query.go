@@ -18,7 +18,7 @@ import (
 
 // cmdQuery runs a historical SQLite query against a single group and
 // emits one JSON message per line. Reads SQLite directly; does not
-// require a running join.
+// require a running daemon.
 func cmdQuery(gf *globalFlags, args []string) int {
 	fs := flag.NewFlagSet("query", flag.ContinueOnError)
 	groupStr := fs.String("group", "", "base64 group id (required if multiple groups are joined)")
