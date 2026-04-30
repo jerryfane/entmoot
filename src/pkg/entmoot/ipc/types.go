@@ -45,6 +45,12 @@ const (
 	MsgJoinGroupReq MsgType = 0x18
 	// MsgJoinGroupResp acknowledges that a group session exists.
 	MsgJoinGroupResp MsgType = 0x19
+	// MsgInviteCreateReq asks the running daemon to create a signed invite
+	// for an active group, applying any target roster add to the live session.
+	MsgInviteCreateReq MsgType = 0x1A
+	// MsgInviteCreateResp returns the signed invite created from live daemon
+	// state, including the roster head the daemon can serve.
+	MsgInviteCreateResp MsgType = 0x1B
 	// MsgError carries a structured error frame. 0x1F is chosen as the
 	// last slot in the 0x10..0x1F namespace so it's easy to spot.
 	MsgError MsgType = 0x1F
@@ -74,6 +80,10 @@ func (t MsgType) String() string {
 		return "join_group_req"
 	case MsgJoinGroupResp:
 		return "join_group_resp"
+	case MsgInviteCreateReq:
+		return "invite_create_req"
+	case MsgInviteCreateResp:
+		return "invite_create_resp"
 	case MsgError:
 		return "error"
 	default:
@@ -139,6 +149,26 @@ type JoinGroupResp struct {
 	Status  string          `json:"status"`
 	GroupID entmoot.GroupID `json:"group_id"`
 	Members int             `json:"members"`
+}
+
+// InviteCreateReq asks the live daemon to mint an invite for an active group.
+// The daemon owns the authoritative in-memory roster, so it must apply target
+// additions before returning an invite that advertises the resulting head.
+type InviteCreateReq struct {
+	GroupID        entmoot.GroupID  `json:"group_id"`
+	Target         entmoot.NodeInfo `json:"target"`
+	ValidForMS     int64            `json:"valid_for_ms,omitempty"`
+	ValidUntilMS   int64            `json:"valid_until_ms,omitempty"`
+	BootstrapPeers []entmoot.NodeID `json:"bootstrap_peers,omitempty"`
+}
+
+// InviteCreateResp reports the invite created from live daemon state.
+type InviteCreateResp struct {
+	Status     string                `json:"status"`
+	GroupID    entmoot.GroupID       `json:"group_id"`
+	Invite     entmoot.Invite        `json:"invite"`
+	RosterHead entmoot.RosterEntryID `json:"roster_head"`
+	Members    int                   `json:"members"`
 }
 
 // TailSubscribe opens a live message stream. GroupID is optional (nil

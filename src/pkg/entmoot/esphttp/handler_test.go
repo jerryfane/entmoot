@@ -603,6 +603,35 @@ func TestHandlerAdminOperationsRequireAdminAtCreation(t *testing.T) {
 	}
 }
 
+func TestHandlerAdminOperationsRequireGroupMembershipAtCreation(t *testing.T) {
+	gid := testGroupID(1)
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	reg, err := NewDeviceRegistry([]Device{{
+		ID:          "ios-1-device",
+		PublicKey:   pub,
+		AdminGroups: []entmoot.GroupID{gid},
+		ClientIDs:   []string{"ios-1"},
+	}})
+	if err != nil {
+		t.Fatalf("NewDeviceRegistry: %v", err)
+	}
+	handler := testMobileHandlerFull(t, gid, reg, &fakeCatalog{groups: []GroupSummary{{GroupID: gid}}}, func() time.Time {
+		return time.UnixMilli(1_234_000)
+	}, nil, NewMemoryStateStore(), nil)
+
+	updateErr := doSignedJSONRequest[errorEnvelope](t, handler, priv, http.MethodPatch, "/v1/groups/"+gid.String(), map[string]any{"name": "ops"}, http.StatusForbidden, 1_234_000, "nonce-update")
+	if updateErr.Error.Code != "forbidden" {
+		t.Fatalf("group_update code = %q, want forbidden", updateErr.Error.Code)
+	}
+	inviteErr := doSignedJSONRequest[errorEnvelope](t, handler, priv, http.MethodPost, "/v1/groups/"+gid.String()+"/invites", map[string]any{}, http.StatusForbidden, 1_235_000, "nonce-invite")
+	if inviteErr.Error.Code != "forbidden" {
+		t.Fatalf("invite_create code = %q, want forbidden", inviteErr.Error.Code)
+	}
+}
+
 func TestHandlerAdminOperationRechecksAdminAtCompletion(t *testing.T) {
 	gid := testGroupID(1)
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
@@ -651,6 +680,106 @@ func TestHandlerAdminOperationRechecksAdminAtCompletion(t *testing.T) {
 	}
 	if op.req.ID != "" {
 		t.Fatalf("executor ran without admin rights: %+v", op.req)
+	}
+}
+
+func TestHandlerAdminOperationRechecksGroupMembershipAtCompletion(t *testing.T) {
+	gid := testGroupID(1)
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	reg, err := NewDeviceRegistry([]Device{{
+		ID:          "ios-1-device",
+		PublicKey:   pub,
+		Groups:      []entmoot.GroupID{gid},
+		AdminGroups: []entmoot.GroupID{gid},
+		ClientIDs:   []string{"ios-1"},
+	}})
+	if err != nil {
+		t.Fatalf("NewDeviceRegistry: %v", err)
+	}
+	op := &fakeOperationExecutor{result: json.RawMessage(`{"status":"updated"}`)}
+	handler := testMobileHandlerFull(t, gid, reg, &fakeCatalog{groups: []GroupSummary{{GroupID: gid}}}, func() time.Time {
+		return time.UnixMilli(1_234_000)
+	}, nil, NewMemoryStateStore(), nil)
+	handler.(*Handler).operations = op
+
+	created := doSignedJSONRequest[struct {
+		SignRequest SignRequest `json:"sign_request"`
+	}](t, handler, priv, http.MethodPatch, "/v1/groups/"+gid.String(), map[string]any{"name": "ops"}, http.StatusAccepted, 1_234_000, "nonce-create")
+	signingPayload, err := base64.StdEncoding.DecodeString(created.SignRequest.SigningPayload)
+	if err != nil {
+		t.Fatalf("Decode signing payload: %v", err)
+	}
+	adminOnly, err := NewDeviceRegistry([]Device{{
+		ID:          "ios-1-device",
+		PublicKey:   pub,
+		AdminGroups: []entmoot.GroupID{gid},
+		ClientIDs:   []string{"ios-1"},
+	}})
+	if err != nil {
+		t.Fatalf("NewDeviceRegistry admin only: %v", err)
+	}
+	reg.Replace(adminOnly)
+	errResp := doSignedJSONRequest[errorEnvelope](t, handler, priv, http.MethodPost, "/v1/sign-requests/"+created.SignRequest.ID+"/complete", map[string]any{
+		"signature":              base64.StdEncoding.EncodeToString(ed25519.Sign(priv, signingPayload)),
+		"signing_payload_sha256": created.SignRequest.SigningPayloadSHA256,
+	}, http.StatusForbidden, 1_235_000, "nonce-complete")
+	if errResp.Error.Code != "forbidden" {
+		t.Fatalf("error code = %q, want forbidden", errResp.Error.Code)
+	}
+	if op.req.ID != "" {
+		t.Fatalf("executor ran without group membership: %+v", op.req)
+	}
+}
+
+func TestHandlerBearerCompletionRechecksStoredDeviceGroupMembership(t *testing.T) {
+	gid := testGroupID(1)
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	reg, err := NewDeviceRegistry([]Device{{
+		ID:          "ios-1-device",
+		PublicKey:   pub,
+		AdminGroups: []entmoot.GroupID{gid},
+		ClientIDs:   []string{"ios-1"},
+	}})
+	if err != nil {
+		t.Fatalf("NewDeviceRegistry: %v", err)
+	}
+	state := NewMemoryStateStore()
+	seeded, err := state.CreateSignRequest(context.Background(), SignRequest{
+		DeviceID: "ios-1-device",
+		Kind:     signRequestKindGroupUpdate,
+		GroupID:  gid,
+		Payload:  json.RawMessage(`{"name":"ops"}`),
+	})
+	if err != nil {
+		t.Fatalf("CreateSignRequest: %v", err)
+	}
+	op := &fakeOperationExecutor{result: json.RawMessage(`{"status":"updated"}`)}
+	handler := testMobileHandlerFull(t, gid, reg, &fakeCatalog{groups: []GroupSummary{{GroupID: gid}}}, func() time.Time {
+		return time.UnixMilli(1_234_000)
+	}, nil, state, nil)
+	handler.(*Handler).authMode = AuthModeDual
+	handler.(*Handler).token = "secret"
+	handler.(*Handler).operations = op
+
+	signingPayload, err := base64.StdEncoding.DecodeString(seeded.SigningPayload)
+	if err != nil {
+		t.Fatalf("Decode signing payload: %v", err)
+	}
+	errResp := doJSONRequest[errorEnvelope](t, handler, http.MethodPost, "/v1/sign-requests/"+seeded.ID+"/complete", map[string]any{
+		"signature":              base64.StdEncoding.EncodeToString(ed25519.Sign(priv, signingPayload)),
+		"signing_payload_sha256": seeded.SigningPayloadSHA256,
+	}, http.StatusForbidden)
+	if errResp.Error.Code != "forbidden" {
+		t.Fatalf("error code = %q, want forbidden", errResp.Error.Code)
+	}
+	if op.req.ID != "" {
+		t.Fatalf("executor ran without stored device group membership: %+v", op.req)
 	}
 }
 

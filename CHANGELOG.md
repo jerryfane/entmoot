@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.31] - 2026-05-01
+
+### Added
+
+- **Live ESP invite creation.** ESP `invite_create` now delegates to the
+  running `entmootd` session over IPC, applies the target member to the live
+  roster, and returns an invite whose roster head is immediately available to
+  bootstrap peers.
+
+### Fixed
+
+- **Roster propagation for invited members.** Invite creation now fans out the
+  updated roster snapshot to existing peers and retries failed roster-update
+  sends, so already-joined peers can accept messages from newly invited
+  members.
+- **Concurrent roster update safety.** Gossip-driven roster snapshot ingestion
+  is serialized, and overlapping invite creation snapshots fanout peers under
+  the per-group roster lock to avoid stale or corrupted roster projections.
+
 ## [1.5.29] - 2026-04-30
 
 ### Changed

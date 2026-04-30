@@ -187,6 +187,10 @@ func TestMsgTypeString(t *testing.T) {
 		MsgPublishResp:       "publish_resp",
 		MsgSignedPublishReq:  "signed_publish_req",
 		MsgSignedPublishResp: "signed_publish_resp",
+		MsgJoinGroupReq:      "join_group_req",
+		MsgJoinGroupResp:     "join_group_resp",
+		MsgInviteCreateReq:   "invite_create_req",
+		MsgInviteCreateResp:  "invite_create_resp",
 		MsgTailSubscribe:     "tail_subscribe",
 		MsgTailEvent:         "tail_event",
 		MsgInfoReq:           "info_req",
@@ -206,7 +210,7 @@ func TestMsgTypeString(t *testing.T) {
 	}
 	// A byte inside the ipc namespace (0x10..0x1F) that is not
 	// registered must also be reported as unknown.
-	if got := MsgType(0x1A).String(); got != "unknown(0x1a)" {
-		t.Errorf("0x1A String() = %q", got)
+	if got := MsgType(0x1C).String(); got != "unknown(0x1c)" {
+		t.Errorf("0x1C String() = %q", got)
 	}
 }

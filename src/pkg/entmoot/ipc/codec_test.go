@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"sync"
 	"testing"
+	"time"
 
 	entmoot "entmoot/pkg/entmoot"
 )
@@ -30,6 +31,14 @@ func mustMessageID(fill byte) entmoot.MessageID {
 		m[i] = fill
 	}
 	return m
+}
+
+func mustRosterEntryID(fill byte) entmoot.RosterEntryID {
+	var id entmoot.RosterEntryID
+	for i := range id {
+		id[i] = fill
+	}
+	return id
 }
 
 // newKey generates an Ed25519 keypair for realistic signature-shaped
@@ -166,6 +175,30 @@ func TestRoundTripInfoReq(t *testing.T) {
 	roundTrip(t, &InfoReq{})
 }
 
+func TestRoundTripInviteCreateReqResp(t *testing.T) {
+	gid := mustGroupID(0x66)
+	pub, _ := newKey(t)
+	req := &InviteCreateReq{
+		GroupID: gid,
+		Target: entmoot.NodeInfo{
+			PilotNodeID:   45981,
+			EntmootPubKey: pub,
+		},
+		ValidForMS:     int64(time.Hour / time.Millisecond),
+		BootstrapPeers: []entmoot.NodeID{45491, 45460},
+	}
+	roundTrip(t, req)
+
+	resp := &InviteCreateResp{
+		Status:     "created",
+		GroupID:    gid,
+		Invite:     entmoot.Invite{GroupID: gid, RosterHead: mustRosterEntryID(0x77)},
+		RosterHead: mustRosterEntryID(0x77),
+		Members:    3,
+	}
+	roundTrip(t, resp)
+}
+
 func TestRoundTripInfoResp(t *testing.T) {
 	pub, _ := newKey(t)
 	var root [32]byte
@@ -257,9 +290,9 @@ func TestEncodeUnknownType(t *testing.T) {
 }
 
 // TestDecodeUnknownType exercises bytes outside the ipc namespace
-// (0x00, 0xFF) and an unused byte inside the namespace (0x1A).
+// (0x00, 0xFF) and an unused byte inside the namespace (0x1C).
 func TestDecodeUnknownType(t *testing.T) {
-	for _, b := range []MsgType{0x00, 0x09, 0x1A, 0x20, 0xFF} {
+	for _, b := range []MsgType{0x00, 0x09, 0x1C, 0x20, 0xFF} {
 		_, err := Decode(b, []byte(`{}`))
 		if !errors.Is(err, ErrUnknownMessage) {
 			t.Errorf("Decode(0x%02x) err = %v, want ErrUnknownMessage", uint8(b), err)
@@ -274,6 +307,7 @@ func TestDecodeMalformedJSON(t *testing.T) {
 		MsgPublishReq, MsgPublishResp,
 		MsgSignedPublishReq, MsgSignedPublishResp,
 		MsgJoinGroupReq, MsgJoinGroupResp,
+		MsgInviteCreateReq, MsgInviteCreateResp,
 		MsgTailSubscribe, MsgTailEvent,
 		MsgInfoResp, MsgError,
 	}

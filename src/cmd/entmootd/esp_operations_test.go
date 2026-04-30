@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"entmoot/pkg/entmoot"
+	"entmoot/pkg/entmoot/canonical"
 	"entmoot/pkg/entmoot/esphttp"
 	"entmoot/pkg/entmoot/ipc"
 	"entmoot/pkg/entmoot/keystore"
@@ -480,6 +481,148 @@ func TestESPAcceptInviteWithDeviceRequiresAuthorizer(t *testing.T) {
 	}
 }
 
+func TestESPBuildInviteCreateRequestNormalizesPayload(t *testing.T) {
+	gid := testESPGroupID(12)
+	targetID, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate target: %v", err)
+	}
+	req, err := buildInviteCreateIPCRequest(gid, inviteCreatePayload{
+		ValidFor: "2d",
+		Peers:    "45491, 45460",
+		Target: &inviteTargetPayload{
+			PilotNodeID:   45981,
+			EntmootPubKey: append([]byte(nil), targetID.PublicKey...),
+		},
+	})
+	if err != nil {
+		t.Fatalf("buildInviteCreateIPCRequest: %v", err)
+	}
+	if req.GroupID != gid || req.Target.PilotNodeID != 45981 || !bytes.Equal(req.Target.EntmootPubKey, targetID.PublicKey) {
+		t.Fatalf("request target/group = %+v", req)
+	}
+	if req.ValidForMS != int64((48*time.Hour)/time.Millisecond) {
+		t.Fatalf("valid_for_ms = %d, want 48h", req.ValidForMS)
+	}
+	if len(req.BootstrapPeers) != 2 || req.BootstrapPeers[0] != 45491 || req.BootstrapPeers[1] != 45460 {
+		t.Fatalf("bootstrap peers = %v, want [45491 45460]", req.BootstrapPeers)
+	}
+}
+
+func TestESPBuildInviteCreateRequestRejectsSubMillisecondValidFor(t *testing.T) {
+	gid := testESPGroupID(18)
+	targetID, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate target: %v", err)
+	}
+	for _, validFor := range []string{"1ns", "500us"} {
+		_, err := buildInviteCreateIPCRequest(gid, inviteCreatePayload{
+			ValidFor: validFor,
+			Target: &inviteTargetPayload{
+				PilotNodeID:   45981,
+				EntmootPubKey: append([]byte(nil), targetID.PublicKey...),
+			},
+		})
+		var opErr *esphttp.OperationError
+		if !errors.As(err, &opErr) || opErr.HTTPStatus != http.StatusBadRequest || opErr.Code != "bad_request" {
+			t.Fatalf("valid_for %q err = %v, want 400 bad_request", validFor, err)
+		}
+	}
+
+	req, err := buildInviteCreateIPCRequest(gid, inviteCreatePayload{
+		ValidFor: "1ms",
+		Target: &inviteTargetPayload{
+			PilotNodeID:   45981,
+			EntmootPubKey: append([]byte(nil), targetID.PublicKey...),
+		},
+	})
+	if err != nil {
+		t.Fatalf("valid_for 1ms err = %v, want nil", err)
+	}
+	if req.ValidForMS != 1 {
+		t.Fatalf("valid_for_ms = %d, want 1", req.ValidForMS)
+	}
+}
+
+func TestESPBuildInviteRequiresTarget(t *testing.T) {
+	_, err := buildInviteCreateIPCRequest(testESPGroupID(13), inviteCreatePayload{})
+	var opErr *esphttp.OperationError
+	if !errors.As(err, &opErr) || opErr.HTTPStatus != http.StatusBadRequest || opErr.Code != "target_required" {
+		t.Fatalf("buildInviteCreateIPCRequest err = %v, want 400 target_required", err)
+	}
+}
+
+func TestESPBuildInviteInvalidValidForDoesNotMutateRoster(t *testing.T) {
+	dataDir := t.TempDir()
+	gid := testESPGroupID(16)
+	founderID, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate founder: %v", err)
+	}
+	targetID, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate target: %v", err)
+	}
+	founder := entmoot.NodeInfo{PilotNodeID: 45491, EntmootPubKey: append([]byte(nil), founderID.PublicKey...)}
+	createTestRoster(t, dataDir, gid, founderID, founder)
+
+	_, err = buildInviteCreateIPCRequest(gid, inviteCreatePayload{
+		ValidFor: "not-a-duration",
+		Target: &inviteTargetPayload{
+			PilotNodeID:   45981,
+			EntmootPubKey: append([]byte(nil), targetID.PublicKey...),
+		},
+	})
+	var opErr *esphttp.OperationError
+	if !errors.As(err, &opErr) || opErr.HTTPStatus != http.StatusBadRequest || opErr.Code != "bad_request" {
+		t.Fatalf("buildInviteCreateIPCRequest err = %v, want 400 bad_request", err)
+	}
+	assertRosterMemberAbsent(t, dataDir, gid, 45981)
+}
+
+func TestESPBuildInviteMalformedPeersDoesNotMutateRoster(t *testing.T) {
+	dataDir := t.TempDir()
+	gid := testESPGroupID(17)
+	founderID, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate founder: %v", err)
+	}
+	targetID, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate target: %v", err)
+	}
+	founder := entmoot.NodeInfo{PilotNodeID: 45491, EntmootPubKey: append([]byte(nil), founderID.PublicKey...)}
+	createTestRoster(t, dataDir, gid, founderID, founder)
+
+	_, err = buildInviteCreateIPCRequest(gid, inviteCreatePayload{
+		Peers: "not-a-node-id",
+		Target: &inviteTargetPayload{
+			PilotNodeID:   45981,
+			EntmootPubKey: append([]byte(nil), targetID.PublicKey...),
+		},
+	})
+	var opErr *esphttp.OperationError
+	if !errors.As(err, &opErr) || opErr.HTTPStatus != http.StatusBadRequest || opErr.Code != "bad_request" {
+		t.Fatalf("buildInviteCreateIPCRequest err = %v, want 400 bad_request", err)
+	}
+	assertRosterMemberAbsent(t, dataDir, gid, 45981)
+}
+
+func assertRosterMemberAbsent(t *testing.T, dataDir string, gid entmoot.GroupID, nodeID entmoot.NodeID) {
+	t.Helper()
+	rlog, err := roster.OpenJSONL(dataDir, gid)
+	if err != nil {
+		t.Fatalf("OpenJSONL: %v", err)
+	}
+	defer rlog.Close()
+	if member, ok := rlog.MemberInfo(nodeID); ok {
+		t.Fatalf("member %d exists after failed invite: %+v", nodeID, member)
+	}
+	if got := len(rlog.Entries()); got != 1 {
+		t.Fatalf("len(entries) = %d, want genesis only", got)
+	}
+}
+
 type rawGroupMetadataStore struct {
 	raw json.RawMessage
 }
@@ -529,6 +672,29 @@ func testUnixSocketPath(t *testing.T) string {
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 	return filepath.Join(dir, "sock")
+}
+
+func createTestRoster(t *testing.T, dataDir string, gid entmoot.GroupID, id *keystore.Identity, founder entmoot.NodeInfo) {
+	t.Helper()
+	rlog, err := roster.OpenJSONL(dataDir, gid)
+	if err != nil {
+		t.Fatalf("OpenJSONL: %v", err)
+	}
+	defer rlog.Close()
+	if err := rlog.Genesis(id, founder, 1_700_000_000_000); err != nil {
+		t.Fatalf("Genesis: %v", err)
+	}
+}
+
+func verifyInviteForTest(t *testing.T, invite entmoot.Invite, pub []byte) bool {
+	t.Helper()
+	signing := invite
+	signing.Signature = nil
+	sigInput, err := canonical.Encode(signing)
+	if err != nil {
+		t.Fatalf("canonical encode invite: %v", err)
+	}
+	return keystore.Verify(pub, sigInput, invite.Signature)
 }
 
 func testDeviceRegistry(t *testing.T) (*esphttp.DeviceRegistry, string) {

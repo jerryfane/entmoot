@@ -209,6 +209,9 @@ const (
 	// Member-profile fanout retry op. Same scheduling/cap semantics as
 	// opTransportAd, but carries retryState.profileAd.
 	opMemberProfileAd retryOp = 7
+	// Roster update fanout retry op. Carries a full ordered roster snapshot
+	// so existing peers can learn founder-signed membership changes.
+	opRosterUpdate retryOp = 8
 )
 
 func (o retryOp) String() string {
@@ -227,6 +230,8 @@ func (o retryOp) String() string {
 		return "transport_ad"
 	case opMemberProfileAd:
 		return "member_profile_ad"
+	case opRosterUpdate:
+		return "roster_update"
 	default:
 		return "unknown"
 	}
@@ -260,6 +265,7 @@ type retryState struct {
 	frame       *wire.Gossip
 	ad          *wire.TransportAd
 	profileAd   *wire.MemberProfileAd
+	roster      []entmoot.RosterEntry
 	seq         uint64
 	firstTry    time.Time
 }
@@ -476,6 +482,11 @@ type Gossiper struct {
 	// may call Start and Publish from concurrent goroutines.
 	lifeMu  sync.Mutex
 	lifeCtx context.Context
+
+	// rosterApplyMu serializes all roster mutations initiated by gossip
+	// request/response paths. roster.RosterLog.Apply intentionally validates
+	// outside its internal write lock, so callers must serialize mutating use.
+	rosterApplyMu sync.Mutex
 
 	// Retry scheduler (patch 6). pending holds (peer, id, op) slots that
 	// failed their initial attempt and are waiting on an exponential-backoff
@@ -1205,6 +1216,8 @@ func (g *Gossiper) handleConn(ctx context.Context, c net.Conn, remote entmoot.No
 		reqCtx, cancel := g.inboundOneShotContext(ctx)
 		defer cancel()
 		g.onRosterReq(reqCtx, c, remote, v)
+	case *wire.RosterResp:
+		g.onRosterResp(ctx, remote, v)
 	case *wire.FetchReq:
 		reqCtx, cancel := g.inboundLargeFrameResponseContext(ctx)
 		defer cancel()
@@ -1271,6 +1284,25 @@ func (g *Gossiper) onRosterReq(ctx context.Context, c net.Conn, remote entmoot.N
 		Entries: g.cfg.Roster.Entries(),
 	}
 	_ = g.writeOneShotResponse(ctx, c, remote, "roster_resp", resp)
+}
+
+func (g *Gossiper) onRosterResp(ctx context.Context, remote entmoot.NodeID, resp *wire.RosterResp) {
+	if resp.GroupID != g.cfg.GroupID {
+		g.logger.Warn("gossip: roster_resp for wrong group",
+			slog.Uint64("remote", uint64(remote)),
+			slog.String("got", resp.GroupID.String()))
+		return
+	}
+	if len(resp.Entries) == 0 {
+		g.logger.Debug("gossip: empty roster_resp",
+			slog.Uint64("remote", uint64(remote)))
+		return
+	}
+	if err := g.applyEntries(resp.Entries); err != nil {
+		g.logger.Debug("gossip: roster_resp apply",
+			slog.Uint64("remote", uint64(remote)),
+			slog.String("err", err.Error()))
+	}
 }
 
 // onFetchReq looks up the requested id in the local store and responds with
@@ -2016,11 +2048,52 @@ func (g *Gossiper) fanoutIHave(ctx context.Context, peers []entmoot.NodeID, fram
 	_ = eg.Wait()
 }
 
+func (g *Gossiper) FanoutRoster(ctx context.Context, peers []entmoot.NodeID, exclude entmoot.NodeID) {
+	entries := g.cfg.Roster.Entries()
+	if len(entries) == 0 {
+		return
+	}
+	frame := &wire.RosterResp{
+		GroupID: g.cfg.GroupID,
+		Entries: entries,
+	}
+	var eg errgroup.Group
+	eg.SetLimit(fanoutMaxConcurrency)
+	seen := make(map[entmoot.NodeID]struct{}, len(peers))
+	for _, p := range peers {
+		if p == 0 || p == g.cfg.LocalNode || p == exclude {
+			continue
+		}
+		if _, ok := seen[p]; ok {
+			continue
+		}
+		seen[p] = struct{}{}
+		p := p
+		eg.Go(func() error {
+			dctx, cancel := context.WithTimeout(ctx, g.fanoutAttemptBudget())
+			defer cancel()
+			if err := g.sendRosterUpdate(dctx, p, frame); err != nil {
+				g.logger.Debug("gossip: roster_update",
+					slog.Uint64("peer", uint64(p)),
+					slog.Int("entries", len(entries)),
+					slog.String("err", err.Error()))
+				g.enqueueRosterRetry(p, entries)
+			}
+			return nil
+		})
+	}
+	_ = eg.Wait()
+}
+
 // sendIHave dials the peer and writes a single IHave frame. Fire-and-
 // forget: Plumtree IHave is an advertisement, not a query, so we do not
 // wait for or interpret any response.
 func (g *Gossiper) sendIHave(ctx context.Context, peer entmoot.NodeID, frame *wire.IHave) error {
 	return g.dialAndWrite(ctx, peer, frame, "ihave")
+}
+
+func (g *Gossiper) sendRosterUpdate(ctx context.Context, peer entmoot.NodeID, frame *wire.RosterResp) error {
+	return g.dialAndWrite(ctx, peer, frame, "roster_update")
 }
 
 // pushGossip opens a connection to peer, writes the frame, and closes. v0 is
@@ -2438,6 +2511,32 @@ func (g *Gossiper) enqueueMemberProfileRetry(peerID entmoot.NodeID, ad *wire.Mem
 	g.pending[key] = state
 }
 
+func (g *Gossiper) enqueueRosterRetry(peerID entmoot.NodeID, entries []entmoot.RosterEntry) {
+	if len(entries) == 0 {
+		return
+	}
+	g.pendMu.Lock()
+	defer g.pendMu.Unlock()
+	key := retryKey{peer: peerID, op: opRosterUpdate}
+	state, ok := g.pending[key]
+	if !ok {
+		state = &retryState{attempts: 1}
+	} else {
+		state.attempts++
+	}
+	state.roster = append([]entmoot.RosterEntry(nil), entries...)
+	if state.attempts >= retryMaxAttempts {
+		g.logger.Warn("gossip: retry budget exhausted",
+			slog.Uint64("peer", uint64(key.peer)),
+			slog.String("op", key.op.String()))
+		delete(g.pending, key)
+		return
+	}
+	state.lastBackoff = g.nextBackoff(state.lastBackoff)
+	state.nextAt = g.clk.Now().Add(state.lastBackoff)
+	g.pending[key] = state
+}
+
 // enqueueRetry inserts (or refreshes) a pending retry slot for a failed
 // push or fetch. First-attempt failures start at attempts=1 with
 // lastBackoff=0, so nextBackoff produces a delay near retryBackoffBase
@@ -2694,6 +2793,12 @@ func (g *Gossiper) executeRetry(ctx context.Context, key retryKey, state *retryS
 			return fmt.Errorf("retry: member_profile_ad missing ad")
 		}
 		return g.sendMemberProfileAd(ctx, key.peer, state.profileAd)
+	case opRosterUpdate:
+		if len(state.roster) == 0 {
+			return fmt.Errorf("retry: roster_update missing entries")
+		}
+		frame := &wire.RosterResp{GroupID: g.cfg.GroupID, Entries: append([]entmoot.RosterEntry(nil), state.roster...)}
+		return g.sendRosterUpdate(ctx, key.peer, frame)
 	default:
 		return fmt.Errorf("retry: unknown op %d", key.op)
 	}

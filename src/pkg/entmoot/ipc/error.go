@@ -30,6 +30,9 @@ const (
 	// failure (e.g. PublishReq with no topics, or a nil GroupID when
 	// more than one group is joined).
 	CodeInvalidArgument ErrorCode = "INVALID_ARGUMENT"
+	// CodeConflict is returned when a request is valid but conflicts with
+	// existing local state, such as reusing a node id with another key.
+	CodeConflict ErrorCode = "CONFLICT"
 )
 
 // ErrorFrame is the JSON body of a MsgError frame.
@@ -60,6 +63,7 @@ type ErrorFrame struct {
 //	CodeNotMember       -> 2
 //	CodeGroupNotFound   -> 3
 //	CodeInvalidArgument -> 5
+//	CodeConflict        -> 5
 //	(unknown)           -> 1
 func ExitCode(c ErrorCode) int {
 	switch c {
@@ -72,6 +76,8 @@ func ExitCode(c ErrorCode) int {
 	case CodeGroupNotFound:
 		return 3
 	case CodeInvalidArgument:
+		return 5
+	case CodeConflict:
 		return 5
 	default:
 		return 1

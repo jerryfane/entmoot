@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/ed25519"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -718,6 +720,8 @@ func (s *ipcServer) handleConn(ctx context.Context, c net.Conn) {
 		s.handleSignedPublish(ctx, c, v)
 	case *ipc.JoinGroupReq:
 		s.handleJoinGroup(ctx, c, v)
+	case *ipc.InviteCreateReq:
+		s.handleInviteCreate(ctx, c, v)
 	case *ipc.InfoReq:
 		s.handleInfo(ctx, c)
 	case *ipc.TailSubscribe:
@@ -937,6 +941,153 @@ func (s *ipcServer) handleJoinGroup(ctx context.Context, c net.Conn, req *ipc.Jo
 		Status:  status,
 		GroupID: sess.groupID,
 		Members: len(sess.roster.Members()),
+	})
+}
+
+func (s *ipcServer) handleInviteCreate(ctx context.Context, c net.Conn, req *ipc.InviteCreateReq) {
+	gid := req.GroupID
+	if gid == (entmoot.GroupID{}) {
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
+			Type:    "error",
+			Code:    ipc.CodeInvalidArgument,
+			Message: "invite_create requires group_id",
+		})
+		return
+	}
+	if req.Target.PilotNodeID == 0 || len(req.Target.EntmootPubKey) != ed25519.PublicKeySize {
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
+			Type:    "error",
+			Code:    ipc.CodeInvalidArgument,
+			GroupID: &gid,
+			Message: "invite_create requires target agent identity",
+		})
+		return
+	}
+	sess, ok := s.runtime.Get(gid)
+	if !ok {
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
+			Type:    "error",
+			Code:    ipc.CodeGroupNotFound,
+			GroupID: &gid,
+			Message: "group not joined",
+		})
+		return
+	}
+	founder, ok := sess.roster.Founder()
+	if !ok {
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
+			Type:    "error",
+			Code:    ipc.CodeGroupNotFound,
+			GroupID: &gid,
+			Message: "group has no founder",
+		})
+		return
+	}
+	if founder.PilotNodeID != s.nodeID || !bytes.Equal(founder.EntmootPubKey, s.identity.PublicKey) {
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
+			Type:    "error",
+			Code:    ipc.CodeNotMember,
+			GroupID: &gid,
+			Message: "invite_create requires the local founder identity",
+		})
+		return
+	}
+	root, err := s.store.MerkleRoot(ctx, gid)
+	if err != nil {
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
+			Type:    "error",
+			Code:    ipc.CodeInternal,
+			GroupID: &gid,
+			Message: "merkle root: " + err.Error(),
+		})
+		return
+	}
+
+	explicitPeers := append([]entmoot.NodeID(nil), req.BootstrapPeers...)
+	var peers []entmoot.NodeID
+	var fanoutPeers []entmoot.NodeID
+	added := false
+	unlock := lockESPInviteRoster(gid)
+	if len(explicitPeers) > 0 {
+		peers = explicitPeers
+	} else {
+		peers = defaultBootstrapPeers(sess.roster, founder.PilotNodeID, 5)
+	}
+	if existing, ok := sess.roster.MemberInfo(req.Target.PilotNodeID); ok {
+		if !bytes.Equal(existing.EntmootPubKey, req.Target.EntmootPubKey) {
+			unlock()
+			_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
+				Type:    "error",
+				Code:    ipc.CodeConflict,
+				GroupID: &gid,
+				Message: "target node already exists with a different Entmoot pubkey",
+			})
+			return
+		}
+	} else if err := applyFounderRosterAdd(s.identity, sess.roster, founder, req.Target); err != nil {
+		unlock()
+		code := ipc.CodeInternal
+		if errors.Is(err, entmoot.ErrRosterReject) {
+			code = ipc.CodeInvalidArgument
+		}
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
+			Type:    "error",
+			Code:    code,
+			GroupID: &gid,
+			Message: err.Error(),
+		})
+		return
+	} else {
+		added = true
+		fanoutPeers = sess.roster.Members()
+	}
+	unlock()
+	if added {
+		sess.gossip.FanoutRoster(ctx, fanoutPeers, req.Target.PilotNodeID)
+	}
+	bootstrap := make([]entmoot.BootstrapPeer, 0, len(peers))
+	for _, p := range peers {
+		if p == req.Target.PilotNodeID {
+			continue
+		}
+		bootstrap = append(bootstrap, entmoot.BootstrapPeer{NodeID: p})
+	}
+	issuedAt := time.Now().UnixMilli()
+	validUntil := issuedAt + (24 * time.Hour).Milliseconds()
+	if req.ValidForMS > 0 {
+		validUntil = issuedAt + req.ValidForMS
+	}
+	if req.ValidUntilMS > 0 {
+		validUntil = req.ValidUntilMS
+	}
+	invite := entmoot.Invite{
+		GroupID:        gid,
+		Founder:        founder,
+		RosterHead:     sess.roster.Head(),
+		MerkleRoot:     root,
+		BootstrapPeers: bootstrap,
+		IssuedAt:       issuedAt,
+		ValidUntil:     validUntil,
+		Issuer: entmoot.NodeInfo{
+			PilotNodeID:   s.nodeID,
+			EntmootPubKey: append([]byte(nil), s.identity.PublicKey...),
+		},
+	}
+	if err := signInvite(s.identity, &invite); err != nil {
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
+			Type:    "error",
+			Code:    ipc.CodeInternal,
+			GroupID: &gid,
+			Message: "sign invite: " + err.Error(),
+		})
+		return
+	}
+	_ = ipc.EncodeAndWrite(c, &ipc.InviteCreateResp{
+		Status:     "created",
+		GroupID:    gid,
+		Invite:     invite,
+		RosterHead: sess.roster.Head(),
+		Members:    len(sess.roster.Members()),
 	})
 }
 

@@ -1,9 +1,11 @@
 package gossip
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"log/slog"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -570,6 +572,144 @@ func TestRosterReqSyncViaJoin(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("member[%d]: got %d want %d", i, got[i], want[i])
 		}
+	}
+}
+
+func TestUnsolicitedRosterRespAppliesUpdate(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, []entmoot.NodeID{10, 20})
+	defer f.closeTransports()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = f.nodes[20].gossip.Start(ctx) }()
+	waitUntil(t, time.Second, "node 20 accept loop started", func() bool {
+		f.nodes[20].gossip.lifeMu.Lock()
+		defer f.nodes[20].gossip.lifeMu.Unlock()
+		return f.nodes[20].gossip.lifeCtx != nil
+	})
+
+	targetID, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate target: %v", err)
+	}
+	target := entmoot.NodeInfo{PilotNodeID: 99, EntmootPubKey: append([]byte(nil), targetID.PublicKey...)}
+	f.founderTS += 100
+	entry := f.buildAddEntry(target, f.founderTS, f.nodes[10].rost.Head())
+	if err := f.nodes[10].rost.Apply(entry); err != nil {
+		t.Fatalf("founder roster apply: %v", err)
+	}
+
+	f.nodes[10].gossip.FanoutRoster(ctx, []entmoot.NodeID{20}, 99)
+	waitUntil(t, time.Second, "node 20 received roster update", func() bool {
+		info, ok := f.nodes[20].rost.MemberInfo(99)
+		return ok && bytes.Equal(info.EntmootPubKey, targetID.PublicKey)
+	})
+}
+
+func TestUnsolicitedRosterRespWrongGroupIgnored(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, []entmoot.NodeID{10, 20})
+	defer f.closeTransports()
+
+	targetID, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate target: %v", err)
+	}
+	target := entmoot.NodeInfo{PilotNodeID: 99, EntmootPubKey: append([]byte(nil), targetID.PublicKey...)}
+	f.founderTS += 100
+	entry := f.buildAddEntry(target, f.founderTS, f.nodes[10].rost.Head())
+	var wrong entmoot.GroupID
+	for i := range wrong {
+		wrong[i] = 0xFE
+	}
+	f.nodes[20].gossip.onRosterResp(context.Background(), 10, &wire.RosterResp{
+		GroupID: wrong,
+		Entries: append(f.nodes[10].rost.Entries(), entry),
+	})
+	if _, ok := f.nodes[20].rost.MemberInfo(99); ok {
+		t.Fatal("wrong-group roster_resp added target member")
+	}
+}
+
+func TestUnsolicitedRosterRespDuplicateIsIdempotent(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, []entmoot.NodeID{10, 20})
+	defer f.closeTransports()
+
+	targetID, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate target: %v", err)
+	}
+	target := entmoot.NodeInfo{PilotNodeID: 99, EntmootPubKey: append([]byte(nil), targetID.PublicKey...)}
+	f.founderTS += 100
+	entry := f.buildAddEntry(target, f.founderTS, f.nodes[10].rost.Head())
+	if err := f.nodes[10].rost.Apply(entry); err != nil {
+		t.Fatalf("founder roster apply: %v", err)
+	}
+	resp := &wire.RosterResp{GroupID: f.groupID, Entries: f.nodes[10].rost.Entries()}
+	f.nodes[20].gossip.onRosterResp(context.Background(), 10, resp)
+	firstLen := len(f.nodes[20].rost.Entries())
+	f.nodes[20].gossip.onRosterResp(context.Background(), 10, resp)
+	if got := len(f.nodes[20].rost.Entries()); got != firstLen {
+		t.Fatalf("len(entries) = %d after duplicate, want %d", got, firstLen)
+	}
+}
+
+func TestUnsolicitedRosterRespConcurrentIsSerialized(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, []entmoot.NodeID{10, 20})
+	defer f.closeTransports()
+
+	targetAID, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate target A: %v", err)
+	}
+	targetA := entmoot.NodeInfo{PilotNodeID: 99, EntmootPubKey: append([]byte(nil), targetAID.PublicKey...)}
+	f.founderTS += 100
+	entryA := f.buildAddEntry(targetA, f.founderTS, f.nodes[10].rost.Head())
+	if err := f.nodes[10].rost.Apply(entryA); err != nil {
+		t.Fatalf("founder roster apply A: %v", err)
+	}
+	entriesA := f.nodes[10].rost.Entries()
+
+	targetBID, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate target B: %v", err)
+	}
+	targetB := entmoot.NodeInfo{PilotNodeID: 100, EntmootPubKey: append([]byte(nil), targetBID.PublicKey...)}
+	f.founderTS += 100
+	entryB := f.buildAddEntry(targetB, f.founderTS, f.nodes[10].rost.Head())
+	if err := f.nodes[10].rost.Apply(entryB); err != nil {
+		t.Fatalf("founder roster apply B: %v", err)
+	}
+	entriesB := f.nodes[10].rost.Entries()
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for _, entries := range [][]entmoot.RosterEntry{entriesA, entriesB} {
+		entries := entries
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			f.nodes[20].gossip.onRosterResp(context.Background(), 10, &wire.RosterResp{
+				GroupID: f.groupID,
+				Entries: entries,
+			})
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if info, ok := f.nodes[20].rost.MemberInfo(99); !ok || !bytes.Equal(info.EntmootPubKey, targetAID.PublicKey) {
+		t.Fatalf("target A member = %+v ok=%v, want target A pubkey", info, ok)
+	}
+	if info, ok := f.nodes[20].rost.MemberInfo(100); !ok || !bytes.Equal(info.EntmootPubKey, targetBID.PublicKey) {
+		t.Fatalf("target B member = %+v ok=%v, want target B pubkey", info, ok)
+	}
+	if got, want := len(f.nodes[20].rost.Entries()), len(entriesB); got != want {
+		t.Fatalf("len(entries) = %d, want %d", got, want)
 	}
 }
 

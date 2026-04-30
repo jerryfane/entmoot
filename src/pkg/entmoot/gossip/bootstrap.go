@@ -221,6 +221,9 @@ func (g *Gossiper) tryRosterSync(ctx context.Context, peer entmoot.NodeID) error
 // genesis and seeded via roster.AcceptGenesis. Entries already at or before
 // the current head are skipped so Join is idempotent under retry.
 func (g *Gossiper) applyEntries(entries []entmoot.RosterEntry) error {
+	g.rosterApplyMu.Lock()
+	defer g.rosterApplyMu.Unlock()
+
 	var zero entmoot.RosterEntryID
 
 	// Empty-log path: seed genesis from the first entry, then fall through

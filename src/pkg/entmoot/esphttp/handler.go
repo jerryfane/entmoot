@@ -1386,11 +1386,13 @@ func (h *Handler) createSignRequest(w http.ResponseWriter, r *http.Request, kind
 		writeError(w, http.StatusForbidden, "device_signature_required", "operation requires a registered device signature")
 		return
 	}
-	if groupID != (entmoot.GroupID{}) && !h.checkDeviceGroup(w, r, groupID) {
-		return
-	}
-	if groupID != (entmoot.GroupID{}) && requiresGroupAdmin(kind) && !h.checkDeviceGroupAdmin(w, r, groupID) {
-		return
+	if groupID != (entmoot.GroupID{}) {
+		if !h.checkDeviceGroup(w, r, groupID) {
+			return
+		}
+		if requiresGroupAdmin(kind) && !h.checkDeviceGroupAdmin(w, r, groupID) {
+			return
+		}
 	}
 	if len(payload) == 0 {
 		payload = []byte("{}")
@@ -1492,7 +1494,7 @@ func (h *Handler) completeExecutableSignRequest(w http.ResponseWriter, r *http.R
 		writeError(w, http.StatusServiceUnavailable, "operation_unavailable", "no operation executor configured")
 		return nil, false
 	}
-	if !h.checkSignRequestAdmin(w, req) {
+	if !h.checkSignRequestDeviceRights(w, req) {
 		return nil, false
 	}
 	if !h.verifyOperationSignature(w, req, signature) {
@@ -1515,8 +1517,8 @@ func (h *Handler) completeExecutableSignRequest(w http.ResponseWriter, r *http.R
 	return append(json.RawMessage(nil), result...), true
 }
 
-func (h *Handler) checkSignRequestAdmin(w http.ResponseWriter, req SignRequest) bool {
-	if !requiresGroupAdmin(req.Kind) || req.GroupID == (entmoot.GroupID{}) {
+func (h *Handler) checkSignRequestDeviceRights(w http.ResponseWriter, req SignRequest) bool {
+	if req.GroupID == (entmoot.GroupID{}) {
 		return true
 	}
 	if req.DeviceID == "" {
@@ -1524,7 +1526,7 @@ func (h *Handler) checkSignRequestAdmin(w http.ResponseWriter, req SignRequest) 
 		return false
 	}
 	if h.devices == nil {
-		writeError(w, http.StatusForbidden, "forbidden", "device admin rights cannot be verified")
+		writeError(w, http.StatusForbidden, "forbidden", "device rights cannot be verified")
 		return false
 	}
 	device, ok := h.devices.lookup(req.DeviceID)
@@ -1532,11 +1534,15 @@ func (h *Handler) checkSignRequestAdmin(w http.ResponseWriter, req SignRequest) 
 		writeError(w, http.StatusForbidden, "forbidden", "sign request device is not registered")
 		return false
 	}
-	if deviceCanAdminGroup(device, req.GroupID) {
-		return true
+	if !deviceAllowsGroup(device, req.GroupID) {
+		writeError(w, http.StatusForbidden, "forbidden", "device is not authorized for group")
+		return false
 	}
-	writeError(w, http.StatusForbidden, "forbidden", "device is not authorized to manage group")
-	return false
+	if requiresGroupAdmin(req.Kind) && !deviceCanAdminGroup(device, req.GroupID) {
+		writeError(w, http.StatusForbidden, "forbidden", "device is not authorized to manage group")
+		return false
+	}
+	return true
 }
 
 func (h *Handler) verifyOperationSignature(w http.ResponseWriter, req SignRequest, signature []byte) bool {
@@ -1625,9 +1631,15 @@ func (h *Handler) signRequestVisible(w http.ResponseWriter, r *http.Request, req
 		writeError(w, http.StatusForbidden, "forbidden", "device is not authorized for sign request")
 		return false
 	}
-	if req.GroupID != (entmoot.GroupID{}) && !deviceAllowsGroup(*auth.device, req.GroupID) {
-		writeError(w, http.StatusForbidden, "forbidden", "device is not authorized for group")
-		return false
+	if req.GroupID != (entmoot.GroupID{}) {
+		if !deviceAllowsGroup(*auth.device, req.GroupID) {
+			writeError(w, http.StatusForbidden, "forbidden", "device is not authorized for group")
+			return false
+		}
+		if requiresGroupAdmin(req.Kind) && !deviceCanAdminGroup(*auth.device, req.GroupID) {
+			writeError(w, http.StatusForbidden, "forbidden", "device is not authorized to manage group")
+			return false
+		}
 	}
 	return true
 }

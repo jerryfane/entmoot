@@ -3,9 +3,11 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -13,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"entmoot/pkg/entmoot"
@@ -33,6 +36,8 @@ type espOperationExecutor struct {
 	deviceGroups  deviceGroupAuthorizer
 }
 
+var espInviteRosterLocks sync.Map
+
 type groupCreatePayload struct {
 	Name        string          `json:"name,omitempty"`
 	Description string          `json:"description,omitempty"`
@@ -40,11 +45,17 @@ type groupCreatePayload struct {
 	Metadata    json.RawMessage `json:"metadata,omitempty"`
 }
 
+type inviteTargetPayload struct {
+	PilotNodeID   entmoot.NodeID `json:"pilot_node_id"`
+	EntmootPubKey []byte         `json:"entmoot_pubkey"`
+}
+
 type inviteCreatePayload struct {
-	ValidFor       string           `json:"valid_for,omitempty"`
-	ValidUntilMS   int64            `json:"valid_until_ms,omitempty"`
-	Peers          string           `json:"peers,omitempty"`
-	BootstrapPeers []entmoot.NodeID `json:"bootstrap_peers,omitempty"`
+	ValidFor       string               `json:"valid_for,omitempty"`
+	ValidUntilMS   int64                `json:"valid_until_ms,omitempty"`
+	Peers          string               `json:"peers,omitempty"`
+	BootstrapPeers []entmoot.NodeID     `json:"bootstrap_peers,omitempty"`
+	Target         *inviteTargetPayload `json:"target,omitempty"`
 }
 
 type inviteAcceptPayload struct {
@@ -94,18 +105,18 @@ func (e espOperationExecutor) createInvite(ctx context.Context, req esphttp.Sign
 	if err := json.Unmarshal(req.Payload, &payload); err != nil {
 		return nil, &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request", Message: "invalid invite_create payload"}
 	}
-	info, err := e.daemonInfo()
+	ipcReq, err := buildInviteCreateIPCRequest(req.GroupID, payload)
 	if err != nil {
-		return nil, joinUnavailableError(err)
+		return nil, err
 	}
-	invite, err := e.buildInvite(ctx, req.GroupID, info.PilotNodeID, payload)
+	resp, err := e.createInviteOverIPC(ctx, ipcReq)
 	if err != nil {
 		return nil, err
 	}
 	return json.Marshal(map[string]any{
 		"status":   "created",
-		"group_id": invite.GroupID,
-		"invite":   invite,
+		"group_id": resp.GroupID,
+		"invite":   resp.Invite,
 	})
 }
 
@@ -285,36 +296,25 @@ func (e espOperationExecutor) updateGroup(ctx context.Context, req esphttp.SignR
 	})
 }
 
-func (e espOperationExecutor) buildInvite(ctx context.Context, gid entmoot.GroupID, issuerNode entmoot.NodeID, payload inviteCreatePayload) (entmoot.Invite, error) {
+func buildInviteCreateIPCRequest(gid entmoot.GroupID, payload inviteCreatePayload) (*ipc.InviteCreateReq, error) {
 	if gid == (entmoot.GroupID{}) {
-		return entmoot.Invite{}, &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request", Message: "invite_create requires group_id"}
+		return nil, &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request", Message: "invite_create requires group_id"}
 	}
-	rlog, err := roster.OpenJSONL(e.dataDir, gid)
+	target, err := validateInviteTarget(payload.Target)
 	if err != nil {
-		return entmoot.Invite{}, err
-	}
-	defer rlog.Close()
-	founder, ok := rlog.Founder()
-	if !ok {
-		return entmoot.Invite{}, &esphttp.OperationError{HTTPStatus: http.StatusNotFound, Code: "group_not_found", Message: "group has no founder"}
-	}
-	st, err := store.OpenSQLite(e.dataDir)
-	if err != nil {
-		return entmoot.Invite{}, err
-	}
-	defer st.Close()
-	root, err := st.MerkleRoot(ctx, gid)
-	if err != nil {
-		return entmoot.Invite{}, err
+		return nil, err
 	}
 	ttl := 24 * time.Hour
 	if payload.ValidFor != "" {
 		parsed, err := parseDurationDays(payload.ValidFor)
 		if err != nil {
-			return entmoot.Invite{}, &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request", Message: "invalid valid_for"}
+			return nil, &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request", Message: "invalid valid_for"}
 		}
 		if parsed <= 0 {
-			return entmoot.Invite{}, &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request", Message: "valid_for must be positive"}
+			return nil, &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request", Message: "valid_for must be positive"}
+		}
+		if parsed < time.Millisecond {
+			return nil, &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request", Message: "valid_for must be at least 1ms"}
 		}
 		ttl = parsed
 	}
@@ -322,46 +322,105 @@ func (e espOperationExecutor) buildInvite(ctx context.Context, gid entmoot.Group
 	if len(peers) == 0 && payload.Peers != "" {
 		parsed, err := parsePeerList(payload.Peers)
 		if err != nil {
-			return entmoot.Invite{}, &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request", Message: err.Error()}
+			return nil, &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request", Message: err.Error()}
 		}
 		peers = parsed
 	}
-	if len(peers) == 0 {
-		peers = defaultBootstrapPeers(rlog, founder.PilotNodeID, 5)
-	}
-	bootstrap := make([]entmoot.BootstrapPeer, 0, len(peers))
-	for _, p := range peers {
-		if p == issuerNode {
-			continue
-		}
-		bootstrap = append(bootstrap, entmoot.BootstrapPeer{NodeID: p})
-	}
-	issuedAt := time.Now().UnixMilli()
-	validUntil := issuedAt + ttl.Milliseconds()
-	if payload.ValidUntilMS > 0 {
-		validUntil = payload.ValidUntilMS
-	}
-	invite := entmoot.Invite{
+	return &ipc.InviteCreateReq{
 		GroupID:        gid,
-		Founder:        founder,
-		RosterHead:     rlog.Head(),
-		MerkleRoot:     root,
-		BootstrapPeers: bootstrap,
-		IssuedAt:       issuedAt,
-		ValidUntil:     validUntil,
-		Issuer: entmoot.NodeInfo{
-			PilotNodeID:   issuerNode,
-			EntmootPubKey: append([]byte(nil), e.identity.PublicKey...),
-		},
+		Target:         target,
+		ValidForMS:     ttl.Milliseconds(),
+		ValidUntilMS:   payload.ValidUntilMS,
+		BootstrapPeers: peers,
+	}, nil
+}
+
+func validateInviteTarget(target *inviteTargetPayload) (entmoot.NodeInfo, error) {
+	if target == nil {
+		return entmoot.NodeInfo{}, &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "target_required", Message: "invite_create requires target agent identity"}
 	}
-	if err := signInvite(e.identity, &invite); err != nil {
-		return entmoot.Invite{}, err
+	if target.PilotNodeID == 0 {
+		return entmoot.NodeInfo{}, &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request", Message: "target pilot_node_id is required"}
 	}
-	return invite, nil
+	if len(target.EntmootPubKey) != ed25519.PublicKeySize {
+		return entmoot.NodeInfo{}, &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request", Message: "target entmoot_pubkey must be 32 bytes"}
+	}
+	return entmoot.NodeInfo{
+		PilotNodeID:   target.PilotNodeID,
+		EntmootPubKey: append([]byte(nil), target.EntmootPubKey...),
+	}, nil
+}
+
+func lockESPInviteRoster(gid entmoot.GroupID) func() {
+	lockAny, _ := espInviteRosterLocks.LoadOrStore(gid.String(), &sync.Mutex{})
+	mu := lockAny.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
+}
+
+func applyFounderRosterAdd(identity *keystore.Identity, rlog *roster.RosterLog, founder entmoot.NodeInfo, target entmoot.NodeInfo) error {
+	now := time.Now().UnixMilli()
+	entries := rlog.Entries()
+	if len(entries) > 0 && now <= entries[len(entries)-1].Timestamp {
+		now = entries[len(entries)-1].Timestamp + 1
+	}
+	entry := entmoot.RosterEntry{
+		Op:        "add",
+		Subject:   target,
+		Actor:     founder.PilotNodeID,
+		Timestamp: now,
+		Parents:   []entmoot.RosterEntryID{rlog.Head()},
+	}
+	sigInput, err := canonical.Encode(entry)
+	if err != nil {
+		return err
+	}
+	entry.Signature = identity.Sign(sigInput)
+	entry.ID = canonical.RosterEntryID(entry)
+	if err := rlog.Apply(entry); err != nil {
+		if errors.Is(err, entmoot.ErrRosterReject) {
+			return &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "roster_rejected", Message: err.Error()}
+		}
+		return err
+	}
+	return nil
 }
 
 func (e espOperationExecutor) daemonInfo() (*ipc.InfoResp, error) {
 	return infoOverIPC(e.socketPath)
+}
+
+func (e espOperationExecutor) createInviteOverIPC(ctx context.Context, req *ipc.InviteCreateReq) (*ipc.InviteCreateResp, error) {
+	timeout := e.timeout
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	dialCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer cancel()
+	var dialer net.Dialer
+	conn, err := dialer.DialContext(dialCtx, "unix", e.socketPath)
+	if err != nil {
+		return nil, joinUnavailableError(err)
+	}
+	defer conn.Close()
+	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+		return nil, err
+	}
+	if err := ipc.EncodeAndWrite(conn, req); err != nil {
+		return nil, err
+	}
+	_, payload, err := ipc.ReadAndDecode(conn)
+	if err != nil {
+		return nil, err
+	}
+	switch v := payload.(type) {
+	case *ipc.InviteCreateResp:
+		return v, nil
+	case *ipc.ErrorFrame:
+		return nil, operationIPCError(v)
+	default:
+		return nil, fmt.Errorf("unexpected invite create response %T", payload)
+	}
 }
 
 func (e espOperationExecutor) joinGroup(ctx context.Context, invite entmoot.Invite) (*ipc.JoinGroupResp, error) {
@@ -546,6 +605,9 @@ func operationIPCError(frame *ipc.ErrorFrame) error {
 	case ipc.CodeInvalidArgument:
 		status = http.StatusBadRequest
 		code = "bad_request"
+	case ipc.CodeConflict:
+		status = http.StatusConflict
+		code = "member_identity_conflict"
 	case ipc.CodeNotMember:
 		status = http.StatusForbidden
 		code = "not_member"

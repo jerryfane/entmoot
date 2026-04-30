@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -99,6 +101,174 @@ func TestGroupRuntimeAddLocalGroupStartsPersistedGroup(t *testing.T) {
 	}
 	if rt.Count() != 1 {
 		t.Fatalf("Count = %d, want 1", rt.Count())
+	}
+}
+
+func TestIPCInviteCreateAppliesTargetToLiveRoster(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	dataDir := t.TempDir()
+	identity, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate identity: %v", err)
+	}
+	st, err := store.OpenSQLite(dataDir)
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	defer st.Close()
+	base := newRuntimeFakeTransport()
+	rt, err := newGroupRuntime(groupRuntimeConfig{
+		NodeID:    45491,
+		Identity:  identity,
+		DataDir:   dataDir,
+		Store:     st,
+		Notify:    newNotifyingStore(st, events.NewBus()),
+		Transport: base,
+	})
+	if err != nil {
+		t.Fatalf("newGroupRuntime: %v", err)
+	}
+	defer rt.Close()
+
+	gid := testRuntimeGroupID(0xAC)
+	invite := selfInvite(t, dataDir, st, identity, 45491, gid)
+	sess, created, err := rt.AddInvite(ctx, invite)
+	if err != nil || !created {
+		t.Fatalf("AddInvite created/err = %v/%v, want true/nil", created, err)
+	}
+	existingID, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate existing: %v", err)
+	}
+	existing := entmoot.NodeInfo{PilotNodeID: 45460, EntmootPubKey: append([]byte(nil), existingID.PublicKey...)}
+	founder, ok := sess.roster.Founder()
+	if !ok {
+		t.Fatal("session roster has no founder")
+	}
+	if err := applyFounderRosterAdd(identity, sess.roster, founder, existing); err != nil {
+		t.Fatalf("add existing member: %v", err)
+	}
+	targetID, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate target: %v", err)
+	}
+	peerSide, daemonSide := net.Pipe()
+	base.dialConn = daemonSide
+	rosterFrameCh := make(chan *wire.RosterResp, 1)
+	rosterErrCh := make(chan error, 1)
+	go func() {
+		defer peerSide.Close()
+		_, payload, err := wire.ReadAndDecode(peerSide)
+		if err != nil {
+			rosterErrCh <- err
+			return
+		}
+		resp, ok := payload.(*wire.RosterResp)
+		if !ok {
+			rosterErrCh <- fmt.Errorf("payload = %T, want *wire.RosterResp", payload)
+			return
+		}
+		rosterFrameCh <- resp
+	}()
+	server := &ipcServer{runtime: rt, nodeID: 45491, identity: identity, store: st}
+	req := &ipc.InviteCreateReq{
+		GroupID:    gid,
+		Target:     entmoot.NodeInfo{PilotNodeID: 45981, EntmootPubKey: append([]byte(nil), targetID.PublicKey...)},
+		ValidForMS: int64(time.Hour / time.Millisecond),
+	}
+	payload := callInviteCreateHandler(t, ctx, server, req)
+	resp, ok := payload.(*ipc.InviteCreateResp)
+	if !ok {
+		t.Fatalf("payload = %T, want *InviteCreateResp", payload)
+	}
+	if resp.Invite.RosterHead != sess.roster.Head() || resp.RosterHead != sess.roster.Head() {
+		t.Fatalf("invite/response head = %s/%s, live head %s", resp.Invite.RosterHead, resp.RosterHead, sess.roster.Head())
+	}
+	member, ok := sess.roster.MemberInfo(45981)
+	if !ok || !bytes.Equal(member.EntmootPubKey, targetID.PublicKey) {
+		t.Fatalf("target member = %+v ok=%v, want target pubkey", member, ok)
+	}
+	if !verifyInviteForTest(t, resp.Invite, identity.PublicKey) {
+		t.Fatal("invite signature did not verify")
+	}
+	select {
+	case got := <-rosterFrameCh:
+		if got.GroupID != gid || len(got.Entries) != len(sess.roster.Entries()) {
+			t.Fatalf("roster fanout = group %s entries %d, want group %s entries %d", got.GroupID, len(got.Entries), gid, len(sess.roster.Entries()))
+		}
+	case err := <-rosterErrCh:
+		t.Fatalf("read roster fanout: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for roster fanout")
+	}
+}
+
+func TestIPCInviteCreateRejectsTargetIdentityConflictWithoutMutation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	dataDir := t.TempDir()
+	identity, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate identity: %v", err)
+	}
+	st, err := store.OpenSQLite(dataDir)
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	defer st.Close()
+	rt, err := newGroupRuntime(groupRuntimeConfig{
+		NodeID:    45491,
+		Identity:  identity,
+		DataDir:   dataDir,
+		Store:     st,
+		Notify:    newNotifyingStore(st, events.NewBus()),
+		Transport: newRuntimeFakeTransport(),
+	})
+	if err != nil {
+		t.Fatalf("newGroupRuntime: %v", err)
+	}
+	defer rt.Close()
+
+	gid := testRuntimeGroupID(0xAD)
+	invite := selfInvite(t, dataDir, st, identity, 45491, gid)
+	sess, created, err := rt.AddInvite(ctx, invite)
+	if err != nil || !created {
+		t.Fatalf("AddInvite created/err = %v/%v, want true/nil", created, err)
+	}
+	targetID, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate target: %v", err)
+	}
+	otherTargetID, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate other target: %v", err)
+	}
+	server := &ipcServer{runtime: rt, nodeID: 45491, identity: identity, store: st}
+	first := &ipc.InviteCreateReq{
+		GroupID: gid,
+		Target:  entmoot.NodeInfo{PilotNodeID: 45981, EntmootPubKey: append([]byte(nil), targetID.PublicKey...)},
+	}
+	if payload := callInviteCreateHandler(t, ctx, server, first); payload == nil {
+		t.Fatal("first invite create returned nil")
+	}
+	entries := len(sess.roster.Entries())
+	conflict := &ipc.InviteCreateReq{
+		GroupID: gid,
+		Target:  entmoot.NodeInfo{PilotNodeID: 45981, EntmootPubKey: append([]byte(nil), otherTargetID.PublicKey...)},
+	}
+	payload := callInviteCreateHandler(t, ctx, server, conflict)
+	frame, ok := payload.(*ipc.ErrorFrame)
+	if !ok {
+		t.Fatalf("payload = %T, want *ErrorFrame", payload)
+	}
+	if frame.Code != ipc.CodeConflict {
+		t.Fatalf("error code = %s, want %s", frame.Code, ipc.CodeConflict)
+	}
+	if got := len(sess.roster.Entries()); got != entries {
+		t.Fatalf("len(entries) = %d, want unchanged %d", got, entries)
 	}
 }
 
@@ -732,6 +902,24 @@ func expectNoTunnelUp(t *testing.T, ch <-chan entmoot.NodeID, name string) {
 		t.Fatalf("%s received unexpected tunnel-up from %d", name, got)
 	case <-time.After(100 * time.Millisecond):
 	}
+}
+
+func callInviteCreateHandler(t *testing.T, ctx context.Context, server *ipcServer, req *ipc.InviteCreateReq) any {
+	t.Helper()
+	client, daemon := net.Pipe()
+	defer client.Close()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer daemon.Close()
+		server.handleInviteCreate(ctx, daemon, req)
+	}()
+	_, payload, err := ipc.ReadAndDecode(client)
+	if err != nil {
+		t.Fatalf("ReadAndDecode invite create response: %v", err)
+	}
+	<-done
+	return payload
 }
 
 func selfInvite(t *testing.T, dataDir string, st *store.SQLite, identity *keystore.Identity, nodeID entmoot.NodeID, gid entmoot.GroupID) entmoot.Invite {

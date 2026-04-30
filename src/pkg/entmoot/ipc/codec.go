@@ -12,8 +12,8 @@ import (
 //
 // Supported payloads (pointers only): *PublishReq, *PublishResp,
 // *SignedPublishReq, *SignedPublishResp, *JoinGroupReq, *JoinGroupResp,
-// *TailSubscribe, *TailEvent, *InfoReq, *InfoResp, *ErrorFrame. Anything else
-// returns ErrUnknownMessage.
+// *InviteCreateReq, *InviteCreateResp, *TailSubscribe, *TailEvent, *InfoReq,
+// *InfoResp, *ErrorFrame. Anything else returns ErrUnknownMessage.
 //
 // As a convenience, Encode fills in ErrorFrame.Type = "error" when the
 // caller left it empty. The wire shape is defined to always carry that
@@ -33,6 +33,10 @@ func Encode(v any) (MsgType, []byte, error) {
 		t = MsgJoinGroupReq
 	case *JoinGroupResp:
 		t = MsgJoinGroupResp
+	case *InviteCreateReq:
+		t = MsgInviteCreateReq
+	case *InviteCreateResp:
+		t = MsgInviteCreateResp
 	case *TailSubscribe:
 		t = MsgTailSubscribe
 	case *TailEvent:
@@ -82,6 +86,10 @@ func Decode(t MsgType, body []byte) (any, error) {
 		return decodeAs[JoinGroupReq](t, body)
 	case MsgJoinGroupResp:
 		return decodeAs[JoinGroupResp](t, body)
+	case MsgInviteCreateReq:
+		return decodeAs[InviteCreateReq](t, body)
+	case MsgInviteCreateResp:
+		return decodeAs[InviteCreateResp](t, body)
 	case MsgTailSubscribe:
 		return decodeAs[TailSubscribe](t, body)
 	case MsgTailEvent:
