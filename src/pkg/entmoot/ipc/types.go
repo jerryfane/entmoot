@@ -7,7 +7,7 @@ import (
 )
 
 // MsgType is the 1-byte message type tag in an ipc frame's framing header.
-// The ipc namespace uses 0x10..0x1F so frames are visually distinct from
+// The ipc namespace starts at 0x10 so frames are visually distinct from
 // the peer-wire namespace (0x01..0x08) at the byte level — that aids log
 // inspection and hex-dump debugging when both protocols are in play.
 // Zero (0x00) is reserved as "unknown" so a freshly-allocated MsgType
@@ -51,8 +51,18 @@ const (
 	// MsgInviteCreateResp returns the signed invite created from live daemon
 	// state, including the roster head the daemon can serve.
 	MsgInviteCreateResp MsgType = 0x1B
-	// MsgError carries a structured error frame. 0x1F is chosen as the
-	// last slot in the 0x10..0x1F namespace so it's easy to spot.
+	// MsgMemberRemoveReq asks the running daemon to append a signed roster
+	// remove entry for an active group.
+	MsgMemberRemoveReq MsgType = 0x1C
+	// MsgMemberRemoveResp acknowledges the updated live roster head.
+	MsgMemberRemoveResp MsgType = 0x1D
+	// MsgInviteAuthorityCheckReq asks whether this daemon can mint invites
+	// for an active group without mutating roster state.
+	MsgInviteAuthorityCheckReq MsgType = 0x1E
+	// MsgInviteAuthorityCheckResp acknowledges local invite authority.
+	MsgInviteAuthorityCheckResp MsgType = 0x20
+	// MsgError carries a structured error frame. 0x1F is kept stable so
+	// existing logs and clients can continue spotting error frames.
 	MsgError MsgType = 0x1F
 )
 
@@ -84,6 +94,14 @@ func (t MsgType) String() string {
 		return "invite_create_req"
 	case MsgInviteCreateResp:
 		return "invite_create_resp"
+	case MsgMemberRemoveReq:
+		return "member_remove_req"
+	case MsgMemberRemoveResp:
+		return "member_remove_resp"
+	case MsgInviteAuthorityCheckReq:
+		return "invite_authority_check_req"
+	case MsgInviteAuthorityCheckResp:
+		return "invite_authority_check_resp"
 	case MsgError:
 		return "error"
 	default:
@@ -155,11 +173,16 @@ type JoinGroupResp struct {
 // The daemon owns the authoritative in-memory roster, so it must apply target
 // additions before returning an invite that advertises the resulting head.
 type InviteCreateReq struct {
-	GroupID        entmoot.GroupID  `json:"group_id"`
-	Target         entmoot.NodeInfo `json:"target"`
-	ValidForMS     int64            `json:"valid_for_ms,omitempty"`
-	ValidUntilMS   int64            `json:"valid_until_ms,omitempty"`
-	BootstrapPeers []entmoot.NodeID `json:"bootstrap_peers,omitempty"`
+	GroupID              entmoot.GroupID  `json:"group_id"`
+	Target               entmoot.NodeInfo `json:"target"`
+	TargetPilotPubKey    []byte           `json:"target_pilot_pubkey,omitempty"`
+	RequirePilotIdentity bool             `json:"require_pilot_identity,omitempty"`
+	RequirePilotProof    bool             `json:"require_pilot_proof,omitempty"`
+	TargetPilotProof     []byte           `json:"target_pilot_proof,omitempty"`
+	TargetPilotSignature []byte           `json:"target_pilot_signature,omitempty"`
+	ValidForMS           int64            `json:"valid_for_ms,omitempty"`
+	ValidUntilMS         int64            `json:"valid_until_ms,omitempty"`
+	BootstrapPeers       []entmoot.NodeID `json:"bootstrap_peers,omitempty"`
 }
 
 // InviteCreateResp reports the invite created from live daemon state.
@@ -167,6 +190,29 @@ type InviteCreateResp struct {
 	Status     string                `json:"status"`
 	GroupID    entmoot.GroupID       `json:"group_id"`
 	Invite     entmoot.Invite        `json:"invite"`
+	RosterHead entmoot.RosterEntryID `json:"roster_head"`
+	Members    int                   `json:"members"`
+}
+
+type InviteAuthorityCheckReq struct {
+	GroupID entmoot.GroupID `json:"group_id"`
+}
+
+type InviteAuthorityCheckResp struct {
+	Status     string                `json:"status"`
+	GroupID    entmoot.GroupID       `json:"group_id"`
+	RosterHead entmoot.RosterEntryID `json:"roster_head"`
+	Members    int                   `json:"members"`
+}
+
+type MemberRemoveReq struct {
+	GroupID entmoot.GroupID  `json:"group_id"`
+	Target  entmoot.NodeInfo `json:"target"`
+}
+
+type MemberRemoveResp struct {
+	Status     string                `json:"status"`
+	GroupID    entmoot.GroupID       `json:"group_id"`
 	RosterHead entmoot.RosterEntryID `json:"roster_head"`
 	Members    int                   `json:"members"`
 }

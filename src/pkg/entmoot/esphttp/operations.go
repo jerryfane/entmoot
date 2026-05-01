@@ -12,6 +12,14 @@ type OperationExecutor interface {
 	ExecuteSignRequest(context.Context, SignRequest, []byte) (json.RawMessage, error)
 }
 
+type OpenInviteRedeemer interface {
+	RedeemOpenInvite(context.Context, string, json.RawMessage) (json.RawMessage, error)
+}
+
+type OpenInviteChallenger interface {
+	CreateOpenInviteChallenge(context.Context, string, json.RawMessage) (json.RawMessage, error)
+}
+
 // OperationError maps executor failures to stable ESP HTTP errors.
 type OperationError struct {
 	HTTPStatus int
@@ -44,7 +52,9 @@ func executableOperationKind(kind string) bool {
 	case signRequestKindGroupCreate,
 		signRequestKindGroupUpdate,
 		signRequestKindInviteCreate,
-		signRequestKindInviteAccept:
+		signRequestKindInviteAccept,
+		signRequestKindOpenInviteCreate,
+		signRequestKindMemberRemove:
 		return true
 	default:
 		return false
@@ -54,7 +64,9 @@ func executableOperationKind(kind string) bool {
 func requiresGroupAdmin(kind string) bool {
 	switch kind {
 	case signRequestKindGroupUpdate,
-		signRequestKindInviteCreate:
+		signRequestKindInviteCreate,
+		signRequestKindOpenInviteCreate,
+		signRequestKindMemberRemove:
 		return true
 	default:
 		return false

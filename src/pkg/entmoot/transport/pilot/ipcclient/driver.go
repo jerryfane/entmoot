@@ -1121,6 +1121,47 @@ func (d *Driver) TrustedPeers(ctx context.Context) (map[string]interface{}, erro
 	return out, nil
 }
 
+// LookupNode asks the Pilot daemon to resolve a node_id -> public_key binding.
+// New daemons answer from trusted peer state when available and otherwise fall
+// back to the registry lookup projection.
+func (d *Driver) LookupNode(ctx context.Context, nodeID uint32) (NodeIdentity, error) {
+	frame := make([]byte, 5)
+	frame[0] = byte(opLookupNode)
+	binary.BigEndian.PutUint32(frame[1:5], nodeID)
+	resp, err := d.sendAndWait(ctx, frame, opLookupNodeOK)
+	if err != nil {
+		return NodeIdentity{}, fmt.Errorf("ipcclient: lookup_node: %w", err)
+	}
+	if len(resp) == 0 {
+		return NodeIdentity{}, nil
+	}
+	var out NodeIdentity
+	if err := json.Unmarshal(resp, &out); err != nil {
+		return NodeIdentity{}, fmt.Errorf("ipcclient: lookup_node: decode: %w", err)
+	}
+	return out, nil
+}
+
+// SignChallenge asks the local Pilot daemon to sign application bytes with
+// its node identity. The daemon domain-separates the payload before signing.
+func (d *Driver) SignChallenge(ctx context.Context, payload []byte) (ChallengeSignature, error) {
+	if len(payload) == 0 {
+		return ChallengeSignature{}, fmt.Errorf("ipcclient: sign_challenge: payload is required")
+	}
+	frame := make([]byte, 1+len(payload))
+	frame[0] = byte(opSignChallenge)
+	copy(frame[1:], payload)
+	resp, err := d.sendAndWait(ctx, frame, opSignChallengeOK)
+	if err != nil {
+		return ChallengeSignature{}, fmt.Errorf("ipcclient: sign_challenge: %w", err)
+	}
+	var out ChallengeSignature
+	if err := json.Unmarshal(resp, &out); err != nil {
+		return ChallengeSignature{}, fmt.Errorf("ipcclient: sign_challenge: decode: %w", err)
+	}
+	return out, nil
+}
+
 // SetPeerEndpoints installs externally-sourced transport endpoints for
 // a peer into the daemon's peer-endpoint map. Called when the gossip
 // layer accepts a transport-advertisement from another node.

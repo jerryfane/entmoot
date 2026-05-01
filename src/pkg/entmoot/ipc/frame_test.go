@@ -183,19 +183,23 @@ func TestPartialWritesViaPipe(t *testing.T) {
 // constant and the unknown-fallback.
 func TestMsgTypeString(t *testing.T) {
 	cases := map[MsgType]string{
-		MsgPublishReq:        "publish_req",
-		MsgPublishResp:       "publish_resp",
-		MsgSignedPublishReq:  "signed_publish_req",
-		MsgSignedPublishResp: "signed_publish_resp",
-		MsgJoinGroupReq:      "join_group_req",
-		MsgJoinGroupResp:     "join_group_resp",
-		MsgInviteCreateReq:   "invite_create_req",
-		MsgInviteCreateResp:  "invite_create_resp",
-		MsgTailSubscribe:     "tail_subscribe",
-		MsgTailEvent:         "tail_event",
-		MsgInfoReq:           "info_req",
-		MsgInfoResp:          "info_resp",
-		MsgError:             "error",
+		MsgPublishReq:               "publish_req",
+		MsgPublishResp:              "publish_resp",
+		MsgSignedPublishReq:         "signed_publish_req",
+		MsgSignedPublishResp:        "signed_publish_resp",
+		MsgJoinGroupReq:             "join_group_req",
+		MsgJoinGroupResp:            "join_group_resp",
+		MsgInviteCreateReq:          "invite_create_req",
+		MsgInviteCreateResp:         "invite_create_resp",
+		MsgMemberRemoveReq:          "member_remove_req",
+		MsgMemberRemoveResp:         "member_remove_resp",
+		MsgInviteAuthorityCheckReq:  "invite_authority_check_req",
+		MsgInviteAuthorityCheckResp: "invite_authority_check_resp",
+		MsgTailSubscribe:            "tail_subscribe",
+		MsgTailEvent:                "tail_event",
+		MsgInfoReq:                  "info_req",
+		MsgInfoResp:                 "info_resp",
+		MsgError:                    "error",
 	}
 	for tt, want := range cases {
 		if got := tt.String(); got != want {
@@ -208,9 +212,8 @@ func TestMsgTypeString(t *testing.T) {
 	if got := MsgType(0xFF).String(); got != "unknown(0xff)" {
 		t.Errorf("0xFF String() = %q", got)
 	}
-	// A byte inside the ipc namespace (0x10..0x1F) that is not
-	// registered must also be reported as unknown.
-	if got := MsgType(0x1C).String(); got != "unknown(0x1c)" {
-		t.Errorf("0x1C String() = %q", got)
+	// An unused byte in the ipc namespace must also be reported as unknown.
+	if got := MsgType(0x21).String(); got != "unknown(0x21)" {
+		t.Errorf("0x21 String() = %q", got)
 	}
 }

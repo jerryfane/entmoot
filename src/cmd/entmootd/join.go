@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -110,6 +111,25 @@ func localPilotHostname(socketPath, command string) (string, bool) {
 	return hostname, ok
 }
 
+func pilotDriverHasCapability(ctx context.Context, d *ipcclient.Driver, want string) bool {
+	if d == nil {
+		return false
+	}
+	infoCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	info, err := d.InfoStruct(infoCtx)
+	if err != nil {
+		slog.Debug("pilot capability lookup failed", slog.String("capability", want), slog.String("err", err.Error()))
+		return false
+	}
+	for _, cap := range info.Capabilities {
+		if cap == want {
+			return true
+		}
+	}
+	return false
+}
+
 // cmdJoin is the blocking top-level command. It reads or fetches an
 // invite, applies it, opens the control socket, and serves IPC traffic
 // until the process is signalled.
@@ -195,6 +215,10 @@ type groupDaemonOptions struct {
 	advertiseEndpoints endpointFlag
 	loadGroups         func(context.Context, *groupRuntime) (int, error)
 }
+
+const pilotCapabilityLookupNode = "lookup_node"
+
+var errPilotLookupUnavailable = errors.New("pilot identity lookup unavailable")
 
 func runGroupDaemon(gf *globalFlags, opts groupDaemonOptions) int {
 	if opts.command == "" {
@@ -308,6 +332,10 @@ func runGroupDaemon(gf *globalFlags, opts groupDaemonOptions) int {
 	}
 	// Background polling runs for the lifetime of the daemon.
 	go turnPoller.Run(rootCtx)
+	pilotLookupNodeSupported := pilotDriverHasCapability(rootCtx, tr.Driver(), pilotCapabilityLookupNode)
+	if !pilotLookupNodeSupported {
+		slog.Warn(opts.command + ": pilot-daemon does not advertise lookup_node; ESP invite creation and open-invite redemption are unavailable until Pilot is upgraded")
+	}
 
 	runtime, err := newGroupRuntime(groupRuntimeConfig{
 		NodeID:           nodeID,
@@ -381,13 +409,15 @@ func runGroupDaemon(gf *globalFlags, opts groupDaemonOptions) int {
 
 	// IPC server state: shared across handlers via closure.
 	srv := &ipcServer{
-		nodeID:     nodeID,
-		identity:   s.identity,
-		dataDir:    s.dataDir,
-		listenPort: uint16(gf.listenPort),
-		runtime:    runtime,
-		store:      rawStore,
-		notify:     notifyStore,
+		nodeID:                   nodeID,
+		identity:                 s.identity,
+		dataDir:                  s.dataDir,
+		listenPort:               uint16(gf.listenPort),
+		runtime:                  runtime,
+		store:                    rawStore,
+		notify:                   notifyStore,
+		pilot:                    tr.Driver(),
+		pilotLookupNodeSupported: pilotLookupNodeSupported,
 	}
 
 	wg.Add(1)
@@ -656,13 +686,15 @@ func (n *notifyingStore) Close() error { return n.inner.Close() }
 // read-only after cmdJoin finishes setup so handlers may access them
 // without locking.
 type ipcServer struct {
-	nodeID     entmoot.NodeID
-	identity   *keystore.Identity
-	dataDir    string
-	listenPort uint16
-	runtime    *groupRuntime
-	store      *store.SQLite
-	notify     *notifyingStore
+	nodeID                   entmoot.NodeID
+	identity                 *keystore.Identity
+	dataDir                  string
+	listenPort               uint16
+	runtime                  *groupRuntime
+	store                    *store.SQLite
+	notify                   *notifyingStore
+	pilot                    *ipcclient.Driver
+	pilotLookupNodeSupported bool
 }
 
 // acceptLoop accepts IPC connections until the listener is closed.
@@ -722,6 +754,10 @@ func (s *ipcServer) handleConn(ctx context.Context, c net.Conn) {
 		s.handleJoinGroup(ctx, c, v)
 	case *ipc.InviteCreateReq:
 		s.handleInviteCreate(ctx, c, v)
+	case *ipc.InviteAuthorityCheckReq:
+		s.handleInviteAuthorityCheck(ctx, c, v)
+	case *ipc.MemberRemoveReq:
+		s.handleMemberRemove(ctx, c, v)
 	case *ipc.InfoReq:
 		s.handleInfo(ctx, c)
 	case *ipc.TailSubscribe:
@@ -963,6 +999,23 @@ func (s *ipcServer) handleInviteCreate(ctx context.Context, c net.Conn, req *ipc
 		})
 		return
 	}
+	if inviteCreateNeedsPilotLookup(req) && !s.pilotLookupNodeSupported {
+		_ = ipc.EncodeAndWrite(c, s.pilotLookupUnavailableError(gid))
+		return
+	}
+	if err := s.verifyTargetPilotIdentity(ctx, req); err != nil {
+		code := ipc.CodeInvalidArgument
+		if errors.Is(err, errPilotLookupUnavailable) {
+			code = ipc.CodeUnavailable
+		}
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
+			Type:    "error",
+			Code:    code,
+			GroupID: &gid,
+			Message: err.Error(),
+		})
+		return
+	}
 	sess, ok := s.runtime.Get(gid)
 	if !ok {
 		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
@@ -1089,6 +1142,181 @@ func (s *ipcServer) handleInviteCreate(ctx context.Context, c net.Conn, req *ipc
 		RosterHead: sess.roster.Head(),
 		Members:    len(sess.roster.Members()),
 	})
+}
+
+func (s *ipcServer) handleInviteAuthorityCheck(ctx context.Context, c net.Conn, req *ipc.InviteAuthorityCheckReq) {
+	gid := req.GroupID
+	if gid == (entmoot.GroupID{}) {
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
+			Type:    "error",
+			Code:    ipc.CodeInvalidArgument,
+			Message: "invite_authority_check requires group_id",
+		})
+		return
+	}
+	sess, ok := s.runtime.Get(gid)
+	if !ok {
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
+			Type:    "error",
+			Code:    ipc.CodeGroupNotFound,
+			GroupID: &gid,
+			Message: "group not joined",
+		})
+		return
+	}
+	founder, ok := sess.roster.Founder()
+	if !ok {
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
+			Type:    "error",
+			Code:    ipc.CodeGroupNotFound,
+			GroupID: &gid,
+			Message: "group has no founder",
+		})
+		return
+	}
+	if founder.PilotNodeID != s.nodeID || !bytes.Equal(founder.EntmootPubKey, s.identity.PublicKey) {
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
+			Type:    "error",
+			Code:    ipc.CodeNotMember,
+			GroupID: &gid,
+			Message: "invite_create requires the local founder identity",
+		})
+		return
+	}
+	if _, err := s.store.MerkleRoot(ctx, gid); err != nil {
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
+			Type:    "error",
+			Code:    ipc.CodeInternal,
+			GroupID: &gid,
+			Message: "merkle root: " + err.Error(),
+		})
+		return
+	}
+	if !s.pilotLookupNodeSupported {
+		_ = ipc.EncodeAndWrite(c, s.pilotLookupUnavailableError(gid))
+		return
+	}
+	_ = ipc.EncodeAndWrite(c, &ipc.InviteAuthorityCheckResp{
+		Status:     "ok",
+		GroupID:    gid,
+		RosterHead: sess.roster.Head(),
+		Members:    len(sess.roster.Members()),
+	})
+}
+
+func inviteCreateNeedsPilotLookup(req *ipc.InviteCreateReq) bool {
+	if req == nil {
+		return false
+	}
+	return req.RequirePilotIdentity || req.RequirePilotProof ||
+		len(req.TargetPilotPubKey) > 0 ||
+		len(req.TargetPilotProof) > 0 ||
+		len(req.TargetPilotSignature) > 0
+}
+
+func (s *ipcServer) pilotLookupUnavailableError(gid entmoot.GroupID) *ipc.ErrorFrame {
+	return &ipc.ErrorFrame{
+		Type:    "error",
+		Code:    ipc.CodeUnavailable,
+		GroupID: &gid,
+		Message: "pilot-daemon does not advertise lookup_node; upgrade Pilot to create invites",
+	}
+}
+
+func (s *ipcServer) verifyTargetPilotIdentity(ctx context.Context, req *ipc.InviteCreateReq) error {
+	if len(req.TargetPilotPubKey) == 0 {
+		if req.RequirePilotIdentity {
+			return fmt.Errorf("target pilot_pubkey is required")
+		}
+		return nil
+	}
+	if len(req.TargetPilotPubKey) != ed25519.PublicKeySize {
+		return fmt.Errorf("target pilot_pubkey must be 32 bytes")
+	}
+	if s.pilot == nil {
+		return errPilotLookupUnavailable
+	}
+	lookupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	got, err := s.pilot.LookupNode(lookupCtx, uint32(req.Target.PilotNodeID))
+	if err != nil {
+		return fmt.Errorf("%w: %v", errPilotLookupUnavailable, err)
+	}
+	if got.NodeID != uint32(req.Target.PilotNodeID) {
+		return fmt.Errorf("pilot identity mismatch: lookup returned node_id %d", got.NodeID)
+	}
+	if got.PublicKey == "" {
+		return fmt.Errorf("pilot identity lookup returned no public key")
+	}
+	want := base64.StdEncoding.EncodeToString(req.TargetPilotPubKey)
+	if got.PublicKey != want {
+		return fmt.Errorf("pilot identity mismatch for node %d", req.Target.PilotNodeID)
+	}
+	if req.RequirePilotProof || len(req.TargetPilotProof) > 0 || len(req.TargetPilotSignature) > 0 {
+		if len(req.TargetPilotProof) == 0 {
+			return fmt.Errorf("target pilot proof is required")
+		}
+		if len(req.TargetPilotSignature) != ed25519.SignatureSize {
+			return fmt.Errorf("target pilot signature must be 64 bytes")
+		}
+		if !ed25519.Verify(ed25519.PublicKey(req.TargetPilotPubKey), pilotChallengeSigningBytes(req.TargetPilotProof), req.TargetPilotSignature) {
+			return fmt.Errorf("target pilot proof signature does not verify")
+		}
+	}
+	return nil
+}
+
+func (s *ipcServer) handleMemberRemove(ctx context.Context, c net.Conn, req *ipc.MemberRemoveReq) {
+	gid := req.GroupID
+	if gid == (entmoot.GroupID{}) {
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInvalidArgument, Message: "member_remove requires group_id"})
+		return
+	}
+	if req.Target.PilotNodeID == 0 || len(req.Target.EntmootPubKey) != ed25519.PublicKeySize {
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInvalidArgument, GroupID: &gid, Message: "member_remove requires target agent identity"})
+		return
+	}
+	sess, ok := s.runtime.Get(gid)
+	if !ok {
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeGroupNotFound, GroupID: &gid, Message: "group not joined"})
+		return
+	}
+	founder, ok := sess.roster.Founder()
+	if !ok {
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeGroupNotFound, GroupID: &gid, Message: "group has no founder"})
+		return
+	}
+	if founder.PilotNodeID != s.nodeID || !bytes.Equal(founder.EntmootPubKey, s.identity.PublicKey) {
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeNotMember, GroupID: &gid, Message: "member_remove requires the local founder identity"})
+		return
+	}
+	if req.Target.PilotNodeID == founder.PilotNodeID {
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInvalidArgument, GroupID: &gid, Message: "cannot remove group founder"})
+		return
+	}
+	unlock := lockESPInviteRoster(gid)
+	existing, ok := sess.roster.MemberInfo(req.Target.PilotNodeID)
+	if !ok {
+		unlock()
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeNotMember, GroupID: &gid, Message: "target is not a member"})
+		return
+	}
+	if !bytes.Equal(existing.EntmootPubKey, req.Target.EntmootPubKey) {
+		unlock()
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeConflict, GroupID: &gid, Message: "target identity does not match current roster"})
+		return
+	}
+	if err := applyFounderRosterRemove(s.identity, sess.roster, founder, existing); err != nil {
+		unlock()
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInternal, GroupID: &gid, Message: err.Error()})
+		return
+	}
+	fanoutPeers := append(sess.roster.Members(), req.Target.PilotNodeID)
+	head := sess.roster.Head()
+	members := len(sess.roster.Members())
+	unlock()
+	sess.gossip.FanoutRoster(ctx, fanoutPeers, 0)
+	_ = ipc.EncodeAndWrite(c, &ipc.MemberRemoveResp{Status: "removed", GroupID: gid, RosterHead: head, Members: members})
 }
 
 // handleInfo assembles a full InfoResp snapshot from live state.

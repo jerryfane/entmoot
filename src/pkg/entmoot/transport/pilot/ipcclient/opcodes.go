@@ -46,6 +46,10 @@ const (
 	opSendResult        Opcode = 0x35
 	opSendTracked       Opcode = 0x36
 	opSendTrackedResult Opcode = 0x37
+	opLookupNode        Opcode = 0x38
+	opLookupNodeOK      Opcode = 0x39
+	opSignChallenge     Opcode = 0x3A
+	opSignChallengeOK   Opcode = 0x3B
 )
 
 const (

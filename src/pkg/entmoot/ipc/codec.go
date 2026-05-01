@@ -12,8 +12,10 @@ import (
 //
 // Supported payloads (pointers only): *PublishReq, *PublishResp,
 // *SignedPublishReq, *SignedPublishResp, *JoinGroupReq, *JoinGroupResp,
-// *InviteCreateReq, *InviteCreateResp, *TailSubscribe, *TailEvent, *InfoReq,
-// *InfoResp, *ErrorFrame. Anything else returns ErrUnknownMessage.
+// *InviteCreateReq, *InviteCreateResp, *InviteAuthorityCheckReq,
+// *InviteAuthorityCheckResp, *MemberRemoveReq, *MemberRemoveResp,
+// *TailSubscribe, *TailEvent, *InfoReq, *InfoResp, *ErrorFrame.
+// Anything else returns ErrUnknownMessage.
 //
 // As a convenience, Encode fills in ErrorFrame.Type = "error" when the
 // caller left it empty. The wire shape is defined to always carry that
@@ -37,6 +39,14 @@ func Encode(v any) (MsgType, []byte, error) {
 		t = MsgInviteCreateReq
 	case *InviteCreateResp:
 		t = MsgInviteCreateResp
+	case *InviteAuthorityCheckReq:
+		t = MsgInviteAuthorityCheckReq
+	case *InviteAuthorityCheckResp:
+		t = MsgInviteAuthorityCheckResp
+	case *MemberRemoveReq:
+		t = MsgMemberRemoveReq
+	case *MemberRemoveResp:
+		t = MsgMemberRemoveResp
 	case *TailSubscribe:
 		t = MsgTailSubscribe
 	case *TailEvent:
@@ -65,9 +75,8 @@ func Encode(v any) (MsgType, []byte, error) {
 // typed value boxed in any. Callers type-switch on the concrete pointer
 // type (e.g. *PublishResp, *ErrorFrame).
 //
-// Returns ErrUnknownMessage for an unrecognized t (0x00, any byte
-// outside the 0x10..0x1F ipc namespace, or an unused byte within it) and
-// ErrMalformedFrame when json.Unmarshal fails.
+// Returns ErrUnknownMessage for an unrecognized t (0x00 or any unused
+// message type) and ErrMalformedFrame when json.Unmarshal fails.
 //
 // InfoReq's body is "{}"; an empty body is also tolerated for InfoReq so
 // a sloppy client does not trip ErrMalformedFrame. All other types
@@ -90,6 +99,14 @@ func Decode(t MsgType, body []byte) (any, error) {
 		return decodeAs[InviteCreateReq](t, body)
 	case MsgInviteCreateResp:
 		return decodeAs[InviteCreateResp](t, body)
+	case MsgInviteAuthorityCheckReq:
+		return decodeAs[InviteAuthorityCheckReq](t, body)
+	case MsgInviteAuthorityCheckResp:
+		return decodeAs[InviteAuthorityCheckResp](t, body)
+	case MsgMemberRemoveReq:
+		return decodeAs[MemberRemoveReq](t, body)
+	case MsgMemberRemoveResp:
+		return decodeAs[MemberRemoveResp](t, body)
 	case MsgTailSubscribe:
 		return decodeAs[TailSubscribe](t, body)
 	case MsgTailEvent:

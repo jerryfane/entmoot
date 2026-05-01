@@ -197,6 +197,17 @@ func TestRoundTripInviteCreateReqResp(t *testing.T) {
 		Members:    3,
 	}
 	roundTrip(t, resp)
+
+	authorityReq := &InviteAuthorityCheckReq{GroupID: gid}
+	roundTrip(t, authorityReq)
+
+	authorityResp := &InviteAuthorityCheckResp{
+		Status:     "ok",
+		GroupID:    gid,
+		RosterHead: mustRosterEntryID(0x78),
+		Members:    3,
+	}
+	roundTrip(t, authorityResp)
 }
 
 func TestRoundTripInfoResp(t *testing.T) {
@@ -290,9 +301,9 @@ func TestEncodeUnknownType(t *testing.T) {
 }
 
 // TestDecodeUnknownType exercises bytes outside the ipc namespace
-// (0x00, 0xFF) and an unused byte inside the namespace (0x1C).
+// (0x00, 0xFF) and unused bytes inside the namespace.
 func TestDecodeUnknownType(t *testing.T) {
-	for _, b := range []MsgType{0x00, 0x09, 0x1C, 0x20, 0xFF} {
+	for _, b := range []MsgType{0x00, 0x09, 0x21, 0xFF} {
 		_, err := Decode(b, []byte(`{}`))
 		if !errors.Is(err, ErrUnknownMessage) {
 			t.Errorf("Decode(0x%02x) err = %v, want ErrUnknownMessage", uint8(b), err)
@@ -308,6 +319,7 @@ func TestDecodeMalformedJSON(t *testing.T) {
 		MsgSignedPublishReq, MsgSignedPublishResp,
 		MsgJoinGroupReq, MsgJoinGroupResp,
 		MsgInviteCreateReq, MsgInviteCreateResp,
+		MsgMemberRemoveReq, MsgMemberRemoveResp,
 		MsgTailSubscribe, MsgTailEvent,
 		MsgInfoResp, MsgError,
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"net/url"
 	"path/filepath"
 	"testing"
@@ -122,6 +123,246 @@ CREATE TABLE esp_devices_state (
 	}
 }
 
+func TestOpenInviteRedemptionReplayRequiresActiveInvite(t *testing.T) {
+	ctx := context.Background()
+	gid := testMobileGroupID(8)
+	for _, tc := range openInviteStateStores(t) {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.close != nil {
+				defer tc.close()
+			}
+			rec, err := tc.store.CreateOpenInvite(ctx, OpenInviteRecord{
+				TokenHash:      "token-a",
+				GroupID:        gid,
+				MaxUses:        2,
+				BootstrapPeers: []entmoot.NodeID{45491, 45460},
+				ExpiresAtMS:    2_000,
+			})
+			if err != nil {
+				t.Fatalf("CreateOpenInvite: %v", err)
+			}
+			if !sameNodeIDs(rec.BootstrapPeers, []entmoot.NodeID{45491, 45460}) {
+				t.Fatalf("created bootstrap peers = %v", rec.BootstrapPeers)
+			}
+			redemption := OpenInviteRedemption{
+				RedeemerKey:   "45981:key",
+				PilotNodeID:   45981,
+				EntmootPubKey: "key",
+			}
+			rec, red, already, err := tc.store.RedeemOpenInvite(ctx, "token-a", redemption, 1_000)
+			if err != nil || already {
+				t.Fatalf("first RedeemOpenInvite err/already = %v/%v", err, already)
+			}
+			if !sameNodeIDs(rec.BootstrapPeers, []entmoot.NodeID{45491, 45460}) || red.Result != nil {
+				t.Fatalf("first redeem rec/red = %+v/%+v", rec, red)
+			}
+			result := json.RawMessage(`{"status":"redeemed","invite":{"group_id":"x"}}`)
+			if err := tc.store.CompleteOpenInviteRedemption(ctx, "token-a", redemption.RedeemerKey, result, 1_001); err != nil {
+				t.Fatalf("CompleteOpenInviteRedemption: %v", err)
+			}
+			stored, ok, err := tc.store.GetOpenInviteRedemption(ctx, "token-a", redemption.RedeemerKey)
+			if err != nil || !ok {
+				t.Fatalf("GetOpenInviteRedemption err/ok = %v/%v", err, ok)
+			}
+			if string(stored.Result) != string(result) {
+				t.Fatalf("stored redemption result = %s, want %s", stored.Result, result)
+			}
+			rec, red, already, err = tc.store.RedeemOpenInvite(ctx, "token-a", redemption, 1_500)
+			if err != nil || !already {
+				t.Fatalf("repeat active RedeemOpenInvite err/already = %v/%v", err, already)
+			}
+			if string(red.Result) != string(result) || rec.UseCount != 1 {
+				t.Fatalf("repeat active rec/red = %+v/%s", rec, red.Result)
+			}
+			_, _, _, err = tc.store.RedeemOpenInvite(ctx, "token-a", redemption, 2_500)
+			if !errors.Is(err, ErrOpenInviteExpired) {
+				t.Fatalf("repeat expired err = %v, want ErrOpenInviteExpired", err)
+			}
+		})
+	}
+}
+
+func TestOpenInviteRepeatRedemptionHonorsRevocation(t *testing.T) {
+	ctx := context.Background()
+	gid := testMobileGroupID(9)
+	for _, tc := range openInviteStateStores(t) {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.close != nil {
+				defer tc.close()
+			}
+			_, err := tc.store.CreateOpenInvite(ctx, OpenInviteRecord{
+				TokenHash:   "token-b",
+				GroupID:     gid,
+				MaxUses:     2,
+				ExpiresAtMS: 10_000,
+			})
+			if err != nil {
+				t.Fatalf("CreateOpenInvite: %v", err)
+			}
+			redemption := OpenInviteRedemption{
+				RedeemerKey:   "45981:key",
+				PilotNodeID:   45981,
+				EntmootPubKey: "key",
+			}
+			if _, _, _, err := tc.store.RedeemOpenInvite(ctx, "token-b", redemption, 1_000); err != nil {
+				t.Fatalf("first RedeemOpenInvite: %v", err)
+			}
+			if err := tc.store.CompleteOpenInviteRedemption(ctx, "token-b", redemption.RedeemerKey, json.RawMessage(`{"status":"redeemed"}`), 1_001); err != nil {
+				t.Fatalf("CompleteOpenInviteRedemption: %v", err)
+			}
+			tc.revoke(t, "token-b")
+			_, _, _, err = tc.store.RedeemOpenInvite(ctx, "token-b", redemption, 1_500)
+			if !errors.Is(err, ErrOpenInviteRevoked) {
+				t.Fatalf("repeat revoked err = %v, want ErrOpenInviteRevoked", err)
+			}
+		})
+	}
+}
+
+func TestOpenInviteChallengesAreSingleUseAndExpire(t *testing.T) {
+	ctx := context.Background()
+	gid := testMobileGroupID(10)
+	for _, tc := range openInviteStateStores(t) {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.close != nil {
+				defer tc.close()
+			}
+			ch := OpenInviteChallenge{
+				ChallengeID:    "challenge-a",
+				TokenHash:      "token-c",
+				GroupID:        gid,
+				PilotNodeID:    45981,
+				PilotPubKey:    "pilot",
+				EntmootPubKey:  "entmoot",
+				Nonce:          "nonce",
+				SigningPayload: "payload",
+				CreatedAtMS:    1_000,
+				ExpiresAtMS:    2_000,
+			}
+			if _, err := tc.store.CreateOpenInviteChallenge(ctx, ch); err != nil {
+				t.Fatalf("CreateOpenInviteChallenge: %v", err)
+			}
+			stored, ok, err := tc.store.GetOpenInviteChallenge(ctx, "challenge-a")
+			if err != nil || !ok || stored.GroupID != gid || stored.PilotNodeID != 45981 {
+				t.Fatalf("GetOpenInviteChallenge = %+v/%v/%v", stored, ok, err)
+			}
+			used, err := tc.store.ConsumeOpenInviteChallenge(ctx, "challenge-a", 1_500)
+			if err != nil || used.UsedAtMS != 1_500 {
+				t.Fatalf("ConsumeOpenInviteChallenge used = %+v err=%v", used, err)
+			}
+			_, err = tc.store.ConsumeOpenInviteChallenge(ctx, "challenge-a", 1_600)
+			if !errors.Is(err, ErrOpenInviteChallengeUsed) {
+				t.Fatalf("second consume err = %v, want ErrOpenInviteChallengeUsed", err)
+			}
+			ch.ChallengeID = "challenge-b"
+			if _, err := tc.store.CreateOpenInviteChallenge(ctx, ch); err != nil {
+				t.Fatalf("CreateOpenInviteChallenge expired case: %v", err)
+			}
+			_, err = tc.store.ConsumeOpenInviteChallenge(ctx, "challenge-b", 2_500)
+			if !errors.Is(err, ErrOpenInviteChallengeExpired) {
+				t.Fatalf("expired consume err = %v, want ErrOpenInviteChallengeExpired", err)
+			}
+		})
+	}
+}
+
+func TestOpenInviteChallengesReusePruneAndCapActiveRows(t *testing.T) {
+	ctx := context.Background()
+	gid := testMobileGroupID(11)
+	for _, tc := range openInviteStateStores(t) {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.close != nil {
+				defer tc.close()
+			}
+			base := OpenInviteChallenge{
+				ChallengeID:    "challenge-reuse",
+				TokenHash:      "token-d",
+				GroupID:        gid,
+				PilotNodeID:    45981,
+				PilotPubKey:    "pilot-a",
+				EntmootPubKey:  "entmoot-a",
+				Nonce:          "nonce-a",
+				SigningPayload: "payload-a",
+				CreatedAtMS:    1_000,
+				ExpiresAtMS:    10_000,
+			}
+			first, err := tc.store.CreateOrReuseOpenInviteChallenge(ctx, base, 2, 2_000)
+			if err != nil {
+				t.Fatalf("first CreateOrReuseOpenInviteChallenge: %v", err)
+			}
+			reused, err := tc.store.CreateOrReuseOpenInviteChallenge(ctx, OpenInviteChallenge{
+				ChallengeID:    "challenge-new",
+				TokenHash:      base.TokenHash,
+				GroupID:        gid,
+				PilotNodeID:    base.PilotNodeID,
+				PilotPubKey:    base.PilotPubKey,
+				EntmootPubKey:  base.EntmootPubKey,
+				Nonce:          "nonce-b",
+				SigningPayload: "payload-b",
+				CreatedAtMS:    3_000,
+				ExpiresAtMS:    10_000,
+			}, 2, 3_000)
+			if err != nil {
+				t.Fatalf("reuse CreateOrReuseOpenInviteChallenge: %v", err)
+			}
+			if reused.ChallengeID != first.ChallengeID || reused.SigningPayload != first.SigningPayload {
+				t.Fatalf("reused challenge = %+v, want first %+v", reused, first)
+			}
+			expired := OpenInviteChallenge{
+				ChallengeID:    "challenge-expired",
+				TokenHash:      base.TokenHash,
+				GroupID:        gid,
+				PilotNodeID:    45982,
+				PilotPubKey:    "pilot-expired",
+				EntmootPubKey:  "entmoot-expired",
+				Nonce:          "nonce-expired",
+				SigningPayload: "payload-expired",
+				CreatedAtMS:    1_000,
+				ExpiresAtMS:    1_500,
+			}
+			if _, err := tc.store.CreateOpenInviteChallenge(ctx, expired); err != nil {
+				t.Fatalf("seed expired challenge: %v", err)
+			}
+			second, err := tc.store.CreateOrReuseOpenInviteChallenge(ctx, OpenInviteChallenge{
+				ChallengeID:    "challenge-second",
+				TokenHash:      base.TokenHash,
+				GroupID:        gid,
+				PilotNodeID:    45983,
+				PilotPubKey:    "pilot-second",
+				EntmootPubKey:  "entmoot-second",
+				Nonce:          "nonce-second",
+				SigningPayload: "payload-second",
+				CreatedAtMS:    4_000,
+				ExpiresAtMS:    10_000,
+			}, 2, 4_000)
+			if err != nil {
+				t.Fatalf("second active CreateOrReuseOpenInviteChallenge: %v", err)
+			}
+			if second.ChallengeID != "challenge-second" {
+				t.Fatalf("second challenge id = %q, want challenge-second", second.ChallengeID)
+			}
+			_, err = tc.store.CreateOrReuseOpenInviteChallenge(ctx, OpenInviteChallenge{
+				ChallengeID:    "challenge-third",
+				TokenHash:      base.TokenHash,
+				GroupID:        gid,
+				PilotNodeID:    45984,
+				PilotPubKey:    "pilot-third",
+				EntmootPubKey:  "entmoot-third",
+				Nonce:          "nonce-third",
+				SigningPayload: "payload-third",
+				CreatedAtMS:    5_000,
+				ExpiresAtMS:    10_000,
+			}, 2, 5_000)
+			if !errors.Is(err, ErrOpenInviteChallengeLimit) {
+				t.Fatalf("third active err = %v, want ErrOpenInviteChallengeLimit", err)
+			}
+			if _, ok, err := tc.store.GetOpenInviteChallenge(ctx, "challenge-expired"); err != nil || ok {
+				t.Fatalf("expired challenge present/err = %v/%v, want pruned", ok, err)
+			}
+		})
+	}
+}
+
 func TestGroupMetadataStoresRejectNonObjectJSON(t *testing.T) {
 	ctx := context.Background()
 	gid := testMobileGroupID(7)
@@ -164,6 +405,58 @@ func TestGroupMetadataStoresRejectNonObjectJSON(t *testing.T) {
 			}
 		})
 	}
+}
+
+type openInviteStoreCase struct {
+	name   string
+	store  StateStore
+	close  func()
+	revoke func(*testing.T, string)
+}
+
+func openInviteStateStores(t *testing.T) []openInviteStoreCase {
+	t.Helper()
+	mem := NewMemoryStateStore()
+	stores := []openInviteStoreCase{{
+		name:  "memory",
+		store: mem,
+		revoke: func(t *testing.T, tokenHash string) {
+			t.Helper()
+			mem.mu.Lock()
+			defer mem.mu.Unlock()
+			rec := mem.invites[tokenHash]
+			rec.Revoked = true
+			mem.invites[tokenHash] = rec
+		},
+	}}
+	sqlite, err := OpenSQLiteStateStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenSQLiteStateStore: %v", err)
+	}
+	stores = append(stores, openInviteStoreCase{
+		name:  "sqlite",
+		store: sqlite,
+		close: func() { _ = sqlite.Close() },
+		revoke: func(t *testing.T, tokenHash string) {
+			t.Helper()
+			if _, err := sqlite.db.Exec(`UPDATE esp_open_invites SET revoked = 1 WHERE token_hash = ?`, tokenHash); err != nil {
+				t.Fatalf("revoke sqlite invite: %v", err)
+			}
+		},
+	})
+	return stores
+}
+
+func sameNodeIDs(a, b []entmoot.NodeID) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func testMobileGroupID(seed byte) entmoot.GroupID {

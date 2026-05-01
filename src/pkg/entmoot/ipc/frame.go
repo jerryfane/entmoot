@@ -8,7 +8,7 @@
 //
 // length = size of (msg_type + body). The framing shape matches the peer
 // wire protocol for developer familiarity, but the type-number namespace
-// (0x10..0x1F), the payload set, and the error taxonomy are all local to
+// (starting at 0x10), the payload set, and the error taxonomy are all local to
 // this package. Sharing a framing library with pkg/entmoot/wire was
 // rejected in CLI_DESIGN §5.2: peer wire crosses encrypted Pilot tunnels
 // to potentially-untrusted peers; ipc frames move between cooperating

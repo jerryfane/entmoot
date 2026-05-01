@@ -202,6 +202,7 @@ func runESPServe(gf *globalFlags, cfg espServeConfig) int {
 			socketPath:    controlSocketPath(gf.data),
 			timeout:       30 * time.Second,
 			metadataStore: metadataStore,
+			stateStore:    resources.espState,
 			deviceGroups:  deviceGroups,
 		},
 		Notifier:    notifier,

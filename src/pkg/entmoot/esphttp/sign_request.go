@@ -12,11 +12,13 @@ import (
 )
 
 const (
-	signRequestKindMessagePublish = "message_publish"
-	signRequestKindGroupCreate    = "group_create"
-	signRequestKindGroupUpdate    = "group_update"
-	signRequestKindInviteCreate   = "invite_create"
-	signRequestKindInviteAccept   = "invite_accept"
+	signRequestKindMessagePublish   = "message_publish"
+	signRequestKindGroupCreate      = "group_create"
+	signRequestKindGroupUpdate      = "group_update"
+	signRequestKindInviteCreate     = "invite_create"
+	signRequestKindInviteAccept     = "invite_accept"
+	signRequestKindOpenInviteCreate = "open_invite_create"
+	signRequestKindMemberRemove     = "member_remove"
 
 	canonicalTypeMessageV1      = "entmoot.message.v1"
 	canonicalTypeESPOperationV1 = "entmoot.esp.operation.v1"

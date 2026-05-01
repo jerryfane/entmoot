@@ -407,6 +407,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "not found")
 		return
 	}
+	if h.handleOpenInviteRedeem(w, r) {
+		return
+	}
 	auth, ok := h.authorize(w, r)
 	if !ok {
 		return
@@ -544,6 +547,17 @@ func (h *Handler) handleGroupSubroute(w http.ResponseWriter, r *http.Request) bo
 	if ok := h.checkGroup(w, r, groupID); !ok {
 		return true
 	}
+	if strings.HasPrefix(suffix, "members/") {
+		if r.Method != http.MethodDelete {
+			methodNotAllowed(w, http.MethodDelete)
+			return true
+		}
+		escapedMember := strings.TrimPrefix(suffix, "members/")
+		h.withIdempotency(w, r, "member_remove:"+groupID.String()+":"+escapedMember, func(w http.ResponseWriter, r *http.Request) {
+			h.createMemberRemoveSignRequest(w, r, groupID, escapedMember)
+		})
+		return true
+	}
 	switch suffix {
 	case "":
 		switch r.Method {
@@ -569,6 +583,14 @@ func (h *Handler) handleGroupSubroute(w http.ResponseWriter, r *http.Request) bo
 		}
 		h.withIdempotency(w, r, "invite_create:"+groupID.String(), func(w http.ResponseWriter, r *http.Request) {
 			h.createSignRequestFromHTTP(w, r, "invite_create", groupID)
+		})
+	case "open-invites":
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w, http.MethodPost)
+			return true
+		}
+		h.withIdempotency(w, r, "open_invite_create:"+groupID.String(), func(w http.ResponseWriter, r *http.Request) {
+			h.createSignRequestFromHTTP(w, r, "open_invite_create", groupID)
 		})
 	case "messages":
 		switch r.Method {
@@ -725,6 +747,69 @@ func (h *Handler) handleInviteAccept(w http.ResponseWriter, r *http.Request) {
 	h.withIdempotency(w, r, "invite_accept", func(w http.ResponseWriter, r *http.Request) {
 		h.createSignRequestFromHTTP(w, r, "invite_accept", entmoot.GroupID{})
 	})
+}
+
+func (h *Handler) handleOpenInviteRedeem(w http.ResponseWriter, r *http.Request) bool {
+	const prefix = "/v1/open-invites/"
+	if !strings.HasPrefix(r.URL.EscapedPath(), prefix) {
+		return false
+	}
+	rest := strings.TrimPrefix(r.URL.EscapedPath(), prefix)
+	escapedToken, suffix, ok := strings.Cut(rest, "/")
+	if !ok || (suffix != "redeem" && suffix != "challenge") {
+		writeError(w, http.StatusNotFound, "not_found", "not found")
+		return true
+	}
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w, http.MethodPost)
+		return true
+	}
+	token, err := url.PathUnescape(escapedToken)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return true
+	}
+	var payload json.RawMessage
+	body, decoded := decodeRawBody(w, r, 1<<20, &payload)
+	if !decoded {
+		return true
+	}
+	if len(payload) == 0 || string(payload) == "null" {
+		body = []byte("{}")
+	}
+	var result json.RawMessage
+	if suffix == "challenge" {
+		challenger, ok := h.operations.(OpenInviteChallenger)
+		if !ok {
+			writeError(w, http.StatusServiceUnavailable, "open_invite_unavailable", "open invite challenge is not configured")
+			return true
+		}
+		result, err = challenger.CreateOpenInviteChallenge(r.Context(), token, body)
+	} else {
+		redeemer, ok := h.operations.(OpenInviteRedeemer)
+		if !ok {
+			writeError(w, http.StatusServiceUnavailable, "open_invite_unavailable", "open invite redemption is not configured")
+			return true
+		}
+		result, err = redeemer.RedeemOpenInvite(r.Context(), token, body)
+	}
+	if err != nil {
+		var opErr *OperationError
+		if errors.As(err, &opErr) {
+			writeError(w, opErr.HTTPStatus, opErr.Code, opErr.Message)
+			return true
+		}
+		h.logger.Error("esphttp: redeem open invite", slog.String("err", err.Error()))
+		writeError(w, http.StatusInternalServerError, "internal_error", "open invite redemption failed")
+		return true
+	}
+	if len(result) == 0 {
+		result = json.RawMessage(`{}`)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(result)
+	return true
 }
 
 func (h *Handler) handleSignRequests(w http.ResponseWriter, r *http.Request) {
@@ -1378,6 +1463,36 @@ func (h *Handler) createSignRequestFromHTTP(w http.ResponseWriter, r *http.Reque
 		body = []byte("{}")
 	}
 	h.createSignRequest(w, r, kind, groupID, body)
+}
+
+func (h *Handler) createMemberRemoveSignRequest(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID, escapedMember string) {
+	rawMember, err := url.PathUnescape(escapedMember)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+	nodeID64, err := strconv.ParseUint(strings.TrimSpace(rawMember), 10, 32)
+	if err != nil || nodeID64 == 0 {
+		writeError(w, http.StatusBadRequest, "bad_request", "member node_id must be a positive integer")
+		return
+	}
+	var body struct {
+		EntmootPubKey string `json:"entmoot_pubkey"`
+	}
+	if _, ok := decodeRawBody(w, r, 1<<20, &body); !ok {
+		return
+	}
+	payload, err := json.Marshal(map[string]any{
+		"target": map[string]any{
+			"pilot_node_id":  entmoot.NodeID(nodeID64),
+			"entmoot_pubkey": strings.TrimSpace(body.EntmootPubKey),
+		},
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "member remove payload encoding failed")
+		return
+	}
+	h.createSignRequest(w, r, "member_remove", groupID, payload)
 }
 
 func (h *Handler) createSignRequest(w http.ResponseWriter, r *http.Request, kind string, groupID entmoot.GroupID, payload []byte) {

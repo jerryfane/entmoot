@@ -18,6 +18,8 @@ func TestExitCodeMapping(t *testing.T) {
 		{CodeNotMember, 2},
 		{CodeGroupNotFound, 3},
 		{CodeInvalidArgument, 5},
+		{CodeConflict, 5},
+		{CodeUnavailable, 1},
 	}
 	for _, tc := range cases {
 		if got := ExitCode(tc.code); got != tc.want {

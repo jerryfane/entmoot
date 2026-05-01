@@ -68,6 +68,20 @@ type Info struct {
 	Capabilities []string `json:"capabilities,omitempty"`
 }
 
+// NodeIdentity is the typed shape of Pilot's lookup_node IPC reply.
+type NodeIdentity struct {
+	NodeID    uint32 `json:"node_id,omitempty"`
+	PublicKey string `json:"public_key,omitempty"`
+	Source    string `json:"source,omitempty"`
+}
+
+// ChallengeSignature is the typed shape of Pilot's sign_challenge IPC reply.
+type ChallengeSignature struct {
+	NodeID    uint32 `json:"node_id,omitempty"`
+	PublicKey string `json:"public_key,omitempty"`
+	Signature string `json:"signature,omitempty"`
+}
+
 // Addr is a Pilot virtual address: a 16-bit network ID paired with a
 // 32-bit node ID. SPEC.md §1.1. The text representation
 // (SPEC.md §1.2) is "N:NNNN.HHHH.LLLL" where N is the network ID in

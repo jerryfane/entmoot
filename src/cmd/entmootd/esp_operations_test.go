@@ -5,8 +5,10 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"os"
@@ -492,6 +494,7 @@ func TestESPBuildInviteCreateRequestNormalizesPayload(t *testing.T) {
 		Peers:    "45491, 45460",
 		Target: &inviteTargetPayload{
 			PilotNodeID:   45981,
+			PilotPubKey:   bytes.Repeat([]byte{0x42}, 32),
 			EntmootPubKey: append([]byte(nil), targetID.PublicKey...),
 		},
 	})
@@ -520,6 +523,7 @@ func TestESPBuildInviteCreateRequestRejectsSubMillisecondValidFor(t *testing.T) 
 			ValidFor: validFor,
 			Target: &inviteTargetPayload{
 				PilotNodeID:   45981,
+				PilotPubKey:   bytes.Repeat([]byte{0x42}, 32),
 				EntmootPubKey: append([]byte(nil), targetID.PublicKey...),
 			},
 		})
@@ -533,6 +537,7 @@ func TestESPBuildInviteCreateRequestRejectsSubMillisecondValidFor(t *testing.T) 
 		ValidFor: "1ms",
 		Target: &inviteTargetPayload{
 			PilotNodeID:   45981,
+			PilotPubKey:   bytes.Repeat([]byte{0x42}, 32),
 			EntmootPubKey: append([]byte(nil), targetID.PublicKey...),
 		},
 	})
@@ -570,6 +575,7 @@ func TestESPBuildInviteInvalidValidForDoesNotMutateRoster(t *testing.T) {
 		ValidFor: "not-a-duration",
 		Target: &inviteTargetPayload{
 			PilotNodeID:   45981,
+			PilotPubKey:   bytes.Repeat([]byte{0x42}, 32),
 			EntmootPubKey: append([]byte(nil), targetID.PublicKey...),
 		},
 	})
@@ -598,6 +604,7 @@ func TestESPBuildInviteMalformedPeersDoesNotMutateRoster(t *testing.T) {
 		Peers: "not-a-node-id",
 		Target: &inviteTargetPayload{
 			PilotNodeID:   45981,
+			PilotPubKey:   bytes.Repeat([]byte{0x42}, 32),
 			EntmootPubKey: append([]byte(nil), targetID.PublicKey...),
 		},
 	})
@@ -606,6 +613,584 @@ func TestESPBuildInviteMalformedPeersDoesNotMutateRoster(t *testing.T) {
 		t.Fatalf("buildInviteCreateIPCRequest err = %v, want 400 bad_request", err)
 	}
 	assertRosterMemberAbsent(t, dataDir, gid, 45981)
+}
+
+func TestESPOpenInviteCreateRequiresLiveInviteAuthority(t *testing.T) {
+	ctx := context.Background()
+	gid := testESPGroupID(22)
+	exec := espOperationExecutor{
+		stateStore: esphttp.NewMemoryStateStore(),
+		socketPath: filepath.Join(t.TempDir(), "missing.sock"),
+		timeout:    time.Millisecond,
+	}
+	_, err := exec.ExecuteSignRequest(ctx, esphttp.SignRequest{
+		Kind:    "open_invite_create",
+		GroupID: gid,
+		Payload: json.RawMessage(`{"max_uses":1,"valid_for":"24h"}`),
+	}, nil)
+	var opErr *esphttp.OperationError
+	if !errors.As(err, &opErr) || opErr.HTTPStatus != http.StatusServiceUnavailable || opErr.Code != "join_unavailable" {
+		t.Fatalf("open_invite_create err = %v, want 503 join_unavailable", err)
+	}
+}
+
+func TestESPOpenInviteStoresAndRedeemsBootstrapPeers(t *testing.T) {
+	ctx := context.Background()
+	gid := testESPGroupID(19)
+	state := esphttp.NewMemoryStateStore()
+	sock := testUnixSocketPath(t)
+	reqCh := make(chan *ipc.InviteCreateReq, 1)
+	stop := serveESPInviteCreateIPC(t, sock, gid, reqCh)
+	defer stop()
+	exec := espOperationExecutor{stateStore: state, socketPath: sock, timeout: time.Second}
+	raw, err := exec.ExecuteSignRequest(ctx, esphttp.SignRequest{
+		Kind:     "open_invite_create",
+		GroupID:  gid,
+		DeviceID: "ios-1",
+		Payload:  json.RawMessage(`{"max_uses":2,"valid_for":"24h","bootstrap_peers":[45491,45460]}`),
+	}, nil)
+	if err != nil {
+		t.Fatalf("open_invite_create: %v", err)
+	}
+	var created struct {
+		Token          string           `json:"token"`
+		BootstrapPeers []entmoot.NodeID `json:"bootstrap_peers"`
+	}
+	if err := json.Unmarshal(raw, &created); err != nil {
+		t.Fatalf("unmarshal created: %v", err)
+	}
+	if created.Token == "" || len(created.BootstrapPeers) != 2 || created.BootstrapPeers[0] != 45491 || created.BootstrapPeers[1] != 45460 {
+		t.Fatalf("created open invite = %+v", created)
+	}
+	rec, ok, err := state.GetOpenInviteByTokenHash(ctx, esphttp.HashOpenInviteToken(created.Token))
+	if err != nil || !ok {
+		t.Fatalf("GetOpenInviteByTokenHash err/ok = %v/%v", err, ok)
+	}
+	if len(rec.BootstrapPeers) != 2 || rec.BootstrapPeers[0] != 45491 || rec.BootstrapPeers[1] != 45460 {
+		t.Fatalf("stored bootstrap peers = %v", rec.BootstrapPeers)
+	}
+
+	targetPilotPub, targetPilotPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey pilot: %v", err)
+	}
+	targetEntmootPub := bytes.Repeat([]byte{0x43}, 32)
+	redeemPayload := openInviteRedeemPayloadForTest(t, exec, ctx, created.Token, 45981, targetPilotPub, targetPilotPriv, targetEntmootPub)
+	redeemed, err := exec.RedeemOpenInvite(ctx, created.Token, redeemPayload)
+	if err != nil {
+		t.Fatalf("RedeemOpenInvite: %v", err)
+	}
+	select {
+	case req := <-reqCh:
+		if len(req.BootstrapPeers) != 2 || req.BootstrapPeers[0] != 45491 || req.BootstrapPeers[1] != 45460 {
+			t.Fatalf("redeem IPC bootstrap peers = %v", req.BootstrapPeers)
+		}
+		if !req.RequirePilotProof || !ed25519.Verify(targetPilotPub, pilotChallengeSigningBytes(req.TargetPilotProof), req.TargetPilotSignature) {
+			t.Fatalf("redeem IPC pilot proof did not verify")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for invite create IPC request")
+	}
+	redeemedAgain, err := exec.RedeemOpenInvite(ctx, created.Token, redeemPayload)
+	if err != nil {
+		t.Fatalf("same-body repeat RedeemOpenInvite: %v", err)
+	}
+	if !bytes.Equal(redeemed, redeemedAgain) {
+		t.Fatalf("same-body repeat redeem result changed:\nfirst=%s\nsecond=%s", redeemed, redeemedAgain)
+	}
+	select {
+	case req := <-reqCh:
+		t.Fatalf("same-body repeat redeem minted another invite: %+v", req)
+	default:
+	}
+	replayWithoutProof := mustMarshalJSON(t, map[string]any{
+		"pilot_node_id":  45981,
+		"pilot_pubkey":   base64.StdEncoding.EncodeToString(targetPilotPub),
+		"entmoot_pubkey": base64.StdEncoding.EncodeToString(targetEntmootPub),
+	})
+	_, err = exec.RedeemOpenInvite(ctx, created.Token, replayWithoutProof)
+	var opErr *esphttp.OperationError
+	if !errors.As(err, &opErr) || opErr.HTTPStatus != http.StatusBadRequest || opErr.Code != "bad_request" {
+		t.Fatalf("replay without proof err = %v, want 400 bad_request", err)
+	}
+	select {
+	case req := <-reqCh:
+		t.Fatalf("replay without proof minted another invite: %+v", req)
+	default:
+	}
+}
+
+func TestESPOpenInvitePendingRedemptionDoesNotRefundUse(t *testing.T) {
+	ctx := context.Background()
+	gid := testESPGroupID(21)
+	state := esphttp.NewMemoryStateStore()
+	sock := testUnixSocketPath(t)
+	reqCh := make(chan *ipc.InviteCreateReq, 2)
+	stop := serveESPInviteCreateIPCFailFirst(t, sock, gid, reqCh)
+	defer stop()
+	exec := espOperationExecutor{stateStore: state, socketPath: sock, timeout: time.Second}
+	raw, err := exec.ExecuteSignRequest(ctx, esphttp.SignRequest{
+		Kind:    "open_invite_create",
+		GroupID: gid,
+		Payload: json.RawMessage(`{"max_uses":1,"valid_for":"24h"}`),
+	}, nil)
+	if err != nil {
+		t.Fatalf("open_invite_create: %v", err)
+	}
+	var created struct {
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal(raw, &created); err != nil {
+		t.Fatalf("unmarshal created: %v", err)
+	}
+
+	targetPilotPub, targetPilotPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey target pilot: %v", err)
+	}
+	targetEntmootPub := bytes.Repeat([]byte{0x45}, 32)
+	redeemPayload := openInviteRedeemPayloadForTest(t, exec, ctx, created.Token, 45981, targetPilotPub, targetPilotPriv, targetEntmootPub)
+	if _, err := exec.RedeemOpenInvite(ctx, created.Token, redeemPayload); err == nil {
+		t.Fatal("first RedeemOpenInvite err = nil, want ambiguous IPC error")
+	}
+	select {
+	case <-reqCh:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for first invite create IPC request")
+	}
+	rec, ok, err := state.GetOpenInviteByTokenHash(ctx, esphttp.HashOpenInviteToken(created.Token))
+	if err != nil || !ok {
+		t.Fatalf("GetOpenInviteByTokenHash err/ok = %v/%v", err, ok)
+	}
+	if rec.UseCount != 1 {
+		t.Fatalf("use_count after ambiguous IPC failure = %d, want 1", rec.UseCount)
+	}
+
+	otherPilotPub, otherPilotPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey other pilot: %v", err)
+	}
+	otherPayload := mustMarshalJSON(t, map[string]any{
+		"pilot_node_id":   45982,
+		"pilot_pubkey":    base64.StdEncoding.EncodeToString(otherPilotPub),
+		"entmoot_pubkey":  base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x46}, 32)),
+		"challenge_id":    "unused",
+		"pilot_signature": base64.StdEncoding.EncodeToString(ed25519.Sign(otherPilotPriv, []byte("unused"))),
+	})
+	_, err = exec.RedeemOpenInvite(ctx, created.Token, otherPayload)
+	var opErr *esphttp.OperationError
+	if !errors.As(err, &opErr) || opErr.Code != "open_invite_exhausted" {
+		t.Fatalf("other redeemer err = %v, want open_invite_exhausted", err)
+	}
+	select {
+	case req := <-reqCh:
+		t.Fatalf("exhausted other redeemer reached IPC: %+v", req)
+	default:
+	}
+
+	redeemed, err := exec.RedeemOpenInvite(ctx, created.Token, redeemPayload)
+	if err != nil {
+		t.Fatalf("same redeemer retry RedeemOpenInvite: %v", err)
+	}
+	if len(redeemed) == 0 {
+		t.Fatal("same redeemer retry returned empty result")
+	}
+	select {
+	case <-reqCh:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for retry invite create IPC request")
+	}
+	rec, ok, err = state.GetOpenInviteByTokenHash(ctx, esphttp.HashOpenInviteToken(created.Token))
+	if err != nil || !ok {
+		t.Fatalf("GetOpenInviteByTokenHash after retry err/ok = %v/%v", err, ok)
+	}
+	if rec.UseCount != 1 {
+		t.Fatalf("use_count after same redeemer retry = %d, want 1", rec.UseCount)
+	}
+}
+
+func TestESPOpenInvitePreSendFailureReleasesRedemption(t *testing.T) {
+	ctx := context.Background()
+	gid := testESPGroupID(23)
+	state := esphttp.NewMemoryStateStore()
+	sock := testUnixSocketPath(t)
+	stop := serveESPInviteCreateIPC(t, sock, gid, nil)
+	exec := espOperationExecutor{stateStore: state, socketPath: sock, timeout: time.Second}
+	raw, err := exec.ExecuteSignRequest(ctx, esphttp.SignRequest{
+		Kind:    "open_invite_create",
+		GroupID: gid,
+		Payload: json.RawMessage(`{"max_uses":1,"valid_for":"24h"}`),
+	}, nil)
+	if err != nil {
+		stop()
+		t.Fatalf("open_invite_create: %v", err)
+	}
+	var created struct {
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal(raw, &created); err != nil {
+		t.Fatalf("unmarshal created: %v", err)
+	}
+	targetPilotPub, targetPilotPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey target pilot: %v", err)
+	}
+	redeemPayload := openInviteRedeemPayloadForTest(t, exec, ctx, created.Token, 45981, targetPilotPub, targetPilotPriv, bytes.Repeat([]byte{0x47}, 32))
+	stop()
+	if _, err := exec.RedeemOpenInvite(ctx, created.Token, redeemPayload); err == nil {
+		t.Fatal("RedeemOpenInvite err = nil, want dial failure")
+	}
+	rec, ok, err := state.GetOpenInviteByTokenHash(ctx, esphttp.HashOpenInviteToken(created.Token))
+	if err != nil || !ok {
+		t.Fatalf("GetOpenInviteByTokenHash err/ok = %v/%v", err, ok)
+	}
+	if rec.UseCount != 0 {
+		t.Fatalf("use_count after pre-send failure = %d, want 0", rec.UseCount)
+	}
+	redeemerKey := fmt.Sprintf("%d:%s", entmoot.NodeID(45981), base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x47}, 32)))
+	if redemption, ok, err := state.GetOpenInviteRedemption(ctx, esphttp.HashOpenInviteToken(created.Token), redeemerKey); err != nil || ok {
+		t.Fatalf("redemption after pre-send failure = %+v/%v/%v, want none", redemption, ok, err)
+	}
+}
+
+func TestESPOpenInviteDaemonRejectionReleasesRedemption(t *testing.T) {
+	ctx := context.Background()
+	gid := testESPGroupID(25)
+	state := esphttp.NewMemoryStateStore()
+	sock := testUnixSocketPath(t)
+	reqCh := make(chan *ipc.InviteCreateReq, 2)
+	stop := serveESPInviteCreateIPCErrorFirst(t, sock, gid, reqCh)
+	defer stop()
+	exec := espOperationExecutor{stateStore: state, socketPath: sock, timeout: time.Second}
+	raw, err := exec.ExecuteSignRequest(ctx, esphttp.SignRequest{
+		Kind:    "open_invite_create",
+		GroupID: gid,
+		Payload: json.RawMessage(`{"max_uses":1,"valid_for":"24h"}`),
+	}, nil)
+	if err != nil {
+		t.Fatalf("open_invite_create: %v", err)
+	}
+	var created struct {
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal(raw, &created); err != nil {
+		t.Fatalf("unmarshal created: %v", err)
+	}
+	targetPilotPub, targetPilotPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey target pilot: %v", err)
+	}
+	targetEntmootPub := bytes.Repeat([]byte{0x4a}, 32)
+	redeemPayload := openInviteRedeemPayloadForTest(t, exec, ctx, created.Token, 45981, targetPilotPub, targetPilotPriv, targetEntmootPub)
+	_, err = exec.RedeemOpenInvite(ctx, created.Token, redeemPayload)
+	var opErr *esphttp.OperationError
+	if !errors.As(err, &opErr) || opErr.HTTPStatus != http.StatusConflict || opErr.Code != "member_identity_conflict" {
+		t.Fatalf("first RedeemOpenInvite err = %v, want 409 member_identity_conflict", err)
+	}
+	select {
+	case <-reqCh:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for rejected invite create IPC request")
+	}
+	tokenHash := esphttp.HashOpenInviteToken(created.Token)
+	rec, ok, err := state.GetOpenInviteByTokenHash(ctx, tokenHash)
+	if err != nil || !ok {
+		t.Fatalf("GetOpenInviteByTokenHash err/ok = %v/%v", err, ok)
+	}
+	if rec.UseCount != 0 {
+		t.Fatalf("use_count after explicit daemon rejection = %d, want 0", rec.UseCount)
+	}
+	redeemerKey := fmt.Sprintf("%d:%s", entmoot.NodeID(45981), base64.StdEncoding.EncodeToString(targetEntmootPub))
+	if redemption, ok, err := state.GetOpenInviteRedemption(ctx, tokenHash, redeemerKey); err != nil || ok {
+		t.Fatalf("redemption after explicit daemon rejection = %+v/%v/%v, want none", redemption, ok, err)
+	}
+
+	otherPilotPub, otherPilotPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey other pilot: %v", err)
+	}
+	otherPayload := openInviteRedeemPayloadForTest(t, exec, ctx, created.Token, 45982, otherPilotPub, otherPilotPriv, bytes.Repeat([]byte{0x4b}, 32))
+	redeemed, err := exec.RedeemOpenInvite(ctx, created.Token, otherPayload)
+	if err != nil {
+		t.Fatalf("second RedeemOpenInvite after refund: %v", err)
+	}
+	if len(redeemed) == 0 {
+		t.Fatal("second RedeemOpenInvite returned empty result")
+	}
+	select {
+	case <-reqCh:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for successful invite create IPC request")
+	}
+	rec, ok, err = state.GetOpenInviteByTokenHash(ctx, tokenHash)
+	if err != nil || !ok {
+		t.Fatalf("GetOpenInviteByTokenHash after success err/ok = %v/%v", err, ok)
+	}
+	if rec.UseCount != 1 {
+		t.Fatalf("use_count after successful retry = %d, want 1", rec.UseCount)
+	}
+}
+
+func TestESPOpenInviteChallengeRejectsExhaustedInvite(t *testing.T) {
+	ctx := context.Background()
+	gid := testESPGroupID(24)
+	state := esphttp.NewMemoryStateStore()
+	sock := testUnixSocketPath(t)
+	stop := serveESPInviteCreateIPC(t, sock, gid, nil)
+	defer stop()
+	exec := espOperationExecutor{stateStore: state, socketPath: sock, timeout: time.Second}
+	raw, err := exec.ExecuteSignRequest(ctx, esphttp.SignRequest{
+		Kind:    "open_invite_create",
+		GroupID: gid,
+		Payload: json.RawMessage(`{"max_uses":1,"valid_for":"24h"}`),
+	}, nil)
+	if err != nil {
+		t.Fatalf("open_invite_create: %v", err)
+	}
+	var created struct {
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal(raw, &created); err != nil {
+		t.Fatalf("unmarshal created: %v", err)
+	}
+	tokenHash := esphttp.HashOpenInviteToken(created.Token)
+	_, _, _, err = state.RedeemOpenInvite(ctx, tokenHash, esphttp.OpenInviteRedemption{
+		RedeemerKey:   "45981:used",
+		PilotNodeID:   45981,
+		EntmootPubKey: base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x48}, 32)),
+	}, time.Now().UnixMilli())
+	if err != nil {
+		t.Fatalf("seed exhausted redemption: %v", err)
+	}
+	pilotPub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey pilot: %v", err)
+	}
+	challengeReq := mustMarshalJSON(t, map[string]any{
+		"pilot_node_id":  45982,
+		"pilot_pubkey":   base64.StdEncoding.EncodeToString(pilotPub),
+		"entmoot_pubkey": base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x49}, 32)),
+	})
+	_, err = exec.CreateOpenInviteChallenge(ctx, created.Token, challengeReq)
+	var opErr *esphttp.OperationError
+	if !errors.As(err, &opErr) || opErr.HTTPStatus != http.StatusConflict || opErr.Code != "open_invite_exhausted" {
+		t.Fatalf("CreateOpenInviteChallenge err = %v, want 409 open_invite_exhausted", err)
+	}
+}
+
+func TestESPOpenInviteChallengeRequiresInviteAuthority(t *testing.T) {
+	ctx := context.Background()
+	gid := testESPGroupID(25)
+	state := esphttp.NewMemoryStateStore()
+	token, tokenHash, err := esphttp.NewOpenInviteToken()
+	if err != nil {
+		t.Fatalf("NewOpenInviteToken: %v", err)
+	}
+	if _, err := state.CreateOpenInvite(ctx, esphttp.OpenInviteRecord{
+		TokenHash:   tokenHash,
+		GroupID:     gid,
+		MaxUses:     1,
+		CreatedAtMS: time.Now().UnixMilli(),
+		ExpiresAtMS: time.Now().Add(time.Hour).UnixMilli(),
+	}); err != nil {
+		t.Fatalf("CreateOpenInvite: %v", err)
+	}
+	sock := testUnixSocketPath(t)
+	stop := serveESPAuthorityIPCError(t, sock, ipc.CodeUnavailable, "pilot lookup unavailable")
+	defer stop()
+	exec := espOperationExecutor{stateStore: state, socketPath: sock, timeout: time.Second}
+	pilotPub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey pilot: %v", err)
+	}
+	challengeReq := mustMarshalJSON(t, map[string]any{
+		"pilot_node_id":  45982,
+		"pilot_pubkey":   base64.StdEncoding.EncodeToString(pilotPub),
+		"entmoot_pubkey": base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x49}, 32)),
+	})
+	_, err = exec.CreateOpenInviteChallenge(ctx, token, challengeReq)
+	var opErr *esphttp.OperationError
+	if !errors.As(err, &opErr) || opErr.HTTPStatus != http.StatusServiceUnavailable || opErr.Code != "join_unavailable" {
+		t.Fatalf("CreateOpenInviteChallenge err = %v, want 503 join_unavailable", err)
+	}
+}
+
+func TestESPOpenInviteChallengeCapsActiveRedeemers(t *testing.T) {
+	ctx := context.Background()
+	gid := testESPGroupID(26)
+	state := esphttp.NewMemoryStateStore()
+	sock := testUnixSocketPath(t)
+	stop := serveESPInviteCreateIPC(t, sock, gid, nil)
+	defer stop()
+	exec := espOperationExecutor{stateStore: state, socketPath: sock, timeout: time.Second}
+	raw, err := exec.ExecuteSignRequest(ctx, esphttp.SignRequest{
+		Kind:    "open_invite_create",
+		GroupID: gid,
+		Payload: json.RawMessage(`{"max_uses":1,"valid_for":"24h"}`),
+	}, nil)
+	if err != nil {
+		t.Fatalf("open_invite_create: %v", err)
+	}
+	var created struct {
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal(raw, &created); err != nil {
+		t.Fatalf("unmarshal created: %v", err)
+	}
+	firstPilotPub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey first pilot: %v", err)
+	}
+	firstReq := mustMarshalJSON(t, map[string]any{
+		"pilot_node_id":  45981,
+		"pilot_pubkey":   base64.StdEncoding.EncodeToString(firstPilotPub),
+		"entmoot_pubkey": base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x50}, 32)),
+	})
+	firstRaw, err := exec.CreateOpenInviteChallenge(ctx, created.Token, firstReq)
+	if err != nil {
+		t.Fatalf("first CreateOpenInviteChallenge: %v", err)
+	}
+	reusedRaw, err := exec.CreateOpenInviteChallenge(ctx, created.Token, firstReq)
+	if err != nil {
+		t.Fatalf("reuse CreateOpenInviteChallenge: %v", err)
+	}
+	if !bytes.Equal(firstRaw, reusedRaw) {
+		t.Fatalf("same redeemer challenge changed:\nfirst=%s\nsecond=%s", firstRaw, reusedRaw)
+	}
+	for i := 1; i < minOpenInviteActiveChallenges; i++ {
+		pilotPub, _, err := ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			t.Fatalf("GenerateKey pilot %d: %v", i, err)
+		}
+		req := mustMarshalJSON(t, map[string]any{
+			"pilot_node_id":  45981 + i,
+			"pilot_pubkey":   base64.StdEncoding.EncodeToString(pilotPub),
+			"entmoot_pubkey": base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{byte(0x50 + i)}, 32)),
+		})
+		if _, err := exec.CreateOpenInviteChallenge(ctx, created.Token, req); err != nil {
+			t.Fatalf("CreateOpenInviteChallenge %d: %v", i, err)
+		}
+	}
+	overflowPilotPub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey overflow pilot: %v", err)
+	}
+	overflowReq := mustMarshalJSON(t, map[string]any{
+		"pilot_node_id":  46999,
+		"pilot_pubkey":   base64.StdEncoding.EncodeToString(overflowPilotPub),
+		"entmoot_pubkey": base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x5f}, 32)),
+	})
+	_, err = exec.CreateOpenInviteChallenge(ctx, created.Token, overflowReq)
+	var opErr *esphttp.OperationError
+	if !errors.As(err, &opErr) || opErr.HTTPStatus != http.StatusTooManyRequests || opErr.Code != "open_invite_challenge_limit" {
+		t.Fatalf("overflow CreateOpenInviteChallenge err = %v, want 429 open_invite_challenge_limit", err)
+	}
+}
+
+func TestESPOpenInviteRedemptionLockIsReclaimedAfterFailure(t *testing.T) {
+	m := keyedMutexMap{}
+	unlock := m.Lock("token\x00redeemer")
+	if got := m.Len(); got != 1 {
+		t.Fatalf("Len while locked = %d, want 1", got)
+	}
+	acquired := make(chan func(), 1)
+	go func() {
+		acquired <- m.Lock("token\x00redeemer")
+	}()
+	time.Sleep(20 * time.Millisecond)
+	if got := m.Len(); got != 1 {
+		t.Fatalf("Len while waiter exists = %d, want 1", got)
+	}
+	unlock()
+	waiterUnlock := <-acquired
+	if got := m.Len(); got != 1 {
+		t.Fatalf("Len while waiter owns lock = %d, want 1", got)
+	}
+	waiterUnlock()
+	if got := m.Len(); got != 0 {
+		t.Fatalf("Len after unlock = %d, want 0", got)
+	}
+}
+
+func TestOperationIPCErrorMapsUnavailable(t *testing.T) {
+	err := operationIPCError(&ipc.ErrorFrame{Code: ipc.CodeUnavailable, Message: "missing lookup_node"})
+	var opErr *esphttp.OperationError
+	if !errors.As(err, &opErr) {
+		t.Fatalf("operationIPCError err = %T, want OperationError", err)
+	}
+	if opErr.HTTPStatus != http.StatusServiceUnavailable || opErr.Code != "join_unavailable" {
+		t.Fatalf("operation error = %d/%s, want 503/join_unavailable", opErr.HTTPStatus, opErr.Code)
+	}
+}
+
+func TestESPOpenInviteRedeemRequiresPilotProof(t *testing.T) {
+	ctx := context.Background()
+	gid := testESPGroupID(20)
+	state := esphttp.NewMemoryStateStore()
+	sock := testUnixSocketPath(t)
+	reqCh := make(chan *ipc.InviteCreateReq, 1)
+	stop := serveESPInviteCreateIPC(t, sock, gid, reqCh)
+	defer stop()
+	exec := espOperationExecutor{stateStore: state, socketPath: sock, timeout: time.Second}
+	raw, err := exec.ExecuteSignRequest(ctx, esphttp.SignRequest{
+		Kind:    "open_invite_create",
+		GroupID: gid,
+		Payload: json.RawMessage(`{"max_uses":1,"valid_for":"24h"}`),
+	}, nil)
+	if err != nil {
+		t.Fatalf("open_invite_create: %v", err)
+	}
+	var created struct {
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal(raw, &created); err != nil {
+		t.Fatalf("unmarshal created: %v", err)
+	}
+	pilotPub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey pilot: %v", err)
+	}
+	body := mustMarshalJSON(t, map[string]any{
+		"pilot_node_id":  45981,
+		"pilot_pubkey":   base64.StdEncoding.EncodeToString(pilotPub),
+		"entmoot_pubkey": base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x44}, 32)),
+	})
+	_, err = exec.RedeemOpenInvite(ctx, created.Token, body)
+	var opErr *esphttp.OperationError
+	if !errors.As(err, &opErr) || opErr.HTTPStatus != http.StatusBadRequest || opErr.Code != "bad_request" {
+		t.Fatalf("RedeemOpenInvite err = %v, want 400 bad_request", err)
+	}
+}
+
+func openInviteRedeemPayloadForTest(t *testing.T, exec espOperationExecutor, ctx context.Context, token string, nodeID entmoot.NodeID, pilotPub ed25519.PublicKey, pilotPriv ed25519.PrivateKey, entmootPub []byte) json.RawMessage {
+	t.Helper()
+	challengeReq := mustMarshalJSON(t, map[string]any{
+		"pilot_node_id":  nodeID,
+		"pilot_pubkey":   base64.StdEncoding.EncodeToString(pilotPub),
+		"entmoot_pubkey": base64.StdEncoding.EncodeToString(entmootPub),
+	})
+	raw, err := exec.CreateOpenInviteChallenge(ctx, token, challengeReq)
+	if err != nil {
+		t.Fatalf("CreateOpenInviteChallenge: %v", err)
+	}
+	var challenge struct {
+		ChallengeID    string `json:"challenge_id"`
+		SigningPayload string `json:"signing_payload"`
+	}
+	if err := json.Unmarshal(raw, &challenge); err != nil {
+		t.Fatalf("unmarshal challenge: %v", err)
+	}
+	payload, err := base64.StdEncoding.DecodeString(challenge.SigningPayload)
+	if err != nil {
+		t.Fatalf("decode challenge signing payload: %v", err)
+	}
+	return mustMarshalJSON(t, map[string]any{
+		"pilot_node_id":   nodeID,
+		"pilot_pubkey":    base64.StdEncoding.EncodeToString(pilotPub),
+		"entmoot_pubkey":  base64.StdEncoding.EncodeToString(entmootPub),
+		"challenge_id":    challenge.ChallengeID,
+		"pilot_signature": base64.StdEncoding.EncodeToString(ed25519.Sign(pilotPriv, pilotChallengeSigningBytes(payload))),
+	})
 }
 
 func assertRosterMemberAbsent(t *testing.T, dataDir string, gid entmoot.GroupID, nodeID entmoot.NodeID) {
@@ -776,6 +1361,203 @@ func serveESPGroupCreateIPC(t *testing.T, sock string, pub []byte, joinOK bool) 
 			case *ipc.JoinGroupReq:
 				if joinOK {
 					_ = ipc.EncodeAndWrite(conn, &ipc.JoinGroupResp{Status: "joined", GroupID: v.Invite.GroupID, Members: 1})
+				}
+			}
+			_ = conn.Close()
+		}
+	}()
+	return func() {
+		_ = ln.Close()
+		<-done
+	}
+}
+
+func serveESPInviteCreateIPC(t *testing.T, sock string, gid entmoot.GroupID, reqCh chan<- *ipc.InviteCreateReq) func() {
+	t.Helper()
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatalf("listen unix: %v", err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer ln.Close()
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			_, payload, err := ipc.ReadAndDecode(conn)
+			if err != nil {
+				_ = conn.Close()
+				continue
+			}
+			switch v := payload.(type) {
+			case *ipc.InviteAuthorityCheckReq:
+				_ = ipc.EncodeAndWrite(conn, &ipc.InviteAuthorityCheckResp{
+					Status:     "ok",
+					GroupID:    v.GroupID,
+					RosterHead: entmoot.RosterEntryID{},
+					Members:    1,
+				})
+			case *ipc.InviteCreateReq:
+				if reqCh != nil {
+					reqCh <- v
+				}
+				_ = ipc.EncodeAndWrite(conn, &ipc.InviteCreateResp{
+					Status:     "created",
+					GroupID:    gid,
+					Invite:     entmoot.Invite{GroupID: gid},
+					RosterHead: entmoot.RosterEntryID{},
+					Members:    2,
+				})
+			}
+			_ = conn.Close()
+		}
+	}()
+	return func() {
+		_ = ln.Close()
+		<-done
+	}
+}
+
+func serveESPInviteCreateIPCFailFirst(t *testing.T, sock string, gid entmoot.GroupID, reqCh chan<- *ipc.InviteCreateReq) func() {
+	t.Helper()
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatalf("listen unix: %v", err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer ln.Close()
+		seen := 0
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			_, payload, err := ipc.ReadAndDecode(conn)
+			if err != nil {
+				_ = conn.Close()
+				continue
+			}
+			switch v := payload.(type) {
+			case *ipc.InviteAuthorityCheckReq:
+				_ = ipc.EncodeAndWrite(conn, &ipc.InviteAuthorityCheckResp{
+					Status:     "ok",
+					GroupID:    v.GroupID,
+					RosterHead: entmoot.RosterEntryID{},
+					Members:    1,
+				})
+			case *ipc.InviteCreateReq:
+				seen++
+				if reqCh != nil {
+					reqCh <- v
+				}
+				if seen == 1 {
+					_ = conn.Close()
+					continue
+				}
+				_ = ipc.EncodeAndWrite(conn, &ipc.InviteCreateResp{
+					Status:     "created",
+					GroupID:    gid,
+					Invite:     entmoot.Invite{GroupID: gid},
+					RosterHead: entmoot.RosterEntryID{},
+					Members:    2,
+				})
+			}
+			_ = conn.Close()
+		}
+	}()
+	return func() {
+		_ = ln.Close()
+		<-done
+	}
+}
+
+func serveESPInviteCreateIPCErrorFirst(t *testing.T, sock string, gid entmoot.GroupID, reqCh chan<- *ipc.InviteCreateReq) func() {
+	t.Helper()
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatalf("listen unix: %v", err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer ln.Close()
+		seen := 0
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			_, payload, err := ipc.ReadAndDecode(conn)
+			if err != nil {
+				_ = conn.Close()
+				continue
+			}
+			switch v := payload.(type) {
+			case *ipc.InviteAuthorityCheckReq:
+				_ = ipc.EncodeAndWrite(conn, &ipc.InviteAuthorityCheckResp{
+					Status:     "ok",
+					GroupID:    v.GroupID,
+					RosterHead: entmoot.RosterEntryID{},
+					Members:    1,
+				})
+			case *ipc.InviteCreateReq:
+				seen++
+				if reqCh != nil {
+					reqCh <- v
+				}
+				if seen == 1 {
+					_ = ipc.EncodeAndWrite(conn, &ipc.ErrorFrame{
+						Code:    ipc.CodeConflict,
+						Message: "target identity conflict",
+					})
+					_ = conn.Close()
+					continue
+				}
+				_ = ipc.EncodeAndWrite(conn, &ipc.InviteCreateResp{
+					Status:     "created",
+					GroupID:    gid,
+					Invite:     entmoot.Invite{GroupID: gid},
+					RosterHead: entmoot.RosterEntryID{},
+					Members:    2,
+				})
+			}
+			_ = conn.Close()
+		}
+	}()
+	return func() {
+		_ = ln.Close()
+		<-done
+	}
+}
+
+func serveESPAuthorityIPCError(t *testing.T, sock string, code ipc.ErrorCode, message string) func() {
+	t.Helper()
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatalf("listen unix: %v", err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer ln.Close()
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			_, payload, err := ipc.ReadAndDecode(conn)
+			if err == nil {
+				if req, ok := payload.(*ipc.InviteAuthorityCheckReq); ok {
+					_ = ipc.EncodeAndWrite(conn, &ipc.ErrorFrame{
+						Code:    code,
+						GroupID: &req.GroupID,
+						Message: message,
+					})
 				}
 			}
 			_ = conn.Close()

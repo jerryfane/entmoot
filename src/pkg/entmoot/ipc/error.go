@@ -33,6 +33,9 @@ const (
 	// CodeConflict is returned when a request is valid but conflicts with
 	// existing local state, such as reusing a node id with another key.
 	CodeConflict ErrorCode = "CONFLICT"
+	// CodeUnavailable is returned when a required local dependency is not
+	// available for the requested operation.
+	CodeUnavailable ErrorCode = "UNAVAILABLE"
 )
 
 // ErrorFrame is the JSON body of a MsgError frame.
@@ -64,6 +67,7 @@ type ErrorFrame struct {
 //	CodeGroupNotFound   -> 3
 //	CodeInvalidArgument -> 5
 //	CodeConflict        -> 5
+//	CodeUnavailable     -> 1
 //	(unknown)           -> 1
 func ExitCode(c ErrorCode) int {
 	switch c {
@@ -79,6 +83,8 @@ func ExitCode(c ErrorCode) int {
 		return 5
 	case CodeConflict:
 		return 5
+	case CodeUnavailable:
+		return 1
 	default:
 		return 1
 	}

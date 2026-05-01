@@ -3,6 +3,10 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"encoding/base64"
+	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -21,6 +25,7 @@ import (
 	"entmoot/pkg/entmoot/keystore"
 	"entmoot/pkg/entmoot/roster"
 	"entmoot/pkg/entmoot/store"
+	"entmoot/pkg/entmoot/transport/pilot/ipcclient"
 	"entmoot/pkg/entmoot/wire"
 )
 
@@ -269,6 +274,143 @@ func TestIPCInviteCreateRejectsTargetIdentityConflictWithoutMutation(t *testing.
 	}
 	if got := len(sess.roster.Entries()); got != entries {
 		t.Fatalf("len(entries) = %d, want unchanged %d", got, entries)
+	}
+}
+
+func TestIPCInviteCreateRequiresPilotLookupCapabilityForIdentityChecks(t *testing.T) {
+	ctx := context.Background()
+	gid := testRuntimeGroupID(0xB0)
+	targetID, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate target: %v", err)
+	}
+	server := &ipcServer{}
+	req := &ipc.InviteCreateReq{
+		GroupID:              gid,
+		Target:               entmoot.NodeInfo{PilotNodeID: 45981, EntmootPubKey: append([]byte(nil), targetID.PublicKey...)},
+		TargetPilotPubKey:    bytes.Repeat([]byte{0x42}, ed25519.PublicKeySize),
+		RequirePilotIdentity: true,
+	}
+	payload := callInviteCreateHandler(t, ctx, server, req)
+	frame, ok := payload.(*ipc.ErrorFrame)
+	if !ok {
+		t.Fatalf("payload = %T, want *ErrorFrame", payload)
+	}
+	if frame.Code != ipc.CodeUnavailable {
+		t.Fatalf("error code = %s, want %s", frame.Code, ipc.CodeUnavailable)
+	}
+
+	malformed := *req
+	malformed.Target.PilotNodeID = 0
+	payload = callInviteCreateHandler(t, ctx, server, &malformed)
+	frame, ok = payload.(*ipc.ErrorFrame)
+	if !ok {
+		t.Fatalf("malformed payload = %T, want *ErrorFrame", payload)
+	}
+	if frame.Code != ipc.CodeInvalidArgument {
+		t.Fatalf("malformed error code = %s, want %s", frame.Code, ipc.CodeInvalidArgument)
+	}
+}
+
+func TestIPCInviteCreatePilotLookupFailureReturnsUnavailable(t *testing.T) {
+	ctx := context.Background()
+	gid := testRuntimeGroupID(0xB2)
+	targetID, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate target: %v", err)
+	}
+	targetPilotPub := bytes.Repeat([]byte{0x43}, ed25519.PublicKeySize)
+	driver, stop := newTestPilotLookupServer(t, nil, true)
+	defer stop()
+	server := &ipcServer{pilot: driver, pilotLookupNodeSupported: true}
+	req := &ipc.InviteCreateReq{
+		GroupID:              gid,
+		Target:               entmoot.NodeInfo{PilotNodeID: 45981, EntmootPubKey: append([]byte(nil), targetID.PublicKey...)},
+		TargetPilotPubKey:    targetPilotPub,
+		RequirePilotIdentity: true,
+	}
+	payload := callInviteCreateHandler(t, ctx, server, req)
+	frame, ok := payload.(*ipc.ErrorFrame)
+	if !ok {
+		t.Fatalf("payload = %T, want *ErrorFrame", payload)
+	}
+	if frame.Code != ipc.CodeUnavailable {
+		t.Fatalf("error code = %s, want %s; message=%q", frame.Code, ipc.CodeUnavailable, frame.Message)
+	}
+}
+
+func TestIPCInviteCreatePilotIdentityMismatchReturnsInvalidArgument(t *testing.T) {
+	ctx := context.Background()
+	gid := testRuntimeGroupID(0xB3)
+	targetID, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate target: %v", err)
+	}
+	wantPilotPub := bytes.Repeat([]byte{0x44}, ed25519.PublicKeySize)
+	gotPilotPub := bytes.Repeat([]byte{0x45}, ed25519.PublicKeySize)
+	driver, stop := newTestPilotLookupServer(t, map[string]any{
+		"node_id":    45981,
+		"public_key": base64.StdEncoding.EncodeToString(gotPilotPub),
+		"source":     "trusted",
+	}, false)
+	defer stop()
+	server := &ipcServer{pilot: driver, pilotLookupNodeSupported: true}
+	req := &ipc.InviteCreateReq{
+		GroupID:              gid,
+		Target:               entmoot.NodeInfo{PilotNodeID: 45981, EntmootPubKey: append([]byte(nil), targetID.PublicKey...)},
+		TargetPilotPubKey:    wantPilotPub,
+		RequirePilotIdentity: true,
+	}
+	payload := callInviteCreateHandler(t, ctx, server, req)
+	frame, ok := payload.(*ipc.ErrorFrame)
+	if !ok {
+		t.Fatalf("payload = %T, want *ErrorFrame", payload)
+	}
+	if frame.Code != ipc.CodeInvalidArgument {
+		t.Fatalf("error code = %s, want %s; message=%q", frame.Code, ipc.CodeInvalidArgument, frame.Message)
+	}
+}
+
+func TestIPCInviteAuthorityCheckRequiresPilotLookupCapability(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	dataDir := t.TempDir()
+	identity, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate identity: %v", err)
+	}
+	st, err := store.OpenSQLite(dataDir)
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	defer st.Close()
+	rt, err := newGroupRuntime(groupRuntimeConfig{
+		NodeID:    45491,
+		Identity:  identity,
+		DataDir:   dataDir,
+		Store:     st,
+		Notify:    newNotifyingStore(st, events.NewBus()),
+		Transport: newRuntimeFakeTransport(),
+	})
+	if err != nil {
+		t.Fatalf("newGroupRuntime: %v", err)
+	}
+	defer rt.Close()
+
+	gid := testRuntimeGroupID(0xB1)
+	invite := selfInvite(t, dataDir, st, identity, 45491, gid)
+	if _, created, err := rt.AddInvite(ctx, invite); err != nil || !created {
+		t.Fatalf("AddInvite created/err = %v/%v, want true/nil", created, err)
+	}
+	server := &ipcServer{runtime: rt, nodeID: 45491, identity: identity, store: st}
+	payload := callInviteAuthorityCheckHandler(t, ctx, server, &ipc.InviteAuthorityCheckReq{GroupID: gid})
+	frame, ok := payload.(*ipc.ErrorFrame)
+	if !ok {
+		t.Fatalf("payload = %T, want *ErrorFrame", payload)
+	}
+	if frame.Code != ipc.CodeUnavailable {
+		t.Fatalf("error code = %s, want %s", frame.Code, ipc.CodeUnavailable)
 	}
 }
 
@@ -920,6 +1062,92 @@ func callInviteCreateHandler(t *testing.T, ctx context.Context, server *ipcServe
 	}
 	<-done
 	return payload
+}
+
+func callInviteAuthorityCheckHandler(t *testing.T, ctx context.Context, server *ipcServer, req *ipc.InviteAuthorityCheckReq) any {
+	t.Helper()
+	client, daemon := net.Pipe()
+	defer client.Close()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer daemon.Close()
+		server.handleInviteAuthorityCheck(ctx, daemon, req)
+	}()
+	_, payload, err := ipc.ReadAndDecode(client)
+	if err != nil {
+		t.Fatalf("ReadAndDecode invite authority response: %v", err)
+	}
+	<-done
+	return payload
+}
+
+func newTestPilotLookupServer(t *testing.T, response map[string]any, closeBeforeResponse bool) (*ipcclient.Driver, func()) {
+	t.Helper()
+	sock := testUnixSocketPath(t)
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatalf("listen pilot socket: %v", err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer ln.Close()
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		frame, err := readTestPilotFrame(conn)
+		if err != nil {
+			return
+		}
+		if len(frame) == 0 || frame[0] != 0x38 {
+			return
+		}
+		if closeBeforeResponse {
+			return
+		}
+		body, err := json.Marshal(response)
+		if err != nil {
+			return
+		}
+		_ = writeTestPilotFrame(conn, append([]byte{0x39}, body...))
+	}()
+	driver, err := ipcclient.Connect(sock)
+	if err != nil {
+		_ = ln.Close()
+		<-done
+		t.Fatalf("connect pilot socket: %v", err)
+	}
+	return driver, func() {
+		_ = driver.Close()
+		_ = ln.Close()
+		<-done
+	}
+}
+
+func readTestPilotFrame(conn net.Conn) ([]byte, error) {
+	var hdr [4]byte
+	if _, err := io.ReadFull(conn, hdr[:]); err != nil {
+		return nil, err
+	}
+	n := binary.BigEndian.Uint32(hdr[:])
+	buf := make([]byte, n)
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		return nil, err
+	}
+	return buf, nil
+}
+
+func writeTestPilotFrame(conn net.Conn, frame []byte) error {
+	var hdr [4]byte
+	binary.BigEndian.PutUint32(hdr[:], uint32(len(frame)))
+	if _, err := conn.Write(hdr[:]); err != nil {
+		return err
+	}
+	_, err := conn.Write(frame)
+	return err
 }
 
 func selfInvite(t *testing.T, dataDir string, st *store.SQLite, identity *keystore.Identity, nodeID entmoot.NodeID, gid entmoot.GroupID) entmoot.Invite {
