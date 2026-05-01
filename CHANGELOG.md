@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.33] - 2026-05-01
+
+### Added
+
+- **Open invite acceptance.** ESP sign requests can now accept open-invite
+  links by proving local Pilot key possession to the issuer, redeeming the
+  returned invite, joining the group, and granting the requesting device access.
+
+### Fixed
+
+- **Open invite retry safety.** Open-invite redemption is now idempotent for
+  the same redeemer after an issued invite is stored, including exhausted
+  single-use invites, while new redeemers remain blocked once uses are
+  exhausted.
+- **Issuer response binding.** Open-invite acceptance now validates that the
+  issuer's redeemed invite belongs to the same group as the signed challenge
+  before joining.
+
 ## [1.5.31] - 2026-05-01
 
 ### Added
