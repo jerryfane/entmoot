@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
@@ -720,6 +721,401 @@ func TestESPOpenInviteStoresAndRedeemsBootstrapPeers(t *testing.T) {
 	}
 }
 
+func TestESPOpenInviteAcceptRedeemsViaIssuerAndJoinsGroup(t *testing.T) {
+	ctx := context.Background()
+	gid := testESPGroupID(27)
+	identity, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate identity: %v", err)
+	}
+	reg, regPath := testDeviceRegistry(t)
+	sock := testUnixSocketPath(t)
+	stop := serveESPGroupCreateIPC(t, sock, identity.PublicKey, true)
+	defer stop()
+
+	pilotPub, pilotPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey pilot: %v", err)
+	}
+	challengeID := "challenge-1"
+	challengePayload, err := canonical.Encode(openInvitePilotProofEnvelope{
+		Type:          "entmoot.open_invite.redeem.v1",
+		TokenHash:     esphttp.HashOpenInviteToken("open-token"),
+		GroupID:       gid,
+		ChallengeID:   challengeID,
+		Nonce:         "nonce-1",
+		IssuedAtMS:    time.Now().UnixMilli(),
+		ExpiresAtMS:   time.Now().Add(time.Minute).UnixMilli(),
+		PilotNodeID:   45981,
+		PilotPubKey:   pilotPub,
+		EntmootPubKey: identity.PublicKey,
+	})
+	if err != nil {
+		t.Fatalf("Encode challenge payload: %v", err)
+	}
+	var challengeCalled, redeemCalled bool
+	issuer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/open-invites/open-token/challenge":
+			challengeCalled = true
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Errorf("decode challenge request: %v", err)
+			}
+			if body["pilot_pubkey"] != base64.StdEncoding.EncodeToString(pilotPub) {
+				t.Errorf("pilot_pubkey = %v", body["pilot_pubkey"])
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"challenge_id":           challengeID,
+				"signing_payload":        base64.StdEncoding.EncodeToString(challengePayload),
+				"signing_payload_sha256": sha256Base64(challengePayload),
+				"expires_at_ms":          time.Now().Add(time.Minute).UnixMilli(),
+			})
+		case "/v1/open-invites/open-token/redeem":
+			redeemCalled = true
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Errorf("decode redeem request: %v", err)
+			}
+			sigText, _ := body["pilot_signature"].(string)
+			sig, _ := base64.StdEncoding.DecodeString(sigText)
+			if !ed25519.Verify(pilotPub, pilotChallengeSigningBytes(challengePayload), sig) {
+				t.Errorf("pilot signature did not verify")
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":        "redeemed",
+				"group_id":      gid,
+				"invite":        entmoot.Invite{GroupID: gid},
+				"max_uses":      5,
+				"use_count":     1,
+				"expires_at_ms": time.Now().Add(time.Hour).UnixMilli(),
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer issuer.Close()
+
+	exec := espOperationExecutor{
+		identity:     identity,
+		socketPath:   sock,
+		timeout:      time.Second,
+		deviceGroups: &fileBackedDeviceGroupAuthorizer{path: regPath, registry: reg},
+		pilotIdentity: func(context.Context) (entmoot.NodeID, string, error) {
+			return 45981, base64.StdEncoding.EncodeToString(pilotPub), nil
+		},
+		pilotSignChallenge: func(_ context.Context, payload []byte) (string, error) {
+			if !bytes.Equal(payload, challengePayload) {
+				t.Fatalf("challenge payload = %q, want %q", payload, challengePayload)
+			}
+			return base64.StdEncoding.EncodeToString(ed25519.Sign(pilotPriv, pilotChallengeSigningBytes(payload))), nil
+		},
+	}
+	raw, err := exec.ExecuteSignRequest(ctx, esphttp.SignRequest{
+		Kind:     "open_invite_accept",
+		DeviceID: "ios-1",
+		Payload:  mustMarshalJSON(t, openInviteAcceptPayload{IssuerURL: issuer.URL, Token: "open-token"}),
+	}, nil)
+	if err != nil {
+		t.Fatalf("open_invite_accept: %v", err)
+	}
+	var out struct {
+		Status  string          `json:"status"`
+		GroupID entmoot.GroupID `json:"group_id"`
+		Members int             `json:"members"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("unmarshal open_invite_accept result: %v", err)
+	}
+	if !challengeCalled || !redeemCalled {
+		t.Fatalf("issuer calls challenge=%v redeem=%v, want both", challengeCalled, redeemCalled)
+	}
+	if out.Status != "joined" || out.GroupID != gid || out.Members != 1 {
+		t.Fatalf("open invite accept result = %+v", out)
+	}
+	assertDeviceGroups(t, regPath, gid)
+}
+
+func TestESPOpenInviteIssuerRedirectsAreRejected(t *testing.T) {
+	ctx := context.Background()
+	var redirectTargetCalled bool
+	redirectTarget := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		redirectTargetCalled = true
+	}))
+	defer redirectTarget.Close()
+	issuer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, redirectTarget.URL+"/leaked", http.StatusTemporaryRedirect)
+	}))
+	defer issuer.Close()
+
+	var out map[string]any
+	err := (espOperationExecutor{timeout: time.Second}).postIssuerJSON(ctx, issuer.URL+"/v1/open-invites/token/challenge", map[string]any{
+		"pilot_node_id":  45981,
+		"pilot_pubkey":   "pilot",
+		"entmoot_pubkey": "entmoot",
+	}, &out)
+
+	var opErr *esphttp.OperationError
+	if !errors.As(err, &opErr) || opErr.HTTPStatus != http.StatusBadGateway || opErr.Code != "issuer_redirect_disallowed" {
+		t.Fatalf("postIssuerJSON err = %v, want issuer_redirect_disallowed 502", err)
+	}
+	if redirectTargetCalled {
+		t.Fatal("redirect target was called")
+	}
+}
+
+func TestValidateOpenInviteIssuerChallengeRejectsMismatches(t *testing.T) {
+	gid := testESPGroupID(28)
+	pilotPub := bytes.Repeat([]byte{0x21}, ed25519.PublicKeySize)
+	entmootPub := bytes.Repeat([]byte{0x42}, ed25519.PublicKeySize)
+	token := "open-token"
+	challengeID := "challenge-1"
+	now := time.Now().UnixMilli()
+	base := openInvitePilotProofEnvelope{
+		Type:          "entmoot.open_invite.redeem.v1",
+		TokenHash:     esphttp.HashOpenInviteToken(token),
+		GroupID:       gid,
+		ChallengeID:   challengeID,
+		Nonce:         "nonce-1",
+		IssuedAtMS:    now,
+		ExpiresAtMS:   now + int64(time.Minute/time.Millisecond),
+		PilotNodeID:   45981,
+		PilotPubKey:   append([]byte(nil), pilotPub...),
+		EntmootPubKey: append([]byte(nil), entmootPub...),
+	}
+	validProof, err := canonical.Encode(base)
+	if err != nil {
+		t.Fatalf("Encode valid proof: %v", err)
+	}
+	validGroupID, err := validateOpenInviteIssuerChallenge(validProof, challengeID, token, base.PilotNodeID, pilotPub, entmootPub, now)
+	if err != nil {
+		t.Fatalf("valid challenge rejected: %v", err)
+	}
+	if validGroupID != gid {
+		t.Fatalf("valid challenge group = %s, want %s", validGroupID, gid)
+	}
+
+	tests := []struct {
+		name  string
+		proof func() []byte
+	}{
+		{
+			name: "wrong type",
+			proof: func() []byte {
+				env := base
+				env.Type = "other"
+				return mustCanonicalProof(t, env)
+			},
+		},
+		{
+			name: "wrong token",
+			proof: func() []byte {
+				env := base
+				env.TokenHash = esphttp.HashOpenInviteToken("other-token")
+				return mustCanonicalProof(t, env)
+			},
+		},
+		{
+			name: "wrong challenge id",
+			proof: func() []byte {
+				env := base
+				env.ChallengeID = "challenge-2"
+				return mustCanonicalProof(t, env)
+			},
+		},
+		{
+			name: "wrong pilot node",
+			proof: func() []byte {
+				env := base
+				env.PilotNodeID = 45982
+				return mustCanonicalProof(t, env)
+			},
+		},
+		{
+			name: "wrong pilot pubkey",
+			proof: func() []byte {
+				env := base
+				env.PilotPubKey = bytes.Repeat([]byte{0x22}, ed25519.PublicKeySize)
+				return mustCanonicalProof(t, env)
+			},
+		},
+		{
+			name: "wrong entmoot pubkey",
+			proof: func() []byte {
+				env := base
+				env.EntmootPubKey = bytes.Repeat([]byte{0x43}, ed25519.PublicKeySize)
+				return mustCanonicalProof(t, env)
+			},
+		},
+		{
+			name: "expired",
+			proof: func() []byte {
+				env := base
+				env.ExpiresAtMS = now
+				return mustCanonicalProof(t, env)
+			},
+		},
+		{
+			name: "non-canonical",
+			proof: func() []byte {
+				out, err := json.Marshal(base)
+				if err != nil {
+					t.Fatalf("Marshal non-canonical proof: %v", err)
+				}
+				return out
+			},
+		},
+		{
+			name: "malformed",
+			proof: func() []byte {
+				return []byte("not-json")
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := validateOpenInviteIssuerChallenge(tt.proof(), challengeID, token, base.PilotNodeID, pilotPub, entmootPub, now)
+			var opErr *esphttp.OperationError
+			if !errors.As(err, &opErr) || opErr.HTTPStatus != http.StatusBadGateway || opErr.Code != "issuer_bad_response" {
+				t.Fatalf("validateOpenInviteIssuerChallenge err = %v, want 502 issuer_bad_response", err)
+			}
+		})
+	}
+}
+
+func TestESPOpenInviteAcceptRejectsMismatchedIssuerChallengeBeforeSigning(t *testing.T) {
+	ctx := context.Background()
+	identity, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate identity: %v", err)
+	}
+	pilotPub := bytes.Repeat([]byte{0x24}, ed25519.PublicKeySize)
+	proof, err := canonical.Encode(openInvitePilotProofEnvelope{
+		Type:          "entmoot.open_invite.redeem.v1",
+		TokenHash:     esphttp.HashOpenInviteToken("other-token"),
+		GroupID:       testESPGroupID(29),
+		ChallengeID:   "challenge-1",
+		Nonce:         "nonce-1",
+		IssuedAtMS:    time.Now().UnixMilli(),
+		ExpiresAtMS:   time.Now().Add(time.Minute).UnixMilli(),
+		PilotNodeID:   45981,
+		PilotPubKey:   pilotPub,
+		EntmootPubKey: identity.PublicKey,
+	})
+	if err != nil {
+		t.Fatalf("Encode proof: %v", err)
+	}
+	issuer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/open-invites/open-token/challenge" {
+			t.Errorf("unexpected issuer path %s", r.URL.Path)
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"challenge_id":           "challenge-1",
+			"signing_payload":        base64.StdEncoding.EncodeToString(proof),
+			"signing_payload_sha256": sha256Base64(proof),
+		})
+	}))
+	defer issuer.Close()
+
+	var signed bool
+	exec := espOperationExecutor{
+		identity: identity,
+		timeout:  time.Second,
+		pilotIdentity: func(context.Context) (entmoot.NodeID, string, error) {
+			return 45981, base64.StdEncoding.EncodeToString(pilotPub), nil
+		},
+		pilotSignChallenge: func(context.Context, []byte) (string, error) {
+			signed = true
+			return "", errors.New("should not sign")
+		},
+	}
+	_, err = exec.ExecuteSignRequest(ctx, esphttp.SignRequest{
+		Kind:    "open_invite_accept",
+		Payload: mustMarshalJSON(t, openInviteAcceptPayload{IssuerURL: issuer.URL, Token: "open-token"}),
+	}, nil)
+	var opErr *esphttp.OperationError
+	if !errors.As(err, &opErr) || opErr.HTTPStatus != http.StatusBadGateway || opErr.Code != "issuer_bad_response" {
+		t.Fatalf("open_invite_accept err = %v, want 502 issuer_bad_response", err)
+	}
+	if signed {
+		t.Fatal("pilotSignChallenge was called")
+	}
+}
+
+func TestESPOpenInviteAcceptRejectsRedeemedInviteGroupMismatch(t *testing.T) {
+	ctx := context.Background()
+	challengeGroup := testESPGroupID(30)
+	redeemedGroup := testESPGroupID(31)
+	identity, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate identity: %v", err)
+	}
+	pilotPub, pilotPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey pilot: %v", err)
+	}
+	challengeID := "challenge-1"
+	challengePayload, err := canonical.Encode(openInvitePilotProofEnvelope{
+		Type:          "entmoot.open_invite.redeem.v1",
+		TokenHash:     esphttp.HashOpenInviteToken("open-token"),
+		GroupID:       challengeGroup,
+		ChallengeID:   challengeID,
+		Nonce:         "nonce-1",
+		IssuedAtMS:    time.Now().UnixMilli(),
+		ExpiresAtMS:   time.Now().Add(time.Minute).UnixMilli(),
+		PilotNodeID:   45981,
+		PilotPubKey:   pilotPub,
+		EntmootPubKey: identity.PublicKey,
+	})
+	if err != nil {
+		t.Fatalf("Encode challenge payload: %v", err)
+	}
+	issuer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/open-invites/open-token/challenge":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"challenge_id":           challengeID,
+				"signing_payload":        base64.StdEncoding.EncodeToString(challengePayload),
+				"signing_payload_sha256": sha256Base64(challengePayload),
+				"expires_at_ms":          time.Now().Add(time.Minute).UnixMilli(),
+			})
+		case "/v1/open-invites/open-token/redeem":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":        "redeemed",
+				"group_id":      redeemedGroup,
+				"invite":        entmoot.Invite{GroupID: redeemedGroup},
+				"max_uses":      1,
+				"use_count":     1,
+				"expires_at_ms": time.Now().Add(time.Hour).UnixMilli(),
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer issuer.Close()
+
+	exec := espOperationExecutor{
+		identity: identity,
+		timeout:  time.Second,
+		pilotIdentity: func(context.Context) (entmoot.NodeID, string, error) {
+			return 45981, base64.StdEncoding.EncodeToString(pilotPub), nil
+		},
+		pilotSignChallenge: func(_ context.Context, payload []byte) (string, error) {
+			return base64.StdEncoding.EncodeToString(ed25519.Sign(pilotPriv, pilotChallengeSigningBytes(payload))), nil
+		},
+	}
+	_, err = exec.ExecuteSignRequest(ctx, esphttp.SignRequest{
+		Kind:    "open_invite_accept",
+		Payload: mustMarshalJSON(t, openInviteAcceptPayload{IssuerURL: issuer.URL, Token: "open-token"}),
+	}, nil)
+	var opErr *esphttp.OperationError
+	if !errors.As(err, &opErr) || opErr.HTTPStatus != http.StatusBadGateway || opErr.Code != "issuer_bad_response" {
+		t.Fatalf("open_invite_accept err = %v, want 502 issuer_bad_response", err)
+	}
+}
+
 func TestESPOpenInvitePendingRedemptionDoesNotRefundUse(t *testing.T) {
 	ctx := context.Background()
 	gid := testESPGroupID(21)
@@ -954,10 +1350,11 @@ func TestESPOpenInviteChallengeRejectsExhaustedInvite(t *testing.T) {
 		t.Fatalf("unmarshal created: %v", err)
 	}
 	tokenHash := esphttp.HashOpenInviteToken(created.Token)
+	usedEntmootPub := bytes.Repeat([]byte{0x48}, 32)
 	_, _, _, err = state.RedeemOpenInvite(ctx, tokenHash, esphttp.OpenInviteRedemption{
-		RedeemerKey:   "45981:used",
+		RedeemerKey:   openInviteRedeemerKey(45981, usedEntmootPub),
 		PilotNodeID:   45981,
-		EntmootPubKey: base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x48}, 32)),
+		EntmootPubKey: base64.StdEncoding.EncodeToString(usedEntmootPub),
 	}, time.Now().UnixMilli())
 	if err != nil {
 		t.Fatalf("seed exhausted redemption: %v", err)
@@ -975,6 +1372,29 @@ func TestESPOpenInviteChallengeRejectsExhaustedInvite(t *testing.T) {
 	var opErr *esphttp.OperationError
 	if !errors.As(err, &opErr) || opErr.HTTPStatus != http.StatusConflict || opErr.Code != "open_invite_exhausted" {
 		t.Fatalf("CreateOpenInviteChallenge err = %v, want 409 open_invite_exhausted", err)
+	}
+
+	usedPilotPub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey used pilot: %v", err)
+	}
+	retryReq := mustMarshalJSON(t, map[string]any{
+		"pilot_node_id":  45981,
+		"pilot_pubkey":   base64.StdEncoding.EncodeToString(usedPilotPub),
+		"entmoot_pubkey": base64.StdEncoding.EncodeToString(usedEntmootPub),
+	})
+	retryChallenge, err := exec.CreateOpenInviteChallenge(ctx, created.Token, retryReq)
+	if err != nil {
+		t.Fatalf("same redeemer CreateOpenInviteChallenge after exhaustion: %v", err)
+	}
+	var retryOut struct {
+		ChallengeID string `json:"challenge_id"`
+	}
+	if err := json.Unmarshal(retryChallenge, &retryOut); err != nil {
+		t.Fatalf("unmarshal retry challenge: %v", err)
+	}
+	if retryOut.ChallengeID == "" {
+		t.Fatal("same redeemer retry challenge id is empty")
 	}
 }
 
@@ -1191,6 +1611,15 @@ func openInviteRedeemPayloadForTest(t *testing.T, exec espOperationExecutor, ctx
 		"challenge_id":    challenge.ChallengeID,
 		"pilot_signature": base64.StdEncoding.EncodeToString(ed25519.Sign(pilotPriv, pilotChallengeSigningBytes(payload))),
 	})
+}
+
+func mustCanonicalProof(t *testing.T, env openInvitePilotProofEnvelope) []byte {
+	t.Helper()
+	proof, err := canonical.Encode(env)
+	if err != nil {
+		t.Fatalf("Encode proof: %v", err)
+	}
+	return proof
 }
 
 func assertRosterMemberAbsent(t *testing.T, dataDir string, gid entmoot.GroupID, nodeID entmoot.NodeID) {

@@ -66,6 +66,9 @@ type Info struct {
 	// Capabilities advertises daemon IPC/application features. Entmoot
 	// requires stream_send_result_v2 for strict tracked stream-send semantics.
 	Capabilities []string `json:"capabilities,omitempty"`
+	// PublicKey is the daemon node identity public key. Older daemons may omit
+	// it; invite redemption treats an empty value as unavailable.
+	PublicKey string `json:"public_key,omitempty"`
 }
 
 // NodeIdentity is the typed shape of Pilot's lookup_node IPC reply.

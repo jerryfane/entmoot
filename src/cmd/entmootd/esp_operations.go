@@ -11,9 +11,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -27,16 +29,20 @@ import (
 	"entmoot/pkg/entmoot/keystore"
 	"entmoot/pkg/entmoot/roster"
 	"entmoot/pkg/entmoot/store"
+	"entmoot/pkg/entmoot/transport/pilot/ipcclient"
 )
 
 type espOperationExecutor struct {
-	dataDir       string
-	identity      *keystore.Identity
-	socketPath    string
-	timeout       time.Duration
-	metadataStore esphttp.GroupMetadataStore
-	stateStore    esphttp.StateStore
-	deviceGroups  deviceGroupAuthorizer
+	dataDir            string
+	identity           *keystore.Identity
+	socketPath         string
+	pilotSocketPath    string
+	timeout            time.Duration
+	metadataStore      esphttp.GroupMetadataStore
+	stateStore         esphttp.StateStore
+	deviceGroups       deviceGroupAuthorizer
+	pilotIdentity      func(context.Context) (entmoot.NodeID, string, error)
+	pilotSignChallenge func(context.Context, []byte) (string, error)
 }
 
 var espInviteRosterLocks sync.Map
@@ -111,6 +117,11 @@ type openInviteCreatePayload struct {
 	BootstrapPeers []entmoot.NodeID `json:"bootstrap_peers,omitempty"`
 }
 
+type openInviteAcceptPayload struct {
+	IssuerURL string `json:"issuer_url"`
+	Token     string `json:"token"`
+}
+
 type inviteAcceptPayload struct {
 	Invite *entmoot.Invite `json:"invite,omitempty"`
 }
@@ -149,6 +160,8 @@ func (e espOperationExecutor) ExecuteSignRequest(ctx context.Context, req esphtt
 		return e.createInvite(ctx, req)
 	case "open_invite_create":
 		return e.createOpenInvite(ctx, req)
+	case "open_invite_accept":
+		return e.acceptOpenInvite(ctx, req)
 	case "member_remove":
 		return e.removeMember(ctx, req)
 	case "group_create":
@@ -185,7 +198,8 @@ func (e espOperationExecutor) CreateOpenInviteChallenge(ctx context.Context, tok
 		return nil, &esphttp.OperationError{HTTPStatus: http.StatusNotFound, Code: "open_invite_not_found", Message: "open invite not found"}
 	}
 	now := time.Now().UnixMilli()
-	if err := ensureOpenInviteCanIssueChallenge(rec, now); err != nil {
+	redeemerKey := openInviteRedeemerKey(payload.PilotNodeID, payload.EntmootPubKey)
+	if err := e.ensureOpenInviteCanIssueChallenge(ctx, rec, tokenHash, redeemerKey, now); err != nil {
 		return nil, openInviteStoreError(err)
 	}
 	if _, err := e.checkInviteAuthorityOverIPC(ctx, &ipc.InviteAuthorityCheckReq{GroupID: rec.GroupID}); err != nil {
@@ -267,7 +281,7 @@ func (e espOperationExecutor) RedeemOpenInvite(ctx context.Context, token string
 	if !ok {
 		return nil, &esphttp.OperationError{HTTPStatus: http.StatusNotFound, Code: "open_invite_not_found", Message: "open invite not found"}
 	}
-	redeemerKey := fmt.Sprintf("%d:%s", payload.PilotNodeID, base64.StdEncoding.EncodeToString(payload.EntmootPubKey))
+	redeemerKey := openInviteRedeemerKey(payload.PilotNodeID, payload.EntmootPubKey)
 	unlock := lockESPOpenInviteRedemption(tokenHash, redeemerKey)
 	defer unlock()
 
@@ -430,7 +444,11 @@ func openInviteChallengeCap(rec esphttp.OpenInviteRecord) int {
 	return cap
 }
 
-func ensureOpenInviteCanIssueChallenge(rec esphttp.OpenInviteRecord, nowMS int64) error {
+func openInviteRedeemerKey(nodeID entmoot.NodeID, entmootPub []byte) string {
+	return fmt.Sprintf("%d:%s", nodeID, base64.StdEncoding.EncodeToString(entmootPub))
+}
+
+func (e espOperationExecutor) ensureOpenInviteCanIssueChallenge(ctx context.Context, rec esphttp.OpenInviteRecord, tokenHash, redeemerKey string, nowMS int64) error {
 	if rec.Revoked {
 		return esphttp.ErrOpenInviteRevoked
 	}
@@ -438,7 +456,218 @@ func ensureOpenInviteCanIssueChallenge(rec esphttp.OpenInviteRecord, nowMS int64
 		return esphttp.ErrOpenInviteExpired
 	}
 	if rec.MaxUses > 0 && rec.UseCount >= rec.MaxUses {
+		if e.stateStore != nil && redeemerKey != "" {
+			if _, ok, err := e.stateStore.GetOpenInviteRedemption(ctx, tokenHash, redeemerKey); err != nil {
+				return err
+			} else if ok {
+				return nil
+			}
+		}
 		return esphttp.ErrOpenInviteExhausted
+	}
+	return nil
+}
+
+type openInviteChallengeResponse struct {
+	ChallengeID          string `json:"challenge_id"`
+	SigningPayload       string `json:"signing_payload"`
+	SigningPayloadSHA256 string `json:"signing_payload_sha256"`
+	ExpiresAtMS          int64  `json:"expires_at_ms"`
+}
+
+type openInviteRedeemResponse struct {
+	Status         string           `json:"status"`
+	GroupID        entmoot.GroupID  `json:"group_id"`
+	Invite         entmoot.Invite   `json:"invite"`
+	MaxUses        int              `json:"max_uses"`
+	UseCount       int              `json:"use_count"`
+	BootstrapPeers []entmoot.NodeID `json:"bootstrap_peers,omitempty"`
+	ExpiresAtMS    int64            `json:"expires_at_ms"`
+}
+
+func parseOpenInviteAcceptPayload(payload openInviteAcceptPayload) (*url.URL, string, error) {
+	token := strings.TrimSpace(payload.Token)
+	if token == "" {
+		return nil, "", &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request", Message: "open invite token is required"}
+	}
+	issuerRaw := strings.TrimSpace(payload.IssuerURL)
+	if issuerRaw == "" {
+		return nil, "", &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request", Message: "issuer_url is required"}
+	}
+	issuer, err := url.Parse(issuerRaw)
+	if err != nil || issuer.Scheme == "" || issuer.Host == "" {
+		return nil, "", &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request", Message: "issuer_url must be an absolute http(s) URL"}
+	}
+	if issuer.User != nil {
+		return nil, "", &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request", Message: "issuer_url must not contain credentials"}
+	}
+	if issuer.Scheme != "https" && !(issuer.Scheme == "http" && issuerHostAllowsCleartext(issuer.Hostname())) {
+		return nil, "", &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request", Message: "issuer_url must use https except for localhost or .local development hosts"}
+	}
+	issuer.RawQuery = ""
+	issuer.Fragment = ""
+	return issuer, token, nil
+}
+
+func issuerHostAllowsCleartext(host string) bool {
+	host = strings.ToLower(strings.Trim(host, "[]"))
+	return host == "localhost" || host == "127.0.0.1" || host == "::1" || strings.HasSuffix(host, ".local")
+}
+
+func openInviteIssuerEndpoint(base *url.URL, token, suffix string) string {
+	u := *base
+	prefix := strings.TrimRight(u.EscapedPath(), "/")
+	u.Path = prefix + "/v1/open-invites/" + url.PathEscape(token) + "/" + suffix
+	u.RawPath = ""
+	u.RawQuery = ""
+	u.Fragment = ""
+	return u.String()
+}
+
+func (e espOperationExecutor) redeemOpenInviteFromIssuer(ctx context.Context, issuer *url.URL, token string) (entmoot.Invite, openInviteRedeemResponse, error) {
+	nodeID, pilotPub, err := e.localPilotIdentity(ctx)
+	if err != nil {
+		return entmoot.Invite{}, openInviteRedeemResponse{}, err
+	}
+	if e.identity == nil || len(e.identity.PublicKey) != ed25519.PublicKeySize {
+		return entmoot.Invite{}, openInviteRedeemResponse{}, &esphttp.OperationError{HTTPStatus: http.StatusServiceUnavailable, Code: "identity_unavailable", Message: "local Entmoot identity is not configured"}
+	}
+	pilotPubBytes, err := base64.StdEncoding.DecodeString(pilotPub)
+	if err != nil || len(pilotPubBytes) != ed25519.PublicKeySize {
+		return entmoot.Invite{}, openInviteRedeemResponse{}, &esphttp.OperationError{HTTPStatus: http.StatusServiceUnavailable, Code: "pilot_unavailable", Message: "local Pilot identity public key is invalid"}
+	}
+	entmootPub := base64.StdEncoding.EncodeToString(e.identity.PublicKey)
+	claim := map[string]any{
+		"pilot_node_id":  nodeID,
+		"pilot_pubkey":   pilotPub,
+		"entmoot_pubkey": entmootPub,
+	}
+	var challenge openInviteChallengeResponse
+	if err := e.postIssuerJSON(ctx, openInviteIssuerEndpoint(issuer, token, "challenge"), claim, &challenge); err != nil {
+		return entmoot.Invite{}, openInviteRedeemResponse{}, err
+	}
+	proof, err := base64.StdEncoding.DecodeString(challenge.SigningPayload)
+	if err != nil || len(proof) == 0 {
+		return entmoot.Invite{}, openInviteRedeemResponse{}, &esphttp.OperationError{HTTPStatus: http.StatusBadGateway, Code: "issuer_bad_response", Message: "issuer returned an invalid challenge"}
+	}
+	if challenge.SigningPayloadSHA256 != "" && sha256Base64(proof) != challenge.SigningPayloadSHA256 {
+		return entmoot.Invite{}, openInviteRedeemResponse{}, &esphttp.OperationError{HTTPStatus: http.StatusBadGateway, Code: "issuer_bad_response", Message: "issuer challenge digest does not match payload"}
+	}
+	challengeGroupID, err := validateOpenInviteIssuerChallenge(proof, challenge.ChallengeID, token, nodeID, pilotPubBytes, e.identity.PublicKey, time.Now().UnixMilli())
+	if err != nil {
+		return entmoot.Invite{}, openInviteRedeemResponse{}, err
+	}
+	signature, err := e.signPilotChallenge(ctx, proof)
+	if err != nil {
+		return entmoot.Invite{}, openInviteRedeemResponse{}, err
+	}
+	redeemReq := map[string]any{
+		"pilot_node_id":   nodeID,
+		"pilot_pubkey":    pilotPub,
+		"entmoot_pubkey":  entmootPub,
+		"challenge_id":    challenge.ChallengeID,
+		"pilot_signature": signature,
+	}
+	var redeemed openInviteRedeemResponse
+	if err := e.postIssuerJSON(ctx, openInviteIssuerEndpoint(issuer, token, "redeem"), redeemReq, &redeemed); err != nil {
+		return entmoot.Invite{}, openInviteRedeemResponse{}, err
+	}
+	if redeemed.Invite.GroupID == (entmoot.GroupID{}) {
+		return entmoot.Invite{}, openInviteRedeemResponse{}, &esphttp.OperationError{HTTPStatus: http.StatusBadGateway, Code: "issuer_bad_response", Message: "issuer redemption response did not include an invite"}
+	}
+	if redeemed.Invite.GroupID != challengeGroupID {
+		return entmoot.Invite{}, openInviteRedeemResponse{}, &esphttp.OperationError{HTTPStatus: http.StatusBadGateway, Code: "issuer_bad_response", Message: "issuer redemption invite group does not match challenge"}
+	}
+	if redeemed.GroupID != (entmoot.GroupID{}) && redeemed.GroupID != challengeGroupID {
+		return entmoot.Invite{}, openInviteRedeemResponse{}, &esphttp.OperationError{HTTPStatus: http.StatusBadGateway, Code: "issuer_bad_response", Message: "issuer redemption group does not match challenge"}
+	}
+	return redeemed.Invite, redeemed, nil
+}
+
+func validateOpenInviteIssuerChallenge(proof []byte, challengeID, token string, pilotNodeID entmoot.NodeID, pilotPub, entmootPub []byte, nowMS int64) (entmoot.GroupID, error) {
+	var env openInvitePilotProofEnvelope
+	if err := json.Unmarshal(proof, &env); err != nil {
+		return entmoot.GroupID{}, issuerChallengeError("issuer returned a malformed challenge payload")
+	}
+	canonicalProof, err := canonical.Encode(env)
+	if err != nil || !bytes.Equal(canonicalProof, proof) {
+		return entmoot.GroupID{}, issuerChallengeError("issuer returned a non-canonical challenge payload")
+	}
+	if env.Type != "entmoot.open_invite.redeem.v1" {
+		return entmoot.GroupID{}, issuerChallengeError("issuer challenge type is invalid")
+	}
+	if env.TokenHash != esphttp.HashOpenInviteToken(token) {
+		return entmoot.GroupID{}, issuerChallengeError("issuer challenge token does not match")
+	}
+	if strings.TrimSpace(challengeID) == "" || env.ChallengeID != challengeID {
+		return entmoot.GroupID{}, issuerChallengeError("issuer challenge id does not match")
+	}
+	if env.GroupID == (entmoot.GroupID{}) {
+		return entmoot.GroupID{}, issuerChallengeError("issuer challenge group is invalid")
+	}
+	if env.ExpiresAtMS <= nowMS {
+		return entmoot.GroupID{}, issuerChallengeError("issuer challenge is expired")
+	}
+	if env.PilotNodeID != pilotNodeID || !bytes.Equal(env.PilotPubKey, pilotPub) || !bytes.Equal(env.EntmootPubKey, entmootPub) {
+		return entmoot.GroupID{}, issuerChallengeError("issuer challenge identity does not match")
+	}
+	return env.GroupID, nil
+}
+
+func issuerChallengeError(message string) *esphttp.OperationError {
+	return &esphttp.OperationError{HTTPStatus: http.StatusBadGateway, Code: "issuer_bad_response", Message: message}
+}
+
+func (e espOperationExecutor) postIssuerJSON(ctx context.Context, endpoint string, body any, out any) error {
+	data, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+	timeout := e.timeout
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	client := &http.Client{
+		Timeout: timeout,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(data))
+	if err != nil {
+		return &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request", Message: "invalid issuer_url"}
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return &esphttp.OperationError{HTTPStatus: http.StatusServiceUnavailable, Code: "issuer_unavailable", Message: "open invite issuer is not reachable: " + err.Error()}
+	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return &esphttp.OperationError{HTTPStatus: http.StatusServiceUnavailable, Code: "issuer_unavailable", Message: "open invite issuer response could not be read"}
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+			return &esphttp.OperationError{HTTPStatus: http.StatusBadGateway, Code: "issuer_redirect_disallowed", Message: "open invite issuer redirects are not allowed"}
+		}
+		var env struct {
+			Error struct {
+				Code    string `json:"code"`
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		code, msg := "issuer_error", strings.TrimSpace(string(respBody))
+		if err := json.Unmarshal(respBody, &env); err == nil && env.Error.Code != "" {
+			code, msg = env.Error.Code, env.Error.Message
+		}
+		if msg == "" {
+			msg = "open invite issuer rejected the request"
+		}
+		return &esphttp.OperationError{HTTPStatus: resp.StatusCode, Code: code, Message: msg}
+	}
+	if err := json.Unmarshal(respBody, out); err != nil {
+		return &esphttp.OperationError{HTTPStatus: http.StatusBadGateway, Code: "issuer_bad_response", Message: "open invite issuer returned invalid JSON"}
 	}
 	return nil
 }
@@ -463,6 +692,42 @@ func (e espOperationExecutor) acceptInvite(ctx context.Context, req esphttp.Sign
 		"status":   resp.Status,
 		"group_id": groupID,
 		"members":  resp.Members,
+	})
+}
+
+func (e espOperationExecutor) acceptOpenInvite(ctx context.Context, req esphttp.SignRequest) (json.RawMessage, error) {
+	var payload openInviteAcceptPayload
+	if err := json.Unmarshal(req.Payload, &payload); err != nil {
+		return nil, &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request", Message: "invalid open_invite_accept payload"}
+	}
+	issuer, token, err := parseOpenInviteAcceptPayload(payload)
+	if err != nil {
+		return nil, err
+	}
+	invite, issuerResult, err := e.redeemOpenInviteFromIssuer(ctx, issuer, token)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := e.joinGroup(ctx, invite)
+	if err != nil {
+		return nil, err
+	}
+	groupID := resp.GroupID
+	if groupID == (entmoot.GroupID{}) {
+		groupID = invite.GroupID
+	}
+	if err := e.grantDeviceGroupIfNeeded(ctx, req.DeviceID, groupID); err != nil {
+		return nil, err
+	}
+	return json.Marshal(map[string]any{
+		"status":          resp.Status,
+		"group_id":        groupID,
+		"members":         resp.Members,
+		"issuer_url":      issuer.String(),
+		"max_uses":        issuerResult.MaxUses,
+		"use_count":       issuerResult.UseCount,
+		"expires_at_ms":   issuerResult.ExpiresAtMS,
+		"bootstrap_peers": issuerResult.BootstrapPeers,
 	})
 }
 
@@ -919,6 +1184,64 @@ func applyFounderRosterRemove(identity *keystore.Identity, rlog *roster.RosterLo
 
 func (e espOperationExecutor) daemonInfo() (*ipc.InfoResp, error) {
 	return infoOverIPC(e.socketPath)
+}
+
+func (e espOperationExecutor) localPilotIdentity(ctx context.Context) (entmoot.NodeID, string, error) {
+	if e.pilotIdentity != nil {
+		return e.pilotIdentity(ctx)
+	}
+	socketPath := e.pilotSocketPath
+	if strings.TrimSpace(socketPath) == "" {
+		socketPath = "/tmp/pilot.sock"
+	}
+	drv, err := ipcclient.Connect(socketPath)
+	if err != nil {
+		return 0, "", &esphttp.OperationError{HTTPStatus: http.StatusServiceUnavailable, Code: "pilot_unavailable", Message: "local Pilot daemon is not reachable: " + err.Error()}
+	}
+	defer drv.Close()
+	timeout := e.timeout
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	infoCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	info, err := drv.InfoStruct(infoCtx)
+	if err != nil {
+		return 0, "", &esphttp.OperationError{HTTPStatus: http.StatusServiceUnavailable, Code: "pilot_unavailable", Message: "local Pilot identity is unavailable: " + err.Error()}
+	}
+	if info.NodeID == 0 || strings.TrimSpace(info.PublicKey) == "" {
+		return 0, "", &esphttp.OperationError{HTTPStatus: http.StatusServiceUnavailable, Code: "pilot_unavailable", Message: "local Pilot identity is incomplete"}
+	}
+	return entmoot.NodeID(info.NodeID), strings.TrimSpace(info.PublicKey), nil
+}
+
+func (e espOperationExecutor) signPilotChallenge(ctx context.Context, payload []byte) (string, error) {
+	if e.pilotSignChallenge != nil {
+		return e.pilotSignChallenge(ctx, payload)
+	}
+	socketPath := e.pilotSocketPath
+	if strings.TrimSpace(socketPath) == "" {
+		socketPath = "/tmp/pilot.sock"
+	}
+	drv, err := ipcclient.Connect(socketPath)
+	if err != nil {
+		return "", &esphttp.OperationError{HTTPStatus: http.StatusServiceUnavailable, Code: "pilot_unavailable", Message: "local Pilot daemon is not reachable: " + err.Error()}
+	}
+	defer drv.Close()
+	timeout := e.timeout
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	signCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	sig, err := drv.SignChallenge(signCtx, payload)
+	if err != nil {
+		return "", &esphttp.OperationError{HTTPStatus: http.StatusServiceUnavailable, Code: "pilot_unavailable", Message: "local Pilot challenge signing failed: " + err.Error()}
+	}
+	if strings.TrimSpace(sig.Signature) == "" {
+		return "", &esphttp.OperationError{HTTPStatus: http.StatusServiceUnavailable, Code: "pilot_unavailable", Message: "local Pilot returned no challenge signature"}
+	}
+	return strings.TrimSpace(sig.Signature), nil
 }
 
 type inviteCreateIPCResult struct {

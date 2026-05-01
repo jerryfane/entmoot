@@ -18,6 +18,7 @@ const (
 	signRequestKindInviteCreate     = "invite_create"
 	signRequestKindInviteAccept     = "invite_accept"
 	signRequestKindOpenInviteCreate = "open_invite_create"
+	signRequestKindOpenInviteAccept = "open_invite_accept"
 	signRequestKindMemberRemove     = "member_remove"
 
 	canonicalTypeMessageV1      = "entmoot.message.v1"

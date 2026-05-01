@@ -432,6 +432,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleGroups(w, r)
 	case "/v1/invites/accept":
 		h.handleInviteAccept(w, r)
+	case "/v1/open-invites/accept":
+		h.handleOpenInviteAccept(w, r)
 	case "/v1/sign-requests":
 		h.handleSignRequests(w, r)
 	case "/v1/devices/current":
@@ -749,9 +751,22 @@ func (h *Handler) handleInviteAccept(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (h *Handler) handleOpenInviteAccept(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w, http.MethodPost)
+		return
+	}
+	h.withIdempotency(w, r, "open_invite_accept", func(w http.ResponseWriter, r *http.Request) {
+		h.createSignRequestFromHTTP(w, r, "open_invite_accept", entmoot.GroupID{})
+	})
+}
+
 func (h *Handler) handleOpenInviteRedeem(w http.ResponseWriter, r *http.Request) bool {
 	const prefix = "/v1/open-invites/"
 	if !strings.HasPrefix(r.URL.EscapedPath(), prefix) {
+		return false
+	}
+	if r.URL.EscapedPath() == prefix+"accept" {
 		return false
 	}
 	rest := strings.TrimPrefix(r.URL.EscapedPath(), prefix)

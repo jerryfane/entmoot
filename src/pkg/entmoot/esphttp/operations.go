@@ -54,6 +54,7 @@ func executableOperationKind(kind string) bool {
 		signRequestKindInviteCreate,
 		signRequestKindInviteAccept,
 		signRequestKindOpenInviteCreate,
+		signRequestKindOpenInviteAccept,
 		signRequestKindMemberRemove:
 		return true
 	default:
