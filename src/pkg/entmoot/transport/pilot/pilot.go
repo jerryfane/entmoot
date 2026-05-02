@@ -52,6 +52,7 @@ const (
 	pilotStreamDialTimeout       = 45 * time.Second
 	pilotStreamDialSlack         = 2 * time.Second
 	pilotMaxConcurrentPeerDials  = 2
+	pilotMaxConcurrentDials      = 16
 	pilotTraceTransportEventName = "pilot transport trace"
 )
 
@@ -104,12 +105,17 @@ type Transport struct {
 	cfg    Config
 	logger *slog.Logger
 
-	driver   *ipcclient.Driver
-	listener *ipcclient.Listener
-	nodeID   entmoot.NodeID
-	dialAddr func(context.Context, Addr, uint16) (*ipcclient.Conn, error)
+	listenerDriver *ipcclient.Driver
+	controlDriver  *ipcclient.Driver
+	listener       *ipcclient.Listener
+	nodeID         entmoot.NodeID
+	dialAddr       func(context.Context, Addr, uint16) (*ipcclient.Conn, error)
 
-	limits *peerDialLimiter
+	limits        *peerDialLimiter
+	outboundSlots chan struct{}
+
+	activeOutboundMu sync.Mutex
+	activeOutbound   map[*outboundStream]struct{}
 
 	// inboundStreams fans accepted Pilot streams into one channel that Accept()
 	// reads from. Buffered so bursty peers do not block the accept goroutine.
@@ -144,7 +150,7 @@ func Open(cfg Config) (*Transport, error) {
 		logger = slog.Default()
 	}
 
-	d, err := ipcclient.Connect(cfg.SocketPath)
+	listenerDriver, err := ipcclient.Connect(cfg.SocketPath)
 	if err != nil {
 		return nil, fmt.Errorf("pilot: connect %q: %w", cfg.SocketPath, err)
 	}
@@ -154,35 +160,43 @@ func Open(cfg Config) (*Transport, error) {
 	// IPC is local and responses arrive in milliseconds.
 	openCtx := context.Background()
 
-	info, err := d.InfoStruct(openCtx)
+	info, err := listenerDriver.InfoStruct(openCtx)
 	if err != nil {
-		_ = d.Close()
+		_ = listenerDriver.Close()
 		return nil, fmt.Errorf("pilot: info: %w", err)
 	}
 	if info.NodeID == 0 {
-		_ = d.Close()
+		_ = listenerDriver.Close()
 		return nil, fmt.Errorf("pilot: info: missing node_id")
 	}
 	if !hasPilotCapability(info, "stream_send_result_v2") {
-		_ = d.Close()
+		_ = listenerDriver.Close()
 		return nil, fmt.Errorf("%w: stream_send_result_v2", ErrRequiredCapabilityMissing)
 	}
 
-	ln, err := d.Listen(openCtx, cfg.ListenPort)
+	ln, err := listenerDriver.Listen(openCtx, cfg.ListenPort)
 	if err != nil {
-		_ = d.Close()
+		_ = listenerDriver.Close()
 		return nil, fmt.Errorf("pilot: listen :%d: %w", cfg.ListenPort, err)
+	}
+	controlDriver, err := ipcclient.Connect(cfg.SocketPath)
+	if err != nil {
+		_ = ln.Close()
+		_ = listenerDriver.Close()
+		return nil, fmt.Errorf("pilot: connect control %q: %w", cfg.SocketPath, err)
 	}
 
 	t := &Transport{
 		cfg:            cfg,
 		logger:         logger,
-		driver:         d,
+		listenerDriver: listenerDriver,
+		controlDriver:  controlDriver,
 		listener:       ln,
 		nodeID:         entmoot.NodeID(info.NodeID),
-		dialAddr:       d.DialAddr,
 		closed:         make(chan struct{}),
 		limits:         newPeerDialLimiter(pilotMaxConcurrentPeerDials),
+		outboundSlots:  make(chan struct{}, pilotMaxConcurrentDials),
+		activeOutbound: make(map[*outboundStream]struct{}),
 		inboundStreams: make(chan inboundStream, 64),
 	}
 	t.acceptWG.Add(1)
@@ -202,12 +216,11 @@ func (t *Transport) DialBudget() time.Duration {
 	return pilotStreamDialTimeout + pilotStreamDialSlack
 }
 
-// Driver returns the underlying *ipcclient.Driver. Exposed so subcommands like
-// `info` can query daemon state (hostname, address) without re-dialing the
-// socket. Callers MUST NOT Close the returned driver; call Transport.Close
-// instead.
+// Driver returns a control-only *ipcclient.Driver. It is intentionally not the
+// listener driver, so slow control calls cannot poison the inbound stream path.
+// Callers MUST NOT Close the returned driver; call Transport.Close instead.
 func (t *Transport) Driver() *ipcclient.Driver {
-	return t.driver
+	return t.controlDriver
 }
 
 // Dial implements gossip.Transport. It returns a fresh Pilot stream for peer.
@@ -231,31 +244,87 @@ func (t *Transport) Dial(ctx context.Context, peer entmoot.NodeID) (net.Conn, er
 		}
 		return nil, err
 	}
-
-	conn, releaseSlotOnError, err := t.dialPilotStream(ctx, peer, slot)
+	releaseGlobal, err := t.acquireOutboundSlot(ctx)
 	if err != nil {
-		if releaseSlotOnError {
-			slot.Release()
+		slot.Release()
+		if ctx.Err() != nil && errors.Is(err, ctx.Err()) {
+			return nil, fmt.Errorf("%w: %w", ErrDialLimiterTimeout, err)
 		}
 		return nil, err
 	}
-	t.trace("stream_opened", slog.Uint64("peer", uint64(peer)), slog.String("direction", "outbound"))
-	t.fireOnTunnelUp(peer)
-	return &limitedConn{
-		Conn: wrapUnblockableConn(conn),
+	releaseDial := func() {
+		releaseGlobal()
+		slot.Release()
+	}
+
+	conn, driver, releaseSlotOnError, err := t.dialPilotStream(ctx, peer, releaseDial)
+	if err != nil {
+		if releaseSlotOnError {
+			releaseDial()
+		}
+		return nil, err
+	}
+	stream := &outboundStream{
+		Conn:   wrapUnblockableConn(conn),
+		driver: driver,
 		release: func() {
 			t.trace("stream_closed", slog.Uint64("peer", uint64(peer)), slog.String("direction", "outbound"))
-			slot.Release()
+			releaseDial()
 		},
-	}, nil
+		unregister: func(s *outboundStream) { t.unregisterOutbound(s) },
+	}
+	if !t.registerOutbound(stream) {
+		_ = stream.Close()
+		return nil, net.ErrClosed
+	}
+	t.trace("stream_opened", slog.Uint64("peer", uint64(peer)), slog.String("direction", "outbound"))
+	t.fireOnTunnelUp(peer)
+	return stream, nil
 }
 
-func (t *Transport) dialPilotStream(ctx context.Context, peer entmoot.NodeID, slot *peerDialSlot) (*ipcclient.Conn, bool, error) {
+func (t *Transport) registerOutbound(stream *outboundStream) bool {
+	t.activeOutboundMu.Lock()
+	defer t.activeOutboundMu.Unlock()
+	select {
+	case <-t.closed:
+		return false
+	default:
+	}
+	if t.activeOutbound == nil {
+		t.activeOutbound = make(map[*outboundStream]struct{})
+	}
+	t.activeOutbound[stream] = struct{}{}
+	return true
+}
+
+func (t *Transport) unregisterOutbound(stream *outboundStream) {
+	t.activeOutboundMu.Lock()
+	delete(t.activeOutbound, stream)
+	t.activeOutboundMu.Unlock()
+}
+
+func (t *Transport) closeActiveOutbound() {
+	t.activeOutboundMu.Lock()
+	active := make([]*outboundStream, 0, len(t.activeOutbound))
+	for stream := range t.activeOutbound {
+		active = append(active, stream)
+	}
+	t.activeOutboundMu.Unlock()
+
+	for _, stream := range active {
+		if err := stream.Close(); err != nil && t.closeErr == nil {
+			t.closeErr = err
+		}
+	}
+}
+
+func (t *Transport) dialPilotStream(ctx context.Context, peer entmoot.NodeID, releaseAfterLateDial func()) (*ipcclient.Conn, *ipcclient.Driver, bool, error) {
 	addr := Addr{Network: t.cfg.Network, Node: uint32(peer)}
 
 	type dialResult struct {
-		conn *ipcclient.Conn
-		err  error
+		conn   *ipcclient.Conn
+		driver *ipcclient.Driver
+		err    error
 	}
 	dialCtx, dialCancel := context.WithTimeout(context.Background(), pilotStreamDialTimeout)
 	doneWatchingDialCtx := make(chan struct{})
@@ -270,25 +339,38 @@ func (t *Transport) dialPilotStream(ctx context.Context, peer entmoot.NodeID, sl
 	resultCh := make(chan dialResult, 1)
 	go func() {
 		dialAddr := t.dialAddr
+		var d *ipcclient.Driver
 		if dialAddr == nil {
-			dialAddr = t.driver.DialAddr
+			var err error
+			d, err = ipcclient.Connect(t.cfg.SocketPath)
+			if err != nil {
+				resultCh <- dialResult{err: fmt.Errorf("pilot: connect dial %q: %w", t.cfg.SocketPath, err)}
+				return
+			}
+			dialAddr = d.DialAddr
 		}
 		c, err := dialAddr(dialCtx, addr, t.cfg.ListenPort)
-		resultCh <- dialResult{conn: c, err: err}
+		if err != nil && d != nil {
+			_ = d.Close()
+			d = nil
+		}
+		resultCh <- dialResult{conn: c, driver: d, err: err}
 	}()
 
 	var pilotConn *ipcclient.Conn
+	var driver *ipcclient.Driver
 	select {
 	case r := <-resultCh:
 		dialCancel()
 		<-doneWatchingDialCtx
 		if r.err != nil {
 			if errors.Is(r.err, context.DeadlineExceeded) && dialCtx.Err() != nil {
-				return nil, true, fmt.Errorf("%w: pilot: dial %s:%d: %w", ErrDaemonDialTimeout, addr, t.cfg.ListenPort, r.err)
+				return nil, nil, true, fmt.Errorf("%w: pilot: dial %s:%d: %w", ErrDaemonDialTimeout, addr, t.cfg.ListenPort, r.err)
 			}
-			return nil, true, fmt.Errorf("pilot: dial %s:%d: %w", addr, t.cfg.ListenPort, r.err)
+			return nil, nil, true, fmt.Errorf("pilot: dial %s:%d: %w", addr, t.cfg.ListenPort, r.err)
 		}
 		pilotConn = r.conn
+		driver = r.driver
 	case <-ctx.Done():
 		go func() {
 			r := <-resultCh
@@ -296,9 +378,14 @@ func (t *Transport) dialPilotStream(ctx context.Context, peer entmoot.NodeID, sl
 			if r.conn != nil {
 				_ = r.conn.Close()
 			}
-			slot.Release()
+			if r.driver != nil {
+				_ = r.driver.Close()
+			}
+			if releaseAfterLateDial != nil {
+				releaseAfterLateDial()
+			}
 		}()
-		return nil, false, fmt.Errorf("%w: pilot: dial %s:%d: %w", ErrDialCallerTimeout, addr, t.cfg.ListenPort, ctx.Err())
+		return nil, nil, false, fmt.Errorf("%w: pilot: dial %s:%d: %w", ErrDialCallerTimeout, addr, t.cfg.ListenPort, ctx.Err())
 	case <-t.closed:
 		dialCancel()
 		<-doneWatchingDialCtx
@@ -308,12 +395,39 @@ func (t *Transport) dialPilotStream(ctx context.Context, peer entmoot.NodeID, sl
 			if r.conn != nil {
 				_ = r.conn.Close()
 			}
-			slot.Release()
+			if r.driver != nil {
+				_ = r.driver.Close()
+			}
+			if releaseAfterLateDial != nil {
+				releaseAfterLateDial()
+			}
 		}()
-		return nil, false, net.ErrClosed
+		return nil, nil, false, net.ErrClosed
 	}
 
-	return pilotConn, false, nil
+	return pilotConn, driver, false, nil
+}
+
+func (t *Transport) acquireOutboundSlot(ctx context.Context) (func(), error) {
+	if t.outboundSlots == nil {
+		return func() {}, nil
+	}
+	select {
+	case t.outboundSlots <- struct{}{}:
+		var once sync.Once
+		return func() {
+			once.Do(func() {
+				select {
+				case <-t.outboundSlots:
+				default:
+				}
+			})
+		}, nil
+	case <-t.closed:
+		return nil, net.ErrClosed
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 // DropPeerSession implements gossip.PeerSessionDropper. Raw Pilot streams are
@@ -406,8 +520,11 @@ func (t *Transport) TrustedPeers(ctx context.Context) ([]entmoot.NodeID, error) 
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	if t.controlDriver == nil {
+		return nil, net.ErrClosed
+	}
 
-	resp, err := t.driver.TrustedPeers(ctx)
+	resp, err := t.controlDriver.TrustedPeers(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("pilot: trusted peers: %w", err)
 	}
@@ -462,11 +579,14 @@ func (t *Transport) SetPeerEndpoints(ctx context.Context, peer entmoot.NodeID, e
 	if peer == t.nodeID {
 		return nil
 	}
+	if t.controlDriver == nil {
+		return net.ErrClosed
+	}
 	ipcEps := make([]ipcclient.Endpoint, 0, len(endpoints))
 	for _, ep := range endpoints {
 		ipcEps = append(ipcEps, ipcclient.Endpoint{Network: ep.Network, Addr: ep.Addr})
 	}
-	if err := t.driver.SetPeerEndpoints(ctx, uint32(peer), ipcEps); err != nil {
+	if err := t.controlDriver.SetPeerEndpoints(ctx, uint32(peer), ipcEps); err != nil {
 		return fmt.Errorf("pilot: set peer endpoints for %d: %w", peer, err)
 	}
 	return nil
@@ -510,7 +630,7 @@ func (t *Transport) fireOnTunnelUp(peer entmoot.NodeID) {
 	}()
 }
 
-// Close releases the listener and driver connection. Safe to call multiple
+// Close releases the listener and driver connections. Safe to call multiple
 // times; the first call does the work, subsequent calls return nil.
 //
 // A pending Accept returns net.ErrClosed once t.closed fires. Pending Dials
@@ -520,6 +640,7 @@ func (t *Transport) fireOnTunnelUp(peer entmoot.NodeID) {
 func (t *Transport) Close() error {
 	t.closeOnce.Do(func() {
 		close(t.closed)
+		t.closeActiveOutbound()
 		if t.listener != nil {
 			if err := t.listener.Close(); err != nil {
 				t.closeErr = err
@@ -527,8 +648,13 @@ func (t *Transport) Close() error {
 		}
 		// Wait for acceptPilotConns to return.
 		t.acceptWG.Wait()
-		if t.driver != nil {
-			if err := t.driver.Close(); err != nil && t.closeErr == nil {
+		if t.listenerDriver != nil {
+			if err := t.listenerDriver.Close(); err != nil && t.closeErr == nil {
+				t.closeErr = err
+			}
+		}
+		if t.controlDriver != nil {
+			if err := t.controlDriver.Close(); err != nil && t.closeErr == nil {
 				t.closeErr = err
 			}
 		}
@@ -599,15 +725,34 @@ func (u *unblockableConn) Close() error {
 	return u.Conn.Close()
 }
 
-type limitedConn struct {
+type outboundStream struct {
 	net.Conn
-	once    sync.Once
-	release func()
+	driver     *ipcclient.Driver
+	once       sync.Once
+	release    func()
+	unregister func(*outboundStream)
 }
 
-func (c *limitedConn) Close() error {
-	err := c.Conn.Close()
-	c.once.Do(c.release)
+func (c *outboundStream) Close() error {
+	var err error
+	c.once.Do(func() {
+		if c.driver != nil {
+			if closeErr := c.driver.Close(); closeErr != nil {
+				err = closeErr
+			}
+		}
+		if c.Conn != nil {
+			if closeErr := c.Conn.Close(); closeErr != nil && err == nil {
+				err = closeErr
+			}
+		}
+		if c.unregister != nil {
+			c.unregister(c)
+		}
+		if c.release != nil {
+			c.release()
+		}
+	})
 	return err
 }
 

@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.34] - 2026-05-03
+
+### Fixed
+
+- **Pilot IPC lane isolation.** Outbound Pilot dials now use dedicated
+  per-stream IPC drivers, while listener and control traffic stay isolated, so
+  a slow peer dial cannot block inbound gossip responses on the shared daemon
+  socket.
+- **Pilot shutdown cleanup.** Active per-dial drivers are now tracked and
+  closed during transport shutdown, ensuring blocked outbound stream I/O
+  unblocks promptly and IPC sockets are not leaked.
+
 ## [1.5.33] - 2026-05-01
 
 ### Added

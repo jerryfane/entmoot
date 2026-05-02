@@ -33,7 +33,7 @@ func TestGetOrCreateSessionKeepsInternalDialContextAfterCallerCancel(t *testing.
 	callerCtx, cancel := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
 	go func() {
-		_, _, err := tp.dialPilotStream(callerCtx, 45981, nil)
+		_, _, _, err := tp.dialPilotStream(callerCtx, 45981, nil)
 		errCh <- err
 	}()
 

@@ -3,6 +3,7 @@ package pilot
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -158,7 +159,6 @@ func TestPilotTransport_DialFiresOnTunnelUp(t *testing.T) {
 	tp := &Transport{
 		cfg:      Config{ListenPort: 1004},
 		logger:   slog.Default(),
-		driver:   driver,
 		closed:   make(chan struct{}),
 		limits:   newPeerDialLimiter(pilotMaxConcurrentPeerDials),
 		dialAddr: driver.DialAddr,
@@ -271,6 +271,339 @@ func TestPilotTransport_InboundAcceptFiresOnTunnelUp(t *testing.T) {
 	}
 }
 
+func TestPilotTransport_DialUsesDedicatedIPCDriver(t *testing.T) {
+	t.Parallel()
+
+	const (
+		peer   entmoot.NodeID = 45981
+		connID uint32         = 88
+	)
+	srv := newPilotMultiConnServer(t)
+	defer srv.Close()
+
+	done := make(chan struct{})
+	defer close(done)
+	errCh := make(chan error, 2)
+	go func() {
+		c, err := srv.acceptConn()
+		if err != nil {
+			errCh <- err
+			return
+		}
+		defer c.Close()
+		frame, err := readPilotTestFrame(c)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		if len(frame) == 0 || frame[0] != 0x0D {
+			errCh <- io.ErrUnexpectedEOF
+			return
+		}
+		if err := writePilotTestFrame(c, append([]byte{0x0E}, []byte(`{"node_id":777,"capabilities":["stream_send_result_v2"]}`)...)); err != nil {
+			errCh <- err
+			return
+		}
+		frame, err = readPilotTestFrame(c)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		if len(frame) == 0 || frame[0] != 0x01 {
+			errCh <- io.ErrUnexpectedEOF
+			return
+		}
+		var bindOK [3]byte
+		bindOK[0] = 0x02
+		binary.BigEndian.PutUint16(bindOK[1:3], 1004)
+		if err := writePilotTestFrame(c, bindOK[:]); err != nil {
+			errCh <- err
+			return
+		}
+		<-done
+	}()
+	go func() {
+		c, err := srv.acceptConn()
+		if err != nil {
+			errCh <- err
+			return
+		}
+		defer c.Close()
+		<-done
+	}()
+
+	tr, err := Open(Config{SocketPath: srv.path, ListenPort: 1004, Logger: slog.Default()})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer tr.Close()
+
+	dialDone := make(chan error, 1)
+	go func() {
+		c, err := srv.acceptConn()
+		if err != nil {
+			dialDone <- err
+			return
+		}
+		defer c.Close()
+		frame, err := readPilotTestFrame(c)
+		if err != nil {
+			dialDone <- err
+			return
+		}
+		if len(frame) == 0 || frame[0] != 0x03 {
+			dialDone <- io.ErrUnexpectedEOF
+			return
+		}
+		var dialOK [5]byte
+		dialOK[0] = 0x04
+		binary.BigEndian.PutUint32(dialOK[1:5], connID)
+		if err := writePilotTestFrame(c, dialOK[:]); err != nil {
+			dialDone <- err
+			return
+		}
+		frame, err = readPilotTestFrame(c)
+		if err != nil {
+			dialDone <- err
+			return
+		}
+		if len(frame) < 13 || frame[0] != 0x36 {
+			dialDone <- io.ErrUnexpectedEOF
+			return
+		}
+		gotConnID := binary.BigEndian.Uint32(frame[1:5])
+		sendID := binary.BigEndian.Uint64(frame[5:13])
+		if gotConnID != connID || string(frame[13:]) != "ping" {
+			dialDone <- errors.New("unexpected tracked send frame")
+			return
+		}
+		result := make([]byte, 1+4+8+2)
+		result[0] = 0x37
+		binary.BigEndian.PutUint32(result[1:5], connID)
+		binary.BigEndian.PutUint64(result[5:13], sendID)
+		if err := writePilotTestFrame(c, result); err != nil {
+			dialDone <- err
+			return
+		}
+		dialDone <- nil
+	}()
+
+	conn, err := tr.Dial(context.Background(), peer)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	if _, err := conn.Write([]byte("ping")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	_ = conn.Close()
+
+	select {
+	case err := <-dialDone:
+		if err != nil {
+			t.Fatalf("dial server: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("dial driver was not used")
+	}
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("server: %v", err)
+		}
+	default:
+	}
+}
+
+func TestPilotTransport_CloseClosesActiveOutboundStreams(t *testing.T) {
+	t.Parallel()
+
+	const (
+		peer   entmoot.NodeID = 45981
+		connID uint32         = 89
+	)
+	srv := newPilotMultiConnServer(t)
+	defer srv.Close()
+	done, openErrs := servePilotTransportOpen(t, srv)
+	defer close(done)
+
+	tr, err := Open(Config{SocketPath: srv.path, ListenPort: 1004, Logger: slog.Default()})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	sendSeen := make(chan struct{})
+	dialDone := make(chan error, 1)
+	go func() {
+		c, err := srv.acceptConn()
+		if err != nil {
+			dialDone <- err
+			return
+		}
+		defer c.Close()
+		frame, err := readPilotTestFrame(c)
+		if err != nil {
+			dialDone <- err
+			return
+		}
+		if len(frame) == 0 || frame[0] != 0x03 {
+			dialDone <- io.ErrUnexpectedEOF
+			return
+		}
+		var dialOK [5]byte
+		dialOK[0] = 0x04
+		binary.BigEndian.PutUint32(dialOK[1:5], connID)
+		if err := writePilotTestFrame(c, dialOK[:]); err != nil {
+			dialDone <- err
+			return
+		}
+		frame, err = readPilotTestFrame(c)
+		if err != nil {
+			dialDone <- err
+			return
+		}
+		if len(frame) < 13 || frame[0] != 0x36 {
+			dialDone <- io.ErrUnexpectedEOF
+			return
+		}
+		close(sendSeen)
+		_, _ = readPilotTestFrame(c)
+		dialDone <- nil
+	}()
+
+	conn, err := tr.Dial(context.Background(), peer)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := conn.Write([]byte("blocked"))
+		writeDone <- err
+	}()
+
+	select {
+	case <-sendSeen:
+	case <-time.After(time.Second):
+		t.Fatal("server did not observe blocked send")
+	}
+	if err := tr.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	select {
+	case err := <-writeDone:
+		if err == nil {
+			t.Fatal("Write returned nil after transport shutdown; want error")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Write did not unblock after Transport.Close")
+	}
+	if got := activeOutboundLen(tr); got != 0 {
+		t.Fatalf("active outbound streams = %d, want 0", got)
+	}
+	if got := len(tr.outboundSlots); got != 0 {
+		t.Fatalf("outbound slots held = %d, want 0", got)
+	}
+	select {
+	case err := <-openErrs:
+		if err != nil {
+			t.Fatalf("open server: %v", err)
+		}
+	default:
+	}
+	select {
+	case err := <-dialDone:
+		if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("dial server: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("dial server did not finish after transport close")
+	}
+}
+
+func TestPilotTransport_OutboundCloseUnregistersBeforeTransportClose(t *testing.T) {
+	t.Parallel()
+
+	const (
+		peer   entmoot.NodeID = 45981
+		connID uint32         = 90
+	)
+	srv := newPilotMultiConnServer(t)
+	defer srv.Close()
+	done, openErrs := servePilotTransportOpen(t, srv)
+	defer close(done)
+
+	tr, err := Open(Config{SocketPath: srv.path, ListenPort: 1004, Logger: slog.Default()})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer tr.Close()
+
+	dialDone := make(chan error, 1)
+	go func() {
+		c, err := srv.acceptConn()
+		if err != nil {
+			dialDone <- err
+			return
+		}
+		defer c.Close()
+		frame, err := readPilotTestFrame(c)
+		if err != nil {
+			dialDone <- err
+			return
+		}
+		if len(frame) == 0 || frame[0] != 0x03 {
+			dialDone <- io.ErrUnexpectedEOF
+			return
+		}
+		var dialOK [5]byte
+		dialOK[0] = 0x04
+		binary.BigEndian.PutUint32(dialOK[1:5], connID)
+		if err := writePilotTestFrame(c, dialOK[:]); err != nil {
+			dialDone <- err
+			return
+		}
+		_, _ = readPilotTestFrame(c)
+		dialDone <- nil
+	}()
+
+	conn, err := tr.Dial(context.Background(), peer)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	if got := activeOutboundLen(tr); got != 1 {
+		t.Fatalf("active outbound streams after Dial = %d, want 1", got)
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatalf("conn.Close: %v", err)
+	}
+	if got := activeOutboundLen(tr); got != 0 {
+		t.Fatalf("active outbound streams after conn.Close = %d, want 0", got)
+	}
+	if got := len(tr.outboundSlots); got != 0 {
+		t.Fatalf("outbound slots held after conn.Close = %d, want 0", got)
+	}
+	if err := tr.Close(); err != nil {
+		t.Fatalf("Transport.Close: %v", err)
+	}
+	if got := len(tr.outboundSlots); got != 0 {
+		t.Fatalf("outbound slots held after Transport.Close = %d, want 0", got)
+	}
+	select {
+	case err := <-openErrs:
+		if err != nil {
+			t.Fatalf("open server: %v", err)
+		}
+	default:
+	}
+	select {
+	case err := <-dialDone:
+		if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("dial server: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("dial server did not finish")
+	}
+}
+
 type pilotCallbackServer struct {
 	t        *testing.T
 	path     string
@@ -278,6 +611,172 @@ type pilotCallbackServer struct {
 	connMu   sync.Mutex
 	conn     net.Conn
 	connWait chan struct{}
+}
+
+type pilotMultiConnServer struct {
+	t     *testing.T
+	path  string
+	ln    net.Listener
+	conns chan net.Conn
+}
+
+func newPilotMultiConnServer(t *testing.T) *pilotMultiConnServer {
+	t.Helper()
+	dir, err := os.MkdirTemp("/tmp", "entmoot-pilot-multi-")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	path := filepath.Join(dir, "p.sock")
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	s := &pilotMultiConnServer{t: t, path: path, ln: ln, conns: make(chan net.Conn, 8)}
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				close(s.conns)
+				return
+			}
+			s.conns <- c
+		}
+	}()
+	return s
+}
+
+func (s *pilotMultiConnServer) Close() {
+	_ = s.ln.Close()
+	for {
+		select {
+		case c, ok := <-s.conns:
+			if !ok {
+				return
+			}
+			_ = c.Close()
+		default:
+			return
+		}
+	}
+}
+
+func (s *pilotMultiConnServer) acceptConn() (net.Conn, error) {
+	select {
+	case c, ok := <-s.conns:
+		if !ok {
+			return nil, net.ErrClosed
+		}
+		return c, nil
+	case <-time.After(time.Second):
+		return nil, context.DeadlineExceeded
+	}
+}
+
+func readPilotTestFrame(c net.Conn) ([]byte, error) {
+	var hdr [4]byte
+	if _, err := io.ReadFull(c, hdr[:]); err != nil {
+		return nil, err
+	}
+	n := binary.BigEndian.Uint32(hdr[:])
+	buf := make([]byte, n)
+	_, err := io.ReadFull(c, buf)
+	return buf, err
+}
+
+func writePilotTestFrame(c net.Conn, payload []byte) error {
+	var hdr [4]byte
+	binary.BigEndian.PutUint32(hdr[:], uint32(len(payload)))
+	if _, err := c.Write(hdr[:]); err != nil {
+		return err
+	}
+	_, err := c.Write(payload)
+	return err
+}
+
+func servePilotTransportOpen(t *testing.T, srv *pilotMultiConnServer) (chan struct{}, <-chan error) {
+	t.Helper()
+	done := make(chan struct{})
+	errCh := make(chan error, 2)
+	go func() {
+		c, err := srv.acceptConn()
+		if err != nil {
+			errCh <- err
+			return
+		}
+		defer c.Close()
+		frame, err := readPilotTestFrame(c)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		if len(frame) == 0 || frame[0] != 0x0D {
+			errCh <- io.ErrUnexpectedEOF
+			return
+		}
+		if err := writePilotTestFrame(c, append([]byte{0x0E}, []byte(`{"node_id":777,"capabilities":["stream_send_result_v2"]}`)...)); err != nil {
+			errCh <- err
+			return
+		}
+		frame, err = readPilotTestFrame(c)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		if len(frame) == 0 || frame[0] != 0x01 {
+			errCh <- io.ErrUnexpectedEOF
+			return
+		}
+		var bindOK [3]byte
+		bindOK[0] = 0x02
+		binary.BigEndian.PutUint16(bindOK[1:3], 1004)
+		if err := writePilotTestFrame(c, bindOK[:]); err != nil {
+			errCh <- err
+			return
+		}
+		go func() {
+			control, err := srv.acceptConn()
+			if err != nil {
+				errCh <- err
+				return
+			}
+			defer control.Close()
+			<-done
+			errCh <- nil
+		}()
+		for {
+			select {
+			case <-done:
+				errCh <- nil
+				return
+			default:
+			}
+			_ = c.SetReadDeadline(time.Now().Add(25 * time.Millisecond))
+			frame, err = readPilotTestFrame(c)
+			if err != nil {
+				if ne, ok := err.(net.Error); ok && ne.Timeout() {
+					continue
+				}
+				errCh <- nil
+				return
+			}
+			if len(frame) > 0 && frame[0] == 0x27 {
+				var unbindOK [3]byte
+				unbindOK[0] = 0x28
+				binary.BigEndian.PutUint16(unbindOK[1:3], 1004)
+				_ = writePilotTestFrame(c, unbindOK[:])
+				errCh <- nil
+				return
+			}
+		}
+	}()
+	return done, errCh
+}
+
+func activeOutboundLen(tr *Transport) int {
+	tr.activeOutboundMu.Lock()
+	defer tr.activeOutboundMu.Unlock()
+	return len(tr.activeOutbound)
 }
 
 func newPilotCallbackServer(t *testing.T) *pilotCallbackServer {
