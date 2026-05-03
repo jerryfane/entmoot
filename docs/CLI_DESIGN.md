@@ -92,14 +92,22 @@ entmootd join <invite> [invite...]
 **Argument**
 
 - Each `<invite>` is either:
-  - a file path (`./my-invite.json`, `/tmp/invite.json`), or
-  - an `http(s)://` URL that returns the invite JSON body with a
+  - a file path (`./my-invite.json`, `/tmp/invite.json`) containing a
+    signed invite JSON bundle or an open-invite descriptor,
+  - an `entmoot://open-invite?issuer=...&token=...` link, or
+  - an `http(s)://` URL that returns either accepted JSON body with a
     documented short TTL (e.g., 5 minutes). The fetch is performed
     synchronously at startup; network errors surface as exit 1.
 
-  Local file paths and HTTPS URLs are distinguished by URL-parse: a
-  string starting with `http://` or `https://` is fetched; anything else
-  is treated as a file path.
+  Local file paths, open-invite links, and HTTPS URLs are distinguished
+  by URL-parse: `entmoot://open-invite` is redeemed through its issuer,
+  a string starting with `http://` or `https://` is fetched, and anything
+  else is treated as a file path. A raw open-invite token is intentionally
+  rejected because the issuer URL is required.
+
+  Open-invite descriptors are redeemed during `join`: the local Pilot key
+  signs the issuer challenge, the issuer returns a signed invite, and the
+  normal roster/bootstrap join path is used.
 
 **Flags**
 

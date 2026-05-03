@@ -59,7 +59,7 @@ func cmdServe(gf *globalFlags, args []string) int {
 		command:            "serve",
 		event:              "serving",
 		advertiseEndpoints: advertiseEndpoints,
-		loadGroups: func(ctx context.Context, runtime *groupRuntime) (int, error) {
+		loadGroups: func(ctx context.Context, runtime *groupRuntime, _ groupDaemonLoadContext) (int, error) {
 			strict := len(groups) > 0
 			for _, gid := range selectedGroups {
 				if _, _, err := runtime.AddLocalGroup(ctx, gid); err != nil {

@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -21,6 +22,7 @@ import (
 	"time"
 
 	"entmoot/pkg/entmoot"
+	"entmoot/pkg/entmoot/esphttp"
 	"entmoot/pkg/entmoot/events"
 	"entmoot/pkg/entmoot/ipc"
 	"entmoot/pkg/entmoot/keystore"
@@ -158,9 +160,9 @@ func cmdJoin(gf *globalFlags, args []string) int {
 		fmt.Fprintln(os.Stderr, "join: missing invite (file path or http(s) URL)")
 		return exitInvalidArgument
 	}
-	invites := make([]*entmoot.Invite, 0, len(rest))
+	inputs := make([]joinInput, 0, len(rest))
 	for _, inviteArg := range rest {
-		invite, err := loadInvite(inviteArg)
+		input, err := loadJoinInput(inviteArg)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "join: invite %s: %v\n", inviteArg, err)
 			// A local-parse failure (bad file, bad JSON, expired ValidUntil)
@@ -176,15 +178,26 @@ func cmdJoin(gf *globalFlags, args []string) int {
 			}
 			return exitInvalidArgument
 		}
-		invites = append(invites, invite)
+		inputs = append(inputs, input)
 	}
 
 	return runGroupDaemon(gf, groupDaemonOptions{
 		command:            "join",
 		event:              "joined",
 		advertiseEndpoints: advertiseEndpoints,
-		loadGroups: func(ctx context.Context, runtime *groupRuntime) (int, error) {
-			for _, invite := range invites {
+		loadGroups: func(ctx context.Context, runtime *groupRuntime, loadCtx groupDaemonLoadContext) (int, error) {
+			for _, input := range inputs {
+				invite := input.invite
+				if input.openInvite != nil {
+					redeemed, err := redeemJoinOpenInvite(ctx, input.openInvite, loadCtx)
+					if err != nil {
+						return classifyJoinOpenInviteError(err), fmt.Errorf("redeem open invite %s: %w", input.source, err)
+					}
+					invite = redeemed
+				}
+				if invite == nil {
+					return exitInvalidArgument, fmt.Errorf("invite %s: no signed invite produced", input.source)
+				}
 				if _, _, err := runtime.AddInvite(ctx, *invite); err != nil {
 					code := classifyJoinAddInviteError(err)
 					if code == exitInvalidArgument {
@@ -196,6 +209,21 @@ func cmdJoin(gf *globalFlags, args []string) int {
 			return exitOK, nil
 		},
 	})
+}
+
+func classifyJoinOpenInviteError(err error) int {
+	var opErr *esphttp.OperationError
+	if errors.As(err, &opErr) {
+		switch {
+		case opErr.HTTPStatus == http.StatusBadRequest,
+			opErr.HTTPStatus == http.StatusNotFound,
+			opErr.HTTPStatus == http.StatusConflict:
+			return exitInvalidArgument
+		default:
+			return exitTransport
+		}
+	}
+	return exitTransport
 }
 
 func classifyJoinAddInviteError(err error) int {
@@ -213,7 +241,18 @@ type groupDaemonOptions struct {
 	command            string
 	event              string
 	advertiseEndpoints endpointFlag
-	loadGroups         func(context.Context, *groupRuntime) (int, error)
+	loadGroups         func(context.Context, *groupRuntime, groupDaemonLoadContext) (int, error)
+}
+
+type groupDaemonLoadContext struct {
+	identity        *keystore.Identity
+	pilot           pilotInfoSigner
+	pilotSocketPath string
+}
+
+type pilotInfoSigner interface {
+	InfoStruct(context.Context) (ipcclient.Info, error)
+	SignChallenge(context.Context, []byte) (ipcclient.ChallengeSignature, error)
 }
 
 const pilotCapabilityLookupNode = "lookup_node"
@@ -361,7 +400,11 @@ func runGroupDaemon(gf *globalFlags, opts groupDaemonOptions) int {
 		fmt.Fprintf(os.Stderr, "%s: no group loader configured\n", opts.command)
 		return exitInvalidArgument
 	}
-	if code, err := opts.loadGroups(rootCtx, runtime); err != nil {
+	if code, err := opts.loadGroups(rootCtx, runtime, groupDaemonLoadContext{
+		identity:        s.identity,
+		pilot:           tr.Driver(),
+		pilotSocketPath: gf.socket,
+	}); err != nil {
 		if code == exitInvalidArgument || code == exitNotMember || code == exitGroupNotFound {
 			fmt.Fprintf(os.Stderr, "%s: %v\n", opts.command, err)
 		} else {
@@ -469,13 +512,56 @@ var errInviteMalformed = errors.New("invite malformed")
 // errFetchFailed marks a network-fetch failure for a URL invite.
 var errFetchFailed = errors.New("invite fetch failed")
 
-// loadInvite reads an invite JSON bundle from arg (file path or
-// http(s) URL) and verifies ValidUntil at parse time (CLI_DESIGN §3.1
-// says an expired invite is rejected at invite-parse time with exit 5).
-// Signature verification happens in gossip.Join; this function only
-// catches structurally-bad invites and expired ones.
+type joinInput struct {
+	source     string
+	invite     *entmoot.Invite
+	openInvite *openInviteAcceptPayload
+}
+
+// loadJoinInput reads a join input from arg (file path, http(s) URL, or
+// entmoot://open-invite link) and classifies it as either a signed invite or an
+// open invite descriptor that must be redeemed after Pilot startup.
+func loadJoinInput(arg string) (joinInput, error) {
+	if payload, ok, err := parseOpenInviteLinkArg(arg); ok || err != nil {
+		if err != nil {
+			return joinInput{}, err
+		}
+		return joinInput{source: arg, openInvite: payload}, nil
+	}
+	raw, err := readJoinInputBytes(arg)
+	if err != nil {
+		return joinInput{}, err
+	}
+	if payload, ok, err := parseOpenInviteDescriptor(raw); ok || err != nil {
+		if err != nil {
+			return joinInput{}, err
+		}
+		return joinInput{source: arg, openInvite: payload}, nil
+	}
+	invite, err := parseSignedInvite(raw)
+	if err != nil {
+		return joinInput{}, err
+	}
+	return joinInput{source: arg, invite: invite}, nil
+}
+
+// loadInvite reads a signed invite JSON bundle from arg. Kept as a small
+// compatibility helper for tests and older internal call sites; cmdJoin uses
+// loadJoinInput so app-generated open invites can be redeemed automatically.
 func loadInvite(arg string) (*entmoot.Invite, error) {
-	var raw []byte
+	input, err := loadJoinInput(arg)
+	if err != nil {
+		return nil, err
+	}
+	if input.invite == nil {
+		return nil, fmt.Errorf("%w: open invite descriptor requires redemption", errInviteMalformed)
+	}
+	return input.invite, nil
+}
+
+// readJoinInputBytes reads a join input JSON bundle from arg (file path or
+// http(s) URL). Signed-invite structural checks happen after classification.
+func readJoinInputBytes(arg string) ([]byte, error) {
 	if len(arg) > 0 && (hasPrefix(arg, "http://") || hasPrefix(arg, "https://")) {
 		client := &http.Client{Timeout: 5 * time.Second}
 		resp, err := client.Get(arg)
@@ -490,14 +576,20 @@ func loadInvite(arg string) (*entmoot.Invite, error) {
 		if err != nil {
 			return nil, fmt.Errorf("%w: %v", errFetchFailed, err)
 		}
-		raw = b
+		return b, nil
 	} else {
 		b, err := os.ReadFile(arg)
 		if err != nil {
+			if errors.Is(err, os.ErrNotExist) && looksLikeOpenInviteToken(arg) {
+				return nil, fmt.Errorf("%w: raw open invite token is not enough; provide the app descriptor JSON or entmoot://open-invite link with issuer and token", errInviteMalformed)
+			}
 			return nil, fmt.Errorf("%w: read %s: %v", errInviteMalformed, arg, err)
 		}
-		raw = b
+		return b, nil
 	}
+}
+
+func parseSignedInvite(raw []byte) (*entmoot.Invite, error) {
 	var invite entmoot.Invite
 	if err := json.Unmarshal(raw, &invite); err != nil {
 		return nil, fmt.Errorf("%w: parse: %v", errInviteMalformed, err)
@@ -508,6 +600,145 @@ func loadInvite(arg string) (*entmoot.Invite, error) {
 			return nil, fmt.Errorf("%w: valid_until=%d now=%d",
 				entmoot.ErrInviteExpired, invite.ValidUntil, now)
 		}
+	}
+	return &invite, nil
+}
+
+func parseOpenInviteDescriptor(raw []byte) (*openInviteAcceptPayload, bool, error) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return nil, false, nil
+	}
+	if !hasJSONField(fields, "issuer_url") && !hasJSONField(fields, "token") && !hasJSONField(fields, "link") {
+		return nil, false, nil
+	}
+	var desc struct {
+		IssuerURL string `json:"issuer_url"`
+		Token     string `json:"token"`
+		Link      string `json:"link"`
+	}
+	if err := json.Unmarshal(raw, &desc); err != nil {
+		return nil, true, fmt.Errorf("%w: open invite descriptor: %v", errInviteMalformed, err)
+	}
+	var out *openInviteAcceptPayload
+	if strings.TrimSpace(desc.IssuerURL) != "" || strings.TrimSpace(desc.Token) != "" {
+		payload, err := normalizeOpenInviteAcceptPayload(openInviteAcceptPayload{IssuerURL: desc.IssuerURL, Token: desc.Token})
+		if err != nil {
+			return nil, true, fmt.Errorf("%w: open invite descriptor: %v", errInviteMalformed, err)
+		}
+		out = payload
+	}
+	if strings.TrimSpace(desc.Link) != "" {
+		payload, err := parseOpenInviteLink(desc.Link)
+		if err != nil {
+			return nil, true, fmt.Errorf("%w: open invite link: %v", errInviteMalformed, err)
+		}
+		if out != nil && (out.IssuerURL != payload.IssuerURL || out.Token != payload.Token) {
+			return nil, true, fmt.Errorf("%w: open invite link does not match issuer_url/token fields", errInviteMalformed)
+		}
+		out = payload
+	}
+	if out == nil {
+		return nil, true, fmt.Errorf("%w: open invite descriptor requires issuer_url and token", errInviteMalformed)
+	}
+	return out, true, nil
+}
+
+func parseOpenInviteLinkArg(arg string) (*openInviteAcceptPayload, bool, error) {
+	if !strings.HasPrefix(strings.TrimSpace(arg), "entmoot:") {
+		return nil, false, nil
+	}
+	payload, err := parseOpenInviteLink(arg)
+	return payload, true, err
+}
+
+func parseOpenInviteLink(raw string) (*openInviteAcceptPayload, error) {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return nil, err
+	}
+	if u.Scheme != "entmoot" {
+		return nil, fmt.Errorf("expected entmoot://open-invite link")
+	}
+	linkKind := strings.Trim(strings.TrimSpace(u.Host+u.Path), "/")
+	if linkKind != "open-invite" {
+		return nil, fmt.Errorf("unsupported entmoot link %q", linkKind)
+	}
+	q := u.Query()
+	return normalizeOpenInviteAcceptPayload(openInviteAcceptPayload{
+		IssuerURL: q.Get("issuer"),
+		Token:     q.Get("token"),
+	})
+}
+
+func normalizeOpenInviteAcceptPayload(payload openInviteAcceptPayload) (*openInviteAcceptPayload, error) {
+	issuer, token, err := parseOpenInviteAcceptPayload(payload)
+	if err != nil {
+		return nil, err
+	}
+	return &openInviteAcceptPayload{IssuerURL: issuer.String(), Token: token}, nil
+}
+
+func hasJSONField(fields map[string]json.RawMessage, name string) bool {
+	_, ok := fields[name]
+	return ok
+}
+
+func looksLikeOpenInviteToken(arg string) bool {
+	if len(arg) < 32 || strings.ContainsAny(arg, `/\.`) {
+		return false
+	}
+	for _, r := range arg {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func redeemJoinOpenInvite(ctx context.Context, payload *openInviteAcceptPayload, loadCtx groupDaemonLoadContext) (*entmoot.Invite, error) {
+	if payload == nil {
+		return nil, fmt.Errorf("%w: open invite payload is missing", errInviteMalformed)
+	}
+	issuer, token, err := parseOpenInviteAcceptPayload(*payload)
+	if err != nil {
+		return nil, err
+	}
+	exec := espOperationExecutor{
+		identity:        loadCtx.identity,
+		pilotSocketPath: loadCtx.pilotSocketPath,
+		timeout:         30 * time.Second,
+	}
+	if loadCtx.pilot != nil {
+		exec.pilotIdentity = func(ctx context.Context) (entmoot.NodeID, string, error) {
+			infoCtx, cancel := context.WithTimeout(ctx, exec.timeout)
+			defer cancel()
+			info, err := loadCtx.pilot.InfoStruct(infoCtx)
+			if err != nil {
+				return 0, "", &esphttp.OperationError{HTTPStatus: http.StatusServiceUnavailable, Code: "pilot_unavailable", Message: "local Pilot identity is unavailable: " + err.Error()}
+			}
+			if info.NodeID == 0 || strings.TrimSpace(info.PublicKey) == "" {
+				return 0, "", &esphttp.OperationError{HTTPStatus: http.StatusServiceUnavailable, Code: "pilot_unavailable", Message: "local Pilot identity is incomplete"}
+			}
+			return entmoot.NodeID(info.NodeID), strings.TrimSpace(info.PublicKey), nil
+		}
+		exec.pilotSignChallenge = func(ctx context.Context, challenge []byte) (string, error) {
+			signCtx, cancel := context.WithTimeout(ctx, exec.timeout)
+			defer cancel()
+			sig, err := loadCtx.pilot.SignChallenge(signCtx, challenge)
+			if err != nil {
+				return "", &esphttp.OperationError{HTTPStatus: http.StatusServiceUnavailable, Code: "pilot_unavailable", Message: "local Pilot challenge signing failed: " + err.Error()}
+			}
+			if strings.TrimSpace(sig.Signature) == "" {
+				return "", &esphttp.OperationError{HTTPStatus: http.StatusServiceUnavailable, Code: "pilot_unavailable", Message: "local Pilot challenge signature is empty"}
+			}
+			return strings.TrimSpace(sig.Signature), nil
+		}
+	}
+	invite, _, err := exec.redeemOpenInviteFromIssuer(ctx, issuer, token)
+	if err != nil {
+		return nil, err
 	}
 	return &invite, nil
 }
