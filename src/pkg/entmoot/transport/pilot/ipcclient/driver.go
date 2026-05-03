@@ -1121,6 +1121,36 @@ func (d *Driver) TrustedPeers(ctx context.Context) (map[string]interface{}, erro
 	return out, nil
 }
 
+// DecodePendingHandshakes decodes the JSON payload returned by
+// Handshake(sub=pending) and pushed on the handshake_pending notify topic.
+func DecodePendingHandshakes(payload []byte) ([]PendingHandshake, error) {
+	if len(payload) == 0 {
+		return nil, nil
+	}
+	var out struct {
+		Pending []PendingHandshake `json:"pending"`
+	}
+	if err := json.Unmarshal(payload, &out); err != nil {
+		return nil, err
+	}
+	return out.Pending, nil
+}
+
+// PendingHandshakes asks the daemon for incoming trust requests waiting for
+// approval.
+func (d *Driver) PendingHandshakes(ctx context.Context) ([]PendingHandshake, error) {
+	frame := []byte{byte(opHandshake), subHandshakePending}
+	resp, err := d.sendAndWait(ctx, frame, opHandshakeOK)
+	if err != nil {
+		return nil, fmt.Errorf("ipcclient: pending handshakes: %w", err)
+	}
+	pending, err := DecodePendingHandshakes(resp)
+	if err != nil {
+		return nil, fmt.Errorf("ipcclient: pending handshakes: decode: %w", err)
+	}
+	return pending, nil
+}
+
 // Handshake sends a Pilot trust-handshake request to nodeID. The daemon
 // returns a JSON status object; this method preserves it so callers can log
 // future daemon fields without changing this client surface.
@@ -1140,6 +1170,26 @@ func (d *Driver) Handshake(ctx context.Context, nodeID uint32, justification str
 	var out map[string]interface{}
 	if err := json.Unmarshal(resp, &out); err != nil {
 		return nil, fmt.Errorf("ipcclient: handshake %d: decode: %w", nodeID, err)
+	}
+	return out, nil
+}
+
+// ApproveHandshake approves a pending Pilot trust request.
+func (d *Driver) ApproveHandshake(ctx context.Context, nodeID uint32) (map[string]interface{}, error) {
+	frame := make([]byte, 6)
+	frame[0] = byte(opHandshake)
+	frame[1] = subHandshakeApprove
+	binary.BigEndian.PutUint32(frame[2:6], nodeID)
+	resp, err := d.sendAndWait(ctx, frame, opHandshakeOK)
+	if err != nil {
+		return nil, fmt.Errorf("ipcclient: approve handshake %d: %w", nodeID, err)
+	}
+	if len(resp) == 0 {
+		return map[string]interface{}{}, nil
+	}
+	var out map[string]interface{}
+	if err := json.Unmarshal(resp, &out); err != nil {
+		return nil, fmt.Errorf("ipcclient: approve handshake %d: decode: %w", nodeID, err)
 	}
 	return out, nil
 }

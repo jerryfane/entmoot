@@ -45,6 +45,7 @@ type groupRuntimeConfig struct {
 	LocalEndpoints   func() []entmoot.NodeEndpoint
 	LocalHostname    func() (string, bool)
 	EndpointsChanged <-chan struct{}
+	PilotDriver      handshakeApprovalPilot
 	HideIP           bool
 	TraceReconcile   bool
 	Logger           *slog.Logger
@@ -59,16 +60,18 @@ type groupRuntime struct {
 	localEndpoints func() []entmoot.NodeEndpoint
 	localHostname  func() (string, bool)
 	endpointFanout *endpointChangeFanout
+	pilotDriver    handshakeApprovalPilot
 	hideIP         bool
 	traceReconcile bool
 	logger         *slog.Logger
 
 	mux *groupMuxTransport
 
-	mu       sync.RWMutex
-	sessions map[entmoot.GroupID]*groupSession
-	joining  map[entmoot.GroupID]chan struct{}
-	wg       sync.WaitGroup
+	mu                    sync.RWMutex
+	sessions              map[entmoot.GroupID]*groupSession
+	joining               map[entmoot.GroupID]chan struct{}
+	handshakeApprovalWake chan struct{}
+	wg                    sync.WaitGroup
 }
 
 type groupSession struct {
@@ -78,6 +81,7 @@ type groupSession struct {
 	gossip               *gossip.Gossiper
 	cancel               context.CancelFunc
 	unsubscribeEndpoints func()
+	unsubscribeRoster    func()
 }
 
 type endpointChangeFanout struct {
@@ -187,20 +191,22 @@ func newGroupRuntime(cfg groupRuntimeConfig) (*groupRuntime, error) {
 		endpointFanout = newEndpointChangeFanout(cfg.EndpointsChanged)
 	}
 	return &groupRuntime{
-		nodeID:         cfg.NodeID,
-		identity:       cfg.Identity,
-		dataDir:        cfg.DataDir,
-		store:          cfg.Store,
-		notify:         cfg.Notify,
-		localEndpoints: cfg.LocalEndpoints,
-		localHostname:  cfg.LocalHostname,
-		endpointFanout: endpointFanout,
-		hideIP:         cfg.HideIP,
-		traceReconcile: cfg.TraceReconcile,
-		logger:         logger,
-		mux:            newGroupMuxTransport(cfg.Transport, logger),
-		sessions:       make(map[entmoot.GroupID]*groupSession),
-		joining:        make(map[entmoot.GroupID]chan struct{}),
+		nodeID:                cfg.NodeID,
+		identity:              cfg.Identity,
+		dataDir:               cfg.DataDir,
+		store:                 cfg.Store,
+		notify:                cfg.Notify,
+		localEndpoints:        cfg.LocalEndpoints,
+		localHostname:         cfg.LocalHostname,
+		endpointFanout:        endpointFanout,
+		pilotDriver:           cfg.PilotDriver,
+		hideIP:                cfg.HideIP,
+		traceReconcile:        cfg.TraceReconcile,
+		logger:                logger,
+		mux:                   newGroupMuxTransport(cfg.Transport, logger),
+		sessions:              make(map[entmoot.GroupID]*groupSession),
+		joining:               make(map[entmoot.GroupID]chan struct{}),
+		handshakeApprovalWake: make(chan struct{}, 1),
 	}, nil
 }
 
@@ -213,6 +219,13 @@ func (r *groupRuntime) Start(ctx context.Context) error {
 		go func() {
 			defer wg.Done()
 			r.endpointFanout.Run(runCtx)
+		}()
+	}
+	if r.pilotDriver != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			r.runHandshakeApprovalLoop(runCtx)
 		}()
 	}
 	err := r.mux.AcceptLoop(ctx)
@@ -360,6 +373,8 @@ func (r *groupRuntime) addGroup(ctx context.Context, groupID entmoot.GroupID, bo
 				slog.String("err", err.Error()))
 		}
 	}()
+	sess.unsubscribeRoster = r.watchRosterForHandshakeApproval(sessCtx, sess)
+	r.wakeHandshakeApproval()
 	return sess, true, nil
 }
 
@@ -492,6 +507,9 @@ func (r *groupRuntime) Close() {
 		sess.cancel()
 		if sess.unsubscribeEndpoints != nil {
 			sess.unsubscribeEndpoints()
+		}
+		if sess.unsubscribeRoster != nil {
+			sess.unsubscribeRoster()
 		}
 	}
 	r.wg.Wait()

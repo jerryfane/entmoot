@@ -383,6 +383,7 @@ func runGroupDaemon(gf *globalFlags, opts groupDaemonOptions) int {
 		Store:            rawStore,
 		Notify:           notifyStore,
 		Transport:        tr,
+		PilotDriver:      tr.Driver(),
 		LocalEndpoints:   localEndpointsFn,
 		LocalHostname:    localHostnameFn,
 		EndpointsChanged: turnPoller.Changed(),

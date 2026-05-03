@@ -78,6 +78,15 @@ type NodeIdentity struct {
 	Source    string `json:"source,omitempty"`
 }
 
+// PendingHandshake is one incoming Pilot trust request returned by the
+// Handshake(sub=pending) IPC command and the handshake_pending notify topic.
+type PendingHandshake struct {
+	NodeID        uint32 `json:"node_id,omitempty"`
+	PublicKey     string `json:"public_key,omitempty"`
+	Justification string `json:"justification,omitempty"`
+	ReceivedAt    int64  `json:"received_at,omitempty"`
+}
+
 // ChallengeSignature is the typed shape of Pilot's sign_challenge IPC reply.
 type ChallengeSignature struct {
 	NodeID    uint32 `json:"node_id,omitempty"`

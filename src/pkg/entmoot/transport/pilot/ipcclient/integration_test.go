@@ -49,6 +49,8 @@ type fakeDaemon struct {
 	lastHandshakePeer      uint32
 	lastHandshakeReason    string
 	lastHandshakeSendCount int
+	pendingHandshakes      []PendingHandshake
+	approvedHandshakePeer  uint32
 
 	// trustedPeers is the static TrustedPeers response body.
 	trustedPeers []map[string]interface{}
@@ -89,6 +91,12 @@ func (d *fakeDaemon) SocketPath() string { return d.path }
 
 func (d *fakeDaemon) SetTrustedPeers(peers []map[string]interface{}) {
 	d.trustedPeers = peers
+}
+
+func (d *fakeDaemon) SetPendingHandshakes(pending []PendingHandshake) {
+	d.handshakeMu.Lock()
+	defer d.handshakeMu.Unlock()
+	d.pendingHandshakes = append([]PendingHandshake(nil), pending...)
 }
 
 func (d *fakeDaemon) Close() {
@@ -226,6 +234,27 @@ func (d *fakeDaemon) serve(t *testing.T, conn net.Conn) {
 					"trusted": d.trustedPeers,
 				})
 				_ = sendFrame(opHandshakeOK, body)
+			} else if sub == subHandshakePending {
+				d.handshakeMu.Lock()
+				pending := append([]PendingHandshake(nil), d.pendingHandshakes...)
+				d.handshakeMu.Unlock()
+				body, _ := json.Marshal(map[string]interface{}{
+					"pending": pending,
+				})
+				_ = sendFrame(opHandshakeOK, body)
+			} else if sub == subHandshakeApprove {
+				if len(payload) < 5 {
+					continue
+				}
+				peer := binary.BigEndian.Uint32(payload[1:5])
+				d.handshakeMu.Lock()
+				d.approvedHandshakePeer = peer
+				d.handshakeMu.Unlock()
+				body, _ := json.Marshal(map[string]interface{}{
+					"ok":      true,
+					"node_id": peer,
+				})
+				_ = sendFrame(opHandshakeOK, body)
 			} else if sub == subHandshakeSend {
 				if len(payload) < 5 {
 					continue
@@ -323,6 +352,9 @@ func TestIntegrationFullLifecycle(t *testing.T) {
 		{"node_id": float64(100), "hostname": "bob"},
 		{"node_id": float64(200), "hostname": "carol"},
 	})
+	daemon.SetPendingHandshakes([]PendingHandshake{
+		{NodeID: 200, PublicKey: "pilot-pub", Justification: "entmoot onboarding", ReceivedAt: 1234},
+	})
 
 	ctx := context.Background()
 	drv, err := Connect(daemon.SocketPath())
@@ -385,6 +417,28 @@ func TestIntegrationFullLifecycle(t *testing.T) {
 	}
 	if len(trusted) != 2 {
 		t.Fatalf("TrustedPeers len = %d, want 2", len(trusted))
+	}
+
+	// --- Pending/approve handshake ---
+	pending, err := drv.PendingHandshakes(ctx)
+	if err != nil {
+		t.Fatalf("PendingHandshakes: %v", err)
+	}
+	if len(pending) != 1 || pending[0].NodeID != 200 || pending[0].PublicKey != "pilot-pub" {
+		t.Fatalf("PendingHandshakes = %+v, want node 200 pilot-pub", pending)
+	}
+	approved, err := drv.ApproveHandshake(ctx, 200)
+	if err != nil {
+		t.Fatalf("ApproveHandshake: %v", err)
+	}
+	if approved["ok"] != true {
+		t.Fatalf("ApproveHandshake ok = %v, want true", approved["ok"])
+	}
+	daemon.handshakeMu.Lock()
+	approvedPeer := daemon.approvedHandshakePeer
+	daemon.handshakeMu.Unlock()
+	if approvedPeer != 200 {
+		t.Fatalf("daemon approved peer = %d, want 200", approvedPeer)
 	}
 
 	// --- Handshake ---
