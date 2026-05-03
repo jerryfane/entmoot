@@ -273,6 +273,92 @@ func TestDoctorNextCommandPreservesGlobalPaths(t *testing.T) {
 	}
 }
 
+func TestPeerSuggestionMapping(t *testing.T) {
+	gid := entmoot.GroupID{0x42}
+	gf := &globalFlags{
+		socket:   "/tmp/pilot custom.sock",
+		identity: "/Users/jerryfane/.entmoot/agent's key.json",
+		data:     "/Users/jerryfane/Entmoot Data",
+	}
+	group := doctorGroupReport{GroupID: gid, LocalMember: true, LocalMemberStatus: doctorLocalMemberOK}
+	cases := []struct {
+		name        string
+		peer        doctorPeerReport
+		wantSuggest string
+		wantCommand string
+	}{
+		{
+			name:        "ok has no suggestion",
+			peer:        doctorPeerReport{NodeID: 7, Diagnosis: "ok"},
+			wantSuggest: "",
+			wantCommand: "",
+		},
+		{
+			name:        "trust missing suggests handshake",
+			peer:        doctorPeerReport{NodeID: 7, Diagnosis: "trust_missing"},
+			wantSuggest: "Pilot trust is missing; send a handshake to this peer",
+			wantCommand: "pilotctl -socket '/tmp/pilot custom.sock' handshake 7 'entmoot group QgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA='",
+		},
+		{
+			name:        "trust pending suggests approve",
+			peer:        doctorPeerReport{NodeID: 8, Diagnosis: "trust_pending"},
+			wantSuggest: "Pilot trust is pending; approve the incoming handshake if this peer should connect",
+			wantCommand: "pilotctl -socket '/tmp/pilot custom.sock' approve 8",
+		},
+		{
+			name:        "route timeout suggests ping",
+			peer:        doctorPeerReport{NodeID: 9, Diagnosis: "route_timeout"},
+			wantSuggest: "Entmoot stream probe timed out; verify the Pilot route and peer daemon",
+			wantCommand: "pilotctl -socket '/tmp/pilot custom.sock' ping 9",
+		},
+		{
+			name:        "daemon down suggests serve",
+			peer:        doctorPeerReport{NodeID: 9, Diagnosis: "daemon_down"},
+			wantSuggest: "local Entmoot daemon is not running; start the joined group before probing peers",
+			wantCommand: "entmootd -socket '/tmp/pilot custom.sock' -identity '/Users/jerryfane/.entmoot/agent'\"'\"'s key.json' -data '/Users/jerryfane/Entmoot Data' serve -group QgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gotSuggest, gotCommand := peerSuggestion(gf, gid, true, group, tc.peer)
+			if gotSuggest != tc.wantSuggest || gotCommand != tc.wantCommand {
+				t.Fatalf("peerSuggestion = (%q, %q), want (%q, %q)", gotSuggest, gotCommand, tc.wantSuggest, tc.wantCommand)
+			}
+		})
+	}
+}
+
+func TestPopulateDoctorSuggestionsGroupAndLocalMembership(t *testing.T) {
+	gid := entmoot.GroupID{0x42}
+	gf := &globalFlags{socket: "/tmp/pilot.sock", identity: "/id.json", data: "/data"}
+	report := &doctorReport{
+		Entmoot: doctorEntmootReport{Running: false, NodeID: 7},
+		Groups: []doctorGroupReport{
+			{
+				GroupID:           gid,
+				LocalMember:       false,
+				LocalMemberStatus: doctorLocalMemberIdentityMismatch,
+				Peers: []doctorPeerReport{
+					{NodeID: 7, Trust: "self", Diagnosis: doctorLocalMemberIdentityMismatch},
+				},
+			},
+		},
+	}
+
+	populateDoctorSuggestions(report, gf)
+	group := report.Groups[0]
+	if group.Suggestion == "" || group.NextCommand == "" {
+		t.Fatalf("group suggestion not populated: %+v", group)
+	}
+	peer := group.Peers[0]
+	if peer.Suggestion != localMembershipSuggestion(doctorLocalMemberIdentityMismatch) {
+		t.Fatalf("peer suggestion = %q, want local membership suggestion", peer.Suggestion)
+	}
+	if peer.NextCommand != "" {
+		t.Fatalf("local membership peer command = %q, want empty", peer.NextCommand)
+	}
+}
+
 func newDoctorTestRoster(t *testing.T, nodeID entmoot.NodeID, id *keystore.Identity) *roster.RosterLog {
 	t.Helper()
 	info := entmoot.NodeInfo{
