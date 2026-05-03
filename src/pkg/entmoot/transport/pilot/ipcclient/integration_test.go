@@ -45,6 +45,11 @@ type fakeDaemon struct {
 	lastPeer uint32
 	lastEps  []Endpoint
 
+	handshakeMu            sync.Mutex
+	lastHandshakePeer      uint32
+	lastHandshakeReason    string
+	lastHandshakeSendCount int
+
 	// trustedPeers is the static TrustedPeers response body.
 	trustedPeers []map[string]interface{}
 
@@ -221,6 +226,22 @@ func (d *fakeDaemon) serve(t *testing.T, conn net.Conn) {
 					"trusted": d.trustedPeers,
 				})
 				_ = sendFrame(opHandshakeOK, body)
+			} else if sub == subHandshakeSend {
+				if len(payload) < 5 {
+					continue
+				}
+				peer := binary.BigEndian.Uint32(payload[1:5])
+				reason := string(payload[5:])
+				d.handshakeMu.Lock()
+				d.lastHandshakePeer = peer
+				d.lastHandshakeReason = reason
+				d.lastHandshakeSendCount++
+				d.handshakeMu.Unlock()
+				body, _ := json.Marshal(map[string]interface{}{
+					"ok":      true,
+					"node_id": peer,
+				})
+				_ = sendFrame(opHandshakeOK, body)
 			}
 
 		case opSetPeerEndpoints:
@@ -364,6 +385,21 @@ func TestIntegrationFullLifecycle(t *testing.T) {
 	}
 	if len(trusted) != 2 {
 		t.Fatalf("TrustedPeers len = %d, want 2", len(trusted))
+	}
+
+	// --- Handshake ---
+	hs, err := drv.Handshake(ctx, 200, "entmoot test")
+	if err != nil {
+		t.Fatalf("Handshake: %v", err)
+	}
+	if hs["ok"] != true {
+		t.Fatalf("Handshake ok = %v, want true", hs["ok"])
+	}
+	daemon.handshakeMu.Lock()
+	hsPeer, hsReason, hsCount := daemon.lastHandshakePeer, daemon.lastHandshakeReason, daemon.lastHandshakeSendCount
+	daemon.handshakeMu.Unlock()
+	if hsPeer != 200 || hsReason != "entmoot test" || hsCount != 1 {
+		t.Fatalf("Handshake frame = peer %d reason %q count %d, want peer 200 reason entmoot test count 1", hsPeer, hsReason, hsCount)
 	}
 
 	// --- SetPeerEndpoints ---

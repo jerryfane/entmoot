@@ -1121,6 +1121,29 @@ func (d *Driver) TrustedPeers(ctx context.Context) (map[string]interface{}, erro
 	return out, nil
 }
 
+// Handshake sends a Pilot trust-handshake request to nodeID. The daemon
+// returns a JSON status object; this method preserves it so callers can log
+// future daemon fields without changing this client surface.
+func (d *Driver) Handshake(ctx context.Context, nodeID uint32, justification string) (map[string]interface{}, error) {
+	frame := make([]byte, 6+len(justification))
+	frame[0] = byte(opHandshake)
+	frame[1] = subHandshakeSend
+	binary.BigEndian.PutUint32(frame[2:6], nodeID)
+	copy(frame[6:], justification)
+	resp, err := d.sendAndWait(ctx, frame, opHandshakeOK)
+	if err != nil {
+		return nil, fmt.Errorf("ipcclient: handshake %d: %w", nodeID, err)
+	}
+	if len(resp) == 0 {
+		return map[string]interface{}{}, nil
+	}
+	var out map[string]interface{}
+	if err := json.Unmarshal(resp, &out); err != nil {
+		return nil, fmt.Errorf("ipcclient: handshake %d: decode: %w", nodeID, err)
+	}
+	return out, nil
+}
+
 // LookupNode asks the Pilot daemon to resolve a node_id -> public_key binding.
 // New daemons answer from trusted peer state when available and otherwise fall
 // back to the registry lookup projection.

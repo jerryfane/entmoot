@@ -561,6 +561,24 @@ func (t *Transport) TrustedPeers(ctx context.Context) ([]entmoot.NodeID, error) 
 	return out, nil
 }
 
+// Handshake sends a best-effort Pilot trust-handshake request to peer. It is
+// intentionally outside gossip.Transport so non-Pilot transports do not need
+// to expose trust-management controls.
+func (t *Transport) Handshake(ctx context.Context, peer entmoot.NodeID, justification string) (map[string]interface{}, error) {
+	select {
+	case <-t.closed:
+		return nil, net.ErrClosed
+	default:
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if t.controlDriver == nil {
+		return nil, net.ErrClosed
+	}
+	return t.controlDriver.Handshake(ctx, uint32(peer), justification)
+}
+
 // SetPeerEndpoints implements gossip.Transport. Forwards the endpoints
 // straight to the Pilot daemon via driver.SetPeerEndpoints so the
 // daemon's peerTCP map gets populated with externally-sourced endpoint

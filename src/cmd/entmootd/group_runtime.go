@@ -73,6 +73,7 @@ type groupRuntime struct {
 
 type groupSession struct {
 	groupID              entmoot.GroupID
+	ctx                  context.Context
 	roster               *roster.RosterLog
 	gossip               *gossip.Gossiper
 	cancel               context.CancelFunc
@@ -224,7 +225,11 @@ func (r *groupRuntime) AddInvite(ctx context.Context, invite entmoot.Invite) (*g
 	bootstrap := func(joinCtx context.Context, g *gossip.Gossiper) error {
 		return g.Join(joinCtx, &invite)
 	}
-	return r.addGroup(ctx, invite.GroupID, bootstrap)
+	sess, created, err := r.addGroup(ctx, invite.GroupID, bootstrap)
+	if err == nil && created {
+		r.scheduleOnboardingHandshakes(sess, invite)
+	}
+	return sess, created, err
 }
 
 func (r *groupRuntime) AddLocalGroup(ctx context.Context, groupID entmoot.GroupID) (*groupSession, bool, error) {
@@ -328,6 +333,7 @@ func (r *groupRuntime) addGroup(ctx context.Context, groupID entmoot.GroupID, bo
 	sessCtx, sessCancel := context.WithCancel(ctx)
 	sess := &groupSession{
 		groupID:              groupID,
+		ctx:                  sessCtx,
 		roster:               rlog,
 		gossip:               g,
 		cancel:               sessCancel,
@@ -699,6 +705,14 @@ func (m *groupMuxTransport) DialBudget() time.Duration {
 
 func (m *groupMuxTransport) TrustedPeers(ctx context.Context) ([]entmoot.NodeID, error) {
 	return m.base.TrustedPeers(ctx)
+}
+
+func (m *groupMuxTransport) Handshake(ctx context.Context, peer entmoot.NodeID, justification string) (map[string]interface{}, error) {
+	h, ok := m.base.(pilotHandshaker)
+	if !ok {
+		return nil, errPilotHandshakeUnsupported
+	}
+	return h.Handshake(ctx, peer, justification)
 }
 
 func (m *groupMuxTransport) SetPeerEndpoints(ctx context.Context, peer entmoot.NodeID, endpoints []entmoot.NodeEndpoint) error {
