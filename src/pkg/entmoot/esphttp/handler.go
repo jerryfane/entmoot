@@ -33,6 +33,11 @@ import (
 // GroupExistsFunc reports whether groupID is locally joined/served.
 type GroupExistsFunc func(context.Context, entmoot.GroupID) (bool, error)
 
+// DiagnosticsProvider produces a group-scoped health report for ESP clients.
+type DiagnosticsProvider interface {
+	GroupDiagnostics(context.Context, entmoot.GroupID, bool, time.Duration) (any, error)
+}
+
 // Config wires the HTTP handler to an existing mailbox service.
 type Config struct {
 	Token       string
@@ -45,6 +50,7 @@ type Config struct {
 	Notifier    espnotify.Notifier
 	State       StateStore
 	Groups      GroupCatalog
+	Diagnostics DiagnosticsProvider
 	GroupExists GroupExistsFunc
 	Logger      *slog.Logger
 }
@@ -337,6 +343,7 @@ type Handler struct {
 	notifier    espnotify.Notifier
 	state       StateStore
 	groups      GroupCatalog
+	diagnostics DiagnosticsProvider
 	groupExists GroupExistsFunc
 	logger      *slog.Logger
 }
@@ -389,6 +396,7 @@ func NewHandler(cfg Config) (*Handler, error) {
 		notifier:    cfg.Notifier,
 		state:       state,
 		groups:      cfg.Groups,
+		diagnostics: cfg.Diagnostics,
 		groupExists: groupExists,
 		logger:      logger,
 	}, nil
@@ -560,6 +568,22 @@ func (h *Handler) handleGroupSubroute(w http.ResponseWriter, r *http.Request) bo
 		})
 		return true
 	}
+	if strings.HasPrefix(suffix, "open-invites/") {
+		rest := strings.TrimPrefix(suffix, "open-invites/")
+		escapedInvite, action, ok := strings.Cut(rest, "/")
+		if !ok || action != "revoke" {
+			writeError(w, http.StatusNotFound, "not_found", "not found")
+			return true
+		}
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w, http.MethodPost)
+			return true
+		}
+		h.withIdempotency(w, r, "open_invite_revoke:"+groupID.String()+":"+escapedInvite, func(w http.ResponseWriter, r *http.Request) {
+			h.handleRevokeOpenInvite(w, r, groupID, escapedInvite)
+		})
+		return true
+	}
 	switch suffix {
 	case "":
 		switch r.Method {
@@ -587,13 +611,22 @@ func (h *Handler) handleGroupSubroute(w http.ResponseWriter, r *http.Request) bo
 			h.createSignRequestFromHTTP(w, r, "invite_create", groupID)
 		})
 	case "open-invites":
-		if r.Method != http.MethodPost {
-			methodNotAllowed(w, http.MethodPost)
+		switch r.Method {
+		case http.MethodGet:
+			h.handleListOpenInvites(w, r, groupID)
+		case http.MethodPost:
+			h.withIdempotency(w, r, "open_invite_create:"+groupID.String(), func(w http.ResponseWriter, r *http.Request) {
+				h.createSignRequestFromHTTP(w, r, "open_invite_create", groupID)
+			})
+		default:
+			methodNotAllowed(w, http.MethodGet+", "+http.MethodPost)
+		}
+	case "diagnostics":
+		if r.Method != http.MethodGet {
+			methodNotAllowed(w, http.MethodGet)
 			return true
 		}
-		h.withIdempotency(w, r, "open_invite_create:"+groupID.String(), func(w http.ResponseWriter, r *http.Request) {
-			h.createSignRequestFromHTTP(w, r, "open_invite_create", groupID)
-		})
+		h.handleGroupDiagnostics(w, r, groupID)
 	case "messages":
 		switch r.Method {
 		case http.MethodGet:
@@ -653,6 +686,90 @@ func (h *Handler) handleListMembers(w http.ResponseWriter, r *http.Request, grou
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"members": members})
+}
+
+func (h *Handler) handleListOpenInvites(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID) {
+	if !h.checkDeviceGroupAdmin(w, r, groupID) {
+		return
+	}
+	records, err := h.state.ListOpenInvitesByGroup(r.Context(), groupID)
+	if err != nil {
+		h.logger.Error("esphttp: list open invites", slog.String("err", err.Error()))
+		writeError(w, http.StatusInternalServerError, "internal_error", "open invite listing failed")
+		return
+	}
+	now := h.clock().UnixMilli()
+	out := make([]OpenInviteSummary, 0, len(records))
+	for _, rec := range records {
+		out = append(out, OpenInviteSummaryFromRecord(rec, now))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"open_invites": out})
+}
+
+func (h *Handler) handleRevokeOpenInvite(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID, escapedInviteID string) {
+	if !h.checkDeviceGroupAdmin(w, r, groupID) {
+		return
+	}
+	inviteID, err := url.PathUnescape(escapedInviteID)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+	inviteID = strings.TrimSpace(inviteID)
+	if inviteID == "" {
+		writeError(w, http.StatusBadRequest, "bad_request", "open invite id is required")
+		return
+	}
+	existing, ok, err := h.state.GetOpenInviteByTokenHash(r.Context(), inviteID)
+	if err != nil {
+		h.logger.Error("esphttp: get open invite for revoke", slog.String("err", err.Error()))
+		writeError(w, http.StatusInternalServerError, "internal_error", "open invite lookup failed")
+		return
+	}
+	if !ok || existing.GroupID != groupID {
+		writeError(w, http.StatusNotFound, "open_invite_not_found", "open invite not found")
+		return
+	}
+	rec, ok, err := h.state.RevokeOpenInvite(r.Context(), inviteID, h.clock().UnixMilli())
+	if err != nil {
+		h.logger.Error("esphttp: revoke open invite", slog.String("err", err.Error()))
+		writeError(w, http.StatusInternalServerError, "internal_error", "open invite revoke failed")
+		return
+	}
+	if !ok {
+		writeError(w, http.StatusNotFound, "open_invite_not_found", "open invite not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"open_invite": OpenInviteSummaryFromRecord(rec, h.clock().UnixMilli())})
+}
+
+func (h *Handler) handleGroupDiagnostics(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID) {
+	if h.diagnostics == nil {
+		writeError(w, http.StatusServiceUnavailable, "diagnostics_unavailable", "diagnostics are not configured")
+		return
+	}
+	probe := parseBoolQuery(r.URL.Query().Get("probe"))
+	timeout := 3 * time.Second
+	if raw := strings.TrimSpace(r.URL.Query().Get("timeout")); raw != "" {
+		parsed, err := time.ParseDuration(raw)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "bad_request", "timeout must be a Go duration such as 3s")
+			return
+		}
+		timeout = parsed
+	}
+	report, err := h.diagnostics.GroupDiagnostics(r.Context(), groupID, probe, timeout)
+	if err != nil {
+		var opErr *OperationError
+		if errors.As(err, &opErr) {
+			writeError(w, opErr.HTTPStatus, opErr.Code, opErr.Message)
+			return
+		}
+		h.logger.Error("esphttp: group diagnostics", slog.String("err", err.Error()))
+		writeError(w, http.StatusInternalServerError, "internal_error", "diagnostics failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"group": report})
 }
 
 func (h *Handler) handleGroupMessages(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID) {
@@ -1852,6 +1969,15 @@ func deviceAllowsGroup(device Device, groupID entmoot.GroupID) bool {
 		}
 	}
 	return false
+}
+
+func parseBoolQuery(raw string) bool {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "1", "t", "true", "y", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 func deviceCanAdminGroup(device Device, groupID entmoot.GroupID) bool {

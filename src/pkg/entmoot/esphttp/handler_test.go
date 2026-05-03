@@ -327,6 +327,82 @@ func TestHandlerMobileGroupsAndSignRequests(t *testing.T) {
 	}
 }
 
+func TestHandlerOpenInviteListAndRevoke(t *testing.T) {
+	gid := testGroupID(1)
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	reg, err := NewDeviceRegistry([]Device{{
+		ID:          "ios-1-device",
+		PublicKey:   priv.Public().(ed25519.PublicKey),
+		Groups:      []entmoot.GroupID{gid},
+		AdminGroups: []entmoot.GroupID{gid},
+		ClientIDs:   []string{"ios-1"},
+	}})
+	if err != nil {
+		t.Fatalf("NewDeviceRegistry: %v", err)
+	}
+	state := NewMemoryStateStore()
+	if _, err := state.CreateOpenInvite(context.Background(), OpenInviteRecord{
+		TokenHash:      "invite-id",
+		GroupID:        gid,
+		DeviceID:       "ios-1-device",
+		MaxUses:        3,
+		UseCount:       1,
+		BootstrapPeers: []entmoot.NodeID{9},
+		CreatedAtMS:    1_000,
+		ExpiresAtMS:    2_000_000,
+	}); err != nil {
+		t.Fatalf("CreateOpenInvite: %v", err)
+	}
+	handler := testMobileHandlerFull(t, gid, reg, nil, func() time.Time { return time.UnixMilli(10_000) }, nil, state, nil)
+
+	list := doSignedJSONRequest[struct {
+		OpenInvites []OpenInviteSummary `json:"open_invites"`
+	}](t, handler, priv, http.MethodGet, "/v1/groups/"+url.PathEscape(gid.String())+"/open-invites", nil, http.StatusOK, 10_000, "nonce-open-list")
+	if len(list.OpenInvites) != 1 {
+		t.Fatalf("open invite count = %d, want 1", len(list.OpenInvites))
+	}
+	if list.OpenInvites[0].ID != "invite-id" || list.OpenInvites[0].Status != "active" || list.OpenInvites[0].UseCount != 1 {
+		t.Fatalf("open invite summary = %+v", list.OpenInvites[0])
+	}
+
+	revoked := doSignedJSONRequest[struct {
+		OpenInvite OpenInviteSummary `json:"open_invite"`
+	}](t, handler, priv, http.MethodPost, "/v1/groups/"+url.PathEscape(gid.String())+"/open-invites/invite-id/revoke", nil, http.StatusOK, 10_001, "nonce-open-revoke")
+	if !revoked.OpenInvite.Revoked || revoked.OpenInvite.Status != "revoked" {
+		t.Fatalf("revoked invite = %+v", revoked.OpenInvite)
+	}
+}
+
+func TestHandlerGroupDiagnostics(t *testing.T) {
+	gid := testGroupID(1)
+	diagnostics := &fakeDiagnostics{result: map[string]any{
+		"group_id":   gid.String(),
+		"members":    2,
+		"suggestion": "ok",
+	}}
+	handler, err := NewHandler(Config{
+		Token:       "secret",
+		Service:     mustMailboxService(t, gid),
+		Diagnostics: diagnostics,
+		GroupExists: func(_ context.Context, got entmoot.GroupID) (bool, error) { return got == gid, nil },
+	})
+	if err != nil {
+		t.Fatalf("NewHandler: %v", err)
+	}
+	resp := doJSONRequest[struct {
+		Group map[string]any `json:"group"`
+	}](t, handler, http.MethodGet, "/v1/groups/"+url.PathEscape(gid.String())+"/diagnostics?probe=true&timeout=4s", nil, http.StatusOK)
+	if !diagnostics.probe || diagnostics.timeout != 4*time.Second || diagnostics.gid != gid {
+		t.Fatalf("diagnostics args gid=%s probe=%v timeout=%s", diagnostics.gid, diagnostics.probe, diagnostics.timeout)
+	}
+	if resp.Group["suggestion"] != "ok" {
+		t.Fatalf("diagnostics response = %+v", resp.Group)
+	}
+}
+
 func TestHandlerGroupSubrouteEscapedSlashInGroupID(t *testing.T) {
 	gid := testGroupIDWithSlash()
 	if !strings.Contains(gid.String(), "/") {
@@ -1296,6 +1372,20 @@ type fakeNotifier struct {
 	got    espnotify.WakeupEvent
 }
 
+type fakeDiagnostics struct {
+	result  any
+	gid     entmoot.GroupID
+	probe   bool
+	timeout time.Duration
+}
+
+func (d *fakeDiagnostics) GroupDiagnostics(_ context.Context, gid entmoot.GroupID, probe bool, timeout time.Duration) (any, error) {
+	d.gid = gid
+	d.probe = probe
+	d.timeout = timeout
+	return d.result, nil
+}
+
 func (n fakeNotifier) SendWakeup(_ context.Context, _ espnotify.DeviceTarget, event espnotify.WakeupEvent) (espnotify.DeliveryResult, error) {
 	n.got = event
 	if n.err != nil {
@@ -1322,6 +1412,19 @@ func (p *fakePublisher) PublishSigned(_ context.Context, msg entmoot.Message) (P
 		}, nil
 	}
 	return p.result, nil
+}
+
+func mustMailboxService(t *testing.T, gid entmoot.GroupID) *mailbox.Service {
+	t.Helper()
+	st := store.NewMemory()
+	if err := st.Put(context.Background(), testMessage(gid, 1, "first")); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	svc, err := mailbox.New(st, nil)
+	if err != nil {
+		t.Fatalf("mailbox.New: %v", err)
+	}
+	return svc
 }
 
 func doJSONRequest[T any](t *testing.T, handler http.Handler, method, path string, body any, wantStatus int) T {

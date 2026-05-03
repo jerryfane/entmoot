@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"net/http"
 	"time"
 
 	"entmoot/pkg/entmoot"
@@ -21,6 +22,21 @@ type localGroupCatalog struct {
 	dataDir  string
 	metadata esphttp.GroupMetadataStore
 	profiles memberProfileReader
+}
+
+type espDiagnosticsProvider struct {
+	flags globalFlags
+}
+
+func (p espDiagnosticsProvider) GroupDiagnostics(ctx context.Context, gid entmoot.GroupID, probe bool, timeout time.Duration) (any, error) {
+	report, err := buildDoctorReport(ctx, &p.flags, &gid, probe, timeout)
+	if err != nil {
+		return nil, err
+	}
+	if len(report.Groups) == 0 {
+		return nil, &esphttp.OperationError{HTTPStatus: http.StatusNotFound, Code: "group_not_found", Message: "group not joined"}
+	}
+	return report.Groups[0], nil
 }
 
 func (c localGroupCatalog) ListGroups(ctx context.Context) ([]esphttp.GroupSummary, error) {

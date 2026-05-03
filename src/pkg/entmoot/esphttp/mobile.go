@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -114,6 +115,44 @@ type OpenInviteRecord struct {
 	ExpiresAtMS    int64            `json:"expires_at_ms"`
 }
 
+type OpenInviteSummary struct {
+	ID             string           `json:"id"`
+	GroupID        entmoot.GroupID  `json:"group_id"`
+	DeviceID       string           `json:"device_id,omitempty"`
+	MaxUses        int              `json:"max_uses"`
+	UseCount       int              `json:"use_count"`
+	Revoked        bool             `json:"revoked"`
+	BootstrapPeers []entmoot.NodeID `json:"bootstrap_peers,omitempty"`
+	CreatedAtMS    int64            `json:"created_at_ms"`
+	UpdatedAtMS    int64            `json:"updated_at_ms"`
+	ExpiresAtMS    int64            `json:"expires_at_ms"`
+	Status         string           `json:"status"`
+}
+
+func OpenInviteSummaryFromRecord(rec OpenInviteRecord, nowMS int64) OpenInviteSummary {
+	status := "active"
+	if rec.Revoked {
+		status = "revoked"
+	} else if rec.ExpiresAtMS > 0 && rec.ExpiresAtMS <= nowMS {
+		status = "expired"
+	} else if rec.MaxUses > 0 && rec.UseCount >= rec.MaxUses {
+		status = "exhausted"
+	}
+	return OpenInviteSummary{
+		ID:             rec.TokenHash,
+		GroupID:        rec.GroupID,
+		DeviceID:       rec.DeviceID,
+		MaxUses:        rec.MaxUses,
+		UseCount:       rec.UseCount,
+		Revoked:        rec.Revoked,
+		BootstrapPeers: append([]entmoot.NodeID(nil), rec.BootstrapPeers...),
+		CreatedAtMS:    rec.CreatedAtMS,
+		UpdatedAtMS:    rec.UpdatedAtMS,
+		ExpiresAtMS:    rec.ExpiresAtMS,
+		Status:         status,
+	}
+}
+
 type OpenInviteRedemption struct {
 	TokenHash     string          `json:"-"`
 	RedeemerKey   string          `json:"redeemer_key"`
@@ -151,7 +190,9 @@ type StateStore interface {
 	GetIdempotencyRecord(context.Context, string, string) (IdempotencyRecord, bool, error)
 	SaveIdempotencyRecord(context.Context, IdempotencyRecord) error
 	CreateOpenInvite(context.Context, OpenInviteRecord) (OpenInviteRecord, error)
+	ListOpenInvitesByGroup(context.Context, entmoot.GroupID) ([]OpenInviteRecord, error)
 	GetOpenInviteByTokenHash(context.Context, string) (OpenInviteRecord, bool, error)
+	RevokeOpenInvite(context.Context, string, int64) (OpenInviteRecord, bool, error)
 	GetOpenInviteRedemption(context.Context, string, string) (OpenInviteRedemption, bool, error)
 	RedeemOpenInvite(context.Context, string, OpenInviteRedemption, int64) (OpenInviteRecord, OpenInviteRedemption, bool, error)
 	CompleteOpenInviteRedemption(context.Context, string, string, json.RawMessage, int64) error
@@ -370,6 +411,32 @@ func (s *MemoryStateStore) GetOpenInviteByTokenHash(_ context.Context, tokenHash
 	defer s.mu.Unlock()
 	rec, ok := s.invites[tokenHash]
 	return cloneOpenInviteRecord(rec), ok, nil
+}
+
+func (s *MemoryStateStore) ListOpenInvitesByGroup(_ context.Context, groupID entmoot.GroupID) ([]OpenInviteRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]OpenInviteRecord, 0)
+	for _, rec := range s.invites {
+		if rec.GroupID == groupID {
+			out = append(out, cloneOpenInviteRecord(rec))
+		}
+	}
+	sortOpenInviteRecords(out)
+	return out, nil
+}
+
+func (s *MemoryStateStore) RevokeOpenInvite(_ context.Context, tokenHash string, nowMS int64) (OpenInviteRecord, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rec, ok := s.invites[tokenHash]
+	if !ok {
+		return OpenInviteRecord{}, false, nil
+	}
+	rec.Revoked = true
+	rec.UpdatedAtMS = nowMS
+	s.invites[tokenHash] = rec
+	return cloneOpenInviteRecord(rec), true, nil
 }
 
 func (s *MemoryStateStore) GetOpenInviteRedemption(_ context.Context, tokenHash string, redeemerKey string) (OpenInviteRedemption, bool, error) {
@@ -974,6 +1041,42 @@ func (s *SQLiteStateStore) GetOpenInviteByTokenHash(ctx context.Context, tokenHa
 	return rec, true, nil
 }
 
+func (s *SQLiteStateStore) ListOpenInvitesByGroup(ctx context.Context, groupID entmoot.GroupID) ([]OpenInviteRecord, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT token_hash, group_id, device_id, max_uses, use_count, revoked, bootstrap_peers, created_at_ms, updated_at_ms, expires_at_ms FROM esp_open_invites WHERE group_id = ? ORDER BY created_at_ms DESC`, groupID[:])
+	if err != nil {
+		return nil, fmt.Errorf("esphttp: list open invites: %w", err)
+	}
+	defer rows.Close()
+	out := make([]OpenInviteRecord, 0)
+	for rows.Next() {
+		rec, err := scanOpenInviteRecord(rows)
+		if err != nil {
+			return nil, fmt.Errorf("esphttp: scan open invite: %w", err)
+		}
+		out = append(out, rec)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("esphttp: list open invites: %w", err)
+	}
+	return out, nil
+}
+
+func (s *SQLiteStateStore) RevokeOpenInvite(ctx context.Context, tokenHash string, nowMS int64) (OpenInviteRecord, bool, error) {
+	res, err := s.db.ExecContext(ctx, `UPDATE esp_open_invites SET revoked = 1, updated_at_ms = ? WHERE token_hash = ?`, nowMS, tokenHash)
+	if err != nil {
+		return OpenInviteRecord{}, false, fmt.Errorf("esphttp: revoke open invite: %w", err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return OpenInviteRecord{}, false, fmt.Errorf("esphttp: revoke open invite: %w", err)
+	}
+	if rows == 0 {
+		return OpenInviteRecord{}, false, nil
+	}
+	rec, ok, err := s.GetOpenInviteByTokenHash(ctx, tokenHash)
+	return rec, ok, err
+}
+
 func (s *SQLiteStateStore) GetOpenInviteRedemption(ctx context.Context, tokenHash string, redeemerKey string) (OpenInviteRedemption, bool, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT token_hash, redeemer_key, pilot_node_id, entmoot_pubkey, result, redeemed_at_ms FROM esp_open_invite_redemptions WHERE token_hash = ? AND redeemer_key = ?`, tokenHash, redeemerKey)
 	redemption, err := scanOpenInviteRedemption(row)
@@ -1468,6 +1571,15 @@ func cloneOpenInviteRedemption(red OpenInviteRedemption) OpenInviteRedemption {
 
 func cloneOpenInviteChallenge(ch OpenInviteChallenge) OpenInviteChallenge {
 	return ch
+}
+
+func sortOpenInviteRecords(records []OpenInviteRecord) {
+	sort.Slice(records, func(i, j int) bool {
+		if records[i].CreatedAtMS == records[j].CreatedAtMS {
+			return records[i].TokenHash < records[j].TokenHash
+		}
+		return records[i].CreatedAtMS > records[j].CreatedAtMS
+	})
 }
 
 func openInviteChallengeMatchesRedeemer(existing OpenInviteChallenge, want OpenInviteChallenge, nowMS int64) bool {

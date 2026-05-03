@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -125,20 +126,37 @@ func cmdInfo(gf *globalFlags, args []string) int {
 // infoOverIPC dials the running daemon's control socket, sends info_req,
 // and decodes the response.
 func infoOverIPC(sockPath string) (*ipc.InfoResp, error) {
-	conn, err := net.DialTimeout("unix", sockPath, 500*time.Millisecond)
+	return infoOverIPCContext(context.Background(), sockPath)
+}
+
+func infoOverIPCContext(ctx context.Context, sockPath string) (*ipc.InfoResp, error) {
+	dialCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer cancel()
+	conn, err := (&net.Dialer{}).DialContext(dialCtx, "unix", sockPath)
 	if err != nil {
 		return nil, fmt.Errorf("dial control socket: %w", err)
 	}
 	defer conn.Close()
 
+	stopCancelWake := context.AfterFunc(ctx, func() {
+		_ = conn.SetDeadline(time.Now())
+		_ = conn.Close()
+	})
+	defer stopCancelWake()
 	if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
 		return nil, err
 	}
 	if err := ipc.EncodeAndWrite(conn, &ipc.InfoReq{}); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
 		return nil, fmt.Errorf("write info_req: %w", err)
 	}
 	_, payload, err := ipc.ReadAndDecode(conn)
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
 		return nil, fmt.Errorf("read info_resp: %w", err)
 	}
 	switch v := payload.(type) {

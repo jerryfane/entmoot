@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -246,7 +248,9 @@ func TestApplyDoctorProbesKeepsSelfPassiveDiagnosis(t *testing.T) {
 			}
 			report.Groups[0].Peers = []doctorPeerReport{tc.peer}
 
-			applyDoctorProbes(report, t.TempDir(), time.Second)
+			if err := applyDoctorProbes(context.Background(), report, t.TempDir(), time.Second); err != nil {
+				t.Fatalf("applyDoctorProbes: %v", err)
+			}
 			peer := report.Groups[0].Peers[0]
 			if peer.Route != "self" {
 				t.Fatalf("self route = %q, want self", peer.Route)
@@ -255,6 +259,42 @@ func TestApplyDoctorProbesKeepsSelfPassiveDiagnosis(t *testing.T) {
 				t.Fatalf("self diagnosis = %q, want %q", peer.Diagnosis, tc.want)
 			}
 		})
+	}
+}
+
+func TestApplyDoctorProbesHonorsCanceledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	report := &doctorReport{
+		Entmoot: doctorEntmootReport{
+			Running: true,
+			NodeID:  1,
+		},
+		Groups: []doctorGroupReport{
+			{
+				GroupID: entmoot.GroupID{0x42},
+				Peers: []doctorPeerReport{
+					{
+						NodeID:    2,
+						Roster:    true,
+						Profile:   "ok",
+						Transport: "ok",
+						Trust:     "trusted",
+						Route:     "not_checked",
+						Diagnosis: "ok",
+					},
+				},
+			},
+		},
+	}
+
+	err := applyDoctorProbes(ctx, report, t.TempDir(), time.Second)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("applyDoctorProbes error = %v, want context.Canceled", err)
+	}
+	peer := report.Groups[0].Peers[0]
+	if peer.Route != "not_checked" {
+		t.Fatalf("route = %q, want not_checked", peer.Route)
 	}
 }
 

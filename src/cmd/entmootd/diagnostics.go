@@ -116,7 +116,7 @@ func cmdDoctor(gf *globalFlags, args []string) int {
 		}
 		gid = &parsed
 	}
-	report, err := buildDoctorReport(gf, gid, *probe, *timeout)
+	report, err := buildDoctorReport(context.Background(), gf, gid, *probe, *timeout)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "doctor: %v\n", err)
 		return exitTransport
@@ -158,7 +158,7 @@ func cmdPeers(gf *globalFlags, args []string) int {
 		fmt.Fprintf(os.Stderr, "peers: %v\n", err)
 		return exitInvalidArgument
 	}
-	report, err := buildDoctorReport(gf, &gid, *probe, *timeout)
+	report, err := buildDoctorReport(context.Background(), gf, &gid, *probe, *timeout)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "peers: %v\n", err)
 		return exitTransport
@@ -180,9 +180,12 @@ func cmdPeers(gf *globalFlags, args []string) int {
 	return exitOK
 }
 
-func buildDoctorReport(gf *globalFlags, groupFilter *entmoot.GroupID, probe bool, probeTimeout time.Duration) (*doctorReport, error) {
+func buildDoctorReport(ctx context.Context, gf *globalFlags, groupFilter *entmoot.GroupID, probe bool, probeTimeout time.Duration) (*doctorReport, error) {
 	s, err := setup(gf)
 	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	report := &doctorReport{
@@ -195,7 +198,7 @@ func buildDoctorReport(gf *globalFlags, groupFilter *entmoot.GroupID, probe bool
 
 	trusted := map[entmoot.NodeID]struct{}{}
 	pending := map[entmoot.NodeID]struct{}{}
-	if pilotInfo, t, p, err := loadPilotDoctorState(gf.socket); err != nil {
+	if pilotInfo, t, p, err := loadPilotDoctorState(ctx, gf.socket); err != nil {
 		report.Pilot.Error = err.Error()
 	} else {
 		report.Pilot = pilotInfo
@@ -207,7 +210,7 @@ func buildDoctorReport(gf *globalFlags, groupFilter *entmoot.GroupID, probe bool
 	report.Entmoot.Running = running
 	liveInfoByGroup := map[entmoot.GroupID]ipc.GroupInfo{}
 	if running {
-		if live, err := infoOverIPC(controlSocketPath(s.dataDir)); err == nil {
+		if live, err := infoOverIPCContext(ctx, controlSocketPath(s.dataDir)); err == nil {
 			report.Entmoot.NodeID = live.PilotNodeID
 			report.Entmoot.ListenPort = live.ListenPort
 			report.Entmoot.DataDir = live.DataDir
@@ -242,9 +245,12 @@ func buildDoctorReport(gf *globalFlags, groupFilter *entmoot.GroupID, probe bool
 	if st != nil {
 		defer func() { _ = st.Close() }()
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	storeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	for _, gid := range gids {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if _, err := os.Stat(groupRosterPath(s.dataDir, gid)); err != nil {
 			if groupFilter != nil && errors.Is(err, os.ErrNotExist) {
 				continue
@@ -259,24 +265,26 @@ func buildDoctorReport(gf *globalFlags, groupFilter *entmoot.GroupID, probe bool
 		if localNode == 0 {
 			localNode = report.Pilot.NodeID
 		}
-		group := buildDoctorGroup(ctx, st, r, gid, localNode, s.identity.PublicKey, report.Pilot, trusted, pending, liveInfoByGroup[gid])
+		group := buildDoctorGroup(storeCtx, st, r, gid, localNode, s.identity.PublicKey, report.Pilot, trusted, pending, liveInfoByGroup[gid])
 		_ = r.Close()
 		report.Groups = append(report.Groups, group)
 	}
 	if probe {
-		applyDoctorProbes(report, s.dataDir, probeTimeout)
+		if err := applyDoctorProbes(ctx, report, s.dataDir, probeTimeout); err != nil {
+			return nil, err
+		}
 	}
 	populateDoctorSuggestions(report, gf)
 	return report, nil
 }
 
-func loadPilotDoctorState(socketPath string) (doctorPilotReport, map[entmoot.NodeID]struct{}, map[entmoot.NodeID]struct{}, error) {
+func loadPilotDoctorState(ctx context.Context, socketPath string) (doctorPilotReport, map[entmoot.NodeID]struct{}, map[entmoot.NodeID]struct{}, error) {
 	drv, err := ipcclient.Connect(socketPath)
 	if err != nil {
 		return doctorPilotReport{}, nil, nil, fmt.Errorf("connect %s: %w", socketPath, err)
 	}
 	defer func() { _ = drv.Close() }()
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 	info, err := drv.InfoStruct(ctx)
 	if err != nil {
@@ -390,7 +398,10 @@ func doctorPeerTrust(localNode, nodeID entmoot.NodeID, pilotReport doctorPilotRe
 	return "missing"
 }
 
-func applyDoctorProbes(report *doctorReport, dataDir string, timeout time.Duration) {
+func applyDoctorProbes(ctx context.Context, report *doctorReport, dataDir string, timeout time.Duration) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if !report.Entmoot.Running {
 		for gi := range report.Groups {
 			for pi := range report.Groups[gi].Peers {
@@ -398,9 +409,12 @@ func applyDoctorProbes(report *doctorReport, dataDir string, timeout time.Durati
 				report.Groups[gi].Peers[pi].Diagnosis = diagnosePeer(report.Groups[gi].Peers[pi], true)
 			}
 		}
-		return
+		return nil
 	}
 	for gi := range report.Groups {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		group := &report.Groups[gi]
 		peers := make([]entmoot.NodeID, 0, len(group.Peers))
 		peerIndexes := make(map[entmoot.NodeID]int, len(group.Peers))
@@ -411,7 +425,13 @@ func applyDoctorProbes(report *doctorReport, dataDir string, timeout time.Durati
 			}
 		}
 		for _, chunk := range chunkDiagProbePeers(peers) {
-			results, err := diagProbeOverIPC(controlSocketPath(dataDir), group.GroupID, chunk, timeout)
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			results, err := diagProbeOverIPC(ctx, controlSocketPath(dataDir), group.GroupID, chunk, timeout)
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
 			for _, nodeID := range chunk {
 				pi, ok := peerIndexes[nodeID]
 				if !ok {
@@ -454,22 +474,36 @@ func applyDoctorProbes(report *doctorReport, dataDir string, timeout time.Durati
 			peer.Diagnosis = diagnosePeer(*peer, true)
 		}
 	}
+	return nil
 }
 
-func diagProbeOverIPC(sockPath string, gid entmoot.GroupID, peers []entmoot.NodeID, timeout time.Duration) (map[entmoot.NodeID]ipc.DiagProbePeer, error) {
+func diagProbeOverIPC(ctx context.Context, sockPath string, gid entmoot.GroupID, peers []entmoot.NodeID, timeout time.Duration) (map[entmoot.NodeID]ipc.DiagProbePeer, error) {
 	timeout = clampDiagProbeTimeout(timeout)
-	conn, err := net.DialTimeout("unix", sockPath, 500*time.Millisecond)
+	dialCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer cancel()
+	conn, err := (&net.Dialer{}).DialContext(dialCtx, "unix", sockPath)
 	if err != nil {
 		return nil, err
 	}
 	defer conn.Close()
+	stopCancelWake := context.AfterFunc(ctx, func() {
+		_ = conn.SetDeadline(time.Now())
+		_ = conn.Close()
+	})
+	defer stopCancelWake()
 	deadline := time.Now().Add(diagProbeBudget(timeout, len(peers)) + diagProbeClientSlack)
 	_ = conn.SetDeadline(deadline)
 	if err := ipc.EncodeAndWrite(conn, &ipc.DiagProbeReq{GroupID: gid, Peers: peers, TimeoutMS: timeout.Milliseconds()}); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
 		return nil, err
 	}
 	_, payload, err := ipc.ReadAndDecode(conn)
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
 		return nil, err
 	}
 	switch v := payload.(type) {
