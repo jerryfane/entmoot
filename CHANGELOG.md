@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.35] - 2026-05-03
+
+### Added
+
+- **Open-invite join UX.** `entmootd join` now accepts app-generated
+  open-invite bundles and links directly, redeems them through the issuer, and
+  joins with the resulting signed invite so operators do not need to manually
+  distinguish token descriptors from joinable invite payloads.
+- **Automatic Pilot onboarding handshakes.** New joiners send bounded Pilot
+  handshake requests to bootstrap, founder, and selected roster peers after a
+  successful join, while existing peers can auto-approve pending handshakes
+  from current group members.
+- **Doctor diagnostics.** Added `entmootd doctor` and `entmootd peers` reports
+  with trust/profile/transport/route state, optional route probes, and repair
+  suggestions.
+- **Post-join health summary.** Join/serve readiness events now include compact
+  group health counts and the suggested doctor command for follow-up checks.
+
+### Fixed
+
+- **Join diagnostics stay lightweight.** Startup health avoids scanning stored
+  message history and still reports onboarding candidates when Pilot trust
+  queries are temporarily unavailable.
+
 ## [1.5.34] - 2026-05-03
 
 ### Fixed

@@ -25,7 +25,7 @@ jobs:
       # that Entmoot starts to depend on.
       - name: Clone Pilot (for src/go.mod replace)
         run: |
-          git clone --depth 1 --branch v1.9.0-jf.15.23 \
+          git clone --depth 1 --branch v1.9.0-jf.15.24 \
             https://github.com/jerryfane/pilotprotocol.git \
             repos/pilotprotocol
 
