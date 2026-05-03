@@ -1246,6 +1246,10 @@ func (g *Gossiper) handleConn(ctx context.Context, c net.Conn, remote entmoot.No
 		reqCtx, cancel := g.inboundLargeFrameResponseContext(ctx)
 		defer cancel()
 		g.onMemberProfileSnapshotReq(reqCtx, c, remote, v)
+	case *wire.DiagPingReq:
+		reqCtx, cancel := g.inboundOneShotContext(ctx)
+		defer cancel()
+		g.onDiagPingReq(reqCtx, c, remote, v)
 	case *wire.TransportSnapshotReq:
 		reqCtx, cancel := g.inboundLargeFrameResponseContext(ctx)
 		defer cancel()
@@ -1268,6 +1272,35 @@ func (g *Gossiper) handleConn(ctx context.Context, c net.Conn, remote entmoot.No
 			slog.String("type", t.String()))
 	}
 	return true
+}
+
+// DiagnosticPing opens a normal Entmoot-over-Pilot stream to peer and expects
+// a tiny echo response. It is used by operator tooling, not gossip control
+// flow, so callers provide the timeout policy.
+func (g *Gossiper) DiagnosticPing(ctx context.Context, peer entmoot.NodeID, nonce []byte) (*wire.DiagPingResp, error) {
+	req := &wire.DiagPingReq{
+		GroupID:     g.cfg.GroupID,
+		Nonce:       append([]byte(nil), nonce...),
+		TimestampMS: g.clk.Now().UnixMilli(),
+	}
+	payload, err := g.requestResponseWithAttemptTimeout(ctx, peer, req, wire.MsgDiagPingResp, "diag_ping", 0)
+	if err != nil {
+		return nil, err
+	}
+	resp, ok := payload.(*wire.DiagPingResp)
+	if !ok {
+		return nil, fmt.Errorf("diag_ping: unexpected response type")
+	}
+	if resp.GroupID != g.cfg.GroupID {
+		return nil, fmt.Errorf("diag_ping: response group mismatch")
+	}
+	if !bytes.Equal(resp.Nonce, nonce) {
+		return nil, fmt.Errorf("diag_ping: nonce mismatch")
+	}
+	if resp.Responder != peer {
+		return nil, fmt.Errorf("diag_ping: responder mismatch: got %d want %d", resp.Responder, peer)
+	}
+	return resp, nil
 }
 
 // onRosterReq responds with the full roster entries. SinceHead is accepted
@@ -4113,6 +4146,27 @@ func (g *Gossiper) onMemberProfileSnapshotReq(ctx context.Context, conn net.Conn
 		}
 	}
 	_ = g.writeOneShotResponse(ctx, conn, remote, "member_profile_snapshot_resp", resp)
+}
+
+func (g *Gossiper) onDiagPingReq(ctx context.Context, conn net.Conn, remote entmoot.NodeID, req *wire.DiagPingReq) {
+	if req.GroupID != g.cfg.GroupID {
+		g.logger.Warn("gossip: diag_ping_req for wrong group",
+			slog.Uint64("remote", uint64(remote)),
+			slog.String("got", req.GroupID.String()))
+		return
+	}
+	if !g.cfg.Roster.IsMember(remote) {
+		g.logger.Warn("gossip: diag_ping_req from non-member",
+			slog.Uint64("remote", uint64(remote)))
+		return
+	}
+	resp := &wire.DiagPingResp{
+		GroupID:     g.cfg.GroupID,
+		Nonce:       append([]byte(nil), req.Nonce...),
+		Responder:   g.cfg.LocalNode,
+		TimestampMS: g.clk.Now().UnixMilli(),
+	}
+	_ = g.writeOneShotResponse(ctx, conn, remote, "diag_ping_resp", resp)
 }
 
 func filterCurrentMemberProfiles(r *roster.RosterLog, profiles []wire.MemberProfileAd) []wire.MemberProfileAd {

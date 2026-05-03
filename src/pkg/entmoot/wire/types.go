@@ -91,6 +91,12 @@ const (
 	// MsgMemberProfileSnapshotResp carries every unexpired MemberProfileAd
 	// the responder holds for the group.
 	MsgMemberProfileSnapshotResp MsgType = 0x14
+	// MsgDiagPingReq is a lightweight diagnostic request used by local
+	// operator tooling to prove that an Entmoot stream to a roster peer can
+	// carry an application frame for this group.
+	MsgDiagPingReq MsgType = 0x15
+	// MsgDiagPingResp echoes MsgDiagPingReq's nonce and records the responder.
+	MsgDiagPingResp MsgType = 0x16
 )
 
 // String returns the human-readable wire name for t, suitable for logs. It
@@ -137,6 +143,10 @@ func (t MsgType) String() string {
 		return "member_profile_snapshot_req"
 	case MsgMemberProfileSnapshotResp:
 		return "member_profile_snapshot_resp"
+	case MsgDiagPingReq:
+		return "diag_ping_req"
+	case MsgDiagPingResp:
+		return "diag_ping_resp"
 	default:
 		return fmt.Sprintf("unknown(0x%02x)", uint8(t))
 	}
@@ -427,6 +437,23 @@ type MemberProfileSnapshotResp struct {
 	GroupID entmoot.GroupID `json:"group_id"`
 	// Profiles is the responder's current set of unexpired profile ads.
 	Profiles []MemberProfileAd `json:"profiles"`
+}
+
+// DiagPingReq is a non-mutating operator diagnostic frame. It is intentionally
+// tiny and carries no private endpoint data.
+type DiagPingReq struct {
+	GroupID     entmoot.GroupID `json:"group_id"`
+	Nonce       []byte          `json:"nonce"`
+	TimestampMS int64           `json:"timestamp_ms"`
+}
+
+// DiagPingResp proves the responder received the request through the normal
+// Entmoot-over-Pilot stream path.
+type DiagPingResp struct {
+	GroupID     entmoot.GroupID `json:"group_id"`
+	Nonce       []byte          `json:"nonce"`
+	Responder   entmoot.NodeID  `json:"responder"`
+	TimestampMS int64           `json:"timestamp_ms"`
 }
 
 // Reconcile carries one round of the Range-Based Set Reconciliation

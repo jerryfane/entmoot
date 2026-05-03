@@ -703,6 +703,10 @@ func (m *groupMuxTransport) groupForPayload(payload any) (entmoot.GroupID, bool)
 		return v.GroupID, true
 	case *wire.MemberProfileSnapshotResp:
 		return v.GroupID, true
+	case *wire.DiagPingReq:
+		return v.GroupID, true
+	case *wire.DiagPingResp:
+		return v.GroupID, true
 	case *wire.Reconcile:
 		return v.GroupID, true
 	}

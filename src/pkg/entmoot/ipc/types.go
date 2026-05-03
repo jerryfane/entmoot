@@ -61,6 +61,10 @@ const (
 	MsgInviteAuthorityCheckReq MsgType = 0x1E
 	// MsgInviteAuthorityCheckResp acknowledges local invite authority.
 	MsgInviteAuthorityCheckResp MsgType = 0x20
+	// MsgDiagProbeReq asks the running daemon to probe peers for one group.
+	MsgDiagProbeReq MsgType = 0x21
+	// MsgDiagProbeResp returns per-peer probe results.
+	MsgDiagProbeResp MsgType = 0x22
 	// MsgError carries a structured error frame. 0x1F is kept stable so
 	// existing logs and clients can continue spotting error frames.
 	MsgError MsgType = 0x1F
@@ -102,6 +106,10 @@ func (t MsgType) String() string {
 		return "invite_authority_check_req"
 	case MsgInviteAuthorityCheckResp:
 		return "invite_authority_check_resp"
+	case MsgDiagProbeReq:
+		return "diag_probe_req"
+	case MsgDiagProbeResp:
+		return "diag_probe_resp"
 	case MsgError:
 		return "error"
 	default:
@@ -215,6 +223,26 @@ type MemberRemoveResp struct {
 	GroupID    entmoot.GroupID       `json:"group_id"`
 	RosterHead entmoot.RosterEntryID `json:"roster_head"`
 	Members    int                   `json:"members"`
+}
+
+type DiagProbeReq struct {
+	GroupID   entmoot.GroupID  `json:"group_id"`
+	Peers     []entmoot.NodeID `json:"peers"`
+	TimeoutMS int64            `json:"timeout_ms,omitempty"`
+}
+
+type DiagProbeResp struct {
+	GroupID entmoot.GroupID `json:"group_id"`
+	Peers   []DiagProbePeer `json:"peers"`
+}
+
+type DiagProbePeer struct {
+	NodeID     entmoot.NodeID `json:"node_id"`
+	OK         bool           `json:"ok"`
+	RTTMS      int64          `json:"rtt_ms,omitempty"`
+	Error      string         `json:"error,omitempty"`
+	Responder  entmoot.NodeID `json:"responder,omitempty"`
+	ReceivedMS int64          `json:"received_ms,omitempty"`
 }
 
 // TailSubscribe opens a live message stream. GroupID is optional (nil

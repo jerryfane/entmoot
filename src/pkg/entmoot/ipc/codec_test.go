@@ -303,7 +303,7 @@ func TestEncodeUnknownType(t *testing.T) {
 // TestDecodeUnknownType exercises bytes outside the ipc namespace
 // (0x00, 0xFF) and unused bytes inside the namespace.
 func TestDecodeUnknownType(t *testing.T) {
-	for _, b := range []MsgType{0x00, 0x09, 0x21, 0xFF} {
+	for _, b := range []MsgType{0x00, 0x09, 0x23, 0xFF} {
 		_, err := Decode(b, []byte(`{}`))
 		if !errors.Is(err, ErrUnknownMessage) {
 			t.Errorf("Decode(0x%02x) err = %v, want ErrUnknownMessage", uint8(b), err)
@@ -320,6 +320,7 @@ func TestDecodeMalformedJSON(t *testing.T) {
 		MsgJoinGroupReq, MsgJoinGroupResp,
 		MsgInviteCreateReq, MsgInviteCreateResp,
 		MsgMemberRemoveReq, MsgMemberRemoveResp,
+		MsgDiagProbeReq, MsgDiagProbeResp,
 		MsgTailSubscribe, MsgTailEvent,
 		MsgInfoResp, MsgError,
 	}

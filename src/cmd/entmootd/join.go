@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -489,6 +490,7 @@ func runGroupDaemon(gf *globalFlags, opts groupDaemonOptions) int {
 		"members":        members,
 		"listen_port":    gf.listenPort,
 		"control_socket": sockPath,
+		"next_command":   doctorNextCommand(gf, groups[0]),
 	}
 	if data, err := json.Marshal(joinedEvent); err == nil {
 		fmt.Println(string(data))
@@ -504,6 +506,35 @@ func runGroupDaemon(gf *globalFlags, opts groupDaemonOptions) int {
 	removeSocket()
 	slog.Info("entmootd shutting down")
 	return exitOK
+}
+
+func doctorNextCommand(gf *globalFlags, gid entmoot.GroupID) string {
+	args := []string{
+		"entmootd",
+		"-socket", gf.socket,
+		"-identity", gf.identity,
+		"-data", gf.data,
+		"doctor",
+		"-group", gid.String(),
+		"--probe",
+	}
+	for i, arg := range args {
+		args[i] = shellQuoteArg(arg)
+	}
+	return strings.Join(args, " ")
+}
+
+func shellQuoteArg(arg string) string {
+	if arg == "" {
+		return "''"
+	}
+	if strings.IndexFunc(arg, func(r rune) bool {
+		return !(r >= 'A' && r <= 'Z' || r >= 'a' && r <= 'z' || r >= '0' && r <= '9' ||
+			r == '_' || r == '-' || r == '.' || r == '/' || r == ':' || r == '=' || r == '+' || r == ',')
+	}) == -1 {
+		return arg
+	}
+	return "'" + strings.ReplaceAll(arg, "'", "'\"'\"'") + "'"
 }
 
 // errInviteMalformed is the local sentinel used to distinguish a
@@ -990,6 +1021,8 @@ func (s *ipcServer) handleConn(ctx context.Context, c net.Conn) {
 		s.handleInviteAuthorityCheck(ctx, c, v)
 	case *ipc.MemberRemoveReq:
 		s.handleMemberRemove(ctx, c, v)
+	case *ipc.DiagProbeReq:
+		s.handleDiagProbe(ctx, c, v)
 	case *ipc.InfoReq:
 		s.handleInfo(ctx, c)
 	case *ipc.TailSubscribe:
@@ -1161,6 +1194,73 @@ func (s *ipcServer) handlePublish(ctx context.Context, c net.Conn, req *ipc.Publ
 		GroupID:     gid,
 		TimestampMS: now,
 	})
+}
+
+func (s *ipcServer) handleDiagProbe(ctx context.Context, c net.Conn, req *ipc.DiagProbeReq) {
+	sess, ok := s.runtime.Get(req.GroupID)
+	if !ok {
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
+			Type:    "error",
+			Code:    ipc.CodeGroupNotFound,
+			GroupID: &req.GroupID,
+			Message: "group not joined",
+		})
+		return
+	}
+	if len(req.Peers) > diagProbeMaxPeersPerRequest {
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
+			Type:    "error",
+			Code:    ipc.CodeInvalidArgument,
+			GroupID: &req.GroupID,
+			Message: "too many peers for one diagnostic probe",
+		})
+		return
+	}
+	timeout := clampDiagProbeTimeout(time.Duration(req.TimeoutMS) * time.Millisecond)
+	probeRoot, cancelProbeRoot := context.WithTimeout(ctx, diagProbeBudget(timeout, len(req.Peers)))
+	defer cancelProbeRoot()
+
+	peers := append([]entmoot.NodeID(nil), req.Peers...)
+	resp := &ipc.DiagProbeResp{
+		GroupID: req.GroupID,
+		Peers:   make([]ipc.DiagProbePeer, len(peers)),
+	}
+	sem := make(chan struct{}, diagProbeConcurrency)
+	var wg sync.WaitGroup
+	for i, peer := range peers {
+		i, peer := i, peer
+		resp.Peers[i].NodeID = peer
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-probeRoot.Done():
+				resp.Peers[i].Error = probeRoot.Err().Error()
+				return
+			}
+			nonce := make([]byte, 16)
+			if _, err := rand.Read(nonce); err != nil {
+				resp.Peers[i].Error = "nonce: " + err.Error()
+				return
+			}
+			probeCtx, cancel := context.WithTimeout(probeRoot, timeout)
+			defer cancel()
+			start := time.Now()
+			got, err := sess.gossip.DiagnosticPing(probeCtx, peer, nonce)
+			if err != nil {
+				resp.Peers[i].Error = err.Error()
+				return
+			}
+			resp.Peers[i].OK = true
+			resp.Peers[i].RTTMS = time.Since(start).Milliseconds()
+			resp.Peers[i].Responder = got.Responder
+			resp.Peers[i].ReceivedMS = got.TimestampMS
+		}()
+	}
+	wg.Wait()
+	_ = ipc.EncodeAndWrite(c, resp)
 }
 
 func (s *ipcServer) resolvePublishGroup(c net.Conn, requested *entmoot.GroupID) (entmoot.GroupID, bool) {

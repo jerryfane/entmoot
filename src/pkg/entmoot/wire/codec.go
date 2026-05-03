@@ -62,6 +62,10 @@ func Encode(v any) (MsgType, []byte, error) {
 		t = MsgMemberProfileSnapshotReq
 	case *MemberProfileSnapshotResp:
 		t = MsgMemberProfileSnapshotResp
+	case *DiagPingReq:
+		t = MsgDiagPingReq
+	case *DiagPingResp:
+		t = MsgDiagPingResp
 	default:
 		return 0, nil, fmt.Errorf("wire: encode %T: %w", v, entmoot.ErrUnknownMessage)
 	}
@@ -128,6 +132,10 @@ func Decode(t MsgType, body []byte) (any, error) {
 		return decodeAs[MemberProfileSnapshotReq](t, body)
 	case MsgMemberProfileSnapshotResp:
 		return decodeAs[MemberProfileSnapshotResp](t, body)
+	case MsgDiagPingReq:
+		return decodeAs[DiagPingReq](t, body)
+	case MsgDiagPingResp:
+		return decodeAs[DiagPingResp](t, body)
 	default:
 		return nil, fmt.Errorf("wire: type 0x%02x: %w", uint8(t), entmoot.ErrUnknownMessage)
 	}

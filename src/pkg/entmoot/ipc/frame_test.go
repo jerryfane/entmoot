@@ -195,6 +195,8 @@ func TestMsgTypeString(t *testing.T) {
 		MsgMemberRemoveResp:         "member_remove_resp",
 		MsgInviteAuthorityCheckReq:  "invite_authority_check_req",
 		MsgInviteAuthorityCheckResp: "invite_authority_check_resp",
+		MsgDiagProbeReq:             "diag_probe_req",
+		MsgDiagProbeResp:            "diag_probe_resp",
 		MsgTailSubscribe:            "tail_subscribe",
 		MsgTailEvent:                "tail_event",
 		MsgInfoReq:                  "info_req",
@@ -213,7 +215,7 @@ func TestMsgTypeString(t *testing.T) {
 		t.Errorf("0xFF String() = %q", got)
 	}
 	// An unused byte in the ipc namespace must also be reported as unknown.
-	if got := MsgType(0x21).String(); got != "unknown(0x21)" {
-		t.Errorf("0x21 String() = %q", got)
+	if got := MsgType(0x23).String(); got != "unknown(0x23)" {
+		t.Errorf("0x23 String() = %q", got)
 	}
 }

@@ -47,6 +47,10 @@ func Encode(v any) (MsgType, []byte, error) {
 		t = MsgMemberRemoveReq
 	case *MemberRemoveResp:
 		t = MsgMemberRemoveResp
+	case *DiagProbeReq:
+		t = MsgDiagProbeReq
+	case *DiagProbeResp:
+		t = MsgDiagProbeResp
 	case *TailSubscribe:
 		t = MsgTailSubscribe
 	case *TailEvent:
@@ -107,6 +111,10 @@ func Decode(t MsgType, body []byte) (any, error) {
 		return decodeAs[MemberRemoveReq](t, body)
 	case MsgMemberRemoveResp:
 		return decodeAs[MemberRemoveResp](t, body)
+	case MsgDiagProbeReq:
+		return decodeAs[DiagProbeReq](t, body)
+	case MsgDiagProbeResp:
+		return decodeAs[DiagProbeResp](t, body)
 	case MsgTailSubscribe:
 		return decodeAs[TailSubscribe](t, body)
 	case MsgTailEvent:

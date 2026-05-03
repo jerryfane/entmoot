@@ -68,8 +68,12 @@ func run() int {
 		fmt.Fprintln(os.Stderr, "                          Join from signed invite(s) or open-invite link/descriptor(s).")
 		fmt.Fprintln(os.Stderr, "  serve [-group GID...]")
 		fmt.Fprintln(os.Stderr, "                          Restart joined groups from persistent local state.")
-		fmt.Fprintln(os.Stderr, "  publish -topic T -content S [-group GID]")
+		fmt.Fprintln(os.Stderr, "  publish -topic T (-content S|-file PATH| -file -) [-group GID]")
 		fmt.Fprintln(os.Stderr, "                          Author and gossip a message via the control socket.")
+		fmt.Fprintln(os.Stderr, "  doctor [-group GID] [--probe] [--json]")
+		fmt.Fprintln(os.Stderr, "                          Diagnose local Pilot, daemon, groups, and peer route state.")
+		fmt.Fprintln(os.Stderr, "  peers -group GID [--probe] [--json]")
+		fmt.Fprintln(os.Stderr, "                          Print a compact peer health table for one group.")
 		fmt.Fprintln(os.Stderr, "  tail [-topic PAT] [-group GID] [-n N]")
 		fmt.Fprintln(os.Stderr, "                          SQLite backfill + live subscription from the control socket.")
 		fmt.Fprintln(os.Stderr, "  info                    Print a JSON snapshot (reads SQLite directly).")
@@ -157,6 +161,10 @@ func run() int {
 		return cmdServe(gf, args[1:])
 	case "publish":
 		return cmdPublish(gf, args[1:])
+	case "doctor":
+		return cmdDoctor(gf, args[1:])
+	case "peers":
+		return cmdPeers(gf, args[1:])
 	case "tail":
 		return cmdTail(gf, args[1:])
 	case "info":

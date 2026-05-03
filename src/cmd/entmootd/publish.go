@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -20,7 +21,8 @@ import (
 func cmdPublish(gf *globalFlags, args []string) int {
 	fs := flag.NewFlagSet("publish", flag.ContinueOnError)
 	topicFlag := fs.String("topic", "", "comma-separated topics (required)")
-	content := fs.String("content", "", "message content (required)")
+	content := fs.String("content", "", "message content")
+	filePath := fs.String("file", "", "read message content from file path, or '-' for stdin")
 	groupStr := fs.String("group", "", "base64 group id (optional when exactly one group is joined)")
 	timeoutFlag := fs.Duration("timeout", 30*time.Second, "IPC response deadline; raise on slow/flaky networks")
 	if err := fs.Parse(args); err != nil {
@@ -33,9 +35,28 @@ func cmdPublish(gf *globalFlags, args []string) int {
 		fmt.Fprintln(os.Stderr, "publish: -topic is required")
 		return exitInvalidArgument
 	}
-	if *content == "" {
-		fmt.Fprintln(os.Stderr, "publish: -content is required")
+	if (*content == "") == (*filePath == "") {
+		fmt.Fprintln(os.Stderr, "publish: exactly one of -content or -file is required")
 		return exitInvalidArgument
+	}
+	contentBytes := []byte(*content)
+	if *filePath != "" {
+		var data []byte
+		var err error
+		if *filePath == "-" {
+			data, err = io.ReadAll(os.Stdin)
+		} else {
+			data, err = os.ReadFile(*filePath)
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "publish: read file: %v\n", err)
+			return exitInvalidArgument
+		}
+		if len(data) == 0 {
+			fmt.Fprintln(os.Stderr, "publish: file content is empty")
+			return exitInvalidArgument
+		}
+		contentBytes = data
 	}
 	topics := parseTopicList(*topicFlag)
 	if len(topics) == 0 {
@@ -79,7 +100,7 @@ func cmdPublish(gf *globalFlags, args []string) int {
 	req := &ipc.PublishReq{
 		GroupID: gidPtr,
 		Topics:  topics,
-		Content: []byte(*content),
+		Content: contentBytes,
 	}
 	if err := ipc.EncodeAndWrite(conn, req); err != nil {
 		slog.Error("publish: write publish_req", slog.String("err", err.Error()))
