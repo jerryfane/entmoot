@@ -187,6 +187,7 @@ func cmdJoin(gf *globalFlags, args []string) int {
 		event:              "joined",
 		advertiseEndpoints: advertiseEndpoints,
 		loadGroups: func(ctx context.Context, runtime *groupRuntime, loadCtx groupDaemonLoadContext) (int, error) {
+			acceptedInvites := make(map[entmoot.GroupID]entmoot.Invite, len(inputs))
 			for _, input := range inputs {
 				invite := input.invite
 				if input.openInvite != nil {
@@ -206,7 +207,9 @@ func cmdJoin(gf *globalFlags, args []string) int {
 					}
 					return code, fmt.Errorf("add group %s: %w", invite.GroupID.String(), err)
 				}
+				acceptedInvites[invite.GroupID] = *invite
 			}
+			runtime.SetJoinHealthInvites(acceptedInvites)
 			return exitOK, nil
 		},
 	})
@@ -483,15 +486,7 @@ func runGroupDaemon(gf *globalFlags, opts groupDaemonOptions) int {
 			members += len(sess.roster.Members())
 		}
 	}
-	joinedEvent := map[string]any{
-		"event":          opts.event,
-		"group_id":       groups[0],
-		"group_ids":      groups,
-		"members":        members,
-		"listen_port":    gf.listenPort,
-		"control_socket": sockPath,
-		"next_command":   doctorNextCommand(gf, groups[0]),
-	}
+	joinedEvent := groupDaemonEvent(opts.event, gf, groups, members, buildJoinHealthSummary(rootCtx, runtime, rawStore, s.identity.PublicKey), sockPath)
 	if data, err := json.Marshal(joinedEvent); err == nil {
 		fmt.Println(string(data))
 	}
@@ -506,6 +501,19 @@ func runGroupDaemon(gf *globalFlags, opts groupDaemonOptions) int {
 	removeSocket()
 	slog.Info("entmootd shutting down")
 	return exitOK
+}
+
+func groupDaemonEvent(event string, gf *globalFlags, groups []entmoot.GroupID, members int, health joinHealthSummary, sockPath string) map[string]any {
+	return map[string]any{
+		"event":          event,
+		"group_id":       groups[0],
+		"group_ids":      groups,
+		"members":        members,
+		"health":         health,
+		"listen_port":    gf.listenPort,
+		"control_socket": sockPath,
+		"next_command":   doctorNextCommand(gf, groups[0]),
+	}
 }
 
 func doctorNextCommand(gf *globalFlags, gid entmoot.GroupID) string {

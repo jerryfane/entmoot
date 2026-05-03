@@ -70,6 +70,7 @@ type groupRuntime struct {
 	mu                    sync.RWMutex
 	sessions              map[entmoot.GroupID]*groupSession
 	joining               map[entmoot.GroupID]chan struct{}
+	joinHealthInvites     map[entmoot.GroupID]entmoot.Invite
 	handshakeApprovalWake chan struct{}
 	wg                    sync.WaitGroup
 }
@@ -475,6 +476,25 @@ func (r *groupRuntime) ActiveGroupIDs() []entmoot.GroupID {
 	sort.Slice(out, func(i, j int) bool {
 		return bytes.Compare(out[i][:], out[j][:]) < 0
 	})
+	return out
+}
+
+func (r *groupRuntime) SetJoinHealthInvites(invites map[entmoot.GroupID]entmoot.Invite) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.joinHealthInvites = make(map[entmoot.GroupID]entmoot.Invite, len(invites))
+	for gid, invite := range invites {
+		r.joinHealthInvites[gid] = invite
+	}
+}
+
+func (r *groupRuntime) JoinHealthInvites() map[entmoot.GroupID]entmoot.Invite {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make(map[entmoot.GroupID]entmoot.Invite, len(r.joinHealthInvites))
+	for gid, invite := range r.joinHealthInvites {
+		out[gid] = invite
+	}
 	return out
 }
 
