@@ -30,11 +30,10 @@
 
 \begin{abstract}
 \noindent
-Between 17 and 27 April 2026 we shipped a dense sequence of
+Between 17 April and 3 May 2026 we shipped a dense sequence of
 patch releases across two layered systems: the Pilot fork moved from
-\texttt{v1.7.2-jf.1} to \texttt{v1.9.0-jf.15.21}, and Entmoot moved
-from \texttt{v1.0.0} to \texttt{v1.5.25}, followed by the current
-member-profile and group-display-metadata work. Every patch was
+\texttt{v1.7.2-jf.1} to \texttt{v1.9.0-jf.15.24}, and Entmoot moved
+from \texttt{v1.0.0} to \texttt{v1.5.35}. Every patch was
 driven by a symptom observed on a three-machine live demo across
 three continents: a laptop on a UAE carrier-grade NAT, a Raspberry Pi
 in Italy on Fastweb residential, and a Hetzner VPS in Germany. The
@@ -1350,7 +1349,7 @@ current split is the useful one: gossip owns retry policy and
 anti-entropy semantics; the Pilot adapter owns IPC/yamux-specific error
 classification and session lifecycle.
 
-\subsection{Pilot \texttt{jf.15.8}--\texttt{jf.15.21}: the stream
+\subsection{Pilot \texttt{jf.15.8}--\texttt{jf.15.24}: the stream
 layer becomes explicit}
 
 \paragraph{What broke.} The last visible symptom was the famous
@@ -1425,8 +1424,8 @@ ESP path does not change Entmoot's consensus state; it packages the
 existing store, roster validation, and gossip fanout into interfaces an
 intermittent client can safely use.
 
-\subsection{Entmoot \texttt{v1.5.20}--\texttt{v1.5.25}: executable ESP,
-multi-group runtime, raw Pilot streams, and hostname-aware members}
+\subsection{Entmoot \texttt{v1.5.20}--\texttt{v1.5.35}: executable ESP,
+multi-group runtime, raw Pilot streams, onboarding, and diagnostics}
 
 \paragraph{What broke.} Once the ESP surface became usable by an iOS
 client, two practical gaps appeared. First, mobile operations beyond
@@ -1459,22 +1458,33 @@ blocking every message on a fixed long timeout. \texttt{v1.5.25}
 forwarded those Pilot transport capabilities through the multi-group
 mux so every active group uses the same retry and stale-stream policy.
 
-\paragraph{What came next.} The current unreleased work adds the
-display metadata layer needed by mobile clients. Groups can carry
+\paragraph{What came next.} The following releases turned the mobile
+and onboarding surfaces into production paths. Groups can carry
 ESP-local \texttt{name}, \texttt{description}, \texttt{tags}, and raw
-\texttt{metadata}. Members can publish signed \texttt{MemberProfileAd}
+\texttt{metadata}. Members publish signed \texttt{MemberProfileAd}
 frames containing their current Pilot hostname; peers store only
-roster-matched, unexpired profiles and new joiners pull a profile
-snapshot during bootstrap. This gives apps readable names such as
-\texttt{laptop}, \texttt{vps}, and \texttt{phobos} without changing
-Pilot registry behavior or Entmoot roster identity.
+roster-matched, unexpired profiles and new joiners pull bounded
+profile snapshots during bootstrap. Open invites add an issuer URL,
+expiry, and max-use count; redeemers prove Pilot key possession with a
+domain-separated challenge before the issuer returns a normal signed
+invite. \texttt{join} now auto-redeems those links, starts from
+persisted state via \texttt{serve}, sends bounded Pilot onboarding
+handshakes to roster/bootstrap/founder candidates, and emits a compact
+health summary with the next \texttt{doctor} command. Existing members
+auto-approve only pending Pilot handshakes from current roster members
+whose Pilot key matches the known identity. \texttt{doctor} and
+\texttt{peers} expose the state operators were previously inferring by
+hand: roster membership, profile visibility, transport-ad freshness,
+Pilot trust, route probes, diagnoses, and suggested repairs.
 
 \paragraph{Why the fix is right.} The pattern is the same in both
 places: keep authoritative protocol state small and signed, and put
 service/UI convenience in explicitly local or signed cache layers. ESP
 metadata does not rewrite rosters. Member hostnames do not decide
-routing. Raw Pilot streams remove a stale cache above the transport
-instead of adding another recovery loop around it.
+routing. Open invites still resolve to signed roster invites. Raw
+Pilot streams remove a stale cache above the transport instead of
+adding another recovery loop around it. Diagnostics make the
+``known peer'' versus ``routable peer'' distinction explicit.
 
 \section{The big picture: how the layers interacted}
 \label{sec:bigpicture}
@@ -1569,9 +1579,10 @@ v1.9.0-jf.12--jf.14.2 & 25--26 Apr & Handshake reply routing, keepalives, rendez
 v1.9.0-jf.15--jf.15.7 & 26 Apr & TURN allocation self-heal, permission refresh diagnostics, bilateral \texttt{CreatePermission}, recovery PILA through TURN, and periodic peer rendezvous re-lookup. \\
 v1.9.0-jf.15.8--jf.15.13 & 26--27 Apr & Preserve TURN ingress, close stale IPC stream conns, recover fatal TURN allocation failures, centralize TURN route policy, and prefer own relay in strict TURN-only mode. \\
 v1.9.0-jf.15.14--jf.15.21 & 27 Apr & Stream lifecycle tracing, listener \texttt{Unbind}, 1024-byte stream segments, passive-open ACK gating, stale handshake reaping, rendezvous 429 retry, and connection-scoped IPC send failures. \\
+v1.9.0-jf.15.22--jf.15.24 & 30 Apr--3 May & Tracked stream-send acknowledgements, lookup/sign-challenge IPC, domain-separated application challenge signing, and pending-handshake notifications for group auto-approval. \\
 \bottomrule
 \end{tabular}
-\caption{Pilot fork release summary through the \texttt{v1.9.0-jf.15} line.}
+\caption{Pilot fork release summary through \texttt{v1.9.0-jf.15.24}.}
 \end{table}
 
 \begin{table}[h]
@@ -1603,10 +1614,12 @@ v1.5.13--v1.5.16 & 27--28 Apr & Durable mailbox cursors, local mailbox CLI, ESP 
 v1.5.17--v1.5.19 & 28 Apr & ESP device-auth registry, request-signing helper, and \texttt{entmootd version} release metadata. \\
 v1.5.20--v1.5.21 & 29 Apr & Expanded ESP mobile API, executable group/invite sign requests, ESP-local group metadata, and bounded latest-history reads. \\
 v1.5.22--v1.5.25 & 29 Apr & Raw Pilot streams per interaction, stale stream invalidation, Pilot-aware fanout budgets, tunnel-up callback repair, and multi-group transport capability forwarding. \\
-unreleased & 30 Apr & Pilot hostname-aware member profiles plus ESP group \texttt{name}/\texttt{description}/\texttt{tags} display projection. \\
+v1.5.26--v1.5.30 & 30 Apr--1 May & Remembered \texttt{serve}, member-profile convergence repair, strict Pilot stream send acknowledgements, large-response timeouts, and dedicated Pilot IPC drivers. \\
+v1.5.31--v1.5.33 & 1--2 May & ESP admin controls, targeted/open invites, member removal, live roster fanout, Pilot proof-of-possession for open invites, and retry-safe redemption. \\
+v1.5.34--v1.5.35 & 2--3 May & Auto-redeem open invites in \texttt{join}, automatic Pilot onboarding handshakes and auto-approval, \texttt{doctor}/\texttt{peers} diagnostics, repair suggestions, and join health summaries. \\
 \bottomrule
 \end{tabular}
-\caption{Entmoot release summary through \texttt{v1.5.25} plus current unreleased work.}
+\caption{Entmoot release summary through \texttt{v1.5.35}.}
 \end{table}
 
 \section*{Appendix A: reading order}

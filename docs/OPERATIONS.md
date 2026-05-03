@@ -43,11 +43,20 @@ After both daemons are up, run:
 
 ```sh
 scripts/verify-mesh-node.sh
+entmootd doctor --json
+entmootd doctor -group <GROUP_ID> --probe
+entmootd peers -group <GROUP_ID> --probe
 ```
 
 The helper prints a local Pilot/Entmoot snapshot: peer auth, Pilot info,
 Entmoot message count, and recent transport/reconcile log lines. It does not
 perform SSH or modify state.
+
+`doctor` is the preferred first-line check for live routing. It reports local
+membership, Pilot trust/pending state, member-profile hostname visibility,
+transport-ad freshness, active Entmoot stream probes, diagnoses, and suggested
+next commands. Use it before restarting services unless the failure is clearly
+below Entmoot.
 
 ## Release Checklist
 
@@ -75,12 +84,16 @@ peers, and changelog stay aligned.
 5. Verify the tag-triggered GitHub release succeeds and the expected
    darwin/linux amd64/arm64 archives are uploaded.
 6. Update each peer from the released tag or source checkout, then restart in
-   the standard order: Pilot first only when needed, then Entmoot.
+   the standard order: Pilot first only when needed, then Entmoot. Current
+   Entmoot invite/open-invite/onboarding flows require the matching Pilot fork
+   capabilities for tracked send acknowledgements, node lookup/challenge
+   signing, and pending-handshake notifications.
 7. Verify every peer reports:
 
    ```sh
    entmootd version
    entmootd info
+   entmootd doctor -group <GROUP_ID> --probe
    entmootd query --limit 1000 | wc -l
    ```
 

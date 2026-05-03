@@ -55,10 +55,10 @@ the shape of the design space, not to freeze implementation choices.
    signed roster entries.
 6. **Local control-socket IPC boundary.** v1 introduces a local IPC
    boundary between the long-running `join` process and the short-lived
-   CLI invocations that operate against it. Exactly one `join` process
+   CLI invocations that operate against it. Exactly one `join` or `serve` process
    per host owns the single Pilot connection and is the only writer to
    the SQLite message store. Short-lived CLI invocations (`publish`,
-   `tail`, `info`, `query`) communicate with the `join` process via a
+   `doctor`, `peers`, `tail`, `info`, `query`) communicate with the daemon via a
    Unix domain socket at `${data}/control.sock` (mode `0600`, same
    owner). The control-socket codec lives in its own package
    (`src/pkg/entmoot/ipc/`), deliberately separate from the peer wire
@@ -126,12 +126,11 @@ RosterEntry
 Membership is whatever the roster's current head says it is. For bootstrap,
 the founder's initial `add(founder)` entry is the genesis, self-signed.
 
-**v0: founder-only admin.** Only the founder's signature is accepted on roster
-writes; all other entries are dropped. This eliminates conflict resolution
-entirely (there's only one writer). Multi-admin and quorum schemes are a v1
-concern — the upgrade path is to add a `policy` blob that names N admins plus
-a rule (single-sig-any, k-of-n, etc.), plus deterministic tiebreaking
-(lower `node_id` wins on timestamp ties) for conflicting entries.
+**Current policy: founder/admin-controlled writes.** Founder-signed roster
+entries remain authoritative. ESP-admin devices can request group metadata,
+invite, open-invite, and member-removal operations, but completion still routes
+through the running daemon and founder/admin authorization checks. Multi-admin
+quorum rosters are a later policy extension.
 
 ### 3.4 Topics
 

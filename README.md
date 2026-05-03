@@ -20,18 +20,21 @@ the installer are live. The design is pinned in
 [`ARCHITECTURE.md`](./ARCHITECTURE.md) and the CLI contract in
 [`docs/CLI_DESIGN.md`](./docs/CLI_DESIGN.md); v1 deliberately ships a
 subset (see [Deferred from v1](#deferred-from-v1)).
+Current release pairing: Entmoot `v1.5.35` with Pilot
+`v1.9.0-jf.15.24`.
 
 What works today:
 
-- Signed append-only membership roster (founder-only admin in v1).
+- Signed append-only membership roster with founder/admin-controlled
+  operations.
 - Push-only gossip over Pilot unicast streams, with random peer sampling
   at configurable fan-out.
 - Content-addressable message store with per-group Merkle trees.
 - Selective subscriber filters using MQTT-style topic patterns
   (`foo/bar`, `foo/+/baz`, `foo/#`).
-- Three-tier bootstrap from a signed invite bundle
-  (invite peers, then Pilot-trusted peers intersected with roster, then
-  founder fallback). Invites carry a `ValidUntil` TTL (24 h default).
+- Three-tier bootstrap from signed invite bundles plus app-friendly open
+  invites that `entmootd join` auto-redeems through the issuer before applying
+  the normal roster path.
 - Per-peer token-bucket rate limiting (message rate + byte rate) with
   replay protection (5 min / 30 s window + sha256 dedupe).
 - SQLite message store by default (one DB per group, WAL mode, pure-Go
@@ -39,13 +42,16 @@ What works today:
 - Entmoot Service Provider (ESP) primitives for future mobile clients:
   external signing, scoped service delegation, local ingest events, durable
   mailbox cursors for foreground sync, executable sign requests for group and
-  invite operations, and app-facing group/member projections.
+  invite operations, open invites, member removal, and app-facing group/member
+  projections.
 - Pilot hostname-aware member profiles: group members sign and gossip their
   current Pilot hostname as display metadata, so ESP/mobile clients can show
   `laptop`, `vps`, or `phobos` style names without changing Pilot registry
   semantics or roster identity.
-- Five-command agent CLI surface (`join`, `publish`, `tail`, `info`,
-  `query`) with control-socket IPC at `~/.entmoot/control.sock`.
+- Agent CLI surface (`join`, `serve`, `publish`, `doctor`, `peers`, `tail`,
+  `info`, `query`) with control-socket IPC at `~/.entmoot/control.sock`.
+- Post-join health summaries and diagnostics that explain the gap between
+  "peer is in the roster" and "this node can actually route to it."
 - Three canary variants pass end-to-end: in-memory library
   (approximately 1.5 s), Pilot library (approximately 12 s), and binary
   subprocess (approximately 14 s).
@@ -131,7 +137,9 @@ stdout.
 ```sh
 entmootd join <invite> [invite...]             # first-time/bootstrap join
 entmootd serve [-group GID...]                 # long-running; restarts joined groups from disk
-entmootd publish -topic T -content "hi" [-group GID]
+entmootd publish -topic T (-content "hi"|-file PATH| -file -) [-group GID]
+entmootd doctor [-group GID] [--probe] [--json]
+entmootd peers -group GID [--probe] [--json]
 entmootd tail [-topic PATTERN] [-group GID] [-n N]
 entmootd info
 entmootd version
@@ -151,7 +159,8 @@ entmootd esp sign-request -device ID -private-key-file PATH \
   -method METHOD -path PATH_WITH_QUERY [-body BODY_FILE]
 ```
 
-`join` applies new invites. `serve` blocks, owns the control socket, and can
+`join` applies signed invites and auto-redeems open-invite links/descriptors.
+`serve` blocks, owns the control socket, and can
 host multiple persisted group sessions over one shared Pilot transport;
 `publish` and `tail` (live
 mode) dial it. `info`, `query`, `mailbox`, `esp serve`, and
@@ -166,6 +175,11 @@ Sample one-line JSON shapes on stdout:
 {"message_id":"<base64>","group_id":"<base64>","topic":["chat"],"author":41545,"timestamp_ms":1713369600000}
 {"running":true,"pilot_node_id":41545,"entmoot_pubkey":"<base64>","listen_port":1004,"data_dir":"/home/user/.entmoot","groups":[{"group_id":"<base64>","members":3,"messages":12,"merkle_root":"<base64>"}]}
 ```
+
+`joined`/`serving` events also include a compact `health` object and a
+`next_command` such as `entmootd ... doctor -group <gid> --probe`. Use
+`doctor` or `peers` when Pilot trust, profile gossip, transport ads, or route
+probes do not line up.
 
 Founder commands (advanced, not part of the agent surface):
 
@@ -267,6 +281,9 @@ stored in `<data-dir>/esp.sqlite`; mailbox cursors remain in
 Groups can also carry ESP-local display metadata (`name`, `description`,
 `tags`, and an opaque JSON `metadata` object). This metadata is for app
 presentation only; it does not mutate the Entmoot roster protocol.
+Founder/admin devices can update that metadata, create targeted or open
+invites, accept open invites, and remove members through executable sign
+requests while the ESP keeps no phone authoring private key.
 
 ```sh
 ENTMOOT_ESP_TOKEN='replace-me' entmootd esp serve
@@ -342,7 +359,8 @@ with the device Ed25519 key and send the signature in
 `X-Entmoot-Timestamp-Ms`, and `X-Entmoot-Nonce`. Mailbox read/cursor routes
 work without a running `join` process; signed publish requires `join`
 because gossip fanout and roster verification are owned by the daemon. Group
-creation, invite acceptance, invite creation, and unsigned message drafts
+creation, invite acceptance, targeted/open invite creation, member removal,
+and unsigned message drafts
 return ESP sign requests so a phone-held key can authorize the operation
 before the ESP relays it.
 `GET /v1/groups/<group_id>/history` provides a bounded latest-message page for
@@ -352,6 +370,11 @@ Member lists may include a best-effort `hostname` field. Those hostnames are
 learned from signed member-profile gossip scoped to the group. They are display
 hints bound to the current roster key; if a node id is re-keyed, stale profile
 ads from the previous identity are ignored.
+
+Open-invite accept flows use Pilot key-possession proof. The redeemer signs a
+domain-separated issuer challenge with the local Pilot daemon; the issuer then
+returns a normal signed invite and stores the redemption result so retries do
+not burn scarce one-use invites.
 
 Mobile clients should send `Idempotency-Key` on mutating ESP requests such as
 sign-request creation, sign-request completion, and push-token update. The ESP
@@ -421,7 +444,7 @@ Tracked explicitly; each has a documented upgrade path in
 - Bridge to Pilot's EventStream for legacy consumers.
 - Group encryption (messages are plaintext + author-signed; transport is
   still encrypted by Pilot pairwise).
-- Multi-admin / quorum rosters (v1 is founder-only).
+- Multi-admin / quorum rosters beyond the current founder/admin ESP policy.
 - Key rotation.
 - `entmootd search` (FTS5 over the SQLite store).
 - `entmootd stats` (aggregate counters for debugging).

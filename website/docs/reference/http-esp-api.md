@@ -13,8 +13,13 @@ POST /v1/groups
 GET  /v1/groups/{group_id}
 PATCH /v1/groups/{group_id}
 GET  /v1/groups/{group_id}/members
+DELETE /v1/groups/{group_id}/members/{node_id}
 POST /v1/groups/{group_id}/invites
+POST /v1/groups/{group_id}/open-invites
 POST /v1/invites/accept
+POST /v1/open-invites/accept
+POST /v1/open-invites/{token}/challenge
+POST /v1/open-invites/{token}/redeem
 GET  /v1/groups/{group_id}/history
 GET  /v1/groups/{group_id}/messages
 POST /v1/groups/{group_id}/messages
@@ -55,15 +60,18 @@ Entmoot message signing bytes. Complete the request with the returned
 `signing_payload_sha256` plus the author `signature`; the ESP verifies both and
 forwards the resulting message through signed publish.
 
-`group_create`, `group_update`, `invite_create`, and `invite_accept` are also
-executable when `esp serve` is connected to a running `join` daemon. Device
-sign requests verify the completion signature with the registered device key.
-Completion stores the operation response in `result`; `message_publish` also
-keeps `publish_result` for compatibility. If the ESP has no operation executor
+`group_create`, `group_update`, `invite_create`, `open_invite_create`,
+`invite_accept`, `open_invite_accept`, and `member_remove` are executable when
+`esp serve` is connected to a running `join` daemon. Device sign requests
+verify the completion signature with the registered device key. Completion
+stores the operation response in `result`; `message_publish` also keeps
+`publish_result` for compatibility. If the ESP has no operation executor
 configured, executable operation completion fails with `operation_unavailable`.
 
 Group updates are ESP-local display metadata. They do not mutate Entmoot's
-roster protocol.
+roster protocol. Device-auth callers for admin-scoped operations must have the
+group in both `groups` and `admin_groups`; membership and admin rights are
+checked again when the sign request is completed.
 
 Group list/get responses may include `name`, `description`, `tags`, and an
 opaque JSON `metadata` object. `name`, `description`, and `tags` are projected
@@ -74,6 +82,37 @@ Member list responses may include `hostname`. Hostnames are learned from signed
 member-profile gossip scoped to the group and are display hints only. The ESP
 only exposes a profile when the profile author's Entmoot key still matches the
 current roster entry for that Pilot node id.
+
+Admin invite and member-management routes:
+
+- `DELETE /v1/groups/{group_id}/members/{node_id}` creates a
+  `member_remove` sign request. Completion appends the signed roster removal
+  through the running daemon and fans out the new roster head.
+- `POST /v1/groups/{group_id}/invites` creates an `invite_create` sign request
+  and returns a targeted signed invite after completion. Entmoot verifies the
+  target Pilot node id/public key binding before adding the roster entry.
+- `POST /v1/groups/{group_id}/open-invites` creates an
+  `open_invite_create` sign request. Completion stores an issuer-scoped token
+  with expiry, max-use count, and optional bootstrap peers, and returns
+  `issuer_url`, `token`, `link`, `expires_at_ms`, `max_uses`, and `use_count`.
+  The daemon must be available at creation time so unusable tokens are not
+  issued.
+- `POST /v1/invites/accept` creates an `invite_accept` sign request for a full
+  signed invite bundle.
+- `POST /v1/open-invites/accept` creates an `open_invite_accept` sign request.
+  Completion validates the issuer challenge for the requested token/local
+  identity, obtains a local Pilot signature, redeems a normal signed invite,
+  persists the redeemed invite for retry safety, and joins the group. Issuer
+  redirects are disabled so URL validation cannot be bypassed.
+
+Public open-invite issuer endpoints:
+
+- `POST /v1/open-invites/{token}/challenge` accepts the redeemer Pilot node id,
+  Pilot public key, and Entmoot public key. It returns a bounded,
+  domain-separated challenge and caps active unused challenges.
+- `POST /v1/open-invites/{token}/redeem` verifies the Pilot signature and
+  returns a signed invite. Replays for the same redeemer return the stored
+  result after re-validating proof.
 
 Create a message draft sign request:
 

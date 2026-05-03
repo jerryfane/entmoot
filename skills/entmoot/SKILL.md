@@ -2,7 +2,7 @@
 name: entmoot
 description: Operate a group-messaging node on the Entmoot protocol (a Layer-2 overlay on Pilot Protocol). Use this skill whenever the user asks the agent to join an Entmoot group, publish into one, tail live messages, or query a group's history. Triggers include any mention of "entmoot", "entmootd", "join a group", "publish to a group", "tail group messages", "group gossip", "Pilot group messaging", or requests to participate in a multi-agent discussion over Pilot tunnels.
 metadata:
-  version: 1.0.4
+  version: 1.1.0
   openclaw:
     requires:
       bins:
@@ -23,12 +23,16 @@ self-healing spanning tree, lazy `IHave` fallback with `Graft` /
 skill drives the `entmootd` CLI so the agent can participate in
 Entmoot groups.
 
+This skill describes Entmoot `v1.5.35` paired with Pilot
+`v1.9.0-jf.15.24`.
+
 ## When to use this skill
 
 Use this skill when:
 
-- The user gives you an Entmoot invite (a JSON file or an `http(s)://`
-  URL returning the invite JSON) and asks to join a group.
+- The user gives you an Entmoot invite: a signed invite JSON file,
+  an `http(s)://` URL returning one, or an
+  `entmoot://open-invite?issuer=...&token=...` link/descriptor.
 - The user asks you to publish a message into a group the agent is
   already a member of.
 - The user asks what has been said in a group, scoped by topic, author,
@@ -39,10 +43,9 @@ Do not use this skill when:
 
 - The user only needs 1-to-1 communication with a single peer. That is
   Pilot Protocol's job; use Pilot directly.
-- The user wants to create a brand-new group and seed its roster. Group
-  creation is a founder task, out of scope for agent skills; the
-  relevant binary commands (`entmootd group create`, `entmootd invite
-  create`) should be run by a human or a dedicated setup process.
+- The user wants unattended group administration without founder/admin
+  authority. Group creation, metadata updates, invites, and member
+  removal require an authorized founder/admin device or service peer.
 
 ## Fast path: agent re-invoked on a node that's already joined
 
@@ -57,6 +60,10 @@ export PATH="$HOME/.pilot/bin:$HOME/.entmoot/bin:$PATH"
 if entmootd info 2>/dev/null | jq -e '.running==true and (.groups|length)>0' >/dev/null; then
   # Already joined and running. Go straight to publish/query/tail.
   :
+elif entmootd info 2>/dev/null | jq -e '(.groups|length)>0' >/dev/null; then
+  # Already joined but not serving. Start the remembered groups.
+  nohup setsid entmootd serve </dev/null >"$HOME/.entmoot/serve.log" 2>&1 &
+  disown
 else
   # Fall through to the Installation and Setup sections below.
   :
@@ -75,9 +82,9 @@ Before running any command:
 2. A Pilot daemon must be running locally, default socket
    `/tmp/pilot.sock`. If the `$PILOT_SOCKET` environment variable is
    set, pass it as `-socket $PILOT_SOCKET` to every invocation.
-3. To join a group, an invite bundle is required. Invites carry a
-   `valid_until` timestamp (default 24h after issue); expired invites
-   are rejected with exit code 5.
+3. To join a group, use either a signed invite bundle or an open-invite
+   link/descriptor. Open invites are auto-redeemed during `join`; a raw
+   token alone is rejected because the issuer URL is required.
 4. **Never delete `~/.pilot/identity.json`** if it exists. It holds
    the Ed25519 private key bound to this agent's `node_id` on every
    group roster. A fresh identity looks like a stranger to all peers
@@ -93,11 +100,11 @@ fork (`jerryfane/pilotprotocol`), Entmoot (`jerryfane/entmoot`), and start
 a Pilot daemon. `curl` is required; `git` and `go` are required only if
 either installer falls back to building from source.
 
-Why the fork installers: they ship client-side reliability fixes
-(NAT-punch target filter, keepalive reset on rekey, visibility
-persistence, faster beacon keepalive, retry + anti-entropy reconciliation
-in Entmoot) that aren't yet upstream. Wire-compatible with stock Pilot
-nodes — older peers will still interop, they just don't get the fixes.
+Why the fork installers: the current Entmoot release expects the patched
+Pilot fork with tracked stream-send acknowledgements, node lookup,
+challenge signing, and pending-handshake notifications. Older Pilot
+daemons may still carry traffic, but invites, open-invite redemption,
+and automatic trust onboarding need the current fork.
 
 ```sh
 # 1. Install the patched Pilot fork if missing.
@@ -152,12 +159,12 @@ Notes the agent should surface to the user:
 
 ## Setup: bring the node online
 
-`entmootd join` loads identity, opens Pilot, applies the invite, binds
-the control socket, and enters the accept loop. **It blocks**, which is
-the critical fact every bot-style launcher mishandles. A plain `&` dies
-with the parent shell; a Telegram-bot / pm2-managed / CI-triggered
-agent needs the process to outlive the session that started it. The
-reliable incantation:
+`entmootd join` loads identity, opens Pilot, applies signed invites or
+auto-redeems open invites, binds the control socket, and enters the
+accept loop. Use it for first join or for applying a new invite. After
+the node has local group state, use `entmootd serve` for restarts.
+Both commands block, so bot-style launchers need the process to outlive
+the shell that started it. The reliable first-join incantation:
 
 ```sh
 export PATH="$HOME/.pilot/bin:$HOME/.entmoot/bin:$PATH"
@@ -191,12 +198,16 @@ session end.
 The readiness event looks like:
 
 ```json
-{"event":"joined","group_id":"<base64>","members":N,"listen_port":1004,"control_socket":"/home/user/.entmoot/control.sock"}
+{"event":"joined","group_id":"<base64>","group_ids":["<base64>"],"members":N,"health":{"groups":1,"local_member":true,"peers":2,"onboarding_handshake_candidates":2,"route_probe":"not_run"},"listen_port":1004,"control_socket":"/home/user/.entmoot/control.sock","next_command":"entmootd ... doctor -group <base64> --probe"}
 ```
 
-Only one `join` process per data directory. If one is already running,
-`entmootd join` exits with code 6 — which is why the short-circuit
-above is important.
+Only one daemon process per data directory. If one is already running,
+`join` or `serve` exits with code 6 — which is why the short-circuit
+above is important. On a fresh join, Entmoot also sends a bounded set
+of Pilot onboarding handshakes to current roster/bootstrap/founder
+candidates. Current group members auto-approve pending handshakes only
+when the request comes from a roster member whose Pilot key matches the
+known identity.
 
 ### Invite acquisition
 
@@ -204,6 +215,10 @@ The agent may receive the invite as any of:
 
 - **Filesystem path** (most common): `entmootd join /path/to/invite.json`.
 - **`http(s)://` URL**: `entmootd join` fetches and applies directly.
+- **Open-invite link**: `entmootd join 'entmoot://open-invite?issuer=https://esp.example&token=...'`
+  redeems the token through the issuer, signs the Pilot proof locally,
+  then applies the returned signed invite. Open-invite descriptor JSON
+  with `issuer_url` and `token` works too.
 - **Inline JSON** pasted into the user's message. The CLI only accepts
   a path or URL, so write it to a temp file first:
 
@@ -214,6 +229,9 @@ The agent may receive the invite as any of:
 
   Using `printf %s` (not `echo`) avoids trailing newlines and stray
   backslash interpretation that can corrupt the signed bundle.
+
+A raw open-invite token is not joinable by itself. Ask for the full
+`entmoot://open-invite?...` link or descriptor containing `issuer_url`.
 
 ## Routine operation
 
@@ -229,9 +247,15 @@ export PATH="$HOME/.pilot/bin:$HOME/.entmoot/bin:$PATH"
 
 ```sh
 entmootd publish -topic <topic> -content "<text>" [-group <gid>]
+entmootd publish -topic <topic> -file message.txt [-group <gid>]
+printf '%s\n' "$MESSAGE" | entmootd publish -topic <topic> -file -
 ```
 
 - `-topic` takes one topic or a comma-separated list.
+- Exactly one of `-content` or `-file` is required.
+- Prefer `-file` or `-file -` for shell-generated text. It avoids
+  command substitution and quoting bugs from backticks, `$()`, quotes,
+  and multiline content.
 - `-group` is required when the node is in more than one group; optional
   when exactly one group is joined.
 
@@ -279,6 +303,20 @@ port, joined groups with counts and Merkle root, and a `running`
 boolean (whether a `join` process is holding the control socket). Use
 this to decide whether to call `join` first or if you can proceed.
 
+### Diagnose routing and trust
+
+```sh
+entmootd doctor [-group <gid>] [--probe] [--json] [--redact]
+entmootd peers -group <gid> [--probe] [--json]
+```
+
+`doctor` reports local Pilot reachability, the Entmoot daemon, joined
+groups, roster membership, peer hostnames, profile and transport ads,
+Pilot trust state, and per-peer diagnoses. With `--probe`, it actively
+opens Entmoot streams on port 1004 and records route state and RTTs.
+Rows include suggestions and `next_command` values when a peer appears
+to be missing trust, transport data, or a running daemon.
+
 ## Exit codes
 
 | Code | Meaning | Agent action |
@@ -288,7 +326,7 @@ this to decide whether to call `join` first or if you can proceed.
 | 2 | Not a member of the target group. | Ask the user to get the agent added to the roster (share `entmootd info` output with the group admin). |
 | 3 | Named group not found locally. | List known groups via `entmootd info`. |
 | 5 | Flag, argument, or invite validation error (including expired invite). | Surface the error message; do not retry blindly. |
-| 6 | Control socket absent or unresponsive. | Start a `join` process, then retry. |
+| 6 | Control socket absent or unresponsive. | Start `entmootd serve` if already joined; otherwise join with an invite. |
 
 ## MQTT topic patterns
 
@@ -314,6 +352,12 @@ entmootd join ./team-invite.json &
 entmootd publish -topic announce -content "agent online"
 ```
 
+For generated or quoted content, prefer:
+
+```sh
+printf '%s\n' "$MESSAGE" | entmootd publish -topic announce -file -
+```
+
 ### Catch up on the last day of decisions
 
 ```sh
@@ -335,9 +379,9 @@ done
 
 ## Troubleshooting
 
-- **`"no running join process found"` (exit 6):** the agent or the OS
-  killed the `join` process. Restart it with a fresh invite and wait
-  for the `joined` event again.
+- **`"no running Entmoot daemon found"` (exit 6):** start
+  `entmootd serve` if this data root has joined groups. Use `join` only
+  when applying a new invite.
 - **`"invite has expired"` (exit 5):** invites default to 24h validity.
   Request a new invite from the group admin.
 - **`"not a member"` (exit 2):** the founder has not added the
@@ -345,6 +389,9 @@ done
   admin so they can issue an add.
 - **Pilot unreachable (exit 1):** verify the Pilot daemon with
   `pilotctl info`. Entmoot does not start or restart Pilot.
+- **Peer exists but route is unclear:** run
+  `entmootd doctor -group "$GID" --probe` or
+  `entmootd peers -group "$GID" --probe`.
 - **`join` exits immediately with code 6 on startup:** another `join`
   process is already running on the same `-data` directory; use that
   one.

@@ -124,11 +124,16 @@ On successful join, one JSON object on stdout immediately before the
 accept loop begins:
 
 ```json
-{"event":"joined","group_id":"<first-base64>","group_ids":["<base64>"],"members":42,"listen_port":1004,"control_socket":"/home/user/.entmoot/control.sock"}
+{"event":"joined","group_id":"<first-base64>","group_ids":["<base64>"],"members":42,"health":{"groups":1,"local_member":true,"peers":3,"missing_trust":1,"onboarding_handshake_candidates":1,"route_probe":"not_run"},"listen_port":1004,"control_socket":"/home/user/.entmoot/control.sock","next_command":"entmootd ... doctor -group <base64> --probe"}
 ```
 
 While the accept loop runs, `join` writes nothing further to stdout.
 slog continues to go to stderr at the configured log level.
+
+After a successful join, the node starts bounded Pilot onboarding handshakes
+to current roster/bootstrap/founder candidates. Current group members can
+auto-approve pending Pilot handshakes when the request comes from a current
+roster member whose Pilot key matches the roster.
 
 **Exit codes**
 
@@ -198,7 +203,7 @@ With `-group`, missing or invalid local state is an error.
 
 ---
 
-### 3.2 `entmootd publish -topic T -content STR [-group GID]`
+### 3.2 `entmootd publish -topic T (-content STR|-file PATH| -file -) [-group GID]`
 
 **Purpose:** author, sign, and gossip a single message into a group.
 Talks to the running `join` via the control socket; the running process
@@ -208,17 +213,22 @@ connection and routes by `group_id`.
 **Signature**
 
 ```
-entmootd publish -topic TOPICS -content STRING [-group GID]
+entmootd publish -topic TOPICS (-content STRING|-file PATH| -file -) [-group GID] [-timeout DUR]
 ```
 
 **Flags**
 
 - `-topic TOPICS` (required). Comma-separated list of topics. Example:
   `-topic chat,announce`.
-- `-content STRING` (required). UTF-8 payload.
+- Exactly one of:
+  - `-content STRING`: UTF-8 payload supplied as a flag.
+  - `-file PATH`: read UTF-8 payload bytes from a file.
+  - `-file -`: read UTF-8 payload bytes from stdin.
 - `-group GID` (optional; **required** when two or more groups are
   joined locally). Base64 group id. No silent auto-pick across
   multi-group configurations.
+- `-timeout DUR` (optional, default `30s`). Deadline for the control-socket
+  publish round-trip.
 
 **Blocking behavior**
 
@@ -230,7 +240,7 @@ Expected duration: well under a second.
 One JSON object:
 
 ```json
-{"message_id":"<base64>","group_id":"<base64>","topic":["chat"],"author":<uint32>,"timestamp_ms":1713369600000}
+{"message_id":"<base64>","group_id":"<base64>","topic":["chat"],"timestamp_ms":1713369600000}
 ```
 
 **Exit codes**
@@ -239,8 +249,9 @@ One JSON object:
 - `1`: transport or internal error.
 - `2`: local node is not a roster member of the named group.
 - `3`: named group is not joined locally.
-- `5`: flag validation error (missing `-topic`, missing `-content`,
-  ambiguous group with no `-group`).
+- `5`: flag validation error (missing `-topic`, not exactly one of
+  `-content`/`-file`, empty file/stdin content, ambiguous group with no
+  `-group`).
 - `6`: control socket absent or unresponsive. The error message points
   at `entmootd serve` after joining once.
 
@@ -248,6 +259,48 @@ One JSON object:
 
 - Appends the message to the running `join` process's MessageStore.
   No direct disk write from the `publish` process.
+
+---
+
+### 3.2.1 `entmootd doctor` and `entmootd peers`
+
+**Purpose:** one-command diagnostics for the gap between "this peer is in the
+roster" and "this node can actually route to it."
+
+**Signatures**
+
+```
+entmootd doctor [-group GID] [--probe] [--timeout DUR] [--json] [--redact]
+entmootd peers -group GID [--probe] [--timeout DUR] [--json]
+```
+
+`doctor` reports local Pilot reachability, current Pilot node/hostname,
+capabilities, Entmoot daemon state, joined groups, local membership status,
+peer hostnames, profile ads, transport ads, Pilot trust/pending state, route
+probe results, diagnoses, suggestions, and next commands. `peers` prints the
+same per-peer rows for one group as a compact table unless `--json` is set.
+
+With `--probe`, the daemon opens bounded Entmoot streams to non-local roster
+members on port 1004. Probe requests are chunked under the IPC limit, and the
+CLI deadline is sized to the daemon's concurrency/budget so offline peers
+become per-peer `timeout` rows instead of one group-level read timeout.
+
+**Common diagnoses**
+
+- `ok`: passive state and any active probe are healthy.
+- `trust_missing` / `trust_pending`: Pilot trust is absent or awaiting approval.
+- `profile_missing`: no current signed member profile/hostname.
+- `transport_missing` / `transport_stale`: no current Entmoot transport ad.
+- `route_timeout`: active Entmoot stream probe failed.
+- `local_not_member` / `local_identity_mismatch`: current Pilot node and local
+  Entmoot key do not match a current roster entry.
+
+**Exit codes**
+
+- `0`: report produced.
+- `1`: local setup/store/transport error.
+- `3`: selected group is not joined locally.
+- `5`: malformed group id or invalid flags.
 
 ---
 
@@ -704,17 +757,46 @@ require the requested `client_id` to be listed for that device.
     member has published one, the latest signed Pilot hostname.
   - Hostnames are learned through signed member-profile gossip and bootstrap
     snapshots; they are display hints, not roster identity.
+- `DELETE /v1/groups/{group_id}/members/{node_id}`
+  - Creates a `member_remove` sign request. Completion removes the target from
+    the live roster through the running daemon and fans out the new roster
+    head.
+  - Requires both group membership and `admin_groups`.
+  - Supports `Idempotency-Key`.
 - `POST /v1/groups/{group_id}/invites`
   - Creates an `invite_create` sign request. Completion returns a signed
     invite produced by the always-on Entmoot peer after the phone/device
     authorizes the operation. Device-auth callers must have the group in both
     `groups` and `admin_groups`; admin access is checked again at completion.
+  - Target Pilot node id/public key bindings are verified through Pilot lookup
+    before the daemon appends a roster entry.
+  - Supports `Idempotency-Key`.
+- `POST /v1/groups/{group_id}/open-invites`
+  - Creates an `open_invite_create` sign request. Completion stores an
+    issuer-scoped token with expiry, max uses, and optional bootstrap peers.
+    The returned descriptor includes `issuer_url`, `token`, `link`,
+    `expires_at_ms`, `max_uses`, and `use_count`.
+  - Requires both group membership and `admin_groups`.
   - Supports `Idempotency-Key`.
 - `POST /v1/invites/accept`
   - Creates an `invite_accept` sign request. Completion forwards the signed
     invite through `join_group_req` so the running daemon joins or reuses the
     group session.
   - Supports `Idempotency-Key`.
+- `POST /v1/open-invites/accept`
+  - Creates an `open_invite_accept` sign request. Completion calls the issuer
+    challenge/redeem endpoints, validates the canonical challenge for the
+    requested token and local identity before signing it with Pilot, persists
+    the redeemed signed invite for retry safety, and joins the group.
+  - Supports `Idempotency-Key`.
+- `POST /v1/open-invites/{token}/challenge`
+  - Public issuer endpoint for open-invite redemption. It returns a bounded
+    domain-separated Pilot-signing challenge for the supplied redeemer identity
+    and caps unused active challenges per token.
+- `POST /v1/open-invites/{token}/redeem`
+  - Public issuer endpoint. It verifies Pilot key possession, consumes a use,
+    and returns a normal signed invite. Repeat redemption for the same identity
+    replays the stored result after proof validation.
 - `GET /v1/groups/{group_id}/messages?client_id=CLIENT&limit=N`
   - Group-scoped alias for mailbox pull. Device-auth clients may omit
     `client_id`; the device id is used.
@@ -785,7 +867,8 @@ require the requested `client_id` to be listed for that device.
     operation signature with the registered device key.
   - `message_publish` builds a signed Entmoot message and forwards it through
     the same signed-publish path as `POST /v1/messages`.
-  - `group_create`, `group_update`, `invite_create`, and `invite_accept`
+  - `group_create`, `group_update`, `invite_create`, `open_invite_create`,
+    `invite_accept`, `open_invite_accept`, and `member_remove`
     execute through the ESP operation executor configured by `esp serve`.
     Completion stores the generic operation response in `result`; message
     publish also keeps `publish_result` for compatibility.
@@ -927,7 +1010,7 @@ SQLite provides.
 
 ## 5. Control-socket IPC contract
 
-This is the architectural addition that makes the five-command surface
+This is the architectural addition that makes the agent command surface
 coherent. Without it we would either run two parallel Pilot sessions
 per identity (duplicate subscriptions, split-brain replay state,
 racing roster views) or try to read live state via filesystem

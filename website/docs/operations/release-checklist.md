@@ -9,8 +9,10 @@ For every Entmoot tag:
 3. Commit implementation and release bookkeeping.
 4. Tag and push.
 5. Verify the GitHub release archives.
-6. Update peers when the release is meant to deploy.
-7. Compare `entmootd version`, message counts, and Merkle roots across peers.
+6. Update Pilot too when Entmoot depends on new Pilot capabilities.
+7. Update peers when the release is meant to deploy.
+8. Compare `entmootd version`, `entmootd doctor --probe`, message counts, and
+   Merkle roots across peers.
 
 ```sh
 cd src
@@ -19,4 +21,3 @@ git tag vX.Y.Z
 git push origin main
 git push origin vX.Y.Z
 ```
-

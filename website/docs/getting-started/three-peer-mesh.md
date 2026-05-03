@@ -21,7 +21,10 @@ For manual checks:
 ```sh
 entmootd version
 entmootd info
+entmootd doctor -group <GROUP_ID> --probe
 entmootd query --limit 1000 | wc -l
 ```
 
-Compare those outputs across laptop, VPS, and phobos.
+Compare those outputs across laptop, VPS, and phobos. `doctor --probe` should
+show current roster membership, trust, profile, transport, and route state for
+each non-local peer.

@@ -53,8 +53,7 @@ It adds multi-party gossip, topic-based subscription, signed group
 membership, and Merkle-verified message completeness on top of Pilot's
 existing unicast primitives, without waiting for Pilot's in-progress
 ``custom networks'' feature. We describe the design, a reference Go
-implementation across the current \texttt{v1.5.25} codebase plus the
-unreleased member-profile work, and
+implementation across the current \texttt{v1.5.35} codebase, and
 end-to-end canary tests that show three sandboxed Pilot nodes
 converging to byte-identical Merkle roots over real encrypted tunnels.
 Entmoot ships a one-command installer and an Agent-Skills-format
@@ -115,18 +114,19 @@ Our contributions are as follows.
     is captured in signed rosters above the transport, not in Pilot's
     own (in-progress) network membership mechanism.
     \item A Go reference implementation, \texttt{entmootd}, comprising
-    the current \texttt{v1.5.25} codebase plus the unreleased
-    member-profile work, including framing, replay
+    the current \texttt{v1.5.35} codebase, including framing, replay
     protection, rate limiting, gossip, Merkle trees, Range-Based Set
     Reconciliation, an independent Pilot IPC client, a Pilot-daemon
-    adapter, and explicit trace modes for transport and reconcile
-    debugging, plus Entmoot Service Provider primitives for mobile
-    clients and hostname-aware member profiles for app display.
+    adapter, explicit trace modes for transport and reconcile
+    debugging, Entmoot Service Provider primitives for mobile
+    clients, hostname-aware member profiles, open-invite redemption,
+    automatic Pilot onboarding handshakes, and route diagnostics.
     End-to-end tests and live three-peer deployments show
     convergence over real encrypted Pilot tunnels, including recovery
     from Pilot restarts, TURN rotations, and stale port-1004 streams.
-    \item An agent-facing CLI surface (\texttt{join}, \texttt{publish},
-    \texttt{tail}, \texttt{info}, \texttt{query}, \texttt{version})
+    \item An agent-facing CLI surface (\texttt{join}, \texttt{serve},
+    \texttt{publish}, \texttt{doctor}, \texttt{peers}, \texttt{tail},
+    \texttt{info}, \texttt{query}, \texttt{version})
     with local-IPC
     coordination, a one-command installer (\texttt{install.sh}), and an
     Agent-Skills-format skill document
@@ -774,17 +774,18 @@ depth.
 \texttt{entmootd} is implemented in Go (${\geq}1.25.3$, matching
 Pilot's toolchain requirement) and compiles against the
 \texttt{jerryfane/pilotprotocol} fork of upstream Pilot v1.7.2
-through \texttt{v1.9.0-jf.15.21}. That fork supplies
+through \texttt{v1.9.0-jf.15.24}. That fork supplies
 the pluggable transport layer discussed in \S\ref{sec:background},
 \texttt{SetPeerEndpoints}, \texttt{Subscribe}/\texttt{Notify} for
-TURN endpoint changes, explicit listener \texttt{Unbind}, stream
-lifecycle traces, route-policy cleanup, and the stream/IPC reliability
-fixes described below. The module is split into focused packages for
+TURN endpoint and pending-handshake changes, explicit listener
+\texttt{Unbind}, stream lifecycle traces, route-policy cleanup,
+tracked send acknowledgements, node lookup, challenge signing, and the
+stream/IPC reliability fixes described below. The module is split into focused packages for
 canonical encoding, storage, gossip, transport, Pilot IPC, and CLI
 operation. Key packages: \texttt{canonical} (deterministic JSON encoding
 used for signing and identifier computation), \texttt{merkle} (tree
 construction and positive-inclusion proofs), \texttt{roster} (signed
-log with the founder-only admin rule and a dedicated
+membership log with founder/admin operation policy and a dedicated
 \texttt{AcceptGenesis} entry point for joiners that lack the founder's
 private key), \texttt{store} (in-memory, JSONL, and a SQLite
 backend using WAL mode with one database file per group, sharing a
@@ -798,10 +799,14 @@ same-host IPC). See \texttt{docs/CLI\_DESIGN.md} \S4 for the SQLite
 layout and \S5 for the IPC contract.
 
 The binary exposes an agent-facing surface, ESP service commands, and
-founder-only subcommands. \texttt{join} consumes an invite, binds the
-listen port, opens a local control socket, and enters the accept loop,
-blocking until signalled; \texttt{publish} authors and gossips a
-message; \texttt{tail} streams live messages with optional SQLite
+founder/admin subcommands. \texttt{join} consumes signed invites or
+auto-redeems open-invite links, binds the listen port, opens a local
+control socket, and enters the accept loop, blocking until signalled;
+\texttt{serve} restarts persisted groups without requiring the
+original invite; \texttt{publish} authors and gossips a message from
+inline content, a file, or stdin; \texttt{doctor} and \texttt{peers}
+report local Pilot, roster, profile, transport, trust, and route-probe
+diagnostics; \texttt{tail} streams live messages with optional SQLite
 backfill; \texttt{info} emits a JSON status snapshot; and
 \texttt{query} runs indexed historical lookups against SQLite.
 \texttt{version} emits release metadata stamped by GoReleaser. The
@@ -840,22 +845,27 @@ structured lifecycle traces for Pilot stream/session state and
 anti-entropy progress respectively; these are intentionally opt-in so
 normal gossip stays quiet.
 
-The \texttt{v1.5.11}--\texttt{v1.5.25} line also adds the service-peer
+The \texttt{v1.5.11}--\texttt{v1.5.35} line also adds the service-peer
 surface needed by intermittent mobile clients. An Entmoot Service
 Provider (ESP) is an always-on Entmoot/Pilot peer that can expose
 durable mailbox cursors, device-authenticated HTTP sync, and
 phone-signed publish forwarding without holding the phone's authoring
 key. The local \texttt{mailbox} commands exercise the same cursor path
 used by the HTTP bridge; \texttt{esp serve} exposes mailbox sync,
-cursor-neutral latest-history reads, group/member inspection, group
-and invite sign requests, and phone-signed publish; \texttt{esp device}
+cursor-neutral latest-history reads, group/member inspection, group,
+invite, open-invite, and member-removal sign requests, and
+phone-signed publish; \texttt{esp device}
 manages local device public keys; and \texttt{esp sign-request}
 creates signed test headers. Mailbox cursors, device state,
 idempotency records, and group display metadata live in local ESP
 state, not the Entmoot consensus log. Signed publish and executable
 group/invite operations still route through the running \texttt{join}
 daemon for roster verification, durable accept, and gossip fanout.
-Member display names are learned through signed member-profile gossip:
+Open invites are issuer-scoped tokens with expiry and max-use counts.
+Redeemers prove Pilot key possession by signing a domain-separated
+issuer challenge, receive a normal signed invite, and then follow the
+same roster/bootstrap path as targeted joins. Member display names are
+learned through signed member-profile gossip:
 each node signs its current Pilot hostname as group-scoped metadata,
 and ESP member APIs expose it only while the advertised Entmoot key
 matches the current roster entry.
@@ -1114,7 +1124,7 @@ daemons and drives them entirely through the CLI surface
 (\texttt{join}, \texttt{publish}, \texttt{tail}, \texttt{query}). It
 completes in approximately 14 seconds of wall clock; it is the only
 variant that exercises the control-socket IPC path and the
-five-command CLI end-to-end, whereas the other two exercise only the
+CLI end-to-end, whereas the other two exercise only the
 library layer.
 
 \begin{figure}[t]
