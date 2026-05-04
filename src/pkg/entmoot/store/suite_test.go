@@ -286,6 +286,47 @@ func runStoreSuite(t *testing.T, newStore func(t *testing.T) MessageStore) {
 		}
 	})
 
+	t.Run("TopicsAndLatestByTopic", func(t *testing.T) {
+		s := newStore(t)
+		gid := randGroupID(t)
+		withTopics := func(ts int64, content string, topics ...string) entmoot.Message {
+			m := mkMsg(t, gid, testAuthor(1, 0x01), ts, content)
+			m.Topics = topics
+			m.ID = canonical.MessageID(m)
+			return m
+		}
+		oldOps := withTopics(10, "old ops", "ops")
+		newResearchOps := withTopics(20, "new research ops", "research", "ops")
+		chat := withTopics(30, "chat", "chat")
+		for _, m := range []entmoot.Message{chat, oldOps, newResearchOps} {
+			if err := s.Put(ctx, m); err != nil {
+				t.Fatalf("Put: %v", err)
+			}
+		}
+
+		topics, err := s.Topics(ctx, gid, 10)
+		if err != nil {
+			t.Fatalf("Topics: %v", err)
+		}
+		if len(topics) != 3 {
+			t.Fatalf("Topics len = %d, want 3", len(topics))
+		}
+		if topics[0].Topic != "ops" || topics[0].Count != 2 || topics[0].LatestMessageAtMS != 20 {
+			t.Fatalf("top topic = %+v, want ops count 2 latest 20", topics[0])
+		}
+		if topics[1].Topic != "chat" || topics[2].Topic != "research" {
+			t.Fatalf("topic tie order = %q, %q; want chat, research", topics[1].Topic, topics[2].Topic)
+		}
+
+		msgs, err := s.LatestByTopic(ctx, gid, "ops", 2)
+		if err != nil {
+			t.Fatalf("LatestByTopic: %v", err)
+		}
+		if len(msgs) != 2 || msgs[0].ID != oldOps.ID || msgs[1].ID != newResearchOps.ID {
+			t.Fatalf("LatestByTopic got %v, want oldOps,newResearchOps", idsOf(msgs))
+		}
+	})
+
 	t.Run("EmptyGroupMerkleRoot", func(t *testing.T) {
 		s := newStore(t)
 		gid := randGroupID(t)

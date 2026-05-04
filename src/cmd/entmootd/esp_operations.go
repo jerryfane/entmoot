@@ -704,6 +704,46 @@ func (e espOperationExecutor) acceptInvite(ctx context.Context, req esphttp.Sign
 	if err != nil {
 		return nil, &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request", Message: err.Error()}
 	}
+	fleetPlan, fleetAccept, err := e.preflightFleetInviteAcceptance(ctx, invite.GroupID)
+	if err != nil {
+		return nil, err
+	}
+	var (
+		fleet       esphttp.FleetRecord
+		fleetMember esphttp.FleetMemberRecord
+		rollback    func()
+	)
+	if fleetAccept {
+		fleet, fleetMember, rollback, err = e.prepareFleetInviteAcceptance(ctx, fleetPlan)
+		if err != nil {
+			return nil, err
+		}
+		defer func() {
+			if rollback != nil {
+				rollback()
+			}
+		}()
+	}
+	deviceGroupGranted := false
+	if req.DeviceID != "" {
+		if fleetAccept {
+			if e.deviceGroups == nil {
+				return nil, &esphttp.OperationError{HTTPStatus: http.StatusServiceUnavailable, Code: "device_registry_unavailable", Message: "device group authorizer is not configured"}
+			}
+			changed, err := e.grantDeviceGroup(ctx, req.DeviceID, invite.GroupID)
+			if err != nil {
+				return nil, err
+			}
+			deviceGroupGranted = changed
+			defer func() {
+				if deviceGroupGranted && e.deviceGroups != nil {
+					if err := e.deviceGroups.RevokeDeviceGroup(context.Background(), req.DeviceID, invite.GroupID); err != nil {
+						slog.Warn("esp invite_accept rollback: revoke device group failed", slog.String("group_id", invite.GroupID.String()), slog.String("device_id", req.DeviceID), slog.String("err", err.Error()))
+					}
+				}
+			}()
+		}
+	}
 	resp, err := e.joinGroup(ctx, invite)
 	if err != nil {
 		return nil, err
@@ -712,14 +752,23 @@ func (e espOperationExecutor) acceptInvite(ctx context.Context, req esphttp.Sign
 	if groupID == (entmoot.GroupID{}) {
 		groupID = invite.GroupID
 	}
-	if err := e.grantDeviceGroupIfNeeded(ctx, req.DeviceID, groupID); err != nil {
-		return nil, err
+	if !fleetAccept {
+		if err := e.grantDeviceGroupIfNeeded(ctx, req.DeviceID, groupID); err != nil {
+			return nil, err
+		}
 	}
-	return json.Marshal(map[string]any{
+	rollback = nil
+	deviceGroupGranted = false
+	result := map[string]any{
 		"status":   resp.Status,
 		"group_id": groupID,
 		"members":  resp.Members,
-	})
+	}
+	if fleetAccept {
+		result["fleet"] = fleet
+		result["fleet_member"] = fleetMember
+	}
+	return json.Marshal(result)
 }
 
 func (e espOperationExecutor) acceptOpenInvite(ctx context.Context, req esphttp.SignRequest) (json.RawMessage, error) {
@@ -1129,6 +1178,184 @@ func (e espOperationExecutor) updateGroup(ctx context.Context, req esphttp.SignR
 		"group_id": req.GroupID,
 		"metadata": json.RawMessage(metadata),
 	})
+}
+
+type fleetInviteAcceptancePlan struct {
+	fleet         esphttp.FleetRecord
+	target        entmoot.NodeInfo
+	member        esphttp.FleetMemberRecord
+	previous      esphttp.FleetMemberRecord
+	previousFound bool
+	invites       []esphttp.FleetInviteRecord
+	noop          bool
+}
+
+func (e espOperationExecutor) preflightFleetInviteAcceptance(ctx context.Context, groupID entmoot.GroupID) (*fleetInviteAcceptancePlan, bool, error) {
+	if e.stateStore == nil || groupID == (entmoot.GroupID{}) || e.identity == nil {
+		return nil, false, nil
+	}
+	fleets, err := e.stateStore.ListFleets(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	var fleet esphttp.FleetRecord
+	found := false
+	for _, candidate := range fleets {
+		if candidate.ControlGroupID == groupID {
+			fleet = candidate
+			found = true
+			break
+		}
+	}
+	if !found {
+		return nil, false, nil
+	}
+	info, err := e.daemonInfo()
+	if err != nil {
+		return nil, false, joinUnavailableError(err)
+	}
+	target := entmoot.NodeInfo{PilotNodeID: info.PilotNodeID, EntmootPubKey: append([]byte(nil), e.identity.PublicKey...)}
+	targetPubKey := encodeBase64(target.EntmootPubKey)
+	members, err := e.stateStore.ListFleetMembers(ctx, fleet.FleetID)
+	if err != nil {
+		return nil, false, err
+	}
+	prev, exists := fleetMemberForNode(members, target.PilotNodeID)
+	if exists {
+		storedPub, err := base64.StdEncoding.DecodeString(prev.EntmootPubKey)
+		if err != nil || !bytes.Equal(storedPub, target.EntmootPubKey) {
+			return nil, false, &esphttp.OperationError{
+				HTTPStatus: http.StatusConflict,
+				Code:       "member_identity_conflict",
+				Message:    "accepted invite identity does not match fleet member",
+			}
+		}
+		if prev.Role == esphttp.FleetRoleCoordinator {
+			return &fleetInviteAcceptancePlan{fleet: fleet, target: target, member: prev, previous: prev, previousFound: true, noop: true}, true, nil
+		}
+		if prev.Status == esphttp.FleetMemberActive {
+			return &fleetInviteAcceptancePlan{fleet: fleet, target: target, member: prev, previous: prev, previousFound: true, noop: true}, true, nil
+		}
+	}
+	now := time.Now().UnixMilli()
+	invites, err := e.stateStore.ListFleetInvites(ctx, fleet.FleetID)
+	if err != nil {
+		return nil, false, err
+	}
+	matchingInvite := false
+	identityConflict := false
+	targetInvites := make([]esphttp.FleetInviteRecord, 0, 1)
+	for _, invite := range invites {
+		if invite.NodeID != target.PilotNodeID {
+			continue
+		}
+		targetInvites = append(targetInvites, invite)
+		if invite.EntmootPubKey != targetPubKey {
+			identityConflict = true
+			continue
+		}
+		if invite.Status != esphttp.FleetMemberInvited {
+			continue
+		}
+		if invite.ExpiresAtMS > 0 && invite.ExpiresAtMS <= now {
+			continue
+		}
+		matchingInvite = true
+	}
+	if !exists || prev.Status != esphttp.FleetMemberInvited || !matchingInvite {
+		if identityConflict {
+			return nil, false, &esphttp.OperationError{
+				HTTPStatus: http.StatusConflict,
+				Code:       "member_identity_conflict",
+				Message:    "accepted invite identity does not match fleet invite",
+			}
+		}
+		return nil, false, &esphttp.OperationError{
+			HTTPStatus: http.StatusConflict,
+			Code:       "fleet_invite_required",
+			Message:    "fleet invite acceptance requires a current pending fleet invite",
+		}
+	}
+	member := esphttp.FleetMemberRecord{
+		FleetID:       fleet.FleetID,
+		NodeID:        target.PilotNodeID,
+		EntmootPubKey: targetPubKey,
+		Role:          esphttp.FleetRoleAgent,
+		Status:        esphttp.FleetMemberActive,
+		AcceptedAtMS:  now,
+	}
+	if exists {
+		member.Hostname = prev.Hostname
+		member.InvitedAtMS = prev.InvitedAtMS
+	}
+	return &fleetInviteAcceptancePlan{
+		fleet:         fleet,
+		target:        target,
+		member:        member,
+		previous:      prev,
+		previousFound: exists,
+		invites:       targetInvites,
+	}, true, nil
+}
+
+func (e espOperationExecutor) prepareFleetInviteAcceptance(ctx context.Context, plan *fleetInviteAcceptancePlan) (esphttp.FleetRecord, esphttp.FleetMemberRecord, func(), error) {
+	if plan == nil {
+		return esphttp.FleetRecord{}, esphttp.FleetMemberRecord{}, nil, nil
+	}
+	if plan.noop {
+		return plan.fleet, plan.member, nil, nil
+	}
+	fleet := plan.fleet
+	target := plan.target
+	member := plan.member
+	memberApplied := false
+	var removedInvites []esphttp.FleetInviteRecord
+	activityApplied := false
+	activityID := ""
+	rollback := func() {
+		if e.stateStore == nil {
+			return
+		}
+		if activityApplied {
+			if err := e.stateStore.DeleteFleetActivity(context.Background(), fleet.FleetID, activityID); err != nil {
+				slog.Warn("esp invite_accept rollback: delete fleet activity failed", slog.String("fleet_id", fleet.FleetID), slog.String("event_id", activityID), slog.String("err", err.Error()))
+			}
+		}
+		if memberApplied {
+			if plan.previousFound {
+				if _, err := e.stateStore.UpsertFleetMember(context.Background(), plan.previous); err != nil {
+					slog.Warn("esp invite_accept rollback: restore fleet member failed", slog.String("fleet_id", fleet.FleetID), slog.Uint64("node_id", uint64(target.PilotNodeID)), slog.String("err", err.Error()))
+				}
+			} else if err := e.stateStore.DeleteFleetMember(context.Background(), fleet.FleetID, target.PilotNodeID); err != nil {
+				slog.Warn("esp invite_accept rollback: restore fleet member failed", slog.String("fleet_id", fleet.FleetID), slog.Uint64("node_id", uint64(target.PilotNodeID)), slog.String("err", err.Error()))
+			}
+		}
+		for _, invite := range removedInvites {
+			if _, err := e.stateStore.CreateFleetInvite(context.Background(), invite); err != nil {
+				slog.Warn("esp invite_accept rollback: restore fleet invite failed", slog.String("fleet_id", fleet.FleetID), slog.String("invite_id", invite.InviteID), slog.String("err", err.Error()))
+			}
+		}
+	}
+	member, err := e.stateStore.UpsertFleetMember(ctx, member)
+	if err != nil {
+		return esphttp.FleetRecord{}, esphttp.FleetMemberRecord{}, nil, err
+	}
+	memberApplied = true
+	for _, invite := range plan.invites {
+		if err := e.stateStore.DeleteFleetInvite(ctx, invite.InviteID); err != nil {
+			rollback()
+			return esphttp.FleetRecord{}, esphttp.FleetMemberRecord{}, nil, err
+		}
+		removedInvites = append(removedInvites, invite)
+	}
+	activity, err := e.appendFleetActivity(ctx, fleet.FleetID, "member.accepted", target, &target, "Agent joined Fleet", map[string]any{"hostname": member.Hostname})
+	if err != nil {
+		rollback()
+		return esphttp.FleetRecord{}, esphttp.FleetMemberRecord{}, nil, err
+	}
+	activityApplied = true
+	activityID = activity.EventID
+	return fleet, member, rollback, nil
 }
 
 func (e espOperationExecutor) createFleet(ctx context.Context, req esphttp.SignRequest) (json.RawMessage, error) {

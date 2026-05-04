@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.37] - 2026-05-05
+
+### Added
+
+- **Fleet control-plane hardening.** Fleet invite acceptance now records
+  accepted agents idempotently, requires a current Fleet invite before
+  activating a member, rolls back local/device side effects on failed joins,
+  and validates coordinator/member identity bindings consistently.
+- **ESP topic indexes.** Group history can now be filtered by exact topic, and
+  ESP clients can list topic aggregates for a group without advancing mailbox
+  cursors.
+
+### Fixed
+
+- **Fleet state consistency.** Fleet create/invite/remove paths now avoid
+  stale member rows, stale invite rows, coordinator self-removal, and
+  local-control-group divergence across rollback and retry paths.
+
 ## [1.5.36] - 2026-05-04
 
 ### Fixed

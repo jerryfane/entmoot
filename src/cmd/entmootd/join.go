@@ -945,6 +945,12 @@ func (n *notifyingStore) Range(ctx context.Context, gid entmoot.GroupID, since, 
 func (n *notifyingStore) Latest(ctx context.Context, gid entmoot.GroupID, limit int) ([]entmoot.Message, error) {
 	return n.inner.Latest(ctx, gid, limit)
 }
+func (n *notifyingStore) Topics(ctx context.Context, gid entmoot.GroupID, limit int) ([]store.TopicSummary, error) {
+	return n.inner.Topics(ctx, gid, limit)
+}
+func (n *notifyingStore) LatestByTopic(ctx context.Context, gid entmoot.GroupID, topic string, limit int) ([]entmoot.Message, error) {
+	return n.inner.LatestByTopic(ctx, gid, topic, limit)
+}
 func (n *notifyingStore) MerkleRoot(ctx context.Context, gid entmoot.GroupID) ([32]byte, error) {
 	return n.inner.MerkleRoot(ctx, gid)
 }

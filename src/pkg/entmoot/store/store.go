@@ -32,6 +32,13 @@ import (
 // a storage-layer concern, not a protocol-level one.
 var ErrNotFound = errors.New("store: message not found")
 
+// TopicSummary is the storage-level aggregate for one message topic in a group.
+type TopicSummary struct {
+	Topic             string
+	Count             int
+	LatestMessageAtMS int64
+}
+
 // MessageStore persists messages grouped by GroupID. All methods are safe for
 // concurrent use.
 type MessageStore interface {
@@ -57,6 +64,15 @@ type MessageStore interface {
 	// returned in topological order within that bounded window. A limit <= 0
 	// returns an empty slice.
 	Latest(ctx context.Context, groupID entmoot.GroupID, limit int) ([]entmoot.Message, error)
+
+	// Topics returns topic aggregates for groupID ordered by message count
+	// descending, latest message timestamp descending, then topic name ascending.
+	// A limit <= 0 returns an empty slice.
+	Topics(ctx context.Context, groupID entmoot.GroupID, limit int) ([]TopicSummary, error)
+
+	// LatestByTopic returns at most limit recent messages in groupID that contain
+	// topic exactly. The recency and output ordering match Latest.
+	LatestByTopic(ctx context.Context, groupID entmoot.GroupID, topic string, limit int) ([]entmoot.Message, error)
 
 	// MerkleRoot returns the Merkle root (pkg/entmoot/merkle) over every
 	// message in the group, ordered topologically. An empty group returns the

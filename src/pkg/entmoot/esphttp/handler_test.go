@@ -603,6 +603,55 @@ func TestHandlerGroupHistoryReturnsLatestWithoutAdvancingCursor(t *testing.T) {
 	}
 }
 
+func TestHandlerGroupTopicsAndTopicHistory(t *testing.T) {
+	gid := testGroupID(1)
+	st := store.NewMemory()
+	withTopics := func(ts int64, content string, topics ...string) entmoot.Message {
+		msg := testMessage(gid, ts, content)
+		msg.Topics = topics
+		msg.ID = canonical.MessageID(msg)
+		return msg
+	}
+	oldOps := withTopics(1, "old ops", "ops")
+	researchOps := withTopics(2, "research ops", "research", "ops")
+	chat := withTopics(3, "chat", "chat")
+	for _, msg := range []entmoot.Message{chat, oldOps, researchOps} {
+		if err := st.Put(context.Background(), msg); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+	}
+	svc, err := mailbox.New(st, nil)
+	if err != nil {
+		t.Fatalf("mailbox.New: %v", err)
+	}
+	handler, err := NewHandler(Config{
+		Token:   "secret",
+		Service: svc,
+		GroupExists: func(_ context.Context, got entmoot.GroupID) (bool, error) {
+			return got == gid, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewHandler: %v", err)
+	}
+
+	topics := doJSONRequest[mailbox.TopicsResult](t, handler, http.MethodGet, "/v1/groups/"+gid.String()+"/topics?client_id=ios-1&limit=10", nil, http.StatusOK)
+	if topics.Count != 3 || len(topics.Topics) != 3 {
+		t.Fatalf("topics count/messages = %d/%d, want 3/3", topics.Count, len(topics.Topics))
+	}
+	if topics.Topics[0].Topic != "ops" || topics.Topics[0].Count != 2 || topics.Topics[0].LatestMessageAtMS != 2 {
+		t.Fatalf("top topic = %+v, want ops count 2 latest 2", topics.Topics[0])
+	}
+
+	history := doJSONRequest[mailbox.HistoryResult](t, handler, http.MethodGet, "/v1/groups/"+gid.String()+"/history?client_id=ios-1&topic=ops&limit=10", nil, http.StatusOK)
+	if history.Count != 2 || len(history.Messages) != 2 {
+		t.Fatalf("topic history count/messages = %d/%d, want 2/2", history.Count, len(history.Messages))
+	}
+	if history.Messages[0].MessageID != oldOps.ID || history.Messages[1].MessageID != researchOps.ID {
+		t.Fatalf("topic history ids = %v, want oldOps,researchOps", []entmoot.MessageID{history.Messages[0].MessageID, history.Messages[1].MessageID})
+	}
+}
+
 func TestHandlerGroupHistoryRejectsLimitZero(t *testing.T) {
 	gid := testGroupID(1)
 	handler := testMobileHandler(t, gid, nil, nil, nil)

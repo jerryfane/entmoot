@@ -329,7 +329,8 @@ func TestESPCreateGroupGrantsCreatingDevice(t *testing.T) {
 		t.Fatalf("Generate: %v", err)
 	}
 	sock := testUnixSocketPath(t)
-	stop := serveESPGroupCreateIPC(t, sock, id.PublicKey, true)
+	joinReqCh := make(chan *ipc.JoinGroupReq, 1)
+	stop := serveESPAcceptInviteIPC(t, sock, id.PublicKey, true, joinReqCh)
 	defer stop()
 	pub, _, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -391,7 +392,8 @@ func TestESPAcceptInviteGrantsDeviceAccess(t *testing.T) {
 		t.Fatalf("Generate: %v", err)
 	}
 	sock := testUnixSocketPath(t)
-	stop := serveESPGroupCreateIPC(t, sock, id.PublicKey, true)
+	joinReqCh := make(chan *ipc.JoinGroupReq, 1)
+	stop := serveESPAcceptInviteIPC(t, sock, id.PublicKey, true, joinReqCh)
 	defer stop()
 	reg, regPath := testDeviceRegistry(t)
 	gid := testESPGroupID(9)
@@ -431,7 +433,8 @@ func TestESPAcceptInviteWithoutDeviceSkipsDeviceGrant(t *testing.T) {
 		t.Fatalf("Generate: %v", err)
 	}
 	sock := testUnixSocketPath(t)
-	stop := serveESPGroupCreateIPC(t, sock, id.PublicKey, true)
+	joinReqCh := make(chan *ipc.JoinGroupReq, 1)
+	stop := serveESPAcceptInviteIPC(t, sock, id.PublicKey, true, joinReqCh)
 	defer stop()
 	gid := testESPGroupID(10)
 	req := esphttp.SignRequest{
@@ -456,6 +459,527 @@ func TestESPAcceptInviteWithoutDeviceSkipsDeviceGrant(t *testing.T) {
 	}
 	if result.GroupID != gid {
 		t.Fatalf("result group_id = %s, want %s", result.GroupID, gid)
+	}
+}
+
+func TestESPAcceptFleetInviteRequiresPendingFleetInvite(t *testing.T) {
+	ctx := context.Background()
+	id, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	gid := testESPGroupID(91)
+	state := esphttp.NewMemoryStateStore()
+	metadataStore := esphttp.NewMemoryStateStore()
+	createFleetForAcceptTest(t, state, gid)
+	if _, err := state.UpsertFleetMember(ctx, esphttp.FleetMemberRecord{
+		FleetID:       "fleet-accept",
+		NodeID:        45491,
+		EntmootPubKey: encodeBase64(id.PublicKey),
+		Hostname:      "laptop",
+		Role:          esphttp.FleetRoleAgent,
+		Status:        esphttp.FleetMemberInvited,
+		InvitedAtMS:   1_700_000_000_000,
+	}); err != nil {
+		t.Fatalf("UpsertFleetMember target: %v", err)
+	}
+	sock := testUnixSocketPath(t)
+	joinReqCh := make(chan *ipc.JoinGroupReq, 1)
+	stop := serveESPAcceptInviteIPC(t, sock, id.PublicKey, true, joinReqCh)
+	defer stop()
+
+	_, err = espOperationExecutor{
+		dataDir:       t.TempDir(),
+		identity:      id,
+		socketPath:    sock,
+		timeout:       time.Second,
+		stateStore:    state,
+		metadataStore: metadataStore,
+	}.ExecuteSignRequest(ctx, esphttp.SignRequest{
+		Kind:    "invite_accept",
+		Payload: mustMarshalJSON(t, entmoot.Invite{GroupID: gid}),
+	}, nil)
+	var opErr *esphttp.OperationError
+	if !errors.As(err, &opErr) || opErr.HTTPStatus != http.StatusConflict || opErr.Code != "fleet_invite_required" {
+		t.Fatalf("ExecuteSignRequest err = %v, want 409 fleet_invite_required", err)
+	}
+	members, err := state.ListFleetMembers(ctx, "fleet-accept")
+	if err != nil {
+		t.Fatalf("ListFleetMembers: %v", err)
+	}
+	member, ok := fleetMemberForNode(members, 45491)
+	if !ok || member.Status != esphttp.FleetMemberInvited {
+		t.Fatalf("member after rejected accept = %+v, ok=%v; want invited", member, ok)
+	}
+	activity, err := state.ListFleetActivity(ctx, "fleet-accept", 10, 0)
+	if err != nil {
+		t.Fatalf("ListFleetActivity: %v", err)
+	}
+	if len(activity) != 0 {
+		t.Fatalf("activity after rejected accept = %+v, want none", activity)
+	}
+	select {
+	case req := <-joinReqCh:
+		t.Fatalf("unexpected join request after rejected fleet accept: %+v", req)
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+func TestESPAcceptFleetInviteMarksPendingInviteActive(t *testing.T) {
+	ctx := context.Background()
+	id, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	gid := testESPGroupID(92)
+	state := esphttp.NewMemoryStateStore()
+	metadataStore := esphttp.NewMemoryStateStore()
+	createFleetForAcceptTest(t, state, gid)
+	if _, err := state.UpsertFleetMember(ctx, esphttp.FleetMemberRecord{
+		FleetID:       "fleet-accept",
+		NodeID:        45491,
+		EntmootPubKey: encodeBase64(id.PublicKey),
+		Hostname:      "laptop",
+		Role:          esphttp.FleetRoleAgent,
+		Status:        esphttp.FleetMemberInvited,
+		InvitedAtMS:   1_700_000_000_000,
+	}); err != nil {
+		t.Fatalf("UpsertFleetMember target: %v", err)
+	}
+	if _, err := state.CreateFleetInvite(ctx, esphttp.FleetInviteRecord{
+		InviteID:      "fleet-invite-laptop",
+		FleetID:       "fleet-accept",
+		NodeID:        45491,
+		EntmootPubKey: encodeBase64(id.PublicKey),
+		Hostname:      "laptop",
+		Status:        esphttp.FleetMemberInvited,
+		Invite:        json.RawMessage(`{"group_id":"control"}`),
+		CreatedAtMS:   1_700_000_000_000,
+		ExpiresAtMS:   time.Now().Add(time.Hour).UnixMilli(),
+	}); err != nil {
+		t.Fatalf("CreateFleetInvite target: %v", err)
+	}
+	sock := testUnixSocketPath(t)
+	stop := serveESPGroupCreateIPC(t, sock, id.PublicKey, true)
+	defer stop()
+
+	raw, err := espOperationExecutor{
+		dataDir:       t.TempDir(),
+		identity:      id,
+		socketPath:    sock,
+		timeout:       time.Second,
+		stateStore:    state,
+		metadataStore: metadataStore,
+	}.ExecuteSignRequest(ctx, esphttp.SignRequest{
+		Kind:    "invite_accept",
+		Payload: mustMarshalJSON(t, entmoot.Invite{GroupID: gid}),
+	}, nil)
+	if err != nil {
+		t.Fatalf("ExecuteSignRequest: %v", err)
+	}
+	var result struct {
+		FleetMember esphttp.FleetMemberRecord `json:"fleet_member"`
+	}
+	if err := json.Unmarshal(raw, &result); err != nil {
+		t.Fatalf("unmarshal result: %v", err)
+	}
+	if result.FleetMember.Status != esphttp.FleetMemberActive || result.FleetMember.AcceptedAtMS == 0 {
+		t.Fatalf("fleet member result = %+v, want active with accepted_at_ms", result.FleetMember)
+	}
+	invites, err := state.ListFleetInvites(ctx, "fleet-accept")
+	if err != nil {
+		t.Fatalf("ListFleetInvites: %v", err)
+	}
+	if len(invites) != 0 {
+		t.Fatalf("invites after accept = %+v, want none", invites)
+	}
+	activity, err := state.ListFleetActivity(ctx, "fleet-accept", 10, 0)
+	if err != nil {
+		t.Fatalf("ListFleetActivity: %v", err)
+	}
+	if len(activity) != 1 || activity[0].Type != "member.accepted" {
+		t.Fatalf("activity after accept = %+v, want one member.accepted", activity)
+	}
+}
+
+func TestESPAcceptFleetInviteUsesFleetRecordWhenMetadataIsStale(t *testing.T) {
+	ctx := context.Background()
+	id, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	gid := testESPGroupID(96)
+	state := esphttp.NewMemoryStateStore()
+	metadataStore := esphttp.NewMemoryStateStore()
+	if err := metadataStore.SetGroupMetadata(ctx, gid, json.RawMessage(`{"fleet_control":false}`)); err != nil {
+		t.Fatalf("SetGroupMetadata: %v", err)
+	}
+	createFleetForAcceptTest(t, state, gid)
+	if _, err := state.UpsertFleetMember(ctx, esphttp.FleetMemberRecord{
+		FleetID:       "fleet-accept",
+		NodeID:        45491,
+		EntmootPubKey: encodeBase64(id.PublicKey),
+		Hostname:      "laptop",
+		Role:          esphttp.FleetRoleAgent,
+		Status:        esphttp.FleetMemberInvited,
+		InvitedAtMS:   1_700_000_000_000,
+	}); err != nil {
+		t.Fatalf("UpsertFleetMember target: %v", err)
+	}
+	if _, err := state.CreateFleetInvite(ctx, esphttp.FleetInviteRecord{
+		InviteID:      "fleet-invite-laptop",
+		FleetID:       "fleet-accept",
+		NodeID:        45491,
+		EntmootPubKey: encodeBase64(id.PublicKey),
+		Hostname:      "laptop",
+		Status:        esphttp.FleetMemberInvited,
+		Invite:        json.RawMessage(`{"group_id":"control"}`),
+		CreatedAtMS:   1_700_000_000_000,
+		ExpiresAtMS:   time.Now().Add(time.Hour).UnixMilli(),
+	}); err != nil {
+		t.Fatalf("CreateFleetInvite target: %v", err)
+	}
+	sock := testUnixSocketPath(t)
+	stop := serveESPGroupCreateIPC(t, sock, id.PublicKey, true)
+	defer stop()
+
+	raw, err := espOperationExecutor{
+		dataDir:       t.TempDir(),
+		identity:      id,
+		socketPath:    sock,
+		timeout:       time.Second,
+		stateStore:    state,
+		metadataStore: metadataStore,
+	}.ExecuteSignRequest(ctx, esphttp.SignRequest{
+		Kind:    "invite_accept",
+		Payload: mustMarshalJSON(t, entmoot.Invite{GroupID: gid}),
+	}, nil)
+	if err != nil {
+		t.Fatalf("ExecuteSignRequest: %v", err)
+	}
+	var result struct {
+		FleetMember esphttp.FleetMemberRecord `json:"fleet_member"`
+	}
+	if err := json.Unmarshal(raw, &result); err != nil {
+		t.Fatalf("unmarshal result: %v", err)
+	}
+	if result.FleetMember.Status != esphttp.FleetMemberActive || result.FleetMember.AcceptedAtMS == 0 {
+		t.Fatalf("fleet member result = %+v, want active with accepted_at_ms", result.FleetMember)
+	}
+	invites, err := state.ListFleetInvites(ctx, "fleet-accept")
+	if err != nil {
+		t.Fatalf("ListFleetInvites: %v", err)
+	}
+	if len(invites) != 0 {
+		t.Fatalf("invites after accept = %+v, want none", invites)
+	}
+	activity, err := state.ListFleetActivity(ctx, "fleet-accept", 10, 0)
+	if err != nil {
+		t.Fatalf("ListFleetActivity: %v", err)
+	}
+	if len(activity) != 1 || activity[0].Type != "member.accepted" {
+		t.Fatalf("activity after accept = %+v, want one member.accepted", activity)
+	}
+}
+
+func TestESPAcceptFleetInviteActivityFailureDoesNotJoin(t *testing.T) {
+	ctx := context.Background()
+	id, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	gid := testESPGroupID(94)
+	state := &failingFleetStateStore{
+		MemoryStateStore:   esphttp.NewMemoryStateStore(),
+		failAppendActivity: true,
+	}
+	createFleetForAcceptTest(t, state, gid)
+	if _, err := state.UpsertFleetMember(ctx, esphttp.FleetMemberRecord{
+		FleetID:       "fleet-accept",
+		NodeID:        45491,
+		EntmootPubKey: encodeBase64(id.PublicKey),
+		Hostname:      "laptop",
+		Role:          esphttp.FleetRoleAgent,
+		Status:        esphttp.FleetMemberInvited,
+		InvitedAtMS:   1_700_000_000_000,
+	}); err != nil {
+		t.Fatalf("UpsertFleetMember target: %v", err)
+	}
+	if _, err := state.CreateFleetInvite(ctx, esphttp.FleetInviteRecord{
+		InviteID:      "fleet-invite-laptop",
+		FleetID:       "fleet-accept",
+		NodeID:        45491,
+		EntmootPubKey: encodeBase64(id.PublicKey),
+		Hostname:      "laptop",
+		Status:        esphttp.FleetMemberInvited,
+		Invite:        json.RawMessage(`{"group_id":"control"}`),
+		CreatedAtMS:   1_700_000_000_000,
+		ExpiresAtMS:   time.Now().Add(time.Hour).UnixMilli(),
+	}); err != nil {
+		t.Fatalf("CreateFleetInvite target: %v", err)
+	}
+	sock := testUnixSocketPath(t)
+	joinReqCh := make(chan *ipc.JoinGroupReq, 1)
+	stop := serveESPAcceptInviteIPC(t, sock, id.PublicKey, true, joinReqCh)
+	defer stop()
+
+	_, err = espOperationExecutor{
+		dataDir:    t.TempDir(),
+		identity:   id,
+		socketPath: sock,
+		timeout:    time.Second,
+		stateStore: state,
+	}.ExecuteSignRequest(ctx, esphttp.SignRequest{
+		Kind:    "invite_accept",
+		Payload: mustMarshalJSON(t, entmoot.Invite{GroupID: gid}),
+	}, nil)
+	if err == nil {
+		t.Fatal("ExecuteSignRequest succeeded, want activity failure")
+	}
+	select {
+	case req := <-joinReqCh:
+		t.Fatalf("unexpected join request after fleet activity failure: %+v", req)
+	case <-time.After(200 * time.Millisecond):
+	}
+	members, err := state.ListFleetMembers(ctx, "fleet-accept")
+	if err != nil {
+		t.Fatalf("ListFleetMembers: %v", err)
+	}
+	member, ok := fleetMemberForNode(members, 45491)
+	if !ok || member.Status != esphttp.FleetMemberInvited {
+		t.Fatalf("member after activity failure = %+v, ok=%v; want invited", member, ok)
+	}
+	invites, err := state.ListFleetInvites(ctx, "fleet-accept")
+	if err != nil {
+		t.Fatalf("ListFleetInvites: %v", err)
+	}
+	if len(invites) != 1 || invites[0].InviteID != "fleet-invite-laptop" {
+		t.Fatalf("invites after activity failure = %+v, want restored pending invite", invites)
+	}
+}
+
+func TestESPAcceptFleetInviteJoinFailureRollsBackPreparedStateAndDeviceGrant(t *testing.T) {
+	ctx := context.Background()
+	id, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	gid := testESPGroupID(95)
+	state := esphttp.NewMemoryStateStore()
+	createFleetForAcceptTest(t, state, gid)
+	if _, err := state.UpsertFleetMember(ctx, esphttp.FleetMemberRecord{
+		FleetID:       "fleet-accept",
+		NodeID:        45491,
+		EntmootPubKey: encodeBase64(id.PublicKey),
+		Hostname:      "laptop",
+		Role:          esphttp.FleetRoleAgent,
+		Status:        esphttp.FleetMemberInvited,
+		InvitedAtMS:   1_700_000_000_000,
+	}); err != nil {
+		t.Fatalf("UpsertFleetMember target: %v", err)
+	}
+	if _, err := state.CreateFleetInvite(ctx, esphttp.FleetInviteRecord{
+		InviteID:      "fleet-invite-laptop",
+		FleetID:       "fleet-accept",
+		NodeID:        45491,
+		EntmootPubKey: encodeBase64(id.PublicKey),
+		Hostname:      "laptop",
+		Status:        esphttp.FleetMemberInvited,
+		Invite:        json.RawMessage(`{"group_id":"control"}`),
+		CreatedAtMS:   1_700_000_000_000,
+		ExpiresAtMS:   time.Now().Add(time.Hour).UnixMilli(),
+	}); err != nil {
+		t.Fatalf("CreateFleetInvite target: %v", err)
+	}
+	reg, regPath := testDeviceRegistry(t)
+	sock := testUnixSocketPath(t)
+	joinReqCh := make(chan *ipc.JoinGroupReq, 1)
+	stop := serveESPAcceptInviteIPC(t, sock, id.PublicKey, false, joinReqCh)
+	defer stop()
+
+	_, err = espOperationExecutor{
+		dataDir:      t.TempDir(),
+		identity:     id,
+		socketPath:   sock,
+		timeout:      time.Second,
+		stateStore:   state,
+		deviceGroups: &fileBackedDeviceGroupAuthorizer{path: regPath, registry: reg},
+	}.ExecuteSignRequest(ctx, esphttp.SignRequest{
+		Kind:     "invite_accept",
+		DeviceID: "ios-1",
+		Payload:  mustMarshalJSON(t, entmoot.Invite{GroupID: gid}),
+	}, nil)
+	if err == nil {
+		t.Fatal("ExecuteSignRequest succeeded, want join failure")
+	}
+	select {
+	case req := <-joinReqCh:
+		if req.Invite.GroupID != gid {
+			t.Fatalf("join group = %s, want %s", req.Invite.GroupID, gid)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for join request")
+	}
+	members, err := state.ListFleetMembers(ctx, "fleet-accept")
+	if err != nil {
+		t.Fatalf("ListFleetMembers: %v", err)
+	}
+	member, ok := fleetMemberForNode(members, 45491)
+	if !ok || member.Status != esphttp.FleetMemberInvited {
+		t.Fatalf("member after join rollback = %+v, ok=%v; want invited", member, ok)
+	}
+	invites, err := state.ListFleetInvites(ctx, "fleet-accept")
+	if err != nil {
+		t.Fatalf("ListFleetInvites: %v", err)
+	}
+	if len(invites) != 1 || invites[0].InviteID != "fleet-invite-laptop" {
+		t.Fatalf("invites after join rollback = %+v, want restored pending invite", invites)
+	}
+	activity, err := state.ListFleetActivity(ctx, "fleet-accept", 10, 0)
+	if err != nil {
+		t.Fatalf("ListFleetActivity: %v", err)
+	}
+	if len(activity) != 0 {
+		t.Fatalf("activity after join rollback = %+v, want none", activity)
+	}
+	loaded, err := esphttp.LoadDeviceRegistry(regPath)
+	if err != nil {
+		t.Fatalf("LoadDeviceRegistry: %v", err)
+	}
+	devices := loaded.Snapshot()
+	if len(devices) != 1 || len(devices[0].Groups) != 0 {
+		t.Fatalf("device groups after join rollback = %+v, want none", devices)
+	}
+}
+
+func TestESPAcceptFleetInviteRejectsCoordinatorIdentityMismatch(t *testing.T) {
+	ctx := context.Background()
+	id, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	storedID, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate stored identity: %v", err)
+	}
+	gid := testESPGroupID(97)
+	state := esphttp.NewMemoryStateStore()
+	fleet, err := state.CreateFleet(ctx, esphttp.FleetRecord{
+		FleetID:             "fleet-coordinator-mismatch",
+		Name:                "Coordinator Mismatch",
+		ControlGroupID:      gid,
+		Coordinator:         entmoot.NodeInfo{PilotNodeID: 45491, EntmootPubKey: append([]byte(nil), storedID.PublicKey...)},
+		CoordinatorDeviceID: "ios-1",
+		CreatedAtMS:         1_700_000_000_000,
+	})
+	if err != nil {
+		t.Fatalf("CreateFleet: %v", err)
+	}
+	if _, err := state.UpsertFleetMember(ctx, esphttp.FleetMemberRecord{
+		FleetID:       fleet.FleetID,
+		NodeID:        45491,
+		EntmootPubKey: encodeBase64(storedID.PublicKey),
+		Hostname:      "coordinator",
+		Role:          esphttp.FleetRoleCoordinator,
+		Status:        esphttp.FleetMemberActive,
+		AcceptedAtMS:  1_700_000_000_000,
+	}); err != nil {
+		t.Fatalf("UpsertFleetMember coordinator: %v", err)
+	}
+	sock := testUnixSocketPath(t)
+	joinReqCh := make(chan *ipc.JoinGroupReq, 1)
+	stop := serveESPAcceptInviteIPC(t, sock, id.PublicKey, true, joinReqCh)
+	defer stop()
+
+	_, err = espOperationExecutor{
+		dataDir:    t.TempDir(),
+		identity:   id,
+		socketPath: sock,
+		timeout:    time.Second,
+		stateStore: state,
+	}.ExecuteSignRequest(ctx, esphttp.SignRequest{
+		Kind:    "invite_accept",
+		Payload: mustMarshalJSON(t, entmoot.Invite{GroupID: gid}),
+	}, nil)
+	var opErr *esphttp.OperationError
+	if !errors.As(err, &opErr) || opErr.HTTPStatus != http.StatusConflict || opErr.Code != "member_identity_conflict" {
+		t.Fatalf("ExecuteSignRequest err = %v, want 409 member_identity_conflict", err)
+	}
+	members, err := state.ListFleetMembers(ctx, fleet.FleetID)
+	if err != nil {
+		t.Fatalf("ListFleetMembers: %v", err)
+	}
+	member, ok := fleetMemberForNode(members, 45491)
+	if !ok || member.Role != esphttp.FleetRoleCoordinator || member.Status != esphttp.FleetMemberActive || member.EntmootPubKey != encodeBase64(storedID.PublicKey) {
+		t.Fatalf("member after rejected coordinator accept = %+v, ok=%v; want unchanged coordinator", member, ok)
+	}
+	activity, err := state.ListFleetActivity(ctx, fleet.FleetID, 10, 0)
+	if err != nil {
+		t.Fatalf("ListFleetActivity: %v", err)
+	}
+	if len(activity) != 0 {
+		t.Fatalf("activity after rejected coordinator accept = %+v, want none", activity)
+	}
+	select {
+	case req := <-joinReqCh:
+		t.Fatalf("unexpected join request after coordinator identity conflict: %+v", req)
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+func TestESPAcceptFleetInviteRetryKeepsActiveMemberIdempotent(t *testing.T) {
+	ctx := context.Background()
+	id, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	gid := testESPGroupID(93)
+	state := esphttp.NewMemoryStateStore()
+	createFleetForAcceptTest(t, state, gid)
+	const acceptedAt = int64(1_700_000_000_000)
+	if _, err := state.UpsertFleetMember(ctx, esphttp.FleetMemberRecord{
+		FleetID:       "fleet-accept",
+		NodeID:        45491,
+		EntmootPubKey: encodeBase64(id.PublicKey),
+		Hostname:      "laptop",
+		Role:          esphttp.FleetRoleAgent,
+		Status:        esphttp.FleetMemberActive,
+		AcceptedAtMS:  acceptedAt,
+	}); err != nil {
+		t.Fatalf("UpsertFleetMember target: %v", err)
+	}
+	sock := testUnixSocketPath(t)
+	stop := serveESPGroupCreateIPC(t, sock, id.PublicKey, true)
+	defer stop()
+
+	raw, err := espOperationExecutor{
+		dataDir:    t.TempDir(),
+		identity:   id,
+		socketPath: sock,
+		timeout:    time.Second,
+		stateStore: state,
+	}.ExecuteSignRequest(ctx, esphttp.SignRequest{
+		Kind:    "invite_accept",
+		Payload: mustMarshalJSON(t, entmoot.Invite{GroupID: gid}),
+	}, nil)
+	if err != nil {
+		t.Fatalf("ExecuteSignRequest: %v", err)
+	}
+	var result struct {
+		FleetMember esphttp.FleetMemberRecord `json:"fleet_member"`
+	}
+	if err := json.Unmarshal(raw, &result); err != nil {
+		t.Fatalf("unmarshal result: %v", err)
+	}
+	if result.FleetMember.AcceptedAtMS != acceptedAt {
+		t.Fatalf("accepted_at_ms = %d, want preserved %d", result.FleetMember.AcceptedAtMS, acceptedAt)
+	}
+	activity, err := state.ListFleetActivity(ctx, "fleet-accept", 10, 0)
+	if err != nil {
+		t.Fatalf("ListFleetActivity: %v", err)
+	}
+	if len(activity) != 0 {
+		t.Fatalf("activity after retry = %+v, want none", activity)
 	}
 }
 
@@ -2955,6 +3479,51 @@ func serveESPGroupCreateIPC(t *testing.T, sock string, pub []byte, joinOK bool) 
 	}
 }
 
+func serveESPAcceptInviteIPC(t *testing.T, sock string, pub []byte, joinOK bool, joinReqCh chan<- *ipc.JoinGroupReq) func() {
+	t.Helper()
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatalf("listen unix: %v", err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer ln.Close()
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			_, payload, err := ipc.ReadAndDecode(conn)
+			if err != nil {
+				_ = conn.Close()
+				continue
+			}
+			switch v := payload.(type) {
+			case *ipc.InfoReq:
+				_ = v
+				_ = ipc.EncodeAndWrite(conn, &ipc.InfoResp{
+					PilotNodeID:   45491,
+					EntmootPubKey: append([]byte(nil), pub...),
+					Running:       true,
+				})
+			case *ipc.JoinGroupReq:
+				if joinReqCh != nil {
+					joinReqCh <- v
+				}
+				if joinOK {
+					_ = ipc.EncodeAndWrite(conn, &ipc.JoinGroupResp{Status: "joined", GroupID: v.Invite.GroupID, Members: 1})
+				}
+			}
+			_ = conn.Close()
+		}
+	}()
+	return func() {
+		_ = ln.Close()
+		<-done
+	}
+}
+
 func serveESPInviteCreateIPC(t *testing.T, sock string, gid entmoot.GroupID, reqCh chan<- *ipc.InviteCreateReq) func() {
 	t.Helper()
 	ln, err := net.Listen("unix", sock)
@@ -3368,6 +3937,40 @@ func createFleetForTest(t *testing.T, state esphttp.StateStore, fleetID, name st
 		t.Fatalf("UpsertFleetMember: %v", err)
 	}
 	return fleet, coordinator
+}
+
+func createFleetForAcceptTest(t *testing.T, state esphttp.StateStore, controlGroupID entmoot.GroupID) esphttp.FleetRecord {
+	t.Helper()
+	coordinatorID, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate coordinator: %v", err)
+	}
+	coordinator := entmoot.NodeInfo{
+		PilotNodeID:   45460,
+		EntmootPubKey: append([]byte(nil), coordinatorID.PublicKey...),
+	}
+	fleet, err := state.CreateFleet(context.Background(), esphttp.FleetRecord{
+		FleetID:             "fleet-accept",
+		Name:                "Accept Fleet",
+		ControlGroupID:      controlGroupID,
+		Coordinator:         coordinator,
+		CoordinatorDeviceID: "ios-1",
+		CreatedAtMS:         1_700_000_000_000,
+	})
+	if err != nil {
+		t.Fatalf("CreateFleet: %v", err)
+	}
+	if _, err := state.UpsertFleetMember(context.Background(), esphttp.FleetMemberRecord{
+		FleetID:       fleet.FleetID,
+		NodeID:        coordinator.PilotNodeID,
+		EntmootPubKey: encodeBase64(coordinator.EntmootPubKey),
+		Role:          esphttp.FleetRoleCoordinator,
+		Status:        esphttp.FleetMemberActive,
+		AcceptedAtMS:  1_700_000_000_000,
+	}); err != nil {
+		t.Fatalf("UpsertFleetMember: %v", err)
+	}
+	return fleet
 }
 
 func serveESPFleetMemberRemoveIPC(t *testing.T, sock string, gid entmoot.GroupID, reqCh chan<- *ipc.MemberRemoveReq) func() {

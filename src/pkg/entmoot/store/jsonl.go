@@ -238,6 +238,46 @@ func (s *JSONL) Latest(_ context.Context, groupID entmoot.GroupID, limit int) ([
 	return latestMessages(candidates, limit)
 }
 
+// Topics implements MessageStore.Topics.
+func (s *JSONL) Topics(_ context.Context, groupID entmoot.GroupID, limit int) ([]TopicSummary, error) {
+	if limit <= 0 {
+		return []TopicSummary{}, nil
+	}
+	s.mu.RLock()
+	gs := s.groups[groupID]
+	var candidates []entmoot.Message
+	if gs != nil {
+		candidates = make([]entmoot.Message, 0, len(gs.msgs))
+		for _, m := range gs.msgs {
+			candidates = append(candidates, m)
+		}
+	}
+	s.mu.RUnlock()
+
+	return topicSummaries(candidates, limit), nil
+}
+
+// LatestByTopic implements MessageStore.LatestByTopic.
+func (s *JSONL) LatestByTopic(_ context.Context, groupID entmoot.GroupID, topic string, limit int) ([]entmoot.Message, error) {
+	if limit <= 0 || topic == "" {
+		return []entmoot.Message{}, nil
+	}
+	s.mu.RLock()
+	gs := s.groups[groupID]
+	var candidates []entmoot.Message
+	if gs != nil {
+		candidates = make([]entmoot.Message, 0, len(gs.msgs))
+		for _, m := range gs.msgs {
+			if messageHasTopic(m, topic) {
+				candidates = append(candidates, m)
+			}
+		}
+	}
+	s.mu.RUnlock()
+
+	return latestMessages(candidates, limit)
+}
+
 // IterMessageIDsInIDRange implements MessageStore.IterMessageIDsInIDRange.
 // Scans the in-memory index under the read lock, filters by byte-range, and
 // returns byte-sorted ascending. JSONL is test-only, so perf is unimportant.

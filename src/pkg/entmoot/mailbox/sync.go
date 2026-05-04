@@ -36,6 +36,20 @@ type HistoryResult struct {
 	Messages []SyncMessage   `json:"messages"`
 }
 
+// TopicSummary describes one topic's message volume and latest activity.
+type TopicSummary struct {
+	Topic             string `json:"topic"`
+	Count             int    `json:"count"`
+	LatestMessageAtMS int64  `json:"latest_message_at_ms"`
+}
+
+// TopicsResult is returned by read-only topic index APIs.
+type TopicsResult struct {
+	GroupID entmoot.GroupID `json:"group_id"`
+	Count   int             `json:"count"`
+	Topics  []TopicSummary  `json:"topics"`
+}
+
 // AckResult is returned after advancing a mailbox cursor to a message.
 type AckResult struct {
 	ClientID    string            `json:"client_id"`
@@ -106,6 +120,54 @@ func (s *Service) History(ctx context.Context, groupID entmoot.GroupID, limit in
 		GroupID:  groupID,
 		Count:    len(msgs),
 		Messages: MessagesView(msgs),
+	}, nil
+}
+
+// TopicHistory returns the most recent messages in groupID that contain topic.
+func (s *Service) TopicHistory(ctx context.Context, groupID entmoot.GroupID, topic string, limit int) (HistoryResult, error) {
+	if limit <= 0 || topic == "" {
+		return HistoryResult{
+			GroupID:  groupID,
+			Count:    0,
+			Messages: MessagesView(nil),
+		}, nil
+	}
+	msgs, err := s.store.LatestByTopic(ctx, groupID, topic, limit)
+	if err != nil {
+		return HistoryResult{}, err
+	}
+	return HistoryResult{
+		GroupID:  groupID,
+		Count:    len(msgs),
+		Messages: MessagesView(msgs),
+	}, nil
+}
+
+// Topics returns topic aggregates for groupID without touching mailbox cursors.
+func (s *Service) Topics(ctx context.Context, groupID entmoot.GroupID, limit int) (TopicsResult, error) {
+	if limit <= 0 {
+		return TopicsResult{
+			GroupID: groupID,
+			Count:   0,
+			Topics:  []TopicSummary{},
+		}, nil
+	}
+	summaries, err := s.store.Topics(ctx, groupID, limit)
+	if err != nil {
+		return TopicsResult{}, err
+	}
+	topics := make([]TopicSummary, 0, len(summaries))
+	for _, summary := range summaries {
+		topics = append(topics, TopicSummary{
+			Topic:             summary.Topic,
+			Count:             summary.Count,
+			LatestMessageAtMS: summary.LatestMessageAtMS,
+		})
+	}
+	return TopicsResult{
+		GroupID: groupID,
+		Count:   len(topics),
+		Topics:  topics,
 	}, nil
 }
 

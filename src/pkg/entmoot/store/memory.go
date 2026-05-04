@@ -120,6 +120,40 @@ func (s *Memory) Latest(_ context.Context, groupID entmoot.GroupID, limit int) (
 	return latestMessages(candidates, limit)
 }
 
+// Topics implements MessageStore.Topics.
+func (s *Memory) Topics(_ context.Context, groupID entmoot.GroupID, limit int) ([]TopicSummary, error) {
+	if limit <= 0 {
+		return []TopicSummary{}, nil
+	}
+	s.mu.RLock()
+	bucket := s.groups[groupID]
+	candidates := make([]entmoot.Message, 0, len(bucket))
+	for _, m := range bucket {
+		candidates = append(candidates, m)
+	}
+	s.mu.RUnlock()
+
+	return topicSummaries(candidates, limit), nil
+}
+
+// LatestByTopic implements MessageStore.LatestByTopic.
+func (s *Memory) LatestByTopic(_ context.Context, groupID entmoot.GroupID, topic string, limit int) ([]entmoot.Message, error) {
+	if limit <= 0 || topic == "" {
+		return []entmoot.Message{}, nil
+	}
+	s.mu.RLock()
+	bucket := s.groups[groupID]
+	candidates := make([]entmoot.Message, 0, len(bucket))
+	for _, m := range bucket {
+		if messageHasTopic(m, topic) {
+			candidates = append(candidates, m)
+		}
+	}
+	s.mu.RUnlock()
+
+	return latestMessages(candidates, limit)
+}
+
 // IterMessageIDsInIDRange implements MessageStore.IterMessageIDsInIDRange.
 // The bucket is scanned under the read lock; results are sorted after the
 // lock is released.
@@ -189,6 +223,53 @@ func topoOrder(msgs []entmoot.Message) ([]entmoot.Message, error) {
 		}
 	}
 	return out, nil
+}
+
+func topicSummaries(msgs []entmoot.Message, limit int) []TopicSummary {
+	if limit <= 0 || len(msgs) == 0 {
+		return []TopicSummary{}
+	}
+	index := make(map[string]TopicSummary)
+	for _, m := range msgs {
+		for _, topic := range m.Topics {
+			if topic == "" {
+				continue
+			}
+			summary := index[topic]
+			summary.Topic = topic
+			summary.Count++
+			if m.Timestamp > summary.LatestMessageAtMS {
+				summary.LatestMessageAtMS = m.Timestamp
+			}
+			index[topic] = summary
+		}
+	}
+	out := make([]TopicSummary, 0, len(index))
+	for _, summary := range index {
+		out = append(out, summary)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Count != out[j].Count {
+			return out[i].Count > out[j].Count
+		}
+		if out[i].LatestMessageAtMS != out[j].LatestMessageAtMS {
+			return out[i].LatestMessageAtMS > out[j].LatestMessageAtMS
+		}
+		return out[i].Topic < out[j].Topic
+	})
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out
+}
+
+func messageHasTopic(m entmoot.Message, topic string) bool {
+	for _, candidate := range m.Topics {
+		if candidate == topic {
+			return true
+		}
+	}
+	return false
 }
 
 func latestMessages(msgs []entmoot.Message, limit int) ([]entmoot.Message, error) {

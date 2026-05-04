@@ -20,7 +20,7 @@ the installer are live. The design is pinned in
 [`ARCHITECTURE.md`](./ARCHITECTURE.md) and the CLI contract in
 [`docs/CLI_DESIGN.md`](./docs/CLI_DESIGN.md); v1 deliberately ships a
 subset (see [Deferred from v1](#deferred-from-v1)).
-Current release pairing: Entmoot `v1.5.35` with Pilot
+Current release pairing: Entmoot `v1.5.37` with Pilot
 `v1.9.0-jf.15.24`.
 
 What works today:

@@ -382,6 +382,87 @@ func (s *SQLite) Latest(ctx context.Context, groupID entmoot.GroupID, limit int)
 	return topoOrder(candidates)
 }
 
+// Topics implements MessageStore.Topics.
+func (s *SQLite) Topics(ctx context.Context, groupID entmoot.GroupID, limit int) ([]TopicSummary, error) {
+	if limit <= 0 {
+		return []TopicSummary{}, nil
+	}
+	db, err := s.dbFor(groupID)
+	if err != nil {
+		return nil, err
+	}
+
+	rows, err := db.QueryContext(ctx, `
+		SELECT mt.topic, COUNT(*) AS count, MAX(m.timestamp_ms) AS latest_message_at_ms
+		FROM message_topics mt
+		JOIN messages m ON m.message_id = mt.message_id
+		WHERE m.group_id = ?
+		GROUP BY mt.topic
+		ORDER BY count DESC, latest_message_at_ms DESC, mt.topic ASC
+		LIMIT ?;`,
+		groupID[:], limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("store: topics query: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]TopicSummary, 0, limit)
+	for rows.Next() {
+		var summary TopicSummary
+		if err := rows.Scan(&summary.Topic, &summary.Count, &summary.LatestMessageAtMS); err != nil {
+			return nil, fmt.Errorf("store: topics scan: %w", err)
+		}
+		out = append(out, summary)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: topics iterate: %w", err)
+	}
+	return out, nil
+}
+
+// LatestByTopic implements MessageStore.LatestByTopic.
+func (s *SQLite) LatestByTopic(ctx context.Context, groupID entmoot.GroupID, topic string, limit int) ([]entmoot.Message, error) {
+	if limit <= 0 || topic == "" {
+		return []entmoot.Message{}, nil
+	}
+	db, err := s.dbFor(groupID)
+	if err != nil {
+		return nil, err
+	}
+
+	rows, err := db.QueryContext(ctx, `
+		SELECT m.canonical_bytes FROM messages m
+		JOIN message_topics mt ON mt.message_id = m.message_id
+		WHERE m.group_id = ? AND mt.topic = ?
+		ORDER BY m.timestamp_ms DESC, m.author_node_id DESC, m.message_id DESC
+		LIMIT ?;`,
+		groupID[:], topic, limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("store: latest by topic query: %w", err)
+	}
+	defer rows.Close()
+
+	candidates := make([]entmoot.Message, 0, limit)
+	for rows.Next() {
+		var canonBytes []byte
+		if err := rows.Scan(&canonBytes); err != nil {
+			return nil, fmt.Errorf("store: latest by topic scan: %w", err)
+		}
+		msg, err := decodeMessage(canonBytes)
+		if err != nil {
+			return nil, err
+		}
+		candidates = append(candidates, msg)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: latest by topic iterate: %w", err)
+	}
+
+	return topoOrder(candidates)
+}
+
 // IterMessageIDsInIDRange implements MessageStore.IterMessageIDsInIDRange.
 // Uses the PRIMARY KEY index on messages.message_id. Verified via
 // EXPLAIN QUERY PLAN to issue "SEARCH messages USING INTEGER PRIMARY KEY"
