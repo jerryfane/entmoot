@@ -50,11 +50,24 @@ func (c localGroupCatalog) ListGroups(ctx context.Context) ([]esphttp.GroupSumma
 		if err != nil {
 			return nil, err
 		}
-		if ok {
+		if ok && !groupHidden(group.Metadata) {
 			out = append(out, group)
 		}
 	}
 	return out, nil
+}
+
+func groupHidden(meta map[string]interface{}) bool {
+	if meta == nil {
+		return false
+	}
+	if hidden, ok := meta["hidden"].(bool); ok && hidden {
+		return true
+	}
+	if hidden, ok := meta["fleet_control"].(bool); ok && hidden {
+		return true
+	}
+	return false
 }
 
 func (c localGroupCatalog) GetGroup(ctx context.Context, gid entmoot.GroupID) (esphttp.GroupSummary, bool, error) {

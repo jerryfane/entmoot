@@ -122,6 +122,27 @@ type openInviteAcceptPayload struct {
 	Token     string `json:"token"`
 }
 
+type fleetCreatePayload struct {
+	Name string `json:"name"`
+}
+
+type fleetScopedPayload struct {
+	FleetID string `json:"fleet_id"`
+}
+
+type fleetInviteCreatePayload struct {
+	FleetID      string               `json:"fleet_id"`
+	Target       *inviteTargetPayload `json:"target,omitempty"`
+	Hostname     string               `json:"hostname,omitempty"`
+	ValidFor     string               `json:"valid_for,omitempty"`
+	ValidUntilMS int64                `json:"valid_until_ms,omitempty"`
+}
+
+type fleetMemberRemovePayload struct {
+	FleetID string               `json:"fleet_id"`
+	Target  *inviteTargetPayload `json:"target,omitempty"`
+}
+
 type inviteAcceptPayload struct {
 	Invite *entmoot.Invite `json:"invite,omitempty"`
 }
@@ -164,6 +185,12 @@ func (e espOperationExecutor) ExecuteSignRequest(ctx context.Context, req esphtt
 		return e.acceptOpenInvite(ctx, req)
 	case "member_remove":
 		return e.removeMember(ctx, req)
+	case "fleet_create":
+		return e.createFleet(ctx, req)
+	case "fleet_invite_create":
+		return e.createFleetInvite(ctx, req)
+	case "fleet_member_remove":
+		return e.removeFleetMember(ctx, req)
 	case "group_create":
 		return e.createGroup(ctx, req)
 	case "group_update":
@@ -968,6 +995,120 @@ func (e espOperationExecutor) createGroup(ctx context.Context, req esphttp.SignR
 	return result, nil
 }
 
+func (e espOperationExecutor) createFleetControlGroup(ctx context.Context, controlGID entmoot.GroupID, fleetID, name string, founder entmoot.NodeInfo, createdAtMS int64) (entmoot.GroupID, error) {
+	groupPath := groupDirPath(e.dataDir, controlGID)
+	groupPreexisted := pathExists(groupPath)
+	committed := false
+	metadataWritten := false
+	var st *store.SQLite
+	var rlog *roster.RosterLog
+	defer func() {
+		if rlog != nil {
+			_ = rlog.Close()
+		}
+		if st != nil {
+			_ = st.Close()
+		}
+		if committed {
+			return
+		}
+		if metadataWritten && e.metadataStore != nil {
+			if err := e.metadataStore.DeleteGroupMetadata(context.Background(), controlGID); err != nil {
+				slog.Warn("esp fleet_create rollback: delete control group metadata failed", slog.String("group_id", controlGID.String()), slog.String("fleet_id", fleetID), slog.String("err", err.Error()))
+			}
+		}
+		if !groupPreexisted {
+			if err := os.RemoveAll(groupPath); err != nil {
+				slog.Warn("esp fleet_create rollback: remove control group dir failed", slog.String("group_id", controlGID.String()), slog.String("fleet_id", fleetID), slog.String("path", groupPath), slog.String("err", err.Error()))
+			}
+		}
+	}()
+	now := createdAtMS
+	if now == 0 {
+		now = time.Now().UnixMilli()
+	}
+	var err error
+	st, err = store.OpenSQLite(e.dataDir)
+	if err != nil {
+		return entmoot.GroupID{}, err
+	}
+	rlog, err = roster.OpenJSONL(e.dataDir, controlGID)
+	if err != nil {
+		return entmoot.GroupID{}, err
+	}
+	if err := rlog.Genesis(e.identity, founder, now); err != nil {
+		return entmoot.GroupID{}, err
+	}
+	root, err := st.MerkleRoot(ctx, controlGID)
+	if err != nil {
+		return entmoot.GroupID{}, err
+	}
+	if e.metadataStore != nil {
+		meta, err := json.Marshal(map[string]any{
+			"name":          "Fleet Control: " + name,
+			"description":   "Hidden Fleet control channel",
+			"hidden":        true,
+			"fleet_control": true,
+			"fleet_id":      fleetID,
+		})
+		if err != nil {
+			return entmoot.GroupID{}, err
+		}
+		if err := e.metadataStore.SetGroupMetadata(ctx, controlGID, meta); err != nil {
+			return entmoot.GroupID{}, err
+		}
+		metadataWritten = true
+	}
+	invite := entmoot.Invite{
+		GroupID:    controlGID,
+		Founder:    founder,
+		RosterHead: rlog.Head(),
+		MerkleRoot: root,
+		IssuedAt:   now,
+		ValidUntil: now + int64((24*time.Hour)/time.Millisecond),
+		Issuer:     founder,
+	}
+	if err := signInvite(e.identity, &invite); err != nil {
+		return entmoot.GroupID{}, err
+	}
+	if err := rlog.Close(); err != nil {
+		return entmoot.GroupID{}, err
+	}
+	rlog = nil
+	if err := st.Close(); err != nil {
+		return entmoot.GroupID{}, err
+	}
+	st = nil
+	if _, err := e.joinGroup(ctx, invite); err != nil {
+		return entmoot.GroupID{}, err
+	}
+	committed = true
+	return controlGID, nil
+}
+
+func (e espOperationExecutor) appendFleetActivity(ctx context.Context, fleetID, typ string, actor entmoot.NodeInfo, subject *entmoot.NodeInfo, summary string, metadata map[string]any) (esphttp.FleetActivityRecord, error) {
+	if e.stateStore == nil {
+		return esphttp.FleetActivityRecord{}, &esphttp.OperationError{HTTPStatus: http.StatusServiceUnavailable, Code: "fleet_unavailable", Message: "fleet store is not configured"}
+	}
+	var raw json.RawMessage
+	if metadata != nil {
+		data, err := json.Marshal(metadata)
+		if err != nil {
+			return esphttp.FleetActivityRecord{}, err
+		}
+		raw = data
+	}
+	return e.stateStore.AppendFleetActivity(ctx, esphttp.FleetActivityRecord{
+		FleetID:     fleetID,
+		Type:        typ,
+		Actor:       actor,
+		Subject:     subject,
+		Summary:     summary,
+		Metadata:    raw,
+		CreatedAtMS: time.Now().UnixMilli(),
+	})
+}
+
 func (e espOperationExecutor) updateGroup(ctx context.Context, req esphttp.SignRequest) (json.RawMessage, error) {
 	if req.GroupID == (entmoot.GroupID{}) {
 		return nil, &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request", Message: "group_update requires group_id"}
@@ -988,6 +1129,393 @@ func (e espOperationExecutor) updateGroup(ctx context.Context, req esphttp.SignR
 		"group_id": req.GroupID,
 		"metadata": json.RawMessage(metadata),
 	})
+}
+
+func (e espOperationExecutor) createFleet(ctx context.Context, req esphttp.SignRequest) (json.RawMessage, error) {
+	if e.stateStore == nil {
+		return nil, &esphttp.OperationError{HTTPStatus: http.StatusServiceUnavailable, Code: "fleet_unavailable", Message: "fleet store is not configured"}
+	}
+	var payload fleetCreatePayload
+	if err := json.Unmarshal(req.Payload, &payload); err != nil {
+		return nil, &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request", Message: "invalid fleet_create payload"}
+	}
+	name, err := esphttp.NormalizeFleetName(payload.Name)
+	if err != nil {
+		return nil, &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request", Message: err.Error()}
+	}
+	fleetID, err := esphttp.NewFleetID()
+	if err != nil {
+		return nil, err
+	}
+	var controlGID entmoot.GroupID
+	if _, err := rand.Read(controlGID[:]); err != nil {
+		return nil, err
+	}
+	info, err := e.daemonInfo()
+	if err != nil {
+		return nil, joinUnavailableError(err)
+	}
+	coordinator := entmoot.NodeInfo{PilotNodeID: info.PilotNodeID, EntmootPubKey: append([]byte(nil), e.identity.PublicKey...)}
+	now := req.CreatedAtMS
+	if now == 0 {
+		now = time.Now().UnixMilli()
+	}
+	committed := false
+	fleetCreated := false
+	defer func() {
+		if committed || !fleetCreated || e.stateStore == nil {
+			return
+		}
+		if err := e.stateStore.DeleteFleet(context.Background(), fleetID); err != nil {
+			slog.Warn("esp fleet_create rollback: delete fleet state failed", slog.String("fleet_id", fleetID), slog.String("err", err.Error()))
+		}
+	}()
+	fleet, err := e.stateStore.CreateFleet(ctx, esphttp.FleetRecord{
+		FleetID:             fleetID,
+		Name:                name,
+		ControlGroupID:      controlGID,
+		Coordinator:         coordinator,
+		CoordinatorDeviceID: req.DeviceID,
+		CreatedAtMS:         now,
+	})
+	if err != nil {
+		return nil, err
+	}
+	fleetCreated = true
+	_, err = e.stateStore.UpsertFleetMember(ctx, esphttp.FleetMemberRecord{
+		FleetID:       fleet.FleetID,
+		NodeID:        coordinator.PilotNodeID,
+		EntmootPubKey: encodeBase64(coordinator.EntmootPubKey),
+		Role:          esphttp.FleetRoleCoordinator,
+		Status:        esphttp.FleetMemberActive,
+		AcceptedAtMS:  now,
+	})
+	if err != nil {
+		return nil, err
+	}
+	activity, err := e.appendFleetActivity(ctx, fleet.FleetID, "fleet.created", coordinator, nil, "Fleet created", map[string]any{"name": name})
+	if err != nil {
+		return nil, err
+	}
+	if _, err := e.createFleetControlGroup(ctx, controlGID, fleetID, name, coordinator, req.CreatedAtMS); err != nil {
+		return nil, err
+	}
+	committed = true
+	return json.Marshal(map[string]any{"status": "created", "fleet": fleet, "activity": activity})
+}
+
+func (e espOperationExecutor) createFleetInvite(ctx context.Context, req esphttp.SignRequest) (json.RawMessage, error) {
+	if e.stateStore == nil {
+		return nil, &esphttp.OperationError{HTTPStatus: http.StatusServiceUnavailable, Code: "fleet_unavailable", Message: "fleet store is not configured"}
+	}
+	var payload fleetInviteCreatePayload
+	if err := json.Unmarshal(req.Payload, &payload); err != nil {
+		return nil, &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request", Message: "invalid fleet_invite_create payload"}
+	}
+	payload.FleetID = strings.TrimSpace(payload.FleetID)
+	if payload.FleetID == "" {
+		return nil, &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request", Message: "fleet_invite_create requires fleet_id"}
+	}
+	fleet, ok, err := e.stateStore.GetFleet(ctx, payload.FleetID)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, &esphttp.OperationError{HTTPStatus: http.StatusNotFound, Code: "fleet_not_found", Message: "fleet not found"}
+	}
+	if req.DeviceID != "" && fleet.CoordinatorDeviceID != "" && req.DeviceID != fleet.CoordinatorDeviceID {
+		return nil, &esphttp.OperationError{HTTPStatus: http.StatusForbidden, Code: "forbidden", Message: "device is not authorized to manage fleet"}
+	}
+	target, err := validateInviteTarget(payload.Target)
+	if err != nil {
+		return nil, err
+	}
+	if target.PilotNodeID == fleet.Coordinator.PilotNodeID && bytes.Equal(target.EntmootPubKey, fleet.Coordinator.EntmootPubKey) {
+		return nil, &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request", Message: "fleet invite target is already the coordinator"}
+	}
+	members, err := e.stateStore.ListFleetMembers(ctx, fleet.FleetID)
+	if err != nil {
+		return nil, err
+	}
+	if existing, ok := fleetMemberForNode(members, target.PilotNodeID); ok && existing.Status == esphttp.FleetMemberActive {
+		return nil, &esphttp.OperationError{
+			HTTPStatus: http.StatusConflict,
+			Code:       "fleet_member_exists",
+			Message:    "target is already a fleet member",
+		}
+	}
+	prevMember, prevMemberExists := fleetMemberForNode(members, target.PilotNodeID)
+	invites, err := e.stateStore.ListFleetInvites(ctx, fleet.FleetID)
+	if err != nil {
+		return nil, err
+	}
+	var staleInvites []esphttp.FleetInviteRecord
+	for _, invite := range invites {
+		if invite.NodeID == target.PilotNodeID {
+			staleInvites = append(staleInvites, invite)
+		}
+	}
+	var removedStaleInvites []esphttp.FleetInviteRecord
+	memberApplied := false
+	controlInviteApplied := false
+	inviteCreated := false
+	inviteID := ""
+	activityApplied := false
+	activityID := ""
+	committed := false
+	now := time.Now().UnixMilli()
+	defer func() {
+		if committed || e.stateStore == nil {
+			return
+		}
+		if controlInviteApplied {
+			if _, err := e.revokeFleetControlMember(context.Background(), fleet.ControlGroupID, target); err != nil {
+				slog.Warn("esp fleet_invite_create rollback: revoke control invite failed", slog.String("fleet_id", fleet.FleetID), slog.Uint64("node_id", uint64(target.PilotNodeID)), slog.String("err", err.Error()))
+			}
+		}
+		if activityApplied {
+			if err := e.stateStore.DeleteFleetActivity(context.Background(), fleet.FleetID, activityID); err != nil {
+				slog.Warn("esp fleet_invite_create rollback: delete activity failed", slog.String("fleet_id", fleet.FleetID), slog.String("event_id", activityID), slog.String("err", err.Error()))
+			}
+		}
+		if inviteCreated {
+			if err := e.stateStore.DeleteFleetInvite(context.Background(), inviteID); err != nil {
+				slog.Warn("esp fleet_invite_create rollback: delete invite failed", slog.String("fleet_id", fleet.FleetID), slog.String("invite_id", inviteID), slog.String("err", err.Error()))
+			}
+		}
+		if memberApplied {
+			if prevMemberExists {
+				if _, err := e.stateStore.UpsertFleetMember(context.Background(), prevMember); err != nil {
+					slog.Warn("esp fleet_invite_create rollback: restore member failed", slog.String("fleet_id", fleet.FleetID), slog.Uint64("node_id", uint64(target.PilotNodeID)), slog.String("err", err.Error()))
+				}
+			} else {
+				if err := e.stateStore.DeleteFleetMember(context.Background(), fleet.FleetID, target.PilotNodeID); err != nil {
+					slog.Warn("esp fleet_invite_create rollback: delete member failed", slog.String("fleet_id", fleet.FleetID), slog.Uint64("node_id", uint64(target.PilotNodeID)), slog.String("err", err.Error()))
+				}
+			}
+		}
+		for _, invite := range removedStaleInvites {
+			if _, err := e.stateStore.CreateFleetInvite(context.Background(), invite); err != nil {
+				slog.Warn("esp fleet_invite_create rollback: restore stale invite failed", slog.String("fleet_id", fleet.FleetID), slog.String("invite_id", invite.InviteID), slog.String("err", err.Error()))
+			}
+		}
+	}()
+	member, err := e.stateStore.UpsertFleetMember(ctx, esphttp.FleetMemberRecord{
+		FleetID:       fleet.FleetID,
+		NodeID:        target.PilotNodeID,
+		EntmootPubKey: encodeBase64(target.EntmootPubKey),
+		Hostname:      strings.TrimSpace(payload.Hostname),
+		Role:          esphttp.FleetRoleAgent,
+		Status:        esphttp.FleetMemberInvited,
+		InvitedAtMS:   time.Now().UnixMilli(),
+	})
+	if err != nil {
+		return nil, err
+	}
+	memberApplied = true
+	for _, invite := range staleInvites {
+		if err := e.stateStore.DeleteFleetInvite(ctx, invite.InviteID); err != nil {
+			return nil, err
+		}
+		removedStaleInvites = append(removedStaleInvites, invite)
+	}
+	ipcReq, err := buildInviteCreateIPCRequest(fleet.ControlGroupID, inviteCreatePayload{
+		ValidFor:     payload.ValidFor,
+		ValidUntilMS: payload.ValidUntilMS,
+		Target:       payload.Target,
+	})
+	if err != nil {
+		return nil, err
+	}
+	resp, err := e.createInviteOverIPC(ctx, ipcReq)
+	if err != nil {
+		if resp != nil && resp.sent && !resp.rejected {
+			controlInviteApplied = true
+		}
+		return nil, err
+	}
+	controlInviteApplied = true
+	inviteRaw, err := json.Marshal(resp.Invite)
+	if err != nil {
+		return nil, err
+	}
+	invite, err := e.stateStore.CreateFleetInvite(ctx, esphttp.FleetInviteRecord{
+		FleetID:       fleet.FleetID,
+		NodeID:        target.PilotNodeID,
+		EntmootPubKey: encodeBase64(target.EntmootPubKey),
+		Hostname:      strings.TrimSpace(payload.Hostname),
+		Status:        esphttp.FleetMemberInvited,
+		Invite:        inviteRaw,
+		CreatedAtMS:   now,
+		ExpiresAtMS:   resp.Invite.ValidUntil,
+	})
+	if err != nil {
+		return nil, err
+	}
+	inviteCreated = true
+	inviteID = invite.InviteID
+	activity, err := e.appendFleetActivity(ctx, fleet.FleetID, "member.invited", fleet.Coordinator, &target, "Agent invited to Fleet", map[string]any{"hostname": payload.Hostname})
+	if err != nil {
+		return nil, err
+	}
+	activityApplied = true
+	activityID = activity.EventID
+	committed = true
+	return json.Marshal(map[string]any{"status": "invited", "fleet": fleet, "member": member, "invite": invite, "activity": activity})
+}
+
+func (e espOperationExecutor) removeFleetMember(ctx context.Context, req esphttp.SignRequest) (json.RawMessage, error) {
+	if e.stateStore == nil {
+		return nil, &esphttp.OperationError{HTTPStatus: http.StatusServiceUnavailable, Code: "fleet_unavailable", Message: "fleet store is not configured"}
+	}
+	var payload fleetMemberRemovePayload
+	if err := json.Unmarshal(req.Payload, &payload); err != nil {
+		return nil, &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request", Message: "invalid fleet_member_remove payload"}
+	}
+	payload.FleetID = strings.TrimSpace(payload.FleetID)
+	if payload.FleetID == "" {
+		return nil, &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request", Message: "fleet_member_remove requires fleet_id"}
+	}
+	fleet, ok, err := e.stateStore.GetFleet(ctx, payload.FleetID)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, &esphttp.OperationError{HTTPStatus: http.StatusNotFound, Code: "fleet_not_found", Message: "fleet not found"}
+	}
+	if req.DeviceID != "" && fleet.CoordinatorDeviceID != "" && req.DeviceID != fleet.CoordinatorDeviceID {
+		return nil, &esphttp.OperationError{HTTPStatus: http.StatusForbidden, Code: "forbidden", Message: "device is not authorized to manage fleet"}
+	}
+	target, err := validateInviteTargetForRemove(payload.Target)
+	if err != nil {
+		return nil, err
+	}
+	members, err := e.stateStore.ListFleetMembers(ctx, fleet.FleetID)
+	if err != nil {
+		return nil, err
+	}
+	prevMember, prevMemberExists := fleetMemberForNode(members, target.PilotNodeID)
+	if !prevMemberExists {
+		return nil, &esphttp.OperationError{
+			HTTPStatus: http.StatusNotFound,
+			Code:       "not_member",
+			Message:    "target is not a fleet member",
+		}
+	}
+	if prevMember.Role == esphttp.FleetRoleCoordinator || target.PilotNodeID == fleet.Coordinator.PilotNodeID {
+		return nil, &esphttp.OperationError{
+			HTTPStatus: http.StatusBadRequest,
+			Code:       "bad_request",
+			Message:    "cannot remove fleet coordinator",
+		}
+	}
+	storedPub, err := base64.StdEncoding.DecodeString(prevMember.EntmootPubKey)
+	if err != nil || !bytes.Equal(storedPub, target.EntmootPubKey) {
+		return nil, &esphttp.OperationError{
+			HTTPStatus: http.StatusConflict,
+			Code:       "member_identity_conflict",
+			Message:    "target identity does not match fleet member",
+		}
+	}
+	invites, err := e.stateStore.ListFleetInvites(ctx, fleet.FleetID)
+	if err != nil {
+		return nil, err
+	}
+	var deletedInvites []esphttp.FleetInviteRecord
+	for _, invite := range invites {
+		if invite.NodeID == target.PilotNodeID {
+			deletedInvites = append(deletedInvites, invite)
+		}
+	}
+	var removedInvites []esphttp.FleetInviteRecord
+	if prevMember.Status == esphttp.FleetMemberRemoved {
+		for _, invite := range deletedInvites {
+			if err := e.stateStore.DeleteFleetInvite(ctx, invite.InviteID); err != nil {
+				for _, removed := range removedInvites {
+					if _, restoreErr := e.stateStore.CreateFleetInvite(context.Background(), removed); restoreErr != nil {
+						slog.Warn("esp fleet_member_remove already-removed rollback: restore invite failed", slog.String("fleet_id", fleet.FleetID), slog.String("invite_id", removed.InviteID), slog.String("err", restoreErr.Error()))
+					}
+				}
+				return nil, err
+			}
+			removedInvites = append(removedInvites, invite)
+		}
+		return json.Marshal(map[string]any{
+			"status":   "removed",
+			"fleet":    fleet,
+			"member":   prevMember,
+			"activity": nil,
+		})
+	}
+	memberApplied := false
+	activityApplied := false
+	activityID := ""
+	committed := false
+	defer func() {
+		if committed || e.stateStore == nil || !memberApplied {
+			return
+		}
+		if activityApplied {
+			if err := e.stateStore.DeleteFleetActivity(context.Background(), fleet.FleetID, activityID); err != nil {
+				slog.Warn("esp fleet_member_remove rollback: delete activity failed", slog.String("fleet_id", fleet.FleetID), slog.String("event_id", activityID), slog.String("err", err.Error()))
+			}
+		}
+		if prevMemberExists {
+			if _, err := e.stateStore.UpsertFleetMember(context.Background(), prevMember); err != nil {
+				slog.Warn("esp fleet_member_remove rollback: restore member failed", slog.String("fleet_id", fleet.FleetID), slog.Uint64("node_id", uint64(target.PilotNodeID)), slog.String("err", err.Error()))
+			}
+		} else {
+			if err := e.stateStore.DeleteFleetMember(context.Background(), fleet.FleetID, target.PilotNodeID); err != nil {
+				slog.Warn("esp fleet_member_remove rollback: delete member failed", slog.String("fleet_id", fleet.FleetID), slog.Uint64("node_id", uint64(target.PilotNodeID)), slog.String("err", err.Error()))
+			}
+		}
+		for _, invite := range removedInvites {
+			if _, err := e.stateStore.CreateFleetInvite(context.Background(), invite); err != nil {
+				slog.Warn("esp fleet_member_remove rollback: restore invite failed", slog.String("fleet_id", fleet.FleetID), slog.String("invite_id", invite.InviteID), slog.String("err", err.Error()))
+			}
+		}
+	}()
+	member, err := e.stateStore.UpsertFleetMember(ctx, esphttp.FleetMemberRecord{
+		FleetID:       fleet.FleetID,
+		NodeID:        target.PilotNodeID,
+		EntmootPubKey: encodeBase64(target.EntmootPubKey),
+		Role:          esphttp.FleetRoleAgent,
+		Status:        esphttp.FleetMemberRemoved,
+		RemovedAtMS:   time.Now().UnixMilli(),
+	})
+	if err != nil {
+		return nil, err
+	}
+	memberApplied = true
+	for _, invite := range deletedInvites {
+		if err := e.stateStore.DeleteFleetInvite(ctx, invite.InviteID); err != nil {
+			return nil, err
+		}
+		removedInvites = append(removedInvites, invite)
+	}
+	activity, err := e.appendFleetActivity(ctx, fleet.FleetID, "member.removed", fleet.Coordinator, &target, "Agent removed from Fleet", nil)
+	if err != nil {
+		return nil, err
+	}
+	activityApplied = true
+	activityID = activity.EventID
+	removeResp, err := e.revokeFleetControlMember(ctx, fleet.ControlGroupID, target)
+	if err != nil {
+		if removeResp != nil && removeResp.sent && !removeResp.rejected {
+			committed = true
+		}
+		return nil, err
+	}
+	committed = true
+	return json.Marshal(map[string]any{"status": "removed", "fleet": fleet, "member": member, "activity": activity})
+}
+
+func (e espOperationExecutor) revokeFleetControlMember(ctx context.Context, groupID entmoot.GroupID, target entmoot.NodeInfo) (*memberRemoveIPCResult, error) {
+	resp, err := e.removeMemberOverIPC(ctx, &ipc.MemberRemoveReq{GroupID: groupID, Target: target})
+	if err != nil && operationErrorCode(err) == "not_member" {
+		return resp, nil
+	}
+	return resp, err
 }
 
 type memberRemovePayload struct {
@@ -1057,6 +1585,15 @@ func buildInviteCreateIPCRequest(gid entmoot.GroupID, payload inviteCreatePayloa
 		ValidUntilMS:         payload.ValidUntilMS,
 		BootstrapPeers:       peers,
 	}, nil
+}
+
+func fleetMemberForNode(members []esphttp.FleetMemberRecord, nodeID entmoot.NodeID) (esphttp.FleetMemberRecord, bool) {
+	for _, member := range members {
+		if member.NodeID == nodeID {
+			return member, true
+		}
+	}
+	return esphttp.FleetMemberRecord{}, false
 }
 
 func validateInviteTarget(target *inviteTargetPayload) (entmoot.NodeInfo, error) {
@@ -1250,6 +1787,12 @@ type inviteCreateIPCResult struct {
 	rejected bool
 }
 
+type memberRemoveIPCResult struct {
+	*ipc.MemberRemoveResp
+	sent     bool
+	rejected bool
+}
+
 func (e espOperationExecutor) createInviteOverIPC(ctx context.Context, req *ipc.InviteCreateReq) (*inviteCreateIPCResult, error) {
 	timeout := e.timeout
 	if timeout <= 0 {
@@ -1324,7 +1867,7 @@ func (e espOperationExecutor) checkInviteAuthorityOverIPC(ctx context.Context, r
 	}
 }
 
-func (e espOperationExecutor) removeMemberOverIPC(ctx context.Context, req *ipc.MemberRemoveReq) (*ipc.MemberRemoveResp, error) {
+func (e espOperationExecutor) removeMemberOverIPC(ctx context.Context, req *ipc.MemberRemoveReq) (*memberRemoveIPCResult, error) {
 	timeout := e.timeout
 	if timeout <= 0 {
 		timeout = 30 * time.Second
@@ -1334,26 +1877,34 @@ func (e espOperationExecutor) removeMemberOverIPC(ctx context.Context, req *ipc.
 	var dialer net.Dialer
 	conn, err := dialer.DialContext(dialCtx, "unix", e.socketPath)
 	if err != nil {
-		return nil, joinUnavailableError(err)
+		return &memberRemoveIPCResult{}, joinUnavailableError(err)
 	}
 	defer conn.Close()
 	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
-		return nil, err
+		return &memberRemoveIPCResult{}, err
 	}
-	if err := ipc.EncodeAndWrite(conn, req); err != nil {
-		return nil, err
+	t, body, err := ipc.Encode(req)
+	if err != nil {
+		return &memberRemoveIPCResult{}, err
 	}
+	result := &memberRemoveIPCResult{}
+	if err := ipc.WriteFrame(conn, t, body); err != nil {
+		return result, err
+	}
+	result.sent = true
 	_, payload, err := ipc.ReadAndDecode(conn)
 	if err != nil {
-		return nil, err
+		return result, err
 	}
 	switch v := payload.(type) {
 	case *ipc.MemberRemoveResp:
-		return v, nil
+		result.MemberRemoveResp = v
+		return result, nil
 	case *ipc.ErrorFrame:
-		return nil, operationIPCError(v)
+		result.rejected = true
+		return result, operationIPCError(v)
 	default:
-		return nil, fmt.Errorf("unexpected member remove response %T", payload)
+		return result, fmt.Errorf("unexpected member remove response %T", payload)
 	}
 }
 
@@ -1555,4 +2106,12 @@ func operationIPCError(frame *ipc.ErrorFrame) error {
 		status = http.StatusInternalServerError
 	}
 	return &esphttp.OperationError{HTTPStatus: status, Code: code, Message: frame.Message}
+}
+
+func operationErrorCode(err error) string {
+	var opErr *esphttp.OperationError
+	if errors.As(err, &opErr) && opErr != nil {
+		return opErr.Code
+	}
+	return ""
 }

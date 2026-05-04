@@ -376,6 +376,131 @@ func TestHandlerOpenInviteListAndRevoke(t *testing.T) {
 	}
 }
 
+func TestHandlerFleetReadsRequireCoordinatorDevice(t *testing.T) {
+	gid := testGroupID(1)
+	_, coordinatorPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey coordinator: %v", err)
+	}
+	_, otherPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey other: %v", err)
+	}
+	reg, err := NewDeviceRegistry([]Device{
+		{ID: "ios-1-device", PublicKey: coordinatorPriv.Public().(ed25519.PublicKey), ClientIDs: []string{"ios-1"}},
+		{ID: "other-device", PublicKey: otherPriv.Public().(ed25519.PublicKey), ClientIDs: []string{"other"}},
+	})
+	if err != nil {
+		t.Fatalf("NewDeviceRegistry: %v", err)
+	}
+	state := NewMemoryStateStore()
+	coordinator := entmoot.NodeInfo{PilotNodeID: 45491, EntmootPubKey: []byte("coordinator")}
+	if _, err := state.CreateFleet(context.Background(), FleetRecord{
+		FleetID:             "fleet-a",
+		Name:                "Fleet A",
+		Coordinator:         coordinator,
+		CoordinatorDeviceID: "ios-1-device",
+		CreatedAtMS:         1,
+	}); err != nil {
+		t.Fatalf("CreateFleet fleet-a: %v", err)
+	}
+	if _, err := state.CreateFleet(context.Background(), FleetRecord{
+		FleetID:             "fleet-b",
+		Name:                "Fleet B",
+		Coordinator:         entmoot.NodeInfo{PilotNodeID: 45492, EntmootPubKey: []byte("other")},
+		CoordinatorDeviceID: "other-device",
+		CreatedAtMS:         2,
+	}); err != nil {
+		t.Fatalf("CreateFleet fleet-b: %v", err)
+	}
+	if _, err := state.CreateFleetInvite(context.Background(), FleetInviteRecord{
+		InviteID:      "invite-a",
+		FleetID:       "fleet-a",
+		NodeID:        45493,
+		EntmootPubKey: base64.StdEncoding.EncodeToString([]byte("invitee")),
+		Status:        FleetMemberInvited,
+		Invite:        json.RawMessage(`{"secret":"control-group-invite"}`),
+		CreatedAtMS:   3,
+	}); err != nil {
+		t.Fatalf("CreateFleetInvite: %v", err)
+	}
+	if _, err := state.UpsertFleetMember(context.Background(), FleetMemberRecord{
+		FleetID:       "fleet-a",
+		NodeID:        45491,
+		EntmootPubKey: base64.StdEncoding.EncodeToString(coordinator.EntmootPubKey),
+		Role:          FleetRoleCoordinator,
+		Status:        FleetMemberActive,
+	}); err != nil {
+		t.Fatalf("UpsertFleetMember: %v", err)
+	}
+	if _, err := state.AppendFleetActivity(context.Background(), FleetActivityRecord{
+		FleetID:     "fleet-a",
+		Type:        "fleet.created",
+		Actor:       coordinator,
+		Summary:     "Fleet created",
+		CreatedAtMS: 4,
+	}); err != nil {
+		t.Fatalf("AppendFleetActivity: %v", err)
+	}
+	handler := testMobileHandlerFull(t, gid, reg, nil, func() time.Time { return time.UnixMilli(10_000) }, nil, state, nil)
+
+	list := doSignedJSONRequest[struct {
+		Fleets []FleetRecord `json:"fleets"`
+	}](t, handler, coordinatorPriv, http.MethodGet, "/v1/fleets", nil, http.StatusOK, 10_000, "nonce-fleet-list")
+	if len(list.Fleets) != 1 || list.Fleets[0].FleetID != "fleet-a" {
+		t.Fatalf("coordinator fleets = %+v, want only fleet-a", list.Fleets)
+	}
+	invites := doSignedJSONRequest[struct {
+		Invites []FleetInviteRecord `json:"invites"`
+	}](t, handler, coordinatorPriv, http.MethodGet, "/v1/fleets/fleet-a/invites", nil, http.StatusOK, 10_001, "nonce-fleet-invites")
+	if len(invites.Invites) != 1 || !bytes.Contains(invites.Invites[0].Invite, []byte("control-group-invite")) {
+		t.Fatalf("coordinator invites = %+v", invites.Invites)
+	}
+	members := doSignedJSONRequest[struct {
+		Members []FleetMemberRecord `json:"members"`
+	}](t, handler, coordinatorPriv, http.MethodGet, "/v1/fleets/fleet-a/members", nil, http.StatusOK, 10_002, "nonce-fleet-members")
+	if len(members.Members) != 1 || members.Members[0].NodeID != 45491 {
+		t.Fatalf("coordinator members = %+v", members.Members)
+	}
+	activity := doSignedJSONRequest[struct {
+		Activity []FleetActivityRecord `json:"activity"`
+	}](t, handler, coordinatorPriv, http.MethodGet, "/v1/fleets/fleet-a/activity", nil, http.StatusOK, 10_003, "nonce-fleet-activity")
+	if len(activity.Activity) != 1 || activity.Activity[0].Type != "fleet.created" {
+		t.Fatalf("coordinator activity = %+v", activity.Activity)
+	}
+
+	otherList := doSignedJSONRequestFor[struct {
+		Fleets []FleetRecord `json:"fleets"`
+	}](t, handler, "other-device", otherPriv, http.MethodGet, "/v1/fleets", nil, http.StatusOK, 10_004, "nonce-other-list")
+	if len(otherList.Fleets) != 1 || otherList.Fleets[0].FleetID != "fleet-b" {
+		t.Fatalf("other fleets = %+v, want only fleet-b", otherList.Fleets)
+	}
+	errResp := doSignedJSONRequestFor[errorEnvelope](t, handler, "other-device", otherPriv, http.MethodGet, "/v1/fleets/fleet-a/invites", nil, http.StatusForbidden, 10_005, "nonce-other-invites")
+	if errResp.Error.Code != "forbidden" {
+		t.Fatalf("other invite error code = %q, want forbidden", errResp.Error.Code)
+	}
+}
+
+func TestHandlerFleetReadsRejectBearerOnly(t *testing.T) {
+	gid := testGroupID(1)
+	state := NewMemoryStateStore()
+	if _, err := state.CreateFleet(context.Background(), FleetRecord{
+		FleetID:             "fleet-a",
+		Name:                "Fleet A",
+		Coordinator:         entmoot.NodeInfo{PilotNodeID: 45491, EntmootPubKey: []byte("coordinator")},
+		CoordinatorDeviceID: "ios-1-device",
+		CreatedAtMS:         1,
+	}); err != nil {
+		t.Fatalf("CreateFleet: %v", err)
+	}
+	handler := testMobileHandlerFull(t, gid, nil, nil, func() time.Time { return time.UnixMilli(10_000) }, nil, state, nil)
+
+	errResp := doJSONRequest[errorEnvelope](t, handler, http.MethodGet, "/v1/fleets", nil, http.StatusForbidden)
+	if errResp.Error.Code != "device_signature_required" {
+		t.Fatalf("bearer fleet list error code = %q, want device_signature_required", errResp.Error.Code)
+	}
+}
+
 func TestHandlerGroupDiagnostics(t *testing.T) {
 	gid := testGroupID(1)
 	diagnostics := &fakeDiagnostics{result: map[string]any{
@@ -1471,6 +1596,11 @@ func authedRequest(method, path string, body *bytes.Reader) *http.Request {
 
 func signedDeviceRequest(t *testing.T, priv ed25519.PrivateKey, method, path string, body any, timestampMillis int64, nonce string) *http.Request {
 	t.Helper()
+	return signedDeviceRequestFor(t, "ios-1-device", priv, method, path, body, timestampMillis, nonce)
+}
+
+func signedDeviceRequestFor(t *testing.T, deviceID string, priv ed25519.PrivateKey, method, path string, body any, timestampMillis int64, nonce string) *http.Request {
+	t.Helper()
 	var data []byte
 	if body != nil {
 		var err error
@@ -1482,7 +1612,7 @@ func signedDeviceRequest(t *testing.T, priv ed25519.PrivateKey, method, path str
 	req := httptest.NewRequest(method, path, bytes.NewReader(data))
 	input := DeviceSigningInput(method, req.URL.RequestURI(), timestampMillis, nonce, data)
 	sig := ed25519.Sign(priv, []byte(input))
-	req.Header.Set(deviceIDHeader, "ios-1-device")
+	req.Header.Set(deviceIDHeader, deviceID)
 	req.Header.Set(timestampHeader, strconv.FormatInt(timestampMillis, 10))
 	req.Header.Set(nonceHeader, nonce)
 	req.Header.Set(signatureHeader, base64.StdEncoding.EncodeToString(sig))
@@ -1492,6 +1622,21 @@ func signedDeviceRequest(t *testing.T, priv ed25519.PrivateKey, method, path str
 func doSignedJSONRequest[T any](t *testing.T, handler http.Handler, priv ed25519.PrivateKey, method, path string, body any, wantStatus int, timestampMillis int64, nonce string) T {
 	t.Helper()
 	req := signedDeviceRequest(t, priv, method, path, body, timestampMillis, nonce)
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+	if resp.Code != wantStatus {
+		t.Fatalf("%s %s status = %d, want %d\nbody=%s", method, path, resp.Code, wantStatus, resp.Body.String())
+	}
+	var out T
+	if err := json.Unmarshal(resp.Body.Bytes(), &out); err != nil {
+		t.Fatalf("Unmarshal response: %v\n%s", err, resp.Body.String())
+	}
+	return out
+}
+
+func doSignedJSONRequestFor[T any](t *testing.T, handler http.Handler, deviceID string, priv ed25519.PrivateKey, method, path string, body any, wantStatus int, timestampMillis int64, nonce string) T {
+	t.Helper()
+	req := signedDeviceRequestFor(t, deviceID, priv, method, path, body, timestampMillis, nonce)
 	resp := httptest.NewRecorder()
 	handler.ServeHTTP(resp, req)
 	if resp.Code != wantStatus {

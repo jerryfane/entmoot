@@ -3,6 +3,7 @@ package esphttp
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"net/url"
@@ -64,6 +65,58 @@ func TestSQLiteStateStorePersistsMobileState(t *testing.T) {
 	if state.PushToken != "token-1" || len(state.NotificationPreferences.Topics) != 1 ||
 		state.NotificationPreferences.Topics[0] != "ops/#" {
 		t.Fatalf("device state after reopen = %+v", state)
+	}
+}
+
+func TestSQLiteStateStoreResetsFleetMemberTimestampsOnReinvite(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenSQLiteStateStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenSQLiteStateStore: %v", err)
+	}
+	defer store.Close()
+
+	pubkey := base64.StdEncoding.EncodeToString([]byte("agent-pubkey"))
+	if _, err := store.UpsertFleetMember(ctx, FleetMemberRecord{
+		FleetID:       "fleet-a",
+		NodeID:        45460,
+		EntmootPubKey: pubkey,
+		Role:          FleetRoleAgent,
+		Status:        FleetMemberActive,
+		AcceptedAtMS:  1_700_000_000_000,
+	}); err != nil {
+		t.Fatalf("Upsert active member: %v", err)
+	}
+	if _, err := store.UpsertFleetMember(ctx, FleetMemberRecord{
+		FleetID:       "fleet-a",
+		NodeID:        45460,
+		EntmootPubKey: pubkey,
+		Role:          FleetRoleAgent,
+		Status:        FleetMemberRemoved,
+		RemovedAtMS:   1_700_000_001_000,
+	}); err != nil {
+		t.Fatalf("Upsert removed member: %v", err)
+	}
+	if _, err := store.UpsertFleetMember(ctx, FleetMemberRecord{
+		FleetID:       "fleet-a",
+		NodeID:        45460,
+		EntmootPubKey: pubkey,
+		Role:          FleetRoleAgent,
+		Status:        FleetMemberInvited,
+		InvitedAtMS:   1_700_000_002_000,
+	}); err != nil {
+		t.Fatalf("Upsert invited member: %v", err)
+	}
+	members, err := store.ListFleetMembers(ctx, "fleet-a")
+	if err != nil {
+		t.Fatalf("ListFleetMembers: %v", err)
+	}
+	if len(members) != 1 {
+		t.Fatalf("members = %+v, want one member", members)
+	}
+	got := members[0]
+	if got.Status != FleetMemberInvited || got.InvitedAtMS != 1_700_000_002_000 || got.AcceptedAtMS != 0 || got.RemovedAtMS != 0 {
+		t.Fatalf("reinvited member = %+v, want invited with stale timestamps reset", got)
 	}
 }
 

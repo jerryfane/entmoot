@@ -78,6 +78,8 @@ func run() int {
 		fmt.Fprintln(os.Stderr, "                          SQLite backfill + live subscription from the control socket.")
 		fmt.Fprintln(os.Stderr, "  info                    Print a JSON snapshot (reads SQLite directly).")
 		fmt.Fprintln(os.Stderr, "  query -group GID [...]  Historical SQLite query with JSON-line output.")
+		fmt.Fprintln(os.Stderr, "  fleet <list|info|activity>")
+		fmt.Fprintln(os.Stderr, "                          Inspect local Fleet control-plane state.")
 		fmt.Fprintln(os.Stderr, "  mailbox <pull|ack|cursor>")
 		fmt.Fprintln(os.Stderr, "                          Local ESP mailbox sync cursor commands.")
 		fmt.Fprintln(os.Stderr, "  esp serve               Serve the local ESP mailbox HTTP API.")
@@ -171,6 +173,8 @@ func run() int {
 		return cmdInfo(gf, args[1:])
 	case "query":
 		return cmdQuery(gf, args[1:])
+	case "fleet":
+		return cmdFleet(gf, args[1:])
 	case "mailbox":
 		return cmdMailbox(gf, args[1:])
 	case "esp":

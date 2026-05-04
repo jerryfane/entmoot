@@ -201,6 +201,19 @@ type StateStore interface {
 	CreateOrReuseOpenInviteChallenge(context.Context, OpenInviteChallenge, int, int64) (OpenInviteChallenge, error)
 	GetOpenInviteChallenge(context.Context, string) (OpenInviteChallenge, bool, error)
 	ConsumeOpenInviteChallenge(context.Context, string, int64) (OpenInviteChallenge, error)
+	CreateFleet(context.Context, FleetRecord) (FleetRecord, error)
+	ListFleets(context.Context) ([]FleetRecord, error)
+	GetFleet(context.Context, string) (FleetRecord, bool, error)
+	DeleteFleet(context.Context, string) error
+	UpsertFleetMember(context.Context, FleetMemberRecord) (FleetMemberRecord, error)
+	ListFleetMembers(context.Context, string) ([]FleetMemberRecord, error)
+	DeleteFleetMember(context.Context, string, entmoot.NodeID) error
+	CreateFleetInvite(context.Context, FleetInviteRecord) (FleetInviteRecord, error)
+	ListFleetInvites(context.Context, string) ([]FleetInviteRecord, error)
+	DeleteFleetInvite(context.Context, string) error
+	AppendFleetActivity(context.Context, FleetActivityRecord) (FleetActivityRecord, error)
+	ListFleetActivity(context.Context, string, int, int64) ([]FleetActivityRecord, error)
+	DeleteFleetActivity(context.Context, string, string) error
 	Close() error
 }
 
@@ -223,27 +236,35 @@ var (
 
 // MemoryStateStore is useful for tests and dev-mode ESP handlers.
 type MemoryStateStore struct {
-	mu       sync.Mutex
-	requests map[string]SignRequest
-	devices  map[string]DeviceState
-	idem     map[string]IdempotencyRecord
-	groups   map[entmoot.GroupID]json.RawMessage
-	invites  map[string]OpenInviteRecord
-	redeems  map[string]map[string]OpenInviteRedemption
-	chals    map[string]OpenInviteChallenge
-	clock    func() time.Time
+	mu            sync.Mutex
+	requests      map[string]SignRequest
+	devices       map[string]DeviceState
+	idem          map[string]IdempotencyRecord
+	groups        map[entmoot.GroupID]json.RawMessage
+	invites       map[string]OpenInviteRecord
+	redeems       map[string]map[string]OpenInviteRedemption
+	chals         map[string]OpenInviteChallenge
+	fleets        map[string]FleetRecord
+	fleetMembers  map[string]map[entmoot.NodeID]FleetMemberRecord
+	fleetInvites  map[string][]FleetInviteRecord
+	fleetActivity map[string][]FleetActivityRecord
+	clock         func() time.Time
 }
 
 func NewMemoryStateStore() *MemoryStateStore {
 	return &MemoryStateStore{
-		requests: make(map[string]SignRequest),
-		devices:  make(map[string]DeviceState),
-		idem:     make(map[string]IdempotencyRecord),
-		groups:   make(map[entmoot.GroupID]json.RawMessage),
-		invites:  make(map[string]OpenInviteRecord),
-		redeems:  make(map[string]map[string]OpenInviteRedemption),
-		chals:    make(map[string]OpenInviteChallenge),
-		clock:    time.Now,
+		requests:      make(map[string]SignRequest),
+		devices:       make(map[string]DeviceState),
+		idem:          make(map[string]IdempotencyRecord),
+		groups:        make(map[entmoot.GroupID]json.RawMessage),
+		invites:       make(map[string]OpenInviteRecord),
+		redeems:       make(map[string]map[string]OpenInviteRedemption),
+		chals:         make(map[string]OpenInviteChallenge),
+		fleets:        make(map[string]FleetRecord),
+		fleetMembers:  make(map[string]map[entmoot.NodeID]FleetMemberRecord),
+		fleetInvites:  make(map[string][]FleetInviteRecord),
+		fleetActivity: make(map[string][]FleetActivityRecord),
+		clock:         time.Now,
 	}
 }
 
@@ -630,6 +651,214 @@ func (s *MemoryStateStore) DeleteGroupMetadata(_ context.Context, groupID entmoo
 	return nil
 }
 
+func (s *MemoryStateStore) CreateFleet(_ context.Context, rec FleetRecord) (FleetRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := s.nowMS()
+	if rec.FleetID == "" {
+		var err error
+		rec.FleetID, err = NewFleetID()
+		if err != nil {
+			return FleetRecord{}, err
+		}
+	}
+	if rec.CreatedAtMS == 0 {
+		rec.CreatedAtMS = now
+	}
+	rec.UpdatedAtMS = now
+	s.fleets[rec.FleetID] = cloneFleetRecord(rec)
+	return cloneFleetRecord(rec), nil
+}
+
+func (s *MemoryStateStore) ListFleets(_ context.Context) ([]FleetRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]FleetRecord, 0, len(s.fleets))
+	for _, rec := range s.fleets {
+		out = append(out, cloneFleetRecord(rec))
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].CreatedAtMS == out[j].CreatedAtMS {
+			return out[i].FleetID < out[j].FleetID
+		}
+		return out[i].CreatedAtMS > out[j].CreatedAtMS
+	})
+	return out, nil
+}
+
+func (s *MemoryStateStore) GetFleet(_ context.Context, fleetID string) (FleetRecord, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rec, ok := s.fleets[fleetID]
+	return cloneFleetRecord(rec), ok, nil
+}
+
+func (s *MemoryStateStore) DeleteFleet(_ context.Context, fleetID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.fleets, fleetID)
+	delete(s.fleetMembers, fleetID)
+	delete(s.fleetInvites, fleetID)
+	delete(s.fleetActivity, fleetID)
+	return nil
+}
+
+func (s *MemoryStateStore) UpsertFleetMember(_ context.Context, rec FleetMemberRecord) (FleetMemberRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.fleetMembers[rec.FleetID] == nil {
+		s.fleetMembers[rec.FleetID] = make(map[entmoot.NodeID]FleetMemberRecord)
+	}
+	rec.Role = NormalizeFleetMemberRole(rec.Role)
+	rec.Status = NormalizeFleetMemberStatus(rec.Status)
+	rec.UpdatedAtMS = s.nowMS()
+	s.fleetMembers[rec.FleetID][rec.NodeID] = cloneFleetMemberRecord(rec)
+	return cloneFleetMemberRecord(rec), nil
+}
+
+func (s *MemoryStateStore) ListFleetMembers(_ context.Context, fleetID string) ([]FleetMemberRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	members := s.fleetMembers[fleetID]
+	out := make([]FleetMemberRecord, 0, len(members))
+	for _, rec := range members {
+		out = append(out, cloneFleetMemberRecord(rec))
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Role != out[j].Role {
+			return out[i].Role == FleetRoleCoordinator
+		}
+		return out[i].NodeID < out[j].NodeID
+	})
+	return out, nil
+}
+
+func (s *MemoryStateStore) DeleteFleetMember(_ context.Context, fleetID string, nodeID entmoot.NodeID) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if members := s.fleetMembers[fleetID]; members != nil {
+		delete(members, nodeID)
+		if len(members) == 0 {
+			delete(s.fleetMembers, fleetID)
+		}
+	}
+	return nil
+}
+
+func (s *MemoryStateStore) CreateFleetInvite(_ context.Context, rec FleetInviteRecord) (FleetInviteRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := s.nowMS()
+	if rec.InviteID == "" {
+		var err error
+		rec.InviteID, err = NewFleetInviteID()
+		if err != nil {
+			return FleetInviteRecord{}, err
+		}
+	}
+	if rec.CreatedAtMS == 0 {
+		rec.CreatedAtMS = now
+	}
+	rec.UpdatedAtMS = now
+	rec.Status = strings.TrimSpace(rec.Status)
+	if rec.Status == "" {
+		rec.Status = FleetMemberInvited
+	}
+	s.fleetInvites[rec.FleetID] = append(s.fleetInvites[rec.FleetID], cloneFleetInviteRecord(rec))
+	return cloneFleetInviteRecord(rec), nil
+}
+
+func (s *MemoryStateStore) ListFleetInvites(_ context.Context, fleetID string) ([]FleetInviteRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := append([]FleetInviteRecord(nil), s.fleetInvites[fleetID]...)
+	for i := range out {
+		out[i] = cloneFleetInviteRecord(out[i])
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].CreatedAtMS == out[j].CreatedAtMS {
+			return out[i].InviteID < out[j].InviteID
+		}
+		return out[i].CreatedAtMS > out[j].CreatedAtMS
+	})
+	return out, nil
+}
+
+func (s *MemoryStateStore) DeleteFleetInvite(_ context.Context, inviteID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for fleetID, invites := range s.fleetInvites {
+		dst := invites[:0]
+		for _, invite := range invites {
+			if invite.InviteID == inviteID {
+				continue
+			}
+			dst = append(dst, invite)
+		}
+		if len(dst) == 0 {
+			delete(s.fleetInvites, fleetID)
+			continue
+		}
+		s.fleetInvites[fleetID] = append([]FleetInviteRecord(nil), dst...)
+	}
+	return nil
+}
+
+func (s *MemoryStateStore) AppendFleetActivity(_ context.Context, rec FleetActivityRecord) (FleetActivityRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if rec.EventID == "" {
+		var err error
+		rec.EventID, err = NewFleetActivityID()
+		if err != nil {
+			return FleetActivityRecord{}, err
+		}
+	}
+	if rec.CreatedAtMS == 0 {
+		rec.CreatedAtMS = s.nowMS()
+	}
+	s.fleetActivity[rec.FleetID] = append(s.fleetActivity[rec.FleetID], cloneFleetActivityRecord(rec))
+	return cloneFleetActivityRecord(rec), nil
+}
+
+func (s *MemoryStateStore) ListFleetActivity(_ context.Context, fleetID string, limit int, beforeMS int64) ([]FleetActivityRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	var out []FleetActivityRecord
+	events := s.fleetActivity[fleetID]
+	for i := len(events) - 1; i >= 0 && len(out) < limit; i-- {
+		ev := events[i]
+		if beforeMS > 0 && ev.CreatedAtMS >= beforeMS {
+			continue
+		}
+		out = append(out, cloneFleetActivityRecord(ev))
+	}
+	return out, nil
+}
+
+func (s *MemoryStateStore) DeleteFleetActivity(_ context.Context, fleetID string, eventID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if events := s.fleetActivity[fleetID]; events != nil {
+		dst := events[:0]
+		for _, event := range events {
+			if event.EventID == eventID {
+				continue
+			}
+			dst = append(dst, event)
+		}
+		if len(dst) == 0 {
+			delete(s.fleetActivity, fleetID)
+			return nil
+		}
+		s.fleetActivity[fleetID] = append([]FleetActivityRecord(nil), dst...)
+	}
+	return nil
+}
+
 func (s *MemoryStateStore) Close() error {
 	return nil
 }
@@ -748,6 +977,66 @@ CREATE INDEX IF NOT EXISTS idx_open_invite_challenges_token_active
 
 CREATE INDEX IF NOT EXISTS idx_open_invite_challenges_redeemer
   ON esp_open_invite_challenges(token_hash, pilot_node_id, pilot_pubkey, entmoot_pubkey, used_at_ms, expires_at_ms);
+
+CREATE TABLE IF NOT EXISTS esp_fleets (
+  fleet_id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  control_group_id BLOB,
+  coordinator_node_id INTEGER NOT NULL,
+  coordinator_pubkey TEXT NOT NULL,
+  coordinator_device_id TEXT NOT NULL DEFAULT '',
+  created_at_ms INTEGER NOT NULL,
+  updated_at_ms INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS esp_fleet_members (
+  fleet_id TEXT NOT NULL,
+  node_id INTEGER NOT NULL,
+  entmoot_pubkey TEXT NOT NULL,
+  hostname TEXT NOT NULL DEFAULT '',
+  role TEXT NOT NULL,
+  status TEXT NOT NULL,
+  invited_at_ms INTEGER NOT NULL DEFAULT 0,
+  accepted_at_ms INTEGER NOT NULL DEFAULT 0,
+  removed_at_ms INTEGER NOT NULL DEFAULT 0,
+  updated_at_ms INTEGER NOT NULL,
+  PRIMARY KEY(fleet_id, node_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_fleet_members_status
+  ON esp_fleet_members(fleet_id, status, role, node_id);
+
+CREATE TABLE IF NOT EXISTS esp_fleet_invites (
+  invite_id TEXT PRIMARY KEY,
+  fleet_id TEXT NOT NULL,
+  node_id INTEGER NOT NULL,
+  entmoot_pubkey TEXT NOT NULL,
+  hostname TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL,
+  invite BLOB,
+  created_at_ms INTEGER NOT NULL,
+  updated_at_ms INTEGER NOT NULL,
+  expires_at_ms INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_fleet_invites_fleet
+  ON esp_fleet_invites(fleet_id, created_at_ms DESC);
+
+CREATE TABLE IF NOT EXISTS esp_fleet_activity (
+  event_id TEXT PRIMARY KEY,
+  fleet_id TEXT NOT NULL,
+  type TEXT NOT NULL,
+  actor_node_id INTEGER NOT NULL,
+  actor_pubkey TEXT NOT NULL,
+  subject_node_id INTEGER NOT NULL DEFAULT 0,
+  subject_pubkey TEXT NOT NULL DEFAULT '',
+  summary TEXT NOT NULL DEFAULT '',
+  metadata BLOB,
+  created_at_ms INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_fleet_activity_fleet_time
+  ON esp_fleet_activity(fleet_id, created_at_ms DESC, event_id);
 `
 
 func OpenSQLiteStateStore(dataDir string) (*SQLiteStateStore, error) {
@@ -1345,6 +1634,242 @@ func (s *SQLiteStateStore) DeleteGroupMetadata(ctx context.Context, groupID entm
 	return nil
 }
 
+func (s *SQLiteStateStore) CreateFleet(ctx context.Context, rec FleetRecord) (FleetRecord, error) {
+	now := time.Now().UnixMilli()
+	if rec.FleetID == "" {
+		var err error
+		rec.FleetID, err = NewFleetID()
+		if err != nil {
+			return FleetRecord{}, err
+		}
+	}
+	if rec.CreatedAtMS == 0 {
+		rec.CreatedAtMS = now
+	}
+	rec.UpdatedAtMS = now
+	var controlGroup []byte
+	if rec.ControlGroupID != (entmoot.GroupID{}) {
+		controlGroup = rec.ControlGroupID[:]
+	}
+	if _, err := s.db.ExecContext(ctx, `
+INSERT INTO esp_fleets
+  (fleet_id, name, control_group_id, coordinator_node_id, coordinator_pubkey, coordinator_device_id, created_at_ms, updated_at_ms)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		rec.FleetID, rec.Name, controlGroup, rec.Coordinator.PilotNodeID, base64.StdEncoding.EncodeToString(rec.Coordinator.EntmootPubKey),
+		rec.CoordinatorDeviceID, rec.CreatedAtMS, rec.UpdatedAtMS); err != nil {
+		return FleetRecord{}, fmt.Errorf("esphttp: create fleet: %w", err)
+	}
+	return cloneFleetRecord(rec), nil
+}
+
+func (s *SQLiteStateStore) ListFleets(ctx context.Context) ([]FleetRecord, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT fleet_id, name, control_group_id, coordinator_node_id, coordinator_pubkey, coordinator_device_id, created_at_ms, updated_at_ms FROM esp_fleets ORDER BY created_at_ms DESC`)
+	if err != nil {
+		return nil, fmt.Errorf("esphttp: list fleets: %w", err)
+	}
+	defer rows.Close()
+	var out []FleetRecord
+	for rows.Next() {
+		rec, err := scanFleetRecord(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, rec)
+	}
+	return out, rows.Err()
+}
+
+func (s *SQLiteStateStore) GetFleet(ctx context.Context, fleetID string) (FleetRecord, bool, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT fleet_id, name, control_group_id, coordinator_node_id, coordinator_pubkey, coordinator_device_id, created_at_ms, updated_at_ms FROM esp_fleets WHERE fleet_id = ?`, fleetID)
+	rec, err := scanFleetRecord(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return FleetRecord{}, false, nil
+	}
+	if err != nil {
+		return FleetRecord{}, false, fmt.Errorf("esphttp: get fleet: %w", err)
+	}
+	return rec, true, nil
+}
+
+func (s *SQLiteStateStore) DeleteFleet(ctx context.Context, fleetID string) error {
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM esp_fleet_activity WHERE fleet_id = ?`, fleetID); err != nil {
+		return fmt.Errorf("esphttp: delete fleet activity: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM esp_fleet_invites WHERE fleet_id = ?`, fleetID); err != nil {
+		return fmt.Errorf("esphttp: delete fleet invites: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM esp_fleet_members WHERE fleet_id = ?`, fleetID); err != nil {
+		return fmt.Errorf("esphttp: delete fleet members: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM esp_fleets WHERE fleet_id = ?`, fleetID); err != nil {
+		return fmt.Errorf("esphttp: delete fleet: %w", err)
+	}
+	return nil
+}
+
+func (s *SQLiteStateStore) UpsertFleetMember(ctx context.Context, rec FleetMemberRecord) (FleetMemberRecord, error) {
+	rec.Role = NormalizeFleetMemberRole(rec.Role)
+	rec.Status = NormalizeFleetMemberStatus(rec.Status)
+	rec.UpdatedAtMS = time.Now().UnixMilli()
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO esp_fleet_members
+  (fleet_id, node_id, entmoot_pubkey, hostname, role, status, invited_at_ms, accepted_at_ms, removed_at_ms, updated_at_ms)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(fleet_id, node_id) DO UPDATE SET
+  entmoot_pubkey = excluded.entmoot_pubkey,
+  hostname = excluded.hostname,
+  role = excluded.role,
+  status = excluded.status,
+  invited_at_ms = excluded.invited_at_ms,
+  accepted_at_ms = excluded.accepted_at_ms,
+  removed_at_ms = excluded.removed_at_ms,
+  updated_at_ms = excluded.updated_at_ms`,
+		rec.FleetID, rec.NodeID, rec.EntmootPubKey, rec.Hostname, rec.Role, rec.Status, rec.InvitedAtMS, rec.AcceptedAtMS, rec.RemovedAtMS, rec.UpdatedAtMS)
+	if err != nil {
+		return FleetMemberRecord{}, fmt.Errorf("esphttp: upsert fleet member: %w", err)
+	}
+	return cloneFleetMemberRecord(rec), nil
+}
+
+func (s *SQLiteStateStore) ListFleetMembers(ctx context.Context, fleetID string) ([]FleetMemberRecord, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT fleet_id, node_id, entmoot_pubkey, hostname, role, status, invited_at_ms, accepted_at_ms, removed_at_ms, updated_at_ms FROM esp_fleet_members WHERE fleet_id = ? ORDER BY role = 'coordinator' DESC, node_id ASC`, fleetID)
+	if err != nil {
+		return nil, fmt.Errorf("esphttp: list fleet members: %w", err)
+	}
+	defer rows.Close()
+	var out []FleetMemberRecord
+	for rows.Next() {
+		rec, err := scanFleetMemberRecord(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, rec)
+	}
+	return out, rows.Err()
+}
+
+func (s *SQLiteStateStore) DeleteFleetMember(ctx context.Context, fleetID string, nodeID entmoot.NodeID) error {
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM esp_fleet_members WHERE fleet_id = ? AND node_id = ?`, fleetID, nodeID); err != nil {
+		return fmt.Errorf("esphttp: delete fleet member: %w", err)
+	}
+	return nil
+}
+
+func (s *SQLiteStateStore) CreateFleetInvite(ctx context.Context, rec FleetInviteRecord) (FleetInviteRecord, error) {
+	now := time.Now().UnixMilli()
+	if rec.InviteID == "" {
+		var err error
+		rec.InviteID, err = NewFleetInviteID()
+		if err != nil {
+			return FleetInviteRecord{}, err
+		}
+	}
+	if rec.CreatedAtMS == 0 {
+		rec.CreatedAtMS = now
+	}
+	rec.UpdatedAtMS = now
+	if strings.TrimSpace(rec.Status) == "" {
+		rec.Status = FleetMemberInvited
+	}
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO esp_fleet_invites
+  (invite_id, fleet_id, node_id, entmoot_pubkey, hostname, status, invite, created_at_ms, updated_at_ms, expires_at_ms)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		rec.InviteID, rec.FleetID, rec.NodeID, rec.EntmootPubKey, rec.Hostname, rec.Status, []byte(rec.Invite), rec.CreatedAtMS, rec.UpdatedAtMS, rec.ExpiresAtMS)
+	if err != nil {
+		return FleetInviteRecord{}, fmt.Errorf("esphttp: create fleet invite: %w", err)
+	}
+	return cloneFleetInviteRecord(rec), nil
+}
+
+func (s *SQLiteStateStore) ListFleetInvites(ctx context.Context, fleetID string) ([]FleetInviteRecord, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT invite_id, fleet_id, node_id, entmoot_pubkey, hostname, status, invite, created_at_ms, updated_at_ms, expires_at_ms FROM esp_fleet_invites WHERE fleet_id = ? ORDER BY created_at_ms DESC`, fleetID)
+	if err != nil {
+		return nil, fmt.Errorf("esphttp: list fleet invites: %w", err)
+	}
+	defer rows.Close()
+	var out []FleetInviteRecord
+	for rows.Next() {
+		rec, err := scanFleetInviteRecord(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, rec)
+	}
+	return out, rows.Err()
+}
+
+func (s *SQLiteStateStore) DeleteFleetInvite(ctx context.Context, inviteID string) error {
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM esp_fleet_invites WHERE invite_id = ?`, inviteID); err != nil {
+		return fmt.Errorf("esphttp: delete fleet invite: %w", err)
+	}
+	return nil
+}
+
+func (s *SQLiteStateStore) AppendFleetActivity(ctx context.Context, rec FleetActivityRecord) (FleetActivityRecord, error) {
+	if rec.EventID == "" {
+		var err error
+		rec.EventID, err = NewFleetActivityID()
+		if err != nil {
+			return FleetActivityRecord{}, err
+		}
+	}
+	if rec.CreatedAtMS == 0 {
+		rec.CreatedAtMS = time.Now().UnixMilli()
+	}
+	var subjectNode entmoot.NodeID
+	var subjectPub string
+	if rec.Subject != nil {
+		subjectNode = rec.Subject.PilotNodeID
+		subjectPub = base64.StdEncoding.EncodeToString(rec.Subject.EntmootPubKey)
+	}
+	_, err := s.db.ExecContext(ctx, `
+INSERT OR IGNORE INTO esp_fleet_activity
+  (event_id, fleet_id, type, actor_node_id, actor_pubkey, subject_node_id, subject_pubkey, summary, metadata, created_at_ms)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		rec.EventID, rec.FleetID, rec.Type, rec.Actor.PilotNodeID, base64.StdEncoding.EncodeToString(rec.Actor.EntmootPubKey),
+		subjectNode, subjectPub, rec.Summary, []byte(rec.Metadata), rec.CreatedAtMS)
+	if err != nil {
+		return FleetActivityRecord{}, fmt.Errorf("esphttp: append fleet activity: %w", err)
+	}
+	return cloneFleetActivityRecord(rec), nil
+}
+
+func (s *SQLiteStateStore) ListFleetActivity(ctx context.Context, fleetID string, limit int, beforeMS int64) ([]FleetActivityRecord, error) {
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	query := `SELECT event_id, fleet_id, type, actor_node_id, actor_pubkey, subject_node_id, subject_pubkey, summary, metadata, created_at_ms FROM esp_fleet_activity WHERE fleet_id = ?`
+	args := []any{fleetID}
+	if beforeMS > 0 {
+		query += ` AND created_at_ms < ?`
+		args = append(args, beforeMS)
+	}
+	query += ` ORDER BY created_at_ms DESC, event_id DESC LIMIT ?`
+	args = append(args, limit)
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("esphttp: list fleet activity: %w", err)
+	}
+	defer rows.Close()
+	var out []FleetActivityRecord
+	for rows.Next() {
+		rec, err := scanFleetActivityRecord(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, rec)
+	}
+	return out, rows.Err()
+}
+
+func (s *SQLiteStateStore) DeleteFleetActivity(ctx context.Context, fleetID string, eventID string) error {
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM esp_fleet_activity WHERE fleet_id = ? AND event_id = ?`, fleetID, eventID); err != nil {
+		return fmt.Errorf("esphttp: delete fleet activity: %w", err)
+	}
+	return nil
+}
+
 func (s *SQLiteStateStore) Close() error {
 	if _, err := s.db.Exec("PRAGMA wal_checkpoint(TRUNCATE);"); err != nil {
 		return fmt.Errorf("esphttp: state wal_checkpoint: %w", err)
@@ -1457,6 +1982,10 @@ type openInviteScanner interface {
 	Scan(...interface{}) error
 }
 
+type fleetScanner interface {
+	Scan(...interface{}) error
+}
+
 func scanSignRequest(row signRequestScanner) (SignRequest, error) {
 	var req SignRequest
 	var groupBytes []byte
@@ -1481,6 +2010,75 @@ func scanSignRequest(row signRequestScanner) (SignRequest, error) {
 	}
 	req.OperationResult = append(json.RawMessage(nil), operationResult...)
 	return req, nil
+}
+
+func scanFleetRecord(row fleetScanner) (FleetRecord, error) {
+	var rec FleetRecord
+	var controlGroup []byte
+	var pub string
+	if err := row.Scan(&rec.FleetID, &rec.Name, &controlGroup, &rec.Coordinator.PilotNodeID, &pub, &rec.CoordinatorDeviceID, &rec.CreatedAtMS, &rec.UpdatedAtMS); err != nil {
+		return FleetRecord{}, err
+	}
+	if len(controlGroup) == len(rec.ControlGroupID) {
+		copy(rec.ControlGroupID[:], controlGroup)
+	}
+	if pub != "" {
+		raw, err := base64.StdEncoding.DecodeString(pub)
+		if err != nil {
+			return FleetRecord{}, fmt.Errorf("esphttp: decode fleet coordinator pubkey: %w", err)
+		}
+		rec.Coordinator.EntmootPubKey = raw
+	}
+	return rec, nil
+}
+
+func scanFleetMemberRecord(row fleetScanner) (FleetMemberRecord, error) {
+	var rec FleetMemberRecord
+	if err := row.Scan(&rec.FleetID, &rec.NodeID, &rec.EntmootPubKey, &rec.Hostname, &rec.Role, &rec.Status, &rec.InvitedAtMS, &rec.AcceptedAtMS, &rec.RemovedAtMS, &rec.UpdatedAtMS); err != nil {
+		return FleetMemberRecord{}, err
+	}
+	return rec, nil
+}
+
+func scanFleetInviteRecord(row fleetScanner) (FleetInviteRecord, error) {
+	var rec FleetInviteRecord
+	var invite []byte
+	if err := row.Scan(&rec.InviteID, &rec.FleetID, &rec.NodeID, &rec.EntmootPubKey, &rec.Hostname, &rec.Status, &invite, &rec.CreatedAtMS, &rec.UpdatedAtMS, &rec.ExpiresAtMS); err != nil {
+		return FleetInviteRecord{}, err
+	}
+	rec.Invite = append(json.RawMessage(nil), invite...)
+	return rec, nil
+}
+
+func scanFleetActivityRecord(row fleetScanner) (FleetActivityRecord, error) {
+	var rec FleetActivityRecord
+	var actorPub string
+	var subjectNode entmoot.NodeID
+	var subjectPub string
+	var metadata []byte
+	if err := row.Scan(&rec.EventID, &rec.FleetID, &rec.Type, &rec.Actor.PilotNodeID, &actorPub, &subjectNode, &subjectPub, &rec.Summary, &metadata, &rec.CreatedAtMS); err != nil {
+		return FleetActivityRecord{}, err
+	}
+	if actorPub != "" {
+		raw, err := base64.StdEncoding.DecodeString(actorPub)
+		if err != nil {
+			return FleetActivityRecord{}, fmt.Errorf("esphttp: decode fleet actor pubkey: %w", err)
+		}
+		rec.Actor.EntmootPubKey = raw
+	}
+	if subjectNode != 0 || subjectPub != "" {
+		subj := entmoot.NodeInfo{PilotNodeID: subjectNode}
+		if subjectPub != "" {
+			raw, err := base64.StdEncoding.DecodeString(subjectPub)
+			if err != nil {
+				return FleetActivityRecord{}, fmt.Errorf("esphttp: decode fleet subject pubkey: %w", err)
+			}
+			subj.EntmootPubKey = raw
+		}
+		rec.Subject = &subj
+	}
+	rec.Metadata = append(json.RawMessage(nil), metadata...)
+	return rec, nil
 }
 
 func scanOpenInviteRecord(row openInviteScanner) (OpenInviteRecord, error) {

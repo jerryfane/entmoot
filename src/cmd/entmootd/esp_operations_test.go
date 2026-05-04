@@ -635,6 +635,1141 @@ func TestESPOpenInviteCreateRequiresLiveInviteAuthority(t *testing.T) {
 	}
 }
 
+func TestESPFleetControlGroupRollsBackOnJoinFailure(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	id, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	sock := testUnixSocketPath(t)
+	stop := serveESPGroupCreateIPC(t, sock, id.PublicKey, false)
+	defer stop()
+	metadata := &recordingGroupMetadataStore{}
+	exec := espOperationExecutor{
+		dataDir:       dataDir,
+		identity:      id,
+		socketPath:    sock,
+		timeout:       time.Second,
+		metadataStore: metadata,
+	}
+	founder := entmoot.NodeInfo{PilotNodeID: 45491, EntmootPubKey: append([]byte(nil), id.PublicKey...)}
+
+	if _, err := exec.createFleetControlGroup(ctx, testESPGroupID(24), "fleet-a", "Ops Fleet", founder, 1_700_000_000_000); err == nil {
+		t.Fatal("createFleetControlGroup succeeded, want join failure")
+	}
+	if ids, err := listGroupIDs(dataDir, nil); err != nil {
+		t.Fatalf("listGroupIDs: %v", err)
+	} else if len(ids) != 0 {
+		t.Fatalf("listGroupIDs = %v, want empty after rollback", ids)
+	}
+	if metadata.setGroup == (entmoot.GroupID{}) {
+		t.Fatal("metadata was not written before failed join")
+	}
+	if metadata.deletedGroup != metadata.setGroup {
+		t.Fatalf("deleted metadata group = %s, want %s", metadata.deletedGroup, metadata.setGroup)
+	}
+}
+
+func TestESPFleetCreateRollsBackLocalStateOnControlGroupFailure(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	id, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	sock := testUnixSocketPath(t)
+	stop := serveESPGroupCreateIPC(t, sock, id.PublicKey, false)
+	defer stop()
+	metadata := &recordingGroupMetadataStore{}
+	state := esphttp.NewMemoryStateStore()
+	exec := espOperationExecutor{
+		dataDir:       dataDir,
+		identity:      id,
+		socketPath:    sock,
+		timeout:       time.Second,
+		metadataStore: metadata,
+		stateStore:    state,
+	}
+
+	_, err = exec.ExecuteSignRequest(ctx, esphttp.SignRequest{
+		Kind:     "fleet_create",
+		DeviceID: "ios-1",
+		Payload:  mustMarshalJSON(t, fleetCreatePayload{Name: "Ops Fleet"}),
+	}, nil)
+	if err == nil {
+		t.Fatal("ExecuteSignRequest succeeded, want join failure")
+	}
+	fleets, err := state.ListFleets(ctx)
+	if err != nil {
+		t.Fatalf("ListFleets: %v", err)
+	}
+	if len(fleets) != 0 {
+		t.Fatalf("fleets after rollback = %+v, want empty", fleets)
+	}
+	if ids, err := listGroupIDs(dataDir, nil); err != nil {
+		t.Fatalf("listGroupIDs: %v", err)
+	} else if len(ids) != 0 {
+		t.Fatalf("listGroupIDs = %v, want empty after rollback", ids)
+	}
+	if metadata.setGroup == (entmoot.GroupID{}) {
+		t.Fatal("metadata was not written before failed join")
+	}
+	if metadata.deletedGroup != metadata.setGroup {
+		t.Fatalf("deleted metadata group = %s, want %s", metadata.deletedGroup, metadata.setGroup)
+	}
+}
+
+func TestESPFleetInviteRejectsCoordinatorTarget(t *testing.T) {
+	ctx := context.Background()
+	state := esphttp.NewMemoryStateStore()
+	coordID, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate coordinator: %v", err)
+	}
+	coordinator := entmoot.NodeInfo{PilotNodeID: 45491, EntmootPubKey: append([]byte(nil), coordID.PublicKey...)}
+	fleet, err := state.CreateFleet(ctx, esphttp.FleetRecord{
+		FleetID:             "fleet-a",
+		Name:                "Ops Fleet",
+		ControlGroupID:      testESPGroupID(23),
+		Coordinator:         coordinator,
+		CoordinatorDeviceID: "ios-1",
+		CreatedAtMS:         1_700_000_000_000,
+	})
+	if err != nil {
+		t.Fatalf("CreateFleet: %v", err)
+	}
+	if _, err := state.UpsertFleetMember(ctx, esphttp.FleetMemberRecord{
+		FleetID:       fleet.FleetID,
+		NodeID:        coordinator.PilotNodeID,
+		EntmootPubKey: encodeBase64(coordinator.EntmootPubKey),
+		Role:          esphttp.FleetRoleCoordinator,
+		Status:        esphttp.FleetMemberActive,
+		AcceptedAtMS:  1_700_000_000_000,
+	}); err != nil {
+		t.Fatalf("UpsertFleetMember: %v", err)
+	}
+	exec := espOperationExecutor{stateStore: state}
+
+	_, err = exec.ExecuteSignRequest(ctx, esphttp.SignRequest{
+		Kind:     "fleet_invite_create",
+		DeviceID: "ios-1",
+		Payload: mustMarshalJSON(t, fleetInviteCreatePayload{
+			FleetID: fleet.FleetID,
+			Target: &inviteTargetPayload{
+				PilotNodeID:   coordinator.PilotNodeID,
+				PilotPubKey:   bytes.Repeat([]byte{0x42}, ed25519.PublicKeySize),
+				EntmootPubKey: append([]byte(nil), coordinator.EntmootPubKey...),
+			},
+		}),
+	}, nil)
+	var opErr *esphttp.OperationError
+	if !errors.As(err, &opErr) || opErr.HTTPStatus != http.StatusBadRequest || opErr.Code != "bad_request" {
+		t.Fatalf("ExecuteSignRequest err = %v, want 400 bad_request", err)
+	}
+	members, err := state.ListFleetMembers(ctx, fleet.FleetID)
+	if err != nil {
+		t.Fatalf("ListFleetMembers: %v", err)
+	}
+	if len(members) != 1 || members[0].Role != esphttp.FleetRoleCoordinator || members[0].Status != esphttp.FleetMemberActive {
+		t.Fatalf("members after rejected self-invite = %+v, want active coordinator", members)
+	}
+	invites, err := state.ListFleetInvites(ctx, fleet.FleetID)
+	if err != nil {
+		t.Fatalf("ListFleetInvites: %v", err)
+	}
+	if len(invites) != 0 {
+		t.Fatalf("invites after rejected self-invite = %+v, want none", invites)
+	}
+	activity, err := state.ListFleetActivity(ctx, fleet.FleetID, 10, 0)
+	if err != nil {
+		t.Fatalf("ListFleetActivity: %v", err)
+	}
+	if len(activity) != 0 {
+		t.Fatalf("activity after rejected self-invite = %+v, want none", activity)
+	}
+}
+
+func TestESPFleetInviteRejectsExistingCurrentMember(t *testing.T) {
+	ctx := context.Background()
+	state := esphttp.NewMemoryStateStore()
+	fleet, coordinator := createFleetForTest(t, state, "fleet-a", "Ops Fleet")
+	targetPub := bytes.Repeat([]byte{0x24}, ed25519.PublicKeySize)
+	targetPilotPub := bytes.Repeat([]byte{0x42}, ed25519.PublicKeySize)
+	if _, err := state.UpsertFleetMember(ctx, esphttp.FleetMemberRecord{
+		FleetID:       fleet.FleetID,
+		NodeID:        45460,
+		EntmootPubKey: encodeBase64(targetPub),
+		Hostname:      "phobos",
+		Role:          esphttp.FleetRoleAgent,
+		Status:        esphttp.FleetMemberActive,
+		AcceptedAtMS:  1_700_000_000_000,
+	}); err != nil {
+		t.Fatalf("UpsertFleetMember target: %v", err)
+	}
+	sock := testUnixSocketPath(t)
+	inviteReqCh := make(chan *ipc.InviteCreateReq, 1)
+	removeReqCh := make(chan *ipc.MemberRemoveReq, 1)
+	stop := serveESPFleetInviteAndRemoveIPC(t, sock, fleet.ControlGroupID, inviteReqCh, removeReqCh)
+	defer stop()
+	exec := espOperationExecutor{stateStore: state, socketPath: sock, timeout: time.Second}
+
+	_, err := exec.ExecuteSignRequest(ctx, esphttp.SignRequest{
+		Kind:     "fleet_invite_create",
+		DeviceID: "ios-1",
+		Payload: mustMarshalJSON(t, fleetInviteCreatePayload{
+			FleetID: fleet.FleetID,
+			Target: &inviteTargetPayload{
+				PilotNodeID:   45460,
+				PilotPubKey:   append([]byte(nil), targetPilotPub...),
+				EntmootPubKey: append([]byte(nil), targetPub...),
+			},
+			Hostname: "phobos",
+		}),
+	}, nil)
+	var opErr *esphttp.OperationError
+	if !errors.As(err, &opErr) || opErr.HTTPStatus != http.StatusConflict || opErr.Code != "fleet_member_exists" {
+		t.Fatalf("ExecuteSignRequest err = %v, want 409 fleet_member_exists", err)
+	}
+	select {
+	case req := <-inviteReqCh:
+		t.Fatalf("unexpected invite create IPC request: %+v", req)
+	case <-time.After(200 * time.Millisecond):
+	}
+	select {
+	case req := <-removeReqCh:
+		t.Fatalf("unexpected member remove IPC request: %+v", req)
+	case <-time.After(200 * time.Millisecond):
+	}
+	members, err := state.ListFleetMembers(ctx, fleet.FleetID)
+	if err != nil {
+		t.Fatalf("ListFleetMembers: %v", err)
+	}
+	if len(members) != 2 {
+		t.Fatalf("members after rejected re-invite = %+v, want coordinator plus target", members)
+	}
+	for _, member := range members {
+		if member.NodeID == 45460 && member.Status != esphttp.FleetMemberActive {
+			t.Fatalf("target member after rejected re-invite = %+v, want active", member)
+		}
+	}
+	invites, err := state.ListFleetInvites(ctx, fleet.FleetID)
+	if err != nil {
+		t.Fatalf("ListFleetInvites: %v", err)
+	}
+	if len(invites) != 0 {
+		t.Fatalf("invites after rejected re-invite = %+v, want none", invites)
+	}
+	_ = coordinator
+}
+
+func TestESPFleetInviteReissuesPendingMemberInvite(t *testing.T) {
+	ctx := context.Background()
+	state := esphttp.NewMemoryStateStore()
+	fleet, coordinator := createFleetForTest(t, state, "fleet-a", "Ops Fleet")
+	targetPub := bytes.Repeat([]byte{0x24}, ed25519.PublicKeySize)
+	targetPilotPub := bytes.Repeat([]byte{0x42}, ed25519.PublicKeySize)
+	if _, err := state.UpsertFleetMember(ctx, esphttp.FleetMemberRecord{
+		FleetID:       fleet.FleetID,
+		NodeID:        45460,
+		EntmootPubKey: encodeBase64(targetPub),
+		Hostname:      "phobos",
+		Role:          esphttp.FleetRoleAgent,
+		Status:        esphttp.FleetMemberInvited,
+		InvitedAtMS:   1_700_000_000_000,
+	}); err != nil {
+		t.Fatalf("UpsertFleetMember target: %v", err)
+	}
+	if _, err := state.CreateFleetInvite(ctx, esphttp.FleetInviteRecord{
+		InviteID:      "old-invite",
+		FleetID:       fleet.FleetID,
+		NodeID:        45460,
+		EntmootPubKey: encodeBase64(targetPub),
+		Hostname:      "phobos",
+		Status:        esphttp.FleetMemberInvited,
+		Invite:        json.RawMessage(`{"group_id":"old"}`),
+		CreatedAtMS:   1_700_000_000_500,
+		ExpiresAtMS:   1_700_000_001_000,
+	}); err != nil {
+		t.Fatalf("CreateFleetInvite target: %v", err)
+	}
+	sock := testUnixSocketPath(t)
+	inviteReqCh := make(chan *ipc.InviteCreateReq, 1)
+	removeReqCh := make(chan *ipc.MemberRemoveReq, 1)
+	stop := serveESPFleetInviteAndRemoveIPC(t, sock, fleet.ControlGroupID, inviteReqCh, removeReqCh)
+	defer stop()
+	exec := espOperationExecutor{stateStore: state, socketPath: sock, timeout: time.Second}
+
+	if _, err := exec.ExecuteSignRequest(ctx, esphttp.SignRequest{
+		Kind:     "fleet_invite_create",
+		DeviceID: "ios-1",
+		Payload: mustMarshalJSON(t, fleetInviteCreatePayload{
+			FleetID: fleet.FleetID,
+			Target: &inviteTargetPayload{
+				PilotNodeID:   45460,
+				PilotPubKey:   append([]byte(nil), targetPilotPub...),
+				EntmootPubKey: append([]byte(nil), targetPub...),
+			},
+			Hostname: "phobos",
+		}),
+	}, nil); err != nil {
+		t.Fatalf("ExecuteSignRequest: %v", err)
+	}
+	select {
+	case req := <-inviteReqCh:
+		if req.GroupID != fleet.ControlGroupID {
+			t.Fatalf("invite group = %s, want %s", req.GroupID, fleet.ControlGroupID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for invite create IPC request")
+	}
+	select {
+	case req := <-removeReqCh:
+		t.Fatalf("unexpected rollback member remove IPC request: %+v", req)
+	case <-time.After(200 * time.Millisecond):
+	}
+	invites, err := state.ListFleetInvites(ctx, fleet.FleetID)
+	if err != nil {
+		t.Fatalf("ListFleetInvites: %v", err)
+	}
+	if len(invites) != 1 || invites[0].InviteID == "old-invite" {
+		t.Fatalf("invites after reissue = %+v, want one fresh invite", invites)
+	}
+	members, err := state.ListFleetMembers(ctx, fleet.FleetID)
+	if err != nil {
+		t.Fatalf("ListFleetMembers: %v", err)
+	}
+	for _, member := range members {
+		if member.NodeID == 45460 && member.Status != esphttp.FleetMemberInvited {
+			t.Fatalf("target member after reissue = %+v, want invited", member)
+		}
+	}
+	_ = coordinator
+}
+
+func TestESPFleetInviteRollsBackLocalStateOnActivityFailure(t *testing.T) {
+	ctx := context.Background()
+	state := &failingFleetStateStore{
+		MemoryStateStore:   esphttp.NewMemoryStateStore(),
+		failAppendActivity: true,
+	}
+	fleet, coordinator := createFleetForTest(t, state, "fleet-a", "Ops Fleet")
+	targetPub := bytes.Repeat([]byte{0x24}, ed25519.PublicKeySize)
+	targetPilotPub := bytes.Repeat([]byte{0x42}, ed25519.PublicKeySize)
+	sock := testUnixSocketPath(t)
+	inviteReqCh := make(chan *ipc.InviteCreateReq, 1)
+	removeReqCh := make(chan *ipc.MemberRemoveReq, 1)
+	stop := serveESPFleetInviteAndRemoveIPC(t, sock, fleet.ControlGroupID, inviteReqCh, removeReqCh)
+	defer stop()
+	exec := espOperationExecutor{stateStore: state, socketPath: sock, timeout: time.Second}
+
+	_, err := exec.ExecuteSignRequest(ctx, esphttp.SignRequest{
+		Kind:     "fleet_invite_create",
+		DeviceID: "ios-1",
+		Payload: mustMarshalJSON(t, fleetInviteCreatePayload{
+			FleetID: fleet.FleetID,
+			Target: &inviteTargetPayload{
+				PilotNodeID:   45460,
+				PilotPubKey:   append([]byte(nil), targetPilotPub...),
+				EntmootPubKey: append([]byte(nil), targetPub...),
+			},
+			Hostname: "phobos",
+		}),
+	}, nil)
+	if err == nil {
+		t.Fatal("ExecuteSignRequest succeeded, want activity failure")
+	}
+	select {
+	case req := <-inviteReqCh:
+		if req.GroupID != fleet.ControlGroupID {
+			t.Fatalf("invite create group = %s, want %s", req.GroupID, fleet.ControlGroupID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for invite create IPC request")
+	}
+	select {
+	case req := <-removeReqCh:
+		if req.GroupID != fleet.ControlGroupID {
+			t.Fatalf("rollback remove group = %s, want %s", req.GroupID, fleet.ControlGroupID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for rollback member remove IPC request")
+	}
+	members, err := state.ListFleetMembers(ctx, fleet.FleetID)
+	if err != nil {
+		t.Fatalf("ListFleetMembers: %v", err)
+	}
+	if len(members) != 1 || members[0].Role != esphttp.FleetRoleCoordinator || members[0].Status != esphttp.FleetMemberActive {
+		t.Fatalf("members after invite rollback = %+v, want active coordinator only", members)
+	}
+	invites, err := state.ListFleetInvites(ctx, fleet.FleetID)
+	if err != nil {
+		t.Fatalf("ListFleetInvites: %v", err)
+	}
+	if len(invites) != 0 {
+		t.Fatalf("invites after invite rollback = %+v, want none", invites)
+	}
+	_ = coordinator
+}
+
+func TestESPFleetInviteRollbackTreatsControlNotMemberAsRevoked(t *testing.T) {
+	ctx := context.Background()
+	state := &failingFleetStateStore{
+		MemoryStateStore:   esphttp.NewMemoryStateStore(),
+		failAppendActivity: true,
+	}
+	fleet, coordinator := createFleetForTest(t, state, "fleet-a", "Ops Fleet")
+	targetPub := bytes.Repeat([]byte{0x24}, ed25519.PublicKeySize)
+	targetPilotPub := bytes.Repeat([]byte{0x42}, ed25519.PublicKeySize)
+	sock := testUnixSocketPath(t)
+	inviteReqCh := make(chan *ipc.InviteCreateReq, 1)
+	removeReqCh := make(chan *ipc.MemberRemoveReq, 1)
+	stop := serveESPFleetInviteRemoveNotMemberIPC(t, sock, fleet.ControlGroupID, inviteReqCh, removeReqCh)
+	defer stop()
+	exec := espOperationExecutor{stateStore: state, socketPath: sock, timeout: time.Second}
+
+	_, err := exec.ExecuteSignRequest(ctx, esphttp.SignRequest{
+		Kind:     "fleet_invite_create",
+		DeviceID: "ios-1",
+		Payload: mustMarshalJSON(t, fleetInviteCreatePayload{
+			FleetID: fleet.FleetID,
+			Target: &inviteTargetPayload{
+				PilotNodeID:   45460,
+				PilotPubKey:   append([]byte(nil), targetPilotPub...),
+				EntmootPubKey: append([]byte(nil), targetPub...),
+			},
+			Hostname: "phobos",
+		}),
+	}, nil)
+	if err == nil {
+		t.Fatal("ExecuteSignRequest succeeded, want activity failure")
+	}
+	select {
+	case req := <-inviteReqCh:
+		if req.GroupID != fleet.ControlGroupID {
+			t.Fatalf("invite create group = %s, want %s", req.GroupID, fleet.ControlGroupID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for invite create IPC request")
+	}
+	select {
+	case req := <-removeReqCh:
+		if req.GroupID != fleet.ControlGroupID {
+			t.Fatalf("rollback remove group = %s, want %s", req.GroupID, fleet.ControlGroupID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for rollback member remove IPC request")
+	}
+	members, err := state.ListFleetMembers(ctx, fleet.FleetID)
+	if err != nil {
+		t.Fatalf("ListFleetMembers: %v", err)
+	}
+	if len(members) != 1 || members[0].Role != esphttp.FleetRoleCoordinator || members[0].Status != esphttp.FleetMemberActive {
+		t.Fatalf("members after invite rollback = %+v, want active coordinator only", members)
+	}
+	invites, err := state.ListFleetInvites(ctx, fleet.FleetID)
+	if err != nil {
+		t.Fatalf("ListFleetInvites: %v", err)
+	}
+	if len(invites) != 0 {
+		t.Fatalf("invites after invite rollback = %+v, want none", invites)
+	}
+	_ = coordinator
+}
+
+func TestESPFleetInviteRevokesControlGroupAfterUncertainIPC(t *testing.T) {
+	ctx := context.Background()
+	state := esphttp.NewMemoryStateStore()
+	fleet, coordinator := createFleetForTest(t, state, "fleet-a", "Ops Fleet")
+	targetPub := bytes.Repeat([]byte{0x24}, ed25519.PublicKeySize)
+	targetPilotPub := bytes.Repeat([]byte{0x42}, ed25519.PublicKeySize)
+	sock := testUnixSocketPath(t)
+	inviteReqCh := make(chan *ipc.InviteCreateReq, 1)
+	removeReqCh := make(chan *ipc.MemberRemoveReq, 1)
+	stop := serveESPFleetInviteUncertainIPC(t, sock, inviteReqCh, removeReqCh)
+	defer stop()
+	exec := espOperationExecutor{stateStore: state, socketPath: sock, timeout: time.Second}
+
+	_, err := exec.ExecuteSignRequest(ctx, esphttp.SignRequest{
+		Kind:     "fleet_invite_create",
+		DeviceID: "ios-1",
+		Payload: mustMarshalJSON(t, fleetInviteCreatePayload{
+			FleetID: fleet.FleetID,
+			Target: &inviteTargetPayload{
+				PilotNodeID:   45460,
+				PilotPubKey:   append([]byte(nil), targetPilotPub...),
+				EntmootPubKey: append([]byte(nil), targetPub...),
+			},
+			Hostname: "phobos",
+		}),
+	}, nil)
+	if err == nil {
+		t.Fatal("ExecuteSignRequest succeeded, want uncertain IPC failure")
+	}
+	select {
+	case req := <-inviteReqCh:
+		if req.GroupID != fleet.ControlGroupID {
+			t.Fatalf("invite create group = %s, want %s", req.GroupID, fleet.ControlGroupID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for invite create IPC request")
+	}
+	select {
+	case req := <-removeReqCh:
+		if req.GroupID != fleet.ControlGroupID {
+			t.Fatalf("rollback remove group = %s, want %s", req.GroupID, fleet.ControlGroupID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for rollback member remove IPC request")
+	}
+	members, err := state.ListFleetMembers(ctx, fleet.FleetID)
+	if err != nil {
+		t.Fatalf("ListFleetMembers: %v", err)
+	}
+	if len(members) != 1 || members[0].Role != esphttp.FleetRoleCoordinator || members[0].Status != esphttp.FleetMemberActive {
+		t.Fatalf("members after uncertain invite rollback = %+v, want active coordinator only", members)
+	}
+	invites, err := state.ListFleetInvites(ctx, fleet.FleetID)
+	if err != nil {
+		t.Fatalf("ListFleetInvites: %v", err)
+	}
+	if len(invites) != 0 {
+		t.Fatalf("invites after uncertain invite rollback = %+v, want none", invites)
+	}
+	_ = coordinator
+}
+
+func TestESPFleetInviteReissueRestoresStaleInviteOnFailure(t *testing.T) {
+	ctx := context.Background()
+	state := &failingFleetStateStore{
+		MemoryStateStore:   esphttp.NewMemoryStateStore(),
+		failAppendActivity: true,
+	}
+	fleet, coordinator := createFleetForTest(t, state, "fleet-a", "Ops Fleet")
+	targetPub := bytes.Repeat([]byte{0x24}, ed25519.PublicKeySize)
+	targetPilotPub := bytes.Repeat([]byte{0x42}, ed25519.PublicKeySize)
+	if _, err := state.UpsertFleetMember(ctx, esphttp.FleetMemberRecord{
+		FleetID:       fleet.FleetID,
+		NodeID:        45460,
+		EntmootPubKey: encodeBase64(targetPub),
+		Hostname:      "phobos",
+		Role:          esphttp.FleetRoleAgent,
+		Status:        esphttp.FleetMemberInvited,
+		InvitedAtMS:   1_700_000_000_000,
+	}); err != nil {
+		t.Fatalf("UpsertFleetMember target: %v", err)
+	}
+	if _, err := state.CreateFleetInvite(ctx, esphttp.FleetInviteRecord{
+		InviteID:      "old-invite",
+		FleetID:       fleet.FleetID,
+		NodeID:        45460,
+		EntmootPubKey: encodeBase64(targetPub),
+		Hostname:      "phobos",
+		Status:        esphttp.FleetMemberInvited,
+		Invite:        json.RawMessage(`{"group_id":"old"}`),
+		CreatedAtMS:   1_700_000_000_500,
+		ExpiresAtMS:   1_700_000_001_000,
+	}); err != nil {
+		t.Fatalf("CreateFleetInvite target: %v", err)
+	}
+	sock := testUnixSocketPath(t)
+	inviteReqCh := make(chan *ipc.InviteCreateReq, 1)
+	removeReqCh := make(chan *ipc.MemberRemoveReq, 1)
+	stop := serveESPFleetInviteAndRemoveIPC(t, sock, fleet.ControlGroupID, inviteReqCh, removeReqCh)
+	defer stop()
+	exec := espOperationExecutor{stateStore: state, socketPath: sock, timeout: time.Second}
+
+	_, err := exec.ExecuteSignRequest(ctx, esphttp.SignRequest{
+		Kind:     "fleet_invite_create",
+		DeviceID: "ios-1",
+		Payload: mustMarshalJSON(t, fleetInviteCreatePayload{
+			FleetID: fleet.FleetID,
+			Target: &inviteTargetPayload{
+				PilotNodeID:   45460,
+				PilotPubKey:   append([]byte(nil), targetPilotPub...),
+				EntmootPubKey: append([]byte(nil), targetPub...),
+			},
+			Hostname: "phobos",
+		}),
+	}, nil)
+	if err == nil {
+		t.Fatal("ExecuteSignRequest succeeded, want activity failure")
+	}
+	select {
+	case <-inviteReqCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for invite create IPC request")
+	}
+	select {
+	case <-removeReqCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for rollback member remove IPC request")
+	}
+	invites, err := state.ListFleetInvites(ctx, fleet.FleetID)
+	if err != nil {
+		t.Fatalf("ListFleetInvites: %v", err)
+	}
+	if len(invites) != 1 || invites[0].InviteID != "old-invite" {
+		t.Fatalf("invites after reissue rollback = %+v, want restored old invite", invites)
+	}
+	members, err := state.ListFleetMembers(ctx, fleet.FleetID)
+	if err != nil {
+		t.Fatalf("ListFleetMembers: %v", err)
+	}
+	for _, member := range members {
+		if member.NodeID == 45460 && (member.Status != esphttp.FleetMemberInvited || member.InvitedAtMS != 1_700_000_000_000) {
+			t.Fatalf("target member after reissue rollback = %+v, want previous invited member", member)
+		}
+	}
+	_ = coordinator
+}
+
+func TestESPFleetRemoveRollsBackLocalStateOnActivityFailure(t *testing.T) {
+	ctx := context.Background()
+	state := &failingFleetStateStore{
+		MemoryStateStore:   esphttp.NewMemoryStateStore(),
+		failAppendActivity: true,
+	}
+	fleet, coordinator := createFleetForTest(t, state, "fleet-a", "Ops Fleet")
+	targetPub := bytes.Repeat([]byte{0x24}, ed25519.PublicKeySize)
+	if _, err := state.UpsertFleetMember(ctx, esphttp.FleetMemberRecord{
+		FleetID:       fleet.FleetID,
+		NodeID:        45460,
+		EntmootPubKey: encodeBase64(targetPub),
+		Hostname:      "phobos",
+		Role:          esphttp.FleetRoleAgent,
+		Status:        esphttp.FleetMemberActive,
+		AcceptedAtMS:  1_700_000_000_000,
+	}); err != nil {
+		t.Fatalf("UpsertFleetMember target: %v", err)
+	}
+	if _, err := state.CreateFleetInvite(ctx, esphttp.FleetInviteRecord{
+		InviteID:      "invite-phobos",
+		FleetID:       fleet.FleetID,
+		NodeID:        45460,
+		EntmootPubKey: encodeBase64(targetPub),
+		Hostname:      "phobos",
+		Status:        esphttp.FleetMemberInvited,
+		Invite:        json.RawMessage(`{"group_id":"control"}`),
+		CreatedAtMS:   1_700_000_000_500,
+	}); err != nil {
+		t.Fatalf("CreateFleetInvite target: %v", err)
+	}
+	sock := testUnixSocketPath(t)
+	removeReqCh := make(chan *ipc.MemberRemoveReq, 1)
+	stop := serveESPFleetMemberRemoveIPC(t, sock, testESPGroupID(26), removeReqCh)
+	defer stop()
+	exec := espOperationExecutor{stateStore: state, socketPath: sock, timeout: time.Second}
+
+	_, err := exec.ExecuteSignRequest(ctx, esphttp.SignRequest{
+		Kind:     "fleet_member_remove",
+		DeviceID: "ios-1",
+		Payload: mustMarshalJSON(t, fleetMemberRemovePayload{
+			FleetID: fleet.FleetID,
+			Target: &inviteTargetPayload{
+				PilotNodeID:   45460,
+				EntmootPubKey: append([]byte(nil), targetPub...),
+			},
+		}),
+	}, nil)
+	if err == nil {
+		t.Fatal("ExecuteSignRequest succeeded, want activity failure")
+	}
+	select {
+	case req := <-removeReqCh:
+		t.Fatalf("unexpected member remove IPC request: %+v", req)
+	case <-time.After(200 * time.Millisecond):
+	}
+	members, err := state.ListFleetMembers(ctx, fleet.FleetID)
+	if err != nil {
+		t.Fatalf("ListFleetMembers: %v", err)
+	}
+	if len(members) != 2 {
+		t.Fatalf("members after remove rollback = %+v, want coordinator plus target", members)
+	}
+	for _, member := range members {
+		if member.NodeID == 45460 && member.Status != esphttp.FleetMemberActive {
+			t.Fatalf("target member after rollback = %+v, want active", member)
+		}
+	}
+	activity, err := state.ListFleetActivity(ctx, fleet.FleetID, 10, 0)
+	if err != nil {
+		t.Fatalf("ListFleetActivity: %v", err)
+	}
+	if len(activity) != 0 {
+		t.Fatalf("activity after remove rollback = %+v, want none", activity)
+	}
+	invites, err := state.ListFleetInvites(ctx, fleet.FleetID)
+	if err != nil {
+		t.Fatalf("ListFleetInvites: %v", err)
+	}
+	if len(invites) != 1 || invites[0].InviteID != "invite-phobos" {
+		t.Fatalf("invites after remove rollback = %+v, want restored invite", invites)
+	}
+	_ = coordinator
+}
+
+func TestESPFleetRemoveKeepsLocalRemovalAfterUncertainIPC(t *testing.T) {
+	ctx := context.Background()
+	state := esphttp.NewMemoryStateStore()
+	fleet, coordinator := createFleetForTest(t, state, "fleet-a", "Ops Fleet")
+	targetPub := bytes.Repeat([]byte{0x24}, ed25519.PublicKeySize)
+	if _, err := state.UpsertFleetMember(ctx, esphttp.FleetMemberRecord{
+		FleetID:       fleet.FleetID,
+		NodeID:        45460,
+		EntmootPubKey: encodeBase64(targetPub),
+		Hostname:      "phobos",
+		Role:          esphttp.FleetRoleAgent,
+		Status:        esphttp.FleetMemberActive,
+		AcceptedAtMS:  1_700_000_000_000,
+	}); err != nil {
+		t.Fatalf("UpsertFleetMember target: %v", err)
+	}
+	if _, err := state.CreateFleetInvite(ctx, esphttp.FleetInviteRecord{
+		InviteID:      "invite-phobos",
+		FleetID:       fleet.FleetID,
+		NodeID:        45460,
+		EntmootPubKey: encodeBase64(targetPub),
+		Hostname:      "phobos",
+		Status:        esphttp.FleetMemberInvited,
+		Invite:        json.RawMessage(`{"group_id":"control"}`),
+		CreatedAtMS:   1_700_000_000_500,
+	}); err != nil {
+		t.Fatalf("CreateFleetInvite target: %v", err)
+	}
+	sock := testUnixSocketPath(t)
+	removeReqCh := make(chan *ipc.MemberRemoveReq, 1)
+	stop := serveESPFleetMemberRemoveUncertainIPC(t, sock, removeReqCh)
+	defer stop()
+	exec := espOperationExecutor{stateStore: state, socketPath: sock, timeout: time.Second}
+
+	_, err := exec.ExecuteSignRequest(ctx, esphttp.SignRequest{
+		Kind:     "fleet_member_remove",
+		DeviceID: "ios-1",
+		Payload: mustMarshalJSON(t, fleetMemberRemovePayload{
+			FleetID: fleet.FleetID,
+			Target: &inviteTargetPayload{
+				PilotNodeID:   45460,
+				EntmootPubKey: append([]byte(nil), targetPub...),
+			},
+		}),
+	}, nil)
+	if err == nil {
+		t.Fatal("ExecuteSignRequest succeeded, want uncertain IPC failure")
+	}
+	select {
+	case req := <-removeReqCh:
+		if req.GroupID != fleet.ControlGroupID {
+			t.Fatalf("remove group = %s, want %s", req.GroupID, fleet.ControlGroupID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for member remove IPC request")
+	}
+	members, err := state.ListFleetMembers(ctx, fleet.FleetID)
+	if err != nil {
+		t.Fatalf("ListFleetMembers: %v", err)
+	}
+	for _, member := range members {
+		if member.NodeID == 45460 && member.Status != esphttp.FleetMemberRemoved {
+			t.Fatalf("target member after uncertain remove = %+v, want removed", member)
+		}
+	}
+	invites, err := state.ListFleetInvites(ctx, fleet.FleetID)
+	if err != nil {
+		t.Fatalf("ListFleetInvites: %v", err)
+	}
+	if len(invites) != 0 {
+		t.Fatalf("invites after uncertain remove = %+v, want none", invites)
+	}
+	activity, err := state.ListFleetActivity(ctx, fleet.FleetID, 10, 0)
+	if err != nil {
+		t.Fatalf("ListFleetActivity: %v", err)
+	}
+	if len(activity) != 1 || activity[0].Type != "member.removed" {
+		t.Fatalf("activity after uncertain remove = %+v, want one removal event", activity)
+	}
+	_ = coordinator
+}
+
+func TestESPFleetRemoveRejectsWrongStoredMemberKey(t *testing.T) {
+	ctx := context.Background()
+	state := esphttp.NewMemoryStateStore()
+	fleet, coordinator := createFleetForTest(t, state, "fleet-a", "Ops Fleet")
+	targetPub := bytes.Repeat([]byte{0x24}, ed25519.PublicKeySize)
+	wrongPub := bytes.Repeat([]byte{0x25}, ed25519.PublicKeySize)
+	if _, err := state.UpsertFleetMember(ctx, esphttp.FleetMemberRecord{
+		FleetID:       fleet.FleetID,
+		NodeID:        45460,
+		EntmootPubKey: encodeBase64(targetPub),
+		Hostname:      "phobos",
+		Role:          esphttp.FleetRoleAgent,
+		Status:        esphttp.FleetMemberActive,
+		AcceptedAtMS:  1_700_000_000_000,
+	}); err != nil {
+		t.Fatalf("UpsertFleetMember target: %v", err)
+	}
+	if _, err := state.CreateFleetInvite(ctx, esphttp.FleetInviteRecord{
+		InviteID:      "invite-phobos",
+		FleetID:       fleet.FleetID,
+		NodeID:        45460,
+		EntmootPubKey: encodeBase64(targetPub),
+		Hostname:      "phobos",
+		Status:        esphttp.FleetMemberInvited,
+		Invite:        json.RawMessage(`{"group_id":"control"}`),
+		CreatedAtMS:   1_700_000_000_500,
+	}); err != nil {
+		t.Fatalf("CreateFleetInvite target: %v", err)
+	}
+	sock := testUnixSocketPath(t)
+	removeReqCh := make(chan *ipc.MemberRemoveReq, 1)
+	stop := serveESPFleetMemberRemoveIPC(t, sock, fleet.ControlGroupID, removeReqCh)
+	defer stop()
+	exec := espOperationExecutor{stateStore: state, socketPath: sock, timeout: time.Second}
+
+	_, err := exec.ExecuteSignRequest(ctx, esphttp.SignRequest{
+		Kind:     "fleet_member_remove",
+		DeviceID: "ios-1",
+		Payload: mustMarshalJSON(t, fleetMemberRemovePayload{
+			FleetID: fleet.FleetID,
+			Target: &inviteTargetPayload{
+				PilotNodeID:   45460,
+				EntmootPubKey: append([]byte(nil), wrongPub...),
+			},
+		}),
+	}, nil)
+	var opErr *esphttp.OperationError
+	if !errors.As(err, &opErr) || opErr.HTTPStatus != http.StatusConflict || opErr.Code != "member_identity_conflict" {
+		t.Fatalf("ExecuteSignRequest err = %v, want 409 member_identity_conflict", err)
+	}
+	select {
+	case req := <-removeReqCh:
+		t.Fatalf("unexpected member remove IPC request: %+v", req)
+	case <-time.After(200 * time.Millisecond):
+	}
+	members, err := state.ListFleetMembers(ctx, fleet.FleetID)
+	if err != nil {
+		t.Fatalf("ListFleetMembers: %v", err)
+	}
+	for _, member := range members {
+		if member.NodeID == 45460 && (member.Status != esphttp.FleetMemberActive || member.EntmootPubKey != encodeBase64(targetPub)) {
+			t.Fatalf("target member after rejected key mismatch = %+v, want active stored key", member)
+		}
+	}
+	invites, err := state.ListFleetInvites(ctx, fleet.FleetID)
+	if err != nil {
+		t.Fatalf("ListFleetInvites: %v", err)
+	}
+	if len(invites) != 1 || invites[0].InviteID != "invite-phobos" {
+		t.Fatalf("invites after rejected key mismatch = %+v, want preserved invite", invites)
+	}
+	_ = coordinator
+}
+
+func TestESPFleetRemoveRejectsCoordinator(t *testing.T) {
+	ctx := context.Background()
+	state := esphttp.NewMemoryStateStore()
+	fleet, coordinator := createFleetForTest(t, state, "fleet-a", "Ops Fleet")
+	sock := testUnixSocketPath(t)
+	removeReqCh := make(chan *ipc.MemberRemoveReq, 1)
+	stop := serveESPFleetMemberRemoveIPC(t, sock, fleet.ControlGroupID, removeReqCh)
+	defer stop()
+	exec := espOperationExecutor{stateStore: state, socketPath: sock, timeout: time.Second}
+
+	_, err := exec.ExecuteSignRequest(ctx, esphttp.SignRequest{
+		Kind:     "fleet_member_remove",
+		DeviceID: "ios-1",
+		Payload: mustMarshalJSON(t, fleetMemberRemovePayload{
+			FleetID: fleet.FleetID,
+			Target: &inviteTargetPayload{
+				PilotNodeID:   coordinator.PilotNodeID,
+				EntmootPubKey: append([]byte(nil), coordinator.EntmootPubKey...),
+			},
+		}),
+	}, nil)
+	var opErr *esphttp.OperationError
+	if !errors.As(err, &opErr) || opErr.HTTPStatus != http.StatusBadRequest || opErr.Code != "bad_request" {
+		t.Fatalf("ExecuteSignRequest err = %v, want 400 bad_request", err)
+	}
+	select {
+	case req := <-removeReqCh:
+		t.Fatalf("unexpected member remove IPC request: %+v", req)
+	case <-time.After(200 * time.Millisecond):
+	}
+	members, err := state.ListFleetMembers(ctx, fleet.FleetID)
+	if err != nil {
+		t.Fatalf("ListFleetMembers: %v", err)
+	}
+	if len(members) != 1 || members[0].Role != esphttp.FleetRoleCoordinator || members[0].Status != esphttp.FleetMemberActive {
+		t.Fatalf("members after rejected coordinator remove = %+v, want active coordinator", members)
+	}
+	_ = coordinator
+}
+
+func TestESPFleetRemoveDeletesPendingInvite(t *testing.T) {
+	ctx := context.Background()
+	state := esphttp.NewMemoryStateStore()
+	fleet, coordinator := createFleetForTest(t, state, "fleet-a", "Ops Fleet")
+	targetPub := bytes.Repeat([]byte{0x24}, ed25519.PublicKeySize)
+	if _, err := state.UpsertFleetMember(ctx, esphttp.FleetMemberRecord{
+		FleetID:       fleet.FleetID,
+		NodeID:        45460,
+		EntmootPubKey: encodeBase64(targetPub),
+		Hostname:      "phobos",
+		Role:          esphttp.FleetRoleAgent,
+		Status:        esphttp.FleetMemberInvited,
+		InvitedAtMS:   1_700_000_000_000,
+	}); err != nil {
+		t.Fatalf("UpsertFleetMember target: %v", err)
+	}
+	if _, err := state.CreateFleetInvite(ctx, esphttp.FleetInviteRecord{
+		InviteID:      "invite-phobos",
+		FleetID:       fleet.FleetID,
+		NodeID:        45460,
+		EntmootPubKey: encodeBase64(targetPub),
+		Hostname:      "phobos",
+		Status:        esphttp.FleetMemberInvited,
+		Invite:        json.RawMessage(`{"group_id":"control"}`),
+		CreatedAtMS:   1_700_000_000_500,
+	}); err != nil {
+		t.Fatalf("CreateFleetInvite target: %v", err)
+	}
+	sock := testUnixSocketPath(t)
+	removeReqCh := make(chan *ipc.MemberRemoveReq, 1)
+	stop := serveESPFleetMemberRemoveIPC(t, sock, fleet.ControlGroupID, removeReqCh)
+	defer stop()
+	exec := espOperationExecutor{stateStore: state, socketPath: sock, timeout: time.Second}
+
+	if _, err := exec.ExecuteSignRequest(ctx, esphttp.SignRequest{
+		Kind:     "fleet_member_remove",
+		DeviceID: "ios-1",
+		Payload: mustMarshalJSON(t, fleetMemberRemovePayload{
+			FleetID: fleet.FleetID,
+			Target: &inviteTargetPayload{
+				PilotNodeID:   45460,
+				EntmootPubKey: append([]byte(nil), targetPub...),
+			},
+		}),
+	}, nil); err != nil {
+		t.Fatalf("ExecuteSignRequest: %v", err)
+	}
+	select {
+	case req := <-removeReqCh:
+		if req.GroupID != fleet.ControlGroupID {
+			t.Fatalf("remove group = %s, want %s", req.GroupID, fleet.ControlGroupID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for member remove IPC request")
+	}
+	invites, err := state.ListFleetInvites(ctx, fleet.FleetID)
+	if err != nil {
+		t.Fatalf("ListFleetInvites: %v", err)
+	}
+	if len(invites) != 0 {
+		t.Fatalf("invites after remove = %+v, want none", invites)
+	}
+	members, err := state.ListFleetMembers(ctx, fleet.FleetID)
+	if err != nil {
+		t.Fatalf("ListFleetMembers: %v", err)
+	}
+	for _, member := range members {
+		if member.NodeID == 45460 && member.Status != esphttp.FleetMemberRemoved {
+			t.Fatalf("target member after remove = %+v, want removed", member)
+		}
+	}
+	_ = coordinator
+}
+
+func TestESPFleetRemoveCancelsPendingInviteWhenControlNotMember(t *testing.T) {
+	ctx := context.Background()
+	state := esphttp.NewMemoryStateStore()
+	fleet, coordinator := createFleetForTest(t, state, "fleet-a", "Ops Fleet")
+	targetPub := bytes.Repeat([]byte{0x24}, ed25519.PublicKeySize)
+	if _, err := state.UpsertFleetMember(ctx, esphttp.FleetMemberRecord{
+		FleetID:       fleet.FleetID,
+		NodeID:        45460,
+		EntmootPubKey: encodeBase64(targetPub),
+		Hostname:      "phobos",
+		Role:          esphttp.FleetRoleAgent,
+		Status:        esphttp.FleetMemberInvited,
+		InvitedAtMS:   1_700_000_000_000,
+	}); err != nil {
+		t.Fatalf("UpsertFleetMember target: %v", err)
+	}
+	if _, err := state.CreateFleetInvite(ctx, esphttp.FleetInviteRecord{
+		InviteID:      "invite-phobos",
+		FleetID:       fleet.FleetID,
+		NodeID:        45460,
+		EntmootPubKey: encodeBase64(targetPub),
+		Hostname:      "phobos",
+		Status:        esphttp.FleetMemberInvited,
+		Invite:        json.RawMessage(`{"group_id":"control"}`),
+		CreatedAtMS:   1_700_000_000_500,
+	}); err != nil {
+		t.Fatalf("CreateFleetInvite target: %v", err)
+	}
+	sock := testUnixSocketPath(t)
+	removeReqCh := make(chan *ipc.MemberRemoveReq, 1)
+	stop := serveESPFleetMemberRemoveNotMemberIPC(t, sock, removeReqCh)
+	defer stop()
+	exec := espOperationExecutor{stateStore: state, socketPath: sock, timeout: time.Second}
+
+	if _, err := exec.ExecuteSignRequest(ctx, esphttp.SignRequest{
+		Kind:     "fleet_member_remove",
+		DeviceID: "ios-1",
+		Payload: mustMarshalJSON(t, fleetMemberRemovePayload{
+			FleetID: fleet.FleetID,
+			Target: &inviteTargetPayload{
+				PilotNodeID:   45460,
+				EntmootPubKey: append([]byte(nil), targetPub...),
+			},
+		}),
+	}, nil); err != nil {
+		t.Fatalf("ExecuteSignRequest: %v", err)
+	}
+	select {
+	case req := <-removeReqCh:
+		if req.GroupID != fleet.ControlGroupID {
+			t.Fatalf("remove group = %s, want %s", req.GroupID, fleet.ControlGroupID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for member remove IPC request")
+	}
+	invites, err := state.ListFleetInvites(ctx, fleet.FleetID)
+	if err != nil {
+		t.Fatalf("ListFleetInvites: %v", err)
+	}
+	if len(invites) != 0 {
+		t.Fatalf("invites after pending cancellation = %+v, want none", invites)
+	}
+	members, err := state.ListFleetMembers(ctx, fleet.FleetID)
+	if err != nil {
+		t.Fatalf("ListFleetMembers: %v", err)
+	}
+	for _, member := range members {
+		if member.NodeID == 45460 && member.Status != esphttp.FleetMemberRemoved {
+			t.Fatalf("target member after pending cancellation = %+v, want removed", member)
+		}
+	}
+	_ = coordinator
+}
+
+func TestESPFleetRemoveAlreadyRemovedDeletesStaleInvite(t *testing.T) {
+	ctx := context.Background()
+	state := esphttp.NewMemoryStateStore()
+	fleet, coordinator := createFleetForTest(t, state, "fleet-a", "Ops Fleet")
+	targetPub := bytes.Repeat([]byte{0x24}, ed25519.PublicKeySize)
+	if _, err := state.UpsertFleetMember(ctx, esphttp.FleetMemberRecord{
+		FleetID:       fleet.FleetID,
+		NodeID:        45460,
+		EntmootPubKey: encodeBase64(targetPub),
+		Hostname:      "phobos",
+		Role:          esphttp.FleetRoleAgent,
+		Status:        esphttp.FleetMemberRemoved,
+		RemovedAtMS:   1_700_000_000_000,
+	}); err != nil {
+		t.Fatalf("UpsertFleetMember target: %v", err)
+	}
+	if _, err := state.CreateFleetInvite(ctx, esphttp.FleetInviteRecord{
+		InviteID:      "invite-phobos",
+		FleetID:       fleet.FleetID,
+		NodeID:        45460,
+		EntmootPubKey: encodeBase64(targetPub),
+		Hostname:      "phobos",
+		Status:        esphttp.FleetMemberInvited,
+		Invite:        json.RawMessage(`{"group_id":"control"}`),
+		CreatedAtMS:   1_700_000_000_500,
+	}); err != nil {
+		t.Fatalf("CreateFleetInvite target: %v", err)
+	}
+	sock := testUnixSocketPath(t)
+	removeReqCh := make(chan *ipc.MemberRemoveReq, 1)
+	stop := serveESPFleetMemberRemoveIPC(t, sock, fleet.ControlGroupID, removeReqCh)
+	defer stop()
+	exec := espOperationExecutor{stateStore: state, socketPath: sock, timeout: time.Second}
+
+	if _, err := exec.ExecuteSignRequest(ctx, esphttp.SignRequest{
+		Kind:     "fleet_member_remove",
+		DeviceID: "ios-1",
+		Payload: mustMarshalJSON(t, fleetMemberRemovePayload{
+			FleetID: fleet.FleetID,
+			Target: &inviteTargetPayload{
+				PilotNodeID:   45460,
+				EntmootPubKey: append([]byte(nil), targetPub...),
+			},
+		}),
+	}, nil); err != nil {
+		t.Fatalf("ExecuteSignRequest: %v", err)
+	}
+	select {
+	case req := <-removeReqCh:
+		t.Fatalf("unexpected member remove IPC request: %+v", req)
+	case <-time.After(200 * time.Millisecond):
+	}
+	invites, err := state.ListFleetInvites(ctx, fleet.FleetID)
+	if err != nil {
+		t.Fatalf("ListFleetInvites: %v", err)
+	}
+	if len(invites) != 0 {
+		t.Fatalf("invites after already-removed cleanup = %+v, want none", invites)
+	}
+	activity, err := state.ListFleetActivity(ctx, fleet.FleetID, 10, 0)
+	if err != nil {
+		t.Fatalf("ListFleetActivity: %v", err)
+	}
+	if len(activity) != 0 {
+		t.Fatalf("activity after already-removed cleanup = %+v, want none", activity)
+	}
+	_ = coordinator
+}
+
+func TestESPFleetRemoveRejectsUnknownMember(t *testing.T) {
+	ctx := context.Background()
+	state := esphttp.NewMemoryStateStore()
+	fleet, coordinator := createFleetForTest(t, state, "fleet-a", "Ops Fleet")
+	targetPub := bytes.Repeat([]byte{0x24}, ed25519.PublicKeySize)
+	sock := testUnixSocketPath(t)
+	removeReqCh := make(chan *ipc.MemberRemoveReq, 1)
+	stop := serveESPFleetMemberRemoveIPC(t, sock, testESPGroupID(26), removeReqCh)
+	defer stop()
+	exec := espOperationExecutor{stateStore: state, socketPath: sock, timeout: time.Second}
+
+	_, err := exec.ExecuteSignRequest(ctx, esphttp.SignRequest{
+		Kind:     "fleet_member_remove",
+		DeviceID: "ios-1",
+		Payload: mustMarshalJSON(t, fleetMemberRemovePayload{
+			FleetID: fleet.FleetID,
+			Target: &inviteTargetPayload{
+				PilotNodeID:   45460,
+				EntmootPubKey: append([]byte(nil), targetPub...),
+			},
+		}),
+	}, nil)
+	var opErr *esphttp.OperationError
+	if !errors.As(err, &opErr) || opErr.HTTPStatus != http.StatusNotFound || opErr.Code != "not_member" {
+		t.Fatalf("ExecuteSignRequest err = %v, want 404 not_member", err)
+	}
+	select {
+	case req := <-removeReqCh:
+		t.Fatalf("unexpected member remove IPC request: %+v", req)
+	case <-time.After(200 * time.Millisecond):
+	}
+	members, err := state.ListFleetMembers(ctx, fleet.FleetID)
+	if err != nil {
+		t.Fatalf("ListFleetMembers: %v", err)
+	}
+	if len(members) != 1 || members[0].Role != esphttp.FleetRoleCoordinator || members[0].Status != esphttp.FleetMemberActive {
+		t.Fatalf("members after rejected remove = %+v, want active coordinator only", members)
+	}
+	activity, err := state.ListFleetActivity(ctx, fleet.FleetID, 10, 0)
+	if err != nil {
+		t.Fatalf("ListFleetActivity: %v", err)
+	}
+	if len(activity) != 0 {
+		t.Fatalf("activity after rejected remove = %+v, want none", activity)
+	}
+	_ = coordinator
+}
+
 func TestESPOpenInviteStoresAndRedeemsBootstrapPeers(t *testing.T) {
 	ctx := context.Background()
 	gid := testESPGroupID(19)
@@ -1653,6 +2788,25 @@ func (s rawGroupMetadataStore) DeleteGroupMetadata(context.Context, entmoot.Grou
 	return nil
 }
 
+type recordingGroupMetadataStore struct {
+	setGroup     entmoot.GroupID
+	deletedGroup entmoot.GroupID
+}
+
+func (s *recordingGroupMetadataStore) GetGroupMetadata(context.Context, entmoot.GroupID) (json.RawMessage, bool, error) {
+	return nil, false, nil
+}
+
+func (s *recordingGroupMetadataStore) SetGroupMetadata(_ context.Context, gid entmoot.GroupID, _ json.RawMessage) error {
+	s.setGroup = gid
+	return nil
+}
+
+func (s *recordingGroupMetadataStore) DeleteGroupMetadata(_ context.Context, gid entmoot.GroupID) error {
+	s.deletedGroup = gid
+	return nil
+}
+
 type fakeMemberProfileReader struct {
 	ads map[entmoot.NodeID]wire.MemberProfileAd
 }
@@ -1850,6 +3004,170 @@ func serveESPInviteCreateIPC(t *testing.T, sock string, gid entmoot.GroupID, req
 	}
 }
 
+func serveESPFleetInviteAndRemoveIPC(t *testing.T, sock string, gid entmoot.GroupID, inviteReqCh chan<- *ipc.InviteCreateReq, removeReqCh chan<- *ipc.MemberRemoveReq) func() {
+	t.Helper()
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatalf("listen unix: %v", err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer ln.Close()
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			_, payload, err := ipc.ReadAndDecode(conn)
+			if err != nil {
+				_ = conn.Close()
+				continue
+			}
+			switch v := payload.(type) {
+			case *ipc.InviteAuthorityCheckReq:
+				_ = ipc.EncodeAndWrite(conn, &ipc.InviteAuthorityCheckResp{
+					Status:     "ok",
+					GroupID:    v.GroupID,
+					RosterHead: entmoot.RosterEntryID{},
+					Members:    1,
+				})
+			case *ipc.InviteCreateReq:
+				if inviteReqCh != nil {
+					inviteReqCh <- v
+				}
+				_ = ipc.EncodeAndWrite(conn, &ipc.InviteCreateResp{
+					Status:     "created",
+					GroupID:    gid,
+					Invite:     entmoot.Invite{GroupID: gid},
+					RosterHead: entmoot.RosterEntryID{},
+					Members:    2,
+				})
+			case *ipc.MemberRemoveReq:
+				if removeReqCh != nil {
+					removeReqCh <- v
+				}
+				_ = ipc.EncodeAndWrite(conn, &ipc.MemberRemoveResp{
+					Status:     "removed",
+					GroupID:    gid,
+					RosterHead: entmoot.RosterEntryID{},
+					Members:    1,
+				})
+			}
+			_ = conn.Close()
+		}
+	}()
+	return func() {
+		_ = ln.Close()
+		<-done
+	}
+}
+
+func serveESPFleetInviteRemoveNotMemberIPC(t *testing.T, sock string, gid entmoot.GroupID, inviteReqCh chan<- *ipc.InviteCreateReq, removeReqCh chan<- *ipc.MemberRemoveReq) func() {
+	t.Helper()
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatalf("listen unix: %v", err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer ln.Close()
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			_, payload, err := ipc.ReadAndDecode(conn)
+			if err != nil {
+				_ = conn.Close()
+				continue
+			}
+			switch v := payload.(type) {
+			case *ipc.InviteAuthorityCheckReq:
+				_ = ipc.EncodeAndWrite(conn, &ipc.InviteAuthorityCheckResp{
+					Status:     "ok",
+					GroupID:    v.GroupID,
+					RosterHead: entmoot.RosterEntryID{},
+					Members:    1,
+				})
+			case *ipc.InviteCreateReq:
+				if inviteReqCh != nil {
+					inviteReqCh <- v
+				}
+				_ = ipc.EncodeAndWrite(conn, &ipc.InviteCreateResp{
+					Status:     "created",
+					GroupID:    gid,
+					Invite:     entmoot.Invite{GroupID: gid},
+					RosterHead: entmoot.RosterEntryID{},
+					Members:    2,
+				})
+			case *ipc.MemberRemoveReq:
+				if removeReqCh != nil {
+					removeReqCh <- v
+				}
+				_ = ipc.EncodeAndWrite(conn, &ipc.ErrorFrame{
+					Code:    ipc.CodeNotMember,
+					GroupID: &v.GroupID,
+					Message: "target is not a member",
+				})
+			}
+			_ = conn.Close()
+		}
+	}()
+	return func() {
+		_ = ln.Close()
+		<-done
+	}
+}
+
+func serveESPFleetInviteUncertainIPC(t *testing.T, sock string, inviteReqCh chan<- *ipc.InviteCreateReq, removeReqCh chan<- *ipc.MemberRemoveReq) func() {
+	t.Helper()
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatalf("listen unix: %v", err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer ln.Close()
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			_, payload, err := ipc.ReadAndDecode(conn)
+			if err != nil {
+				_ = conn.Close()
+				continue
+			}
+			switch v := payload.(type) {
+			case *ipc.InviteCreateReq:
+				if inviteReqCh != nil {
+					inviteReqCh <- v
+				}
+				_ = conn.Close()
+				continue
+			case *ipc.MemberRemoveReq:
+				if removeReqCh != nil {
+					removeReqCh <- v
+				}
+				_ = ipc.EncodeAndWrite(conn, &ipc.MemberRemoveResp{
+					Status:     "removed",
+					GroupID:    v.GroupID,
+					RosterHead: entmoot.RosterEntryID{},
+					Members:    1,
+				})
+			}
+			_ = conn.Close()
+		}
+	}()
+	return func() {
+		_ = ln.Close()
+		<-done
+	}
+}
+
 func serveESPInviteCreateIPCFailFirst(t *testing.T, sock string, gid entmoot.GroupID, reqCh chan<- *ipc.InviteCreateReq) func() {
 	t.Helper()
 	ln, err := net.Listen("unix", sock)
@@ -1987,6 +3305,174 @@ func serveESPAuthorityIPCError(t *testing.T, sock string, code ipc.ErrorCode, me
 						GroupID: &req.GroupID,
 						Message: message,
 					})
+				}
+			}
+			_ = conn.Close()
+		}
+	}()
+	return func() {
+		_ = ln.Close()
+		<-done
+	}
+}
+
+type failingFleetStateStore struct {
+	*esphttp.MemoryStateStore
+	failAppendActivity    bool
+	failCreateFleetInvite bool
+}
+
+func (s *failingFleetStateStore) AppendFleetActivity(ctx context.Context, rec esphttp.FleetActivityRecord) (esphttp.FleetActivityRecord, error) {
+	if s.failAppendActivity {
+		return esphttp.FleetActivityRecord{}, fmt.Errorf("fleet activity store unavailable")
+	}
+	return s.MemoryStateStore.AppendFleetActivity(ctx, rec)
+}
+
+func (s *failingFleetStateStore) CreateFleetInvite(ctx context.Context, rec esphttp.FleetInviteRecord) (esphttp.FleetInviteRecord, error) {
+	if s.failCreateFleetInvite {
+		return esphttp.FleetInviteRecord{}, fmt.Errorf("fleet invite store unavailable")
+	}
+	return s.MemoryStateStore.CreateFleetInvite(ctx, rec)
+}
+
+func createFleetForTest(t *testing.T, state esphttp.StateStore, fleetID, name string) (esphttp.FleetRecord, entmoot.NodeInfo) {
+	t.Helper()
+	coordinatorID, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate coordinator: %v", err)
+	}
+	coordinator := entmoot.NodeInfo{
+		PilotNodeID:   45491,
+		EntmootPubKey: append([]byte(nil), coordinatorID.PublicKey...),
+	}
+	fleet, err := state.CreateFleet(context.Background(), esphttp.FleetRecord{
+		FleetID:             fleetID,
+		Name:                name,
+		ControlGroupID:      testESPGroupID(90),
+		Coordinator:         coordinator,
+		CoordinatorDeviceID: "ios-1",
+		CreatedAtMS:         1_700_000_000_000,
+	})
+	if err != nil {
+		t.Fatalf("CreateFleet: %v", err)
+	}
+	if _, err := state.UpsertFleetMember(context.Background(), esphttp.FleetMemberRecord{
+		FleetID:       fleet.FleetID,
+		NodeID:        coordinator.PilotNodeID,
+		EntmootPubKey: encodeBase64(coordinator.EntmootPubKey),
+		Role:          esphttp.FleetRoleCoordinator,
+		Status:        esphttp.FleetMemberActive,
+		AcceptedAtMS:  1_700_000_000_000,
+	}); err != nil {
+		t.Fatalf("UpsertFleetMember: %v", err)
+	}
+	return fleet, coordinator
+}
+
+func serveESPFleetMemberRemoveIPC(t *testing.T, sock string, gid entmoot.GroupID, reqCh chan<- *ipc.MemberRemoveReq) func() {
+	t.Helper()
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatalf("listen unix: %v", err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer ln.Close()
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			_, payload, err := ipc.ReadAndDecode(conn)
+			if err != nil {
+				_ = conn.Close()
+				continue
+			}
+			if req, ok := payload.(*ipc.MemberRemoveReq); ok {
+				if reqCh != nil {
+					reqCh <- req
+				}
+				_ = ipc.EncodeAndWrite(conn, &ipc.MemberRemoveResp{
+					Status:     "removed",
+					GroupID:    gid,
+					RosterHead: entmoot.RosterEntryID{},
+					Members:    1,
+				})
+				_ = req
+			}
+			_ = conn.Close()
+		}
+	}()
+	return func() {
+		_ = ln.Close()
+		<-done
+	}
+}
+
+func serveESPFleetMemberRemoveNotMemberIPC(t *testing.T, sock string, reqCh chan<- *ipc.MemberRemoveReq) func() {
+	t.Helper()
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatalf("listen unix: %v", err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer ln.Close()
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			_, payload, err := ipc.ReadAndDecode(conn)
+			if err != nil {
+				_ = conn.Close()
+				continue
+			}
+			if req, ok := payload.(*ipc.MemberRemoveReq); ok {
+				if reqCh != nil {
+					reqCh <- req
+				}
+				_ = ipc.EncodeAndWrite(conn, &ipc.ErrorFrame{
+					Code:    ipc.CodeNotMember,
+					GroupID: &req.GroupID,
+					Message: "target is not a member",
+				})
+			}
+			_ = conn.Close()
+		}
+	}()
+	return func() {
+		_ = ln.Close()
+		<-done
+	}
+}
+
+func serveESPFleetMemberRemoveUncertainIPC(t *testing.T, sock string, reqCh chan<- *ipc.MemberRemoveReq) func() {
+	t.Helper()
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatalf("listen unix: %v", err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer ln.Close()
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			_, payload, err := ipc.ReadAndDecode(conn)
+			if err != nil {
+				_ = conn.Close()
+				continue
+			}
+			if req, ok := payload.(*ipc.MemberRemoveReq); ok {
+				if reqCh != nil {
+					reqCh <- req
 				}
 			}
 			_ = conn.Close()
