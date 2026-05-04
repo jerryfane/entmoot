@@ -485,7 +485,7 @@ func (h *Handler) handleFleets(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, "internal_error", "fleet listing failed")
 			return
 		}
-		visible := fleets[:0]
+		visible := make([]FleetRecord, 0, len(fleets))
 		for _, fleet := range fleets {
 			if fleet.CoordinatorDeviceID == device.ID {
 				visible = append(visible, fleet)
@@ -583,6 +583,9 @@ func (h *Handler) handleListFleetMembers(w http.ResponseWriter, r *http.Request,
 		writeError(w, http.StatusInternalServerError, "internal_error", "fleet member listing failed")
 		return
 	}
+	if members == nil {
+		members = []FleetMemberRecord{}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"members": members})
 }
 
@@ -599,6 +602,9 @@ func (h *Handler) handleListFleetInvites(w http.ResponseWriter, r *http.Request,
 		h.logger.Error("esphttp: list fleet invites", slog.String("err", err.Error()))
 		writeError(w, http.StatusInternalServerError, "internal_error", "fleet invite listing failed")
 		return
+	}
+	if invites == nil {
+		invites = []FleetInviteRecord{}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"invites": invites})
 }
@@ -626,6 +632,9 @@ func (h *Handler) handleFleetActivity(w http.ResponseWriter, r *http.Request, fl
 		h.logger.Error("esphttp: list fleet activity", slog.String("err", err.Error()))
 		writeError(w, http.StatusInternalServerError, "internal_error", "fleet activity listing failed")
 		return
+	}
+	if activity == nil {
+		activity = []FleetActivityRecord{}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"activity": activity})
 }

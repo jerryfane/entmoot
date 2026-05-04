@@ -501,6 +501,36 @@ func TestHandlerFleetReadsRejectBearerOnly(t *testing.T) {
 	}
 }
 
+func TestHandlerFleetListReturnsEmptyArrayWhenNoFleetsVisible(t *testing.T) {
+	gid := testGroupID(1)
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	reg, err := NewDeviceRegistry([]Device{
+		{ID: "ios-1-device", PublicKey: priv.Public().(ed25519.PublicKey), ClientIDs: []string{"ios-1"}},
+	})
+	if err != nil {
+		t.Fatalf("NewDeviceRegistry: %v", err)
+	}
+	state := NewMemoryStateStore()
+	handler := testMobileHandlerFull(t, gid, reg, nil, func() time.Time { return time.UnixMilli(10_000) }, nil, state, nil)
+
+	req := signedDeviceRequest(t, priv, http.MethodGet, "/v1/fleets", nil, 10_000, "nonce-empty-fleets")
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("GET /v1/fleets status = %d, want %d\nbody=%s", resp.Code, http.StatusOK, resp.Body.String())
+	}
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(resp.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("Unmarshal response: %v\n%s", err, resp.Body.String())
+	}
+	if got := strings.TrimSpace(string(envelope["fleets"])); got != "[]" {
+		t.Fatalf("fleets JSON = %s, want []\nbody=%s", got, resp.Body.String())
+	}
+}
+
 func TestHandlerGroupDiagnostics(t *testing.T) {
 	gid := testGroupID(1)
 	diagnostics := &fakeDiagnostics{result: map[string]any{
