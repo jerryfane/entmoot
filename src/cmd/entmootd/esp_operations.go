@@ -42,6 +42,7 @@ type espOperationExecutor struct {
 	stateStore         esphttp.StateStore
 	deviceGroups       deviceGroupAuthorizer
 	pilotIdentity      func(context.Context) (entmoot.NodeID, string, error)
+	pilotLookup        func(context.Context, entmoot.NodeID) (string, error)
 	pilotSignChallenge func(context.Context, []byte) (string, error)
 }
 
@@ -107,6 +108,8 @@ type inviteCreatePayload struct {
 	ValidUntilMS   int64                `json:"valid_until_ms,omitempty"`
 	Peers          string               `json:"peers,omitempty"`
 	BootstrapPeers []entmoot.NodeID     `json:"bootstrap_peers,omitempty"`
+	SourceGroupID  entmoot.GroupID      `json:"source_group_id,omitempty"`
+	PilotNodeID    entmoot.NodeID       `json:"pilot_node_id,omitempty"`
 	Target         *inviteTargetPayload `json:"target,omitempty"`
 }
 
@@ -131,11 +134,13 @@ type fleetScopedPayload struct {
 }
 
 type fleetInviteCreatePayload struct {
-	FleetID      string               `json:"fleet_id"`
-	Target       *inviteTargetPayload `json:"target,omitempty"`
-	Hostname     string               `json:"hostname,omitempty"`
-	ValidFor     string               `json:"valid_for,omitempty"`
-	ValidUntilMS int64                `json:"valid_until_ms,omitempty"`
+	FleetID       string               `json:"fleet_id"`
+	Target        *inviteTargetPayload `json:"target,omitempty"`
+	SourceGroupID entmoot.GroupID      `json:"source_group_id,omitempty"`
+	PilotNodeID   entmoot.NodeID       `json:"pilot_node_id,omitempty"`
+	Hostname      string               `json:"hostname,omitempty"`
+	ValidFor      string               `json:"valid_for,omitempty"`
+	ValidUntilMS  int64                `json:"valid_until_ms,omitempty"`
 }
 
 type fleetMemberRemovePayload struct {
@@ -812,6 +817,11 @@ func (e espOperationExecutor) createInvite(ctx context.Context, req esphttp.Sign
 	if err := json.Unmarshal(req.Payload, &payload); err != nil {
 		return nil, &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request", Message: "invalid invite_create payload"}
 	}
+	target, err := e.resolveInviteTarget(ctx, req, payload.Target, payload.SourceGroupID, payload.PilotNodeID)
+	if err != nil {
+		return nil, err
+	}
+	payload.Target = target
 	ipcReq, err := buildInviteCreateIPCRequest(req.GroupID, payload)
 	if err != nil {
 		return nil, err
@@ -1453,6 +1463,11 @@ func (e espOperationExecutor) createFleetInvite(ctx context.Context, req esphttp
 	if req.DeviceID != "" && fleet.CoordinatorDeviceID != "" && req.DeviceID != fleet.CoordinatorDeviceID {
 		return nil, &esphttp.OperationError{HTTPStatus: http.StatusForbidden, Code: "forbidden", Message: "device is not authorized to manage fleet"}
 	}
+	resolvedTarget, err := e.resolveInviteTarget(ctx, req, payload.Target, payload.SourceGroupID, payload.PilotNodeID)
+	if err != nil {
+		return nil, err
+	}
+	payload.Target = resolvedTarget
 	target, err := validateInviteTarget(payload.Target)
 	if err != nil {
 		return nil, err
@@ -1821,6 +1836,107 @@ func fleetMemberForNode(members []esphttp.FleetMemberRecord, nodeID entmoot.Node
 		}
 	}
 	return esphttp.FleetMemberRecord{}, false
+}
+
+func (e espOperationExecutor) resolveInviteTarget(ctx context.Context, req esphttp.SignRequest, target *inviteTargetPayload, sourceGroupID entmoot.GroupID, pilotNodeID entmoot.NodeID) (*inviteTargetPayload, error) {
+	if target != nil {
+		if _, err := validateInviteTarget(target); err != nil {
+			return nil, err
+		}
+		return target, nil
+	}
+	if sourceGroupID == (entmoot.GroupID{}) && pilotNodeID == 0 {
+		return nil, &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "target_required", Message: "invite_create requires target agent identity"}
+	}
+	if sourceGroupID == (entmoot.GroupID{}) {
+		return nil, &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request", Message: "source_group_id is required for member-based invites"}
+	}
+	if pilotNodeID == 0 {
+		return nil, &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request", Message: "pilot_node_id is required for member-based invites"}
+	}
+	if req.DeviceID == "" {
+		return nil, &esphttp.OperationError{HTTPStatus: http.StatusForbidden, Code: "device_signature_required", Message: "member-based invites require a registered device signature"}
+	}
+	if e.deviceGroups == nil {
+		return nil, &esphttp.OperationError{HTTPStatus: http.StatusForbidden, Code: "forbidden", Message: "source group access cannot be verified"}
+	}
+	ok, err := e.deviceGroups.DeviceAllowsGroup(ctx, req.DeviceID, sourceGroupID)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, &esphttp.OperationError{HTTPStatus: http.StatusForbidden, Code: "forbidden", Message: "device is not authorized for source group"}
+	}
+	if _, err := os.Stat(groupRosterPath(e.dataDir, sourceGroupID)); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, &esphttp.OperationError{HTTPStatus: http.StatusNotFound, Code: "source_group_not_found", Message: "source group not joined"}
+		}
+		return nil, err
+	}
+	rlog, err := roster.OpenJSONL(e.dataDir, sourceGroupID)
+	if err != nil {
+		return nil, err
+	}
+	defer rlog.Close()
+	info, ok := rlog.MemberInfo(pilotNodeID)
+	if !ok {
+		return nil, &esphttp.OperationError{HTTPStatus: http.StatusNotFound, Code: "source_member_not_found", Message: "source group member not found"}
+	}
+	if len(info.EntmootPubKey) != ed25519.PublicKeySize {
+		return nil, &esphttp.OperationError{HTTPStatus: http.StatusConflict, Code: "source_member_invalid", Message: "source member Entmoot public key is invalid"}
+	}
+	pilotPubKey, err := e.lookupPilotPubKey(ctx, pilotNodeID)
+	if err != nil {
+		return nil, err
+	}
+	return &inviteTargetPayload{
+		PilotNodeID:   pilotNodeID,
+		PilotPubKey:   pilotPubKey,
+		EntmootPubKey: append([]byte(nil), info.EntmootPubKey...),
+	}, nil
+}
+
+func (e espOperationExecutor) lookupPilotPubKey(ctx context.Context, nodeID entmoot.NodeID) ([]byte, error) {
+	var encoded string
+	if e.pilotLookup != nil {
+		got, err := e.pilotLookup(ctx, nodeID)
+		if err != nil {
+			return nil, err
+		}
+		encoded = strings.TrimSpace(got)
+	} else {
+		socketPath := e.pilotSocketPath
+		if strings.TrimSpace(socketPath) == "" {
+			socketPath = "/tmp/pilot.sock"
+		}
+		drv, err := ipcclient.Connect(socketPath)
+		if err != nil {
+			return nil, &esphttp.OperationError{HTTPStatus: http.StatusServiceUnavailable, Code: "pilot_unavailable", Message: "Pilot daemon is not reachable: " + err.Error()}
+		}
+		defer drv.Close()
+		timeout := e.timeout
+		if timeout <= 0 {
+			timeout = 30 * time.Second
+		}
+		lookupCtx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+		identity, err := drv.LookupNode(lookupCtx, uint32(nodeID))
+		if err != nil {
+			return nil, &esphttp.OperationError{HTTPStatus: http.StatusServiceUnavailable, Code: "pilot_unavailable", Message: "Pilot identity lookup failed: " + err.Error()}
+		}
+		if identity.NodeID != uint32(nodeID) {
+			return nil, &esphttp.OperationError{HTTPStatus: http.StatusConflict, Code: "pilot_identity_mismatch", Message: "Pilot identity lookup returned a different node"}
+		}
+		encoded = strings.TrimSpace(identity.PublicKey)
+	}
+	if encoded == "" {
+		return nil, &esphttp.OperationError{HTTPStatus: http.StatusServiceUnavailable, Code: "pilot_unavailable", Message: "Pilot identity lookup returned no public key"}
+	}
+	raw, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil || len(raw) != ed25519.PublicKeySize {
+		return nil, &esphttp.OperationError{HTTPStatus: http.StatusServiceUnavailable, Code: "pilot_unavailable", Message: "Pilot identity lookup returned an invalid public key"}
+	}
+	return raw, nil
 }
 
 func validateInviteTarget(target *inviteTargetPayload) (entmoot.NodeInfo, error) {

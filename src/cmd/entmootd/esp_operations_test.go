@@ -1037,6 +1037,77 @@ func TestESPBuildInviteCreateRequestNormalizesPayload(t *testing.T) {
 	}
 }
 
+func TestESPInviteResolvesKnownMootMemberTarget(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	sourceGID := testESPGroupID(31)
+	targetGID := testESPGroupID(32)
+	memberID, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate member: %v", err)
+	}
+	member := entmoot.NodeInfo{PilotNodeID: 45460, EntmootPubKey: append([]byte(nil), memberID.PublicKey...)}
+	rlog, err := roster.OpenJSONL(dataDir, sourceGID)
+	if err != nil {
+		t.Fatalf("OpenJSONL: %v", err)
+	}
+	if err := rlog.Genesis(memberID, member, 1_700_000_000_000); err != nil {
+		t.Fatalf("Genesis: %v", err)
+	}
+	if err := rlog.Close(); err != nil {
+		t.Fatalf("Close roster: %v", err)
+	}
+	_, devicePriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey device: %v", err)
+	}
+	reg, err := esphttp.NewDeviceRegistry([]esphttp.Device{{
+		ID:        "ios-1",
+		PublicKey: devicePriv.Public().(ed25519.PublicKey),
+		Groups:    []entmoot.GroupID{sourceGID},
+	}})
+	if err != nil {
+		t.Fatalf("NewDeviceRegistry: %v", err)
+	}
+	targetPilotPub := bytes.Repeat([]byte{0x24}, ed25519.PublicKeySize)
+	sock := testUnixSocketPath(t)
+	reqCh := make(chan *ipc.InviteCreateReq, 1)
+	stop := serveESPInviteCreateIPC(t, sock, targetGID, reqCh)
+	defer stop()
+	exec := espOperationExecutor{
+		dataDir:      dataDir,
+		socketPath:   sock,
+		timeout:      time.Second,
+		deviceGroups: &fileBackedDeviceGroupAuthorizer{registry: reg},
+		pilotLookup: func(_ context.Context, nodeID entmoot.NodeID) (string, error) {
+			if nodeID != member.PilotNodeID {
+				t.Fatalf("pilot lookup node = %d, want %d", nodeID, member.PilotNodeID)
+			}
+			return base64.StdEncoding.EncodeToString(targetPilotPub), nil
+		},
+	}
+	if _, err := exec.ExecuteSignRequest(ctx, esphttp.SignRequest{
+		Kind:     "invite_create",
+		GroupID:  targetGID,
+		DeviceID: "ios-1",
+		Payload: mustMarshalJSON(t, inviteCreatePayload{
+			SourceGroupID: sourceGID,
+			PilotNodeID:   member.PilotNodeID,
+			ValidFor:      "24h",
+		}),
+	}, nil); err != nil {
+		t.Fatalf("ExecuteSignRequest: %v", err)
+	}
+	select {
+	case req := <-reqCh:
+		if req.GroupID != targetGID || req.Target.PilotNodeID != member.PilotNodeID || !bytes.Equal(req.Target.EntmootPubKey, member.EntmootPubKey) || !bytes.Equal(req.TargetPilotPubKey, targetPilotPub) {
+			t.Fatalf("invite request = %+v pilot_pub=%x, want target group and resolved member identity", req, req.TargetPilotPubKey)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for invite create IPC request")
+	}
+}
+
 func TestESPBuildInviteCreateRequestRejectsSubMillisecondValidFor(t *testing.T) {
 	gid := testESPGroupID(18)
 	targetID, err := keystore.Generate()
@@ -1469,6 +1540,87 @@ func TestESPFleetInviteReissuesPendingMemberInvite(t *testing.T) {
 		}
 	}
 	_ = coordinator
+}
+
+func TestESPFleetInviteResolvesKnownMootMemberTarget(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	sourceGID := testESPGroupID(31)
+	memberID, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate member: %v", err)
+	}
+	member := entmoot.NodeInfo{PilotNodeID: 45460, EntmootPubKey: append([]byte(nil), memberID.PublicKey...)}
+	rlog, err := roster.OpenJSONL(dataDir, sourceGID)
+	if err != nil {
+		t.Fatalf("OpenJSONL: %v", err)
+	}
+	if err := rlog.Genesis(memberID, member, 1_700_000_000_000); err != nil {
+		t.Fatalf("Genesis: %v", err)
+	}
+	if err := rlog.Close(); err != nil {
+		t.Fatalf("Close roster: %v", err)
+	}
+	state := esphttp.NewMemoryStateStore()
+	fleet, _ := createFleetForTest(t, state, "fleet-a", "Ops Fleet")
+	_, devicePriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey device: %v", err)
+	}
+	reg, err := esphttp.NewDeviceRegistry([]esphttp.Device{{
+		ID:        "ios-1",
+		PublicKey: devicePriv.Public().(ed25519.PublicKey),
+		Groups:    []entmoot.GroupID{sourceGID},
+	}})
+	if err != nil {
+		t.Fatalf("NewDeviceRegistry: %v", err)
+	}
+	targetPilotPub := bytes.Repeat([]byte{0x42}, ed25519.PublicKeySize)
+	sock := testUnixSocketPath(t)
+	inviteReqCh := make(chan *ipc.InviteCreateReq, 1)
+	removeReqCh := make(chan *ipc.MemberRemoveReq, 1)
+	stop := serveESPFleetInviteAndRemoveIPC(t, sock, fleet.ControlGroupID, inviteReqCh, removeReqCh)
+	defer stop()
+	exec := espOperationExecutor{
+		dataDir:      dataDir,
+		stateStore:   state,
+		socketPath:   sock,
+		timeout:      time.Second,
+		deviceGroups: &fileBackedDeviceGroupAuthorizer{registry: reg},
+		pilotLookup: func(_ context.Context, nodeID entmoot.NodeID) (string, error) {
+			if nodeID != member.PilotNodeID {
+				t.Fatalf("pilot lookup node = %d, want %d", nodeID, member.PilotNodeID)
+			}
+			return base64.StdEncoding.EncodeToString(targetPilotPub), nil
+		},
+	}
+	if _, err := exec.ExecuteSignRequest(ctx, esphttp.SignRequest{
+		Kind:     "fleet_invite_create",
+		DeviceID: "ios-1",
+		Payload: mustMarshalJSON(t, fleetInviteCreatePayload{
+			FleetID:       fleet.FleetID,
+			SourceGroupID: sourceGID,
+			PilotNodeID:   member.PilotNodeID,
+			Hostname:      "phobos",
+		}),
+	}, nil); err != nil {
+		t.Fatalf("ExecuteSignRequest: %v", err)
+	}
+	select {
+	case req := <-inviteReqCh:
+		if req.Target.PilotNodeID != member.PilotNodeID || !bytes.Equal(req.Target.EntmootPubKey, member.EntmootPubKey) || !bytes.Equal(req.TargetPilotPubKey, targetPilotPub) {
+			t.Fatalf("invite target = %+v pilot_pub=%x, want member and looked-up Pilot pubkey", req.Target, req.TargetPilotPubKey)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for invite create IPC request")
+	}
+	invites, err := state.ListFleetInvites(ctx, fleet.FleetID)
+	if err != nil {
+		t.Fatalf("ListFleetInvites: %v", err)
+	}
+	if len(invites) != 1 || invites[0].NodeID != member.PilotNodeID || invites[0].EntmootPubKey != encodeBase64(member.EntmootPubKey) {
+		t.Fatalf("fleet invites = %+v, want resolved member identity", invites)
+	}
 }
 
 func TestESPFleetInviteRollsBackLocalStateOnActivityFailure(t *testing.T) {
