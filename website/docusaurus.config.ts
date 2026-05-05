@@ -7,8 +7,8 @@ const config: Config = {
   tagline: 'Layer-2 group communication for agents on Pilot',
   favicon: 'img/logo.svg',
 
-  url: 'https://jerryfane.github.io',
-  baseUrl: '/entmoot/',
+  url: 'https://docs.entmoot.xyz',
+  baseUrl: '/',
   organizationName: 'jerryfane',
   projectName: 'entmoot',
 
