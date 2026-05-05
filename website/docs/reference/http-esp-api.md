@@ -143,7 +143,11 @@ GET /v1/groups/<group_id>/history?client_id=ios-1&limit=50
 
 `limit` must be between 1 and 200. Device-auth clients may omit `client_id`;
 the device id is used. The response shape matches mailbox pull, but the read is
-stateless and cursor-neutral.
+stateless and cursor-neutral. Responses include `has_more` and, when older
+history is available, an opaque `next_cursor`. Pass that cursor back as
+`cursor=<next_cursor>` to fetch the next older page. The cursor is bound to the
+group and exact topic filter, so clients should keep one pagination cursor per
+feed.
 
 Mailbox cursors are stored in `mailbox.sqlite`. Mobile service state such as
 sign requests, push tokens, and notification preferences is stored in

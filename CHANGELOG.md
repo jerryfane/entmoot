@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.38] - 2026-05-05
+
+### Added
+
+- **ESP history pagination.** `GET /v1/groups/{group_id}/history` now supports
+  opaque older-history cursors and returns `has_more`/`next_cursor` so clients
+  can page beyond the 200-message per-request cap.
+
 ## [1.5.37] - 2026-05-05
 
 ### Added

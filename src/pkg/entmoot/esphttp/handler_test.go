@@ -621,8 +621,18 @@ func TestHandlerGroupHistoryReturnsLatestWithoutAdvancingCursor(t *testing.T) {
 	if history.Count != 2 || len(history.Messages) != 2 {
 		t.Fatalf("history count/messages = %d/%d, want 2/2", history.Count, len(history.Messages))
 	}
+	if !history.HasMore || history.NextCursor == "" {
+		t.Fatalf("history has_more/cursor = %v/%q, want older page cursor", history.HasMore, history.NextCursor)
+	}
 	if history.Messages[0].Content != "second" || history.Messages[1].Content != "third" {
 		t.Fatalf("history contents = %q, %q; want second, third", history.Messages[0].Content, history.Messages[1].Content)
+	}
+	older := doJSONRequest[mailbox.HistoryResult](t, handler, http.MethodGet, "/v1/groups/"+gid.String()+"/history?client_id=ios-1&limit=2&cursor="+url.QueryEscape(history.NextCursor), nil, http.StatusOK)
+	if older.Count != 1 || len(older.Messages) != 1 || older.Messages[0].Content != "first" {
+		t.Fatalf("older history = %+v, want first only", older)
+	}
+	if older.HasMore || older.NextCursor != "" {
+		t.Fatalf("older history has_more/cursor = %v/%q, want exhausted", older.HasMore, older.NextCursor)
 	}
 	cursor, err := svc.CursorStatus(context.Background(), gid, "ios-1")
 	if err != nil {
@@ -630,6 +640,27 @@ func TestHandlerGroupHistoryReturnsLatestWithoutAdvancingCursor(t *testing.T) {
 	}
 	if cursor.Cursor.TimestampMS != 2 {
 		t.Fatalf("cursor timestamp = %d, want unchanged 2", cursor.Cursor.TimestampMS)
+	}
+}
+
+func TestHistoryCursorAcceptsZeroBoundaryFields(t *testing.T) {
+	gid := testGroupID(1)
+	var msgID entmoot.MessageID
+	msgID[0] = 1
+	cursor := encodeHistoryCursor(gid, "", &store.PageBoundary{
+		TimestampMS:  0,
+		AuthorNodeID: 0,
+		MessageID:    msgID,
+	})
+	if cursor == "" {
+		t.Fatal("encodeHistoryCursor returned empty cursor")
+	}
+	boundary, err := parseHistoryCursor(cursor, gid, "")
+	if err != nil {
+		t.Fatalf("parseHistoryCursor: %v", err)
+	}
+	if boundary.TimestampMS != 0 || boundary.AuthorNodeID != 0 || boundary.MessageID != msgID {
+		t.Fatalf("boundary = %+v, want zero timestamp/node and message id %s", boundary, msgID)
 	}
 }
 
@@ -673,12 +704,22 @@ func TestHandlerGroupTopicsAndTopicHistory(t *testing.T) {
 		t.Fatalf("top topic = %+v, want ops count 2 latest 2", topics.Topics[0])
 	}
 
-	history := doJSONRequest[mailbox.HistoryResult](t, handler, http.MethodGet, "/v1/groups/"+gid.String()+"/history?client_id=ios-1&topic=ops&limit=10", nil, http.StatusOK)
-	if history.Count != 2 || len(history.Messages) != 2 {
-		t.Fatalf("topic history count/messages = %d/%d, want 2/2", history.Count, len(history.Messages))
+	history := doJSONRequest[mailbox.HistoryResult](t, handler, http.MethodGet, "/v1/groups/"+gid.String()+"/history?client_id=ios-1&topic=ops&limit=1", nil, http.StatusOK)
+	if history.Count != 1 || len(history.Messages) != 1 {
+		t.Fatalf("topic history count/messages = %d/%d, want 1/1", history.Count, len(history.Messages))
 	}
-	if history.Messages[0].MessageID != oldOps.ID || history.Messages[1].MessageID != researchOps.ID {
-		t.Fatalf("topic history ids = %v, want oldOps,researchOps", []entmoot.MessageID{history.Messages[0].MessageID, history.Messages[1].MessageID})
+	if !history.HasMore || history.NextCursor == "" {
+		t.Fatalf("topic history has_more/cursor = %v/%q, want older page cursor", history.HasMore, history.NextCursor)
+	}
+	if history.Messages[0].MessageID != researchOps.ID {
+		t.Fatalf("topic history ids = %v, want researchOps", []entmoot.MessageID{history.Messages[0].MessageID})
+	}
+	older := doJSONRequest[mailbox.HistoryResult](t, handler, http.MethodGet, "/v1/groups/"+gid.String()+"/history?client_id=ios-1&topic=ops&limit=1&cursor="+url.QueryEscape(history.NextCursor), nil, http.StatusOK)
+	if older.Count != 1 || len(older.Messages) != 1 || older.Messages[0].MessageID != oldOps.ID {
+		t.Fatalf("older topic history = %+v, want oldOps", older)
+	}
+	if older.HasMore || older.NextCursor != "" {
+		t.Fatalf("older topic history has_more/cursor = %v/%q, want exhausted", older.HasMore, older.NextCursor)
 	}
 }
 

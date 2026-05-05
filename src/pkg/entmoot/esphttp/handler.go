@@ -1005,13 +1005,79 @@ func (h *Handler) handleGroupHistory(w http.ResponseWriter, r *http.Request, gro
 		limit = n
 	}
 	topic := strings.TrimSpace(r.URL.Query().Get("topic"))
+	boundary, err := parseHistoryCursor(strings.TrimSpace(r.URL.Query().Get("cursor")), groupID, topic)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
 	if topic != "" {
-		result, err := h.service.TopicHistory(r.Context(), groupID, topic, limit)
+		result, err := h.service.TopicHistoryBefore(r.Context(), groupID, topic, limit, boundary)
+		if err == nil {
+			result.NextCursor = encodeHistoryCursor(groupID, topic, result.NextCursorBoundary)
+		}
 		h.writeMailboxResult(w, "group topic history", result, err)
 		return
 	}
-	result, err := h.service.History(r.Context(), groupID, limit)
+	result, err := h.service.HistoryBefore(r.Context(), groupID, limit, boundary)
+	if err == nil {
+		result.NextCursor = encodeHistoryCursor(groupID, topic, result.NextCursorBoundary)
+	}
 	h.writeMailboxResult(w, "group history", result, err)
+}
+
+type historyCursorPayload struct {
+	Version      int               `json:"v"`
+	GroupID      entmoot.GroupID   `json:"group_id"`
+	Topic        string            `json:"topic,omitempty"`
+	TimestampMS  int64             `json:"timestamp_ms"`
+	AuthorNodeID entmoot.NodeID    `json:"author_node_id"`
+	MessageID    entmoot.MessageID `json:"message_id"`
+}
+
+func parseHistoryCursor(raw string, groupID entmoot.GroupID, topic string) (*store.PageBoundary, error) {
+	if raw == "" {
+		return nil, nil
+	}
+	data, err := base64.RawURLEncoding.DecodeString(raw)
+	if err != nil {
+		return nil, fmt.Errorf("invalid history cursor")
+	}
+	var payload historyCursorPayload
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return nil, fmt.Errorf("invalid history cursor")
+	}
+	if payload.Version != 1 {
+		return nil, fmt.Errorf("unsupported history cursor")
+	}
+	if payload.GroupID != groupID || payload.Topic != topic {
+		return nil, fmt.Errorf("history cursor does not match requested group or topic")
+	}
+	if payload.MessageID == (entmoot.MessageID{}) {
+		return nil, fmt.Errorf("invalid history cursor")
+	}
+	return &store.PageBoundary{
+		TimestampMS:  payload.TimestampMS,
+		AuthorNodeID: payload.AuthorNodeID,
+		MessageID:    payload.MessageID,
+	}, nil
+}
+
+func encodeHistoryCursor(groupID entmoot.GroupID, topic string, boundary *store.PageBoundary) string {
+	if boundary == nil {
+		return ""
+	}
+	data, err := json.Marshal(historyCursorPayload{
+		Version:      1,
+		GroupID:      groupID,
+		Topic:        topic,
+		TimestampMS:  boundary.TimestampMS,
+		AuthorNodeID: boundary.AuthorNodeID,
+		MessageID:    boundary.MessageID,
+	})
+	if err != nil {
+		return ""
+	}
+	return base64.RawURLEncoding.EncodeToString(data)
 }
 
 func (h *Handler) handleGroupTopics(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID) {

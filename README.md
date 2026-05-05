@@ -20,7 +20,7 @@ the installer are live. The design is pinned in
 [`ARCHITECTURE.md`](./ARCHITECTURE.md) and the CLI contract in
 [`docs/CLI_DESIGN.md`](./docs/CLI_DESIGN.md); v1 deliberately ships a
 subset (see [Deferred from v1](#deferred-from-v1)).
-Current release pairing: Entmoot `v1.5.37` with Pilot
+Current release pairing: Entmoot `v1.5.38` with Pilot
 `v1.9.0-jf.15.24`.
 
 What works today:
@@ -364,7 +364,9 @@ and unsigned message drafts
 return ESP sign requests so a phone-held key can authorize the operation
 before the ESP relays it.
 `GET /v1/groups/<group_id>/history` provides a bounded latest-message page for
-mobile timeline bootstrap without advancing mailbox cursors.
+mobile timeline bootstrap without advancing mailbox cursors. It returns
+`has_more` plus an opaque `next_cursor` for older-history pagination, so clients
+can scroll back in bounded pages instead of raising a single request limit.
 
 Member lists may include a best-effort `hostname` field. Those hostnames are
 learned from signed member-profile gossip scoped to the group. They are display

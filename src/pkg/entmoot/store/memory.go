@@ -120,6 +120,27 @@ func (s *Memory) Latest(_ context.Context, groupID entmoot.GroupID, limit int) (
 	return latestMessages(candidates, limit)
 }
 
+// LatestBefore implements MessageStore.LatestBefore.
+func (s *Memory) LatestBefore(ctx context.Context, groupID entmoot.GroupID, limit int, boundary *PageBoundary) ([]entmoot.Message, error) {
+	if limit <= 0 {
+		return []entmoot.Message{}, nil
+	}
+	if boundary == nil {
+		return s.Latest(ctx, groupID, limit)
+	}
+	s.mu.RLock()
+	bucket := s.groups[groupID]
+	candidates := make([]entmoot.Message, 0, len(bucket))
+	for _, m := range bucket {
+		if messageOlderThan(m, *boundary) {
+			candidates = append(candidates, m)
+		}
+	}
+	s.mu.RUnlock()
+
+	return latestMessages(candidates, limit)
+}
+
 // Topics implements MessageStore.Topics.
 func (s *Memory) Topics(_ context.Context, groupID entmoot.GroupID, limit int) ([]TopicSummary, error) {
 	if limit <= 0 {
@@ -146,6 +167,27 @@ func (s *Memory) LatestByTopic(_ context.Context, groupID entmoot.GroupID, topic
 	candidates := make([]entmoot.Message, 0, len(bucket))
 	for _, m := range bucket {
 		if messageHasTopic(m, topic) {
+			candidates = append(candidates, m)
+		}
+	}
+	s.mu.RUnlock()
+
+	return latestMessages(candidates, limit)
+}
+
+// LatestByTopicBefore implements MessageStore.LatestByTopicBefore.
+func (s *Memory) LatestByTopicBefore(ctx context.Context, groupID entmoot.GroupID, topic string, limit int, boundary *PageBoundary) ([]entmoot.Message, error) {
+	if limit <= 0 || topic == "" {
+		return []entmoot.Message{}, nil
+	}
+	if boundary == nil {
+		return s.LatestByTopic(ctx, groupID, topic, limit)
+	}
+	s.mu.RLock()
+	bucket := s.groups[groupID]
+	candidates := make([]entmoot.Message, 0, len(bucket))
+	for _, m := range bucket {
+		if messageHasTopic(m, topic) && messageOlderThan(m, *boundary) {
 			candidates = append(candidates, m)
 		}
 	}
@@ -270,6 +312,16 @@ func messageHasTopic(m entmoot.Message, topic string) bool {
 		}
 	}
 	return false
+}
+
+func messageOlderThan(m entmoot.Message, boundary PageBoundary) bool {
+	if m.Timestamp != boundary.TimestampMS {
+		return m.Timestamp < boundary.TimestampMS
+	}
+	if m.Author.PilotNodeID != boundary.AuthorNodeID {
+		return m.Author.PilotNodeID < boundary.AuthorNodeID
+	}
+	return bytes.Compare(m.ID[:], boundary.MessageID[:]) < 0
 }
 
 func latestMessages(msgs []entmoot.Message, limit int) ([]entmoot.Message, error) {

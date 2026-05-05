@@ -1,10 +1,13 @@
 package mailbox
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"sort"
 
 	"entmoot/pkg/entmoot"
+	"entmoot/pkg/entmoot/order"
 	"entmoot/pkg/entmoot/store"
 )
 
@@ -31,9 +34,12 @@ type PullResult struct {
 // HistoryResult is returned by read-only latest-message APIs. It does not
 // include or update a per-client cursor.
 type HistoryResult struct {
-	GroupID  entmoot.GroupID `json:"group_id"`
-	Count    int             `json:"count"`
-	Messages []SyncMessage   `json:"messages"`
+	GroupID            entmoot.GroupID     `json:"group_id"`
+	Count              int                 `json:"count"`
+	HasMore            bool                `json:"has_more"`
+	NextCursor         string              `json:"next_cursor,omitempty"`
+	Messages           []SyncMessage       `json:"messages"`
+	NextCursorBoundary *store.PageBoundary `json:"-"`
 }
 
 // TopicSummary describes one topic's message volume and latest activity.
@@ -105,6 +111,12 @@ func (s *Service) Pull(ctx context.Context, groupID entmoot.GroupID, clientID st
 // advancing any mailbox cursor. Results are returned oldest-to-newest so
 // clients can render them as a conversation.
 func (s *Service) History(ctx context.Context, groupID entmoot.GroupID, limit int) (HistoryResult, error) {
+	return s.HistoryBefore(ctx, groupID, limit, nil)
+}
+
+// HistoryBefore returns one read-only history page older than boundary. A nil
+// boundary returns the latest page.
+func (s *Service) HistoryBefore(ctx context.Context, groupID entmoot.GroupID, limit int, boundary *store.PageBoundary) (HistoryResult, error) {
 	if limit <= 0 {
 		return HistoryResult{
 			GroupID:  groupID,
@@ -112,19 +124,21 @@ func (s *Service) History(ctx context.Context, groupID entmoot.GroupID, limit in
 			Messages: MessagesView(nil),
 		}, nil
 	}
-	msgs, err := s.store.Latest(ctx, groupID, limit)
+	msgs, err := s.store.LatestBefore(ctx, groupID, limit+1, boundary)
 	if err != nil {
 		return HistoryResult{}, err
 	}
-	return HistoryResult{
-		GroupID:  groupID,
-		Count:    len(msgs),
-		Messages: MessagesView(msgs),
-	}, nil
+	return historyResultFromMessages(groupID, msgs, limit)
 }
 
 // TopicHistory returns the most recent messages in groupID that contain topic.
 func (s *Service) TopicHistory(ctx context.Context, groupID entmoot.GroupID, topic string, limit int) (HistoryResult, error) {
+	return s.TopicHistoryBefore(ctx, groupID, topic, limit, nil)
+}
+
+// TopicHistoryBefore returns one read-only topic history page older than
+// boundary. A nil boundary returns the latest topic page.
+func (s *Service) TopicHistoryBefore(ctx context.Context, groupID entmoot.GroupID, topic string, limit int, boundary *store.PageBoundary) (HistoryResult, error) {
 	if limit <= 0 || topic == "" {
 		return HistoryResult{
 			GroupID:  groupID,
@@ -132,15 +146,81 @@ func (s *Service) TopicHistory(ctx context.Context, groupID entmoot.GroupID, top
 			Messages: MessagesView(nil),
 		}, nil
 	}
-	msgs, err := s.store.LatestByTopic(ctx, groupID, topic, limit)
+	msgs, err := s.store.LatestByTopicBefore(ctx, groupID, topic, limit+1, boundary)
 	if err != nil {
 		return HistoryResult{}, err
 	}
-	return HistoryResult{
+	return historyResultFromMessages(groupID, msgs, limit)
+}
+
+func historyResultFromMessages(groupID entmoot.GroupID, msgs []entmoot.Message, limit int) (HistoryResult, error) {
+	hasMore := limit > 0 && len(msgs) > limit
+	selected := msgs
+	if hasMore {
+		byRecency := append([]entmoot.Message(nil), msgs...)
+		sort.Slice(byRecency, func(i, j int) bool {
+			return messageNewerThan(byRecency[i], byRecency[j])
+		})
+		selected = byRecency[:limit]
+	}
+	selected, err := orderMessagesTopologically(selected)
+	if err != nil {
+		return HistoryResult{}, err
+	}
+	result := HistoryResult{
 		GroupID:  groupID,
-		Count:    len(msgs),
-		Messages: MessagesView(msgs),
-	}, nil
+		Count:    len(selected),
+		HasMore:  hasMore,
+		Messages: MessagesView(selected),
+	}
+	if hasMore && len(selected) > 0 {
+		oldest := oldestByRecency(selected)
+		result.NextCursorBoundary = &store.PageBoundary{
+			TimestampMS:  oldest.Timestamp,
+			AuthorNodeID: oldest.Author.PilotNodeID,
+			MessageID:    oldest.ID,
+		}
+	}
+	return result, nil
+}
+
+func messageNewerThan(a, b entmoot.Message) bool {
+	if a.Timestamp != b.Timestamp {
+		return a.Timestamp > b.Timestamp
+	}
+	if a.Author.PilotNodeID != b.Author.PilotNodeID {
+		return a.Author.PilotNodeID > b.Author.PilotNodeID
+	}
+	return bytes.Compare(a.ID[:], b.ID[:]) > 0
+}
+
+func oldestByRecency(msgs []entmoot.Message) entmoot.Message {
+	oldest := msgs[0]
+	for _, msg := range msgs[1:] {
+		if messageNewerThan(oldest, msg) {
+			oldest = msg
+		}
+	}
+	return oldest
+}
+
+func orderMessagesTopologically(msgs []entmoot.Message) ([]entmoot.Message, error) {
+	if len(msgs) == 0 {
+		return []entmoot.Message{}, nil
+	}
+	ids, err := order.Topological(msgs)
+	if err != nil {
+		return nil, err
+	}
+	byID := make(map[entmoot.MessageID]entmoot.Message, len(msgs))
+	for _, msg := range msgs {
+		byID[msg.ID] = msg
+	}
+	out := make([]entmoot.Message, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, byID[id])
+	}
+	return out, nil
 }
 
 // Topics returns topic aggregates for groupID without touching mailbox cursors.

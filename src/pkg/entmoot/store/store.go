@@ -39,6 +39,14 @@ type TopicSummary struct {
 	LatestMessageAtMS int64
 }
 
+// PageBoundary identifies the exclusive upper edge for older-history keyset
+// pagination in the same recency order used by Latest.
+type PageBoundary struct {
+	TimestampMS  int64
+	AuthorNodeID entmoot.NodeID
+	MessageID    entmoot.MessageID
+}
+
 // MessageStore persists messages grouped by GroupID. All methods are safe for
 // concurrent use.
 type MessageStore interface {
@@ -65,6 +73,11 @@ type MessageStore interface {
 	// returns an empty slice.
 	Latest(ctx context.Context, groupID entmoot.GroupID, limit int) ([]entmoot.Message, error)
 
+	// LatestBefore returns at most limit messages older than boundary in the
+	// same recency order used by Latest, then returns that bounded window in
+	// topological order. A nil boundary is equivalent to Latest.
+	LatestBefore(ctx context.Context, groupID entmoot.GroupID, limit int, boundary *PageBoundary) ([]entmoot.Message, error)
+
 	// Topics returns topic aggregates for groupID ordered by message count
 	// descending, latest message timestamp descending, then topic name ascending.
 	// A limit <= 0 returns an empty slice.
@@ -73,6 +86,10 @@ type MessageStore interface {
 	// LatestByTopic returns at most limit recent messages in groupID that contain
 	// topic exactly. The recency and output ordering match Latest.
 	LatestByTopic(ctx context.Context, groupID entmoot.GroupID, topic string, limit int) ([]entmoot.Message, error)
+
+	// LatestByTopicBefore is LatestBefore restricted to messages containing
+	// topic exactly. A nil boundary is equivalent to LatestByTopic.
+	LatestByTopicBefore(ctx context.Context, groupID entmoot.GroupID, topic string, limit int, boundary *PageBoundary) ([]entmoot.Message, error)
 
 	// MerkleRoot returns the Merkle root (pkg/entmoot/merkle) over every
 	// message in the group, ordered topologically. An empty group returns the

@@ -238,6 +238,30 @@ func (s *JSONL) Latest(_ context.Context, groupID entmoot.GroupID, limit int) ([
 	return latestMessages(candidates, limit)
 }
 
+// LatestBefore implements MessageStore.LatestBefore.
+func (s *JSONL) LatestBefore(ctx context.Context, groupID entmoot.GroupID, limit int, boundary *PageBoundary) ([]entmoot.Message, error) {
+	if limit <= 0 {
+		return []entmoot.Message{}, nil
+	}
+	if boundary == nil {
+		return s.Latest(ctx, groupID, limit)
+	}
+	s.mu.RLock()
+	gs := s.groups[groupID]
+	var candidates []entmoot.Message
+	if gs != nil {
+		candidates = make([]entmoot.Message, 0, len(gs.msgs))
+		for _, m := range gs.msgs {
+			if messageOlderThan(m, *boundary) {
+				candidates = append(candidates, m)
+			}
+		}
+	}
+	s.mu.RUnlock()
+
+	return latestMessages(candidates, limit)
+}
+
 // Topics implements MessageStore.Topics.
 func (s *JSONL) Topics(_ context.Context, groupID entmoot.GroupID, limit int) ([]TopicSummary, error) {
 	if limit <= 0 {
@@ -269,6 +293,30 @@ func (s *JSONL) LatestByTopic(_ context.Context, groupID entmoot.GroupID, topic 
 		candidates = make([]entmoot.Message, 0, len(gs.msgs))
 		for _, m := range gs.msgs {
 			if messageHasTopic(m, topic) {
+				candidates = append(candidates, m)
+			}
+		}
+	}
+	s.mu.RUnlock()
+
+	return latestMessages(candidates, limit)
+}
+
+// LatestByTopicBefore implements MessageStore.LatestByTopicBefore.
+func (s *JSONL) LatestByTopicBefore(ctx context.Context, groupID entmoot.GroupID, topic string, limit int, boundary *PageBoundary) ([]entmoot.Message, error) {
+	if limit <= 0 || topic == "" {
+		return []entmoot.Message{}, nil
+	}
+	if boundary == nil {
+		return s.LatestByTopic(ctx, groupID, topic, limit)
+	}
+	s.mu.RLock()
+	gs := s.groups[groupID]
+	var candidates []entmoot.Message
+	if gs != nil {
+		candidates = make([]entmoot.Message, 0, len(gs.msgs))
+		for _, m := range gs.msgs {
+			if messageHasTopic(m, topic) && messageOlderThan(m, *boundary) {
 				candidates = append(candidates, m)
 			}
 		}

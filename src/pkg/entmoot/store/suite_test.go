@@ -286,6 +286,32 @@ func runStoreSuite(t *testing.T, newStore func(t *testing.T) MessageStore) {
 		}
 	})
 
+	t.Run("LatestBeforeUsesStableRecencyBoundary", func(t *testing.T) {
+		s := newStore(t)
+		gid := randGroupID(t)
+		m1 := mkMsg(t, gid, testAuthor(1, 0x01), 10, "old")
+		m2 := mkMsg(t, gid, testAuthor(1, 0x01), 20, "middle")
+		m3 := mkMsg(t, gid, testAuthor(2, 0x02), 20, "middle newer author")
+		m4 := mkMsg(t, gid, testAuthor(1, 0x01), 30, "new")
+		for _, m := range []entmoot.Message{m4, m1, m3, m2} {
+			if err := s.Put(ctx, m); err != nil {
+				t.Fatalf("Put: %v", err)
+			}
+		}
+
+		got, err := s.LatestBefore(ctx, gid, 2, &PageBoundary{
+			TimestampMS:  m3.Timestamp,
+			AuthorNodeID: m3.Author.PilotNodeID,
+			MessageID:    m3.ID,
+		})
+		if err != nil {
+			t.Fatalf("LatestBefore: %v", err)
+		}
+		if len(got) != 2 || got[0].ID != m1.ID || got[1].ID != m2.ID {
+			t.Fatalf("LatestBefore got %v, want old,middle", idsOf(got))
+		}
+	})
+
 	t.Run("TopicsAndLatestByTopic", func(t *testing.T) {
 		s := newStore(t)
 		gid := randGroupID(t)
@@ -324,6 +350,18 @@ func runStoreSuite(t *testing.T, newStore func(t *testing.T) MessageStore) {
 		}
 		if len(msgs) != 2 || msgs[0].ID != oldOps.ID || msgs[1].ID != newResearchOps.ID {
 			t.Fatalf("LatestByTopic got %v, want oldOps,newResearchOps", idsOf(msgs))
+		}
+
+		msgs, err = s.LatestByTopicBefore(ctx, gid, "ops", 1, &PageBoundary{
+			TimestampMS:  newResearchOps.Timestamp,
+			AuthorNodeID: newResearchOps.Author.PilotNodeID,
+			MessageID:    newResearchOps.ID,
+		})
+		if err != nil {
+			t.Fatalf("LatestByTopicBefore: %v", err)
+		}
+		if len(msgs) != 1 || msgs[0].ID != oldOps.ID {
+			t.Fatalf("LatestByTopicBefore got %v, want oldOps", idsOf(msgs))
 		}
 	})
 

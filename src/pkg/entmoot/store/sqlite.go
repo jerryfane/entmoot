@@ -382,6 +382,59 @@ func (s *SQLite) Latest(ctx context.Context, groupID entmoot.GroupID, limit int)
 	return topoOrder(candidates)
 }
 
+// LatestBefore implements MessageStore.LatestBefore.
+func (s *SQLite) LatestBefore(ctx context.Context, groupID entmoot.GroupID, limit int, boundary *PageBoundary) ([]entmoot.Message, error) {
+	if limit <= 0 {
+		return []entmoot.Message{}, nil
+	}
+	if boundary == nil {
+		return s.Latest(ctx, groupID, limit)
+	}
+	db, err := s.dbFor(groupID)
+	if err != nil {
+		return nil, err
+	}
+
+	rows, err := db.QueryContext(ctx, `
+		SELECT canonical_bytes FROM messages
+		WHERE group_id = ?
+		  AND (
+		    timestamp_ms < ?
+		    OR (timestamp_ms = ? AND author_node_id < ?)
+		    OR (timestamp_ms = ? AND author_node_id = ? AND message_id < ?)
+		  )
+		ORDER BY timestamp_ms DESC, author_node_id DESC, message_id DESC
+		LIMIT ?;`,
+		groupID[:],
+		boundary.TimestampMS,
+		boundary.TimestampMS, uint32(boundary.AuthorNodeID),
+		boundary.TimestampMS, uint32(boundary.AuthorNodeID), boundary.MessageID[:],
+		limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("store: latest before query: %w", err)
+	}
+	defer rows.Close()
+
+	candidates := make([]entmoot.Message, 0, limit)
+	for rows.Next() {
+		var canonBytes []byte
+		if err := rows.Scan(&canonBytes); err != nil {
+			return nil, fmt.Errorf("store: latest before scan: %w", err)
+		}
+		msg, err := decodeMessage(canonBytes)
+		if err != nil {
+			return nil, err
+		}
+		candidates = append(candidates, msg)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: latest before iterate: %w", err)
+	}
+
+	return topoOrder(candidates)
+}
+
 // Topics implements MessageStore.Topics.
 func (s *SQLite) Topics(ctx context.Context, groupID entmoot.GroupID, limit int) ([]TopicSummary, error) {
 	if limit <= 0 {
@@ -458,6 +511,60 @@ func (s *SQLite) LatestByTopic(ctx context.Context, groupID entmoot.GroupID, top
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("store: latest by topic iterate: %w", err)
+	}
+
+	return topoOrder(candidates)
+}
+
+// LatestByTopicBefore implements MessageStore.LatestByTopicBefore.
+func (s *SQLite) LatestByTopicBefore(ctx context.Context, groupID entmoot.GroupID, topic string, limit int, boundary *PageBoundary) ([]entmoot.Message, error) {
+	if limit <= 0 || topic == "" {
+		return []entmoot.Message{}, nil
+	}
+	if boundary == nil {
+		return s.LatestByTopic(ctx, groupID, topic, limit)
+	}
+	db, err := s.dbFor(groupID)
+	if err != nil {
+		return nil, err
+	}
+
+	rows, err := db.QueryContext(ctx, `
+		SELECT m.canonical_bytes FROM messages m
+		JOIN message_topics mt ON mt.message_id = m.message_id
+		WHERE m.group_id = ? AND mt.topic = ?
+		  AND (
+		    m.timestamp_ms < ?
+		    OR (m.timestamp_ms = ? AND m.author_node_id < ?)
+		    OR (m.timestamp_ms = ? AND m.author_node_id = ? AND m.message_id < ?)
+		  )
+		ORDER BY m.timestamp_ms DESC, m.author_node_id DESC, m.message_id DESC
+		LIMIT ?;`,
+		groupID[:], topic,
+		boundary.TimestampMS,
+		boundary.TimestampMS, uint32(boundary.AuthorNodeID),
+		boundary.TimestampMS, uint32(boundary.AuthorNodeID), boundary.MessageID[:],
+		limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("store: latest by topic before query: %w", err)
+	}
+	defer rows.Close()
+
+	candidates := make([]entmoot.Message, 0, limit)
+	for rows.Next() {
+		var canonBytes []byte
+		if err := rows.Scan(&canonBytes); err != nil {
+			return nil, fmt.Errorf("store: latest by topic before scan: %w", err)
+		}
+		msg, err := decodeMessage(canonBytes)
+		if err != nil {
+			return nil, err
+		}
+		candidates = append(candidates, msg)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: latest by topic before iterate: %w", err)
 	}
 
 	return topoOrder(candidates)

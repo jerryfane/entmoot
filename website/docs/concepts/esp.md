@@ -69,5 +69,7 @@ duplicate sign requests or re-completing operations with ambiguous outcomes.
 
 For initial timeline rendering, mobile clients can use
 `GET /v1/groups/{group_id}/history`. This returns a bounded latest-message page
-without advancing the mailbox cursor. Foreground sync should still use mailbox
-pull/ack once the client is ready to track durable delivery state.
+without advancing the mailbox cursor. The endpoint is paginated with an opaque
+`next_cursor`, allowing clients to scroll back through older pages while keeping
+the per-request limit capped. Foreground sync should still use mailbox pull/ack
+once the client is ready to track durable delivery state.
