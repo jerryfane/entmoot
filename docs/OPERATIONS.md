@@ -83,8 +83,9 @@ peers, and changelog stay aligned.
 
 5. Verify the tag-triggered GitHub release succeeds and the expected
    darwin/linux amd64/arm64 archives are uploaded.
-6. Update each peer from the released tag or source checkout, then restart in
-   the standard order: Pilot first only when needed, then Entmoot. Current
+6. Update each peer from the released tag with `entmootd update --restart`
+   where possible; use the installer or source checkout only as fallback.
+   Restart in the standard order: Pilot first only when needed, then Entmoot. Current
    Entmoot invite/open-invite/onboarding flows require the matching Pilot fork
    capabilities for tracked send acknowledgements, node lookup/challenge
    signing, and pending-handshake notifications.

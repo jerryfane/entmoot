@@ -20,8 +20,8 @@ the installer are live. The design is pinned in
 [`ARCHITECTURE.md`](./ARCHITECTURE.md) and the CLI contract in
 [`docs/CLI_DESIGN.md`](./docs/CLI_DESIGN.md); v1 deliberately ships a
 subset (see [Deferred from v1](#deferred-from-v1)).
-Current release pairing: Entmoot `v1.5.38` with Pilot
-`v1.9.0-jf.15.24`.
+Current release pairing: Entmoot `v1.5.39` with Pilot
+`v1.9.0-jf.15.25`.
 
 What works today:
 
@@ -83,6 +83,17 @@ install Pilot; install that separately:
 ```sh
 curl -fsSL https://pilotprotocol.network/install.sh | sh
 ```
+
+Update an existing install:
+
+```sh
+entmootd update --check
+entmootd update --restart
+```
+
+The update command downloads the latest GitHub Release archive for the host
+OS/arch, verifies it against `checksums.txt`, and replaces the installed
+`entmootd` binary.
 
 Uninstall:
 

@@ -2,7 +2,7 @@
 title: Peer Upgrades
 ---
 
-Current release pairing: Entmoot `v1.5.37` with Pilot `v1.9.0-jf.15.24`.
+Current release pairing: Entmoot `v1.5.39` with Pilot `v1.9.0-jf.15.25`.
 
 Upgrade order:
 

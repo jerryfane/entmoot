@@ -18,6 +18,12 @@ entmootd version
 entmootd --help
 ```
 
+Update an existing install:
+
+```sh
+entmootd update --check
+entmootd update --restart
+```
+
 Entmoot requires a running Pilot daemon. By default, `entmootd` uses
 `/tmp/pilot.sock`.
-
