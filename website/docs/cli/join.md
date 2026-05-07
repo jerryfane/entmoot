@@ -6,9 +6,10 @@ title: join
 entmootd join <invite> [invite...]
 ```
 
-`join` validates each invite, opens one shared Pilot listener, starts the local
-control socket, loads persistent state, and blocks while participating in every
-joined group session.
+`join` validates each invite, applies it to local state, and exits. When an
+Entmoot daemon is already running for the same data root, `join` sends the
+invite to that daemon over the local control socket so agents can join new
+groups without stopping `serve`.
 
 Accepted invite inputs:
 
@@ -24,7 +25,8 @@ the issuer URL is required.
 
 For production restarts, prefer `entmootd serve` after the first successful
 join. `serve` loads persisted groups from disk and does not need the original
-invite file.
+invite file. Use `entmootd join --serve <invite>` only when you explicitly want
+the legacy join-and-run daemon mode.
 
 On containerized agents, run joins through the installed wrapper:
 
@@ -44,7 +46,7 @@ Useful flags:
 -trace-gossip-transport
 ```
 
-On success, `join` emits a readiness event before blocking. The event includes
+On success, `join` emits a readiness event before exiting. The event includes
 `health` and `next_command` so operators can immediately run a route check:
 
 ```json

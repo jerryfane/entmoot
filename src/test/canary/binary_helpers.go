@@ -79,7 +79,7 @@ func runEntmootd(t *testing.T, binary string, envExtra []string, args ...string)
 	return stdout.String(), stderr.String(), code
 }
 
-// joinHandle owns a backgrounded `entmootd join` subprocess and the
+// joinHandle owns a backgrounded `entmootd join --serve` subprocess and the
 // goroutines draining its stdout/stderr.
 type joinHandle struct {
 	name    string
@@ -102,13 +102,12 @@ type joinHandle struct {
 }
 
 // startEntmootdJoin launches `entmootd -socket SOCK -identity ID -data DIR
-// -listen-port PORT join <invite>` in the background, waits for the
+// -listen-port PORT join --serve <invite>` in the background, waits for the
 // `{"event":"joined",...}` line on stdout (with a 15-second timeout), and
 // returns a handle the caller can Stop.
 //
-// This mirrors the blocking-process contract in CLI_DESIGN §3.1: join
-// emits exactly one JSON stdout line and then nothing further during
-// normal operation.
+// This mirrors join's legacy blocking-process mode: join --serve emits exactly
+// one JSON stdout line and then nothing further during normal operation.
 func startEntmootdJoin(
 	t *testing.T,
 	name string,
@@ -128,6 +127,7 @@ func startEntmootdJoin(
 		"-listen-port", fmt.Sprintf("%d", listenPort),
 		"-log-level", "info",
 		"join",
+		"--serve",
 		invitePath,
 	}
 

@@ -76,17 +76,17 @@ across all five: `-socket` (Pilot IPC socket, default `/tmp/pilot.sock`),
 `publish` dials it. `info` and `query` read SQLite directly and work
 whether or not the daemon is running.
 
-### 3.1 `entmootd join <invite> [invite...]`
+### 3.1 `entmootd join [--serve] <invite> [invite...]`
 
-**Purpose:** the *only* command that brings an agent online. Reads or
-generates identity, opens Pilot, applies one or more invites to local
-rosters, binds the listen port, opens the control socket, and enters the
-accept loop. Blocks until SIGINT or SIGTERM.
+**Purpose:** applies one or more invites to local rosters. By default,
+`join` is one-shot: if a daemon is already running for the data root it
+submits the invite over IPC, otherwise it opens Pilot long enough to apply the
+invite, writes local state, emits a JSON readiness event, and exits.
 
 **Signature**
 
 ```
-entmootd join <invite> [invite...]
+entmootd join [--serve] <invite> [invite...]
 ```
 
 **Argument**
@@ -111,24 +111,27 @@ entmootd join <invite> [invite...]
 
 **Flags**
 
-None beyond globals.
+- `--serve`: legacy join-and-run mode. Opens the control socket and accept loop
+  after applying the invite, then blocks until SIGINT or SIGTERM.
+- `--timeout DURATION`: live-daemon IPC response deadline when a control socket
+  is already running. Defaults to `30s`.
 
 **Blocking behavior**
 
-Blocks until the process is signalled. A clean SIGINT/SIGTERM flushes
-any pending writes, removes the control socket, and exits 0.
+Plain `join` exits after the invite is applied. `join --serve` blocks until the
+process is signalled; a clean SIGINT/SIGTERM flushes any pending writes, removes
+the control socket, and exits 0.
 
 **Stdout**
 
-On successful join, one JSON object on stdout immediately before the
-accept loop begins:
+On successful join, one JSON object on stdout:
 
 ```json
 {"event":"joined","group_id":"<first-base64>","group_ids":["<base64>"],"members":42,"health":{"groups":1,"local_member":true,"peers":3,"missing_trust":1,"onboarding_handshake_candidates":1,"route_probe":"not_run"},"listen_port":1004,"control_socket":"/home/user/.entmoot/control.sock","next_command":"entmootd ... doctor -group <base64> --probe"}
 ```
 
-While the accept loop runs, `join` writes nothing further to stdout.
-slog continues to go to stderr at the configured log level.
+In `--serve` mode, `join` writes nothing further to stdout while the accept loop
+runs. slog continues to go to stderr at the configured log level.
 
 After a successful join, the node starts bounded Pilot onboarding handshakes
 to current roster/bootstrap/founder candidates. Current group members can
@@ -1135,10 +1138,10 @@ routed), and the v0 binary is simply replaced.
 
 | v0 command | Status in v1 |
 |---|---|
-| `run` | **Removed.** `join` now blocks and runs; there is no separate `run`. |
+| `run` | **Removed.** Use `serve` for persisted long-running sessions or `join --serve` for legacy join-and-run behavior. |
 | `group create -name N` | **Kept.** Advanced / founder-only; not part of the agent surface. |
 | `invite create -group ...` | **Kept.** Advanced / founder-only. Emits invites with a `ValidUntil` field. |
-| `join -invite FILE` | **Changed.** Positional argument; blocks and runs; accepts URLs. |
+| `join -invite FILE` | **Changed.** Positional argument; applies invite(s), auto-redeems open-invite URLs, and exits unless `--serve` is set. |
 | `publish` | **Changed.** JSON stdout; routes through the control socket; `-group` optional when exactly one group is joined. |
 | `info` | **Changed.** JSON-only output; reads SQLite directly; reports a `running` bool. |
 | `tail` | **New.** |

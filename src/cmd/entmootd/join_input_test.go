@@ -7,6 +7,8 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -18,6 +20,7 @@ import (
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/canonical"
 	"entmoot/pkg/entmoot/esphttp"
+	"entmoot/pkg/entmoot/ipc"
 	"entmoot/pkg/entmoot/keystore"
 	"entmoot/pkg/entmoot/transport/pilot/ipcclient"
 )
@@ -189,6 +192,258 @@ func TestRedeemJoinOpenInviteLivePilotCallbacksUseDeadlines(t *testing.T) {
 	if time.Until(pilot.signDeadline) <= 0 || time.Until(pilot.signDeadline) > 31*time.Second {
 		t.Fatalf("sign deadline = %v, want about 30s", pilot.signDeadline)
 	}
+}
+
+func TestJoinInviteOverIPCSendsJoinGroupRequest(t *testing.T) {
+	sock := shortTestUnixSocket(t)
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatalf("listen unix: %v", err)
+	}
+	defer ln.Close()
+
+	gid := testESPGroupID(77)
+	reqCh := make(chan *ipc.JoinGroupReq, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			errCh <- err
+			return
+		}
+		defer conn.Close()
+		_, payload, err := ipc.ReadAndDecode(conn)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		req, ok := payload.(*ipc.JoinGroupReq)
+		if !ok {
+			errCh <- fmt.Errorf("payload = %T, want *ipc.JoinGroupReq", payload)
+			return
+		}
+		reqCh <- req
+		_ = ipc.EncodeAndWrite(conn, &ipc.JoinGroupResp{Status: "joined", GroupID: req.Invite.GroupID, Members: 2})
+	}()
+
+	resp, frame, err := joinInviteOverIPC(context.Background(), sock, entmoot.Invite{GroupID: gid}, time.Second)
+	if err != nil {
+		t.Fatalf("joinInviteOverIPC: %v", err)
+	}
+	if frame != nil {
+		t.Fatalf("frame = %+v, want nil", frame)
+	}
+	if resp.Status != "joined" || resp.GroupID != gid || resp.Members != 2 {
+		t.Fatalf("resp = %+v", resp)
+	}
+	select {
+	case req := <-reqCh:
+		if req.Invite.GroupID != gid {
+			t.Fatalf("req group = %s, want %s", req.Invite.GroupID, gid)
+		}
+	case err := <-errCh:
+		t.Fatalf("server error: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for join request")
+	}
+}
+
+func TestJoinInputOverIPCSendsOpenInviteDescriptor(t *testing.T) {
+	sock := shortTestUnixSocket(t)
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatalf("listen unix: %v", err)
+	}
+	defer ln.Close()
+
+	gid := testESPGroupID(79)
+	reqCh := make(chan *ipc.JoinGroupReq, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			errCh <- err
+			return
+		}
+		defer conn.Close()
+		_, payload, err := ipc.ReadAndDecode(conn)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		req, ok := payload.(*ipc.JoinGroupReq)
+		if !ok {
+			errCh <- fmt.Errorf("payload = %T, want *ipc.JoinGroupReq", payload)
+			return
+		}
+		reqCh <- req
+		_ = ipc.EncodeAndWrite(conn, &ipc.JoinGroupResp{Status: "joined", GroupID: gid, Members: 2})
+	}()
+
+	resp, frame, err := joinInputOverIPC(context.Background(), sock, joinInput{
+		source: "open",
+		openInvite: &openInviteAcceptPayload{
+			IssuerURL: "https://esp.example.com",
+			Token:     "open-token",
+		},
+	}, time.Second)
+	if err != nil {
+		t.Fatalf("joinInputOverIPC: %v", err)
+	}
+	if frame != nil {
+		t.Fatalf("frame = %+v, want nil", frame)
+	}
+	if resp.Status != "joined" || resp.GroupID != gid {
+		t.Fatalf("resp = %+v", resp)
+	}
+	select {
+	case req := <-reqCh:
+		if req.OpenInvite == nil {
+			t.Fatalf("req.OpenInvite = nil")
+		}
+		if req.Invite.GroupID != (entmoot.GroupID{}) {
+			t.Fatalf("req.Invite.GroupID = %s, want zero", req.Invite.GroupID)
+		}
+		if req.OpenInvite.IssuerURL != "https://esp.example.com" || req.OpenInvite.Token != "open-token" {
+			t.Fatalf("req.OpenInvite = %+v", req.OpenInvite)
+		}
+	case err := <-errCh:
+		t.Fatalf("server error: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for join request")
+	}
+}
+
+func TestJoinInviteOverIPCReturnsErrorFrame(t *testing.T) {
+	sock := shortTestUnixSocket(t)
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatalf("listen unix: %v", err)
+	}
+	defer ln.Close()
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_, _, _ = ipc.ReadAndDecode(conn)
+		_ = ipc.EncodeAndWrite(conn, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInvalidArgument, Message: "bad invite"})
+	}()
+
+	resp, frame, err := joinInviteOverIPC(context.Background(), sock, entmoot.Invite{GroupID: testESPGroupID(78)}, time.Second)
+	if err != nil {
+		t.Fatalf("joinInviteOverIPC: %v", err)
+	}
+	if resp != nil {
+		t.Fatalf("resp = %+v, want nil", resp)
+	}
+	if frame == nil || frame.Code != ipc.CodeInvalidArgument || frame.Message != "bad invite" {
+		t.Fatalf("frame = %+v", frame)
+	}
+}
+
+func TestIPCServerResolveJoinGroupInviteRedeemsOpenInviteWithDaemonIdentity(t *testing.T) {
+	daemonIdentity, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate daemon identity: %v", err)
+	}
+	pilotPub, pilotPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey pilot: %v", err)
+	}
+	gid := testESPGroupID(80)
+	challengeID := "challenge-daemon"
+	challengePayload, err := canonical.Encode(openInvitePilotProofEnvelope{
+		Type:          "entmoot.open_invite.redeem.v1",
+		TokenHash:     esphttp.HashOpenInviteToken("open-token"),
+		GroupID:       gid,
+		ChallengeID:   challengeID,
+		Nonce:         "nonce-daemon",
+		IssuedAtMS:    time.Now().UnixMilli(),
+		ExpiresAtMS:   time.Now().Add(time.Minute).UnixMilli(),
+		PilotNodeID:   133053,
+		PilotPubKey:   pilotPub,
+		EntmootPubKey: daemonIdentity.PublicKey,
+	})
+	if err != nil {
+		t.Fatalf("Encode challenge payload: %v", err)
+	}
+
+	issuer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/open-invites/open-token/challenge":
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Errorf("decode challenge request: %v", err)
+			}
+			if body["pilot_node_id"] != float64(133053) {
+				t.Errorf("pilot_node_id = %v, want daemon node", body["pilot_node_id"])
+			}
+			if body["entmoot_pubkey"] != base64.StdEncoding.EncodeToString(daemonIdentity.PublicKey) {
+				t.Errorf("entmoot_pubkey = %v, want daemon key", body["entmoot_pubkey"])
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"challenge_id":           challengeID,
+				"signing_payload":        base64.StdEncoding.EncodeToString(challengePayload),
+				"signing_payload_sha256": sha256Base64(challengePayload),
+				"expires_at_ms":          time.Now().Add(time.Minute).UnixMilli(),
+			})
+		case "/v1/open-invites/open-token/redeem":
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Errorf("decode redeem request: %v", err)
+			}
+			if body["pilot_node_id"] != float64(133053) {
+				t.Errorf("redeem pilot_node_id = %v, want daemon node", body["pilot_node_id"])
+			}
+			if body["entmoot_pubkey"] != base64.StdEncoding.EncodeToString(daemonIdentity.PublicKey) {
+				t.Errorf("redeem entmoot_pubkey = %v, want daemon key", body["entmoot_pubkey"])
+			}
+			sigText, _ := body["pilot_signature"].(string)
+			sig, _ := base64.StdEncoding.DecodeString(sigText)
+			if !ed25519.Verify(pilotPub, pilotChallengeSigningBytes(challengePayload), sig) {
+				t.Errorf("pilot signature did not verify")
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":   "redeemed",
+				"group_id": gid,
+				"invite":   entmoot.Invite{GroupID: gid},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer issuer.Close()
+
+	pilot := &deadlineCheckingPilot{
+		t:         t,
+		nodeID:    133053,
+		publicKey: base64.StdEncoding.EncodeToString(pilotPub),
+		sign: func(payload []byte) string {
+			return base64.StdEncoding.EncodeToString(ed25519.Sign(pilotPriv, pilotChallengeSigningBytes(payload)))
+		},
+	}
+	invite, err := resolveJoinGroupInviteWithContext(context.Background(), &ipc.JoinGroupReq{
+		OpenInvite: &ipc.OpenInviteJoin{
+			IssuerURL: issuer.URL,
+			Token:     "open-token",
+		},
+	}, daemonIdentity, pilot, "/daemon/pilot.sock")
+	if err != nil {
+		t.Fatalf("resolveJoinGroupInvite: %v", err)
+	}
+	if invite.GroupID != gid {
+		t.Fatalf("invite.GroupID = %s, want %s", invite.GroupID, gid)
+	}
+}
+
+func shortTestUnixSocket(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(os.TempDir(), fmt.Sprintf("entmoot-%d.sock", time.Now().UnixNano()))
+	t.Cleanup(func() { _ = os.Remove(path) })
+	return path
 }
 
 type deadlineCheckingPilot struct {

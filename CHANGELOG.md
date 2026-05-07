@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.41] - 2026-05-07
+
+### Changed
+
+- **One-shot join by default.** `entmootd join` now applies signed or open
+  invites and exits. If a daemon is already running for the data root, `join`
+  submits the invite over IPC so agents can join new groups without stopping
+  `serve`.
+- **Legacy blocking join moved to `join --serve`.** Canary helpers and docs now
+  use `join --serve` only where the old join-and-run daemon behavior is
+  explicitly required.
+
+### Fixed
+
+- **Daemon-owned open-invite redemption.** Live-daemon joins now redeem
+  open-invite descriptors inside the running daemon so the issuer sees the
+  daemon's Entmoot identity and Pilot socket, not a foreground CLI mismatch.
+- **Invite validation on live rejoin.** Already-active daemon sessions now still
+  validate signed invite signatures and expiry before acknowledging a join.
+- **One-shot onboarding cleanup.** Fresh one-shot joins run bounded onboarding
+  handshakes before exiting instead of leaving daemon-style background work
+  behind.
+
 ## [1.5.40] - 2026-05-07
 
 ### Added

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/canonical"
@@ -62,20 +63,8 @@ func (g *Gossiper) Join(ctx context.Context, invite *entmoot.Invite) error {
 		return fmt.Errorf("gossip: Join: invite is for group %s, want %s",
 			invite.GroupID, g.cfg.GroupID)
 	}
-	if err := verifyInvite(invite); err != nil {
+	if err := ValidateInvite(invite, g.clk.Now()); err != nil {
 		return err
-	}
-
-	// Expiry check runs after signature verification so a tampered
-	// ValidUntil can never short-circuit verification. ValidUntil == 0
-	// means "no expiry asserted" (pre-v1 bundles and test fixtures); any
-	// strictly-positive ValidUntil that has elapsed rejects the invite.
-	if invite.ValidUntil > 0 {
-		now := g.clk.Now().UnixMilli()
-		if now > invite.ValidUntil {
-			return fmt.Errorf("%w: valid_until=%d now=%d",
-				entmoot.ErrInviteExpired, invite.ValidUntil, now)
-		}
 	}
 
 	// Early-return for the "already synced" case. The founder's own
@@ -328,6 +317,27 @@ func (g *Gossiper) pullMemberProfileSnapshot(ctx context.Context, peer entmoot.N
 		g.ingestMemberProfileAd(ctx, peer, ad, false)
 	}
 	return len(resp.Profiles), nil
+}
+
+// ValidateInvite verifies the signed invite envelope and expiry. Expiry runs
+// after signature verification so a tampered ValidUntil cannot be evaluated
+// before its signature is trusted. ValidUntil == 0 means "no expiry asserted"
+// for backwards compatibility with pre-v1 invite bundles and test fixtures.
+func ValidateInvite(invite *entmoot.Invite, now time.Time) error {
+	if invite == nil {
+		return errors.New("gossip: ValidateInvite: invite is nil")
+	}
+	if err := verifyInvite(invite); err != nil {
+		return err
+	}
+	if invite.ValidUntil > 0 {
+		nowMS := now.UnixMilli()
+		if nowMS > invite.ValidUntil {
+			return fmt.Errorf("%w: valid_until=%d now=%d",
+				entmoot.ErrInviteExpired, invite.ValidUntil, nowMS)
+		}
+	}
+	return nil
 }
 
 // verifyInvite checks invite.Signature against invite.Issuer.EntmootPubKey

@@ -133,9 +133,10 @@ func pilotDriverHasCapability(ctx context.Context, d *ipcclient.Driver, want str
 	return false
 }
 
-// cmdJoin is the blocking top-level command. It reads or fetches an
-// invite, applies it, opens the control socket, and serves IPC traffic
-// until the process is signalled.
+// cmdJoin reads or fetches invites and joins them. By default it behaves like
+// a one-shot command: if a daemon is already running, it asks that daemon to
+// join over IPC; otherwise it joins offline, writes local state, and exits.
+// --serve preserves the legacy "join then run a daemon until signalled" mode.
 func cmdJoin(gf *globalFlags, args []string) int {
 	fs := flag.NewFlagSet("join", flag.ContinueOnError)
 	// v1.2.0: repeatable -advertise-endpoint flag feeds the gossiper's
@@ -150,6 +151,8 @@ func cmdJoin(gf *globalFlags, args []string) int {
 	var advertiseEndpoints endpointFlag
 	fs.Var(&advertiseEndpoints, "advertise-endpoint",
 		"advertise this node's endpoint (network=host:port); repeatable (v1.2.0)")
+	serveAfterJoin := fs.Bool("serve", false, "after joining, keep running as the Entmoot daemon (legacy blocking behavior)")
+	ipcTimeout := fs.Duration("timeout", 30*time.Second, "live-daemon join IPC response deadline")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return exitOK
@@ -161,46 +164,33 @@ func cmdJoin(gf *globalFlags, args []string) int {
 		fmt.Fprintln(os.Stderr, "join: missing invite (file path or http(s) URL)")
 		return exitInvalidArgument
 	}
-	inputs := make([]joinInput, 0, len(rest))
-	for _, inviteArg := range rest {
-		input, err := loadJoinInput(inviteArg)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "join: invite %s: %v\n", inviteArg, err)
-			// A local-parse failure (bad file, bad JSON, expired ValidUntil)
-			// is INVALID_ARGUMENT per CLI_DESIGN §3.1. A network-fetch
-			// failure is a transport error (exit 1).
-			if errors.Is(err, errFetchFailed) {
-				return exitTransport
-			}
-			if errors.Is(err, entmoot.ErrInviteExpired) ||
-				errors.Is(err, entmoot.ErrSigInvalid) ||
-				errors.Is(err, errInviteMalformed) {
-				return exitInvalidArgument
-			}
-			return exitInvalidArgument
-		}
-		inputs = append(inputs, input)
+	inputs, code := loadJoinInputs(rest)
+	if code != exitOK {
+		return code
+	}
+	sockPath := controlSocketPath(gf.data)
+	if !*serveAfterJoin && controlSocketAlive(sockPath, 200*time.Millisecond) {
+		return joinInputsOverIPC(sockPath, inputs, *ipcTimeout)
 	}
 
+	exitAfterLoad := !*serveAfterJoin
 	return runGroupDaemon(gf, groupDaemonOptions{
 		command:            "join",
 		event:              "joined",
 		advertiseEndpoints: advertiseEndpoints,
+		exitAfterLoad:      exitAfterLoad,
 		loadGroups: func(ctx context.Context, runtime *groupRuntime, loadCtx groupDaemonLoadContext) (int, error) {
 			acceptedInvites := make(map[entmoot.GroupID]entmoot.Invite, len(inputs))
 			for _, input := range inputs {
-				invite := input.invite
-				if input.openInvite != nil {
-					redeemed, err := redeemJoinOpenInvite(ctx, input.openInvite, loadCtx)
-					if err != nil {
-						return classifyJoinOpenInviteError(err), fmt.Errorf("redeem open invite %s: %w", input.source, err)
-					}
-					invite = redeemed
+				invite, code, err := resolveJoinInput(ctx, input, loadCtx)
+				if err != nil {
+					return code, err
 				}
-				if invite == nil {
-					return exitInvalidArgument, fmt.Errorf("invite %s: no signed invite produced", input.source)
+				addInvite := runtime.AddInvite
+				if exitAfterLoad {
+					addInvite = runtime.AddInviteWithoutAsyncOnboarding
 				}
-				if _, _, err := runtime.AddInvite(ctx, *invite); err != nil {
+				if _, _, err := addInvite(ctx, *invite); err != nil {
 					code := classifyJoinAddInviteError(err)
 					if code == exitInvalidArgument {
 						return code, err
@@ -215,7 +205,124 @@ func cmdJoin(gf *globalFlags, args []string) int {
 	})
 }
 
+func loadJoinInputs(args []string) ([]joinInput, int) {
+	inputs := make([]joinInput, 0, len(args))
+	for _, inviteArg := range args {
+		input, err := loadJoinInput(inviteArg)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "join: invite %s: %v\n", inviteArg, err)
+			// A local-parse failure (bad file, bad JSON, expired ValidUntil)
+			// is INVALID_ARGUMENT per CLI_DESIGN §3.1. A network-fetch
+			// failure is a transport error (exit 1).
+			if errors.Is(err, errFetchFailed) {
+				return nil, exitTransport
+			}
+			if errors.Is(err, entmoot.ErrInviteExpired) ||
+				errors.Is(err, entmoot.ErrSigInvalid) ||
+				errors.Is(err, errInviteMalformed) {
+				return nil, exitInvalidArgument
+			}
+			return nil, exitInvalidArgument
+		}
+		inputs = append(inputs, input)
+	}
+	return inputs, exitOK
+}
+
+func resolveJoinInput(ctx context.Context, input joinInput, loadCtx groupDaemonLoadContext) (*entmoot.Invite, int, error) {
+	invite := input.invite
+	if input.openInvite != nil {
+		redeemed, err := redeemJoinOpenInvite(ctx, input.openInvite, loadCtx)
+		if err != nil {
+			return nil, classifyJoinOpenInviteError(err), fmt.Errorf("redeem open invite %s: %w", input.source, err)
+		}
+		invite = redeemed
+	}
+	if invite == nil {
+		return nil, exitInvalidArgument, fmt.Errorf("invite %s: no signed invite produced", input.source)
+	}
+	return invite, exitOK, nil
+}
+
+func joinInputsOverIPC(sockPath string, inputs []joinInput, timeout time.Duration) int {
+	ctx := context.Background()
+	var lastReadiness []byte
+	for _, input := range inputs {
+		resp, frame, err := joinInputOverIPC(ctx, sockPath, input, timeout)
+		if err != nil {
+			slog.Error("join: live daemon join", slog.String("err", err.Error()))
+			return exitTransport
+		}
+		if frame != nil {
+			fmt.Fprintf(os.Stderr, "join: %s: %s\n", frame.Code, frame.Message)
+			return ipc.ExitCode(frame.Code)
+		}
+		if len(resp.Readiness) > 0 {
+			lastReadiness = append(lastReadiness[:0], resp.Readiness...)
+		}
+	}
+	if len(lastReadiness) > 0 {
+		fmt.Println(string(lastReadiness))
+	}
+	return exitOK
+}
+
+func joinInviteOverIPC(ctx context.Context, sockPath string, invite entmoot.Invite, timeout time.Duration) (*ipc.JoinGroupResp, *ipc.ErrorFrame, error) {
+	return joinGroupReqOverIPC(ctx, sockPath, &ipc.JoinGroupReq{Invite: invite}, timeout)
+}
+
+func joinInputOverIPC(ctx context.Context, sockPath string, input joinInput, timeout time.Duration) (*ipc.JoinGroupResp, *ipc.ErrorFrame, error) {
+	req := &ipc.JoinGroupReq{}
+	switch {
+	case input.invite != nil:
+		req.Invite = *input.invite
+	case input.openInvite != nil:
+		req.OpenInvite = &ipc.OpenInviteJoin{
+			IssuerURL: input.openInvite.IssuerURL,
+			Token:     input.openInvite.Token,
+		}
+	default:
+		return nil, nil, fmt.Errorf("invite %s: no signed invite or open invite descriptor", input.source)
+	}
+	return joinGroupReqOverIPC(ctx, sockPath, req, timeout)
+}
+
+func joinGroupReqOverIPC(ctx context.Context, sockPath string, req *ipc.JoinGroupReq, timeout time.Duration) (*ipc.JoinGroupResp, *ipc.ErrorFrame, error) {
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	dialCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer cancel()
+	var dialer net.Dialer
+	conn, err := dialer.DialContext(dialCtx, "unix", sockPath)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer conn.Close()
+	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+		return nil, nil, err
+	}
+	if err := ipc.EncodeAndWrite(conn, req); err != nil {
+		return nil, nil, err
+	}
+	_, payload, err := ipc.ReadAndDecode(conn)
+	if err != nil {
+		return nil, nil, err
+	}
+	switch v := payload.(type) {
+	case *ipc.JoinGroupResp:
+		return v, nil, nil
+	case *ipc.ErrorFrame:
+		return nil, v, nil
+	default:
+		return nil, nil, fmt.Errorf("unexpected join response %T", payload)
+	}
+}
+
 func classifyJoinOpenInviteError(err error) int {
+	if errors.Is(err, errInviteMalformed) {
+		return exitInvalidArgument
+	}
 	var opErr *esphttp.OperationError
 	if errors.As(err, &opErr) {
 		switch {
@@ -245,6 +352,7 @@ type groupDaemonOptions struct {
 	command            string
 	event              string
 	advertiseEndpoints endpointFlag
+	exitAfterLoad      bool
 	loadGroups         func(context.Context, *groupRuntime, groupDaemonLoadContext) (int, error)
 }
 
@@ -424,6 +532,18 @@ func runGroupDaemon(gf *globalFlags, opts groupDaemonOptions) int {
 		return exitGroupNotFound
 	}
 
+	if opts.exitAfterLoad {
+		groups := runtime.ActiveGroupIDs()
+		runtime.runOneShotOnboardingHandshakes(rootCtx, runtime.JoinHealthInvites())
+		members := groupRuntimeMemberCount(runtime, groups)
+		joinedEvent := groupDaemonEvent(opts.event, gf, groups, members, buildJoinHealthSummary(rootCtx, runtime, rawStore, s.identity.PublicKey), sockPath)
+		if data, err := json.Marshal(joinedEvent); err == nil {
+			fmt.Println(string(data))
+		}
+		runtime.Close()
+		return exitOK
+	}
+
 	// Bind the control socket with 0600 permissions. net.Listen uses
 	// the process umask, so explicitly chmod afterwards.
 	listener, err := net.Listen("unix", sockPath)
@@ -459,7 +579,10 @@ func runGroupDaemon(gf *globalFlags, opts groupDaemonOptions) int {
 	srv := &ipcServer{
 		nodeID:                   nodeID,
 		identity:                 s.identity,
+		identityPath:             gf.identity,
 		dataDir:                  s.dataDir,
+		pilotSocketPath:          gf.socket,
+		controlSocketPath:        sockPath,
 		listenPort:               uint16(gf.listenPort),
 		runtime:                  runtime,
 		store:                    rawStore,
@@ -480,12 +603,7 @@ func runGroupDaemon(gf *globalFlags, opts groupDaemonOptions) int {
 
 	// Emit the one-line "joined" event on stdout.
 	groups := runtime.ActiveGroupIDs()
-	members := 0
-	for _, gid := range groups {
-		if sess, ok := runtime.Get(gid); ok {
-			members += len(sess.roster.Members())
-		}
-	}
+	members := groupRuntimeMemberCount(runtime, groups)
 	joinedEvent := groupDaemonEvent(opts.event, gf, groups, members, buildJoinHealthSummary(rootCtx, runtime, rawStore, s.identity.PublicKey), sockPath)
 	if data, err := json.Marshal(joinedEvent); err == nil {
 		fmt.Println(string(data))
@@ -501,6 +619,16 @@ func runGroupDaemon(gf *globalFlags, opts groupDaemonOptions) int {
 	removeSocket()
 	slog.Info("entmootd shutting down")
 	return exitOK
+}
+
+func groupRuntimeMemberCount(runtime *groupRuntime, groups []entmoot.GroupID) int {
+	members := 0
+	for _, gid := range groups {
+		if sess, ok := runtime.Get(gid); ok {
+			members += len(sess.roster.Members())
+		}
+	}
+	return members
 }
 
 func groupDaemonEvent(event string, gf *globalFlags, groups []entmoot.GroupID, members int, health joinHealthSummary, sockPath string) map[string]any {
@@ -971,7 +1099,10 @@ func (n *notifyingStore) Close() error { return n.inner.Close() }
 type ipcServer struct {
 	nodeID                   entmoot.NodeID
 	identity                 *keystore.Identity
+	identityPath             string
 	dataDir                  string
+	pilotSocketPath          string
+	controlSocketPath        string
 	listenPort               uint16
 	runtime                  *groupRuntime
 	store                    *store.SQLite
@@ -1306,13 +1437,23 @@ func (s *ipcServer) resolvePublishGroup(c net.Conn, requested *entmoot.GroupID) 
 }
 
 func (s *ipcServer) handleJoinGroup(ctx context.Context, c net.Conn, req *ipc.JoinGroupReq) {
-	sess, created, err := s.runtime.AddInvite(ctx, req.Invite)
+	invite, err := s.resolveJoinGroupInvite(ctx, req)
+	if err != nil {
+		code := ipcCodeForJoinResolveError(err)
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
+			Type:    "error",
+			Code:    code,
+			Message: "join group: " + err.Error(),
+		})
+		return
+	}
+	sess, created, err := s.runtime.AddInvite(ctx, invite)
 	if err != nil {
 		code := ipc.CodeInternal
 		if errors.Is(err, entmoot.ErrInviteExpired) || errors.Is(err, entmoot.ErrSigInvalid) {
 			code = ipc.CodeInvalidArgument
 		}
-		gid := req.Invite.GroupID
+		gid := invite.GroupID
 		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
 			Type:    "error",
 			Code:    code,
@@ -1325,11 +1466,85 @@ func (s *ipcServer) handleJoinGroup(ctx context.Context, c net.Conn, req *ipc.Jo
 	if created {
 		status = "joined"
 	}
+	s.runtime.RecordJoinHealthInvite(invite)
 	_ = ipc.EncodeAndWrite(c, &ipc.JoinGroupResp{
-		Status:  status,
-		GroupID: sess.groupID,
-		Members: len(sess.roster.Members()),
+		Status:    status,
+		GroupID:   sess.groupID,
+		Members:   len(sess.roster.Members()),
+		Readiness: s.joinReadinessEvent(ctx),
 	})
+}
+
+func (s *ipcServer) resolveJoinGroupInvite(ctx context.Context, req *ipc.JoinGroupReq) (entmoot.Invite, error) {
+	return resolveJoinGroupInviteWithContext(ctx, req, s.identity, s.pilot, s.pilotSocketPath)
+}
+
+func resolveJoinGroupInviteWithContext(ctx context.Context, req *ipc.JoinGroupReq, identity *keystore.Identity, pilot pilotInfoSigner, pilotSocketPath string) (entmoot.Invite, error) {
+	if req == nil {
+		return entmoot.Invite{}, fmt.Errorf("%w: missing join request", errInviteMalformed)
+	}
+	hasSignedInvite := req.Invite.GroupID != (entmoot.GroupID{})
+	hasOpenInvite := req.OpenInvite != nil
+	if hasSignedInvite == hasOpenInvite {
+		return entmoot.Invite{}, fmt.Errorf("%w: join request requires exactly one signed invite or open invite", errInviteMalformed)
+	}
+	if hasSignedInvite {
+		return req.Invite, nil
+	}
+	invite, err := redeemJoinOpenInvite(ctx, &openInviteAcceptPayload{
+		IssuerURL: req.OpenInvite.IssuerURL,
+		Token:     req.OpenInvite.Token,
+	}, groupDaemonLoadContext{
+		identity:        identity,
+		pilot:           pilot,
+		pilotSocketPath: pilotSocketPath,
+	})
+	if err != nil {
+		return entmoot.Invite{}, err
+	}
+	if invite == nil {
+		return entmoot.Invite{}, fmt.Errorf("%w: open invite redemption returned no signed invite", errInviteMalformed)
+	}
+	return *invite, nil
+}
+
+func ipcCodeForJoinResolveError(err error) ipc.ErrorCode {
+	switch classifyJoinOpenInviteError(err) {
+	case exitInvalidArgument:
+		return ipc.CodeInvalidArgument
+	case exitNotMember:
+		return ipc.CodeNotMember
+	case exitGroupNotFound:
+		return ipc.CodeGroupNotFound
+	default:
+		return ipc.CodeUnavailable
+	}
+}
+
+func (s *ipcServer) joinReadinessEvent(ctx context.Context) json.RawMessage {
+	groups := s.runtime.ActiveGroupIDs()
+	if len(groups) == 0 {
+		return nil
+	}
+	gf := &globalFlags{
+		socket:     s.pilotSocketPath,
+		identity:   s.identityPath,
+		data:       s.dataDir,
+		listenPort: uint(s.listenPort),
+	}
+	event := groupDaemonEvent(
+		"joined",
+		gf,
+		groups,
+		groupRuntimeMemberCount(s.runtime, groups),
+		buildJoinHealthSummary(ctx, s.runtime, s.store, s.identity.PublicKey),
+		s.controlSocketPath,
+	)
+	data, err := json.Marshal(event)
+	if err != nil {
+		return nil
+	}
+	return data
 }
 
 func (s *ipcServer) handleInviteCreate(ctx context.Context, c net.Conn, req *ipc.InviteCreateReq) {

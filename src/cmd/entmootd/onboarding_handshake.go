@@ -16,6 +16,7 @@ const (
 	onboardingHandshakeConcurrency = 2
 	onboardingHandshakeTimeout     = 10 * time.Second
 	onboardingTrustedPeersTimeout  = 5 * time.Second
+	oneShotOnboardingTimeout       = 30 * time.Second
 )
 
 var (
@@ -45,8 +46,7 @@ func (r *groupRuntime) scheduleOnboardingHandshakes(sess *groupSession, invite e
 }
 
 func (r *groupRuntime) runOnboardingHandshakes(ctx context.Context, sess *groupSession, invite entmoot.Invite, h pilotHandshaker) {
-	trusted := r.onboardingTrustedPeers(ctx, invite.GroupID)
-	candidates := selectOnboardingHandshakePeers(r.nodeID, invite, sess.roster.Members(), trusted)
+	candidates := r.onboardingHandshakeCandidates(ctx, sess, invite)
 	if len(candidates) == 0 {
 		r.logger.Debug("join: no pilot onboarding handshakes needed",
 			slog.String("group_id", invite.GroupID.String()))
@@ -59,6 +59,49 @@ func (r *groupRuntime) runOnboardingHandshakes(ctx context.Context, sess *groupS
 
 	justification := "Entmoot onboarding for group " + invite.GroupID.String()
 	r.runOnboardingHandshakeRounds(ctx, h, invite.GroupID, candidates, justification)
+}
+
+func (r *groupRuntime) runOneShotOnboardingHandshakes(ctx context.Context, invites map[entmoot.GroupID]entmoot.Invite) {
+	if len(invites) == 0 || r == nil || r.mux == nil {
+		return
+	}
+	h, ok := r.mux.base.(pilotHandshaker)
+	if !ok {
+		return
+	}
+	runCtx, cancel := context.WithTimeout(ctx, oneShotOnboardingTimeout)
+	defer cancel()
+	for _, gid := range r.ActiveGroupIDs() {
+		invite, ok := invites[gid]
+		if !ok {
+			continue
+		}
+		sess, ok := r.Get(gid)
+		if !ok {
+			continue
+		}
+		r.runOneShotOnboardingHandshakeRound(runCtx, sess, invite, h)
+		if runCtx.Err() != nil {
+			return
+		}
+	}
+}
+
+func (r *groupRuntime) runOneShotOnboardingHandshakeRound(ctx context.Context, sess *groupSession, invite entmoot.Invite, h pilotHandshaker) {
+	candidates := r.onboardingHandshakeCandidates(ctx, sess, invite)
+	if len(candidates) == 0 {
+		return
+	}
+	justification := "Entmoot onboarding for group " + invite.GroupID.String()
+	r.runOnboardingHandshakeRound(ctx, h, invite.GroupID, candidates, justification, 0)
+}
+
+func (r *groupRuntime) onboardingHandshakeCandidates(ctx context.Context, sess *groupSession, invite entmoot.Invite) []entmoot.NodeID {
+	if sess == nil || sess.roster == nil {
+		return nil
+	}
+	trusted := r.onboardingTrustedPeers(ctx, invite.GroupID)
+	return selectOnboardingHandshakePeers(r.nodeID, invite, sess.roster.Members(), trusted)
 }
 
 func (r *groupRuntime) runOnboardingHandshakeRounds(ctx context.Context, h pilotHandshaker, groupID entmoot.GroupID, peers []entmoot.NodeID, justification string) {

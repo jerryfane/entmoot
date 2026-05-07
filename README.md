@@ -20,7 +20,7 @@ the installer are live. The design is pinned in
 [`ARCHITECTURE.md`](./ARCHITECTURE.md) and the CLI contract in
 [`docs/CLI_DESIGN.md`](./docs/CLI_DESIGN.md); v1 deliberately ships a
 subset (see [Deferred from v1](#deferred-from-v1)).
-Current release pairing: Entmoot `v1.5.40` with Pilot
+Current release pairing: Entmoot `v1.5.41` with Pilot
 `v1.9.0-jf.15.28`.
 
 What works today:
@@ -146,7 +146,8 @@ before running. Both are skipped under `-short` or when
 stdout.
 
 ```sh
-entmootd join <invite> [invite...]             # first-time/bootstrap join
+entmootd join <invite> [invite...]             # apply signed/open invite(s) and exit
+entmootd join --serve <invite> [invite...]     # join, then run as the daemon
 entmootd serve [-group GID...]                 # long-running; restarts joined groups from disk
 entmootd publish -topic T (-content "hi"|-file PATH| -file -) [-group GID]
 entmootd doctor [-group GID] [--probe] [--json]
@@ -171,9 +172,12 @@ entmootd esp sign-request -device ID -private-key-file PATH \
   -method METHOD -path PATH_WITH_QUERY [-body BODY_FILE]
 ```
 
-`join` applies signed invites and auto-redeems open-invite links/descriptors.
-`serve` blocks, owns the control socket, and can
+`join` applies signed invites, auto-redeems open-invite links/descriptors, and
+exits after local state is updated. If a daemon is already running for the data
+root, `join` sends the invite to that daemon over the control socket. `serve`
+blocks, owns the control socket, and can
 host multiple persisted group sessions over one shared Pilot transport;
+`join --serve` keeps the legacy join-and-run daemon behavior;
 `publish` and `tail` (live
 mode) dial it. `info`, `query`, `mailbox`, `esp serve`, and
 `esp device` read SQLite or local JSON directly. `esp sign-request` is a

@@ -1,6 +1,7 @@
 package ipc
 
 import (
+	"encoding/json"
 	"fmt"
 
 	entmoot "entmoot/pkg/entmoot"
@@ -164,17 +165,27 @@ type SignedPublishResp struct {
 	TimestampMS int64             `json:"timestamp_ms"`
 }
 
-// JoinGroupReq carries a signed invite to the running daemon. The daemon
-// verifies and joins through the same gossip bootstrap path as startup join.
+// JoinGroupReq carries either a signed invite or an open-invite descriptor to
+// the running daemon. The daemon resolves and joins through the same gossip
+// bootstrap path as startup join.
 type JoinGroupReq struct {
-	Invite entmoot.Invite `json:"invite"`
+	Invite     entmoot.Invite  `json:"invite,omitempty"`
+	OpenInvite *OpenInviteJoin `json:"open_invite,omitempty"`
+}
+
+// OpenInviteJoin describes an open invite that must be redeemed by the daemon
+// using the daemon's Entmoot identity and Pilot socket.
+type OpenInviteJoin struct {
+	IssuerURL string `json:"issuer_url"`
+	Token     string `json:"token"`
 }
 
 // JoinGroupResp reports the active session created or found for JoinGroupReq.
 type JoinGroupResp struct {
-	Status  string          `json:"status"`
-	GroupID entmoot.GroupID `json:"group_id"`
-	Members int             `json:"members"`
+	Status    string          `json:"status"`
+	GroupID   entmoot.GroupID `json:"group_id"`
+	Members   int             `json:"members"`
+	Readiness json.RawMessage `json:"readiness,omitempty"`
 }
 
 // InviteCreateReq asks the live daemon to mint an invite for an active group.

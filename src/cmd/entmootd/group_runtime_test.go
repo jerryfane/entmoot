@@ -72,6 +72,49 @@ func TestGroupRuntimeAddsMultipleSelfGroups(t *testing.T) {
 	}
 }
 
+func TestGroupRuntimeValidatesInviteBeforeExistingSessionReuse(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	dataDir := t.TempDir()
+	identity, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate identity: %v", err)
+	}
+	st, err := store.OpenSQLite(dataDir)
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	defer st.Close()
+	rt, err := newGroupRuntime(groupRuntimeConfig{
+		NodeID:    45491,
+		Identity:  identity,
+		DataDir:   dataDir,
+		Store:     st,
+		Notify:    newNotifyingStore(st, events.NewBus()),
+		Transport: newRuntimeFakeTransport(),
+	})
+	if err != nil {
+		t.Fatalf("newGroupRuntime: %v", err)
+	}
+	defer rt.Close()
+
+	gid := testRuntimeGroupID(0xA4)
+	invite := selfInvite(t, dataDir, st, identity, 45491, gid)
+	if _, created, err := rt.AddInvite(ctx, invite); err != nil || !created {
+		t.Fatalf("AddInvite created/err = %v/%v, want true/nil", created, err)
+	}
+	tampered := invite
+	tampered.Signature = append([]byte(nil), invite.Signature...)
+	tampered.Signature[0] ^= 0xff
+	if _, created, err := rt.AddInvite(ctx, tampered); !errors.Is(err, entmoot.ErrSigInvalid) || created {
+		t.Fatalf("AddInvite tampered created/err = %v/%v, want false/ErrSigInvalid", created, err)
+	}
+	if rt.Count() != 1 {
+		t.Fatalf("Count = %d, want existing session preserved", rt.Count())
+	}
+}
+
 func TestGroupRuntimeAddLocalGroupStartsPersistedGroup(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

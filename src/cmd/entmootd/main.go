@@ -64,7 +64,7 @@ func run() int {
 		fmt.Fprintln(os.Stderr, "Usage: entmootd [flags] <subcommand> [args]")
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "Agent subcommands:")
-		fmt.Fprintln(os.Stderr, "  join <invite> [invite...]")
+		fmt.Fprintln(os.Stderr, "  join [--serve] <invite> [invite...]")
 		fmt.Fprintln(os.Stderr, "                          Join from signed invite(s) or open-invite link/descriptor(s).")
 		fmt.Fprintln(os.Stderr, "  serve [-group GID...]")
 		fmt.Fprintln(os.Stderr, "                          Restart joined groups from persistent local state.")

@@ -14,7 +14,7 @@ Members join with a valid invite:
 ```sh
 entmootd join invite.json
 entmootd join 'entmoot://open-invite?issuer=https://esp.example&token=<token>'
-# or host multiple group sessions in one daemon:
+# or apply multiple invites at once:
 entmootd join invite-a.json invite-b.json
 ```
 
@@ -24,7 +24,7 @@ commands so the join targets the agent's persistent Pilot socket.
 Open-invite links are redeemed automatically during `join`; a raw token is not
 enough because the issuer URL is part of the proof flow.
 
-After the first successful join, restart from persisted state:
+After the first successful join, start from persisted state:
 
 ```sh
 entmootd serve

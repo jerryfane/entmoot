@@ -236,11 +236,22 @@ func (r *groupRuntime) Start(ctx context.Context) error {
 }
 
 func (r *groupRuntime) AddInvite(ctx context.Context, invite entmoot.Invite) (*groupSession, bool, error) {
+	return r.addInvite(ctx, invite, true)
+}
+
+func (r *groupRuntime) AddInviteWithoutAsyncOnboarding(ctx context.Context, invite entmoot.Invite) (*groupSession, bool, error) {
+	return r.addInvite(ctx, invite, false)
+}
+
+func (r *groupRuntime) addInvite(ctx context.Context, invite entmoot.Invite, scheduleOnboarding bool) (*groupSession, bool, error) {
+	if err := gossip.ValidateInvite(&invite, time.Now()); err != nil {
+		return nil, false, err
+	}
 	bootstrap := func(joinCtx context.Context, g *gossip.Gossiper) error {
 		return g.Join(joinCtx, &invite)
 	}
 	sess, created, err := r.addGroup(ctx, invite.GroupID, bootstrap)
-	if err == nil && created {
+	if err == nil && created && scheduleOnboarding {
 		r.scheduleOnboardingHandshakes(sess, invite)
 	}
 	return sess, created, err
@@ -486,6 +497,15 @@ func (r *groupRuntime) SetJoinHealthInvites(invites map[entmoot.GroupID]entmoot.
 	for gid, invite := range invites {
 		r.joinHealthInvites[gid] = invite
 	}
+}
+
+func (r *groupRuntime) RecordJoinHealthInvite(invite entmoot.Invite) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.joinHealthInvites == nil {
+		r.joinHealthInvites = make(map[entmoot.GroupID]entmoot.Invite, 1)
+	}
+	r.joinHealthInvites[invite.GroupID] = invite
 }
 
 func (r *groupRuntime) JoinHealthInvites() map[entmoot.GroupID]entmoot.Invite {
