@@ -238,6 +238,7 @@ func (r *groupRuntime) Start(ctx context.Context) error {
 type addInviteOptions struct {
 	scheduleOnboarding bool
 	bootstrapTimeout   time.Duration
+	sessionParent      context.Context
 }
 
 func (r *groupRuntime) AddInvite(ctx context.Context, invite entmoot.Invite) (*groupSession, bool, error) {
@@ -259,7 +260,7 @@ func (r *groupRuntime) addInvite(ctx context.Context, invite entmoot.Invite, opt
 	bootstrap := func(joinCtx context.Context, g *gossip.Gossiper) error {
 		return g.Join(joinCtx, &invite)
 	}
-	sess, created, err := r.addGroup(ctx, invite.GroupID, bootstrap, opts.bootstrapTimeout)
+	sess, created, err := r.addGroup(ctx, invite.GroupID, bootstrap, opts.bootstrapTimeout, opts.sessionParent)
 	if err == nil && created && opts.scheduleOnboarding {
 		r.scheduleOnboardingHandshakes(sess, invite)
 	}
@@ -267,10 +268,13 @@ func (r *groupRuntime) addInvite(ctx context.Context, invite entmoot.Invite, opt
 }
 
 func (r *groupRuntime) AddLocalGroup(ctx context.Context, groupID entmoot.GroupID) (*groupSession, bool, error) {
-	return r.addGroup(ctx, groupID, nil, 0)
+	return r.addGroup(ctx, groupID, nil, 0, nil)
 }
 
-func (r *groupRuntime) addGroup(ctx context.Context, groupID entmoot.GroupID, bootstrap func(context.Context, *gossip.Gossiper) error, bootstrapTimeout time.Duration) (*groupSession, bool, error) {
+func (r *groupRuntime) addGroup(ctx context.Context, groupID entmoot.GroupID, bootstrap func(context.Context, *gossip.Gossiper) error, bootstrapTimeout time.Duration, sessionParent context.Context) (*groupSession, bool, error) {
+	if sessionParent == nil {
+		sessionParent = ctx
+	}
 	var joinDone chan struct{}
 	for {
 		r.mu.Lock()
@@ -367,7 +371,7 @@ func (r *groupRuntime) addGroup(ctx context.Context, groupID entmoot.GroupID, bo
 	}
 	r.replayTransportAds(ctx, groupID)
 
-	sessCtx, sessCancel := context.WithCancel(ctx)
+	sessCtx, sessCancel := context.WithCancel(sessionParent)
 	sess := &groupSession{
 		groupID:              groupID,
 		ctx:                  sessCtx,
@@ -403,14 +407,46 @@ func (r *groupRuntime) addGroup(ctx context.Context, groupID entmoot.GroupID, bo
 }
 
 func (r *groupRuntime) validateLocalMembership(rlog *roster.RosterLog) error {
-	info, ok := rlog.MemberInfo(r.nodeID)
-	if !ok {
+	if !rosterHasLocalNodeIdentity(rlog, r.nodeID, r.identity.PublicKey) {
+		if _, ok := rlog.MemberInfo(r.nodeID); ok {
+			return errLocalGroupIdentityMismatch
+		}
 		return errLocalGroupNotMember
 	}
-	if !bytes.Equal(info.EntmootPubKey, r.identity.PublicKey) {
-		return errLocalGroupIdentityMismatch
-	}
 	return nil
+}
+
+func rosterHasLocalNodeIdentity(rlog *roster.RosterLog, nodeID entmoot.NodeID, pubKey []byte) bool {
+	info, ok := rlog.MemberInfo(nodeID)
+	return ok && bytes.Equal(info.EntmootPubKey, pubKey)
+}
+
+func rosterHasLocalIdentityPubKey(rlog *roster.RosterLog, pubKey []byte) bool {
+	for _, member := range rlog.Members() {
+		info, ok := rlog.MemberInfo(member)
+		if ok && bytes.Equal(info.EntmootPubKey, pubKey) {
+			return true
+		}
+	}
+	return false
+}
+
+func openExistingRosterLog(dataDir string, groupID entmoot.GroupID) (*roster.RosterLog, bool, error) {
+	info, err := os.Stat(groupRosterPath(dataDir, groupID))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	if info.IsDir() || info.Size() == 0 {
+		return nil, false, nil
+	}
+	rlog, err := roster.OpenJSONL(dataDir, groupID)
+	if err != nil {
+		return nil, false, err
+	}
+	return rlog, true, nil
 }
 
 func snapshotGroupDiskState(dataDir string, groupID entmoot.GroupID) groupDiskState {

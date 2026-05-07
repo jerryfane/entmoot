@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"entmoot/pkg/entmoot/ipc"
-	"entmoot/pkg/entmoot/roster"
 	"entmoot/pkg/entmoot/store"
 )
 
@@ -84,11 +83,18 @@ func cmdInfo(gf *globalFlags, args []string) int {
 
 			groups := make([]ipc.GroupInfo, 0, len(gids))
 			for _, gid := range gids {
-				r, err := roster.OpenJSONL(s.dataDir, gid)
+				r, ok, err := openExistingRosterLog(s.dataDir, gid)
 				if err != nil {
 					slog.Warn("info: open roster",
 						slog.String("group", gid.String()),
 						slog.String("err", err.Error()))
+					continue
+				}
+				if !ok {
+					continue
+				}
+				if !rosterHasLocalIdentityPubKey(r, s.identity.PublicKey) {
+					_ = r.Close()
 					continue
 				}
 				members := len(r.Members())

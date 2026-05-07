@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -248,6 +249,79 @@ func TestJoinInviteOverIPCSendsJoinGroupRequest(t *testing.T) {
 		t.Fatalf("server error: %v", err)
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for join request")
+	}
+}
+
+func TestJoinInviteOverIPCWaitsForResponseMargin(t *testing.T) {
+	sock := shortTestUnixSocket(t)
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatalf("listen unix: %v", err)
+	}
+	defer ln.Close()
+
+	gid := testESPGroupID(78)
+	errCh := make(chan error, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			errCh <- err
+			return
+		}
+		defer conn.Close()
+		_, payload, err := ipc.ReadAndDecode(conn)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		req, ok := payload.(*ipc.JoinGroupReq)
+		if !ok {
+			errCh <- fmt.Errorf("payload = %T, want *ipc.JoinGroupReq", payload)
+			return
+		}
+		time.Sleep(150 * time.Millisecond)
+		_ = ipc.EncodeAndWrite(conn, &ipc.JoinGroupResp{Status: "joined", GroupID: req.Invite.GroupID, Members: 2})
+	}()
+
+	resp, frame, err := joinInviteOverIPC(context.Background(), sock, entmoot.Invite{GroupID: gid}, 100*time.Millisecond)
+	if err != nil {
+		t.Fatalf("joinInviteOverIPC: %v", err)
+	}
+	if frame != nil {
+		t.Fatalf("frame = %+v, want nil", frame)
+	}
+	if resp.Status != "joined" || resp.GroupID != gid {
+		t.Fatalf("resp = %+v", resp)
+	}
+	select {
+	case err := <-errCh:
+		t.Fatalf("server error: %v", err)
+	default:
+	}
+}
+
+func TestRemainingJoinBootstrapTimeoutUsesExistingDeadline(t *testing.T) {
+	now := time.Now()
+	ctx, cancel := context.WithDeadline(context.Background(), now.Add(time.Second))
+	defer cancel()
+
+	remaining, err := remainingJoinBootstrapTimeout(ctx, 30*time.Second, now.Add(250*time.Millisecond))
+	if err != nil {
+		t.Fatalf("remainingJoinBootstrapTimeout: %v", err)
+	}
+	if remaining != 750*time.Millisecond {
+		t.Fatalf("remaining = %v, want 750ms", remaining)
+	}
+}
+
+func TestRemainingJoinBootstrapTimeoutRejectsExpiredDeadline(t *testing.T) {
+	now := time.Now()
+	ctx, cancel := context.WithDeadline(context.Background(), now.Add(time.Second))
+	defer cancel()
+
+	remaining, err := remainingJoinBootstrapTimeout(ctx, 30*time.Second, now.Add(2*time.Second))
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, remaining = %v; want DeadlineExceeded", err, remaining)
 	}
 }
 

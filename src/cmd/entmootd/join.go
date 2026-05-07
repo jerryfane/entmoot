@@ -303,7 +303,7 @@ func joinGroupReqOverIPC(ctx context.Context, sockPath string, req *ipc.JoinGrou
 		return nil, nil, err
 	}
 	defer conn.Close()
-	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+	if err := conn.SetDeadline(time.Now().Add(joinIPCResponseTimeout(timeout))); err != nil {
 		return nil, nil, err
 	}
 	if err := ipc.EncodeAndWrite(conn, req); err != nil {
@@ -321,6 +321,35 @@ func joinGroupReqOverIPC(ctx context.Context, sockPath string, req *ipc.JoinGrou
 	default:
 		return nil, nil, fmt.Errorf("unexpected join response %T", payload)
 	}
+}
+
+func joinIPCResponseTimeout(bootstrapTimeout time.Duration) time.Duration {
+	if bootstrapTimeout <= 0 {
+		bootstrapTimeout = defaultJoinTimeout
+	}
+	margin := bootstrapTimeout / 10
+	if margin < 5*time.Second {
+		margin = 5 * time.Second
+	}
+	if margin > 30*time.Second {
+		margin = 30 * time.Second
+	}
+	return bootstrapTimeout + margin
+}
+
+func remainingJoinBootstrapTimeout(ctx context.Context, fallback time.Duration, now time.Time) (time.Duration, error) {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		if fallback <= 0 {
+			fallback = defaultJoinTimeout
+		}
+		return fallback, nil
+	}
+	remaining := deadline.Sub(now)
+	if remaining <= 0 {
+		return 0, context.DeadlineExceeded
+	}
+	return remaining, nil
 }
 
 func classifyJoinOpenInviteError(err error) int {
@@ -1457,9 +1486,19 @@ func (s *ipcServer) handleJoinGroup(ctx context.Context, c net.Conn, req *ipc.Jo
 		})
 		return
 	}
+	bootstrapTimeout, err := remainingJoinBootstrapTimeout(joinCtx, joinTimeout, time.Now())
+	if err != nil {
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
+			Type:    "error",
+			Code:    ipc.CodeUnavailable,
+			Message: "join group: timeout before bootstrap",
+		})
+		return
+	}
 	sess, created, err := s.runtime.AddInviteWithOptions(joinCtx, invite, addInviteOptions{
 		scheduleOnboarding: true,
-		bootstrapTimeout:   joinTimeout,
+		bootstrapTimeout:   bootstrapTimeout,
+		sessionParent:      ctx,
 	})
 	if err != nil {
 		code := ipc.CodeInternal
@@ -1929,11 +1968,25 @@ func (s *ipcServer) handleInfo(ctx context.Context, c net.Conn) {
 			members = len(sess.roster.Members())
 		} else {
 			// For groups outside the daemon's active roster, peek at
-			// the roster file directly.
-			if r, err := roster.OpenJSONL(s.dataDir, gid); err == nil {
-				members = len(r.Members())
-				_ = r.Close()
+			// the existing roster file directly. Empty/orphan roster
+			// shells are not joined groups and should not leak through
+			// info after a failed live join attempt.
+			r, ok, err := openExistingRosterLog(s.dataDir, gid)
+			if err != nil {
+				slog.Warn("info: open roster",
+					slog.String("group", gid.String()),
+					slog.String("err", err.Error()))
+				continue
 			}
+			if !ok {
+				continue
+			}
+			if !rosterHasLocalNodeIdentity(r, s.nodeID, s.identity.PublicKey) {
+				_ = r.Close()
+				continue
+			}
+			members = len(r.Members())
+			_ = r.Close()
 		}
 		msgs, err := s.store.Range(ctx, gid, 0, 0)
 		msgCount := 0

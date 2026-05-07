@@ -72,6 +72,56 @@ func TestGroupRuntimeAddsMultipleSelfGroups(t *testing.T) {
 	}
 }
 
+func TestGroupRuntimeSessionCanOutliveJoinRequestContext(t *testing.T) {
+	sessionParent, stopSessionParent := context.WithCancel(context.Background())
+	defer stopSessionParent()
+	joinCtx, cancelJoin := context.WithCancel(context.Background())
+
+	dataDir := t.TempDir()
+	identity, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate identity: %v", err)
+	}
+	st, err := store.OpenSQLite(dataDir)
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	defer st.Close()
+	rt, err := newGroupRuntime(groupRuntimeConfig{
+		NodeID:    45491,
+		Identity:  identity,
+		DataDir:   dataDir,
+		Store:     st,
+		Notify:    newNotifyingStore(st, events.NewBus()),
+		Transport: newRuntimeFakeTransport(),
+	})
+	if err != nil {
+		t.Fatalf("newGroupRuntime: %v", err)
+	}
+	defer rt.Close()
+
+	invite := selfInvite(t, dataDir, st, identity, 45491, testRuntimeGroupID(0xC1))
+	sess, created, err := rt.AddInviteWithOptions(joinCtx, invite, addInviteOptions{
+		sessionParent: sessionParent,
+	})
+	if err != nil || !created {
+		t.Fatalf("AddInviteWithOptions created/err = %v/%v, want true/nil", created, err)
+	}
+
+	cancelJoin()
+	select {
+	case <-sess.ctx.Done():
+		t.Fatal("session was canceled with the completed join request")
+	default:
+	}
+	stopSessionParent()
+	select {
+	case <-sess.ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("session did not stop after session parent cancellation")
+	}
+}
+
 func TestGroupRuntimeValidatesInviteBeforeExistingSessionReuse(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -555,7 +605,7 @@ func TestGroupRuntimeRejectedJoinRollsBackNewGroupDir(t *testing.T) {
 	defer rt.Close()
 
 	gid := testRuntimeGroupID(0xA9)
-	if _, _, err := rt.addGroup(ctx, gid, persistForeignRosterBootstrap(t, dataDir, rosterIdentity, 99999, gid), 0); !errors.Is(err, errLocalGroupNotMember) {
+	if _, _, err := rt.addGroup(ctx, gid, persistForeignRosterBootstrap(t, dataDir, rosterIdentity, 99999, gid), 0, nil); !errors.Is(err, errLocalGroupNotMember) {
 		t.Fatalf("addGroup err = %v, want errLocalGroupNotMember", err)
 	}
 	if _, err := os.Stat(groupDirPath(dataDir, gid)); !errors.Is(err, os.ErrNotExist) {
@@ -605,7 +655,7 @@ func TestGroupRuntimeRejectedJoinPreservesExistingGroupDir(t *testing.T) {
 	if err := os.WriteFile(sentinel, []byte("keep"), 0o600); err != nil {
 		t.Fatalf("write sentinel: %v", err)
 	}
-	if _, _, err := rt.addGroup(ctx, gid, persistForeignRosterBootstrap(t, dataDir, rosterIdentity, 99999, gid), 0); !errors.Is(err, errLocalGroupNotMember) {
+	if _, _, err := rt.addGroup(ctx, gid, persistForeignRosterBootstrap(t, dataDir, rosterIdentity, 99999, gid), 0, nil); !errors.Is(err, errLocalGroupNotMember) {
 		t.Fatalf("addGroup err = %v, want errLocalGroupNotMember", err)
 	}
 	if _, err := os.Stat(sentinel); err != nil {
@@ -640,6 +690,22 @@ func TestSelectServeGroupIDsFiltersGroupsWithoutRoster(t *testing.T) {
 	}
 	if len(gids) != 1 || gids[0] != valid {
 		t.Fatalf("gids = %v, want [%s]", gids, valid.String())
+	}
+}
+
+func TestSelectServeGroupIDsFiltersEmptyRosterShell(t *testing.T) {
+	dataDir := t.TempDir()
+	emptyRoster := testRuntimeGroupID(0xAB)
+	if err := os.MkdirAll(groupDirPath(dataDir, emptyRoster), 0o700); err != nil {
+		t.Fatalf("mkdir empty roster group: %v", err)
+	}
+	if err := os.WriteFile(groupRosterPath(dataDir, emptyRoster), nil, 0o600); err != nil {
+		t.Fatalf("write empty roster: %v", err)
+	}
+
+	gids, err := selectServeGroupIDs(dataDir, nil, nil)
+	if !errors.Is(err, errServeNoGroups) {
+		t.Fatalf("selectServeGroupIDs err = %v, gids = %v; want errServeNoGroups", err, gids)
 	}
 }
 
