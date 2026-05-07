@@ -171,6 +171,7 @@ type SignedPublishResp struct {
 type JoinGroupReq struct {
 	Invite     entmoot.Invite  `json:"invite,omitempty"`
 	OpenInvite *OpenInviteJoin `json:"open_invite,omitempty"`
+	TimeoutMS  int64           `json:"timeout_ms,omitempty"`
 }
 
 // OpenInviteJoin describes an open invite that must be redeemed by the daemon

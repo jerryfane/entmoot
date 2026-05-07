@@ -137,6 +137,8 @@ func pilotDriverHasCapability(ctx context.Context, d *ipcclient.Driver, want str
 // a one-shot command: if a daemon is already running, it asks that daemon to
 // join over IPC; otherwise it joins offline, writes local state, and exits.
 // --serve preserves the legacy "join then run a daemon until signalled" mode.
+const defaultJoinTimeout = 90 * time.Second
+
 func cmdJoin(gf *globalFlags, args []string) int {
 	fs := flag.NewFlagSet("join", flag.ContinueOnError)
 	// v1.2.0: repeatable -advertise-endpoint flag feeds the gossiper's
@@ -152,7 +154,7 @@ func cmdJoin(gf *globalFlags, args []string) int {
 	fs.Var(&advertiseEndpoints, "advertise-endpoint",
 		"advertise this node's endpoint (network=host:port); repeatable (v1.2.0)")
 	serveAfterJoin := fs.Bool("serve", false, "after joining, keep running as the Entmoot daemon (legacy blocking behavior)")
-	ipcTimeout := fs.Duration("timeout", 30*time.Second, "live-daemon join IPC response deadline")
+	ipcTimeout := fs.Duration("timeout", defaultJoinTimeout, "join bootstrap and live-daemon IPC response deadline")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return exitOK
@@ -186,11 +188,12 @@ func cmdJoin(gf *globalFlags, args []string) int {
 				if err != nil {
 					return code, err
 				}
-				addInvite := runtime.AddInvite
+				addInvite := runtime.AddInviteWithOptions
+				addOpts := addInviteOptions{scheduleOnboarding: true, bootstrapTimeout: *ipcTimeout}
 				if exitAfterLoad {
-					addInvite = runtime.AddInviteWithoutAsyncOnboarding
+					addOpts.scheduleOnboarding = false
 				}
-				if _, _, err := addInvite(ctx, *invite); err != nil {
+				if _, _, err := addInvite(ctx, *invite, addOpts); err != nil {
 					code := classifyJoinAddInviteError(err)
 					if code == exitInvalidArgument {
 						return code, err
@@ -289,8 +292,9 @@ func joinInputOverIPC(ctx context.Context, sockPath string, input joinInput, tim
 
 func joinGroupReqOverIPC(ctx context.Context, sockPath string, req *ipc.JoinGroupReq, timeout time.Duration) (*ipc.JoinGroupResp, *ipc.ErrorFrame, error) {
 	if timeout <= 0 {
-		timeout = 30 * time.Second
+		timeout = defaultJoinTimeout
 	}
+	req.TimeoutMS = timeout.Milliseconds()
 	dialCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
 	defer cancel()
 	var dialer net.Dialer
@@ -1437,7 +1441,13 @@ func (s *ipcServer) resolvePublishGroup(c net.Conn, requested *entmoot.GroupID) 
 }
 
 func (s *ipcServer) handleJoinGroup(ctx context.Context, c net.Conn, req *ipc.JoinGroupReq) {
-	invite, err := s.resolveJoinGroupInvite(ctx, req)
+	joinTimeout := time.Duration(req.TimeoutMS) * time.Millisecond
+	if joinTimeout <= 0 {
+		joinTimeout = defaultJoinTimeout
+	}
+	joinCtx, cancel := context.WithTimeout(ctx, joinTimeout)
+	defer cancel()
+	invite, err := s.resolveJoinGroupInvite(joinCtx, req)
 	if err != nil {
 		code := ipcCodeForJoinResolveError(err)
 		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
@@ -1447,7 +1457,10 @@ func (s *ipcServer) handleJoinGroup(ctx context.Context, c net.Conn, req *ipc.Jo
 		})
 		return
 	}
-	sess, created, err := s.runtime.AddInvite(ctx, invite)
+	sess, created, err := s.runtime.AddInviteWithOptions(joinCtx, invite, addInviteOptions{
+		scheduleOnboarding: true,
+		bootstrapTimeout:   joinTimeout,
+	})
 	if err != nil {
 		code := ipc.CodeInternal
 		if errors.Is(err, entmoot.ErrInviteExpired) || errors.Is(err, entmoot.ErrSigInvalid) {

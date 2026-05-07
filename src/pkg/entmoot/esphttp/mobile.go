@@ -204,11 +204,14 @@ type StateStore interface {
 	CreateFleet(context.Context, FleetRecord) (FleetRecord, error)
 	ListFleets(context.Context) ([]FleetRecord, error)
 	GetFleet(context.Context, string) (FleetRecord, bool, error)
+	ArchiveFleet(context.Context, string, int64) (FleetRecord, bool, error)
 	DeleteFleet(context.Context, string) error
 	UpsertFleetMember(context.Context, FleetMemberRecord) (FleetMemberRecord, error)
+	UpsertFleetMemberForActiveFleet(context.Context, FleetMemberRecord) (FleetMemberRecord, error)
 	ListFleetMembers(context.Context, string) ([]FleetMemberRecord, error)
 	DeleteFleetMember(context.Context, string, entmoot.NodeID) error
 	CreateFleetInvite(context.Context, FleetInviteRecord) (FleetInviteRecord, error)
+	CreateFleetInviteForActiveFleet(context.Context, FleetInviteRecord) (FleetInviteRecord, error)
 	ListFleetInvites(context.Context, string) ([]FleetInviteRecord, error)
 	DeleteFleetInvite(context.Context, string) error
 	AppendFleetActivity(context.Context, FleetActivityRecord) (FleetActivityRecord, error)
@@ -232,6 +235,7 @@ var (
 	ErrOpenInviteChallengeExpired = errors.New("esphttp: open invite challenge expired")
 	ErrOpenInviteChallengeUsed    = errors.New("esphttp: open invite challenge used")
 	ErrOpenInviteChallengeLimit   = errors.New("esphttp: open invite challenge limit reached")
+	ErrFleetNotActive             = errors.New("esphttp: fleet is not active")
 )
 
 // MemoryStateStore is useful for tests and dev-mode ESP handlers.
@@ -665,6 +669,7 @@ func (s *MemoryStateStore) CreateFleet(_ context.Context, rec FleetRecord) (Flee
 	if rec.CreatedAtMS == 0 {
 		rec.CreatedAtMS = now
 	}
+	rec.Status = NormalizeFleetStatus(rec.Status)
 	rec.UpdatedAtMS = now
 	s.fleets[rec.FleetID] = cloneFleetRecord(rec)
 	return cloneFleetRecord(rec), nil
@@ -693,6 +698,26 @@ func (s *MemoryStateStore) GetFleet(_ context.Context, fleetID string) (FleetRec
 	return cloneFleetRecord(rec), ok, nil
 }
 
+func (s *MemoryStateStore) ArchiveFleet(_ context.Context, fleetID string, archivedAtMS int64) (FleetRecord, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rec, ok := s.fleets[fleetID]
+	if !ok {
+		return FleetRecord{}, false, nil
+	}
+	if archivedAtMS == 0 {
+		archivedAtMS = s.nowMS()
+	}
+	if rec.Status != FleetStatusArchived {
+		rec.Status = FleetStatusArchived
+		rec.ArchivedAtMS = archivedAtMS
+		rec.UpdatedAtMS = archivedAtMS
+		s.fleets[fleetID] = cloneFleetRecord(rec)
+	}
+	delete(s.fleetInvites, fleetID)
+	return cloneFleetRecord(rec), true, nil
+}
+
 func (s *MemoryStateStore) DeleteFleet(_ context.Context, fleetID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -706,6 +731,24 @@ func (s *MemoryStateStore) DeleteFleet(_ context.Context, fleetID string) error 
 func (s *MemoryStateStore) UpsertFleetMember(_ context.Context, rec FleetMemberRecord) (FleetMemberRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.upsertFleetMemberLocked(rec)
+}
+
+func (s *MemoryStateStore) UpsertFleetMemberForActiveFleet(_ context.Context, rec FleetMemberRecord) (FleetMemberRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.fleetActiveLocked(rec.FleetID) {
+		return FleetMemberRecord{}, ErrFleetNotActive
+	}
+	return s.upsertFleetMemberLocked(rec)
+}
+
+func (s *MemoryStateStore) fleetActiveLocked(fleetID string) bool {
+	fleet, ok := s.fleets[fleetID]
+	return ok && NormalizeFleetStatus(fleet.Status) == FleetStatusActive
+}
+
+func (s *MemoryStateStore) upsertFleetMemberLocked(rec FleetMemberRecord) (FleetMemberRecord, error) {
 	if s.fleetMembers[rec.FleetID] == nil {
 		s.fleetMembers[rec.FleetID] = make(map[entmoot.NodeID]FleetMemberRecord)
 	}
@@ -748,6 +791,19 @@ func (s *MemoryStateStore) DeleteFleetMember(_ context.Context, fleetID string, 
 func (s *MemoryStateStore) CreateFleetInvite(_ context.Context, rec FleetInviteRecord) (FleetInviteRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.createFleetInviteLocked(rec)
+}
+
+func (s *MemoryStateStore) CreateFleetInviteForActiveFleet(_ context.Context, rec FleetInviteRecord) (FleetInviteRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.fleetActiveLocked(rec.FleetID) {
+		return FleetInviteRecord{}, ErrFleetNotActive
+	}
+	return s.createFleetInviteLocked(rec)
+}
+
+func (s *MemoryStateStore) createFleetInviteLocked(rec FleetInviteRecord) (FleetInviteRecord, error) {
 	now := s.nowMS()
 	if rec.InviteID == "" {
 		var err error
@@ -985,8 +1041,11 @@ CREATE TABLE IF NOT EXISTS esp_fleets (
   coordinator_node_id INTEGER NOT NULL,
   coordinator_pubkey TEXT NOT NULL,
   coordinator_device_id TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'active',
   created_at_ms INTEGER NOT NULL,
-  updated_at_ms INTEGER NOT NULL
+  updated_at_ms INTEGER NOT NULL,
+  archived_at_ms INTEGER NOT NULL DEFAULT 0,
+  deleted_at_ms INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS esp_fleet_members (
@@ -1653,17 +1712,18 @@ func (s *SQLiteStateStore) CreateFleet(ctx context.Context, rec FleetRecord) (Fl
 	}
 	if _, err := s.db.ExecContext(ctx, `
 INSERT INTO esp_fleets
-  (fleet_id, name, control_group_id, coordinator_node_id, coordinator_pubkey, coordinator_device_id, created_at_ms, updated_at_ms)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+  (fleet_id, name, control_group_id, coordinator_node_id, coordinator_pubkey, coordinator_device_id, status, created_at_ms, updated_at_ms, archived_at_ms, deleted_at_ms)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		rec.FleetID, rec.Name, controlGroup, rec.Coordinator.PilotNodeID, base64.StdEncoding.EncodeToString(rec.Coordinator.EntmootPubKey),
-		rec.CoordinatorDeviceID, rec.CreatedAtMS, rec.UpdatedAtMS); err != nil {
+		rec.CoordinatorDeviceID, NormalizeFleetStatus(rec.Status), rec.CreatedAtMS, rec.UpdatedAtMS, rec.ArchivedAtMS, rec.DeletedAtMS); err != nil {
 		return FleetRecord{}, fmt.Errorf("esphttp: create fleet: %w", err)
 	}
+	rec.Status = NormalizeFleetStatus(rec.Status)
 	return cloneFleetRecord(rec), nil
 }
 
 func (s *SQLiteStateStore) ListFleets(ctx context.Context) ([]FleetRecord, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT fleet_id, name, control_group_id, coordinator_node_id, coordinator_pubkey, coordinator_device_id, created_at_ms, updated_at_ms FROM esp_fleets ORDER BY created_at_ms DESC`)
+	rows, err := s.db.QueryContext(ctx, `SELECT fleet_id, name, control_group_id, coordinator_node_id, coordinator_pubkey, coordinator_device_id, status, created_at_ms, updated_at_ms, archived_at_ms, deleted_at_ms FROM esp_fleets ORDER BY created_at_ms DESC`)
 	if err != nil {
 		return nil, fmt.Errorf("esphttp: list fleets: %w", err)
 	}
@@ -1680,13 +1740,51 @@ func (s *SQLiteStateStore) ListFleets(ctx context.Context) ([]FleetRecord, error
 }
 
 func (s *SQLiteStateStore) GetFleet(ctx context.Context, fleetID string) (FleetRecord, bool, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT fleet_id, name, control_group_id, coordinator_node_id, coordinator_pubkey, coordinator_device_id, created_at_ms, updated_at_ms FROM esp_fleets WHERE fleet_id = ?`, fleetID)
+	row := s.db.QueryRowContext(ctx, `SELECT fleet_id, name, control_group_id, coordinator_node_id, coordinator_pubkey, coordinator_device_id, status, created_at_ms, updated_at_ms, archived_at_ms, deleted_at_ms FROM esp_fleets WHERE fleet_id = ?`, fleetID)
 	rec, err := scanFleetRecord(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return FleetRecord{}, false, nil
 	}
 	if err != nil {
 		return FleetRecord{}, false, fmt.Errorf("esphttp: get fleet: %w", err)
+	}
+	return rec, true, nil
+}
+
+func (s *SQLiteStateStore) ArchiveFleet(ctx context.Context, fleetID string, archivedAtMS int64) (FleetRecord, bool, error) {
+	if archivedAtMS == 0 {
+		archivedAtMS = time.Now().UnixMilli()
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return FleetRecord{}, false, fmt.Errorf("esphttp: archive fleet begin: %w", err)
+	}
+	defer tx.Rollback()
+	res, err := tx.ExecContext(ctx, `UPDATE esp_fleets SET status = ?, archived_at_ms = CASE WHEN archived_at_ms = 0 THEN ? ELSE archived_at_ms END, updated_at_ms = ? WHERE fleet_id = ? AND status != ?`,
+		FleetStatusArchived, archivedAtMS, archivedAtMS, fleetID, FleetStatusArchived)
+	if err != nil {
+		return FleetRecord{}, false, fmt.Errorf("esphttp: archive fleet: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return FleetRecord{}, false, fmt.Errorf("esphttp: archive fleet affected rows: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM esp_fleet_invites WHERE fleet_id = ?`, fleetID); err != nil {
+		return FleetRecord{}, false, fmt.Errorf("esphttp: archive fleet invites: %w", err)
+	}
+	row := tx.QueryRowContext(ctx, `SELECT fleet_id, name, control_group_id, coordinator_node_id, coordinator_pubkey, coordinator_device_id, status, created_at_ms, updated_at_ms, archived_at_ms, deleted_at_ms FROM esp_fleets WHERE fleet_id = ?`, fleetID)
+	rec, err := scanFleetRecord(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return FleetRecord{}, false, nil
+	}
+	if err != nil {
+		return FleetRecord{}, false, fmt.Errorf("esphttp: get archived fleet: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return FleetRecord{}, false, fmt.Errorf("esphttp: archive fleet commit: %w", err)
+	}
+	if affected == 0 && rec.Status != FleetStatusArchived {
+		return FleetRecord{}, false, nil
 	}
 	return rec, true, nil
 }
@@ -1708,10 +1806,18 @@ func (s *SQLiteStateStore) DeleteFleet(ctx context.Context, fleetID string) erro
 }
 
 func (s *SQLiteStateStore) UpsertFleetMember(ctx context.Context, rec FleetMemberRecord) (FleetMemberRecord, error) {
+	return s.upsertFleetMember(ctx, rec, false)
+}
+
+func (s *SQLiteStateStore) UpsertFleetMemberForActiveFleet(ctx context.Context, rec FleetMemberRecord) (FleetMemberRecord, error) {
+	return s.upsertFleetMember(ctx, rec, true)
+}
+
+func (s *SQLiteStateStore) upsertFleetMember(ctx context.Context, rec FleetMemberRecord, requireActive bool) (FleetMemberRecord, error) {
 	rec.Role = NormalizeFleetMemberRole(rec.Role)
 	rec.Status = NormalizeFleetMemberStatus(rec.Status)
 	rec.UpdatedAtMS = time.Now().UnixMilli()
-	_, err := s.db.ExecContext(ctx, `
+	query := `
 INSERT INTO esp_fleet_members
   (fleet_id, node_id, entmoot_pubkey, hostname, role, status, invited_at_ms, accepted_at_ms, removed_at_ms, updated_at_ms)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -1723,10 +1829,37 @@ ON CONFLICT(fleet_id, node_id) DO UPDATE SET
   invited_at_ms = excluded.invited_at_ms,
   accepted_at_ms = excluded.accepted_at_ms,
   removed_at_ms = excluded.removed_at_ms,
-  updated_at_ms = excluded.updated_at_ms`,
-		rec.FleetID, rec.NodeID, rec.EntmootPubKey, rec.Hostname, rec.Role, rec.Status, rec.InvitedAtMS, rec.AcceptedAtMS, rec.RemovedAtMS, rec.UpdatedAtMS)
+  updated_at_ms = excluded.updated_at_ms`
+	args := []any{rec.FleetID, rec.NodeID, rec.EntmootPubKey, rec.Hostname, rec.Role, rec.Status, rec.InvitedAtMS, rec.AcceptedAtMS, rec.RemovedAtMS, rec.UpdatedAtMS}
+	if requireActive {
+		query = `
+INSERT INTO esp_fleet_members
+  (fleet_id, node_id, entmoot_pubkey, hostname, role, status, invited_at_ms, accepted_at_ms, removed_at_ms, updated_at_ms)
+SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+WHERE EXISTS (SELECT 1 FROM esp_fleets WHERE fleet_id = ? AND status = ?)
+ON CONFLICT(fleet_id, node_id) DO UPDATE SET
+  entmoot_pubkey = excluded.entmoot_pubkey,
+  hostname = excluded.hostname,
+  role = excluded.role,
+  status = excluded.status,
+  invited_at_ms = excluded.invited_at_ms,
+  accepted_at_ms = excluded.accepted_at_ms,
+  removed_at_ms = excluded.removed_at_ms,
+  updated_at_ms = excluded.updated_at_ms`
+		args = append(args, rec.FleetID, FleetStatusActive)
+	}
+	res, err := s.db.ExecContext(ctx, query, args...)
 	if err != nil {
 		return FleetMemberRecord{}, fmt.Errorf("esphttp: upsert fleet member: %w", err)
+	}
+	if requireActive {
+		affected, err := res.RowsAffected()
+		if err != nil {
+			return FleetMemberRecord{}, fmt.Errorf("esphttp: upsert fleet member affected rows: %w", err)
+		}
+		if affected == 0 {
+			return FleetMemberRecord{}, ErrFleetNotActive
+		}
 	}
 	return cloneFleetMemberRecord(rec), nil
 }
@@ -1756,6 +1889,14 @@ func (s *SQLiteStateStore) DeleteFleetMember(ctx context.Context, fleetID string
 }
 
 func (s *SQLiteStateStore) CreateFleetInvite(ctx context.Context, rec FleetInviteRecord) (FleetInviteRecord, error) {
+	return s.createFleetInvite(ctx, rec, false)
+}
+
+func (s *SQLiteStateStore) CreateFleetInviteForActiveFleet(ctx context.Context, rec FleetInviteRecord) (FleetInviteRecord, error) {
+	return s.createFleetInvite(ctx, rec, true)
+}
+
+func (s *SQLiteStateStore) createFleetInvite(ctx context.Context, rec FleetInviteRecord, requireActive bool) (FleetInviteRecord, error) {
 	now := time.Now().UnixMilli()
 	if rec.InviteID == "" {
 		var err error
@@ -1771,13 +1912,31 @@ func (s *SQLiteStateStore) CreateFleetInvite(ctx context.Context, rec FleetInvit
 	if strings.TrimSpace(rec.Status) == "" {
 		rec.Status = FleetMemberInvited
 	}
-	_, err := s.db.ExecContext(ctx, `
+	query := `
 INSERT INTO esp_fleet_invites
   (invite_id, fleet_id, node_id, entmoot_pubkey, hostname, status, invite, created_at_ms, updated_at_ms, expires_at_ms)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		rec.InviteID, rec.FleetID, rec.NodeID, rec.EntmootPubKey, rec.Hostname, rec.Status, []byte(rec.Invite), rec.CreatedAtMS, rec.UpdatedAtMS, rec.ExpiresAtMS)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	args := []any{rec.InviteID, rec.FleetID, rec.NodeID, rec.EntmootPubKey, rec.Hostname, rec.Status, []byte(rec.Invite), rec.CreatedAtMS, rec.UpdatedAtMS, rec.ExpiresAtMS}
+	if requireActive {
+		query = `
+INSERT INTO esp_fleet_invites
+  (invite_id, fleet_id, node_id, entmoot_pubkey, hostname, status, invite, created_at_ms, updated_at_ms, expires_at_ms)
+SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+WHERE EXISTS (SELECT 1 FROM esp_fleets WHERE fleet_id = ? AND status = ?)`
+		args = append(args, rec.FleetID, FleetStatusActive)
+	}
+	res, err := s.db.ExecContext(ctx, query, args...)
 	if err != nil {
 		return FleetInviteRecord{}, fmt.Errorf("esphttp: create fleet invite: %w", err)
+	}
+	if requireActive {
+		affected, err := res.RowsAffected()
+		if err != nil {
+			return FleetInviteRecord{}, fmt.Errorf("esphttp: create fleet invite affected rows: %w", err)
+		}
+		if affected == 0 {
+			return FleetInviteRecord{}, ErrFleetNotActive
+		}
 	}
 	return cloneFleetInviteRecord(rec), nil
 }
@@ -1947,6 +2106,25 @@ func migrateSQLiteState(db *sql.DB) error {
 			return fmt.Errorf("esphttp: migrate state schema add open invite challenge index: %w", err)
 		}
 	}
+	fleetCols, err := tableColumns(db, "esp_fleets")
+	if err != nil {
+		return err
+	}
+	for _, stmt := range []struct {
+		name string
+		sql  string
+	}{
+		{"status", `ALTER TABLE esp_fleets ADD COLUMN status TEXT NOT NULL DEFAULT 'active'`},
+		{"archived_at_ms", `ALTER TABLE esp_fleets ADD COLUMN archived_at_ms INTEGER NOT NULL DEFAULT 0`},
+		{"deleted_at_ms", `ALTER TABLE esp_fleets ADD COLUMN deleted_at_ms INTEGER NOT NULL DEFAULT 0`},
+	} {
+		if fleetCols[stmt.name] {
+			continue
+		}
+		if _, err := db.Exec(stmt.sql); err != nil {
+			return fmt.Errorf("esphttp: migrate state schema add fleet %s: %w", stmt.name, err)
+		}
+	}
 	return nil
 }
 
@@ -2016,9 +2194,10 @@ func scanFleetRecord(row fleetScanner) (FleetRecord, error) {
 	var rec FleetRecord
 	var controlGroup []byte
 	var pub string
-	if err := row.Scan(&rec.FleetID, &rec.Name, &controlGroup, &rec.Coordinator.PilotNodeID, &pub, &rec.CoordinatorDeviceID, &rec.CreatedAtMS, &rec.UpdatedAtMS); err != nil {
+	if err := row.Scan(&rec.FleetID, &rec.Name, &controlGroup, &rec.Coordinator.PilotNodeID, &pub, &rec.CoordinatorDeviceID, &rec.Status, &rec.CreatedAtMS, &rec.UpdatedAtMS, &rec.ArchivedAtMS, &rec.DeletedAtMS); err != nil {
 		return FleetRecord{}, err
 	}
+	rec.Status = NormalizeFleetStatus(rec.Status)
 	if len(controlGroup) == len(rec.ControlGroupID) {
 		copy(rec.ControlGroupID[:], controlGroup)
 	}

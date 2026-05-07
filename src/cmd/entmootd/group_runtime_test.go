@@ -555,7 +555,7 @@ func TestGroupRuntimeRejectedJoinRollsBackNewGroupDir(t *testing.T) {
 	defer rt.Close()
 
 	gid := testRuntimeGroupID(0xA9)
-	if _, _, err := rt.addGroup(ctx, gid, persistForeignRosterBootstrap(t, dataDir, rosterIdentity, 99999, gid)); !errors.Is(err, errLocalGroupNotMember) {
+	if _, _, err := rt.addGroup(ctx, gid, persistForeignRosterBootstrap(t, dataDir, rosterIdentity, 99999, gid), 0); !errors.Is(err, errLocalGroupNotMember) {
 		t.Fatalf("addGroup err = %v, want errLocalGroupNotMember", err)
 	}
 	if _, err := os.Stat(groupDirPath(dataDir, gid)); !errors.Is(err, os.ErrNotExist) {
@@ -605,7 +605,7 @@ func TestGroupRuntimeRejectedJoinPreservesExistingGroupDir(t *testing.T) {
 	if err := os.WriteFile(sentinel, []byte("keep"), 0o600); err != nil {
 		t.Fatalf("write sentinel: %v", err)
 	}
-	if _, _, err := rt.addGroup(ctx, gid, persistForeignRosterBootstrap(t, dataDir, rosterIdentity, 99999, gid)); !errors.Is(err, errLocalGroupNotMember) {
+	if _, _, err := rt.addGroup(ctx, gid, persistForeignRosterBootstrap(t, dataDir, rosterIdentity, 99999, gid), 0); !errors.Is(err, errLocalGroupNotMember) {
 		t.Fatalf("addGroup err = %v, want errLocalGroupNotMember", err)
 	}
 	if _, err := os.Stat(sentinel); err != nil {

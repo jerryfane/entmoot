@@ -133,6 +133,7 @@ func TestRoundTripJoinGroupReqResp(t *testing.T) {
 			IssuedAt:   1_700_000_000_000,
 			ValidUntil: 1_700_086_400_000,
 		},
+		TimeoutMS: 90_000,
 	})
 	roundTrip(t, &JoinGroupResp{
 		Status:  "joined",

@@ -151,6 +151,7 @@ if [ -z "\${PILOT_DIR+x}" ]; then PILOT_DIR=$(shell_quote "$PILOT_DIR"); fi
 if [ -z "\${PILOT_BIN_DIR+x}" ]; then PILOT_BIN_DIR=$(shell_quote "$PILOT_BIN_DIR"); fi
 if [ -z "\${PILOT_SOCKET+x}" ]; then PILOT_SOCKET=$(shell_quote "$PILOT_SOCKET_DEFAULT"); fi
 if [ -z "\${ENTMOOT_HIDE_IP+x}" ]; then ENTMOOT_HIDE_IP=0; fi
+if [ -z "\${ENTMOOT_START_TIMEOUT+x}" ]; then ENTMOOT_START_TIMEOUT=90; fi
 EOF
 
 cat > "$INSTALL_DIR/entmoot" <<EOF
@@ -248,6 +249,13 @@ RUN_DIR=\${ENTMOOT_RUN_DIR:-"\$ENTMOOT_DATA/run"}
 PILOT_PIDFILE="\$RUN_DIR/pilot-daemon.pid"
 ENTMOOT_PIDFILE="\$RUN_DIR/entmootd.pid"
 ENTMOOT_CONTROL_SOCKET=\${ENTMOOT_CONTROL_SOCKET:-"\$ENTMOOT_DATA/control.sock"}
+ENTMOOT_START_TIMEOUT=\${ENTMOOT_START_TIMEOUT:-90}
+case "\$ENTMOOT_START_TIMEOUT" in
+  ''|*[!0-9]*)
+    echo "invalid ENTMOOT_START_TIMEOUT=\$ENTMOOT_START_TIMEOUT; using 90" >&2
+    ENTMOOT_START_TIMEOUT=90
+    ;;
+esac
 
 quote() {
   printf "'%s'" "\$(printf '%s' "\$1" | sed "s/'/'\\\\''/g")"
@@ -392,7 +400,7 @@ print_entmoot_start_failure() {
 if [ "\$(id -u)" = "0" ] && id node >/dev/null 2>&1 && [ -d /data ]; then
   chown -R node:node "\$PILOT_DIR" "\$ENTMOOT_DATA"
   envs="ENTMOOT_RUNTIME_ENV=\$(quote "\$RUNTIME_ENV")"
-  for name in ENTMOOT_BIN ENTMOOT_DATA ENTMOOT_IDENTITY ENTMOOT_CONTROL_SOCKET ENTMOOT_HIDE_IP ENTMOOT_RUN_DIR PILOT_DIR PILOT_BIN_DIR PILOT_SOCKET TMP_PILOT_SOCKET PILOT_DAEMON_BIN PILOTCTL_BIN PILOT_REGISTRY PILOT_BEACON PILOT_HOSTNAME PILOT_EMAIL PILOT_TURN_PROVIDER PILOT_CLOUDFLARE_TURN_CREDS_FILE PILOT_RENDEZVOUS_URL; do
+  for name in ENTMOOT_BIN ENTMOOT_DATA ENTMOOT_IDENTITY ENTMOOT_CONTROL_SOCKET ENTMOOT_HIDE_IP ENTMOOT_START_TIMEOUT ENTMOOT_RUN_DIR PILOT_DIR PILOT_BIN_DIR PILOT_SOCKET TMP_PILOT_SOCKET PILOT_DAEMON_BIN PILOTCTL_BIN PILOT_REGISTRY PILOT_BEACON PILOT_HOSTNAME PILOT_EMAIL PILOT_TURN_PROVIDER PILOT_CLOUDFLARE_TURN_CREDS_FILE PILOT_RENDEZVOUS_URL; do
     eval "value=\\\${\$name-}"
     if [ -n "\$value" ]; then
       envs="\$envs \$name=\$(quote "\$value")"
@@ -473,7 +481,8 @@ fi
 
 nohup "\$ENTMOOT_BIN" "\$@" >> "\$ENTMOOT_DATA/restart.log" 2>&1 &
 entmoot_pid="\$!"
-for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+elapsed=0
+while [ "\$elapsed" -lt "\$ENTMOOT_START_TIMEOUT" ]; do
   if ! entmoot_pid_alive "\$entmoot_pid"; then
     rm -f "\$ENTMOOT_PIDFILE"
     print_entmoot_start_failure
@@ -484,10 +493,13 @@ for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
     exit 0
   fi
   sleep 1
+  elapsed=\$((elapsed + 1))
 done
 
 if entmoot_pid_alive "\$entmoot_pid"; then
-  kill -TERM "\$entmoot_pid" 2>/dev/null || true
+  echo "\$entmoot_pid" > "\$ENTMOOT_PIDFILE"
+  echo "entmoot daemon is still not ready after \$ENTMOOT_START_TIMEOUT seconds; leaving process \$entmoot_pid running" >&2
+  exit 1
 fi
 rm -f "\$ENTMOOT_PIDFILE"
 print_entmoot_start_failure

@@ -235,33 +235,42 @@ func (r *groupRuntime) Start(ctx context.Context) error {
 	return err
 }
 
+type addInviteOptions struct {
+	scheduleOnboarding bool
+	bootstrapTimeout   time.Duration
+}
+
 func (r *groupRuntime) AddInvite(ctx context.Context, invite entmoot.Invite) (*groupSession, bool, error) {
-	return r.addInvite(ctx, invite, true)
+	return r.addInvite(ctx, invite, addInviteOptions{scheduleOnboarding: true})
 }
 
 func (r *groupRuntime) AddInviteWithoutAsyncOnboarding(ctx context.Context, invite entmoot.Invite) (*groupSession, bool, error) {
-	return r.addInvite(ctx, invite, false)
+	return r.addInvite(ctx, invite, addInviteOptions{})
 }
 
-func (r *groupRuntime) addInvite(ctx context.Context, invite entmoot.Invite, scheduleOnboarding bool) (*groupSession, bool, error) {
+func (r *groupRuntime) AddInviteWithOptions(ctx context.Context, invite entmoot.Invite, opts addInviteOptions) (*groupSession, bool, error) {
+	return r.addInvite(ctx, invite, opts)
+}
+
+func (r *groupRuntime) addInvite(ctx context.Context, invite entmoot.Invite, opts addInviteOptions) (*groupSession, bool, error) {
 	if err := gossip.ValidateInvite(&invite, time.Now()); err != nil {
 		return nil, false, err
 	}
 	bootstrap := func(joinCtx context.Context, g *gossip.Gossiper) error {
 		return g.Join(joinCtx, &invite)
 	}
-	sess, created, err := r.addGroup(ctx, invite.GroupID, bootstrap)
-	if err == nil && created && scheduleOnboarding {
+	sess, created, err := r.addGroup(ctx, invite.GroupID, bootstrap, opts.bootstrapTimeout)
+	if err == nil && created && opts.scheduleOnboarding {
 		r.scheduleOnboardingHandshakes(sess, invite)
 	}
 	return sess, created, err
 }
 
 func (r *groupRuntime) AddLocalGroup(ctx context.Context, groupID entmoot.GroupID) (*groupSession, bool, error) {
-	return r.addGroup(ctx, groupID, nil)
+	return r.addGroup(ctx, groupID, nil, 0)
 }
 
-func (r *groupRuntime) addGroup(ctx context.Context, groupID entmoot.GroupID, bootstrap func(context.Context, *gossip.Gossiper) error) (*groupSession, bool, error) {
+func (r *groupRuntime) addGroup(ctx context.Context, groupID entmoot.GroupID, bootstrap func(context.Context, *gossip.Gossiper) error, bootstrapTimeout time.Duration) (*groupSession, bool, error) {
 	var joinDone chan struct{}
 	for {
 		r.mu.Lock()
@@ -337,7 +346,10 @@ func (r *groupRuntime) addGroup(ctx context.Context, groupID entmoot.GroupID, bo
 	}
 
 	if bootstrap != nil {
-		joinCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		if bootstrapTimeout <= 0 {
+			bootstrapTimeout = defaultJoinTimeout
+		}
+		joinCtx, cancel := context.WithTimeout(ctx, bootstrapTimeout)
 		err = bootstrap(joinCtx, g)
 		cancel()
 		if err != nil {

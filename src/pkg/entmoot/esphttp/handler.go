@@ -486,7 +486,7 @@ func (h *Handler) handleFleets(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		visible := make([]FleetRecord, 0, len(fleets))
-		for _, fleet := range fleets {
+		for _, fleet := range ActiveFleetRecords(fleets) {
 			if fleet.CoordinatorDeviceID == device.ID {
 				visible = append(visible, fleet)
 			}
@@ -516,11 +516,17 @@ func (h *Handler) handleFleetSubroute(w http.ResponseWriter, r *http.Request) bo
 	}
 	switch suffix {
 	case "":
-		if r.Method != http.MethodGet {
-			methodNotAllowed(w, http.MethodGet)
+		switch r.Method {
+		case http.MethodGet:
+			h.handleGetFleet(w, r, fleetID)
+		case http.MethodDelete:
+			h.withIdempotency(w, r, "fleet_archive:"+fleetID, func(w http.ResponseWriter, r *http.Request) {
+				h.createFleetSignRequestFromHTTP(w, r, signRequestKindFleetArchive, fleetID)
+			})
+		default:
+			methodNotAllowed(w, http.MethodGet+", "+http.MethodDelete)
 			return true
 		}
-		h.handleGetFleet(w, r, fleetID)
 	case "members":
 		if r.Method != http.MethodGet {
 			methodNotAllowed(w, http.MethodGet)
@@ -1889,6 +1895,18 @@ func (h *Handler) checkDeviceFleetAdmin(w http.ResponseWriter, r *http.Request, 
 	return ok
 }
 
+func (h *Handler) checkDeviceActiveFleetAdmin(w http.ResponseWriter, r *http.Request, fleetID string, allowArchived bool) bool {
+	fleet, ok := h.authorizedFleet(w, r, fleetID)
+	if !ok {
+		return false
+	}
+	if !allowArchived && fleet.Status != FleetStatusActive {
+		writeError(w, http.StatusConflict, "fleet_archived", "fleet is archived")
+		return false
+	}
+	return true
+}
+
 func (h *Handler) checkDeviceClient(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID, clientID string) bool {
 	if !h.checkDeviceGroup(w, r, groupID) {
 		return false
@@ -1919,7 +1937,7 @@ func (h *Handler) createSignRequestFromHTTP(w http.ResponseWriter, r *http.Reque
 }
 
 func (h *Handler) createFleetSignRequestFromHTTP(w http.ResponseWriter, r *http.Request, kind string, fleetID string) {
-	if !h.checkDeviceFleetAdmin(w, r, fleetID) {
+	if !h.checkDeviceActiveFleetAdmin(w, r, fleetID, kind == signRequestKindFleetArchive) {
 		return
 	}
 	var payload map[string]any
@@ -1940,7 +1958,7 @@ func (h *Handler) createFleetSignRequestFromHTTP(w http.ResponseWriter, r *http.
 }
 
 func (h *Handler) createFleetMemberRemoveSignRequest(w http.ResponseWriter, r *http.Request, fleetID string, escapedMember string) {
-	if !h.checkDeviceFleetAdmin(w, r, fleetID) {
+	if !h.checkDeviceActiveFleetAdmin(w, r, fleetID, false) {
 		return
 	}
 	rawMember, err := url.PathUnescape(escapedMember)

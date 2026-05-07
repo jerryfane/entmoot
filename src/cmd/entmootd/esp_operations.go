@@ -48,6 +48,7 @@ type espOperationExecutor struct {
 
 var espInviteRosterLocks sync.Map
 var espOpenInviteRedeemLocks keyedMutexMap
+var espFleetMutationLocks keyedMutexMap
 
 type keyedMutexMap struct {
 	mu    sync.Mutex
@@ -88,6 +89,10 @@ func (m *keyedMutexMap) Len() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return len(m.locks)
+}
+
+func lockFleetMutation(fleetID string) func() {
+	return espFleetMutationLocks.Lock("fleet:" + strings.TrimSpace(fleetID))
 }
 
 type groupCreatePayload struct {
@@ -196,6 +201,8 @@ func (e espOperationExecutor) ExecuteSignRequest(ctx context.Context, req esphtt
 		return e.createFleetInvite(ctx, req)
 	case "fleet_member_remove":
 		return e.removeFleetMember(ctx, req)
+	case "fleet_archive":
+		return e.archiveFleet(ctx, req)
 	case "group_create":
 		return e.createGroup(ctx, req)
 	case "group_update":
@@ -719,6 +726,19 @@ func (e espOperationExecutor) acceptInvite(ctx context.Context, req esphttp.Sign
 		rollback    func()
 	)
 	if fleetAccept {
+		unlockFleet := lockFleetMutation(fleetPlan.fleet.FleetID)
+		defer unlockFleet()
+		fleetPlan, fleetAccept, err = e.preflightFleetInviteAcceptance(ctx, invite.GroupID)
+		if err != nil {
+			return nil, err
+		}
+		if !fleetAccept {
+			return nil, &esphttp.OperationError{
+				HTTPStatus: http.StatusConflict,
+				Code:       "fleet_invite_required",
+				Message:    "fleet invite acceptance requires a current pending fleet invite",
+			}
+		}
 		fleet, fleetMember, rollback, err = e.prepareFleetInviteAcceptance(ctx, fleetPlan)
 		if err != nil {
 			return nil, err
@@ -1168,6 +1188,20 @@ func (e espOperationExecutor) appendFleetActivity(ctx context.Context, fleetID, 
 	})
 }
 
+func requireActiveFleet(fleet esphttp.FleetRecord) error {
+	if fleet.Status == "" || fleet.Status == esphttp.FleetStatusActive {
+		return nil
+	}
+	return &esphttp.OperationError{HTTPStatus: http.StatusConflict, Code: "fleet_archived", Message: "fleet is archived"}
+}
+
+func fleetMutationError(err error) error {
+	if errors.Is(err, esphttp.ErrFleetNotActive) {
+		return &esphttp.OperationError{HTTPStatus: http.StatusConflict, Code: "fleet_archived", Message: "fleet is archived"}
+	}
+	return err
+}
+
 func (e espOperationExecutor) updateGroup(ctx context.Context, req esphttp.SignRequest) (json.RawMessage, error) {
 	if req.GroupID == (entmoot.GroupID{}) {
 		return nil, &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request", Message: "group_update requires group_id"}
@@ -1219,6 +1253,9 @@ func (e espOperationExecutor) preflightFleetInviteAcceptance(ctx context.Context
 	}
 	if !found {
 		return nil, false, nil
+	}
+	if err := requireActiveFleet(fleet); err != nil {
+		return nil, false, err
 	}
 	info, err := e.daemonInfo()
 	if err != nil {
@@ -1346,9 +1383,9 @@ func (e espOperationExecutor) prepareFleetInviteAcceptance(ctx context.Context, 
 			}
 		}
 	}
-	member, err := e.stateStore.UpsertFleetMember(ctx, member)
+	member, err := e.stateStore.UpsertFleetMemberForActiveFleet(ctx, member)
 	if err != nil {
-		return esphttp.FleetRecord{}, esphttp.FleetMemberRecord{}, nil, err
+		return esphttp.FleetRecord{}, esphttp.FleetMemberRecord{}, nil, fleetMutationError(err)
 	}
 	memberApplied = true
 	for _, invite := range plan.invites {
@@ -1441,6 +1478,51 @@ func (e espOperationExecutor) createFleet(ctx context.Context, req esphttp.SignR
 	return json.Marshal(map[string]any{"status": "created", "fleet": fleet, "activity": activity})
 }
 
+func (e espOperationExecutor) archiveFleet(ctx context.Context, req esphttp.SignRequest) (json.RawMessage, error) {
+	if e.stateStore == nil {
+		return nil, &esphttp.OperationError{HTTPStatus: http.StatusServiceUnavailable, Code: "fleet_unavailable", Message: "fleet store is not configured"}
+	}
+	var payload fleetScopedPayload
+	if err := json.Unmarshal(req.Payload, &payload); err != nil {
+		return nil, &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request", Message: "invalid fleet_archive payload"}
+	}
+	payload.FleetID = strings.TrimSpace(payload.FleetID)
+	if payload.FleetID == "" {
+		return nil, &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request", Message: "fleet_archive requires fleet_id"}
+	}
+	unlockFleet := lockFleetMutation(payload.FleetID)
+	defer unlockFleet()
+	prev, ok, err := e.stateStore.GetFleet(ctx, payload.FleetID)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, &esphttp.OperationError{HTTPStatus: http.StatusNotFound, Code: "fleet_not_found", Message: "fleet not found"}
+	}
+	if req.DeviceID != "" && prev.CoordinatorDeviceID != "" && req.DeviceID != prev.CoordinatorDeviceID {
+		return nil, &esphttp.OperationError{HTTPStatus: http.StatusForbidden, Code: "forbidden", Message: "device is not authorized to manage fleet"}
+	}
+	if prev.Status == esphttp.FleetStatusArchived {
+		return json.Marshal(map[string]any{"status": "archived", "fleet": prev, "activity": nil})
+	}
+	if prev.Status != "" && prev.Status != esphttp.FleetStatusActive {
+		return nil, &esphttp.OperationError{HTTPStatus: http.StatusConflict, Code: "fleet_archived", Message: "fleet is not active"}
+	}
+	archivedAt := time.Now().UnixMilli()
+	fleet, ok, err := e.stateStore.ArchiveFleet(ctx, payload.FleetID, archivedAt)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, &esphttp.OperationError{HTTPStatus: http.StatusNotFound, Code: "fleet_not_found", Message: "fleet not found"}
+	}
+	activity, err := e.appendFleetActivity(ctx, fleet.FleetID, "fleet.archived", fleet.Coordinator, nil, "Fleet archived", map[string]any{"name": fleet.Name})
+	if err != nil {
+		slog.Warn("esp fleet_archive: append activity failed", slog.String("fleet_id", fleet.FleetID), slog.String("err", err.Error()))
+	}
+	return json.Marshal(map[string]any{"status": "archived", "fleet": fleet, "activity": activity})
+}
+
 func (e espOperationExecutor) createFleetInvite(ctx context.Context, req esphttp.SignRequest) (json.RawMessage, error) {
 	if e.stateStore == nil {
 		return nil, &esphttp.OperationError{HTTPStatus: http.StatusServiceUnavailable, Code: "fleet_unavailable", Message: "fleet store is not configured"}
@@ -1453,12 +1535,17 @@ func (e espOperationExecutor) createFleetInvite(ctx context.Context, req esphttp
 	if payload.FleetID == "" {
 		return nil, &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request", Message: "fleet_invite_create requires fleet_id"}
 	}
+	unlockFleet := lockFleetMutation(payload.FleetID)
+	defer unlockFleet()
 	fleet, ok, err := e.stateStore.GetFleet(ctx, payload.FleetID)
 	if err != nil {
 		return nil, err
 	}
 	if !ok {
 		return nil, &esphttp.OperationError{HTTPStatus: http.StatusNotFound, Code: "fleet_not_found", Message: "fleet not found"}
+	}
+	if err := requireActiveFleet(fleet); err != nil {
+		return nil, err
 	}
 	if req.DeviceID != "" && fleet.CoordinatorDeviceID != "" && req.DeviceID != fleet.CoordinatorDeviceID {
 		return nil, &esphttp.OperationError{HTTPStatus: http.StatusForbidden, Code: "forbidden", Message: "device is not authorized to manage fleet"}
@@ -1542,7 +1629,7 @@ func (e espOperationExecutor) createFleetInvite(ctx context.Context, req esphttp
 			}
 		}
 	}()
-	member, err := e.stateStore.UpsertFleetMember(ctx, esphttp.FleetMemberRecord{
+	member, err := e.stateStore.UpsertFleetMemberForActiveFleet(ctx, esphttp.FleetMemberRecord{
 		FleetID:       fleet.FleetID,
 		NodeID:        target.PilotNodeID,
 		EntmootPubKey: encodeBase64(target.EntmootPubKey),
@@ -1552,7 +1639,7 @@ func (e espOperationExecutor) createFleetInvite(ctx context.Context, req esphttp
 		InvitedAtMS:   time.Now().UnixMilli(),
 	})
 	if err != nil {
-		return nil, err
+		return nil, fleetMutationError(err)
 	}
 	memberApplied = true
 	for _, invite := range staleInvites {
@@ -1581,7 +1668,7 @@ func (e espOperationExecutor) createFleetInvite(ctx context.Context, req esphttp
 	if err != nil {
 		return nil, err
 	}
-	invite, err := e.stateStore.CreateFleetInvite(ctx, esphttp.FleetInviteRecord{
+	invite, err := e.stateStore.CreateFleetInviteForActiveFleet(ctx, esphttp.FleetInviteRecord{
 		FleetID:       fleet.FleetID,
 		NodeID:        target.PilotNodeID,
 		EntmootPubKey: encodeBase64(target.EntmootPubKey),
@@ -1592,7 +1679,7 @@ func (e espOperationExecutor) createFleetInvite(ctx context.Context, req esphttp
 		ExpiresAtMS:   resp.Invite.ValidUntil,
 	})
 	if err != nil {
-		return nil, err
+		return nil, fleetMutationError(err)
 	}
 	inviteCreated = true
 	inviteID = invite.InviteID
@@ -1618,12 +1705,17 @@ func (e espOperationExecutor) removeFleetMember(ctx context.Context, req esphttp
 	if payload.FleetID == "" {
 		return nil, &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request", Message: "fleet_member_remove requires fleet_id"}
 	}
+	unlockFleet := lockFleetMutation(payload.FleetID)
+	defer unlockFleet()
 	fleet, ok, err := e.stateStore.GetFleet(ctx, payload.FleetID)
 	if err != nil {
 		return nil, err
 	}
 	if !ok {
 		return nil, &esphttp.OperationError{HTTPStatus: http.StatusNotFound, Code: "fleet_not_found", Message: "fleet not found"}
+	}
+	if err := requireActiveFleet(fleet); err != nil {
+		return nil, err
 	}
 	if req.DeviceID != "" && fleet.CoordinatorDeviceID != "" && req.DeviceID != fleet.CoordinatorDeviceID {
 		return nil, &esphttp.OperationError{HTTPStatus: http.StatusForbidden, Code: "forbidden", Message: "device is not authorized to manage fleet"}
@@ -1717,7 +1809,7 @@ func (e espOperationExecutor) removeFleetMember(ctx context.Context, req esphttp
 			}
 		}
 	}()
-	member, err := e.stateStore.UpsertFleetMember(ctx, esphttp.FleetMemberRecord{
+	member, err := e.stateStore.UpsertFleetMemberForActiveFleet(ctx, esphttp.FleetMemberRecord{
 		FleetID:       fleet.FleetID,
 		NodeID:        target.PilotNodeID,
 		EntmootPubKey: encodeBase64(target.EntmootPubKey),
@@ -1726,7 +1818,7 @@ func (e espOperationExecutor) removeFleetMember(ctx context.Context, req esphttp
 		RemovedAtMS:   time.Now().UnixMilli(),
 	})
 	if err != nil {
-		return nil, err
+		return nil, fleetMutationError(err)
 	}
 	memberApplied = true
 	for _, invite := range deletedInvites {
@@ -2267,7 +2359,7 @@ func (e espOperationExecutor) joinGroup(ctx context.Context, invite entmoot.Invi
 	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
 		return nil, err
 	}
-	if err := ipc.EncodeAndWrite(conn, &ipc.JoinGroupReq{Invite: invite}); err != nil {
+	if err := ipc.EncodeAndWrite(conn, &ipc.JoinGroupReq{Invite: invite, TimeoutMS: timeout.Milliseconds()}); err != nil {
 		return nil, err
 	}
 	_, payload, err := ipc.ReadAndDecode(conn)

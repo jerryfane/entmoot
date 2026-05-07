@@ -241,6 +241,9 @@ func TestJoinInviteOverIPCSendsJoinGroupRequest(t *testing.T) {
 		if req.Invite.GroupID != gid {
 			t.Fatalf("req group = %s, want %s", req.Invite.GroupID, gid)
 		}
+		if req.TimeoutMS != 1_000 {
+			t.Fatalf("req timeout_ms = %d, want 1000", req.TimeoutMS)
+		}
 	case err := <-errCh:
 		t.Fatalf("server error: %v", err)
 	case <-time.After(time.Second):
@@ -300,6 +303,9 @@ func TestJoinInputOverIPCSendsOpenInviteDescriptor(t *testing.T) {
 	case req := <-reqCh:
 		if req.OpenInvite == nil {
 			t.Fatalf("req.OpenInvite = nil")
+		}
+		if req.TimeoutMS != 1_000 {
+			t.Fatalf("req timeout_ms = %d, want 1000", req.TimeoutMS)
 		}
 		if req.Invite.GroupID != (entmoot.GroupID{}) {
 			t.Fatalf("req.Invite.GroupID = %s, want zero", req.Invite.GroupID)

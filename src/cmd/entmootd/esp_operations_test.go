@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -1382,6 +1383,258 @@ func TestESPFleetInviteRejectsCoordinatorTarget(t *testing.T) {
 	}
 	if len(activity) != 0 {
 		t.Fatalf("activity after rejected self-invite = %+v, want none", activity)
+	}
+}
+
+func TestESPFleetArchiveMarksFleetAndClearsInvites(t *testing.T) {
+	ctx := context.Background()
+	state := esphttp.NewMemoryStateStore()
+	fleet, coordinator := createFleetForTest(t, state, "fleet-a", "Ops Fleet")
+	if _, err := state.CreateFleetInvite(ctx, esphttp.FleetInviteRecord{
+		InviteID:      "invite-a",
+		FleetID:       fleet.FleetID,
+		NodeID:        45460,
+		EntmootPubKey: encodeBase64([]byte("agent")),
+		Status:        esphttp.FleetMemberInvited,
+		CreatedAtMS:   1_700_000_000_000,
+	}); err != nil {
+		t.Fatalf("CreateFleetInvite: %v", err)
+	}
+	exec := espOperationExecutor{stateStore: state}
+	raw, err := exec.ExecuteSignRequest(ctx, esphttp.SignRequest{
+		Kind:     "fleet_archive",
+		DeviceID: "ios-1",
+		Payload:  mustMarshalJSON(t, fleetScopedPayload{FleetID: fleet.FleetID}),
+	}, nil)
+	if err != nil {
+		t.Fatalf("ExecuteSignRequest archive: %v", err)
+	}
+	var out struct {
+		Status string              `json:"status"`
+		Fleet  esphttp.FleetRecord `json:"fleet"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("unmarshal archive result: %v", err)
+	}
+	if out.Status != "archived" || out.Fleet.Status != esphttp.FleetStatusArchived {
+		t.Fatalf("archive result = %s/%+v", out.Status, out.Fleet)
+	}
+	if out.Fleet.Coordinator.PilotNodeID != coordinator.PilotNodeID {
+		t.Fatalf("archive coordinator = %+v, want %+v", out.Fleet.Coordinator, coordinator)
+	}
+	invites, err := state.ListFleetInvites(ctx, fleet.FleetID)
+	if err != nil {
+		t.Fatalf("ListFleetInvites: %v", err)
+	}
+	if len(invites) != 0 {
+		t.Fatalf("invites after archive = %+v, want none", invites)
+	}
+	activity, err := state.ListFleetActivity(ctx, fleet.FleetID, 10, 0)
+	if err != nil {
+		t.Fatalf("ListFleetActivity: %v", err)
+	}
+	if len(activity) != 1 || activity[0].Type != "fleet.archived" {
+		t.Fatalf("activity after archive = %+v", activity)
+	}
+}
+
+func TestESPFleetInviteRejectsArchivedFleet(t *testing.T) {
+	ctx := context.Background()
+	state := esphttp.NewMemoryStateStore()
+	fleet, _ := createFleetForTest(t, state, "fleet-a", "Ops Fleet")
+	if _, ok, err := state.ArchiveFleet(ctx, fleet.FleetID, 1_700_000_000_000); err != nil || !ok {
+		t.Fatalf("ArchiveFleet ok/err = %v/%v", ok, err)
+	}
+	exec := espOperationExecutor{stateStore: state}
+	_, err := exec.ExecuteSignRequest(ctx, esphttp.SignRequest{
+		Kind:     "fleet_invite_create",
+		DeviceID: "ios-1",
+		Payload: mustMarshalJSON(t, fleetInviteCreatePayload{
+			FleetID: fleet.FleetID,
+			Target: &inviteTargetPayload{
+				PilotNodeID:   45460,
+				EntmootPubKey: []byte("agent"),
+			},
+		}),
+	}, nil)
+	var opErr *esphttp.OperationError
+	if !errors.As(err, &opErr) || opErr.Code != "fleet_archived" {
+		t.Fatalf("archive invite err = %v, want fleet_archived", err)
+	}
+}
+
+func TestESPFleetInviteAcceptanceRejectsArchivedFleetAtMutation(t *testing.T) {
+	ctx := context.Background()
+	state := esphttp.NewMemoryStateStore()
+	fleet, _ := createFleetForTest(t, state, "fleet-a", "Ops Fleet")
+	targetPub := bytes.Repeat([]byte{0x24}, ed25519.PublicKeySize)
+	target := entmoot.NodeInfo{PilotNodeID: 45460, EntmootPubKey: targetPub}
+	targetPubKey := encodeBase64(targetPub)
+	previous := esphttp.FleetMemberRecord{
+		FleetID:       fleet.FleetID,
+		NodeID:        target.PilotNodeID,
+		EntmootPubKey: targetPubKey,
+		Hostname:      "phobos",
+		Role:          esphttp.FleetRoleAgent,
+		Status:        esphttp.FleetMemberInvited,
+		InvitedAtMS:   1_700_000_000_000,
+	}
+	if _, err := state.UpsertFleetMember(ctx, previous); err != nil {
+		t.Fatalf("UpsertFleetMember: %v", err)
+	}
+	invite := esphttp.FleetInviteRecord{
+		InviteID:      "invite-a",
+		FleetID:       fleet.FleetID,
+		NodeID:        target.PilotNodeID,
+		EntmootPubKey: targetPubKey,
+		Status:        esphttp.FleetMemberInvited,
+		CreatedAtMS:   previous.InvitedAtMS,
+	}
+	if _, err := state.CreateFleetInvite(ctx, invite); err != nil {
+		t.Fatalf("CreateFleetInvite: %v", err)
+	}
+	member := previous
+	member.Status = esphttp.FleetMemberActive
+	member.AcceptedAtMS = 1_700_000_010_000
+	plan := &fleetInviteAcceptancePlan{
+		fleet:         fleet,
+		target:        target,
+		member:        member,
+		previous:      previous,
+		previousFound: true,
+		invites:       []esphttp.FleetInviteRecord{invite},
+	}
+	if _, ok, err := state.ArchiveFleet(ctx, fleet.FleetID, 1_700_000_005_000); err != nil || !ok {
+		t.Fatalf("ArchiveFleet ok/err = %v/%v", ok, err)
+	}
+	exec := espOperationExecutor{stateStore: state}
+	_, _, rollback, err := exec.prepareFleetInviteAcceptance(ctx, plan)
+	var opErr *esphttp.OperationError
+	if !errors.As(err, &opErr) || opErr.Code != "fleet_archived" {
+		t.Fatalf("prepare acceptance err = %v, want fleet_archived", err)
+	}
+	if rollback != nil {
+		t.Fatalf("prepare acceptance rollback = %p, want nil on rejected archived fleet", rollback)
+	}
+	members, err := state.ListFleetMembers(ctx, fleet.FleetID)
+	if err != nil {
+		t.Fatalf("ListFleetMembers: %v", err)
+	}
+	got, ok := fleetMemberForNode(members, target.PilotNodeID)
+	if !ok || got.Status != esphttp.FleetMemberInvited {
+		t.Fatalf("member after archived acceptance = %+v/%v, want invited previous member", got, ok)
+	}
+	activity, err := state.ListFleetActivity(ctx, fleet.FleetID, 10, 0)
+	if err != nil {
+		t.Fatalf("ListFleetActivity: %v", err)
+	}
+	if len(activity) != 0 {
+		t.Fatalf("activity after archived acceptance = %+v, want none", activity)
+	}
+}
+
+func TestESPFleetArchiveWaitsForInviteAcceptance(t *testing.T) {
+	ctx := context.Background()
+	id, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	gid := testESPGroupID(96)
+	state := esphttp.NewMemoryStateStore()
+	fleet := createFleetForAcceptTest(t, state, gid)
+	if _, err := state.UpsertFleetMember(ctx, esphttp.FleetMemberRecord{
+		FleetID:       fleet.FleetID,
+		NodeID:        45491,
+		EntmootPubKey: encodeBase64(id.PublicKey),
+		Hostname:      "laptop",
+		Role:          esphttp.FleetRoleAgent,
+		Status:        esphttp.FleetMemberInvited,
+		InvitedAtMS:   1_700_000_000_000,
+	}); err != nil {
+		t.Fatalf("UpsertFleetMember target: %v", err)
+	}
+	if _, err := state.CreateFleetInvite(ctx, esphttp.FleetInviteRecord{
+		InviteID:      "fleet-invite-laptop",
+		FleetID:       fleet.FleetID,
+		NodeID:        45491,
+		EntmootPubKey: encodeBase64(id.PublicKey),
+		Hostname:      "laptop",
+		Status:        esphttp.FleetMemberInvited,
+		CreatedAtMS:   1_700_000_000_000,
+		ExpiresAtMS:   time.Now().Add(time.Hour).UnixMilli(),
+	}); err != nil {
+		t.Fatalf("CreateFleetInvite target: %v", err)
+	}
+	sock := testUnixSocketPath(t)
+	joinReqCh := make(chan *ipc.JoinGroupReq, 1)
+	releaseJoin := make(chan struct{})
+	var releaseJoinOnce sync.Once
+	releaseJoinNow := func() {
+		releaseJoinOnce.Do(func() { close(releaseJoin) })
+	}
+	defer releaseJoinNow()
+	stop := serveESPAcceptInviteIPCWithJoinGate(t, sock, id.PublicKey, joinReqCh, releaseJoin)
+	defer stop()
+	exec := espOperationExecutor{
+		dataDir:    t.TempDir(),
+		identity:   id,
+		socketPath: sock,
+		timeout:    time.Second,
+		stateStore: state,
+	}
+	acceptDone := make(chan error, 1)
+	go func() {
+		_, err := exec.ExecuteSignRequest(ctx, esphttp.SignRequest{
+			Kind:    "invite_accept",
+			Payload: mustMarshalJSON(t, entmoot.Invite{GroupID: gid}),
+		}, nil)
+		acceptDone <- err
+	}()
+	select {
+	case req := <-joinReqCh:
+		if req.Invite.GroupID != gid {
+			t.Fatalf("join group = %s, want %s", req.Invite.GroupID, gid)
+		}
+	case err := <-acceptDone:
+		t.Fatalf("accept finished before join gate: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for join request")
+	}
+	archiveDone := make(chan error, 1)
+	go func() {
+		_, err := exec.ExecuteSignRequest(ctx, esphttp.SignRequest{
+			Kind:     "fleet_archive",
+			DeviceID: "ios-1",
+			Payload:  mustMarshalJSON(t, fleetScopedPayload{FleetID: fleet.FleetID}),
+		}, nil)
+		archiveDone <- err
+	}()
+	select {
+	case err := <-archiveDone:
+		t.Fatalf("archive finished while accept held fleet lock: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	releaseJoinNow()
+	if err := <-acceptDone; err != nil {
+		t.Fatalf("accept after join release: %v", err)
+	}
+	if err := <-archiveDone; err != nil {
+		t.Fatalf("archive after accept: %v", err)
+	}
+	gotFleet, ok, err := state.GetFleet(ctx, fleet.FleetID)
+	if err != nil || !ok {
+		t.Fatalf("GetFleet ok/err = %v/%v", ok, err)
+	}
+	if gotFleet.Status != esphttp.FleetStatusArchived {
+		t.Fatalf("fleet status = %q, want archived", gotFleet.Status)
+	}
+	members, err := state.ListFleetMembers(ctx, fleet.FleetID)
+	if err != nil {
+		t.Fatalf("ListFleetMembers: %v", err)
+	}
+	member, ok := fleetMemberForNode(members, 45491)
+	if !ok || member.Status != esphttp.FleetMemberActive {
+		t.Fatalf("member after serialized accept/archive = %+v/%v, want active accepted member", member, ok)
 	}
 }
 
@@ -3666,6 +3919,50 @@ func serveESPAcceptInviteIPC(t *testing.T, sock string, pub []byte, joinOK bool,
 				if joinOK {
 					_ = ipc.EncodeAndWrite(conn, &ipc.JoinGroupResp{Status: "joined", GroupID: v.Invite.GroupID, Members: 1})
 				}
+			}
+			_ = conn.Close()
+		}
+	}()
+	return func() {
+		_ = ln.Close()
+		<-done
+	}
+}
+
+func serveESPAcceptInviteIPCWithJoinGate(t *testing.T, sock string, pub []byte, joinReqCh chan<- *ipc.JoinGroupReq, releaseJoin <-chan struct{}) func() {
+	t.Helper()
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatalf("listen unix: %v", err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer ln.Close()
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			_, payload, err := ipc.ReadAndDecode(conn)
+			if err != nil {
+				_ = conn.Close()
+				continue
+			}
+			switch v := payload.(type) {
+			case *ipc.InfoReq:
+				_ = v
+				_ = ipc.EncodeAndWrite(conn, &ipc.InfoResp{
+					PilotNodeID:   45491,
+					EntmootPubKey: append([]byte(nil), pub...),
+					Running:       true,
+				})
+			case *ipc.JoinGroupReq:
+				if joinReqCh != nil {
+					joinReqCh <- v
+				}
+				<-releaseJoin
+				_ = ipc.EncodeAndWrite(conn, &ipc.JoinGroupResp{Status: "joined", GroupID: v.Invite.GroupID, Members: 1})
 			}
 			_ = conn.Close()
 		}

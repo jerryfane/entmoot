@@ -120,6 +120,79 @@ func TestSQLiteStateStoreResetsFleetMemberTimestampsOnReinvite(t *testing.T) {
 	}
 }
 
+func TestStateStoresArchiveFleetAndClearInvites(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name string
+		open func(*testing.T) StateStore
+	}{
+		{name: "memory", open: func(t *testing.T) StateStore { return NewMemoryStateStore() }},
+		{name: "sqlite", open: func(t *testing.T) StateStore {
+			store, err := OpenSQLiteStateStore(t.TempDir())
+			if err != nil {
+				t.Fatalf("OpenSQLiteStateStore: %v", err)
+			}
+			return store
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := tc.open(t)
+			defer store.Close()
+			if _, err := store.CreateFleet(ctx, FleetRecord{
+				FleetID:             "fleet-a",
+				Name:                "Fleet A",
+				Coordinator:         entmoot.NodeInfo{PilotNodeID: 45491, EntmootPubKey: []byte("coordinator")},
+				CoordinatorDeviceID: "ios-1",
+				CreatedAtMS:         1,
+			}); err != nil {
+				t.Fatalf("CreateFleet: %v", err)
+			}
+			if _, err := store.CreateFleetInvite(ctx, FleetInviteRecord{
+				InviteID:      "invite-a",
+				FleetID:       "fleet-a",
+				NodeID:        45460,
+				EntmootPubKey: base64.StdEncoding.EncodeToString([]byte("agent")),
+				Status:        FleetMemberInvited,
+				CreatedAtMS:   2,
+			}); err != nil {
+				t.Fatalf("CreateFleetInvite: %v", err)
+			}
+			fleet, ok, err := store.ArchiveFleet(ctx, "fleet-a", 1_700_000_000_000)
+			if err != nil || !ok {
+				t.Fatalf("ArchiveFleet ok/err = %v/%v", ok, err)
+			}
+			if fleet.Status != FleetStatusArchived || fleet.ArchivedAtMS != 1_700_000_000_000 {
+				t.Fatalf("archived fleet = %+v", fleet)
+			}
+			invites, err := store.ListFleetInvites(ctx, "fleet-a")
+			if err != nil {
+				t.Fatalf("ListFleetInvites: %v", err)
+			}
+			if len(invites) != 0 {
+				t.Fatalf("invites after archive = %+v, want none", invites)
+			}
+			if _, err := store.UpsertFleetMemberForActiveFleet(ctx, FleetMemberRecord{
+				FleetID:       "fleet-a",
+				NodeID:        45461,
+				EntmootPubKey: base64.StdEncoding.EncodeToString([]byte("agent-2")),
+				Role:          FleetRoleAgent,
+				Status:        FleetMemberInvited,
+			}); !errors.Is(err, ErrFleetNotActive) {
+				t.Fatalf("UpsertFleetMemberForActiveFleet err = %v, want ErrFleetNotActive", err)
+			}
+			if _, err := store.CreateFleetInviteForActiveFleet(ctx, FleetInviteRecord{
+				InviteID:      "invite-b",
+				FleetID:       "fleet-a",
+				NodeID:        45461,
+				EntmootPubKey: base64.StdEncoding.EncodeToString([]byte("agent-2")),
+				Status:        FleetMemberInvited,
+			}); !errors.Is(err, ErrFleetNotActive) {
+				t.Fatalf("CreateFleetInviteForActiveFleet err = %v, want ErrFleetNotActive", err)
+			}
+		})
+	}
+}
+
 func TestSQLiteStateStoreMigratesSignRequests(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()

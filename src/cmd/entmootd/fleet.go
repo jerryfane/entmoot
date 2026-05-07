@@ -51,7 +51,7 @@ func cmdFleetList(gf *globalFlags, args []string) int {
 		slog.Error("fleet list: list", slog.String("err", err.Error()))
 		return exitTransport
 	}
-	return printJSON(map[string]any{"fleets": fleets})
+	return printJSON(map[string]any{"fleets": esphttp.ActiveFleetRecords(fleets)})
 }
 
 func cmdFleetInfo(gf *globalFlags, args []string) int {

@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.42] - 2026-05-07
+
+### Added
+
+- **Fleet archive operations.** ESP clients can now request signed Fleet
+  archival, hiding archived Fleets from list views while preserving authorized
+  detail inspection for known Fleet IDs.
+
+### Changed
+
+- **Longer join bootstrap window.** `entmootd join` now uses a 90-second
+  bootstrap/IPC deadline and forwards that timeout to live-daemon joins.
+
+### Fixed
+
+- **Fleet mutation races.** Fleet invite creation, member removal, invite
+  acceptance, and archival now serialize per Fleet and reject mutations once a
+  Fleet is archived.
+- **Agent stack readiness reporting.** The generated `start-entmoot-stack.sh`
+  helper now waits longer for Entmoot readiness and reports a still-starting
+  daemon without killing it or claiming success.
+
 ## [1.5.41] - 2026-05-07
 
 ### Changed

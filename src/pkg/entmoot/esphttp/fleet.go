@@ -17,6 +17,10 @@ const (
 	FleetMemberInvited = "invited"
 	FleetMemberActive  = "active"
 	FleetMemberRemoved = "removed"
+
+	FleetStatusActive   = "active"
+	FleetStatusArchived = "archived"
+	FleetStatusDeleted  = "deleted"
 )
 
 type FleetRecord struct {
@@ -25,8 +29,11 @@ type FleetRecord struct {
 	ControlGroupID      entmoot.GroupID  `json:"control_group_id,omitempty"`
 	Coordinator         entmoot.NodeInfo `json:"coordinator"`
 	CoordinatorDeviceID string           `json:"coordinator_device_id,omitempty"`
+	Status              string           `json:"status"`
 	CreatedAtMS         int64            `json:"created_at_ms"`
 	UpdatedAtMS         int64            `json:"updated_at_ms"`
+	ArchivedAtMS        int64            `json:"archived_at_ms,omitempty"`
+	DeletedAtMS         int64            `json:"deleted_at_ms,omitempty"`
 }
 
 type FleetMemberRecord struct {
@@ -105,6 +112,28 @@ func NormalizeFleetMemberRole(role string) string {
 	default:
 		return FleetRoleAgent
 	}
+}
+
+func NormalizeFleetStatus(status string) string {
+	switch strings.TrimSpace(status) {
+	case FleetStatusActive, FleetStatusArchived, FleetStatusDeleted:
+		return status
+	default:
+		return FleetStatusActive
+	}
+}
+
+func ActiveFleetRecords(fleets []FleetRecord) []FleetRecord {
+	active := make([]FleetRecord, 0, len(fleets))
+	for _, fleet := range fleets {
+		if NormalizeFleetStatus(fleet.Status) == FleetStatusActive {
+			active = append(active, fleet)
+		}
+	}
+	if active == nil {
+		return []FleetRecord{}
+	}
+	return active
 }
 
 func cloneFleetRecord(in FleetRecord) FleetRecord {
