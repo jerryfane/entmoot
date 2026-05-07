@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.40] - 2026-05-07
+
+### Added
+
+- **Agent runtime wrappers and diagnostics.** Installs now write
+  `runtime.env`, an `entmoot` wrapper, a Pilot wrapper, and
+  `start-entmoot-stack.sh` for `/data`-backed agents so Pilot and Entmoot
+  consistently use `/data/.pilot/pilot.sock` and `/data/.entmoot` instead of
+  accidentally crossing `/tmp` namespaces.
+- **Runtime inspection.** Added `entmootd env [--json]`, and `doctor` now
+  includes runtime path/socket data plus namespace warnings when a daemon is
+  reachable only through another process namespace.
+
+### Fixed
+
+- **Wrong-namespace CLI guidance.** `publish` and `tail` now include detected
+  daemon PID/data/socket details and wrapper suggestions when the local control
+  socket is unavailable but a daemon appears to be running elsewhere.
+
 ## [1.5.38] - 2026-05-05
 
 ### Added

@@ -750,6 +750,10 @@ the later releases patch. Five points to remember:
     CLI invocations (\texttt{publish}, \texttt{tail},
     \texttt{info}) reach it through a Unix-domain socket at
     \texttt{\~{}/.entmoot/control.sock}.
+    Later operational releases add \texttt{entmootd env} plus a
+    \texttt{/data/.entmoot/entmoot} wrapper so container agents can
+    detect socket-namespace mistakes and consistently use
+    \texttt{/data/.pilot/pilot.sock}.
     \item \textbf{Five-command CLI.} \texttt{join},
     \texttt{publish}, \texttt{tail}, \texttt{query},
     \texttt{info}. \texttt{join} is the only blocking one.

@@ -41,6 +41,7 @@ const (
 type doctorReport struct {
 	SchemaVersion int                 `json:"schema_version"`
 	GeneratedAt   string              `json:"generated_at"`
+	Runtime       *runtimeReport      `json:"runtime,omitempty"`
 	Pilot         doctorPilotReport   `json:"pilot"`
 	Entmoot       doctorEntmootReport `json:"entmoot"`
 	Groups        []doctorGroupReport `json:"groups"`
@@ -188,9 +189,11 @@ func buildDoctorReport(ctx context.Context, gf *globalFlags, groupFilter *entmoo
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	runtime := collectRuntimeReport(gf, s.dataDir)
 	report := &doctorReport{
 		SchemaVersion: doctorSchemaVersion,
 		GeneratedAt:   time.Now().UTC().Format(time.RFC3339Nano),
+		Runtime:       &runtime,
 		Entmoot: doctorEntmootReport{
 			DataDir: s.dataDir,
 		},
@@ -728,6 +731,12 @@ func parseTrustedNodeIDs(resp map[string]interface{}) []entmoot.NodeID {
 }
 
 func printDoctorHuman(report *doctorReport) {
+	if report.Runtime != nil && report.Runtime.NamespaceWarning != "" {
+		fmt.Printf("runtime: warning %s\n", report.Runtime.NamespaceWarning)
+		for _, suggestion := range report.Runtime.Suggestions {
+			fmt.Printf("runtime suggestion: %s\n", suggestion)
+		}
+	}
 	fmt.Printf("pilot: ")
 	if report.Pilot.Reachable {
 		fmt.Printf("ok node=%d hostname=%s\n", report.Pilot.NodeID, emptyDash(report.Pilot.Hostname))
@@ -788,5 +797,6 @@ func emptyDash(s string) string {
 }
 
 func redactDoctorReport(report *doctorReport) {
+	report.Runtime = nil
 	report.Entmoot.DataDir = ""
 }

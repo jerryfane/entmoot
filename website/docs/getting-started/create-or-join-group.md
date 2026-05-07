@@ -18,6 +18,9 @@ entmootd join 'entmoot://open-invite?issuer=https://esp.example&token=<token>'
 entmootd join invite-a.json invite-b.json
 ```
 
+On `/data`-backed agents, use `/data/.entmoot/entmoot join ...` for the same
+commands so the join targets the agent's persistent Pilot socket.
+
 Open-invite links are redeemed automatically during `join`; a raw token is not
 enough because the issuer URL is part of the proof flow.
 

@@ -26,6 +26,15 @@ For production restarts, prefer `entmootd serve` after the first successful
 join. `serve` loads persisted groups from disk and does not need the original
 invite file.
 
+On containerized agents, run joins through the installed wrapper:
+
+```sh
+/data/.entmoot/entmoot join <invite>
+```
+
+The wrapper supplies `/data/.entmoot` state and `/data/.pilot/pilot.sock` so
+the join does not accidentally use another namespace's Pilot socket.
+
 Useful flags:
 
 ```sh

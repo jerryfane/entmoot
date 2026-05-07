@@ -262,7 +262,7 @@ One JSON object:
 
 ---
 
-### 3.2.1 `entmootd doctor` and `entmootd peers`
+### 3.2.1 `entmootd env`, `entmootd doctor`, and `entmootd peers`
 
 **Purpose:** one-command diagnostics for the gap between "this peer is in the
 roster" and "this node can actually route to it."
@@ -270,15 +270,21 @@ roster" and "this node can actually route to it."
 **Signatures**
 
 ```
+entmootd env [--json]
 entmootd doctor [-group GID] [--probe] [--timeout DUR] [--json] [--redact]
 entmootd peers -group GID [--probe] [--timeout DUR] [--json]
 ```
 
+`env` reports the selected binary, data root, identity, Pilot socket, control
+socket, wrapper paths, socket reachability, and wrong-namespace hints. It is
+inspection-only and must not create an identity or data root.
+
 `doctor` reports local Pilot reachability, current Pilot node/hostname,
-capabilities, Entmoot daemon state, joined groups, local membership status,
-peer hostnames, profile ads, transport ads, Pilot trust/pending state, route
-probe results, diagnoses, suggestions, and next commands. `peers` prints the
-same per-peer rows for one group as a compact table unless `--json` is set.
+capabilities, runtime path/socket state, Entmoot daemon state, joined groups,
+local membership status, peer hostnames, profile ads, transport ads, Pilot
+trust/pending state, route probe results, diagnoses, suggestions, and next
+commands. `peers` prints the same per-peer rows for one group as a compact
+table unless `--json` is set.
 
 With `--probe`, the daemon opens bounded Entmoot streams to non-local roster
 members on port 1004. Probe requests are chunked under the IPC limit, and the
@@ -1086,10 +1092,13 @@ request, read one response, close. `tail` (live mode) opens, sends
 `tail_subscribe`, then reads a stream of `tail_event` frames until the
 client closes. Backfill runs before the subscription via SQLite.
 
-Clients (`publish`, `tail`) probe the socket first. If absent or
-unresponsive within a short timeout (500 ms), they exit 6 with a help
-string: `entmootd: no running Entmoot daemon found; after joining once, start one with "entmootd serve"`. `info` and `query` skip the probe and go
-straight to SQLite.
+Clients (`publish`, `tail`) probe the socket first. If absent or unresponsive
+within a short timeout (500 ms), they exit 6 with a help string:
+`entmootd: no running Entmoot daemon found; after joining once, start one with "entmootd serve"`.
+When a running daemon is visible in another Linux mount namespace, the message
+also includes the detected pid, daemon data path, and a suggested `nsenter` or
+Docker/OpenClaw command. `info` and `query` skip the probe and go straight to
+SQLite.
 
 ---
 

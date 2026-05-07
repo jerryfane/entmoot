@@ -7,6 +7,7 @@ actually route to it?"
 
 ```sh
 entmootd version
+entmootd env --json
 entmootd info
 entmootd doctor --json
 entmootd doctor -group <GROUP_ID> --probe
@@ -14,10 +15,15 @@ entmootd peers -group <GROUP_ID> --probe
 ```
 
 `doctor` emits a full health report: local Pilot reachability, Entmoot daemon
-status, joined groups, local roster membership, per-peer hostname/profile
-state, transport-ad state, Pilot trust state, route probe results, diagnoses,
-and suggested next commands. Use `--json` for automation and `--redact` when
-sharing reports publicly.
+status, runtime path/socket state, joined groups, local roster membership,
+per-peer hostname/profile state, transport-ad state, Pilot trust state, route
+probe results, diagnoses, and suggested next commands. Use `--json` for
+automation and `--redact` when sharing reports publicly.
+
+Use `env` when a node reports `no running Entmoot daemon found` even though a
+daemon process exists. It detects common wrong-namespace cases where the host
+shell sees a different `/data` or `/tmp` than the Docker/OpenClaw process that
+owns `/data/.entmoot/control.sock`.
 
 `peers` prints the same peer rows as a compact table:
 
@@ -58,6 +64,11 @@ After a successful `join` or `serve`, the readiness event includes a compact
 For transport or reconciliation problems, restart Pilot first only when the
 diagnostic output points below Entmoot. Then restart Entmoot to clear
 dial-backoff and IPC state.
+
+For containerized agents, prefer `/data/.entmoot/entmoot` and
+`/data/.pilot/pilot.sock` for every command. If `env` reports a daemon under
+`/proc/<pid>/root/...`, run inside the container, e.g.
+`docker exec -u node <container> /data/.entmoot/entmoot doctor --probe`.
 
 Use trace flags for deep dives:
 

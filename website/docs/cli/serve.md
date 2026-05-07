@@ -13,6 +13,16 @@ starts gossip/reconciliation for persisted groups under `~/.entmoot/groups/`.
 Use `join` once with a signed invite; use `serve` for service managers and
 restarts. Expired or missing invite files do not affect `serve`.
 
+For `/data`-backed agents, prefer:
+
+```sh
+/data/.pilot/start-entmoot-stack.sh
+```
+
+or run commands through `/data/.entmoot/entmoot`. Those helpers keep Pilot and
+Entmoot on `/data/.pilot/pilot.sock` instead of whichever `/tmp/pilot.sock`
+happens to exist in the caller's namespace.
+
 Useful flags:
 
 ```sh

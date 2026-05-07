@@ -15,6 +15,18 @@ Important flags:
 -trace-reconcile
 ```
 
+For long-lived container/OpenClaw agents, use the installed wrapper
+instead of raw flags:
+
+```sh
+/data/.entmoot/entmoot env
+/data/.entmoot/entmoot doctor --probe
+```
+
+The recommended persistent Pilot socket is `/data/.pilot/pilot.sock`.
+Keep `/tmp/pilot.sock` only as a compatibility symlink inside the same
+runtime namespace as the daemon.
+
 ESP-specific flags:
 
 ```sh
@@ -23,4 +35,3 @@ ESP-specific flags:
 -device-keys ~/.entmoot/esp-devices.json
 -allow-non-loopback
 ```
-

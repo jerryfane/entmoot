@@ -74,6 +74,8 @@ func run() int {
 		fmt.Fprintln(os.Stderr, "                          Diagnose local Pilot, daemon, groups, and peer route state.")
 		fmt.Fprintln(os.Stderr, "  peers -group GID [--probe] [--json]")
 		fmt.Fprintln(os.Stderr, "                          Print a compact peer health table for one group.")
+		fmt.Fprintln(os.Stderr, "  env [--json]")
+		fmt.Fprintln(os.Stderr, "                          Inspect runtime paths, sockets, wrappers, and namespace hints.")
 		fmt.Fprintln(os.Stderr, "  tail [-topic PAT] [-group GID] [-n N]")
 		fmt.Fprintln(os.Stderr, "                          SQLite backfill + live subscription from the control socket.")
 		fmt.Fprintln(os.Stderr, "  info                    Print a JSON snapshot (reads SQLite directly).")
@@ -103,7 +105,7 @@ func run() int {
 	gf := &globalFlags{}
 	fs.StringVar(&gf.socket, "socket", "/tmp/pilot.sock", "Pilot daemon IPC socket path")
 	fs.StringVar(&gf.identity, "identity", "~/.entmoot/identity.json", "Entmoot identity file")
-	fs.StringVar(&gf.data, "data", "~/.entmoot", "Entmoot data root")
+	fs.StringVar(&gf.data, "data", defaultEntmootDataDir, "Entmoot data root")
 	fs.UintVar(&gf.listenPort, "listen-port", 1004, "Entmoot listen port")
 	fs.StringVar(&gf.logLevel, "log-level", "info", "slog level: debug|info|warn|error")
 	fs.DurationVar(&gf.pilotWaitTimeout, "pilot-wait-timeout", 45*time.Second,
@@ -169,6 +171,8 @@ func run() int {
 		return cmdDoctor(gf, args[1:])
 	case "peers":
 		return cmdPeers(gf, args[1:])
+	case "env":
+		return cmdEnv(gf, args[1:])
 	case "tail":
 		return cmdTail(gf, args[1:])
 	case "info":

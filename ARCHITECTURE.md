@@ -67,6 +67,9 @@ the shape of the design space, not to freeze implementation choices.
    tunnels to potentially-untrusted peers), so the framing libraries do
    not share a namespace. The full contract (message types, error
    codes, lifecycle) is documented in `docs/CLI_DESIGN.md` §5.
+   `/data`-backed agents should enter this boundary through the installed
+   `/data/.entmoot/entmoot` wrapper, which pins Entmoot state to
+   `/data/.entmoot` and Pilot IPC to `/data/.pilot/pilot.sock`.
 
 ## 3. Data model
 

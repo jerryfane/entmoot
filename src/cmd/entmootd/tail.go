@@ -95,13 +95,13 @@ func cmdTail(gf *globalFlags, args []string) int {
 	// Live phase: subscribe via IPC.
 	sockPath := controlSocketPath(gf.data)
 	if !controlSocketAlive(sockPath, 500*time.Millisecond) {
-		fmt.Fprintln(os.Stderr, noJoinHelp)
+		fmt.Fprintln(os.Stderr, runtimeNoDaemonHelp(gf, gf.data))
 		return exitControlUnavail
 	}
 
 	conn, err := net.DialTimeout("unix", sockPath, 500*time.Millisecond)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, noJoinHelp)
+		fmt.Fprintln(os.Stderr, runtimeNoDaemonHelp(gf, gf.data))
 		return exitControlUnavail
 	}
 	defer conn.Close()

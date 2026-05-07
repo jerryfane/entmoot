@@ -804,10 +804,12 @@ auto-redeems open-invite links, binds the listen port, opens a local
 control socket, and enters the accept loop, blocking until signalled;
 \texttt{serve} restarts persisted groups without requiring the
 original invite; \texttt{publish} authors and gossips a message from
-inline content, a file, or stdin; \texttt{doctor} and \texttt{peers}
-report local Pilot, roster, profile, transport, trust, and route-probe
-diagnostics; \texttt{tail} streams live messages with optional SQLite
-backfill; \texttt{info} emits a JSON status snapshot; and
+inline content, a file, or stdin; \texttt{env} reports the effective
+binary, data, identity, Pilot socket, control socket, wrappers, and
+namespace hints; \texttt{doctor} and \texttt{peers} report local
+Pilot, roster, profile, transport, trust, and route-probe diagnostics;
+\texttt{tail} streams live messages with optional SQLite backfill;
+\texttt{info} emits a JSON status snapshot; and
 \texttt{query} runs indexed historical lookups against SQLite.
 \texttt{version} emits release metadata stamped by GoReleaser. The
 founder-only commands \texttt{group create} and \texttt{invite create}
@@ -815,7 +817,11 @@ produce new group identifiers and signed invite bundles respectively.
 Default paths follow Pilot's conventions: \texttt{/tmp/pilot.sock} for
 Pilot IPC, \texttt{\textasciitilde/.entmoot/} for persistent state,
 and \texttt{\textasciitilde/.entmoot/control.sock} for the local
-control socket.
+control socket. Container agents use a persistent namespace wrapper,
+\texttt{/data/.entmoot/entmoot}, backed by
+\texttt{/data/.entmoot/runtime.env} and
+\texttt{/data/.pilot/pilot.sock}, with \texttt{/tmp/pilot.sock} kept
+only as a compatibility symlink inside that same namespace.
 
 The control-socket IPC model keeps multi-process operation coherent.
 Exactly one \texttt{join} process per host owns the single Pilot

@@ -23,6 +23,27 @@ REPO="jerryfane/entmoot"
 PILOT_TAG="v1.7.2"
 INSTALL_DIR="${ENTMOOT_HOME:-$HOME/.entmoot}"
 BIN_DIR="$INSTALL_DIR/bin"
+PILOT_DIR="${PILOT_HOME:-$HOME/.pilot}"
+if [ -z "${PILOT_HOME:-}" ] && [ "$INSTALL_DIR" = "/data/.entmoot" ]; then
+    PILOT_DIR="/data/.pilot"
+fi
+PILOT_BIN_DIR="${PILOT_BIN_DIR:-$PILOT_DIR/bin}"
+PILOT_SOCKET_DEFAULT="/tmp/pilot.sock"
+if [ -n "${PILOT_HOME:-}" ] || [ "$INSTALL_DIR" = "/data/.entmoot" ]; then
+    PILOT_SOCKET_DEFAULT="$PILOT_DIR/pilot.sock"
+fi
+HELPER_MARKER="# entmoot-runtime-helper: $INSTALL_DIR"
+
+remove_owned_helper() {
+    path="$1"
+    if [ ! -f "$path" ]; then
+        return 0
+    fi
+    if grep -Fqx "$HELPER_MARKER" "$path" 2>/dev/null || grep -Fq "$INSTALL_DIR/runtime.env" "$path" 2>/dev/null; then
+        rm -f "$path"
+        echo "  Removed $path"
+    fi
+}
 
 # --- Uninstall -----------------------------------------------------------
 
@@ -31,6 +52,8 @@ if [ "${1:-}" = "uninstall" ]; then
     echo "  Uninstalling Entmoot..."
     rm -rf "$INSTALL_DIR"
     echo "  Removed $INSTALL_DIR"
+    remove_owned_helper "$PILOT_DIR/pilot"
+    remove_owned_helper "$PILOT_DIR/start-entmoot-stack.sh"
     echo "  (You may want to remove Entmoot's PATH export from your shell rc file.)"
     echo ""
     exit 0
@@ -112,6 +135,365 @@ mkdir -p "$BIN_DIR"
 cp "$TMPDIR/entmootd" "$BIN_DIR/entmootd"
 chmod 755 "$BIN_DIR/entmootd"
 echo "  Installed: $BIN_DIR/entmootd"
+
+# --- Agent runtime helpers ----------------------------------------------
+
+shell_quote() {
+    printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
+cat > "$INSTALL_DIR/runtime.env" <<EOF
+if [ -z "\${ENTMOOT_BIN+x}" ]; then ENTMOOT_BIN=$(shell_quote "$BIN_DIR/entmootd"); fi
+if [ -z "\${ENTMOOT_DATA+x}" ]; then ENTMOOT_DATA=$(shell_quote "$INSTALL_DIR"); fi
+if [ -z "\${ENTMOOT_IDENTITY+x}" ]; then ENTMOOT_IDENTITY=$(shell_quote "$INSTALL_DIR/identity.json"); fi
+if [ -z "\${ENTMOOT_CONTROL_SOCKET+x}" ]; then ENTMOOT_CONTROL_SOCKET=$(shell_quote "$INSTALL_DIR/control.sock"); fi
+if [ -z "\${PILOT_DIR+x}" ]; then PILOT_DIR=$(shell_quote "$PILOT_DIR"); fi
+if [ -z "\${PILOT_BIN_DIR+x}" ]; then PILOT_BIN_DIR=$(shell_quote "$PILOT_BIN_DIR"); fi
+if [ -z "\${PILOT_SOCKET+x}" ]; then PILOT_SOCKET=$(shell_quote "$PILOT_SOCKET_DEFAULT"); fi
+if [ -z "\${ENTMOOT_HIDE_IP+x}" ]; then ENTMOOT_HIDE_IP=0; fi
+EOF
+
+cat > "$INSTALL_DIR/entmoot" <<EOF
+#!/bin/sh
+$HELPER_MARKER
+set -eu
+
+RUNTIME_ENV=\${ENTMOOT_RUNTIME_ENV:-$(shell_quote "$INSTALL_DIR/runtime.env")}
+if [ -f "\$RUNTIME_ENV" ]; then
+  # shellcheck disable=SC1090
+  . "\$RUNTIME_ENV"
+fi
+
+ENTMOOT_BIN=\${ENTMOOT_BIN:-$(shell_quote "$BIN_DIR/entmootd")}
+ENTMOOT_DATA=\${ENTMOOT_DATA:-$(shell_quote "$INSTALL_DIR")}
+ENTMOOT_IDENTITY=\${ENTMOOT_IDENTITY:-$(shell_quote "$INSTALL_DIR/identity.json")}
+PILOT_SOCKET=\${PILOT_SOCKET:-$(shell_quote "$PILOT_SOCKET_DEFAULT")}
+
+set -- -socket "\$PILOT_SOCKET" -identity "\$ENTMOOT_IDENTITY" -data "\$ENTMOOT_DATA" "\$@"
+case "\${ENTMOOT_HIDE_IP:-0}" in
+  1|true|yes) set -- -hide-ip "\$@" ;;
+esac
+
+exec "\$ENTMOOT_BIN" "\$@"
+EOF
+chmod 755 "$INSTALL_DIR/entmoot"
+ln -sf "../entmoot" "$BIN_DIR/entmoot"
+echo "  Installed: $INSTALL_DIR/entmoot"
+
+mkdir -p "$PILOT_DIR"
+cat > "$PILOT_DIR/pilot" <<EOF
+#!/bin/sh
+$HELPER_MARKER
+set -eu
+
+RUNTIME_ENV=\${ENTMOOT_RUNTIME_ENV:-$(shell_quote "$INSTALL_DIR/runtime.env")}
+if [ -f "\$RUNTIME_ENV" ]; then
+  # shellcheck disable=SC1090
+  . "\$RUNTIME_ENV"
+fi
+
+PILOT_BIN_DIR=\${PILOT_BIN_DIR:-$(shell_quote "$PILOT_BIN_DIR")}
+PILOT_SOCKET=\${PILOT_SOCKET:-$(shell_quote "$PILOT_SOCKET_DEFAULT")}
+
+resolve_pilot_binary() {
+  name="\$1"
+  override="\$2"
+  shift 2
+  fallback="\$PILOT_BIN_DIR/\$name"
+  if [ -n "\$override" ]; then
+    if [ -x "\$override" ]; then
+      printf '%s\n' "\$override"
+      return 0
+    fi
+    echo "\$name is not executable at \$override" >&2
+    return 1
+  fi
+  if [ -x "\$fallback" ]; then
+    printf '%s\n' "\$fallback"
+    return 0
+  fi
+  if command -v "\$name" >/dev/null 2>&1; then
+    command -v "\$name"
+    return 0
+  fi
+  echo "\$name not found; install Pilot or set PILOT_BIN_DIR/PILOTCTL_BIN" >&2
+  return 1
+}
+
+PILOTCTL_BIN=\$(resolve_pilot_binary pilotctl "\${PILOTCTL_BIN:-}")
+
+PILOT_SOCKET="\$PILOT_SOCKET" exec "\$PILOTCTL_BIN" "\$@"
+EOF
+chmod 755 "$PILOT_DIR/pilot"
+
+cat > "$PILOT_DIR/start-entmoot-stack.sh" <<EOF
+#!/bin/sh
+$HELPER_MARKER
+set -eu
+
+RUNTIME_ENV=\${ENTMOOT_RUNTIME_ENV:-$(shell_quote "$INSTALL_DIR/runtime.env")}
+if [ -f "\$RUNTIME_ENV" ]; then
+  # shellcheck disable=SC1090
+  . "\$RUNTIME_ENV"
+fi
+
+ENTMOOT_DATA=\${ENTMOOT_DATA:-$(shell_quote "$INSTALL_DIR")}
+ENTMOOT_BIN=\${ENTMOOT_BIN:-$(shell_quote "$BIN_DIR/entmootd")}
+ENTMOOT_IDENTITY=\${ENTMOOT_IDENTITY:-$(shell_quote "$INSTALL_DIR/identity.json")}
+PILOT_DIR=\${PILOT_DIR:-$(shell_quote "$PILOT_DIR")}
+PILOT_BIN_DIR=\${PILOT_BIN_DIR:-$(shell_quote "$PILOT_BIN_DIR")}
+PILOT_SOCKET=\${PILOT_SOCKET:-$(shell_quote "$PILOT_SOCKET_DEFAULT")}
+TMP_PILOT_SOCKET=\${TMP_PILOT_SOCKET:-/tmp/pilot.sock}
+RUN_DIR=\${ENTMOOT_RUN_DIR:-"\$ENTMOOT_DATA/run"}
+PILOT_PIDFILE="\$RUN_DIR/pilot-daemon.pid"
+ENTMOOT_PIDFILE="\$RUN_DIR/entmootd.pid"
+ENTMOOT_CONTROL_SOCKET=\${ENTMOOT_CONTROL_SOCKET:-"\$ENTMOOT_DATA/control.sock"}
+
+quote() {
+  printf "'%s'" "\$(printf '%s' "\$1" | sed "s/'/'\\\\''/g")"
+}
+
+has_proc_arg() {
+  pid="\$1"
+  want="\$2"
+  [ -r "/proc/\$pid/cmdline" ] || return 1
+  tr '\000' '\n' < "/proc/\$pid/cmdline" | grep -Fx -- "\$want" >/dev/null 2>&1
+}
+
+pid_matches_stack() {
+  kind="\$1"
+  pid="\$2"
+  [ -n "\$pid" ] || return 1
+  kill -0 "\$pid" 2>/dev/null || return 1
+  [ -r "/proc/\$pid/cmdline" ] || return 1
+  case "\$kind" in
+    pilot)
+      has_proc_arg "\$pid" "-socket" && has_proc_arg "\$pid" "\$PILOT_SOCKET"
+      ;;
+    entmoot)
+      has_proc_arg "\$pid" "-data" && has_proc_arg "\$pid" "\$ENTMOOT_DATA"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+stop_pidfile() {
+  kind="\$1"
+  pidfile="\$2"
+  pid=""
+  stopped=0
+  if [ -f "\$pidfile" ]; then
+    pid=\$(cat "\$pidfile" 2>/dev/null || true)
+  fi
+  if pid_matches_stack "\$kind" "\$pid"; then
+    stopped=1
+    kill -TERM "\$pid" 2>/dev/null || true
+    sleep 2
+    if pid_matches_stack "\$kind" "\$pid"; then
+      kill -KILL "\$pid" 2>/dev/null || true
+    fi
+  fi
+  rm -f "\$pidfile"
+  [ "\$stopped" = "1" ]
+}
+
+remove_compat_pilot_socket() {
+  if [ "\$TMP_PILOT_SOCKET" = "\$PILOT_SOCKET" ]; then
+    return 0
+  fi
+  if [ -L "\$TMP_PILOT_SOCKET" ] && [ "\$(readlink "\$TMP_PILOT_SOCKET" 2>/dev/null || true)" = "\$PILOT_SOCKET" ]; then
+    rm -f "\$TMP_PILOT_SOCKET"
+  fi
+}
+
+install_compat_pilot_socket() {
+  if [ "\$TMP_PILOT_SOCKET" = "\$PILOT_SOCKET" ]; then
+    return 0
+  fi
+  if [ -e "\$TMP_PILOT_SOCKET" ] || [ -L "\$TMP_PILOT_SOCKET" ]; then
+    if [ -L "\$TMP_PILOT_SOCKET" ] && [ "\$(readlink "\$TMP_PILOT_SOCKET" 2>/dev/null || true)" = "\$PILOT_SOCKET" ]; then
+      ln -sf "\$PILOT_SOCKET" "\$TMP_PILOT_SOCKET"
+    else
+      echo "leaving existing \$TMP_PILOT_SOCKET in place; it is not this stack's compatibility symlink" >&2
+    fi
+  else
+    ln -s "\$PILOT_SOCKET" "\$TMP_PILOT_SOCKET"
+  fi
+}
+
+pilot_socket_live() {
+  [ -S "\$PILOT_SOCKET" ] || return 1
+  run_pilotctl info >/dev/null 2>&1
+}
+
+resolve_pilot_binary() {
+  name="\$1"
+  override="\$2"
+  shift 2
+  fallback="\$PILOT_BIN_DIR/\$name"
+  if [ -n "\$override" ]; then
+    if [ -x "\$override" ]; then
+      printf '%s\n' "\$override"
+      return 0
+    fi
+    echo "\$name is not executable at \$override" >&2
+    return 1
+  fi
+  for candidate in "\$name" "\$@"; do
+    [ -n "\$candidate" ] || continue
+    fallback="\$PILOT_BIN_DIR/\$candidate"
+    if [ -x "\$fallback" ]; then
+      printf '%s\n' "\$fallback"
+      return 0
+    fi
+  done
+  for candidate in "\$name" "\$@"; do
+    [ -n "\$candidate" ] || continue
+    if command -v "\$candidate" >/dev/null 2>&1; then
+      command -v "\$candidate"
+      return 0
+    fi
+  done
+  echo "\$name not found; install Pilot or set PILOT_BIN_DIR/PILOT_DAEMON_BIN/PILOTCTL_BIN" >&2
+  return 1
+}
+
+run_pilotctl() {
+  PILOT_SOCKET="\$PILOT_SOCKET" "\$PILOTCTL_BIN" "\$@"
+}
+
+entmoot_hide_ip_enabled() {
+  case "\${ENTMOOT_HIDE_IP:-0}" in
+    1|true|yes) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+entmoot_pid_alive() {
+  pid="\$1"
+  [ -n "\$pid" ] && kill -0 "\$pid" 2>/dev/null
+}
+
+entmoot_socket_live() {
+  [ -S "\$ENTMOOT_CONTROL_SOCKET" ] || return 1
+  "\$ENTMOOT_BIN" -socket "\$PILOT_SOCKET" -identity "\$ENTMOOT_IDENTITY" -data "\$ENTMOOT_DATA" info 2>/dev/null | grep '"running":[[:space:]]*true' >/dev/null 2>&1
+}
+
+print_entmoot_start_failure() {
+  echo "entmoot daemon did not become ready at \$ENTMOOT_CONTROL_SOCKET" >&2
+  if [ -f "\$ENTMOOT_DATA/restart.log" ]; then
+    echo "last entmoot log lines:" >&2
+    tail -n 40 "\$ENTMOOT_DATA/restart.log" >&2 || true
+  fi
+}
+
+if [ "\$(id -u)" = "0" ] && id node >/dev/null 2>&1 && [ -d /data ]; then
+  chown -R node:node "\$PILOT_DIR" "\$ENTMOOT_DATA"
+  envs="ENTMOOT_RUNTIME_ENV=\$(quote "\$RUNTIME_ENV")"
+  for name in ENTMOOT_BIN ENTMOOT_DATA ENTMOOT_IDENTITY ENTMOOT_CONTROL_SOCKET ENTMOOT_HIDE_IP ENTMOOT_RUN_DIR PILOT_DIR PILOT_BIN_DIR PILOT_SOCKET TMP_PILOT_SOCKET PILOT_DAEMON_BIN PILOTCTL_BIN PILOT_REGISTRY PILOT_BEACON PILOT_HOSTNAME PILOT_EMAIL PILOT_TURN_PROVIDER PILOT_CLOUDFLARE_TURN_CREDS_FILE PILOT_RENDEZVOUS_URL; do
+    eval "value=\\\${\$name-}"
+    if [ -n "\$value" ]; then
+      envs="\$envs \$name=\$(quote "\$value")"
+    fi
+  done
+  exec su node -c "\$envs sh \$(quote "\$0")"
+fi
+
+PILOT_DAEMON_BIN=\$(resolve_pilot_binary pilot-daemon "\${PILOT_DAEMON_BIN:-}" daemon)
+PILOTCTL_BIN=\$(resolve_pilot_binary pilotctl "\${PILOTCTL_BIN:-}")
+
+mkdir -p "\$RUN_DIR"
+stop_pidfile entmoot "\$ENTMOOT_PIDFILE" || true
+if [ -e "\$ENTMOOT_CONTROL_SOCKET" ] || [ -S "\$ENTMOOT_CONTROL_SOCKET" ]; then
+  if entmoot_socket_live; then
+    echo "entmoot control socket is already live at \$ENTMOOT_CONTROL_SOCKET; refusing to start an unmanaged duplicate" >&2
+    exit 1
+  fi
+  rm -f "\$ENTMOOT_CONTROL_SOCKET"
+fi
+pilot_stopped=0
+if stop_pidfile pilot "\$PILOT_PIDFILE"; then
+  pilot_stopped=1
+fi
+if [ "\$pilot_stopped" = "1" ] || { [ ! -e "\$PILOT_SOCKET" ] && [ ! -S "\$PILOT_SOCKET" ]; }; then
+  rm -f "\$PILOT_SOCKET"
+fi
+if [ -e "\$PILOT_SOCKET" ] || [ -S "\$PILOT_SOCKET" ]; then
+  if ! pilot_socket_live; then
+    rm -f "\$PILOT_SOCKET"
+  fi
+fi
+remove_compat_pilot_socket
+
+if ! pilot_socket_live; then
+  set -- -socket "\$PILOT_SOCKET" -identity "\$PILOT_DIR/identity.json" -email "\${PILOT_EMAIL:-agent@example.com}" -listen :0
+  if [ -n "\${PILOT_REGISTRY:-}" ]; then
+    set -- "\$@" -registry "\$PILOT_REGISTRY"
+  fi
+  if [ -n "\${PILOT_BEACON:-}" ]; then
+    set -- "\$@" -beacon "\$PILOT_BEACON"
+  fi
+  if [ -n "\${PILOT_HOSTNAME:-}" ]; then
+    set -- "\$@" -hostname "\$PILOT_HOSTNAME"
+  fi
+  if entmoot_hide_ip_enabled; then
+    set -- "\$@" -no-registry-endpoint -outbound-turn-only
+    if [ -n "\${PILOT_TURN_PROVIDER:-}" ]; then
+      set -- "\$@" -turn-provider "\$PILOT_TURN_PROVIDER"
+    fi
+    if [ -n "\${PILOT_CLOUDFLARE_TURN_CREDS_FILE:-}" ]; then
+      set -- "\$@" -cloudflare-turn-creds-file "\$PILOT_CLOUDFLARE_TURN_CREDS_FILE"
+    fi
+    if [ -n "\${PILOT_RENDEZVOUS_URL:-}" ]; then
+      set -- "\$@" -rendezvous-url "\$PILOT_RENDEZVOUS_URL"
+    fi
+  fi
+
+  nohup "\$PILOT_DAEMON_BIN" "\$@" >> "\$PILOT_DIR/restart.log" 2>&1 &
+  echo "\$!" > "\$PILOT_PIDFILE"
+fi
+
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
+  pilot_socket_live && break
+  sleep 1
+done
+
+if ! pilot_socket_live; then
+  echo "pilot socket did not appear at \$PILOT_SOCKET" >&2
+  exit 1
+fi
+install_compat_pilot_socket
+
+set -- -socket "\$PILOT_SOCKET" -identity "\$ENTMOOT_IDENTITY" -data "\$ENTMOOT_DATA" serve
+if entmoot_hide_ip_enabled; then
+  set -- -hide-ip "\$@"
+fi
+
+nohup "\$ENTMOOT_BIN" "\$@" >> "\$ENTMOOT_DATA/restart.log" 2>&1 &
+entmoot_pid="\$!"
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+  if ! entmoot_pid_alive "\$entmoot_pid"; then
+    rm -f "\$ENTMOOT_PIDFILE"
+    print_entmoot_start_failure
+    exit 1
+  fi
+  if entmoot_socket_live; then
+    echo "\$entmoot_pid" > "\$ENTMOOT_PIDFILE"
+    exit 0
+  fi
+  sleep 1
+done
+
+if entmoot_pid_alive "\$entmoot_pid"; then
+  kill -TERM "\$entmoot_pid" 2>/dev/null || true
+fi
+rm -f "\$ENTMOOT_PIDFILE"
+print_entmoot_start_failure
+exit 1
+EOF
+chmod 755 "$PILOT_DIR/start-entmoot-stack.sh"
 
 # --- PATH setup ----------------------------------------------------------
 

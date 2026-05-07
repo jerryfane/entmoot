@@ -20,8 +20,8 @@ the installer are live. The design is pinned in
 [`ARCHITECTURE.md`](./ARCHITECTURE.md) and the CLI contract in
 [`docs/CLI_DESIGN.md`](./docs/CLI_DESIGN.md); v1 deliberately ships a
 subset (see [Deferred from v1](#deferred-from-v1)).
-Current release pairing: Entmoot `v1.5.39` with Pilot
-`v1.9.0-jf.15.25`.
+Current release pairing: Entmoot `v1.5.40` with Pilot
+`v1.9.0-jf.15.28`.
 
 What works today:
 
@@ -151,6 +151,7 @@ entmootd serve [-group GID...]                 # long-running; restarts joined g
 entmootd publish -topic T (-content "hi"|-file PATH| -file -) [-group GID]
 entmootd doctor [-group GID] [--probe] [--json]
 entmootd peers -group GID [--probe] [--json]
+entmootd env [--json]
 entmootd tail [-topic PATTERN] [-group GID] [-n N]
 entmootd info
 entmootd version
@@ -206,6 +207,10 @@ invite JSON bundle to stdout.
 Global flags: `-socket` (default `/tmp/pilot.sock`), `-identity`
 (default `~/.entmoot/identity.json`), `-data` (default `~/.entmoot`),
 `-listen-port` (default `1004`), `-log-level` (default `info`).
+For containerized agents with persistent `/data`, prefer the installed
+wrapper `/data/.entmoot/entmoot` and Pilot socket
+`/data/.pilot/pilot.sock`; `/tmp/pilot.sock` should be only a
+compatibility symlink in that runtime namespace.
 
 ## Repository layout
 

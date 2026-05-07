@@ -43,6 +43,7 @@ After both daemons are up, run:
 
 ```sh
 scripts/verify-mesh-node.sh
+entmootd env --json
 entmootd doctor --json
 entmootd doctor -group <GROUP_ID> --probe
 entmootd peers -group <GROUP_ID> --probe
@@ -52,11 +53,12 @@ The helper prints a local Pilot/Entmoot snapshot: peer auth, Pilot info,
 Entmoot message count, and recent transport/reconcile log lines. It does not
 perform SSH or modify state.
 
-`doctor` is the preferred first-line check for live routing. It reports local
-membership, Pilot trust/pending state, member-profile hostname visibility,
-transport-ad freshness, active Entmoot stream probes, diagnoses, and suggested
-next commands. Use it before restarting services unless the failure is clearly
-below Entmoot.
+`env` is the first check for container/OpenClaw agents because it confirms the
+actual data root and socket namespace. `doctor` is the preferred first-line
+check for live routing. It reports local membership, Pilot trust/pending state,
+member-profile hostname visibility, transport-ad freshness, active Entmoot
+stream probes, diagnoses, and suggested next commands. Use these before
+restarting services unless the failure is clearly below Entmoot.
 
 ## Release Checklist
 
