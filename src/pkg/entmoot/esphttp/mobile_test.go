@@ -193,6 +193,161 @@ func TestStateStoresArchiveFleetAndClearInvites(t *testing.T) {
 	}
 }
 
+func TestStateStoresReconcileFleetInviteAcceptanceIsConditional(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name string
+		open func(*testing.T) StateStore
+	}{
+		{name: "memory", open: func(t *testing.T) StateStore { return NewMemoryStateStore() }},
+		{name: "sqlite", open: func(t *testing.T) StateStore {
+			store, err := OpenSQLiteStateStore(t.TempDir())
+			if err != nil {
+				t.Fatalf("OpenSQLiteStateStore: %v", err)
+			}
+			return store
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := tc.open(t)
+			defer store.Close()
+			pubkey := base64.StdEncoding.EncodeToString([]byte("agent"))
+			if _, err := store.CreateFleet(ctx, FleetRecord{
+				FleetID:             "fleet-a",
+				Name:                "Fleet A",
+				Coordinator:         entmoot.NodeInfo{PilotNodeID: 45491, EntmootPubKey: []byte("coordinator")},
+				CoordinatorDeviceID: "ios-1",
+				CreatedAtMS:         1,
+			}); err != nil {
+				t.Fatalf("CreateFleet: %v", err)
+			}
+			if _, err := store.UpsertFleetMember(ctx, FleetMemberRecord{
+				FleetID:       "fleet-a",
+				NodeID:        45460,
+				EntmootPubKey: pubkey,
+				Role:          FleetRoleAgent,
+				Status:        FleetMemberInvited,
+				InvitedAtMS:   2,
+			}); err != nil {
+				t.Fatalf("Upsert invited member: %v", err)
+			}
+			if _, err := store.CreateFleetInvite(ctx, FleetInviteRecord{
+				InviteID:      "invite-a",
+				FleetID:       "fleet-a",
+				NodeID:        45460,
+				EntmootPubKey: pubkey,
+				Status:        FleetMemberInvited,
+				CreatedAtMS:   3,
+				ExpiresAtMS:   20_000,
+			}); err != nil {
+				t.Fatalf("CreateFleetInvite: %v", err)
+			}
+			member, activity, applied, err := store.ReconcileFleetInviteAcceptance(ctx, "fleet-a", 45460, pubkey, 10_000, "deimos")
+			if err != nil || !applied {
+				t.Fatalf("ReconcileFleetInviteAcceptance applied/err = %v/%v", applied, err)
+			}
+			if member.Status != FleetMemberActive || member.AcceptedAtMS != 10_000 || member.Hostname != "deimos" {
+				t.Fatalf("reconciled member = %+v, want active deimos", member)
+			}
+			if activity.Type != "member.accepted" || activity.EventID == "" {
+				t.Fatalf("reconciled activity = %+v, want member.accepted", activity)
+			}
+			invites, err := store.ListFleetInvites(ctx, "fleet-a")
+			if err != nil {
+				t.Fatalf("ListFleetInvites: %v", err)
+			}
+			if len(invites) != 0 {
+				t.Fatalf("invites after reconcile = %+v, want none", invites)
+			}
+			activityList, err := store.ListFleetActivity(ctx, "fleet-a", 10, 0)
+			if err != nil {
+				t.Fatalf("ListFleetActivity: %v", err)
+			}
+			if len(activityList) != 1 || activityList[0].Type != "member.accepted" {
+				t.Fatalf("activity after reconcile = %+v, want one member.accepted", activityList)
+			}
+
+			if _, err := store.UpsertFleetMember(ctx, FleetMemberRecord{
+				FleetID:       "fleet-a",
+				NodeID:        45460,
+				EntmootPubKey: pubkey,
+				Role:          FleetRoleAgent,
+				Status:        FleetMemberRemoved,
+				RemovedAtMS:   11_000,
+			}); err != nil {
+				t.Fatalf("Upsert removed member: %v", err)
+			}
+			if _, err := store.CreateFleetInvite(ctx, FleetInviteRecord{
+				InviteID:      "invite-b",
+				FleetID:       "fleet-a",
+				NodeID:        45460,
+				EntmootPubKey: pubkey,
+				Status:        FleetMemberInvited,
+				CreatedAtMS:   12_000,
+				ExpiresAtMS:   20_000,
+			}); err != nil {
+				t.Fatalf("CreateFleetInvite invite-b: %v", err)
+			}
+			if _, _, applied, err := store.ReconcileFleetInviteAcceptance(ctx, "fleet-a", 45460, pubkey, 13_000, "deimos"); err != nil || applied {
+				t.Fatalf("removed reconcile applied/err = %v/%v, want false/nil", applied, err)
+			}
+			members, err := store.ListFleetMembers(ctx, "fleet-a")
+			if err != nil {
+				t.Fatalf("ListFleetMembers: %v", err)
+			}
+			if len(members) != 1 || members[0].Status != FleetMemberRemoved {
+				t.Fatalf("member after removed reconcile = %+v, want removed", members)
+			}
+
+			if _, err := store.UpsertFleetMember(ctx, FleetMemberRecord{
+				FleetID:       "fleet-a",
+				NodeID:        45460,
+				EntmootPubKey: pubkey,
+				Role:          FleetRoleAgent,
+				Status:        FleetMemberInvited,
+				InvitedAtMS:   14_000,
+			}); err != nil {
+				t.Fatalf("Upsert reinvited member: %v", err)
+			}
+			if err := store.DeleteFleetInvite(ctx, "invite-b"); err != nil {
+				t.Fatalf("DeleteFleetInvite invite-b: %v", err)
+			}
+			if _, _, applied, err := store.ReconcileFleetInviteAcceptance(ctx, "fleet-a", 45460, pubkey, 15_000, "deimos"); err != nil || applied {
+				t.Fatalf("missing invite reconcile applied/err = %v/%v, want false/nil", applied, err)
+			}
+			members, err = store.ListFleetMembers(ctx, "fleet-a")
+			if err != nil {
+				t.Fatalf("ListFleetMembers after missing invite: %v", err)
+			}
+				if len(members) != 1 || members[0].Status != FleetMemberInvited {
+					t.Fatalf("member after missing invite reconcile = %+v, want invited", members)
+				}
+
+				if _, err := store.CreateFleetInvite(ctx, FleetInviteRecord{
+					InviteID:      "invite-expired",
+					FleetID:       "fleet-a",
+					NodeID:        45460,
+					EntmootPubKey: pubkey,
+					Status:        FleetMemberInvited,
+					CreatedAtMS:   16_000,
+					ExpiresAtMS:   17_000,
+				}); err != nil {
+					t.Fatalf("CreateFleetInvite expired: %v", err)
+				}
+				if _, _, applied, err := store.ReconcileFleetInviteAcceptance(ctx, "fleet-a", 45460, pubkey, 18_000, "deimos"); err != nil || !applied {
+					t.Fatalf("expired invite reconcile applied/err = %v/%v, want true/nil", applied, err)
+				}
+				invites, err = store.ListFleetInvites(ctx, "fleet-a")
+				if err != nil {
+					t.Fatalf("ListFleetInvites after expired reconcile: %v", err)
+				}
+				if len(invites) != 0 {
+					t.Fatalf("invites after expired reconcile = %+v, want none", invites)
+				}
+			})
+		}
+	}
+
 func TestSQLiteStateStoreMigratesSignRequests(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()

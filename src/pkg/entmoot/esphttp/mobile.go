@@ -208,6 +208,7 @@ type StateStore interface {
 	DeleteFleet(context.Context, string) error
 	UpsertFleetMember(context.Context, FleetMemberRecord) (FleetMemberRecord, error)
 	UpsertFleetMemberForActiveFleet(context.Context, FleetMemberRecord) (FleetMemberRecord, error)
+	ReconcileFleetInviteAcceptance(context.Context, string, entmoot.NodeID, string, int64, string) (FleetMemberRecord, FleetActivityRecord, bool, error)
 	ListFleetMembers(context.Context, string) ([]FleetMemberRecord, error)
 	DeleteFleetMember(context.Context, string, entmoot.NodeID) error
 	CreateFleetInvite(context.Context, FleetInviteRecord) (FleetInviteRecord, error)
@@ -741,6 +742,55 @@ func (s *MemoryStateStore) UpsertFleetMemberForActiveFleet(_ context.Context, re
 		return FleetMemberRecord{}, ErrFleetNotActive
 	}
 	return s.upsertFleetMemberLocked(rec)
+}
+
+func (s *MemoryStateStore) ReconcileFleetInviteAcceptance(_ context.Context, fleetID string, nodeID entmoot.NodeID, entmootPubKey string, acceptedAtMS int64, hostname string) (FleetMemberRecord, FleetActivityRecord, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entmootPubKey = strings.TrimSpace(entmootPubKey)
+	if !s.fleetActiveLocked(fleetID) {
+		return FleetMemberRecord{}, FleetActivityRecord{}, false, nil
+	}
+	members := s.fleetMembers[fleetID]
+	member, ok := members[nodeID]
+	if !ok || member.Status != FleetMemberInvited || member.Role == FleetRoleCoordinator || member.EntmootPubKey != entmootPubKey {
+		return FleetMemberRecord{}, FleetActivityRecord{}, false, nil
+	}
+	if acceptedAtMS == 0 {
+		acceptedAtMS = s.nowMS()
+	}
+	hasInvite := false
+	invites := s.fleetInvites[fleetID]
+	remainingInvites := invites[:0]
+	for _, invite := range invites {
+		if invite.NodeID == nodeID && invite.EntmootPubKey == entmootPubKey && invite.Status == FleetMemberInvited {
+			hasInvite = true
+			continue
+		}
+		remainingInvites = append(remainingInvites, invite)
+	}
+	if !hasInvite {
+		return FleetMemberRecord{}, FleetActivityRecord{}, false, nil
+	}
+	if strings.TrimSpace(member.Hostname) == "" {
+		member.Hostname = strings.TrimSpace(hostname)
+	}
+	member.Status = FleetMemberActive
+	member.AcceptedAtMS = acceptedAtMS
+	member.RemovedAtMS = 0
+	member.UpdatedAtMS = s.nowMS()
+	activity, err := fleetAcceptanceActivityFromMember(member, acceptedAtMS)
+	if err != nil {
+		return FleetMemberRecord{}, FleetActivityRecord{}, false, err
+	}
+	members[nodeID] = cloneFleetMemberRecord(member)
+	if len(remainingInvites) == 0 {
+		delete(s.fleetInvites, fleetID)
+	} else {
+		s.fleetInvites[fleetID] = append([]FleetInviteRecord(nil), remainingInvites...)
+	}
+	s.fleetActivity[fleetID] = append(s.fleetActivity[fleetID], cloneFleetActivityRecord(activity))
+	return cloneFleetMemberRecord(member), cloneFleetActivityRecord(activity), true, nil
 }
 
 func (s *MemoryStateStore) fleetActiveLocked(fleetID string) bool {
@@ -1813,6 +1863,91 @@ func (s *SQLiteStateStore) UpsertFleetMemberForActiveFleet(ctx context.Context, 
 	return s.upsertFleetMember(ctx, rec, true)
 }
 
+func (s *SQLiteStateStore) ReconcileFleetInviteAcceptance(ctx context.Context, fleetID string, nodeID entmoot.NodeID, entmootPubKey string, acceptedAtMS int64, hostname string) (FleetMemberRecord, FleetActivityRecord, bool, error) {
+	entmootPubKey = strings.TrimSpace(entmootPubKey)
+	if acceptedAtMS == 0 {
+		acceptedAtMS = time.Now().UnixMilli()
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return FleetMemberRecord{}, FleetActivityRecord{}, false, fmt.Errorf("esphttp: reconcile fleet invite acceptance begin: %w", err)
+	}
+	defer tx.Rollback()
+	row := tx.QueryRowContext(ctx, `
+SELECT m.fleet_id, m.node_id, m.entmoot_pubkey, m.hostname, m.role, m.status, m.invited_at_ms, m.accepted_at_ms, m.removed_at_ms, m.updated_at_ms
+FROM esp_fleet_members m
+JOIN esp_fleets f ON f.fleet_id = m.fleet_id
+WHERE m.fleet_id = ? AND m.node_id = ? AND f.status = ?`, fleetID, nodeID, FleetStatusActive)
+	member, err := scanFleetMemberRecord(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return FleetMemberRecord{}, FleetActivityRecord{}, false, nil
+	}
+	if err != nil {
+		return FleetMemberRecord{}, FleetActivityRecord{}, false, fmt.Errorf("esphttp: reconcile fleet invite acceptance member: %w", err)
+	}
+	if member.Status != FleetMemberInvited || member.Role == FleetRoleCoordinator || member.EntmootPubKey != entmootPubKey {
+		return FleetMemberRecord{}, FleetActivityRecord{}, false, nil
+	}
+	var inviteCount int
+	if err := tx.QueryRowContext(ctx, `
+	SELECT COUNT(1)
+	FROM esp_fleet_invites
+	WHERE fleet_id = ? AND node_id = ? AND entmoot_pubkey = ? AND status = ?`,
+		fleetID, nodeID, entmootPubKey, FleetMemberInvited).Scan(&inviteCount); err != nil {
+		return FleetMemberRecord{}, FleetActivityRecord{}, false, fmt.Errorf("esphttp: reconcile fleet invite acceptance invites: %w", err)
+	}
+	if inviteCount == 0 {
+		return FleetMemberRecord{}, FleetActivityRecord{}, false, nil
+	}
+	if strings.TrimSpace(member.Hostname) == "" {
+		member.Hostname = strings.TrimSpace(hostname)
+	}
+	member.Status = FleetMemberActive
+	member.AcceptedAtMS = acceptedAtMS
+	member.RemovedAtMS = 0
+	member.UpdatedAtMS = time.Now().UnixMilli()
+	activity, err := fleetAcceptanceActivityFromMember(member, acceptedAtMS)
+	if err != nil {
+		return FleetMemberRecord{}, FleetActivityRecord{}, false, err
+	}
+	res, err := tx.ExecContext(ctx, `
+UPDATE esp_fleet_members
+SET hostname = ?, status = ?, accepted_at_ms = ?, removed_at_ms = 0, updated_at_ms = ?
+WHERE fleet_id = ? AND node_id = ? AND entmoot_pubkey = ? AND status = ? AND role != ?
+  AND EXISTS (SELECT 1 FROM esp_fleets WHERE fleet_id = ? AND status = ?)
+	  AND EXISTS (
+	    SELECT 1 FROM esp_fleet_invites
+	    WHERE fleet_id = ? AND node_id = ? AND entmoot_pubkey = ? AND status = ?
+	  )`,
+		member.Hostname, member.Status, member.AcceptedAtMS, member.UpdatedAtMS,
+		fleetID, nodeID, entmootPubKey, FleetMemberInvited, FleetRoleCoordinator,
+		fleetID, FleetStatusActive,
+		fleetID, nodeID, entmootPubKey, FleetMemberInvited)
+	if err != nil {
+		return FleetMemberRecord{}, FleetActivityRecord{}, false, fmt.Errorf("esphttp: reconcile fleet invite acceptance update member: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return FleetMemberRecord{}, FleetActivityRecord{}, false, fmt.Errorf("esphttp: reconcile fleet invite acceptance affected rows: %w", err)
+	}
+	if affected == 0 {
+		return FleetMemberRecord{}, FleetActivityRecord{}, false, nil
+	}
+	if _, err := tx.ExecContext(ctx, `
+	DELETE FROM esp_fleet_invites
+	WHERE fleet_id = ? AND node_id = ? AND entmoot_pubkey = ? AND status = ?`,
+		fleetID, nodeID, entmootPubKey, FleetMemberInvited); err != nil {
+		return FleetMemberRecord{}, FleetActivityRecord{}, false, fmt.Errorf("esphttp: reconcile fleet invite acceptance delete invites: %w", err)
+	}
+	if err := insertFleetActivity(ctx, tx, activity); err != nil {
+		return FleetMemberRecord{}, FleetActivityRecord{}, false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return FleetMemberRecord{}, FleetActivityRecord{}, false, fmt.Errorf("esphttp: reconcile fleet invite acceptance commit: %w", err)
+	}
+	return cloneFleetMemberRecord(member), cloneFleetActivityRecord(activity), true, nil
+}
+
 func (s *SQLiteStateStore) upsertFleetMember(ctx context.Context, rec FleetMemberRecord, requireActive bool) (FleetMemberRecord, error) {
 	rec.Role = NormalizeFleetMemberRole(rec.Role)
 	rec.Status = NormalizeFleetMemberStatus(rec.Status)
@@ -1976,22 +2111,33 @@ func (s *SQLiteStateStore) AppendFleetActivity(ctx context.Context, rec FleetAct
 	if rec.CreatedAtMS == 0 {
 		rec.CreatedAtMS = time.Now().UnixMilli()
 	}
+	if err := insertFleetActivity(ctx, s.db, rec); err != nil {
+		return FleetActivityRecord{}, err
+	}
+	return cloneFleetActivityRecord(rec), nil
+}
+
+type fleetActivityExecer interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
+func insertFleetActivity(ctx context.Context, execer fleetActivityExecer, rec FleetActivityRecord) error {
 	var subjectNode entmoot.NodeID
 	var subjectPub string
 	if rec.Subject != nil {
 		subjectNode = rec.Subject.PilotNodeID
 		subjectPub = base64.StdEncoding.EncodeToString(rec.Subject.EntmootPubKey)
 	}
-	_, err := s.db.ExecContext(ctx, `
+	_, err := execer.ExecContext(ctx, `
 INSERT OR IGNORE INTO esp_fleet_activity
   (event_id, fleet_id, type, actor_node_id, actor_pubkey, subject_node_id, subject_pubkey, summary, metadata, created_at_ms)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		rec.EventID, rec.FleetID, rec.Type, rec.Actor.PilotNodeID, base64.StdEncoding.EncodeToString(rec.Actor.EntmootPubKey),
 		subjectNode, subjectPub, rec.Summary, []byte(rec.Metadata), rec.CreatedAtMS)
 	if err != nil {
-		return FleetActivityRecord{}, fmt.Errorf("esphttp: append fleet activity: %w", err)
+		return fmt.Errorf("esphttp: append fleet activity: %w", err)
 	}
-	return cloneFleetActivityRecord(rec), nil
+	return nil
 }
 
 func (s *SQLiteStateStore) ListFleetActivity(ctx context.Context, fleetID string, limit int, beforeMS int64) ([]FleetActivityRecord, error) {

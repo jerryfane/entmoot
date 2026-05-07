@@ -481,6 +481,88 @@ func TestHandlerFleetReadsRequireCoordinatorDevice(t *testing.T) {
 	}
 }
 
+func TestHandlerReconcilesAcceptedFleetInviteFromControlRoster(t *testing.T) {
+	controlGID := testGroupID(42)
+	_, coordinatorPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey coordinator: %v", err)
+	}
+	reg, err := NewDeviceRegistry([]Device{
+		{ID: "ios-1-device", PublicKey: coordinatorPriv.Public().(ed25519.PublicKey), ClientIDs: []string{"ios-1"}},
+	})
+	if err != nil {
+		t.Fatalf("NewDeviceRegistry: %v", err)
+	}
+	state := NewMemoryStateStore()
+	coordinator := entmoot.NodeInfo{PilotNodeID: 45491, EntmootPubKey: []byte("coordinator")}
+	inviteePubkey := base64.StdEncoding.EncodeToString([]byte("invitee"))
+	if _, err := state.CreateFleet(context.Background(), FleetRecord{
+		FleetID:             "fleet-a",
+		Name:                "Fleet A",
+		ControlGroupID:      controlGID,
+		Coordinator:         coordinator,
+		CoordinatorDeviceID: "ios-1-device",
+		Status:              FleetStatusActive,
+		CreatedAtMS:         1,
+	}); err != nil {
+		t.Fatalf("CreateFleet: %v", err)
+	}
+	if _, err := state.UpsertFleetMember(context.Background(), FleetMemberRecord{
+		FleetID:       "fleet-a",
+		NodeID:        45493,
+		EntmootPubKey: inviteePubkey,
+		Hostname:      "deimos",
+		Role:          FleetRoleAgent,
+		Status:        FleetMemberInvited,
+		InvitedAtMS:   2,
+	}); err != nil {
+		t.Fatalf("UpsertFleetMember: %v", err)
+	}
+	if _, err := state.CreateFleetInvite(context.Background(), FleetInviteRecord{
+		InviteID:      "invite-a",
+		FleetID:       "fleet-a",
+		NodeID:        45493,
+		EntmootPubKey: inviteePubkey,
+		Hostname:      "deimos",
+		Status:        FleetMemberInvited,
+		Invite:        json.RawMessage(`{"secret":"control-group-invite"}`),
+		CreatedAtMS:   3,
+		ExpiresAtMS:   20_000,
+	}); err != nil {
+		t.Fatalf("CreateFleetInvite: %v", err)
+	}
+	catalog := &fakeCatalog{members: []MemberSummary{
+		{NodeID: 45491, EntmootPubKey: base64.StdEncoding.EncodeToString(coordinator.EntmootPubKey), Hostname: "vps", Founder: true},
+		{NodeID: 45493, EntmootPubKey: inviteePubkey, Hostname: "deimos"},
+	}}
+	handler := testMobileHandlerFull(t, controlGID, reg, catalog, func() time.Time { return time.UnixMilli(10_000) }, nil, state, nil)
+
+	members := doSignedJSONRequest[struct {
+		Members []FleetMemberRecord `json:"members"`
+	}](t, handler, coordinatorPriv, http.MethodGet, "/v1/fleets/fleet-a/members", nil, http.StatusOK, 10_000, "nonce-reconcile-members")
+	if len(members.Members) != 1 || members.Members[0].Status != FleetMemberActive || members.Members[0].AcceptedAtMS != 10_000 {
+		t.Fatalf("reconciled members = %+v, want active invitee", members.Members)
+	}
+	invites := doSignedJSONRequest[struct {
+		Invites []FleetInviteRecord `json:"invites"`
+	}](t, handler, coordinatorPriv, http.MethodGet, "/v1/fleets/fleet-a/invites", nil, http.StatusOK, 10_001, "nonce-reconcile-invites")
+	if len(invites.Invites) != 0 {
+		t.Fatalf("reconciled invites = %+v, want none", invites.Invites)
+	}
+	activity := doSignedJSONRequest[struct {
+		Activity []FleetActivityRecord `json:"activity"`
+	}](t, handler, coordinatorPriv, http.MethodGet, "/v1/fleets/fleet-a/activity", nil, http.StatusOK, 10_002, "nonce-reconcile-activity")
+	if len(activity.Activity) != 1 || activity.Activity[0].Type != "member.accepted" || activity.Activity[0].Summary != "Agent joined Fleet" {
+		t.Fatalf("reconciled activity = %+v, want member.accepted", activity.Activity)
+	}
+	activityAgain := doSignedJSONRequest[struct {
+		Activity []FleetActivityRecord `json:"activity"`
+	}](t, handler, coordinatorPriv, http.MethodGet, "/v1/fleets/fleet-a/activity", nil, http.StatusOK, 10_003, "nonce-reconcile-activity-again")
+	if len(activityAgain.Activity) != 1 {
+		t.Fatalf("second reconcile activity = %+v, want no duplicate", activityAgain.Activity)
+	}
+}
+
 func TestHandlerFleetReadsRejectBearerOnly(t *testing.T) {
 	gid := testGroupID(1)
 	state := NewMemoryStateStore()

@@ -576,13 +576,15 @@ func (h *Handler) handleGetFleet(w http.ResponseWriter, r *http.Request, fleetID
 }
 
 func (h *Handler) handleListFleetMembers(w http.ResponseWriter, r *http.Request, fleetID string) {
-	if _, ok := h.authorizedFleet(w, r, fleetID); !ok {
+	fleet, ok := h.authorizedFleet(w, r, fleetID)
+	if !ok {
 		return
 	}
 	if h.state == nil {
 		writeJSON(w, http.StatusOK, map[string]any{"members": []FleetMemberRecord{}})
 		return
 	}
+	h.reconcileFleetAcceptance(r.Context(), fleet)
 	members, err := h.state.ListFleetMembers(r.Context(), fleetID)
 	if err != nil {
 		h.logger.Error("esphttp: list fleet members", slog.String("err", err.Error()))
@@ -596,13 +598,15 @@ func (h *Handler) handleListFleetMembers(w http.ResponseWriter, r *http.Request,
 }
 
 func (h *Handler) handleListFleetInvites(w http.ResponseWriter, r *http.Request, fleetID string) {
-	if _, ok := h.authorizedFleet(w, r, fleetID); !ok {
+	fleet, ok := h.authorizedFleet(w, r, fleetID)
+	if !ok {
 		return
 	}
 	if h.state == nil {
 		writeJSON(w, http.StatusOK, map[string]any{"invites": []FleetInviteRecord{}})
 		return
 	}
+	h.reconcileFleetAcceptance(r.Context(), fleet)
 	invites, err := h.state.ListFleetInvites(r.Context(), fleetID)
 	if err != nil {
 		h.logger.Error("esphttp: list fleet invites", slog.String("err", err.Error()))
@@ -616,13 +620,15 @@ func (h *Handler) handleListFleetInvites(w http.ResponseWriter, r *http.Request,
 }
 
 func (h *Handler) handleFleetActivity(w http.ResponseWriter, r *http.Request, fleetID string) {
-	if _, ok := h.authorizedFleet(w, r, fleetID); !ok {
+	fleet, ok := h.authorizedFleet(w, r, fleetID)
+	if !ok {
 		return
 	}
 	if h.state == nil {
 		writeJSON(w, http.StatusOK, map[string]any{"activity": []FleetActivityRecord{}})
 		return
 	}
+	h.reconcileFleetAcceptance(r.Context(), fleet)
 	limit := 50
 	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
 		if parsed, err := strconv.Atoi(raw); err == nil {
@@ -643,6 +649,114 @@ func (h *Handler) handleFleetActivity(w http.ResponseWriter, r *http.Request, fl
 		activity = []FleetActivityRecord{}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"activity": activity})
+}
+
+func (h *Handler) reconcileFleetAcceptance(ctx context.Context, fleet FleetRecord) {
+	if h.state == nil || h.groups == nil || fleet.ControlGroupID == (entmoot.GroupID{}) || fleet.Status != FleetStatusActive {
+		return
+	}
+	rosterMembers, err := h.groups.ListMembers(ctx, fleet.ControlGroupID)
+	if err != nil {
+		h.logger.Warn("esphttp: reconcile fleet acceptance roster unavailable", slog.String("fleet_id", fleet.FleetID), slog.String("group_id", fleet.ControlGroupID.String()), slog.String("err", err.Error()))
+		return
+	}
+	rosterByIdentity := make(map[string]MemberSummary, len(rosterMembers))
+	for _, member := range rosterMembers {
+		if member.NodeID == 0 || strings.TrimSpace(member.EntmootPubKey) == "" {
+			continue
+		}
+		rosterByIdentity[fleetIdentityKey(member.NodeID, member.EntmootPubKey)] = member
+	}
+	if len(rosterByIdentity) == 0 {
+		return
+	}
+	members, err := h.state.ListFleetMembers(ctx, fleet.FleetID)
+	if err != nil {
+		h.logger.Warn("esphttp: reconcile fleet acceptance members unavailable", slog.String("fleet_id", fleet.FleetID), slog.String("err", err.Error()))
+		return
+	}
+	invites, err := h.state.ListFleetInvites(ctx, fleet.FleetID)
+	if err != nil {
+		h.logger.Warn("esphttp: reconcile fleet acceptance invites unavailable", slog.String("fleet_id", fleet.FleetID), slog.String("err", err.Error()))
+		return
+	}
+	now := h.clock().UnixMilli()
+	invitesByIdentity := make(map[string][]FleetInviteRecord)
+	for _, invite := range invites {
+		if invite.Status != FleetMemberInvited {
+			continue
+		}
+		key := fleetIdentityKey(invite.NodeID, invite.EntmootPubKey)
+		invitesByIdentity[key] = append(invitesByIdentity[key], invite)
+	}
+	for _, member := range members {
+		if member.Status != FleetMemberInvited || member.Role == FleetRoleCoordinator {
+			continue
+		}
+		key := fleetIdentityKey(member.NodeID, member.EntmootPubKey)
+		rosterMember, joined := rosterByIdentity[key]
+		if !joined {
+			continue
+		}
+		matchingInvites := invitesByIdentity[key]
+		if len(matchingInvites) == 0 {
+			continue
+		}
+		accepted, activity, applied, err := h.state.ReconcileFleetInviteAcceptance(ctx, fleet.FleetID, member.NodeID, member.EntmootPubKey, now, rosterMember.Hostname)
+		if err != nil {
+			h.logger.Warn("esphttp: reconcile fleet acceptance member update failed", slog.String("fleet_id", fleet.FleetID), slog.Uint64("node_id", uint64(member.NodeID)), slog.String("err", err.Error()))
+			continue
+		}
+		if !applied {
+			continue
+		}
+		h.logger.Debug("esphttp: reconciled fleet invite acceptance", slog.String("fleet_id", fleet.FleetID), slog.Uint64("node_id", uint64(accepted.NodeID)), slog.String("event_id", activity.EventID))
+	}
+}
+
+func fleetIdentityKey(nodeID entmoot.NodeID, pubkey string) string {
+	return strconv.FormatUint(uint64(nodeID), 10) + ":" + strings.TrimSpace(pubkey)
+}
+
+func fleetNodeInfoFromMember(member FleetMemberRecord) (entmoot.NodeInfo, bool) {
+	pubkey, err := base64.StdEncoding.DecodeString(member.EntmootPubKey)
+	if err != nil {
+		return entmoot.NodeInfo{}, false
+	}
+	return entmoot.NodeInfo{PilotNodeID: member.NodeID, EntmootPubKey: pubkey}, true
+}
+
+func fleetAcceptanceActivityFromMember(member FleetMemberRecord, createdAtMS int64) (FleetActivityRecord, error) {
+	nodeInfo, ok := fleetNodeInfoFromMember(member)
+	if !ok {
+		return FleetActivityRecord{}, fmt.Errorf("invalid fleet member identity")
+	}
+	eventID, err := NewFleetActivityID()
+	if err != nil {
+		return FleetActivityRecord{}, err
+	}
+	return FleetActivityRecord{
+		EventID:     eventID,
+		FleetID:     member.FleetID,
+		Type:        "member.accepted",
+		Actor:       nodeInfo,
+		Subject:     &nodeInfo,
+		Summary:     "Agent joined Fleet",
+		Metadata:    fleetAcceptanceMetadata(member.Hostname),
+		CreatedAtMS: createdAtMS,
+	}, nil
+}
+
+func fleetAcceptanceMetadata(hostname string) json.RawMessage {
+	hostname = strings.TrimSpace(hostname)
+	if hostname == "" {
+		return nil
+	}
+	data, err := json.Marshal(map[string]any{"hostname": hostname})
+	if err != nil {
+		return nil
+	}
+	return data
 }
 
 func (h *Handler) handleSession(w http.ResponseWriter, r *http.Request) {
