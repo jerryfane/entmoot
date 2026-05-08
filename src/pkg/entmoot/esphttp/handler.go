@@ -1070,7 +1070,7 @@ func (h *Handler) handleRevokeOpenInvite(w http.ResponseWriter, r *http.Request,
 }
 
 func (h *Handler) handleGroupDiagnostics(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID) {
-	if !h.checkDeviceGroup(w, r, groupID) {
+	if !h.checkDeviceGroupRead(w, r, groupID) {
 		return
 	}
 	if h.diagnostics == nil {

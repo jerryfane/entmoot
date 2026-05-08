@@ -526,6 +526,68 @@ func TestHandlerFleetControlGroupReadAllowsCoordinatorDevice(t *testing.T) {
 	}
 }
 
+func TestHandlerFleetControlGroupDiagnosticsAllowsCoordinatorDevice(t *testing.T) {
+	controlGID := testGroupID(35)
+	_, coordinatorPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey coordinator: %v", err)
+	}
+	_, otherPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey other: %v", err)
+	}
+	reg, err := NewDeviceRegistry([]Device{
+		{ID: "ios-1-device", PublicKey: coordinatorPriv.Public().(ed25519.PublicKey), ClientIDs: []string{"ios-1"}},
+		{ID: "other-device", PublicKey: otherPriv.Public().(ed25519.PublicKey), ClientIDs: []string{"ios-1"}},
+	})
+	if err != nil {
+		t.Fatalf("NewDeviceRegistry: %v", err)
+	}
+	state := NewMemoryStateStore()
+	if _, err := state.CreateFleet(context.Background(), FleetRecord{
+		FleetID:             "fleet-a",
+		Name:                "Fleet A",
+		ControlGroupID:      controlGID,
+		Coordinator:         entmoot.NodeInfo{PilotNodeID: 45491, EntmootPubKey: []byte("coordinator")},
+		CoordinatorDeviceID: "ios-1-device",
+		CreatedAtMS:         1,
+	}); err != nil {
+		t.Fatalf("CreateFleet: %v", err)
+	}
+	diagnostics := &fakeDiagnostics{result: map[string]any{
+		"group_id":   controlGID.String(),
+		"suggestion": "ok",
+	}}
+	handler, err := NewHandler(Config{
+		AuthMode:    AuthModeDevice,
+		Devices:     reg,
+		Service:     mustMailboxService(t, controlGID),
+		State:       state,
+		Diagnostics: diagnostics,
+		GroupExists: func(_ context.Context, got entmoot.GroupID) (bool, error) {
+			return got == controlGID, nil
+		},
+		Clock: func() time.Time { return time.UnixMilli(10_000) },
+	})
+	if err != nil {
+		t.Fatalf("NewHandler: %v", err)
+	}
+
+	resp := doSignedJSONRequest[struct {
+		Group map[string]any `json:"group"`
+	}](t, handler, coordinatorPriv, http.MethodGet, "/v1/groups/"+url.PathEscape(controlGID.String())+"/diagnostics?probe=true", nil, http.StatusOK, 10_000, "nonce-control-diagnostics")
+	if diagnostics.gid != controlGID || !diagnostics.probe {
+		t.Fatalf("diagnostics args gid=%s probe=%v", diagnostics.gid, diagnostics.probe)
+	}
+	if resp.Group["suggestion"] != "ok" {
+		t.Fatalf("diagnostics response = %+v", resp.Group)
+	}
+	errResp := doSignedJSONRequestFor[errorEnvelope](t, handler, "other-device", otherPriv, http.MethodGet, "/v1/groups/"+url.PathEscape(controlGID.String())+"/diagnostics", nil, http.StatusForbidden, 10_001, "nonce-other-control-diagnostics")
+	if errResp.Error.Code != "forbidden" {
+		t.Fatalf("other control diagnostics error code = %q, want forbidden", errResp.Error.Code)
+	}
+}
+
 func TestHandlerListGroupsCanIncludeHidden(t *testing.T) {
 	gid := testGroupID(32)
 	hiddenGID := testGroupID(33)
