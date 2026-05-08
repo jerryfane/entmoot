@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.48] - 2026-05-08
+
+### Added
+
+- **Service-scoped peer update helpers.** Added `scripts/update-entmoot-peer.sh`
+  and shared release helpers so peer deploys can update Entmoot and restart
+  only explicitly named `serve` services or verified unmanaged `serve`/`join`
+  processes.
+- **ESP health verification.** Added `scripts/verify-esp-service.sh` to verify
+  local and public ESP health after VPS deploys, including the public auth
+  boundary on `/v1/session`.
+
+### Changed
+
+- **Safer release operations.** Operations docs now forbid broad
+  process-name cleanup for Entmoot hosts that also run ESP, and document the
+  scoped update plus ESP health-gate flow.
+
 ## [1.5.42] - 2026-05-07
 
 ### Added

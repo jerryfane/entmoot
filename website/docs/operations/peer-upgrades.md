@@ -8,7 +8,8 @@ Upgrade order:
 
 1. Update Pilot only when the Entmoot release depends on a newer Pilot.
 2. Restart Pilot and wait for IPC readiness.
-3. Restart Entmoot.
+3. Restart the main Entmoot `serve` runtime through its service manager or
+   wrapper.
 4. Verify local message count and Merkle root.
 5. Verify the Pilot hostname if the release affects ESP/member display data.
 6. Run `entmootd doctor -group <GROUP_ID> --probe` before declaring the peer
@@ -20,6 +21,34 @@ pilotctl info
 scripts/verify-mesh-node.sh
 entmootd doctor -group <GROUP_ID> --probe
 ```
+
+Do not use broad process-name cleanup for Entmoot. A public host may run both
+`entmootd serve` and `entmootd esp serve`; killing by executable name can take
+down the ESP HTTP bridge while leaving nginx up.
+
+For service-managed peers, use the update helper so the restart target is
+explicit:
+
+```sh
+scripts/update-entmoot-peer.sh --tag vX.Y.Z \
+  --install-dir "$HOME/.entmoot/bin" \
+  --serve-service entmoot-serve.service
+```
+
+For the public ESP host, include the ESP health gate:
+
+```sh
+scripts/update-entmoot-peer.sh --tag vX.Y.Z \
+  --install-dir /root/.entmoot/bin \
+  --serve-service entmoot-serve.service \
+  --restart-esp \
+  --verify-esp \
+  --esp-url https://esp.entmoot.xyz
+```
+
+For unmanaged `serve` processes, pass `--serve-restart-cmd` or set
+`ENTMOOT_SERVE_RESTART_CMD`; the helper will stop only top-level
+`entmootd serve`/`join` processes before running that command.
 
 Peer updates are operational state changes. Do them separately from docs-only
 releases.

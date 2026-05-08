@@ -7,14 +7,16 @@ Entmoot. Entmoot `serve` also waits for Pilot readiness by default, but the
 explicit wait helper keeps manual upgrades easier to inspect.
 
 ```sh
-pkill -f pilot-daemon
 # restart pilot-daemon with the existing service manager and flags
 
 scripts/wait-pilot-ready.sh --timeout 45
 
-pkill entmootd
-# restart entmootd with the existing service manager; it should run entmootd serve
+# restart only the main entmootd serve service or wrapper for this peer
 ```
+
+Do not use broad process-name cleanup such as `pkill entmootd` on hosts that
+also run ESP. The main mesh daemon runs `entmootd serve`, while the HTTP bridge
+runs `entmootd esp serve`; treat them as separate service boundaries.
 
 On macOS LaunchAgents, use the same ordering:
 
@@ -91,6 +93,30 @@ peers, and changelog stay aligned.
    Entmoot invite/open-invite/onboarding flows require the matching Pilot fork
    capabilities for tracked send acknowledgements, node lookup/challenge
    signing, and pending-handshake notifications.
+   On service-managed peers, prefer:
+
+   ```sh
+   scripts/update-entmoot-peer.sh --tag vX.Y.Z \
+     --install-dir "$HOME/.entmoot/bin" \
+     --serve-service entmoot-serve.service
+   ```
+
+   On the VPS, where ESP is also reverse-proxied publicly, include the ESP
+   restart and health gate:
+
+   ```sh
+   scripts/update-entmoot-peer.sh --tag vX.Y.Z \
+     --install-dir /root/.entmoot/bin \
+     --serve-service entmoot-serve.service \
+     --restart-esp \
+     --verify-esp \
+     --esp-url https://esp.entmoot.xyz
+   ```
+
+   If the main `serve` process is not managed by systemd, set
+   `ENTMOOT_SERVE_RESTART_CMD` explicitly. In that mode the helper uses
+   `entmootd update --restart` to stop only top-level `serve`/`join`
+   processes, excluding `esp serve`, then runs the provided start command.
 7. Verify every peer reports:
 
    ```sh
@@ -102,3 +128,13 @@ peers, and changelog stay aligned.
 
    Versions, message counts, and Merkle roots should match across laptop,
    VPS, and phobos before considering the release complete.
+
+8. For the public ESP host, verify the bridge after every deploy:
+
+   ```sh
+   scripts/verify-esp-service.sh --public-url https://esp.entmoot.xyz
+   ```
+
+   A healthy deploy returns `200` for `/healthz` and the expected
+   unauthenticated `401` for `/v1/session`. A `502` means nginx is reachable
+   but the local ESP backend is not.
