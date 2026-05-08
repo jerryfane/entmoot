@@ -3,10 +3,13 @@ package main
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"entmoot/pkg/entmoot"
+	"entmoot/pkg/entmoot/esphttp"
 	"entmoot/pkg/entmoot/keystore"
 	"entmoot/pkg/entmoot/roster"
 )
@@ -46,6 +49,195 @@ func TestDiagnosePeerPrecedence(t *testing.T) {
 				t.Fatalf("diagnosePeer = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestBuildFleetDiagnosticsReportFlagsActiveMemberMissingFromControlGroup(t *testing.T) {
+	var controlGID entmoot.GroupID
+	controlGID[31] = 1
+	fleet := esphttp.FleetRecord{FleetID: "fleet-a", Name: "Fleet A", ControlGroupID: controlGID}
+	members := []esphttp.FleetMemberRecord{
+		{
+			FleetID:       "fleet-a",
+			NodeID:        45491,
+			EntmootPubKey: "coordinator-key",
+			Hostname:      "vps",
+			Role:          esphttp.FleetRoleCoordinator,
+			Status:        esphttp.FleetMemberActive,
+		},
+		{
+			FleetID:       "fleet-a",
+			NodeID:        133053,
+			EntmootPubKey: "deimos-key",
+			Hostname:      "deimos",
+			Role:          esphttp.FleetRoleAgent,
+			Status:        esphttp.FleetMemberActive,
+		},
+	}
+	control := &doctorGroupReport{
+		GroupID: fleet.ControlGroupID,
+		Members: 1,
+		Peers: []doctorPeerReport{
+			{NodeID: 45491, Hostname: "vps", Roster: true, Profile: "ok", Transport: "ok", Trust: "self", Route: "self", Diagnosis: "ok"},
+		},
+	}
+	rosterIdentities := []fleetRosterIdentity{{NodeID: 45491, EntmootPubKey: "coordinator-key"}}
+
+	report := buildFleetDiagnosticsReport(fleet, members, control, rosterIdentities)
+	if report.Consistent {
+		t.Fatalf("report.Consistent = true, want false")
+	}
+	if report.Members != 2 || report.ActiveMembers != 2 || report.ControlMembers != 1 {
+		t.Fatalf("counts = members:%d active:%d control:%d, want 2/2/1", report.Members, report.ActiveMembers, report.ControlMembers)
+	}
+	var deimos espFleetDiagnosticsPeer
+	for _, peer := range report.Peers {
+		if peer.NodeID == 133053 {
+			deimos = peer
+			break
+		}
+	}
+	if deimos.Diagnosis != "active_missing_from_control_group" || deimos.ControlRoster {
+		t.Fatalf("deimos peer = %+v, want active_missing_from_control_group outside control roster", deimos)
+	}
+}
+
+func TestBuildFleetDiagnosticsReportFlagsExtraControlGroupMember(t *testing.T) {
+	var controlGID entmoot.GroupID
+	controlGID[31] = 1
+	fleet := esphttp.FleetRecord{FleetID: "fleet-a", Name: "Fleet A", ControlGroupID: controlGID}
+	members := []esphttp.FleetMemberRecord{
+		{
+			FleetID:       "fleet-a",
+			NodeID:        45491,
+			EntmootPubKey: "coordinator-key",
+			Hostname:      "vps",
+			Role:          esphttp.FleetRoleCoordinator,
+			Status:        esphttp.FleetMemberActive,
+		},
+	}
+	control := &doctorGroupReport{
+		GroupID: fleet.ControlGroupID,
+		Members: 2,
+		Peers: []doctorPeerReport{
+			{NodeID: 45491, Hostname: "vps", Roster: true, Profile: "ok", Transport: "ok", Trust: "self", Route: "self", Diagnosis: "ok"},
+			{NodeID: 133053, Hostname: "deimos", Roster: true, Profile: "ok", Transport: "ok", Trust: "trusted", Route: "ok", Diagnosis: "ok"},
+		},
+	}
+	rosterIdentities := []fleetRosterIdentity{
+		{NodeID: 45491, EntmootPubKey: "coordinator-key"},
+		{NodeID: 133053, EntmootPubKey: "deimos-key"},
+	}
+
+	report := buildFleetDiagnosticsReport(fleet, members, control, rosterIdentities)
+	if report.Consistent {
+		t.Fatalf("report.Consistent = true, want false")
+	}
+	if report.Members != 1 || report.ActiveMembers != 1 || report.ControlMembers != 2 {
+		t.Fatalf("counts = members:%d active:%d control:%d, want 1/1/2", report.Members, report.ActiveMembers, report.ControlMembers)
+	}
+	var deimos espFleetDiagnosticsPeer
+	for _, peer := range report.Peers {
+		if peer.NodeID == 133053 {
+			deimos = peer
+			break
+		}
+	}
+	if deimos.Diagnosis != "control_member_missing_from_fleet_state" || !deimos.ControlRoster {
+		t.Fatalf("deimos peer = %+v, want control_member_missing_from_fleet_state inside control roster", deimos)
+	}
+}
+
+func TestBuildFleetDiagnosticsReportDoesNotAttachControlHealthToMismatchedPubkey(t *testing.T) {
+	var controlGID entmoot.GroupID
+	controlGID[31] = 1
+	fleet := esphttp.FleetRecord{FleetID: "fleet-a", Name: "Fleet A", ControlGroupID: controlGID}
+	members := []esphttp.FleetMemberRecord{
+		{
+			FleetID:       "fleet-a",
+			NodeID:        133053,
+			EntmootPubKey: "fleet-state-key",
+			Hostname:      "deimos-state",
+			Role:          esphttp.FleetRoleAgent,
+			Status:        esphttp.FleetMemberActive,
+		},
+	}
+	control := &doctorGroupReport{
+		GroupID: fleet.ControlGroupID,
+		Members: 1,
+		Peers: []doctorPeerReport{
+			{NodeID: 133053, Hostname: "deimos-control", Roster: true, Profile: "ok", Transport: "ok", Trust: "trusted", Route: "ok", Diagnosis: "ok"},
+		},
+	}
+	rosterIdentities := []fleetRosterIdentity{
+		{NodeID: 133053, EntmootPubKey: "control-key"},
+	}
+
+	report := buildFleetDiagnosticsReport(fleet, members, control, rosterIdentities)
+	var fleetStatePeer espFleetDiagnosticsPeer
+	for _, peer := range report.Peers {
+		if peer.NodeID == 133053 && peer.EntmootPubKey == "fleet-state-key" {
+			fleetStatePeer = peer
+			break
+		}
+	}
+	if fleetStatePeer.Diagnosis != "active_missing_from_control_group" || fleetStatePeer.Route != "not_checked" || fleetStatePeer.Trust != "not_applicable" {
+		t.Fatalf("fleet state peer = %+v, want missing member without borrowed control health", fleetStatePeer)
+	}
+}
+
+func TestBuildFleetDiagnosticsReportPreservesMatchedControlHealth(t *testing.T) {
+	var controlGID entmoot.GroupID
+	controlGID[31] = 1
+	fleet := esphttp.FleetRecord{FleetID: "fleet-a", Name: "Fleet A", ControlGroupID: controlGID}
+	members := []esphttp.FleetMemberRecord{
+		{
+			FleetID:       "fleet-a",
+			NodeID:        133053,
+			EntmootPubKey: "deimos-key",
+			Hostname:      "deimos",
+			Role:          esphttp.FleetRoleAgent,
+			Status:        esphttp.FleetMemberActive,
+		},
+	}
+	control := &doctorGroupReport{
+		GroupID: fleet.ControlGroupID,
+		Members: 1,
+		Peers: []doctorPeerReport{
+			{NodeID: 133053, Hostname: "deimos", Roster: true, Profile: "ok", Transport: "missing", Trust: "trusted", Route: "not_checked", Diagnosis: "transport_missing", Suggestion: "restart peer"},
+		},
+	}
+	rosterIdentities := []fleetRosterIdentity{{NodeID: 133053, EntmootPubKey: "deimos-key"}}
+
+	report := buildFleetDiagnosticsReport(fleet, members, control, rosterIdentities)
+	if !report.Consistent {
+		t.Fatalf("report.Consistent = false, want true for matched roster membership")
+	}
+	if len(report.Peers) != 1 || report.Peers[0].Diagnosis != "transport_missing" || report.Peers[0].Suggestion != "restart peer" {
+		t.Fatalf("peer = %+v, want preserved control health diagnosis", report.Peers)
+	}
+}
+
+func TestFleetDiagnosticsDoesNotCreateMissingControlRoster(t *testing.T) {
+	dataDir := t.TempDir()
+	var controlGID entmoot.GroupID
+	controlGID[31] = 9
+	provider := espDiagnosticsProvider{flags: globalFlags{
+		socket:   filepath.Join(dataDir, "missing-pilot.sock"),
+		identity: filepath.Join(dataDir, "identity.json"),
+		data:     dataDir,
+	}}
+	fleet := esphttp.FleetRecord{FleetID: "fleet-a", Name: "Fleet A", ControlGroupID: controlGID}
+
+	report, err := provider.FleetDiagnostics(context.Background(), fleet, nil, false, time.Second)
+	if err != nil {
+		t.Fatalf("FleetDiagnostics error = %v", err)
+	}
+	if report.(espFleetDiagnosticsReport).ControlMembers != 0 {
+		t.Fatalf("ControlMembers = %d, want 0", report.(espFleetDiagnosticsReport).ControlMembers)
+	}
+	if _, err := os.Stat(groupRosterPath(dataDir, controlGID)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("missing control roster stat error = %v, want not exist", err)
 	}
 }
 

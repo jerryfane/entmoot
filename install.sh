@@ -142,6 +142,14 @@ shell_quote() {
     printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
 }
 
+write_runtime_default() {
+    name="$1"
+    value="$2"
+    if [ -n "$value" ]; then
+        printf 'if [ -z "${%s+x}" ]; then %s=%s; fi\n' "$name" "$name" "$(shell_quote "$value")" >> "$INSTALL_DIR/runtime.env"
+    fi
+}
+
 cat > "$INSTALL_DIR/runtime.env" <<EOF
 if [ -z "\${ENTMOOT_BIN+x}" ]; then ENTMOOT_BIN=$(shell_quote "$BIN_DIR/entmootd"); fi
 if [ -z "\${ENTMOOT_DATA+x}" ]; then ENTMOOT_DATA=$(shell_quote "$INSTALL_DIR"); fi
@@ -153,6 +161,16 @@ if [ -z "\${PILOT_SOCKET+x}" ]; then PILOT_SOCKET=$(shell_quote "$PILOT_SOCKET_D
 if [ -z "\${ENTMOOT_HIDE_IP+x}" ]; then ENTMOOT_HIDE_IP=0; fi
 if [ -z "\${ENTMOOT_START_TIMEOUT+x}" ]; then ENTMOOT_START_TIMEOUT=90; fi
 EOF
+write_runtime_default ENTMOOT_RUN_USER "${ENTMOOT_RUN_USER:-}"
+write_runtime_default PILOT_DAEMON_BIN "${PILOT_DAEMON_BIN:-}"
+write_runtime_default PILOTCTL_BIN "${PILOTCTL_BIN:-}"
+write_runtime_default PILOT_REGISTRY "${PILOT_REGISTRY:-}"
+write_runtime_default PILOT_BEACON "${PILOT_BEACON:-}"
+write_runtime_default PILOT_HOSTNAME "${PILOT_HOSTNAME:-}"
+write_runtime_default PILOT_EMAIL "${PILOT_EMAIL:-}"
+write_runtime_default PILOT_TURN_PROVIDER "${PILOT_TURN_PROVIDER:-}"
+write_runtime_default PILOT_CLOUDFLARE_TURN_CREDS_FILE "${PILOT_CLOUDFLARE_TURN_CREDS_FILE:-}"
+write_runtime_default PILOT_RENDEZVOUS_URL "${PILOT_RENDEZVOUS_URL:-}"
 
 cat > "$INSTALL_DIR/entmoot" <<EOF
 #!/bin/sh
@@ -307,6 +325,55 @@ stop_pidfile() {
   [ "\$stopped" = "1" ]
 }
 
+stop_stack_processes() {
+  kind="\$1"
+  for proc in /proc/[0-9]*; do
+    [ -d "\$proc" ] || continue
+    pid="\${proc#/proc/}"
+    if pid_matches_stack "\$kind" "\$pid"; then
+      kill -TERM "\$pid" 2>/dev/null || true
+    fi
+  done
+  sleep 2
+  for proc in /proc/[0-9]*; do
+    [ -d "\$proc" ] || continue
+    pid="\${proc#/proc/}"
+    if pid_matches_stack "\$kind" "\$pid"; then
+      kill -KILL "\$pid" 2>/dev/null || true
+    fi
+  done
+}
+
+is_data_agent_layout() {
+  [ "\$ENTMOOT_DATA" = "/data/.entmoot" ] && return 0
+  [ "\$PILOT_DIR" = "/data/.pilot" ] && return 0
+  case "\$PILOT_SOCKET" in
+    /data/.pilot/*) return 0 ;;
+  esac
+  return 1
+}
+
+select_stack_run_user() {
+  if [ -n "\${ENTMOOT_RUN_USER:-}" ]; then
+    id "\$ENTMOOT_RUN_USER" >/dev/null 2>&1 || {
+      echo "ENTMOOT_RUN_USER=\$ENTMOOT_RUN_USER does not exist" >&2
+      return 1
+    }
+    if [ "\$(id -u "\$ENTMOOT_RUN_USER" 2>/dev/null || printf 0)" = "0" ]; then
+      return 1
+    fi
+    printf '%s\n' "\$ENTMOOT_RUN_USER"
+    return 0
+  fi
+  for candidate in node ubuntu; do
+    if id "\$candidate" >/dev/null 2>&1; then
+      printf '%s\n' "\$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
 remove_compat_pilot_socket() {
   if [ "\$TMP_PILOT_SOCKET" = "\$PILOT_SOCKET" ]; then
     return 0
@@ -397,16 +464,27 @@ print_entmoot_start_failure() {
   fi
 }
 
-if [ "\$(id -u)" = "0" ] && id node >/dev/null 2>&1 && [ -d /data ]; then
-  chown -R node:node "\$PILOT_DIR" "\$ENTMOOT_DATA"
-  envs="ENTMOOT_RUNTIME_ENV=\$(quote "\$RUNTIME_ENV")"
-  for name in ENTMOOT_BIN ENTMOOT_DATA ENTMOOT_IDENTITY ENTMOOT_CONTROL_SOCKET ENTMOOT_HIDE_IP ENTMOOT_START_TIMEOUT ENTMOOT_RUN_DIR PILOT_DIR PILOT_BIN_DIR PILOT_SOCKET TMP_PILOT_SOCKET PILOT_DAEMON_BIN PILOTCTL_BIN PILOT_REGISTRY PILOT_BEACON PILOT_HOSTNAME PILOT_EMAIL PILOT_TURN_PROVIDER PILOT_CLOUDFLARE_TURN_CREDS_FILE PILOT_RENDEZVOUS_URL; do
-    eval "value=\\\${\$name-}"
-    if [ -n "\$value" ]; then
-      envs="\$envs \$name=\$(quote "\$value")"
-    fi
-  done
-  exec su node -c "\$envs sh \$(quote "\$0")"
+if [ "\$(id -u)" = "0" ] && [ -d /data ] && is_data_agent_layout; then
+  if STACK_RUN_USER=\$(select_stack_run_user); then
+    mkdir -p "\$RUN_DIR"
+    stop_pidfile entmoot "\$ENTMOOT_PIDFILE" || true
+    stop_pidfile pilot "\$PILOT_PIDFILE" || true
+    stop_stack_processes entmoot || true
+    stop_stack_processes pilot || true
+    remove_compat_pilot_socket || true
+    STACK_RUN_GROUP=\$(id -gn "\$STACK_RUN_USER" 2>/dev/null || printf '%s' "\$STACK_RUN_USER")
+    chown -R "\$STACK_RUN_USER:\$STACK_RUN_GROUP" "\$PILOT_DIR" "\$ENTMOOT_DATA" "\$RUN_DIR"
+    envs="ENTMOOT_RUNTIME_ENV=\$(quote "\$RUNTIME_ENV")"
+    for name in ENTMOOT_BIN ENTMOOT_DATA ENTMOOT_IDENTITY ENTMOOT_CONTROL_SOCKET ENTMOOT_HIDE_IP ENTMOOT_START_TIMEOUT ENTMOOT_RUN_DIR ENTMOOT_RUN_USER PILOT_DIR PILOT_BIN_DIR PILOT_SOCKET TMP_PILOT_SOCKET PILOT_DAEMON_BIN PILOTCTL_BIN PILOT_REGISTRY PILOT_BEACON PILOT_HOSTNAME PILOT_EMAIL PILOT_TURN_PROVIDER PILOT_CLOUDFLARE_TURN_CREDS_FILE PILOT_RENDEZVOUS_URL; do
+      eval "value=\\\${\$name-}"
+      if [ -n "\$value" ]; then
+        envs="\$envs \$name=\$(quote "\$value")"
+      fi
+    done
+    exec su "\$STACK_RUN_USER" -c "\$envs sh \$(quote "\$0")"
+  elif [ -n "\${ENTMOOT_RUN_USER:-}" ]; then
+    exit 1
+  fi
 fi
 
 PILOT_DAEMON_BIN=\$(resolve_pilot_binary pilot-daemon "\${PILOT_DAEMON_BIN:-}" daemon)

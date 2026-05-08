@@ -588,6 +588,80 @@ func TestHandlerFleetControlGroupDiagnosticsAllowsCoordinatorDevice(t *testing.T
 	}
 }
 
+func TestHandlerFleetDiagnosticsAllowsCoordinatorDevice(t *testing.T) {
+	controlGID := testGroupID(36)
+	_, coordinatorPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey coordinator: %v", err)
+	}
+	_, otherPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey other: %v", err)
+	}
+	reg, err := NewDeviceRegistry([]Device{
+		{ID: "ios-1-device", PublicKey: coordinatorPriv.Public().(ed25519.PublicKey), ClientIDs: []string{"ios-1"}},
+		{ID: "other-device", PublicKey: otherPriv.Public().(ed25519.PublicKey), ClientIDs: []string{"ios-1"}},
+	})
+	if err != nil {
+		t.Fatalf("NewDeviceRegistry: %v", err)
+	}
+	state := NewMemoryStateStore()
+	if _, err := state.CreateFleet(context.Background(), FleetRecord{
+		FleetID:             "fleet-a",
+		Name:                "Fleet A",
+		ControlGroupID:      controlGID,
+		Coordinator:         entmoot.NodeInfo{PilotNodeID: 45491, EntmootPubKey: []byte("coordinator")},
+		CoordinatorDeviceID: "ios-1-device",
+		Status:              FleetStatusActive,
+		CreatedAtMS:         1,
+	}); err != nil {
+		t.Fatalf("CreateFleet: %v", err)
+	}
+	if _, err := state.UpsertFleetMember(context.Background(), FleetMemberRecord{
+		FleetID:       "fleet-a",
+		NodeID:        45493,
+		EntmootPubKey: base64.StdEncoding.EncodeToString([]byte("invitee")),
+		Hostname:      "deimos",
+		Role:          FleetRoleAgent,
+		Status:        FleetMemberActive,
+		AcceptedAtMS:  2,
+	}); err != nil {
+		t.Fatalf("UpsertFleetMember: %v", err)
+	}
+	diagnostics := &fakeDiagnostics{fleet: map[string]any{
+		"fleet_id":   "fleet-a",
+		"consistent": false,
+	}}
+	handler, err := NewHandler(Config{
+		AuthMode:    AuthModeDevice,
+		Devices:     reg,
+		Service:     mustMailboxService(t, controlGID),
+		State:       state,
+		Diagnostics: diagnostics,
+		GroupExists: func(_ context.Context, got entmoot.GroupID) (bool, error) {
+			return got == controlGID, nil
+		},
+		Clock: func() time.Time { return time.UnixMilli(10_000) },
+	})
+	if err != nil {
+		t.Fatalf("NewHandler: %v", err)
+	}
+
+	resp := doSignedJSONRequest[struct {
+		Fleet map[string]any `json:"fleet"`
+	}](t, handler, coordinatorPriv, http.MethodGet, "/v1/fleets/fleet-a/diagnostics?probe=true&timeout=4s", nil, http.StatusOK, 10_000, "nonce-fleet-diagnostics")
+	if diagnostics.fleetID != "fleet-a" || !diagnostics.probe || diagnostics.timeout != 4*time.Second {
+		t.Fatalf("fleet diagnostics args fleet=%s probe=%v timeout=%s", diagnostics.fleetID, diagnostics.probe, diagnostics.timeout)
+	}
+	if resp.Fleet["consistent"] != false {
+		t.Fatalf("fleet diagnostics response = %+v", resp.Fleet)
+	}
+	errResp := doSignedJSONRequestFor[errorEnvelope](t, handler, "other-device", otherPriv, http.MethodGet, "/v1/fleets/fleet-a/diagnostics", nil, http.StatusForbidden, 10_001, "nonce-other-fleet-diagnostics")
+	if errResp.Error.Code != "forbidden" {
+		t.Fatalf("other fleet diagnostics error code = %q, want forbidden", errResp.Error.Code)
+	}
+}
+
 func TestHandlerListGroupsCanIncludeHidden(t *testing.T) {
 	gid := testGroupID(32)
 	hiddenGID := testGroupID(33)
@@ -1846,7 +1920,9 @@ type fakeNotifier struct {
 
 type fakeDiagnostics struct {
 	result  any
+	fleet   any
 	gid     entmoot.GroupID
+	fleetID string
 	probe   bool
 	timeout time.Duration
 }
@@ -1855,6 +1931,16 @@ func (d *fakeDiagnostics) GroupDiagnostics(_ context.Context, gid entmoot.GroupI
 	d.gid = gid
 	d.probe = probe
 	d.timeout = timeout
+	return d.result, nil
+}
+
+func (d *fakeDiagnostics) FleetDiagnostics(_ context.Context, fleet FleetRecord, _ []FleetMemberRecord, probe bool, timeout time.Duration) (any, error) {
+	d.fleetID = fleet.FleetID
+	d.probe = probe
+	d.timeout = timeout
+	if d.fleet != nil {
+		return d.fleet, nil
+	}
 	return d.result, nil
 }
 

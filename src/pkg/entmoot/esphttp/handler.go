@@ -36,6 +36,7 @@ type GroupExistsFunc func(context.Context, entmoot.GroupID) (bool, error)
 // DiagnosticsProvider produces a group-scoped health report for ESP clients.
 type DiagnosticsProvider interface {
 	GroupDiagnostics(context.Context, entmoot.GroupID, bool, time.Duration) (any, error)
+	FleetDiagnostics(context.Context, FleetRecord, []FleetMemberRecord, bool, time.Duration) (any, error)
 }
 
 // Config wires the HTTP handler to an existing mailbox service.
@@ -559,6 +560,12 @@ func (h *Handler) handleFleetSubroute(w http.ResponseWriter, r *http.Request) bo
 			return true
 		}
 		h.handleFleetActivity(w, r, fleetID)
+	case "diagnostics":
+		if r.Method != http.MethodGet {
+			methodNotAllowed(w, http.MethodGet)
+			return true
+		}
+		h.handleFleetDiagnostics(w, r, fleetID)
 	default:
 		if strings.HasPrefix(suffix, "members/") && strings.HasSuffix(suffix, "/remove") {
 			if r.Method != http.MethodPost {
@@ -658,6 +665,53 @@ func (h *Handler) handleFleetActivity(w http.ResponseWriter, r *http.Request, fl
 		activity = []FleetActivityRecord{}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"activity": activity})
+}
+
+func (h *Handler) handleFleetDiagnostics(w http.ResponseWriter, r *http.Request, fleetID string) {
+	fleet, ok := h.authorizedFleet(w, r, fleetID)
+	if !ok {
+		return
+	}
+	if h.state == nil {
+		writeError(w, http.StatusServiceUnavailable, "fleet_unavailable", "fleet store is not configured")
+		return
+	}
+	if h.diagnostics == nil {
+		writeError(w, http.StatusServiceUnavailable, "diagnostics_unavailable", "diagnostics are not configured")
+		return
+	}
+	h.reconcileFleetAcceptance(r.Context(), fleet)
+	members, err := h.state.ListFleetMembers(r.Context(), fleetID)
+	if err != nil {
+		h.logger.Error("esphttp: fleet diagnostics members", slog.String("err", err.Error()))
+		writeError(w, http.StatusInternalServerError, "internal_error", "fleet member listing failed")
+		return
+	}
+	if members == nil {
+		members = []FleetMemberRecord{}
+	}
+	probe := parseBoolQuery(r.URL.Query().Get("probe"))
+	timeout := 3 * time.Second
+	if raw := strings.TrimSpace(r.URL.Query().Get("timeout")); raw != "" {
+		parsed, err := time.ParseDuration(raw)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "bad_request", "timeout must be a Go duration such as 3s")
+			return
+		}
+		timeout = parsed
+	}
+	report, err := h.diagnostics.FleetDiagnostics(r.Context(), fleet, members, probe, timeout)
+	if err != nil {
+		var opErr *OperationError
+		if errors.As(err, &opErr) {
+			writeError(w, opErr.HTTPStatus, opErr.Code, opErr.Message)
+			return
+		}
+		h.logger.Error("esphttp: fleet diagnostics", slog.String("err", err.Error()))
+		writeError(w, http.StatusInternalServerError, "internal_error", "fleet diagnostics failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"fleet": report})
 }
 
 func (h *Handler) reconcileFleetAcceptance(ctx context.Context, fleet FleetRecord) {
