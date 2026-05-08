@@ -59,7 +59,8 @@ func executableOperationKind(kind string) bool {
 		signRequestKindFleetCreate,
 		signRequestKindFleetInviteCreate,
 		signRequestKindFleetMemberRemove,
-		signRequestKindFleetArchive:
+		signRequestKindFleetArchive,
+		signRequestKindFleetRestore:
 		return true
 	default:
 		return false
@@ -74,7 +75,8 @@ func requiresGroupAdmin(kind string) bool {
 		signRequestKindMemberRemove,
 		signRequestKindFleetInviteCreate,
 		signRequestKindFleetMemberRemove,
-		signRequestKindFleetArchive:
+		signRequestKindFleetArchive,
+		signRequestKindFleetRestore:
 		return true
 	default:
 		return false

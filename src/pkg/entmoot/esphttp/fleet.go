@@ -136,6 +136,24 @@ func ActiveFleetRecords(fleets []FleetRecord) []FleetRecord {
 	return active
 }
 
+func VisibleFleetRecords(fleets []FleetRecord, includeArchived bool) []FleetRecord {
+	visible := make([]FleetRecord, 0, len(fleets))
+	for _, fleet := range fleets {
+		switch NormalizeFleetStatus(fleet.Status) {
+		case FleetStatusActive:
+			visible = append(visible, fleet)
+		case FleetStatusArchived:
+			if includeArchived {
+				visible = append(visible, fleet)
+			}
+		}
+	}
+	if visible == nil {
+		return []FleetRecord{}
+	}
+	return visible
+}
+
 func cloneFleetRecord(in FleetRecord) FleetRecord {
 	out := in
 	out.Coordinator.EntmootPubKey = append([]byte(nil), in.Coordinator.EntmootPubKey...)

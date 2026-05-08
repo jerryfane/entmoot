@@ -189,6 +189,22 @@ func TestStateStoresArchiveFleetAndClearInvites(t *testing.T) {
 			}); !errors.Is(err, ErrFleetNotActive) {
 				t.Fatalf("CreateFleetInviteForActiveFleet err = %v, want ErrFleetNotActive", err)
 			}
+			restored, ok, err := store.RestoreFleet(ctx, "fleet-a", 1_700_000_001_000)
+			if err != nil || !ok {
+				t.Fatalf("RestoreFleet ok/err = %v/%v", ok, err)
+			}
+			if restored.Status != FleetStatusActive || restored.ArchivedAtMS != 0 || restored.UpdatedAtMS != 1_700_000_001_000 {
+				t.Fatalf("restored fleet = %+v", restored)
+			}
+			if _, err := store.CreateFleetInviteForActiveFleet(ctx, FleetInviteRecord{
+				InviteID:      "invite-c",
+				FleetID:       "fleet-a",
+				NodeID:        45462,
+				EntmootPubKey: base64.StdEncoding.EncodeToString([]byte("agent-3")),
+				Status:        FleetMemberInvited,
+			}); err != nil {
+				t.Fatalf("CreateFleetInviteForActiveFleet after restore: %v", err)
+			}
 		})
 	}
 }
@@ -319,34 +335,34 @@ func TestStateStoresReconcileFleetInviteAcceptanceIsConditional(t *testing.T) {
 			if err != nil {
 				t.Fatalf("ListFleetMembers after missing invite: %v", err)
 			}
-				if len(members) != 1 || members[0].Status != FleetMemberInvited {
-					t.Fatalf("member after missing invite reconcile = %+v, want invited", members)
-				}
+			if len(members) != 1 || members[0].Status != FleetMemberInvited {
+				t.Fatalf("member after missing invite reconcile = %+v, want invited", members)
+			}
 
-				if _, err := store.CreateFleetInvite(ctx, FleetInviteRecord{
-					InviteID:      "invite-expired",
-					FleetID:       "fleet-a",
-					NodeID:        45460,
-					EntmootPubKey: pubkey,
-					Status:        FleetMemberInvited,
-					CreatedAtMS:   16_000,
-					ExpiresAtMS:   17_000,
-				}); err != nil {
-					t.Fatalf("CreateFleetInvite expired: %v", err)
-				}
-				if _, _, applied, err := store.ReconcileFleetInviteAcceptance(ctx, "fleet-a", 45460, pubkey, 18_000, "deimos"); err != nil || !applied {
-					t.Fatalf("expired invite reconcile applied/err = %v/%v, want true/nil", applied, err)
-				}
-				invites, err = store.ListFleetInvites(ctx, "fleet-a")
-				if err != nil {
-					t.Fatalf("ListFleetInvites after expired reconcile: %v", err)
-				}
-				if len(invites) != 0 {
-					t.Fatalf("invites after expired reconcile = %+v, want none", invites)
-				}
-			})
-		}
+			if _, err := store.CreateFleetInvite(ctx, FleetInviteRecord{
+				InviteID:      "invite-expired",
+				FleetID:       "fleet-a",
+				NodeID:        45460,
+				EntmootPubKey: pubkey,
+				Status:        FleetMemberInvited,
+				CreatedAtMS:   16_000,
+				ExpiresAtMS:   17_000,
+			}); err != nil {
+				t.Fatalf("CreateFleetInvite expired: %v", err)
+			}
+			if _, _, applied, err := store.ReconcileFleetInviteAcceptance(ctx, "fleet-a", 45460, pubkey, 18_000, "deimos"); err != nil || !applied {
+				t.Fatalf("expired invite reconcile applied/err = %v/%v, want true/nil", applied, err)
+			}
+			invites, err = store.ListFleetInvites(ctx, "fleet-a")
+			if err != nil {
+				t.Fatalf("ListFleetInvites after expired reconcile: %v", err)
+			}
+			if len(invites) != 0 {
+				t.Fatalf("invites after expired reconcile = %+v, want none", invites)
+			}
+		})
 	}
+}
 
 func TestSQLiteStateStoreMigratesSignRequests(t *testing.T) {
 	ctx := context.Background()

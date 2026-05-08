@@ -48,6 +48,14 @@ type GroupCatalog interface {
 	ListMembers(context.Context, entmoot.GroupID) ([]MemberSummary, error)
 }
 
+type GroupListOptions struct {
+	IncludeHidden bool
+}
+
+type GroupCatalogWithOptions interface {
+	ListGroupsWithOptions(context.Context, GroupListOptions) ([]GroupSummary, error)
+}
+
 // GroupMetadataStore persists ESP-local group display metadata.
 type GroupMetadataStore interface {
 	GetGroupMetadata(context.Context, entmoot.GroupID) (json.RawMessage, bool, error)
@@ -204,7 +212,9 @@ type StateStore interface {
 	CreateFleet(context.Context, FleetRecord) (FleetRecord, error)
 	ListFleets(context.Context) ([]FleetRecord, error)
 	GetFleet(context.Context, string) (FleetRecord, bool, error)
+	GetFleetByControlGroup(context.Context, entmoot.GroupID) (FleetRecord, bool, error)
 	ArchiveFleet(context.Context, string, int64) (FleetRecord, bool, error)
+	RestoreFleet(context.Context, string, int64) (FleetRecord, bool, error)
 	DeleteFleet(context.Context, string) error
 	UpsertFleetMember(context.Context, FleetMemberRecord) (FleetMemberRecord, error)
 	UpsertFleetMemberForActiveFleet(context.Context, FleetMemberRecord) (FleetMemberRecord, error)
@@ -699,6 +709,17 @@ func (s *MemoryStateStore) GetFleet(_ context.Context, fleetID string) (FleetRec
 	return cloneFleetRecord(rec), ok, nil
 }
 
+func (s *MemoryStateStore) GetFleetByControlGroup(_ context.Context, groupID entmoot.GroupID) (FleetRecord, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, rec := range s.fleets {
+		if rec.ControlGroupID == groupID {
+			return cloneFleetRecord(rec), true, nil
+		}
+	}
+	return FleetRecord{}, false, nil
+}
+
 func (s *MemoryStateStore) ArchiveFleet(_ context.Context, fleetID string, archivedAtMS int64) (FleetRecord, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -716,6 +737,26 @@ func (s *MemoryStateStore) ArchiveFleet(_ context.Context, fleetID string, archi
 		s.fleets[fleetID] = cloneFleetRecord(rec)
 	}
 	delete(s.fleetInvites, fleetID)
+	return cloneFleetRecord(rec), true, nil
+}
+
+func (s *MemoryStateStore) RestoreFleet(_ context.Context, fleetID string, restoredAtMS int64) (FleetRecord, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rec, ok := s.fleets[fleetID]
+	if !ok {
+		return FleetRecord{}, false, nil
+	}
+	if restoredAtMS == 0 {
+		restoredAtMS = s.nowMS()
+	}
+	if rec.Status != FleetStatusActive {
+		rec.Status = FleetStatusActive
+		rec.ArchivedAtMS = 0
+		rec.DeletedAtMS = 0
+		rec.UpdatedAtMS = restoredAtMS
+		s.fleets[fleetID] = cloneFleetRecord(rec)
+	}
 	return cloneFleetRecord(rec), true, nil
 }
 
@@ -1801,6 +1842,18 @@ func (s *SQLiteStateStore) GetFleet(ctx context.Context, fleetID string) (FleetR
 	return rec, true, nil
 }
 
+func (s *SQLiteStateStore) GetFleetByControlGroup(ctx context.Context, groupID entmoot.GroupID) (FleetRecord, bool, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT fleet_id, name, control_group_id, coordinator_node_id, coordinator_pubkey, coordinator_device_id, status, created_at_ms, updated_at_ms, archived_at_ms, deleted_at_ms FROM esp_fleets WHERE control_group_id = ?`, groupID[:])
+	rec, err := scanFleetRecord(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return FleetRecord{}, false, nil
+	}
+	if err != nil {
+		return FleetRecord{}, false, fmt.Errorf("esphttp: get fleet by control group: %w", err)
+	}
+	return rec, true, nil
+}
+
 func (s *SQLiteStateStore) ArchiveFleet(ctx context.Context, fleetID string, archivedAtMS int64) (FleetRecord, bool, error) {
 	if archivedAtMS == 0 {
 		archivedAtMS = time.Now().UnixMilli()
@@ -1834,6 +1887,41 @@ func (s *SQLiteStateStore) ArchiveFleet(ctx context.Context, fleetID string, arc
 		return FleetRecord{}, false, fmt.Errorf("esphttp: archive fleet commit: %w", err)
 	}
 	if affected == 0 && rec.Status != FleetStatusArchived {
+		return FleetRecord{}, false, nil
+	}
+	return rec, true, nil
+}
+
+func (s *SQLiteStateStore) RestoreFleet(ctx context.Context, fleetID string, restoredAtMS int64) (FleetRecord, bool, error) {
+	if restoredAtMS == 0 {
+		restoredAtMS = time.Now().UnixMilli()
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return FleetRecord{}, false, fmt.Errorf("esphttp: restore fleet begin: %w", err)
+	}
+	defer tx.Rollback()
+	res, err := tx.ExecContext(ctx, `UPDATE esp_fleets SET status = ?, archived_at_ms = 0, deleted_at_ms = 0, updated_at_ms = ? WHERE fleet_id = ? AND status != ?`,
+		FleetStatusActive, restoredAtMS, fleetID, FleetStatusActive)
+	if err != nil {
+		return FleetRecord{}, false, fmt.Errorf("esphttp: restore fleet: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return FleetRecord{}, false, fmt.Errorf("esphttp: restore fleet affected rows: %w", err)
+	}
+	row := tx.QueryRowContext(ctx, `SELECT fleet_id, name, control_group_id, coordinator_node_id, coordinator_pubkey, coordinator_device_id, status, created_at_ms, updated_at_ms, archived_at_ms, deleted_at_ms FROM esp_fleets WHERE fleet_id = ?`, fleetID)
+	rec, err := scanFleetRecord(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return FleetRecord{}, false, nil
+	}
+	if err != nil {
+		return FleetRecord{}, false, fmt.Errorf("esphttp: get restored fleet: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return FleetRecord{}, false, fmt.Errorf("esphttp: restore fleet commit: %w", err)
+	}
+	if affected == 0 && rec.Status != FleetStatusActive {
 		return FleetRecord{}, false, nil
 	}
 	return rec, true, nil

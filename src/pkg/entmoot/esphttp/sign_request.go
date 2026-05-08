@@ -24,6 +24,7 @@ const (
 	signRequestKindFleetInviteCreate = "fleet_invite_create"
 	signRequestKindFleetMemberRemove = "fleet_member_remove"
 	signRequestKindFleetArchive      = "fleet_archive"
+	signRequestKindFleetRestore      = "fleet_restore"
 
 	canonicalTypeMessageV1      = "entmoot.message.v1"
 	canonicalTypeESPOperationV1 = "entmoot.esp.operation.v1"

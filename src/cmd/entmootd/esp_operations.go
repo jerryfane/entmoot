@@ -203,6 +203,8 @@ func (e espOperationExecutor) ExecuteSignRequest(ctx context.Context, req esphtt
 		return e.removeFleetMember(ctx, req)
 	case "fleet_archive":
 		return e.archiveFleet(ctx, req)
+	case "fleet_restore":
+		return e.restoreFleet(ctx, req)
 	case "group_create":
 		return e.createGroup(ctx, req)
 	case "group_update":
@@ -1521,6 +1523,51 @@ func (e espOperationExecutor) archiveFleet(ctx context.Context, req esphttp.Sign
 		slog.Warn("esp fleet_archive: append activity failed", slog.String("fleet_id", fleet.FleetID), slog.String("err", err.Error()))
 	}
 	return json.Marshal(map[string]any{"status": "archived", "fleet": fleet, "activity": activity})
+}
+
+func (e espOperationExecutor) restoreFleet(ctx context.Context, req esphttp.SignRequest) (json.RawMessage, error) {
+	if e.stateStore == nil {
+		return nil, &esphttp.OperationError{HTTPStatus: http.StatusServiceUnavailable, Code: "fleet_unavailable", Message: "fleet store is not configured"}
+	}
+	var payload fleetScopedPayload
+	if err := json.Unmarshal(req.Payload, &payload); err != nil {
+		return nil, &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request", Message: "invalid fleet_restore payload"}
+	}
+	payload.FleetID = strings.TrimSpace(payload.FleetID)
+	if payload.FleetID == "" {
+		return nil, &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request", Message: "fleet_restore requires fleet_id"}
+	}
+	unlockFleet := lockFleetMutation(payload.FleetID)
+	defer unlockFleet()
+	prev, ok, err := e.stateStore.GetFleet(ctx, payload.FleetID)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, &esphttp.OperationError{HTTPStatus: http.StatusNotFound, Code: "fleet_not_found", Message: "fleet not found"}
+	}
+	if req.DeviceID != "" && prev.CoordinatorDeviceID != "" && req.DeviceID != prev.CoordinatorDeviceID {
+		return nil, &esphttp.OperationError{HTTPStatus: http.StatusForbidden, Code: "forbidden", Message: "device is not authorized to manage fleet"}
+	}
+	if prev.Status == esphttp.FleetStatusActive {
+		return json.Marshal(map[string]any{"status": "active", "fleet": prev, "activity": nil})
+	}
+	if prev.Status != esphttp.FleetStatusArchived {
+		return nil, &esphttp.OperationError{HTTPStatus: http.StatusConflict, Code: "fleet_archived", Message: "fleet cannot be restored"}
+	}
+	restoredAt := time.Now().UnixMilli()
+	fleet, ok, err := e.stateStore.RestoreFleet(ctx, payload.FleetID, restoredAt)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, &esphttp.OperationError{HTTPStatus: http.StatusNotFound, Code: "fleet_not_found", Message: "fleet not found"}
+	}
+	activity, err := e.appendFleetActivity(ctx, fleet.FleetID, "fleet.restored", fleet.Coordinator, nil, "Fleet restored", map[string]any{"name": fleet.Name})
+	if err != nil {
+		slog.Warn("esp fleet_restore: append activity failed", slog.String("fleet_id", fleet.FleetID), slog.String("err", err.Error()))
+	}
+	return json.Marshal(map[string]any{"status": "active", "fleet": fleet, "activity": activity})
 }
 
 func (e espOperationExecutor) createFleetInvite(ctx context.Context, req esphttp.SignRequest) (json.RawMessage, error) {

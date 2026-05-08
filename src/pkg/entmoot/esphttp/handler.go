@@ -479,6 +479,7 @@ func (h *Handler) handleFleets(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusOK, map[string]any{"fleets": []FleetRecord{}})
 			return
 		}
+		includeArchived := parseBoolQuery(r.URL.Query().Get("include_archived"))
 		fleets, err := h.state.ListFleets(r.Context())
 		if err != nil {
 			h.logger.Error("esphttp: list fleets", slog.String("err", err.Error()))
@@ -486,7 +487,7 @@ func (h *Handler) handleFleets(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		visible := make([]FleetRecord, 0, len(fleets))
-		for _, fleet := range ActiveFleetRecords(fleets) {
+		for _, fleet := range VisibleFleetRecords(fleets, includeArchived) {
 			if fleet.CoordinatorDeviceID == device.ID {
 				visible = append(visible, fleet)
 			}
@@ -527,6 +528,14 @@ func (h *Handler) handleFleetSubroute(w http.ResponseWriter, r *http.Request) bo
 			methodNotAllowed(w, http.MethodGet+", "+http.MethodDelete)
 			return true
 		}
+	case "restore":
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w, http.MethodPost)
+			return true
+		}
+		h.withIdempotency(w, r, "fleet_restore:"+fleetID, func(w http.ResponseWriter, r *http.Request) {
+			h.createFleetSignRequestFromHTTP(w, r, signRequestKindFleetRestore, fleetID)
+		})
 	case "members":
 		if r.Method != http.MethodGet {
 			methodNotAllowed(w, http.MethodGet)
@@ -813,7 +822,7 @@ func (h *Handler) handleListGroups(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"groups": []GroupSummary{}})
 		return
 	}
-	groups, err := h.groups.ListGroups(r.Context())
+	groups, err := h.listGroupsForRequest(r)
 	if err != nil {
 		h.logger.Error("esphttp: list groups", slog.String("err", err.Error()))
 		writeError(w, http.StatusInternalServerError, "internal_error", "group listing failed")
@@ -830,6 +839,15 @@ func (h *Handler) handleListGroups(w http.ResponseWriter, r *http.Request) {
 		groups = filtered
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"groups": groups})
+}
+
+func (h *Handler) listGroupsForRequest(r *http.Request) ([]GroupSummary, error) {
+	if parseBoolQuery(r.URL.Query().Get("include_hidden")) {
+		if catalog, ok := h.groups.(GroupCatalogWithOptions); ok {
+			return catalog.ListGroupsWithOptions(r.Context(), GroupListOptions{IncludeHidden: true})
+		}
+	}
+	return h.groups.ListGroups(r.Context())
 }
 
 func (h *Handler) handleGroupSubroute(w http.ResponseWriter, r *http.Request) bool {
@@ -850,7 +868,7 @@ func (h *Handler) handleGroupSubroute(w http.ResponseWriter, r *http.Request) bo
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return true
 	}
-	if ok := h.checkGroup(w, r, groupID); !ok {
+	if ok := h.checkGroupExists(w, r, groupID); !ok {
 		return true
 	}
 	if strings.HasPrefix(suffix, "members/") {
@@ -959,6 +977,9 @@ func (h *Handler) handleGroupSubroute(w http.ResponseWriter, r *http.Request) bo
 }
 
 func (h *Handler) handleGetGroup(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID) {
+	if !h.checkDeviceGroupRead(w, r, groupID) {
+		return
+	}
 	if h.groups == nil {
 		writeError(w, http.StatusNotFound, "group_not_found", "group not joined")
 		return
@@ -977,6 +998,9 @@ func (h *Handler) handleGetGroup(w http.ResponseWriter, r *http.Request, groupID
 }
 
 func (h *Handler) handleListMembers(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID) {
+	if !h.checkDeviceGroupRead(w, r, groupID) {
+		return
+	}
 	if h.groups == nil {
 		writeJSON(w, http.StatusOK, map[string]any{"members": []MemberSummary{}})
 		return
@@ -1046,6 +1070,9 @@ func (h *Handler) handleRevokeOpenInvite(w http.ResponseWriter, r *http.Request,
 }
 
 func (h *Handler) handleGroupDiagnostics(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID) {
+	if !h.checkDeviceGroup(w, r, groupID) {
+		return
+	}
 	if h.diagnostics == nil {
 		writeError(w, http.StatusServiceUnavailable, "diagnostics_unavailable", "diagnostics are not configured")
 		return
@@ -1085,7 +1112,7 @@ func (h *Handler) handleGroupMessages(w http.ResponseWriter, r *http.Request, gr
 		writeError(w, http.StatusBadRequest, "bad_request", "client_id is required")
 		return
 	}
-	if !h.checkDeviceClient(w, r, groupID, clientID) {
+	if !h.checkDeviceClientRead(w, r, groupID, clientID) {
 		return
 	}
 	limit := 50
@@ -1112,7 +1139,7 @@ func (h *Handler) handleGroupHistory(w http.ResponseWriter, r *http.Request, gro
 		writeError(w, http.StatusBadRequest, "bad_request", "client_id is required")
 		return
 	}
-	if !h.checkDeviceClient(w, r, groupID, clientID) {
+	if !h.checkDeviceClientRead(w, r, groupID, clientID) {
 		return
 	}
 	limit := 50
@@ -1211,7 +1238,7 @@ func (h *Handler) handleGroupTopics(w http.ResponseWriter, r *http.Request, grou
 		writeError(w, http.StatusBadRequest, "bad_request", "client_id is required")
 		return
 	}
-	if !h.checkDeviceClient(w, r, groupID, clientID) {
+	if !h.checkDeviceClientRead(w, r, groupID, clientID) {
 		return
 	}
 	limit := 100
@@ -1228,6 +1255,9 @@ func (h *Handler) handleGroupTopics(w http.ResponseWriter, r *http.Request, grou
 }
 
 func (h *Handler) handleGroupMessagePublish(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID) {
+	if !h.checkDeviceGroup(w, r, groupID) {
+		return
+	}
 	var raw map[string]json.RawMessage
 	body, ok := decodeRawBody(w, r, 16<<20, &raw)
 	if !ok {
@@ -1774,6 +1804,16 @@ func (h *Handler) requireGroup(w http.ResponseWriter, r *http.Request) (entmoot.
 }
 
 func (h *Handler) checkGroup(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID) bool {
+	if !h.checkGroupExists(w, r, groupID) {
+		return false
+	}
+	if !h.checkDeviceGroup(w, r, groupID) {
+		return false
+	}
+	return true
+}
+
+func (h *Handler) checkGroupExists(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID) bool {
 	exists, err := h.groupExists(r.Context(), groupID)
 	if err != nil {
 		h.logger.Error("esphttp: group lookup failed", slog.String("err", err.Error()))
@@ -1782,9 +1822,6 @@ func (h *Handler) checkGroup(w http.ResponseWriter, r *http.Request, groupID ent
 	}
 	if !exists {
 		writeError(w, http.StatusNotFound, "group_not_found", "group not joined")
-		return false
-	}
-	if !h.checkDeviceGroup(w, r, groupID) {
 		return false
 	}
 	return true
@@ -1957,6 +1994,36 @@ func (h *Handler) checkDeviceGroup(w http.ResponseWriter, r *http.Request, group
 	return false
 }
 
+func (h *Handler) checkDeviceGroupRead(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID) bool {
+	auth, _ := r.Context().Value(authContextKey{}).(authContext)
+	if auth.device == nil {
+		return true
+	}
+	if deviceAllowsGroup(*auth.device, groupID) {
+		return true
+	}
+	if h.deviceCanReadFleetControlGroup(r.Context(), *auth.device, groupID) {
+		return true
+	}
+	writeError(w, http.StatusForbidden, "forbidden", "device is not authorized for group")
+	return false
+}
+
+func (h *Handler) deviceCanReadFleetControlGroup(ctx context.Context, device Device, groupID entmoot.GroupID) bool {
+	if h.state == nil {
+		return false
+	}
+	fleet, ok, err := h.state.GetFleetByControlGroup(ctx, groupID)
+	if err != nil {
+		h.logger.Error("esphttp: fleet control group lookup failed", slog.String("err", err.Error()))
+		return false
+	}
+	if !ok || fleet.CoordinatorDeviceID != device.ID {
+		return false
+	}
+	return NormalizeFleetStatus(fleet.Status) != FleetStatusDeleted
+}
+
 func (h *Handler) checkDeviceGroupAdmin(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID) bool {
 	auth, _ := r.Context().Value(authContextKey{}).(authContext)
 	if auth.device == nil {
@@ -2025,6 +2092,17 @@ func (h *Handler) checkDeviceClient(w http.ResponseWriter, r *http.Request, grou
 	if !h.checkDeviceGroup(w, r, groupID) {
 		return false
 	}
+	return h.checkDeviceClientID(w, r, clientID)
+}
+
+func (h *Handler) checkDeviceClientRead(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID, clientID string) bool {
+	if !h.checkDeviceGroupRead(w, r, groupID) {
+		return false
+	}
+	return h.checkDeviceClientID(w, r, clientID)
+}
+
+func (h *Handler) checkDeviceClientID(w http.ResponseWriter, r *http.Request, clientID string) bool {
 	auth, _ := r.Context().Value(authContextKey{}).(authContext)
 	if auth.device == nil {
 		return true
@@ -2051,7 +2129,7 @@ func (h *Handler) createSignRequestFromHTTP(w http.ResponseWriter, r *http.Reque
 }
 
 func (h *Handler) createFleetSignRequestFromHTTP(w http.ResponseWriter, r *http.Request, kind string, fleetID string) {
-	if !h.checkDeviceActiveFleetAdmin(w, r, fleetID, kind == signRequestKindFleetArchive) {
+	if !h.checkDeviceActiveFleetAdmin(w, r, fleetID, kind == signRequestKindFleetArchive || kind == signRequestKindFleetRestore) {
 		return
 	}
 	var payload map[string]any

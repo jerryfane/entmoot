@@ -481,6 +481,89 @@ func TestHandlerFleetReadsRequireCoordinatorDevice(t *testing.T) {
 	}
 }
 
+func TestHandlerFleetControlGroupReadAllowsCoordinatorDevice(t *testing.T) {
+	controlGID := testGroupID(31)
+	_, coordinatorPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey coordinator: %v", err)
+	}
+	_, otherPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey other: %v", err)
+	}
+	reg, err := NewDeviceRegistry([]Device{
+		{ID: "ios-1-device", PublicKey: coordinatorPriv.Public().(ed25519.PublicKey), ClientIDs: []string{"ios-1"}},
+		{ID: "other-device", PublicKey: otherPriv.Public().(ed25519.PublicKey), ClientIDs: []string{"ios-1"}},
+	})
+	if err != nil {
+		t.Fatalf("NewDeviceRegistry: %v", err)
+	}
+	state := NewMemoryStateStore()
+	if _, err := state.CreateFleet(context.Background(), FleetRecord{
+		FleetID:             "fleet-a",
+		Name:                "Fleet A",
+		ControlGroupID:      controlGID,
+		Coordinator:         entmoot.NodeInfo{PilotNodeID: 45491, EntmootPubKey: []byte("coordinator")},
+		CoordinatorDeviceID: "ios-1-device",
+		CreatedAtMS:         1,
+	}); err != nil {
+		t.Fatalf("CreateFleet: %v", err)
+	}
+	handler := testMobileHandlerFull(t, controlGID, reg, &fakeCatalog{
+		groups:  []GroupSummary{{GroupID: controlGID, Metadata: map[string]interface{}{"fleet_control": true}}},
+		members: []MemberSummary{{NodeID: 45491}},
+	}, func() time.Time { return time.UnixMilli(10_000) }, nil, state, nil)
+
+	doSignedJSONRequest[struct {
+		Members []MemberSummary `json:"members"`
+	}](t, handler, coordinatorPriv, http.MethodGet, "/v1/groups/"+url.PathEscape(controlGID.String())+"/members", nil, http.StatusOK, 10_000, "nonce-control-members")
+	doSignedJSONRequest[struct {
+		Messages []json.RawMessage `json:"messages"`
+	}](t, handler, coordinatorPriv, http.MethodGet, "/v1/groups/"+url.PathEscape(controlGID.String())+"/history?client_id=ios-1&limit=1", nil, http.StatusOK, 10_001, "nonce-control-history")
+	errResp := doSignedJSONRequestFor[errorEnvelope](t, handler, "other-device", otherPriv, http.MethodGet, "/v1/groups/"+url.PathEscape(controlGID.String())+"/history?client_id=ios-1&limit=1", nil, http.StatusForbidden, 10_002, "nonce-other-control-history")
+	if errResp.Error.Code != "forbidden" {
+		t.Fatalf("other control history error code = %q, want forbidden", errResp.Error.Code)
+	}
+}
+
+func TestHandlerListGroupsCanIncludeHidden(t *testing.T) {
+	gid := testGroupID(32)
+	hiddenGID := testGroupID(33)
+	controlGID := testGroupID(34)
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	reg, err := NewDeviceRegistry([]Device{{
+		ID:          "ios-1",
+		PublicKey:   priv.Public().(ed25519.PublicKey),
+		Groups:      []entmoot.GroupID{gid, hiddenGID, controlGID},
+		AdminGroups: []entmoot.GroupID{gid, hiddenGID, controlGID},
+		ClientIDs:   []string{"ios-1"},
+	}})
+	if err != nil {
+		t.Fatalf("NewDeviceRegistry: %v", err)
+	}
+	handler := testMobileHandlerFull(t, gid, reg, &fakeCatalog{groups: []GroupSummary{
+		{GroupID: gid},
+		{GroupID: hiddenGID, Metadata: map[string]interface{}{"hidden": true}},
+		{GroupID: controlGID, Metadata: map[string]interface{}{"fleet_control": true}},
+	}}, func() time.Time { return time.UnixMilli(10_000) }, nil, NewMemoryStateStore(), nil)
+
+	active := doSignedJSONRequestFor[struct {
+		Groups []GroupSummary `json:"groups"`
+	}](t, handler, "ios-1", priv, http.MethodGet, "/v1/groups", nil, http.StatusOK, 10_000, "nonce-groups")
+	if len(active.Groups) != 1 || active.Groups[0].GroupID != gid {
+		t.Fatalf("active groups = %+v, want only visible group", active.Groups)
+	}
+	hidden := doSignedJSONRequestFor[struct {
+		Groups []GroupSummary `json:"groups"`
+	}](t, handler, "ios-1", priv, http.MethodGet, "/v1/groups?include_hidden=true", nil, http.StatusOK, 10_001, "nonce-groups-hidden")
+	if len(hidden.Groups) != 2 {
+		t.Fatalf("hidden groups = %+v, want visible plus hidden non-fleet-control", hidden.Groups)
+	}
+}
+
 func TestHandlerReconcilesAcceptedFleetInviteFromControlRoster(t *testing.T) {
 	controlGID := testGroupID(42)
 	_, coordinatorPriv, err := ed25519.GenerateKey(rand.Reader)
@@ -1880,8 +1963,21 @@ type fakeCatalog struct {
 	members []MemberSummary
 }
 
-func (c *fakeCatalog) ListGroups(context.Context) ([]GroupSummary, error) {
-	return append([]GroupSummary(nil), c.groups...), nil
+func (c *fakeCatalog) ListGroups(ctx context.Context) ([]GroupSummary, error) {
+	return c.ListGroupsWithOptions(ctx, GroupListOptions{})
+}
+
+func (c *fakeCatalog) ListGroupsWithOptions(_ context.Context, opts GroupListOptions) ([]GroupSummary, error) {
+	out := make([]GroupSummary, 0, len(c.groups))
+	for _, group := range c.groups {
+		if group.Metadata["fleet_control"] == true {
+			continue
+		}
+		if opts.IncludeHidden || group.Metadata["hidden"] != true {
+			out = append(out, group)
+		}
+	}
+	return out, nil
 }
 
 func (c *fakeCatalog) GetGroup(_ context.Context, gid entmoot.GroupID) (GroupSummary, bool, error) {

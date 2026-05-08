@@ -40,6 +40,10 @@ func (p espDiagnosticsProvider) GroupDiagnostics(ctx context.Context, gid entmoo
 }
 
 func (c localGroupCatalog) ListGroups(ctx context.Context) ([]esphttp.GroupSummary, error) {
+	return c.ListGroupsWithOptions(ctx, esphttp.GroupListOptions{})
+}
+
+func (c localGroupCatalog) ListGroupsWithOptions(ctx context.Context, opts esphttp.GroupListOptions) ([]esphttp.GroupSummary, error) {
 	gids, err := listGroupIDs(c.dataDir, nil)
 	if err != nil {
 		return nil, err
@@ -50,11 +54,21 @@ func (c localGroupCatalog) ListGroups(ctx context.Context) ([]esphttp.GroupSumma
 		if err != nil {
 			return nil, err
 		}
-		if ok && !groupHidden(group.Metadata) {
+		if ok && groupVisibleForList(group.Metadata, opts) {
 			out = append(out, group)
 		}
 	}
 	return out, nil
+}
+
+func groupVisibleForList(meta map[string]interface{}, opts esphttp.GroupListOptions) bool {
+	if groupFleetControl(meta) {
+		return false
+	}
+	if !opts.IncludeHidden && groupHidden(meta) {
+		return false
+	}
+	return true
 }
 
 func groupHidden(meta map[string]interface{}) bool {
@@ -63,6 +77,13 @@ func groupHidden(meta map[string]interface{}) bool {
 	}
 	if hidden, ok := meta["hidden"].(bool); ok && hidden {
 		return true
+	}
+	return groupFleetControl(meta)
+}
+
+func groupFleetControl(meta map[string]interface{}) bool {
+	if meta == nil {
+		return false
 	}
 	if hidden, ok := meta["fleet_control"].(bool); ok && hidden {
 		return true
