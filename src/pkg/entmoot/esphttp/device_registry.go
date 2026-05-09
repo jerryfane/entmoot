@@ -21,12 +21,14 @@ type DeviceRegistryDocument struct {
 
 // DeviceRecord is one serializable ESP device registry entry.
 type DeviceRecord struct {
-	ID          string   `json:"id"`
-	PublicKey   string   `json:"public_key"`
-	Groups      []string `json:"groups"`
-	AdminGroups []string `json:"admin_groups"`
-	ClientIDs   []string `json:"client_ids"`
-	Disabled    bool     `json:"disabled"`
+	ID            string   `json:"id"`
+	PublicKey     string   `json:"public_key"`
+	Groups        []string `json:"groups"`
+	AdminGroups   []string `json:"admin_groups"`
+	ClientIDs     []string `json:"client_ids"`
+	PilotNodeID   uint32   `json:"pilot_node_id,omitempty"`
+	EntmootPubKey string   `json:"entmoot_pubkey,omitempty"`
+	Disabled      bool     `json:"disabled"`
 }
 
 // LoadDeviceRegistryOrEmpty reads path, returning an empty registry when the
@@ -140,12 +142,14 @@ func DeviceRegistryDocumentFromRegistry(reg *DeviceRegistry) DeviceRegistryDocum
 			adminGroups = append(adminGroups, gid.String())
 		}
 		devices = append(devices, DeviceRecord{
-			ID:          d.ID,
-			PublicKey:   base64.StdEncoding.EncodeToString(d.PublicKey),
-			Groups:      groups,
-			AdminGroups: adminGroups,
-			ClientIDs:   append([]string(nil), d.ClientIDs...),
-			Disabled:    d.Disabled,
+			ID:            d.ID,
+			PublicKey:     base64.StdEncoding.EncodeToString(d.PublicKey),
+			Groups:        groups,
+			AdminGroups:   adminGroups,
+			ClientIDs:     append([]string(nil), d.ClientIDs...),
+			PilotNodeID:   uint32(d.PilotNodeID),
+			EntmootPubKey: base64.StdEncoding.EncodeToString(d.EntmootPubKey),
+			Disabled:      d.Disabled,
 		})
 	}
 	return DeviceRegistryDocument{Devices: devices}
@@ -163,6 +167,17 @@ func DeviceFromRecord(in DeviceRecord) (Device, error) {
 	}
 	if len(pub) != ed25519.PublicKeySize {
 		return Device{}, fmt.Errorf("esphttp: device %q public_key length %d", id, len(pub))
+	}
+	var entmootPub []byte
+	if strings.TrimSpace(in.EntmootPubKey) != "" {
+		var err error
+		entmootPub, err = base64.StdEncoding.DecodeString(strings.TrimSpace(in.EntmootPubKey))
+		if err != nil {
+			return Device{}, fmt.Errorf("esphttp: device %q entmoot_pubkey: %w", id, err)
+		}
+		if len(entmootPub) != ed25519.PublicKeySize {
+			return Device{}, fmt.Errorf("esphttp: device %q entmoot_pubkey length %d", id, len(entmootPub))
+		}
 	}
 	groups := make([]entmoot.GroupID, 0, len(in.Groups))
 	for _, rawGroup := range in.Groups {
@@ -189,12 +204,14 @@ func DeviceFromRecord(in DeviceRecord) (Device, error) {
 		clients = append(clients, clientID)
 	}
 	return Device{
-		ID:          id,
-		PublicKey:   append(ed25519.PublicKey(nil), pub...),
-		Groups:      groups,
-		AdminGroups: adminGroups,
-		ClientIDs:   clients,
-		Disabled:    in.Disabled,
+		ID:            id,
+		PublicKey:     append(ed25519.PublicKey(nil), pub...),
+		Groups:        groups,
+		AdminGroups:   adminGroups,
+		ClientIDs:     clients,
+		PilotNodeID:   entmoot.NodeID(in.PilotNodeID),
+		EntmootPubKey: append([]byte(nil), entmootPub...),
+		Disabled:      in.Disabled,
 	}, nil
 }
 

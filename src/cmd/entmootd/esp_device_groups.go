@@ -16,6 +16,7 @@ type deviceGroupAuthorizer interface {
 	GrantDeviceAdminGroup(context.Context, string, entmoot.GroupID) (bool, error)
 	RevokeDeviceAdminGroup(context.Context, string, entmoot.GroupID) error
 	DeviceAllowsGroup(context.Context, string, entmoot.GroupID) (bool, error)
+	BindDeviceIdentity(context.Context, string, entmoot.NodeID, []byte) (bool, error)
 }
 
 type fileBackedDeviceGroupAuthorizer struct {
@@ -64,6 +65,23 @@ func (a *fileBackedDeviceGroupAuthorizer) DeviceAllowsGroup(_ context.Context, d
 		return false, nil
 	}
 	return false, fmt.Errorf("esp device %q not found", deviceID)
+}
+
+func (a *fileBackedDeviceGroupAuthorizer) BindDeviceIdentity(_ context.Context, deviceID string, nodeID entmoot.NodeID, entmootPubKey []byte) (bool, error) {
+	if a == nil || a.registry == nil {
+		return false, fmt.Errorf("esp device group authorizer is not configured")
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	next, changed, err := a.registry.WithDeviceIdentity(deviceID, nodeID, entmootPubKey)
+	if err != nil || !changed {
+		return false, err
+	}
+	if err := esphttp.SaveDeviceRegistry(a.path, next); err != nil {
+		return false, err
+	}
+	a.registry.Replace(next)
+	return true, nil
 }
 
 func (a *fileBackedDeviceGroupAuthorizer) update(deviceID string, gid entmoot.GroupID, grant bool) (bool, error) {

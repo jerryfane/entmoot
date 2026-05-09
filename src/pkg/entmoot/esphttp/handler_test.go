@@ -481,6 +481,188 @@ func TestHandlerFleetReadsRequireCoordinatorDevice(t *testing.T) {
 	}
 }
 
+func TestHandlerFleetTasksCreateAssignSubmitComplete(t *testing.T) {
+	gid := testGroupID(91)
+	_, coordinatorPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey coordinator: %v", err)
+	}
+	agentPub, agentPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey agent: %v", err)
+	}
+	agentTwoPub, agentTwoPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey second agent: %v", err)
+	}
+	reg, err := NewDeviceRegistry([]Device{
+		{ID: "ios-1-device", PublicKey: coordinatorPriv.Public().(ed25519.PublicKey), ClientIDs: []string{"ios-1"}},
+		{ID: "agent-device", PublicKey: agentPriv.Public().(ed25519.PublicKey), Groups: []entmoot.GroupID{gid}, PilotNodeID: 45493, EntmootPubKey: agentPub},
+		{ID: "agent-two-device", PublicKey: agentTwoPriv.Public().(ed25519.PublicKey), Groups: []entmoot.GroupID{gid}, PilotNodeID: 45494, EntmootPubKey: agentTwoPub},
+	})
+	if err != nil {
+		t.Fatalf("NewDeviceRegistry: %v", err)
+	}
+	state := NewMemoryStateStore()
+	coordinator := entmoot.NodeInfo{PilotNodeID: 45491, EntmootPubKey: []byte("coordinator")}
+	if _, err := state.CreateFleet(context.Background(), FleetRecord{
+		FleetID:             "fleet-tasks",
+		Name:                "Fleet Tasks",
+		ControlGroupID:      gid,
+		Coordinator:         coordinator,
+		CoordinatorDeviceID: "ios-1-device",
+		CreatedAtMS:         1,
+	}); err != nil {
+		t.Fatalf("CreateFleet: %v", err)
+	}
+	for _, member := range []FleetMemberRecord{
+		{FleetID: "fleet-tasks", NodeID: coordinator.PilotNodeID, EntmootPubKey: base64.StdEncoding.EncodeToString(coordinator.EntmootPubKey), Role: FleetRoleCoordinator, Status: FleetMemberActive},
+		{FleetID: "fleet-tasks", NodeID: 1, EntmootPubKey: base64.StdEncoding.EncodeToString([]byte("wrapped")), Role: FleetRoleAgent, Status: FleetMemberActive},
+		{FleetID: "fleet-tasks", NodeID: 45493, EntmootPubKey: base64.StdEncoding.EncodeToString(agentPub), Role: FleetRoleAgent, Status: FleetMemberActive},
+		{FleetID: "fleet-tasks", NodeID: 45494, EntmootPubKey: base64.StdEncoding.EncodeToString(agentTwoPub), Role: FleetRoleAgent, Status: FleetMemberActive},
+	} {
+		if _, err := state.UpsertFleetMember(context.Background(), member); err != nil {
+			t.Fatalf("UpsertFleetMember: %v", err)
+		}
+	}
+	handler := testMobileHandlerFull(t, gid, reg, nil, func() time.Time { return time.UnixMilli(20_000) }, nil, state, nil)
+
+	create := doSignedJSONRequest[struct {
+		Task     FleetTaskRecord       `json:"task"`
+		Activity []FleetActivityRecord `json:"activity"`
+	}](t, handler, coordinatorPriv, http.MethodPost, "/v1/fleets/fleet-tasks/tasks", map[string]any{
+		"title":            "Audit deploy",
+		"description":      "Check peers",
+		"mode":             FleetTaskModeDirectAssignment,
+		"assignee_node_id": 45493,
+	}, http.StatusCreated, 20_000, "nonce-task-create")
+	if create.Task.Status != FleetTaskStatusAssigned || create.Task.Assignee == nil || create.Task.Assignee.PilotNodeID != 45493 {
+		t.Fatalf("created task = %+v, want assigned to agent", create.Task)
+	}
+	if len(create.Activity) != 2 || create.Activity[0].Type != "task.opened" || create.Activity[1].Type != "task.assigned" {
+		t.Fatalf("create activity = %+v", create.Activity)
+	}
+	overflowCreate := doSignedJSONRequest[errorEnvelope](t, handler, coordinatorPriv, http.MethodPost, "/v1/fleets/fleet-tasks/tasks", map[string]any{
+		"title":            "Overflow assignee",
+		"mode":             FleetTaskModeDirectAssignment,
+		"assignee_node_id": uint64(4294967297),
+	}, http.StatusBadRequest, 20_012, "nonce-task-create-overflow")
+	if overflowCreate.Error.Code != "bad_request" {
+		t.Fatalf("overflow create error = %+v", overflowCreate.Error)
+	}
+
+	list := doSignedJSONRequest[struct {
+		Tasks []FleetTaskRecord `json:"tasks"`
+	}](t, handler, coordinatorPriv, http.MethodGet, "/v1/fleets/fleet-tasks/tasks?status=assigned", nil, http.StatusOK, 20_001, "nonce-task-list")
+	if len(list.Tasks) != 1 || list.Tasks[0].TaskID != create.Task.TaskID {
+		t.Fatalf("task list = %+v", list.Tasks)
+	}
+	overflowAssign := doSignedJSONRequest[errorEnvelope](t, handler, coordinatorPriv, http.MethodPost, "/v1/fleets/fleet-tasks/tasks/"+url.PathEscape(create.Task.TaskID)+"/assign", map[string]any{
+		"assignee_node_id": uint64(4294967297),
+	}, http.StatusBadRequest, 20_013, "nonce-task-assign-overflow")
+	if overflowAssign.Error.Code != "bad_request" {
+		t.Fatalf("overflow assign error = %+v", overflowAssign.Error)
+	}
+
+	submitAssigned := doSignedJSONRequestFor[struct {
+		Task       FleetTaskRecord           `json:"task"`
+		Submission FleetTaskSubmissionRecord `json:"submission"`
+	}](t, handler, "agent-device", agentPriv, http.MethodPost, "/v1/fleets/fleet-tasks/tasks/"+url.PathEscape(create.Task.TaskID)+"/submit", map[string]any{
+		"content": "direct done",
+	}, http.StatusOK, 20_002, "nonce-task-submit-direct")
+	if submitAssigned.Task.Status != FleetTaskStatusSubmitted || submitAssigned.Submission.Author.PilotNodeID != 45493 {
+		t.Fatalf("direct submit = %+v / %+v", submitAssigned.Task, submitAssigned.Submission)
+	}
+
+	complete := doSignedJSONRequest[struct {
+		Task FleetTaskRecord `json:"task"`
+	}](t, handler, coordinatorPriv, http.MethodPost, "/v1/fleets/fleet-tasks/tasks/"+url.PathEscape(create.Task.TaskID)+"/complete", nil, http.StatusOK, 20_003, "nonce-task-complete")
+	if complete.Task.Status != FleetTaskStatusCompleted || complete.Task.CompletedAtMS == 0 {
+		t.Fatalf("complete task = %+v", complete.Task)
+	}
+
+	claimable := doSignedJSONRequest[struct {
+		Task FleetTaskRecord `json:"task"`
+	}](t, handler, coordinatorPriv, http.MethodPost, "/v1/fleets/fleet-tasks/tasks", map[string]any{
+		"title": "Claim this",
+		"mode":  FleetTaskModeFirstClaim,
+	}, http.StatusCreated, 20_004, "nonce-task-create-claim")
+	claim := doSignedJSONRequestFor[struct {
+		Task FleetTaskRecord `json:"task"`
+	}](t, handler, "agent-device", agentPriv, http.MethodPost, "/v1/fleets/fleet-tasks/tasks/"+url.PathEscape(claimable.Task.TaskID)+"/claim", nil, http.StatusOK, 20_005, "nonce-task-claim")
+	if claim.Task.Status != FleetTaskStatusAssigned || claim.Task.Assignee == nil || claim.Task.Assignee.PilotNodeID != 45493 {
+		t.Fatalf("claim task = %+v", claim.Task)
+	}
+	claimAgain := doSignedJSONRequestFor[errorEnvelope](t, handler, "agent-device", agentPriv, http.MethodPost, "/v1/fleets/fleet-tasks/tasks/"+url.PathEscape(claimable.Task.TaskID)+"/claim", nil, http.StatusConflict, 20_010, "nonce-task-claim-again")
+	if claimAgain.Error.Code != "invalid_task_transition" {
+		t.Fatalf("claim again error = %+v", claimAgain.Error)
+	}
+
+	idempotentClaimable := doSignedJSONRequest[struct {
+		Task FleetTaskRecord `json:"task"`
+	}](t, handler, coordinatorPriv, http.MethodPost, "/v1/fleets/fleet-tasks/tasks", map[string]any{
+		"title": "Claim with shared key",
+		"mode":  FleetTaskModeFirstClaim,
+	}, http.StatusCreated, 20_014, "nonce-task-create-idem-claim")
+	firstIdempotentClaim := doSignedJSONRequestForWithIdempotency[struct {
+		Task FleetTaskRecord `json:"task"`
+	}](t, handler, "agent-device", agentPriv, http.MethodPost, "/v1/fleets/fleet-tasks/tasks/"+url.PathEscape(idempotentClaimable.Task.TaskID)+"/claim", nil, http.StatusOK, 20_015, "nonce-task-idem-claim-a", "same-task-claim")
+	if firstIdempotentClaim.Task.Assignee == nil || firstIdempotentClaim.Task.Assignee.PilotNodeID != 45493 {
+		t.Fatalf("first idempotent claim = %+v", firstIdempotentClaim.Task)
+	}
+	secondIdempotentClaim := doSignedJSONRequestForWithIdempotency[errorEnvelope](t, handler, "agent-two-device", agentTwoPriv, http.MethodPost, "/v1/fleets/fleet-tasks/tasks/"+url.PathEscape(idempotentClaimable.Task.TaskID)+"/claim", nil, http.StatusConflict, 20_016, "nonce-task-idem-claim-b", "same-task-claim")
+	if secondIdempotentClaim.Error.Code != "invalid_task_transition" {
+		t.Fatalf("second idempotent claim error = %+v", secondIdempotentClaim.Error)
+	}
+
+	errResp := doSignedJSONRequestFor[errorEnvelope](t, handler, "ios-1-device", coordinatorPriv, http.MethodPost, "/v1/fleets/fleet-tasks/tasks", map[string]any{
+		"title": "Bad mode",
+		"mode":  "frist_claim",
+	}, http.StatusBadRequest, 20_006, "nonce-task-bad-mode")
+	if errResp.Error.Code != "bad_request" {
+		t.Fatalf("bad mode error = %+v", errResp.Error)
+	}
+
+	open := doSignedJSONRequest[struct {
+		Task FleetTaskRecord `json:"task"`
+	}](t, handler, coordinatorPriv, http.MethodPost, "/v1/fleets/fleet-tasks/tasks", map[string]any{
+		"title": "Open submission",
+		"mode":  FleetTaskModeOpenSubmission,
+	}, http.StatusCreated, 20_007, "nonce-task-create-open")
+	assignOpen := doSignedJSONRequest[errorEnvelope](t, handler, coordinatorPriv, http.MethodPost, "/v1/fleets/fleet-tasks/tasks/"+url.PathEscape(open.Task.TaskID)+"/assign", map[string]any{
+		"assignee_node_id": 45493,
+	}, http.StatusConflict, 20_011, "nonce-task-assign-open")
+	if assignOpen.Error.Code != "invalid_task_transition" {
+		t.Fatalf("assign open error = %+v", assignOpen.Error)
+	}
+	submit := doSignedJSONRequest[struct {
+		Task       FleetTaskRecord           `json:"task"`
+		Submission FleetTaskSubmissionRecord `json:"submission"`
+	}](t, handler, coordinatorPriv, http.MethodPost, "/v1/fleets/fleet-tasks/tasks/"+url.PathEscape(open.Task.TaskID)+"/submit", map[string]any{
+		"content": "done",
+	}, http.StatusOK, 20_008, "nonce-task-submit")
+	if submit.Task.Status != FleetTaskStatusOpen || submit.Submission.Status != FleetTaskSubmissionPending {
+		t.Fatalf("submit = %+v / %+v", submit.Task, submit.Submission)
+	}
+	submitTwo := doSignedJSONRequestFor[struct {
+		Task       FleetTaskRecord           `json:"task"`
+		Submission FleetTaskSubmissionRecord `json:"submission"`
+	}](t, handler, "agent-two-device", agentTwoPriv, http.MethodPost, "/v1/fleets/fleet-tasks/tasks/"+url.PathEscape(open.Task.TaskID)+"/submit", map[string]any{
+		"content": "done too",
+	}, http.StatusOK, 20_017, "nonce-task-submit-open-second")
+	if submitTwo.Task.Status != FleetTaskStatusOpen || submitTwo.Submission.Author.PilotNodeID != 45494 {
+		t.Fatalf("second open submit = %+v / %+v", submitTwo.Task, submitTwo.Submission)
+	}
+
+	detail := doSignedJSONRequest[struct {
+		Task        FleetTaskRecord             `json:"task"`
+		Submissions []FleetTaskSubmissionRecord `json:"submissions"`
+	}](t, handler, coordinatorPriv, http.MethodGet, "/v1/fleets/fleet-tasks/tasks/"+url.PathEscape(open.Task.TaskID), nil, http.StatusOK, 20_009, "nonce-task-detail")
+	if detail.Task.Status != FleetTaskStatusOpen || len(detail.Submissions) != 2 {
+		t.Fatalf("detail = %+v submissions=%+v", detail.Task, detail.Submissions)
+	}
+}
+
 func TestHandlerFleetControlGroupReadAllowsCoordinatorDevice(t *testing.T) {
 	controlGID := testGroupID(31)
 	_, coordinatorPriv, err := ed25519.GenerateKey(rand.Reader)
@@ -2070,6 +2252,22 @@ func doSignedJSONRequest[T any](t *testing.T, handler http.Handler, priv ed25519
 func doSignedJSONRequestFor[T any](t *testing.T, handler http.Handler, deviceID string, priv ed25519.PrivateKey, method, path string, body any, wantStatus int, timestampMillis int64, nonce string) T {
 	t.Helper()
 	req := signedDeviceRequestFor(t, deviceID, priv, method, path, body, timestampMillis, nonce)
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+	if resp.Code != wantStatus {
+		t.Fatalf("%s %s status = %d, want %d\nbody=%s", method, path, resp.Code, wantStatus, resp.Body.String())
+	}
+	var out T
+	if err := json.Unmarshal(resp.Body.Bytes(), &out); err != nil {
+		t.Fatalf("Unmarshal response: %v\n%s", err, resp.Body.String())
+	}
+	return out
+}
+
+func doSignedJSONRequestForWithIdempotency[T any](t *testing.T, handler http.Handler, deviceID string, priv ed25519.PrivateKey, method, path string, body any, wantStatus int, timestampMillis int64, nonce, idempotencyKey string) T {
+	t.Helper()
+	req := signedDeviceRequestFor(t, deviceID, priv, method, path, body, timestampMillis, nonce)
+	req.Header.Set(idempotencyHeader, idempotencyKey)
 	resp := httptest.NewRecorder()
 	handler.ServeHTTP(resp, req)
 	if resp.Code != wantStatus {

@@ -704,6 +704,226 @@ func TestGroupMetadataStoresRejectNonObjectJSON(t *testing.T) {
 	}
 }
 
+func TestStateStoresClaimFleetTaskConditionally(t *testing.T) {
+	ctx := context.Background()
+	assigneeA := entmoot.NodeInfo{PilotNodeID: 45492, EntmootPubKey: []byte("assignee-a")}
+	assigneeB := entmoot.NodeInfo{PilotNodeID: 45493, EntmootPubKey: []byte("assignee-b")}
+	stores := []struct {
+		name  string
+		store StateStore
+		close func()
+	}{
+		{name: "memory", store: NewMemoryStateStore()},
+	}
+	sqlite, err := OpenSQLiteStateStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenSQLiteStateStore: %v", err)
+	}
+	stores = append(stores, struct {
+		name  string
+		store StateStore
+		close func()
+	}{name: "sqlite", store: sqlite, close: func() { _ = sqlite.Close() }})
+
+	for _, tc := range stores {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.close != nil {
+				defer tc.close()
+			}
+			base := FleetTaskRecord{
+				TaskID:      "task-claim",
+				FleetID:     "fleet-claim",
+				Title:       "Claim once",
+				Mode:        FleetTaskModeFirstClaim,
+				Status:      FleetTaskStatusOpen,
+				Creator:     entmoot.NodeInfo{PilotNodeID: 45491, EntmootPubKey: []byte("creator")},
+				CreatedAtMS: 1,
+				UpdatedAtMS: 1,
+			}
+			if _, err := tc.store.UpsertFleetTask(ctx, base); err != nil {
+				t.Fatalf("UpsertFleetTask: %v", err)
+			}
+			first := base
+			first.Status = FleetTaskStatusAssigned
+			first.Assignee = &assigneeA
+			claimed, ok, err := tc.store.ClaimFleetTask(ctx, first)
+			if err != nil || !ok {
+				t.Fatalf("first ClaimFleetTask ok/err = %v/%v", ok, err)
+			}
+			if claimed.Assignee == nil || claimed.Assignee.PilotNodeID != assigneeA.PilotNodeID {
+				t.Fatalf("claimed assignee = %+v", claimed.Assignee)
+			}
+			second := base
+			second.Status = FleetTaskStatusAssigned
+			second.Assignee = &assigneeB
+			_, ok, err = tc.store.ClaimFleetTask(ctx, second)
+			if err != nil {
+				t.Fatalf("second ClaimFleetTask error: %v", err)
+			}
+			if ok {
+				t.Fatalf("second ClaimFleetTask succeeded, want conditional miss")
+			}
+			got, found, err := tc.store.GetFleetTask(ctx, base.FleetID, base.TaskID)
+			if err != nil || !found {
+				t.Fatalf("GetFleetTask found/err = %v/%v", found, err)
+			}
+			if got.Assignee == nil || got.Assignee.PilotNodeID != assigneeA.PilotNodeID {
+				t.Fatalf("stored assignee = %+v, want first assignee", got.Assignee)
+			}
+			stale := got
+			stale.Status = FleetTaskStatusCanceled
+			if _, ok, err := tc.store.UpdateFleetTaskIfCurrent(ctx, stale, got.UpdatedAtMS-1); err != nil || ok {
+				t.Fatalf("stale UpdateFleetTaskIfCurrent ok/err = %v/%v, want false/nil", ok, err)
+			}
+			updated, ok, err := tc.store.UpdateFleetTaskIfCurrent(ctx, stale, got.UpdatedAtMS)
+			if err != nil || !ok {
+				t.Fatalf("current UpdateFleetTaskIfCurrent ok/err = %v/%v", ok, err)
+			}
+			if updated.Status != FleetTaskStatusCanceled {
+				t.Fatalf("updated status = %q, want canceled", updated.Status)
+			}
+
+			submitBase := FleetTaskRecord{
+				TaskID:      "task-submit",
+				FleetID:     "fleet-claim",
+				Title:       "Submit atomically",
+				Mode:        FleetTaskModeDirectAssignment,
+				Status:      FleetTaskStatusAssigned,
+				Creator:     entmoot.NodeInfo{PilotNodeID: 45491, EntmootPubKey: []byte("creator")},
+				Assignee:    &assigneeA,
+				CreatedAtMS: 1,
+				UpdatedAtMS: 1,
+			}
+			if _, err := tc.store.UpsertFleetTask(ctx, submitBase); err != nil {
+				t.Fatalf("UpsertFleetTask submit: %v", err)
+			}
+			current, found, err := tc.store.GetFleetTask(ctx, submitBase.FleetID, submitBase.TaskID)
+			if err != nil || !found {
+				t.Fatalf("GetFleetTask submit found/err = %v/%v", found, err)
+			}
+			submittedTask := current
+			submittedTask.Status = FleetTaskStatusSubmitted
+			submittedTask.UpdatedAtMS = current.UpdatedAtMS + 1
+			submission := FleetTaskSubmissionRecord{
+				SubmissionID: "submission-a",
+				FleetID:      current.FleetID,
+				TaskID:       current.TaskID,
+				Author:       assigneeA,
+				Content:      "done",
+				Status:       FleetTaskSubmissionPending,
+				CreatedAtMS:  current.UpdatedAtMS + 1,
+				UpdatedAtMS:  current.UpdatedAtMS + 1,
+			}
+			submitted, storedSubmission, ok, err := tc.store.SubmitFleetTask(ctx, submittedTask, current.UpdatedAtMS, submission)
+			if err != nil || !ok {
+				t.Fatalf("SubmitFleetTask ok/err = %v/%v", ok, err)
+			}
+			if submitted.Status != FleetTaskStatusSubmitted || storedSubmission.SubmissionID != submission.SubmissionID {
+				t.Fatalf("SubmitFleetTask result = %+v / %+v", submitted, storedSubmission)
+			}
+			if _, _, ok, err := tc.store.SubmitFleetTask(ctx, submittedTask, current.UpdatedAtMS, submission); err != nil || ok {
+				t.Fatalf("stale SubmitFleetTask ok/err = %v/%v, want false/nil", ok, err)
+			}
+			submissions, err := tc.store.ListFleetTaskSubmissions(ctx, current.FleetID, current.TaskID)
+			if err != nil {
+				t.Fatalf("ListFleetTaskSubmissions: %v", err)
+			}
+			if len(submissions) != 1 || submissions[0].SubmissionID != submission.SubmissionID {
+				t.Fatalf("submissions = %+v, want one stored submission", submissions)
+			}
+
+			openBase := FleetTaskRecord{
+				TaskID:      "task-open-submit",
+				FleetID:     "fleet-claim",
+				Title:       "Open submit",
+				Mode:        FleetTaskModeOpenSubmission,
+				Status:      FleetTaskStatusOpen,
+				Creator:     entmoot.NodeInfo{PilotNodeID: 45491, EntmootPubKey: []byte("creator")},
+				CreatedAtMS: 1,
+				UpdatedAtMS: 1,
+			}
+			if _, err := tc.store.UpsertFleetTask(ctx, openBase); err != nil {
+				t.Fatalf("UpsertFleetTask open submit: %v", err)
+			}
+			currentOpen, found, err := tc.store.GetFleetTask(ctx, openBase.FleetID, openBase.TaskID)
+			if err != nil || !found {
+				t.Fatalf("GetFleetTask open submit found/err = %v/%v", found, err)
+			}
+			openMutation := currentOpen
+			openMutation.UpdatedAtMS = currentOpen.UpdatedAtMS + 1
+			openSubmissionA := FleetTaskSubmissionRecord{
+				SubmissionID: "submission-open-a",
+				FleetID:      currentOpen.FleetID,
+				TaskID:       currentOpen.TaskID,
+				Author:       assigneeA,
+				Content:      "first",
+				Status:       FleetTaskSubmissionPending,
+				CreatedAtMS:  currentOpen.UpdatedAtMS + 1,
+				UpdatedAtMS:  currentOpen.UpdatedAtMS + 1,
+			}
+			openSubmissionB := openSubmissionA
+			openSubmissionB.SubmissionID = "submission-open-b"
+			openSubmissionB.Author = assigneeB
+			openSubmissionB.Content = "second"
+			if _, _, ok, err := tc.store.SubmitFleetTask(ctx, openMutation, currentOpen.UpdatedAtMS, openSubmissionA); err != nil || !ok {
+				t.Fatalf("first open SubmitFleetTask ok/err = %v/%v", ok, err)
+			}
+			if _, _, ok, err := tc.store.SubmitFleetTask(ctx, openMutation, currentOpen.UpdatedAtMS, openSubmissionB); err != nil || !ok {
+				t.Fatalf("second open SubmitFleetTask ok/err = %v/%v", ok, err)
+			}
+			openSubmissions, err := tc.store.ListFleetTaskSubmissions(ctx, currentOpen.FleetID, currentOpen.TaskID)
+			if err != nil {
+				t.Fatalf("ListFleetTaskSubmissions open: %v", err)
+			}
+			if len(openSubmissions) != 2 {
+				t.Fatalf("open submissions = %+v, want two", openSubmissions)
+			}
+		})
+	}
+}
+
+func TestFleetTaskCanMutateRequiresActiveMember(t *testing.T) {
+	if !FleetTaskCanMutate(FleetMemberRecord{Role: FleetRoleAgent, Status: FleetMemberActive}) {
+		t.Fatalf("active agent should mutate tasks")
+	}
+	if FleetTaskCanMutate(FleetMemberRecord{Role: FleetRoleCoordinator, Status: FleetMemberRemoved}) {
+		t.Fatalf("removed coordinator-role member should not mutate tasks")
+	}
+	if FleetTaskCanMutate(FleetMemberRecord{Role: FleetRoleCoordinator, Status: FleetMemberInvited}) {
+		t.Fatalf("invited coordinator-role member should not mutate tasks")
+	}
+}
+
+func TestApplyFleetTaskMutationAdvancesUpdatedAt(t *testing.T) {
+	task := FleetTaskRecord{
+		TaskID:      "task-version",
+		FleetID:     "fleet-version",
+		Title:       "Versioned task",
+		Mode:        FleetTaskModeOpenSubmission,
+		Status:      FleetTaskStatusOpen,
+		Creator:     entmoot.NodeInfo{PilotNodeID: 45491, EntmootPubKey: []byte("creator")},
+		CreatedAtMS: 100,
+		UpdatedAtMS: 200,
+	}
+	actor := FleetMemberRecord{
+		FleetID:       task.FleetID,
+		NodeID:        task.Creator.PilotNodeID,
+		EntmootPubKey: base64.StdEncoding.EncodeToString(task.Creator.EntmootPubKey),
+		Role:          FleetRoleCoordinator,
+		Status:        FleetMemberActive,
+	}
+	mutation, err := ApplyFleetTaskMutation(task, FleetTaskActionCancel, actor, task.UpdatedAtMS, nil, nil)
+	if err != nil {
+		t.Fatalf("ApplyFleetTaskMutation: %v", err)
+	}
+	if mutation.ExpectedUpdatedAtMS != task.UpdatedAtMS {
+		t.Fatalf("expected version = %d, want %d", mutation.ExpectedUpdatedAtMS, task.UpdatedAtMS)
+	}
+	if mutation.Task.UpdatedAtMS <= task.UpdatedAtMS {
+		t.Fatalf("updated_at_ms = %d, want > %d", mutation.Task.UpdatedAtMS, task.UpdatedAtMS)
+	}
+}
+
 type openInviteStoreCase struct {
 	name   string
 	store  StateStore

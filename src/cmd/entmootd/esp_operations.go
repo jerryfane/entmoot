@@ -784,6 +784,11 @@ func (e espOperationExecutor) acceptInvite(ctx context.Context, req esphttp.Sign
 			return nil, err
 		}
 	}
+	if fleetAccept && req.DeviceID != "" {
+		if err := e.bindFleetDeviceMember(ctx, req.DeviceID, fleetMember); err != nil {
+			return nil, err
+		}
+	}
 	rollback = nil
 	deviceGroupGranted = false
 	result := map[string]any{
@@ -2547,6 +2552,20 @@ func (e espOperationExecutor) grantDeviceGroup(ctx context.Context, deviceID str
 		return false, &esphttp.OperationError{HTTPStatus: http.StatusServiceUnavailable, Code: "device_registry_unavailable", Message: "device group authorizer is not configured"}
 	}
 	return e.deviceGroups.GrantDeviceGroup(ctx, deviceID, gid)
+}
+
+func (e espOperationExecutor) bindFleetDeviceMember(ctx context.Context, deviceID string, member esphttp.FleetMemberRecord) error {
+	if e.deviceGroups == nil {
+		return &esphttp.OperationError{HTTPStatus: http.StatusServiceUnavailable, Code: "device_registry_unavailable", Message: "device group authorizer is not configured"}
+	}
+	pub, err := base64.StdEncoding.DecodeString(strings.TrimSpace(member.EntmootPubKey))
+	if err != nil || len(pub) != ed25519.PublicKeySize {
+		return &esphttp.OperationError{HTTPStatus: http.StatusInternalServerError, Code: "fleet_member_invalid", Message: "fleet member identity is invalid"}
+	}
+	if _, err := e.deviceGroups.BindDeviceIdentity(ctx, deviceID, member.NodeID, pub); err != nil {
+		return err
+	}
+	return nil
 }
 
 func pathExists(path string) bool {

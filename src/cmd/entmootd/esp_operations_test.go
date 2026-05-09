@@ -563,6 +563,7 @@ func TestESPAcceptFleetInviteMarksPendingInviteActive(t *testing.T) {
 	sock := testUnixSocketPath(t)
 	stop := serveESPGroupCreateIPC(t, sock, id.PublicKey, true)
 	defer stop()
+	reg, regPath := testDeviceRegistry(t)
 
 	raw, err := espOperationExecutor{
 		dataDir:       t.TempDir(),
@@ -571,9 +572,11 @@ func TestESPAcceptFleetInviteMarksPendingInviteActive(t *testing.T) {
 		timeout:       time.Second,
 		stateStore:    state,
 		metadataStore: metadataStore,
+		deviceGroups:  &fileBackedDeviceGroupAuthorizer{path: regPath, registry: reg},
 	}.ExecuteSignRequest(ctx, esphttp.SignRequest{
-		Kind:    "invite_accept",
-		Payload: mustMarshalJSON(t, entmoot.Invite{GroupID: gid}),
+		Kind:     "invite_accept",
+		DeviceID: "ios-1",
+		Payload:  mustMarshalJSON(t, entmoot.Invite{GroupID: gid}),
 	}, nil)
 	if err != nil {
 		t.Fatalf("ExecuteSignRequest: %v", err)
@@ -600,6 +603,17 @@ func TestESPAcceptFleetInviteMarksPendingInviteActive(t *testing.T) {
 	}
 	if len(activity) != 1 || activity[0].Type != "member.accepted" {
 		t.Fatalf("activity after accept = %+v, want one member.accepted", activity)
+	}
+	loaded, err := esphttp.LoadDeviceRegistry(regPath)
+	if err != nil {
+		t.Fatalf("LoadDeviceRegistry: %v", err)
+	}
+	devices := loaded.Snapshot()
+	if len(devices) != 1 || devices[0].PilotNodeID != 45491 || !bytes.Equal(devices[0].EntmootPubKey, id.PublicKey) {
+		t.Fatalf("device identity after accept = %+v, want accepted fleet member identity", devices)
+	}
+	if len(devices[0].Groups) != 1 || devices[0].Groups[0] != gid {
+		t.Fatalf("device groups after accept = %+v, want control group", devices[0].Groups)
 	}
 }
 

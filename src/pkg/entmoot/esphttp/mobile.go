@@ -228,6 +228,16 @@ type StateStore interface {
 	AppendFleetActivity(context.Context, FleetActivityRecord) (FleetActivityRecord, error)
 	ListFleetActivity(context.Context, string, int, int64) ([]FleetActivityRecord, error)
 	DeleteFleetActivity(context.Context, string, string) error
+	UpsertFleetTask(context.Context, FleetTaskRecord) (FleetTaskRecord, error)
+	UpdateFleetTaskIfCurrent(context.Context, FleetTaskRecord, int64) (FleetTaskRecord, bool, error)
+	ClaimFleetTask(context.Context, FleetTaskRecord) (FleetTaskRecord, bool, error)
+	SubmitFleetTask(context.Context, FleetTaskRecord, int64, FleetTaskSubmissionRecord) (FleetTaskRecord, FleetTaskSubmissionRecord, bool, error)
+	GetFleetTask(context.Context, string, string) (FleetTaskRecord, bool, error)
+	ListFleetTasks(context.Context, string, string) ([]FleetTaskRecord, error)
+	DeleteFleetTask(context.Context, string, string) error
+	UpsertFleetTaskSubmission(context.Context, FleetTaskSubmissionRecord) (FleetTaskSubmissionRecord, error)
+	GetFleetTaskSubmission(context.Context, string, string, string) (FleetTaskSubmissionRecord, bool, error)
+	ListFleetTaskSubmissions(context.Context, string, string) ([]FleetTaskSubmissionRecord, error)
 	Close() error
 }
 
@@ -263,6 +273,8 @@ type MemoryStateStore struct {
 	fleetMembers  map[string]map[entmoot.NodeID]FleetMemberRecord
 	fleetInvites  map[string][]FleetInviteRecord
 	fleetActivity map[string][]FleetActivityRecord
+	fleetTasks    map[string]map[string]FleetTaskRecord
+	fleetTaskSubs map[string]map[string][]FleetTaskSubmissionRecord
 	clock         func() time.Time
 }
 
@@ -279,6 +291,8 @@ func NewMemoryStateStore() *MemoryStateStore {
 		fleetMembers:  make(map[string]map[entmoot.NodeID]FleetMemberRecord),
 		fleetInvites:  make(map[string][]FleetInviteRecord),
 		fleetActivity: make(map[string][]FleetActivityRecord),
+		fleetTasks:    make(map[string]map[string]FleetTaskRecord),
+		fleetTaskSubs: make(map[string]map[string][]FleetTaskSubmissionRecord),
 		clock:         time.Now,
 	}
 }
@@ -767,6 +781,8 @@ func (s *MemoryStateStore) DeleteFleet(_ context.Context, fleetID string) error 
 	delete(s.fleetMembers, fleetID)
 	delete(s.fleetInvites, fleetID)
 	delete(s.fleetActivity, fleetID)
+	delete(s.fleetTasks, fleetID)
+	delete(s.fleetTaskSubs, fleetID)
 	return nil
 }
 
@@ -1006,6 +1022,204 @@ func (s *MemoryStateStore) DeleteFleetActivity(_ context.Context, fleetID string
 	return nil
 }
 
+func (s *MemoryStateStore) UpsertFleetTask(_ context.Context, rec FleetTaskRecord) (FleetTaskRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := s.nowMS()
+	var err error
+	rec, err = normalizeFleetTaskRecord(rec, now)
+	if err != nil {
+		return FleetTaskRecord{}, err
+	}
+	if s.fleetTasks[rec.FleetID] == nil {
+		s.fleetTasks[rec.FleetID] = make(map[string]FleetTaskRecord)
+	}
+	s.fleetTasks[rec.FleetID][rec.TaskID] = cloneFleetTaskRecord(rec)
+	return cloneFleetTaskRecord(rec), nil
+}
+
+func (s *MemoryStateStore) ClaimFleetTask(_ context.Context, rec FleetTaskRecord) (FleetTaskRecord, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := s.nowMS()
+	var err error
+	rec, err = normalizeFleetTaskRecord(rec, now)
+	if err != nil {
+		return FleetTaskRecord{}, false, err
+	}
+	current, ok := s.fleetTasks[rec.FleetID][rec.TaskID]
+	if !ok || !fleetTaskCanBeClaimed(current) {
+		return FleetTaskRecord{}, false, nil
+	}
+	if s.fleetTasks[rec.FleetID] == nil {
+		s.fleetTasks[rec.FleetID] = make(map[string]FleetTaskRecord)
+	}
+	s.fleetTasks[rec.FleetID][rec.TaskID] = cloneFleetTaskRecord(rec)
+	return cloneFleetTaskRecord(rec), true, nil
+}
+
+func (s *MemoryStateStore) UpdateFleetTaskIfCurrent(_ context.Context, rec FleetTaskRecord, expectedUpdatedAtMS int64) (FleetTaskRecord, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := s.nowMS()
+	var err error
+	rec, err = normalizeFleetTaskRecord(rec, now)
+	if err != nil {
+		return FleetTaskRecord{}, false, err
+	}
+	current, ok := s.fleetTasks[rec.FleetID][rec.TaskID]
+	if !ok || current.UpdatedAtMS != expectedUpdatedAtMS {
+		return FleetTaskRecord{}, false, nil
+	}
+	if s.fleetTasks[rec.FleetID] == nil {
+		s.fleetTasks[rec.FleetID] = make(map[string]FleetTaskRecord)
+	}
+	s.fleetTasks[rec.FleetID][rec.TaskID] = cloneFleetTaskRecord(rec)
+	return cloneFleetTaskRecord(rec), true, nil
+}
+
+func (s *MemoryStateStore) SubmitFleetTask(_ context.Context, rec FleetTaskRecord, expectedUpdatedAtMS int64, submission FleetTaskSubmissionRecord) (FleetTaskRecord, FleetTaskSubmissionRecord, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := s.nowMS()
+	var err error
+	rec, err = normalizeFleetTaskRecord(rec, now)
+	if err != nil {
+		return FleetTaskRecord{}, FleetTaskSubmissionRecord{}, false, err
+	}
+	submission, err = normalizeFleetTaskSubmissionRecord(submission, now)
+	if err != nil {
+		return FleetTaskRecord{}, FleetTaskSubmissionRecord{}, false, err
+	}
+	current, ok := s.fleetTasks[rec.FleetID][rec.TaskID]
+	if rec.Mode == FleetTaskModeOpenSubmission {
+		if !ok || current.Mode != FleetTaskModeOpenSubmission || !fleetTaskCanAcceptSubmission(current) {
+			return FleetTaskRecord{}, FleetTaskSubmissionRecord{}, false, nil
+		}
+		stored, err := s.upsertFleetTaskSubmissionLocked(submission)
+		if err != nil {
+			return FleetTaskRecord{}, FleetTaskSubmissionRecord{}, false, err
+		}
+		return cloneFleetTaskRecord(current), stored, true, nil
+	}
+	if !ok || current.UpdatedAtMS != expectedUpdatedAtMS {
+		return FleetTaskRecord{}, FleetTaskSubmissionRecord{}, false, nil
+	}
+	if s.fleetTasks[rec.FleetID] == nil {
+		s.fleetTasks[rec.FleetID] = make(map[string]FleetTaskRecord)
+	}
+	s.fleetTasks[rec.FleetID][rec.TaskID] = cloneFleetTaskRecord(rec)
+	stored, err := s.upsertFleetTaskSubmissionLocked(submission)
+	if err != nil {
+		return FleetTaskRecord{}, FleetTaskSubmissionRecord{}, false, err
+	}
+	return cloneFleetTaskRecord(rec), stored, true, nil
+}
+
+func (s *MemoryStateStore) GetFleetTask(_ context.Context, fleetID, taskID string) (FleetTaskRecord, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rec, ok := s.fleetTasks[fleetID][taskID]
+	return cloneFleetTaskRecord(rec), ok, nil
+}
+
+func (s *MemoryStateStore) ListFleetTasks(_ context.Context, fleetID, status string) ([]FleetTaskRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]FleetTaskRecord, 0, len(s.fleetTasks[fleetID]))
+	status = strings.TrimSpace(status)
+	for _, rec := range s.fleetTasks[fleetID] {
+		if status != "" && rec.Status != status {
+			continue
+		}
+		out = append(out, cloneFleetTaskRecord(rec))
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].UpdatedAtMS == out[j].UpdatedAtMS {
+			return out[i].TaskID < out[j].TaskID
+		}
+		return out[i].UpdatedAtMS > out[j].UpdatedAtMS
+	})
+	return out, nil
+}
+
+func (s *MemoryStateStore) DeleteFleetTask(_ context.Context, fleetID, taskID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if tasks := s.fleetTasks[fleetID]; tasks != nil {
+		delete(tasks, taskID)
+		if len(tasks) == 0 {
+			delete(s.fleetTasks, fleetID)
+		}
+	}
+	if subs := s.fleetTaskSubs[fleetID]; subs != nil {
+		delete(subs, taskID)
+		if len(subs) == 0 {
+			delete(s.fleetTaskSubs, fleetID)
+		}
+	}
+	return nil
+}
+
+func (s *MemoryStateStore) UpsertFleetTaskSubmission(_ context.Context, rec FleetTaskSubmissionRecord) (FleetTaskSubmissionRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := s.nowMS()
+	var err error
+	rec, err = normalizeFleetTaskSubmissionRecord(rec, now)
+	if err != nil {
+		return FleetTaskSubmissionRecord{}, err
+	}
+	return s.upsertFleetTaskSubmissionLocked(rec)
+}
+
+func (s *MemoryStateStore) upsertFleetTaskSubmissionLocked(rec FleetTaskSubmissionRecord) (FleetTaskSubmissionRecord, error) {
+	if s.fleetTaskSubs[rec.FleetID] == nil {
+		s.fleetTaskSubs[rec.FleetID] = make(map[string][]FleetTaskSubmissionRecord)
+	}
+	submissions := s.fleetTaskSubs[rec.FleetID][rec.TaskID]
+	replaced := false
+	for i := range submissions {
+		if submissions[i].SubmissionID == rec.SubmissionID {
+			submissions[i] = cloneFleetTaskSubmissionRecord(rec)
+			replaced = true
+			break
+		}
+	}
+	if !replaced {
+		submissions = append(submissions, cloneFleetTaskSubmissionRecord(rec))
+	}
+	s.fleetTaskSubs[rec.FleetID][rec.TaskID] = submissions
+	return cloneFleetTaskSubmissionRecord(rec), nil
+}
+
+func (s *MemoryStateStore) GetFleetTaskSubmission(_ context.Context, fleetID, taskID, submissionID string) (FleetTaskSubmissionRecord, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, rec := range s.fleetTaskSubs[fleetID][taskID] {
+		if rec.SubmissionID == submissionID {
+			return cloneFleetTaskSubmissionRecord(rec), true, nil
+		}
+	}
+	return FleetTaskSubmissionRecord{}, false, nil
+}
+
+func (s *MemoryStateStore) ListFleetTaskSubmissions(_ context.Context, fleetID, taskID string) ([]FleetTaskSubmissionRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := append([]FleetTaskSubmissionRecord(nil), s.fleetTaskSubs[fleetID][taskID]...)
+	for i := range out {
+		out[i] = cloneFleetTaskSubmissionRecord(out[i])
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].CreatedAtMS == out[j].CreatedAtMS {
+			return out[i].SubmissionID < out[j].SubmissionID
+		}
+		return out[i].CreatedAtMS > out[j].CreatedAtMS
+	})
+	return out, nil
+}
+
 func (s *MemoryStateStore) Close() error {
 	return nil
 }
@@ -1187,6 +1401,42 @@ CREATE TABLE IF NOT EXISTS esp_fleet_activity (
 
 CREATE INDEX IF NOT EXISTS idx_fleet_activity_fleet_time
   ON esp_fleet_activity(fleet_id, created_at_ms DESC, event_id);
+
+CREATE TABLE IF NOT EXISTS esp_fleet_tasks (
+  task_id TEXT PRIMARY KEY,
+  fleet_id TEXT NOT NULL,
+  title TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  mode TEXT NOT NULL,
+  status TEXT NOT NULL,
+  creator_node_id INTEGER NOT NULL,
+  creator_pubkey TEXT NOT NULL,
+  assignee_node_id INTEGER NOT NULL DEFAULT 0,
+  assignee_pubkey TEXT NOT NULL DEFAULT '',
+  created_at_ms INTEGER NOT NULL,
+  updated_at_ms INTEGER NOT NULL,
+  completed_at_ms INTEGER NOT NULL DEFAULT 0,
+  rejected_at_ms INTEGER NOT NULL DEFAULT 0,
+  canceled_at_ms INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_fleet_tasks_fleet_status
+  ON esp_fleet_tasks(fleet_id, status, updated_at_ms DESC);
+
+CREATE TABLE IF NOT EXISTS esp_fleet_task_submissions (
+  submission_id TEXT PRIMARY KEY,
+  fleet_id TEXT NOT NULL,
+  task_id TEXT NOT NULL,
+  author_node_id INTEGER NOT NULL,
+  author_pubkey TEXT NOT NULL,
+  content TEXT NOT NULL,
+  status TEXT NOT NULL,
+  created_at_ms INTEGER NOT NULL,
+  updated_at_ms INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_fleet_task_submissions_task
+  ON esp_fleet_task_submissions(fleet_id, task_id, created_at_ms DESC);
 `
 
 func OpenSQLiteStateStore(dataDir string) (*SQLiteStateStore, error) {
@@ -1928,6 +2178,12 @@ func (s *SQLiteStateStore) RestoreFleet(ctx context.Context, fleetID string, res
 }
 
 func (s *SQLiteStateStore) DeleteFleet(ctx context.Context, fleetID string) error {
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM esp_fleet_task_submissions WHERE fleet_id = ?`, fleetID); err != nil {
+		return fmt.Errorf("esphttp: delete fleet task submissions: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM esp_fleet_tasks WHERE fleet_id = ?`, fleetID); err != nil {
+		return fmt.Errorf("esphttp: delete fleet tasks: %w", err)
+	}
 	if _, err := s.db.ExecContext(ctx, `DELETE FROM esp_fleet_activity WHERE fleet_id = ?`, fleetID); err != nil {
 		return fmt.Errorf("esphttp: delete fleet activity: %w", err)
 	}

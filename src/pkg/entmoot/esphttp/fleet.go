@@ -21,6 +21,23 @@ const (
 	FleetStatusActive   = "active"
 	FleetStatusArchived = "archived"
 	FleetStatusDeleted  = "deleted"
+
+	FleetTaskModeDirectAssignment = "direct_assignee"
+	FleetTaskModeFirstClaim       = "first_claim"
+	FleetTaskModeOpenSubmission   = "open_submission"
+
+	FleetTaskStatusProposed   = "proposed"
+	FleetTaskStatusOpen       = "open"
+	FleetTaskStatusAssigned   = "assigned"
+	FleetTaskStatusInProgress = "in_progress"
+	FleetTaskStatusSubmitted  = "submitted"
+	FleetTaskStatusCompleted  = "completed"
+	FleetTaskStatusRejected   = "rejected"
+	FleetTaskStatusCanceled   = "canceled"
+
+	FleetTaskSubmissionPending  = "pending"
+	FleetTaskSubmissionAccepted = "accepted"
+	FleetTaskSubmissionRejected = "rejected"
 )
 
 type FleetRecord struct {
@@ -73,6 +90,33 @@ type FleetActivityRecord struct {
 	CreatedAtMS int64             `json:"created_at_ms"`
 }
 
+type FleetTaskRecord struct {
+	TaskID        string            `json:"task_id"`
+	FleetID       string            `json:"fleet_id"`
+	Title         string            `json:"title"`
+	Description   string            `json:"description,omitempty"`
+	Mode          string            `json:"mode"`
+	Status        string            `json:"status"`
+	Creator       entmoot.NodeInfo  `json:"creator"`
+	Assignee      *entmoot.NodeInfo `json:"assignee,omitempty"`
+	CreatedAtMS   int64             `json:"created_at_ms"`
+	UpdatedAtMS   int64             `json:"updated_at_ms"`
+	CompletedAtMS int64             `json:"completed_at_ms,omitempty"`
+	RejectedAtMS  int64             `json:"rejected_at_ms,omitempty"`
+	CanceledAtMS  int64             `json:"canceled_at_ms,omitempty"`
+}
+
+type FleetTaskSubmissionRecord struct {
+	SubmissionID string           `json:"submission_id"`
+	FleetID      string           `json:"fleet_id"`
+	TaskID       string           `json:"task_id"`
+	Author       entmoot.NodeInfo `json:"author"`
+	Content      string           `json:"content"`
+	Status       string           `json:"status"`
+	CreatedAtMS  int64            `json:"created_at_ms"`
+	UpdatedAtMS  int64            `json:"updated_at_ms"`
+}
+
 func NewFleetID() (string, error) {
 	return randomBase64URL(24)
 }
@@ -82,6 +126,14 @@ func NewFleetInviteID() (string, error) {
 }
 
 func NewFleetActivityID() (string, error) {
+	return randomBase64URL(18)
+}
+
+func NewFleetTaskID() (string, error) {
+	return randomBase64URL(18)
+}
+
+func NewFleetTaskSubmissionID() (string, error) {
 	return randomBase64URL(18)
 }
 
@@ -121,6 +173,72 @@ func NormalizeFleetStatus(status string) string {
 	default:
 		return FleetStatusActive
 	}
+}
+
+func NormalizeFleetTaskMode(mode string) string {
+	switch strings.TrimSpace(mode) {
+	case FleetTaskModeDirectAssignment, FleetTaskModeFirstClaim, FleetTaskModeOpenSubmission:
+		return strings.TrimSpace(mode)
+	default:
+		return FleetTaskModeOpenSubmission
+	}
+}
+
+func IsValidFleetTaskMode(mode string) bool {
+	switch strings.TrimSpace(mode) {
+	case FleetTaskModeDirectAssignment, FleetTaskModeFirstClaim, FleetTaskModeOpenSubmission:
+		return true
+	default:
+		return false
+	}
+}
+
+func NormalizeFleetTaskStatus(status string) string {
+	switch strings.TrimSpace(status) {
+	case FleetTaskStatusProposed, FleetTaskStatusOpen, FleetTaskStatusAssigned, FleetTaskStatusInProgress, FleetTaskStatusSubmitted, FleetTaskStatusCompleted, FleetTaskStatusRejected, FleetTaskStatusCanceled:
+		return status
+	default:
+		return FleetTaskStatusProposed
+	}
+}
+
+func NormalizeFleetTaskSubmissionStatus(status string) string {
+	switch strings.TrimSpace(status) {
+	case FleetTaskSubmissionPending, FleetTaskSubmissionAccepted, FleetTaskSubmissionRejected:
+		return status
+	default:
+		return FleetTaskSubmissionPending
+	}
+}
+
+func NormalizeFleetTaskTitle(title string) (string, error) {
+	title = strings.TrimSpace(title)
+	if title == "" {
+		return "", fmt.Errorf("task title is required")
+	}
+	if len(title) > 160 {
+		return "", fmt.Errorf("task title is too long")
+	}
+	return title, nil
+}
+
+func NormalizeFleetTaskDescription(description string) (string, error) {
+	description = strings.TrimSpace(description)
+	if len(description) > 8000 {
+		return "", fmt.Errorf("task description is too long")
+	}
+	return description, nil
+}
+
+func NormalizeFleetTaskSubmissionContent(content string) (string, error) {
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return "", fmt.Errorf("submission content is required")
+	}
+	if len(content) > 16000 {
+		return "", fmt.Errorf("submission content is too long")
+	}
+	return content, nil
 }
 
 func ActiveFleetRecords(fleets []FleetRecord) []FleetRecord {
@@ -178,6 +296,23 @@ func cloneFleetActivityRecord(in FleetActivityRecord) FleetActivityRecord {
 		out.Subject = &subj
 	}
 	out.Metadata = append(json.RawMessage(nil), in.Metadata...)
+	return out
+}
+
+func cloneFleetTaskRecord(in FleetTaskRecord) FleetTaskRecord {
+	out := in
+	out.Creator.EntmootPubKey = append([]byte(nil), in.Creator.EntmootPubKey...)
+	if in.Assignee != nil {
+		assignee := *in.Assignee
+		assignee.EntmootPubKey = append([]byte(nil), in.Assignee.EntmootPubKey...)
+		out.Assignee = &assignee
+	}
+	return out
+}
+
+func cloneFleetTaskSubmissionRecord(in FleetTaskSubmissionRecord) FleetTaskSubmissionRecord {
+	out := in
+	out.Author.EntmootPubKey = append([]byte(nil), in.Author.EntmootPubKey...)
 	return out
 }
 
