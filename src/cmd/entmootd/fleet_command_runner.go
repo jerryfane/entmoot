@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -22,6 +23,13 @@ type fleetCommandRunner struct {
 
 	mu        sync.Mutex
 	processed map[string]struct{}
+}
+
+type fleetCommandContext struct {
+	fleet       esphttp.FleetRecord
+	local       esphttp.FleetMemberRecord
+	memberCount int
+	source      string
 }
 
 func newFleetCommandRunner(server *ipcServer, state *esphttp.SQLiteStateStore, notify *notifyingStore, logger *slog.Logger) *fleetCommandRunner {
@@ -89,9 +97,6 @@ func (r *fleetCommandRunner) handleMessage(ctx context.Context, msg entmoot.Mess
 	if cmd.CommandID == "" {
 		return
 	}
-	if !r.markCommand(cmd.CommandID) {
-		return
-	}
 	r.processCommand(ctx, msg, cmd)
 }
 
@@ -106,7 +111,7 @@ func (r *fleetCommandRunner) markCommand(commandID string) bool {
 }
 
 func (r *fleetCommandRunner) processCommand(ctx context.Context, msg entmoot.Message, cmd esphttp.FleetCommandEnvelope) {
-	fleet, ok, err := r.fleetForCommand(ctx, msg.GroupID, cmd)
+	commandCtx, ok, err := r.commandContextForCommand(ctx, msg.GroupID, cmd)
 	if err != nil {
 		r.logger.Warn("fleet command: fleet lookup failed", slog.String("command_id", cmd.CommandID), slog.String("err", err.Error()))
 		return
@@ -114,26 +119,23 @@ func (r *fleetCommandRunner) processCommand(ctx context.Context, msg entmoot.Mes
 	if !ok {
 		return
 	}
-	members, err := r.state.ListFleetMembers(ctx, fleet.FleetID)
-	if err != nil {
-		r.logger.Warn("fleet command: member lookup failed", slog.String("fleet_id", fleet.FleetID), slog.String("err", err.Error()))
+	if !esphttp.FleetTaskCanMutate(commandCtx.local) {
 		return
 	}
-	local, ok := fleetCommandMemberForNode(members, r.server.nodeID)
-	if !ok || !esphttp.FleetTaskCanMutate(local) {
+	if !fleetCommandTargetsLocal(cmd, commandCtx.local) {
 		return
 	}
-	if !fleetCommandTargetsLocal(cmd, local) {
+	if commandCtx.local.Role == esphttp.FleetRoleCoordinator && cmd.Target.Kind == esphttp.FleetCommandTargetAll {
 		return
 	}
-	if local.Role == esphttp.FleetRoleCoordinator && cmd.Target.Kind == esphttp.FleetCommandTargetAll {
+	if !r.markCommand(cmd.CommandID) {
 		return
 	}
 	if cmd.ExpiresAtMS > 0 && cmd.ExpiresAtMS <= time.Now().UnixMilli() {
 		r.publishResult(ctx, msg.GroupID, cmd, esphttp.FleetCommandStatusExpired, "Command expired", "", 0)
 		return
 	}
-	if !fleetCommandIssuedByCoordinator(msg, cmd, fleet) {
+	if !fleetCommandIssuedByCoordinator(msg, cmd, commandCtx.fleet) {
 		r.publishResult(ctx, msg.GroupID, cmd, esphttp.FleetCommandStatusRejected, "Command rejected: issuer is not the Fleet coordinator", "", 0)
 		return
 	}
@@ -146,7 +148,7 @@ func (r *fleetCommandRunner) processCommand(ctx context.Context, msg entmoot.Mes
 	r.publishResult(ctx, msg.GroupID, cmd, esphttp.FleetCommandStatusAccepted, "Command accepted", "", started)
 	execCtx, cancel := context.WithTimeout(ctx, time.Duration(entry.TimeoutMS)*time.Millisecond)
 	defer cancel()
-	output, err := r.execute(execCtx, fleet, cmd)
+	output, err := r.execute(execCtx, commandCtx, cmd)
 	status := esphttp.FleetCommandStatusCompleted
 	summary := "Command completed"
 	if err != nil {
@@ -156,23 +158,92 @@ func (r *fleetCommandRunner) processCommand(ctx context.Context, msg entmoot.Mes
 	r.publishResult(ctx, msg.GroupID, cmd, status, summary, truncateCommandOutput(output, entry.MaxOutputBytes), started)
 }
 
-func (r *fleetCommandRunner) fleetForCommand(ctx context.Context, groupID entmoot.GroupID, cmd esphttp.FleetCommandEnvelope) (esphttp.FleetRecord, bool, error) {
+func (r *fleetCommandRunner) commandContextForCommand(ctx context.Context, groupID entmoot.GroupID, cmd esphttp.FleetCommandEnvelope) (fleetCommandContext, bool, error) {
+	if cmd.FleetID == "" || cmd.ControlGroupID != groupID {
+		return fleetCommandContext{}, false, nil
+	}
 	fleets, err := r.state.ListFleets(ctx)
 	if err != nil {
-		return esphttp.FleetRecord{}, false, err
+		return fleetCommandContext{}, false, err
 	}
 	for _, fleet := range fleets {
-		if fleet.Status == esphttp.FleetStatusActive &&
-			fleet.ControlGroupID == groupID &&
-			fleet.FleetID == cmd.FleetID &&
-			cmd.ControlGroupID == groupID {
-			return fleet, true, nil
+		if fleet.ControlGroupID != groupID || fleet.FleetID != cmd.FleetID {
+			continue
 		}
+		if fleet.Status != "" && fleet.Status != esphttp.FleetStatusActive {
+			return fleetCommandContext{}, false, nil
+		}
+		members, err := r.state.ListFleetMembers(ctx, fleet.FleetID)
+		if err != nil {
+			return fleetCommandContext{}, false, err
+		}
+		local, ok := fleetCommandMemberForNode(members, r.server.nodeID)
+		if !ok {
+			return fleetCommandContext{}, false, nil
+		}
+		return fleetCommandContext{
+			fleet:       fleet,
+			local:       local,
+			memberCount: len(members),
+			source:      "fleet_state",
+		}, true, nil
 	}
-	return esphttp.FleetRecord{}, false, nil
+	return r.commandContextFromControlRoster(ctx, groupID, cmd)
 }
 
-func (r *fleetCommandRunner) execute(ctx context.Context, fleet esphttp.FleetRecord, cmd esphttp.FleetCommandEnvelope) (string, error) {
+func (r *fleetCommandRunner) commandContextFromControlRoster(ctx context.Context, groupID entmoot.GroupID, cmd esphttp.FleetCommandEnvelope) (fleetCommandContext, bool, error) {
+	if r.server == nil || r.server.identity == nil || r.server.dataDir == "" {
+		return fleetCommandContext{}, false, nil
+	}
+	ok, err := r.groupMetadataMatchesFleet(ctx, groupID, cmd.FleetID)
+	if err != nil || !ok {
+		return fleetCommandContext{}, false, err
+	}
+	rlog, ok, err := openExistingRosterLog(r.server.dataDir, groupID)
+	if err != nil || !ok {
+		return fleetCommandContext{}, false, err
+	}
+	defer rlog.Close()
+	localInfo, ok := rlog.MemberInfo(r.server.nodeID)
+	if !ok || !bytes.Equal(localInfo.EntmootPubKey, r.server.identity.PublicKey) {
+		return fleetCommandContext{}, false, nil
+	}
+	founder, ok := rlog.Founder()
+	if !ok {
+		return fleetCommandContext{}, false, nil
+	}
+	role := esphttp.FleetRoleAgent
+	if founder.PilotNodeID == localInfo.PilotNodeID && bytes.Equal(founder.EntmootPubKey, localInfo.EntmootPubKey) {
+		role = esphttp.FleetRoleCoordinator
+	}
+	return fleetCommandContext{
+		fleet: esphttp.FleetRecord{
+			FleetID:        cmd.FleetID,
+			ControlGroupID: groupID,
+			Coordinator:    founder,
+			Status:         esphttp.FleetStatusActive,
+		},
+		local: esphttp.FleetMemberRecord{
+			FleetID:       cmd.FleetID,
+			NodeID:        localInfo.PilotNodeID,
+			EntmootPubKey: encodeBase64(localInfo.EntmootPubKey),
+			Role:          role,
+			Status:        esphttp.FleetMemberActive,
+		},
+		memberCount: len(rlog.Members()),
+		source:      "control_roster",
+	}, true, nil
+}
+
+func (r *fleetCommandRunner) groupMetadataMatchesFleet(ctx context.Context, groupID entmoot.GroupID, fleetID string) (bool, error) {
+	raw, ok, err := r.state.GetGroupMetadata(ctx, groupID)
+	if err != nil || !ok {
+		return false, err
+	}
+	return fleetControlMetadataMatches(raw, fleetID), nil
+}
+
+func (r *fleetCommandRunner) execute(ctx context.Context, commandCtx fleetCommandContext, cmd esphttp.FleetCommandEnvelope) (string, error) {
 	select {
 	case <-ctx.Done():
 		return "", ctx.Err()
@@ -189,7 +260,7 @@ func (r *fleetCommandRunner) execute(ctx context.Context, fleet esphttp.FleetRec
 	case esphttp.FleetCommandActionEntmootInfo:
 		return marshalCommandOutput(r.localInfo())
 	case esphttp.FleetCommandActionEntmootDoctor:
-		return marshalCommandOutput(r.localFleetState(ctx, fleet))
+		return marshalCommandOutput(r.localFleetState(ctx, commandCtx))
 	case esphttp.FleetCommandActionPilotInfo:
 		info, err := r.server.pilot.Info(ctx)
 		if err != nil {
@@ -197,7 +268,7 @@ func (r *fleetCommandRunner) execute(ctx context.Context, fleet esphttp.FleetRec
 		}
 		return marshalCommandOutput(redactCommandMap(info))
 	case esphttp.FleetCommandActionFleetLocalState:
-		return marshalCommandOutput(r.localFleetState(ctx, fleet))
+		return marshalCommandOutput(r.localFleetState(ctx, commandCtx))
 	default:
 		return "", fmt.Errorf("unsupported action")
 	}
@@ -217,13 +288,21 @@ func (r *fleetCommandRunner) localInfo() map[string]any {
 	}
 }
 
-func (r *fleetCommandRunner) localFleetState(ctx context.Context, fleet esphttp.FleetRecord) map[string]any {
-	members, _ := r.state.ListFleetMembers(ctx, fleet.FleetID)
+func (r *fleetCommandRunner) localFleetState(ctx context.Context, commandCtx fleetCommandContext) map[string]any {
+	memberCount := commandCtx.memberCount
+	source := commandCtx.source
+	if commandCtx.source == "fleet_state" {
+		members, err := r.state.ListFleetMembers(ctx, commandCtx.fleet.FleetID)
+		if err == nil {
+			memberCount = len(members)
+		}
+	}
 	return map[string]any{
-		"fleet_id":         fleet.FleetID,
-		"control_group_id": fleet.ControlGroupID,
+		"fleet_id":         commandCtx.fleet.FleetID,
+		"control_group_id": commandCtx.fleet.ControlGroupID,
 		"local_node_id":    r.server.nodeID,
-		"members":          len(members),
+		"members":          memberCount,
+		"source":           source,
 	}
 }
 

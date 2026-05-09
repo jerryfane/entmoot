@@ -1130,13 +1130,7 @@ func (e espOperationExecutor) createFleetControlGroup(ctx context.Context, contr
 		return entmoot.GroupID{}, err
 	}
 	if e.metadataStore != nil {
-		meta, err := json.Marshal(map[string]any{
-			"name":          "Fleet Control: " + name,
-			"description":   "Hidden Fleet control channel",
-			"hidden":        true,
-			"fleet_control": true,
-			"fleet_id":      fleetID,
-		})
+		meta, err := fleetControlGroupMetadata(fleetID, name)
 		if err != nil {
 			return entmoot.GroupID{}, err
 		}
@@ -1170,6 +1164,26 @@ func (e espOperationExecutor) createFleetControlGroup(ctx context.Context, contr
 	}
 	committed = true
 	return controlGID, nil
+}
+
+func fleetControlGroupMetadata(fleetID, name string) (json.RawMessage, error) {
+	return json.Marshal(map[string]any{
+		"name":          "Fleet Control: " + strings.TrimSpace(name),
+		"description":   "Hidden Fleet control channel",
+		"hidden":        true,
+		"fleet_control": true,
+		"fleet_id":      strings.TrimSpace(fleetID),
+	})
+}
+
+func fleetControlMetadataMatches(raw json.RawMessage, fleetID string) bool {
+	var metadata map[string]any
+	if err := json.Unmarshal(raw, &metadata); err != nil {
+		return false
+	}
+	fleetControl, _ := metadata["fleet_control"].(bool)
+	metadataFleetID, _ := metadata["fleet_id"].(string)
+	return fleetControl && strings.TrimSpace(metadataFleetID) == strings.TrimSpace(fleetID)
 }
 
 func (e espOperationExecutor) appendFleetActivity(ctx context.Context, fleetID, typ string, actor entmoot.NodeInfo, subject *entmoot.NodeInfo, summary string, metadata map[string]any) (esphttp.FleetActivityRecord, error) {
@@ -1741,8 +1755,12 @@ func (e espOperationExecutor) createFleetInvite(ctx context.Context, req esphttp
 	}
 	activityApplied = true
 	activityID = activity.EventID
+	descriptor, err := newFleetInviteDescriptor(fleet, resp.Invite)
+	if err != nil {
+		return nil, err
+	}
 	committed = true
-	return json.Marshal(map[string]any{"status": "invited", "fleet": fleet, "member": member, "invite": invite, "activity": activity})
+	return json.Marshal(map[string]any{"status": "invited", "fleet": fleet, "member": member, "invite": invite, "join_invite": descriptor, "activity": activity})
 }
 
 func (e espOperationExecutor) removeFleetMember(ctx context.Context, req esphttp.SignRequest) (json.RawMessage, error) {

@@ -200,6 +200,9 @@ func cmdJoin(gf *globalFlags, args []string) int {
 					}
 					return code, fmt.Errorf("add group %s: %w", invite.GroupID.String(), err)
 				}
+				if err := persistJoinGroupMetadata(ctx, loadCtx.metadataStore, invite.GroupID, input.groupMetadata); err != nil {
+					return exitTransport, fmt.Errorf("persist group metadata %s: %w", invite.GroupID.String(), err)
+				}
 				acceptedInvites[invite.GroupID] = *invite
 			}
 			runtime.SetJoinHealthInvites(acceptedInvites)
@@ -287,6 +290,7 @@ func joinInputOverIPC(ctx context.Context, sockPath string, input joinInput, tim
 	default:
 		return nil, nil, fmt.Errorf("invite %s: no signed invite or open invite descriptor", input.source)
 	}
+	req.GroupMetadata = append(json.RawMessage(nil), input.groupMetadata...)
 	return joinGroupReqOverIPC(ctx, sockPath, req, timeout)
 }
 
@@ -393,6 +397,7 @@ type groupDaemonLoadContext struct {
 	identity        *keystore.Identity
 	pilot           pilotInfoSigner
 	pilotSocketPath string
+	metadataStore   esphttp.GroupMetadataStore
 }
 
 type pilotInfoSigner interface {
@@ -556,6 +561,7 @@ func runGroupDaemon(gf *globalFlags, opts groupDaemonOptions) int {
 		identity:        s.identity,
 		pilot:           tr.Driver(),
 		pilotSocketPath: gf.socket,
+		metadataStore:   fleetState,
 	}); err != nil {
 		if code == exitInvalidArgument || code == exitNotMember || code == exitGroupNotFound {
 			fmt.Fprintf(os.Stderr, "%s: %v\n", opts.command, err)
@@ -628,6 +634,7 @@ func runGroupDaemon(gf *globalFlags, opts groupDaemonOptions) int {
 		notify:                   notifyStore,
 		pilot:                    tr.Driver(),
 		pilotLookupNodeSupported: pilotLookupNodeSupported,
+		metadataStore:            fleetState,
 	}
 	commandRunner := newFleetCommandRunner(srv, fleetState, notifyStore, slog.Default())
 
@@ -726,9 +733,10 @@ var errInviteMalformed = errors.New("invite malformed")
 var errFetchFailed = errors.New("invite fetch failed")
 
 type joinInput struct {
-	source     string
-	invite     *entmoot.Invite
-	openInvite *openInviteAcceptPayload
+	source        string
+	invite        *entmoot.Invite
+	openInvite    *openInviteAcceptPayload
+	groupMetadata json.RawMessage
 }
 
 // loadJoinInput reads a join input from arg (file path, http(s) URL, or
@@ -750,6 +758,13 @@ func loadJoinInput(arg string) (joinInput, error) {
 			return joinInput{}, err
 		}
 		return joinInput{source: arg, openInvite: payload}, nil
+	}
+	if input, ok, err := parseFleetInviteDescriptor(raw); ok || err != nil {
+		if err != nil {
+			return joinInput{}, err
+		}
+		input.source = arg
+		return input, nil
 	}
 	invite, err := parseSignedInvite(raw)
 	if err != nil {
@@ -815,6 +830,77 @@ func parseSignedInvite(raw []byte) (*entmoot.Invite, error) {
 		}
 	}
 	return &invite, nil
+}
+
+const fleetInviteDescriptorType = "entmoot.fleet_invite.v1"
+
+type fleetInviteDescriptor struct {
+	Type           string          `json:"type,omitempty"`
+	FleetID        string          `json:"fleet_id"`
+	FleetName      string          `json:"fleet_name,omitempty"`
+	ControlGroupID entmoot.GroupID `json:"control_group_id,omitempty"`
+	Invite         entmoot.Invite  `json:"invite"`
+	GroupMetadata  json.RawMessage `json:"group_metadata,omitempty"`
+}
+
+func newFleetInviteDescriptor(fleet esphttp.FleetRecord, invite entmoot.Invite) (fleetInviteDescriptor, error) {
+	metadata, err := fleetControlGroupMetadata(fleet.FleetID, fleet.Name)
+	if err != nil {
+		return fleetInviteDescriptor{}, err
+	}
+	return fleetInviteDescriptor{
+		Type:           fleetInviteDescriptorType,
+		FleetID:        fleet.FleetID,
+		FleetName:      fleet.Name,
+		ControlGroupID: fleet.ControlGroupID,
+		Invite:         invite,
+		GroupMetadata:  metadata,
+	}, nil
+}
+
+func parseFleetInviteDescriptor(raw []byte) (joinInput, bool, error) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return joinInput{}, false, nil
+	}
+	if !hasJSONField(fields, "fleet_id") && !hasJSONField(fields, "group_metadata") {
+		return joinInput{}, false, nil
+	}
+	if !hasJSONField(fields, "invite") {
+		return joinInput{}, false, nil
+	}
+	var desc fleetInviteDescriptor
+	if err := json.Unmarshal(raw, &desc); err != nil {
+		return joinInput{}, true, fmt.Errorf("%w: fleet invite descriptor: %v", errInviteMalformed, err)
+	}
+	if desc.Type != "" && desc.Type != fleetInviteDescriptorType {
+		return joinInput{}, true, fmt.Errorf("%w: unsupported fleet invite descriptor type %q", errInviteMalformed, desc.Type)
+	}
+	desc.FleetID = strings.TrimSpace(desc.FleetID)
+	if desc.FleetID == "" {
+		return joinInput{}, true, fmt.Errorf("%w: fleet invite descriptor requires fleet_id", errInviteMalformed)
+	}
+	if desc.Invite.GroupID == (entmoot.GroupID{}) {
+		return joinInput{}, true, fmt.Errorf("%w: fleet invite descriptor requires a signed invite", errInviteMalformed)
+	}
+	if desc.ControlGroupID != (entmoot.GroupID{}) && desc.ControlGroupID != desc.Invite.GroupID {
+		return joinInput{}, true, fmt.Errorf("%w: fleet invite descriptor control_group_id does not match invite", errInviteMalformed)
+	}
+	metadata := desc.GroupMetadata
+	if len(bytes.TrimSpace(metadata)) == 0 {
+		var err error
+		metadata, err = fleetControlGroupMetadata(desc.FleetID, desc.FleetName)
+		if err != nil {
+			return joinInput{}, true, fmt.Errorf("%w: fleet invite descriptor metadata: %v", errInviteMalformed, err)
+		}
+	} else if _, err := esphttp.NormalizeGroupMetadata(metadata); err != nil {
+		return joinInput{}, true, fmt.Errorf("%w: fleet invite descriptor metadata: %v", errInviteMalformed, err)
+	}
+	if !fleetControlMetadataMatches(metadata, desc.FleetID) {
+		return joinInput{}, true, fmt.Errorf("%w: fleet invite descriptor metadata does not match fleet_id", errInviteMalformed)
+	}
+	invite := desc.Invite
+	return joinInput{invite: &invite, groupMetadata: metadata}, true, nil
 }
 
 func parseOpenInviteDescriptor(raw []byte) (*openInviteAcceptPayload, bool, error) {
@@ -1154,6 +1240,7 @@ type ipcServer struct {
 	notify                   *notifyingStore
 	pilot                    *ipcclient.Driver
 	pilotLookupNodeSupported bool
+	metadataStore            esphttp.GroupMetadataStore
 }
 
 // acceptLoop accepts IPC connections until the listener is closed.
@@ -1528,6 +1615,15 @@ func (s *ipcServer) handleJoinGroup(ctx context.Context, c net.Conn, req *ipc.Jo
 		})
 		return
 	}
+	if err := persistJoinGroupMetadata(joinCtx, s.metadataStore, invite.GroupID, req.GroupMetadata); err != nil {
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
+			Type:    "error",
+			Code:    ipc.CodeInternal,
+			GroupID: &invite.GroupID,
+			Message: "join group: persist group metadata: " + err.Error(),
+		})
+		return
+	}
 	status := "already_joined"
 	if created {
 		status = "joined"
@@ -1539,6 +1635,16 @@ func (s *ipcServer) handleJoinGroup(ctx context.Context, c net.Conn, req *ipc.Jo
 		Members:   len(sess.roster.Members()),
 		Readiness: s.joinReadinessEvent(ctx),
 	})
+}
+
+func persistJoinGroupMetadata(ctx context.Context, metadataStore esphttp.GroupMetadataStore, groupID entmoot.GroupID, metadata json.RawMessage) error {
+	if metadataStore == nil || len(bytes.TrimSpace(metadata)) == 0 {
+		return nil
+	}
+	if _, err := esphttp.NormalizeGroupMetadata(metadata); err != nil {
+		return err
+	}
+	return metadataStore.SetGroupMetadata(ctx, groupID, metadata)
 }
 
 func (s *ipcServer) resolveJoinGroupInvite(ctx context.Context, req *ipc.JoinGroupReq) (entmoot.Invite, error) {

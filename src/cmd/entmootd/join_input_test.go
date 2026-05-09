@@ -50,6 +50,40 @@ func TestLoadJoinInputClassifiesSignedInvite(t *testing.T) {
 	}
 }
 
+func TestLoadJoinInputClassifiesFleetInviteDescriptor(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "fleet-invite.json")
+	gid := testESPGroupID(77)
+	raw, err := json.Marshal(fleetInviteDescriptor{
+		Type:           fleetInviteDescriptorType,
+		FleetID:        "fleet-a",
+		FleetName:      "Fleet A",
+		ControlGroupID: gid,
+		Invite: entmoot.Invite{
+			GroupID:    gid,
+			Founder:    entmoot.NodeInfo{PilotNodeID: 1, EntmootPubKey: make([]byte, 32)},
+			Issuer:     entmoot.NodeInfo{PilotNodeID: 1, EntmootPubKey: make([]byte, 32)},
+			IssuedAt:   1,
+			ValidUntil: 0,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Marshal descriptor: %v", err)
+	}
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	input, err := loadJoinInput(path)
+	if err != nil {
+		t.Fatalf("loadJoinInput: %v", err)
+	}
+	if input.invite == nil || input.openInvite != nil {
+		t.Fatalf("input = %+v, want fleet invite descriptor", input)
+	}
+	if !fleetControlMetadataMatches(input.groupMetadata, "fleet-a") {
+		t.Fatalf("group metadata = %s, want Fleet control metadata", input.groupMetadata)
+	}
+}
+
 func TestLoadJoinInputClassifiesOpenInviteDescriptor(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "open-invite.json")
 	raw := `{"issuer_url":"https://esp.example.com/base","token":"open-token","group_id":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","max_uses":5}`

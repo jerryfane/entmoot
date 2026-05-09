@@ -169,9 +169,10 @@ type SignedPublishResp struct {
 // the running daemon. The daemon resolves and joins through the same gossip
 // bootstrap path as startup join.
 type JoinGroupReq struct {
-	Invite     entmoot.Invite  `json:"invite,omitempty"`
-	OpenInvite *OpenInviteJoin `json:"open_invite,omitempty"`
-	TimeoutMS  int64           `json:"timeout_ms,omitempty"`
+	Invite        entmoot.Invite  `json:"invite,omitempty"`
+	OpenInvite    *OpenInviteJoin `json:"open_invite,omitempty"`
+	GroupMetadata json.RawMessage `json:"group_metadata,omitempty"`
+	TimeoutMS     int64           `json:"timeout_ms,omitempty"`
 }
 
 // OpenInviteJoin describes an open invite that must be redeemed by the daemon
