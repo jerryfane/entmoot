@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.51] - 2026-05-09
+
+### Added
+
+- **Fleet command protocol.** Fleet coordinators can now publish signed,
+  allowlisted commands to Fleet agents through the Fleet control group.
+- **Agent auto-accept runner.** `entmootd serve` now watches Fleet command
+  messages and auto-accepts safe read-only actions such as Entmoot info,
+  Entmoot version, Pilot info, Fleet local state, diagnostics snapshots, and
+  echo.
+- **Fleet command CLI.** Added `entmootd fleet commands catalog` and
+  `entmootd fleet commands send` for coordinator command dispatch.
+
 ## [1.5.50] - 2026-05-09
 
 ### Added
