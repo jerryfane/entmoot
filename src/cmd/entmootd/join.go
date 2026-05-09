@@ -458,6 +458,12 @@ func runGroupDaemon(gf *globalFlags, opts groupDaemonOptions) int {
 		return exitTransport
 	}
 	defer func() { _ = rawStore.Close() }()
+	fleetState, err := esphttp.OpenSQLiteStateStore(s.dataDir)
+	if err != nil {
+		slog.Error(opts.command+": open fleet state", slog.String("err", err.Error()))
+		return exitTransport
+	}
+	defer fleetState.Close()
 
 	// Wrap the store so IPC tail subscribers and service integrations see
 	// new messages as they land. The gossip/publish path writes through this
@@ -623,6 +629,7 @@ func runGroupDaemon(gf *globalFlags, opts groupDaemonOptions) int {
 		pilot:                    tr.Driver(),
 		pilotLookupNodeSupported: pilotLookupNodeSupported,
 	}
+	commandRunner := newFleetCommandRunner(srv, fleetState, notifyStore, slog.Default())
 
 	wg.Add(1)
 	go func() {
@@ -632,6 +639,11 @@ func runGroupDaemon(gf *globalFlags, opts groupDaemonOptions) int {
 			_ = listener.Close()
 		}()
 		srv.acceptLoop(rootCtx, listener)
+	}()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		commandRunner.run(rootCtx)
 	}()
 
 	// Emit the one-line "joined" event on stdout.
@@ -1272,45 +1284,50 @@ func (s *ipcServer) handlePublish(ctx context.Context, c net.Conn, req *ipc.Publ
 	if !ok {
 		return
 	}
+	resp, frame := s.publishLocalMessage(ctx, gid, req.Topics, req.Content)
+	if frame != nil {
+		_ = ipc.EncodeAndWrite(c, frame)
+		return
+	}
+	_ = ipc.EncodeAndWrite(c, resp)
+}
+
+func (s *ipcServer) publishLocalMessage(ctx context.Context, gid entmoot.GroupID, topics []string, content []byte) (*ipc.PublishResp, *ipc.ErrorFrame) {
 	sess, ok := s.runtime.Get(gid)
 	if !ok {
-		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
+		return nil, &ipc.ErrorFrame{
 			Type:    "error",
 			Code:    ipc.CodeGroupNotFound,
 			GroupID: &gid,
 			Message: "group not joined",
-		})
-		return
+		}
 	}
-	if len(req.Topics) == 0 {
-		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
+	if len(topics) == 0 {
+		return nil, &ipc.ErrorFrame{
 			Type:    "error",
 			Code:    ipc.CodeInvalidArgument,
 			Message: "no topics supplied",
-		})
-		return
+		}
 	}
-	for _, t := range req.Topics {
+	for _, t := range topics {
 		// We don't call topic.ValidPattern here because topics on a
 		// message are concrete strings, not patterns. We just reject
 		// empty topics defensively.
 		if t == "" {
-			_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
+			return nil, &ipc.ErrorFrame{
 				Type:    "error",
 				Code:    ipc.CodeInvalidArgument,
 				Message: "empty topic",
-			})
-			return
+			}
 		}
 	}
 	if !sess.roster.IsMember(s.nodeID) {
-		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
+		return nil, &ipc.ErrorFrame{
 			Type:    "error",
 			Code:    ipc.CodeNotMember,
 			GroupID: &gid,
 			Message: fmt.Sprintf("local node %d is not a member", s.nodeID),
-		})
-		return
+		}
 	}
 
 	// Build and sign the Message. Author pubkey comes from the
@@ -1329,8 +1346,8 @@ func (s *ipcServer) handlePublish(ctx context.Context, c net.Conn, req *ipc.Publ
 		GroupID:   gid,
 		Author:    author,
 		Timestamp: now,
-		Topics:    append([]string(nil), req.Topics...),
-		Content:   append([]byte(nil), req.Content...),
+		Topics:    append([]string(nil), topics...),
+		Content:   append([]byte(nil), content...),
 	}
 
 	// Parent selection mirrors v0's cmdPublish: include up to 3 of
@@ -1347,37 +1364,34 @@ func (s *ipcServer) handlePublish(ctx context.Context, c net.Conn, req *ipc.Publ
 
 	signer, err := signing.NewLocalSigner(author, s.identity)
 	if err != nil {
-		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
+		return nil, &ipc.ErrorFrame{
 			Type:    "error",
 			Code:    ipc.CodeInternal,
 			Message: "local signer: " + err.Error(),
-		})
-		return
+		}
 	}
 	msg, err = signing.SignMessage(ctx, signer, msg)
 	if err != nil {
-		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
+		return nil, &ipc.ErrorFrame{
 			Type:    "error",
 			Code:    ipc.CodeInternal,
 			Message: "sign message: " + err.Error(),
-		})
-		return
+		}
 	}
 
 	if err := sess.gossip.Publish(ctx, msg); err != nil {
-		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
+		return nil, &ipc.ErrorFrame{
 			Type:    "error",
 			Code:    ipc.CodeInternal,
 			Message: "gossiper.Publish: " + err.Error(),
-		})
-		return
+		}
 	}
 
-	_ = ipc.EncodeAndWrite(c, &ipc.PublishResp{
+	return &ipc.PublishResp{
 		MessageID:   msg.ID,
 		GroupID:     gid,
 		TimestampMS: now,
-	})
+	}, nil
 }
 
 func (s *ipcServer) handleDiagProbe(ctx context.Context, c net.Conn, req *ipc.DiagProbeReq) {

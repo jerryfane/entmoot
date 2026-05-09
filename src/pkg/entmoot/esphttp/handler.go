@@ -365,6 +365,10 @@ type TaskEventPublisher interface {
 	PublishTaskEvent(context.Context, entmoot.GroupID, []string, []byte) (PublishResult, error)
 }
 
+type TaskEventPublisherInfo interface {
+	LocalNodeInfo(context.Context) (entmoot.NodeInfo, error)
+}
+
 // PublishResult is the HTTP response for an accepted phone-signed message.
 type PublishResult struct {
 	Status      string            `json:"status"`
@@ -650,6 +654,14 @@ func (h *Handler) handleFleetSubroute(w http.ResponseWriter, r *http.Request) bo
 		default:
 			methodNotAllowed(w, http.MethodGet+", "+http.MethodPost)
 		}
+	case "commands":
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w, http.MethodPost)
+			return true
+		}
+		h.withIdempotency(w, r, fleetTaskIdempotencyScope(r, "fleet_command_create:"+fleetID), func(w http.ResponseWriter, r *http.Request) {
+			h.handleCreateFleetCommand(w, r, fleetID)
+		})
 	case "diagnostics":
 		if r.Method != http.MethodGet {
 			methodNotAllowed(w, http.MethodGet)
@@ -1185,6 +1197,190 @@ type fleetTaskEventEnvelope struct {
 	ActorNodeID    entmoot.NodeID  `json:"actor_node_id"`
 	Summary        string          `json:"summary"`
 	CreatedAtMS    int64           `json:"created_at_ms"`
+}
+
+type fleetCommandCreateRequest struct {
+	Target       string          `json:"target"`
+	TargetNodeID uint64          `json:"target_node_id"`
+	Action       string          `json:"action"`
+	Args         json.RawMessage `json:"args"`
+	AutoAccept   *bool           `json:"auto_accept"`
+	ExpiresAtMS  int64           `json:"expires_at_ms"`
+}
+
+func (h *Handler) handleCreateFleetCommand(w http.ResponseWriter, r *http.Request, fleetID string) {
+	fleet, actor, ok := h.fleetTaskCoordinator(w, r, fleetID)
+	if !ok {
+		return
+	}
+	if h.taskEvents == nil {
+		writeError(w, http.StatusServiceUnavailable, "join_unavailable", "no running join publisher configured")
+		return
+	}
+	var req fleetCommandCreateRequest
+	rawBody, ok := decodeRawBody(w, r, 1<<20, &req)
+	if !ok {
+		return
+	}
+	action := NormalizeFleetCommandAction(req.Action)
+	entry, found := FleetCommandCatalogLookup(action)
+	if !found {
+		writeError(w, http.StatusBadRequest, "bad_request", "unsupported fleet command action")
+		return
+	}
+	autoAccept := true
+	if req.AutoAccept != nil {
+		autoAccept = *req.AutoAccept
+	}
+	if autoAccept && !entry.AutoAcceptSafe {
+		writeError(w, http.StatusBadRequest, "bad_request", "command is not safe for auto-accept")
+		return
+	}
+	args, err := DecodeFleetCommandArgs(req.Args)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+	targetKind := NormalizeFleetCommandTarget(req.Target)
+	target := FleetCommandTarget{Kind: targetKind}
+	var subject *entmoot.NodeInfo
+	if targetKind == FleetCommandTargetNode {
+		nodeID, err := fleetTaskNodeIDFromRequest(req.TargetNodeID)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+			return
+		}
+		member, found, err := h.fleetMemberByNode(r.Context(), fleet.FleetID, nodeID)
+		if err != nil {
+			h.logger.Error("esphttp: fleet command target lookup", slog.String("err", err.Error()))
+			writeError(w, http.StatusInternalServerError, "internal_error", "fleet member lookup failed")
+			return
+		}
+		if !found || !FleetTaskCanMutate(member) {
+			writeError(w, http.StatusBadRequest, "bad_request", "target must be an active fleet member")
+			return
+		}
+		target.PilotNodeID = nodeID
+		info := FleetTaskActorFromMember(member)
+		subject = &info
+	} else if targetKind != FleetCommandTargetAll {
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid command target")
+		return
+	}
+	now := h.clock().UnixMilli()
+	expiresAtMS := req.ExpiresAtMS
+	if expiresAtMS == 0 {
+		if auth := authFromContext(r); auth.member != nil && auth.member.TimestampMS > 0 {
+			expiresAtMS = auth.member.TimestampMS + DefaultFleetCommandTTL.Milliseconds()
+		} else {
+			expiresAtMS = now + DefaultFleetCommandTTL.Milliseconds()
+		}
+	}
+	if expiresAtMS <= now {
+		writeError(w, http.StatusBadRequest, "bad_request", "command expiration must be in the future")
+		return
+	}
+	auth := authFromContext(r)
+	var issuerProof *FleetCommandIssuerProof
+	var commandID string
+	if auth.member != nil {
+		issuerProof = fleetCommandIssuerProofFromMember(*auth.member, rawBody)
+		commandID = FleetCommandIDFromIssuerProofMaterial(*issuerProof)
+	} else {
+		var err error
+		commandID, err = NewFleetCommandID()
+		if err != nil {
+			h.logger.Error("esphttp: fleet command id", slog.String("err", err.Error()))
+			writeError(w, http.StatusInternalServerError, "internal_error", "fleet command creation failed")
+			return
+		}
+	}
+	command := FleetCommandEnvelope{
+		Type:           FleetCommandMessageType,
+		Version:        1,
+		CommandID:      commandID,
+		FleetID:        fleet.FleetID,
+		ControlGroupID: fleet.ControlGroupID,
+		IssuerNodeID:   actor.NodeID,
+		Target:         target,
+		Action:         action,
+		Args:           args,
+		AutoAccept:     autoAccept,
+		CreatedAtMS:    now,
+		ExpiresAtMS:    expiresAtMS,
+		IssuerProof:    issuerProof,
+	}
+	if auth.member == nil {
+		if ok, err := h.taskEventPublisherMatchesCoordinator(r.Context(), fleet.Coordinator); err != nil {
+			h.logger.Error("esphttp: fleet command publisher identity", slog.String("err", err.Error()))
+			writeError(w, http.StatusServiceUnavailable, "join_unavailable", "fleet command publisher identity is unavailable")
+			return
+		} else if !ok {
+			writeError(w, http.StatusConflict, "coordinator_publisher_required", "fleet commands require the local publisher to match the Fleet coordinator")
+			return
+		}
+	}
+	body, err := json.Marshal(command)
+	if err != nil {
+		h.logger.Error("esphttp: marshal fleet command", slog.String("err", err.Error()))
+		writeError(w, http.StatusInternalServerError, "internal_error", "fleet command creation failed")
+		return
+	}
+	publishResult, err := h.taskEvents.PublishTaskEvent(r.Context(), fleet.ControlGroupID, []string{"fleet/commands"}, body)
+	if err != nil {
+		h.writePublishResult(w, publishResult, err)
+		return
+	}
+	response := map[string]any{
+		"command":        command,
+		"publish_result": publishResult,
+	}
+	metadata, _ := json.Marshal(map[string]any{
+		"command_id": command.CommandID,
+		"action":     command.Action,
+		"target":     command.Target,
+	})
+	activity, err := h.state.AppendFleetActivity(r.Context(), FleetActivityRecord{
+		FleetID:     fleet.FleetID,
+		Type:        "command.sent",
+		Actor:       FleetTaskActorFromMember(actor),
+		Subject:     subject,
+		Summary:     "Command sent",
+		Metadata:    metadata,
+		CreatedAtMS: now,
+	})
+	if err != nil {
+		h.logger.Warn("esphttp: append fleet command activity failed after publish", slog.String("fleet_id", fleet.FleetID), slog.String("command_id", command.CommandID), slog.String("err", err.Error()))
+	} else {
+		response["activity"] = activity
+	}
+	writeJSON(w, http.StatusAccepted, response)
+}
+
+func fleetCommandIssuerProofFromMember(auth MemberAuth, body []byte) *FleetCommandIssuerProof {
+	return &FleetCommandIssuerProof{
+		Scheme:        FleetCommandIssuerProofMemberV1,
+		NodeID:        auth.NodeID,
+		EntmootPubKey: base64.StdEncoding.EncodeToString(auth.EntmootPubKey),
+		Method:        strings.ToUpper(strings.TrimSpace(auth.Method)),
+		Path:          auth.Path,
+		TimestampMS:   auth.TimestampMS,
+		Nonce:         auth.Nonce,
+		Body:          append([]byte(nil), body...),
+		Signature:     auth.Signature,
+	}
+}
+
+func (h *Handler) taskEventPublisherMatchesCoordinator(ctx context.Context, coordinator entmoot.NodeInfo) (bool, error) {
+	infoProvider, ok := h.taskEvents.(TaskEventPublisherInfo)
+	if !ok {
+		return false, nil
+	}
+	info, err := infoProvider.LocalNodeInfo(ctx)
+	if err != nil {
+		return false, err
+	}
+	return info.PilotNodeID == coordinator.PilotNodeID && bytes.Equal(info.EntmootPubKey, coordinator.EntmootPubKey), nil
 }
 
 func (h *Handler) persistFleetTaskMutation(ctx context.Context, mutation FleetTaskMutation, actor FleetMemberRecord) (FleetTaskRecord, FleetActivityRecord, FleetTaskSubmissionRecord, error) {
@@ -2550,6 +2746,11 @@ type authContext struct {
 type MemberAuth struct {
 	NodeID        entmoot.NodeID `json:"node_id"`
 	EntmootPubKey []byte         `json:"entmoot_pubkey"`
+	Method        string         `json:"-"`
+	Path          string         `json:"-"`
+	TimestampMS   int64          `json:"-"`
+	Nonce         string         `json:"-"`
+	Signature     string         `json:"-"`
 }
 
 func (h *Handler) authorize(w http.ResponseWriter, r *http.Request) (authContext, bool) {
@@ -2634,7 +2835,10 @@ func memberAuthAllowedForRequest(r *http.Request) bool {
 	if !ok {
 		return false
 	}
-	return suffix == "tasks" || strings.HasPrefix(suffix, "tasks/")
+	return suffix == "tasks" ||
+		strings.HasPrefix(suffix, "tasks/") ||
+		suffix == "commands" ||
+		strings.HasPrefix(suffix, "commands/")
 }
 
 func (h *Handler) bufferBodyForAuth(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
@@ -2758,7 +2962,15 @@ func (h *Handler) memberAuthFromRequest(r *http.Request, body []byte) (authConte
 	if !h.nonceCache.use(nonceKey, nonce, now.Add(deviceAuthSkew)) {
 		return authContext{}, "replayed nonce", false
 	}
-	return authContext{member: &MemberAuth{NodeID: entmoot.NodeID(node64), EntmootPubKey: append([]byte(nil), pub...)}}, "", true
+	return authContext{member: &MemberAuth{
+		NodeID:        entmoot.NodeID(node64),
+		EntmootPubKey: append([]byte(nil), pub...),
+		Method:        r.Method,
+		Path:          r.URL.RequestURI(),
+		TimestampMS:   tsMillis,
+		Nonce:         nonce,
+		Signature:     strings.TrimSpace(r.Header.Get(memberSignatureHeader)),
+	}}, "", true
 }
 
 // DeviceSigningInput returns the canonical bytes a device signs for one ESP

@@ -711,7 +711,7 @@ func TestHandlerFleetTasksMemberAuthAndEvents(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("CreateFleetInvite: %v", err)
 	}
-	taskEvents := &fakeTaskEventPublisher{}
+	taskEvents := &fakeTaskEventPublisher{localInfo: coordinator}
 	catalog := &fakeCatalog{members: []MemberSummary{
 		{NodeID: coordinator.PilotNodeID, EntmootPubKey: base64.StdEncoding.EncodeToString(coordinator.EntmootPubKey), Hostname: "vps"},
 		{NodeID: 45493, EntmootPubKey: base64.StdEncoding.EncodeToString(agentPub), Hostname: "deimos"},
@@ -790,6 +790,74 @@ func TestHandlerFleetTasksMemberAuthAndEvents(t *testing.T) {
 	forbidden := doMemberSignedJSONRequest[errorEnvelope](t, handler, 45493, otherPriv, http.MethodGet, "/v1/fleets/fleet-member-tasks/tasks", nil, http.StatusForbidden, 30_003, "nonce-member-wrong-key")
 	if forbidden.Error.Code != "forbidden" {
 		t.Fatalf("wrong key error = %+v", forbidden.Error)
+	}
+}
+
+func TestHandlerFleetCommandsCoordinatorPublishesSafeCommand(t *testing.T) {
+	gid := testGroupID(94)
+	coordinatorPub, coordinatorPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey coordinator: %v", err)
+	}
+	agentPub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey agent: %v", err)
+	}
+	reg, err := NewDeviceRegistry([]Device{{
+		ID:        "ios-1-device",
+		PublicKey: coordinatorPub,
+	}})
+	if err != nil {
+		t.Fatalf("NewDeviceRegistry: %v", err)
+	}
+	state := NewMemoryStateStore()
+	coordinator := entmoot.NodeInfo{PilotNodeID: 45491, EntmootPubKey: coordinatorPub}
+	if _, err := state.CreateFleet(context.Background(), FleetRecord{
+		FleetID:             "fleet-commands",
+		Name:                "Fleet Commands",
+		ControlGroupID:      gid,
+		Coordinator:         coordinator,
+		CoordinatorDeviceID: "ios-1-device",
+		Status:              FleetStatusActive,
+		CreatedAtMS:         1,
+	}); err != nil {
+		t.Fatalf("CreateFleet: %v", err)
+	}
+	for _, member := range []FleetMemberRecord{
+		{FleetID: "fleet-commands", NodeID: coordinator.PilotNodeID, EntmootPubKey: base64.StdEncoding.EncodeToString(coordinator.EntmootPubKey), Role: FleetRoleCoordinator, Status: FleetMemberActive},
+		{FleetID: "fleet-commands", NodeID: 45493, EntmootPubKey: base64.StdEncoding.EncodeToString(agentPub), Role: FleetRoleAgent, Status: FleetMemberActive},
+	} {
+		if _, err := state.UpsertFleetMember(context.Background(), member); err != nil {
+			t.Fatalf("UpsertFleetMember: %v", err)
+		}
+	}
+	taskEvents := &fakeTaskEventPublisher{localInfo: coordinator}
+	handler := testMobileHandlerFull(t, gid, reg, nil, func() time.Time { return time.UnixMilli(40_000) }, nil, state, nil)
+	handler.(*Handler).taskEvents = taskEvents
+
+	created := doSignedJSONRequest[struct {
+		Command  FleetCommandEnvelope `json:"command"`
+		Activity FleetActivityRecord  `json:"activity"`
+	}](t, handler, coordinatorPriv, http.MethodPost, "/v1/fleets/fleet-commands/commands", map[string]any{
+		"target":         FleetCommandTargetNode,
+		"target_node_id": 45493,
+		"action":         FleetCommandActionEntmootInfo,
+	}, http.StatusAccepted, 40_000, "nonce-command-create")
+	if created.Command.Action != FleetCommandActionEntmootInfo || created.Command.Target.PilotNodeID != 45493 || !created.Command.AutoAccept {
+		t.Fatalf("command = %+v", created.Command)
+	}
+	if created.Activity.Type != "command.sent" {
+		t.Fatalf("activity = %+v", created.Activity)
+	}
+	if len(taskEvents.events) != 1 || taskEvents.events[0].groupID != gid || taskEvents.events[0].topics[0] != "fleet/commands" {
+		t.Fatalf("command events = %+v", taskEvents.events)
+	}
+	var event FleetCommandEnvelope
+	if err := json.Unmarshal(taskEvents.events[0].content, &event); err != nil {
+		t.Fatalf("command event decode: %v", err)
+	}
+	if event.CommandID != created.Command.CommandID || event.Type != FleetCommandMessageType {
+		t.Fatalf("command event = %+v", event)
 	}
 }
 
@@ -2216,8 +2284,10 @@ type fakePublisher struct {
 }
 
 type fakeTaskEventPublisher struct {
-	events []fakeTaskEvent
-	err    error
+	events    []fakeTaskEvent
+	err       error
+	localInfo entmoot.NodeInfo
+	infoErr   error
 }
 
 type fakeTaskEvent struct {
@@ -2312,6 +2382,16 @@ func (p *fakeTaskEventPublisher) PublishTaskEvent(_ context.Context, groupID ent
 		return PublishResult{}, p.err
 	}
 	return PublishResult{Status: "accepted", GroupID: groupID}, nil
+}
+
+func (p *fakeTaskEventPublisher) LocalNodeInfo(_ context.Context) (entmoot.NodeInfo, error) {
+	if p.infoErr != nil {
+		return entmoot.NodeInfo{}, p.infoErr
+	}
+	return entmoot.NodeInfo{
+		PilotNodeID:   p.localInfo.PilotNodeID,
+		EntmootPubKey: append([]byte(nil), p.localInfo.EntmootPubKey...),
+	}, nil
 }
 
 func mustMailboxService(t *testing.T, gid entmoot.GroupID) *mailbox.Service {

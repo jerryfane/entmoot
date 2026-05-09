@@ -399,6 +399,17 @@ func (p controlSocketTaskEventPublisher) PublishTaskEvent(ctx context.Context, g
 	}
 }
 
+func (p controlSocketTaskEventPublisher) LocalNodeInfo(ctx context.Context) (entmoot.NodeInfo, error) {
+	info, err := infoOverIPCContext(ctx, p.socketPath)
+	if err != nil {
+		return entmoot.NodeInfo{}, err
+	}
+	return entmoot.NodeInfo{
+		PilotNodeID:   info.PilotNodeID,
+		EntmootPubKey: append([]byte(nil), info.EntmootPubKey...),
+	}, nil
+}
+
 func publishHTTPError(frame *ipc.ErrorFrame) error {
 	if frame == nil {
 		return &esphttp.PublishError{
