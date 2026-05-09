@@ -47,6 +47,7 @@ type Config struct {
 	Clock       func() time.Time
 	Service     *mailbox.Service
 	Publisher   Publisher
+	TaskEvents  TaskEventPublisher
 	Operations  OperationExecutor
 	Notifier    espnotify.Notifier
 	State       StateStore
@@ -66,15 +67,19 @@ const (
 )
 
 const (
-	deviceIDHeader    = "X-Entmoot-Device-ID"
-	idempotencyHeader = "Idempotency-Key"
-	timestampHeader   = "X-Entmoot-Timestamp-Ms"
-	nonceHeader       = "X-Entmoot-Nonce"
-	signatureHeader   = "X-Entmoot-Signature"
-	deviceAuthVersion = "ENTMOOT-ESP-AUTH-V1"
-	deviceAuthSkew    = 5 * time.Minute
-	maxAuthBodyBytes  = 16 << 20
-	maxListLimit      = 200
+	deviceIDHeader        = "X-Entmoot-Device-ID"
+	memberNodeHeader      = "X-Entmoot-Member-Node-ID"
+	memberPubKeyHeader    = "X-Entmoot-Member-Pubkey"
+	memberSignatureHeader = "X-Entmoot-Member-Signature"
+	idempotencyHeader     = "Idempotency-Key"
+	timestampHeader       = "X-Entmoot-Timestamp-Ms"
+	nonceHeader           = "X-Entmoot-Nonce"
+	signatureHeader       = "X-Entmoot-Signature"
+	deviceAuthVersion     = "ENTMOOT-ESP-AUTH-V1"
+	memberAuthVersion     = "ENTMOOT-ESP-MEMBER-AUTH-V1"
+	deviceAuthSkew        = 5 * time.Minute
+	maxAuthBodyBytes      = 16 << 20
+	maxListLimit          = 200
 )
 
 // Device describes one ESP client device authorized to use this service.
@@ -356,6 +361,10 @@ type Publisher interface {
 	PublishSigned(context.Context, entmoot.Message) (PublishResult, error)
 }
 
+type TaskEventPublisher interface {
+	PublishTaskEvent(context.Context, entmoot.GroupID, []string, []byte) (PublishResult, error)
+}
+
 // PublishResult is the HTTP response for an accepted phone-signed message.
 type PublishResult struct {
 	Status      string            `json:"status"`
@@ -389,6 +398,7 @@ type Handler struct {
 	clock       func() time.Time
 	service     *mailbox.Service
 	publisher   Publisher
+	taskEvents  TaskEventPublisher
 	operations  OperationExecutor
 	notifier    espnotify.Notifier
 	state       StateStore
@@ -442,6 +452,7 @@ func NewHandler(cfg Config) (*Handler, error) {
 		clock:       clock,
 		service:     cfg.Service,
 		publisher:   cfg.Publisher,
+		taskEvents:  cfg.TaskEvents,
 		operations:  cfg.Operations,
 		notifier:    cfg.Notifier,
 		state:       state,
@@ -521,8 +532,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleFleets(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		device, ok := h.requireFleetDevice(w, r)
-		if !ok {
+		auth := authFromContext(r)
+		if auth.device == nil && auth.member == nil {
+			writeError(w, http.StatusForbidden, "device_signature_required", "fleet access requires a registered device or active fleet member signature")
 			return
 		}
 		if h.state == nil {
@@ -530,6 +542,15 @@ func (h *Handler) handleFleets(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		includeArchived := parseBoolQuery(r.URL.Query().Get("include_archived"))
+		var controlGroupID entmoot.GroupID
+		if rawControl := strings.TrimSpace(r.URL.Query().Get("control_group_id")); rawControl != "" {
+			gid, err := decodeGroupID(rawControl)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+				return
+			}
+			controlGroupID = gid
+		}
 		fleets, err := h.state.ListFleets(r.Context())
 		if err != nil {
 			h.logger.Error("esphttp: list fleets", slog.String("err", err.Error()))
@@ -538,7 +559,16 @@ func (h *Handler) handleFleets(w http.ResponseWriter, r *http.Request) {
 		}
 		visible := make([]FleetRecord, 0, len(fleets))
 		for _, fleet := range VisibleFleetRecords(fleets, includeArchived) {
-			if fleet.CoordinatorDeviceID == device.ID {
+			if controlGroupID != (entmoot.GroupID{}) && fleet.ControlGroupID != controlGroupID {
+				continue
+			}
+			if auth.member != nil {
+				h.reconcileFleetAcceptance(r.Context(), fleet)
+			}
+			switch {
+			case auth.device != nil && fleet.CoordinatorDeviceID == auth.device.ID:
+				visible = append(visible, fleet)
+			case auth.member != nil && h.memberCanAccessFleet(r.Context(), fleet, *auth.member):
 				visible = append(visible, fleet)
 			}
 		}
@@ -911,6 +941,14 @@ func fleetTaskIdempotencyScope(r *http.Request, base string) string {
 			return base + ":device:" + deviceID
 		}
 	}
+	if auth.member != nil {
+		return base + ":member:" +
+			strconv.FormatUint(uint64(auth.member.NodeID), 10) + ":" +
+			base64.StdEncoding.EncodeToString(auth.member.EntmootPubKey)
+	}
+	if auth.bearer {
+		return base + ":bearer"
+	}
 	return base + ":auth:anonymous"
 }
 
@@ -1027,10 +1065,7 @@ func (h *Handler) fleetTaskCoordinator(w http.ResponseWriter, r *http.Request, f
 }
 
 func (h *Handler) fleetTaskActor(w http.ResponseWriter, r *http.Request, fleetID string) (FleetRecord, FleetMemberRecord, bool) {
-	device, ok := h.requireFleetDevice(w, r)
-	if !ok {
-		return FleetRecord{}, FleetMemberRecord{}, false
-	}
+	auth := authFromContext(r)
 	if h.state == nil {
 		writeError(w, http.StatusServiceUnavailable, "fleet_unavailable", "fleet store is not configured")
 		return FleetRecord{}, FleetMemberRecord{}, false
@@ -1050,22 +1085,39 @@ func (h *Handler) fleetTaskActor(w http.ResponseWriter, r *http.Request, fleetID
 		return FleetRecord{}, FleetMemberRecord{}, false
 	}
 	h.reconcileFleetAcceptance(r.Context(), fleet)
-	if device.ID != fleet.CoordinatorDeviceID {
-		if fleet.ControlGroupID == (entmoot.GroupID{}) || (!deviceAllowsGroup(*device, fleet.ControlGroupID) && !deviceCanAdminGroup(*device, fleet.ControlGroupID)) {
-			writeError(w, http.StatusForbidden, "forbidden", "device is not authorized to access fleet")
-			return FleetRecord{}, FleetMemberRecord{}, false
-		}
-		if device.PilotNodeID == 0 || len(device.EntmootPubKey) != ed25519.PublicKeySize {
-			writeError(w, http.StatusForbidden, "forbidden", "device is not bound to a fleet member")
-			return FleetRecord{}, FleetMemberRecord{}, false
-		}
-		member, found, err := h.fleetMemberByNode(r.Context(), fleet.FleetID, device.PilotNodeID)
+	if auth.member != nil {
+		member, found, err := h.fleetMemberByNode(r.Context(), fleet.FleetID, auth.member.NodeID)
 		if err != nil {
 			h.logger.Error("esphttp: fleet task member lookup", slog.String("err", err.Error()))
 			writeError(w, http.StatusInternalServerError, "internal_error", "fleet member lookup failed")
 			return FleetRecord{}, FleetMemberRecord{}, false
 		}
-		if !found || member.EntmootPubKey != base64.StdEncoding.EncodeToString(device.EntmootPubKey) || !FleetTaskCanMutate(member) {
+		if !found || member.EntmootPubKey != base64.StdEncoding.EncodeToString(auth.member.EntmootPubKey) || !FleetTaskCanMutate(member) {
+			writeError(w, http.StatusForbidden, "forbidden", "signature is not from an active fleet member")
+			return FleetRecord{}, FleetMemberRecord{}, false
+		}
+		return fleet, member, true
+	}
+	if auth.device == nil {
+		writeError(w, http.StatusForbidden, "fleet_signature_required", "fleet task access requires a registered device or active fleet member signature")
+		return FleetRecord{}, FleetMemberRecord{}, false
+	}
+	if auth.device.ID != fleet.CoordinatorDeviceID {
+		if fleet.ControlGroupID == (entmoot.GroupID{}) || (!deviceAllowsGroup(*auth.device, fleet.ControlGroupID) && !deviceCanAdminGroup(*auth.device, fleet.ControlGroupID)) {
+			writeError(w, http.StatusForbidden, "forbidden", "device is not authorized to access fleet")
+			return FleetRecord{}, FleetMemberRecord{}, false
+		}
+		if auth.device.PilotNodeID == 0 || len(auth.device.EntmootPubKey) != ed25519.PublicKeySize {
+			writeError(w, http.StatusForbidden, "forbidden", "device is not bound to a fleet member")
+			return FleetRecord{}, FleetMemberRecord{}, false
+		}
+		member, found, err := h.fleetMemberByNode(r.Context(), fleet.FleetID, auth.device.PilotNodeID)
+		if err != nil {
+			h.logger.Error("esphttp: fleet task member lookup", slog.String("err", err.Error()))
+			writeError(w, http.StatusInternalServerError, "internal_error", "fleet member lookup failed")
+			return FleetRecord{}, FleetMemberRecord{}, false
+		}
+		if !found || member.EntmootPubKey != base64.StdEncoding.EncodeToString(auth.device.EntmootPubKey) || !FleetTaskCanMutate(member) {
 			writeError(w, http.StatusForbidden, "forbidden", "device is not an active fleet member")
 			return FleetRecord{}, FleetMemberRecord{}, false
 		}
@@ -1079,15 +1131,7 @@ func (h *Handler) fleetTaskActor(w http.ResponseWriter, r *http.Request, fleetID
 	}
 	coordinatorPub := base64.StdEncoding.EncodeToString(fleet.Coordinator.EntmootPubKey)
 	if !found || member.Role != FleetRoleCoordinator || member.EntmootPubKey != coordinatorPub {
-		member = FleetMemberRecord{
-			FleetID:       fleet.FleetID,
-			NodeID:        fleet.Coordinator.PilotNodeID,
-			EntmootPubKey: coordinatorPub,
-			Role:          FleetRoleCoordinator,
-			Status:        FleetMemberActive,
-			AcceptedAtMS:  fleet.CreatedAtMS,
-			UpdatedAtMS:   h.clock().UnixMilli(),
-		}
+		member = fleetCoordinatorMember(fleet, h.clock().UnixMilli())
 	}
 	member.Role = FleetRoleCoordinator
 	member.Status = FleetMemberActive
@@ -1105,6 +1149,42 @@ func (h *Handler) fleetMemberByNode(ctx context.Context, fleetID string, nodeID 
 		}
 	}
 	return FleetMemberRecord{}, false, nil
+}
+
+func (h *Handler) memberCanAccessFleet(ctx context.Context, fleet FleetRecord, member MemberAuth) bool {
+	rec, found, err := h.fleetMemberByNode(ctx, fleet.FleetID, member.NodeID)
+	if err != nil {
+		h.logger.Error("esphttp: fleet member access lookup", slog.String("err", err.Error()))
+		return false
+	}
+	return found &&
+		rec.Status == FleetMemberActive &&
+		rec.EntmootPubKey == base64.StdEncoding.EncodeToString(member.EntmootPubKey)
+}
+
+func fleetCoordinatorMember(fleet FleetRecord, nowMS int64) FleetMemberRecord {
+	return FleetMemberRecord{
+		FleetID:       fleet.FleetID,
+		NodeID:        fleet.Coordinator.PilotNodeID,
+		EntmootPubKey: base64.StdEncoding.EncodeToString(fleet.Coordinator.EntmootPubKey),
+		Role:          FleetRoleCoordinator,
+		Status:        FleetMemberActive,
+		AcceptedAtMS:  fleet.CreatedAtMS,
+		UpdatedAtMS:   nowMS,
+	}
+}
+
+type fleetTaskEventEnvelope struct {
+	Type           string          `json:"type"`
+	FleetID        string          `json:"fleet_id"`
+	ControlGroupID entmoot.GroupID `json:"control_group_id"`
+	TaskID         string          `json:"task_id"`
+	Action         string          `json:"action"`
+	Status         string          `json:"status"`
+	Title          string          `json:"title"`
+	ActorNodeID    entmoot.NodeID  `json:"actor_node_id"`
+	Summary        string          `json:"summary"`
+	CreatedAtMS    int64           `json:"created_at_ms"`
 }
 
 func (h *Handler) persistFleetTaskMutation(ctx context.Context, mutation FleetTaskMutation, actor FleetMemberRecord) (FleetTaskRecord, FleetActivityRecord, FleetTaskSubmissionRecord, error) {
@@ -1161,7 +1241,42 @@ func (h *Handler) persistFleetTaskMutation(ctx context.Context, mutation FleetTa
 	if err != nil {
 		return FleetTaskRecord{}, FleetActivityRecord{}, FleetTaskSubmissionRecord{}, err
 	}
+	h.publishFleetTaskEvent(ctx, mutation, task, actor, activity.CreatedAtMS)
 	return task, activity, submission, nil
+}
+
+func (h *Handler) publishFleetTaskEvent(ctx context.Context, mutation FleetTaskMutation, task FleetTaskRecord, actor FleetMemberRecord, createdAtMS int64) {
+	if h.taskEvents == nil || h.state == nil {
+		return
+	}
+	fleet, found, err := h.state.GetFleet(ctx, task.FleetID)
+	if err != nil {
+		h.logger.Warn("esphttp: fleet task event fleet lookup failed", slog.String("fleet_id", task.FleetID), slog.String("err", err.Error()))
+		return
+	}
+	if !found || fleet.ControlGroupID == (entmoot.GroupID{}) {
+		return
+	}
+	event := fleetTaskEventEnvelope{
+		Type:           "fleet.task",
+		FleetID:        task.FleetID,
+		ControlGroupID: fleet.ControlGroupID,
+		TaskID:         task.TaskID,
+		Action:         mutation.Action,
+		Status:         task.Status,
+		Title:          task.Title,
+		ActorNodeID:    actor.NodeID,
+		Summary:        mutation.Summary,
+		CreatedAtMS:    createdAtMS,
+	}
+	body, err := json.Marshal(event)
+	if err != nil {
+		h.logger.Warn("esphttp: fleet task event marshal failed", slog.String("fleet_id", task.FleetID), slog.String("task_id", task.TaskID), slog.String("err", err.Error()))
+		return
+	}
+	if _, err := h.taskEvents.PublishTaskEvent(ctx, fleet.ControlGroupID, []string{"fleet/tasks"}, body); err != nil {
+		h.logger.Warn("esphttp: fleet task event publish failed", slog.String("fleet_id", task.FleetID), slog.String("task_id", task.TaskID), slog.String("err", err.Error()))
+	}
 }
 
 func (h *Handler) writeFleetTaskError(w http.ResponseWriter, err error) {
@@ -1340,6 +1455,9 @@ func (h *Handler) handleSession(w http.ResponseWriter, r *http.Request) {
 	}
 	if auth.device != nil {
 		resp["device"] = deviceView(*auth.device)
+	}
+	if auth.member != nil {
+		resp["member"] = memberAuthView(*auth.member)
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -2424,7 +2542,14 @@ func (h *Handler) writeMailboxResult(w http.ResponseWriter, op string, result an
 type authContextKey struct{}
 
 type authContext struct {
+	bearer bool
 	device *Device
+	member *MemberAuth
+}
+
+type MemberAuth struct {
+	NodeID        entmoot.NodeID `json:"node_id"`
+	EntmootPubKey []byte         `json:"entmoot_pubkey"`
 }
 
 func (h *Handler) authorize(w http.ResponseWriter, r *http.Request) (authContext, bool) {
@@ -2434,22 +2559,82 @@ func (h *Handler) authorize(w http.ResponseWriter, r *http.Request) (authContext
 	}
 	switch h.authMode {
 	case AuthModeBearer:
-		if h.authorizedBearer(r) {
-			return authContext{}, true
+		bearerOK := h.authorizedBearer(r)
+		if requestHasMemberAuth(r) && memberAuthAllowedForRequest(r) {
+			auth, msg, ok := h.memberAuthFromRequest(r, body)
+			if ok {
+				auth.bearer = bearerOK
+				return auth, true
+			}
+			if !bearerOK {
+				writeError(w, http.StatusUnauthorized, "unauthorized", msg)
+				return authContext{}, false
+			}
+		}
+		if bearerOK {
+			return authContext{bearer: true}, true
 		}
 	case AuthModeDevice:
-		return h.authorizedDevice(w, r, body)
-	case AuthModeDual:
-		if h.authorizedBearer(r) {
-			return authContext{}, true
+		if r.Header.Get(deviceIDHeader) != "" {
+			return h.authorizedDevice(w, r, body)
 		}
-		return h.authorizedDevice(w, r, body)
+		if requestHasMemberAuth(r) && memberAuthAllowedForRequest(r) {
+			return h.authorizedMember(w, r, body)
+		}
+	case AuthModeDual:
+		bearerOK := h.authorizedBearer(r)
+		memberAttempted := false
+		memberMsg := ""
+		if requestHasMemberAuth(r) && memberAuthAllowedForRequest(r) {
+			memberAttempted = true
+			auth, msg, ok := h.memberAuthFromRequest(r, body)
+			if ok {
+				auth.bearer = bearerOK
+				return auth, true
+			}
+			memberMsg = msg
+		}
+		if bearerOK {
+			return authContext{bearer: true}, true
+		}
+		if r.Header.Get(deviceIDHeader) != "" {
+			return h.authorizedDevice(w, r, body)
+		}
+		if memberAttempted {
+			writeError(w, http.StatusUnauthorized, "unauthorized", memberMsg)
+			return authContext{}, false
+		}
 	}
 	if h.authMode == AuthModeBearer || h.authMode == AuthModeDual {
 		w.Header().Set("WWW-Authenticate", `Bearer realm="entmoot-esp"`)
 	}
 	writeError(w, http.StatusUnauthorized, "unauthorized", "missing or invalid credentials")
 	return authContext{}, false
+}
+
+func requestHasMemberAuth(r *http.Request) bool {
+	return r.Header.Get(memberNodeHeader) != "" ||
+		r.Header.Get(memberPubKeyHeader) != "" ||
+		r.Header.Get(memberSignatureHeader) != ""
+}
+
+func memberAuthAllowedForRequest(r *http.Request) bool {
+	if r.Method == http.MethodGet && r.URL.Path == "/v1/session" {
+		return true
+	}
+	if r.Method == http.MethodGet && r.URL.Path == "/v1/fleets" {
+		return true
+	}
+	const prefix = "/v1/fleets/"
+	if !strings.HasPrefix(r.URL.Path, prefix) {
+		return false
+	}
+	rest := strings.TrimPrefix(r.URL.Path, prefix)
+	_, suffix, ok := strings.Cut(rest, "/")
+	if !ok {
+		return false
+	}
+	return suffix == "tasks" || strings.HasPrefix(suffix, "tasks/")
 }
 
 func (h *Handler) bufferBodyForAuth(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
@@ -2528,6 +2713,54 @@ func (h *Handler) authorizedDevice(w http.ResponseWriter, r *http.Request, body 
 	return authContext{device: &device}, true
 }
 
+func (h *Handler) authorizedMember(w http.ResponseWriter, r *http.Request, body []byte) (authContext, bool) {
+	auth, msg, ok := h.memberAuthFromRequest(r, body)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized", msg)
+		return authContext{}, false
+	}
+	return auth, true
+}
+
+func (h *Handler) memberAuthFromRequest(r *http.Request, body []byte) (authContext, string, bool) {
+	nodeRaw := strings.TrimSpace(r.Header.Get(memberNodeHeader))
+	node64, err := strconv.ParseUint(nodeRaw, 10, 32)
+	if err != nil || node64 == 0 {
+		return authContext{}, "invalid member node id", false
+	}
+	pub, err := base64.StdEncoding.DecodeString(strings.TrimSpace(r.Header.Get(memberPubKeyHeader)))
+	if err != nil || len(pub) != ed25519.PublicKeySize {
+		return authContext{}, "invalid member public key", false
+	}
+	tsRaw := strings.TrimSpace(r.Header.Get(timestampHeader))
+	tsMillis, err := strconv.ParseInt(tsRaw, 10, 64)
+	if err != nil {
+		return authContext{}, "invalid request timestamp", false
+	}
+	now := h.clock()
+	ts := time.UnixMilli(tsMillis)
+	if ts.Before(now.Add(-deviceAuthSkew)) || ts.After(now.Add(deviceAuthSkew)) {
+		return authContext{}, "request timestamp outside allowed window", false
+	}
+	nonce := strings.TrimSpace(r.Header.Get(nonceHeader))
+	if nonce == "" || len(nonce) > 256 {
+		return authContext{}, "invalid nonce", false
+	}
+	sig, err := base64.StdEncoding.DecodeString(strings.TrimSpace(r.Header.Get(memberSignatureHeader)))
+	if err != nil || len(sig) != ed25519.SignatureSize {
+		return authContext{}, "invalid signature", false
+	}
+	input := MemberSigningInput(r.Method, r.URL.RequestURI(), entmoot.NodeID(node64), pub, tsMillis, nonce, body)
+	if !ed25519.Verify(pub, []byte(input), sig) {
+		return authContext{}, "invalid signature", false
+	}
+	nonceKey := fmt.Sprintf("member:%d:%s", node64, base64.StdEncoding.EncodeToString(pub))
+	if !h.nonceCache.use(nonceKey, nonce, now.Add(deviceAuthSkew)) {
+		return authContext{}, "replayed nonce", false
+	}
+	return authContext{member: &MemberAuth{NodeID: entmoot.NodeID(node64), EntmootPubKey: append([]byte(nil), pub...)}}, "", true
+}
+
 // DeviceSigningInput returns the canonical bytes a device signs for one ESP
 // HTTP request.
 func DeviceSigningInput(method, pathWithRawQuery string, timestampMillis int64, nonce string, body []byte) string {
@@ -2542,12 +2775,26 @@ func DeviceSigningInput(method, pathWithRawQuery string, timestampMillis int64, 
 	}, "\n")
 }
 
+func MemberSigningInput(method, pathWithRawQuery string, nodeID entmoot.NodeID, entmootPubKey []byte, timestampMillis int64, nonce string, body []byte) string {
+	sum := sha256.Sum256(body)
+	return strings.Join([]string{
+		memberAuthVersion,
+		strings.ToUpper(method),
+		pathWithRawQuery,
+		strconv.FormatUint(uint64(nodeID), 10),
+		base64.StdEncoding.EncodeToString(entmootPubKey),
+		strconv.FormatInt(timestampMillis, 10),
+		nonce,
+		base64.StdEncoding.EncodeToString(sum[:]),
+	}, "\n")
+}
+
 func (h *Handler) checkDeviceGroup(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID) bool {
 	auth, _ := r.Context().Value(authContextKey{}).(authContext)
-	if auth.device == nil {
+	if auth.bearer {
 		return true
 	}
-	if deviceAllowsGroup(*auth.device, groupID) {
+	if auth.device != nil && deviceAllowsGroup(*auth.device, groupID) {
 		return true
 	}
 	writeError(w, http.StatusForbidden, "forbidden", "device is not authorized for group")
@@ -2556,13 +2803,13 @@ func (h *Handler) checkDeviceGroup(w http.ResponseWriter, r *http.Request, group
 
 func (h *Handler) checkDeviceGroupRead(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID) bool {
 	auth, _ := r.Context().Value(authContextKey{}).(authContext)
-	if auth.device == nil {
+	if auth.bearer {
 		return true
 	}
-	if deviceAllowsGroup(*auth.device, groupID) {
+	if auth.device != nil && deviceAllowsGroup(*auth.device, groupID) {
 		return true
 	}
-	if h.deviceCanReadFleetControlGroup(r.Context(), *auth.device, groupID) {
+	if auth.device != nil && h.deviceCanReadFleetControlGroup(r.Context(), *auth.device, groupID) {
 		return true
 	}
 	writeError(w, http.StatusForbidden, "forbidden", "device is not authorized for group")
@@ -2586,10 +2833,10 @@ func (h *Handler) deviceCanReadFleetControlGroup(ctx context.Context, device Dev
 
 func (h *Handler) checkDeviceGroupAdmin(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID) bool {
 	auth, _ := r.Context().Value(authContextKey{}).(authContext)
-	if auth.device == nil {
+	if auth.bearer {
 		return true
 	}
-	if deviceCanAdminGroup(*auth.device, groupID) {
+	if auth.device != nil && deviceCanAdminGroup(*auth.device, groupID) {
 		return true
 	}
 	writeError(w, http.StatusForbidden, "forbidden", "device is not authorized to manage group")
@@ -2664,8 +2911,12 @@ func (h *Handler) checkDeviceClientRead(w http.ResponseWriter, r *http.Request, 
 
 func (h *Handler) checkDeviceClientID(w http.ResponseWriter, r *http.Request, clientID string) bool {
 	auth, _ := r.Context().Value(authContextKey{}).(authContext)
-	if auth.device == nil {
+	if auth.bearer {
 		return true
+	}
+	if auth.device == nil {
+		writeError(w, http.StatusForbidden, "forbidden", "device is not authorized for client_id")
+		return false
 	}
 	for _, allowed := range auth.device.ClientIDs {
 		if allowed == clientID {
@@ -3158,6 +3409,13 @@ func deviceView(device Device) map[string]any {
 		out["entmoot_pubkey"] = base64.StdEncoding.EncodeToString(device.EntmootPubKey)
 	}
 	return out
+}
+
+func memberAuthView(member MemberAuth) map[string]any {
+	return map[string]any{
+		"node_id":        member.NodeID,
+		"entmoot_pubkey": base64.StdEncoding.EncodeToString(member.EntmootPubKey),
+	}
 }
 
 type captureResponseWriter struct {

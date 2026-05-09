@@ -16,7 +16,7 @@ import (
 
 func cmdFleet(gf *globalFlags, args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "fleet: missing op (want: list, info, activity)")
+		fmt.Fprintln(os.Stderr, "fleet: missing op (want: list, info, activity, tasks)")
 		return exitInvalidArgument
 	}
 	switch args[0] {
@@ -26,6 +26,8 @@ func cmdFleet(gf *globalFlags, args []string) int {
 		return cmdFleetInfo(gf, args[1:])
 	case "activity":
 		return cmdFleetActivity(gf, args[1:])
+	case "tasks":
+		return cmdFleetTasks(gf, args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "fleet: unknown op %q\n", args[0])
 		return exitInvalidArgument

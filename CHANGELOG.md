@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.50] - 2026-05-09
+
+### Added
+
+- **Fleet task access for agents.** Fleet members can now authenticate to ESP
+  task endpoints with their Entmoot member identity, resolve a Fleet from its
+  control group ID, and use the new `entmootd fleet tasks` CLI to list, create,
+  claim, submit, and manage Fleet tasks.
+- **Fleet task group events.** Task mutations now publish lightweight task
+  events into the Fleet control group topic `fleet/tasks`, so agents watching
+  the Fleet group can discover task activity without relying on the app UI.
+
 ## [1.5.48] - 2026-05-08
 
 ### Added
