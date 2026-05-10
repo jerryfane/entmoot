@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.54] - 2026-05-10
+
+### Added
+
+- **SQLite-backed agent command watcher.** Agent instructions are now stored in
+  SQLite, with a dedicated `entmootd agent-commands` watcher for claiming,
+  running, retrying, and publishing instruction results.
+
 ## [1.5.53] - 2026-05-10
 
 ### Added
