@@ -36,6 +36,28 @@ type agentInstructionRunnerResult struct {
 	Output  string `json:"output"`
 }
 
+type agentRuntimeProcessResult struct {
+	stdout string
+	stderr string
+	err    error
+}
+
+type openClawAgentInstructionContext struct {
+	CommandID      string                     `json:"command_id"`
+	FleetID        string                     `json:"fleet_id"`
+	ControlGroupID entmoot.GroupID            `json:"control_group_id"`
+	IssuerNodeID   entmoot.NodeID             `json:"issuer_node_id"`
+	Target         esphttp.FleetCommandTarget `json:"target"`
+	AgentNodeID    entmoot.NodeID             `json:"agent_node_id"`
+	Action         string                     `json:"action"`
+	Context        map[string]interface{}     `json:"context"`
+}
+
+const (
+	agentCommandRunnerOpenClaw = "openclaw"
+	openClawSelectorError      = "Pass --to <E.164>, --session-id, or --agent to choose a session"
+)
+
 func cmdAgentCommands(gf *globalFlags, args []string) int {
 	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
 		fmt.Fprintln(os.Stderr, "usage: entmootd agent-commands <watch|run-once|status> [flags]")
@@ -92,7 +114,7 @@ func cmdAgentCommandsWatch(gf *globalFlags, args []string, once bool) int {
 	fs.DurationVar(&cfg.interval, "interval", cfg.interval, "poll interval")
 	fs.DurationVar(&cfg.lease, "lease", cfg.lease, "processing lease duration")
 	fs.IntVar(&cfg.maxAttempts, "max-attempts", cfg.maxAttempts, "maximum attempts per command")
-	fs.StringVar(&cfg.runner, "runner", cfg.runner, "agent runtime adapter executable")
+	fs.StringVar(&cfg.runner, "runner", cfg.runner, "agent runtime adapter executable, or \"openclaw\" for the built-in OpenClaw adapter")
 	fs.BoolVar(&cfg.once, "once", cfg.once, "scan and process available commands once")
 	fs.BoolVar(&cfg.json, "json", false, "print JSON summary")
 	if err := fs.Parse(args); err != nil {
@@ -206,36 +228,83 @@ func processClaimedAgentCommand(ctx context.Context, gf *globalFlags, state *esp
 }
 
 func runAgentCommandRunner(ctx context.Context, runner, dataDir string, payload esphttp.AgentInstructionPayload) fleetCommandExecution {
+	if strings.EqualFold(strings.TrimSpace(runner), agentCommandRunnerOpenClaw) {
+		return runOpenClawAgentInstruction(ctx, dataDir, payload)
+	}
 	data, err := json.Marshal(payload)
 	if err != nil {
 		return fleetCommandExecution{status: esphttp.FleetCommandStatusFailed, summary: "Agent command encode failed", output: err.Error()}
 	}
 	cmd := exec.CommandContext(ctx, runner)
-	cmd.Stdin = bytes.NewReader(data)
-	cmd.Env = append(os.Environ(),
+	run := runAgentRuntimeProcess(cmd, data, dataDir, payload)
+	if ctx.Err() != nil {
+		return fleetCommandExecution{status: esphttp.FleetCommandStatusFailed, summary: "Agent runtime timed out", output: strings.TrimSpace(run.stderr)}
+	}
+	if run.err != nil {
+		output := strings.TrimSpace(run.stderr)
+		if output == "" {
+			output = run.err.Error()
+		}
+		output = addAgentRuntimeFailureAdvice(output)
+		return fleetCommandExecution{status: esphttp.FleetCommandStatusFailed, summary: "Agent runtime failed", output: output}
+	}
+	return parseAgentInstructionRunnerResult(run.stdout)
+}
+
+func runOpenClawAgentInstruction(ctx context.Context, dataDir string, payload esphttp.AgentInstructionPayload) fleetCommandExecution {
+	args, err := openClawAgentArgs(payload)
+	if err != nil {
+		return fleetCommandExecution{status: esphttp.FleetCommandStatusFailed, summary: "OpenClaw agent instruction context encode failed", output: err.Error()}
+	}
+	cmd := exec.CommandContext(ctx, openClawBinary(), args...)
+	run := runAgentRuntimeProcess(cmd, nil, dataDir, payload)
+	if ctx.Err() != nil {
+		return fleetCommandExecution{status: esphttp.FleetCommandStatusFailed, summary: "OpenClaw agent instruction timed out", output: strings.TrimSpace(run.stderr)}
+	}
+	if run.err != nil {
+		output := strings.TrimSpace(run.stderr)
+		if output == "" {
+			output = run.err.Error()
+		}
+		return fleetCommandExecution{status: esphttp.FleetCommandStatusFailed, summary: "OpenClaw agent instruction failed", output: addAgentRuntimeFailureAdvice(output)}
+	}
+	return fleetCommandExecution{
+		status:  esphttp.FleetCommandStatusCompleted,
+		summary: "OpenClaw handled agent instruction",
+		output:  strings.TrimSpace(run.stdout),
+	}
+}
+
+func runAgentRuntimeProcess(cmd *exec.Cmd, stdin []byte, dataDir string, payload esphttp.AgentInstructionPayload) agentRuntimeProcessResult {
+	if stdin != nil {
+		cmd.Stdin = bytes.NewReader(stdin)
+	}
+	cmd.Env = agentCommandRunnerEnv(dataDir, payload)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	return agentRuntimeProcessResult{
+		stdout: stdout.String(),
+		stderr: stderr.String(),
+		err:    err,
+	}
+}
+
+func agentCommandRunnerEnv(dataDir string, payload esphttp.AgentInstructionPayload) []string {
+	return append(os.Environ(),
 		"ENTMOOT_AGENT_COMMAND_ID="+payload.CommandID,
 		"ENTMOOT_AGENT_FLEET_ID="+payload.FleetID,
 		"ENTMOOT_AGENT_CONTROL_GROUP_ID="+payload.ControlGroupID.String(),
 		"ENTMOOT_AGENT_NODE_ID="+fmt.Sprintf("%d", payload.AgentNodeID),
 		"ENTMOOT_AGENT_DATA_DIR="+dataDir,
 	)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	err = cmd.Run()
-	if ctx.Err() != nil {
-		return fleetCommandExecution{status: esphttp.FleetCommandStatusFailed, summary: "Agent runtime timed out", output: strings.TrimSpace(stderr.String())}
-	}
-	if err != nil {
-		output := strings.TrimSpace(stderr.String())
-		if output == "" {
-			output = err.Error()
-		}
-		return fleetCommandExecution{status: esphttp.FleetCommandStatusFailed, summary: "Agent runtime failed", output: output}
-	}
+}
+
+func parseAgentInstructionRunnerResult(stdout string) fleetCommandExecution {
 	var result agentInstructionRunnerResult
-	if len(bytes.TrimSpace(stdout.Bytes())) > 0 {
-		if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+	if len(bytes.TrimSpace([]byte(stdout))) > 0 {
+		if err := json.Unmarshal([]byte(stdout), &result); err != nil {
 			return fleetCommandExecution{status: esphttp.FleetCommandStatusFailed, summary: "Agent runtime returned invalid JSON", output: err.Error()}
 		}
 	}
@@ -252,6 +321,99 @@ func runAgentCommandRunner(ctx context.Context, runner, dataDir string, payload 
 		summary = "Agent instruction handled"
 	}
 	return fleetCommandExecution{status: status, summary: summary, output: result.Output}
+}
+
+func openClawBinary() string {
+	if bin := strings.TrimSpace(os.Getenv("OPENCLAW_BIN")); bin != "" {
+		return bin
+	}
+	return "openclaw"
+}
+
+func openClawAgentArgs(payload esphttp.AgentInstructionPayload) ([]string, error) {
+	selectorFlag, selectorValue := openClawAgentSelector()
+	message, err := openClawAgentMessage(payload)
+	if err != nil {
+		return nil, err
+	}
+	return []string{
+		"agent",
+		selectorFlag, selectorValue,
+		"--message", message,
+		"--json",
+		"--timeout", fmt.Sprintf("%d", agentCommandTimeoutSeconds(payload.TimeoutMS)),
+	}, nil
+}
+
+func openClawAgentMessage(payload esphttp.AgentInstructionPayload) (string, error) {
+	if len(payload.Context) == 0 {
+		return payload.Instruction, nil
+	}
+	context := openClawAgentInstructionContext{
+		CommandID:      payload.CommandID,
+		FleetID:        payload.FleetID,
+		ControlGroupID: payload.ControlGroupID,
+		IssuerNodeID:   payload.IssuerNodeID,
+		Target:         payload.Target,
+		AgentNodeID:    payload.AgentNodeID,
+		Action:         payload.Action,
+		Context:        payload.Context,
+	}
+	data, err := json.Marshal(context)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(payload.Instruction) + "\n\nEntmoot agent command context JSON:\n" + string(data), nil
+}
+
+func openClawAgentSelector() (string, string) {
+	if v := strings.TrimSpace(os.Getenv("ENTMOOT_OPENCLAW_SESSION_ID")); v != "" {
+		return "--session-id", v
+	}
+	if v := strings.TrimSpace(os.Getenv("ENTMOOT_OPENCLAW_TO")); v != "" {
+		return "--to", v
+	}
+	if v := strings.TrimSpace(os.Getenv("ENTMOOT_OPENCLAW_AGENT")); v != "" {
+		return "--agent", v
+	}
+	if v := strings.TrimSpace(os.Getenv("OPENCLAW_SESSION_ID")); v != "" {
+		return "--session-id", v
+	}
+	if v := strings.TrimSpace(os.Getenv("OPENCLAW_TO")); v != "" {
+		return "--to", v
+	}
+	if v := strings.TrimSpace(os.Getenv("OPENCLAW_AGENT_ID")); v != "" {
+		return "--agent", v
+	}
+	return "--agent", "main"
+}
+
+func agentCommandTimeoutSeconds(timeoutMS int64) int64 {
+	if timeoutMS <= 0 {
+		return esphttp.DefaultFleetInstructionTimeoutMS / 1000
+	}
+	seconds := timeoutMS / 1000
+	if seconds < 5 {
+		return 5
+	}
+	if seconds > 1800 {
+		return 1800
+	}
+	return seconds
+}
+
+func addAgentRuntimeFailureAdvice(output string) string {
+	if !strings.Contains(output, openClawSelectorError) {
+		return output
+	}
+	const advice = "Entmoot fix: use the built-in OpenClaw adapter with ENTMOOT_AGENT_RUNNER=openclaw and set ENTMOOT_OPENCLAW_AGENT, ENTMOOT_OPENCLAW_SESSION_ID, or ENTMOOT_OPENCLAW_TO as needed. Without an explicit selector, the built-in adapter defaults to ENTMOOT_OPENCLAW_AGENT=main."
+	if strings.Contains(output, advice) {
+		return output
+	}
+	if strings.TrimSpace(output) == "" {
+		return advice
+	}
+	return strings.TrimSpace(output) + "\n\n" + advice
 }
 
 func publishPendingAgentCommandResult(ctx context.Context, gf *globalFlags, state *esphttp.SQLiteStateStore, cfg agentCommandsConfig, owner string, rec esphttp.AgentCommandRecord) error {

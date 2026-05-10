@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.56] - 2026-05-11
+
+### Added
+
+- **Built-in OpenClaw agent runner.** `entmootd agent-commands` can now use
+  `ENTMOOT_AGENT_RUNNER=openclaw`, selecting the OpenClaw agent with
+  `ENTMOOT_OPENCLAW_AGENT`, `ENTMOOT_OPENCLAW_SESSION_ID`, or
+  `ENTMOOT_OPENCLAW_TO`, plus matching OpenClaw environment aliases.
+
+### Changed
+
+- **Clearer agent runtime failures.** OpenClaw selector errors from custom
+  runners now include the Entmoot runner setting needed to fix the peer.
+
 ## [1.5.54] - 2026-05-10
 
 ### Added

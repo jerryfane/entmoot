@@ -117,6 +117,19 @@ peers, and changelog stay aligned.
    `ENTMOOT_SERVE_RESTART_CMD` explicitly. In that mode the helper uses
    `entmootd update --restart` to stop only top-level `serve`/`join`
    processes, excluding `esp serve`, then runs the provided start command.
+   For OpenClaw-backed agent instruction peers, prefer the built-in adapter
+   instead of a shell runner:
+
+   ```sh
+   ENTMOOT_AGENT_INSTRUCTIONS=1
+   ENTMOOT_AGENT_RUNNER=openclaw
+   ENTMOOT_OPENCLAW_AGENT=main
+   ```
+
+   Use `ENTMOOT_OPENCLAW_SESSION_ID` or `ENTMOOT_OPENCLAW_TO` only when the
+   peer must target a specific OpenClaw session or recipient. Existing
+   `OPENCLAW_SESSION_ID`, `OPENCLAW_TO`, and `OPENCLAW_AGENT_ID` settings are
+   honored as aliases, with Entmoot-prefixed settings taking precedence.
 7. Verify every peer reports:
 
    ```sh

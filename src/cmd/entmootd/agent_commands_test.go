@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -45,6 +47,134 @@ func TestRunAgentCommandRunnerNonTerminalStatusFails(t *testing.T) {
 	result := runAgentCommandRunner(context.Background(), runner, t.TempDir(), testCommandPayload("cmd-non-terminal"))
 	if result.status != esphttp.FleetCommandStatusFailed || result.summary != "Agent runtime returned non-terminal status" {
 		t.Fatalf("result = %+v, want non-terminal failure", result)
+	}
+}
+
+func TestRunAgentCommandRunnerOpenClawDefaultsToMainAgent(t *testing.T) {
+	clearOpenClawRunnerEnv(t)
+	argsPath := filepath.Join(t.TempDir(), "args")
+	runner := filepath.Join(t.TempDir(), "openclaw")
+	script := "#!/bin/sh\nprintf '%s\n' \"$@\" > \"$ARGS_PATH\"\nprintf '%s' '{\"ok\":true}'\n"
+	if err := os.WriteFile(runner, []byte(script), 0o700); err != nil {
+		t.Fatalf("WriteFile runner: %v", err)
+	}
+	t.Setenv("ARGS_PATH", argsPath)
+	t.Setenv("OPENCLAW_BIN", runner)
+	result := runAgentCommandRunner(context.Background(), "openclaw", t.TempDir(), testCommandPayload("cmd-openclaw"))
+	if result.status != esphttp.FleetCommandStatusCompleted || result.summary != "OpenClaw handled agent instruction" || result.output != `{"ok":true}` {
+		t.Fatalf("result = %+v, want completed OpenClaw result", result)
+	}
+	data, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatalf("ReadFile args: %v", err)
+	}
+	got := strings.Split(strings.TrimSpace(string(data)), "\n")
+	want := []string{"agent", "--agent", "main", "--message", "report status", "--json", "--timeout", "60"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("openclaw args = %#v, want %#v", got, want)
+	}
+}
+
+func TestRunAgentCommandRunnerOpenClawIncludesPayloadContext(t *testing.T) {
+	clearOpenClawRunnerEnv(t)
+	messagePath := filepath.Join(t.TempDir(), "message")
+	runner := filepath.Join(t.TempDir(), "openclaw")
+	script := "#!/bin/sh\nprintf '%s' \"$5\" > \"$MESSAGE_PATH\"\nprintf '%s' '{\"ok\":true}'\n"
+	if err := os.WriteFile(runner, []byte(script), 0o700); err != nil {
+		t.Fatalf("WriteFile runner: %v", err)
+	}
+	t.Setenv("MESSAGE_PATH", messagePath)
+	t.Setenv("OPENCLAW_BIN", runner)
+	payload := testCommandPayload("cmd-openclaw-context")
+	payload.Context = map[string]interface{}{
+		"group":  "Mars Hub",
+		"source": "fleet-command",
+	}
+	result := runAgentCommandRunner(context.Background(), "openclaw", t.TempDir(), payload)
+	if result.status != esphttp.FleetCommandStatusCompleted {
+		t.Fatalf("result = %+v, want completed OpenClaw result", result)
+	}
+	data, err := os.ReadFile(messagePath)
+	if err != nil {
+		t.Fatalf("ReadFile message: %v", err)
+	}
+	message := string(data)
+	for _, want := range []string{
+		"report status",
+		"Entmoot agent command context JSON:",
+		`"command_id":"cmd-openclaw-context"`,
+		`"agent_node_id":133053`,
+		`"context":{"group":"Mars Hub","source":"fleet-command"}`,
+	} {
+		if !strings.Contains(message, want) {
+			t.Fatalf("message = %q, want substring %q", message, want)
+		}
+	}
+}
+
+func TestOpenClawAgentSelectorPrecedence(t *testing.T) {
+	tests := []struct {
+		name string
+		env  map[string]string
+		want []string
+	}{
+		{name: "default main agent", want: []string{"--agent", "main"}},
+		{name: "agent", env: map[string]string{"ENTMOOT_OPENCLAW_AGENT": "ops"}, want: []string{"--agent", "ops"}},
+		{name: "openclaw agent alias", env: map[string]string{"OPENCLAW_AGENT_ID": "alias"}, want: []string{"--agent", "alias"}},
+		{name: "to", env: map[string]string{"ENTMOOT_OPENCLAW_AGENT": "ops", "ENTMOOT_OPENCLAW_TO": "+15555550123"}, want: []string{"--to", "+15555550123"}},
+		{name: "openclaw to alias", env: map[string]string{"OPENCLAW_AGENT_ID": "alias", "OPENCLAW_TO": "+15555550123"}, want: []string{"--to", "+15555550123"}},
+		{name: "session id", env: map[string]string{"ENTMOOT_OPENCLAW_AGENT": "ops", "ENTMOOT_OPENCLAW_TO": "+15555550123", "ENTMOOT_OPENCLAW_SESSION_ID": "sess-1"}, want: []string{"--session-id", "sess-1"}},
+		{name: "openclaw session alias", env: map[string]string{"OPENCLAW_AGENT_ID": "alias", "OPENCLAW_TO": "+15555550123", "OPENCLAW_SESSION_ID": "sess-2"}, want: []string{"--session-id", "sess-2"}},
+		{name: "entmoot to beats openclaw session alias", env: map[string]string{"ENTMOOT_OPENCLAW_TO": "+15555550123", "OPENCLAW_SESSION_ID": "sess-2"}, want: []string{"--to", "+15555550123"}},
+		{name: "entmoot agent beats openclaw session alias", env: map[string]string{"ENTMOOT_OPENCLAW_AGENT": "ops", "OPENCLAW_SESSION_ID": "sess-2"}, want: []string{"--agent", "ops"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			clearOpenClawRunnerEnv(t)
+			for k, v := range tt.env {
+				t.Setenv(k, v)
+			}
+			gotFlag, gotValue := openClawAgentSelector()
+			got := []string{gotFlag, gotValue}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("selector = %#v, want %#v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestAgentCommandTimeoutSecondsClampsOpenClawTimeout(t *testing.T) {
+	tests := []struct {
+		timeoutMS int64
+		want      int64
+	}{
+		{timeoutMS: 0, want: 600},
+		{timeoutMS: -1_000, want: 600},
+		{timeoutMS: 4_000, want: 5},
+		{timeoutMS: 60_000, want: 60},
+		{timeoutMS: 1_900_000, want: 1800},
+	}
+	for _, tt := range tests {
+		if got := agentCommandTimeoutSeconds(tt.timeoutMS); got != tt.want {
+			t.Fatalf("agentCommandTimeoutSeconds(%d) = %d, want %d", tt.timeoutMS, got, tt.want)
+		}
+	}
+}
+
+func TestRunAgentCommandRunnerAddsOpenClawSelectorAdvice(t *testing.T) {
+	runner := filepath.Join(t.TempDir(), "agent-runner.sh")
+	script := "#!/bin/sh\ncat >/dev/null\nprintf '%s' 'Error: " + openClawSelectorError + "' >&2\nexit 1\n"
+	if err := os.WriteFile(runner, []byte(script), 0o700); err != nil {
+		t.Fatalf("WriteFile runner: %v", err)
+	}
+	result := runAgentCommandRunner(context.Background(), runner, t.TempDir(), testCommandPayload("cmd-openclaw-advice"))
+	if result.status != esphttp.FleetCommandStatusFailed || result.summary != "Agent runtime failed" {
+		t.Fatalf("result = %+v, want failed external runner", result)
+	}
+	for _, want := range []string{openClawSelectorError, "ENTMOOT_AGENT_RUNNER=openclaw", "ENTMOOT_OPENCLAW_AGENT=main"} {
+		if !strings.Contains(result.output, want) {
+			t.Fatalf("output = %q, want substring %q", result.output, want)
+		}
 	}
 }
 
@@ -236,6 +366,21 @@ func TestImportLegacyAgentCommandFiles(t *testing.T) {
 	}
 	if _, err := os.Stat(path + ".imported"); err != nil {
 		t.Fatalf("imported marker missing: %v", err)
+	}
+}
+
+func clearOpenClawRunnerEnv(t *testing.T) {
+	t.Helper()
+	for _, name := range []string{
+		"ENTMOOT_OPENCLAW_AGENT",
+		"ENTMOOT_OPENCLAW_SESSION_ID",
+		"ENTMOOT_OPENCLAW_TO",
+		"OPENCLAW_AGENT_ID",
+		"OPENCLAW_SESSION_ID",
+		"OPENCLAW_TO",
+		"OPENCLAW_BIN",
+	} {
+		t.Setenv(name, "")
 	}
 }
 
