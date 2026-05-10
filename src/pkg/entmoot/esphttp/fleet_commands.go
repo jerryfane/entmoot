@@ -38,15 +38,23 @@ const (
 	FleetCommandStatusExpired   = "expired"
 	FleetCommandStatusDuplicate = "duplicate"
 
-	FleetCommandActionEcho            = "echo"
-	FleetCommandActionEntmootInfo     = "entmoot.info"
-	FleetCommandActionEntmootVersion  = "entmoot.version"
-	FleetCommandActionEntmootDoctor   = "entmoot.doctor_probe"
-	FleetCommandActionPilotInfo       = "pilot.info"
-	FleetCommandActionFleetLocalState = "fleet.local_state"
+	FleetCommandActionEcho             = "echo"
+	FleetCommandActionEntmootInfo      = "entmoot.info"
+	FleetCommandActionEntmootVersion   = "entmoot.version"
+	FleetCommandActionEntmootDoctor    = "entmoot.doctor_probe"
+	FleetCommandActionPilotInfo        = "pilot.info"
+	FleetCommandActionFleetLocalState  = "fleet.local_state"
+	FleetCommandActionAgentInstruction = "agent.instruction"
 )
 
 const DefaultFleetCommandTTL = 5 * time.Minute
+const (
+	MaxFleetInstructionBytes         = 16 << 10
+	MaxFleetInstructionContextBytes  = 16 << 10
+	DefaultFleetInstructionTimeoutMS = 10 * 60 * 1000
+	MinFleetInstructionTimeoutMS     = 5 * 1000
+	MaxFleetInstructionTimeoutMS     = 30 * 60 * 1000
+)
 
 type FleetCommandTarget struct {
 	Kind        string         `json:"kind"`
@@ -116,6 +124,7 @@ var fleetCommandCatalog = []FleetCommandCatalogEntry{
 	{Name: FleetCommandActionEntmootDoctor, Risk: FleetCommandRiskSafe, ReadOnly: true, Idempotent: true, AutoAcceptSafe: true, TimeoutMS: 15_000, MaxOutputBytes: 16_384, Description: "Run a bounded local Fleet diagnostic snapshot."},
 	{Name: FleetCommandActionPilotInfo, Risk: FleetCommandRiskSafe, ReadOnly: true, Idempotent: true, AutoAcceptSafe: true, TimeoutMS: 5_000, MaxOutputBytes: 8_192, Description: "Report local Pilot daemon info."},
 	{Name: FleetCommandActionFleetLocalState, Risk: FleetCommandRiskSafe, ReadOnly: true, Idempotent: true, AutoAcceptSafe: true, TimeoutMS: 5_000, MaxOutputBytes: 8_192, Description: "Report local Fleet membership state from ESP storage."},
+	{Name: FleetCommandActionAgentInstruction, Risk: FleetCommandRiskManual, ReadOnly: false, Idempotent: false, AutoAcceptSafe: false, TimeoutMS: MaxFleetInstructionTimeoutMS, MaxOutputBytes: 32_768, Description: "Queue a natural-language instruction for the local agent runtime."},
 }
 
 func FleetCommandCatalog() []FleetCommandCatalogEntry {
@@ -146,6 +155,21 @@ func NormalizeFleetCommandTarget(kind string) string {
 		return FleetCommandTargetNode
 	default:
 		return strings.TrimSpace(strings.ToLower(kind))
+	}
+}
+
+func NormalizeFleetCommandResultStatus(status string) string {
+	switch strings.TrimSpace(strings.ToLower(status)) {
+	case FleetCommandStatusAccepted,
+		FleetCommandStatusRunning,
+		FleetCommandStatusCompleted,
+		FleetCommandStatusFailed,
+		FleetCommandStatusRejected,
+		FleetCommandStatusExpired,
+		FleetCommandStatusDuplicate:
+		return strings.TrimSpace(strings.ToLower(status))
+	default:
+		return ""
 	}
 }
 
@@ -181,6 +205,78 @@ func DecodeFleetCommandArgs(raw json.RawMessage) (map[string]interface{}, error)
 		return nil, fmt.Errorf("invalid command args: %w", err)
 	}
 	return args, nil
+}
+
+func ValidateFleetCommandArgs(action string, args map[string]interface{}) error {
+	switch NormalizeFleetCommandAction(action) {
+	case FleetCommandActionAgentInstruction:
+		_, _, _, err := FleetCommandInstructionArgs(args)
+		return err
+	default:
+		return nil
+	}
+}
+
+func FleetCommandInstructionArgs(args map[string]interface{}) (string, int64, map[string]interface{}, error) {
+	if args == nil {
+		return "", 0, nil, fmt.Errorf("instruction args are required")
+	}
+	instruction, ok := args["instruction"].(string)
+	instruction = strings.TrimSpace(instruction)
+	if !ok || instruction == "" {
+		return "", 0, nil, fmt.Errorf("instruction is required")
+	}
+	if len([]byte(instruction)) > MaxFleetInstructionBytes {
+		return "", 0, nil, fmt.Errorf("instruction is too large")
+	}
+	timeoutMS := int64(DefaultFleetInstructionTimeoutMS)
+	if raw, ok := args["timeout_ms"]; ok {
+		parsed, err := fleetCommandInt64Arg(raw)
+		if err != nil {
+			return "", 0, nil, fmt.Errorf("timeout_ms must be an integer")
+		}
+		if parsed < MinFleetInstructionTimeoutMS {
+			parsed = MinFleetInstructionTimeoutMS
+		}
+		if parsed > MaxFleetInstructionTimeoutMS {
+			parsed = MaxFleetInstructionTimeoutMS
+		}
+		timeoutMS = parsed
+	}
+	contextArgs := map[string]interface{}{}
+	if raw, ok := args["context"]; ok {
+		obj, ok := raw.(map[string]interface{})
+		if !ok {
+			return "", 0, nil, fmt.Errorf("context must be an object")
+		}
+		encoded, err := json.Marshal(obj)
+		if err != nil {
+			return "", 0, nil, fmt.Errorf("context: %w", err)
+		}
+		if len(encoded) > MaxFleetInstructionContextBytes {
+			return "", 0, nil, fmt.Errorf("context is too large")
+		}
+		contextArgs = obj
+	}
+	return instruction, timeoutMS, contextArgs, nil
+}
+
+func fleetCommandInt64Arg(v interface{}) (int64, error) {
+	switch n := v.(type) {
+	case float64:
+		if n != float64(int64(n)) {
+			return 0, fmt.Errorf("not an integer")
+		}
+		return int64(n), nil
+	case int64:
+		return n, nil
+	case int:
+		return int64(n), nil
+	case json.Number:
+		return n.Int64()
+	default:
+		return 0, fmt.Errorf("not an integer")
+	}
 }
 
 func VerifyFleetCommandIssuerProof(cmd FleetCommandEnvelope, coordinatorPubKey []byte) bool {

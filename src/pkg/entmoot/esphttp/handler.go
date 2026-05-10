@@ -1241,6 +1241,10 @@ func (h *Handler) handleCreateFleetCommand(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
 	}
+	if err := ValidateFleetCommandArgs(action, args); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
 	targetKind := NormalizeFleetCommandTarget(req.Target)
 	target := FleetCommandTarget{Kind: targetKind}
 	var subject *entmoot.NodeInfo

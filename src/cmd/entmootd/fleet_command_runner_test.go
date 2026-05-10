@@ -2,7 +2,11 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"entmoot/pkg/entmoot"
@@ -210,6 +214,220 @@ func TestFleetCommandContextDoesNotFallbackForArchivedFleetState(t *testing.T) {
 	} else if ok {
 		t.Fatal("commandContextForCommand ok=true for archived local fleet state")
 	}
+}
+
+func TestFleetCommandAgentInstructionRequiresOptIn(t *testing.T) {
+	runner, commandCtx, cmd := testFleetCommandInstructionRunner(t)
+	result, err := runner.execute(context.Background(), commandCtx, cmd)
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if result.status != esphttp.FleetCommandStatusRejected {
+		t.Fatalf("status = %q, want rejected", result.status)
+	}
+	if !strings.Contains(result.summary, "not enabled") {
+		t.Fatalf("summary = %q, want opt-in rejection", result.summary)
+	}
+}
+
+func TestFleetCommandAgentInstructionQueuesInboxFile(t *testing.T) {
+	runner, commandCtx, cmd := testFleetCommandInstructionRunner(t)
+	commandDir := filepath.Join(t.TempDir(), "agent-commands")
+	t.Setenv("ENTMOOT_AGENT_INSTRUCTIONS", "1")
+	t.Setenv("ENTMOOT_AGENT_COMMAND_DIR", commandDir)
+	result, err := runner.execute(context.Background(), commandCtx, cmd)
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if result.status != esphttp.FleetCommandStatusRunning {
+		t.Fatalf("status = %q, want running", result.status)
+	}
+	if result.output != `{"queued":true}` {
+		t.Fatalf("output = %q, want queued JSON", result.output)
+	}
+	queuedPath, err := agentInstructionPath(filepath.Join(commandDir, "inbox"), cmd.CommandID)
+	if err != nil {
+		t.Fatalf("agentInstructionPath: %v", err)
+	}
+	data, err := os.ReadFile(queuedPath)
+	if err != nil {
+		t.Fatalf("ReadFile queued command: %v", err)
+	}
+	var queued agentInstructionFile
+	if err := json.Unmarshal(data, &queued); err != nil {
+		t.Fatalf("Unmarshal queued command: %v", err)
+	}
+	if queued.Instruction != "Send a status update to Mars Hub" {
+		t.Fatalf("instruction = %q", queued.Instruction)
+	}
+	if queued.AgentNodeID != commandCtx.local.NodeID {
+		t.Fatalf("agent node = %d, want %d", queued.AgentNodeID, commandCtx.local.NodeID)
+	}
+}
+
+func TestFleetCommandAgentInstructionDoesNotRequeueExistingCommand(t *testing.T) {
+	runner, commandCtx, cmd := testFleetCommandInstructionRunner(t)
+	commandDir := filepath.Join(t.TempDir(), "agent-commands")
+	inboxDir := filepath.Join(commandDir, "inbox")
+	if err := os.MkdirAll(inboxDir, 0o700); err != nil {
+		t.Fatalf("MkdirAll inbox: %v", err)
+	}
+	path, err := agentInstructionPath(inboxDir, cmd.CommandID)
+	if err != nil {
+		t.Fatalf("agentInstructionPath: %v", err)
+	}
+	if err := os.WriteFile(path, []byte(`{"existing":true}`), 0o600); err != nil {
+		t.Fatalf("WriteFile existing command: %v", err)
+	}
+	hook := filepath.Join(t.TempDir(), "hook.sh")
+	if err := os.WriteFile(hook, []byte("#!/bin/sh\nexit 17\n"), 0o700); err != nil {
+		t.Fatalf("WriteFile hook: %v", err)
+	}
+	t.Setenv("ENTMOOT_AGENT_INSTRUCTIONS", "1")
+	t.Setenv("ENTMOOT_AGENT_COMMAND_DIR", commandDir)
+	t.Setenv("ENTMOOT_AGENT_COMMAND_HOOK", hook)
+	result, err := runner.execute(context.Background(), commandCtx, cmd)
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if result.status != esphttp.FleetCommandStatusDuplicate {
+		t.Fatalf("status = %q, want duplicate", result.status)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile existing command: %v", err)
+	}
+	if string(data) != `{"existing":true}` {
+		t.Fatalf("existing command was overwritten: %s", string(data))
+	}
+}
+
+func TestFleetCommandAgentInstructionHookResult(t *testing.T) {
+	runner, commandCtx, cmd := testFleetCommandInstructionRunner(t)
+	commandDir := filepath.Join(t.TempDir(), "agent-commands")
+	hook := filepath.Join(t.TempDir(), "hook.sh")
+	script := "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{\"status\":\"completed\",\"summary\":\"sent\",\"output\":\"ok\"}'\n"
+	if err := os.WriteFile(hook, []byte(script), 0o700); err != nil {
+		t.Fatalf("WriteFile hook: %v", err)
+	}
+	t.Setenv("ENTMOOT_AGENT_INSTRUCTIONS", "1")
+	t.Setenv("ENTMOOT_AGENT_COMMAND_DIR", commandDir)
+	t.Setenv("ENTMOOT_AGENT_COMMAND_HOOK", hook)
+	result, err := runner.execute(context.Background(), commandCtx, cmd)
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if result.status != esphttp.FleetCommandStatusCompleted || result.summary != "sent" || result.output != "ok" {
+		t.Fatalf("result = %+v, want completed/sent/ok", result)
+	}
+}
+
+func TestFleetCommandAgentInstructionHookRejectsInvalidStatus(t *testing.T) {
+	runner, commandCtx, cmd := testFleetCommandInstructionRunner(t)
+	commandDir := filepath.Join(t.TempDir(), "agent-commands")
+	hook := filepath.Join(t.TempDir(), "hook.sh")
+	script := "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{\"status\":\"fail\",\"summary\":\"typo\"}'\n"
+	if err := os.WriteFile(hook, []byte(script), 0o700); err != nil {
+		t.Fatalf("WriteFile hook: %v", err)
+	}
+	t.Setenv("ENTMOOT_AGENT_INSTRUCTIONS", "1")
+	t.Setenv("ENTMOOT_AGENT_COMMAND_DIR", commandDir)
+	t.Setenv("ENTMOOT_AGENT_COMMAND_HOOK", hook)
+	if _, err := runner.execute(context.Background(), commandCtx, cmd); err == nil || !strings.Contains(err.Error(), "invalid status") {
+		t.Fatalf("execute error = %v, want invalid status", err)
+	}
+}
+
+func TestFleetCommandAgentInstructionEncodesUnsafeCommandID(t *testing.T) {
+	runner, commandCtx, cmd := testFleetCommandInstructionRunner(t)
+	cmd.CommandID = "../../somefile"
+	commandDir := filepath.Join(t.TempDir(), "agent-commands")
+	t.Setenv("ENTMOOT_AGENT_INSTRUCTIONS", "1")
+	t.Setenv("ENTMOOT_AGENT_COMMAND_DIR", commandDir)
+	result, err := runner.execute(context.Background(), commandCtx, cmd)
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if result.status != esphttp.FleetCommandStatusRunning {
+		t.Fatalf("status = %q, want running", result.status)
+	}
+	if _, err := os.Stat(filepath.Join(commandDir, "somefile")); !os.IsNotExist(err) {
+		t.Fatalf("unsafe path write err = %v, want not exist", err)
+	}
+	if _, err := os.Stat(filepath.Join(commandDir, "inbox", "Li4vLi4vc29tZWZpbGU.json")); err != nil {
+		t.Fatalf("encoded command file missing: %v", err)
+	}
+}
+
+func TestFleetCommandStatusIsTerminal(t *testing.T) {
+	if fleetCommandStatusIsTerminal(esphttp.FleetCommandStatusRunning) {
+		t.Fatal("running status should not be terminal")
+	}
+	if fleetCommandStatusIsTerminal(esphttp.FleetCommandStatusAccepted) {
+		t.Fatal("accepted status should not be terminal")
+	}
+	if !fleetCommandStatusIsTerminal(esphttp.FleetCommandStatusCompleted) {
+		t.Fatal("completed status should be terminal")
+	}
+	if !fleetCommandStatusIsTerminal(esphttp.FleetCommandStatusRejected) {
+		t.Fatal("rejected status should be terminal")
+	}
+	if !fleetCommandStatusIsTerminal(esphttp.FleetCommandStatusDuplicate) {
+		t.Fatal("duplicate status should be terminal")
+	}
+	if !fleetCommandStatusIsTerminal(esphttp.FleetCommandStatusExpired) {
+		t.Fatal("expired status should be terminal")
+	}
+}
+
+func testFleetCommandInstructionRunner(t *testing.T) (*fleetCommandRunner, fleetCommandContext, esphttp.FleetCommandEnvelope) {
+	t.Helper()
+	dataDir := t.TempDir()
+	agentID, agent := testFleetCommandIdentity(t, 133053)
+	coordinator := entmoot.NodeInfo{PilotNodeID: 45981}
+	gid := testFleetCommandGroupID(0x47)
+	runner := &fleetCommandRunner{
+		server: &ipcServer{
+			nodeID:   agent.PilotNodeID,
+			identity: agentID,
+			dataDir:  dataDir,
+		},
+	}
+	commandCtx := fleetCommandContext{
+		fleet: esphttp.FleetRecord{
+			FleetID:        "fleet-a",
+			ControlGroupID: gid,
+			Coordinator:    coordinator,
+			Status:         esphttp.FleetStatusActive,
+		},
+		local: esphttp.FleetMemberRecord{
+			FleetID:       "fleet-a",
+			Role:          esphttp.FleetRoleAgent,
+			Status:        esphttp.FleetMemberActive,
+			NodeID:        agent.PilotNodeID,
+			EntmootPubKey: base64.StdEncoding.EncodeToString(agent.EntmootPubKey),
+		},
+	}
+	cmd := esphttp.FleetCommandEnvelope{
+		Type:           esphttp.FleetCommandMessageType,
+		Version:        1,
+		CommandID:      "cmd_agent_instruction",
+		FleetID:        "fleet-a",
+		ControlGroupID: gid,
+		IssuerNodeID:   coordinator.PilotNodeID,
+		Target:         esphttp.FleetCommandTarget{Kind: esphttp.FleetCommandTargetNode, PilotNodeID: agent.PilotNodeID},
+		Action:         esphttp.FleetCommandActionAgentInstruction,
+		AutoAccept:     true,
+		CreatedAtMS:    1234,
+		Args: map[string]interface{}{
+			"instruction": "Send a status update to Mars Hub",
+			"timeout_ms":  float64(60000),
+			"context": map[string]interface{}{
+				"source": "test",
+			},
+		},
+	}
+	return runner, commandCtx, cmd
 }
 
 func testFleetCommandIdentity(t *testing.T, nodeID entmoot.NodeID) (*keystore.Identity, entmoot.NodeInfo) {
