@@ -299,6 +299,9 @@ pid_matches_stack() {
     entmoot)
       has_proc_arg "\$pid" "-data" && has_proc_arg "\$pid" "\$ENTMOOT_DATA"
       ;;
+    agent-watcher)
+      has_proc_arg "\$pid" "-data" && has_proc_arg "\$pid" "\$ENTMOOT_DATA" && has_proc_arg "\$pid" "agent-commands" && has_proc_arg "\$pid" "watch"
+      ;;
     *)
       return 1
       ;;
@@ -464,9 +467,41 @@ print_entmoot_start_failure() {
   fi
 }
 
+stop_agent_command_watcher() {
+  watch_pidfile="\$RUN_DIR/agent-commands-watch.pid"
+  old_pid=""
+  if [ -f "\$watch_pidfile" ]; then
+    old_pid=\$(cat "\$watch_pidfile" 2>/dev/null || true)
+  fi
+  if pid_matches_stack agent-watcher "\$old_pid"; then
+    kill -TERM "\$old_pid" 2>/dev/null || true
+    sleep 1
+    if pid_matches_stack agent-watcher "\$old_pid"; then
+      kill -KILL "\$old_pid" 2>/dev/null || true
+    fi
+  fi
+  stop_stack_processes agent-watcher || true
+  rm -f "\$watch_pidfile"
+}
+
+start_agent_command_watcher() {
+  stop_agent_command_watcher
+  runner="\${ENTMOOT_AGENT_RUNNER:-}"
+  [ -n "\$runner" ] || return 0
+  if [ "\$runner" != "openclaw" ] && [ ! -x "\$runner" ] && ! command -v "\$runner" >/dev/null 2>&1; then
+    echo "ENTMOOT_AGENT_RUNNER=\$runner is not executable or on PATH" >&2
+    return 1
+  fi
+  interval="\${ENTMOOT_AGENT_WATCH_INTERVAL:-10s}"
+  watch_pidfile="\$RUN_DIR/agent-commands-watch.pid"
+  nohup "\$ENTMOOT_BIN" -socket "\$PILOT_SOCKET" -identity "\$ENTMOOT_IDENTITY" -data "\$ENTMOOT_DATA" agent-commands watch -interval "\$interval" -runner "\$runner" >> "\$ENTMOOT_DATA/agent-commands-watch.log" 2>&1 &
+  echo "\$!" > "\$watch_pidfile"
+}
+
 if [ "\$(id -u)" = "0" ] && [ -d /data ] && is_data_agent_layout; then
   if STACK_RUN_USER=\$(select_stack_run_user); then
     mkdir -p "\$RUN_DIR"
+    stop_agent_command_watcher || true
     stop_pidfile entmoot "\$ENTMOOT_PIDFILE" || true
     stop_pidfile pilot "\$PILOT_PIDFILE" || true
     stop_stack_processes entmoot || true
@@ -475,7 +510,7 @@ if [ "\$(id -u)" = "0" ] && [ -d /data ] && is_data_agent_layout; then
     STACK_RUN_GROUP=\$(id -gn "\$STACK_RUN_USER" 2>/dev/null || printf '%s' "\$STACK_RUN_USER")
     chown -R "\$STACK_RUN_USER:\$STACK_RUN_GROUP" "\$PILOT_DIR" "\$ENTMOOT_DATA" "\$RUN_DIR"
     envs="ENTMOOT_RUNTIME_ENV=\$(quote "\$RUNTIME_ENV")"
-    for name in ENTMOOT_BIN ENTMOOT_DATA ENTMOOT_IDENTITY ENTMOOT_CONTROL_SOCKET ENTMOOT_HIDE_IP ENTMOOT_START_TIMEOUT ENTMOOT_RUN_DIR ENTMOOT_RUN_USER PILOT_DIR PILOT_BIN_DIR PILOT_SOCKET TMP_PILOT_SOCKET PILOT_DAEMON_BIN PILOTCTL_BIN PILOT_REGISTRY PILOT_BEACON PILOT_HOSTNAME PILOT_EMAIL PILOT_TURN_PROVIDER PILOT_CLOUDFLARE_TURN_CREDS_FILE PILOT_RENDEZVOUS_URL; do
+    for name in ENTMOOT_BIN ENTMOOT_DATA ENTMOOT_IDENTITY ENTMOOT_CONTROL_SOCKET ENTMOOT_HIDE_IP ENTMOOT_START_TIMEOUT ENTMOOT_RUN_DIR ENTMOOT_RUN_USER ENTMOOT_AGENT_INSTRUCTIONS ENTMOOT_AGENT_RUNNER ENTMOOT_AGENT_WATCH_INTERVAL ENTMOOT_OPENCLAW_AGENT ENTMOOT_OPENCLAW_SESSION_ID ENTMOOT_OPENCLAW_TO OPENCLAW_AGENT_ID OPENCLAW_SESSION_ID OPENCLAW_TO OPENCLAW_BIN PILOT_DIR PILOT_BIN_DIR PILOT_SOCKET TMP_PILOT_SOCKET PILOT_DAEMON_BIN PILOTCTL_BIN PILOT_REGISTRY PILOT_BEACON PILOT_HOSTNAME PILOT_EMAIL PILOT_TURN_PROVIDER PILOT_CLOUDFLARE_TURN_CREDS_FILE PILOT_RENDEZVOUS_URL; do
       eval "value=\\\${\$name-}"
       if [ -n "\$value" ]; then
         envs="\$envs \$name=\$(quote "\$value")"
@@ -491,6 +526,7 @@ PILOT_DAEMON_BIN=\$(resolve_pilot_binary pilot-daemon "\${PILOT_DAEMON_BIN:-}" d
 PILOTCTL_BIN=\$(resolve_pilot_binary pilotctl "\${PILOTCTL_BIN:-}")
 
 mkdir -p "\$RUN_DIR"
+stop_agent_command_watcher || true
 stop_pidfile entmoot "\$ENTMOOT_PIDFILE" || true
 if [ -e "\$ENTMOOT_CONTROL_SOCKET" ] || [ -S "\$ENTMOOT_CONTROL_SOCKET" ]; then
   if entmoot_socket_live; then
@@ -568,6 +604,7 @@ while [ "\$elapsed" -lt "\$ENTMOOT_START_TIMEOUT" ]; do
   fi
   if entmoot_socket_live; then
     echo "\$entmoot_pid" > "\$ENTMOOT_PIDFILE"
+    start_agent_command_watcher
     exit 0
   fi
   sleep 1

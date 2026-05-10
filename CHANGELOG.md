@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.57] - 2026-05-11
+
+### Changed
+
+- **OpenClaw container startup.** The generated container stack helper now
+  accepts `ENTMOOT_AGENT_RUNNER=openclaw`, preserves OpenClaw selector
+  environment, and starts the agent command watcher with the built-in adapter.
+
 ## [1.5.56] - 2026-05-11
 
 ### Added
