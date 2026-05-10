@@ -1437,6 +1437,39 @@ CREATE TABLE IF NOT EXISTS esp_fleet_task_submissions (
 
 CREATE INDEX IF NOT EXISTS idx_fleet_task_submissions_task
   ON esp_fleet_task_submissions(fleet_id, task_id, created_at_ms DESC);
+
+CREATE TABLE IF NOT EXISTS esp_agent_commands (
+  command_id TEXT PRIMARY KEY,
+  fleet_id TEXT NOT NULL,
+  control_group_id BLOB NOT NULL,
+  issuer_node_id INTEGER NOT NULL,
+  agent_node_id INTEGER NOT NULL,
+  action TEXT NOT NULL,
+  target BLOB NOT NULL,
+  instruction TEXT NOT NULL,
+  context BLOB,
+  args BLOB,
+  command BLOB NOT NULL,
+  payload BLOB NOT NULL,
+  status TEXT NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  lease_owner TEXT NOT NULL DEFAULT '',
+  lease_until_ms INTEGER NOT NULL DEFAULT 0,
+  created_at_ms INTEGER NOT NULL,
+  expires_at_ms INTEGER NOT NULL DEFAULT 0,
+  received_at_ms INTEGER NOT NULL,
+  started_at_ms INTEGER NOT NULL DEFAULT 0,
+  completed_at_ms INTEGER NOT NULL DEFAULT 0,
+  updated_at_ms INTEGER NOT NULL,
+  result BLOB,
+  last_error TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_commands_status
+  ON esp_agent_commands(status, received_at_ms);
+
+CREATE INDEX IF NOT EXISTS idx_agent_commands_lease
+  ON esp_agent_commands(status, lease_until_ms);
 `
 
 func OpenSQLiteStateStore(dataDir string) (*SQLiteStateStore, error) {
@@ -2613,6 +2646,40 @@ func migrateSQLiteState(db *sql.DB) error {
 		}
 		if _, err := db.Exec(stmt.sql); err != nil {
 			return fmt.Errorf("esphttp: migrate state schema add fleet %s: %w", stmt.name, err)
+		}
+	}
+	for _, stmt := range []string{
+		`CREATE TABLE IF NOT EXISTS esp_agent_commands (
+		  command_id TEXT PRIMARY KEY,
+		  fleet_id TEXT NOT NULL,
+		  control_group_id BLOB NOT NULL,
+		  issuer_node_id INTEGER NOT NULL,
+		  agent_node_id INTEGER NOT NULL,
+		  action TEXT NOT NULL,
+		  target BLOB NOT NULL,
+		  instruction TEXT NOT NULL,
+		  context BLOB,
+		  args BLOB,
+		  command BLOB NOT NULL,
+		  payload BLOB NOT NULL,
+		  status TEXT NOT NULL,
+		  attempts INTEGER NOT NULL DEFAULT 0,
+		  lease_owner TEXT NOT NULL DEFAULT '',
+		  lease_until_ms INTEGER NOT NULL DEFAULT 0,
+		  created_at_ms INTEGER NOT NULL,
+		  expires_at_ms INTEGER NOT NULL DEFAULT 0,
+		  received_at_ms INTEGER NOT NULL,
+		  started_at_ms INTEGER NOT NULL DEFAULT 0,
+		  completed_at_ms INTEGER NOT NULL DEFAULT 0,
+		  updated_at_ms INTEGER NOT NULL,
+		  result BLOB,
+		  last_error TEXT NOT NULL DEFAULT ''
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_agent_commands_status ON esp_agent_commands(status, received_at_ms)`,
+		`CREATE INDEX IF NOT EXISTS idx_agent_commands_lease ON esp_agent_commands(status, lease_until_ms)`,
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			return fmt.Errorf("esphttp: migrate state schema add agent commands: %w", err)
 		}
 	}
 	return nil

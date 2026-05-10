@@ -4,8 +4,6 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -230,11 +228,9 @@ func TestFleetCommandAgentInstructionRequiresOptIn(t *testing.T) {
 	}
 }
 
-func TestFleetCommandAgentInstructionQueuesInboxFile(t *testing.T) {
+func TestFleetCommandAgentInstructionQueuesSQLite(t *testing.T) {
 	runner, commandCtx, cmd := testFleetCommandInstructionRunner(t)
-	commandDir := filepath.Join(t.TempDir(), "agent-commands")
 	t.Setenv("ENTMOOT_AGENT_INSTRUCTIONS", "1")
-	t.Setenv("ENTMOOT_AGENT_COMMAND_DIR", commandDir)
 	result, err := runner.execute(context.Background(), commandCtx, cmd)
 	if err != nil {
 		t.Fatalf("execute: %v", err)
@@ -245,47 +241,29 @@ func TestFleetCommandAgentInstructionQueuesInboxFile(t *testing.T) {
 	if result.output != `{"queued":true}` {
 		t.Fatalf("output = %q, want queued JSON", result.output)
 	}
-	queuedPath, err := agentInstructionPath(filepath.Join(commandDir, "inbox"), cmd.CommandID)
-	if err != nil {
-		t.Fatalf("agentInstructionPath: %v", err)
+	queued, ok, err := runner.state.GetAgentCommand(context.Background(), cmd.CommandID)
+	if err != nil || !ok {
+		t.Fatalf("GetAgentCommand ok/err = %v/%v", ok, err)
 	}
-	data, err := os.ReadFile(queuedPath)
-	if err != nil {
-		t.Fatalf("ReadFile queued command: %v", err)
+	if queued.Payload.Instruction != "Send a status update to Mars Hub" {
+		t.Fatalf("instruction = %q", queued.Payload.Instruction)
 	}
-	var queued agentInstructionFile
-	if err := json.Unmarshal(data, &queued); err != nil {
-		t.Fatalf("Unmarshal queued command: %v", err)
+	if queued.Payload.AgentNodeID != commandCtx.local.NodeID {
+		t.Fatalf("agent node = %d, want %d", queued.Payload.AgentNodeID, commandCtx.local.NodeID)
 	}
-	if queued.Instruction != "Send a status update to Mars Hub" {
-		t.Fatalf("instruction = %q", queued.Instruction)
-	}
-	if queued.AgentNodeID != commandCtx.local.NodeID {
-		t.Fatalf("agent node = %d, want %d", queued.AgentNodeID, commandCtx.local.NodeID)
+	if queued.Status != esphttp.FleetCommandStatusRunning {
+		t.Fatalf("queued status = %q, want running", queued.Status)
 	}
 }
 
 func TestFleetCommandAgentInstructionDoesNotRequeueExistingCommand(t *testing.T) {
 	runner, commandCtx, cmd := testFleetCommandInstructionRunner(t)
-	commandDir := filepath.Join(t.TempDir(), "agent-commands")
-	inboxDir := filepath.Join(commandDir, "inbox")
-	if err := os.MkdirAll(inboxDir, 0o700); err != nil {
-		t.Fatalf("MkdirAll inbox: %v", err)
-	}
-	path, err := agentInstructionPath(inboxDir, cmd.CommandID)
-	if err != nil {
-		t.Fatalf("agentInstructionPath: %v", err)
-	}
-	if err := os.WriteFile(path, []byte(`{"existing":true}`), 0o600); err != nil {
-		t.Fatalf("WriteFile existing command: %v", err)
-	}
-	hook := filepath.Join(t.TempDir(), "hook.sh")
-	if err := os.WriteFile(hook, []byte("#!/bin/sh\nexit 17\n"), 0o700); err != nil {
-		t.Fatalf("WriteFile hook: %v", err)
-	}
 	t.Setenv("ENTMOOT_AGENT_INSTRUCTIONS", "1")
-	t.Setenv("ENTMOOT_AGENT_COMMAND_DIR", commandDir)
-	t.Setenv("ENTMOOT_AGENT_COMMAND_HOOK", hook)
+	receivedAt := int64(9999)
+	payload := esphttp.NewAgentInstructionPayload(cmd, commandCtx.local.NodeID, "existing", nil, 60000, receivedAt)
+	if _, created, err := runner.state.EnqueueAgentCommand(context.Background(), payload); err != nil || !created {
+		t.Fatalf("EnqueueAgentCommand created/err = %v/%v", created, err)
+	}
 	result, err := runner.execute(context.Background(), commandCtx, cmd)
 	if err != nil {
 		t.Fatalf("execute: %v", err)
@@ -293,57 +271,19 @@ func TestFleetCommandAgentInstructionDoesNotRequeueExistingCommand(t *testing.T)
 	if result.status != esphttp.FleetCommandStatusDuplicate {
 		t.Fatalf("status = %q, want duplicate", result.status)
 	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("ReadFile existing command: %v", err)
+	queued, ok, err := runner.state.GetAgentCommand(context.Background(), cmd.CommandID)
+	if err != nil || !ok {
+		t.Fatalf("GetAgentCommand ok/err = %v/%v", ok, err)
 	}
-	if string(data) != `{"existing":true}` {
-		t.Fatalf("existing command was overwritten: %s", string(data))
-	}
-}
-
-func TestFleetCommandAgentInstructionHookResult(t *testing.T) {
-	runner, commandCtx, cmd := testFleetCommandInstructionRunner(t)
-	commandDir := filepath.Join(t.TempDir(), "agent-commands")
-	hook := filepath.Join(t.TempDir(), "hook.sh")
-	script := "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{\"status\":\"completed\",\"summary\":\"sent\",\"output\":\"ok\"}'\n"
-	if err := os.WriteFile(hook, []byte(script), 0o700); err != nil {
-		t.Fatalf("WriteFile hook: %v", err)
-	}
-	t.Setenv("ENTMOOT_AGENT_INSTRUCTIONS", "1")
-	t.Setenv("ENTMOOT_AGENT_COMMAND_DIR", commandDir)
-	t.Setenv("ENTMOOT_AGENT_COMMAND_HOOK", hook)
-	result, err := runner.execute(context.Background(), commandCtx, cmd)
-	if err != nil {
-		t.Fatalf("execute: %v", err)
-	}
-	if result.status != esphttp.FleetCommandStatusCompleted || result.summary != "sent" || result.output != "ok" {
-		t.Fatalf("result = %+v, want completed/sent/ok", result)
+	if queued.Payload.Instruction != "existing" {
+		t.Fatalf("existing command was overwritten: %q", queued.Payload.Instruction)
 	}
 }
 
-func TestFleetCommandAgentInstructionHookRejectsInvalidStatus(t *testing.T) {
-	runner, commandCtx, cmd := testFleetCommandInstructionRunner(t)
-	commandDir := filepath.Join(t.TempDir(), "agent-commands")
-	hook := filepath.Join(t.TempDir(), "hook.sh")
-	script := "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{\"status\":\"fail\",\"summary\":\"typo\"}'\n"
-	if err := os.WriteFile(hook, []byte(script), 0o700); err != nil {
-		t.Fatalf("WriteFile hook: %v", err)
-	}
-	t.Setenv("ENTMOOT_AGENT_INSTRUCTIONS", "1")
-	t.Setenv("ENTMOOT_AGENT_COMMAND_DIR", commandDir)
-	t.Setenv("ENTMOOT_AGENT_COMMAND_HOOK", hook)
-	if _, err := runner.execute(context.Background(), commandCtx, cmd); err == nil || !strings.Contains(err.Error(), "invalid status") {
-		t.Fatalf("execute error = %v, want invalid status", err)
-	}
-}
-
-func TestFleetCommandAgentInstructionEncodesUnsafeCommandID(t *testing.T) {
+func TestFleetCommandAgentInstructionStoresUnsafeCommandIDWithoutPathWrite(t *testing.T) {
 	runner, commandCtx, cmd := testFleetCommandInstructionRunner(t)
 	cmd.CommandID = "../../somefile"
-	commandDir := filepath.Join(t.TempDir(), "agent-commands")
 	t.Setenv("ENTMOOT_AGENT_INSTRUCTIONS", "1")
-	t.Setenv("ENTMOOT_AGENT_COMMAND_DIR", commandDir)
 	result, err := runner.execute(context.Background(), commandCtx, cmd)
 	if err != nil {
 		t.Fatalf("execute: %v", err)
@@ -351,11 +291,8 @@ func TestFleetCommandAgentInstructionEncodesUnsafeCommandID(t *testing.T) {
 	if result.status != esphttp.FleetCommandStatusRunning {
 		t.Fatalf("status = %q, want running", result.status)
 	}
-	if _, err := os.Stat(filepath.Join(commandDir, "somefile")); !os.IsNotExist(err) {
-		t.Fatalf("unsafe path write err = %v, want not exist", err)
-	}
-	if _, err := os.Stat(filepath.Join(commandDir, "inbox", "Li4vLi4vc29tZWZpbGU.json")); err != nil {
-		t.Fatalf("encoded command file missing: %v", err)
+	if _, ok, err := runner.state.GetAgentCommand(context.Background(), cmd.CommandID); err != nil || !ok {
+		t.Fatalf("GetAgentCommand unsafe id ok/err = %v/%v", ok, err)
 	}
 }
 
@@ -392,6 +329,7 @@ func testFleetCommandInstructionRunner(t *testing.T) (*fleetCommandRunner, fleet
 			identity: agentID,
 			dataDir:  dataDir,
 		},
+		state: mustOpenFleetCommandState(t, dataDir),
 	}
 	commandCtx := fleetCommandContext{
 		fleet: esphttp.FleetRecord{
@@ -428,6 +366,16 @@ func testFleetCommandInstructionRunner(t *testing.T) (*fleetCommandRunner, fleet
 		},
 	}
 	return runner, commandCtx, cmd
+}
+
+func mustOpenFleetCommandState(t *testing.T, dataDir string) *esphttp.SQLiteStateStore {
+	t.Helper()
+	state, err := esphttp.OpenSQLiteStateStore(dataDir)
+	if err != nil {
+		t.Fatalf("OpenSQLiteStateStore: %v", err)
+	}
+	t.Cleanup(func() { _ = state.Close() })
+	return state
 }
 
 func testFleetCommandIdentity(t *testing.T, nodeID entmoot.NodeID) (*keystore.Identity, entmoot.NodeInfo) {

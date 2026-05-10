@@ -8,8 +8,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"os/exec"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -39,30 +37,6 @@ type fleetCommandExecution struct {
 	status  string
 	summary string
 	output  string
-}
-
-type agentInstructionFile struct {
-	Type           string                     `json:"type"`
-	Version        int                        `json:"version"`
-	CommandID      string                     `json:"command_id"`
-	FleetID        string                     `json:"fleet_id"`
-	ControlGroupID entmoot.GroupID            `json:"control_group_id"`
-	IssuerNodeID   entmoot.NodeID             `json:"issuer_node_id"`
-	Target         esphttp.FleetCommandTarget `json:"target"`
-	AgentNodeID    entmoot.NodeID             `json:"agent_node_id"`
-	Instruction    string                     `json:"instruction"`
-	Context        map[string]interface{}     `json:"context,omitempty"`
-	TimeoutMS      int64                      `json:"timeout_ms"`
-	CreatedAtMS    int64                      `json:"created_at_ms"`
-	ExpiresAtMS    int64                      `json:"expires_at_ms,omitempty"`
-	ReceivedAtMS   int64                      `json:"received_at_ms"`
-	Args           map[string]interface{}     `json:"args,omitempty"`
-}
-
-type agentInstructionHookResult struct {
-	Status  string `json:"status"`
-	Summary string `json:"summary"`
-	Output  string `json:"output"`
 }
 
 func newFleetCommandRunner(server *ipcServer, state *esphttp.SQLiteStateStore, notify *notifyingStore, logger *slog.Logger) *fleetCommandRunner {
@@ -343,32 +317,9 @@ func (r *fleetCommandRunner) dispatchAgentInstruction(ctx context.Context, comma
 	if err != nil {
 		return fleetCommandExecution{}, err
 	}
-	commandDir := strings.TrimSpace(os.Getenv("ENTMOOT_AGENT_COMMAND_DIR"))
-	if commandDir == "" {
-		commandDir = filepath.Join(r.server.dataDir, "agent-commands")
-	}
-	inboxDir := filepath.Join(commandDir, "inbox")
-	if err := os.MkdirAll(inboxDir, 0o700); err != nil {
-		return fleetCommandExecution{}, fmt.Errorf("create agent command inbox: %w", err)
-	}
-	commandFile := agentInstructionFile{
-		Type:           "entmoot.agent_instruction.v1",
-		Version:        1,
-		CommandID:      cmd.CommandID,
-		FleetID:        cmd.FleetID,
-		ControlGroupID: cmd.ControlGroupID,
-		IssuerNodeID:   cmd.IssuerNodeID,
-		Target:         cmd.Target,
-		AgentNodeID:    commandCtx.local.NodeID,
-		Instruction:    instruction,
-		Context:        instructionContext,
-		TimeoutMS:      timeoutMS,
-		CreatedAtMS:    cmd.CreatedAtMS,
-		ExpiresAtMS:    cmd.ExpiresAtMS,
-		ReceivedAtMS:   time.Now().UnixMilli(),
-		Args:           cmd.Args,
-	}
-	path, created, err := writeAgentInstructionFile(inboxDir, commandFile)
+	receivedAt := time.Now().UnixMilli()
+	payload := esphttp.NewAgentInstructionPayload(cmd, commandCtx.local.NodeID, instruction, instructionContext, timeoutMS, receivedAt)
+	_, created, err := r.state.EnqueueAgentCommand(ctx, payload)
 	if err != nil {
 		return fleetCommandExecution{}, err
 	}
@@ -379,115 +330,10 @@ func (r *fleetCommandRunner) dispatchAgentInstruction(ctx context.Context, comma
 			output:  `{"queued":true}`,
 		}, nil
 	}
-	hook := strings.TrimSpace(os.Getenv("ENTMOOT_AGENT_COMMAND_HOOK"))
-	if hook == "" {
-		return fleetCommandExecution{
-			status:  esphttp.FleetCommandStatusRunning,
-			summary: "Queued for local agent runtime",
-			output:  `{"queued":true}`,
-		}, nil
-	}
-	hookCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutMS)*time.Millisecond)
-	defer cancel()
-	return runAgentInstructionHook(hookCtx, hook, path, commandFile)
-}
-
-func writeAgentInstructionFile(inboxDir string, command agentInstructionFile) (string, bool, error) {
-	path, err := agentInstructionPath(inboxDir, command.CommandID)
-	if err != nil {
-		return "", false, err
-	}
-	if _, err := os.Stat(path); err == nil {
-		return path, false, nil
-	} else if !os.IsNotExist(err) {
-		return "", false, fmt.Errorf("stat agent command file: %w", err)
-	}
-	tmp, err := os.CreateTemp(inboxDir, filepath.Base(path)+".*.tmp")
-	if err != nil {
-		return "", false, fmt.Errorf("create agent command file: %w", err)
-	}
-	tmpName := tmp.Name()
-	enc := json.NewEncoder(tmp)
-	enc.SetIndent("", "  ")
-	if err := enc.Encode(command); err != nil {
-		_ = tmp.Close()
-		_ = os.Remove(tmpName)
-		return "", false, fmt.Errorf("encode agent command file: %w", err)
-	}
-	if err := tmp.Chmod(0o600); err != nil {
-		_ = tmp.Close()
-		_ = os.Remove(tmpName)
-		return "", false, fmt.Errorf("chmod agent command file: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		_ = os.Remove(tmpName)
-		return "", false, fmt.Errorf("close agent command file: %w", err)
-	}
-	if err := os.Link(tmpName, path); err != nil {
-		_ = os.Remove(tmpName)
-		if os.IsExist(err) {
-			return path, false, nil
-		}
-		return "", false, fmt.Errorf("install agent command file: %w", err)
-	}
-	_ = os.Remove(tmpName)
-	return path, true, nil
-}
-
-func agentInstructionPath(inboxDir, commandID string) (string, error) {
-	commandID = strings.TrimSpace(commandID)
-	if commandID == "" {
-		return "", fmt.Errorf("agent command id is required")
-	}
-	name := base64.RawURLEncoding.EncodeToString([]byte(commandID)) + ".json"
-	return filepath.Join(inboxDir, name), nil
-}
-
-func runAgentInstructionHook(ctx context.Context, hook, path string, command agentInstructionFile) (fleetCommandExecution, error) {
-	data, err := json.Marshal(command)
-	if err != nil {
-		return fleetCommandExecution{}, err
-	}
-	hookCmd := exec.CommandContext(ctx, hook)
-	hookCmd.Stdin = bytes.NewReader(data)
-	hookCmd.Env = append(os.Environ(),
-		"ENTMOOT_AGENT_COMMAND_FILE="+path,
-		"ENTMOOT_AGENT_COMMAND_ID="+command.CommandID,
-		"ENTMOOT_AGENT_FLEET_ID="+command.FleetID,
-	)
-	out, err := hookCmd.Output()
-	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			return fleetCommandExecution{
-				status:  esphttp.FleetCommandStatusFailed,
-				summary: "Agent hook failed",
-				output:  strings.TrimSpace(string(exitErr.Stderr)),
-			}, nil
-		}
-		return fleetCommandExecution{}, err
-	}
-	var result agentInstructionHookResult
-	if len(bytes.TrimSpace(out)) > 0 {
-		if err := json.Unmarshal(out, &result); err != nil {
-			return fleetCommandExecution{}, fmt.Errorf("agent hook returned invalid JSON: %w", err)
-		}
-	}
-	rawStatus := strings.TrimSpace(result.Status)
-	status := esphttp.NormalizeFleetCommandResultStatus(rawStatus)
-	if rawStatus != "" && status == "" {
-		return fleetCommandExecution{}, fmt.Errorf("agent hook returned invalid status %q", rawStatus)
-	}
-	if rawStatus == "" {
-		status = esphttp.FleetCommandStatusCompleted
-	}
-	summary := strings.TrimSpace(result.Summary)
-	if summary == "" {
-		summary = "Agent instruction handled"
-	}
 	return fleetCommandExecution{
-		status:  status,
-		summary: summary,
-		output:  result.Output,
+		status:  esphttp.FleetCommandStatusRunning,
+		summary: "Queued for local agent runtime",
+		output:  `{"queued":true}`,
 	}, nil
 }
 
