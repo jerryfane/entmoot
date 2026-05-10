@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.53] - 2026-05-10
+
+### Added
+
+- **Agent instruction commands.** Fleet coordinators can now issue signed
+  agent instruction commands, and local agents can opt in to run them through
+  the Fleet command queue and hook dispatcher.
+- **Instruction result publishing.** Added CLI support for local agent runtimes
+  to publish structured instruction results back into the Fleet command stream.
+
 ## [1.5.51] - 2026-05-09
 
 ### Added
