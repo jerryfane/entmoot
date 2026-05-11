@@ -19,23 +19,24 @@ const (
 )
 
 type AgentInstructionPayload struct {
-	Type           string                 `json:"type"`
-	Version        int                    `json:"version"`
-	CommandID      string                 `json:"command_id"`
-	FleetID        string                 `json:"fleet_id"`
-	ControlGroupID entmoot.GroupID        `json:"control_group_id"`
-	IssuerNodeID   entmoot.NodeID         `json:"issuer_node_id"`
-	Target         FleetCommandTarget     `json:"target"`
-	AgentNodeID    entmoot.NodeID         `json:"agent_node_id"`
-	Action         string                 `json:"action"`
-	Instruction    string                 `json:"instruction"`
-	Context        map[string]interface{} `json:"context,omitempty"`
-	TimeoutMS      int64                  `json:"timeout_ms"`
-	CreatedAtMS    int64                  `json:"created_at_ms"`
-	ExpiresAtMS    int64                  `json:"expires_at_ms,omitempty"`
-	ReceivedAtMS   int64                  `json:"received_at_ms"`
-	Args           map[string]interface{} `json:"args,omitempty"`
-	Command        *FleetCommandEnvelope  `json:"command,omitempty"`
+	Type           string                       `json:"type"`
+	Version        int                          `json:"version"`
+	CommandID      string                       `json:"command_id"`
+	FleetID        string                       `json:"fleet_id"`
+	ControlGroupID entmoot.GroupID              `json:"control_group_id"`
+	IssuerNodeID   entmoot.NodeID               `json:"issuer_node_id"`
+	Target         FleetCommandTarget           `json:"target"`
+	AgentNodeID    entmoot.NodeID               `json:"agent_node_id"`
+	Action         string                       `json:"action"`
+	Instruction    string                       `json:"instruction"`
+	Context        map[string]interface{}       `json:"context,omitempty"`
+	Actions        []FleetCommandExternalAction `json:"actions,omitempty"`
+	TimeoutMS      int64                        `json:"timeout_ms"`
+	CreatedAtMS    int64                        `json:"created_at_ms"`
+	ExpiresAtMS    int64                        `json:"expires_at_ms,omitempty"`
+	ReceivedAtMS   int64                        `json:"received_at_ms"`
+	Args           map[string]interface{}       `json:"args,omitempty"`
+	Command        *FleetCommandEnvelope        `json:"command,omitempty"`
 }
 
 type AgentCommandRecord struct {

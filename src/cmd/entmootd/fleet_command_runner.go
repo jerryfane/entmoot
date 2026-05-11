@@ -313,12 +313,13 @@ func (r *fleetCommandRunner) dispatchAgentInstruction(ctx context.Context, comma
 			summary: "Agent instruction rejected: local agent instructions are not enabled",
 		}, nil
 	}
-	instruction, timeoutMS, instructionContext, err := esphttp.FleetCommandInstructionArgs(cmd.Args)
+	spec, err := esphttp.FleetCommandInstructionSpecFromArgs(cmd.Args)
 	if err != nil {
 		return fleetCommandExecution{}, err
 	}
 	receivedAt := time.Now().UnixMilli()
-	payload := esphttp.NewAgentInstructionPayload(cmd, commandCtx.local.NodeID, instruction, instructionContext, timeoutMS, receivedAt)
+	payload := esphttp.NewAgentInstructionPayload(cmd, commandCtx.local.NodeID, spec.Instruction, spec.Context, spec.TimeoutMS, receivedAt)
+	payload.Actions = spec.Actions
 	_, created, err := r.state.EnqueueAgentCommand(ctx, payload)
 	if err != nil {
 		return fleetCommandExecution{}, err

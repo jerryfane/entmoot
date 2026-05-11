@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.58] - 2026-05-11
+
+### Added
+
+- **Agent external action requirements.** `agent.instruction` commands can now
+  carry structured `actions` requirements such as `message.send`, so external
+  action success is based on OpenClaw delivery evidence rather than agent text.
+
+### Fixed
+
+- **OpenClaw result output.** Built-in OpenClaw agent results now publish a
+  compact output and strip prompt, tool schema, token, and workspace metadata.
+- **OpenClaw startup validation.** The generated stack helper now fails fast
+  when `ENTMOOT_AGENT_RUNNER=openclaw` is configured but neither
+  `OPENCLAW_BIN` nor `openclaw` on `$PATH` can be executed.
+
 ## [1.5.57] - 2026-05-11
 
 ### Changed

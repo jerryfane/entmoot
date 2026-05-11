@@ -40,7 +40,10 @@ calls `openclaw agent` with one selector, defaulting to `--agent main`. Override
 the selector with `ENTMOOT_OPENCLAW_SESSION_ID`, `ENTMOOT_OPENCLAW_TO`, or
 `ENTMOOT_OPENCLAW_AGENT`; the matching `OPENCLAW_SESSION_ID`, `OPENCLAW_TO`,
 and `OPENCLAW_AGENT_ID` aliases are also honored. Set `OPENCLAW_BIN` only when
-the CLI is not named `openclaw` on `$PATH`.
+the CLI is not named `openclaw` on `$PATH`. When `agent.instruction` includes
+structured `actions`, Entmoot uses OpenClaw delivery/tool evidence for required
+external-action success and publishes compact results instead of OpenClaw run
+metadata.
 
 ESP-specific flags:
 

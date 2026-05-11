@@ -86,15 +86,29 @@ echo ""
 TMPDIR=$(mktemp -d)
 trap 'rm -rf "$TMPDIR"' EXIT
 
-# --- Try latest GitHub release ------------------------------------------
+# --- Use a caller-provided binary ----------------------------------------
 
 TAG=""
-if command -v curl >/dev/null 2>&1; then
+LOCAL_BINARY=0
+if [ -n "${ENTMOOTD_LOCAL_BIN:-}" ]; then
+    if [ ! -f "$ENTMOOTD_LOCAL_BIN" ]; then
+        echo "  Error: ENTMOOTD_LOCAL_BIN does not exist: $ENTMOOTD_LOCAL_BIN"
+        exit 1
+    fi
+    echo "  Using local entmootd binary: $ENTMOOTD_LOCAL_BIN"
+    cp "$ENTMOOTD_LOCAL_BIN" "$TMPDIR/entmootd"
+    chmod 755 "$TMPDIR/entmootd"
+    LOCAL_BINARY=1
+fi
+
+# --- Try latest GitHub release ------------------------------------------
+
+if [ "$LOCAL_BINARY" -eq 0 ] && [ -z "$TAG" ] && command -v curl >/dev/null 2>&1; then
     TAG=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null \
           | grep '"tag_name"' | head -1 | cut -d'"' -f4 || true)
 fi
 
-if [ -n "$TAG" ]; then
+if [ "$LOCAL_BINARY" -eq 0 ] && [ -n "$TAG" ]; then
     ARCHIVE="entmoot-${OS}-${ARCH}.tar.gz"
     URL="https://github.com/${REPO}/releases/download/${TAG}/${ARCHIVE}"
     echo "  Downloading ${TAG}..."
@@ -108,7 +122,7 @@ fi
 
 # --- Fallback: build from source ----------------------------------------
 
-if [ -z "$TAG" ]; then
+if [ "$LOCAL_BINARY" -eq 0 ] && [ -z "$TAG" ]; then
     echo "  Building from source..."
     command -v go >/dev/null 2>&1 || {
         echo "  Error: Go is required to build from source."
@@ -132,8 +146,10 @@ fi
 # --- Install -------------------------------------------------------------
 
 mkdir -p "$BIN_DIR"
-cp "$TMPDIR/entmootd" "$BIN_DIR/entmootd"
-chmod 755 "$BIN_DIR/entmootd"
+tmp_entmootd="$BIN_DIR/.entmootd.tmp.$$"
+cp "$TMPDIR/entmootd" "$tmp_entmootd"
+chmod 755 "$tmp_entmootd"
+mv -f "$tmp_entmootd" "$BIN_DIR/entmootd"
 echo "  Installed: $BIN_DIR/entmootd"
 
 # --- Agent runtime helpers ----------------------------------------------
@@ -297,7 +313,10 @@ pid_matches_stack() {
       has_proc_arg "\$pid" "-socket" && has_proc_arg "\$pid" "\$PILOT_SOCKET"
       ;;
     entmoot)
-      has_proc_arg "\$pid" "-data" && has_proc_arg "\$pid" "\$ENTMOOT_DATA"
+      if has_proc_arg "\$pid" "-data" && has_proc_arg "\$pid" "\$ENTMOOT_DATA"; then
+        return 0
+      fi
+      has_proc_arg "\$pid" "\$ENTMOOT_BIN" && has_proc_arg "\$pid" "serve" && ! has_proc_arg "\$pid" "esp"
       ;;
     agent-watcher)
       has_proc_arg "\$pid" "-data" && has_proc_arg "\$pid" "\$ENTMOOT_DATA" && has_proc_arg "\$pid" "agent-commands" && has_proc_arg "\$pid" "watch"
@@ -484,14 +503,32 @@ stop_agent_command_watcher() {
   rm -f "\$watch_pidfile"
 }
 
-start_agent_command_watcher() {
-  stop_agent_command_watcher
+runner_command_available() {
+  candidate="\$1"
+  [ -n "\$candidate" ] || return 1
+  [ -x "\$candidate" ] || command -v "\$candidate" >/dev/null 2>&1
+}
+
+validate_agent_command_runner() {
   runner="\${ENTMOOT_AGENT_RUNNER:-}"
   [ -n "\$runner" ] || return 0
-  if [ "\$runner" != "openclaw" ] && [ ! -x "\$runner" ] && ! command -v "\$runner" >/dev/null 2>&1; then
+  if [ "\$runner" = "openclaw" ]; then
+    openclaw_bin="\${OPENCLAW_BIN:-openclaw}"
+    if ! runner_command_available "\$openclaw_bin"; then
+      echo "ENTMOOT_AGENT_RUNNER=openclaw requires OPENCLAW_BIN to be executable or openclaw on PATH" >&2
+      return 1
+    fi
+  elif ! runner_command_available "\$runner"; then
     echo "ENTMOOT_AGENT_RUNNER=\$runner is not executable or on PATH" >&2
     return 1
   fi
+}
+
+start_agent_command_watcher() {
+  validate_agent_command_runner || return 1
+  stop_agent_command_watcher
+  runner="\${ENTMOOT_AGENT_RUNNER:-}"
+  [ -n "\$runner" ] || return 0
   interval="\${ENTMOOT_AGENT_WATCH_INTERVAL:-10s}"
   watch_pidfile="\$RUN_DIR/agent-commands-watch.pid"
   nohup "\$ENTMOOT_BIN" -socket "\$PILOT_SOCKET" -identity "\$ENTMOOT_IDENTITY" -data "\$ENTMOOT_DATA" agent-commands watch -interval "\$interval" -runner "\$runner" >> "\$ENTMOOT_DATA/agent-commands-watch.log" 2>&1 &
@@ -526,8 +563,10 @@ PILOT_DAEMON_BIN=\$(resolve_pilot_binary pilot-daemon "\${PILOT_DAEMON_BIN:-}" d
 PILOTCTL_BIN=\$(resolve_pilot_binary pilotctl "\${PILOTCTL_BIN:-}")
 
 mkdir -p "\$RUN_DIR"
+validate_agent_command_runner || exit 1
 stop_agent_command_watcher || true
 stop_pidfile entmoot "\$ENTMOOT_PIDFILE" || true
+stop_stack_processes entmoot || true
 if [ -e "\$ENTMOOT_CONTROL_SOCKET" ] || [ -S "\$ENTMOOT_CONTROL_SOCKET" ]; then
   if entmoot_socket_live; then
     echo "entmoot control socket is already live at \$ENTMOOT_CONTROL_SOCKET; refusing to start an unmanaged duplicate" >&2
@@ -604,8 +643,12 @@ while [ "\$elapsed" -lt "\$ENTMOOT_START_TIMEOUT" ]; do
   fi
   if entmoot_socket_live; then
     echo "\$entmoot_pid" > "\$ENTMOOT_PIDFILE"
-    start_agent_command_watcher
-    exit 0
+    if start_agent_command_watcher; then
+      exit 0
+    fi
+    kill -TERM "\$entmoot_pid" 2>/dev/null || true
+    rm -f "\$ENTMOOT_PIDFILE"
+    exit 1
   fi
   sleep 1
   elapsed=\$((elapsed + 1))

@@ -45,6 +45,8 @@ const (
 	FleetCommandActionPilotInfo        = "pilot.info"
 	FleetCommandActionFleetLocalState  = "fleet.local_state"
 	FleetCommandActionAgentInstruction = "agent.instruction"
+
+	FleetCommandExternalActionMessageSend = "message.send"
 )
 
 const DefaultFleetCommandTTL = 5 * time.Minute
@@ -103,6 +105,22 @@ type FleetCommandResultEnvelope struct {
 	Output        string         `json:"output,omitempty"`
 	StartedAtMS   int64          `json:"started_at_ms,omitempty"`
 	CompletedAtMS int64          `json:"completed_at_ms,omitempty"`
+}
+
+type FleetCommandInstructionSpec struct {
+	Instruction string                       `json:"instruction"`
+	TimeoutMS   int64                        `json:"timeout_ms"`
+	Context     map[string]interface{}       `json:"context,omitempty"`
+	Actions     []FleetCommandExternalAction `json:"actions,omitempty"`
+}
+
+type FleetCommandExternalAction struct {
+	ID               string `json:"id,omitempty"`
+	Kind             string `json:"kind"`
+	Channel          string `json:"channel,omitempty"`
+	Target           string `json:"target,omitempty"`
+	Required         bool   `json:"required,omitempty"`
+	DeliveryRequired bool   `json:"delivery_required,omitempty"`
 }
 
 type FleetCommandCatalogEntry struct {
@@ -210,7 +228,7 @@ func DecodeFleetCommandArgs(raw json.RawMessage) (map[string]interface{}, error)
 func ValidateFleetCommandArgs(action string, args map[string]interface{}) error {
 	switch NormalizeFleetCommandAction(action) {
 	case FleetCommandActionAgentInstruction:
-		_, _, _, err := FleetCommandInstructionArgs(args)
+		_, err := FleetCommandInstructionSpecFromArgs(args)
 		return err
 	default:
 		return nil
@@ -218,22 +236,30 @@ func ValidateFleetCommandArgs(action string, args map[string]interface{}) error 
 }
 
 func FleetCommandInstructionArgs(args map[string]interface{}) (string, int64, map[string]interface{}, error) {
+	spec, err := FleetCommandInstructionSpecFromArgs(args)
+	if err != nil {
+		return "", 0, nil, err
+	}
+	return spec.Instruction, spec.TimeoutMS, spec.Context, nil
+}
+
+func FleetCommandInstructionSpecFromArgs(args map[string]interface{}) (FleetCommandInstructionSpec, error) {
 	if args == nil {
-		return "", 0, nil, fmt.Errorf("instruction args are required")
+		return FleetCommandInstructionSpec{}, fmt.Errorf("instruction args are required")
 	}
 	instruction, ok := args["instruction"].(string)
 	instruction = strings.TrimSpace(instruction)
 	if !ok || instruction == "" {
-		return "", 0, nil, fmt.Errorf("instruction is required")
+		return FleetCommandInstructionSpec{}, fmt.Errorf("instruction is required")
 	}
 	if len([]byte(instruction)) > MaxFleetInstructionBytes {
-		return "", 0, nil, fmt.Errorf("instruction is too large")
+		return FleetCommandInstructionSpec{}, fmt.Errorf("instruction is too large")
 	}
 	timeoutMS := int64(DefaultFleetInstructionTimeoutMS)
 	if raw, ok := args["timeout_ms"]; ok {
 		parsed, err := fleetCommandInt64Arg(raw)
 		if err != nil {
-			return "", 0, nil, fmt.Errorf("timeout_ms must be an integer")
+			return FleetCommandInstructionSpec{}, fmt.Errorf("timeout_ms must be an integer")
 		}
 		if parsed < MinFleetInstructionTimeoutMS {
 			parsed = MinFleetInstructionTimeoutMS
@@ -247,18 +273,27 @@ func FleetCommandInstructionArgs(args map[string]interface{}) (string, int64, ma
 	if raw, ok := args["context"]; ok {
 		obj, ok := raw.(map[string]interface{})
 		if !ok {
-			return "", 0, nil, fmt.Errorf("context must be an object")
+			return FleetCommandInstructionSpec{}, fmt.Errorf("context must be an object")
 		}
 		encoded, err := json.Marshal(obj)
 		if err != nil {
-			return "", 0, nil, fmt.Errorf("context: %w", err)
+			return FleetCommandInstructionSpec{}, fmt.Errorf("context: %w", err)
 		}
 		if len(encoded) > MaxFleetInstructionContextBytes {
-			return "", 0, nil, fmt.Errorf("context is too large")
+			return FleetCommandInstructionSpec{}, fmt.Errorf("context is too large")
 		}
 		contextArgs = obj
 	}
-	return instruction, timeoutMS, contextArgs, nil
+	actions, err := fleetCommandExternalActionsArg(args["actions"])
+	if err != nil {
+		return FleetCommandInstructionSpec{}, err
+	}
+	return FleetCommandInstructionSpec{
+		Instruction: instruction,
+		TimeoutMS:   timeoutMS,
+		Context:     contextArgs,
+		Actions:     actions,
+	}, nil
 }
 
 func fleetCommandInt64Arg(v interface{}) (int64, error) {
@@ -277,6 +312,51 @@ func fleetCommandInt64Arg(v interface{}) (int64, error) {
 	default:
 		return 0, fmt.Errorf("not an integer")
 	}
+}
+
+func fleetCommandExternalActionsArg(raw interface{}) ([]FleetCommandExternalAction, error) {
+	if raw == nil {
+		return nil, nil
+	}
+	data, err := json.Marshal(raw)
+	if err != nil {
+		return nil, fmt.Errorf("actions: %w", err)
+	}
+	var actions []FleetCommandExternalAction
+	if err := json.Unmarshal(data, &actions); err != nil {
+		return nil, fmt.Errorf("actions must be an array of objects")
+	}
+	requiredMessageSendActions := 0
+	for i := range actions {
+		action := &actions[i]
+		action.ID = strings.TrimSpace(action.ID)
+		action.Kind = strings.TrimSpace(strings.ToLower(action.Kind))
+		action.Channel = strings.TrimSpace(strings.ToLower(action.Channel))
+		action.Target = strings.TrimSpace(action.Target)
+		if action.Kind == "" {
+			return nil, fmt.Errorf("actions[%d].kind is required", i)
+		}
+		switch action.Kind {
+		case FleetCommandExternalActionMessageSend:
+			if action.Required || action.DeliveryRequired {
+				requiredMessageSendActions++
+				if requiredMessageSendActions > 1 {
+					return nil, fmt.Errorf("only one required message.send action is supported")
+				}
+				if action.Channel == "" {
+					return nil, fmt.Errorf("actions[%d].channel is required for message.send", i)
+				}
+				if action.Target == "" {
+					return nil, fmt.Errorf("actions[%d].target is required for message.send", i)
+				}
+			}
+		default:
+			if action.Required || action.DeliveryRequired {
+				return nil, fmt.Errorf("actions[%d].kind %q is not supported for required external actions", i, action.Kind)
+			}
+		}
+	}
+	return actions, nil
 }
 
 func VerifyFleetCommandIssuerProof(cmd FleetCommandEnvelope, coordinatorPubKey []byte) bool {

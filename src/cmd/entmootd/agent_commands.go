@@ -43,14 +43,57 @@ type agentRuntimeProcessResult struct {
 }
 
 type openClawAgentInstructionContext struct {
-	CommandID      string                     `json:"command_id"`
-	FleetID        string                     `json:"fleet_id"`
-	ControlGroupID entmoot.GroupID            `json:"control_group_id"`
-	IssuerNodeID   entmoot.NodeID             `json:"issuer_node_id"`
-	Target         esphttp.FleetCommandTarget `json:"target"`
-	AgentNodeID    entmoot.NodeID             `json:"agent_node_id"`
-	Action         string                     `json:"action"`
-	Context        map[string]interface{}     `json:"context"`
+	CommandID      string                               `json:"command_id"`
+	FleetID        string                               `json:"fleet_id"`
+	ControlGroupID entmoot.GroupID                      `json:"control_group_id"`
+	IssuerNodeID   entmoot.NodeID                       `json:"issuer_node_id"`
+	Target         esphttp.FleetCommandTarget           `json:"target"`
+	AgentNodeID    entmoot.NodeID                       `json:"agent_node_id"`
+	Action         string                               `json:"action"`
+	Context        map[string]interface{}               `json:"context"`
+	Actions        []esphttp.FleetCommandExternalAction `json:"actions,omitempty"`
+	Success        string                               `json:"success,omitempty"`
+}
+
+type openClawAgentRunReport struct {
+	RunID   string          `json:"runId"`
+	Status  string          `json:"status"`
+	Summary string          `json:"summary"`
+	Result  json.RawMessage `json:"result"`
+	Meta    struct {
+		FinalAssistantVisibleText string `json:"finalAssistantVisibleText"`
+		FinalAssistantRawText     string `json:"finalAssistantRawText"`
+	} `json:"meta"`
+}
+
+type openClawAgentRunResult struct {
+	Payloads []openClawAgentPayload `json:"payloads"`
+}
+
+type openClawAgentPayload struct {
+	Text     string `json:"text,omitempty"`
+	MediaURL string `json:"mediaUrl,omitempty"`
+}
+
+type openClawAgentCompactOutput struct {
+	Runner    string                   `json:"runner"`
+	RunID     string                   `json:"run_id,omitempty"`
+	Status    string                   `json:"status,omitempty"`
+	Summary   string                   `json:"summary,omitempty"`
+	FinalText string                   `json:"final_text,omitempty"`
+	Payloads  []openClawAgentPayload   `json:"payloads,omitempty"`
+	Actions   []openClawActionEvidence `json:"actions,omitempty"`
+}
+
+type openClawActionEvidence struct {
+	ID               string          `json:"id,omitempty"`
+	Kind             string          `json:"kind"`
+	Channel          string          `json:"channel,omitempty"`
+	Target           string          `json:"target,omitempty"`
+	Required         bool            `json:"required,omitempty"`
+	DeliveryRequired bool            `json:"delivery_required,omitempty"`
+	Confirmed        bool            `json:"confirmed"`
+	Receipt          json.RawMessage `json:"receipt,omitempty"`
 }
 
 const (
@@ -268,10 +311,18 @@ func runOpenClawAgentInstruction(ctx context.Context, dataDir string, payload es
 		}
 		return fleetCommandExecution{status: esphttp.FleetCommandStatusFailed, summary: "OpenClaw agent instruction failed", output: addAgentRuntimeFailureAdvice(output)}
 	}
+	output := compactOpenClawAgentOutput(run.stdout, payload.Actions)
+	if openClawRequiredActionMissing(run.stdout, payload.Actions) {
+		return fleetCommandExecution{
+			status:  esphttp.FleetCommandStatusFailed,
+			summary: "OpenClaw completed without required external action evidence",
+			output:  output,
+		}
+	}
 	return fleetCommandExecution{
 		status:  esphttp.FleetCommandStatusCompleted,
 		summary: "OpenClaw handled agent instruction",
-		output:  strings.TrimSpace(run.stdout),
+		output:  output,
 	}
 }
 
@@ -336,19 +387,24 @@ func openClawAgentArgs(payload esphttp.AgentInstructionPayload) ([]string, error
 	if err != nil {
 		return nil, err
 	}
-	return []string{
+	args := []string{
 		"agent",
 		selectorFlag, selectorValue,
 		"--message", message,
 		"--json",
 		"--timeout", fmt.Sprintf("%d", agentCommandTimeoutSeconds(payload.TimeoutMS)),
-	}, nil
+	}
+	deliveryAction, ok, err := openClawDeliveryAction(payload.Actions)
+	if err != nil {
+		return nil, err
+	}
+	if ok {
+		args = append(args, "--deliver", "--reply-channel", deliveryAction.Channel, "--reply-to", deliveryAction.Target)
+	}
+	return args, nil
 }
 
 func openClawAgentMessage(payload esphttp.AgentInstructionPayload) (string, error) {
-	if len(payload.Context) == 0 {
-		return payload.Instruction, nil
-	}
 	context := openClawAgentInstructionContext{
 		CommandID:      payload.CommandID,
 		FleetID:        payload.FleetID,
@@ -358,12 +414,14 @@ func openClawAgentMessage(payload esphttp.AgentInstructionPayload) (string, erro
 		AgentNodeID:    payload.AgentNodeID,
 		Action:         payload.Action,
 		Context:        payload.Context,
+		Actions:        payload.Actions,
+		Success:        "External action success requires tool or delivery evidence, not agent prose.",
 	}
 	data, err := json.Marshal(context)
 	if err != nil {
 		return "", err
 	}
-	return strings.TrimSpace(payload.Instruction) + "\n\nEntmoot agent command context JSON:\n" + string(data), nil
+	return strings.TrimSpace(payload.Instruction) + "\n\nEntmoot fleet command context JSON:\n" + string(data), nil
 }
 
 func openClawAgentSelector() (string, string) {
@@ -386,6 +444,250 @@ func openClawAgentSelector() (string, string) {
 		return "--agent", v
 	}
 	return "--agent", "main"
+}
+
+func openClawDeliveryAction(actions []esphttp.FleetCommandExternalAction) (esphttp.FleetCommandExternalAction, bool, error) {
+	var selected esphttp.FleetCommandExternalAction
+	found := false
+	for _, action := range actions {
+		if action.Kind != esphttp.FleetCommandExternalActionMessageSend || (!action.Required && !action.DeliveryRequired) {
+			continue
+		}
+		if found {
+			return esphttp.FleetCommandExternalAction{}, false, fmt.Errorf("OpenClaw adapter supports one delivery-required message.send action per instruction")
+		}
+		selected = action
+		found = true
+	}
+	return selected, found, nil
+}
+
+func compactOpenClawAgentOutput(stdout string, actions []esphttp.FleetCommandExternalAction) string {
+	stdout = strings.TrimSpace(stdout)
+	if stdout == "" {
+		return ""
+	}
+	var report openClawAgentRunReport
+	if err := json.Unmarshal([]byte(stdout), &report); err != nil {
+		return stdout
+	}
+	if strings.TrimSpace(report.RunID) == "" && strings.TrimSpace(report.Status) == "" && strings.TrimSpace(report.Summary) == "" && len(report.Result) == 0 && strings.TrimSpace(report.Meta.FinalAssistantVisibleText) == "" && strings.TrimSpace(report.Meta.FinalAssistantRawText) == "" {
+		return stdout
+	}
+	output := openClawAgentCompactOutput{
+		Runner:    agentCommandRunnerOpenClaw,
+		RunID:     strings.TrimSpace(report.RunID),
+		Status:    strings.TrimSpace(report.Status),
+		Summary:   strings.TrimSpace(report.Summary),
+		FinalText: openClawFinalText(report),
+		Payloads:  openClawPayloads(report.Result),
+		Actions:   openClawActionEvidenceFromResult(report.Result, actions),
+	}
+	data, err := json.Marshal(output)
+	if err != nil {
+		return stdout
+	}
+	return string(data)
+}
+
+func openClawFinalText(report openClawAgentRunReport) string {
+	if text := strings.TrimSpace(report.Meta.FinalAssistantVisibleText); text != "" {
+		return text
+	}
+	return strings.TrimSpace(report.Meta.FinalAssistantRawText)
+}
+
+func openClawPayloads(result json.RawMessage) []openClawAgentPayload {
+	var parsed openClawAgentRunResult
+	if len(result) == 0 || json.Unmarshal(result, &parsed) != nil {
+		return nil
+	}
+	payloads := make([]openClawAgentPayload, 0, len(parsed.Payloads))
+	for _, payload := range parsed.Payloads {
+		payload.Text = strings.TrimSpace(payload.Text)
+		payload.MediaURL = strings.TrimSpace(payload.MediaURL)
+		if payload.Text == "" && payload.MediaURL == "" {
+			continue
+		}
+		payloads = append(payloads, payload)
+	}
+	return payloads
+}
+
+func openClawActionEvidenceFromResult(result json.RawMessage, actions []esphttp.FleetCommandExternalAction) []openClawActionEvidence {
+	if len(actions) == 0 {
+		return nil
+	}
+	receipt := openClawDeliveryReceipt(result)
+	deliveredAction, deliverySelected, _ := openClawDeliveryAction(actions)
+	evidence := make([]openClawActionEvidence, 0, len(actions))
+	for _, action := range actions {
+		confirmed := deliverySelected && openClawSameExternalAction(action, deliveredAction) && len(receipt) > 0
+		ev := openClawActionEvidence{
+			ID:               action.ID,
+			Kind:             action.Kind,
+			Channel:          action.Channel,
+			Target:           action.Target,
+			Required:         action.Required,
+			DeliveryRequired: action.DeliveryRequired,
+			Confirmed:        confirmed,
+		}
+		if ev.Confirmed {
+			ev.Receipt = append(json.RawMessage(nil), receipt...)
+		}
+		evidence = append(evidence, ev)
+	}
+	return evidence
+}
+
+func openClawSameExternalAction(a, b esphttp.FleetCommandExternalAction) bool {
+	return a.ID == b.ID &&
+		a.Kind == b.Kind &&
+		a.Channel == b.Channel &&
+		a.Target == b.Target &&
+		a.Required == b.Required &&
+		a.DeliveryRequired == b.DeliveryRequired
+}
+
+func openClawRequiredActionMissing(stdout string, actions []esphttp.FleetCommandExternalAction) bool {
+	required := false
+	for _, action := range actions {
+		if action.Required || action.DeliveryRequired {
+			required = true
+			break
+		}
+	}
+	if !required {
+		return false
+	}
+	var report openClawAgentRunReport
+	if err := json.Unmarshal([]byte(strings.TrimSpace(stdout)), &report); err != nil {
+		return true
+	}
+	return len(openClawDeliveryReceipt(report.Result)) == 0
+}
+
+func openClawDeliveryReceipt(result json.RawMessage) json.RawMessage {
+	if len(result) == 0 {
+		return nil
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(result, &fields); err != nil {
+		return nil
+	}
+	for _, key := range []string{"delivery", "deliveries", "delivery_receipts", "deliveryReceipts", "receipt", "receipts"} {
+		raw := bytes.TrimSpace(fields[key])
+		if openClawReceiptHasEvidence(raw) {
+			return raw
+		}
+	}
+	return nil
+}
+
+func openClawReceiptHasEvidence(raw json.RawMessage) bool {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+		return false
+	}
+	var arr []json.RawMessage
+	if err := json.Unmarshal(raw, &arr); err == nil {
+		for _, item := range arr {
+			if openClawReceiptHasEvidence(item) {
+				return true
+			}
+		}
+		return false
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &obj); err == nil {
+		return openClawReceiptObjectHasEvidence(obj)
+	}
+	var text string
+	if err := json.Unmarshal(raw, &text); err == nil {
+		switch strings.ToLower(strings.TrimSpace(text)) {
+		case "", "false", "no", "none", "null":
+			return false
+		default:
+			return true
+		}
+	}
+	var delivered bool
+	if err := json.Unmarshal(raw, &delivered); err == nil {
+		return delivered
+	}
+	var number json.Number
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	if err := decoder.Decode(&number); err == nil {
+		value, err := number.Float64()
+		return err == nil && value != 0
+	}
+	return false
+}
+
+func openClawReceiptObjectHasEvidence(obj map[string]json.RawMessage) bool {
+	if len(obj) == 0 {
+		return false
+	}
+	success := false
+	for _, key := range []string{"ok", "success", "sent", "delivered", "delivery_success", "deliverySuccess"} {
+		if raw, ok := obj[key]; ok {
+			value, parsed := openClawBoolReceiptField(raw)
+			if parsed {
+				if !value {
+					return false
+				}
+				success = true
+			}
+		}
+	}
+	for _, key := range []string{"status", "state", "result"} {
+		if raw, ok := obj[key]; ok {
+			value, parsed := openClawStringReceiptField(raw)
+			if !parsed {
+				continue
+			}
+			switch value {
+			case "failed", "failure", "error", "rejected", "blocked", "undelivered", "not_delivered", "not-delivered", "false", "no":
+				return false
+			case "ok", "success", "succeeded", "sent", "delivered", "completed", "true", "yes":
+				success = true
+			}
+		}
+	}
+	for _, key := range []string{"error", "errors", "failure"} {
+		if raw, ok := obj[key]; ok && openClawReceiptHasEvidence(raw) && !success {
+			return false
+		}
+	}
+	return true
+}
+
+func openClawBoolReceiptField(raw json.RawMessage) (bool, bool) {
+	var value bool
+	if err := json.Unmarshal(raw, &value); err == nil {
+		return value, true
+	}
+	text, ok := openClawStringReceiptField(raw)
+	if !ok {
+		return false, false
+	}
+	switch text {
+	case "true", "yes", "ok", "success", "sent", "delivered":
+		return true, true
+	case "false", "no", "failed", "failure", "error", "blocked", "undelivered", "not_delivered", "not-delivered":
+		return false, true
+	default:
+		return false, false
+	}
+}
+
+func openClawStringReceiptField(raw json.RawMessage) (string, bool) {
+	var text string
+	if err := json.Unmarshal(raw, &text); err != nil {
+		return "", false
+	}
+	return strings.ToLower(strings.TrimSpace(text)), true
 }
 
 func agentCommandTimeoutSeconds(timeoutMS int64) int64 {

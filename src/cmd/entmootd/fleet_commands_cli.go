@@ -19,23 +19,29 @@ import (
 )
 
 type fleetCommandsFlags struct {
-	espURL        string
-	fleet         string
-	group         string
-	target        string
-	targetNodeID  uint64
-	action        string
-	argsJSON      string
-	instruction   string
-	timeoutMS     int64
-	expiresAtMS   int64
-	autoAccept    bool
-	commandID     string
-	status        string
-	summary       string
-	output        string
-	startedAtMS   int64
-	completedAtMS int64
+	espURL                         string
+	fleet                          string
+	group                          string
+	target                         string
+	targetNodeID                   uint64
+	action                         string
+	argsJSON                       string
+	instruction                    string
+	timeoutMS                      int64
+	externalActionID               string
+	externalActionKind             string
+	externalActionChannel          string
+	externalActionTarget           string
+	externalActionRequired         bool
+	externalActionDeliveryRequired bool
+	expiresAtMS                    int64
+	autoAccept                     bool
+	commandID                      string
+	status                         string
+	summary                        string
+	output                         string
+	startedAtMS                    int64
+	completedAtMS                  int64
 }
 
 func cmdFleetCommands(gf *globalFlags, args []string) int {
@@ -62,7 +68,7 @@ func cmdFleetCommands(gf *globalFlags, args []string) int {
 
 func cmdFleetCommandsSend(gf *globalFlags, args []string) int {
 	fs := flag.NewFlagSet("fleet commands send", flag.ContinueOnError)
-	cfg := &fleetCommandsFlags{autoAccept: true, target: esphttp.FleetCommandTargetAll}
+	cfg := &fleetCommandsFlags{autoAccept: true, target: esphttp.FleetCommandTargetAll, externalActionRequired: true, externalActionDeliveryRequired: true}
 	fs.StringVar(&cfg.espURL, "esp-url", os.Getenv("ENTMOOT_ESP_URL"), "ESP base URL (defaults to ENTMOOT_ESP_URL)")
 	fs.StringVar(&cfg.fleet, "fleet", "", "fleet id")
 	fs.StringVar(&cfg.group, "group", "", "fleet control group id")
@@ -72,6 +78,12 @@ func cmdFleetCommandsSend(gf *globalFlags, args []string) int {
 	fs.StringVar(&cfg.argsJSON, "args-json", "", "optional command args JSON object")
 	fs.StringVar(&cfg.instruction, "instruction", "", "natural-language instruction for agent.instruction")
 	fs.Int64Var(&cfg.timeoutMS, "timeout-ms", 0, "optional instruction timeout in milliseconds")
+	fs.StringVar(&cfg.externalActionID, "external-action-id", "", "optional external action id for agent.instruction")
+	fs.StringVar(&cfg.externalActionKind, "external-action-kind", "", "external action kind for agent.instruction, for example message.send")
+	fs.StringVar(&cfg.externalActionChannel, "external-action-channel", "", "external action channel, for example telegram")
+	fs.StringVar(&cfg.externalActionTarget, "external-action-target", "", "external action target")
+	fs.BoolVar(&cfg.externalActionRequired, "external-action-required", cfg.externalActionRequired, "require external action support")
+	fs.BoolVar(&cfg.externalActionDeliveryRequired, "external-delivery-required", cfg.externalActionDeliveryRequired, "require external delivery evidence")
 	fs.Int64Var(&cfg.expiresAtMS, "expires-at-ms", 0, "optional command expiration timestamp")
 	fs.BoolVar(&cfg.autoAccept, "auto-accept", true, "request agent auto-accept for safe commands")
 	if err := fs.Parse(args); err != nil {
@@ -146,6 +158,36 @@ func fleetCommandSendArgs(cfg *fleetCommandsFlags) (map[string]any, int, bool) {
 		}
 		commandArgs["timeout_ms"] = cfg.timeoutMS
 	}
+	if fleetCommandExternalActionFlagSet(cfg) {
+		if cfg.action != esphttp.FleetCommandActionAgentInstruction {
+			fmt.Fprintln(os.Stderr, "fleet commands send: external action flags can only be used with agent.instruction")
+			return nil, exitInvalidArgument, false
+		}
+		if strings.TrimSpace(cfg.externalActionKind) == "" {
+			fmt.Fprintln(os.Stderr, "fleet commands send: -external-action-kind is required when using external action flags")
+			return nil, exitInvalidArgument, false
+		}
+		action := map[string]any{
+			"kind":              strings.TrimSpace(cfg.externalActionKind),
+			"required":          cfg.externalActionRequired,
+			"delivery_required": cfg.externalActionDeliveryRequired,
+		}
+		if strings.TrimSpace(cfg.externalActionID) != "" {
+			action["id"] = strings.TrimSpace(cfg.externalActionID)
+		}
+		if strings.TrimSpace(cfg.externalActionChannel) != "" {
+			action["channel"] = strings.TrimSpace(cfg.externalActionChannel)
+		}
+		if strings.TrimSpace(cfg.externalActionTarget) != "" {
+			action["target"] = strings.TrimSpace(cfg.externalActionTarget)
+		}
+		actions, ok := appendFleetCommandExternalAction(commandArgs["actions"], action)
+		if !ok {
+			fmt.Fprintln(os.Stderr, "fleet commands send: -args-json actions must be an array when using external action flags")
+			return nil, exitInvalidArgument, false
+		}
+		commandArgs["actions"] = actions
+	}
 	if cfg.action == esphttp.FleetCommandActionAgentInstruction || len(commandArgs) > 0 {
 		if err := esphttp.ValidateFleetCommandArgs(cfg.action, commandArgs); err != nil {
 			fmt.Fprintf(os.Stderr, "fleet commands send: %v\n", err)
@@ -153,6 +195,27 @@ func fleetCommandSendArgs(cfg *fleetCommandsFlags) (map[string]any, int, bool) {
 		}
 	}
 	return commandArgs, exitOK, true
+}
+
+func fleetCommandExternalActionFlagSet(cfg *fleetCommandsFlags) bool {
+	return strings.TrimSpace(cfg.externalActionID) != "" ||
+		strings.TrimSpace(cfg.externalActionKind) != "" ||
+		strings.TrimSpace(cfg.externalActionChannel) != "" ||
+		strings.TrimSpace(cfg.externalActionTarget) != ""
+}
+
+func appendFleetCommandExternalAction(existing interface{}, action map[string]any) ([]any, bool) {
+	actions := []any{}
+	if existing == nil {
+		return append(actions, action), true
+	}
+	switch v := existing.(type) {
+	case []any:
+		actions = append(actions, v...)
+	default:
+		return nil, false
+	}
+	return append(actions, action), true
 }
 
 func cmdFleetCommandsResult(gf *globalFlags, args []string) int {

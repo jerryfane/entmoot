@@ -69,9 +69,14 @@ func TestRunAgentCommandRunnerOpenClawDefaultsToMainAgent(t *testing.T) {
 		t.Fatalf("ReadFile args: %v", err)
 	}
 	got := strings.Split(strings.TrimSpace(string(data)), "\n")
-	want := []string{"agent", "--agent", "main", "--message", "report status", "--json", "--timeout", "60"}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("openclaw args = %#v, want %#v", got, want)
+	wantPrefix := []string{"agent", "--agent", "main", "--message", "report status"}
+	if len(got) < len(wantPrefix) || !reflect.DeepEqual(got[:len(wantPrefix)], wantPrefix) {
+		t.Fatalf("openclaw args prefix = %#v, want %#v", got, wantPrefix)
+	}
+	for _, want := range []string{"Entmoot fleet command context JSON:", `"command_id":"cmd-openclaw"`, "--json", "--timeout", "60"} {
+		if !strings.Contains(string(data), want) {
+			t.Fatalf("openclaw args = %q, want substring %q", string(data), want)
+		}
 	}
 }
 
@@ -101,7 +106,7 @@ func TestRunAgentCommandRunnerOpenClawIncludesPayloadContext(t *testing.T) {
 	message := string(data)
 	for _, want := range []string{
 		"report status",
-		"Entmoot agent command context JSON:",
+		"Entmoot fleet command context JSON:",
 		`"command_id":"cmd-openclaw-context"`,
 		`"agent_node_id":133053`,
 		`"context":{"group":"Mars Hub","source":"fleet-command"}`,
@@ -109,6 +114,253 @@ func TestRunAgentCommandRunnerOpenClawIncludesPayloadContext(t *testing.T) {
 		if !strings.Contains(message, want) {
 			t.Fatalf("message = %q, want substring %q", message, want)
 		}
+	}
+}
+
+func TestRunAgentCommandRunnerOpenClawAddsDeliveryArgsForRequiredMessageAction(t *testing.T) {
+	clearOpenClawRunnerEnv(t)
+	argsPath := filepath.Join(t.TempDir(), "args")
+	runner := filepath.Join(t.TempDir(), "openclaw")
+	script := "#!/bin/sh\nprintf '%s\n' \"$@\" > \"$ARGS_PATH\"\nprintf '%s' '{\"runId\":\"run-1\",\"status\":\"ok\",\"summary\":\"completed\",\"result\":{\"delivery\":{\"message_id\":\"m-1\"}}}'\n"
+	if err := os.WriteFile(runner, []byte(script), 0o700); err != nil {
+		t.Fatalf("WriteFile runner: %v", err)
+	}
+	t.Setenv("ARGS_PATH", argsPath)
+	t.Setenv("OPENCLAW_BIN", runner)
+	payload := testCommandPayload("cmd-openclaw-delivery")
+	payload.Actions = []esphttp.FleetCommandExternalAction{{
+		ID:               "notify-owner",
+		Kind:             esphttp.FleetCommandExternalActionMessageSend,
+		Channel:          "telegram",
+		Target:           "owner",
+		Required:         true,
+		DeliveryRequired: true,
+	}}
+	result := runAgentCommandRunner(context.Background(), "openclaw", t.TempDir(), payload)
+	if result.status != esphttp.FleetCommandStatusCompleted {
+		t.Fatalf("result = %+v, want completed OpenClaw result", result)
+	}
+	data, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatalf("ReadFile args: %v", err)
+	}
+	for _, want := range []string{"--deliver", "--reply-channel\ntelegram", "--reply-to\nowner"} {
+		if !strings.Contains(string(data), want) {
+			t.Fatalf("openclaw args = %q, want substring %q", string(data), want)
+		}
+	}
+	var compact openClawAgentCompactOutput
+	if err := json.Unmarshal([]byte(result.output), &compact); err != nil {
+		t.Fatalf("compact output JSON: %v; output=%s", err, result.output)
+	}
+	if len(compact.Actions) != 1 || !compact.Actions[0].Confirmed {
+		t.Fatalf("compact actions = %+v, want confirmed delivery evidence", compact.Actions)
+	}
+}
+
+func TestRunAgentCommandRunnerOpenClawConfirmsOnlyDeliveredMessageAction(t *testing.T) {
+	clearOpenClawRunnerEnv(t)
+	runner := filepath.Join(t.TempDir(), "openclaw")
+	script := "#!/bin/sh\nprintf '%s' '{\"runId\":\"run-1\",\"status\":\"ok\",\"summary\":\"completed\",\"result\":{\"delivery\":{\"message_id\":\"m-1\"}}}'\n"
+	if err := os.WriteFile(runner, []byte(script), 0o700); err != nil {
+		t.Fatalf("WriteFile runner: %v", err)
+	}
+	t.Setenv("OPENCLAW_BIN", runner)
+	payload := testCommandPayload("cmd-openclaw-selected-delivery")
+	payload.Actions = []esphttp.FleetCommandExternalAction{
+		{
+			ID:               "notify-owner",
+			Kind:             esphttp.FleetCommandExternalActionMessageSend,
+			Channel:          "telegram",
+			Target:           "owner",
+			DeliveryRequired: true,
+		},
+		{
+			ID:      "optional-team-note",
+			Kind:    esphttp.FleetCommandExternalActionMessageSend,
+			Channel: "telegram",
+			Target:  "team",
+		},
+	}
+	result := runAgentCommandRunner(context.Background(), "openclaw", t.TempDir(), payload)
+	if result.status != esphttp.FleetCommandStatusCompleted {
+		t.Fatalf("result = %+v, want completed OpenClaw result", result)
+	}
+	var compact openClawAgentCompactOutput
+	if err := json.Unmarshal([]byte(result.output), &compact); err != nil {
+		t.Fatalf("compact output JSON: %v; output=%s", err, result.output)
+	}
+	if len(compact.Actions) != 2 {
+		t.Fatalf("compact actions = %+v, want two action evidence entries", compact.Actions)
+	}
+	if !compact.Actions[0].Confirmed {
+		t.Fatalf("compact actions = %+v, want selected delivery action confirmed", compact.Actions)
+	}
+	if compact.Actions[1].Confirmed {
+		t.Fatalf("compact actions = %+v, want optional different target unconfirmed", compact.Actions)
+	}
+}
+
+func TestRunAgentCommandRunnerOpenClawFailsRequiredActionWithoutEvidence(t *testing.T) {
+	clearOpenClawRunnerEnv(t)
+	runner := filepath.Join(t.TempDir(), "openclaw")
+	script := "#!/bin/sh\nprintf '%s' '{\"runId\":\"run-1\",\"status\":\"ok\",\"summary\":\"completed\",\"result\":{\"payloads\":[{\"text\":\"done\"}]}}'\n"
+	if err := os.WriteFile(runner, []byte(script), 0o700); err != nil {
+		t.Fatalf("WriteFile runner: %v", err)
+	}
+	t.Setenv("OPENCLAW_BIN", runner)
+	payload := testCommandPayload("cmd-openclaw-missing-evidence")
+	payload.Actions = []esphttp.FleetCommandExternalAction{{
+		Kind:             esphttp.FleetCommandExternalActionMessageSend,
+		Channel:          "telegram",
+		Target:           "owner",
+		DeliveryRequired: true,
+	}}
+	result := runAgentCommandRunner(context.Background(), "openclaw", t.TempDir(), payload)
+	if result.status != esphttp.FleetCommandStatusFailed || result.summary != "OpenClaw completed without required external action evidence" {
+		t.Fatalf("result = %+v, want missing-evidence failure", result)
+	}
+	var compact openClawAgentCompactOutput
+	if err := json.Unmarshal([]byte(result.output), &compact); err != nil {
+		t.Fatalf("compact output JSON: %v; output=%s", err, result.output)
+	}
+	if len(compact.Actions) != 1 || compact.Actions[0].Confirmed {
+		t.Fatalf("compact actions = %+v, want unconfirmed action evidence", compact.Actions)
+	}
+}
+
+func TestRunAgentCommandRunnerOpenClawDoesNotTreatChatMessageAsDeliveryEvidence(t *testing.T) {
+	clearOpenClawRunnerEnv(t)
+	runner := filepath.Join(t.TempDir(), "openclaw")
+	script := "#!/bin/sh\nprintf '%s' '{\"runId\":\"run-1\",\"status\":\"ok\",\"summary\":\"completed\",\"result\":{\"message\":{\"text\":\"I sent it\"}}}'\n"
+	if err := os.WriteFile(runner, []byte(script), 0o700); err != nil {
+		t.Fatalf("WriteFile runner: %v", err)
+	}
+	t.Setenv("OPENCLAW_BIN", runner)
+	payload := testCommandPayload("cmd-openclaw-chat-message-not-evidence")
+	payload.Actions = []esphttp.FleetCommandExternalAction{{
+		Kind:             esphttp.FleetCommandExternalActionMessageSend,
+		Channel:          "telegram",
+		Target:           "owner",
+		DeliveryRequired: true,
+	}}
+	result := runAgentCommandRunner(context.Background(), "openclaw", t.TempDir(), payload)
+	if result.status != esphttp.FleetCommandStatusFailed || result.summary != "OpenClaw completed without required external action evidence" {
+		t.Fatalf("result = %+v, want missing-evidence failure", result)
+	}
+}
+
+func TestRunAgentCommandRunnerOpenClawDoesNotTreatFormattedEmptyReceiptAsEvidence(t *testing.T) {
+	clearOpenClawRunnerEnv(t)
+	runner := filepath.Join(t.TempDir(), "openclaw")
+	script := "#!/bin/sh\ncat <<'JSON'\n{\"runId\":\"run-1\",\"status\":\"ok\",\"summary\":\"completed\",\"result\":{\"deliveries\":[\n]}}\nJSON\n"
+	if err := os.WriteFile(runner, []byte(script), 0o700); err != nil {
+		t.Fatalf("WriteFile runner: %v", err)
+	}
+	t.Setenv("OPENCLAW_BIN", runner)
+	payload := testCommandPayload("cmd-openclaw-empty-delivery-not-evidence")
+	payload.Actions = []esphttp.FleetCommandExternalAction{{
+		Kind:             esphttp.FleetCommandExternalActionMessageSend,
+		Channel:          "telegram",
+		Target:           "owner",
+		DeliveryRequired: true,
+	}}
+	result := runAgentCommandRunner(context.Background(), "openclaw", t.TempDir(), payload)
+	if result.status != esphttp.FleetCommandStatusFailed || result.summary != "OpenClaw completed without required external action evidence" {
+		t.Fatalf("result = %+v, want missing-evidence failure", result)
+	}
+}
+
+func TestRunAgentCommandRunnerOpenClawDoesNotTreatFalseReceiptAsEvidence(t *testing.T) {
+	clearOpenClawRunnerEnv(t)
+	runner := filepath.Join(t.TempDir(), "openclaw")
+	script := "#!/bin/sh\nprintf '%s' '{\"runId\":\"run-1\",\"status\":\"ok\",\"summary\":\"completed\",\"result\":{\"delivery\":false}}'\n"
+	if err := os.WriteFile(runner, []byte(script), 0o700); err != nil {
+		t.Fatalf("WriteFile runner: %v", err)
+	}
+	t.Setenv("OPENCLAW_BIN", runner)
+	payload := testCommandPayload("cmd-openclaw-false-delivery-not-evidence")
+	payload.Actions = []esphttp.FleetCommandExternalAction{{
+		Kind:             esphttp.FleetCommandExternalActionMessageSend,
+		Channel:          "telegram",
+		Target:           "owner",
+		DeliveryRequired: true,
+	}}
+	result := runAgentCommandRunner(context.Background(), "openclaw", t.TempDir(), payload)
+	if result.status != esphttp.FleetCommandStatusFailed || result.summary != "OpenClaw completed without required external action evidence" {
+		t.Fatalf("result = %+v, want missing-evidence failure", result)
+	}
+}
+
+func TestRunAgentCommandRunnerOpenClawDoesNotTreatFailedReceiptAsEvidence(t *testing.T) {
+	clearOpenClawRunnerEnv(t)
+	runner := filepath.Join(t.TempDir(), "openclaw")
+	script := "#!/bin/sh\nprintf '%s' '{\"runId\":\"run-1\",\"status\":\"ok\",\"summary\":\"completed\",\"result\":{\"delivery\":{\"ok\":false,\"error\":\"blocked\"}}}'\n"
+	if err := os.WriteFile(runner, []byte(script), 0o700); err != nil {
+		t.Fatalf("WriteFile runner: %v", err)
+	}
+	t.Setenv("OPENCLAW_BIN", runner)
+	payload := testCommandPayload("cmd-openclaw-failed-delivery-not-evidence")
+	payload.Actions = []esphttp.FleetCommandExternalAction{{
+		Kind:             esphttp.FleetCommandExternalActionMessageSend,
+		Channel:          "telegram",
+		Target:           "owner",
+		DeliveryRequired: true,
+	}}
+	result := runAgentCommandRunner(context.Background(), "openclaw", t.TempDir(), payload)
+	if result.status != esphttp.FleetCommandStatusFailed || result.summary != "OpenClaw completed without required external action evidence" {
+		t.Fatalf("result = %+v, want missing-evidence failure", result)
+	}
+}
+
+func TestRunAgentCommandRunnerOpenClawCompactsRunReport(t *testing.T) {
+	clearOpenClawRunnerEnv(t)
+	runner := filepath.Join(t.TempDir(), "openclaw")
+	report := `{
+  "runId": "run-1",
+  "status": "ok",
+  "summary": "completed",
+  "result": {
+    "payloads": [
+      {
+        "text": "message received",
+        "mediaUrl": null
+      }
+    ]
+  },
+  "meta": {
+    "finalAssistantVisibleText": "message received",
+    "systemPromptReport": {
+      "tools": {
+        "schemaChars": 27210
+      }
+    },
+    "agentMeta": {
+      "promptTokens": 121336
+    }
+  }
+}`
+	script := "#!/bin/sh\ncat <<'JSON'\n" + report + "\nJSON\n"
+	if err := os.WriteFile(runner, []byte(script), 0o700); err != nil {
+		t.Fatalf("WriteFile runner: %v", err)
+	}
+	t.Setenv("OPENCLAW_BIN", runner)
+	result := runAgentCommandRunner(context.Background(), "openclaw", t.TempDir(), testCommandPayload("cmd-openclaw-report"))
+	if result.status != esphttp.FleetCommandStatusCompleted {
+		t.Fatalf("result = %+v, want completed OpenClaw result", result)
+	}
+	if strings.Contains(result.output, "systemPromptReport") || strings.Contains(result.output, "promptTokens") || strings.Contains(result.output, "schemaChars") {
+		t.Fatalf("output leaked verbose OpenClaw metadata: %s", result.output)
+	}
+	var compact openClawAgentCompactOutput
+	if err := json.Unmarshal([]byte(result.output), &compact); err != nil {
+		t.Fatalf("compact output JSON: %v; output=%s", err, result.output)
+	}
+	if compact.RunID != "run-1" || compact.Status != "ok" || compact.Summary != "completed" || compact.FinalText != "message received" {
+		t.Fatalf("compact = %+v, want run/status/summary/final text", compact)
+	}
+	if len(compact.Payloads) != 1 || compact.Payloads[0].Text != "message received" || compact.Payloads[0].MediaURL != "" {
+		t.Fatalf("compact payloads = %+v, want single text payload without media URL", compact.Payloads)
 	}
 }
 

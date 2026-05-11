@@ -130,6 +130,9 @@ peers, and changelog stay aligned.
    peer must target a specific OpenClaw session or recipient. Existing
    `OPENCLAW_SESSION_ID`, `OPENCLAW_TO`, and `OPENCLAW_AGENT_ID` settings are
    honored as aliases, with Entmoot-prefixed settings taking precedence.
+   For external actions, send structured `actions` requirements in the
+   command args. Required actions are treated as successful only when the
+   OpenClaw result includes delivery or tool evidence.
 7. Verify every peer reports:
 
    ```sh
