@@ -1,6 +1,7 @@
 package esphttp
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -265,6 +266,19 @@ func (s *MemoryStateStore) ListLiveAgentConfigs(_ context.Context, gid entmoot.G
 	return out, nil
 }
 
+func (s *MemoryStateStore) ListLiveAgentConfigsForNode(_ context.Context, nodeID entmoot.NodeID) ([]LiveAgentConfig, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]LiveAgentConfig, 0)
+	for _, configs := range s.liveAgentConfigs {
+		if cfg, ok := configs[nodeID]; ok {
+			out = append(out, cloneLiveAgentConfig(cfg))
+		}
+	}
+	sortLiveAgentConfigsByGroup(out)
+	return out, nil
+}
+
 func (s *MemoryStateStore) DeleteLiveAgentConfig(_ context.Context, gid entmoot.GroupID, nodeID entmoot.NodeID, updatedAtMS int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -409,6 +423,23 @@ func (s *SQLiteStateStore) ListLiveAgentConfigs(ctx context.Context, gid entmoot
 	rows, err := s.db.QueryContext(ctx, `SELECT group_id, node_id, enabled, mode, topic_filters, allowed_actions, max_actions_per_scan, max_action_bytes, updated_at_ms FROM esp_live_agent_configs WHERE group_id = ? ORDER BY node_id`, gid[:])
 	if err != nil {
 		return nil, fmt.Errorf("esphttp: list live agent configs: %w", err)
+	}
+	defer rows.Close()
+	out := []LiveAgentConfig{}
+	for rows.Next() {
+		cfg, err := scanLiveAgentConfig(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, cfg)
+	}
+	return out, rows.Err()
+}
+
+func (s *SQLiteStateStore) ListLiveAgentConfigsForNode(ctx context.Context, nodeID entmoot.NodeID) ([]LiveAgentConfig, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT group_id, node_id, enabled, mode, topic_filters, allowed_actions, max_actions_per_scan, max_action_bytes, updated_at_ms FROM esp_live_agent_configs WHERE node_id = ? ORDER BY group_id`, uint64(nodeID))
+	if err != nil {
+		return nil, fmt.Errorf("esphttp: list live agent configs for node: %w", err)
 	}
 	defer rows.Close()
 	out := []LiveAgentConfig{}
@@ -658,6 +689,15 @@ func cloneLiveAgentCursor(cursor LiveAgentCursor) LiveAgentCursor {
 
 func sortLiveAgentConfigs(items []LiveAgentConfig) {
 	sort.Slice(items, func(i, j int) bool {
+		return items[i].NodeID < items[j].NodeID
+	})
+}
+
+func sortLiveAgentConfigsByGroup(items []LiveAgentConfig) {
+	sort.Slice(items, func(i, j int) bool {
+		if cmp := bytes.Compare(items[i].GroupID[:], items[j].GroupID[:]); cmp != 0 {
+			return cmp < 0
+		}
 		return items[i].NodeID < items[j].NodeID
 	})
 }

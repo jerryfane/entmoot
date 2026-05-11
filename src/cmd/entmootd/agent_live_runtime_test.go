@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -637,6 +639,192 @@ func TestParseLiveRunnerOutputExtractsJSON(t *testing.T) {
 	}
 	if len(output.Actions) != 1 || output.Actions[0].Kind != "reply" || output.Actions[0].Message != "ok" {
 		t.Fatalf("output = %+v", output)
+	}
+}
+
+func TestAgentLiveRunGroupsFiltersByTags(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	state, err := esphttp.OpenSQLiteStateStore(dataDir)
+	if err != nil {
+		t.Fatalf("OpenSQLiteStateStore: %v", err)
+	}
+	defer state.Close()
+	ops := testAgentLiveGroupID(21)
+	docs := testAgentLiveGroupID(22)
+	untagged := testAgentLiveGroupID(23)
+	disabled := testAgentLiveGroupID(24)
+	nodeID := entmoot.NodeID(7)
+	for _, gid := range []entmoot.GroupID{ops, docs, untagged, disabled} {
+		enabled := gid != disabled
+		if _, err := state.UpsertLiveAgentConfig(ctx, esphttp.LiveAgentConfig{
+			GroupID:     gid,
+			NodeID:      nodeID,
+			Enabled:     enabled,
+			Mode:        esphttp.LiveModeListen,
+			UpdatedAtMS: 1,
+		}); err != nil {
+			t.Fatalf("UpsertLiveAgentConfig: %v", err)
+		}
+	}
+	if err := state.SetGroupMetadata(ctx, ops, json.RawMessage(`{"tags":["ops","ios"]}`)); err != nil {
+		t.Fatalf("SetGroupMetadata ops: %v", err)
+	}
+	if err := state.SetGroupMetadata(ctx, docs, json.RawMessage(`{"tags":["docs"]}`)); err != nil {
+		t.Fatalf("SetGroupMetadata docs: %v", err)
+	}
+	if err := state.SetGroupMetadata(ctx, disabled, json.RawMessage(`{"tags":["ops"]}`)); err != nil {
+		t.Fatalf("SetGroupMetadata disabled: %v", err)
+	}
+	got, err := agentLiveRunGroups(ctx, state, "", true, nodeID, []string{"ops"})
+	if err != nil {
+		t.Fatalf("agentLiveRunGroups ops: %v", err)
+	}
+	if len(got) != 1 || got[0].GroupID != ops || got[0].Mode != esphttp.LiveModeListen {
+		t.Fatalf("ops groups = %v, want only %s", got, ops)
+	}
+	got, err = agentLiveRunGroups(ctx, state, "", true, nodeID, []string{"ops", "ios"})
+	if err != nil {
+		t.Fatalf("agentLiveRunGroups ops+ios: %v", err)
+	}
+	if len(got) != 1 || got[0].GroupID != ops {
+		t.Fatalf("ops+ios groups = %v, want only %s", got, ops)
+	}
+	got, err = agentLiveRunGroups(ctx, state, "", true, nodeID, nil)
+	if err != nil {
+		t.Fatalf("agentLiveRunGroups all: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("all groups = %v, want 3", got)
+	}
+}
+
+func TestValidateAgentLiveAllGroupsLeaseRequiresAggregateBudget(t *testing.T) {
+	adapterGroups := []agentLiveRunGroup{
+		{GroupID: testAgentLiveGroupID(31), Mode: esphttp.LiveModeConverse},
+		{GroupID: testAgentLiveGroupID(32), Mode: esphttp.LiveModeConverse},
+		{GroupID: testAgentLiveGroupID(33), Mode: esphttp.LiveModeConverse},
+	}
+	err := validateAgentLiveAllGroupsLease(true, false, adapterGroups, 10*time.Second, 30*time.Second, 45*time.Second)
+	if err == nil {
+		t.Fatal("validateAgentLiveAllGroupsLease accepted lease shorter than aggregate scan budget")
+	}
+	if err := validateAgentLiveAllGroupsLease(true, false, adapterGroups, 10*time.Second, 30*time.Second, 2*time.Minute); err != nil {
+		t.Fatalf("validateAgentLiveAllGroupsLease rejected sufficient lease: %v", err)
+	}
+	twoAdapterGroups := []agentLiveRunGroup{
+		{GroupID: testAgentLiveGroupID(34), Mode: esphttp.LiveModeConverse},
+		{GroupID: testAgentLiveGroupID(35), Mode: esphttp.LiveModeConverse},
+	}
+	if err := validateAgentLiveAllGroupsLease(true, false, twoAdapterGroups, 10*time.Second, 30*time.Second, 45*time.Second); err != nil {
+		t.Fatalf("validateAgentLiveAllGroupsLease rejected default two-group budget: %v", err)
+	}
+	listenGroups := []agentLiveRunGroup{
+		{GroupID: testAgentLiveGroupID(36), Mode: esphttp.LiveModeListen},
+		{GroupID: testAgentLiveGroupID(37), Mode: esphttp.LiveModeListen},
+		{GroupID: testAgentLiveGroupID(38), Mode: esphttp.LiveModeListen},
+	}
+	if err := validateAgentLiveAllGroupsLease(true, false, listenGroups, 10*time.Second, 30*time.Second, 45*time.Second); err != nil {
+		t.Fatalf("validateAgentLiveAllGroupsLease rejected listen-only defaults: %v", err)
+	}
+	mixedGroups := []agentLiveRunGroup{
+		{GroupID: testAgentLiveGroupID(39), Mode: esphttp.LiveModeListen},
+		{GroupID: testAgentLiveGroupID(40), Mode: esphttp.LiveModeConverse},
+		{GroupID: testAgentLiveGroupID(41), Mode: esphttp.LiveModeOperator},
+	}
+	if err := validateAgentLiveAllGroupsLease(true, false, mixedGroups, 10*time.Second, 30*time.Second, 45*time.Second); err == nil {
+		t.Fatal("validateAgentLiveAllGroupsLease accepted listen group followed by two adapter groups with default lease")
+	}
+	adapterBeforeListen := []agentLiveRunGroup{
+		{GroupID: testAgentLiveGroupID(42), Mode: esphttp.LiveModeConverse},
+		{GroupID: testAgentLiveGroupID(43), Mode: esphttp.LiveModeListen},
+	}
+	if err := validateAgentLiveAllGroupsLease(true, false, adapterBeforeListen, 10*time.Second, 30*time.Second, 35*time.Second); err == nil {
+		t.Fatal("validateAgentLiveAllGroupsLease ignored earlier adapter group before listen renewal")
+	}
+	if err := validateAgentLiveAllGroupsLease(true, true, adapterGroups, 10*time.Second, 30*time.Second, 45*time.Second); err != nil {
+		t.Fatalf("validateAgentLiveAllGroupsLease rejected once mode: %v", err)
+	}
+}
+
+func TestRenewAgentLiveRunBindingsSkipsMissingOnlyInAllGroupsMode(t *testing.T) {
+	ctx := context.Background()
+	gid := testAgentLiveGroupID(31)
+	missing := testAgentLiveGroupID(32)
+	nodeID := entmoot.NodeID(7)
+	state := esphttp.NewMemoryStateStore()
+	if _, err := state.UpsertLiveAgentConfig(ctx, esphttp.LiveAgentConfig{
+		GroupID:      gid,
+		NodeID:       nodeID,
+		Enabled:      true,
+		Mode:         esphttp.LiveModeListen,
+		TopicFilters: []string{"chat"},
+		UpdatedAtMS:  1,
+	}); err != nil {
+		t.Fatalf("UpsertLiveAgentConfig: %v", err)
+	}
+	bindings, err := renewAgentLiveRunBindings(ctx, state, []agentLiveRunGroup{{GroupID: gid}, {GroupID: missing}}, nodeID, time.Second, false)
+	if err != nil {
+		t.Fatalf("renewAgentLiveRunBindings all groups: %v", err)
+	}
+	if len(bindings) != 1 || bindings[0].Config.GroupID != gid || bindings[0].Presence.GroupID != gid {
+		t.Fatalf("bindings = %+v, want only configured group", bindings)
+	}
+	if _, err := renewAgentLiveRunBindings(ctx, state, []agentLiveRunGroup{{GroupID: missing}}, nodeID, time.Second, true); err == nil {
+		t.Fatal("renewAgentLiveRunBindings single group missing config succeeded, want error")
+	}
+}
+
+func TestPrintAgentLiveRunJSONPreservesSingleGroupShape(t *testing.T) {
+	gid := testAgentLiveGroupID(41)
+	binding := agentLiveRunBinding{Presence: esphttp.LiveAgentPresence{GroupID: gid, NodeID: 7, Status: esphttp.LiveStatusOnline}}
+	scan := agentLiveRunGroupScan{GroupID: gid, Scan: agentLiveScanResult{Seen: 1, Matched: 1}}
+	code, stdout, stderr := captureCommandOutput(t, func() int {
+		return printAgentLiveRunJSON(false, []agentLiveRunBinding{binding}, []agentLiveRunGroupScan{scan})
+	})
+	if code != exitOK || stderr != "" {
+		t.Fatalf("printAgentLiveRunJSON single code/stderr = %d/%q", code, stderr)
+	}
+	var got map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(stdout), &got); err != nil {
+		t.Fatalf("single JSON: %v; stdout=%s", err, stdout)
+	}
+	if _, ok := got["presence"]; !ok {
+		t.Fatalf("single JSON = %s, missing presence", stdout)
+	}
+	if _, ok := got["scan"]; !ok {
+		t.Fatalf("single JSON = %s, missing scan", stdout)
+	}
+	if _, ok := got["scans"]; ok {
+		t.Fatalf("single JSON = %s, must not use plural scans", stdout)
+	}
+	code, stdout, stderr = captureCommandOutput(t, func() int {
+		return printAgentLiveRunJSON(true, []agentLiveRunBinding{binding}, []agentLiveRunGroupScan{scan})
+	})
+	if code != exitOK || stderr != "" {
+		t.Fatalf("printAgentLiveRunJSON all-groups code/stderr = %d/%q", code, stderr)
+	}
+	got = nil
+	if err := json.Unmarshal([]byte(stdout), &got); err != nil {
+		t.Fatalf("all-groups JSON: %v; stdout=%s", err, stdout)
+	}
+	if _, ok := got["scans"]; !ok {
+		t.Fatalf("all-groups JSON = %s, missing plural scans", stdout)
+	}
+	if _, ok := got["scan"]; ok {
+		t.Fatalf("all-groups JSON = %s, must not use singular scan", stdout)
+	}
+}
+
+func TestCmdAgentLiveRunMalformedGroupIsInvalidArgument(t *testing.T) {
+	code, _, stderr := captureCommandOutput(t, func() int {
+		return cmdAgentLiveRun(&globalFlags{data: t.TempDir()}, []string{"-group", "not-a-group", "-node", "7", "-once"})
+	})
+	if code != exitInvalidArgument {
+		t.Fatalf("cmdAgentLiveRun code = %d, want %d; stderr=%s", code, exitInvalidArgument, stderr)
+	}
+	if !strings.Contains(stderr, "agent-live run:") {
+		t.Fatalf("stderr = %q, want agent-live run error", stderr)
 	}
 }
 

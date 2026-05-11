@@ -103,6 +103,13 @@ func TestLiveAgentConfigPersists(t *testing.T) {
 			if err != nil {
 				t.Fatalf("ListLiveAgentConfigs: %v", err)
 			}
+			nodeConfigs, err := tc.store.ListLiveAgentConfigsForNode(ctx, 9)
+			if err != nil {
+				t.Fatalf("ListLiveAgentConfigsForNode: %v", err)
+			}
+			if len(nodeConfigs) != 1 || nodeConfigs[0].GroupID != gid || nodeConfigs[0].NodeID != 9 {
+				t.Fatalf("node configs = %+v, want config for node 9 in group %s", nodeConfigs, gid)
+			}
 			presences, err := tc.store.ListLiveAgentPresence(ctx, gid)
 			if err != nil {
 				t.Fatalf("ListLiveAgentPresence: %v", err)
@@ -113,6 +120,44 @@ func TestLiveAgentConfigPersists(t *testing.T) {
 			}
 			if states[9].MaxActionsPerScan != 3 || states[9].MaxActionBytes != 128 {
 				t.Fatalf("live state spam controls = %+v, want 3/128", states[9])
+			}
+		})
+	}
+}
+
+func TestListLiveAgentConfigsForNodeOrdersByGroup(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name  string
+		store StateStore
+	}{
+		{name: "memory", store: NewMemoryStateStore()},
+		{name: "sqlite", store: mustOpenLiveStateStore(t)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, gid := range []entmoot.GroupID{testLiveGroupID(9), testLiveGroupID(3), testLiveGroupID(6)} {
+				if _, err := tc.store.UpsertLiveAgentConfig(ctx, LiveAgentConfig{
+					GroupID:      gid,
+					NodeID:       9,
+					Enabled:      true,
+					Mode:         LiveModeListen,
+					TopicFilters: []string{"#"},
+				}); err != nil {
+					t.Fatalf("UpsertLiveAgentConfig(%s): %v", gid, err)
+				}
+			}
+			configs, err := tc.store.ListLiveAgentConfigsForNode(ctx, 9)
+			if err != nil {
+				t.Fatalf("ListLiveAgentConfigsForNode: %v", err)
+			}
+			want := []entmoot.GroupID{testLiveGroupID(3), testLiveGroupID(6), testLiveGroupID(9)}
+			if len(configs) != len(want) {
+				t.Fatalf("configs = %d, want %d", len(configs), len(want))
+			}
+			for i, cfg := range configs {
+				if cfg.GroupID != want[i] {
+					t.Fatalf("configs[%d].GroupID = %s, want %s", i, cfg.GroupID, want[i])
+				}
 			}
 		})
 	}

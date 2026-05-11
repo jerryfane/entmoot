@@ -243,6 +243,7 @@ type StateStore interface {
 	UpsertLiveAgentConfig(context.Context, LiveAgentConfig) (LiveAgentConfig, error)
 	GetLiveAgentConfig(context.Context, entmoot.GroupID, entmoot.NodeID) (LiveAgentConfig, bool, error)
 	ListLiveAgentConfigs(context.Context, entmoot.GroupID) ([]LiveAgentConfig, error)
+	ListLiveAgentConfigsForNode(context.Context, entmoot.NodeID) ([]LiveAgentConfig, error)
 	DeleteLiveAgentConfig(context.Context, entmoot.GroupID, entmoot.NodeID, int64) error
 	UpsertLiveAgentPresence(context.Context, LiveAgentPresence) (LiveAgentPresence, error)
 	ListLiveAgentPresence(context.Context, entmoot.GroupID) ([]LiveAgentPresence, error)
