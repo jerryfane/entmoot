@@ -849,6 +849,13 @@ func TestHandlerFleetCommandsCoordinatorPublishesSafeCommand(t *testing.T) {
 	if created.Activity.Type != "command.sent" {
 		t.Fatalf("activity = %+v", created.Activity)
 	}
+	ambiguousTarget := doSignedJSONRequest[errorEnvelope](t, handler, coordinatorPriv, http.MethodPost, "/v1/fleets/fleet-commands/commands", map[string]any{
+		"target_node_id": 45493,
+		"action":         FleetCommandActionEntmootInfo,
+	}, http.StatusBadRequest, 40_012, "nonce-command-ambiguous-target")
+	if ambiguousTarget.Error.Code != "bad_request" {
+		t.Fatalf("ambiguous target error = %+v", ambiguousTarget.Error)
+	}
 	if len(taskEvents.events) != 1 || taskEvents.events[0].groupID != gid || taskEvents.events[0].topics[0] != "fleet/commands" {
 		t.Fatalf("command events = %+v", taskEvents.events)
 	}

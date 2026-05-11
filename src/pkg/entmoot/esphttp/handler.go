@@ -1463,6 +1463,9 @@ func (h *Handler) handleCreateFleetCommand(w http.ResponseWriter, r *http.Reques
 	} else if targetKind != FleetCommandTargetAll {
 		writeError(w, http.StatusBadRequest, "bad_request", "invalid command target")
 		return
+	} else if req.TargetNodeID != 0 {
+		writeError(w, http.StatusBadRequest, "bad_request", "target_node_id requires target=node")
+		return
 	}
 	now := h.clock().UnixMilli()
 	expiresAtMS := req.ExpiresAtMS
