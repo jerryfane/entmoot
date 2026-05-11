@@ -246,6 +246,8 @@ type StateStore interface {
 	DeleteLiveAgentConfig(context.Context, entmoot.GroupID, entmoot.NodeID, int64) error
 	UpsertLiveAgentPresence(context.Context, LiveAgentPresence) (LiveAgentPresence, error)
 	ListLiveAgentPresence(context.Context, entmoot.GroupID) ([]LiveAgentPresence, error)
+	GetLiveAgentCursor(context.Context, entmoot.GroupID, entmoot.NodeID) (LiveAgentCursor, bool, error)
+	UpsertLiveAgentCursor(context.Context, LiveAgentCursor) (LiveAgentCursor, error)
 	UpsertFleetTaskSubmission(context.Context, FleetTaskSubmissionRecord) (FleetTaskSubmissionRecord, error)
 	GetFleetTaskSubmission(context.Context, string, string, string) (FleetTaskSubmissionRecord, bool, error)
 	ListFleetTaskSubmissions(context.Context, string, string) ([]FleetTaskSubmissionRecord, error)
@@ -290,6 +292,7 @@ type MemoryStateStore struct {
 	fleetCommandResults map[string]map[string]map[entmoot.NodeID]FleetCommandResultEnvelope
 	liveAgentConfigs    map[entmoot.GroupID]map[entmoot.NodeID]LiveAgentConfig
 	liveAgentPresence   map[entmoot.GroupID]map[entmoot.NodeID]LiveAgentPresence
+	liveAgentCursors    map[entmoot.GroupID]map[entmoot.NodeID]LiveAgentCursor
 	clock               func() time.Time
 }
 
@@ -312,6 +315,7 @@ func NewMemoryStateStore() *MemoryStateStore {
 		fleetCommandResults: make(map[string]map[string]map[entmoot.NodeID]FleetCommandResultEnvelope),
 		liveAgentConfigs:    make(map[entmoot.GroupID]map[entmoot.NodeID]LiveAgentConfig),
 		liveAgentPresence:   make(map[entmoot.GroupID]map[entmoot.NodeID]LiveAgentPresence),
+		liveAgentCursors:    make(map[entmoot.GroupID]map[entmoot.NodeID]LiveAgentCursor),
 		clock:               time.Now,
 	}
 }
@@ -1558,6 +1562,18 @@ CREATE TABLE IF NOT EXISTS esp_live_agent_presence (
 
 CREATE INDEX IF NOT EXISTS idx_live_agent_presence_group
   ON esp_live_agent_presence(group_id, lease_until_ms, node_id);
+
+CREATE TABLE IF NOT EXISTS esp_live_agent_cursors (
+  group_id BLOB NOT NULL,
+  node_id INTEGER NOT NULL,
+  scan_floor_at_ms INTEGER NOT NULL DEFAULT 0,
+  last_seen_at_ms INTEGER NOT NULL,
+  last_seen_author_node_id INTEGER NOT NULL DEFAULT 0,
+  last_seen_message_id BLOB NOT NULL DEFAULT x'',
+  seen_message_ids BLOB NOT NULL DEFAULT '[]',
+  updated_at_ms INTEGER NOT NULL,
+  PRIMARY KEY(group_id, node_id)
+);
 `
 
 func OpenSQLiteStateStore(dataDir string) (*SQLiteStateStore, error) {
@@ -2824,9 +2840,40 @@ func migrateSQLiteState(db *sql.DB) error {
 		  PRIMARY KEY(group_id, node_id)
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_live_agent_presence_group ON esp_live_agent_presence(group_id, lease_until_ms, node_id)`,
+		`CREATE TABLE IF NOT EXISTS esp_live_agent_cursors (
+		  group_id BLOB NOT NULL,
+		  node_id INTEGER NOT NULL,
+		  scan_floor_at_ms INTEGER NOT NULL DEFAULT 0,
+		  last_seen_at_ms INTEGER NOT NULL,
+		  last_seen_author_node_id INTEGER NOT NULL DEFAULT 0,
+		  last_seen_message_id BLOB NOT NULL DEFAULT x'',
+		  seen_message_ids BLOB NOT NULL DEFAULT '[]',
+		  updated_at_ms INTEGER NOT NULL,
+		  PRIMARY KEY(group_id, node_id)
+		)`,
 	} {
 		if _, err := db.Exec(stmt); err != nil {
 			return fmt.Errorf("esphttp: migrate state schema add agent commands: %w", err)
+		}
+	}
+	liveCursorCols, err := tableColumns(db, "esp_live_agent_cursors")
+	if err != nil {
+		return err
+	}
+	for _, stmt := range []struct {
+		name string
+		sql  string
+	}{
+		{"scan_floor_at_ms", `ALTER TABLE esp_live_agent_cursors ADD COLUMN scan_floor_at_ms INTEGER NOT NULL DEFAULT 0`},
+		{"last_seen_author_node_id", `ALTER TABLE esp_live_agent_cursors ADD COLUMN last_seen_author_node_id INTEGER NOT NULL DEFAULT 0`},
+		{"last_seen_message_id", `ALTER TABLE esp_live_agent_cursors ADD COLUMN last_seen_message_id BLOB NOT NULL DEFAULT x''`},
+		{"seen_message_ids", `ALTER TABLE esp_live_agent_cursors ADD COLUMN seen_message_ids BLOB NOT NULL DEFAULT '[]'`},
+	} {
+		if liveCursorCols[stmt.name] {
+			continue
+		}
+		if _, err := db.Exec(stmt.sql); err != nil {
+			return fmt.Errorf("esphttp: migrate state schema add live cursor %s: %w", stmt.name, err)
 		}
 	}
 	return nil

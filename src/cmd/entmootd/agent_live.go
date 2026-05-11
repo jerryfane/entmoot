@@ -14,6 +14,7 @@ import (
 
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/esphttp"
+	"entmoot/pkg/entmoot/store"
 )
 
 type agentLiveConfig struct {
@@ -199,12 +200,18 @@ func cmdAgentLiveRun(gf *globalFlags, args []string) int {
 	var rawGroup string
 	var node uint64
 	var interval, lease time.Duration
+	var runner string
+	var timeout time.Duration
+	var scanLimit int
 	var once, jsonOut bool
 	fs := flag.NewFlagSet("agent-live run", flag.ContinueOnError)
 	fs.StringVar(&rawGroup, "group", "", "base64 moot group id")
 	fs.Uint64Var(&node, "node", 0, "local Pilot node id")
 	fs.DurationVar(&interval, "interval", 10*time.Second, "heartbeat interval")
 	fs.DurationVar(&lease, "lease", 45*time.Second, "presence lease duration")
+	fs.StringVar(&runner, "runner", firstNonEmpty(os.Getenv("ENTMOOT_AGENT_RUNNER"), os.Getenv("ENTMOOT_AGENT_COMMAND_HOOK")), "agent runtime adapter executable, or \"openclaw\" for the built-in OpenClaw adapter")
+	fs.DurationVar(&timeout, "timeout", 30*time.Second, "agent runtime timeout; must be shorter than -lease")
+	fs.IntVar(&scanLimit, "limit", 20, "maximum matched messages to send to the agent per scan")
 	fs.BoolVar(&once, "once", false, "renew presence once")
 	fs.BoolVar(&jsonOut, "json", false, "print JSON summary")
 	if err := fs.Parse(args); err != nil {
@@ -221,6 +228,18 @@ func cmdAgentLiveRun(gf *globalFlags, args []string) int {
 		fmt.Fprintln(os.Stderr, "agent-live run: -interval and -lease must be positive")
 		return exitInvalidArgument
 	}
+	if timeout <= 0 {
+		fmt.Fprintln(os.Stderr, "agent-live run: -timeout must be positive")
+		return exitInvalidArgument
+	}
+	if timeout >= lease {
+		fmt.Fprintln(os.Stderr, "agent-live run: -timeout must be shorter than -lease")
+		return exitInvalidArgument
+	}
+	if scanLimit <= 0 {
+		fmt.Fprintln(os.Stderr, "agent-live run: -limit must be positive")
+		return exitInvalidArgument
+	}
 	state, err := esphttp.OpenSQLiteStateStore(gf.data)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "agent-live run: %v\n", err)
@@ -229,16 +248,23 @@ func cmdAgentLiveRun(gf *globalFlags, args []string) int {
 	defer state.Close()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	renew := func() (esphttp.LiveAgentPresence, error) {
+	runCfg := agentLiveRuntimeConfig{
+		groupID: gid,
+		nodeID:  nodeID,
+		runner:  strings.TrimSpace(runner),
+		timeout: timeout,
+		limit:   scanLimit,
+	}
+	renew := func() (esphttp.LiveAgentConfig, esphttp.LiveAgentPresence, error) {
 		cfg, found, err := state.GetLiveAgentConfig(ctx, gid, nodeID)
 		if err != nil {
-			return esphttp.LiveAgentPresence{}, err
+			return esphttp.LiveAgentConfig{}, esphttp.LiveAgentPresence{}, err
 		}
 		if !found || !cfg.Enabled {
-			return esphttp.LiveAgentPresence{}, fmt.Errorf("live mode is not enabled for node %d in group %s", nodeID, rawGroup)
+			return esphttp.LiveAgentConfig{}, esphttp.LiveAgentPresence{}, fmt.Errorf("live mode is not enabled for node %d in group %s", nodeID, rawGroup)
 		}
 		now := time.Now().UnixMilli()
-		return state.UpsertLiveAgentPresence(ctx, esphttp.LiveAgentPresence{
+		presence, err := state.UpsertLiveAgentPresence(ctx, esphttp.LiveAgentPresence{
 			GroupID:      gid,
 			NodeID:       nodeID,
 			Status:       esphttp.LiveStatusOnline,
@@ -248,8 +274,9 @@ func cmdAgentLiveRun(gf *globalFlags, args []string) int {
 			LeaseUntilMS: time.UnixMilli(now).Add(lease).UnixMilli(),
 			UpdatedAtMS:  now,
 		})
+		return cfg, presence, err
 	}
-	last, err := renew()
+	cfg, last, err := renew()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "agent-live run: %v\n", err)
 		return exitTransport
@@ -261,6 +288,17 @@ func cmdAgentLiveRun(gf *globalFlags, args []string) int {
 		fmt.Fprintf(os.Stdout, "renewed live presence for node %d until %d\n", nodeID, last.LeaseUntilMS)
 		return exitOK
 	}
+	msgStore, err := store.OpenSQLite(gf.data)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "agent-live run: %v\n", err)
+		return exitTransport
+	}
+	defer msgStore.Close()
+	scan, err := runAgentLiveScan(ctx, gf, state, msgStore, cfg, runCfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "agent-live run: %v\n", err)
+		return exitTransport
+	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -268,13 +306,18 @@ func cmdAgentLiveRun(gf *globalFlags, args []string) int {
 		case <-ctx.Done():
 			return exitOK
 		case <-ticker.C:
-			last, err = renew()
+			cfg, last, err = renew()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "agent-live run: %v\n", err)
+				return exitTransport
+			}
+			scan, err = runAgentLiveScan(ctx, gf, state, msgStore, cfg, runCfg)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "agent-live run: %v\n", err)
 				return exitTransport
 			}
 			if jsonOut {
-				_ = printJSON(last)
+				_ = printJSON(map[string]any{"presence": last, "scan": scan})
 			}
 		}
 	}

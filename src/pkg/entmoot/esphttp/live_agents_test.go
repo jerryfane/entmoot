@@ -110,6 +110,44 @@ func TestLiveAgentConfigPersists(t *testing.T) {
 	}
 }
 
+func TestLiveAgentCursorPersists(t *testing.T) {
+	ctx := context.Background()
+	gid := testLiveGroupID(5)
+	for _, tc := range []struct {
+		name  string
+		store StateStore
+	}{
+		{name: "memory", store: NewMemoryStateStore()},
+		{name: "sqlite", store: mustOpenLiveStateStore(t)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cursor, err := tc.store.UpsertLiveAgentCursor(ctx, LiveAgentCursor{
+				GroupID:              gid,
+				NodeID:               15,
+				ScanFloorAtMS:        120,
+				LastSeenAtMS:         123,
+				LastSeenAuthorNodeID: 16,
+				LastSeenMessageID:    testLiveMessageID(17),
+				SeenMessageIDs:       []entmoot.MessageID{testLiveMessageID(17), testLiveMessageID(18)},
+				UpdatedAtMS:          124,
+			})
+			if err != nil {
+				t.Fatalf("UpsertLiveAgentCursor: %v", err)
+			}
+			if cursor.LastSeenAtMS != 123 {
+				t.Fatalf("cursor.LastSeenAtMS = %d, want 123", cursor.LastSeenAtMS)
+			}
+			got, ok, err := tc.store.GetLiveAgentCursor(ctx, gid, 15)
+			if err != nil || !ok {
+				t.Fatalf("GetLiveAgentCursor ok/err = %v/%v", ok, err)
+			}
+			if got.ScanFloorAtMS != 120 || got.LastSeenAtMS != 123 || got.LastSeenAuthorNodeID != 16 || got.LastSeenMessageID != testLiveMessageID(17) || len(got.SeenMessageIDs) != 2 || got.SeenMessageIDs[1] != testLiveMessageID(18) || got.UpdatedAtMS != 124 {
+				t.Fatalf("cursor = %+v", got)
+			}
+		})
+	}
+}
+
 func TestLiveAgentConfigRejectsUnknownActions(t *testing.T) {
 	ctx := context.Background()
 	gid := testLiveGroupID(3)
@@ -181,4 +219,10 @@ func testLiveGroupID(seed byte) entmoot.GroupID {
 	var gid entmoot.GroupID
 	gid[0] = seed
 	return gid
+}
+
+func testLiveMessageID(seed byte) entmoot.MessageID {
+	var id entmoot.MessageID
+	id[0] = seed
+	return id
 }

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"entmoot/pkg/entmoot"
+	topicmatch "entmoot/pkg/entmoot/topic"
 )
 
 const (
@@ -72,6 +73,17 @@ type LiveAgentPresence struct {
 	LastSeenAtMS int64           `json:"last_seen_at_ms"`
 	LeaseUntilMS int64           `json:"lease_until_ms"`
 	UpdatedAtMS  int64           `json:"updated_at_ms"`
+}
+
+type LiveAgentCursor struct {
+	GroupID              entmoot.GroupID     `json:"group_id"`
+	NodeID               entmoot.NodeID      `json:"node_id"`
+	ScanFloorAtMS        int64               `json:"scan_floor_at_ms,omitempty"`
+	LastSeenAtMS         int64               `json:"last_seen_at_ms"`
+	LastSeenAuthorNodeID entmoot.NodeID      `json:"last_seen_author_node_id,omitempty"`
+	LastSeenMessageID    entmoot.MessageID   `json:"last_seen_message_id,omitempty"`
+	SeenMessageIDs       []entmoot.MessageID `json:"seen_message_ids,omitempty"`
+	UpdatedAtMS          int64               `json:"updated_at_ms"`
 }
 
 func DefaultLiveActions() []string {
@@ -189,28 +201,12 @@ func ValidateLiveConfig(cfg LiveAgentConfig) error {
 }
 
 func LiveTopicMatches(filter, topic string) bool {
-	filter = strings.Trim(strings.TrimSpace(filter), "/")
-	topic = strings.Trim(strings.TrimSpace(topic), "/")
-	if filter == "" || topic == "" {
+	filter = strings.TrimSpace(filter)
+	topic = strings.TrimSpace(topic)
+	if filter == "" || topic == "" || topicmatch.ValidPattern(filter) != nil {
 		return false
 	}
-	fp := strings.Split(filter, "/")
-	tp := strings.Split(topic, "/")
-	for i, part := range fp {
-		if part == "#" {
-			return i == len(fp)-1
-		}
-		if i >= len(tp) {
-			return false
-		}
-		if part == "+" {
-			continue
-		}
-		if part != tp[i] {
-			return false
-		}
-	}
-	return len(fp) == len(tp)
+	return topicmatch.Match(filter, topic)
 }
 
 func (s *MemoryStateStore) UpsertLiveAgentConfig(_ context.Context, cfg LiveAgentConfig) (LiveAgentConfig, error) {
@@ -316,6 +312,35 @@ func (s *MemoryStateStore) ListLiveAgentPresence(_ context.Context, gid entmoot.
 	}
 	sortLiveAgentPresence(out)
 	return out, nil
+}
+
+func (s *MemoryStateStore) GetLiveAgentCursor(_ context.Context, gid entmoot.GroupID, nodeID entmoot.NodeID) (LiveAgentCursor, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cursor, ok := s.liveAgentCursors[gid][nodeID]
+	if !ok {
+		return LiveAgentCursor{}, false, nil
+	}
+	return cloneLiveAgentCursor(cursor), true, nil
+}
+
+func (s *MemoryStateStore) UpsertLiveAgentCursor(_ context.Context, cursor LiveAgentCursor) (LiveAgentCursor, error) {
+	if cursor.GroupID == (entmoot.GroupID{}) {
+		return LiveAgentCursor{}, errors.New("esphttp: live cursor group id is required")
+	}
+	if cursor.NodeID == 0 {
+		return LiveAgentCursor{}, errors.New("esphttp: live cursor node id is required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if cursor.UpdatedAtMS == 0 {
+		cursor.UpdatedAtMS = s.nowMS()
+	}
+	if s.liveAgentCursors[cursor.GroupID] == nil {
+		s.liveAgentCursors[cursor.GroupID] = make(map[entmoot.NodeID]LiveAgentCursor)
+	}
+	s.liveAgentCursors[cursor.GroupID][cursor.NodeID] = cloneLiveAgentCursor(cursor)
+	return cloneLiveAgentCursor(cursor), nil
 }
 
 func (s *SQLiteStateStore) UpsertLiveAgentConfig(ctx context.Context, cfg LiveAgentConfig) (LiveAgentConfig, error) {
@@ -458,6 +483,49 @@ func (s *SQLiteStateStore) ListLiveAgentPresence(ctx context.Context, gid entmoo
 	return out, rows.Err()
 }
 
+func (s *SQLiteStateStore) GetLiveAgentCursor(ctx context.Context, gid entmoot.GroupID, nodeID entmoot.NodeID) (LiveAgentCursor, bool, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT group_id, node_id, scan_floor_at_ms, last_seen_at_ms, last_seen_author_node_id, last_seen_message_id, seen_message_ids, updated_at_ms FROM esp_live_agent_cursors WHERE group_id = ? AND node_id = ?`, gid[:], uint64(nodeID))
+	cursor, err := scanLiveAgentCursor(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return LiveAgentCursor{}, false, nil
+	}
+	if err != nil {
+		return LiveAgentCursor{}, false, err
+	}
+	return cursor, true, nil
+}
+
+func (s *SQLiteStateStore) UpsertLiveAgentCursor(ctx context.Context, cursor LiveAgentCursor) (LiveAgentCursor, error) {
+	if cursor.GroupID == (entmoot.GroupID{}) {
+		return LiveAgentCursor{}, errors.New("esphttp: live cursor group id is required")
+	}
+	if cursor.NodeID == 0 {
+		return LiveAgentCursor{}, errors.New("esphttp: live cursor node id is required")
+	}
+	if cursor.UpdatedAtMS == 0 {
+		cursor.UpdatedAtMS = nowMS()
+	}
+	seenIDs, err := json.Marshal(cursor.SeenMessageIDs)
+	if err != nil {
+		return LiveAgentCursor{}, fmt.Errorf("esphttp: encode live agent cursor seen ids: %w", err)
+	}
+	_, err = s.db.ExecContext(ctx, `
+INSERT INTO esp_live_agent_cursors (group_id, node_id, scan_floor_at_ms, last_seen_at_ms, last_seen_author_node_id, last_seen_message_id, seen_message_ids, updated_at_ms)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(group_id, node_id) DO UPDATE SET
+  scan_floor_at_ms=excluded.scan_floor_at_ms,
+  last_seen_at_ms=excluded.last_seen_at_ms,
+  last_seen_author_node_id=excluded.last_seen_author_node_id,
+  last_seen_message_id=excluded.last_seen_message_id,
+  seen_message_ids=excluded.seen_message_ids,
+  updated_at_ms=excluded.updated_at_ms`,
+		cursor.GroupID[:], uint64(cursor.NodeID), cursor.ScanFloorAtMS, cursor.LastSeenAtMS, uint64(cursor.LastSeenAuthorNodeID), cursor.LastSeenMessageID[:], seenIDs, cursor.UpdatedAtMS)
+	if err != nil {
+		return LiveAgentCursor{}, fmt.Errorf("esphttp: upsert live agent cursor: %w", err)
+	}
+	return cursor, nil
+}
+
 func LiveAgentStatesByNode(configs []LiveAgentConfig, presences []LiveAgentPresence, nowMS int64) map[entmoot.NodeID]LiveAgentState {
 	out := make(map[entmoot.NodeID]LiveAgentState, len(configs))
 	for _, cfg := range configs {
@@ -536,6 +604,28 @@ func scanLiveAgentPresence(row interface {
 	return p, nil
 }
 
+func scanLiveAgentCursor(row interface {
+	Scan(dest ...interface{}) error
+}) (LiveAgentCursor, error) {
+	var cursor LiveAgentCursor
+	var groupBytes []byte
+	var nodeID, authorNodeID uint64
+	var msgID, seenIDs []byte
+	if err := row.Scan(&groupBytes, &nodeID, &cursor.ScanFloorAtMS, &cursor.LastSeenAtMS, &authorNodeID, &msgID, &seenIDs, &cursor.UpdatedAtMS); err != nil {
+		return LiveAgentCursor{}, err
+	}
+	if err := decodeGroupIDBytes(groupBytes, &cursor.GroupID); err != nil {
+		return LiveAgentCursor{}, err
+	}
+	cursor.NodeID = entmoot.NodeID(nodeID)
+	cursor.LastSeenAuthorNodeID = entmoot.NodeID(authorNodeID)
+	if len(msgID) == len(cursor.LastSeenMessageID) {
+		copy(cursor.LastSeenMessageID[:], msgID)
+	}
+	_ = json.Unmarshal(seenIDs, &cursor.SeenMessageIDs)
+	return cursor, nil
+}
+
 func cloneLiveAgentConfig(cfg LiveAgentConfig) LiveAgentConfig {
 	cfg.TopicFilters = append([]string(nil), cfg.TopicFilters...)
 	cfg.AllowedActions = append([]string(nil), cfg.AllowedActions...)
@@ -545,6 +635,11 @@ func cloneLiveAgentConfig(cfg LiveAgentConfig) LiveAgentConfig {
 func cloneLiveAgentPresence(p LiveAgentPresence) LiveAgentPresence {
 	p.TopicFilters = append([]string(nil), p.TopicFilters...)
 	return p
+}
+
+func cloneLiveAgentCursor(cursor LiveAgentCursor) LiveAgentCursor {
+	cursor.SeenMessageIDs = append([]entmoot.MessageID(nil), cursor.SeenMessageIDs...)
+	return cursor
 }
 
 func sortLiveAgentConfigs(items []LiveAgentConfig) {

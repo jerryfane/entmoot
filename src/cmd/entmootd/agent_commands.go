@@ -7,7 +7,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"net"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -18,7 +17,6 @@ import (
 
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/esphttp"
-	"entmoot/pkg/entmoot/ipc"
 )
 
 type agentCommandsConfig struct {
@@ -803,35 +801,7 @@ func publishAgentCommandResult(ctx context.Context, gf *globalFlags, groupID ent
 	if err != nil {
 		return err
 	}
-	dialCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
-	defer cancel()
-	conn, err := (&net.Dialer{}).DialContext(dialCtx, "unix", controlSocketPath(gf.data))
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-	if err := conn.SetDeadline(time.Now().Add(30 * time.Second)); err != nil {
-		return err
-	}
-	if err := ipc.EncodeAndWrite(conn, &ipc.PublishReq{
-		GroupID: &groupID,
-		Topics:  []string{"fleet/commands/results"},
-		Content: data,
-	}); err != nil {
-		return err
-	}
-	_, payload, err := ipc.ReadAndDecode(conn)
-	if err != nil {
-		return err
-	}
-	switch v := payload.(type) {
-	case *ipc.PublishResp:
-		return nil
-	case *ipc.ErrorFrame:
-		return fmt.Errorf("ipc error %s: %s", v.Code, v.Message)
-	default:
-		return fmt.Errorf("unexpected ipc response %T", payload)
-	}
+	return publishIPCMessage(ctx, gf, groupID, []string{"fleet/commands/results"}, data)
 }
 
 func importLegacyAgentCommandFiles(ctx context.Context, dataDir string, state *esphttp.SQLiteStateStore) error {
