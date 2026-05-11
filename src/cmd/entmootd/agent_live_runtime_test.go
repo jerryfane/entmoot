@@ -689,6 +689,121 @@ func TestApplyLiveAgentActionCreatesFleetTask(t *testing.T) {
 	}
 }
 
+func TestApplyLiveAgentActionAssignsFleetTasks(t *testing.T) {
+	ctx := context.Background()
+	gid := testAgentLiveGroupID(26)
+	coordinatorNodeID := entmoot.NodeID(7)
+	agentNodeID := entmoot.NodeID(8)
+	state := esphttp.NewMemoryStateStore()
+	coordinator := entmoot.NodeInfo{PilotNodeID: coordinatorNodeID, EntmootPubKey: []byte("coordinator-key")}
+	agent := entmoot.NodeInfo{PilotNodeID: agentNodeID, EntmootPubKey: []byte("agent-key")}
+	if _, err := state.CreateFleet(ctx, esphttp.FleetRecord{
+		FleetID:        "fleet-live",
+		Name:           "Live Fleet",
+		ControlGroupID: gid,
+		Coordinator:    coordinator,
+		CreatedAtMS:    1,
+	}); err != nil {
+		t.Fatalf("CreateFleet: %v", err)
+	}
+	for _, member := range []esphttp.FleetMemberRecord{
+		{FleetID: "fleet-live", NodeID: coordinatorNodeID, EntmootPubKey: base64.StdEncoding.EncodeToString(coordinator.EntmootPubKey), Role: esphttp.FleetRoleCoordinator, Status: esphttp.FleetMemberActive},
+		{FleetID: "fleet-live", NodeID: agentNodeID, EntmootPubKey: base64.StdEncoding.EncodeToString(agent.EntmootPubKey), Role: esphttp.FleetRoleAgent, Status: esphttp.FleetMemberActive},
+	} {
+		if _, err := state.UpsertFleetMember(ctx, member); err != nil {
+			t.Fatalf("UpsertFleetMember(%d): %v", member.NodeID, err)
+		}
+	}
+	for _, task := range []esphttp.FleetTaskRecord{
+		{
+			TaskID:      "task-claim",
+			FleetID:     "fleet-live",
+			Title:       "Claim me",
+			Description: "First claim task",
+			Mode:        esphttp.FleetTaskModeFirstClaim,
+			Status:      esphttp.FleetTaskStatusOpen,
+			Creator:     coordinator,
+			CreatedAtMS: 10,
+			UpdatedAtMS: 10,
+		},
+		{
+			TaskID:      "task-assign",
+			FleetID:     "fleet-live",
+			Title:       "Assign me",
+			Description: "Direct assignment task",
+			Mode:        esphttp.FleetTaskModeDirectAssignment,
+			Status:      esphttp.FleetTaskStatusOpen,
+			Creator:     coordinator,
+			CreatedAtMS: 11,
+			UpdatedAtMS: 11,
+		},
+	} {
+		if _, err := state.UpsertFleetTask(ctx, task); err != nil {
+			t.Fatalf("UpsertFleetTask(%s): %v", task.TaskID, err)
+		}
+	}
+	agentCfg := esphttp.LiveAgentConfig{
+		GroupID:        gid,
+		NodeID:         agentNodeID,
+		Enabled:        true,
+		Mode:           esphttp.LiveModeOperator,
+		AllowedActions: []string{liveActionTaskAssignSelf},
+	}
+	applied, err := applyLiveAgentAction(ctx, &globalFlags{data: t.TempDir()}, state, agentCfg, nil, liveAgentAction{
+		Kind:   liveActionTaskAssignSelf,
+		TaskID: "task-claim",
+	})
+	if err != nil {
+		t.Fatalf("assign_self applyLiveAgentAction: %v", err)
+	}
+	if !applied {
+		t.Fatal("assign_self applied = false, want true")
+	}
+	claimed, found, err := state.GetFleetTask(ctx, "fleet-live", "task-claim")
+	if err != nil || !found {
+		t.Fatalf("GetFleetTask claim found/err = %v/%v", found, err)
+	}
+	if claimed.Status != esphttp.FleetTaskStatusAssigned || claimed.Assignee == nil || claimed.Assignee.PilotNodeID != agentNodeID {
+		t.Fatalf("claimed task = %+v, want assigned to live agent", claimed)
+	}
+	coordinatorCfg := esphttp.LiveAgentConfig{
+		GroupID:        gid,
+		NodeID:         coordinatorNodeID,
+		Enabled:        true,
+		Mode:           esphttp.LiveModeOperator,
+		AllowedActions: []string{liveActionTaskAssignOthers},
+	}
+	applied, err = applyLiveAgentAction(ctx, &globalFlags{data: t.TempDir()}, state, coordinatorCfg, nil, liveAgentAction{
+		Kind:           liveActionTaskAssignOthers,
+		TaskID:         "task-assign",
+		AssigneeNodeID: uint64(agentNodeID),
+	})
+	if err != nil {
+		t.Fatalf("assign_others applyLiveAgentAction: %v", err)
+	}
+	if !applied {
+		t.Fatal("assign_others applied = false, want true")
+	}
+	assigned, found, err := state.GetFleetTask(ctx, "fleet-live", "task-assign")
+	if err != nil || !found {
+		t.Fatalf("GetFleetTask assign found/err = %v/%v", found, err)
+	}
+	if assigned.Status != esphttp.FleetTaskStatusAssigned || assigned.Assignee == nil || assigned.Assignee.PilotNodeID != agentNodeID {
+		t.Fatalf("assigned task = %+v, want assigned to target agent", assigned)
+	}
+	activity, err := state.ListFleetActivity(ctx, "fleet-live", 10, 0)
+	if err != nil {
+		t.Fatalf("ListFleetActivity: %v", err)
+	}
+	activityTypes := map[string]bool{}
+	for _, item := range activity {
+		activityTypes[item.Type] = true
+	}
+	if len(activity) != 2 || !activityTypes["task.claimed"] || !activityTypes["task.assigned"] {
+		t.Fatalf("activity = %+v, want task.claimed and task.assigned", activity)
+	}
+}
+
 func TestApplyLiveAgentActionRejectsForeignOrArchivedFleetTask(t *testing.T) {
 	ctx := context.Background()
 	gid := testAgentLiveGroupID(17)

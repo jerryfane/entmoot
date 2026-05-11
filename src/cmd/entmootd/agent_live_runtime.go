@@ -22,6 +22,8 @@ const (
 	liveActionReply            = "reply"
 	liveActionMessageSummarize = "message.summarize"
 	liveActionTaskCreate       = "task.create"
+	liveActionTaskAssignSelf   = "task.assign_self"
+	liveActionTaskAssignOthers = "task.assign_others"
 	liveActionCommandSend      = "command.send"
 	liveActionAlertOwner       = "alert.owner"
 	liveCursorMaxSeenIDs       = 512
@@ -78,6 +80,7 @@ type liveAgentAction struct {
 	Description    string                 `json:"description,omitempty"`
 	Topic          string                 `json:"topic,omitempty"`
 	FleetID        string                 `json:"fleet_id,omitempty"`
+	TaskID         string                 `json:"task_id,omitempty"`
 	Mode           string                 `json:"mode,omitempty"`
 	AssigneeNodeID uint64                 `json:"assignee_node_id,omitempty"`
 	Target         string                 `json:"target,omitempty"`
@@ -176,7 +179,7 @@ func runAgentLiveScan(ctx context.Context, gf *globalFlags, state esphttp.StateS
 		AllowedActions: append([]string(nil), cfg.AllowedActions...),
 		Trigger:        liveTriggerForMode(cfg.Mode),
 		Events:         events,
-		Instructions:   "Return JSON only: {\"actions\":[{\"kind\":\"reply\",\"message\":\"...\"}]}. Supported local actions include reply, message.summarize, alert.owner, task.create with title, description, mode, fleet_id, and assignee_node_id, and command.send with action, args, target, target_node_id, instruction, timeout_ms, expires_at_ms, and auto_accept. Entmoot will validate and apply allowed actions. Do not claim that you posted anything yourself.",
+		Instructions:   "Return JSON only: {\"actions\":[{\"kind\":\"reply\",\"message\":\"...\"}]}. Supported local actions include reply, message.summarize, alert.owner, task.create with title, description, mode, fleet_id, and assignee_node_id, task.assign_self with fleet_id and task_id, task.assign_others with fleet_id, task_id, and assignee_node_id, and command.send with action, args, target, target_node_id, instruction, timeout_ms, expires_at_ms, and auto_accept. Entmoot will validate and apply allowed actions. Do not claim that you posted anything yourself.",
 	}
 	output, err := runLiveAgentRunner(ctx, runCfg, runnerCtx)
 	if err != nil {
@@ -382,6 +385,16 @@ func applyLiveAgentAction(ctx context.Context, gf *globalFlags, state esphttp.St
 			return false, errors.New("live action task.create requires state store")
 		}
 		return applyLiveAgentTaskCreate(ctx, gf, state, cfg, action)
+	case liveActionTaskAssignSelf:
+		if state == nil {
+			return false, errors.New("live action task.assign_self requires state store")
+		}
+		return applyLiveAgentTaskAssignSelf(ctx, gf, state, cfg, action)
+	case liveActionTaskAssignOthers:
+		if state == nil {
+			return false, errors.New("live action task.assign_others requires state store")
+		}
+		return applyLiveAgentTaskAssignOthers(ctx, gf, state, cfg, action)
 	case liveActionCommandSend:
 		if state == nil {
 			return false, errors.New("live action command.send requires state store")
@@ -479,6 +492,91 @@ func applyLiveAgentTaskCreate(ctx context.Context, gf *globalFlags, state esphtt
 		publishLiveFleetTaskEvent(ctx, gf, fleet, mutation, task, actor)
 	}
 	return true, nil
+}
+
+func applyLiveAgentTaskAssignSelf(ctx context.Context, gf *globalFlags, state esphttp.StateStore, cfg esphttp.LiveAgentConfig, action liveAgentAction) (bool, error) {
+	fleet, actor, task, err := liveActionFleetTask(ctx, state, cfg.GroupID, cfg.NodeID, action)
+	if err != nil {
+		return false, err
+	}
+	now := time.Now().UnixMilli()
+	mutation, err := esphttp.ApplyFleetTaskMutation(task, esphttp.FleetTaskActionClaim, actor, now, nil, nil)
+	if err != nil {
+		return false, err
+	}
+	task, ok, err := state.ClaimFleetTask(ctx, mutation.Task)
+	if err != nil {
+		return false, err
+	}
+	if !ok {
+		return false, fmt.Errorf("%w: task changed concurrently", esphttp.ErrFleetTaskInvalidTransition)
+	}
+	if err := appendLiveFleetActivity(ctx, state, fleet.FleetID, mutation, task, actor); err != nil {
+		return false, err
+	}
+	publishLiveFleetTaskEvent(ctx, gf, fleet, mutation, task, actor)
+	return true, nil
+}
+
+func applyLiveAgentTaskAssignOthers(ctx context.Context, gf *globalFlags, state esphttp.StateStore, cfg esphttp.LiveAgentConfig, action liveAgentAction) (bool, error) {
+	fleet, actor, task, err := liveActionFleetTask(ctx, state, cfg.GroupID, cfg.NodeID, action)
+	if err != nil {
+		return false, err
+	}
+	assignee, err := liveActionAssignee(ctx, state, fleet.FleetID, action, "task.assign_others")
+	if err != nil {
+		return false, err
+	}
+	now := time.Now().UnixMilli()
+	mutation, err := esphttp.ApplyFleetTaskMutation(task, esphttp.FleetTaskActionAssign, actor, now, &assignee, nil)
+	if err != nil {
+		return false, err
+	}
+	task, ok, err := state.UpdateFleetTaskIfCurrent(ctx, mutation.Task, mutation.ExpectedUpdatedAtMS)
+	if err != nil {
+		return false, err
+	}
+	if !ok {
+		return false, fmt.Errorf("%w: task changed concurrently", esphttp.ErrFleetTaskInvalidTransition)
+	}
+	if err := appendLiveFleetActivity(ctx, state, fleet.FleetID, mutation, task, actor); err != nil {
+		return false, err
+	}
+	publishLiveFleetTaskEvent(ctx, gf, fleet, mutation, task, actor)
+	return true, nil
+}
+
+func liveActionFleetTask(ctx context.Context, state esphttp.StateStore, groupID entmoot.GroupID, actorNodeID entmoot.NodeID, action liveAgentAction) (esphttp.FleetRecord, esphttp.FleetMemberRecord, esphttp.FleetTaskRecord, error) {
+	fleet, err := liveActionFleet(ctx, state, groupID, action.FleetID)
+	if err != nil {
+		return esphttp.FleetRecord{}, esphttp.FleetMemberRecord{}, esphttp.FleetTaskRecord{}, err
+	}
+	actor, err := liveActionFleetMember(ctx, state, fleet.FleetID, actorNodeID)
+	if err != nil {
+		return esphttp.FleetRecord{}, esphttp.FleetMemberRecord{}, esphttp.FleetTaskRecord{}, err
+	}
+	taskID := strings.TrimSpace(action.TaskID)
+	if taskID == "" {
+		return esphttp.FleetRecord{}, esphttp.FleetMemberRecord{}, esphttp.FleetTaskRecord{}, errors.New("live action task mutation requires task_id")
+	}
+	task, found, err := state.GetFleetTask(ctx, fleet.FleetID, taskID)
+	if err != nil {
+		return esphttp.FleetRecord{}, esphttp.FleetMemberRecord{}, esphttp.FleetTaskRecord{}, err
+	}
+	if !found {
+		return esphttp.FleetRecord{}, esphttp.FleetMemberRecord{}, esphttp.FleetTaskRecord{}, fmt.Errorf("task %s was not found in fleet %s", taskID, fleet.FleetID)
+	}
+	return fleet, actor, task, nil
+}
+
+func liveActionAssignee(ctx context.Context, state esphttp.StateStore, fleetID string, action liveAgentAction, actionName string) (esphttp.FleetMemberRecord, error) {
+	if action.AssigneeNodeID == 0 {
+		return esphttp.FleetMemberRecord{}, fmt.Errorf("live action %s requires assignee_node_id", actionName)
+	}
+	if action.AssigneeNodeID > uint64(^uint32(0)) {
+		return esphttp.FleetMemberRecord{}, fmt.Errorf("live action %s assignee_node_id is too large: %d", actionName, action.AssigneeNodeID)
+	}
+	return liveActionFleetMember(ctx, state, fleetID, entmoot.NodeID(action.AssigneeNodeID))
 }
 
 func liveActionFleet(ctx context.Context, state esphttp.StateStore, groupID entmoot.GroupID, rawFleetID string) (esphttp.FleetRecord, error) {
