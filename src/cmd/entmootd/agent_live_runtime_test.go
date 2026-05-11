@@ -1249,6 +1249,217 @@ func TestApplyLiveAgentActionRejectsCommandSendBeforePublish(t *testing.T) {
 	}
 }
 
+func TestApplyLiveAgentActionRemovesFleetMember(t *testing.T) {
+	ctx := context.Background()
+	gid := testAgentLiveGroupID(29)
+	coordinatorNodeID := entmoot.NodeID(7)
+	targetNodeID := entmoot.NodeID(8)
+	dataDir, err := os.MkdirTemp("/tmp", "entmoot-live-ipc-")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dataDir) })
+	state := esphttp.NewMemoryStateStore()
+	coordinator := entmoot.NodeInfo{PilotNodeID: coordinatorNodeID, EntmootPubKey: []byte(strings.Repeat("c", 32))}
+	targetPub := []byte(strings.Repeat("t", 32))
+	if _, err := state.CreateFleet(ctx, esphttp.FleetRecord{
+		FleetID:        "fleet-live",
+		Name:           "Live Fleet",
+		ControlGroupID: gid,
+		Coordinator:    coordinator,
+		CreatedAtMS:    1,
+	}); err != nil {
+		t.Fatalf("CreateFleet: %v", err)
+	}
+	for _, member := range []esphttp.FleetMemberRecord{
+		{FleetID: "fleet-live", NodeID: coordinatorNodeID, EntmootPubKey: base64.StdEncoding.EncodeToString(coordinator.EntmootPubKey), Role: esphttp.FleetRoleCoordinator, Status: esphttp.FleetMemberActive},
+		{FleetID: "fleet-live", NodeID: targetNodeID, EntmootPubKey: base64.StdEncoding.EncodeToString(targetPub), Role: esphttp.FleetRoleAgent, Status: esphttp.FleetMemberInvited},
+	} {
+		if _, err := state.UpsertFleetMember(ctx, member); err != nil {
+			t.Fatalf("UpsertFleetMember(%d): %v", member.NodeID, err)
+		}
+	}
+	if _, err := state.CreateFleetInvite(ctx, esphttp.FleetInviteRecord{
+		InviteID:      "invite-target",
+		FleetID:       "fleet-live",
+		NodeID:        targetNodeID,
+		EntmootPubKey: base64.StdEncoding.EncodeToString(targetPub),
+		Status:        esphttp.FleetMemberInvited,
+		Invite:        json.RawMessage(`{"group_id":"test"}`),
+		CreatedAtMS:   1,
+	}); err != nil {
+		t.Fatalf("CreateFleetInvite: %v", err)
+	}
+	removeCh := make(chan *ipc.MemberRemoveReq, 1)
+	stop := serveLiveInfoRemoveCapture(t, controlSocketPath(dataDir), &ipc.InfoResp{
+		PilotNodeID:   coordinator.PilotNodeID,
+		EntmootPubKey: coordinator.EntmootPubKey,
+		Running:       true,
+	}, removeCh)
+	defer stop()
+	cfg := esphttp.LiveAgentConfig{
+		GroupID:        gid,
+		NodeID:         coordinatorNodeID,
+		Enabled:        true,
+		Mode:           esphttp.LiveModeOperator,
+		AllowedActions: []string{liveActionMemberRemove},
+	}
+	applied, err := applyLiveAgentAction(ctx, &globalFlags{data: dataDir}, state, cfg, nil, liveAgentAction{
+		Kind:         liveActionMemberRemove,
+		TargetNodeID: uint64(targetNodeID),
+	})
+	if err != nil {
+		t.Fatalf("applyLiveAgentAction: %v", err)
+	}
+	if !applied {
+		t.Fatal("applied = false, want true")
+	}
+	select {
+	case req := <-removeCh:
+		if req.GroupID != gid || req.Target.PilotNodeID != targetNodeID || base64.StdEncoding.EncodeToString(req.Target.EntmootPubKey) != base64.StdEncoding.EncodeToString(targetPub) {
+			t.Fatalf("member remove req = %+v, want target %d", req, targetNodeID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for member remove IPC request")
+	}
+	members, err := state.ListFleetMembers(ctx, "fleet-live")
+	if err != nil {
+		t.Fatalf("ListFleetMembers: %v", err)
+	}
+	removed, ok := fleetMemberForNode(members, targetNodeID)
+	if !ok || removed.Status != esphttp.FleetMemberRemoved {
+		t.Fatalf("removed member = %+v/%v, want removed", removed, ok)
+	}
+	invites, err := state.ListFleetInvites(ctx, "fleet-live")
+	if err != nil {
+		t.Fatalf("ListFleetInvites: %v", err)
+	}
+	if len(invites) != 0 {
+		t.Fatalf("invites = %+v, want removed invite cleared", invites)
+	}
+	activity, err := state.ListFleetActivity(ctx, "fleet-live", 10, 0)
+	if err != nil {
+		t.Fatalf("ListFleetActivity: %v", err)
+	}
+	if len(activity) != 1 || activity[0].Type != "member.removed" || activity[0].Subject == nil || activity[0].Subject.PilotNodeID != targetNodeID {
+		t.Fatalf("activity = %+v, want member.removed for target", activity)
+	}
+}
+
+func TestApplyLiveAgentActionMemberRemoveRetriesDroppedIPC(t *testing.T) {
+	ctx := context.Background()
+	gid := testAgentLiveGroupID(31)
+	coordinatorNodeID := entmoot.NodeID(7)
+	targetNodeID := entmoot.NodeID(8)
+	dataDir, err := os.MkdirTemp("/tmp", "entmoot-live-ipc-")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dataDir) })
+	state := esphttp.NewMemoryStateStore()
+	coordinator := entmoot.NodeInfo{PilotNodeID: coordinatorNodeID, EntmootPubKey: []byte(strings.Repeat("c", 32))}
+	targetPub := []byte(strings.Repeat("t", 32))
+	if _, err := state.CreateFleet(ctx, esphttp.FleetRecord{
+		FleetID:        "fleet-live",
+		Name:           "Live Fleet",
+		ControlGroupID: gid,
+		Coordinator:    coordinator,
+		CreatedAtMS:    1,
+	}); err != nil {
+		t.Fatalf("CreateFleet: %v", err)
+	}
+	for _, member := range []esphttp.FleetMemberRecord{
+		{FleetID: "fleet-live", NodeID: coordinatorNodeID, EntmootPubKey: base64.StdEncoding.EncodeToString(coordinator.EntmootPubKey), Role: esphttp.FleetRoleCoordinator, Status: esphttp.FleetMemberActive},
+		{FleetID: "fleet-live", NodeID: targetNodeID, EntmootPubKey: base64.StdEncoding.EncodeToString(targetPub), Role: esphttp.FleetRoleAgent, Status: esphttp.FleetMemberActive},
+	} {
+		if _, err := state.UpsertFleetMember(ctx, member); err != nil {
+			t.Fatalf("UpsertFleetMember(%d): %v", member.NodeID, err)
+		}
+	}
+	removeCh := make(chan *ipc.MemberRemoveReq, 1)
+	stop := serveLiveInfoRemoveDrop(t, controlSocketPath(dataDir), &ipc.InfoResp{
+		PilotNodeID:   coordinator.PilotNodeID,
+		EntmootPubKey: coordinator.EntmootPubKey,
+		Running:       true,
+	}, removeCh)
+	defer stop()
+	cfg := esphttp.LiveAgentConfig{
+		GroupID:        gid,
+		NodeID:         coordinatorNodeID,
+		Enabled:        true,
+		Mode:           esphttp.LiveModeOperator,
+		AllowedActions: []string{liveActionMemberRemove},
+	}
+	applied, err := applyLiveAgentAction(ctx, &globalFlags{data: dataDir}, state, cfg, nil, liveAgentAction{
+		Kind:         liveActionMemberRemove,
+		TargetNodeID: uint64(targetNodeID),
+	})
+	if !errors.Is(err, errLiveActionTransport) {
+		t.Fatalf("applyLiveAgentAction err = %v, want live action transport", err)
+	}
+	if applied {
+		t.Fatal("applied = true, want false for retryable IPC failure")
+	}
+	select {
+	case <-removeCh:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for member remove IPC request")
+	}
+}
+
+func TestApplyLiveAgentActionRejectsMemberRemoveByNonCoordinator(t *testing.T) {
+	ctx := context.Background()
+	gid := testAgentLiveGroupID(30)
+	coordinatorNodeID := entmoot.NodeID(7)
+	agentNodeID := entmoot.NodeID(8)
+	targetNodeID := entmoot.NodeID(9)
+	state := esphttp.NewMemoryStateStore()
+	coordinator := entmoot.NodeInfo{PilotNodeID: coordinatorNodeID, EntmootPubKey: []byte(strings.Repeat("c", 32))}
+	if _, err := state.CreateFleet(ctx, esphttp.FleetRecord{
+		FleetID:        "fleet-live",
+		Name:           "Live Fleet",
+		ControlGroupID: gid,
+		Coordinator:    coordinator,
+		CreatedAtMS:    1,
+	}); err != nil {
+		t.Fatalf("CreateFleet: %v", err)
+	}
+	for _, member := range []esphttp.FleetMemberRecord{
+		{FleetID: "fleet-live", NodeID: coordinatorNodeID, EntmootPubKey: base64.StdEncoding.EncodeToString(coordinator.EntmootPubKey), Role: esphttp.FleetRoleCoordinator, Status: esphttp.FleetMemberActive},
+		{FleetID: "fleet-live", NodeID: agentNodeID, EntmootPubKey: base64.StdEncoding.EncodeToString([]byte(strings.Repeat("a", 32))), Role: esphttp.FleetRoleAgent, Status: esphttp.FleetMemberActive},
+		{FleetID: "fleet-live", NodeID: targetNodeID, EntmootPubKey: base64.StdEncoding.EncodeToString([]byte(strings.Repeat("t", 32))), Role: esphttp.FleetRoleAgent, Status: esphttp.FleetMemberActive},
+	} {
+		if _, err := state.UpsertFleetMember(ctx, member); err != nil {
+			t.Fatalf("UpsertFleetMember(%d): %v", member.NodeID, err)
+		}
+	}
+	cfg := esphttp.LiveAgentConfig{
+		GroupID:        gid,
+		NodeID:         agentNodeID,
+		Enabled:        true,
+		Mode:           esphttp.LiveModeOperator,
+		AllowedActions: []string{liveActionMemberRemove},
+	}
+	applied, err := applyLiveAgentAction(ctx, &globalFlags{data: t.TempDir()}, state, cfg, nil, liveAgentAction{
+		Kind:         liveActionMemberRemove,
+		TargetNodeID: uint64(targetNodeID),
+	})
+	if !errors.Is(err, esphttp.ErrFleetTaskUnauthorized) {
+		t.Fatalf("applyLiveAgentAction err = %v, want unauthorized", err)
+	}
+	if applied {
+		t.Fatal("applied = true, want false")
+	}
+	members, err := state.ListFleetMembers(ctx, "fleet-live")
+	if err != nil {
+		t.Fatalf("ListFleetMembers: %v", err)
+	}
+	target, ok := fleetMemberForNode(members, targetNodeID)
+	if !ok || target.Status != esphttp.FleetMemberActive {
+		t.Fatalf("target member = %+v/%v, want still active", target, ok)
+	}
+}
+
 func TestLiveMessageMentionsAgentRequiresExactToken(t *testing.T) {
 	gid := testAgentLiveGroupID(7)
 	matches := []string{
@@ -1588,6 +1799,82 @@ func serveLiveInfoPublishCapture(t *testing.T, sock string, info *ipc.InfoResp, 
 					resp.GroupID = *req.GroupID
 				}
 				_ = ipc.EncodeAndWrite(conn, resp)
+			}
+			_ = conn.Close()
+		}
+	}()
+	return func() {
+		_ = ln.Close()
+		<-done
+	}
+}
+
+func serveLiveInfoRemoveCapture(t *testing.T, sock string, info *ipc.InfoResp, removeCh chan<- *ipc.MemberRemoveReq) func() {
+	t.Helper()
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatalf("listen unix: %v", err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer ln.Close()
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			_, payload, err := ipc.ReadAndDecode(conn)
+			if err != nil {
+				_ = conn.Close()
+				continue
+			}
+			switch req := payload.(type) {
+			case *ipc.InfoReq:
+				_ = ipc.EncodeAndWrite(conn, info)
+			case *ipc.MemberRemoveReq:
+				removeCh <- req
+				_ = ipc.EncodeAndWrite(conn, &ipc.MemberRemoveResp{
+					Status:     "removed",
+					GroupID:    req.GroupID,
+					RosterHead: entmoot.RosterEntryID{},
+					Members:    1,
+				})
+			}
+			_ = conn.Close()
+		}
+	}()
+	return func() {
+		_ = ln.Close()
+		<-done
+	}
+}
+
+func serveLiveInfoRemoveDrop(t *testing.T, sock string, info *ipc.InfoResp, removeCh chan<- *ipc.MemberRemoveReq) func() {
+	t.Helper()
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatalf("listen unix: %v", err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer ln.Close()
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			_, payload, err := ipc.ReadAndDecode(conn)
+			if err != nil {
+				_ = conn.Close()
+				continue
+			}
+			switch req := payload.(type) {
+			case *ipc.InfoReq:
+				_ = ipc.EncodeAndWrite(conn, info)
+			case *ipc.MemberRemoveReq:
+				removeCh <- req
 			}
 			_ = conn.Close()
 		}
