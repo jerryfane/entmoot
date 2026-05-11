@@ -99,6 +99,8 @@ func run() int {
 		fmt.Fprintln(os.Stderr, "                          Emit a signed invite JSON bundle.")
 		fmt.Fprintln(os.Stderr, "  roster add -group GID -node NODEID -pubkey PUBKEY_B64")
 		fmt.Fprintln(os.Stderr, "                          Admit a new member to the roster (founder-only).")
+		fmt.Fprintln(os.Stderr, "  roster remove -group GID -node NODEID -pubkey PUBKEY_B64")
+		fmt.Fprintln(os.Stderr, "                          Remove a member from the roster (founder-only).")
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "Global flags:")
 		fs.PrintDefaults()
