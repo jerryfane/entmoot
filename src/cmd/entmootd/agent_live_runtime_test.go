@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -1249,6 +1250,155 @@ func TestApplyLiveAgentActionRejectsCommandSendBeforePublish(t *testing.T) {
 	}
 }
 
+func TestApplyLiveAgentActionCreatesFleetInvite(t *testing.T) {
+	ctx := context.Background()
+	gid := testAgentLiveGroupID(32)
+	coordinatorNodeID := entmoot.NodeID(7)
+	targetNodeID := entmoot.NodeID(8)
+	dataDir, err := os.MkdirTemp("/tmp", "entmoot-live-ipc-")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dataDir) })
+	state := esphttp.NewMemoryStateStore()
+	coordinator := entmoot.NodeInfo{PilotNodeID: coordinatorNodeID, EntmootPubKey: []byte(strings.Repeat("c", 32))}
+	targetPilotPub := []byte(strings.Repeat("p", 32))
+	targetEntPub := []byte(strings.Repeat("t", 32))
+	if _, err := state.CreateFleet(ctx, esphttp.FleetRecord{
+		FleetID:        "fleet-live",
+		Name:           "Live Fleet",
+		ControlGroupID: gid,
+		Coordinator:    coordinator,
+		Status:         esphttp.FleetStatusActive,
+		CreatedAtMS:    1,
+	}); err != nil {
+		t.Fatalf("CreateFleet: %v", err)
+	}
+	if _, err := state.UpsertFleetMember(ctx, esphttp.FleetMemberRecord{
+		FleetID:       "fleet-live",
+		NodeID:        coordinatorNodeID,
+		EntmootPubKey: base64.StdEncoding.EncodeToString(coordinator.EntmootPubKey),
+		Role:          esphttp.FleetRoleCoordinator,
+		Status:        esphttp.FleetMemberActive,
+	}); err != nil {
+		t.Fatalf("UpsertFleetMember: %v", err)
+	}
+	inviteCh := make(chan *ipc.InviteCreateReq, 1)
+	stop := serveLiveInfoInviteCapture(t, controlSocketPath(dataDir), &ipc.InfoResp{
+		PilotNodeID:   coordinator.PilotNodeID,
+		EntmootPubKey: coordinator.EntmootPubKey,
+		Running:       true,
+	}, gid, inviteCh)
+	defer stop()
+	cfg := esphttp.LiveAgentConfig{
+		GroupID:        gid,
+		NodeID:         coordinatorNodeID,
+		Enabled:        true,
+		Mode:           esphttp.LiveModeOperator,
+		AllowedActions: []string{liveActionInviteCreate},
+	}
+	applied, err := applyLiveAgentAction(ctx, &globalFlags{data: dataDir}, state, cfg, nil, liveAgentAction{
+		Kind:           liveActionInviteCreate,
+		TargetNodeID:   uint64(targetNodeID),
+		TargetPilotKey: base64.StdEncoding.EncodeToString(targetPilotPub),
+		TargetEntKey:   base64.StdEncoding.EncodeToString(targetEntPub),
+		Hostname:       "deimos",
+		ValidFor:       "1h",
+	})
+	if err != nil {
+		t.Fatalf("applyLiveAgentAction: %v", err)
+	}
+	if !applied {
+		t.Fatal("applied = false, want true")
+	}
+	select {
+	case req := <-inviteCh:
+		if req.GroupID != gid || req.Target.PilotNodeID != targetNodeID {
+			t.Fatalf("invite req = %+v, want target node %d", req, targetNodeID)
+		}
+		if !bytes.Equal(req.TargetPilotPubKey, targetPilotPub) || !bytes.Equal(req.Target.EntmootPubKey, targetEntPub) {
+			t.Fatalf("invite target keys = %+v, want supplied keys", req.Target)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for invite create IPC request")
+	}
+	members, err := state.ListFleetMembers(ctx, "fleet-live")
+	if err != nil {
+		t.Fatalf("ListFleetMembers: %v", err)
+	}
+	invited, ok := fleetMemberForNode(members, targetNodeID)
+	if !ok || invited.Status != esphttp.FleetMemberInvited || invited.Hostname != "deimos" {
+		t.Fatalf("invited member = %+v/%v, want invited deimos", invited, ok)
+	}
+	invites, err := state.ListFleetInvites(ctx, "fleet-live")
+	if err != nil {
+		t.Fatalf("ListFleetInvites: %v", err)
+	}
+	if len(invites) != 1 || invites[0].NodeID != targetNodeID || invites[0].Status != esphttp.FleetMemberInvited {
+		t.Fatalf("invites = %+v, want one invited target", invites)
+	}
+	activity, err := state.ListFleetActivity(ctx, "fleet-live", 10, 0)
+	if err != nil {
+		t.Fatalf("ListFleetActivity: %v", err)
+	}
+	if len(activity) != 1 || activity[0].Type != "member.invited" || activity[0].Subject == nil || activity[0].Subject.PilotNodeID != targetNodeID {
+		t.Fatalf("activity = %+v, want member.invited for target", activity)
+	}
+}
+
+func TestApplyLiveAgentActionRejectsInviteCreateByNonCoordinator(t *testing.T) {
+	ctx := context.Background()
+	gid := testAgentLiveGroupID(33)
+	coordinatorNodeID := entmoot.NodeID(7)
+	agentNodeID := entmoot.NodeID(8)
+	state := esphttp.NewMemoryStateStore()
+	coordinator := entmoot.NodeInfo{PilotNodeID: coordinatorNodeID, EntmootPubKey: []byte(strings.Repeat("c", 32))}
+	if _, err := state.CreateFleet(ctx, esphttp.FleetRecord{
+		FleetID:        "fleet-live",
+		Name:           "Live Fleet",
+		ControlGroupID: gid,
+		Coordinator:    coordinator,
+		Status:         esphttp.FleetStatusActive,
+		CreatedAtMS:    1,
+	}); err != nil {
+		t.Fatalf("CreateFleet: %v", err)
+	}
+	for _, member := range []esphttp.FleetMemberRecord{
+		{FleetID: "fleet-live", NodeID: coordinatorNodeID, EntmootPubKey: base64.StdEncoding.EncodeToString(coordinator.EntmootPubKey), Role: esphttp.FleetRoleCoordinator, Status: esphttp.FleetMemberActive},
+		{FleetID: "fleet-live", NodeID: agentNodeID, EntmootPubKey: base64.StdEncoding.EncodeToString([]byte(strings.Repeat("a", 32))), Role: esphttp.FleetRoleAgent, Status: esphttp.FleetMemberActive},
+	} {
+		if _, err := state.UpsertFleetMember(ctx, member); err != nil {
+			t.Fatalf("UpsertFleetMember(%d): %v", member.NodeID, err)
+		}
+	}
+	cfg := esphttp.LiveAgentConfig{
+		GroupID:        gid,
+		NodeID:         agentNodeID,
+		Enabled:        true,
+		Mode:           esphttp.LiveModeOperator,
+		AllowedActions: []string{liveActionInviteCreate},
+	}
+	applied, err := applyLiveAgentAction(ctx, &globalFlags{data: t.TempDir()}, state, cfg, nil, liveAgentAction{
+		Kind:           liveActionInviteCreate,
+		TargetNodeID:   9,
+		TargetPilotKey: base64.StdEncoding.EncodeToString([]byte(strings.Repeat("p", 32))),
+		TargetEntKey:   base64.StdEncoding.EncodeToString([]byte(strings.Repeat("t", 32))),
+	})
+	if !errors.Is(err, esphttp.ErrFleetTaskUnauthorized) {
+		t.Fatalf("applyLiveAgentAction err = %v, want unauthorized", err)
+	}
+	if applied {
+		t.Fatal("applied = true, want false")
+	}
+	members, err := state.ListFleetMembers(ctx, "fleet-live")
+	if err != nil {
+		t.Fatalf("ListFleetMembers: %v", err)
+	}
+	if _, ok := fleetMemberForNode(members, 9); ok {
+		t.Fatal("target member exists, want no invite mutation")
+	}
+}
+
 func TestApplyLiveAgentActionRemovesFleetMember(t *testing.T) {
 	ctx := context.Background()
 	gid := testAgentLiveGroupID(29)
@@ -1799,6 +1949,48 @@ func serveLiveInfoPublishCapture(t *testing.T, sock string, info *ipc.InfoResp, 
 					resp.GroupID = *req.GroupID
 				}
 				_ = ipc.EncodeAndWrite(conn, resp)
+			}
+			_ = conn.Close()
+		}
+	}()
+	return func() {
+		_ = ln.Close()
+		<-done
+	}
+}
+
+func serveLiveInfoInviteCapture(t *testing.T, sock string, info *ipc.InfoResp, gid entmoot.GroupID, inviteCh chan<- *ipc.InviteCreateReq) func() {
+	t.Helper()
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatalf("listen unix: %v", err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer ln.Close()
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			_, payload, err := ipc.ReadAndDecode(conn)
+			if err != nil {
+				_ = conn.Close()
+				continue
+			}
+			switch req := payload.(type) {
+			case *ipc.InfoReq:
+				_ = ipc.EncodeAndWrite(conn, info)
+			case *ipc.InviteCreateReq:
+				inviteCh <- req
+				_ = ipc.EncodeAndWrite(conn, &ipc.InviteCreateResp{
+					Status:     "created",
+					GroupID:    gid,
+					Invite:     entmoot.Invite{GroupID: gid},
+					RosterHead: entmoot.RosterEntryID{},
+					Members:    2,
+				})
 			}
 			_ = conn.Close()
 		}

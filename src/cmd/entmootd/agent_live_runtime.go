@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -27,6 +28,7 @@ const (
 	liveActionTaskUpdateOwn    = "task.update_own"
 	liveActionTaskAssignOthers = "task.assign_others"
 	liveActionCommandSend      = "command.send"
+	liveActionInviteCreate     = "invite.create"
 	liveActionMemberRemove     = "member.remove"
 	liveActionAlertOwner       = "alert.owner"
 	liveCursorMaxSeenIDs       = 512
@@ -88,6 +90,11 @@ type liveAgentAction struct {
 	AssigneeNodeID uint64                 `json:"assignee_node_id,omitempty"`
 	Target         string                 `json:"target,omitempty"`
 	TargetNodeID   uint64                 `json:"target_node_id,omitempty"`
+	TargetPilotKey string                 `json:"target_pilot_pubkey,omitempty"`
+	TargetEntKey   string                 `json:"target_entmoot_pubkey,omitempty"`
+	Hostname       string                 `json:"hostname,omitempty"`
+	ValidFor       string                 `json:"valid_for,omitempty"`
+	ValidUntilMS   int64                  `json:"valid_until_ms,omitempty"`
 	Args           map[string]interface{} `json:"args,omitempty"`
 	Instruction    string                 `json:"instruction,omitempty"`
 	TimeoutMS      int64                  `json:"timeout_ms,omitempty"`
@@ -182,7 +189,7 @@ func runAgentLiveScan(ctx context.Context, gf *globalFlags, state esphttp.StateS
 		AllowedActions: append([]string(nil), cfg.AllowedActions...),
 		Trigger:        liveTriggerForMode(cfg.Mode),
 		Events:         events,
-		Instructions:   "Return JSON only: {\"actions\":[{\"kind\":\"reply\",\"message\":\"...\"}]}. Supported local actions include reply, message.summarize, alert.owner, task.create with title, description, mode, fleet_id, and assignee_node_id, task.assign_self with fleet_id and task_id, task.update_own with fleet_id, task_id, and content, task.assign_others with fleet_id, task_id, and assignee_node_id, command.send with action, args, target, target_node_id, instruction, timeout_ms, expires_at_ms, and auto_accept, and member.remove with fleet_id and target_node_id. Entmoot will validate and apply allowed actions. Do not claim that you posted anything yourself.",
+		Instructions:   "Return JSON only: {\"actions\":[{\"kind\":\"reply\",\"message\":\"...\"}]}. Supported local actions include reply, message.summarize, alert.owner, task.create with title, description, mode, fleet_id, and assignee_node_id, task.assign_self with fleet_id and task_id, task.update_own with fleet_id, task_id, and content, task.assign_others with fleet_id, task_id, and assignee_node_id, command.send with action, args, target, target_node_id, instruction, timeout_ms, expires_at_ms, and auto_accept, invite.create with fleet_id, target_node_id, target_pilot_pubkey, target_entmoot_pubkey, hostname, valid_for, and valid_until_ms, and member.remove with fleet_id and target_node_id. Entmoot will validate and apply allowed actions. Do not claim that you posted anything yourself.",
 	}
 	output, err := runLiveAgentRunner(ctx, runCfg, runnerCtx)
 	if err != nil {
@@ -408,6 +415,11 @@ func applyLiveAgentAction(ctx context.Context, gf *globalFlags, state esphttp.St
 			return false, errors.New("live action command.send requires state store")
 		}
 		return applyLiveAgentCommandSend(ctx, gf, state, cfg, action)
+	case liveActionInviteCreate:
+		if state == nil {
+			return false, errors.New("live action invite.create requires state store")
+		}
+		return applyLiveAgentInviteCreate(ctx, gf, state, cfg, action)
 	case liveActionMemberRemove:
 		if state == nil {
 			return false, errors.New("live action member.remove requires state store")
@@ -764,6 +776,63 @@ func applyLiveAgentCommandSend(ctx context.Context, gf *globalFlags, state espht
 	return true, nil
 }
 
+func applyLiveAgentInviteCreate(ctx context.Context, gf *globalFlags, state esphttp.StateStore, cfg esphttp.LiveAgentConfig, action liveAgentAction) (bool, error) {
+	fleet, err := liveActionFleet(ctx, state, cfg.GroupID, action.FleetID)
+	if err != nil {
+		return false, err
+	}
+	actor, err := liveActionFleetMember(ctx, state, fleet.FleetID, cfg.NodeID)
+	if err != nil {
+		return false, err
+	}
+	if !esphttp.FleetTaskIsCoordinator(actor) {
+		return false, esphttp.ErrFleetTaskUnauthorized
+	}
+	if err := liveActionRequireCoordinatorPublisher(ctx, gf, fleet, liveActionInviteCreate); err != nil {
+		return false, err
+	}
+	targetNodeID, err := liveActionTargetNodeID(action, liveActionInviteCreate)
+	if err != nil {
+		return false, err
+	}
+	pilotPub, err := liveActionDecodePublicKey(action.TargetPilotKey, "target_pilot_pubkey", liveActionInviteCreate)
+	if err != nil {
+		return false, err
+	}
+	entPub, err := liveActionDecodePublicKey(action.TargetEntKey, "target_entmoot_pubkey", liveActionInviteCreate)
+	if err != nil {
+		return false, err
+	}
+	body, err := json.Marshal(fleetInviteCreatePayload{
+		FleetID: fleet.FleetID,
+		Target: &inviteTargetPayload{
+			PilotNodeID:   targetNodeID,
+			PilotPubKey:   pilotPub,
+			EntmootPubKey: entPub,
+		},
+		Hostname:     strings.TrimSpace(action.Hostname),
+		ValidFor:     strings.TrimSpace(action.ValidFor),
+		ValidUntilMS: action.ValidUntilMS,
+	})
+	if err != nil {
+		return false, err
+	}
+	if cfg.MaxActionBytes > 0 && len(body) > cfg.MaxActionBytes {
+		return false, errors.New("live action invite.create payload exceeds max_action_bytes")
+	}
+	exec := liveActionESPOperationExecutor(gf, state)
+	if _, err := exec.createFleetInvite(ctx, esphttp.SignRequest{
+		Kind:    "fleet_invite_create",
+		Payload: append(json.RawMessage(nil), body...),
+	}); err != nil {
+		if liveActionOperationTransportError(err) {
+			return false, fmt.Errorf("%w: %v", errLiveActionTransport, err)
+		}
+		return false, err
+	}
+	return true, nil
+}
+
 func applyLiveAgentMemberRemove(ctx context.Context, gf *globalFlags, state esphttp.StateStore, cfg esphttp.LiveAgentConfig, action liveAgentAction) (bool, error) {
 	fleet, err := liveActionFleet(ctx, state, cfg.GroupID, action.FleetID)
 	if err != nil {
@@ -854,6 +923,18 @@ func liveActionTargetNodeID(action liveAgentAction, actionName string) (entmoot.
 		return 0, fmt.Errorf("live action %s target_node_id is too large: %d", actionName, action.TargetNodeID)
 	}
 	return entmoot.NodeID(action.TargetNodeID), nil
+}
+
+func liveActionDecodePublicKey(raw string, field string, actionName string) ([]byte, error) {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return nil, fmt.Errorf("live action %s requires %s", actionName, field)
+	}
+	decoded, err := base64.StdEncoding.DecodeString(value)
+	if err != nil || len(decoded) != ed25519.PublicKeySize {
+		return nil, fmt.Errorf("live action %s %s must be a base64-encoded 32-byte public key", actionName, field)
+	}
+	return decoded, nil
 }
 
 func liveCommandArgs(action liveAgentAction, commandAction string) (map[string]interface{}, error) {
