@@ -34,6 +34,7 @@ const (
 	liveActionInviteCreate     = "invite.create"
 	liveActionMemberRemove     = "member.remove"
 	liveActionMetadataUpdate   = "metadata.update"
+	liveActionExternalMessage  = "external.message.send"
 	liveActionAlertOwner       = "alert.owner"
 	liveCursorMaxSeenIDs       = 512
 	liveCursorOverlapWindow    = 10 * time.Minute
@@ -81,30 +82,33 @@ type liveAgentRunnerOutput struct {
 }
 
 type liveAgentAction struct {
-	Kind           string                 `json:"kind"`
-	Action         string                 `json:"action,omitempty"`
-	Message        string                 `json:"message,omitempty"`
-	Title          string                 `json:"title,omitempty"`
-	Content        string                 `json:"content,omitempty"`
-	Description    string                 `json:"description,omitempty"`
-	Topic          string                 `json:"topic,omitempty"`
-	FleetID        string                 `json:"fleet_id,omitempty"`
-	TaskID         string                 `json:"task_id,omitempty"`
-	Mode           string                 `json:"mode,omitempty"`
-	AssigneeNodeID uint64                 `json:"assignee_node_id,omitempty"`
-	Target         string                 `json:"target,omitempty"`
-	TargetNodeID   uint64                 `json:"target_node_id,omitempty"`
-	TargetPilotKey string                 `json:"target_pilot_pubkey,omitempty"`
-	TargetEntKey   string                 `json:"target_entmoot_pubkey,omitempty"`
-	Hostname       string                 `json:"hostname,omitempty"`
-	ValidFor       string                 `json:"valid_for,omitempty"`
-	ValidUntilMS   int64                  `json:"valid_until_ms,omitempty"`
-	Metadata       json.RawMessage        `json:"metadata,omitempty"`
-	Args           map[string]interface{} `json:"args,omitempty"`
-	Instruction    string                 `json:"instruction,omitempty"`
-	TimeoutMS      int64                  `json:"timeout_ms,omitempty"`
-	ExpiresAtMS    int64                  `json:"expires_at_ms,omitempty"`
-	AutoAccept     *bool                  `json:"auto_accept,omitempty"`
+	Kind             string                 `json:"kind"`
+	Action           string                 `json:"action,omitempty"`
+	Message          string                 `json:"message,omitempty"`
+	Title            string                 `json:"title,omitempty"`
+	Content          string                 `json:"content,omitempty"`
+	Description      string                 `json:"description,omitempty"`
+	Topic            string                 `json:"topic,omitempty"`
+	FleetID          string                 `json:"fleet_id,omitempty"`
+	TaskID           string                 `json:"task_id,omitempty"`
+	Mode             string                 `json:"mode,omitempty"`
+	AssigneeNodeID   uint64                 `json:"assignee_node_id,omitempty"`
+	Target           string                 `json:"target,omitempty"`
+	TargetNodeID     uint64                 `json:"target_node_id,omitempty"`
+	Channel          string                 `json:"channel,omitempty"`
+	ExternalTarget   string                 `json:"external_target,omitempty"`
+	ExternalActionID string                 `json:"external_action_id,omitempty"`
+	TargetPilotKey   string                 `json:"target_pilot_pubkey,omitempty"`
+	TargetEntKey     string                 `json:"target_entmoot_pubkey,omitempty"`
+	Hostname         string                 `json:"hostname,omitempty"`
+	ValidFor         string                 `json:"valid_for,omitempty"`
+	ValidUntilMS     int64                  `json:"valid_until_ms,omitempty"`
+	Metadata         json.RawMessage        `json:"metadata,omitempty"`
+	Args             map[string]interface{} `json:"args,omitempty"`
+	Instruction      string                 `json:"instruction,omitempty"`
+	TimeoutMS        int64                  `json:"timeout_ms,omitempty"`
+	ExpiresAtMS      int64                  `json:"expires_at_ms,omitempty"`
+	AutoAccept       *bool                  `json:"auto_accept,omitempty"`
 }
 
 func runAgentLiveScan(ctx context.Context, gf *globalFlags, state esphttp.StateStore, msgStore store.MessageStore, cfg esphttp.LiveAgentConfig, runCfg agentLiveRuntimeConfig) (agentLiveScanResult, error) {
@@ -194,7 +198,7 @@ func runAgentLiveScan(ctx context.Context, gf *globalFlags, state esphttp.StateS
 		AllowedActions: append([]string(nil), cfg.AllowedActions...),
 		Trigger:        liveTriggerForMode(cfg.Mode),
 		Events:         events,
-		Instructions:   "Return JSON only: {\"actions\":[{\"kind\":\"reply\",\"message\":\"...\"}]}. Supported local actions include reply, message.summarize, alert.owner, task.create with title, description, mode, fleet_id, and assignee_node_id, task.comment with fleet_id, task_id, and content, task.assign_self with fleet_id and task_id, task.update_own with fleet_id, task_id, and content, task.assign_others with fleet_id, task_id, and assignee_node_id, command.request with action, args, target, target_node_id, instruction, timeout_ms, and expires_at_ms, command.send with action, args, target, target_node_id, instruction, timeout_ms, expires_at_ms, and auto_accept, invite.create with fleet_id, target_node_id, target_pilot_pubkey, target_entmoot_pubkey, hostname, valid_for, and valid_until_ms, member.remove with fleet_id and target_node_id, and metadata.update with a metadata JSON object. Entmoot will validate and apply allowed actions. Do not claim that you posted anything yourself.",
+		Instructions:   "Return JSON only: {\"actions\":[{\"kind\":\"reply\",\"message\":\"...\"}]}. Supported local actions include reply, message.summarize, alert.owner, task.create with title, description, mode, fleet_id, and assignee_node_id, task.comment with fleet_id, task_id, and content, task.assign_self with fleet_id and task_id, task.update_own with fleet_id, task_id, and content, task.assign_others with fleet_id, task_id, and assignee_node_id, command.request with action, args, target, target_node_id, instruction, timeout_ms, and expires_at_ms, command.send with action, args, target, target_node_id, instruction, timeout_ms, expires_at_ms, and auto_accept, invite.create with fleet_id, target_node_id, target_pilot_pubkey, target_entmoot_pubkey, hostname, valid_for, and valid_until_ms, member.remove with fleet_id and target_node_id, metadata.update with a metadata JSON object, and external.message.send with fleet_id, target_node_id, channel, external_target, message, external_action_id, timeout_ms, and expires_at_ms. Entmoot will validate and apply allowed actions. Do not claim that you posted anything yourself.",
 	}
 	output, err := runLiveAgentRunner(ctx, runCfg, runnerCtx)
 	if err != nil {
@@ -445,6 +449,11 @@ func applyLiveAgentAction(ctx context.Context, gf *globalFlags, state esphttp.St
 			return false, errors.New("live action metadata.update requires state store")
 		}
 		return applyLiveAgentMetadataUpdate(ctx, gf, state, cfg, action)
+	case liveActionExternalMessage:
+		if state == nil {
+			return false, errors.New("live action external.message.send requires state store")
+		}
+		return applyLiveAgentExternalMessage(ctx, gf, state, cfg, action)
 	default:
 		return false, fmt.Errorf("live action %q has no local executor yet", kind)
 	}
@@ -736,6 +745,69 @@ func applyLiveAgentCommandSend(ctx context.Context, gf *globalFlags, state espht
 
 func applyLiveAgentCommandRequest(ctx context.Context, gf *globalFlags, state esphttp.StateStore, cfg esphttp.LiveAgentConfig, action liveAgentAction) (bool, error) {
 	return applyLiveAgentCommand(ctx, gf, state, cfg, action, liveActionCommandRequest, true)
+}
+
+func applyLiveAgentExternalMessage(ctx context.Context, gf *globalFlags, state esphttp.StateStore, cfg esphttp.LiveAgentConfig, action liveAgentAction) (bool, error) {
+	message := strings.TrimSpace(firstNonEmpty(action.Message, action.Content))
+	if message == "" {
+		return false, errors.New("live action external.message.send requires message")
+	}
+	channel := strings.TrimSpace(strings.ToLower(action.Channel))
+	if channel == "" {
+		return false, errors.New("live action external.message.send requires channel")
+	}
+	externalTarget := strings.TrimSpace(action.ExternalTarget)
+	if externalTarget == "" {
+		target := strings.TrimSpace(action.Target)
+		switch esphttp.NormalizeFleetCommandTarget(target) {
+		case esphttp.FleetCommandTargetAll, esphttp.FleetCommandTargetNode:
+		default:
+			externalTarget = target
+		}
+	}
+	if externalTarget == "" {
+		return false, errors.New("live action external.message.send requires external_target")
+	}
+	if action.TargetNodeID == 0 {
+		return false, errors.New("live action external.message.send requires target_node_id")
+	}
+	instruction := strings.TrimSpace(action.Instruction)
+	if instruction == "" {
+		instruction = fmt.Sprintf("Send this exact message to %s on %s and return delivery evidence for the required external action:\n\n%s", externalTarget, channel, message)
+	} else {
+		instruction = fmt.Sprintf("%s\n\nSend this exact message to %s on %s and return delivery evidence for the required external action:\n\n%s", instruction, externalTarget, channel, message)
+	}
+	contextArgs := make(map[string]interface{}, len(action.Args)+3)
+	for key, value := range action.Args {
+		contextArgs[key] = value
+	}
+	contextArgs["message"] = message
+	contextArgs["channel"] = channel
+	contextArgs["external_target"] = externalTarget
+	externalActionID := strings.TrimSpace(action.ExternalActionID)
+	if externalActionID == "" {
+		externalActionID = "live-external-message"
+	}
+	return applyLiveAgentCommand(ctx, gf, state, cfg, liveAgentAction{
+		FleetID:      action.FleetID,
+		Action:       esphttp.FleetCommandActionAgentInstruction,
+		Target:       esphttp.FleetCommandTargetNode,
+		TargetNodeID: action.TargetNodeID,
+		Args: map[string]interface{}{
+			"instruction": instruction,
+			"context":     contextArgs,
+			"actions": []map[string]interface{}{{
+				"id":                externalActionID,
+				"kind":              esphttp.FleetCommandExternalActionMessageSend,
+				"channel":           channel,
+				"target":            externalTarget,
+				"required":          true,
+				"delivery_required": true,
+			}},
+		},
+		TimeoutMS:   action.TimeoutMS,
+		ExpiresAtMS: action.ExpiresAtMS,
+	}, liveActionExternalMessage, true)
 }
 
 func applyLiveAgentCommand(ctx context.Context, gf *globalFlags, state esphttp.StateStore, cfg esphttp.LiveAgentConfig, action liveAgentAction, actionName string, forceManual bool) (bool, error) {
