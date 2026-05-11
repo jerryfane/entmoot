@@ -1541,6 +1541,8 @@ CREATE TABLE IF NOT EXISTS esp_live_agent_configs (
   mode TEXT NOT NULL,
   topic_filters BLOB NOT NULL,
   allowed_actions BLOB NOT NULL,
+  max_actions_per_scan INTEGER NOT NULL DEFAULT 0,
+  max_action_bytes INTEGER NOT NULL DEFAULT 0,
   updated_at_ms INTEGER NOT NULL,
   PRIMARY KEY(group_id, node_id)
 );
@@ -2824,6 +2826,8 @@ func migrateSQLiteState(db *sql.DB) error {
 		  mode TEXT NOT NULL,
 		  topic_filters BLOB NOT NULL,
 		  allowed_actions BLOB NOT NULL,
+		  max_actions_per_scan INTEGER NOT NULL DEFAULT 0,
+		  max_action_bytes INTEGER NOT NULL DEFAULT 0,
 		  updated_at_ms INTEGER NOT NULL,
 		  PRIMARY KEY(group_id, node_id)
 		)`,
@@ -2854,6 +2858,24 @@ func migrateSQLiteState(db *sql.DB) error {
 	} {
 		if _, err := db.Exec(stmt); err != nil {
 			return fmt.Errorf("esphttp: migrate state schema add agent commands: %w", err)
+		}
+	}
+	liveConfigCols, err := tableColumns(db, "esp_live_agent_configs")
+	if err != nil {
+		return err
+	}
+	for _, stmt := range []struct {
+		name string
+		sql  string
+	}{
+		{"max_actions_per_scan", `ALTER TABLE esp_live_agent_configs ADD COLUMN max_actions_per_scan INTEGER NOT NULL DEFAULT 0`},
+		{"max_action_bytes", `ALTER TABLE esp_live_agent_configs ADD COLUMN max_action_bytes INTEGER NOT NULL DEFAULT 0`},
+	} {
+		if liveConfigCols[stmt.name] {
+			continue
+		}
+		if _, err := db.Exec(stmt.sql); err != nil {
+			return fmt.Errorf("esphttp: migrate state schema add live config %s: %w", stmt.name, err)
 		}
 	}
 	liveCursorCols, err := tableColumns(db, "esp_live_agent_cursors")

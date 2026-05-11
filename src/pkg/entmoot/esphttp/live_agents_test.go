@@ -63,11 +63,13 @@ func TestLiveAgentConfigPersists(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg, err := tc.store.UpsertLiveAgentConfig(ctx, LiveAgentConfig{
-				GroupID:      gid,
-				NodeID:       9,
-				Enabled:      true,
-				Mode:         LiveModeOperator,
-				TopicFilters: []string{"story/#", "story/#", "chat"},
+				GroupID:           gid,
+				NodeID:            9,
+				Enabled:           true,
+				Mode:              LiveModeOperator,
+				TopicFilters:      []string{"story/#", "story/#", "chat"},
+				MaxActionsPerScan: 3,
+				MaxActionBytes:    128,
 			})
 			if err != nil {
 				t.Fatalf("UpsertLiveAgentConfig: %v", err)
@@ -77,6 +79,9 @@ func TestLiveAgentConfigPersists(t *testing.T) {
 			}
 			if len(cfg.TopicFilters) != 2 {
 				t.Fatalf("topic filters = %v, want deduped two filters", cfg.TopicFilters)
+			}
+			if cfg.MaxActionsPerScan != 3 || cfg.MaxActionBytes != 128 {
+				t.Fatalf("spam controls = %d/%d, want 3/128", cfg.MaxActionsPerScan, cfg.MaxActionBytes)
 			}
 			presence, err := tc.store.UpsertLiveAgentPresence(ctx, LiveAgentPresence{
 				GroupID:      gid,
@@ -105,6 +110,33 @@ func TestLiveAgentConfigPersists(t *testing.T) {
 			states := LiveAgentStatesByNode(configs, presences, 150)
 			if states[9].Status != LiveStatusOnline || states[9].Mode != LiveModeOperator {
 				t.Fatalf("live state = %+v", states[9])
+			}
+			if states[9].MaxActionsPerScan != 3 || states[9].MaxActionBytes != 128 {
+				t.Fatalf("live state spam controls = %+v, want 3/128", states[9])
+			}
+		})
+	}
+}
+
+func TestLiveAgentConfigRejectsNegativeSpamControls(t *testing.T) {
+	ctx := context.Background()
+	gid := testLiveGroupID(6)
+	for _, tc := range []struct {
+		name string
+		cfg  LiveAgentConfig
+	}{
+		{name: "negative actions", cfg: LiveAgentConfig{MaxActionsPerScan: -1}},
+		{name: "negative bytes", cfg: LiveAgentConfig{MaxActionBytes: -1}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := tc.cfg
+			cfg.GroupID = gid
+			cfg.NodeID = 16
+			cfg.Enabled = true
+			cfg.Mode = LiveModeConverse
+			cfg.TopicFilters = []string{"chat"}
+			if _, err := NewMemoryStateStore().UpsertLiveAgentConfig(ctx, cfg); err == nil {
+				t.Fatal("UpsertLiveAgentConfig accepted negative spam control")
 			}
 		})
 	}

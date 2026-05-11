@@ -169,7 +169,12 @@ func runAgentLiveScan(ctx context.Context, gf *globalFlags, state esphttp.StateS
 		return result, err
 	}
 	result.Proposed = len(output.Actions)
-	for _, action := range output.Actions {
+	actions := output.Actions
+	if cfg.MaxActionsPerScan > 0 && len(actions) > cfg.MaxActionsPerScan {
+		result.Rejected += len(actions) - cfg.MaxActionsPerScan
+		actions = actions[:cfg.MaxActionsPerScan]
+	}
+	for _, action := range actions {
 		applied, err := applyLiveAgentAction(ctx, gf, cfg, events, action)
 		if err != nil {
 			if errors.Is(err, errLiveActionTransport) {
@@ -334,6 +339,9 @@ func applyLiveAgentAction(ctx context.Context, gf *globalFlags, cfg esphttp.Live
 		message := strings.TrimSpace(firstNonEmpty(action.Message, action.Content, action.Title))
 		if message == "" {
 			return false, fmt.Errorf("live action %q has empty message", kind)
+		}
+		if cfg.MaxActionBytes > 0 && len([]byte(message)) > cfg.MaxActionBytes {
+			return false, fmt.Errorf("live action %q message exceeds max_action_bytes", kind)
 		}
 		topic := strings.TrimSpace(action.Topic)
 		if kind == liveActionAlertOwner && topic == "" {

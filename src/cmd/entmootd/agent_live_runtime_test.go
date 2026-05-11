@@ -381,6 +381,56 @@ func TestRunAgentLiveScanPartialPublishFailurePersistsCursor(t *testing.T) {
 	}
 }
 
+func TestRunAgentLiveScanHonorsMaxActionsPerScan(t *testing.T) {
+	ctx := context.Background()
+	gid := testAgentLiveGroupID(14)
+	nodeID := entmoot.NodeID(7)
+	state := esphttp.NewMemoryStateStore()
+	msgStore := store.NewMemory()
+	msg := testAgentLiveMessage(gid, 11, 100, "chat", "hello")
+	if err := msgStore.Put(ctx, msg); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	cfg, err := state.UpsertLiveAgentConfig(ctx, esphttp.LiveAgentConfig{
+		GroupID:           gid,
+		NodeID:            nodeID,
+		Enabled:           true,
+		Mode:              esphttp.LiveModeConverse,
+		TopicFilters:      []string{"chat"},
+		MaxActionsPerScan: 1,
+		UpdatedAtMS:       1,
+	})
+	if err != nil {
+		t.Fatalf("UpsertLiveAgentConfig: %v", err)
+	}
+	runner := filepath.Join(t.TempDir(), "runner.sh")
+	if err := os.WriteFile(runner, []byte("#!/bin/sh\nprintf '{\"actions\":[{\"kind\":\"reply\",\"message\":\"one\"},{\"kind\":\"reply\",\"message\":\"two\"}]}'\n"), 0o700); err != nil {
+		t.Fatalf("WriteFile runner: %v", err)
+	}
+	dataDir, err := os.MkdirTemp("/tmp", "entmoot-live-ipc-")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dataDir) })
+	topicsCh := make(chan []string, 1)
+	stop := serveLivePublishCapture(t, controlSocketPath(dataDir), topicsCh)
+	defer stop()
+	result, err := runAgentLiveScan(ctx, &globalFlags{data: dataDir}, state, msgStore, cfg, agentLiveRuntimeConfig{
+		groupID: gid,
+		nodeID:  nodeID,
+		runner:  runner,
+		timeout: time.Second,
+		limit:   10,
+	})
+	if err != nil {
+		t.Fatalf("runAgentLiveScan: %v", err)
+	}
+	if result.Proposed != 2 || result.Applied != 1 || result.Rejected != 1 {
+		t.Fatalf("result = %+v, want two proposed, one applied, one rejected by budget", result)
+	}
+	<-topicsCh
+}
+
 func TestRunAgentLiveScanLimitAdvancesOnlySentBatch(t *testing.T) {
 	ctx := context.Background()
 	gid := testAgentLiveGroupID(5)
@@ -525,6 +575,34 @@ func TestApplyLiveAgentActionDefaultsToMatchedReplyTopic(t *testing.T) {
 	topics := <-topicsCh
 	if len(topics) != 1 || topics[0] != "ops" {
 		t.Fatalf("topics = %+v, want [ops]", topics)
+	}
+}
+
+func TestApplyLiveAgentActionRejectsOversizedMessage(t *testing.T) {
+	ctx := context.Background()
+	gid := testAgentLiveGroupID(15)
+	cfg := esphttp.LiveAgentConfig{
+		GroupID:        gid,
+		NodeID:         7,
+		Enabled:        true,
+		Mode:           esphttp.LiveModeConverse,
+		TopicFilters:   []string{"chat"},
+		MaxActionBytes: 3,
+	}
+	applied, err := applyLiveAgentAction(ctx, &globalFlags{data: t.TempDir()}, cfg, []liveAgentRunnerMessage{{
+		Topics: []string{"chat"},
+	}}, liveAgentAction{
+		Kind:    liveActionReply,
+		Message: "four",
+	})
+	if err == nil {
+		t.Fatal("applyLiveAgentAction err = nil, want max_action_bytes rejection")
+	}
+	if errors.Is(err, errLiveActionTransport) {
+		t.Fatalf("applyLiveAgentAction err = %v, want validation rejection before transport", err)
+	}
+	if applied {
+		t.Fatal("applied = true, want false")
 	}
 }
 

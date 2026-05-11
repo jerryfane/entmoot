@@ -18,12 +18,14 @@ import (
 )
 
 type agentLiveConfig struct {
-	group   string
-	node    uint64
-	mode    string
-	topics  repeatedStringFlag
-	actions repeatedStringFlag
-	json    bool
+	group             string
+	node              uint64
+	mode              string
+	topics            repeatedStringFlag
+	actions           repeatedStringFlag
+	maxActionsPerScan int
+	maxActionBytes    int
+	json              bool
 }
 
 func cmdAgentLive(gf *globalFlags, args []string) int {
@@ -58,6 +60,8 @@ func cmdAgentLiveEnable(gf *globalFlags, args []string) int {
 	fs.StringVar(&cfg.mode, "mode", cfg.mode, "live mode: listen, reply_on_mention, converse, operator")
 	fs.Var(&cfg.topics, "topic", "topic filter; may be repeated")
 	fs.Var(&cfg.actions, "action", "operator action; may be repeated, defaults to all operator actions")
+	fs.IntVar(&cfg.maxActionsPerScan, "max-actions", 0, "optional maximum actions to apply per scan; 0 means unlimited")
+	fs.IntVar(&cfg.maxActionBytes, "max-action-bytes", 0, "optional maximum bytes per action message; 0 means unlimited")
 	fs.BoolVar(&cfg.json, "json", false, "print JSON summary")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -72,6 +76,10 @@ func cmdAgentLiveEnable(gf *globalFlags, args []string) int {
 	mode := esphttp.NormalizeLiveMode(cfg.mode)
 	if mode == "" {
 		fmt.Fprintln(os.Stderr, "agent-live enable: invalid -mode")
+		return exitInvalidArgument
+	}
+	if cfg.maxActionsPerScan < 0 || cfg.maxActionBytes < 0 {
+		fmt.Fprintln(os.Stderr, "agent-live enable: -max-actions and -max-action-bytes must be non-negative")
 		return exitInvalidArgument
 	}
 	topics := esphttp.NormalizeLiveTopicFilters([]string(cfg.topics))
@@ -93,13 +101,15 @@ func cmdAgentLiveEnable(gf *globalFlags, args []string) int {
 	}
 	defer state.Close()
 	rec, err := state.UpsertLiveAgentConfig(context.Background(), esphttp.LiveAgentConfig{
-		GroupID:        gid,
-		NodeID:         nodeID,
-		Enabled:        true,
-		Mode:           mode,
-		TopicFilters:   topics,
-		AllowedActions: actions,
-		UpdatedAtMS:    time.Now().UnixMilli(),
+		GroupID:           gid,
+		NodeID:            nodeID,
+		Enabled:           true,
+		Mode:              mode,
+		TopicFilters:      topics,
+		AllowedActions:    actions,
+		MaxActionsPerScan: cfg.maxActionsPerScan,
+		MaxActionBytes:    cfg.maxActionBytes,
+		UpdatedAtMS:       time.Now().UnixMilli(),
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "agent-live enable: %v\n", err)

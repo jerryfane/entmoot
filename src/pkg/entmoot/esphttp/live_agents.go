@@ -44,24 +44,28 @@ var defaultLiveActions = []string{
 }
 
 type LiveAgentState struct {
-	Enabled        bool     `json:"enabled"`
-	Status         string   `json:"status,omitempty"`
-	Mode           string   `json:"mode,omitempty"`
-	TopicFilters   []string `json:"topic_filters,omitempty"`
-	AllowedActions []string `json:"allowed_actions,omitempty"`
-	LastSeenAtMS   int64    `json:"last_seen_at_ms,omitempty"`
-	LeaseUntilMS   int64    `json:"lease_until_ms,omitempty"`
-	UpdatedAtMS    int64    `json:"updated_at_ms,omitempty"`
+	Enabled           bool     `json:"enabled"`
+	Status            string   `json:"status,omitempty"`
+	Mode              string   `json:"mode,omitempty"`
+	TopicFilters      []string `json:"topic_filters,omitempty"`
+	AllowedActions    []string `json:"allowed_actions,omitempty"`
+	MaxActionsPerScan int      `json:"max_actions_per_scan,omitempty"`
+	MaxActionBytes    int      `json:"max_action_bytes,omitempty"`
+	LastSeenAtMS      int64    `json:"last_seen_at_ms,omitempty"`
+	LeaseUntilMS      int64    `json:"lease_until_ms,omitempty"`
+	UpdatedAtMS       int64    `json:"updated_at_ms,omitempty"`
 }
 
 type LiveAgentConfig struct {
-	GroupID        entmoot.GroupID `json:"group_id"`
-	NodeID         entmoot.NodeID  `json:"node_id"`
-	Enabled        bool            `json:"enabled"`
-	Mode           string          `json:"mode"`
-	TopicFilters   []string        `json:"topic_filters,omitempty"`
-	AllowedActions []string        `json:"allowed_actions,omitempty"`
-	UpdatedAtMS    int64           `json:"updated_at_ms"`
+	GroupID           entmoot.GroupID `json:"group_id"`
+	NodeID            entmoot.NodeID  `json:"node_id"`
+	Enabled           bool            `json:"enabled"`
+	Mode              string          `json:"mode"`
+	TopicFilters      []string        `json:"topic_filters,omitempty"`
+	AllowedActions    []string        `json:"allowed_actions,omitempty"`
+	MaxActionsPerScan int             `json:"max_actions_per_scan,omitempty"`
+	MaxActionBytes    int             `json:"max_action_bytes,omitempty"`
+	UpdatedAtMS       int64           `json:"updated_at_ms"`
 }
 
 type LiveAgentPresence struct {
@@ -196,6 +200,12 @@ func ValidateLiveConfig(cfg LiveAgentConfig) error {
 	}
 	if NormalizeLiveMode(cfg.Mode) == "" {
 		return errors.New("esphttp: live mode is invalid")
+	}
+	if cfg.MaxActionsPerScan < 0 {
+		return errors.New("esphttp: live max actions per scan must be non-negative")
+	}
+	if cfg.MaxActionBytes < 0 {
+		return errors.New("esphttp: live max action bytes must be non-negative")
 	}
 	return nil
 }
@@ -366,15 +376,17 @@ func (s *SQLiteStateStore) UpsertLiveAgentConfig(ctx context.Context, cfg LiveAg
 		enabled = 1
 	}
 	_, err := s.db.ExecContext(ctx, `
-INSERT INTO esp_live_agent_configs (group_id, node_id, enabled, mode, topic_filters, allowed_actions, updated_at_ms)
-VALUES (?, ?, ?, ?, ?, ?, ?)
+INSERT INTO esp_live_agent_configs (group_id, node_id, enabled, mode, topic_filters, allowed_actions, max_actions_per_scan, max_action_bytes, updated_at_ms)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(group_id, node_id) DO UPDATE SET
   enabled=excluded.enabled,
   mode=excluded.mode,
   topic_filters=excluded.topic_filters,
   allowed_actions=excluded.allowed_actions,
+  max_actions_per_scan=excluded.max_actions_per_scan,
+  max_action_bytes=excluded.max_action_bytes,
   updated_at_ms=excluded.updated_at_ms`,
-		cfg.GroupID[:], uint64(cfg.NodeID), enabled, cfg.Mode, topics, actions, cfg.UpdatedAtMS)
+		cfg.GroupID[:], uint64(cfg.NodeID), enabled, cfg.Mode, topics, actions, cfg.MaxActionsPerScan, cfg.MaxActionBytes, cfg.UpdatedAtMS)
 	if err != nil {
 		return LiveAgentConfig{}, fmt.Errorf("esphttp: upsert live agent config: %w", err)
 	}
@@ -382,7 +394,7 @@ ON CONFLICT(group_id, node_id) DO UPDATE SET
 }
 
 func (s *SQLiteStateStore) GetLiveAgentConfig(ctx context.Context, gid entmoot.GroupID, nodeID entmoot.NodeID) (LiveAgentConfig, bool, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT group_id, node_id, enabled, mode, topic_filters, allowed_actions, updated_at_ms FROM esp_live_agent_configs WHERE group_id = ? AND node_id = ?`, gid[:], uint64(nodeID))
+	row := s.db.QueryRowContext(ctx, `SELECT group_id, node_id, enabled, mode, topic_filters, allowed_actions, max_actions_per_scan, max_action_bytes, updated_at_ms FROM esp_live_agent_configs WHERE group_id = ? AND node_id = ?`, gid[:], uint64(nodeID))
 	cfg, err := scanLiveAgentConfig(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return LiveAgentConfig{}, false, nil
@@ -394,7 +406,7 @@ func (s *SQLiteStateStore) GetLiveAgentConfig(ctx context.Context, gid entmoot.G
 }
 
 func (s *SQLiteStateStore) ListLiveAgentConfigs(ctx context.Context, gid entmoot.GroupID) ([]LiveAgentConfig, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT group_id, node_id, enabled, mode, topic_filters, allowed_actions, updated_at_ms FROM esp_live_agent_configs WHERE group_id = ? ORDER BY node_id`, gid[:])
+	rows, err := s.db.QueryContext(ctx, `SELECT group_id, node_id, enabled, mode, topic_filters, allowed_actions, max_actions_per_scan, max_action_bytes, updated_at_ms FROM esp_live_agent_configs WHERE group_id = ? ORDER BY node_id`, gid[:])
 	if err != nil {
 		return nil, fmt.Errorf("esphttp: list live agent configs: %w", err)
 	}
@@ -533,12 +545,14 @@ func LiveAgentStatesByNode(configs []LiveAgentConfig, presences []LiveAgentPrese
 			continue
 		}
 		out[cfg.NodeID] = LiveAgentState{
-			Enabled:        cfg.Enabled,
-			Status:         LiveStatusOffline,
-			Mode:           cfg.Mode,
-			TopicFilters:   append([]string(nil), cfg.TopicFilters...),
-			AllowedActions: append([]string(nil), cfg.AllowedActions...),
-			UpdatedAtMS:    cfg.UpdatedAtMS,
+			Enabled:           cfg.Enabled,
+			Status:            LiveStatusOffline,
+			Mode:              cfg.Mode,
+			TopicFilters:      append([]string(nil), cfg.TopicFilters...),
+			AllowedActions:    append([]string(nil), cfg.AllowedActions...),
+			MaxActionsPerScan: cfg.MaxActionsPerScan,
+			MaxActionBytes:    cfg.MaxActionBytes,
+			UpdatedAtMS:       cfg.UpdatedAtMS,
 		}
 	}
 	for _, p := range presences {
@@ -573,7 +587,7 @@ func scanLiveAgentConfig(row interface {
 	var nodeID uint64
 	var enabled int
 	var topics, actions []byte
-	if err := row.Scan(&groupBytes, &nodeID, &enabled, &cfg.Mode, &topics, &actions, &cfg.UpdatedAtMS); err != nil {
+	if err := row.Scan(&groupBytes, &nodeID, &enabled, &cfg.Mode, &topics, &actions, &cfg.MaxActionsPerScan, &cfg.MaxActionBytes, &cfg.UpdatedAtMS); err != nil {
 		return LiveAgentConfig{}, err
 	}
 	if err := decodeGroupIDBytes(groupBytes, &cfg.GroupID); err != nil {
