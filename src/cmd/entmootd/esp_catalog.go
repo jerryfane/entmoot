@@ -25,6 +25,7 @@ type localGroupCatalog struct {
 	dataDir  string
 	metadata esphttp.GroupMetadataStore
 	profiles memberProfileReader
+	state    esphttp.StateStore
 }
 
 type espDiagnosticsProvider struct {
@@ -433,6 +434,23 @@ func (c localGroupCatalog) ListMembers(ctx context.Context, gid entmoot.GroupID)
 			}
 		}
 		out = append(out, member)
+	}
+	if c.state != nil {
+		configs, err := c.state.ListLiveAgentConfigs(ctx, gid)
+		if err != nil {
+			return nil, err
+		}
+		presences, err := c.state.ListLiveAgentPresence(ctx, gid)
+		if err != nil {
+			return nil, err
+		}
+		liveByNode := esphttp.LiveAgentStatesByNode(configs, presences, time.Now().UnixMilli())
+		for i := range out {
+			if live, ok := liveByNode[out[i].NodeID]; ok {
+				state := live
+				out[i].Live = &state
+			}
+		}
 	}
 	return out, nil
 }

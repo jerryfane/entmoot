@@ -35,10 +35,11 @@ type GroupSummary struct {
 
 // MemberSummary is the mobile/API projection for one group member.
 type MemberSummary struct {
-	NodeID        entmoot.NodeID `json:"node_id"`
-	EntmootPubKey string         `json:"entmoot_pubkey"`
-	Founder       bool           `json:"founder,omitempty"`
-	Hostname      string         `json:"hostname,omitempty"`
+	NodeID        entmoot.NodeID  `json:"node_id"`
+	EntmootPubKey string          `json:"entmoot_pubkey"`
+	Founder       bool            `json:"founder,omitempty"`
+	Hostname      string          `json:"hostname,omitempty"`
+	Live          *LiveAgentState `json:"live,omitempty"`
 }
 
 // GroupCatalog reads local group/roster state for mobile API requests.
@@ -239,6 +240,12 @@ type StateStore interface {
 	UpsertFleetCommandResult(context.Context, FleetCommandResultEnvelope) error
 	GetFleetCommandDetail(context.Context, string, string) (FleetCommandDetailRecord, bool, error)
 	ListFleetCommands(context.Context, string, FleetCommandListFilter) ([]FleetCommandSummaryRecord, error)
+	UpsertLiveAgentConfig(context.Context, LiveAgentConfig) (LiveAgentConfig, error)
+	GetLiveAgentConfig(context.Context, entmoot.GroupID, entmoot.NodeID) (LiveAgentConfig, bool, error)
+	ListLiveAgentConfigs(context.Context, entmoot.GroupID) ([]LiveAgentConfig, error)
+	DeleteLiveAgentConfig(context.Context, entmoot.GroupID, entmoot.NodeID, int64) error
+	UpsertLiveAgentPresence(context.Context, LiveAgentPresence) (LiveAgentPresence, error)
+	ListLiveAgentPresence(context.Context, entmoot.GroupID) ([]LiveAgentPresence, error)
 	UpsertFleetTaskSubmission(context.Context, FleetTaskSubmissionRecord) (FleetTaskSubmissionRecord, error)
 	GetFleetTaskSubmission(context.Context, string, string, string) (FleetTaskSubmissionRecord, bool, error)
 	ListFleetTaskSubmissions(context.Context, string, string) ([]FleetTaskSubmissionRecord, error)
@@ -281,6 +288,8 @@ type MemoryStateStore struct {
 	fleetTaskSubs       map[string]map[string][]FleetTaskSubmissionRecord
 	fleetCommands       map[string]map[string]FleetCommandEnvelope
 	fleetCommandResults map[string]map[string]map[entmoot.NodeID]FleetCommandResultEnvelope
+	liveAgentConfigs    map[entmoot.GroupID]map[entmoot.NodeID]LiveAgentConfig
+	liveAgentPresence   map[entmoot.GroupID]map[entmoot.NodeID]LiveAgentPresence
 	clock               func() time.Time
 }
 
@@ -301,6 +310,8 @@ func NewMemoryStateStore() *MemoryStateStore {
 		fleetTaskSubs:       make(map[string]map[string][]FleetTaskSubmissionRecord),
 		fleetCommands:       make(map[string]map[string]FleetCommandEnvelope),
 		fleetCommandResults: make(map[string]map[string]map[entmoot.NodeID]FleetCommandResultEnvelope),
+		liveAgentConfigs:    make(map[entmoot.GroupID]map[entmoot.NodeID]LiveAgentConfig),
+		liveAgentPresence:   make(map[entmoot.GroupID]map[entmoot.NodeID]LiveAgentPresence),
 		clock:               time.Now,
 	}
 }
@@ -1518,6 +1529,35 @@ CREATE INDEX IF NOT EXISTS idx_agent_commands_status
 
 CREATE INDEX IF NOT EXISTS idx_agent_commands_lease
   ON esp_agent_commands(status, lease_until_ms);
+
+CREATE TABLE IF NOT EXISTS esp_live_agent_configs (
+  group_id BLOB NOT NULL,
+  node_id INTEGER NOT NULL,
+  enabled INTEGER NOT NULL,
+  mode TEXT NOT NULL,
+  topic_filters BLOB NOT NULL,
+  allowed_actions BLOB NOT NULL,
+  updated_at_ms INTEGER NOT NULL,
+  PRIMARY KEY(group_id, node_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_live_agent_configs_group
+  ON esp_live_agent_configs(group_id, enabled, node_id);
+
+CREATE TABLE IF NOT EXISTS esp_live_agent_presence (
+  group_id BLOB NOT NULL,
+  node_id INTEGER NOT NULL,
+  status TEXT NOT NULL,
+  mode TEXT NOT NULL,
+  topic_filters BLOB NOT NULL,
+  last_seen_at_ms INTEGER NOT NULL,
+  lease_until_ms INTEGER NOT NULL,
+  updated_at_ms INTEGER NOT NULL,
+  PRIMARY KEY(group_id, node_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_live_agent_presence_group
+  ON esp_live_agent_presence(group_id, lease_until_ms, node_id);
 `
 
 func OpenSQLiteStateStore(dataDir string) (*SQLiteStateStore, error) {
@@ -2761,6 +2801,29 @@ func migrateSQLiteState(db *sql.DB) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_agent_commands_status ON esp_agent_commands(status, received_at_ms)`,
 		`CREATE INDEX IF NOT EXISTS idx_agent_commands_lease ON esp_agent_commands(status, lease_until_ms)`,
+		`CREATE TABLE IF NOT EXISTS esp_live_agent_configs (
+		  group_id BLOB NOT NULL,
+		  node_id INTEGER NOT NULL,
+		  enabled INTEGER NOT NULL,
+		  mode TEXT NOT NULL,
+		  topic_filters BLOB NOT NULL,
+		  allowed_actions BLOB NOT NULL,
+		  updated_at_ms INTEGER NOT NULL,
+		  PRIMARY KEY(group_id, node_id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_live_agent_configs_group ON esp_live_agent_configs(group_id, enabled, node_id)`,
+		`CREATE TABLE IF NOT EXISTS esp_live_agent_presence (
+		  group_id BLOB NOT NULL,
+		  node_id INTEGER NOT NULL,
+		  status TEXT NOT NULL,
+		  mode TEXT NOT NULL,
+		  topic_filters BLOB NOT NULL,
+		  last_seen_at_ms INTEGER NOT NULL,
+		  lease_until_ms INTEGER NOT NULL,
+		  updated_at_ms INTEGER NOT NULL,
+		  PRIMARY KEY(group_id, node_id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_live_agent_presence_group ON esp_live_agent_presence(group_id, lease_until_ms, node_id)`,
 	} {
 		if _, err := db.Exec(stmt); err != nil {
 			return fmt.Errorf("esphttp: migrate state schema add agent commands: %w", err)

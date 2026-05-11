@@ -212,7 +212,7 @@ func runESPServe(gf *globalFlags, cfg espServeConfig) int {
 		},
 		Notifier:    notifier,
 		State:       resources.espState,
-		Groups:      localGroupCatalog{dataDir: gf.data, metadata: metadataStore, profiles: profileStore},
+		Groups:      localGroupCatalog{dataDir: gf.data, metadata: metadataStore, profiles: profileStore, state: resources.espState},
 		Diagnostics: espDiagnosticsProvider{flags: *gf},
 		GroupExists: espGroupExists(gf.data),
 		Logger:      slog.Default(),

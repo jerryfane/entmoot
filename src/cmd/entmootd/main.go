@@ -84,6 +84,8 @@ func run() int {
 		fmt.Fprintln(os.Stderr, "                          Inspect local Fleet control-plane state.")
 		fmt.Fprintln(os.Stderr, "  agent-commands <watch|run-once|status>")
 		fmt.Fprintln(os.Stderr, "                          Process queued local agent instructions.")
+		fmt.Fprintln(os.Stderr, "  agent-live <enable|disable|status|run>")
+		fmt.Fprintln(os.Stderr, "                          Manage live agent participation presence.")
 		fmt.Fprintln(os.Stderr, "  mailbox <pull|ack|cursor>")
 		fmt.Fprintln(os.Stderr, "                          Local ESP mailbox sync cursor commands.")
 		fmt.Fprintln(os.Stderr, "  esp serve               Serve the local ESP mailbox HTTP API.")
@@ -187,6 +189,8 @@ func run() int {
 		return cmdFleet(gf, args[1:])
 	case "agent-commands":
 		return cmdAgentCommands(gf, args[1:])
+	case "agent-live":
+		return cmdAgentLive(gf, args[1:])
 	case "mailbox":
 		return cmdMailbox(gf, args[1:])
 	case "esp":
