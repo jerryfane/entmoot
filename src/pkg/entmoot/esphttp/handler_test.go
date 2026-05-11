@@ -327,6 +327,104 @@ func TestHandlerMobileGroupsAndSignRequests(t *testing.T) {
 	}
 }
 
+func TestHandlerLiveAgentConfigDeviceAndMemberPolicy(t *testing.T) {
+	gid := testGroupID(1)
+	adminPub, adminPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("Generate admin key: %v", err)
+	}
+	agentPub, agentPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("Generate agent key: %v", err)
+	}
+	otherPub, otherPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("Generate other key: %v", err)
+	}
+	reg, err := NewDeviceRegistry([]Device{{
+		ID:          "ios-1-device",
+		PublicKey:   adminPub,
+		Groups:      []entmoot.GroupID{gid},
+		AdminGroups: []entmoot.GroupID{gid},
+		ClientIDs:   []string{"ios-1"},
+	}})
+	if err != nil {
+		t.Fatalf("NewDeviceRegistry: %v", err)
+	}
+	state := NewMemoryStateStore()
+	catalog := fakeCatalog{
+		groups: []GroupSummary{{GroupID: gid, Members: 2}},
+		members: []MemberSummary{
+			{NodeID: 45491, EntmootPubKey: base64.StdEncoding.EncodeToString(agentPub), Founder: true},
+			{NodeID: 45492, EntmootPubKey: base64.StdEncoding.EncodeToString(otherPub)},
+		},
+	}
+	handler := testMobileHandlerFull(t, gid, reg, &catalog, func() time.Time { return time.UnixMilli(40_000) }, nil, state, nil)
+
+	create := doMemberSignedJSONRequest[struct {
+		Config LiveAgentConfig `json:"config"`
+	}](t, handler, 45491, agentPriv, http.MethodPut, "/v1/groups/"+gid.String()+"/live-agents/45491", map[string]any{
+		"mode":                 LiveModeOperator,
+		"topic_filters":        []string{"chat", "story/#"},
+		"allowed_actions":      []string{"reply", "command.send"},
+		"max_actions_per_scan": 2,
+		"max_action_bytes":     512,
+	}, http.StatusOK, 40_000, "nonce-live-agent-create")
+	if !create.Config.Enabled || create.Config.Mode != LiveModeOperator || len(create.Config.AllowedActions) != 2 {
+		t.Fatalf("created live config = %+v", create.Config)
+	}
+
+	denied := doMemberSignedJSONRequest[errorEnvelope](t, handler, 45491, agentPriv, http.MethodPut, "/v1/groups/"+gid.String()+"/live-agents/45492", map[string]any{
+		"mode": LiveModeListen,
+	}, http.StatusForbidden, 40_001, "nonce-live-agent-wrong-node")
+	if denied.Error.Code != "forbidden" {
+		t.Fatalf("denied error = %+v, want forbidden", denied.Error)
+	}
+
+	unknown := doMemberSignedJSONRequest[errorEnvelope](t, handler, 45492, otherPriv, http.MethodPut, "/v1/groups/"+gid.String()+"/live-agents/45492", map[string]any{
+		"mode":            LiveModeOperator,
+		"allowed_actions": []string{"reply", "sudo"},
+	}, http.StatusBadRequest, 40_002, "nonce-live-agent-unknown")
+	if unknown.Error.Code != "bad_request" {
+		t.Fatalf("unknown action error = %+v, want bad_request", unknown.Error)
+	}
+
+	list := doSignedJSONRequest[struct {
+		Configs []LiveAgentConfig                 `json:"configs"`
+		Members map[entmoot.NodeID]LiveAgentState `json:"members"`
+	}](t, handler, adminPriv, http.MethodGet, "/v1/groups/"+gid.String()+"/live-agents", nil, http.StatusOK, 40_003, "nonce-live-agent-list")
+	if len(list.Configs) != 1 || list.Configs[0].NodeID != 45491 || !list.Members[45491].Enabled {
+		t.Fatalf("live config list = %+v / %+v", list.Configs, list.Members)
+	}
+
+	deleted := doSignedJSONRequest[struct {
+		Enabled bool `json:"enabled"`
+	}](t, handler, adminPriv, http.MethodDelete, "/v1/groups/"+gid.String()+"/live-agents/45491", nil, http.StatusOK, 40_004, "nonce-live-agent-delete")
+	if deleted.Enabled {
+		t.Fatal("delete response enabled = true, want false")
+	}
+	configs, err := state.ListLiveAgentConfigs(context.Background(), gid)
+	if err != nil {
+		t.Fatalf("ListLiveAgentConfigs: %v", err)
+	}
+	if len(configs) != 0 {
+		t.Fatalf("configs after delete = %+v, want none", configs)
+	}
+}
+
+func TestLiveAgentConfigReadHonorsBearerBeforeMember(t *testing.T) {
+	gid := testGroupID(9)
+	req := httptest.NewRequest(http.MethodGet, "/v1/groups/"+gid.String()+"/live-agents", nil)
+	req = req.WithContext(context.WithValue(req.Context(), authContextKey{}, authContext{
+		bearer: true,
+		member: &MemberAuth{NodeID: 45499, EntmootPubKey: []byte("not-a-group-member")},
+	}))
+	rec := httptest.NewRecorder()
+	if !(&Handler{}).checkLiveAgentConfigRead(rec, req, gid) {
+		t.Fatalf("checkLiveAgentConfigRead = false, status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestHandlerOpenInviteListAndRevoke(t *testing.T) {
 	gid := testGroupID(1)
 	_, priv, err := ed25519.GenerateKey(rand.Reader)

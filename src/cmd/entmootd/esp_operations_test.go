@@ -194,6 +194,61 @@ func TestLocalGroupCatalogIgnoresStaleMemberProfileIdentity(t *testing.T) {
 	}
 }
 
+func TestLocalGroupCatalogListMembersIncludesLiveAgentState(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	gid := testESPGroupID(41)
+	id, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	rlog, err := roster.OpenJSONL(dataDir, gid)
+	if err != nil {
+		t.Fatalf("OpenJSONL: %v", err)
+	}
+	defer rlog.Close()
+	info := entmoot.NodeInfo{PilotNodeID: 45491, EntmootPubKey: append([]byte(nil), id.PublicKey...)}
+	if err := rlog.Genesis(id, info, 1_000); err != nil {
+		t.Fatalf("Genesis: %v", err)
+	}
+	state := esphttp.NewMemoryStateStore()
+	now := time.Now().UnixMilli()
+	if _, err := state.UpsertLiveAgentConfig(ctx, esphttp.LiveAgentConfig{
+		GroupID:        gid,
+		NodeID:         info.PilotNodeID,
+		Enabled:        true,
+		Mode:           esphttp.LiveModeOperator,
+		TopicFilters:   []string{"chat"},
+		AllowedActions: []string{"reply", "command.send"},
+		UpdatedAtMS:    now,
+	}); err != nil {
+		t.Fatalf("UpsertLiveAgentConfig: %v", err)
+	}
+	if _, err := state.UpsertLiveAgentPresence(ctx, esphttp.LiveAgentPresence{
+		GroupID:      gid,
+		NodeID:       info.PilotNodeID,
+		Status:       esphttp.LiveStatusOnline,
+		Mode:         esphttp.LiveModeOperator,
+		TopicFilters: []string{"chat"},
+		LastSeenAtMS: now,
+		LeaseUntilMS: time.Now().Add(time.Minute).UnixMilli(),
+		UpdatedAtMS:  now,
+	}); err != nil {
+		t.Fatalf("UpsertLiveAgentPresence: %v", err)
+	}
+	catalog := localGroupCatalog{dataDir: dataDir, state: state}
+	members, err := catalog.ListMembers(ctx, gid)
+	if err != nil {
+		t.Fatalf("ListMembers: %v", err)
+	}
+	if len(members) != 1 || members[0].Live == nil {
+		t.Fatalf("members = %+v, want live state", members)
+	}
+	if members[0].Live.Status != esphttp.LiveStatusOnline || members[0].Live.Mode != esphttp.LiveModeOperator {
+		t.Fatalf("live state = %+v, want online operator", members[0].Live)
+	}
+}
+
 func TestESPCreateGroupUsesDeterministicID(t *testing.T) {
 	req := esphttp.SignRequest{ID: "req-1", SigningPayloadSHA256: "payload-digest"}
 	a, err := groupIDForCreateRequest(req)

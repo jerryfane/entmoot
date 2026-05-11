@@ -1959,6 +1959,26 @@ func (h *Handler) handleGroupSubroute(w http.ResponseWriter, r *http.Request) bo
 		})
 		return true
 	}
+	if strings.HasPrefix(suffix, "live-agents/") {
+		escapedNode := strings.TrimPrefix(suffix, "live-agents/")
+		nodeID, ok := parseLiveAgentNodePath(w, escapedNode)
+		if !ok {
+			return true
+		}
+		switch r.Method {
+		case http.MethodPut:
+			h.withIdempotency(w, r, "live_agent_config:"+groupID.String()+":"+strconv.FormatUint(uint64(nodeID), 10), func(w http.ResponseWriter, r *http.Request) {
+				h.handleUpsertLiveAgentConfig(w, r, groupID, nodeID)
+			})
+		case http.MethodDelete:
+			h.withIdempotency(w, r, "live_agent_config_delete:"+groupID.String()+":"+strconv.FormatUint(uint64(nodeID), 10), func(w http.ResponseWriter, r *http.Request) {
+				h.handleDeleteLiveAgentConfig(w, r, groupID, nodeID)
+			})
+		default:
+			methodNotAllowed(w, http.MethodPut+", "+http.MethodDelete)
+		}
+		return true
+	}
 	if strings.HasPrefix(suffix, "open-invites/") {
 		rest := strings.TrimPrefix(suffix, "open-invites/")
 		escapedInvite, action, ok := strings.Cut(rest, "/")
@@ -1993,6 +2013,12 @@ func (h *Handler) handleGroupSubroute(w http.ResponseWriter, r *http.Request) bo
 			return true
 		}
 		h.handleListMembers(w, r, groupID)
+	case "live-agents":
+		if r.Method != http.MethodGet {
+			methodNotAllowed(w, http.MethodGet)
+			return true
+		}
+		h.handleListLiveAgentConfigs(w, r, groupID)
 	case "invites":
 		if r.Method != http.MethodPost {
 			methodNotAllowed(w, http.MethodPost)
@@ -2089,6 +2115,98 @@ func (h *Handler) handleListMembers(w http.ResponseWriter, r *http.Request, grou
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"members": members})
+}
+
+type liveAgentConfigHTTPPayload struct {
+	Enabled           *bool    `json:"enabled,omitempty"`
+	Mode              string   `json:"mode,omitempty"`
+	TopicFilters      []string `json:"topic_filters,omitempty"`
+	AllowedActions    []string `json:"allowed_actions,omitempty"`
+	MaxActionsPerScan int      `json:"max_actions_per_scan,omitempty"`
+	MaxActionBytes    int      `json:"max_action_bytes,omitempty"`
+}
+
+func (h *Handler) handleListLiveAgentConfigs(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID) {
+	if !h.checkLiveAgentConfigRead(w, r, groupID) {
+		return
+	}
+	configs, err := h.state.ListLiveAgentConfigs(r.Context(), groupID)
+	if err != nil {
+		h.logger.Error("esphttp: list live agent configs", slog.String("err", err.Error()))
+		writeError(w, http.StatusInternalServerError, "internal_error", "live agent config listing failed")
+		return
+	}
+	presence, err := h.state.ListLiveAgentPresence(r.Context(), groupID)
+	if err != nil {
+		h.logger.Error("esphttp: list live agent presence", slog.String("err", err.Error()))
+		writeError(w, http.StatusInternalServerError, "internal_error", "live agent presence listing failed")
+		return
+	}
+	states := LiveAgentStatesByNode(configs, presence, h.clock().UnixMilli())
+	writeJSON(w, http.StatusOK, map[string]any{"configs": configs, "presence": presence, "members": states})
+}
+
+func (h *Handler) handleUpsertLiveAgentConfig(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID, nodeID entmoot.NodeID) {
+	if !h.checkLiveAgentConfigWrite(w, r, groupID, nodeID) {
+		return
+	}
+	var payload liveAgentConfigHTTPPayload
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid JSON body")
+		return
+	}
+	enabled := true
+	if payload.Enabled != nil {
+		enabled = *payload.Enabled
+	}
+	mode := NormalizeLiveMode(payload.Mode)
+	if mode == "" {
+		if strings.TrimSpace(payload.Mode) != "" {
+			writeError(w, http.StatusBadRequest, "bad_request", "invalid live mode")
+			return
+		}
+		mode = LiveModeReplyOnMention
+	}
+	topicFilters := NormalizeLiveTopicFilters(payload.TopicFilters)
+	if len(topicFilters) == 0 {
+		topicFilters = []string{"#"}
+	}
+	if unknown := UnknownLiveActions(payload.AllowedActions); len(unknown) > 0 {
+		writeError(w, http.StatusBadRequest, "bad_request", "unknown live actions: "+strings.Join(unknown, ", "))
+		return
+	}
+	if payload.MaxActionsPerScan < 0 || payload.MaxActionBytes < 0 {
+		writeError(w, http.StatusBadRequest, "bad_request", "live spam controls must be non-negative")
+		return
+	}
+	cfg, err := h.state.UpsertLiveAgentConfig(r.Context(), LiveAgentConfig{
+		GroupID:           groupID,
+		NodeID:            nodeID,
+		Enabled:           enabled,
+		Mode:              mode,
+		TopicFilters:      topicFilters,
+		AllowedActions:    payload.AllowedActions,
+		MaxActionsPerScan: payload.MaxActionsPerScan,
+		MaxActionBytes:    payload.MaxActionBytes,
+		UpdatedAtMS:       h.clock().UnixMilli(),
+	})
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"config": cfg})
+}
+
+func (h *Handler) handleDeleteLiveAgentConfig(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID, nodeID entmoot.NodeID) {
+	if !h.checkLiveAgentConfigWrite(w, r, groupID, nodeID) {
+		return
+	}
+	if err := h.state.DeleteLiveAgentConfig(r.Context(), groupID, nodeID, h.clock().UnixMilli()); err != nil {
+		h.logger.Error("esphttp: delete live agent config", slog.String("err", err.Error()))
+		writeError(w, http.StatusInternalServerError, "internal_error", "live agent config delete failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"group_id": groupID, "node_id": nodeID, "enabled": false})
 }
 
 func (h *Handler) handleListOpenInvites(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID) {
@@ -3031,7 +3149,7 @@ func memberAuthAllowedForRequest(r *http.Request) bool {
 	}
 	const prefix = "/v1/fleets/"
 	if !strings.HasPrefix(r.URL.Path, prefix) {
-		return false
+		return memberAuthAllowedForGroupRequest(r)
 	}
 	rest := strings.TrimPrefix(r.URL.Path, prefix)
 	_, suffix, ok := strings.Cut(rest, "/")
@@ -3042,6 +3160,19 @@ func memberAuthAllowedForRequest(r *http.Request) bool {
 		strings.HasPrefix(suffix, "tasks/") ||
 		suffix == "commands" ||
 		strings.HasPrefix(suffix, "commands/")
+}
+
+func memberAuthAllowedForGroupRequest(r *http.Request) bool {
+	const prefix = "/v1/groups/"
+	if !strings.HasPrefix(r.URL.Path, prefix) {
+		return false
+	}
+	rest := strings.TrimPrefix(r.URL.Path, prefix)
+	_, suffix, ok := strings.Cut(rest, "/")
+	if !ok {
+		return false
+	}
+	return suffix == "live-agents" || strings.HasPrefix(suffix, "live-agents/")
 }
 
 func (h *Handler) bufferBodyForAuth(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
@@ -3256,6 +3387,80 @@ func (h *Handler) checkDeviceGroupAdmin(w http.ResponseWriter, r *http.Request, 
 	}
 	writeError(w, http.StatusForbidden, "forbidden", "device is not authorized to manage group")
 	return false
+}
+
+func (h *Handler) checkLiveAgentConfigRead(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID) bool {
+	auth := authFromContext(r)
+	if auth.bearer {
+		return true
+	}
+	if auth.member != nil {
+		if h.memberAuthMatchesGroupMember(r.Context(), groupID, auth.member.NodeID, auth.member.EntmootPubKey) {
+			return true
+		}
+		writeError(w, http.StatusForbidden, "forbidden", "member is not authorized for group")
+		return false
+	}
+	return h.checkDeviceGroupRead(w, r, groupID)
+}
+
+func (h *Handler) checkLiveAgentConfigWrite(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID, nodeID entmoot.NodeID) bool {
+	auth := authFromContext(r)
+	if auth.bearer {
+		return true
+	}
+	if auth.device != nil {
+		if deviceCanAdminGroup(*auth.device, groupID) {
+			return true
+		}
+		writeError(w, http.StatusForbidden, "forbidden", "device is not authorized to manage group")
+		return false
+	}
+	if auth.member != nil {
+		if auth.member.NodeID != nodeID {
+			writeError(w, http.StatusForbidden, "forbidden", "member can only manage its own live agent config")
+			return false
+		}
+		if h.memberAuthMatchesGroupMember(r.Context(), groupID, nodeID, auth.member.EntmootPubKey) {
+			return true
+		}
+		writeError(w, http.StatusForbidden, "forbidden", "member is not authorized for group")
+		return false
+	}
+	writeError(w, http.StatusForbidden, "device_signature_required", "live agent config requires a registered device or member signature")
+	return false
+}
+
+func (h *Handler) memberAuthMatchesGroupMember(ctx context.Context, groupID entmoot.GroupID, nodeID entmoot.NodeID, pub []byte) bool {
+	if h.groups == nil {
+		return false
+	}
+	members, err := h.groups.ListMembers(ctx, groupID)
+	if err != nil {
+		h.logger.Error("esphttp: live agent member lookup failed", slog.String("err", err.Error()))
+		return false
+	}
+	encodedPub := base64.StdEncoding.EncodeToString(pub)
+	for _, member := range members {
+		if member.NodeID == nodeID && member.EntmootPubKey == encodedPub {
+			return true
+		}
+	}
+	return false
+}
+
+func parseLiveAgentNodePath(w http.ResponseWriter, escapedNode string) (entmoot.NodeID, bool) {
+	rawNode, err := url.PathUnescape(escapedNode)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "node id is invalid")
+		return 0, false
+	}
+	node64, err := strconv.ParseUint(strings.TrimSpace(rawNode), 10, 32)
+	if err != nil || node64 == 0 {
+		writeError(w, http.StatusBadRequest, "bad_request", "node id is required")
+		return 0, false
+	}
+	return entmoot.NodeID(node64), true
 }
 
 func (h *Handler) requireFleetDevice(w http.ResponseWriter, r *http.Request) (*Device, bool) {
