@@ -655,13 +655,16 @@ func (h *Handler) handleFleetSubroute(w http.ResponseWriter, r *http.Request) bo
 			methodNotAllowed(w, http.MethodGet+", "+http.MethodPost)
 		}
 	case "commands":
-		if r.Method != http.MethodPost {
-			methodNotAllowed(w, http.MethodPost)
-			return true
+		switch r.Method {
+		case http.MethodGet:
+			h.handleListFleetCommands(w, r, fleetID)
+		case http.MethodPost:
+			h.withIdempotency(w, r, fleetTaskIdempotencyScope(r, "fleet_command_create:"+fleetID), func(w http.ResponseWriter, r *http.Request) {
+				h.handleCreateFleetCommand(w, r, fleetID)
+			})
+		default:
+			methodNotAllowed(w, http.MethodGet+", "+http.MethodPost)
 		}
-		h.withIdempotency(w, r, fleetTaskIdempotencyScope(r, "fleet_command_create:"+fleetID), func(w http.ResponseWriter, r *http.Request) {
-			h.handleCreateFleetCommand(w, r, fleetID)
-		})
 	case "diagnostics":
 		if r.Method != http.MethodGet {
 			methodNotAllowed(w, http.MethodGet)
@@ -682,6 +685,10 @@ func (h *Handler) handleFleetSubroute(w http.ResponseWriter, r *http.Request) bo
 		}
 		if strings.HasPrefix(suffix, "tasks/") {
 			h.handleFleetTaskSubroute(w, r, fleetID, strings.TrimPrefix(suffix, "tasks/"))
+			return true
+		}
+		if strings.HasPrefix(suffix, "commands/") {
+			h.handleFleetCommandSubroute(w, r, fleetID, strings.TrimPrefix(suffix, "commands/"))
 			return true
 		}
 		writeError(w, http.StatusNotFound, "not_found", "not found")
@@ -1208,6 +1215,192 @@ type fleetCommandCreateRequest struct {
 	ExpiresAtMS  int64           `json:"expires_at_ms"`
 }
 
+func (h *Handler) handleListFleetCommands(w http.ResponseWriter, r *http.Request, fleetID string) {
+	fleet, _, ok := h.fleetTaskActor(w, r, fleetID)
+	if !ok {
+		return
+	}
+	h.reconcileFleetCommandHistory(r.Context(), fleet)
+	filter, ok := fleetCommandListFilterFromRequest(w, r)
+	if !ok {
+		return
+	}
+	commands, err := h.state.ListFleetCommands(r.Context(), fleetID, filter)
+	if err != nil {
+		h.logger.Error("esphttp: list fleet commands", slog.String("err", err.Error()))
+		writeError(w, http.StatusInternalServerError, "internal_error", "fleet command listing failed")
+		return
+	}
+	if commands == nil {
+		commands = []FleetCommandSummaryRecord{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"commands": commands})
+}
+
+func (h *Handler) handleFleetCommandSubroute(w http.ResponseWriter, r *http.Request, fleetID, rest string) {
+	escapedCommandID, action, _ := strings.Cut(rest, "/")
+	commandID, err := url.PathUnescape(escapedCommandID)
+	if err != nil || strings.TrimSpace(commandID) == "" {
+		writeError(w, http.StatusBadRequest, "bad_request", "command id is required")
+		return
+	}
+	if action != "" {
+		writeError(w, http.StatusNotFound, "not_found", "not found")
+		return
+	}
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w, http.MethodGet)
+		return
+	}
+	h.handleGetFleetCommand(w, r, fleetID, commandID)
+}
+
+func (h *Handler) handleGetFleetCommand(w http.ResponseWriter, r *http.Request, fleetID, commandID string) {
+	fleet, _, ok := h.fleetTaskActor(w, r, fleetID)
+	if !ok {
+		return
+	}
+	h.reconcileFleetCommandHistory(r.Context(), fleet)
+	detail, found, err := h.state.GetFleetCommandDetail(r.Context(), fleetID, commandID)
+	if err != nil {
+		h.logger.Error("esphttp: get fleet command", slog.String("err", err.Error()))
+		writeError(w, http.StatusInternalServerError, "internal_error", "fleet command lookup failed")
+		return
+	}
+	if !found {
+		writeError(w, http.StatusNotFound, "command_not_found", "command not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"command":       detail.Command,
+		"status":        detail.Status,
+		"results":       detail.Results,
+		"updated_at_ms": detail.UpdatedAtMS,
+	})
+}
+
+func fleetCommandListFilterFromRequest(w http.ResponseWriter, r *http.Request) (FleetCommandListFilter, bool) {
+	q := r.URL.Query()
+	filter := FleetCommandListFilter{
+		Status: strings.TrimSpace(strings.ToLower(q.Get("status"))),
+		Action: NormalizeFleetCommandAction(q.Get("action")),
+		Limit:  50,
+	}
+	if raw := strings.TrimSpace(q.Get("limit")); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 || n > 200 {
+			writeError(w, http.StatusBadRequest, "bad_request", "limit must be between 1 and 200")
+			return FleetCommandListFilter{}, false
+		}
+		filter.Limit = n
+	}
+	if filter.Status != "" {
+		switch filter.Status {
+		case FleetCommandStatusSent,
+			FleetCommandStatusAccepted,
+			FleetCommandStatusRunning,
+			FleetCommandStatusCompleted,
+			FleetCommandStatusFailed,
+			FleetCommandStatusRejected,
+			FleetCommandStatusExpired,
+			FleetCommandStatusDuplicate:
+		default:
+			writeError(w, http.StatusBadRequest, "bad_request", "invalid command status")
+			return FleetCommandListFilter{}, false
+		}
+	}
+	if raw := strings.TrimSpace(q.Get("agent_node_id")); raw != "" {
+		nodeID, err := strconv.ParseUint(raw, 10, 32)
+		if err != nil || nodeID == 0 {
+			writeError(w, http.StatusBadRequest, "bad_request", "agent_node_id must be a positive node id")
+			return FleetCommandListFilter{}, false
+		}
+		filter.AgentNodeID = entmoot.NodeID(nodeID)
+	}
+	return filter, true
+}
+
+func (h *Handler) reconcileFleetCommandHistory(ctx context.Context, fleet FleetRecord) {
+	if h.service == nil || h.state == nil || fleet.ControlGroupID == (entmoot.GroupID{}) {
+		return
+	}
+	for _, topic := range []string{"fleet/commands", "fleet/commands/results"} {
+		history, err := h.service.TopicHistory(ctx, fleet.ControlGroupID, topic, 200)
+		if err != nil {
+			h.logger.Debug("esphttp: fleet command history reconcile failed", slog.String("topic", topic), slog.String("err", err.Error()))
+			continue
+		}
+		for _, msg := range history.Messages {
+			switch topic {
+			case "fleet/commands":
+				var cmd FleetCommandEnvelope
+				if err := json.Unmarshal([]byte(msg.Content), &cmd); err == nil &&
+					cmd.Type == FleetCommandMessageType &&
+					cmd.FleetID == fleet.FleetID &&
+					fleetCommandMessageIssuedByCoordinator(msg.Author, cmd, fleet) {
+					if _, err := h.state.UpsertFleetCommand(ctx, cmd); err != nil {
+						h.logger.Debug("esphttp: fleet command projection failed", slog.String("command_id", cmd.CommandID), slog.String("err", err.Error()))
+					}
+				}
+			case "fleet/commands/results":
+				var result FleetCommandResultEnvelope
+				if err := json.Unmarshal([]byte(msg.Content), &result); err == nil &&
+					result.Type == FleetCommandResultType &&
+					result.FleetID == fleet.FleetID &&
+					h.fleetCommandResultAuthoredByAgent(ctx, fleet, msg.Author, result) {
+					if err := h.state.UpsertFleetCommandResult(ctx, result); err != nil {
+						h.logger.Debug("esphttp: fleet command result projection failed", slog.String("command_id", result.CommandID), slog.String("err", err.Error()))
+					}
+				}
+			}
+		}
+	}
+}
+
+func fleetCommandMessageIssuedByCoordinator(authorNodeID uint32, cmd FleetCommandEnvelope, fleet FleetRecord) bool {
+	if cmd.IssuerNodeID != fleet.Coordinator.PilotNodeID {
+		return false
+	}
+	if entmoot.NodeID(authorNodeID) == fleet.Coordinator.PilotNodeID {
+		return true
+	}
+	return VerifyFleetCommandIssuerProof(cmd, fleet.Coordinator.EntmootPubKey)
+}
+
+func (h *Handler) fleetCommandResultAuthoredByAgent(ctx context.Context, fleet FleetRecord, authorNodeID uint32, result FleetCommandResultEnvelope) bool {
+	if result.AgentNodeID == 0 || entmoot.NodeID(authorNodeID) != result.AgentNodeID {
+		return false
+	}
+	member, found, err := h.fleetMemberByNode(ctx, fleet.FleetID, result.AgentNodeID)
+	if err != nil {
+		h.logger.Debug("esphttp: fleet command result author lookup failed", slog.String("fleet_id", fleet.FleetID), slog.String("command_id", result.CommandID), slog.String("err", err.Error()))
+		return false
+	}
+	if !found || !FleetTaskCanMutate(member) {
+		return false
+	}
+	detail, found, err := h.state.GetFleetCommandDetail(ctx, fleet.FleetID, result.CommandID)
+	if err != nil {
+		h.logger.Debug("esphttp: fleet command result command lookup failed", slog.String("fleet_id", fleet.FleetID), slog.String("command_id", result.CommandID), slog.String("err", err.Error()))
+		return false
+	}
+	if !found || NormalizeFleetCommandAction(detail.Command.Action) != NormalizeFleetCommandAction(result.Action) {
+		return false
+	}
+	return fleetCommandTargetIncludesResultAgent(detail.Command, member)
+}
+
+func fleetCommandTargetIncludesResultAgent(cmd FleetCommandEnvelope, member FleetMemberRecord) bool {
+	switch NormalizeFleetCommandTarget(cmd.Target.Kind) {
+	case FleetCommandTargetAll:
+		return !FleetTaskIsCoordinator(member)
+	case FleetCommandTargetNode:
+		return cmd.Target.PilotNodeID == member.NodeID
+	default:
+		return false
+	}
+}
+
 func (h *Handler) handleCreateFleetCommand(w http.ResponseWriter, r *http.Request, fleetID string) {
 	fleet, actor, ok := h.fleetTaskCoordinator(w, r, fleetID)
 	if !ok {
@@ -1334,6 +1527,9 @@ func (h *Handler) handleCreateFleetCommand(w http.ResponseWriter, r *http.Reques
 	if err != nil {
 		h.writePublishResult(w, publishResult, err)
 		return
+	}
+	if _, err := h.state.UpsertFleetCommand(r.Context(), command); err != nil {
+		h.logger.Warn("esphttp: upsert fleet command failed after publish", slog.String("fleet_id", fleet.FleetID), slog.String("command_id", command.CommandID), slog.String("err", err.Error()))
 	}
 	response := map[string]any{
 		"command":        command,

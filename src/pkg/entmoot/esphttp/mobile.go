@@ -235,6 +235,10 @@ type StateStore interface {
 	GetFleetTask(context.Context, string, string) (FleetTaskRecord, bool, error)
 	ListFleetTasks(context.Context, string, string) ([]FleetTaskRecord, error)
 	DeleteFleetTask(context.Context, string, string) error
+	UpsertFleetCommand(context.Context, FleetCommandEnvelope) (FleetCommandSummaryRecord, error)
+	UpsertFleetCommandResult(context.Context, FleetCommandResultEnvelope) error
+	GetFleetCommandDetail(context.Context, string, string) (FleetCommandDetailRecord, bool, error)
+	ListFleetCommands(context.Context, string, FleetCommandListFilter) ([]FleetCommandSummaryRecord, error)
 	UpsertFleetTaskSubmission(context.Context, FleetTaskSubmissionRecord) (FleetTaskSubmissionRecord, error)
 	GetFleetTaskSubmission(context.Context, string, string, string) (FleetTaskSubmissionRecord, bool, error)
 	ListFleetTaskSubmissions(context.Context, string, string) ([]FleetTaskSubmissionRecord, error)
@@ -261,39 +265,43 @@ var (
 
 // MemoryStateStore is useful for tests and dev-mode ESP handlers.
 type MemoryStateStore struct {
-	mu            sync.Mutex
-	requests      map[string]SignRequest
-	devices       map[string]DeviceState
-	idem          map[string]IdempotencyRecord
-	groups        map[entmoot.GroupID]json.RawMessage
-	invites       map[string]OpenInviteRecord
-	redeems       map[string]map[string]OpenInviteRedemption
-	chals         map[string]OpenInviteChallenge
-	fleets        map[string]FleetRecord
-	fleetMembers  map[string]map[entmoot.NodeID]FleetMemberRecord
-	fleetInvites  map[string][]FleetInviteRecord
-	fleetActivity map[string][]FleetActivityRecord
-	fleetTasks    map[string]map[string]FleetTaskRecord
-	fleetTaskSubs map[string]map[string][]FleetTaskSubmissionRecord
-	clock         func() time.Time
+	mu                  sync.Mutex
+	requests            map[string]SignRequest
+	devices             map[string]DeviceState
+	idem                map[string]IdempotencyRecord
+	groups              map[entmoot.GroupID]json.RawMessage
+	invites             map[string]OpenInviteRecord
+	redeems             map[string]map[string]OpenInviteRedemption
+	chals               map[string]OpenInviteChallenge
+	fleets              map[string]FleetRecord
+	fleetMembers        map[string]map[entmoot.NodeID]FleetMemberRecord
+	fleetInvites        map[string][]FleetInviteRecord
+	fleetActivity       map[string][]FleetActivityRecord
+	fleetTasks          map[string]map[string]FleetTaskRecord
+	fleetTaskSubs       map[string]map[string][]FleetTaskSubmissionRecord
+	fleetCommands       map[string]map[string]FleetCommandEnvelope
+	fleetCommandResults map[string]map[string]map[entmoot.NodeID]FleetCommandResultEnvelope
+	clock               func() time.Time
 }
 
 func NewMemoryStateStore() *MemoryStateStore {
 	return &MemoryStateStore{
-		requests:      make(map[string]SignRequest),
-		devices:       make(map[string]DeviceState),
-		idem:          make(map[string]IdempotencyRecord),
-		groups:        make(map[entmoot.GroupID]json.RawMessage),
-		invites:       make(map[string]OpenInviteRecord),
-		redeems:       make(map[string]map[string]OpenInviteRedemption),
-		chals:         make(map[string]OpenInviteChallenge),
-		fleets:        make(map[string]FleetRecord),
-		fleetMembers:  make(map[string]map[entmoot.NodeID]FleetMemberRecord),
-		fleetInvites:  make(map[string][]FleetInviteRecord),
-		fleetActivity: make(map[string][]FleetActivityRecord),
-		fleetTasks:    make(map[string]map[string]FleetTaskRecord),
-		fleetTaskSubs: make(map[string]map[string][]FleetTaskSubmissionRecord),
-		clock:         time.Now,
+		requests:            make(map[string]SignRequest),
+		devices:             make(map[string]DeviceState),
+		idem:                make(map[string]IdempotencyRecord),
+		groups:              make(map[entmoot.GroupID]json.RawMessage),
+		invites:             make(map[string]OpenInviteRecord),
+		redeems:             make(map[string]map[string]OpenInviteRedemption),
+		chals:               make(map[string]OpenInviteChallenge),
+		fleets:              make(map[string]FleetRecord),
+		fleetMembers:        make(map[string]map[entmoot.NodeID]FleetMemberRecord),
+		fleetInvites:        make(map[string][]FleetInviteRecord),
+		fleetActivity:       make(map[string][]FleetActivityRecord),
+		fleetTasks:          make(map[string]map[string]FleetTaskRecord),
+		fleetTaskSubs:       make(map[string]map[string][]FleetTaskSubmissionRecord),
+		fleetCommands:       make(map[string]map[string]FleetCommandEnvelope),
+		fleetCommandResults: make(map[string]map[string]map[entmoot.NodeID]FleetCommandResultEnvelope),
+		clock:               time.Now,
 	}
 }
 
@@ -783,6 +791,8 @@ func (s *MemoryStateStore) DeleteFleet(_ context.Context, fleetID string) error 
 	delete(s.fleetActivity, fleetID)
 	delete(s.fleetTasks, fleetID)
 	delete(s.fleetTaskSubs, fleetID)
+	delete(s.fleetCommands, fleetID)
+	delete(s.fleetCommandResults, fleetID)
 	return nil
 }
 
@@ -1437,6 +1447,44 @@ CREATE TABLE IF NOT EXISTS esp_fleet_task_submissions (
 
 CREATE INDEX IF NOT EXISTS idx_fleet_task_submissions_task
   ON esp_fleet_task_submissions(fleet_id, task_id, created_at_ms DESC);
+
+CREATE TABLE IF NOT EXISTS esp_fleet_commands (
+  command_id TEXT PRIMARY KEY,
+  fleet_id TEXT NOT NULL,
+  issuer_node_id INTEGER NOT NULL,
+  target BLOB NOT NULL,
+  action TEXT NOT NULL,
+  args BLOB,
+  auto_accept INTEGER NOT NULL,
+  created_at_ms INTEGER NOT NULL,
+  expires_at_ms INTEGER NOT NULL DEFAULT 0,
+  command BLOB NOT NULL,
+  updated_at_ms INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_fleet_commands_fleet_time
+  ON esp_fleet_commands(fleet_id, updated_at_ms DESC, command_id);
+
+CREATE INDEX IF NOT EXISTS idx_fleet_commands_fleet_action
+  ON esp_fleet_commands(fleet_id, action, updated_at_ms DESC);
+
+CREATE TABLE IF NOT EXISTS esp_fleet_command_results (
+  command_id TEXT NOT NULL,
+  fleet_id TEXT NOT NULL,
+  agent_node_id INTEGER NOT NULL,
+  action TEXT NOT NULL,
+  status TEXT NOT NULL,
+  summary TEXT NOT NULL DEFAULT '',
+  output TEXT NOT NULL DEFAULT '',
+  started_at_ms INTEGER NOT NULL DEFAULT 0,
+  completed_at_ms INTEGER NOT NULL DEFAULT 0,
+  result BLOB NOT NULL,
+  updated_at_ms INTEGER NOT NULL,
+  PRIMARY KEY(command_id, agent_node_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_fleet_command_results_fleet_command
+  ON esp_fleet_command_results(fleet_id, command_id, updated_at_ms DESC);
 
 CREATE TABLE IF NOT EXISTS esp_agent_commands (
   command_id TEXT PRIMARY KEY,
@@ -2211,6 +2259,12 @@ func (s *SQLiteStateStore) RestoreFleet(ctx context.Context, fleetID string, res
 }
 
 func (s *SQLiteStateStore) DeleteFleet(ctx context.Context, fleetID string) error {
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM esp_fleet_command_results WHERE fleet_id = ?`, fleetID); err != nil {
+		return fmt.Errorf("esphttp: delete fleet command results: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM esp_fleet_commands WHERE fleet_id = ?`, fleetID); err != nil {
+		return fmt.Errorf("esphttp: delete fleet commands: %w", err)
+	}
 	if _, err := s.db.ExecContext(ctx, `DELETE FROM esp_fleet_task_submissions WHERE fleet_id = ?`, fleetID); err != nil {
 		return fmt.Errorf("esphttp: delete fleet task submissions: %w", err)
 	}
@@ -2649,6 +2703,36 @@ func migrateSQLiteState(db *sql.DB) error {
 		}
 	}
 	for _, stmt := range []string{
+		`CREATE TABLE IF NOT EXISTS esp_fleet_commands (
+		  command_id TEXT PRIMARY KEY,
+		  fleet_id TEXT NOT NULL,
+		  issuer_node_id INTEGER NOT NULL,
+		  target BLOB NOT NULL,
+		  action TEXT NOT NULL,
+		  args BLOB,
+		  auto_accept INTEGER NOT NULL,
+		  created_at_ms INTEGER NOT NULL,
+		  expires_at_ms INTEGER NOT NULL DEFAULT 0,
+		  command BLOB NOT NULL,
+		  updated_at_ms INTEGER NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_fleet_commands_fleet_time ON esp_fleet_commands(fleet_id, updated_at_ms DESC, command_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_fleet_commands_fleet_action ON esp_fleet_commands(fleet_id, action, updated_at_ms DESC)`,
+		`CREATE TABLE IF NOT EXISTS esp_fleet_command_results (
+		  command_id TEXT NOT NULL,
+		  fleet_id TEXT NOT NULL,
+		  agent_node_id INTEGER NOT NULL,
+		  action TEXT NOT NULL,
+		  status TEXT NOT NULL,
+		  summary TEXT NOT NULL DEFAULT '',
+		  output TEXT NOT NULL DEFAULT '',
+		  started_at_ms INTEGER NOT NULL DEFAULT 0,
+		  completed_at_ms INTEGER NOT NULL DEFAULT 0,
+		  result BLOB NOT NULL,
+		  updated_at_ms INTEGER NOT NULL,
+		  PRIMARY KEY(command_id, agent_node_id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_fleet_command_results_fleet_command ON esp_fleet_command_results(fleet_id, command_id, updated_at_ms DESC)`,
 		`CREATE TABLE IF NOT EXISTS esp_agent_commands (
 		  command_id TEXT PRIMARY KEY,
 		  fleet_id TEXT NOT NULL,

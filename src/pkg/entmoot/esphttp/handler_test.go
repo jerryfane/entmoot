@@ -859,6 +859,199 @@ func TestHandlerFleetCommandsCoordinatorPublishesSafeCommand(t *testing.T) {
 	if event.CommandID != created.Command.CommandID || event.Type != FleetCommandMessageType {
 		t.Fatalf("command event = %+v", event)
 	}
+	if err := state.UpsertFleetCommandResult(context.Background(), FleetCommandResultEnvelope{
+		Type:          FleetCommandResultType,
+		Version:       1,
+		CommandID:     created.Command.CommandID,
+		FleetID:       created.Command.FleetID,
+		AgentNodeID:   45493,
+		Action:        created.Command.Action,
+		Status:        FleetCommandStatusCompleted,
+		Summary:       "reported info",
+		Output:        `{"finalAssistantVisibleText":"done"}`,
+		StartedAtMS:   41_000,
+		CompletedAtMS: 42_000,
+	}); err != nil {
+		t.Fatalf("UpsertFleetCommandResult: %v", err)
+	}
+	list := doSignedJSONRequest[struct {
+		Commands []FleetCommandSummaryRecord `json:"commands"`
+	}](t, handler, coordinatorPriv, http.MethodGet, "/v1/fleets/fleet-commands/commands?status=completed", nil, http.StatusOK, 40_001, "nonce-command-list")
+	if len(list.Commands) != 1 || list.Commands[0].Command.CommandID != created.Command.CommandID {
+		t.Fatalf("command list = %+v", list.Commands)
+	}
+	if list.Commands[0].Status != FleetCommandStatusCompleted || list.Commands[0].ResultCount != 1 || list.Commands[0].LatestResult == nil {
+		t.Fatalf("command summary = %+v", list.Commands[0])
+	}
+	detail := doSignedJSONRequest[struct {
+		Command     FleetCommandEnvelope         `json:"command"`
+		Status      string                       `json:"status"`
+		Results     []FleetCommandResultEnvelope `json:"results"`
+		UpdatedAtMS int64                        `json:"updated_at_ms"`
+	}](t, handler, coordinatorPriv, http.MethodGet, "/v1/fleets/fleet-commands/commands/"+url.PathEscape(created.Command.CommandID), nil, http.StatusOK, 40_002, "nonce-command-detail")
+	if detail.Command.CommandID != created.Command.CommandID || detail.Status != FleetCommandStatusCompleted || len(detail.Results) != 1 || detail.Results[0].Output == "" {
+		t.Fatalf("command detail = %+v", detail)
+	}
+	if err := state.UpsertFleetCommandResult(context.Background(), FleetCommandResultEnvelope{
+		Type:          FleetCommandResultType,
+		Version:       1,
+		CommandID:     created.Command.CommandID,
+		FleetID:       created.Command.FleetID,
+		AgentNodeID:   45494,
+		Action:        created.Command.Action,
+		Status:        FleetCommandStatusFailed,
+		Summary:       "other agent failed later",
+		StartedAtMS:   43_000,
+		CompletedAtMS: 44_000,
+	}); err != nil {
+		t.Fatalf("UpsertFleetCommandResult second agent: %v", err)
+	}
+	agentList := doSignedJSONRequest[struct {
+		Commands []FleetCommandSummaryRecord `json:"commands"`
+	}](t, handler, coordinatorPriv, http.MethodGet, "/v1/fleets/fleet-commands/commands?status=completed&agent_node_id=45493", nil, http.StatusOK, 40_003, "nonce-command-agent-list")
+	if len(agentList.Commands) != 1 || agentList.Commands[0].Command.CommandID != created.Command.CommandID {
+		t.Fatalf("agent command list = %+v", agentList.Commands)
+	}
+	if agentList.Commands[0].LatestResult == nil || agentList.Commands[0].LatestResult.AgentNodeID != 45493 {
+		t.Fatalf("agent command summary = %+v", agentList.Commands[0])
+	}
+	duplicateCommand := created.Command
+	duplicateCommand.CommandID = "cmd-duplicate"
+	duplicateCommand.CreatedAtMS = 45_000
+	if _, err := state.UpsertFleetCommand(context.Background(), duplicateCommand); err != nil {
+		t.Fatalf("UpsertFleetCommand duplicate: %v", err)
+	}
+	if err := state.UpsertFleetCommandResult(context.Background(), FleetCommandResultEnvelope{
+		Type:          FleetCommandResultType,
+		Version:       1,
+		CommandID:     duplicateCommand.CommandID,
+		FleetID:       duplicateCommand.FleetID,
+		AgentNodeID:   45493,
+		Action:        duplicateCommand.Action,
+		Status:        FleetCommandStatusDuplicate,
+		Summary:       "already handled",
+		StartedAtMS:   46_000,
+		CompletedAtMS: 47_000,
+	}); err != nil {
+		t.Fatalf("UpsertFleetCommandResult duplicate: %v", err)
+	}
+	duplicateList := doSignedJSONRequest[struct {
+		Commands []FleetCommandSummaryRecord `json:"commands"`
+	}](t, handler, coordinatorPriv, http.MethodGet, "/v1/fleets/fleet-commands/commands?status=duplicate", nil, http.StatusOK, 40_004, "nonce-command-duplicate-list")
+	if len(duplicateList.Commands) != 1 || duplicateList.Commands[0].Command.CommandID != duplicateCommand.CommandID || duplicateList.Commands[0].Status != FleetCommandStatusDuplicate {
+		t.Fatalf("duplicate command list = %+v", duplicateList.Commands)
+	}
+}
+
+func TestHandlerFleetCommandHistoryRejectsSpoofedTopicMessages(t *testing.T) {
+	gid := testGroupID(95)
+	coordinatorPub, coordinatorPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey coordinator: %v", err)
+	}
+	agentPub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey agent: %v", err)
+	}
+	otherPub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey other agent: %v", err)
+	}
+	reg, err := NewDeviceRegistry([]Device{{
+		ID:        "ios-1-device",
+		PublicKey: coordinatorPub,
+	}})
+	if err != nil {
+		t.Fatalf("NewDeviceRegistry: %v", err)
+	}
+	state := NewMemoryStateStore()
+	coordinator := entmoot.NodeInfo{PilotNodeID: 45491, EntmootPubKey: coordinatorPub}
+	if _, err := state.CreateFleet(context.Background(), FleetRecord{
+		FleetID:             "fleet-history-auth",
+		Name:                "Fleet History Auth",
+		ControlGroupID:      gid,
+		Coordinator:         coordinator,
+		CoordinatorDeviceID: "ios-1-device",
+		Status:              FleetStatusActive,
+		CreatedAtMS:         1,
+	}); err != nil {
+		t.Fatalf("CreateFleet: %v", err)
+	}
+	for _, member := range []FleetMemberRecord{
+		{FleetID: "fleet-history-auth", NodeID: coordinator.PilotNodeID, EntmootPubKey: base64.StdEncoding.EncodeToString(coordinator.EntmootPubKey), Role: FleetRoleCoordinator, Status: FleetMemberActive},
+		{FleetID: "fleet-history-auth", NodeID: 45493, EntmootPubKey: base64.StdEncoding.EncodeToString(agentPub), Role: FleetRoleAgent, Status: FleetMemberActive},
+		{FleetID: "fleet-history-auth", NodeID: 45494, EntmootPubKey: base64.StdEncoding.EncodeToString(otherPub), Role: FleetRoleAgent, Status: FleetMemberActive},
+	} {
+		if _, err := state.UpsertFleetMember(context.Background(), member); err != nil {
+			t.Fatalf("UpsertFleetMember: %v", err)
+		}
+	}
+	validCommand := FleetCommandEnvelope{
+		Type:           FleetCommandMessageType,
+		Version:        1,
+		CommandID:      "cmd-valid-history",
+		FleetID:        "fleet-history-auth",
+		ControlGroupID: gid,
+		IssuerNodeID:   coordinator.PilotNodeID,
+		Target:         FleetCommandTarget{Kind: FleetCommandTargetNode, PilotNodeID: 45493},
+		Action:         FleetCommandActionEntmootInfo,
+		AutoAccept:     true,
+		CreatedAtMS:    50_000,
+		ExpiresAtMS:    time.Now().Add(time.Hour).UnixMilli(),
+	}
+	if _, err := state.UpsertFleetCommand(context.Background(), validCommand); err != nil {
+		t.Fatalf("UpsertFleetCommand valid: %v", err)
+	}
+	spoofedCommand := validCommand
+	spoofedCommand.CommandID = "cmd-spoofed-history"
+	spoofedCommand.CreatedAtMS = 51_000
+	spoofedCommand.ExpiresAtMS = 61_000
+	spoofedResult := FleetCommandResultEnvelope{
+		Type:          FleetCommandResultType,
+		Version:       1,
+		CommandID:     validCommand.CommandID,
+		FleetID:       validCommand.FleetID,
+		AgentNodeID:   45493,
+		Action:        validCommand.Action,
+		Status:        FleetCommandStatusCompleted,
+		Summary:       "spoofed",
+		StartedAtMS:   52_000,
+		CompletedAtMS: 53_000,
+	}
+	untargetedResult := spoofedResult
+	untargetedResult.AgentNodeID = 45494
+	untargetedResult.Summary = "untargeted"
+	untargetedResult.StartedAtMS = 53_500
+	untargetedResult.CompletedAtMS = 53_600
+	mbox := store.NewMemory()
+	for _, msg := range []entmoot.Message{
+		testTopicMessage(t, gid, 51_000, entmoot.NodeInfo{PilotNodeID: 45493, EntmootPubKey: agentPub}, []string{"fleet/commands"}, spoofedCommand),
+		testTopicMessage(t, gid, 52_000, entmoot.NodeInfo{PilotNodeID: 45494, EntmootPubKey: otherPub}, []string{"fleet/commands/results"}, spoofedResult),
+		testTopicMessage(t, gid, 53_000, entmoot.NodeInfo{PilotNodeID: 45494, EntmootPubKey: otherPub}, []string{"fleet/commands/results"}, untargetedResult),
+	} {
+		if err := mbox.Put(context.Background(), msg); err != nil {
+			t.Fatalf("Put topic message: %v", err)
+		}
+	}
+	svc, err := mailbox.New(mbox, nil)
+	if err != nil {
+		t.Fatalf("mailbox.New: %v", err)
+	}
+	handler := testMobileHandlerFull(t, gid, reg, nil, func() time.Time { return time.UnixMilli(54_000) }, nil, state, nil)
+	handler.(*Handler).service = svc
+
+	sentList := doSignedJSONRequest[struct {
+		Commands []FleetCommandSummaryRecord `json:"commands"`
+	}](t, handler, coordinatorPriv, http.MethodGet, "/v1/fleets/fleet-history-auth/commands?status=sent", nil, http.StatusOK, 54_000, "nonce-history-auth-sent")
+	if len(sentList.Commands) != 1 || sentList.Commands[0].Command.CommandID != validCommand.CommandID {
+		t.Fatalf("sent commands = %+v", sentList.Commands)
+	}
+	completedList := doSignedJSONRequest[struct {
+		Commands []FleetCommandSummaryRecord `json:"commands"`
+	}](t, handler, coordinatorPriv, http.MethodGet, "/v1/fleets/fleet-history-auth/commands?status=completed", nil, http.StatusOK, 54_001, "nonce-history-auth-completed")
+	if len(completedList.Commands) != 0 {
+		t.Fatalf("completed commands = %+v", completedList.Commands)
+	}
 }
 
 func TestHandlerFleetControlGroupReadAllowsCoordinatorDevice(t *testing.T) {
@@ -2564,6 +2757,23 @@ func testMessage(gid entmoot.GroupID, ts int64, content string) entmoot.Message 
 		Timestamp: ts,
 		Topics:    []string{"test/mailbox"},
 		Content:   []byte(content),
+	}
+	msg.ID = canonical.MessageID(msg)
+	return msg
+}
+
+func testTopicMessage(t *testing.T, gid entmoot.GroupID, ts int64, author entmoot.NodeInfo, topics []string, content any) entmoot.Message {
+	t.Helper()
+	data, err := json.Marshal(content)
+	if err != nil {
+		t.Fatalf("Marshal topic message: %v", err)
+	}
+	msg := entmoot.Message{
+		GroupID:   gid,
+		Author:    author,
+		Timestamp: ts,
+		Topics:    topics,
+		Content:   data,
 	}
 	msg.ID = canonical.MessageID(msg)
 	return msg

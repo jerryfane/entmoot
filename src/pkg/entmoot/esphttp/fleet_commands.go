@@ -30,6 +30,7 @@ const (
 	FleetCommandRiskManual = "manual"
 
 	FleetCommandStatusReceived  = "received"
+	FleetCommandStatusSent      = "sent"
 	FleetCommandStatusAccepted  = "accepted"
 	FleetCommandStatusRunning   = "running"
 	FleetCommandStatusCompleted = "completed"
@@ -105,6 +106,21 @@ type FleetCommandResultEnvelope struct {
 	Output        string         `json:"output,omitempty"`
 	StartedAtMS   int64          `json:"started_at_ms,omitempty"`
 	CompletedAtMS int64          `json:"completed_at_ms,omitempty"`
+}
+
+type FleetCommandSummaryRecord struct {
+	Command      FleetCommandEnvelope        `json:"command"`
+	Status       string                      `json:"status"`
+	ResultCount  int                         `json:"result_count"`
+	LatestResult *FleetCommandResultEnvelope `json:"latest_result,omitempty"`
+	UpdatedAtMS  int64                       `json:"updated_at_ms"`
+}
+
+type FleetCommandDetailRecord struct {
+	Command     FleetCommandEnvelope         `json:"command"`
+	Status      string                       `json:"status"`
+	Results     []FleetCommandResultEnvelope `json:"results"`
+	UpdatedAtMS int64                        `json:"updated_at_ms"`
 }
 
 type FleetCommandInstructionSpec struct {

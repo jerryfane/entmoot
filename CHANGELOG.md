@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.60] - 2026-05-11
+
+### Added
+
+- **Fleet command history API.** Added Fleet command list/detail endpoints with
+  SQLite-backed command/result projection, status filtering, agent filtering,
+  and expiry-aware summaries.
+- **Command detail support for clients.** ESP clients can now fetch command
+  summaries and full command results for Fleet command detail views.
+
+### Fixed
+
+- **Fleet command result projection.** Command results reconciled from topic
+  history now validate the author, stored command, action, and target before
+  affecting list/detail status.
+
 ## [1.5.58] - 2026-05-11
 
 ### Added
