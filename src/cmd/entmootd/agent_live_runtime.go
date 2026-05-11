@@ -23,6 +23,7 @@ const (
 	liveActionMessageSummarize = "message.summarize"
 	liveActionTaskCreate       = "task.create"
 	liveActionTaskAssignSelf   = "task.assign_self"
+	liveActionTaskUpdateOwn    = "task.update_own"
 	liveActionTaskAssignOthers = "task.assign_others"
 	liveActionCommandSend      = "command.send"
 	liveActionAlertOwner       = "alert.owner"
@@ -179,7 +180,7 @@ func runAgentLiveScan(ctx context.Context, gf *globalFlags, state esphttp.StateS
 		AllowedActions: append([]string(nil), cfg.AllowedActions...),
 		Trigger:        liveTriggerForMode(cfg.Mode),
 		Events:         events,
-		Instructions:   "Return JSON only: {\"actions\":[{\"kind\":\"reply\",\"message\":\"...\"}]}. Supported local actions include reply, message.summarize, alert.owner, task.create with title, description, mode, fleet_id, and assignee_node_id, task.assign_self with fleet_id and task_id, task.assign_others with fleet_id, task_id, and assignee_node_id, and command.send with action, args, target, target_node_id, instruction, timeout_ms, expires_at_ms, and auto_accept. Entmoot will validate and apply allowed actions. Do not claim that you posted anything yourself.",
+		Instructions:   "Return JSON only: {\"actions\":[{\"kind\":\"reply\",\"message\":\"...\"}]}. Supported local actions include reply, message.summarize, alert.owner, task.create with title, description, mode, fleet_id, and assignee_node_id, task.assign_self with fleet_id and task_id, task.update_own with fleet_id, task_id, and content, task.assign_others with fleet_id, task_id, and assignee_node_id, and command.send with action, args, target, target_node_id, instruction, timeout_ms, expires_at_ms, and auto_accept. Entmoot will validate and apply allowed actions. Do not claim that you posted anything yourself.",
 	}
 	output, err := runLiveAgentRunner(ctx, runCfg, runnerCtx)
 	if err != nil {
@@ -390,6 +391,11 @@ func applyLiveAgentAction(ctx context.Context, gf *globalFlags, state esphttp.St
 			return false, errors.New("live action task.assign_self requires state store")
 		}
 		return applyLiveAgentTaskAssignSelf(ctx, gf, state, cfg, action)
+	case liveActionTaskUpdateOwn:
+		if state == nil {
+			return false, errors.New("live action task.update_own requires state store")
+		}
+		return applyLiveAgentTaskUpdateOwn(ctx, gf, state, cfg, action)
 	case liveActionTaskAssignOthers:
 		if state == nil {
 			return false, errors.New("live action task.assign_others requires state store")
@@ -515,6 +521,48 @@ func applyLiveAgentTaskAssignSelf(ctx context.Context, gf *globalFlags, state es
 		return false, err
 	}
 	publishLiveFleetTaskEvent(ctx, gf, fleet, mutation, task, actor)
+	return true, nil
+}
+
+func applyLiveAgentTaskUpdateOwn(ctx context.Context, gf *globalFlags, state esphttp.StateStore, cfg esphttp.LiveAgentConfig, action liveAgentAction) (bool, error) {
+	fleet, actor, task, err := liveActionFleetTask(ctx, state, cfg.GroupID, cfg.NodeID, action)
+	if err != nil {
+		return false, err
+	}
+	content, err := esphttp.NormalizeFleetTaskSubmissionContent(firstNonEmpty(action.Content, action.Message, action.Description))
+	if err != nil {
+		return false, err
+	}
+	if cfg.MaxActionBytes > 0 && len([]byte(content)) > cfg.MaxActionBytes {
+		return false, errors.New("live action task.update_own payload exceeds max_action_bytes")
+	}
+	now := time.Now().UnixMilli()
+	submission := esphttp.FleetTaskSubmissionRecord{
+		FleetID:     fleet.FleetID,
+		TaskID:      task.TaskID,
+		Content:     content,
+		CreatedAtMS: now,
+		UpdatedAtMS: now,
+	}
+	mutation, err := esphttp.ApplyFleetTaskMutation(task, esphttp.FleetTaskActionSubmit, actor, now, nil, &submission)
+	if err != nil {
+		return false, err
+	}
+	task, submission, ok, err := state.SubmitFleetTask(ctx, mutation.Task, mutation.ExpectedUpdatedAtMS, mutation.Submission)
+	if err != nil {
+		return false, err
+	}
+	if !ok {
+		return false, fmt.Errorf("%w: task changed concurrently", esphttp.ErrFleetTaskInvalidTransition)
+	}
+	createdAtMS := task.UpdatedAtMS
+	if submission.CreatedAtMS > 0 {
+		createdAtMS = submission.CreatedAtMS
+	}
+	if err := appendLiveFleetActivityAt(ctx, state, fleet.FleetID, mutation, task, actor, createdAtMS); err != nil {
+		return false, err
+	}
+	publishLiveFleetTaskEventAt(ctx, gf, fleet, mutation, task, actor, createdAtMS)
 	return true, nil
 }
 
@@ -785,6 +833,10 @@ func liveActionFleetMember(ctx context.Context, state esphttp.StateStore, fleetI
 }
 
 func appendLiveFleetActivity(ctx context.Context, state esphttp.StateStore, fleetID string, mutation esphttp.FleetTaskMutation, task esphttp.FleetTaskRecord, actor esphttp.FleetMemberRecord) error {
+	return appendLiveFleetActivityAt(ctx, state, fleetID, mutation, task, actor, task.UpdatedAtMS)
+}
+
+func appendLiveFleetActivityAt(ctx context.Context, state esphttp.StateStore, fleetID string, mutation esphttp.FleetTaskMutation, task esphttp.FleetTaskRecord, actor esphttp.FleetMemberRecord, createdAtMS int64) error {
 	if mutation.ActivityType == "" {
 		return nil
 	}
@@ -799,12 +851,16 @@ func appendLiveFleetActivity(ctx context.Context, state esphttp.StateStore, flee
 		Actor:       esphttp.FleetTaskActorFromMember(actor),
 		Subject:     mutation.Subject,
 		Summary:     mutation.Summary,
-		CreatedAtMS: task.UpdatedAtMS,
+		CreatedAtMS: createdAtMS,
 	})
 	return err
 }
 
 func publishLiveFleetTaskEvent(ctx context.Context, gf *globalFlags, fleet esphttp.FleetRecord, mutation esphttp.FleetTaskMutation, task esphttp.FleetTaskRecord, actor esphttp.FleetMemberRecord) {
+	publishLiveFleetTaskEventAt(ctx, gf, fleet, mutation, task, actor, task.UpdatedAtMS)
+}
+
+func publishLiveFleetTaskEventAt(ctx context.Context, gf *globalFlags, fleet esphttp.FleetRecord, mutation esphttp.FleetTaskMutation, task esphttp.FleetTaskRecord, actor esphttp.FleetMemberRecord, createdAtMS int64) {
 	if fleet.ControlGroupID == (entmoot.GroupID{}) {
 		return
 	}
@@ -818,7 +874,7 @@ func publishLiveFleetTaskEvent(ctx context.Context, gf *globalFlags, fleet espht
 		"title":            task.Title,
 		"actor_node_id":    actor.NodeID,
 		"summary":          mutation.Summary,
-		"created_at_ms":    task.UpdatedAtMS,
+		"created_at_ms":    createdAtMS,
 	})
 	if err != nil {
 		return
