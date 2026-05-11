@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"net"
@@ -497,7 +498,7 @@ func TestApplyLiveAgentActionAllowsOwnerAlertOutsideFilters(t *testing.T) {
 		TopicFilters:   []string{"tasks/#"},
 		AllowedActions: []string{liveActionAlertOwner},
 	}
-	_, err := applyLiveAgentAction(ctx, &globalFlags{data: t.TempDir()}, cfg, nil, liveAgentAction{
+	_, err := applyLiveAgentAction(ctx, &globalFlags{data: t.TempDir()}, esphttp.NewMemoryStateStore(), cfg, nil, liveAgentAction{
 		Kind:    liveActionAlertOwner,
 		Message: "owner check",
 	})
@@ -525,7 +526,7 @@ func TestApplyLiveAgentActionDefaultsWhitespaceOwnerAlertTopic(t *testing.T) {
 	topicsCh := make(chan []string, 1)
 	stop := serveLivePublishCapture(t, controlSocketPath(dataDir), topicsCh)
 	defer stop()
-	applied, err := applyLiveAgentAction(ctx, &globalFlags{data: dataDir}, cfg, []liveAgentRunnerMessage{{
+	applied, err := applyLiveAgentAction(ctx, &globalFlags{data: dataDir}, esphttp.NewMemoryStateStore(), cfg, []liveAgentRunnerMessage{{
 		Topics: []string{"tasks/incident"},
 	}}, liveAgentAction{
 		Kind:    liveActionAlertOwner,
@@ -562,7 +563,7 @@ func TestApplyLiveAgentActionDefaultsToMatchedReplyTopic(t *testing.T) {
 	topicsCh := make(chan []string, 1)
 	stop := serveLivePublishCapture(t, controlSocketPath(dataDir), topicsCh)
 	defer stop()
-	applied, err := applyLiveAgentAction(ctx, &globalFlags{data: dataDir}, cfg, []liveAgentRunnerMessage{{
+	applied, err := applyLiveAgentAction(ctx, &globalFlags{data: dataDir}, esphttp.NewMemoryStateStore(), cfg, []liveAgentRunnerMessage{{
 		Topics: []string{"noise", "ops"},
 	}}, liveAgentAction{
 		Kind:    liveActionReply,
@@ -591,7 +592,7 @@ func TestApplyLiveAgentActionRejectsOversizedMessage(t *testing.T) {
 		TopicFilters:   []string{"chat"},
 		MaxActionBytes: 3,
 	}
-	applied, err := applyLiveAgentAction(ctx, &globalFlags{data: t.TempDir()}, cfg, []liveAgentRunnerMessage{{
+	applied, err := applyLiveAgentAction(ctx, &globalFlags{data: t.TempDir()}, esphttp.NewMemoryStateStore(), cfg, []liveAgentRunnerMessage{{
 		Topics: []string{"chat"},
 	}}, liveAgentAction{
 		Kind:    liveActionReply,
@@ -605,6 +606,193 @@ func TestApplyLiveAgentActionRejectsOversizedMessage(t *testing.T) {
 	}
 	if applied {
 		t.Fatal("applied = true, want false")
+	}
+}
+
+func TestApplyLiveAgentActionCreatesFleetTask(t *testing.T) {
+	ctx := context.Background()
+	gid := testAgentLiveGroupID(16)
+	nodeID := entmoot.NodeID(7)
+	state := esphttp.NewMemoryStateStore()
+	coordinator := entmoot.NodeInfo{PilotNodeID: nodeID, EntmootPubKey: []byte("agent-key")}
+	if _, err := state.CreateFleet(ctx, esphttp.FleetRecord{
+		FleetID:        "fleet-live",
+		Name:           "Live Fleet",
+		ControlGroupID: gid,
+		Coordinator:    coordinator,
+		CreatedAtMS:    1,
+	}); err != nil {
+		t.Fatalf("CreateFleet: %v", err)
+	}
+	if _, err := state.UpsertFleetMember(ctx, esphttp.FleetMemberRecord{
+		FleetID:       "fleet-live",
+		NodeID:        nodeID,
+		EntmootPubKey: base64.StdEncoding.EncodeToString(coordinator.EntmootPubKey),
+		Role:          esphttp.FleetRoleCoordinator,
+		Status:        esphttp.FleetMemberActive,
+	}); err != nil {
+		t.Fatalf("UpsertFleetMember: %v", err)
+	}
+	cfg := esphttp.LiveAgentConfig{
+		GroupID:        gid,
+		NodeID:         nodeID,
+		Enabled:        true,
+		Mode:           esphttp.LiveModeOperator,
+		TopicFilters:   []string{"fleet/#"},
+		AllowedActions: []string{liveActionTaskCreate},
+	}
+	applied, err := applyLiveAgentAction(ctx, &globalFlags{data: t.TempDir()}, state, cfg, nil, liveAgentAction{
+		Kind:        liveActionTaskCreate,
+		Title:       "Audit deploy",
+		Description: "Check live agent rollout",
+		Mode:        esphttp.FleetTaskModeOpenSubmission,
+	})
+	if err != nil {
+		t.Fatalf("applyLiveAgentAction: %v", err)
+	}
+	if !applied {
+		t.Fatal("applied = false, want true")
+	}
+	tasks, err := state.ListFleetTasks(ctx, "fleet-live", "")
+	if err != nil {
+		t.Fatalf("ListFleetTasks: %v", err)
+	}
+	if len(tasks) != 1 || tasks[0].Title != "Audit deploy" || tasks[0].Status != esphttp.FleetTaskStatusOpen {
+		t.Fatalf("tasks = %+v, want one opened task", tasks)
+	}
+	activity, err := state.ListFleetActivity(ctx, "fleet-live", 10, 0)
+	if err != nil {
+		t.Fatalf("ListFleetActivity: %v", err)
+	}
+	if len(activity) != 1 || activity[0].Type != "task.opened" || activity[0].Actor.PilotNodeID != nodeID {
+		t.Fatalf("activity = %+v, want task.opened by live node", activity)
+	}
+	cappedCfg := cfg
+	cappedCfg.MaxActionBytes = 10
+	applied, err = applyLiveAgentAction(ctx, &globalFlags{data: t.TempDir()}, state, cappedCfg, nil, liveAgentAction{
+		Kind:        liveActionTaskCreate,
+		Title:       "Small",
+		Description: "this description is too long",
+	})
+	if err == nil {
+		t.Fatal("applyLiveAgentAction capped task err = nil, want max_action_bytes rejection")
+	}
+	if applied {
+		t.Fatal("capped task applied = true, want false")
+	}
+	tasks, err = state.ListFleetTasks(ctx, "fleet-live", "")
+	if err != nil {
+		t.Fatalf("ListFleetTasks after capped task: %v", err)
+	}
+	if len(tasks) != 1 {
+		t.Fatalf("tasks after capped task = %+v, want original task only", tasks)
+	}
+}
+
+func TestApplyLiveAgentActionRejectsForeignOrArchivedFleetTask(t *testing.T) {
+	ctx := context.Background()
+	gid := testAgentLiveGroupID(17)
+	foreignGID := testAgentLiveGroupID(18)
+	nodeID := entmoot.NodeID(7)
+	state := esphttp.NewMemoryStateStore()
+	coordinator := entmoot.NodeInfo{PilotNodeID: nodeID, EntmootPubKey: []byte("agent-key")}
+	for _, rec := range []esphttp.FleetRecord{
+		{FleetID: "fleet-live", Name: "Live Fleet", ControlGroupID: gid, Coordinator: coordinator, CreatedAtMS: 1},
+		{FleetID: "fleet-foreign", Name: "Foreign Fleet", ControlGroupID: foreignGID, Coordinator: coordinator, CreatedAtMS: 1},
+		{FleetID: "fleet-archived", Name: "Archived Fleet", ControlGroupID: gid, Coordinator: coordinator, CreatedAtMS: 1, Status: esphttp.FleetStatusArchived},
+	} {
+		if _, err := state.CreateFleet(ctx, rec); err != nil {
+			t.Fatalf("CreateFleet(%s): %v", rec.FleetID, err)
+		}
+		if _, err := state.UpsertFleetMember(ctx, esphttp.FleetMemberRecord{
+			FleetID:       rec.FleetID,
+			NodeID:        nodeID,
+			EntmootPubKey: base64.StdEncoding.EncodeToString(coordinator.EntmootPubKey),
+			Role:          esphttp.FleetRoleCoordinator,
+			Status:        esphttp.FleetMemberActive,
+		}); err != nil {
+			t.Fatalf("UpsertFleetMember(%s): %v", rec.FleetID, err)
+		}
+	}
+	cfg := esphttp.LiveAgentConfig{
+		GroupID:        gid,
+		NodeID:         nodeID,
+		Enabled:        true,
+		Mode:           esphttp.LiveModeOperator,
+		AllowedActions: []string{liveActionTaskCreate},
+	}
+	for _, fleetID := range []string{"fleet-foreign", "fleet-archived"} {
+		applied, err := applyLiveAgentAction(ctx, &globalFlags{data: t.TempDir()}, state, cfg, nil, liveAgentAction{
+			Kind:    liveActionTaskCreate,
+			FleetID: fleetID,
+			Title:   "Should not persist",
+		})
+		if err == nil {
+			t.Fatalf("applyLiveAgentAction(%s) err = nil, want rejection", fleetID)
+		}
+		if applied {
+			t.Fatalf("applyLiveAgentAction(%s) applied = true, want false", fleetID)
+		}
+		tasks, err := state.ListFleetTasks(ctx, fleetID, "")
+		if err != nil {
+			t.Fatalf("ListFleetTasks(%s): %v", fleetID, err)
+		}
+		if len(tasks) != 0 {
+			t.Fatalf("ListFleetTasks(%s) = %+v, want none", fleetID, tasks)
+		}
+	}
+}
+
+func TestApplyLiveAgentActionRejectsUnauthorizedDirectAssignmentBeforePersist(t *testing.T) {
+	ctx := context.Background()
+	gid := testAgentLiveGroupID(19)
+	nodeID := entmoot.NodeID(7)
+	assigneeNodeID := entmoot.NodeID(8)
+	state := esphttp.NewMemoryStateStore()
+	coordinator := entmoot.NodeInfo{PilotNodeID: 1, EntmootPubKey: []byte("coordinator-key")}
+	if _, err := state.CreateFleet(ctx, esphttp.FleetRecord{
+		FleetID:        "fleet-live",
+		Name:           "Live Fleet",
+		ControlGroupID: gid,
+		Coordinator:    coordinator,
+		CreatedAtMS:    1,
+	}); err != nil {
+		t.Fatalf("CreateFleet: %v", err)
+	}
+	for _, member := range []esphttp.FleetMemberRecord{
+		{FleetID: "fleet-live", NodeID: 1, EntmootPubKey: base64.StdEncoding.EncodeToString(coordinator.EntmootPubKey), Role: esphttp.FleetRoleCoordinator, Status: esphttp.FleetMemberActive},
+		{FleetID: "fleet-live", NodeID: nodeID, EntmootPubKey: base64.StdEncoding.EncodeToString([]byte("agent-key")), Role: esphttp.FleetRoleAgent, Status: esphttp.FleetMemberActive},
+		{FleetID: "fleet-live", NodeID: assigneeNodeID, EntmootPubKey: base64.StdEncoding.EncodeToString([]byte("assignee-key")), Role: esphttp.FleetRoleAgent, Status: esphttp.FleetMemberActive},
+	} {
+		if _, err := state.UpsertFleetMember(ctx, member); err != nil {
+			t.Fatalf("UpsertFleetMember(%d): %v", member.NodeID, err)
+		}
+	}
+	cfg := esphttp.LiveAgentConfig{
+		GroupID:        gid,
+		NodeID:         nodeID,
+		Enabled:        true,
+		Mode:           esphttp.LiveModeOperator,
+		AllowedActions: []string{liveActionTaskCreate},
+	}
+	applied, err := applyLiveAgentAction(ctx, &globalFlags{data: t.TempDir()}, state, cfg, nil, liveAgentAction{
+		Kind:           liveActionTaskCreate,
+		Title:          "Unauthorized direct task",
+		Mode:           esphttp.FleetTaskModeDirectAssignment,
+		AssigneeNodeID: uint64(assigneeNodeID),
+	})
+	if !errors.Is(err, esphttp.ErrFleetTaskUnauthorized) {
+		t.Fatalf("applyLiveAgentAction err = %v, want unauthorized", err)
+	}
+	if applied {
+		t.Fatal("applied = true, want false")
+	}
+	tasks, err := state.ListFleetTasks(ctx, "fleet-live", "")
+	if err != nil {
+		t.Fatalf("ListFleetTasks: %v", err)
+	}
+	if len(tasks) != 0 {
+		t.Fatalf("tasks = %+v, want none after rejected direct assignment", tasks)
 	}
 }
 

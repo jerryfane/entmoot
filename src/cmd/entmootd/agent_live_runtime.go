@@ -21,6 +21,7 @@ import (
 const (
 	liveActionReply            = "reply"
 	liveActionMessageSummarize = "message.summarize"
+	liveActionTaskCreate       = "task.create"
 	liveActionAlertOwner       = "alert.owner"
 	liveCursorMaxSeenIDs       = 512
 	liveCursorOverlapWindow    = 10 * time.Minute
@@ -68,11 +69,15 @@ type liveAgentRunnerOutput struct {
 }
 
 type liveAgentAction struct {
-	Kind    string `json:"kind"`
-	Message string `json:"message,omitempty"`
-	Title   string `json:"title,omitempty"`
-	Content string `json:"content,omitempty"`
-	Topic   string `json:"topic,omitempty"`
+	Kind           string `json:"kind"`
+	Message        string `json:"message,omitempty"`
+	Title          string `json:"title,omitempty"`
+	Content        string `json:"content,omitempty"`
+	Description    string `json:"description,omitempty"`
+	Topic          string `json:"topic,omitempty"`
+	FleetID        string `json:"fleet_id,omitempty"`
+	Mode           string `json:"mode,omitempty"`
+	AssigneeNodeID uint64 `json:"assignee_node_id,omitempty"`
 }
 
 func runAgentLiveScan(ctx context.Context, gf *globalFlags, state esphttp.StateStore, msgStore store.MessageStore, cfg esphttp.LiveAgentConfig, runCfg agentLiveRuntimeConfig) (agentLiveScanResult, error) {
@@ -162,7 +167,7 @@ func runAgentLiveScan(ctx context.Context, gf *globalFlags, state esphttp.StateS
 		AllowedActions: append([]string(nil), cfg.AllowedActions...),
 		Trigger:        liveTriggerForMode(cfg.Mode),
 		Events:         events,
-		Instructions:   "Return JSON only: {\"actions\":[{\"kind\":\"reply\",\"message\":\"...\"}]}. Entmoot will validate and apply allowed actions. Do not claim that you posted anything yourself.",
+		Instructions:   "Return JSON only: {\"actions\":[{\"kind\":\"reply\",\"message\":\"...\"}]}. Supported local actions include reply, message.summarize, alert.owner, and task.create with title, description, mode, fleet_id, and assignee_node_id. Entmoot will validate and apply allowed actions. Do not claim that you posted anything yourself.",
 	}
 	output, err := runLiveAgentRunner(ctx, runCfg, runnerCtx)
 	if err != nil {
@@ -175,7 +180,7 @@ func runAgentLiveScan(ctx context.Context, gf *globalFlags, state esphttp.StateS
 		actions = actions[:cfg.MaxActionsPerScan]
 	}
 	for _, action := range actions {
-		applied, err := applyLiveAgentAction(ctx, gf, cfg, events, action)
+		applied, err := applyLiveAgentAction(ctx, gf, state, cfg, events, action)
 		if err != nil {
 			if errors.Is(err, errLiveActionTransport) {
 				if result.Applied > 0 && !liveCursorsEqual(nextCursor, cursor) {
@@ -329,7 +334,7 @@ func openClawLiveFinalText(stdout string) string {
 	return stdout
 }
 
-func applyLiveAgentAction(ctx context.Context, gf *globalFlags, cfg esphttp.LiveAgentConfig, events []liveAgentRunnerMessage, action liveAgentAction) (bool, error) {
+func applyLiveAgentAction(ctx context.Context, gf *globalFlags, state esphttp.StateStore, cfg esphttp.LiveAgentConfig, events []liveAgentRunnerMessage, action liveAgentAction) (bool, error) {
 	kind := strings.TrimSpace(strings.ToLower(action.Kind))
 	if !liveActionAllowed(cfg, kind) {
 		return false, fmt.Errorf("live action %q is not allowed", kind)
@@ -363,9 +368,189 @@ func applyLiveAgentAction(ctx context.Context, gf *globalFlags, cfg esphttp.Live
 			return false, fmt.Errorf("%w: %v", errLiveActionTransport, err)
 		}
 		return true, nil
+	case liveActionTaskCreate:
+		if state == nil {
+			return false, errors.New("live action task.create requires state store")
+		}
+		return applyLiveAgentTaskCreate(ctx, gf, state, cfg, action)
 	default:
 		return false, fmt.Errorf("live action %q has no local executor yet", kind)
 	}
+}
+
+func applyLiveAgentTaskCreate(ctx context.Context, gf *globalFlags, state esphttp.StateStore, cfg esphttp.LiveAgentConfig, action liveAgentAction) (bool, error) {
+	fleet, err := liveActionFleet(ctx, state, cfg.GroupID, action.FleetID)
+	if err != nil {
+		return false, err
+	}
+	actor, err := liveActionFleetMember(ctx, state, fleet.FleetID, cfg.NodeID)
+	if err != nil {
+		return false, err
+	}
+	title, err := esphttp.NormalizeFleetTaskTitle(firstNonEmpty(action.Title, action.Message))
+	if err != nil {
+		return false, err
+	}
+	description, err := esphttp.NormalizeFleetTaskDescription(firstNonEmpty(action.Description, action.Content))
+	if err != nil {
+		return false, err
+	}
+	if cfg.MaxActionBytes > 0 && len([]byte(title))+len([]byte(description)) > cfg.MaxActionBytes {
+		return false, errors.New("live action task.create payload exceeds max_action_bytes")
+	}
+	if strings.TrimSpace(action.Mode) != "" && !esphttp.IsValidFleetTaskMode(action.Mode) {
+		return false, fmt.Errorf("live action task.create mode %q is invalid", action.Mode)
+	}
+	mode := esphttp.NormalizeFleetTaskMode(action.Mode)
+	var assignee *esphttp.FleetMemberRecord
+	if action.AssigneeNodeID != 0 {
+		if action.AssigneeNodeID > uint64(^uint32(0)) {
+			return false, fmt.Errorf("live action task.create assignee_node_id is too large: %d", action.AssigneeNodeID)
+		}
+		member, err := liveActionFleetMember(ctx, state, fleet.FleetID, entmoot.NodeID(action.AssigneeNodeID))
+		if err != nil {
+			return false, err
+		}
+		assignee = &member
+	}
+	if mode == esphttp.FleetTaskModeDirectAssignment && assignee == nil {
+		return false, errors.New("live action task.create direct_assignee mode requires assignee_node_id")
+	}
+	if mode != esphttp.FleetTaskModeDirectAssignment && assignee != nil {
+		return false, errors.New("live action task.create assignee_node_id is only valid for direct_assignee mode")
+	}
+	if assignee != nil && !esphttp.FleetTaskIsCoordinator(actor) {
+		return false, esphttp.ErrFleetTaskUnauthorized
+	}
+	now := time.Now().UnixMilli()
+	task := esphttp.FleetTaskRecord{
+		FleetID:     fleet.FleetID,
+		Title:       title,
+		Description: description,
+		Mode:        mode,
+		Status:      esphttp.FleetTaskStatusOpen,
+		Creator:     esphttp.FleetTaskActorFromMember(actor),
+		CreatedAtMS: now,
+		UpdatedAtMS: now,
+	}
+	mutation, err := esphttp.ApplyFleetTaskMutation(task, esphttp.FleetTaskActionCreate, actor, now, nil, nil)
+	if err != nil {
+		return false, err
+	}
+	task, err = state.UpsertFleetTask(ctx, mutation.Task)
+	if err != nil {
+		return false, err
+	}
+	if err := appendLiveFleetActivity(ctx, state, fleet.FleetID, mutation, task, actor); err != nil {
+		return false, err
+	}
+	publishLiveFleetTaskEvent(ctx, gf, fleet, mutation, task, actor)
+	if assignee != nil {
+		now = time.Now().UnixMilli()
+		mutation, err = esphttp.ApplyFleetTaskMutation(task, esphttp.FleetTaskActionAssign, actor, now, assignee, nil)
+		if err != nil {
+			return false, err
+		}
+		updated, ok, err := state.UpdateFleetTaskIfCurrent(ctx, mutation.Task, mutation.ExpectedUpdatedAtMS)
+		if err != nil {
+			return false, err
+		}
+		if !ok {
+			return false, fmt.Errorf("%w: task changed concurrently", esphttp.ErrFleetTaskInvalidTransition)
+		}
+		task = updated
+		if err := appendLiveFleetActivity(ctx, state, fleet.FleetID, mutation, task, actor); err != nil {
+			return false, err
+		}
+		publishLiveFleetTaskEvent(ctx, gf, fleet, mutation, task, actor)
+	}
+	return true, nil
+}
+
+func liveActionFleet(ctx context.Context, state esphttp.StateStore, groupID entmoot.GroupID, rawFleetID string) (esphttp.FleetRecord, error) {
+	if fleetID := strings.TrimSpace(rawFleetID); fleetID != "" {
+		fleet, found, err := state.GetFleet(ctx, fleetID)
+		if err != nil {
+			return esphttp.FleetRecord{}, err
+		}
+		if !found {
+			return esphttp.FleetRecord{}, fmt.Errorf("fleet %q not found", fleetID)
+		}
+		return liveActionValidateFleet(groupID, fleet)
+	}
+	fleet, found, err := state.GetFleetByControlGroup(ctx, groupID)
+	if err != nil {
+		return esphttp.FleetRecord{}, err
+	}
+	if !found {
+		return esphttp.FleetRecord{}, fmt.Errorf("no fleet is linked to control group %s", groupID.String())
+	}
+	return liveActionValidateFleet(groupID, fleet)
+}
+
+func liveActionValidateFleet(groupID entmoot.GroupID, fleet esphttp.FleetRecord) (esphttp.FleetRecord, error) {
+	if fleet.ControlGroupID != groupID {
+		return esphttp.FleetRecord{}, fmt.Errorf("fleet %q is not linked to control group %s", fleet.FleetID, groupID.String())
+	}
+	if fleet.Status != "" && fleet.Status != esphttp.FleetStatusActive {
+		return esphttp.FleetRecord{}, esphttp.ErrFleetNotActive
+	}
+	return fleet, nil
+}
+
+func liveActionFleetMember(ctx context.Context, state esphttp.StateStore, fleetID string, nodeID entmoot.NodeID) (esphttp.FleetMemberRecord, error) {
+	members, err := state.ListFleetMembers(ctx, fleetID)
+	if err != nil {
+		return esphttp.FleetMemberRecord{}, err
+	}
+	for _, member := range members {
+		if member.NodeID == nodeID && esphttp.FleetTaskCanMutate(member) {
+			return member, nil
+		}
+	}
+	return esphttp.FleetMemberRecord{}, fmt.Errorf("node %d is not an active member of fleet %s", nodeID, fleetID)
+}
+
+func appendLiveFleetActivity(ctx context.Context, state esphttp.StateStore, fleetID string, mutation esphttp.FleetTaskMutation, task esphttp.FleetTaskRecord, actor esphttp.FleetMemberRecord) error {
+	if mutation.ActivityType == "" {
+		return nil
+	}
+	eventID, err := esphttp.NewFleetActivityID()
+	if err != nil {
+		return err
+	}
+	_, err = state.AppendFleetActivity(ctx, esphttp.FleetActivityRecord{
+		EventID:     eventID,
+		FleetID:     fleetID,
+		Type:        mutation.ActivityType,
+		Actor:       esphttp.FleetTaskActorFromMember(actor),
+		Subject:     mutation.Subject,
+		Summary:     mutation.Summary,
+		CreatedAtMS: task.UpdatedAtMS,
+	})
+	return err
+}
+
+func publishLiveFleetTaskEvent(ctx context.Context, gf *globalFlags, fleet esphttp.FleetRecord, mutation esphttp.FleetTaskMutation, task esphttp.FleetTaskRecord, actor esphttp.FleetMemberRecord) {
+	if fleet.ControlGroupID == (entmoot.GroupID{}) {
+		return
+	}
+	body, err := json.Marshal(map[string]any{
+		"type":             "fleet.task",
+		"fleet_id":         fleet.FleetID,
+		"control_group_id": fleet.ControlGroupID,
+		"task_id":          task.TaskID,
+		"action":           mutation.Action,
+		"status":           task.Status,
+		"title":            task.Title,
+		"actor_node_id":    actor.NodeID,
+		"summary":          mutation.Summary,
+		"created_at_ms":    task.UpdatedAtMS,
+	})
+	if err != nil {
+		return
+	}
+	_ = publishIPCMessage(ctx, gf, fleet.ControlGroupID, []string{"fleet/tasks"}, body)
 }
 
 func liveMessageKeyAfterCursor(msg entmoot.Message, cursor esphttp.LiveAgentCursor) bool {
