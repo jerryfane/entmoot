@@ -1434,6 +1434,135 @@ func TestApplyLiveAgentActionSendsFleetCommand(t *testing.T) {
 	}
 }
 
+func TestApplyLiveAgentActionRequestsFleetCommand(t *testing.T) {
+	ctx := context.Background()
+	gid := testAgentLiveGroupID(38)
+	nodeID := entmoot.NodeID(7)
+	targetNodeID := entmoot.NodeID(8)
+	dataDir, err := os.MkdirTemp("/tmp", "entmoot-live-ipc-")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dataDir) })
+	state := esphttp.NewMemoryStateStore()
+	coordinator := entmoot.NodeInfo{PilotNodeID: nodeID, EntmootPubKey: []byte("coordinator-key")}
+	if _, err := state.CreateFleet(ctx, esphttp.FleetRecord{
+		FleetID:        "fleet-live",
+		Name:           "Live Fleet",
+		ControlGroupID: gid,
+		Coordinator:    coordinator,
+		CreatedAtMS:    1,
+	}); err != nil {
+		t.Fatalf("CreateFleet: %v", err)
+	}
+	for _, member := range []esphttp.FleetMemberRecord{
+		{FleetID: "fleet-live", NodeID: nodeID, EntmootPubKey: base64.StdEncoding.EncodeToString(coordinator.EntmootPubKey), Role: esphttp.FleetRoleCoordinator, Status: esphttp.FleetMemberActive},
+		{FleetID: "fleet-live", NodeID: targetNodeID, EntmootPubKey: base64.StdEncoding.EncodeToString([]byte("target-key")), Role: esphttp.FleetRoleAgent, Status: esphttp.FleetMemberActive},
+	} {
+		if _, err := state.UpsertFleetMember(ctx, member); err != nil {
+			t.Fatalf("UpsertFleetMember(%d): %v", member.NodeID, err)
+		}
+	}
+	topicsCh := make(chan []string, 1)
+	contentCh := make(chan []byte, 1)
+	stop := serveLiveInfoPublishCapture(t, controlSocketPath(dataDir), &ipc.InfoResp{
+		PilotNodeID:   coordinator.PilotNodeID,
+		EntmootPubKey: coordinator.EntmootPubKey,
+		Running:       true,
+	}, topicsCh, contentCh)
+	defer stop()
+	cfg := esphttp.LiveAgentConfig{
+		GroupID:        gid,
+		NodeID:         nodeID,
+		Enabled:        true,
+		Mode:           esphttp.LiveModeOperator,
+		AllowedActions: []string{liveActionCommandRequest},
+	}
+	autoAccept := true
+	applied, err := applyLiveAgentAction(ctx, &globalFlags{data: dataDir}, state, cfg, nil, liveAgentAction{
+		Kind:         liveActionCommandRequest,
+		Action:       esphttp.FleetCommandActionEntmootVersion,
+		Target:       esphttp.FleetCommandTargetNode,
+		TargetNodeID: uint64(targetNodeID),
+		AutoAccept:   &autoAccept,
+	})
+	if err != nil {
+		t.Fatalf("applyLiveAgentAction: %v", err)
+	}
+	if !applied {
+		t.Fatal("applied = false, want true")
+	}
+	topics := <-topicsCh
+	if len(topics) != 1 || topics[0] != "fleet/commands" {
+		t.Fatalf("topics = %+v, want [fleet/commands]", topics)
+	}
+	var command esphttp.FleetCommandEnvelope
+	if err := json.Unmarshal(<-contentCh, &command); err != nil {
+		t.Fatalf("command JSON: %v", err)
+	}
+	if !command.AutoAccept {
+		t.Fatalf("command.AutoAccept = false, want true for safe command.request")
+	}
+	if command.Action != esphttp.FleetCommandActionEntmootVersion || command.Target.Kind != esphttp.FleetCommandTargetNode || command.Target.PilotNodeID != targetNodeID {
+		t.Fatalf("command = %+v, want version request targeting node %d", command, targetNodeID)
+	}
+	detail, found, err := state.GetFleetCommandDetail(ctx, "fleet-live", command.CommandID)
+	if err != nil || !found {
+		t.Fatalf("GetFleetCommandDetail found/err = %v/%v", found, err)
+	}
+	if !detail.Command.AutoAccept {
+		t.Fatalf("stored command AutoAccept = false, want true")
+	}
+	applied, err = applyLiveAgentAction(ctx, &globalFlags{data: dataDir}, state, cfg, nil, liveAgentAction{
+		Kind:         liveActionCommandRequest,
+		Action:       esphttp.FleetCommandActionAgentInstruction,
+		Target:       esphttp.FleetCommandTargetNode,
+		TargetNodeID: uint64(targetNodeID),
+		Instruction:  "Summarize local status",
+		AutoAccept:   &autoAccept,
+	})
+	if err != nil {
+		t.Fatalf("applyLiveAgentAction agent instruction: %v", err)
+	}
+	if !applied {
+		t.Fatal("agent instruction applied = false, want true")
+	}
+	topics = <-topicsCh
+	if len(topics) != 1 || topics[0] != "fleet/commands" {
+		t.Fatalf("agent instruction topics = %+v, want [fleet/commands]", topics)
+	}
+	if err := json.Unmarshal(<-contentCh, &command); err != nil {
+		t.Fatalf("agent instruction command JSON: %v", err)
+	}
+	if command.AutoAccept {
+		t.Fatalf("agent instruction AutoAccept = true, want false")
+	}
+	if command.Action != esphttp.FleetCommandActionAgentInstruction || command.Args["instruction"] != "Summarize local status" {
+		t.Fatalf("agent instruction command = %+v, want manual agent instruction", command)
+	}
+	sendCfg := cfg
+	sendCfg.AllowedActions = []string{liveActionCommandSend}
+	applied, err = applyLiveAgentAction(ctx, &globalFlags{data: dataDir}, state, sendCfg, nil, liveAgentAction{
+		Kind:         liveActionCommandSend,
+		Action:       esphttp.FleetCommandActionAgentInstruction,
+		Target:       esphttp.FleetCommandTargetNode,
+		TargetNodeID: uint64(targetNodeID),
+		Instruction:  "Summarize local status",
+		AutoAccept:   &autoAccept,
+	})
+	if err == nil {
+		t.Fatal("command.send agent instruction auto_accept=true err = nil, want unsafe auto-accept rejection")
+	}
+	if applied {
+		t.Fatal("command.send agent instruction applied = true, want false")
+	}
+	select {
+	case topics := <-topicsCh:
+		t.Fatalf("unexpected command.send publish topics = %+v", topics)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
 func TestApplyLiveAgentActionRejectsCommandSendBeforePublish(t *testing.T) {
 	ctx := context.Background()
 	gid := testAgentLiveGroupID(25)

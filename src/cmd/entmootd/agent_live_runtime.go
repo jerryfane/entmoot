@@ -29,6 +29,7 @@ const (
 	liveActionTaskAssignSelf   = "task.assign_self"
 	liveActionTaskUpdateOwn    = "task.update_own"
 	liveActionTaskAssignOthers = "task.assign_others"
+	liveActionCommandRequest   = "command.request"
 	liveActionCommandSend      = "command.send"
 	liveActionInviteCreate     = "invite.create"
 	liveActionMemberRemove     = "member.remove"
@@ -193,7 +194,7 @@ func runAgentLiveScan(ctx context.Context, gf *globalFlags, state esphttp.StateS
 		AllowedActions: append([]string(nil), cfg.AllowedActions...),
 		Trigger:        liveTriggerForMode(cfg.Mode),
 		Events:         events,
-		Instructions:   "Return JSON only: {\"actions\":[{\"kind\":\"reply\",\"message\":\"...\"}]}. Supported local actions include reply, message.summarize, alert.owner, task.create with title, description, mode, fleet_id, and assignee_node_id, task.comment with fleet_id, task_id, and content, task.assign_self with fleet_id and task_id, task.update_own with fleet_id, task_id, and content, task.assign_others with fleet_id, task_id, and assignee_node_id, command.send with action, args, target, target_node_id, instruction, timeout_ms, expires_at_ms, and auto_accept, invite.create with fleet_id, target_node_id, target_pilot_pubkey, target_entmoot_pubkey, hostname, valid_for, and valid_until_ms, member.remove with fleet_id and target_node_id, and metadata.update with a metadata JSON object. Entmoot will validate and apply allowed actions. Do not claim that you posted anything yourself.",
+		Instructions:   "Return JSON only: {\"actions\":[{\"kind\":\"reply\",\"message\":\"...\"}]}. Supported local actions include reply, message.summarize, alert.owner, task.create with title, description, mode, fleet_id, and assignee_node_id, task.comment with fleet_id, task_id, and content, task.assign_self with fleet_id and task_id, task.update_own with fleet_id, task_id, and content, task.assign_others with fleet_id, task_id, and assignee_node_id, command.request with action, args, target, target_node_id, instruction, timeout_ms, and expires_at_ms, command.send with action, args, target, target_node_id, instruction, timeout_ms, expires_at_ms, and auto_accept, invite.create with fleet_id, target_node_id, target_pilot_pubkey, target_entmoot_pubkey, hostname, valid_for, and valid_until_ms, member.remove with fleet_id and target_node_id, and metadata.update with a metadata JSON object. Entmoot will validate and apply allowed actions. Do not claim that you posted anything yourself.",
 	}
 	output, err := runLiveAgentRunner(ctx, runCfg, runnerCtx)
 	if err != nil {
@@ -419,6 +420,11 @@ func applyLiveAgentAction(ctx context.Context, gf *globalFlags, state esphttp.St
 			return false, errors.New("live action task.assign_others requires state store")
 		}
 		return applyLiveAgentTaskAssignOthers(ctx, gf, state, cfg, action)
+	case liveActionCommandRequest:
+		if state == nil {
+			return false, errors.New("live action command.request requires state store")
+		}
+		return applyLiveAgentCommandRequest(ctx, gf, state, cfg, action)
 	case liveActionCommandSend:
 		if state == nil {
 			return false, errors.New("live action command.send requires state store")
@@ -725,6 +731,14 @@ func liveActionValidateFleet(groupID entmoot.GroupID, fleet esphttp.FleetRecord)
 }
 
 func applyLiveAgentCommandSend(ctx context.Context, gf *globalFlags, state esphttp.StateStore, cfg esphttp.LiveAgentConfig, action liveAgentAction) (bool, error) {
+	return applyLiveAgentCommand(ctx, gf, state, cfg, action, liveActionCommandSend, false)
+}
+
+func applyLiveAgentCommandRequest(ctx context.Context, gf *globalFlags, state esphttp.StateStore, cfg esphttp.LiveAgentConfig, action liveAgentAction) (bool, error) {
+	return applyLiveAgentCommand(ctx, gf, state, cfg, action, liveActionCommandRequest, true)
+}
+
+func applyLiveAgentCommand(ctx context.Context, gf *globalFlags, state esphttp.StateStore, cfg esphttp.LiveAgentConfig, action liveAgentAction, actionName string, forceManual bool) (bool, error) {
 	fleet, err := liveActionFleet(ctx, state, cfg.GroupID, action.FleetID)
 	if err != nil {
 		return false, err
@@ -736,7 +750,7 @@ func applyLiveAgentCommandSend(ctx context.Context, gf *globalFlags, state espht
 	if !esphttp.FleetTaskIsCoordinator(actor) {
 		return false, esphttp.ErrFleetTaskUnauthorized
 	}
-	if err := liveActionRequireCoordinatorPublisher(ctx, gf, fleet, liveActionCommandSend); err != nil {
+	if err := liveActionRequireCoordinatorPublisher(ctx, gf, fleet, actionName); err != nil {
 		return false, err
 	}
 	commandAction := esphttp.NormalizeFleetCommandAction(action.Action)
@@ -745,25 +759,29 @@ func applyLiveAgentCommandSend(ctx context.Context, gf *globalFlags, state espht
 	}
 	entry, found := esphttp.FleetCommandCatalogLookup(commandAction)
 	if !found {
-		return false, errors.New("live action command.send action is unsupported")
+		return false, fmt.Errorf("live action %s action is unsupported", actionName)
 	}
 	autoAccept := true
-	if action.AutoAccept != nil {
+	if !forceManual && action.AutoAccept != nil {
 		autoAccept = *action.AutoAccept
-	} else if commandAction == esphttp.FleetCommandActionAgentInstruction {
+	}
+	if commandAction == esphttp.FleetCommandActionAgentInstruction {
+		if !forceManual && autoAccept {
+			return false, fmt.Errorf("live action %s action is not safe for auto-accept", actionName)
+		}
 		autoAccept = false
 	}
 	if autoAccept && !entry.AutoAcceptSafe {
-		return false, errors.New("live action command.send action is not safe for auto-accept")
+		return false, fmt.Errorf("live action %s action is not safe for auto-accept", actionName)
 	}
-	args, err := liveCommandArgs(action, commandAction)
+	args, err := liveCommandArgs(action, commandAction, actionName)
 	if err != nil {
 		return false, err
 	}
 	if err := esphttp.ValidateFleetCommandArgs(commandAction, args); err != nil {
 		return false, err
 	}
-	target, subject, err := liveCommandTarget(ctx, state, fleet.FleetID, action)
+	target, subject, err := liveCommandTarget(ctx, state, fleet.FleetID, action, actionName)
 	if err != nil {
 		return false, err
 	}
@@ -773,7 +791,7 @@ func applyLiveAgentCommandSend(ctx context.Context, gf *globalFlags, state espht
 		expiresAtMS = now + esphttp.DefaultFleetCommandTTL.Milliseconds()
 	}
 	if expiresAtMS <= now {
-		return false, errors.New("live action command.send expiration must be in the future")
+		return false, fmt.Errorf("live action %s expiration must be in the future", actionName)
 	}
 	commandID, err := esphttp.NewFleetCommandID()
 	if err != nil {
@@ -798,7 +816,7 @@ func applyLiveAgentCommandSend(ctx context.Context, gf *globalFlags, state espht
 		return false, err
 	}
 	if cfg.MaxActionBytes > 0 && len(body) > cfg.MaxActionBytes {
-		return false, errors.New("live action command.send payload exceeds max_action_bytes")
+		return false, fmt.Errorf("live action %s payload exceeds max_action_bytes", actionName)
 	}
 	if err := publishIPCMessage(ctx, gf, fleet.ControlGroupID, []string{"fleet/commands"}, body); err != nil {
 		return false, fmt.Errorf("%w: %v", errLiveActionTransport, err)
@@ -1046,20 +1064,20 @@ func liveActionDecodePublicKey(raw string, field string, actionName string) ([]b
 	return decoded, nil
 }
 
-func liveCommandArgs(action liveAgentAction, commandAction string) (map[string]interface{}, error) {
+func liveCommandArgs(action liveAgentAction, commandAction, actionName string) (map[string]interface{}, error) {
 	args := make(map[string]interface{}, len(action.Args)+2)
 	for key, value := range action.Args {
 		args[key] = value
 	}
 	if strings.TrimSpace(action.Instruction) != "" {
 		if commandAction != esphttp.FleetCommandActionAgentInstruction {
-			return nil, errors.New("live action command.send instruction is only valid for agent.instruction")
+			return nil, fmt.Errorf("live action %s instruction is only valid for agent.instruction", actionName)
 		}
 		args["instruction"] = strings.TrimSpace(action.Instruction)
 	}
 	if action.TimeoutMS != 0 {
 		if commandAction != esphttp.FleetCommandActionAgentInstruction {
-			return nil, errors.New("live action command.send timeout_ms is only valid for agent.instruction")
+			return nil, fmt.Errorf("live action %s timeout_ms is only valid for agent.instruction", actionName)
 		}
 		args["timeout_ms"] = action.TimeoutMS
 	}
@@ -1069,21 +1087,21 @@ func liveCommandArgs(action liveAgentAction, commandAction string) (map[string]i
 	return args, nil
 }
 
-func liveCommandTarget(ctx context.Context, state esphttp.StateStore, fleetID string, action liveAgentAction) (esphttp.FleetCommandTarget, *entmoot.NodeInfo, error) {
+func liveCommandTarget(ctx context.Context, state esphttp.StateStore, fleetID string, action liveAgentAction, actionName string) (esphttp.FleetCommandTarget, *entmoot.NodeInfo, error) {
 	targetKind := esphttp.NormalizeFleetCommandTarget(action.Target)
 	target := esphttp.FleetCommandTarget{Kind: targetKind}
 	switch targetKind {
 	case esphttp.FleetCommandTargetAll:
 		if action.TargetNodeID != 0 {
-			return esphttp.FleetCommandTarget{}, nil, errors.New("live action command.send target_node_id requires target=node")
+			return esphttp.FleetCommandTarget{}, nil, fmt.Errorf("live action %s target_node_id requires target=node", actionName)
 		}
 		return target, nil, nil
 	case esphttp.FleetCommandTargetNode:
 		if action.TargetNodeID == 0 {
-			return esphttp.FleetCommandTarget{}, nil, errors.New("live action command.send target_node_id is required for node target")
+			return esphttp.FleetCommandTarget{}, nil, fmt.Errorf("live action %s target_node_id is required for node target", actionName)
 		}
 		if action.TargetNodeID > uint64(^uint32(0)) {
-			return esphttp.FleetCommandTarget{}, nil, fmt.Errorf("live action command.send target_node_id is too large: %d", action.TargetNodeID)
+			return esphttp.FleetCommandTarget{}, nil, fmt.Errorf("live action %s target_node_id is too large: %d", actionName, action.TargetNodeID)
 		}
 		member, err := liveActionFleetMember(ctx, state, fleetID, entmoot.NodeID(action.TargetNodeID))
 		if err != nil {
@@ -1093,7 +1111,7 @@ func liveCommandTarget(ctx context.Context, state esphttp.StateStore, fleetID st
 		target.PilotNodeID = info.PilotNodeID
 		return target, &info, nil
 	default:
-		return esphttp.FleetCommandTarget{}, nil, errors.New("live action command.send target is invalid")
+		return esphttp.FleetCommandTarget{}, nil, fmt.Errorf("live action %s target is invalid", actionName)
 	}
 }
 
