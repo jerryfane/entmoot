@@ -17,6 +17,7 @@ import (
 
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/esphttp"
+	"entmoot/pkg/entmoot/roster"
 	"entmoot/pkg/entmoot/store"
 )
 
@@ -31,6 +32,7 @@ const (
 	liveActionCommandSend      = "command.send"
 	liveActionInviteCreate     = "invite.create"
 	liveActionMemberRemove     = "member.remove"
+	liveActionMetadataUpdate   = "metadata.update"
 	liveActionAlertOwner       = "alert.owner"
 	liveCursorMaxSeenIDs       = 512
 	liveCursorOverlapWindow    = 10 * time.Minute
@@ -96,6 +98,7 @@ type liveAgentAction struct {
 	Hostname       string                 `json:"hostname,omitempty"`
 	ValidFor       string                 `json:"valid_for,omitempty"`
 	ValidUntilMS   int64                  `json:"valid_until_ms,omitempty"`
+	Metadata       json.RawMessage        `json:"metadata,omitempty"`
 	Args           map[string]interface{} `json:"args,omitempty"`
 	Instruction    string                 `json:"instruction,omitempty"`
 	TimeoutMS      int64                  `json:"timeout_ms,omitempty"`
@@ -190,7 +193,7 @@ func runAgentLiveScan(ctx context.Context, gf *globalFlags, state esphttp.StateS
 		AllowedActions: append([]string(nil), cfg.AllowedActions...),
 		Trigger:        liveTriggerForMode(cfg.Mode),
 		Events:         events,
-		Instructions:   "Return JSON only: {\"actions\":[{\"kind\":\"reply\",\"message\":\"...\"}]}. Supported local actions include reply, message.summarize, alert.owner, task.create with title, description, mode, fleet_id, and assignee_node_id, task.comment with fleet_id, task_id, and content, task.assign_self with fleet_id and task_id, task.update_own with fleet_id, task_id, and content, task.assign_others with fleet_id, task_id, and assignee_node_id, command.send with action, args, target, target_node_id, instruction, timeout_ms, expires_at_ms, and auto_accept, invite.create with fleet_id, target_node_id, target_pilot_pubkey, target_entmoot_pubkey, hostname, valid_for, and valid_until_ms, and member.remove with fleet_id and target_node_id. Entmoot will validate and apply allowed actions. Do not claim that you posted anything yourself.",
+		Instructions:   "Return JSON only: {\"actions\":[{\"kind\":\"reply\",\"message\":\"...\"}]}. Supported local actions include reply, message.summarize, alert.owner, task.create with title, description, mode, fleet_id, and assignee_node_id, task.comment with fleet_id, task_id, and content, task.assign_self with fleet_id and task_id, task.update_own with fleet_id, task_id, and content, task.assign_others with fleet_id, task_id, and assignee_node_id, command.send with action, args, target, target_node_id, instruction, timeout_ms, expires_at_ms, and auto_accept, invite.create with fleet_id, target_node_id, target_pilot_pubkey, target_entmoot_pubkey, hostname, valid_for, and valid_until_ms, member.remove with fleet_id and target_node_id, and metadata.update with a metadata JSON object. Entmoot will validate and apply allowed actions. Do not claim that you posted anything yourself.",
 	}
 	output, err := runLiveAgentRunner(ctx, runCfg, runnerCtx)
 	if err != nil {
@@ -431,6 +434,11 @@ func applyLiveAgentAction(ctx context.Context, gf *globalFlags, state esphttp.St
 			return false, errors.New("live action member.remove requires state store")
 		}
 		return applyLiveAgentMemberRemove(ctx, gf, state, cfg, action)
+	case liveActionMetadataUpdate:
+		if state == nil {
+			return false, errors.New("live action metadata.update requires state store")
+		}
+		return applyLiveAgentMetadataUpdate(ctx, gf, state, cfg, action)
 	default:
 		return false, fmt.Errorf("live action %q has no local executor yet", kind)
 	}
@@ -925,14 +933,47 @@ func applyLiveAgentMemberRemove(ctx context.Context, gf *globalFlags, state esph
 	return true, nil
 }
 
+func applyLiveAgentMetadataUpdate(ctx context.Context, gf *globalFlags, state esphttp.StateStore, cfg esphttp.LiveAgentConfig, action liveAgentAction) (bool, error) {
+	if _, ok := state.(esphttp.GroupMetadataStore); !ok {
+		return false, errors.New("live action metadata.update requires group metadata store")
+	}
+	if err := liveActionRequireGroupFounderPublisher(ctx, gf, cfg.GroupID, cfg.NodeID); err != nil {
+		return false, err
+	}
+	raw := bytes.TrimSpace(action.Metadata)
+	if len(raw) == 0 {
+		return false, errors.New("live action metadata.update requires metadata")
+	}
+	metadata, err := esphttp.NormalizeGroupMetadata(raw)
+	if err != nil {
+		return false, err
+	}
+	if cfg.MaxActionBytes > 0 && len(metadata) > cfg.MaxActionBytes {
+		return false, errors.New("live action metadata.update payload exceeds max_action_bytes")
+	}
+	exec := liveActionESPOperationExecutor(gf, state)
+	if _, err := exec.updateGroup(ctx, esphttp.SignRequest{
+		Kind:    "group_update",
+		GroupID: cfg.GroupID,
+		Payload: append(json.RawMessage(nil), metadata...),
+	}); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 func liveActionESPOperationExecutor(gf *globalFlags, state esphttp.StateStore) espOperationExecutor {
-	return espOperationExecutor{
+	exec := espOperationExecutor{
 		dataDir:         gf.data,
 		socketPath:      controlSocketPath(gf.data),
 		pilotSocketPath: gf.socket,
 		timeout:         30 * time.Second,
 		stateStore:      state,
 	}
+	if metadataStore, ok := state.(esphttp.GroupMetadataStore); ok {
+		exec.metadataStore = metadataStore
+	}
+	return exec
 }
 
 func liveActionOperationTransportError(err error) bool {
@@ -950,6 +991,35 @@ func liveActionRequireCoordinatorPublisher(ctx context.Context, gf *globalFlags,
 	}
 	if info.PilotNodeID != fleet.Coordinator.PilotNodeID || !bytes.Equal(info.EntmootPubKey, fleet.Coordinator.EntmootPubKey) {
 		return fmt.Errorf("live action %s requires the local publisher to match the Fleet coordinator", actionName)
+	}
+	return nil
+}
+
+func liveActionRequireGroupFounderPublisher(ctx context.Context, gf *globalFlags, groupID entmoot.GroupID, nodeID entmoot.NodeID) error {
+	info, err := infoOverIPCContext(ctx, controlSocketPath(gf.data))
+	if err != nil {
+		return fmt.Errorf("%w: %v", errLiveActionTransport, err)
+	}
+	if info.PilotNodeID != nodeID {
+		return fmt.Errorf("live action metadata.update requires the local publisher to match live node %d", nodeID)
+	}
+	if _, err := os.Stat(groupRosterPath(gf.data, groupID)); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("live action metadata.update requires group roster")
+		}
+		return err
+	}
+	rlog, err := roster.OpenJSONL(gf.data, groupID)
+	if err != nil {
+		return err
+	}
+	defer rlog.Close()
+	founder, ok := rlog.Founder()
+	if !ok {
+		return fmt.Errorf("live action metadata.update requires group founder")
+	}
+	if founder.PilotNodeID != info.PilotNodeID || !bytes.Equal(founder.EntmootPubKey, info.EntmootPubKey) {
+		return errors.New("live action metadata.update requires the local publisher to match the group founder")
 	}
 	return nil
 }

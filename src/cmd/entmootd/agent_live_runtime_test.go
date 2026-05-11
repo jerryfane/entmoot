@@ -16,6 +16,8 @@ import (
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/esphttp"
 	"entmoot/pkg/entmoot/ipc"
+	"entmoot/pkg/entmoot/keystore"
+	"entmoot/pkg/entmoot/roster"
 	"entmoot/pkg/entmoot/store"
 )
 
@@ -988,6 +990,173 @@ func TestApplyLiveAgentActionCommentsOnFleetTask(t *testing.T) {
 	}
 	if applied {
 		t.Fatal("capped comment applied = true, want false")
+	}
+}
+
+func TestApplyLiveAgentActionUpdatesGroupMetadata(t *testing.T) {
+	ctx := context.Background()
+	gid := testAgentLiveGroupID(35)
+	nodeID := entmoot.NodeID(7)
+	dataDir, err := os.MkdirTemp("/tmp", "entmoot-live-ipc-")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dataDir) })
+	state := esphttp.NewMemoryStateStore()
+	id, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	founder := entmoot.NodeInfo{PilotNodeID: nodeID, EntmootPubKey: append([]byte(nil), id.PublicKey...)}
+	createLiveActionRoster(t, dataDir, gid, id, founder)
+	topicsCh := make(chan []string, 1)
+	contentCh := make(chan []byte, 1)
+	stop := serveLiveInfoPublishCapture(t, controlSocketPath(dataDir), &ipc.InfoResp{
+		PilotNodeID:   founder.PilotNodeID,
+		EntmootPubKey: founder.EntmootPubKey,
+		Running:       true,
+	}, topicsCh, contentCh)
+	defer stop()
+	cfg := esphttp.LiveAgentConfig{
+		GroupID:        gid,
+		NodeID:         nodeID,
+		Enabled:        true,
+		Mode:           esphttp.LiveModeOperator,
+		AllowedActions: []string{liveActionMetadataUpdate},
+	}
+	applied, err := applyLiveAgentAction(ctx, &globalFlags{data: dataDir}, state, cfg, nil, liveAgentAction{
+		Kind:     liveActionMetadataUpdate,
+		Metadata: json.RawMessage(`{"name":"Ops","tags":["live","fleet"],"custom":{"level":2}}`),
+	})
+	if err != nil {
+		t.Fatalf("applyLiveAgentAction: %v", err)
+	}
+	if !applied {
+		t.Fatal("applied = false, want true")
+	}
+	raw, ok, err := state.GetGroupMetadata(ctx, gid)
+	if err != nil || !ok {
+		t.Fatalf("GetGroupMetadata ok/err = %v/%v", ok, err)
+	}
+	var metadata map[string]any
+	if err := json.Unmarshal(raw, &metadata); err != nil {
+		t.Fatalf("Unmarshal metadata: %v", err)
+	}
+	if metadata["name"] != "Ops" {
+		t.Fatalf("metadata = %+v, want name Ops", metadata)
+	}
+	select {
+	case topics := <-topicsCh:
+		t.Fatalf("unexpected metadata update publish topics = %+v", topics)
+	case <-time.After(50 * time.Millisecond):
+	}
+	cappedCfg := cfg
+	cappedCfg.MaxActionBytes = 4
+	applied, err = applyLiveAgentAction(ctx, &globalFlags{data: dataDir}, state, cappedCfg, nil, liveAgentAction{
+		Kind:     liveActionMetadataUpdate,
+		Metadata: json.RawMessage(`{"name":"Too long"}`),
+	})
+	if err == nil {
+		t.Fatal("capped metadata update err = nil, want max_action_bytes rejection")
+	}
+	if applied {
+		t.Fatal("capped metadata update applied = true, want false")
+	}
+}
+
+func TestApplyLiveAgentActionRejectsMetadataUpdateByNonFounder(t *testing.T) {
+	ctx := context.Background()
+	gid := testAgentLiveGroupID(36)
+	founderNodeID := entmoot.NodeID(7)
+	agentNodeID := entmoot.NodeID(8)
+	dataDir, err := os.MkdirTemp("/tmp", "entmoot-live-ipc-")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dataDir) })
+	state := esphttp.NewMemoryStateStore()
+	founderID, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate founder: %v", err)
+	}
+	agentID, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate agent: %v", err)
+	}
+	founder := entmoot.NodeInfo{PilotNodeID: founderNodeID, EntmootPubKey: append([]byte(nil), founderID.PublicKey...)}
+	agent := entmoot.NodeInfo{PilotNodeID: agentNodeID, EntmootPubKey: append([]byte(nil), agentID.PublicKey...)}
+	createLiveActionRoster(t, dataDir, gid, founderID, founder)
+	topicsCh := make(chan []string, 1)
+	contentCh := make(chan []byte, 1)
+	stop := serveLiveInfoPublishCapture(t, controlSocketPath(dataDir), &ipc.InfoResp{
+		PilotNodeID:   agent.PilotNodeID,
+		EntmootPubKey: agent.EntmootPubKey,
+		Running:       true,
+	}, topicsCh, contentCh)
+	defer stop()
+	cfg := esphttp.LiveAgentConfig{
+		GroupID:        gid,
+		NodeID:         agentNodeID,
+		Enabled:        true,
+		Mode:           esphttp.LiveModeOperator,
+		AllowedActions: []string{liveActionMetadataUpdate},
+	}
+	applied, err := applyLiveAgentAction(ctx, &globalFlags{data: dataDir}, state, cfg, nil, liveAgentAction{
+		Kind:     liveActionMetadataUpdate,
+		Metadata: json.RawMessage(`{"name":"Nope"}`),
+	})
+	if err == nil {
+		t.Fatal("applyLiveAgentAction err = nil, want founder authorization error")
+	}
+	if applied {
+		t.Fatal("applied = true, want false")
+	}
+	if _, ok, err := state.GetGroupMetadata(ctx, gid); err != nil || ok {
+		t.Fatalf("GetGroupMetadata ok/err = %v/%v, want no metadata", ok, err)
+	}
+}
+
+func TestApplyLiveAgentActionRejectsMetadataUpdateWithoutCreatingRoster(t *testing.T) {
+	ctx := context.Background()
+	gid := testAgentLiveGroupID(37)
+	nodeID := entmoot.NodeID(7)
+	dataDir, err := os.MkdirTemp("/tmp", "entmoot-live-ipc-")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dataDir) })
+	state := esphttp.NewMemoryStateStore()
+	id, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	topicsCh := make(chan []string, 1)
+	contentCh := make(chan []byte, 1)
+	stop := serveLiveInfoPublishCapture(t, controlSocketPath(dataDir), &ipc.InfoResp{
+		PilotNodeID:   nodeID,
+		EntmootPubKey: append([]byte(nil), id.PublicKey...),
+		Running:       true,
+	}, topicsCh, contentCh)
+	defer stop()
+	cfg := esphttp.LiveAgentConfig{
+		GroupID:        gid,
+		NodeID:         nodeID,
+		Enabled:        true,
+		Mode:           esphttp.LiveModeOperator,
+		AllowedActions: []string{liveActionMetadataUpdate},
+	}
+	applied, err := applyLiveAgentAction(ctx, &globalFlags{data: dataDir}, state, cfg, nil, liveAgentAction{
+		Kind:     liveActionMetadataUpdate,
+		Metadata: json.RawMessage(`{"name":"Missing roster"}`),
+	})
+	if err == nil {
+		t.Fatal("applyLiveAgentAction err = nil, want missing roster authorization error")
+	}
+	if applied {
+		t.Fatal("applied = true, want false")
+	}
+	if _, err := os.Stat(groupRosterPath(dataDir, gid)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("roster stat err = %v, want not exist", err)
 	}
 }
 
@@ -2174,6 +2343,18 @@ func serveLiveInfoRemoveDrop(t *testing.T, sock string, info *ipc.InfoResp, remo
 	return func() {
 		_ = ln.Close()
 		<-done
+	}
+}
+
+func createLiveActionRoster(t *testing.T, dataDir string, gid entmoot.GroupID, founderID *keystore.Identity, founder entmoot.NodeInfo) {
+	t.Helper()
+	rlog, err := roster.OpenJSONL(dataDir, gid)
+	if err != nil {
+		t.Fatalf("OpenJSONL: %v", err)
+	}
+	defer rlog.Close()
+	if err := rlog.Genesis(founderID, founder, 1_700_000_000_000); err != nil {
+		t.Fatalf("Genesis: %v", err)
 	}
 }
 
