@@ -891,6 +891,106 @@ func TestApplyLiveAgentActionUpdatesOwnFleetTask(t *testing.T) {
 	}
 }
 
+func TestApplyLiveAgentActionCommentsOnFleetTask(t *testing.T) {
+	ctx := context.Background()
+	gid := testAgentLiveGroupID(34)
+	coordinatorNodeID := entmoot.NodeID(7)
+	agentNodeID := entmoot.NodeID(8)
+	state := esphttp.NewMemoryStateStore()
+	coordinator := entmoot.NodeInfo{PilotNodeID: coordinatorNodeID, EntmootPubKey: []byte("coordinator-key")}
+	agent := entmoot.NodeInfo{PilotNodeID: agentNodeID, EntmootPubKey: []byte("agent-key")}
+	if _, err := state.CreateFleet(ctx, esphttp.FleetRecord{
+		FleetID:        "fleet-live",
+		Name:           "Live Fleet",
+		ControlGroupID: gid,
+		Coordinator:    coordinator,
+		CreatedAtMS:    1,
+	}); err != nil {
+		t.Fatalf("CreateFleet: %v", err)
+	}
+	for _, member := range []esphttp.FleetMemberRecord{
+		{FleetID: "fleet-live", NodeID: coordinatorNodeID, EntmootPubKey: base64.StdEncoding.EncodeToString(coordinator.EntmootPubKey), Role: esphttp.FleetRoleCoordinator, Status: esphttp.FleetMemberActive},
+		{FleetID: "fleet-live", NodeID: agentNodeID, EntmootPubKey: base64.StdEncoding.EncodeToString(agent.EntmootPubKey), Role: esphttp.FleetRoleAgent, Status: esphttp.FleetMemberActive},
+	} {
+		if _, err := state.UpsertFleetMember(ctx, member); err != nil {
+			t.Fatalf("UpsertFleetMember(%d): %v", member.NodeID, err)
+		}
+	}
+	if _, err := state.UpsertFleetTask(ctx, esphttp.FleetTaskRecord{
+		TaskID:      "task-comment",
+		FleetID:     "fleet-live",
+		Title:       "Commented task",
+		Description: "Task with comment",
+		Mode:        esphttp.FleetTaskModeOpenSubmission,
+		Status:      esphttp.FleetTaskStatusOpen,
+		Creator:     coordinator,
+		CreatedAtMS: 10,
+		UpdatedAtMS: 10,
+	}); err != nil {
+		t.Fatalf("UpsertFleetTask: %v", err)
+	}
+	before, found, err := state.GetFleetTask(ctx, "fleet-live", "task-comment")
+	if err != nil || !found {
+		t.Fatalf("GetFleetTask before found/err = %v/%v", found, err)
+	}
+	cfg := esphttp.LiveAgentConfig{
+		GroupID:        gid,
+		NodeID:         agentNodeID,
+		Enabled:        true,
+		Mode:           esphttp.LiveModeOperator,
+		AllowedActions: []string{liveActionTaskComment},
+	}
+	applied, err := applyLiveAgentAction(ctx, &globalFlags{data: t.TempDir()}, state, cfg, nil, liveAgentAction{
+		Kind:    liveActionTaskComment,
+		TaskID:  "task-comment",
+		Content: "Blocked until the invite is accepted",
+	})
+	if err != nil {
+		t.Fatalf("applyLiveAgentAction: %v", err)
+	}
+	if !applied {
+		t.Fatal("applied = false, want true")
+	}
+	task, found, err := state.GetFleetTask(ctx, "fleet-live", "task-comment")
+	if err != nil || !found {
+		t.Fatalf("GetFleetTask found/err = %v/%v", found, err)
+	}
+	if task.UpdatedAtMS != before.UpdatedAtMS || task.Status != esphttp.FleetTaskStatusOpen {
+		t.Fatalf("task = %+v, want comment without task mutation", task)
+	}
+	activity, err := state.ListFleetActivity(ctx, "fleet-live", 10, 0)
+	if err != nil {
+		t.Fatalf("ListFleetActivity: %v", err)
+	}
+	if len(activity) != 1 || activity[0].Type != "task.comment" || activity[0].Actor.PilotNodeID != agentNodeID {
+		t.Fatalf("activity = %+v, want one task.comment by live agent", activity)
+	}
+	var metadata struct {
+		TaskID  string `json:"task_id"`
+		Title   string `json:"task_title"`
+		Comment string `json:"comment"`
+	}
+	if err := json.Unmarshal(activity[0].Metadata, &metadata); err != nil {
+		t.Fatalf("Unmarshal activity metadata: %v", err)
+	}
+	if metadata.TaskID != "task-comment" || metadata.Title != "Commented task" || metadata.Comment != "Blocked until the invite is accepted" {
+		t.Fatalf("activity metadata = %+v, want task comment metadata", metadata)
+	}
+	cappedCfg := cfg
+	cappedCfg.MaxActionBytes = 4
+	applied, err = applyLiveAgentAction(ctx, &globalFlags{data: t.TempDir()}, state, cappedCfg, nil, liveAgentAction{
+		Kind:    liveActionTaskComment,
+		TaskID:  "task-comment",
+		Content: "too long",
+	})
+	if err == nil {
+		t.Fatal("capped comment err = nil, want max_action_bytes rejection")
+	}
+	if applied {
+		t.Fatal("capped comment applied = true, want false")
+	}
+}
+
 func TestApplyLiveAgentActionUpdatesOpenSubmissionTaskUsesSubmissionTime(t *testing.T) {
 	ctx := context.Background()
 	gid := testAgentLiveGroupID(28)

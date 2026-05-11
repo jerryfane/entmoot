@@ -24,6 +24,7 @@ const (
 	liveActionReply            = "reply"
 	liveActionMessageSummarize = "message.summarize"
 	liveActionTaskCreate       = "task.create"
+	liveActionTaskComment      = "task.comment"
 	liveActionTaskAssignSelf   = "task.assign_self"
 	liveActionTaskUpdateOwn    = "task.update_own"
 	liveActionTaskAssignOthers = "task.assign_others"
@@ -189,7 +190,7 @@ func runAgentLiveScan(ctx context.Context, gf *globalFlags, state esphttp.StateS
 		AllowedActions: append([]string(nil), cfg.AllowedActions...),
 		Trigger:        liveTriggerForMode(cfg.Mode),
 		Events:         events,
-		Instructions:   "Return JSON only: {\"actions\":[{\"kind\":\"reply\",\"message\":\"...\"}]}. Supported local actions include reply, message.summarize, alert.owner, task.create with title, description, mode, fleet_id, and assignee_node_id, task.assign_self with fleet_id and task_id, task.update_own with fleet_id, task_id, and content, task.assign_others with fleet_id, task_id, and assignee_node_id, command.send with action, args, target, target_node_id, instruction, timeout_ms, expires_at_ms, and auto_accept, invite.create with fleet_id, target_node_id, target_pilot_pubkey, target_entmoot_pubkey, hostname, valid_for, and valid_until_ms, and member.remove with fleet_id and target_node_id. Entmoot will validate and apply allowed actions. Do not claim that you posted anything yourself.",
+		Instructions:   "Return JSON only: {\"actions\":[{\"kind\":\"reply\",\"message\":\"...\"}]}. Supported local actions include reply, message.summarize, alert.owner, task.create with title, description, mode, fleet_id, and assignee_node_id, task.comment with fleet_id, task_id, and content, task.assign_self with fleet_id and task_id, task.update_own with fleet_id, task_id, and content, task.assign_others with fleet_id, task_id, and assignee_node_id, command.send with action, args, target, target_node_id, instruction, timeout_ms, expires_at_ms, and auto_accept, invite.create with fleet_id, target_node_id, target_pilot_pubkey, target_entmoot_pubkey, hostname, valid_for, and valid_until_ms, and member.remove with fleet_id and target_node_id. Entmoot will validate and apply allowed actions. Do not claim that you posted anything yourself.",
 	}
 	output, err := runLiveAgentRunner(ctx, runCfg, runnerCtx)
 	if err != nil {
@@ -395,6 +396,11 @@ func applyLiveAgentAction(ctx context.Context, gf *globalFlags, state esphttp.St
 			return false, errors.New("live action task.create requires state store")
 		}
 		return applyLiveAgentTaskCreate(ctx, gf, state, cfg, action)
+	case liveActionTaskComment:
+		if state == nil {
+			return false, errors.New("live action task.comment requires state store")
+		}
+		return applyLiveAgentTaskComment(ctx, gf, state, cfg, action)
 	case liveActionTaskAssignSelf:
 		if state == nil {
 			return false, errors.New("live action task.assign_self requires state store")
@@ -516,6 +522,39 @@ func applyLiveAgentTaskCreate(ctx context.Context, gf *globalFlags, state esphtt
 		}
 		publishLiveFleetTaskEvent(ctx, gf, fleet, mutation, task, actor)
 	}
+	return true, nil
+}
+
+func applyLiveAgentTaskComment(ctx context.Context, gf *globalFlags, state esphttp.StateStore, cfg esphttp.LiveAgentConfig, action liveAgentAction) (bool, error) {
+	fleet, actor, task, err := liveActionFleetTask(ctx, state, cfg.GroupID, cfg.NodeID, action)
+	if err != nil {
+		return false, err
+	}
+	content, err := esphttp.NormalizeFleetTaskSubmissionContent(firstNonEmpty(action.Content, action.Message, action.Description))
+	if err != nil {
+		return false, err
+	}
+	if cfg.MaxActionBytes > 0 && len([]byte(content)) > cfg.MaxActionBytes {
+		return false, errors.New("live action task.comment payload exceeds max_action_bytes")
+	}
+	now := time.Now().UnixMilli()
+	metadata, _ := json.Marshal(map[string]any{
+		"task_id":    task.TaskID,
+		"task_title": task.Title,
+		"comment":    content,
+	})
+	activity, err := state.AppendFleetActivity(ctx, esphttp.FleetActivityRecord{
+		FleetID:     fleet.FleetID,
+		Type:        "task.comment",
+		Actor:       esphttp.FleetTaskActorFromMember(actor),
+		Summary:     "Task comment",
+		Metadata:    metadata,
+		CreatedAtMS: now,
+	})
+	if err != nil {
+		return false, err
+	}
+	publishLiveFleetTaskCommentEvent(ctx, gf, fleet, task, actor, activity.CreatedAtMS, content)
 	return true, nil
 }
 
@@ -1054,6 +1093,29 @@ func publishLiveFleetTaskEventAt(ctx context.Context, gf *globalFlags, fleet esp
 		"title":            task.Title,
 		"actor_node_id":    actor.NodeID,
 		"summary":          mutation.Summary,
+		"created_at_ms":    createdAtMS,
+	})
+	if err != nil {
+		return
+	}
+	_ = publishIPCMessage(ctx, gf, fleet.ControlGroupID, []string{"fleet/tasks"}, body)
+}
+
+func publishLiveFleetTaskCommentEvent(ctx context.Context, gf *globalFlags, fleet esphttp.FleetRecord, task esphttp.FleetTaskRecord, actor esphttp.FleetMemberRecord, createdAtMS int64, comment string) {
+	if fleet.ControlGroupID == (entmoot.GroupID{}) {
+		return
+	}
+	body, err := json.Marshal(map[string]any{
+		"type":             "fleet.task",
+		"fleet_id":         fleet.FleetID,
+		"control_group_id": fleet.ControlGroupID,
+		"task_id":          task.TaskID,
+		"action":           "comment",
+		"status":           task.Status,
+		"title":            task.Title,
+		"actor_node_id":    actor.NodeID,
+		"summary":          "Task comment",
+		"comment":          comment,
 		"created_at_ms":    createdAtMS,
 	})
 	if err != nil {
