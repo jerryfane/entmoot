@@ -40,8 +40,6 @@ var defaultLiveActions = []string{
 	"member.remove",
 	"metadata.update",
 	"external.message.send",
-	"webhook.call",
-	"shell.run",
 }
 
 type LiveAgentState struct {

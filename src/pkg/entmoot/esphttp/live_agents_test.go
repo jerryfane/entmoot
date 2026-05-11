@@ -257,6 +257,18 @@ func TestLiveAgentConfigRejectsUnknownActions(t *testing.T) {
 	}
 }
 
+func TestDefaultLiveActionsExcludeUnsupportedExecutors(t *testing.T) {
+	unknown := UnknownLiveActions([]string{"webhook.call", "shell.run"})
+	if len(unknown) != 2 || unknown[0] != "shell.run" || unknown[1] != "webhook.call" {
+		t.Fatalf("unsupported executor actions = %v, want shell.run and webhook.call rejected", unknown)
+	}
+	for _, action := range DefaultLiveActions() {
+		if action == "webhook.call" || action == "shell.run" {
+			t.Fatalf("DefaultLiveActions includes unsupported executor action %q", action)
+		}
+	}
+}
+
 func TestMemoryDeleteLiveAgentConfigDoesNotInsertMissingPresence(t *testing.T) {
 	ctx := context.Background()
 	store := NewMemoryStateStore()
