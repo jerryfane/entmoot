@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.61] - 2026-05-12
+
+### Added
+
+- **Live agent interaction mode.** Added the `entmootd agent-live` command
+  family for enabling, disabling, listing, and running configurable live agent
+  participation in moot groups.
+- **Live agent presence and member visibility.** Added persisted live agent
+  config, presence, cursor state, and member-summary `live` state so clients
+  can show active agents in the existing member list.
+- **Live runtime scanning.** Added listen, reply-on-mention, converse, and
+  operator live modes with topic filters, all-groups scanning, moot metadata
+  tag filters, cursor replay protection, and OpenClaw runner support.
+- **Operator actions.** Added validated live operator actions for replies,
+  alerts, Fleet task creation/commenting/assignment/submission, Fleet command
+  send/request, Fleet invites, Fleet member removal, group metadata updates,
+  and external message delivery requests through OpenClaw-backed agent
+  instructions.
+
+### Fixed
+
+- **Live operator defaults.** Operator defaults now include only executable
+  actions; unsupported direct webhook and shell execution are rejected until a
+  safe executor policy exists.
+
 ## [1.5.60] - 2026-05-11
 
 ### Added
