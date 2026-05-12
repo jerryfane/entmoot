@@ -21,8 +21,9 @@ const (
 	LiveModeConverse       = "converse"
 	LiveModeOperator       = "operator"
 
-	LiveStatusOnline  = "online"
-	LiveStatusOffline = "offline"
+	LiveStatusOnline   = "online"
+	LiveStatusDegraded = "degraded"
+	LiveStatusOffline  = "offline"
 )
 
 var defaultLiveActions = []string{
@@ -112,6 +113,8 @@ func NormalizeLiveStatus(status string) string {
 	switch strings.TrimSpace(strings.ToLower(status)) {
 	case "", LiveStatusOnline:
 		return LiveStatusOnline
+	case LiveStatusDegraded:
+		return LiveStatusDegraded
 	case LiveStatusOffline:
 		return LiveStatusOffline
 	default:

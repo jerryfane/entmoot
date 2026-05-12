@@ -7,6 +7,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/signal"
 	"sort"
@@ -18,6 +19,13 @@ import (
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/esphttp"
 	"entmoot/pkg/entmoot/store"
+)
+
+const (
+	defaultAgentLiveRunTimeout = 90 * time.Second
+	defaultAgentLiveRunLease   = 150 * time.Second
+	defaultAgentLiveBackoffMin = 30 * time.Second
+	defaultAgentLiveBackoffMax = 5 * time.Minute
 )
 
 type agentLiveConfig struct {
@@ -44,6 +52,25 @@ type agentLiveRunGroup struct {
 type agentLiveRunGroupScan struct {
 	GroupID entmoot.GroupID     `json:"group_id"`
 	Scan    agentLiveScanResult `json:"scan"`
+}
+
+type agentLiveBackoffKey struct {
+	groupID entmoot.GroupID
+	nodeID  entmoot.NodeID
+}
+
+type agentLiveBackoffEntry struct {
+	attempt        int
+	nextAttemptAt  time.Time
+	nextAttemptMS  int64
+	lastErrKind    string
+	lastErrMessage string
+}
+
+type agentLiveBackoffTracker struct {
+	min     time.Duration
+	max     time.Duration
+	entries map[agentLiveBackoffKey]agentLiveBackoffEntry
 }
 
 type agentLiveRunState interface {
@@ -267,9 +294,9 @@ func cmdAgentLiveRun(gf *globalFlags, args []string) int {
 	fs.BoolVar(&allGroups, "all-groups", false, "run every enabled live config for this node")
 	fs.Var(&tags, "tag", "moot metadata tag filter for -all-groups; may be repeated")
 	fs.DurationVar(&interval, "interval", 10*time.Second, "heartbeat interval")
-	fs.DurationVar(&lease, "lease", 45*time.Second, "presence lease duration")
+	fs.DurationVar(&lease, "lease", defaultAgentLiveRunLease, "presence lease duration")
 	fs.StringVar(&runner, "runner", firstNonEmpty(os.Getenv("ENTMOOT_AGENT_RUNNER"), os.Getenv("ENTMOOT_AGENT_COMMAND_HOOK")), "agent runtime adapter executable, or \"openclaw\" for the built-in OpenClaw adapter")
-	fs.DurationVar(&timeout, "timeout", 30*time.Second, "agent runtime timeout; must be shorter than -lease")
+	fs.DurationVar(&timeout, "timeout", defaultAgentLiveRunTimeout, "agent runtime timeout; must be shorter than -lease")
 	fs.IntVar(&scanLimit, "limit", 20, "maximum matched messages to send to the agent per scan")
 	fs.BoolVar(&once, "once", false, "renew presence once")
 	fs.BoolVar(&jsonOut, "json", false, "print JSON summary")
@@ -368,7 +395,8 @@ func cmdAgentLiveRun(gf *globalFlags, args []string) int {
 		return exitTransport
 	}
 	defer msgStore.Close()
-	bindings, scans, err := scanAgentLiveRunGroups(ctx, gf, state, msgStore, groups, nodeID, lease, !allGroups, runCfg)
+	backoffs := newAgentLiveBackoffTracker(defaultAgentLiveBackoffMin, defaultAgentLiveBackoffMax)
+	bindings, scans, err := scanAgentLiveRunGroups(ctx, gf, state, msgStore, groups, nodeID, lease, !allGroups, runCfg, backoffs)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "agent-live run: %v\n", err)
 		return exitTransport
@@ -394,7 +422,7 @@ func cmdAgentLiveRun(gf *globalFlags, args []string) int {
 					return exitInvalidArgument
 				}
 			}
-			bindings, scans, err = scanAgentLiveRunGroups(ctx, gf, state, msgStore, groups, nodeID, lease, !allGroups, runCfg)
+			bindings, scans, err = scanAgentLiveRunGroups(ctx, gf, state, msgStore, groups, nodeID, lease, !allGroups, runCfg, backoffs)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "agent-live run: %v\n", err)
 				return exitTransport
@@ -531,6 +559,10 @@ func renewAgentLiveRunBindings(ctx context.Context, state esphttp.StateStore, gr
 }
 
 func renewAgentLiveRunBinding(ctx context.Context, state esphttp.StateStore, gid entmoot.GroupID, nodeID entmoot.NodeID, lease time.Duration, requireAll bool) (agentLiveRunBinding, bool, error) {
+	return renewAgentLiveRunBindingStatus(ctx, state, gid, nodeID, lease, requireAll, esphttp.LiveStatusOnline)
+}
+
+func renewAgentLiveRunBindingStatus(ctx context.Context, state esphttp.StateStore, gid entmoot.GroupID, nodeID entmoot.NodeID, lease time.Duration, requireAll bool, status string) (agentLiveRunBinding, bool, error) {
 	cfg, found, err := state.GetLiveAgentConfig(ctx, gid, nodeID)
 	if err != nil {
 		return agentLiveRunBinding{}, false, err
@@ -545,7 +577,7 @@ func renewAgentLiveRunBinding(ctx context.Context, state esphttp.StateStore, gid
 	presence, err := state.UpsertLiveAgentPresence(ctx, esphttp.LiveAgentPresence{
 		GroupID:      gid,
 		NodeID:       nodeID,
-		Status:       esphttp.LiveStatusOnline,
+		Status:       status,
 		Mode:         cfg.Mode,
 		TopicFilters: cfg.TopicFilters,
 		LastSeenAtMS: now,
@@ -558,7 +590,7 @@ func renewAgentLiveRunBinding(ctx context.Context, state esphttp.StateStore, gid
 	return agentLiveRunBinding{Config: cfg, Presence: presence}, true, nil
 }
 
-func scanAgentLiveRunGroups(ctx context.Context, gf *globalFlags, state esphttp.StateStore, msgStore store.MessageStore, groups []agentLiveRunGroup, nodeID entmoot.NodeID, lease time.Duration, requireAll bool, runCfg agentLiveRuntimeConfig) ([]agentLiveRunBinding, []agentLiveRunGroupScan, error) {
+func scanAgentLiveRunGroups(ctx context.Context, gf *globalFlags, state esphttp.StateStore, msgStore store.MessageStore, groups []agentLiveRunGroup, nodeID entmoot.NodeID, lease time.Duration, requireAll bool, runCfg agentLiveRuntimeConfig, backoffs *agentLiveBackoffTracker) ([]agentLiveRunBinding, []agentLiveRunGroupScan, error) {
 	bindings := make([]agentLiveRunBinding, 0, len(groups))
 	scans := make([]agentLiveRunGroupScan, 0, len(groups))
 	for _, group := range groups {
@@ -571,9 +603,49 @@ func scanAgentLiveRunGroups(ctx context.Context, gf *globalFlags, state esphttp.
 		}
 		groupRunCfg := runCfg
 		groupRunCfg.groupID = binding.Config.GroupID
+		backoffKey := agentLiveBackoffKey{groupID: binding.Config.GroupID, nodeID: nodeID}
+		if scan, ok := backoffScanResult(backoffs, backoffKey, time.Now()); ok {
+			refreshed, ok, err := renewAgentLiveRunBindingStatus(ctx, state, group.GroupID, nodeID, lease, requireAll, esphttp.LiveStatusDegraded)
+			if err != nil {
+				return bindings, scans, err
+			}
+			if ok {
+				binding = refreshed
+			}
+			bindings = append(bindings, binding)
+			scans = append(scans, agentLiveRunGroupScan{GroupID: binding.Config.GroupID, Scan: scan})
+			continue
+		}
 		scan, err := runAgentLiveScan(ctx, gf, state, msgStore, binding.Config, groupRunCfg)
 		if err != nil {
-			return bindings, scans, err
+			kind, ok := liveRecoverableErrorKind(err)
+			if !ok {
+				return bindings, scans, err
+			}
+			nextAttemptMS := int64(0)
+			if backoffs != nil {
+				nextAttemptMS = backoffs.RecordFailure(backoffKey, time.Now(), kind, err).UnixMilli()
+			}
+			scan = recoverableLiveScanResult(scan, kind, err, nextAttemptMS)
+			slog.Warn("agent-live run: recoverable scan error",
+				slog.String("group_id", binding.Config.GroupID.String()),
+				slog.Uint64("node_id", uint64(nodeID)),
+				slog.String("kind", kind),
+				slog.Int64("next_attempt_at_ms", nextAttemptMS),
+				slog.String("err", err.Error()))
+			refreshed, ok, renewErr := renewAgentLiveRunBindingStatus(ctx, state, group.GroupID, nodeID, lease, requireAll, esphttp.LiveStatusDegraded)
+			if renewErr != nil {
+				return bindings, scans, renewErr
+			}
+			if ok {
+				binding = refreshed
+			}
+			bindings = append(bindings, binding)
+			scans = append(scans, agentLiveRunGroupScan{GroupID: binding.Config.GroupID, Scan: scan})
+			continue
+		}
+		if backoffs != nil {
+			backoffs.Reset(backoffKey)
 		}
 		refreshed, ok, err := renewAgentLiveRunBinding(ctx, state, group.GroupID, nodeID, lease, requireAll)
 		if err != nil {
@@ -586,6 +658,144 @@ func scanAgentLiveRunGroups(ctx context.Context, gf *globalFlags, state esphttp.
 		scans = append(scans, agentLiveRunGroupScan{GroupID: binding.Config.GroupID, Scan: scan})
 	}
 	return bindings, scans, nil
+}
+
+func newAgentLiveBackoffTracker(minDelay, maxDelay time.Duration) *agentLiveBackoffTracker {
+	if minDelay <= 0 {
+		minDelay = defaultAgentLiveBackoffMin
+	}
+	if maxDelay < minDelay {
+		maxDelay = minDelay
+	}
+	return &agentLiveBackoffTracker{
+		min:     minDelay,
+		max:     maxDelay,
+		entries: make(map[agentLiveBackoffKey]agentLiveBackoffEntry),
+	}
+}
+
+func (b *agentLiveBackoffTracker) RecordFailure(key agentLiveBackoffKey, now time.Time, kind string, err error) time.Time {
+	if b == nil {
+		return time.Time{}
+	}
+	entry := b.entries[key]
+	entry.attempt++
+	delay := agentLiveBackoffDelay(b.min, b.max, entry.attempt, key)
+	entry.nextAttemptAt = now.Add(delay)
+	entry.nextAttemptMS = entry.nextAttemptAt.UnixMilli()
+	entry.lastErrKind = kind
+	entry.lastErrMessage = liveScanErrorMessage(err)
+	b.entries[key] = entry
+	return entry.nextAttemptAt
+}
+
+func (b *agentLiveBackoffTracker) Reset(key agentLiveBackoffKey) {
+	if b == nil {
+		return
+	}
+	delete(b.entries, key)
+}
+
+func (b *agentLiveBackoffTracker) Active(key agentLiveBackoffKey, now time.Time) (agentLiveBackoffEntry, bool) {
+	if b == nil {
+		return agentLiveBackoffEntry{}, false
+	}
+	entry, ok := b.entries[key]
+	if !ok || !now.Before(entry.nextAttemptAt) {
+		return agentLiveBackoffEntry{}, false
+	}
+	return entry, true
+}
+
+func backoffScanResult(backoffs *agentLiveBackoffTracker, key agentLiveBackoffKey, now time.Time) (agentLiveScanResult, bool) {
+	entry, ok := backoffs.Active(key, now)
+	if !ok {
+		return agentLiveScanResult{}, false
+	}
+	errKind := entry.lastErrKind
+	if errKind == "" {
+		errKind = "backoff"
+	}
+	errMessage := entry.lastErrMessage
+	if errMessage == "" {
+		errMessage = "live runner retry backoff active"
+	}
+	return agentLiveScanResult{
+		Status:          agentLiveScanStatusBackoff,
+		ErrorKind:       errKind,
+		Error:           errMessage,
+		NextAttemptAtMS: entry.nextAttemptMS,
+	}, true
+}
+
+func agentLiveBackoffDelay(minDelay, maxDelay time.Duration, attempt int, key agentLiveBackoffKey) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	delay := minDelay
+	for i := 1; i < attempt; i++ {
+		if delay >= maxDelay/2 {
+			delay = maxDelay
+			break
+		}
+		delay *= 2
+	}
+	if delay > maxDelay {
+		delay = maxDelay
+	}
+	jitterWindow := delay / 4
+	if jitterWindow > 0 {
+		delay += agentLiveBackoffJitter(jitterWindow, attempt, key)
+	}
+	if delay > maxDelay {
+		return maxDelay
+	}
+	return delay
+}
+
+func agentLiveBackoffJitter(window time.Duration, attempt int, key agentLiveBackoffKey) time.Duration {
+	var h uint64 = 1469598103934665603
+	for _, b := range key.groupID {
+		h ^= uint64(b)
+		h *= 1099511628211
+	}
+	h ^= uint64(key.nodeID)
+	h *= 1099511628211
+	h ^= uint64(attempt)
+	h *= 1099511628211
+	return time.Duration(h % uint64(window+1))
+}
+
+func recoverableLiveScanResult(scan agentLiveScanResult, kind string, err error, nextAttemptMS int64) agentLiveScanResult {
+	scan.Status = agentLiveScanStatusError
+	scan.ErrorKind = kind
+	scan.Error = liveScanErrorMessage(err)
+	scan.NextAttemptAtMS = nextAttemptMS
+	return scan
+}
+
+func liveRecoverableErrorKind(err error) (string, bool) {
+	switch {
+	case errors.Is(err, errLiveRunnerTimeout):
+		return liveRecoverableRunnerTimeout, true
+	case errors.Is(err, errLiveRunnerInvalidJSON):
+		return liveRecoverableRunnerInvalidJSON, true
+	case errors.Is(err, errLiveRunnerFailed):
+		return liveRecoverableRunnerFailed, true
+	case errors.Is(err, errLiveActionTransport):
+		return liveRecoverableActionTransport, true
+	default:
+		return "", false
+	}
+}
+
+func liveScanErrorMessage(err error) string {
+	msg := strings.TrimSpace(err.Error())
+	const max = 512
+	if len(msg) > max {
+		return msg[:max] + "..."
+	}
+	return msg
 }
 
 func printAgentLiveRunJSON(allGroups bool, bindings []agentLiveRunBinding, scans []agentLiveRunGroupScan) int {

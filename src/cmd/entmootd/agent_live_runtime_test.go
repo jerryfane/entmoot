@@ -2206,6 +2206,249 @@ func TestParseLiveRunnerOutputExtractsJSON(t *testing.T) {
 	}
 }
 
+func TestParseLiveRunnerOutputClassifiesInvalidJSON(t *testing.T) {
+	_, err := parseLiveRunnerOutput("not-json")
+	if !errors.Is(err, errLiveRunnerInvalidJSON) {
+		t.Fatalf("parseLiveRunnerOutput err = %v, want invalid JSON classification", err)
+	}
+}
+
+func TestRunLiveAgentRunnerCustomRuntimeReceivesContextAndEnv(t *testing.T) {
+	ctx := context.Background()
+	tempDir := t.TempDir()
+	t.Setenv("ENTMOOT_TEST_DIR", tempDir)
+	gid := testAgentLiveGroupID(51)
+	runner := filepath.Join(tempDir, "runner.sh")
+	if err := os.WriteFile(runner, []byte(`#!/bin/sh
+cat > "$ENTMOOT_TEST_DIR/stdin.json"
+{
+  printf '%s\n' "$ENTMOOT_LIVE_GROUP_ID"
+  printf '%s\n' "$ENTMOOT_LIVE_NODE_ID"
+  printf '%s\n' "$ENTMOOT_LIVE_MODE"
+} > "$ENTMOOT_TEST_DIR/env.txt"
+printf '{"actions":[]}'
+`), 0o700); err != nil {
+		t.Fatalf("WriteFile runner: %v", err)
+	}
+	output, err := runLiveAgentRunner(ctx, agentLiveRuntimeConfig{
+		groupID: gid,
+		nodeID:  7,
+		runner:  runner,
+		timeout: time.Second,
+		limit:   10,
+	}, liveAgentRunnerContext{
+		GroupID: gid,
+		NodeID:  7,
+		Mode:    esphttp.LiveModeConverse,
+		Events:  []liveAgentRunnerMessage{{Content: "hello"}},
+	})
+	if err != nil {
+		t.Fatalf("runLiveAgentRunner: %v", err)
+	}
+	if len(output.Actions) != 0 {
+		t.Fatalf("actions = %+v, want none", output.Actions)
+	}
+	envData, err := os.ReadFile(filepath.Join(tempDir, "env.txt"))
+	if err != nil {
+		t.Fatalf("ReadFile env: %v", err)
+	}
+	wantEnv := gid.String() + "\n7\n" + esphttp.LiveModeConverse + "\n"
+	if string(envData) != wantEnv {
+		t.Fatalf("env = %q, want %q", envData, wantEnv)
+	}
+	stdinData, err := os.ReadFile(filepath.Join(tempDir, "stdin.json"))
+	if err != nil {
+		t.Fatalf("ReadFile stdin: %v", err)
+	}
+	if !bytes.Contains(stdinData, []byte(`"group_id":"`+gid.String()+`"`)) || !bytes.Contains(stdinData, []byte(`"mode":"converse"`)) {
+		t.Fatalf("stdin context = %s, missing live context", stdinData)
+	}
+}
+
+func TestRunLiveAgentRunnerTimeoutIsRecoverableDeadline(t *testing.T) {
+	ctx := context.Background()
+	tempDir := t.TempDir()
+	runner := filepath.Join(tempDir, "runner.sh")
+	if err := os.WriteFile(runner, []byte("#!/bin/sh\necho slow >&2\nsleep 1\n"), 0o700); err != nil {
+		t.Fatalf("WriteFile runner: %v", err)
+	}
+	_, err := runLiveAgentRunner(ctx, agentLiveRuntimeConfig{
+		groupID: testAgentLiveGroupID(52),
+		nodeID:  7,
+		runner:  runner,
+		timeout: 20 * time.Millisecond,
+		limit:   10,
+	}, liveAgentRunnerContext{
+		GroupID: testAgentLiveGroupID(52),
+		NodeID:  7,
+		Mode:    esphttp.LiveModeConverse,
+		Events:  []liveAgentRunnerMessage{{Content: "hello"}},
+	})
+	if !errors.Is(err, errLiveRunnerTimeout) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("runLiveAgentRunner err = %v, want runner timeout and deadline", err)
+	}
+}
+
+func TestOpenClawLiveAgentArgsPreserveCommandShape(t *testing.T) {
+	clearOpenClawRunnerEnv(t)
+	t.Setenv("ENTMOOT_OPENCLAW_AGENT", "mars")
+	args := openClawLiveAgentArgs(agentLiveRuntimeConfig{timeout: 90 * time.Second}, `{"ok":true}`)
+	want := []string{
+		"agent",
+		"--agent", "mars",
+		"--message", "Entmoot live interaction context JSON:\n" + `{"ok":true}`,
+		"--json",
+		"--timeout", "90",
+	}
+	if strings.Join(args, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("args = %#v, want %#v", args, want)
+	}
+}
+
+func TestScanAgentLiveRunGroupsTimeoutDegradesAndBacksOff(t *testing.T) {
+	ctx := context.Background()
+	tempDir := t.TempDir()
+	t.Setenv("ENTMOOT_TEST_DIR", tempDir)
+	gid := testAgentLiveGroupID(53)
+	nodeID := entmoot.NodeID(7)
+	state := esphttp.NewMemoryStateStore()
+	msgStore := store.NewMemory()
+	msg := testAgentLiveMessage(gid, 11, 100, "chat", "hello")
+	if err := msgStore.Put(ctx, msg); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if _, err := state.UpsertLiveAgentConfig(ctx, esphttp.LiveAgentConfig{
+		GroupID:      gid,
+		NodeID:       nodeID,
+		Enabled:      true,
+		Mode:         esphttp.LiveModeConverse,
+		TopicFilters: []string{"chat"},
+		UpdatedAtMS:  1,
+	}); err != nil {
+		t.Fatalf("UpsertLiveAgentConfig: %v", err)
+	}
+	slowRunner := filepath.Join(tempDir, "slow.sh")
+	if err := os.WriteFile(slowRunner, []byte("#!/bin/sh\necho slow >&2\nsleep 1\n"), 0o700); err != nil {
+		t.Fatalf("WriteFile slow runner: %v", err)
+	}
+	backoffs := newAgentLiveBackoffTracker(50*time.Millisecond, time.Second)
+	bindings, scans, err := scanAgentLiveRunGroups(ctx, &globalFlags{}, state, msgStore, []agentLiveRunGroup{{GroupID: gid, Mode: esphttp.LiveModeConverse}}, nodeID, time.Second, true, agentLiveRuntimeConfig{
+		nodeID:  nodeID,
+		runner:  slowRunner,
+		timeout: 20 * time.Millisecond,
+		limit:   10,
+	}, backoffs)
+	if err != nil {
+		t.Fatalf("scanAgentLiveRunGroups: %v", err)
+	}
+	if len(bindings) != 1 || bindings[0].Presence.Status != esphttp.LiveStatusDegraded {
+		t.Fatalf("bindings = %+v, want degraded presence", bindings)
+	}
+	if len(scans) != 1 || scans[0].Scan.Status != agentLiveScanStatusError || scans[0].Scan.ErrorKind != liveRecoverableRunnerTimeout || scans[0].Scan.NextAttemptAtMS == 0 {
+		t.Fatalf("scans = %+v, want timeout degraded scan", scans)
+	}
+	if _, ok, err := state.GetLiveAgentCursor(ctx, gid, nodeID); err != nil || ok {
+		t.Fatalf("GetLiveAgentCursor ok/err = %v/%v, want no consumed cursor", ok, err)
+	}
+
+	fastRunner := filepath.Join(tempDir, "fast.sh")
+	if err := os.WriteFile(fastRunner, []byte(`#!/bin/sh
+printf ran > "$ENTMOOT_TEST_DIR/ran"
+printf '{"actions":[]}'
+`), 0o700); err != nil {
+		t.Fatalf("WriteFile fast runner: %v", err)
+	}
+	bindings, scans, err = scanAgentLiveRunGroups(ctx, &globalFlags{}, state, msgStore, []agentLiveRunGroup{{GroupID: gid, Mode: esphttp.LiveModeConverse}}, nodeID, time.Second, true, agentLiveRuntimeConfig{
+		nodeID:  nodeID,
+		runner:  fastRunner,
+		timeout: time.Second,
+		limit:   10,
+	}, backoffs)
+	if err != nil {
+		t.Fatalf("scanAgentLiveRunGroups during backoff: %v", err)
+	}
+	if len(scans) != 1 || scans[0].Scan.Status != agentLiveScanStatusBackoff || scans[0].Scan.ErrorKind != liveRecoverableRunnerTimeout {
+		t.Fatalf("backoff scans = %+v, want backoff scan", scans)
+	}
+	if _, err := os.Stat(filepath.Join(tempDir, "ran")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("runner executed during backoff, stat err = %v", err)
+	}
+
+	key := agentLiveBackoffKey{groupID: gid, nodeID: nodeID}
+	entry := backoffs.entries[key]
+	entry.nextAttemptAt = time.Now().Add(-time.Millisecond)
+	backoffs.entries[key] = entry
+	bindings, scans, err = scanAgentLiveRunGroups(ctx, &globalFlags{}, state, msgStore, []agentLiveRunGroup{{GroupID: gid, Mode: esphttp.LiveModeConverse}}, nodeID, time.Second, true, agentLiveRuntimeConfig{
+		nodeID:  nodeID,
+		runner:  fastRunner,
+		timeout: time.Second,
+		limit:   10,
+	}, backoffs)
+	if err != nil {
+		t.Fatalf("scanAgentLiveRunGroups after backoff: %v", err)
+	}
+	if len(bindings) != 1 || bindings[0].Presence.Status != esphttp.LiveStatusOnline {
+		t.Fatalf("bindings after success = %+v, want online presence", bindings)
+	}
+	if len(scans) != 1 || scans[0].Scan.Status != agentLiveScanStatusOK {
+		t.Fatalf("success scans = %+v, want ok scan", scans)
+	}
+	if _, ok := backoffs.entries[key]; ok {
+		t.Fatalf("backoff entry still present after success: %+v", backoffs.entries[key])
+	}
+	if _, err := os.Stat(filepath.Join(tempDir, "ran")); err != nil {
+		t.Fatalf("runner did not execute after backoff: %v", err)
+	}
+	cursor, ok, err := state.GetLiveAgentCursor(ctx, gid, nodeID)
+	if err != nil || !ok {
+		t.Fatalf("GetLiveAgentCursor ok/err = %v/%v, want consumed cursor", ok, err)
+	}
+	if cursor.LastSeenMessageID != msg.ID {
+		t.Fatalf("cursor.LastSeenMessageID = %s, want %s", cursor.LastSeenMessageID, msg.ID)
+	}
+}
+
+func TestScanAgentLiveRunGroupsActionTransportDegrades(t *testing.T) {
+	ctx := context.Background()
+	gid := testAgentLiveGroupID(54)
+	nodeID := entmoot.NodeID(7)
+	state := esphttp.NewMemoryStateStore()
+	msgStore := store.NewMemory()
+	msg := testAgentLiveMessage(gid, 11, 100, "chat", "hello")
+	if err := msgStore.Put(ctx, msg); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if _, err := state.UpsertLiveAgentConfig(ctx, esphttp.LiveAgentConfig{
+		GroupID:      gid,
+		NodeID:       nodeID,
+		Enabled:      true,
+		Mode:         esphttp.LiveModeConverse,
+		TopicFilters: []string{"chat"},
+		UpdatedAtMS:  1,
+	}); err != nil {
+		t.Fatalf("UpsertLiveAgentConfig: %v", err)
+	}
+	runner := filepath.Join(t.TempDir(), "runner.sh")
+	if err := os.WriteFile(runner, []byte("#!/bin/sh\nprintf '{\"actions\":[{\"kind\":\"reply\",\"message\":\"ok\"}]}'\n"), 0o700); err != nil {
+		t.Fatalf("WriteFile runner: %v", err)
+	}
+	bindings, scans, err := scanAgentLiveRunGroups(ctx, &globalFlags{data: t.TempDir()}, state, msgStore, []agentLiveRunGroup{{GroupID: gid, Mode: esphttp.LiveModeConverse}}, nodeID, time.Second, true, agentLiveRuntimeConfig{
+		nodeID:  nodeID,
+		runner:  runner,
+		timeout: time.Second,
+		limit:   10,
+	}, newAgentLiveBackoffTracker(50*time.Millisecond, time.Second))
+	if err != nil {
+		t.Fatalf("scanAgentLiveRunGroups: %v", err)
+	}
+	if len(bindings) != 1 || bindings[0].Presence.Status != esphttp.LiveStatusDegraded {
+		t.Fatalf("bindings = %+v, want degraded presence", bindings)
+	}
+	if len(scans) != 1 || scans[0].Scan.Status != agentLiveScanStatusError || scans[0].Scan.ErrorKind != liveRecoverableActionTransport {
+		t.Fatalf("scans = %+v, want action transport degraded scan", scans)
+	}
+}
+
 func TestAgentLiveRunGroupsFiltersByTags(t *testing.T) {
 	ctx := context.Background()
 	dataDir := t.TempDir()

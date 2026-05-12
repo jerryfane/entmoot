@@ -51,9 +51,37 @@ func TestLiveAgentStateExpiresLease(t *testing.T) {
 	}
 }
 
+func TestLiveAgentStatePreservesDegradedUntilLeaseExpires(t *testing.T) {
+	gid := testLiveGroupID(2)
+	configs := []LiveAgentConfig{{
+		GroupID:     gid,
+		NodeID:      7,
+		Enabled:     true,
+		Mode:        LiveModeConverse,
+		UpdatedAtMS: 10,
+	}}
+	presences := []LiveAgentPresence{{
+		GroupID:      gid,
+		NodeID:       7,
+		Status:       LiveStatusDegraded,
+		Mode:         LiveModeConverse,
+		LastSeenAtMS: 20,
+		LeaseUntilMS: 40,
+		UpdatedAtMS:  20,
+	}}
+	states := LiveAgentStatesByNode(configs, presences, 30)
+	if states[7].Status != LiveStatusDegraded {
+		t.Fatalf("active degraded live status = %q, want degraded", states[7].Status)
+	}
+	states = LiveAgentStatesByNode(configs, presences, 41)
+	if states[7].Status != LiveStatusOffline {
+		t.Fatalf("expired degraded live status = %q, want offline", states[7].Status)
+	}
+}
+
 func TestLiveAgentConfigPersists(t *testing.T) {
 	ctx := context.Background()
-	gid := testLiveGroupID(2)
+	gid := testLiveGroupID(3)
 	for _, tc := range []struct {
 		name  string
 		store StateStore

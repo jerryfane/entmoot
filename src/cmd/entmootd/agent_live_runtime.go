@@ -40,7 +40,23 @@ const (
 	liveCursorOverlapWindow    = 10 * time.Minute
 )
 
-var errLiveActionTransport = errors.New("live action transport")
+const (
+	agentLiveScanStatusOK      = "ok"
+	agentLiveScanStatusError   = "error"
+	agentLiveScanStatusBackoff = "backoff"
+
+	liveRecoverableRunnerTimeout     = "runner_timeout"
+	liveRecoverableRunnerFailed      = "runner_failed"
+	liveRecoverableRunnerInvalidJSON = "runner_invalid_json"
+	liveRecoverableActionTransport   = "action_transport"
+)
+
+var (
+	errLiveActionTransport   = errors.New("live action transport")
+	errLiveRunnerTimeout     = errors.New("live runner timeout")
+	errLiveRunnerFailed      = errors.New("live runner failed")
+	errLiveRunnerInvalidJSON = errors.New("live runner invalid json")
+)
 
 type agentLiveRuntimeConfig struct {
 	groupID entmoot.GroupID
@@ -51,11 +67,15 @@ type agentLiveRuntimeConfig struct {
 }
 
 type agentLiveScanResult struct {
-	Seen     int `json:"seen"`
-	Matched  int `json:"matched"`
-	Proposed int `json:"proposed"`
-	Applied  int `json:"applied"`
-	Rejected int `json:"rejected"`
+	Status          string `json:"status,omitempty"`
+	Seen            int    `json:"seen"`
+	Matched         int    `json:"matched"`
+	Proposed        int    `json:"proposed"`
+	Applied         int    `json:"applied"`
+	Rejected        int    `json:"rejected"`
+	ErrorKind       string `json:"error_kind,omitempty"`
+	Error           string `json:"error,omitempty"`
+	NextAttemptAtMS int64  `json:"next_attempt_at_ms,omitempty"`
 }
 
 type liveAgentRunnerContext struct {
@@ -112,7 +132,7 @@ type liveAgentAction struct {
 }
 
 func runAgentLiveScan(ctx context.Context, gf *globalFlags, state esphttp.StateStore, msgStore store.MessageStore, cfg esphttp.LiveAgentConfig, runCfg agentLiveRuntimeConfig) (agentLiveScanResult, error) {
-	var result agentLiveScanResult
+	result := agentLiveScanResult{Status: agentLiveScanStatusOK}
 	cursor, ok, err := state.GetLiveAgentCursor(ctx, cfg.GroupID, cfg.NodeID)
 	if err != nil {
 		return result, err
@@ -280,41 +300,53 @@ func runLiveAgentRunner(ctx context.Context, cfg agentLiveRuntimeConfig, liveCtx
 		return liveAgentRunnerOutput{}, err
 	}
 	if strings.EqualFold(runner, agentCommandRunnerOpenClaw) {
-		selectorFlag, selectorValue := openClawAgentSelector()
-		args := []string{
-			"agent",
-			selectorFlag, selectorValue,
-			"--message", "Entmoot live interaction context JSON:\n" + string(data),
-			"--json",
-			"--timeout", strconv.Itoa(agentLiveTimeoutSeconds(cfg.timeout)),
-		}
+		args := openClawLiveAgentArgs(cfg, string(data))
 		cmd := exec.CommandContext(runnerCtx, openClawBinary(), args...)
 		run := runLiveRuntimeProcess(cmd, nil, liveCtx)
 		if runnerCtx.Err() != nil {
-			return liveAgentRunnerOutput{}, fmt.Errorf("OpenClaw live interaction timed out: %s", strings.TrimSpace(run.stderr))
+			return liveAgentRunnerOutput{}, liveRunnerTimeoutError("OpenClaw live interaction timed out", runnerCtx.Err(), run.stderr)
 		}
 		if run.err != nil {
-			output := strings.TrimSpace(run.stderr)
-			if output == "" {
-				output = run.err.Error()
-			}
-			return liveAgentRunnerOutput{}, fmt.Errorf("OpenClaw live interaction failed: %s", addAgentRuntimeFailureAdvice(output))
+			return liveAgentRunnerOutput{}, liveRunnerFailedError("OpenClaw live interaction failed", run)
 		}
 		return parseLiveRunnerOutput(openClawLiveFinalText(run.stdout))
 	}
 	cmd := exec.CommandContext(runnerCtx, runner)
 	run := runLiveRuntimeProcess(cmd, data, liveCtx)
 	if runnerCtx.Err() != nil {
-		return liveAgentRunnerOutput{}, fmt.Errorf("live agent runtime timed out: %s", strings.TrimSpace(run.stderr))
+		return liveAgentRunnerOutput{}, liveRunnerTimeoutError("live agent runtime timed out", runnerCtx.Err(), run.stderr)
 	}
 	if run.err != nil {
-		output := strings.TrimSpace(run.stderr)
-		if output == "" {
-			output = run.err.Error()
-		}
-		return liveAgentRunnerOutput{}, fmt.Errorf("live agent runtime failed: %s", addAgentRuntimeFailureAdvice(output))
+		return liveAgentRunnerOutput{}, liveRunnerFailedError("live agent runtime failed", run)
 	}
 	return parseLiveRunnerOutput(run.stdout)
+}
+
+func openClawLiveAgentArgs(cfg agentLiveRuntimeConfig, contextJSON string) []string {
+	selectorFlag, selectorValue := openClawAgentSelector()
+	return []string{
+		"agent",
+		selectorFlag, selectorValue,
+		"--message", "Entmoot live interaction context JSON:\n" + contextJSON,
+		"--json",
+		"--timeout", strconv.Itoa(agentLiveTimeoutSeconds(cfg.timeout)),
+	}
+}
+
+func liveRunnerTimeoutError(prefix string, ctxErr error, stderr string) error {
+	output := strings.TrimSpace(stderr)
+	if output == "" {
+		return fmt.Errorf("%w: %w: %s", errLiveRunnerTimeout, ctxErr, prefix)
+	}
+	return fmt.Errorf("%w: %w: %s: %s", errLiveRunnerTimeout, ctxErr, prefix, output)
+}
+
+func liveRunnerFailedError(prefix string, run agentRuntimeProcessResult) error {
+	output := strings.TrimSpace(run.stderr)
+	if output == "" && run.err != nil {
+		output = run.err.Error()
+	}
+	return fmt.Errorf("%w: %s: %s", errLiveRunnerFailed, prefix, addAgentRuntimeFailureAdvice(output))
 }
 
 func runLiveRuntimeProcess(cmd *exec.Cmd, stdin []byte, liveCtx liveAgentRunnerContext) agentRuntimeProcessResult {
@@ -349,7 +381,7 @@ func parseLiveRunnerOutput(stdout string) (liveAgentRunnerOutput, error) {
 			return output, nil
 		}
 	}
-	return liveAgentRunnerOutput{}, fmt.Errorf("live agent runtime returned invalid JSON")
+	return liveAgentRunnerOutput{}, fmt.Errorf("%w: live agent runtime returned invalid JSON", errLiveRunnerInvalidJSON)
 }
 
 func openClawLiveFinalText(stdout string) string {

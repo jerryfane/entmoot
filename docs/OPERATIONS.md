@@ -154,9 +154,13 @@ peers, and changelog stay aligned.
 
    The custom command runner receives instruction JSON on stdin. The live
    runner receives live context JSON on stdin and must return
-   `{"actions":[...]}`. `bootstrap agent` does not install runtimes or manage
-   supervisors; keep `serve`, `agent-commands watch`, and `agent-live run`
-   under the existing container or service manager.
+   `{"actions":[...]}`. `agent-live run` treats per-scan runner timeouts,
+   runner failures, invalid runner JSON, and retryable action transport errors
+   as degraded scan results with capped backoff, so one slow agent turn does not
+   stop live presence renewal. `bootstrap agent` does not install runtimes or
+   manage supervisors; keep `serve`, `agent-commands watch`, and
+   `agent-live run` under the existing container or service manager for host
+   restarts, crashes, upgrades, and fatal config or storage errors.
 
    Live-agent config is scoped by `group_id + node_id` and is stored in the
    current data root's `esp.sqlite`. The default per-moot live limits are
@@ -189,6 +193,7 @@ peers, and changelog stay aligned.
    If Hermes or another agent runs inside its own container, VPS-local status
    commands can legitimately show no live config unless they read the same
    `esp.sqlite`.
+
 7. Verify every peer reports:
 
    ```sh

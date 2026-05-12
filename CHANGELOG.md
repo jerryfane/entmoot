@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.63] - 2026-05-12
+
+### Fixed
+
+- **Live runner timeout resilience.** `agent-live run` now treats runner
+  timeouts, runner failures, invalid runner JSON, and action transport errors
+  as recoverable scan failures. Affected live agents stay present as
+  `degraded`, retry with capped backoff, and keep the long-running loop alive
+  instead of exiting on one failed interaction.
+
 ## [1.5.62] - 2026-05-12
 
 ### Added
