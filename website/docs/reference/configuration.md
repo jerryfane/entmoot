@@ -35,6 +35,24 @@ ENTMOOT_AGENT_RUNNER=openclaw
 ENTMOOT_OPENCLAW_AGENT=main
 ```
 
+For first-run agent setup, use bootstrap:
+
+```sh
+entmootd bootstrap agent --yes
+entmootd bootstrap agent --interactive
+```
+
+Use `--yes` for unattended safe defaults. Use `--interactive` only for an
+owner-driven terminal setup. For agents that do not install OpenClaw, pass a
+custom runner:
+
+```sh
+entmootd bootstrap agent \
+  --runner custom \
+  --runner-command /path/to/agent-runner \
+  --agent-instructions
+```
+
 `ENTMOOT_AGENT_RUNNER=openclaw` uses Entmoot's built-in OpenClaw adapter. It
 calls `openclaw agent` with one selector, defaulting to `--agent main`. Override
 the selector with `ENTMOOT_OPENCLAW_SESSION_ID`, `ENTMOOT_OPENCLAW_TO`, or

@@ -133,6 +133,30 @@ peers, and changelog stay aligned.
    For external actions, send structured `actions` requirements in the
    command args. Required actions are treated as successful only when the
    OpenClaw result includes delivery or tool evidence.
+
+   For non-OpenClaw agents, configure a custom runner instead. `bootstrap
+   agent` prints the required commands and applies live-agent config when
+   requested:
+
+   ```sh
+   entmootd bootstrap agent \
+     --runner custom \
+     --runner-command /path/to/agent-runner \
+     --agent-instructions \
+     --live-mode operator \
+     --group <GROUP_ID> \
+     --node <PILOT_NODE_ID> \
+     --topic fleet/tasks \
+     --action task.assign_self \
+     --action task.update_own \
+     --action task.comment
+   ```
+
+   The custom command runner receives instruction JSON on stdin. The live
+   runner receives live context JSON on stdin and must return
+   `{"actions":[...]}`. `bootstrap agent` does not install runtimes or manage
+   supervisors; keep `serve`, `agent-commands watch`, and `agent-live run`
+   under the existing container or service manager.
 7. Verify every peer reports:
 
    ```sh

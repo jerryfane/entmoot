@@ -76,6 +76,8 @@ func run() int {
 		fmt.Fprintln(os.Stderr, "                          Print a compact peer health table for one group.")
 		fmt.Fprintln(os.Stderr, "  env [--json]")
 		fmt.Fprintln(os.Stderr, "                          Inspect runtime paths, sockets, wrappers, and namespace hints.")
+		fmt.Fprintln(os.Stderr, "  bootstrap agent [--yes|--interactive] [flags]")
+		fmt.Fprintln(os.Stderr, "                          Plan and apply local agent runner/live-mode setup.")
 		fmt.Fprintln(os.Stderr, "  tail [-topic PAT] [-group GID] [-n N]")
 		fmt.Fprintln(os.Stderr, "                          SQLite backfill + live subscription from the control socket.")
 		fmt.Fprintln(os.Stderr, "  info                    Print a JSON snapshot (reads SQLite directly).")
@@ -179,6 +181,8 @@ func run() int {
 		return cmdPeers(gf, args[1:])
 	case "env":
 		return cmdEnv(gf, args[1:])
+	case "bootstrap":
+		return cmdBootstrap(gf, args[1:])
 	case "tail":
 		return cmdTail(gf, args[1:])
 	case "info":

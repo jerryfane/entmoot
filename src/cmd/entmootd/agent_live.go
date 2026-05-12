@@ -113,26 +113,20 @@ func cmdAgentLiveEnable(gf *globalFlags, args []string) int {
 		fmt.Fprintf(os.Stderr, "agent-live enable: unknown -action value(s): %s\n", strings.Join(unknown, ", "))
 		return exitInvalidArgument
 	}
-	actions := esphttp.NormalizeLiveActions([]string(cfg.actions))
-	if mode == esphttp.LiveModeOperator && len(actions) == 0 {
-		actions = esphttp.DefaultLiveActions()
-	}
 	state, err := esphttp.OpenSQLiteStateStore(gf.data)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "agent-live enable: %v\n", err)
 		return exitTransport
 	}
 	defer state.Close()
-	rec, err := state.UpsertLiveAgentConfig(context.Background(), esphttp.LiveAgentConfig{
-		GroupID:           gid,
-		NodeID:            nodeID,
-		Enabled:           true,
-		Mode:              mode,
-		TopicFilters:      topics,
-		AllowedActions:    actions,
-		MaxActionsPerScan: cfg.maxActionsPerScan,
-		MaxActionBytes:    cfg.maxActionBytes,
-		UpdatedAtMS:       time.Now().UnixMilli(),
+	rec, err := enableAgentLiveConfig(context.Background(), state, enableAgentLiveConfigOptions{
+		groupID:           gid,
+		nodeID:            nodeID,
+		mode:              mode,
+		topics:            topics,
+		actions:           []string(cfg.actions),
+		maxActionsPerScan: cfg.maxActionsPerScan,
+		maxActionBytes:    cfg.maxActionBytes,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "agent-live enable: %v\n", err)
@@ -143,6 +137,34 @@ func cmdAgentLiveEnable(gf *globalFlags, args []string) int {
 	}
 	fmt.Fprintf(os.Stdout, "enabled live %s for node %d in group %s\n", rec.Mode, rec.NodeID, cfg.group)
 	return exitOK
+}
+
+type enableAgentLiveConfigOptions struct {
+	groupID           entmoot.GroupID
+	nodeID            entmoot.NodeID
+	mode              string
+	topics            []string
+	actions           []string
+	maxActionsPerScan int
+	maxActionBytes    int
+}
+
+func enableAgentLiveConfig(ctx context.Context, state esphttp.StateStore, opts enableAgentLiveConfigOptions) (esphttp.LiveAgentConfig, error) {
+	actions := esphttp.NormalizeLiveActions(opts.actions)
+	if opts.mode == esphttp.LiveModeOperator && len(actions) == 0 {
+		actions = esphttp.DefaultLiveActions()
+	}
+	return state.UpsertLiveAgentConfig(ctx, esphttp.LiveAgentConfig{
+		GroupID:           opts.groupID,
+		NodeID:            opts.nodeID,
+		Enabled:           true,
+		Mode:              opts.mode,
+		TopicFilters:      append([]string(nil), opts.topics...),
+		AllowedActions:    actions,
+		MaxActionsPerScan: opts.maxActionsPerScan,
+		MaxActionBytes:    opts.maxActionBytes,
+		UpdatedAtMS:       time.Now().UnixMilli(),
+	})
 }
 
 func cmdAgentLiveDisable(gf *globalFlags, args []string) int {
