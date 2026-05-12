@@ -82,7 +82,7 @@ func run() int {
 		fmt.Fprintln(os.Stderr, "                          SQLite backfill + live subscription from the control socket.")
 		fmt.Fprintln(os.Stderr, "  info                    Print a JSON snapshot (reads SQLite directly).")
 		fmt.Fprintln(os.Stderr, "  query -group GID [...]  Historical SQLite query with JSON-line output.")
-		fmt.Fprintln(os.Stderr, "  fleet <list|info|activity>")
+		fmt.Fprintln(os.Stderr, "  fleet <list|info|activity|tasks|commands>")
 		fmt.Fprintln(os.Stderr, "                          Inspect local Fleet control-plane state.")
 		fmt.Fprintln(os.Stderr, "  agent-commands <watch|run-once|status>")
 		fmt.Fprintln(os.Stderr, "                          Process queued local agent instructions.")

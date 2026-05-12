@@ -1,11 +1,18 @@
-#    Entmoot CLI Design (v1 draft)
+# Entmoot CLI Design (historical v1 draft)
 
-**Status:** design document. No code changes yet. This spec pins the
-target CLI surface for an AI-agent-friendly `entmootd`, as the
-prerequisite for writing a skill.md and for building install automation.
-Once implemented, this document becomes the contract for what
-`entmootd` does; until then, the current `v0` CLI in
-`src/cmd/entmootd/main.go` remains authoritative.
+**Status:** historical design document. The v1 CLI has been implemented and
+extended since this draft was written. Treat this file as background on the
+original command model, not as the current contract.
+
+Current command truth lives in:
+
+- `entmootd --help`
+- `website/docs/cli/*.md`
+- the command implementations under `src/cmd/entmootd/`
+
+The current CLI includes the original mesh commands plus `bootstrap agent`,
+`fleet`, `agent-commands`, `agent-live`, ESP device/sign-request commands, and
+update helpers.
 
 ---
 

@@ -157,6 +157,38 @@ peers, and changelog stay aligned.
    `{"actions":[...]}`. `bootstrap agent` does not install runtimes or manage
    supervisors; keep `serve`, `agent-commands watch`, and `agent-live run`
    under the existing container or service manager.
+
+   Live-agent config is scoped by `group_id + node_id` and is stored in the
+   current data root's `esp.sqlite`. The default per-moot live limits are
+   unlimited: `-max-actions 0` and `-max-action-bytes 0`. Add explicit caps for
+   busy groups:
+
+   ```sh
+   entmootd agent-live enable \
+     -group <GROUP_ID> \
+     -node <PILOT_NODE_ID> \
+     -mode operator \
+     -topic fleet/tasks \
+     -action task.assign_self \
+     -action task.update_own \
+     -action task.comment \
+     -max-actions 3 \
+     -max-action-bytes 4096
+   ```
+
+   Inspect from the same namespace and data root as the agent:
+
+   ```sh
+   entmootd agent-commands status
+   entmootd agent-live status -group <GROUP_ID> --json
+   entmootd fleet list
+   entmootd fleet commands catalog
+   ENTMOOT_ESP_URL=<ESP_URL> entmootd fleet tasks list -fleet <FLEET_ID>
+   ```
+
+   If Hermes or another agent runs inside its own container, VPS-local status
+   commands can legitimately show no live config unless they read the same
+   `esp.sqlite`.
 7. Verify every peer reports:
 
    ```sh

@@ -371,9 +371,14 @@ Default setup:
 - Live mode is off until enabled.
 - `agent-live enable` defaults to `reply_on_mention`.
 - No `-topic` means `#`.
+- `-max-actions 0` and `-max-action-bytes 0` mean unlimited; there is no
+  default product-level per-moot action quota.
 - Runtime defaults: interval `10s`, lease `45s`, timeout `30s`, scan limit
   `20`.
 - Non-listen modes need `-runner` or `ENTMOOT_AGENT_RUNNER`.
+- Config, presence, cursors, Fleet tasks, Fleet commands, and the local
+  instruction queue are stored in `esp.sqlite` for the current `-data` path.
+  Run status commands from the same container/data root as the agent.
 
 Modes:
 
@@ -426,6 +431,9 @@ Inspect or disable:
 "$ENTMOOT" agent-live status -group <gid> --json
 "$ENTMOOT" agent-live disable -group <gid> -node <pilot-node-id>
 ```
+
+If a node enabled live mode inside its own container, a VPS or host shell using
+another data root can correctly show empty `configs` and `presence`.
 
 Operator actions available by default:
 

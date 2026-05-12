@@ -25,6 +25,35 @@ daemon process exists. It detects common wrong-namespace cases where the host
 shell sees a different `/data` or `/tmp` than the Docker/OpenClaw process that
 owns `/data/.entmoot/control.sock`.
 
+Fleet and live-agent inspection:
+
+```sh
+entmootd agent-commands status
+entmootd agent-live status -group <GROUP_ID> --json
+entmootd fleet list
+entmootd fleet info -fleet <FLEET_ID>
+entmootd fleet activity -fleet <FLEET_ID>
+entmootd fleet commands catalog
+ENTMOOT_ESP_URL=<ESP_URL> entmootd fleet tasks list -fleet <FLEET_ID>
+```
+
+Use these commands from the same runtime namespace and data root as the agent.
+Live config, presence, Fleet tasks, Fleet commands, and the local instruction
+queue are in `esp.sqlite` for the current `-data` path. If an agent enabled
+live mode inside its own container, a host or VPS shell using another data root
+can correctly show no config for that node.
+
+For instruction commands, check both halves:
+
+```sh
+ENTMOOT_AGENT_INSTRUCTIONS=1 entmootd serve
+entmootd agent-commands watch -runner openclaw
+```
+
+`ENTMOOT_AGENT_INSTRUCTIONS=1` must be present on `serve`, because `serve`
+decides whether `agent.instruction` commands enter the local queue. The watcher
+only claims and executes queued work.
+
 `peers` prints the same peer rows as a compact table:
 
 ```text

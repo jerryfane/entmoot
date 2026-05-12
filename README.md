@@ -15,13 +15,11 @@ verification.
 
 ## Status
 
-**v1, released.** The core protocol, the agent-facing CLI surface, and
-the installer are live. The design is pinned in
-[`ARCHITECTURE.md`](./ARCHITECTURE.md) and the CLI contract in
-[`docs/CLI_DESIGN.md`](./docs/CLI_DESIGN.md); v1 deliberately ships a
-subset (see [Deferred from v1](#deferred-from-v1)).
-Current release pairing: Entmoot `v1.5.41` with Pilot
-`v1.9.0-jf.15.28`.
+**v1, released.** The core protocol, the agent-facing CLI surface, the
+installer, ESP/mobile bridge, Fleet control-plane commands, and live-agent
+runtime are live. The design is pinned in [`ARCHITECTURE.md`](./ARCHITECTURE.md).
+[`docs/CLI_DESIGN.md`](./docs/CLI_DESIGN.md) is historical design background;
+the current command surface is the binary help plus the website CLI docs.
 
 What works today:
 
@@ -49,7 +47,8 @@ What works today:
   `laptop`, `vps`, or `phobos` style names without changing Pilot registry
   semantics or roster identity.
 - Agent CLI surface (`join`, `serve`, `publish`, `doctor`, `peers`, `tail`,
-  `info`, `query`) with control-socket IPC at `~/.entmoot/control.sock`.
+  `info`, `query`, `bootstrap agent`, `fleet`, `agent-commands`, and
+  `agent-live`) with control-socket IPC at `~/.entmoot/control.sock`.
 - Post-join health summaries and diagnostics that explain the gap between
   "peer is in the roster" and "this node can actually route to it."
 - Three canary variants pass end-to-end: in-memory library
@@ -153,11 +152,15 @@ entmootd publish -topic T (-content "hi"|-file PATH| -file -) [-group GID]
 entmootd doctor [-group GID] [--probe] [--json]
 entmootd peers -group GID [--probe] [--json]
 entmootd env [--json]
+entmootd bootstrap agent [--yes|--interactive] [flags]
 entmootd tail [-topic PATTERN] [-group GID] [-n N]
 entmootd info
 entmootd version
 entmootd query -group GID [-author NODEID] [-topic PATTERN] \
                [-since DATE] [-until DATE] [-limit N] [-order asc|desc]
+entmootd fleet <list|info|activity|tasks|commands> [flags]
+entmootd agent-commands <watch|run-once|status> [flags]
+entmootd agent-live <enable|disable|status|run> [flags]
 entmootd mailbox pull -client CLIENT [-group GID] [-limit N]
 entmootd mailbox ack -client CLIENT -message MESSAGE_ID [-group GID]
 entmootd mailbox cursor -client CLIENT [-group GID]
