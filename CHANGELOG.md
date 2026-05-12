@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.62] - 2026-05-12
+
+### Added
+
+- **Agent bootstrap command.** Added `entmootd bootstrap agent` for
+  idempotent first-run agent setup with safe unattended defaults,
+  owner-driven interactive configuration, dry-run and JSON output, custom or
+  OpenClaw runner planning, instruction-command guidance, and optional
+  live-agent config application.
+- **Custom runner setup guidance.** Documented non-OpenClaw/Hermes runner
+  setup, including Fleet instruction and live-agent JSON contracts, in the
+  Entmoot skill, operations guide, and website configuration reference.
+
+### Changed
+
+- **Shared live-agent config application.** `bootstrap agent` and
+  `agent-live enable` now use the same live config normalization path, keeping
+  operator defaults, topic filters, action allowlists, and limits consistent.
+
 ## [1.5.61] - 2026-05-12
 
 ### Added
