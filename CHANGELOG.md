@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.64] - 2026-05-14
+
+### Fixed
+
+- **Live runner command envelope handling.** `agent-live run` now unwraps
+  completed command-runner envelopes whose `output` contains live
+  `{"actions":[...]}` JSON, while rejecting empty output, malformed live
+  schemas, and failed or non-completed envelopes so cursors are not consumed
+  without applying replies.
+
 ## [1.5.63] - 2026-05-12
 
 ### Fixed

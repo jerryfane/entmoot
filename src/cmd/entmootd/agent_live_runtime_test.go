@@ -437,6 +437,68 @@ func TestRunAgentLiveScanHonorsMaxActionsPerScan(t *testing.T) {
 	<-topicsCh
 }
 
+func TestRunAgentLiveScanUnwrapsCommandRunnerOutput(t *testing.T) {
+	ctx := context.Background()
+	gid := testAgentLiveGroupID(55)
+	nodeID := entmoot.NodeID(7)
+	state := esphttp.NewMemoryStateStore()
+	msgStore := store.NewMemory()
+	msg := testAgentLiveMessage(gid, 11, 100, "chat", "hello")
+	if err := msgStore.Put(ctx, msg); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	cfg, err := state.UpsertLiveAgentConfig(ctx, esphttp.LiveAgentConfig{
+		GroupID:      gid,
+		NodeID:       nodeID,
+		Enabled:      true,
+		Mode:         esphttp.LiveModeConverse,
+		TopicFilters: []string{"chat"},
+		UpdatedAtMS:  1,
+	})
+	if err != nil {
+		t.Fatalf("UpsertLiveAgentConfig: %v", err)
+	}
+	runner := filepath.Join(t.TempDir(), "runner.sh")
+	if err := os.WriteFile(runner, []byte(`#!/bin/sh
+cat <<'JSON'
+{"status":"completed","summary":"done","output":"{\"actions\":[{\"kind\":\"reply\",\"message\":\"wrapped\"}]}"}
+JSON
+`), 0o700); err != nil {
+		t.Fatalf("WriteFile runner: %v", err)
+	}
+	dataDir, err := os.MkdirTemp("/tmp", "entmoot-live-ipc-")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dataDir) })
+	topicsCh := make(chan []string, 1)
+	stop := serveLivePublishCapture(t, controlSocketPath(dataDir), topicsCh)
+	defer stop()
+	result, err := runAgentLiveScan(ctx, &globalFlags{data: dataDir}, state, msgStore, cfg, agentLiveRuntimeConfig{
+		groupID: gid,
+		nodeID:  nodeID,
+		runner:  runner,
+		timeout: time.Second,
+		limit:   10,
+	})
+	if err != nil {
+		t.Fatalf("runAgentLiveScan: %v", err)
+	}
+	if result.Proposed != 1 || result.Applied != 1 || result.Rejected != 0 {
+		t.Fatalf("result = %+v, want one applied unwrapped action", result)
+	}
+	if topics := <-topicsCh; len(topics) != 1 || topics[0] != "chat" {
+		t.Fatalf("topics = %+v, want chat", topics)
+	}
+	cursor, ok, err := state.GetLiveAgentCursor(ctx, gid, nodeID)
+	if err != nil || !ok {
+		t.Fatalf("GetLiveAgentCursor ok/err = %v/%v", ok, err)
+	}
+	if cursor.LastSeenMessageID != msg.ID {
+		t.Fatalf("cursor.LastSeenMessageID = %s, want %s", cursor.LastSeenMessageID, msg.ID)
+	}
+}
+
 func TestRunAgentLiveScanLimitAdvancesOnlySentBatch(t *testing.T) {
 	ctx := context.Background()
 	gid := testAgentLiveGroupID(5)
@@ -2206,10 +2268,43 @@ func TestParseLiveRunnerOutputExtractsJSON(t *testing.T) {
 	}
 }
 
+func TestParseLiveRunnerOutputAllowsExplicitNoActions(t *testing.T) {
+	output, err := parseLiveRunnerOutput(`{"actions":[]}`)
+	if err != nil {
+		t.Fatalf("parseLiveRunnerOutput: %v", err)
+	}
+	if len(output.Actions) != 0 {
+		t.Fatalf("actions = %+v, want none", output.Actions)
+	}
+}
+
+func TestParseLiveRunnerOutputUnwrapsCommandRunnerOutput(t *testing.T) {
+	output, err := parseLiveRunnerOutput(`{"status":"completed","summary":"done","output":"{\"actions\":[{\"kind\":\"reply\",\"message\":\"wrapped\"}]}"}`)
+	if err != nil {
+		t.Fatalf("parseLiveRunnerOutput: %v", err)
+	}
+	if len(output.Actions) != 1 || output.Actions[0].Kind != "reply" || output.Actions[0].Message != "wrapped" {
+		t.Fatalf("output = %+v", output)
+	}
+}
+
 func TestParseLiveRunnerOutputClassifiesInvalidJSON(t *testing.T) {
-	_, err := parseLiveRunnerOutput("not-json")
-	if !errors.Is(err, errLiveRunnerInvalidJSON) {
-		t.Fatalf("parseLiveRunnerOutput err = %v, want invalid JSON classification", err)
+	tests := []string{
+		"",
+		"not-json",
+		`{"status":"completed","summary":"done"}`,
+		`{"status":"completed","output":"not-json"}`,
+		`{"status":"failed","output":"{\"actions\":[{\"kind\":\"reply\",\"message\":\"bad\"}]}"}`,
+		`{"status":"running","output":"{\"actions\":[{\"kind\":\"reply\",\"message\":\"bad\"}]}"}`,
+		`{"actions":null}`,
+		`{"actions":{"kind":"reply","message":"bad"}}`,
+		`{"status":"completed","output":"{\"runner\":\"openclaw\",\"actions\":[{\"kind\":\"message.send\",\"confirmed\":true}]}"}`,
+	}
+	for _, stdout := range tests {
+		_, err := parseLiveRunnerOutput(stdout)
+		if !errors.Is(err, errLiveRunnerInvalidJSON) {
+			t.Fatalf("parseLiveRunnerOutput(%q) err = %v, want invalid JSON classification", stdout, err)
+		}
 	}
 }
 
@@ -2446,6 +2541,52 @@ func TestScanAgentLiveRunGroupsActionTransportDegrades(t *testing.T) {
 	}
 	if len(scans) != 1 || scans[0].Scan.Status != agentLiveScanStatusError || scans[0].Scan.ErrorKind != liveRecoverableActionTransport {
 		t.Fatalf("scans = %+v, want action transport degraded scan", scans)
+	}
+}
+
+func TestScanAgentLiveRunGroupsInvalidWrapperDoesNotAdvanceCursor(t *testing.T) {
+	ctx := context.Background()
+	gid := testAgentLiveGroupID(56)
+	nodeID := entmoot.NodeID(7)
+	state := esphttp.NewMemoryStateStore()
+	msgStore := store.NewMemory()
+	msg := testAgentLiveMessage(gid, 11, 100, "chat", "hello")
+	if err := msgStore.Put(ctx, msg); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if _, err := state.UpsertLiveAgentConfig(ctx, esphttp.LiveAgentConfig{
+		GroupID:      gid,
+		NodeID:       nodeID,
+		Enabled:      true,
+		Mode:         esphttp.LiveModeConverse,
+		TopicFilters: []string{"chat"},
+		UpdatedAtMS:  1,
+	}); err != nil {
+		t.Fatalf("UpsertLiveAgentConfig: %v", err)
+	}
+	runner := filepath.Join(t.TempDir(), "runner.sh")
+	if err := os.WriteFile(runner, []byte(`#!/bin/sh
+printf '%s' '{"status":"completed","summary":"done"}'
+`), 0o700); err != nil {
+		t.Fatalf("WriteFile runner: %v", err)
+	}
+	bindings, scans, err := scanAgentLiveRunGroups(ctx, &globalFlags{}, state, msgStore, []agentLiveRunGroup{{GroupID: gid, Mode: esphttp.LiveModeConverse}}, nodeID, time.Second, true, agentLiveRuntimeConfig{
+		nodeID:  nodeID,
+		runner:  runner,
+		timeout: time.Second,
+		limit:   10,
+	}, newAgentLiveBackoffTracker(50*time.Millisecond, time.Second))
+	if err != nil {
+		t.Fatalf("scanAgentLiveRunGroups: %v", err)
+	}
+	if len(bindings) != 1 || bindings[0].Presence.Status != esphttp.LiveStatusDegraded {
+		t.Fatalf("bindings = %+v, want degraded presence", bindings)
+	}
+	if len(scans) != 1 || scans[0].Scan.Status != agentLiveScanStatusError || scans[0].Scan.ErrorKind != liveRecoverableRunnerInvalidJSON {
+		t.Fatalf("scans = %+v, want invalid-json degraded scan", scans)
+	}
+	if _, ok, err := state.GetLiveAgentCursor(ctx, gid, nodeID); err != nil || ok {
+		t.Fatalf("GetLiveAgentCursor ok/err = %v/%v, want no consumed cursor", ok, err)
 	}
 }
 

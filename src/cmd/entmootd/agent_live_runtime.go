@@ -101,6 +101,12 @@ type liveAgentRunnerOutput struct {
 	Actions []liveAgentAction `json:"actions"`
 }
 
+type liveAgentRunnerRawOutput struct {
+	Actions json.RawMessage `json:"actions"`
+	Output  string          `json:"output"`
+	Status  string          `json:"status"`
+}
+
 type liveAgentAction struct {
 	Kind             string                 `json:"kind"`
 	Action           string                 `json:"action,omitempty"`
@@ -368,20 +374,108 @@ func runLiveRuntimeProcess(cmd *exec.Cmd, stdin []byte, liveCtx liveAgentRunnerC
 func parseLiveRunnerOutput(stdout string) (liveAgentRunnerOutput, error) {
 	raw := bytes.TrimSpace([]byte(stdout))
 	if len(raw) == 0 {
-		return liveAgentRunnerOutput{}, nil
+		return liveAgentRunnerOutput{}, fmt.Errorf("%w: live agent runtime returned empty output", errLiveRunnerInvalidJSON)
 	}
-	var output liveAgentRunnerOutput
-	if err := json.Unmarshal(raw, &output); err == nil {
+	if output, err := parseLiveRunnerJSON(raw, 0); err == nil {
 		return output, nil
 	}
 	start := bytes.IndexByte(raw, '{')
 	end := bytes.LastIndexByte(raw, '}')
 	if start >= 0 && end > start {
-		if err := json.Unmarshal(raw[start:end+1], &output); err == nil {
+		if output, err := parseLiveRunnerJSON(raw[start:end+1], 0); err == nil {
 			return output, nil
 		}
 	}
 	return liveAgentRunnerOutput{}, fmt.Errorf("%w: live agent runtime returned invalid JSON", errLiveRunnerInvalidJSON)
+}
+
+func parseLiveRunnerJSON(raw []byte, depth int) (liveAgentRunnerOutput, error) {
+	if depth > 4 {
+		return liveAgentRunnerOutput{}, fmt.Errorf("%w: live agent runtime output nesting is too deep", errLiveRunnerInvalidJSON)
+	}
+	var envelope liveAgentRunnerRawOutput
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return liveAgentRunnerOutput{}, err
+	}
+	if len(envelope.Actions) > 0 {
+		if !rawJSONStartsWith(envelope.Actions, '[') {
+			return liveAgentRunnerOutput{}, fmt.Errorf("%w: live agent runtime actions must be an array", errLiveRunnerInvalidJSON)
+		}
+		var output liveAgentRunnerOutput
+		if err := json.Unmarshal(raw, &output); err != nil {
+			return liveAgentRunnerOutput{}, err
+		}
+		if err := validateLiveRunnerOutputActions(output.Actions); err != nil {
+			return liveAgentRunnerOutput{}, err
+		}
+		return output, nil
+	}
+	if strings.TrimSpace(envelope.Output) != "" {
+		if !liveRunnerOutputEnvelopeStatusAllowsActions(envelope.Status) {
+			return liveAgentRunnerOutput{}, fmt.Errorf("%w: live agent runtime output envelope status %q is not completed", errLiveRunnerInvalidJSON, strings.TrimSpace(envelope.Status))
+		}
+		return parseLiveRunnerOutputEnvelope(envelope.Output, depth+1)
+	}
+	return liveAgentRunnerOutput{}, fmt.Errorf("%w: live agent runtime output missing actions", errLiveRunnerInvalidJSON)
+}
+
+func parseLiveRunnerOutputEnvelope(output string, depth int) (liveAgentRunnerOutput, error) {
+	raw := bytes.TrimSpace([]byte(output))
+	if len(raw) == 0 {
+		return liveAgentRunnerOutput{}, fmt.Errorf("%w: live agent runtime output envelope is empty", errLiveRunnerInvalidJSON)
+	}
+	if parsed, err := parseLiveRunnerJSON(raw, depth); err == nil {
+		return parsed, nil
+	}
+	start := bytes.IndexByte(raw, '{')
+	end := bytes.LastIndexByte(raw, '}')
+	if start >= 0 && end > start {
+		if parsed, err := parseLiveRunnerJSON(raw[start:end+1], depth); err == nil {
+			return parsed, nil
+		}
+	}
+	return liveAgentRunnerOutput{}, fmt.Errorf("%w: live agent runtime output envelope missing actions", errLiveRunnerInvalidJSON)
+}
+
+func rawJSONStartsWith(raw json.RawMessage, want byte) bool {
+	raw = bytes.TrimSpace(raw)
+	return len(raw) > 0 && raw[0] == want
+}
+
+func liveRunnerOutputEnvelopeStatusAllowsActions(status string) bool {
+	status = strings.TrimSpace(status)
+	return status == "" || esphttp.NormalizeFleetCommandResultStatus(status) == esphttp.FleetCommandStatusCompleted
+}
+
+func validateLiveRunnerOutputActions(actions []liveAgentAction) error {
+	for _, action := range actions {
+		if !knownLiveActionKind(action.Kind) {
+			return fmt.Errorf("%w: live agent runtime action kind %q is not supported", errLiveRunnerInvalidJSON, strings.TrimSpace(action.Kind))
+		}
+	}
+	return nil
+}
+
+func knownLiveActionKind(kind string) bool {
+	switch strings.TrimSpace(strings.ToLower(kind)) {
+	case liveActionReply,
+		liveActionMessageSummarize,
+		liveActionTaskCreate,
+		liveActionTaskComment,
+		liveActionTaskAssignSelf,
+		liveActionTaskUpdateOwn,
+		liveActionTaskAssignOthers,
+		liveActionCommandRequest,
+		liveActionCommandSend,
+		liveActionInviteCreate,
+		liveActionMemberRemove,
+		liveActionMetadataUpdate,
+		liveActionExternalMessage,
+		liveActionAlertOwner:
+		return true
+	default:
+		return false
+	}
 }
 
 func openClawLiveFinalText(stdout string) string {
