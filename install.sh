@@ -327,14 +327,40 @@ pid_matches_stack() {
   esac
 }
 
+socket_path_exists() {
+  path="\$1"
+  [ -e "\$path" ] || [ -S "\$path" ] || [ -L "\$path" ]
+}
+
+pidfile_pid() {
+  pidfile="\$1"
+  if [ -f "\$pidfile" ]; then
+    cat "\$pidfile" 2>/dev/null || true
+  fi
+}
+
+pidfile_live_for_kind() {
+  kind="\$1"
+  pidfile="\$2"
+  pid=\$(pidfile_pid "\$pidfile")
+  pid_matches_stack "\$kind" "\$pid"
+}
+
+remove_stale_pidfile() {
+  kind="\$1"
+  pidfile="\$2"
+  [ -f "\$pidfile" ] || return 1
+  if pidfile_live_for_kind "\$kind" "\$pidfile"; then
+    return 1
+  fi
+  rm -f "\$pidfile"
+}
+
 stop_pidfile() {
   kind="\$1"
   pidfile="\$2"
-  pid=""
+  pid=\$(pidfile_pid "\$pidfile")
   stopped=0
-  if [ -f "\$pidfile" ]; then
-    pid=\$(cat "\$pidfile" 2>/dev/null || true)
-  fi
   if pid_matches_stack "\$kind" "\$pid"; then
     stopped=1
     kill -TERM "\$pid" 2>/dev/null || true
@@ -425,6 +451,24 @@ pilot_socket_live() {
   run_pilotctl info >/dev/null 2>&1
 }
 
+remove_stale_socket_if_dead() {
+  path="\$1"
+  probe="\$2"
+  socket_path_exists "\$path" || return 1
+  if "\$probe"; then
+    return 1
+  fi
+  rm -f "\$path"
+}
+
+require_pilot_live() {
+  if pilot_socket_live; then
+    return 0
+  fi
+  echo "pilot socket did not appear at \$PILOT_SOCKET" >&2
+  return 1
+}
+
 resolve_pilot_binary() {
   name="\$1"
   override="\$2"
@@ -476,6 +520,10 @@ entmoot_pid_alive() {
 entmoot_socket_live() {
   [ -S "\$ENTMOOT_CONTROL_SOCKET" ] || return 1
   "\$ENTMOOT_BIN" -socket "\$PILOT_SOCKET" -identity "\$ENTMOOT_IDENTITY" -data "\$ENTMOOT_DATA" info 2>/dev/null | grep '"running":[[:space:]]*true' >/dev/null 2>&1
+}
+
+require_entmoot_live() {
+  entmoot_socket_live
 }
 
 print_entmoot_start_failure() {
@@ -567,25 +615,21 @@ validate_agent_command_runner || exit 1
 stop_agent_command_watcher || true
 stop_pidfile entmoot "\$ENTMOOT_PIDFILE" || true
 stop_stack_processes entmoot || true
-if [ -e "\$ENTMOOT_CONTROL_SOCKET" ] || [ -S "\$ENTMOOT_CONTROL_SOCKET" ]; then
+if socket_path_exists "\$ENTMOOT_CONTROL_SOCKET"; then
   if entmoot_socket_live; then
     echo "entmoot control socket is already live at \$ENTMOOT_CONTROL_SOCKET; refusing to start an unmanaged duplicate" >&2
     exit 1
   fi
-  rm -f "\$ENTMOOT_CONTROL_SOCKET"
+  remove_stale_socket_if_dead "\$ENTMOOT_CONTROL_SOCKET" entmoot_socket_live || true
 fi
 pilot_stopped=0
 if stop_pidfile pilot "\$PILOT_PIDFILE"; then
   pilot_stopped=1
 fi
-if [ "\$pilot_stopped" = "1" ] || { [ ! -e "\$PILOT_SOCKET" ] && [ ! -S "\$PILOT_SOCKET" ]; }; then
+if [ "\$pilot_stopped" = "1" ] || ! socket_path_exists "\$PILOT_SOCKET"; then
   rm -f "\$PILOT_SOCKET"
 fi
-if [ -e "\$PILOT_SOCKET" ] || [ -S "\$PILOT_SOCKET" ]; then
-  if ! pilot_socket_live; then
-    rm -f "\$PILOT_SOCKET"
-  fi
-fi
+remove_stale_socket_if_dead "\$PILOT_SOCKET" pilot_socket_live || true
 remove_compat_pilot_socket
 
 if ! pilot_socket_live; then
@@ -621,10 +665,7 @@ for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
   sleep 1
 done
 
-if ! pilot_socket_live; then
-  echo "pilot socket did not appear at \$PILOT_SOCKET" >&2
-  exit 1
-fi
+require_pilot_live || exit 1
 install_compat_pilot_socket
 
 set -- -socket "\$PILOT_SOCKET" -identity "\$ENTMOOT_IDENTITY" -data "\$ENTMOOT_DATA" serve
@@ -641,7 +682,7 @@ while [ "\$elapsed" -lt "\$ENTMOOT_START_TIMEOUT" ]; do
     print_entmoot_start_failure
     exit 1
   fi
-  if entmoot_socket_live; then
+  if require_entmoot_live; then
     echo "\$entmoot_pid" > "\$ENTMOOT_PIDFILE"
     if start_agent_command_watcher; then
       exit 0
