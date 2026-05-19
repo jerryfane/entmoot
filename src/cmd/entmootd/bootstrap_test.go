@@ -101,6 +101,96 @@ func TestBootstrapAgentCustomRunnerLiveDryRun(t *testing.T) {
 	}
 }
 
+func TestBootstrapAgentCommandsGateLiveRunWithStackHelper(t *testing.T) {
+	gf := &globalFlags{
+		socket:   agentPilotSocketPath,
+		identity: "/data/.entmoot/custom-identity.json",
+		data:     agentEntmootDataPath,
+		hideIP:   true,
+		logLevel: "info",
+	}
+	report := bootstrapAgentReport{
+		Runner:            agentRunnerCustom,
+		RunnerCommand:     "/tmp/runner",
+		AgentInstructions: true,
+		Runtime: runtimeReport{
+			Binary:      "entmootd",
+			StackHelper: "/data/.pilot/start-entmoot-stack.sh",
+		},
+		Live: bootstrapAgentLiveReport{
+			Enabled: true,
+			Group:   testAgentLiveGroupID(0x77).String(),
+			NodeID:  155760,
+		},
+	}
+
+	commands := bootstrapAgentCommands(gf, report)
+	if len(commands) != 3 {
+		t.Fatalf("commands = %#v, want serve, watcher, live", commands)
+	}
+	for _, command := range commands[:2] {
+		if strings.Contains(command, "start-entmoot-stack.sh") {
+			t.Fatalf("non-live command is stack gated: %q", command)
+		}
+	}
+	live := commands[2]
+	for _, want := range []string{
+		"ENTMOOT_DATA=/data/.entmoot",
+		"ENTMOOT_IDENTITY=/data/.entmoot/custom-identity.json",
+		"PILOT_SOCKET=/data/.pilot/pilot.sock",
+		"ENTMOOT_HIDE_IP=true",
+		"ENTMOOT_AGENT_INSTRUCTIONS=1",
+		"ENTMOOT_AGENT_RUNNER=/tmp/runner",
+		"/data/.pilot/start-entmoot-stack.sh ensure",
+		"/data/.pilot/start-entmoot-stack.sh check",
+		"agent-live run",
+		"-runner /tmp/runner",
+	} {
+		if !strings.Contains(live, want) {
+			t.Fatalf("live command = %q, missing %q", live, want)
+		}
+	}
+	if !strings.Contains(live, "start-entmoot-stack.sh ensure && ENTMOOT_DATA=/data/.entmoot") {
+		t.Fatalf("live command does not gate before run: %q", live)
+	}
+}
+
+func TestBootstrapAgentCommandsSkipStackGateForMismatchedRuntime(t *testing.T) {
+	gf := testBootstrapGlobalFlags(t)
+	report := bootstrapAgentReport{
+		Runner:        agentRunnerOpenClaw,
+		RunnerCommand: agentRunnerOpenClaw,
+		Runtime: runtimeReport{
+			Binary:      "entmootd",
+			StackHelper: "/data/.pilot/start-entmoot-stack.sh",
+		},
+		Live: bootstrapAgentLiveReport{
+			Enabled: true,
+			Group:   testAgentLiveGroupID(0x78).String(),
+			NodeID:  155760,
+		},
+	}
+
+	commands := bootstrapAgentCommands(gf, report)
+	if len(commands) != 3 {
+		t.Fatalf("commands = %#v, want serve, watcher, live", commands)
+	}
+	if strings.Contains(commands[2], "start-entmoot-stack.sh") {
+		t.Fatalf("mismatched runtime command should not be stack gated: %q", commands[2])
+	}
+}
+
+func TestStackGatedCommandQuotesHelperEnvValues(t *testing.T) {
+	got := stackGatedCommand("/data/.pilot/start-entmoot-stack.sh", []string{
+		shellEnvAssignment("ENTMOOT_AGENT_RUNNER", "/tmp/Hermes Runner/runner.sh"),
+	}, "entmootd agent-live run")
+
+	want := "ENTMOOT_AGENT_RUNNER='/tmp/Hermes Runner/runner.sh' /data/.pilot/start-entmoot-stack.sh ensure"
+	if !strings.Contains(got, want) {
+		t.Fatalf("stack command = %q, missing %q", got, want)
+	}
+}
+
 func TestBootstrapAgentAppliesLiveConfig(t *testing.T) {
 	gf := testBootstrapGlobalFlags(t)
 	gid := testAgentLiveGroupID(0x72)

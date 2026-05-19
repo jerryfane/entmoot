@@ -160,7 +160,10 @@ peers, and changelog stay aligned.
    stop live presence renewal. `bootstrap agent` does not install runtimes or
    manage supervisors; keep `serve`, `agent-commands watch`, and
    `agent-live run` under the existing container or service manager for host
-   restarts, crashes, upgrades, and fatal config or storage errors.
+   restarts, crashes, upgrades, and fatal config or storage errors. In `/data`
+   agent installs, the generated live-run command first runs the existing
+   `/data/.pilot/start-entmoot-stack.sh ensure` helper, then its `check` mode,
+   so live mode starts only after the normal publish path is reachable.
 
    Live-agent config is scoped by `group_id + node_id` and is stored in the
    current data root's `esp.sqlite`. The default per-moot live limits are
