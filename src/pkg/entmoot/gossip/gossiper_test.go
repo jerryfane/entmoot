@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"log/slog"
+	"net"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -46,6 +48,89 @@ type nodeState struct {
 	storeM  store.MessageStore
 	gossip  *Gossiper
 	running atomic.Bool
+}
+
+type failFirstDialTransport struct {
+	Transport
+	mu        sync.Mutex
+	remaining int
+}
+
+func (t *failFirstDialTransport) Dial(ctx context.Context, peer entmoot.NodeID) (net.Conn, error) {
+	t.mu.Lock()
+	if t.remaining > 0 {
+		t.remaining--
+		t.mu.Unlock()
+		return nil, errors.New("scripted transient dial failure")
+	}
+	t.mu.Unlock()
+	return t.Transport.Dial(ctx, peer)
+}
+
+type rosterRespTransport struct {
+	Transport
+	mu    sync.Mutex
+	dials int
+	resp  *wire.RosterResp
+}
+
+func (t *rosterRespTransport) Dial(ctx context.Context, peer entmoot.NodeID) (net.Conn, error) {
+	t.mu.Lock()
+	t.dials++
+	t.mu.Unlock()
+
+	client, server := net.Pipe()
+	go func() {
+		defer server.Close()
+		_, _, _ = wire.ReadAndDecode(server)
+		_ = wire.EncodeAndWrite(server, t.resp)
+	}()
+	return client, nil
+}
+
+func (t *rosterRespTransport) dialCount() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.dials
+}
+
+type rosterRespOnceTransport struct {
+	Transport
+	mu       sync.Mutex
+	peer     entmoot.NodeID
+	used     bool
+	response *wire.RosterResp
+}
+
+func (t *rosterRespOnceTransport) Dial(ctx context.Context, peer entmoot.NodeID) (net.Conn, error) {
+	t.mu.Lock()
+	if peer == t.peer && !t.used {
+		t.used = true
+		t.mu.Unlock()
+		client, server := net.Pipe()
+		go func() {
+			defer server.Close()
+			_, _, _ = wire.ReadAndDecode(server)
+			_ = wire.EncodeAndWrite(server, t.response)
+		}()
+		return client, nil
+	}
+	t.mu.Unlock()
+	return t.Transport.Dial(ctx, peer)
+}
+
+type rosterStallTransport struct {
+	Transport
+}
+
+func (t rosterStallTransport) Dial(ctx context.Context, peer entmoot.NodeID) (net.Conn, error) {
+	client, server := net.Pipe()
+	go func() {
+		defer server.Close()
+		_, _, _ = wire.ReadAndDecode(server)
+		_, _ = io.Copy(io.Discard, server)
+	}()
+	return client, nil
 }
 
 // newFixture builds a fixture with nodes named by the supplied NodeIDs. The
@@ -572,6 +657,182 @@ func TestRosterReqSyncViaJoin(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("member[%d]: got %d want %d", i, got[i], want[i])
 		}
+	}
+}
+
+func TestJoinRetriesBootstrapUntilDeadline(t *testing.T) {
+	t.Parallel()
+	f := newFixtureWithGenesisOnly(t, []entmoot.NodeID{10, 99}, 99)
+	defer f.closeTransports()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = f.nodes[10].gossip.Start(ctx) }()
+
+	joiner := f.nodes[99].gossip
+	joiner.cfg.Transport = &failFirstDialTransport{
+		Transport: joiner.cfg.Transport,
+		remaining: 3,
+	}
+
+	joinCtx, joinCancel := context.WithTimeout(ctx, 2*time.Second)
+	defer joinCancel()
+	invite := f.buildInvite([]entmoot.NodeID{10})
+	if err := joiner.Join(joinCtx, invite); err != nil {
+		t.Fatalf("Join: %v", err)
+	}
+	got := f.nodes[99].rost.Members()
+	want := f.nodes[10].rost.Members()
+	if len(got) != len(want) {
+		t.Fatalf("member count mismatch: got %v want %v", got, want)
+	}
+}
+
+func TestJoinRetryDelayBacksOffAndCaps(t *testing.T) {
+	if got := nextJoinRetryDelay(joinRetryBase); got != time.Second {
+		t.Fatalf("nextJoinRetryDelay(base) = %s, want 1s", got)
+	}
+	if got := nextJoinRetryDelay(2 * time.Second); got != joinRetryCap {
+		t.Fatalf("nextJoinRetryDelay(2s) = %s, want %s", got, joinRetryCap)
+	}
+	if got := nextJoinRetryDelay(joinRetryCap); got != joinRetryCap {
+		t.Fatalf("nextJoinRetryDelay(cap) = %s, want %s", got, joinRetryCap)
+	}
+}
+
+func TestTryRosterSyncCancelsBlockedRead(t *testing.T) {
+	t.Parallel()
+	f := newFixtureWithGenesisOnly(t, []entmoot.NodeID{10, 99}, 99)
+	defer f.closeTransports()
+
+	joiner := f.nodes[99].gossip
+	joiner.cfg.Transport = rosterStallTransport{Transport: joiner.cfg.Transport}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- joiner.tryRosterSync(ctx, 10)
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("tryRosterSync unexpectedly succeeded")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("tryRosterSync did not return after context deadline")
+	}
+}
+
+func TestJoinDoesNotRetryPermanentRosterError(t *testing.T) {
+	t.Parallel()
+	f := newFixtureWithGenesisOnly(t, []entmoot.NodeID{10, 99}, 99)
+	defer f.closeTransports()
+
+	var wrongGroup entmoot.GroupID
+	wrongGroup[0] = 99
+	tr := &rosterRespTransport{
+		Transport: f.nodes[99].gossip.cfg.Transport,
+		resp: &wire.RosterResp{
+			GroupID: wrongGroup,
+			Entries: f.nodes[10].rost.Entries(),
+		},
+	}
+	f.nodes[99].gossip.cfg.Transport = tr
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	invite := f.buildInvite([]entmoot.NodeID{10})
+	err := f.nodes[99].gossip.Join(ctx, invite)
+	if err == nil {
+		t.Fatal("Join unexpectedly succeeded")
+	}
+	if errors.Is(err, ErrJoinFailed) {
+		t.Fatalf("Join returned retryable ErrJoinFailed for permanent error: %v", err)
+	}
+	if got := tr.dialCount(); got != 3 {
+		t.Fatalf("dials = %d, want one pass through the available join strategies", got)
+	}
+}
+
+func TestJoinContinuesAfterPermanentPeerError(t *testing.T) {
+	t.Parallel()
+	f := newFixtureWithGenesisOnly(t, []entmoot.NodeID{10, 20, 99}, 99)
+	defer f.closeTransports()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = f.nodes[10].gossip.Start(ctx) }()
+
+	var wrongGroup entmoot.GroupID
+	wrongGroup[0] = 99
+	joiner := f.nodes[99].gossip
+	joiner.cfg.Transport = &rosterRespOnceTransport{
+		Transport: joiner.cfg.Transport,
+		peer:      20,
+		response: &wire.RosterResp{
+			GroupID: wrongGroup,
+			Entries: f.nodes[10].rost.Entries(),
+		},
+	}
+
+	joinCtx, joinCancel := context.WithTimeout(ctx, 2*time.Second)
+	defer joinCancel()
+	invite := f.buildInvite([]entmoot.NodeID{20, 10})
+	if err := joiner.Join(joinCtx, invite); err != nil {
+		t.Fatalf("Join: %v", err)
+	}
+	got := f.nodes[99].rost.Members()
+	want := f.nodes[10].rost.Members()
+	if len(got) != len(want) {
+		t.Fatalf("member count mismatch: got %v want %v", got, want)
+	}
+}
+
+func TestJoinContinuesAfterStaleRosterHead(t *testing.T) {
+	t.Parallel()
+	f := newFixtureWithGenesisOnly(t, []entmoot.NodeID{10, 20, 99}, 99)
+	defer f.closeTransports()
+
+	entries := f.nodes[10].rost.Entries()
+	if len(entries) < 2 {
+		t.Fatalf("fixture entries = %d, want at least 2", len(entries))
+	}
+	if err := f.nodes[99].rost.AcceptGenesis(entries[0]); err != nil {
+		t.Fatalf("joiner AcceptGenesis: %v", err)
+	}
+	if err := f.nodes[99].rost.Apply(entries[1]); err != nil {
+		t.Fatalf("joiner Apply partial head: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = f.nodes[10].gossip.Start(ctx) }()
+	go func() { _ = f.nodes[20].gossip.Start(ctx) }()
+
+	joiner := f.nodes[99].gossip
+	joiner.cfg.Transport = &rosterRespOnceTransport{
+		Transport: joiner.cfg.Transport,
+		peer:      20,
+		response: &wire.RosterResp{
+			GroupID: f.groupID,
+			Entries: []entmoot.RosterEntry{
+				entries[0],
+			},
+		},
+	}
+
+	joinCtx, joinCancel := context.WithTimeout(ctx, 2*time.Second)
+	defer joinCancel()
+	invite := f.buildInvite([]entmoot.NodeID{20})
+	if err := joiner.Join(joinCtx, invite); err != nil {
+		t.Fatalf("Join: %v", err)
+	}
+	got := f.nodes[99].rost.Members()
+	want := f.nodes[10].rost.Members()
+	if len(got) != len(want) {
+		t.Fatalf("member count mismatch: got %v want %v", got, want)
 	}
 }
 

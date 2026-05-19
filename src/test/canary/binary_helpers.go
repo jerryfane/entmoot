@@ -177,7 +177,8 @@ func startEntmootdJoin(
 		}
 	}()
 
-	// Block on the first stdout line for up to 15s. CLI_DESIGN §3.1 says
+	// Block on the first stdout line for a Pilot-sized join window.
+	// CLI_DESIGN §3.1 says
 	// join emits exactly one JSON line before going quiet.
 	type readResult struct {
 		line string
@@ -217,13 +218,13 @@ func startEntmootdJoin(
 				name, ev["event"], r.line)
 		}
 		t.Logf("[join %s] joined event: %s", name, r.line)
-	case <-time.After(15 * time.Second):
+	case <-time.After(pilotCanaryJoinEventTimeout):
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
 		h.stderrMu.Lock()
 		stderr := h.stderrBuf.String()
 		h.stderrMu.Unlock()
-		t.Fatalf("join %s: no joined-event within 15s; stderr=\n%s", name, stderr)
+		t.Fatalf("join %s: no joined-event within %s; stderr=\n%s", name, pilotCanaryJoinEventTimeout, stderr)
 	}
 
 	// Continue reading post-joined stdout in the background so a stdout
@@ -403,6 +404,32 @@ func startEntmootdTail(
 
 	t.Cleanup(func() { h.Stop(t) })
 	return h
+}
+
+func waitForTailMessage(t *testing.T, h *tailHandle, content string, messageID string, timeout time.Duration) map[string]any {
+	t.Helper()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	var seen []string
+	for {
+		select {
+		case ev := <-h.Events:
+			gotContent, _ := ev["content"].(string)
+			if gotContent != content {
+				seen = append(seen, gotContent)
+				continue
+			}
+			if gotID, _ := ev["message_id"].(string); gotID != messageID {
+				t.Fatalf("tail: message_id %q != published %q", gotID, messageID)
+			}
+			return ev
+		case <-h.readDone:
+			t.Fatalf("tail %s: exited before receiving content %q; saw=%v", h.name, content, seen)
+		case <-timer.C:
+			t.Fatalf("tail: no content %q within %s; saw=%v", content, timeout, seen)
+		}
+	}
 }
 
 // Stop terminates the tail process with SIGTERM → SIGKILL fallback.

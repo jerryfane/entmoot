@@ -67,7 +67,7 @@ func TestGenericStreamErrorClassification(t *testing.T) {
 	}
 }
 
-func TestGenericStreamErrorLocalDeadline(t *testing.T) {
+func TestGenericStreamErrorDeadlineIsBackoffWorthy(t *testing.T) {
 	t.Parallel()
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Nanosecond)
@@ -75,7 +75,20 @@ func TestGenericStreamErrorLocalDeadline(t *testing.T) {
 	<-ctx.Done()
 
 	got := classifyGenericStreamError(ctx, context.DeadlineExceeded)
-	want := StreamErrorClassification{Retryable: true, Timeout: true, LocalContext: true}
+	want := StreamErrorClassification{Retryable: true, Timeout: true}
+	if got != want {
+		t.Fatalf("classification = %+v, want %+v", got, want)
+	}
+}
+
+func TestGenericStreamErrorCanceledContextIsLocal(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	got := classifyGenericStreamError(ctx, net.ErrClosed)
+	want := StreamErrorClassification{Retryable: true, StaleSession: true, LocalContext: true}
 	if got != want {
 		t.Fatalf("classification = %+v, want %+v", got, want)
 	}
@@ -95,8 +108,16 @@ func TestStreamErrorDecisionHelpers(t *testing.T) {
 	if shouldRetryStreamFailure(retryable, 1, ctx, 0) {
 		t.Fatal("retryable second attempt retried")
 	}
-	if !shouldDropPeerSessionAfterStreamFailure(stale, 0) {
+	if !shouldDropPeerSessionAfterStreamFailure(stale, 0, ctx) {
 		t.Fatal("stale stream did not request session drop")
+	}
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if shouldDropPeerSessionAfterStreamFailure(stale, 0, canceledCtx) {
+		t.Fatal("canceled parent context requested stream session drop")
+	}
+	if shouldDropPeerSessionAfterResponseFailure(stale, canceledCtx) {
+		t.Fatal("canceled parent context requested response session drop")
 	}
 	if shouldRecordDialFailure(local) {
 		t.Fatal("local context would record dial failure")
