@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.65] - 2026-05-19
+
+### Added
+
+- **Runtime health diagnostics.** Added shared runtime health checks, stack
+  helper check mode, `entmootd env` publish-path reporting, and an agent
+  runtime verification helper so operators can distinguish a live runner from
+  a healthy direct publish path.
+
+### Changed
+
+- **Live agent startup gating.** Live agent startup now verifies the normal
+  Entmoot publish path before entering live mode, avoiding half-alive agent
+  states where replies can be produced but not posted directly.
+- **Live runner JSON parsing.** Live runner action parsing now uses a shared
+  helper for direct action payloads and command-runner envelopes, keeping
+  validation behavior consistent across live-agent paths.
+
+### Fixed
+
+- **Pilot canary runtime resilience.** Pilot-backed canary tests now tolerate
+  delayed stream result delivery and clean up sandbox binaries/processes more
+  reliably, matching the patched Pilot fork runtime behavior.
+
 ## [1.5.64] - 2026-05-14
 
 ### Fixed
