@@ -19,6 +19,7 @@ const (
 	agentEntmootDataPath   = "/data/.entmoot"
 	agentEntmootWrapper    = "/data/.entmoot/entmoot"
 	agentPilotWrapper      = "/data/.pilot/pilot"
+	agentStackHelper       = "/data/.pilot/start-entmoot-stack.sh"
 	runtimeProcScanTimeout = 250 * time.Millisecond
 )
 
@@ -36,6 +37,7 @@ type runtimeReport struct {
 	ControlSocketReachable bool                 `json:"control_socket_reachable"`
 	AgentWrapper           string               `json:"agent_wrapper,omitempty"`
 	PilotWrapper           string               `json:"pilot_wrapper,omitempty"`
+	StackHelper            string               `json:"stack_helper,omitempty"`
 	RunningDaemon          *runtimeDaemonReport `json:"running_daemon,omitempty"`
 	NamespaceWarning       string               `json:"namespace_warning,omitempty"`
 	Suggestions            []string             `json:"suggestions,omitempty"`
@@ -150,6 +152,9 @@ func collectRuntimeReport(gf *globalFlags, dataDir string) runtimeReport {
 	}
 	if fileExists(agentPilotWrapper) {
 		report.PilotWrapper = agentPilotWrapper
+	}
+	if fileExists(agentStackHelper) {
+		report.StackHelper = agentStackHelper
 	}
 	if daemon := findBestRuntimeDaemon(dataDir, controlSock); daemon != nil {
 		report.RunningDaemon = daemon
