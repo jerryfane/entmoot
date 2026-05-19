@@ -96,6 +96,93 @@ func TestRuntimeNoDaemonHelpReportsNamespaceMismatch(t *testing.T) {
 	}
 }
 
+func TestRuntimeReportClassifiesHalfAliveDaemon(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("proc runtime discovery is linux-only")
+	}
+	dir := t.TempDir()
+	oldProcRoot := procRoot
+	procRoot = filepath.Join(dir, "proc")
+	defer func() { procRoot = oldProcRoot }()
+
+	dataDir := filepath.Join(dir, "data")
+	pidRoot := filepath.Join(procRoot, "12345")
+	if err := os.MkdirAll(pidRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cmdline := strings.Join([]string{
+		"/usr/local/bin/entmootd",
+		"-socket", filepath.Join(dir, "pilot.sock"),
+		"-identity", filepath.Join(dataDir, "identity.json"),
+		"-data", dataDir,
+		"serve",
+	}, "\x00") + "\x00"
+	if err := os.WriteFile(filepath.Join(pidRoot, "cmdline"), []byte(cmdline), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	report := collectRuntimeReport(&globalFlags{
+		socket:   filepath.Join(dir, "pilot.sock"),
+		data:     dataDir,
+		identity: filepath.Join(dataDir, "identity.json"),
+	}, dataDir)
+	if report.RuntimeStatus != runtimeStatusHalfAlive {
+		t.Fatalf("runtime status = %q, want half_alive; report=%+v", report.RuntimeStatus, report)
+	}
+	if report.PublishPathHealthy {
+		t.Fatalf("publish path unexpectedly healthy: %+v", report)
+	}
+	if report.RunningDaemon == nil {
+		t.Fatalf("running daemon missing: %+v", report)
+	}
+	if !strings.Contains(strings.Join(report.Suggestions, "\n"), "direct publish path is not healthy") {
+		t.Fatalf("half-alive suggestion missing: %#v", report.Suggestions)
+	}
+}
+
+func TestRuntimeReportClassifiesHealthyPublishPath(t *testing.T) {
+	dir, err := os.MkdirTemp("/tmp", "entmoot-runtime-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	dataDir := filepath.Join(dir, "data")
+	pilotSock := filepath.Join(dir, "missing-pilot.sock")
+	controlSock := controlSocketPath(dataDir)
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	controlLn, err := net.Listen("unix", controlSock)
+	if err != nil {
+		t.Fatalf("listen control socket: %v", err)
+	}
+	defer controlLn.Close()
+	go func() {
+		conn, err := controlLn.Accept()
+		if err == nil {
+			_ = conn.Close()
+		}
+	}()
+
+	report := collectRuntimeReport(&globalFlags{
+		socket:   pilotSock,
+		data:     dataDir,
+		identity: filepath.Join(dataDir, "identity.json"),
+	}, dataDir)
+	if report.RuntimeStatus != runtimeStatusHealthy {
+		t.Fatalf("runtime status = %q, want healthy; report=%+v", report.RuntimeStatus, report)
+	}
+	if !report.PublishPathHealthy {
+		t.Fatalf("publish path not healthy: %+v", report)
+	}
+	if report.PilotSocketReachable {
+		t.Fatalf("pilot socket unexpectedly reachable: %+v", report)
+	}
+	if !report.ControlSocketReachable {
+		t.Fatalf("control socket not reachable: %+v", report)
+	}
+}
+
 func TestRuntimeSocketProbeDistinguishesStaleSocket(t *testing.T) {
 	dir, err := os.MkdirTemp("/tmp", "entmoot-runtime-*")
 	if err != nil {
