@@ -96,6 +96,79 @@ func TestRuntimeNoDaemonHelpReportsNamespaceMismatch(t *testing.T) {
 	}
 }
 
+func TestRuntimeSocketProbeDistinguishesStaleSocket(t *testing.T) {
+	dir, err := os.MkdirTemp("/tmp", "entmoot-runtime-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	missing := filepath.Join(dir, "missing.sock")
+	missingHealth := runtimeSocketProbe(missing, runtimeProcScanTimeout)
+	if missingHealth.Exists || missingHealth.Reachable || missingHealth.Stale {
+		t.Fatalf("missing socket health = %+v, want all false", missingHealth)
+	}
+
+	stale := filepath.Join(dir, "stale.sock")
+	if err := os.WriteFile(stale, []byte("stale"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	staleHealth := runtimeSocketProbe(stale, runtimeProcScanTimeout)
+	if !staleHealth.Exists || staleHealth.Reachable || !staleHealth.Stale {
+		t.Fatalf("stale socket health = %+v, want exists stale unreachable", staleHealth)
+	}
+
+	live := filepath.Join(dir, "live.sock")
+	ln, err := net.Listen("unix", live)
+	if err != nil {
+		t.Fatalf("listen live socket fixture: %v", err)
+	}
+	defer ln.Close()
+	accepted := make(chan struct{})
+	go func() {
+		conn, err := ln.Accept()
+		if err == nil {
+			_ = conn.Close()
+		}
+		close(accepted)
+	}()
+	liveHealth := runtimeSocketProbe(live, runtimeProcScanTimeout)
+	if !liveHealth.Exists || !liveHealth.Reachable || liveHealth.Stale {
+		t.Fatalf("live socket health = %+v, want exists reachable not stale", liveHealth)
+	}
+	<-accepted
+}
+
+func TestRuntimePIDFileProbeClassifiesLiveAndStale(t *testing.T) {
+	dir := t.TempDir()
+	missing := runtimePIDFileProbe(filepath.Join(dir, "missing.pid"), nil)
+	if missing.PID != 0 || missing.Live || missing.Stale {
+		t.Fatalf("missing pidfile health = %+v, want empty", missing)
+	}
+
+	badPath := filepath.Join(dir, "bad.pid")
+	if err := os.WriteFile(badPath, []byte("not-a-pid"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	bad := runtimePIDFileProbe(badPath, nil)
+	if bad.PID != 0 || bad.Live || !bad.Stale {
+		t.Fatalf("bad pidfile health = %+v, want stale", bad)
+	}
+
+	livePath := filepath.Join(dir, "live.pid")
+	if err := os.WriteFile(livePath, []byte("42\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	live := runtimePIDFileProbe(livePath, func(pid int) bool { return pid == 42 })
+	if live.PID != 42 || !live.Live || live.Stale {
+		t.Fatalf("live pidfile health = %+v, want live pid 42", live)
+	}
+
+	stale := runtimePIDFileProbe(livePath, func(int) bool { return false })
+	if stale.PID != 42 || stale.Live || !stale.Stale {
+		t.Fatalf("stale pidfile health = %+v, want stale pid 42", stale)
+	}
+}
+
 func TestRuntimeDiscoveryExpandsDefaultDaemonDataDir(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("proc runtime discovery is linux-only")
