@@ -68,9 +68,9 @@ func TestCanaryBinary(t *testing.T) {
 	c := startPilotDaemon(t, "c", false, pilotBin, logger)
 	t.Cleanup(func() { stopPilotDaemon(t, c, logger) })
 
-	waitPilotRegistered(t, a, 20*time.Second, logger)
-	waitPilotRegistered(t, b, 20*time.Second, logger)
-	waitPilotRegistered(t, c, 20*time.Second, logger)
+	waitPilotRegistered(t, a, pilotCanaryRegistrationTimeout, logger)
+	waitPilotRegistered(t, b, pilotCanaryRegistrationTimeout, logger)
+	waitPilotRegistered(t, c, pilotCanaryRegistrationTimeout, logger)
 
 	a.NodeID = pilotctlNodeID(t, a, pilotBin)
 	b.NodeID = pilotctlNodeID(t, b, pilotBin)
@@ -350,7 +350,7 @@ func TestCanaryBinary(t *testing.T) {
 		{"c", globalC},
 	}
 
-	deadline := time.Now().Add(25 * time.Second)
+	deadline := time.Now().Add(pilotCanaryConvergenceTimeout)
 	lastCounts := make(map[string]int)
 	for {
 		allGood := true
@@ -399,39 +399,10 @@ func TestCanaryBinary(t *testing.T) {
 
 	msg4 := publish(globalA, envBase(a.Socket, dataA), "fourth message (tail)")
 
-	// Block on the tail event with a 10s budget.
-	var tailEv map[string]any
-	select {
-	case ev := <-tailH.Events:
-		tailEv = ev
-	case <-time.After(10 * time.Second):
-		t.Fatalf("tail: no event received within 10s")
-	}
-
-	// tail_event JSON wraps the full message as "message"; emitMessageJSON
-	// on the daemon side for direct tail output flattens it. The daemon's
-	// handleTail emits *ipc.TailEvent, which the tail CLI re-renders via
-	// emitMessageJSON — so the stdout shape on the client side mirrors
-	// `query`'s output.
-	content, _ := tailEv["content"].(string)
-	if content != "fourth message (tail)" {
-		// One failure mode: stale backlog leaked onto the live stream.
-		// Drain any extra events to assert bounded; fail with rich diag.
-		extra := []map[string]any{tailEv}
-		for {
-			select {
-			case e := <-tailH.Events:
-				extra = append(extra, e)
-			case <-time.After(200 * time.Millisecond):
-				t.Fatalf("tail: expected \"fourth message (tail)\" but saw %d events; first content=%q", len(extra), content)
-				return
-			}
-		}
-	}
-	// msg4 is the id we expect; confirm the tail carried the same id.
-	if gotID, _ := tailEv["message_id"].(string); gotID != msg4.String() {
-		t.Fatalf("tail: message_id %q != published %q", gotID, msg4.String())
-	}
+	// Block on the tail event with a Pilot-sized budget. Relay recovery can
+	// legitimately take longer than a LAN/local transport hop, and the tail
+	// stream can still have pre-subscription backlog buffered locally.
+	waitForTailMessage(t, tailH, "fourth message (tail)", msg4.String(), pilotCanaryTailTimeout)
 
 	// Stop the tail now so the next phase (teardown) doesn't race.
 	tailH.Stop(t)

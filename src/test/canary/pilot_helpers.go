@@ -22,15 +22,20 @@ import (
 // (once discovered), and the *exec.Cmd / stdout-pipe / stderr-pipe so we can
 // stop it cleanly at test teardown.
 type pilotNode struct {
-	Name   string          // "a", "b", "c"
-	Socket string          // /tmp/entmoot-canary-<name>.sock
-	Dir    string          // per-node identity dir (t.TempDir()/pilot-<name>)
-	NodeID entmoot.NodeID  // populated after daemon registers
-	Cmd    *exec.Cmd       // subprocess
-	LogBuf *syncBuffer     // captured daemon stdout/stderr (for debug)
+	Name   string         // "a", "b", "c"
+	Socket string         // /tmp/entmoot-canary-<name>.sock
+	Dir    string         // per-node identity dir (t.TempDir()/pilot-<name>)
+	NodeID entmoot.NodeID // populated after daemon registers
+	Cmd    *exec.Cmd      // subprocess
+	LogBuf *syncBuffer    // captured daemon stdout/stderr (for debug)
 	Cancel context.CancelFunc
 	Ctx    context.Context
 }
+
+const pilotCanaryRegistrationTimeout = 45 * time.Second
+const pilotCanaryJoinEventTimeout = 45 * time.Second
+const pilotCanaryConvergenceTimeout = 60 * time.Second
+const pilotCanaryTailTimeout = 30 * time.Second
 
 // syncBuffer is a tiny goroutine-safe buffer used to capture daemon output so
 // test failures can dump it at the end. It intentionally mirrors bytes.Buffer
@@ -486,4 +491,3 @@ func waitForTrustSoft(p *pilotNode, peer entmoot.NodeID, timeout time.Duration) 
 		time.Sleep(300 * time.Millisecond)
 	}
 }
-

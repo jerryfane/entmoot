@@ -733,6 +733,11 @@ func openGroupDB(groupsDir string, groupID entmoot.GroupID) (*sql.DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("store: open sqlite %q: %w", dbPath, err)
 	}
+	// SQLite has one writer per database file. Keep database/sql from opening
+	// parallel connections for the same embedded DB so concurrent goroutines
+	// queue in Go instead of racing into SQLITE_BUSY/LOCKED inside SQLite.
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
 	// Ping to force the driver to actually open the file and run the pragmas
 	// so we surface errors here rather than deep in a query path.
 	if err := db.Ping(); err != nil {
