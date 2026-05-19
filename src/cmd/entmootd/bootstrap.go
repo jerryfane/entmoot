@@ -242,9 +242,70 @@ func bootstrapAgentCommands(gf *globalFlags, report bootstrapAgentReport) []stri
 		if report.Runner != agentRunnerNone {
 			parts = append(parts, "-runner", report.RunnerCommand)
 		}
-		out = append(out, entmootCommand(gf, report.Runtime, parts...))
+		out = append(out, stackGatedCommand(bootstrapStackHelper(gf, report), bootstrapStackHelperEnv(gf, report), entmootCommand(gf, report.Runtime, parts...)))
 	}
 	return out
+}
+
+func bootstrapStackHelper(gf *globalFlags, report bootstrapAgentReport) string {
+	stackHelper := strings.TrimSpace(report.Runtime.StackHelper)
+	if stackHelper == "" || gf == nil {
+		return ""
+	}
+	if strings.TrimSpace(gf.data) != agentEntmootDataPath || strings.TrimSpace(gf.socket) != agentPilotSocketPath {
+		return ""
+	}
+	if gf.listenPort != 0 && gf.listenPort != 1004 {
+		return ""
+	}
+	if logLevel := strings.TrimSpace(gf.logLevel); logLevel != "" && logLevel != "info" {
+		return ""
+	}
+	if gf.traceGossipTransport || gf.traceReconcile {
+		return ""
+	}
+	return stackHelper
+}
+
+func bootstrapStackHelperEnv(gf *globalFlags, report bootstrapAgentReport) []string {
+	var env []string
+	if gf != nil {
+		env = append(env,
+			shellEnvAssignment("ENTMOOT_DATA", gf.data),
+			shellEnvAssignment("ENTMOOT_IDENTITY", gf.identity),
+			shellEnvAssignment("PILOT_SOCKET", gf.socket),
+			shellEnvAssignment("ENTMOOT_HIDE_IP", strconv.FormatBool(gf.hideIP)),
+		)
+	}
+	if report.AgentInstructions {
+		env = append(env, "ENTMOOT_AGENT_INSTRUCTIONS=1")
+	}
+	if report.Runner != agentRunnerNone && report.RunnerCommand != "" {
+		env = append(env, shellEnvAssignment("ENTMOOT_AGENT_RUNNER", report.RunnerCommand))
+	}
+	return env
+}
+
+func shellEnvAssignment(name, value string) string {
+	return name + "=" + shellQuoteArg(value)
+}
+
+func stackGatedCommand(stackHelper string, env []string, command string) string {
+	stackHelper = strings.TrimSpace(stackHelper)
+	if stackHelper == "" {
+		return command
+	}
+	return strings.Join([]string{
+		stackHelperCommand(stackHelper, "ensure", env),
+		stackHelperCommand(stackHelper, "check", env),
+		command,
+	}, " && ")
+}
+
+func stackHelperCommand(stackHelper, mode string, env []string) string {
+	parts := append([]string{}, env...)
+	parts = append(parts, shellCommand(stackHelper, mode))
+	return strings.Join(parts, " ")
 }
 
 func entmootCommand(gf *globalFlags, report runtimeReport, args ...string) string {
