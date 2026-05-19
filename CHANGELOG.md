@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.66] - 2026-05-19
+
+### Changed
+
+- **Pilot fork release pin.** Entmoot release artifacts now build against
+  Pilot fork `v1.9.0-jf.15.28`, picking up the latest TURN routing recovery
+  fixes in the released binary build path.
+
 ## [1.5.65] - 2026-05-19
 
 ### Added
