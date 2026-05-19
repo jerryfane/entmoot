@@ -372,21 +372,25 @@ func runLiveRuntimeProcess(cmd *exec.Cmd, stdin []byte, liveCtx liveAgentRunnerC
 }
 
 func parseLiveRunnerOutput(stdout string) (liveAgentRunnerOutput, error) {
-	raw := bytes.TrimSpace([]byte(stdout))
+	return parseLiveRunnerJSONText(stdout, 0, "live agent runtime returned empty output", "live agent runtime returned invalid JSON")
+}
+
+func parseLiveRunnerJSONText(text string, depth int, emptyMessage, invalidMessage string) (liveAgentRunnerOutput, error) {
+	raw := bytes.TrimSpace([]byte(text))
 	if len(raw) == 0 {
-		return liveAgentRunnerOutput{}, fmt.Errorf("%w: live agent runtime returned empty output", errLiveRunnerInvalidJSON)
+		return liveAgentRunnerOutput{}, fmt.Errorf("%w: %s", errLiveRunnerInvalidJSON, emptyMessage)
 	}
-	if output, err := parseLiveRunnerJSON(raw, 0); err == nil {
+	if output, err := parseLiveRunnerJSON(raw, depth); err == nil {
 		return output, nil
 	}
 	start := bytes.IndexByte(raw, '{')
 	end := bytes.LastIndexByte(raw, '}')
 	if start >= 0 && end > start {
-		if output, err := parseLiveRunnerJSON(raw[start:end+1], 0); err == nil {
+		if output, err := parseLiveRunnerJSON(raw[start:end+1], depth); err == nil {
 			return output, nil
 		}
 	}
-	return liveAgentRunnerOutput{}, fmt.Errorf("%w: live agent runtime returned invalid JSON", errLiveRunnerInvalidJSON)
+	return liveAgentRunnerOutput{}, fmt.Errorf("%w: %s", errLiveRunnerInvalidJSON, invalidMessage)
 }
 
 func parseLiveRunnerJSON(raw []byte, depth int) (liveAgentRunnerOutput, error) {
@@ -414,27 +418,9 @@ func parseLiveRunnerJSON(raw []byte, depth int) (liveAgentRunnerOutput, error) {
 		if !liveRunnerOutputEnvelopeStatusAllowsActions(envelope.Status) {
 			return liveAgentRunnerOutput{}, fmt.Errorf("%w: live agent runtime output envelope status %q is not completed", errLiveRunnerInvalidJSON, strings.TrimSpace(envelope.Status))
 		}
-		return parseLiveRunnerOutputEnvelope(envelope.Output, depth+1)
+		return parseLiveRunnerJSONText(envelope.Output, depth+1, "live agent runtime output envelope is empty", "live agent runtime output envelope missing actions")
 	}
 	return liveAgentRunnerOutput{}, fmt.Errorf("%w: live agent runtime output missing actions", errLiveRunnerInvalidJSON)
-}
-
-func parseLiveRunnerOutputEnvelope(output string, depth int) (liveAgentRunnerOutput, error) {
-	raw := bytes.TrimSpace([]byte(output))
-	if len(raw) == 0 {
-		return liveAgentRunnerOutput{}, fmt.Errorf("%w: live agent runtime output envelope is empty", errLiveRunnerInvalidJSON)
-	}
-	if parsed, err := parseLiveRunnerJSON(raw, depth); err == nil {
-		return parsed, nil
-	}
-	start := bytes.IndexByte(raw, '{')
-	end := bytes.LastIndexByte(raw, '}')
-	if start >= 0 && end > start {
-		if parsed, err := parseLiveRunnerJSON(raw[start:end+1], depth); err == nil {
-			return parsed, nil
-		}
-	}
-	return liveAgentRunnerOutput{}, fmt.Errorf("%w: live agent runtime output envelope missing actions", errLiveRunnerInvalidJSON)
 }
 
 func rawJSONStartsWith(raw json.RawMessage, want byte) bool {
