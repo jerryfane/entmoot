@@ -45,6 +45,7 @@ After both daemons are up, run:
 
 ```sh
 scripts/verify-mesh-node.sh
+scripts/verify-agent-runtime.sh
 entmootd env --json
 entmootd doctor --json
 entmootd doctor -group <GROUP_ID> --probe
@@ -56,11 +57,15 @@ Entmoot message count, and recent transport/reconcile log lines. It does not
 perform SSH or modify state.
 
 `env` is the first check for container/OpenClaw agents because it confirms the
-actual data root and socket namespace. `doctor` is the preferred first-line
-check for live routing. It reports local membership, Pilot trust/pending state,
-member-profile hostname visibility, transport-ad freshness, active Entmoot
-stream probes, diagnoses, and suggested next commands. Use these before
-restarting services unless the failure is clearly below Entmoot.
+actual data root and socket namespace. `verify-agent-runtime.sh` wraps that
+read-only check for deployed agents: it fails unless `publish_path_healthy` is
+true, prefers `/data/.entmoot/entmoot` when the deployed wrapper exists, and
+runs `/data/.pilot/start-entmoot-stack.sh check` when the generated helper
+exists. `doctor` is the preferred first-line check for live routing. It reports
+local membership, Pilot trust/pending state, member-profile hostname
+visibility, transport-ad freshness, active Entmoot stream probes, diagnoses,
+and suggested next commands. Use these before restarting services unless the
+failure is clearly below Entmoot.
 
 ## Release Checklist
 
