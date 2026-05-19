@@ -57,6 +57,47 @@ type runtimeDaemonReport struct {
 	ContainerLike       bool   `json:"container_like,omitempty"`
 }
 
+type runtimeSocketHealth struct {
+	Path      string
+	Exists    bool
+	Reachable bool
+	Stale     bool
+}
+
+func runtimeSocketProbe(path string, timeout time.Duration) runtimeSocketHealth {
+	health := runtimeSocketHealth{Path: path, Exists: pathExists(path)}
+	health.Reachable = controlSocketAlive(path, timeout)
+	health.Stale = health.Exists && !health.Reachable
+	return health
+}
+
+type runtimePIDFileHealth struct {
+	Path  string
+	PID   int
+	Live  bool
+	Stale bool
+}
+
+func runtimePIDFileProbe(path string, live func(int) bool) runtimePIDFileHealth {
+	health := runtimePIDFileHealth{Path: path}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return health
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil || pid <= 0 {
+		health.Stale = true
+		return health
+	}
+	health.PID = pid
+	if live != nil && live(pid) {
+		health.Live = true
+		return health
+	}
+	health.Stale = true
+	return health
+}
+
 func cmdEnv(gf *globalFlags, args []string) int {
 	fs := flag.NewFlagSet("env", flag.ContinueOnError)
 	jsonOut := fs.Bool("json", false, "emit JSON instead of a human summary")
@@ -83,6 +124,8 @@ func cmdEnv(gf *globalFlags, args []string) int {
 func collectRuntimeReport(gf *globalFlags, dataDir string) runtimeReport {
 	bin, _ := os.Executable()
 	controlSock := controlSocketPath(dataDir)
+	pilotSocket := runtimeSocketProbe(gf.socket, runtimeProcScanTimeout)
+	controlSocket := runtimeSocketProbe(controlSock, runtimeProcScanTimeout)
 	report := runtimeReport{
 		Binary:                 bin,
 		UID:                    os.Getuid(),
@@ -90,9 +133,9 @@ func collectRuntimeReport(gf *globalFlags, dataDir string) runtimeReport {
 		DataDir:                dataDir,
 		IdentityPath:           gf.identity,
 		PilotSocket:            gf.socket,
-		PilotSocketReachable:   controlSocketAlive(gf.socket, runtimeProcScanTimeout),
+		PilotSocketReachable:   pilotSocket.Reachable,
 		ControlSocket:          controlSock,
-		ControlSocketReachable: controlSocketAlive(controlSock, runtimeProcScanTimeout),
+		ControlSocketReachable: controlSocket.Reachable,
 		Recommended: map[string]string{
 			"agent_pilot_socket": agentPilotSocketPath,
 			"agent_data_dir":     agentEntmootDataPath,
