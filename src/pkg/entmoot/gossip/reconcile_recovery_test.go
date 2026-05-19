@@ -151,7 +151,7 @@ func TestTransportClassifiedStaleStreamErrorsAreRetryable(t *testing.T) {
 	if !classification.StaleSession {
 		t.Fatal("transport-classified stale stream was not stale-session")
 	}
-	if !shouldDropPeerSessionAfterStreamFailure(classification, 0) {
+	if !shouldDropPeerSessionAfterStreamFailure(classification, 0, context.Background()) {
 		t.Fatal("transport-classified stale stream did not request cached session drop")
 	}
 }
@@ -296,6 +296,38 @@ func TestFetchPeerRootDropsSessionOnFirstReadDeadline(t *testing.T) {
 	}
 }
 
+func TestRequestResponseReadDeadlineArmsDialBackoff(t *testing.T) {
+	t.Parallel()
+
+	var gid entmoot.GroupID
+	gid[0] = 1
+	tr := &scriptedTransport{
+		handlers: []func(net.Conn){
+			func(c net.Conn) {
+				defer c.Close()
+				_, _, _ = wire.ReadAndDecode(c)
+				time.Sleep(50 * time.Millisecond)
+			},
+			func(c net.Conn) {
+				defer c.Close()
+				_, _, _ = wire.ReadAndDecode(c)
+				time.Sleep(50 * time.Millisecond)
+			},
+		},
+	}
+	g := newScriptedRecoveryGossiper(gid, tr)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, err := g.requestResponseWithAttemptTimeout(ctx, 20, &wire.MerkleReq{GroupID: gid}, wire.MsgMerkleResp, "merkle_req", 10*time.Millisecond)
+	if err == nil {
+		t.Fatal("requestResponseWithAttemptTimeout unexpectedly succeeded")
+	}
+	if g.canDial(20) {
+		t.Fatal("read deadline did not arm dial backoff")
+	}
+}
+
 func TestRequestResponseDialBudgetDoesNotUseAttemptTimeout(t *testing.T) {
 	t.Parallel()
 
@@ -392,6 +424,46 @@ func TestLocalContextCancellationDoesNotArmDialBackoff(t *testing.T) {
 	}
 	if !g.canDial(20) {
 		t.Fatal("local cancellation armed dial backoff")
+	}
+}
+
+func TestRequestResponseCancelsBlockedRead(t *testing.T) {
+	t.Parallel()
+
+	var gid entmoot.GroupID
+	gid[0] = 1
+	tr := &scriptedTransport{
+		handlers: []func(net.Conn){
+			func(c net.Conn) {
+				defer c.Close()
+				_, _, _ = wire.ReadAndDecode(c)
+				_, _ = io.Copy(io.Discard, c)
+			},
+		},
+	}
+	g := newScriptedRecoveryGossiper(gid, tr)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := g.requestResponse(ctx, 20, &wire.MerkleReq{GroupID: gid}, wire.MsgMerkleResp, "merkle_req")
+		done <- err
+	}()
+
+	cancel()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("requestResponse unexpectedly succeeded")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("requestResponse did not return after context cancellation")
+	}
+	if !g.canDial(20) {
+		t.Fatal("local cancellation armed dial backoff")
+	}
+	if _, drops := tr.counts(); drops != 0 {
+		t.Fatalf("drops = %d, want 0 for local cancellation", drops)
 	}
 }
 

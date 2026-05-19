@@ -35,15 +35,15 @@ func classifyGenericStreamError(ctx context.Context, err error) StreamErrorClass
 	if err == nil {
 		return c
 	}
+	if errors.Is(ctx.Err(), context.Canceled) {
+		c.LocalContext = true
+	}
 	if errors.Is(err, context.Canceled) {
 		c.LocalContext = true
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		c.Retryable = true
 		c.Timeout = true
-		if ctx.Err() != nil {
-			c.LocalContext = true
-		}
 	}
 	if errors.Is(err, io.EOF) ||
 		errors.Is(err, io.ErrUnexpectedEOF) ||
@@ -85,14 +85,20 @@ func shouldRetryStreamFailure(c StreamErrorClassification, attempt int, parentCt
 	return attemptTimeout > 0 || parentCtx.Err() == nil
 }
 
-func shouldDropPeerSessionAfterStreamFailure(c StreamErrorClassification, attempt int) bool {
+func shouldDropPeerSessionAfterStreamFailure(c StreamErrorClassification, attempt int, parentCtx context.Context) bool {
+	if parentCtx.Err() != nil {
+		return false
+	}
 	if c.StaleSession {
 		return true
 	}
 	return attempt > 0 && c.Retryable
 }
 
-func shouldDropPeerSessionAfterResponseFailure(c StreamErrorClassification) bool {
+func shouldDropPeerSessionAfterResponseFailure(c StreamErrorClassification, parentCtx context.Context) bool {
+	if parentCtx.Err() != nil {
+		return false
+	}
 	return c.Retryable
 }
 

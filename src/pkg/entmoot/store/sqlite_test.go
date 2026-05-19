@@ -1016,3 +1016,19 @@ func TestSQLiteFilePermissions(t *testing.T) {
 		t.Fatalf("sqlite file mode = %04o, want 0600", mode)
 	}
 }
+
+func TestSQLiteGroupDBUsesSingleConnection(t *testing.T) {
+	s, err := OpenSQLite(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	db, err := s.dbFor(randGroupID(t))
+	if err != nil {
+		t.Fatalf("dbFor: %v", err)
+	}
+	if got := db.Stats().MaxOpenConnections; got != 1 {
+		t.Fatalf("MaxOpenConnections = %d, want 1", got)
+	}
+}
