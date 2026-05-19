@@ -2288,6 +2288,16 @@ func TestParseLiveRunnerOutputUnwrapsCommandRunnerOutput(t *testing.T) {
 	}
 }
 
+func TestParseLiveRunnerOutputUnwrapsNoisyCommandRunnerOutput(t *testing.T) {
+	output, err := parseLiveRunnerOutput(`{"status":"completed","summary":"done","output":"thinking\n{\"actions\":[{\"kind\":\"reply\",\"message\":\"wrapped noisy\"}]}\n"}`)
+	if err != nil {
+		t.Fatalf("parseLiveRunnerOutput: %v", err)
+	}
+	if len(output.Actions) != 1 || output.Actions[0].Kind != "reply" || output.Actions[0].Message != "wrapped noisy" {
+		t.Fatalf("output = %+v", output)
+	}
+}
+
 func TestParseLiveRunnerOutputClassifiesInvalidJSON(t *testing.T) {
 	tests := []string{
 		"",
