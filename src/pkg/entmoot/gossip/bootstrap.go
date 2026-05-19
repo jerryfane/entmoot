@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"net"
 	"time"
 
 	"entmoot/pkg/entmoot"
@@ -17,6 +19,13 @@ import (
 // exhausted without producing a synced roster. Callers decide whether to
 // retry (ARCHITECTURE §5 calls for a 30s→10m exponential backoff).
 var ErrJoinFailed = errors.New("gossip: join failed: all bootstrap candidates unreachable")
+
+var errRosterResponseMissingLocalHead = errors.New("roster sync: response missing local head")
+
+const (
+	joinRetryBase = 500 * time.Millisecond
+	joinRetryCap  = 3 * time.Second
+)
 
 // Join executes the three-stage bootstrap described in ARCHITECTURE §5:
 //
@@ -101,6 +110,125 @@ func (g *Gossiper) Join(ctx context.Context, invite *entmoot.Invite) error {
 		}
 	}
 
+	var lastErr error
+	retryDelay := joinRetryBase
+	for {
+		if err := g.tryJoinBootstrap(ctx, invite); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+		if !errors.Is(lastErr, ErrJoinFailed) || !joinRetryEnabled(ctx) {
+			return lastErr
+		}
+		if err := sleepJoinRetry(ctx, retryDelay); err != nil {
+			return fmt.Errorf("%w: %w", lastErr, err)
+		}
+		retryDelay = nextJoinRetryDelay(retryDelay)
+	}
+}
+
+func joinRetryEnabled(ctx context.Context) bool {
+	_, ok := ctx.Deadline()
+	return ok
+}
+
+func nextJoinRetryDelay(delay time.Duration) time.Duration {
+	if delay <= 0 {
+		return joinRetryBase
+	}
+	delay *= 2
+	if delay > joinRetryCap {
+		return joinRetryCap
+	}
+	return delay
+}
+
+func sleepJoinRetry(ctx context.Context, delay time.Duration) error {
+	if delay <= 0 {
+		delay = joinRetryBase
+	}
+	if delay > joinRetryCap {
+		delay = joinRetryCap
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return ctx.Err()
+		}
+		if remaining < delay {
+			delay = remaining
+		}
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+type permanentJoinError struct {
+	err error
+}
+
+func (e permanentJoinError) Error() string {
+	return e.err.Error()
+}
+
+func (e permanentJoinError) Unwrap() error {
+	return e.err
+}
+
+func permanentJoinFailure(err error) error {
+	return permanentJoinError{err: err}
+}
+
+func isPermanentJoinFailure(err error) bool {
+	var permanent permanentJoinError
+	return errors.As(err, &permanent)
+}
+
+func isTransientJoinStreamError(ctx context.Context, err error) bool {
+	if err == nil {
+		return false
+	}
+	if ctx.Err() != nil {
+		return true
+	}
+	return errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, net.ErrClosed)
+}
+
+func (g *Gossiper) isPermanentJoinReadError(ctx context.Context, err error) bool {
+	if isTransientJoinStreamError(ctx, err) {
+		return false
+	}
+	classification := g.classifyStreamError(ctx, err)
+	if classification.Retryable || classification.LocalContext || classification.StaleSession || classification.Timeout {
+		return false
+	}
+	return errors.Is(err, entmoot.ErrMalformedFrame) ||
+		errors.Is(err, entmoot.ErrUnknownMessage) ||
+		errors.Is(err, entmoot.ErrOversized)
+}
+
+func (g *Gossiper) tryJoinBootstrap(ctx context.Context, invite *entmoot.Invite) error {
+	var firstPermanentErr error
+	var sawTransientErr bool
+	recordJoinErr := func(err error) {
+		if isPermanentJoinFailure(err) {
+			if firstPermanentErr == nil {
+				firstPermanentErr = err
+			}
+			return
+		}
+		sawTransientErr = true
+	}
+
 	// Strategy 1: invite.BootstrapPeers in listed order.
 	for _, bp := range invite.BootstrapPeers {
 		if bp.NodeID == g.cfg.LocalNode {
@@ -110,6 +238,7 @@ func (g *Gossiper) Join(ctx context.Context, invite *entmoot.Invite) error {
 			g.pullJoinSnapshots(ctx, bp.NodeID)
 			return nil
 		} else {
+			recordJoinErr(err)
 			g.logger.Warn("gossip: bootstrap peer failed",
 				slog.Uint64("peer", uint64(bp.NodeID)),
 				slog.String("err", err.Error()))
@@ -136,6 +265,7 @@ func (g *Gossiper) Join(ctx context.Context, invite *entmoot.Invite) error {
 				g.pullJoinSnapshots(ctx, peer)
 				return nil
 			} else {
+				recordJoinErr(err)
 				g.logger.Warn("gossip: trusted-intersect peer failed",
 					slog.Uint64("peer", uint64(peer)),
 					slog.String("err", err.Error()))
@@ -149,12 +279,16 @@ func (g *Gossiper) Join(ctx context.Context, invite *entmoot.Invite) error {
 			g.pullJoinSnapshots(ctx, invite.Founder.PilotNodeID)
 			return nil
 		} else {
+			recordJoinErr(err)
 			g.logger.Warn("gossip: founder fallback failed",
 				slog.Uint64("peer", uint64(invite.Founder.PilotNodeID)),
 				slog.String("err", err.Error()))
 		}
 	}
 
+	if firstPermanentErr != nil && !sawTransientErr {
+		return firstPermanentErr
+	}
 	return ErrJoinFailed
 }
 
@@ -182,6 +316,9 @@ func (g *Gossiper) tryRosterSync(ctx context.Context, peer entmoot.NodeID) error
 		return fmt.Errorf("dial: %w", err)
 	}
 	defer conn.Close()
+	setConnDeadlineFromContext(ctx, conn)
+	stopCancelClose := closeConnOnContextDone(ctx, conn)
+	defer stopCancelClose()
 
 	req := &wire.RosterReq{GroupID: g.cfg.GroupID}
 	if err := wire.EncodeAndWrite(conn, req); err != nil {
@@ -189,20 +326,29 @@ func (g *Gossiper) tryRosterSync(ctx context.Context, peer entmoot.NodeID) error
 	}
 	_, payload, err := wire.ReadAndDecode(conn)
 	if err != nil {
+		if g.isPermanentJoinReadError(ctx, err) {
+			return permanentJoinFailure(fmt.Errorf("read roster_resp: %w", err))
+		}
 		return fmt.Errorf("read roster_resp: %w", err)
 	}
 	resp, ok := payload.(*wire.RosterResp)
 	if !ok {
-		return fmt.Errorf("roster sync: unexpected response type")
+		return permanentJoinFailure(fmt.Errorf("roster sync: unexpected response type"))
 	}
 	if resp.GroupID != g.cfg.GroupID {
-		return fmt.Errorf("roster sync: wrong group in response")
+		return permanentJoinFailure(fmt.Errorf("roster sync: wrong group in response"))
 	}
 	if len(resp.Entries) == 0 {
-		return fmt.Errorf("roster sync: empty entries")
+		return permanentJoinFailure(fmt.Errorf("roster sync: empty entries"))
 	}
 
-	return g.applyEntries(resp.Entries)
+	if err := g.applyEntries(resp.Entries); err != nil {
+		if errors.Is(err, errRosterResponseMissingLocalHead) {
+			return err
+		}
+		return permanentJoinFailure(err)
+	}
+	return nil
 }
 
 // applyEntries applies roster entries from a RosterResp to the local log.
@@ -239,7 +385,7 @@ func (g *Gossiper) applyEntries(entries []entmoot.RosterEntry) error {
 		// hasn't seen us yet. v0 cannot reconcile forks (founder-only admin
 		// precludes them), so treat this as a soft error and log; we apply
 		// nothing.
-		return fmt.Errorf("roster sync: response does not include local head %s", head)
+		return fmt.Errorf("%w %s", errRosterResponseMissingLocalHead, head)
 	}
 	for i := startIdx + 1; i < len(entries); i++ {
 		if err := g.cfg.Roster.Apply(entries[i]); err != nil {

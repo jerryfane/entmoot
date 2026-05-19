@@ -872,6 +872,14 @@ func setConnDeadlineFromContext(ctx context.Context, conn net.Conn) {
 	}
 }
 
+func closeConnOnContextDone(ctx context.Context, conn net.Conn) func() bool {
+	return context.AfterFunc(ctx, func() {
+		if errors.Is(ctx.Err(), context.Canceled) {
+			_ = conn.Close()
+		}
+	})
+}
+
 func setConnWriteDeadlineFromContext(ctx context.Context, conn net.Conn) {
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = conn.SetWriteDeadline(deadline)
@@ -980,28 +988,31 @@ func (g *Gossiper) requestResponseWithAttemptTimeout(ctx context.Context, peer e
 			attemptCtx, cancel = context.WithTimeout(ctx, attemptTimeout)
 		}
 		setConnDeadlineFromContext(attemptCtx, conn)
+		stopCancelClose := closeConnOnContextDone(attemptCtx, conn)
 
 		err = wire.EncodeAndWrite(conn, req)
 		if err != nil {
 			classification := g.classifyStreamError(attemptCtx, err)
+			stopCancelClose()
 			_ = conn.Close()
 			if cancel != nil {
 				cancel()
 			}
 			lastErr = fmt.Errorf("%s: write: %w", op, err)
 			if shouldRetryStreamFailure(classification, attempt, ctx, attemptTimeout) {
-				if shouldDropPeerSessionAfterStreamFailure(classification, attempt) {
+				if shouldDropPeerSessionAfterStreamFailure(classification, attempt, ctx) {
 					g.dropPeerSession(peer, op, err)
 				}
 				continue
 			}
-			if classification.Retryable && shouldDropPeerSessionAfterStreamFailure(classification, attempt) {
+			if classification.Retryable && shouldDropPeerSessionAfterStreamFailure(classification, attempt, ctx) {
 				g.dropPeerSession(peer, op, err)
 			}
 			return nil, lastErr
 		}
 
 		msgType, payload, err := wire.ReadAndDecode(conn)
+		stopCancelClose()
 		_ = conn.Close()
 		if cancel != nil {
 			cancel()
@@ -1010,12 +1021,12 @@ func (g *Gossiper) requestResponseWithAttemptTimeout(ctx context.Context, peer e
 			classification := g.classifyStreamError(attemptCtx, err)
 			lastErr = fmt.Errorf("%s: read: %w", op, err)
 			if shouldRetryStreamFailure(classification, attempt, ctx, attemptTimeout) {
-				if shouldDropPeerSessionAfterResponseFailure(classification) {
+				if shouldDropPeerSessionAfterResponseFailure(classification, ctx) {
 					g.dropPeerSession(peer, op, err)
 				}
 				continue
 			}
-			if shouldDropPeerSessionAfterResponseFailure(classification) {
+			if shouldDropPeerSessionAfterResponseFailure(classification, ctx) {
 				g.dropPeerSession(peer, op, err)
 			}
 			if classification.Retryable && shouldRecordDialFailure(classification) {
@@ -1074,12 +1085,12 @@ func (g *Gossiper) dialAndWrite(ctx context.Context, peer entmoot.NodeID, frame 
 		classification := g.classifyStreamError(writeCtx, err)
 		writeCancel()
 		if shouldRetryStreamFailure(classification, attempt, ctx, 0) {
-			if shouldDropPeerSessionAfterStreamFailure(classification, attempt) {
+			if shouldDropPeerSessionAfterStreamFailure(classification, attempt, ctx) {
 				g.dropPeerSession(peer, op, err)
 			}
 			continue
 		}
-		if classification.Retryable && shouldDropPeerSessionAfterStreamFailure(classification, attempt) {
+		if classification.Retryable && shouldDropPeerSessionAfterStreamFailure(classification, attempt, ctx) {
 			g.dropPeerSession(peer, op, err)
 		}
 		if classification.Retryable && shouldRecordDialFailure(classification) {

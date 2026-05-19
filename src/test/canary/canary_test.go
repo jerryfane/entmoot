@@ -24,21 +24,21 @@ import (
 // TestCanaryPilot then proves the same flow works over a real Pilot network.
 //
 // Flow (ARCHITECTURE §12):
-//   1. Generate 3 Entmoot identities (A, B, C).
-//   2. Assign Pilot NodeIDs 1, 2, 3 respectively.
-//   3. A opens a JSONL RosterLog, calls Genesis, then applies two signed
-//      add(subject) entries for B and C (in-process; there is no CLI for
-//      admin-side roster mutation in v0).
-//   4. Snapshot the resulting 3 entries onto B and C via AcceptGenesis +
-//      Apply so every node agrees on membership — this exercises the Join
-//      code path without running the accept loops yet.
-//   5. Open a JSONL MessageStore per node; wire a gossip.Gossiper around
-//      each (fanout = 2).
-//   6. Start all three accept loops.
-//   7. Publish 3 messages: A publishes #1, B publishes #2, A publishes #3.
-//   8. Poll for convergence: all three stores have 3 messages AND identical
-//      Merkle roots.
-//   9. Cancel the gossipers, close stores/rosters/transports.
+//  1. Generate 3 Entmoot identities (A, B, C).
+//  2. Assign Pilot NodeIDs 1, 2, 3 respectively.
+//  3. A opens a JSONL RosterLog, calls Genesis, then applies two signed
+//     add(subject) entries for B and C (in-process; there is no CLI for
+//     admin-side roster mutation in v0).
+//  4. Snapshot the resulting 3 entries onto B and C via AcceptGenesis +
+//     Apply so every node agrees on membership — this exercises the Join
+//     code path without running the accept loops yet.
+//  5. Open a JSONL MessageStore per node; wire a gossip.Gossiper around
+//     each (fanout = 2).
+//  6. Start all three accept loops.
+//  7. Publish 3 messages: A publishes #1, B publishes #2, A publishes #3.
+//  8. Poll for convergence: all three stores have 3 messages AND identical
+//     Merkle roots.
+//  9. Cancel the gossipers, close stores/rosters/transports.
 func TestCanaryInMemory(t *testing.T) {
 	t.Parallel()
 
@@ -293,9 +293,9 @@ func TestCanaryPilot(t *testing.T) {
 
 	// Wait for each daemon to register (have an addr). Up to 20s per node; a
 	// fresh daemon on a cold path occasionally takes >10s.
-	waitPilotRegistered(t, a, 20*time.Second, logger)
-	waitPilotRegistered(t, b, 20*time.Second, logger)
-	waitPilotRegistered(t, c, 20*time.Second, logger)
+	waitPilotRegistered(t, a, pilotCanaryRegistrationTimeout, logger)
+	waitPilotRegistered(t, b, pilotCanaryRegistrationTimeout, logger)
+	waitPilotRegistered(t, c, pilotCanaryRegistrationTimeout, logger)
 
 	// Populate NodeIDs via `pilotctl info` (the Entmoot pilot adapter also
 	// reads them on Open, but we need them now so the three rosters can
@@ -478,7 +478,7 @@ func TestCanaryPilot(t *testing.T) {
 			Store:            s,
 			Transport:        tr,
 			GroupID:          gid,
-			Fanout:            2,
+			Fanout:           2,
 			Logger:           logger,
 			TransportAdStore: tas,
 			RateLimiter:      ratelimit.New(ratelimit.DefaultLimits(), nil),
