@@ -23,18 +23,27 @@ const (
 	runtimeProcScanTimeout = 250 * time.Millisecond
 )
 
+const (
+	runtimeStatusHealthy   = "healthy"
+	runtimeStatusHalfAlive = "half_alive"
+	runtimeStatusDown      = "down"
+)
+
 var procRoot = "/proc"
 
 type runtimeReport struct {
 	Binary                 string               `json:"binary,omitempty"`
 	UID                    int                  `json:"uid"`
 	GID                    int                  `json:"gid"`
+	RuntimeStatus          string               `json:"runtime_status"`
+	RuntimeStatusReason    string               `json:"runtime_status_reason,omitempty"`
 	DataDir                string               `json:"data_dir"`
 	IdentityPath           string               `json:"identity_path"`
 	PilotSocket            string               `json:"pilot_socket"`
 	PilotSocketReachable   bool                 `json:"pilot_socket_reachable"`
 	ControlSocket          string               `json:"control_socket"`
 	ControlSocketReachable bool                 `json:"control_socket_reachable"`
+	PublishPathHealthy     bool                 `json:"publish_path_healthy"`
 	AgentWrapper           string               `json:"agent_wrapper,omitempty"`
 	PilotWrapper           string               `json:"pilot_wrapper,omitempty"`
 	StackHelper            string               `json:"stack_helper,omitempty"`
@@ -134,6 +143,7 @@ func collectRuntimeReport(gf *globalFlags, dataDir string) runtimeReport {
 		GID:                    os.Getgid(),
 		DataDir:                dataDir,
 		IdentityPath:           gf.identity,
+		PublishPathHealthy:     controlSocket.Reachable,
 		PilotSocket:            gf.socket,
 		PilotSocketReachable:   pilotSocket.Reachable,
 		ControlSocket:          controlSock,
@@ -168,15 +178,37 @@ func collectRuntimeReport(gf *globalFlags, dataDir string) runtimeReport {
 			}
 		}
 	}
+	report.RuntimeStatus, report.RuntimeStatusReason = classifyRuntimeStatus(report)
+	if report.RuntimeStatus == runtimeStatusHalfAlive {
+		report.Suggestions = append(report.Suggestions, "process discovery found entmootd, but the direct publish path is not healthy; trust socket probes over process lists")
+		if report.StackHelper != "" {
+			report.Suggestions = append(report.Suggestions, fmt.Sprintf("check the managed stack without mutation: %s check", report.StackHelper))
+		}
+	}
 	if strings.HasPrefix(dataDir, "/data/") && gf.socket == "/tmp/pilot.sock" {
 		report.Suggestions = append(report.Suggestions, "for containerized agents, prefer -socket /data/.pilot/pilot.sock and keep /tmp/pilot.sock as a compatibility symlink")
 	}
 	return report
 }
 
+func classifyRuntimeStatus(report runtimeReport) (string, string) {
+	if report.PublishPathHealthy {
+		return runtimeStatusHealthy, ""
+	}
+	if report.RunningDaemon != nil {
+		return runtimeStatusHalfAlive, "running entmootd process found, but the control socket is not reachable"
+	}
+	return runtimeStatusDown, "control socket is not reachable"
+}
+
 func printRuntimeReport(report runtimeReport) {
 	fmt.Printf("binary: %s\n", report.Binary)
 	fmt.Printf("uid: %d gid: %d\n", report.UID, report.GID)
+	fmt.Printf("runtime_status: %s\n", report.RuntimeStatus)
+	if report.RuntimeStatusReason != "" {
+		fmt.Printf("runtime_status_reason: %s\n", report.RuntimeStatusReason)
+	}
+	fmt.Printf("publish_path_healthy: %t\n", report.PublishPathHealthy)
 	fmt.Printf("data: %s\n", report.DataDir)
 	fmt.Printf("identity: %s\n", report.IdentityPath)
 	fmt.Printf("pilot_socket: %s reachable=%t\n", report.PilotSocket, report.PilotSocketReachable)
