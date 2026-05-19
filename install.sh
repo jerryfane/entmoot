@@ -284,6 +284,15 @@ PILOT_PIDFILE="\$RUN_DIR/pilot-daemon.pid"
 ENTMOOT_PIDFILE="\$RUN_DIR/entmootd.pid"
 ENTMOOT_CONTROL_SOCKET=\${ENTMOOT_CONTROL_SOCKET:-"\$ENTMOOT_DATA/control.sock"}
 ENTMOOT_START_TIMEOUT=\${ENTMOOT_START_TIMEOUT:-90}
+STACK_MODE=\${1:-ensure}
+case "\$STACK_MODE" in
+  ensure) ;;
+  check) ;;
+  *)
+    echo "usage: \$0 [ensure|check]" >&2
+    exit 2
+    ;;
+esac
 case "\$ENTMOOT_START_TIMEOUT" in
   ''|*[!0-9]*)
     echo "invalid ENTMOOT_START_TIMEOUT=\$ENTMOOT_START_TIMEOUT; using 90" >&2
@@ -298,8 +307,13 @@ quote() {
 has_proc_arg() {
   pid="\$1"
   want="\$2"
-  [ -r "/proc/\$pid/cmdline" ] || return 1
-  tr '\000' '\n' < "/proc/\$pid/cmdline" | grep -Fx -- "\$want" >/dev/null 2>&1
+  if [ -r "/proc/\$pid/cmdline" ]; then
+    tr '\000' '\n' < "/proc/\$pid/cmdline" | grep -Fx -- "\$want" >/dev/null 2>&1
+    return \$?
+  fi
+  cmd=\$(ps -p "\$pid" -o command= 2>/dev/null || true)
+  [ -n "\$cmd" ] || return 1
+  printf '%s\n' "\$cmd" | grep -F -- "\$want" >/dev/null 2>&1
 }
 
 pid_matches_stack() {
@@ -307,7 +321,6 @@ pid_matches_stack() {
   pid="\$2"
   [ -n "\$pid" ] || return 1
   kill -0 "\$pid" 2>/dev/null || return 1
-  [ -r "/proc/\$pid/cmdline" ] || return 1
   case "\$kind" in
     pilot)
       has_proc_arg "\$pid" "-socket" && has_proc_arg "\$pid" "\$PILOT_SOCKET"
@@ -526,6 +539,44 @@ require_entmoot_live() {
   entmoot_socket_live
 }
 
+check_pidfile_for_kind() {
+  kind="\$1"
+  pidfile="\$2"
+  if [ ! -f "\$pidfile" ]; then
+    echo "\$kind pidfile is missing at \$pidfile" >&2
+    return 1
+  fi
+  if pidfile_live_for_kind "\$kind" "\$pidfile"; then
+    return 0
+  fi
+  pid=\$(pidfile_pid "\$pidfile")
+  echo "\$kind pidfile is stale at \$pidfile pid=\$pid" >&2
+  return 1
+}
+
+check_stack() {
+  status=0
+  pilot_ready=0
+  if pilot_socket_live; then
+    pilot_ready=1
+  else
+    echo "pilot socket is not live at \$PILOT_SOCKET" >&2
+    status=1
+  fi
+  if ! entmoot_socket_live; then
+    echo "entmoot control socket is not live at \$ENTMOOT_CONTROL_SOCKET" >&2
+    status=1
+  fi
+  if [ "\$pilot_ready" = "0" ]; then
+    check_pidfile_for_kind pilot "\$PILOT_PIDFILE" || status=1
+  fi
+  check_pidfile_for_kind entmoot "\$ENTMOOT_PIDFILE" || status=1
+  if [ -n "\${ENTMOOT_AGENT_RUNNER:-}" ]; then
+    check_pidfile_for_kind agent-watcher "\$RUN_DIR/agent-commands-watch.pid" || status=1
+  fi
+  return "\$status"
+}
+
 print_entmoot_start_failure() {
   echo "entmoot daemon did not become ready at \$ENTMOOT_CONTROL_SOCKET" >&2
   if [ -f "\$ENTMOOT_DATA/restart.log" ]; then
@@ -585,15 +636,6 @@ start_agent_command_watcher() {
 
 if [ "\$(id -u)" = "0" ] && [ -d /data ] && is_data_agent_layout; then
   if STACK_RUN_USER=\$(select_stack_run_user); then
-    mkdir -p "\$RUN_DIR"
-    stop_agent_command_watcher || true
-    stop_pidfile entmoot "\$ENTMOOT_PIDFILE" || true
-    stop_pidfile pilot "\$PILOT_PIDFILE" || true
-    stop_stack_processes entmoot || true
-    stop_stack_processes pilot || true
-    remove_compat_pilot_socket || true
-    STACK_RUN_GROUP=\$(id -gn "\$STACK_RUN_USER" 2>/dev/null || printf '%s' "\$STACK_RUN_USER")
-    chown -R "\$STACK_RUN_USER:\$STACK_RUN_GROUP" "\$PILOT_DIR" "\$ENTMOOT_DATA" "\$RUN_DIR"
     envs="ENTMOOT_RUNTIME_ENV=\$(quote "\$RUNTIME_ENV")"
     for name in ENTMOOT_BIN ENTMOOT_DATA ENTMOOT_IDENTITY ENTMOOT_CONTROL_SOCKET ENTMOOT_HIDE_IP ENTMOOT_START_TIMEOUT ENTMOOT_RUN_DIR ENTMOOT_RUN_USER ENTMOOT_AGENT_INSTRUCTIONS ENTMOOT_AGENT_RUNNER ENTMOOT_AGENT_WATCH_INTERVAL ENTMOOT_OPENCLAW_AGENT ENTMOOT_OPENCLAW_SESSION_ID ENTMOOT_OPENCLAW_TO OPENCLAW_AGENT_ID OPENCLAW_SESSION_ID OPENCLAW_TO OPENCLAW_BIN PILOT_DIR PILOT_BIN_DIR PILOT_SOCKET TMP_PILOT_SOCKET PILOT_DAEMON_BIN PILOTCTL_BIN PILOT_REGISTRY PILOT_BEACON PILOT_HOSTNAME PILOT_EMAIL PILOT_TURN_PROVIDER PILOT_CLOUDFLARE_TURN_CREDS_FILE PILOT_RENDEZVOUS_URL; do
       eval "value=\\\${\$name-}"
@@ -601,14 +643,32 @@ if [ "\$(id -u)" = "0" ] && [ -d /data ] && is_data_agent_layout; then
         envs="\$envs \$name=\$(quote "\$value")"
       fi
     done
-    exec su "\$STACK_RUN_USER" -c "\$envs sh \$(quote "\$0")"
+    if [ "\$STACK_MODE" = "check" ]; then
+      exec su "\$STACK_RUN_USER" -c "\$envs sh \$(quote "\$0") check"
+    fi
+    STACK_RUN_GROUP=\$(id -gn "\$STACK_RUN_USER" 2>/dev/null || printf '%s' "\$STACK_RUN_USER")
+    mkdir -p "\$RUN_DIR"
+    stop_agent_command_watcher || true
+    stop_pidfile entmoot "\$ENTMOOT_PIDFILE" || true
+    stop_pidfile pilot "\$PILOT_PIDFILE" || true
+    stop_stack_processes entmoot || true
+    stop_stack_processes pilot || true
+    remove_compat_pilot_socket || true
+    chown -R "\$STACK_RUN_USER:\$STACK_RUN_GROUP" "\$PILOT_DIR" "\$ENTMOOT_DATA" "\$RUN_DIR"
+    exec su "\$STACK_RUN_USER" -c "\$envs sh \$(quote "\$0") ensure"
   elif [ -n "\${ENTMOOT_RUN_USER:-}" ]; then
     exit 1
   fi
 fi
 
-PILOT_DAEMON_BIN=\$(resolve_pilot_binary pilot-daemon "\${PILOT_DAEMON_BIN:-}" daemon)
 PILOTCTL_BIN=\$(resolve_pilot_binary pilotctl "\${PILOTCTL_BIN:-}")
+
+if [ "\$STACK_MODE" = "check" ]; then
+  check_stack || exit \$?
+  exit 0
+fi
+
+PILOT_DAEMON_BIN=\$(resolve_pilot_binary pilot-daemon "\${PILOT_DAEMON_BIN:-}" daemon)
 
 mkdir -p "\$RUN_DIR"
 validate_agent_command_runner || exit 1
