@@ -467,11 +467,8 @@ func knownLiveActionKind(kind string) bool {
 func openClawLiveFinalText(stdout string) string {
 	var report openClawAgentRunReport
 	if err := json.Unmarshal([]byte(stdout), &report); err == nil {
-		if strings.TrimSpace(report.Meta.FinalAssistantVisibleText) != "" {
-			return report.Meta.FinalAssistantVisibleText
-		}
-		if strings.TrimSpace(report.Meta.FinalAssistantRawText) != "" {
-			return report.Meta.FinalAssistantRawText
+		if text := openClawFinalText(report); strings.TrimSpace(text) != "" {
+			return text
 		}
 	}
 	return stdout

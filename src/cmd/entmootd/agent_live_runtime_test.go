@@ -2298,6 +2298,29 @@ func TestParseLiveRunnerOutputUnwrapsNoisyCommandRunnerOutput(t *testing.T) {
 	}
 }
 
+func TestOpenClawLiveFinalTextReadsResultMetaFinalText(t *testing.T) {
+	stdout := `{
+  "runId": "run-1",
+  "status": "ok",
+  "summary": "completed",
+  "result": {
+    "payloads": [{"text": "{\"actions\":[]}"}],
+    "meta": {
+      "finalAssistantVisibleText": "{\"actions\":[{\"kind\":\"reply\",\"message\":\"nested\"}]}",
+      "finalAssistantRawText": "{\"actions\":[{\"kind\":\"reply\",\"message\":\"raw\"}]}"
+    }
+  }
+}`
+	text := openClawLiveFinalText(stdout)
+	output, err := parseLiveRunnerOutput(text)
+	if err != nil {
+		t.Fatalf("parseLiveRunnerOutput: %v; text=%s", err, text)
+	}
+	if len(output.Actions) != 1 || output.Actions[0].Kind != "reply" || output.Actions[0].Message != "nested" {
+		t.Fatalf("output = %+v, want nested visible text action", output)
+	}
+}
+
 func TestParseLiveRunnerOutputClassifiesInvalidJSON(t *testing.T) {
 	tests := []string{
 		"",
