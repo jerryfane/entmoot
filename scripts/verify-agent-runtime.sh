@@ -21,6 +21,13 @@ Usage: verify-agent-runtime.sh
 
 Read-only verification for an agent/container Entmoot runtime. The check fails
 unless `entmootd env --json` reports a reachable direct publish path.
+When `--group` is provided, it also runs `doctor` for that group and fails on
+any non-ok peer diagnosis.
+
+Options:
+  --group GROUP_ID       run doctor for this group after env/stack checks
+  --probe                actively probe routes during the doctor check
+  --timeout DURATION     per-peer doctor probe timeout (default: 3s)
 
 Environment:
   ENTMOOTD              entmootd or wrapper path (default: /data/.entmoot/entmoot when present, else entmootd)
@@ -32,8 +39,24 @@ Environment:
 USAGE
 }
 
+group_id=""
+probe=0
+probe_timeout="3s"
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --group)
+      group_id="${2:?missing value for --group}"
+      shift 2
+      ;;
+    --probe)
+      probe=1
+      shift
+      ;;
+    --timeout)
+      probe_timeout="${2:?missing value for --timeout}"
+      shift 2
+      ;;
     -h|--help)
       usage
       exit 0
@@ -99,4 +122,45 @@ if [[ -x "$stack_helper" ]]; then
 else
   echo
   echo "stack helper not executable or not present: $stack_helper"
+fi
+
+if [[ -n "$group_id" ]]; then
+  echo
+  echo "== entmoot doctor =="
+  doctor_cmd=("${entmoot_base[@]}" doctor -group "$group_id" --json)
+  if (( probe )); then
+    doctor_cmd+=(--probe --timeout "$probe_timeout")
+  fi
+  if ! doctor_report="$("${doctor_cmd[@]}" 2>&1)"; then
+    printf '%s\n' "$doctor_report" >&2
+    exit 1
+  fi
+  diagnoses="$(
+    printf '%s\n' "$doctor_report" \
+      | grep -o '"diagnosis":"[^"]*"' \
+      | cut -d: -f2 \
+      | tr -d '"' || true
+  )"
+  diagnosis_count="$(
+    printf '%s\n' "$diagnoses" \
+      | grep -Ec '.+' || true
+  )"
+  if [[ "$diagnosis_count" == "0" ]]; then
+    echo "verify-agent-runtime.sh: doctor checked no peer diagnoses for group $group_id" >&2
+    printf '%s\n' "$doctor_report" >&2
+    exit 1
+  fi
+  bad_diagnoses="$(
+    printf '%s\n' "$diagnoses" \
+      | grep -Ev '^ok$' \
+      | sort -u \
+      | tr '\n' ' ' \
+      | sed 's/[[:space:]]*$//' || true
+  )"
+  if [[ -n "$bad_diagnoses" ]]; then
+    echo "verify-agent-runtime.sh: unhealthy doctor diagnoses: $bad_diagnoses" >&2
+    printf '%s\n' "$doctor_report" >&2
+    exit 1
+  fi
+  echo "doctor_diagnoses: ok"
 fi
