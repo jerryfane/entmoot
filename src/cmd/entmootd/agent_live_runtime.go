@@ -13,12 +13,16 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/esphttp"
+	entpolicy "entmoot/pkg/entmoot/policy"
 	"entmoot/pkg/entmoot/roster"
 	"entmoot/pkg/entmoot/store"
+
+	"golang.org/x/time/rate"
 )
 
 const (
@@ -49,6 +53,7 @@ const (
 	liveRecoverableRunnerFailed      = "runner_failed"
 	liveRecoverableRunnerInvalidJSON = "runner_invalid_json"
 	liveRecoverableActionTransport   = "action_transport"
+	liveRecoverableTriggerRateLimit  = "trigger_rate_limited"
 )
 
 var (
@@ -59,11 +64,93 @@ var (
 )
 
 type agentLiveRuntimeConfig struct {
+	groupID        entmoot.GroupID
+	nodeID         entmoot.NodeID
+	runner         string
+	timeout        time.Duration
+	limit          int
+	policies       livePolicyStore
+	triggerLimiter *agentLiveTriggerLimiter
+}
+
+type livePolicyStore interface {
+	Get(ctx context.Context, groupID entmoot.GroupID) (entpolicy.Policy, bool, error)
+}
+
+type agentLiveTriggerLimiter struct {
+	clk clockSource
+	mu  sync.Mutex
+	m   map[agentLiveTriggerKey]*agentLiveTriggerBucket
+}
+
+type clockSource interface {
+	Now() time.Time
+}
+
+type agentLiveTriggerKey struct {
 	groupID entmoot.GroupID
 	nodeID  entmoot.NodeID
-	runner  string
-	timeout time.Duration
-	limit   int
+}
+
+type agentLiveTriggerBucket struct {
+	rate    rate.Limit
+	burst   int
+	limiter *rate.Limiter
+}
+
+type systemClockSource struct{}
+
+func (systemClockSource) Now() time.Time { return time.Now() }
+
+func newAgentLiveTriggerLimiter(clk clockSource) *agentLiveTriggerLimiter {
+	if clk == nil {
+		clk = systemClockSource{}
+	}
+	return &agentLiveTriggerLimiter{
+		clk: clk,
+		m:   make(map[agentLiveTriggerKey]*agentLiveTriggerBucket),
+	}
+}
+
+func (l *agentLiveTriggerLimiter) Allow(groupID entmoot.GroupID, nodeID entmoot.NodeID, limit rate.Limit, burst int) bool {
+	if l == nil || limit <= 0 || burst <= 0 {
+		return true
+	}
+	key := agentLiveTriggerKey{groupID: groupID, nodeID: nodeID}
+	l.mu.Lock()
+	bucket := l.m[key]
+	if bucket == nil || bucket.rate != limit || bucket.burst != burst {
+		bucket = &agentLiveTriggerBucket{
+			rate:    limit,
+			burst:   burst,
+			limiter: rate.NewLimiter(limit, burst),
+		}
+		l.m[key] = bucket
+	}
+	allowed := bucket.limiter.AllowN(l.clk.Now(), 1)
+	l.mu.Unlock()
+	return allowed
+}
+
+func allowLiveTrigger(ctx context.Context, runCfg agentLiveRuntimeConfig, groupID entmoot.GroupID, nodeID entmoot.NodeID) (bool, error) {
+	if runCfg.policies == nil || runCfg.triggerLimiter == nil {
+		return true, nil
+	}
+	p, ok, err := runCfg.policies.Get(ctx, groupID)
+	if err != nil {
+		return false, err
+	}
+	if !ok {
+		return true, nil
+	}
+	spec, err := entpolicy.ParseMessageRate(p.LiveTriggerRate)
+	if err != nil {
+		return false, fmt.Errorf("live_trigger_rate: %w", err)
+	}
+	if p.LiveTriggerBurst <= 0 {
+		return false, fmt.Errorf("live_trigger_burst must be positive")
+	}
+	return runCfg.triggerLimiter.Allow(groupID, nodeID, spec.Limit(), p.LiveTriggerBurst), nil
 }
 
 type agentLiveScanResult struct {
@@ -215,6 +302,16 @@ func runAgentLiveScan(ctx context.Context, gf *globalFlags, state esphttp.StateS
 	}
 	if strings.TrimSpace(runCfg.runner) == "" {
 		return result, fmt.Errorf("live mode matched %d event(s), but -runner or ENTMOOT_AGENT_RUNNER is not configured", len(events))
+	}
+	allowed, err := allowLiveTrigger(ctx, runCfg, cfg.GroupID, cfg.NodeID)
+	if err != nil {
+		return result, err
+	}
+	if !allowed {
+		result.Status = agentLiveScanStatusError
+		result.ErrorKind = liveRecoverableTriggerRateLimit
+		result.Error = "live trigger rate limit reached"
+		return result, nil
 	}
 	runnerCtx := liveAgentRunnerContext{
 		GroupID:        cfg.GroupID,

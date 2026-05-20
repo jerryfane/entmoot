@@ -50,7 +50,9 @@ func cmdFleetList(gf *globalFlags, args []string) int {
 		return exitTransport
 	}
 	defer state.Close()
-	fleets, err := state.ListFleets(withBackgroundTimeout())
+	ctx, cancel := withBackgroundTimeout()
+	defer cancel()
+	fleets, err := state.ListFleets(ctx)
 	if err != nil {
 		slog.Error("fleet list: list", slog.String("err", err.Error()))
 		return exitTransport
@@ -77,7 +79,8 @@ func cmdFleetInfo(gf *globalFlags, args []string) int {
 		return exitTransport
 	}
 	defer state.Close()
-	ctx := withBackgroundTimeout()
+	ctx, cancel := withBackgroundTimeout()
+	defer cancel()
 	fleet, ok, err := state.GetFleet(ctx, *fleetID)
 	if err != nil {
 		slog.Error("fleet info: get", slog.String("err", err.Error()))
@@ -130,7 +133,9 @@ func cmdFleetActivity(gf *globalFlags, args []string) int {
 		return exitTransport
 	}
 	defer state.Close()
-	activity, err := state.ListFleetActivity(withBackgroundTimeout(), *fleetID, *limit, beforeMS)
+	ctx, cancel := withBackgroundTimeout()
+	defer cancel()
+	activity, err := state.ListFleetActivity(ctx, *fleetID, *limit, beforeMS)
 	if err != nil {
 		slog.Error("fleet activity: list", slog.String("err", err.Error()))
 		return exitTransport
@@ -138,9 +143,8 @@ func cmdFleetActivity(gf *globalFlags, args []string) int {
 	return printJSON(map[string]any{"activity": activity})
 }
 
-func withBackgroundTimeout() context.Context {
-	ctx, _ := context.WithTimeout(context.Background(), 10*time.Second)
-	return ctx
+func withBackgroundTimeout() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), 10*time.Second)
 }
 
 func printJSON(v any) int {

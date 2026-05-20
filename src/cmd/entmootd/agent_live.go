@@ -18,6 +18,7 @@ import (
 
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/esphttp"
+	entpolicy "entmoot/pkg/entmoot/policy"
 	"entmoot/pkg/entmoot/store"
 )
 
@@ -362,10 +363,11 @@ func cmdAgentLiveRun(gf *globalFlags, args []string) int {
 		return exitInvalidArgument
 	}
 	runCfg := agentLiveRuntimeConfig{
-		nodeID:  nodeID,
-		runner:  strings.TrimSpace(runner),
-		timeout: timeout,
-		limit:   scanLimit,
+		nodeID:         nodeID,
+		runner:         strings.TrimSpace(runner),
+		timeout:        timeout,
+		limit:          scanLimit,
+		triggerLimiter: newAgentLiveTriggerLimiter(nil),
 	}
 	bindings, err := renewAgentLiveRunBindings(ctx, state, groups, nodeID, lease, !allGroups)
 	if err != nil {
@@ -389,6 +391,12 @@ func cmdAgentLiveRun(gf *globalFlags, args []string) int {
 		}
 		return exitOK
 	}
+	policyStore, err := entpolicy.OpenFileStore(gf.data)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "agent-live run: %v\n", err)
+		return exitTransport
+	}
+	runCfg.policies = policyStore
 	msgStore, err := store.OpenSQLite(gf.data)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "agent-live run: %v\n", err)

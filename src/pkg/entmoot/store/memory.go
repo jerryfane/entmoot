@@ -55,6 +55,31 @@ func (s *Memory) Put(_ context.Context, m entmoot.Message) error {
 	return nil
 }
 
+// PruneBefore removes messages in groupID older than beforeMillis.
+func (s *Memory) PruneBefore(_ context.Context, groupID entmoot.GroupID, beforeMillis int64) (int64, error) {
+	if beforeMillis <= 0 {
+		return 0, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	bucket := s.groups[groupID]
+	if len(bucket) == 0 {
+		return 0, nil
+	}
+	var pruned int64
+	for id, msg := range bucket {
+		if msg.Timestamp < beforeMillis {
+			delete(bucket, id)
+			pruned++
+		}
+	}
+	if len(bucket) == 0 {
+		delete(s.groups, groupID)
+	}
+	return pruned, nil
+}
+
 // Get implements MessageStore.Get.
 func (s *Memory) Get(_ context.Context, groupID entmoot.GroupID, id entmoot.MessageID) (entmoot.Message, error) {
 	s.mu.RLock()
