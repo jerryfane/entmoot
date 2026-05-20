@@ -102,10 +102,12 @@ func cmdDefaultMootStatus(gf *globalFlags, args []string) int {
 func cmdDefaultMootJoin(gf *globalFlags, args []string) int {
 	dryRun := false
 	jsonOut := false
+	intro := ""
 	timeout := defaultJoinTimeout
 	fs := flag.NewFlagSet("default-moot join", flag.ContinueOnError)
 	fs.BoolVar(&dryRun, "dry-run", false, "verify descriptor and print the join target without joining")
 	fs.BoolVar(&jsonOut, "json", false, "print JSON summary")
+	fs.StringVar(&intro, "intro", "", "optional introduction message to publish on the introductions topic after joining")
 	fs.DurationVar(&timeout, "timeout", defaultJoinTimeout, "join bootstrap and live-daemon IPC response deadline")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -118,8 +120,9 @@ func cmdDefaultMootJoin(gf *globalFlags, args []string) int {
 		fmt.Fprintf(os.Stderr, "default-moot join: %v\n", err)
 		return exitTransport
 	}
+	intro = strings.TrimSpace(intro)
 	if dryRun {
-		return printDefaultMootJoinResult(jsonOut, desc, cfg.URL, "verified")
+		return printDefaultMootJoinResult(jsonOut, desc, cfg.URL, "verified", "")
 	}
 	joinInput, cleanup, err := writeDefaultMootJoinInput(desc)
 	if err != nil {
@@ -147,7 +150,13 @@ func cmdDefaultMootJoin(gf *globalFlags, args []string) int {
 		fmt.Fprintf(os.Stderr, "default-moot join: persist consent: %v\n", err)
 		return exitTransport
 	}
-	return printDefaultMootJoinResult(jsonOut, desc, cfg.URL, "joined")
+	introPublishReady := intro != "" && controlSocketAlive(controlSocketPath(gf.data), 200*time.Millisecond)
+	introStatus, err := publishDefaultMootIntro(context.Background(), gf, desc.GroupID, intro, introPublishReady)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "default-moot join: joined, but publish intro failed: %v\n", err)
+		return exitControlUnavail
+	}
+	return printDefaultMootJoinResult(jsonOut, desc, cfg.URL, "joined", introStatus)
 }
 
 func cmdDefaultMootDecline(gf *globalFlags, args []string) int {
@@ -458,13 +467,41 @@ func printDefaultMootStatus(report defaultMootStatusReport) {
 	}
 }
 
-func printDefaultMootJoinResult(jsonOut bool, desc defaultmoot.Descriptor, descriptorURL, status string) int {
+func printDefaultMootJoinResult(jsonOut bool, desc defaultmoot.Descriptor, descriptorURL, status string, introStatus string) int {
 	out := map[string]any{"status": status, "name": defaultmoot.Name, "group_id": desc.GroupID, "descriptor_url": descriptorURL}
+	switch introStatus {
+	case "published":
+		out["intro_published"] = true
+		out["intro_status"] = introStatus
+	case "skipped_no_daemon":
+		out["intro_published"] = false
+		out["intro_status"] = introStatus
+	}
 	if jsonOut {
 		return printJSON(out)
 	}
 	fmt.Fprintf(os.Stdout, "%s %s (%s)\n", status, defaultmoot.Name, desc.GroupID)
+	switch introStatus {
+	case "published":
+		fmt.Fprintln(os.Stdout, "published introduction")
+	case "skipped_no_daemon":
+		fmt.Fprintln(os.Stdout, "skipped introduction publish: no running Entmoot daemon")
+	}
 	return exitOK
+}
+
+func publishDefaultMootIntro(ctx context.Context, gf *globalFlags, gid entmoot.GroupID, intro string, publishReady bool) (string, error) {
+	intro = strings.TrimSpace(intro)
+	if intro == "" {
+		return "", nil
+	}
+	if !publishReady {
+		return "skipped_no_daemon", nil
+	}
+	if err := publishIPCMessage(ctx, gf, gid, []string{"introductions"}, []byte(intro)); err != nil {
+		return "failed", err
+	}
+	return "published", nil
 }
 
 func runWithStdoutDiscarded(fn func() int) (int, error) {
