@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.70] - 2026-05-20
+
+### Fixed
+
+- **Hide-IP install persistence.** Installing with `ENTMOOT_HIDE_IP=true` now
+  persists that default into generated `runtime.env`, so hidden/TURN peers keep
+  their launch mode during upgrades.
+
 ## [1.5.69] - 2026-05-20
 
 ### Fixed
