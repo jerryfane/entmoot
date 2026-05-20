@@ -48,17 +48,20 @@ type doctorReport struct {
 }
 
 type doctorPilotReport struct {
-	Reachable      bool             `json:"reachable"`
-	Error          string           `json:"error,omitempty"`
-	NodeID         entmoot.NodeID   `json:"node_id,omitempty"`
-	Hostname       string           `json:"hostname,omitempty"`
-	Capabilities   []string         `json:"capabilities,omitempty"`
-	TrustedQueryOK bool             `json:"trusted_query_ok"`
-	TrustedError   string           `json:"trusted_error,omitempty"`
-	Trusted        []entmoot.NodeID `json:"trusted,omitempty"`
-	PendingQueryOK bool             `json:"pending_query_ok"`
-	PendingError   string           `json:"pending_error,omitempty"`
-	Pending        []entmoot.NodeID `json:"pending,omitempty"`
+	Reachable          bool             `json:"reachable"`
+	Error              string           `json:"error,omitempty"`
+	NodeID             entmoot.NodeID   `json:"node_id,omitempty"`
+	Hostname           string           `json:"hostname,omitempty"`
+	TURNEndpoint       string           `json:"turn_endpoint,omitempty"`
+	OutboundTURNOnly   bool             `json:"outbound_turn_only"`
+	NoRegistryEndpoint bool             `json:"no_registry_endpoint"`
+	Capabilities       []string         `json:"capabilities,omitempty"`
+	TrustedQueryOK     bool             `json:"trusted_query_ok"`
+	TrustedError       string           `json:"trusted_error,omitempty"`
+	Trusted            []entmoot.NodeID `json:"trusted,omitempty"`
+	PendingQueryOK     bool             `json:"pending_query_ok"`
+	PendingError       string           `json:"pending_error,omitempty"`
+	Pending            []entmoot.NodeID `json:"pending,omitempty"`
 }
 
 type doctorEntmootReport struct {
@@ -294,10 +297,13 @@ func loadPilotDoctorState(ctx context.Context, socketPath string) (doctorPilotRe
 		return doctorPilotReport{}, nil, nil, err
 	}
 	report := doctorPilotReport{
-		Reachable:    true,
-		NodeID:       entmoot.NodeID(info.NodeID),
-		Hostname:     info.Hostname,
-		Capabilities: append([]string(nil), info.Capabilities...),
+		Reachable:          true,
+		NodeID:             entmoot.NodeID(info.NodeID),
+		Hostname:           info.Hostname,
+		TURNEndpoint:       info.TURNEndpoint,
+		OutboundTURNOnly:   info.OutboundTURNOnly,
+		NoRegistryEndpoint: info.NoRegistryEndpoint,
+		Capabilities:       append([]string(nil), info.Capabilities...),
 	}
 	trusted := map[entmoot.NodeID]struct{}{}
 	if resp, err := drv.TrustedPeers(ctx); err == nil {

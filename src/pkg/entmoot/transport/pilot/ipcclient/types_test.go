@@ -11,7 +11,7 @@ import (
 // configured.
 func TestInfoDecodeWithTURNEndpoint(t *testing.T) {
 	t.Parallel()
-	body := []byte(`{"node_id": 42, "hostname": "alice", "turn_endpoint": "relay.example.test:3478"}`)
+	body := []byte(`{"node_id": 42, "hostname": "alice", "turn_endpoint": "relay.example.test:3478", "outbound_turn_only": true, "no_registry_endpoint": true}`)
 	var info Info
 	if err := json.Unmarshal(body, &info); err != nil {
 		t.Fatalf("json.Unmarshal: %v", err)
@@ -24,6 +24,12 @@ func TestInfoDecodeWithTURNEndpoint(t *testing.T) {
 	}
 	if info.TURNEndpoint != "relay.example.test:3478" {
 		t.Fatalf("TURNEndpoint = %q, want relay.example.test:3478", info.TURNEndpoint)
+	}
+	if !info.OutboundTURNOnly {
+		t.Fatal("OutboundTURNOnly = false, want true")
+	}
+	if !info.NoRegistryEndpoint {
+		t.Fatal("NoRegistryEndpoint = false, want true")
 	}
 }
 

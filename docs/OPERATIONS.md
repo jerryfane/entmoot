@@ -61,11 +61,14 @@ actual data root and socket namespace. `verify-agent-runtime.sh` wraps that
 read-only check for deployed agents: it fails unless `publish_path_healthy` is
 true, prefers `/data/.entmoot/entmoot` when the deployed wrapper exists, and
 runs `/data/.pilot/start-entmoot-stack.sh check` when the generated helper
-exists. `doctor` is the preferred first-line check for live routing. It reports
-local membership, Pilot trust/pending state, member-profile hostname
-visibility, transport-ad freshness, active Entmoot stream probes, diagnoses,
-and suggested next commands. Use these before restarting services unless the
-failure is clearly below Entmoot.
+exists. Pass `--group <GROUP_ID> --probe` when validating a live moot; the
+script then runs `doctor` and fails on any non-`ok` peer diagnosis, catching
+cases where the local publish path is healthy but routing is broken. `doctor`
+is the preferred first-line check for live routing. It reports local
+membership, Pilot trust/pending state, Pilot TURN/privacy mode,
+member-profile hostname visibility, transport-ad freshness, active Entmoot
+stream probes, diagnoses, and suggested next commands. Use these before
+restarting services unless the failure is clearly below Entmoot.
 
 ## Release Checklist
 
