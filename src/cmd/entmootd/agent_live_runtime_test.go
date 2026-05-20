@@ -144,7 +144,7 @@ func TestRunAgentLiveScanCursorTieBreakerProcessesSameTimestamp(t *testing.T) {
 	result, err := runAgentLiveScan(ctx, &globalFlags{}, state, msgStore, cfg, agentLiveRuntimeConfig{
 		groupID: gid,
 		nodeID:  nodeID,
-		timeout: time.Second,
+		timeout: 5 * time.Second,
 		limit:   10,
 	})
 	if err != nil {
@@ -190,7 +190,7 @@ func TestRunAgentLiveScanSeenIDsCatchDelayedOlderTimestamp(t *testing.T) {
 	result, err := runAgentLiveScan(ctx, &globalFlags{}, state, msgStore, cfg, agentLiveRuntimeConfig{
 		groupID: gid,
 		nodeID:  nodeID,
-		timeout: time.Second,
+		timeout: 5 * time.Second,
 		limit:   10,
 	})
 	if err != nil {

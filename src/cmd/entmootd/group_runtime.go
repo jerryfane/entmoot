@@ -246,6 +246,7 @@ type addInviteOptions struct {
 	scheduleOnboarding bool
 	bootstrapTimeout   time.Duration
 	sessionParent      context.Context
+	groupPolicy        *entpolicy.Policy
 }
 
 func (r *groupRuntime) groupPolicy(ctx context.Context, groupID entmoot.GroupID) (*entpolicy.Policy, error) {
@@ -278,10 +279,49 @@ func (r *groupRuntime) addInvite(ctx context.Context, invite entmoot.Invite, opt
 	if err := gossip.ValidateInvite(&invite, time.Now()); err != nil {
 		return nil, false, err
 	}
+	var rollbackPolicy func()
+	if opts.groupPolicy != nil {
+		if err := opts.groupPolicy.Validate(); err != nil {
+			return nil, false, fmt.Errorf("%w: group policy: %v", errInviteMalformed, err)
+		}
+		if r.policyStore == nil {
+			return nil, false, errors.New("policy store is not configured")
+		}
+		previousPolicy, hadPreviousPolicy, err := r.policyStore.Get(ctx, invite.GroupID)
+		if err != nil {
+			return nil, false, fmt.Errorf("load previous group policy: %w", err)
+		}
+		if err := r.policyStore.Put(ctx, invite.GroupID, *opts.groupPolicy); err != nil {
+			return nil, false, fmt.Errorf("store group policy: %w", err)
+		}
+		rollbackPolicy = func() {
+			rollbackCtx := context.Background()
+			if hadPreviousPolicy {
+				if err := r.policyStore.Put(rollbackCtx, invite.GroupID, previousPolicy); err != nil {
+					r.logger.Warn("group runtime: restore group policy after failed join", slog.String("group_id", invite.GroupID.String()), slog.String("err", err.Error()))
+				}
+				return
+			}
+			if err := r.policyStore.Delete(rollbackCtx, invite.GroupID); err != nil {
+				r.logger.Warn("group runtime: delete group policy after failed join", slog.String("group_id", invite.GroupID.String()), slog.String("err", err.Error()))
+			}
+		}
+	}
 	bootstrap := func(joinCtx context.Context, g *gossip.Gossiper) error {
 		return g.Join(joinCtx, &invite)
 	}
 	sess, created, err := r.addGroup(ctx, invite.GroupID, bootstrap, opts.bootstrapTimeout, opts.sessionParent)
+	if err != nil && rollbackPolicy != nil {
+		rollbackPolicy()
+	}
+	if err == nil && opts.groupPolicy != nil {
+		if applyErr := sess.gossip.SetGroupPolicy(*opts.groupPolicy); applyErr != nil {
+			if rollbackPolicy != nil {
+				rollbackPolicy()
+			}
+			return nil, false, fmt.Errorf("apply group policy: %w", applyErr)
+		}
+	}
 	if err == nil && created && opts.scheduleOnboarding {
 		r.scheduleOnboardingHandshakes(sess, invite)
 	}

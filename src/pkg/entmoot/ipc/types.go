@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	entmoot "entmoot/pkg/entmoot"
+	entpolicy "entmoot/pkg/entmoot/policy"
 )
 
 // MsgType is the 1-byte message type tag in an ipc frame's framing header.
@@ -169,25 +170,29 @@ type SignedPublishResp struct {
 // the running daemon. The daemon resolves and joins through the same gossip
 // bootstrap path as startup join.
 type JoinGroupReq struct {
-	Invite        entmoot.Invite  `json:"invite,omitempty"`
-	OpenInvite    *OpenInviteJoin `json:"open_invite,omitempty"`
-	GroupMetadata json.RawMessage `json:"group_metadata,omitempty"`
-	TimeoutMS     int64           `json:"timeout_ms,omitempty"`
+	Invite        entmoot.Invite    `json:"invite,omitempty"`
+	OpenInvite    *OpenInviteJoin   `json:"open_invite,omitempty"`
+	GroupMetadata json.RawMessage   `json:"group_metadata,omitempty"`
+	GroupPolicy   *entpolicy.Policy `json:"group_policy,omitempty"`
+	TimeoutMS     int64             `json:"timeout_ms,omitempty"`
 }
 
 // OpenInviteJoin describes an open invite that must be redeemed by the daemon
 // using the daemon's Entmoot identity and Pilot socket.
 type OpenInviteJoin struct {
-	IssuerURL string `json:"issuer_url"`
-	Token     string `json:"token"`
+	IssuerURL       string            `json:"issuer_url"`
+	Token           string            `json:"token"`
+	ExpectedGroupID *entmoot.GroupID  `json:"expected_group_id,omitempty"`
+	ExpectedIssuer  *entmoot.NodeInfo `json:"expected_issuer,omitempty"`
 }
 
 // JoinGroupResp reports the active session created or found for JoinGroupReq.
 type JoinGroupResp struct {
-	Status    string          `json:"status"`
-	GroupID   entmoot.GroupID `json:"group_id"`
-	Members   int             `json:"members"`
-	Readiness json.RawMessage `json:"readiness,omitempty"`
+	Status    string            `json:"status"`
+	GroupID   entmoot.GroupID   `json:"group_id"`
+	Issuer    *entmoot.NodeInfo `json:"issuer,omitempty"`
+	Members   int               `json:"members"`
+	Readiness json.RawMessage   `json:"readiness,omitempty"`
 }
 
 // InviteCreateReq asks the live daemon to mint an invite for an active group.
