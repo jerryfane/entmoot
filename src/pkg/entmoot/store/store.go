@@ -112,6 +112,23 @@ type MessageStore interface {
 	Close() error
 }
 
+// RetentionPruner is implemented by stores that can remove old persisted
+// messages for a group.
+type RetentionPruner interface {
+	PruneBefore(ctx context.Context, groupID entmoot.GroupID, beforeMillis int64) (int64, error)
+}
+
+// PruneBefore removes messages older than beforeMillis when st supports
+// retention pruning. Stores that do not implement RetentionPruner are left
+// unchanged so older test doubles keep current behavior.
+func PruneBefore(ctx context.Context, st MessageStore, groupID entmoot.GroupID, beforeMillis int64) (int64, error) {
+	pruner, ok := st.(RetentionPruner)
+	if !ok || beforeMillis <= 0 {
+		return 0, nil
+	}
+	return pruner.PruneBefore(ctx, groupID, beforeMillis)
+}
+
 // isZeroGroupID reports whether g is the zero GroupID.
 func isZeroGroupID(g entmoot.GroupID) bool {
 	var z entmoot.GroupID

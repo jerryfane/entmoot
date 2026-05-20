@@ -168,6 +168,91 @@ func (s *JSONL) Put(_ context.Context, m entmoot.Message) error {
 	return nil
 }
 
+// PruneBefore removes messages in groupID older than beforeMillis and rewrites
+// that group's JSONL file to match the bounded in-memory index.
+func (s *JSONL) PruneBefore(_ context.Context, groupID entmoot.GroupID, beforeMillis int64) (int64, error) {
+	if beforeMillis <= 0 {
+		return 0, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	gs := s.groups[groupID]
+	if gs == nil || len(gs.msgs) == 0 {
+		return 0, nil
+	}
+	kept := make(map[entmoot.MessageID]entmoot.Message, len(gs.msgs))
+	var pruned int64
+	for id, msg := range gs.msgs {
+		if msg.Timestamp < beforeMillis {
+			pruned++
+			continue
+		}
+		kept[id] = msg
+	}
+	if pruned == 0 {
+		return 0, nil
+	}
+	if gs.file != nil {
+		if err := gs.file.Close(); err != nil {
+			return 0, fmt.Errorf("store: close before prune: %w", err)
+		}
+		gs.file = nil
+	}
+
+	dir := filepath.Join(s.groupsDir, encodeGroupDirName(groupID))
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return 0, fmt.Errorf("store: mkdir group %q: %w", dir, err)
+	}
+	tmp, err := os.CreateTemp(dir, "messages.jsonl.*.tmp")
+	if err != nil {
+		return 0, fmt.Errorf("store: create prune temp: %w", err)
+	}
+	tmpPath := tmp.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	messages := make([]entmoot.Message, 0, len(kept))
+	for _, msg := range kept {
+		messages = append(messages, msg)
+	}
+	sort.Slice(messages, func(i, j int) bool {
+		if messages[i].Timestamp == messages[j].Timestamp {
+			return bytes.Compare(messages[i].ID[:], messages[j].ID[:]) < 0
+		}
+		return messages[i].Timestamp < messages[j].Timestamp
+	})
+	for _, msg := range messages {
+		encoded, err := canonical.Encode(msg)
+		if err != nil {
+			_ = tmp.Close()
+			return 0, fmt.Errorf("store: canonical encode: %w", err)
+		}
+		if _, err := tmp.Write(append(encoded, '\n')); err != nil {
+			_ = tmp.Close()
+			return 0, fmt.Errorf("store: write prune temp: %w", err)
+		}
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return 0, fmt.Errorf("store: sync prune temp: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return 0, fmt.Errorf("store: close prune temp: %w", err)
+	}
+	path := filepath.Join(dir, "messages.jsonl")
+	if err := os.Rename(tmpPath, path); err != nil {
+		return 0, fmt.Errorf("store: replace pruned JSONL: %w", err)
+	}
+	cleanup = false
+	syncDir(dir)
+	gs.msgs = kept
+	return pruned, nil
+}
+
 // Get implements MessageStore.Get.
 func (s *JSONL) Get(_ context.Context, groupID entmoot.GroupID, id entmoot.MessageID) (entmoot.Message, error) {
 	s.mu.RLock()
