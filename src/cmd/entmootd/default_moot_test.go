@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -19,6 +20,7 @@ import (
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/defaultmoot"
 	"entmoot/pkg/entmoot/esphttp"
+	"entmoot/pkg/entmoot/ipc"
 	entpolicy "entmoot/pkg/entmoot/policy"
 	"entmoot/pkg/entmoot/roster"
 )
@@ -273,6 +275,107 @@ func TestDefaultMootJoinDryRunUsesVerifiedDescriptor(t *testing.T) {
 	}
 	if _, ok := loadDefaultMootLocalState(gf.data); ok {
 		t.Fatal("dry-run persisted default moot state")
+	}
+}
+
+func TestDefaultMootJoinUsesDaemonJoinContractAndPersistsConsent(t *testing.T) {
+	gf := testBootstrapGlobalFlags(t)
+	useShortDefaultMootDataDir(t, gf)
+	desc := testDefaultMootDescriptorServer(t, testAgentLiveGroupID(0xa7))
+	requests := startDefaultMootIPCServer(t, gf, func(payload any) any {
+		if _, ok := payload.(*ipc.JoinGroupReq); ok {
+			issuer := desc.Issuer
+			return &ipc.JoinGroupResp{Status: "joined", GroupID: desc.GroupID, Issuer: &issuer, Members: 1}
+		}
+		return &ipc.ErrorFrame{Code: ipc.CodeInvalidArgument, Message: fmt.Sprintf("unexpected request %T", payload)}
+	})
+
+	code, stdout, stderr := captureCommandOutput(t, func() int {
+		return cmdDefaultMootJoin(gf, []string{"--json"})
+	})
+	if code != exitOK {
+		t.Fatalf("cmdDefaultMootJoin code = %d stdout=%s stderr=%s", code, stdout, stderr)
+	}
+	req := waitDefaultMootIPCRequest[*ipc.JoinGroupReq](t, requests)
+	if req.OpenInvite == nil {
+		t.Fatalf("JoinGroupReq.OpenInvite = nil")
+	}
+	if req.OpenInvite.IssuerURL != desc.OpenInvite.IssuerURL || req.OpenInvite.Token != desc.OpenInvite.Token {
+		t.Fatalf("open invite = %+v, want descriptor invite", req.OpenInvite)
+	}
+	if req.OpenInvite.ExpectedGroupID == nil || *req.OpenInvite.ExpectedGroupID != desc.GroupID {
+		t.Fatalf("expected group = %v, want %s", req.OpenInvite.ExpectedGroupID, desc.GroupID)
+	}
+	if req.GroupPolicy == nil || req.GroupPolicy.RetentionDays != entpolicy.DefaultRetentionDays {
+		t.Fatalf("group policy = %+v", req.GroupPolicy)
+	}
+	if !strings.Contains(string(req.GroupMetadata), `"name":"The Ent Moot"`) || !strings.Contains(string(req.GroupMetadata), `"default_moot":true`) {
+		t.Fatalf("group metadata = %s", req.GroupMetadata)
+	}
+	state, ok := loadDefaultMootLocalState(gf.data)
+	if !ok || state.Consent != defaultMootConsentJoined || state.GroupID != desc.GroupID.String() || state.DescriptorIssuedAtMS != desc.IssuedAtMS {
+		t.Fatalf("local state = %+v ok=%t", state, ok)
+	}
+	var out map[string]any
+	if err := json.Unmarshal([]byte(stdout), &out); err != nil {
+		t.Fatalf("stdout is not JSON: %v\n%s", err, stdout)
+	}
+	if out["status"] != "joined" || out["name"] != defaultmoot.Name {
+		t.Fatalf("stdout = %s", stdout)
+	}
+}
+
+func TestDefaultMootJoinPublishesOptionalIntro(t *testing.T) {
+	gf := testBootstrapGlobalFlags(t)
+	useShortDefaultMootDataDir(t, gf)
+	desc := testDefaultMootDescriptorServer(t, testAgentLiveGroupID(0xa8))
+	requests := startDefaultMootIPCServer(t, gf, func(payload any) any {
+		switch payload.(type) {
+		case *ipc.JoinGroupReq:
+			issuer := desc.Issuer
+			return &ipc.JoinGroupResp{Status: "joined", GroupID: desc.GroupID, Issuer: &issuer, Members: 1}
+		case *ipc.PublishReq:
+			return &ipc.PublishResp{GroupID: desc.GroupID, TimestampMS: time.Now().UnixMilli()}
+		default:
+			return &ipc.ErrorFrame{Code: ipc.CodeInvalidArgument, Message: fmt.Sprintf("unexpected request %T", payload)}
+		}
+	})
+
+	code, stdout, stderr := captureCommandOutput(t, func() int {
+		return cmdDefaultMootJoin(gf, []string{"--json", "--intro", "Hello from test agent"})
+	})
+	if code != exitOK {
+		t.Fatalf("cmdDefaultMootJoin code = %d stdout=%s stderr=%s", code, stdout, stderr)
+	}
+	_ = waitDefaultMootIPCRequest[*ipc.JoinGroupReq](t, requests)
+	pub := waitDefaultMootIPCRequest[*ipc.PublishReq](t, requests)
+	if pub.GroupID == nil || *pub.GroupID != desc.GroupID {
+		t.Fatalf("publish group = %v, want %s", pub.GroupID, desc.GroupID)
+	}
+	if len(pub.Topics) != 1 || pub.Topics[0] != "introductions" {
+		t.Fatalf("publish topics = %#v", pub.Topics)
+	}
+	if string(pub.Content) != "Hello from test agent" {
+		t.Fatalf("publish content = %q", string(pub.Content))
+	}
+	var out map[string]any
+	if err := json.Unmarshal([]byte(stdout), &out); err != nil {
+		t.Fatalf("stdout is not JSON: %v\n%s", err, stdout)
+	}
+	if out["intro_published"] != true {
+		t.Fatalf("stdout = %s, want intro_published", stdout)
+	}
+}
+
+func TestDefaultMootIntroSkipsWhenDaemonUnavailable(t *testing.T) {
+	gf := testBootstrapGlobalFlags(t)
+	gid := testAgentLiveGroupID(0xa9)
+	status, err := publishDefaultMootIntro(context.Background(), gf, gid, "Hello later", false)
+	if err != nil {
+		t.Fatalf("publishDefaultMootIntro: %v", err)
+	}
+	if status != "skipped_no_daemon" {
+		t.Fatalf("intro status = %q, want skipped_no_daemon", status)
 	}
 }
 
@@ -646,6 +749,72 @@ func TestDefaultMootJoinSuppressesInnerStdout(t *testing.T) {
 	}
 	if out["status"] != "joined" {
 		t.Fatalf("stdout = %q", stdout)
+	}
+}
+
+func startDefaultMootIPCServer(t *testing.T, gf *globalFlags, responder func(any) any) <-chan any {
+	t.Helper()
+	if err := os.MkdirAll(gf.data, 0o700); err != nil {
+		t.Fatalf("mkdir data: %v", err)
+	}
+	_ = os.Remove(controlSocketPath(gf.data))
+	ln, err := net.Listen("unix", controlSocketPath(gf.data))
+	if err != nil {
+		t.Fatalf("listen control socket: %v", err)
+	}
+	requests := make(chan any, 8)
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+				_, payload, err := ipc.ReadAndDecode(conn)
+				if err != nil {
+					return
+				}
+				requests <- payload
+				if responder == nil {
+					return
+				}
+				if resp := responder(payload); resp != nil {
+					_ = ipc.EncodeAndWrite(conn, resp)
+				}
+			}()
+		}
+	}()
+	return requests
+}
+
+func useShortDefaultMootDataDir(t *testing.T, gf *globalFlags) {
+	t.Helper()
+	shortData, err := os.MkdirTemp("/tmp", "entmoot-default-moot-*")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(shortData) })
+	gf.data = shortData
+}
+
+func waitDefaultMootIPCRequest[T any](t *testing.T, requests <-chan any) T {
+	t.Helper()
+	select {
+	case payload := <-requests:
+		req, ok := payload.(T)
+		if !ok {
+			var zero T
+			t.Fatalf("request = %T, want requested type", payload)
+			return zero
+		}
+		return req
+	case <-time.After(2 * time.Second):
+		var zero T
+		t.Fatalf("timed out waiting for IPC request")
+		return zero
 	}
 }
 
