@@ -121,7 +121,7 @@ type inviteCreatePayload struct {
 type openInviteCreatePayload struct {
 	ValidFor       string           `json:"valid_for,omitempty"`
 	ValidUntilMS   int64            `json:"valid_until_ms,omitempty"`
-	MaxUses        int              `json:"max_uses"`
+	MaxUses        *int             `json:"max_uses"`
 	BootstrapPeers []entmoot.NodeID `json:"bootstrap_peers,omitempty"`
 }
 
@@ -337,7 +337,7 @@ func (e espOperationExecutor) RedeemOpenInvite(ctx context.Context, token string
 	if err != nil {
 		return nil, err
 	}
-	if !ok && rec.MaxUses > 0 && rec.UseCount >= rec.MaxUses {
+	if !ok && esphttp.OpenInviteUseLimitReached(rec) {
 		return nil, openInviteStoreError(esphttp.ErrOpenInviteExhausted)
 	}
 	proof, err := e.verifyOpenInvitePilotProof(ctx, tokenHash, rec, payload, ok)
@@ -464,13 +464,16 @@ func ensureOpenInviteActive(rec esphttp.OpenInviteRecord, nowMS int64) error {
 	if rec.ExpiresAtMS > 0 && rec.ExpiresAtMS <= nowMS {
 		return esphttp.ErrOpenInviteExpired
 	}
-	if rec.MaxUses > 0 && rec.UseCount >= rec.MaxUses {
+	if esphttp.OpenInviteUseLimitReached(rec) {
 		return esphttp.ErrOpenInviteExhausted
 	}
 	return nil
 }
 
 func openInviteChallengeCap(rec esphttp.OpenInviteRecord) int {
+	if rec.MaxUses == esphttp.OpenInviteUnlimitedMaxUses {
+		return maxOpenInviteActiveChallenges
+	}
 	remaining := rec.MaxUses - rec.UseCount
 	if remaining < 0 {
 		remaining = 0
@@ -496,7 +499,7 @@ func (e espOperationExecutor) ensureOpenInviteCanIssueChallenge(ctx context.Cont
 	if rec.ExpiresAtMS > 0 && rec.ExpiresAtMS <= nowMS {
 		return esphttp.ErrOpenInviteExpired
 	}
-	if rec.MaxUses > 0 && rec.UseCount >= rec.MaxUses {
+	if esphttp.OpenInviteUseLimitReached(rec) {
 		if e.stateStore != nil && redeemerKey != "" {
 			if _, ok, err := e.stateStore.GetOpenInviteRedemption(ctx, tokenHash, redeemerKey); err != nil {
 				return err
@@ -875,8 +878,12 @@ func (e espOperationExecutor) createOpenInvite(ctx context.Context, req esphttp.
 	if err := json.Unmarshal(req.Payload, &payload); err != nil {
 		return nil, &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request", Message: "invalid open_invite_create payload"}
 	}
-	if payload.MaxUses <= 0 || payload.MaxUses > 100 {
-		return nil, &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request", Message: "max_uses must be between 1 and 100"}
+	if payload.MaxUses == nil {
+		return nil, &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request", Message: "max_uses is required"}
+	}
+	maxUses := *payload.MaxUses
+	if err := esphttp.ValidateOpenInviteMaxUses(maxUses); err != nil || maxUses > 100 {
+		return nil, &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request", Message: "max_uses must be between 0 and 100 (0 means unlimited)"}
 	}
 	ttl := 24 * time.Hour
 	if payload.ValidFor != "" {
@@ -908,7 +915,7 @@ func (e espOperationExecutor) createOpenInvite(ctx context.Context, req esphttp.
 		TokenHash:      tokenHash,
 		GroupID:        req.GroupID,
 		DeviceID:       req.DeviceID,
-		MaxUses:        payload.MaxUses,
+		MaxUses:        maxUses,
 		BootstrapPeers: append([]entmoot.NodeID(nil), payload.BootstrapPeers...),
 		CreatedAtMS:    now,
 		ExpiresAtMS:    expires,

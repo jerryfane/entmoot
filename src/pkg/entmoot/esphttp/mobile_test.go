@@ -516,6 +516,118 @@ func TestOpenInviteRepeatRedemptionHonorsRevocation(t *testing.T) {
 	}
 }
 
+func TestOpenInviteUnlimitedMaxUsesRedeemsMultipleIdentities(t *testing.T) {
+	ctx := context.Background()
+	gid := testMobileGroupID(10)
+	for _, tc := range openInviteStateStores(t) {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.close != nil {
+				defer tc.close()
+			}
+			if _, err := tc.store.CreateOpenInvite(ctx, OpenInviteRecord{
+				TokenHash:   "token-unlimited",
+				GroupID:     gid,
+				MaxUses:     OpenInviteUnlimitedMaxUses,
+				ExpiresAtMS: 10_000,
+			}); err != nil {
+				t.Fatalf("CreateOpenInvite: %v", err)
+			}
+			redemptions := []OpenInviteRedemption{{
+				RedeemerKey:   "45981:key-a",
+				PilotNodeID:   45981,
+				EntmootPubKey: "key-a",
+			}, {
+				RedeemerKey:   "45982:key-b",
+				PilotNodeID:   45982,
+				EntmootPubKey: "key-b",
+			}, {
+				RedeemerKey:   "45983:key-c",
+				PilotNodeID:   45983,
+				EntmootPubKey: "key-c",
+			}}
+			for i, redemption := range redemptions {
+				rec, _, already, err := tc.store.RedeemOpenInvite(ctx, "token-unlimited", redemption, 1_000+int64(i))
+				if err != nil || already {
+					t.Fatalf("RedeemOpenInvite %d err/already = %v/%v", i, err, already)
+				}
+				if rec.MaxUses != OpenInviteUnlimitedMaxUses || rec.UseCount != i+1 {
+					t.Fatalf("unlimited redeem %d rec = %+v", i, rec)
+				}
+			}
+			rec, _, already, err := tc.store.RedeemOpenInvite(ctx, "token-unlimited", redemptions[0], 2_000)
+			if err != nil || !already {
+				t.Fatalf("repeat RedeemOpenInvite err/already = %v/%v", err, already)
+			}
+			summary := OpenInviteSummaryFromRecord(rec, 2_000)
+			if rec.UseCount != len(redemptions) || summary.Status != "active" {
+				t.Fatalf("repeat unlimited rec = %+v summary=%+v", rec, summary)
+			}
+		})
+	}
+}
+
+func TestOpenInviteUnlimitedStillRejectsRevokedAndExpiredInvites(t *testing.T) {
+	ctx := context.Background()
+	gid := testMobileGroupID(11)
+	for _, tc := range openInviteStateStores(t) {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.close != nil {
+				defer tc.close()
+			}
+			if _, err := tc.store.CreateOpenInvite(ctx, OpenInviteRecord{
+				TokenHash:   "token-unlimited-revoked",
+				GroupID:     gid,
+				MaxUses:     OpenInviteUnlimitedMaxUses,
+				ExpiresAtMS: 10_000,
+			}); err != nil {
+				t.Fatalf("CreateOpenInvite revoked case: %v", err)
+			}
+			tc.revoke(t, "token-unlimited-revoked")
+			redemption := OpenInviteRedemption{
+				RedeemerKey:   "45981:key-a",
+				PilotNodeID:   45981,
+				EntmootPubKey: "key-a",
+			}
+			_, _, _, err := tc.store.RedeemOpenInvite(ctx, "token-unlimited-revoked", redemption, 1_000)
+			if !errors.Is(err, ErrOpenInviteRevoked) {
+				t.Fatalf("revoked unlimited err = %v, want ErrOpenInviteRevoked", err)
+			}
+			if _, err := tc.store.CreateOpenInvite(ctx, OpenInviteRecord{
+				TokenHash:   "token-unlimited-expired",
+				GroupID:     gid,
+				MaxUses:     OpenInviteUnlimitedMaxUses,
+				ExpiresAtMS: 1_000,
+			}); err != nil {
+				t.Fatalf("CreateOpenInvite expired case: %v", err)
+			}
+			_, _, _, err = tc.store.RedeemOpenInvite(ctx, "token-unlimited-expired", redemption, 1_001)
+			if !errors.Is(err, ErrOpenInviteExpired) {
+				t.Fatalf("expired unlimited err = %v, want ErrOpenInviteExpired", err)
+			}
+		})
+	}
+}
+
+func TestOpenInviteRejectsNegativeMaxUses(t *testing.T) {
+	ctx := context.Background()
+	gid := testMobileGroupID(12)
+	for _, tc := range openInviteStateStores(t) {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.close != nil {
+				defer tc.close()
+			}
+			_, err := tc.store.CreateOpenInvite(ctx, OpenInviteRecord{
+				TokenHash: "token-negative",
+				GroupID:   gid,
+				MaxUses:   -1,
+			})
+			if err == nil {
+				t.Fatal("CreateOpenInvite err = nil, want negative max_uses rejection")
+			}
+		})
+	}
+}
+
 func TestOpenInviteChallengesAreSingleUseAndExpire(t *testing.T) {
 	ctx := context.Background()
 	gid := testMobileGroupID(10)
