@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.71] - 2026-05-20
+
+### Fixed
+
+- **OpenClaw live-agent JSON parsing.** Entmoot now reads OpenClaw final
+  assistant text from the current nested `result.meta` report shape as well as
+  the older top-level `meta` shape, preventing live-agent runs from degrading
+  when `openclaw agent --json` returns actions inside nested result metadata.
+
 ## [1.5.70] - 2026-05-20
 
 ### Fixed
