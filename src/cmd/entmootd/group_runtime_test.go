@@ -23,6 +23,7 @@ import (
 	"entmoot/pkg/entmoot/gossip"
 	"entmoot/pkg/entmoot/ipc"
 	"entmoot/pkg/entmoot/keystore"
+	entpolicy "entmoot/pkg/entmoot/policy"
 	"entmoot/pkg/entmoot/roster"
 	"entmoot/pkg/entmoot/store"
 	"entmoot/pkg/entmoot/transport/pilot/ipcclient"
@@ -69,6 +70,135 @@ func TestGroupRuntimeAddsMultipleSelfGroups(t *testing.T) {
 	}
 	if _, ok := rt.SingleGroup(); ok {
 		t.Fatal("SingleGroup returned ok with two active groups")
+	}
+}
+
+func TestGroupRuntimeAddInviteWithOptionsStoresGroupPolicyBeforeSession(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	identity, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate identity: %v", err)
+	}
+	st, err := store.OpenSQLite(dataDir)
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	defer st.Close()
+	rt, err := newGroupRuntime(groupRuntimeConfig{
+		NodeID:    45491,
+		Identity:  identity,
+		DataDir:   dataDir,
+		Store:     st,
+		Notify:    newNotifyingStore(st, events.NewBus()),
+		Transport: newRuntimeFakeTransport(),
+	})
+	if err != nil {
+		t.Fatalf("newGroupRuntime: %v", err)
+	}
+	defer rt.Close()
+
+	gid := testRuntimeGroupID(0xC3)
+	invite := selfInvite(t, dataDir, st, identity, 45491, gid)
+	p := entpolicy.TheEntMootDefault()
+	p.MaxMessageBytes = 4096
+	if _, created, err := rt.AddInviteWithOptions(ctx, invite, addInviteOptions{groupPolicy: &p}); err != nil || !created {
+		t.Fatalf("AddInviteWithOptions created/err = %v/%v, want true/nil", created, err)
+	}
+	got, ok, err := rt.policyStore.Get(ctx, gid)
+	if err != nil {
+		t.Fatalf("policy Get: %v", err)
+	}
+	if !ok || got.MaxMessageBytes != 4096 {
+		t.Fatalf("stored policy ok=%v policy=%+v, want max_message_bytes=4096", ok, got)
+	}
+}
+
+func TestGroupRuntimeAddInviteWithOptionsRestoresPolicyAfterJoinFailure(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	identity, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate identity: %v", err)
+	}
+	st, err := store.OpenSQLite(dataDir)
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	defer st.Close()
+	rt, err := newGroupRuntime(groupRuntimeConfig{
+		NodeID:    45491,
+		Identity:  identity,
+		DataDir:   dataDir,
+		Store:     st,
+		Notify:    newNotifyingStore(st, events.NewBus()),
+		Transport: newRuntimeFakeTransport(),
+	})
+	if err != nil {
+		t.Fatalf("newGroupRuntime: %v", err)
+	}
+	defer rt.Close()
+
+	gid := testRuntimeGroupID(0xC5)
+	previous := entpolicy.TheEntMootDefault()
+	previous.MaxMessageBytes = 2048
+	if err := rt.policyStore.Put(ctx, gid, previous); err != nil {
+		t.Fatalf("Put previous policy: %v", err)
+	}
+	next := entpolicy.TheEntMootDefault()
+	next.MaxMessageBytes = 4096
+	if _, created, err := rt.AddInviteWithOptions(ctx, foreignInvite(t, gid), addInviteOptions{groupPolicy: &next, bootstrapTimeout: 100 * time.Millisecond}); err == nil || created {
+		t.Fatalf("AddInviteWithOptions created/err = %v/%v, want failed join", created, err)
+	}
+	got, ok, err := rt.policyStore.Get(ctx, gid)
+	if err != nil {
+		t.Fatalf("policy Get: %v", err)
+	}
+	if !ok || got.MaxMessageBytes != previous.MaxMessageBytes {
+		t.Fatalf("stored policy ok=%v policy=%+v, want previous policy %+v", ok, got, previous)
+	}
+}
+
+func TestIPCJoinGroupMalformedPolicyReturnsInvalidArgument(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	identity, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate identity: %v", err)
+	}
+	st, err := store.OpenSQLite(dataDir)
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	defer st.Close()
+	rt, err := newGroupRuntime(groupRuntimeConfig{
+		NodeID:    45491,
+		Identity:  identity,
+		DataDir:   dataDir,
+		Store:     st,
+		Notify:    newNotifyingStore(st, events.NewBus()),
+		Transport: newRuntimeFakeTransport(),
+	})
+	if err != nil {
+		t.Fatalf("newGroupRuntime: %v", err)
+	}
+	defer rt.Close()
+
+	gid := testRuntimeGroupID(0xC4)
+	badPolicy := entpolicy.TheEntMootDefault()
+	badPolicy.MaxMessageBytes = 0
+	server := &ipcServer{runtime: rt, nodeID: 45491, identity: identity, store: st}
+	payload := callJoinGroupHandler(t, ctx, server, &ipc.JoinGroupReq{
+		Invite:      selfInvite(t, dataDir, st, identity, 45491, gid),
+		GroupPolicy: &badPolicy,
+		TimeoutMS:   int64(time.Second / time.Millisecond),
+	})
+	frame, ok := payload.(*ipc.ErrorFrame)
+	if !ok {
+		t.Fatalf("payload = %T, want *ErrorFrame", payload)
+	}
+	if frame.Code != ipc.CodeInvalidArgument {
+		t.Fatalf("frame.Code = %s, want %s", frame.Code, ipc.CodeInvalidArgument)
 	}
 }
 
@@ -1173,6 +1303,24 @@ func callInviteCreateHandler(t *testing.T, ctx context.Context, server *ipcServe
 	return payload
 }
 
+func callJoinGroupHandler(t *testing.T, ctx context.Context, server *ipcServer, req *ipc.JoinGroupReq) any {
+	t.Helper()
+	client, daemon := net.Pipe()
+	defer client.Close()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer daemon.Close()
+		server.handleJoinGroup(ctx, daemon, req)
+	}()
+	_, payload, err := ipc.ReadAndDecode(client)
+	if err != nil {
+		t.Fatalf("ReadAndDecode join group response: %v", err)
+	}
+	<-done
+	return payload
+}
+
 func callInviteAuthorityCheckHandler(t *testing.T, ctx context.Context, server *ipcServer, req *ipc.InviteAuthorityCheckReq) any {
 	t.Helper()
 	client, daemon := net.Pipe()
@@ -1289,6 +1437,31 @@ func selfInvite(t *testing.T, dataDir string, st *store.SQLite, identity *keysto
 	sigInput, err := canonical.Encode(signing)
 	if err != nil {
 		t.Fatalf("canonical invite: %v", err)
+	}
+	invite.Signature = identity.Sign(sigInput)
+	return invite
+}
+
+func foreignInvite(t *testing.T, gid entmoot.GroupID) entmoot.Invite {
+	t.Helper()
+	identity, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate foreign identity: %v", err)
+	}
+	info := entmoot.NodeInfo{PilotNodeID: 45981, EntmootPubKey: append([]byte(nil), identity.PublicKey...)}
+	now := time.Now().UnixMilli()
+	invite := entmoot.Invite{
+		GroupID:    gid,
+		Founder:    info,
+		IssuedAt:   now,
+		ValidUntil: now + int64(time.Hour/time.Millisecond),
+		Issuer:     info,
+	}
+	signing := invite
+	signing.Signature = nil
+	sigInput, err := canonical.Encode(signing)
+	if err != nil {
+		t.Fatalf("canonical foreign invite: %v", err)
 	}
 	invite.Signature = identity.Sign(sigInput)
 	return invite

@@ -565,6 +565,7 @@ type Gossiper struct {
 	dialMu       sync.Mutex
 	dialBackoffs map[entmoot.NodeID]*peerDialState
 
+	policyMu        sync.RWMutex
 	contentLimiter  *ratelimit.Limiter
 	maxMessageBytes int64
 	retentionDays   int
@@ -623,20 +624,9 @@ func New(cfg Config) (*Gossiper, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	var contentLimiter *ratelimit.Limiter
-	var maxMessageBytes int64
-	var retentionDays int
-	if cfg.GroupPolicy != nil {
-		if err := cfg.GroupPolicy.Validate(); err != nil {
-			return nil, fmt.Errorf("gossip: group policy: %w", err)
-		}
-		contentLimits, err := policy.ContentLimits(*cfg.GroupPolicy)
-		if err != nil {
-			return nil, fmt.Errorf("gossip: content limits: %w", err)
-		}
-		contentLimiter = ratelimit.New(contentLimits, clk)
-		maxMessageBytes = cfg.GroupPolicy.MaxMessageBytes
-		retentionDays = cfg.GroupPolicy.RetentionDays
+	contentLimiter, maxMessageBytes, retentionDays, err := contentPolicyRuntime(cfg.GroupPolicy, clk)
+	if err != nil {
+		return nil, err
 	}
 	// Seed off the clock so Fake-clock tests stay deterministic.
 	// Mirrors the getPicker seeding pattern (same file, below) so
@@ -674,6 +664,36 @@ func New(cfg Config) (*Gossiper, error) {
 		// clears reachability.
 		dialBackoffs: make(map[entmoot.NodeID]*peerDialState),
 	}, nil
+}
+
+func contentPolicyRuntime(p *policy.Policy, clk clock.Clock) (*ratelimit.Limiter, int64, int, error) {
+	if p == nil {
+		return nil, 0, 0, nil
+	}
+	if err := p.Validate(); err != nil {
+		return nil, 0, 0, fmt.Errorf("gossip: group policy: %w", err)
+	}
+	contentLimits, err := policy.ContentLimits(*p)
+	if err != nil {
+		return nil, 0, 0, fmt.Errorf("gossip: content limits: %w", err)
+	}
+	return ratelimit.New(contentLimits, clk), p.MaxMessageBytes, p.RetentionDays, nil
+}
+
+// SetGroupPolicy applies a verified group policy to an already-running
+// gossiper. The new limiter starts with fresh buckets, matching a session
+// created after the policy was stored.
+func (g *Gossiper) SetGroupPolicy(p policy.Policy) error {
+	contentLimiter, maxMessageBytes, retentionDays, err := contentPolicyRuntime(&p, g.clk)
+	if err != nil {
+		return err
+	}
+	g.policyMu.Lock()
+	g.contentLimiter = contentLimiter
+	g.maxMessageBytes = maxMessageBytes
+	g.retentionDays = retentionDays
+	g.policyMu.Unlock()
+	return nil
 }
 
 // seedPlumtreeLocked populates eagerPushPeers with every current roster
@@ -1947,25 +1967,33 @@ func (g *Gossiper) acceptInboundMessage(ctx context.Context, relay entmoot.NodeI
 }
 
 func (g *Gossiper) checkContentPolicy(relay entmoot.NodeID, msg entmoot.Message) error {
-	if g.maxMessageBytes > 0 && int64(len(msg.Content)) > g.maxMessageBytes {
-		return fmt.Errorf("message content is %d bytes, exceeds group max %d", len(msg.Content), g.maxMessageBytes)
+	contentLimiter, maxMessageBytes, retentionDays := g.contentPolicySnapshot()
+	if maxMessageBytes > 0 && int64(len(msg.Content)) > maxMessageBytes {
+		return fmt.Errorf("message content is %d bytes, exceeds group max %d", len(msg.Content), maxMessageBytes)
 	}
-	if err := g.checkRetentionWindow(msg); err != nil {
+	if err := g.checkRetentionWindow(msg, retentionDays); err != nil {
 		return err
 	}
-	if g.contentLimiter != nil {
-		if err := g.contentLimiter.Allow(msg.Author.PilotNodeID, len(msg.Content)); err != nil {
+	if contentLimiter != nil {
+		if err := contentLimiter.Allow(msg.Author.PilotNodeID, len(msg.Content)); err != nil {
 			return fmt.Errorf("content budget for author %d via relay %d: %w", msg.Author.PilotNodeID, relay, err)
 		}
 	}
 	return nil
 }
 
+func (g *Gossiper) contentPolicySnapshot() (*ratelimit.Limiter, int64, int) {
+	g.policyMu.RLock()
+	defer g.policyMu.RUnlock()
+	return g.contentLimiter, g.maxMessageBytes, g.retentionDays
+}
+
 func (g *Gossiper) prunePolicyRetention(ctx context.Context) error {
-	if g.retentionDays <= 0 {
+	_, _, retentionDays := g.contentPolicySnapshot()
+	if retentionDays <= 0 {
 		return nil
 	}
-	cutoff := g.retentionCutoff()
+	cutoff := g.retentionCutoff(retentionDays)
 	if cutoff <= 0 {
 		return nil
 	}
@@ -1973,15 +2001,15 @@ func (g *Gossiper) prunePolicyRetention(ctx context.Context) error {
 	return err
 }
 
-func (g *Gossiper) retentionCutoff() int64 {
-	if g.retentionDays <= 0 {
+func (g *Gossiper) retentionCutoff(retentionDays int) int64 {
+	if retentionDays <= 0 {
 		return 0
 	}
-	return g.clk.Now().Add(-time.Duration(g.retentionDays) * 24 * time.Hour).UnixMilli()
+	return g.clk.Now().Add(-time.Duration(retentionDays) * 24 * time.Hour).UnixMilli()
 }
 
-func (g *Gossiper) checkRetentionWindow(msg entmoot.Message) error {
-	if cutoff := g.retentionCutoff(); cutoff > 0 && msg.Timestamp < cutoff {
+func (g *Gossiper) checkRetentionWindow(msg entmoot.Message, retentionDays int) error {
+	if cutoff := g.retentionCutoff(retentionDays); cutoff > 0 && msg.Timestamp < cutoff {
 		return fmt.Errorf("message timestamp %d is older than retention cutoff %d", msg.Timestamp, cutoff)
 	}
 	return nil

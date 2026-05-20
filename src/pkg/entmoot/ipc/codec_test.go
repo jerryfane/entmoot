@@ -12,6 +12,7 @@ import (
 	"time"
 
 	entmoot "entmoot/pkg/entmoot"
+	entpolicy "entmoot/pkg/entmoot/policy"
 )
 
 // mustGroupID returns a GroupID filled with the given byte for test
@@ -22,6 +23,10 @@ func mustGroupID(fill byte) entmoot.GroupID {
 		g[i] = fill
 	}
 	return g
+}
+
+func ptr[T any](v T) *T {
+	return &v
 }
 
 // mustMessageID returns a MessageID filled with the given byte.
@@ -123,21 +128,34 @@ func TestRoundTripSignedPublishReqResp(t *testing.T) {
 
 func TestRoundTripJoinGroupReqResp(t *testing.T) {
 	gid := mustGroupID(0x24)
+	issuer := entmoot.NodeInfo{
+		PilotNodeID:   45491,
+		EntmootPubKey: []byte("founder-key"),
+	}
 	roundTrip(t, &JoinGroupReq{
 		Invite: entmoot.Invite{
-			GroupID: gid,
-			Founder: entmoot.NodeInfo{
-				PilotNodeID:   45491,
-				EntmootPubKey: []byte("founder-key"),
-			},
+			GroupID:    gid,
+			Founder:    issuer,
+			Issuer:     issuer,
 			IssuedAt:   1_700_000_000_000,
 			ValidUntil: 1_700_086_400_000,
 		},
 		TimeoutMS: 90_000,
 	})
+	roundTrip(t, &JoinGroupReq{
+		OpenInvite: &OpenInviteJoin{
+			IssuerURL:       "https://esp.example.com",
+			Token:           "open-token",
+			ExpectedGroupID: &gid,
+			ExpectedIssuer:  &issuer,
+		},
+		GroupPolicy: ptr(entpolicy.TheEntMootDefault()),
+		TimeoutMS:   90_000,
+	})
 	roundTrip(t, &JoinGroupResp{
 		Status:  "joined",
 		GroupID: gid,
+		Issuer:  &issuer,
 		Members: 3,
 	})
 }
