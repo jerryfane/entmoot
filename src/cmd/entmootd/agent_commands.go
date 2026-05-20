@@ -58,14 +58,17 @@ type openClawAgentRunReport struct {
 	Status  string          `json:"status"`
 	Summary string          `json:"summary"`
 	Result  json.RawMessage `json:"result"`
-	Meta    struct {
-		FinalAssistantVisibleText string `json:"finalAssistantVisibleText"`
-		FinalAssistantRawText     string `json:"finalAssistantRawText"`
-	} `json:"meta"`
+	Meta    openClawRunMeta `json:"meta"`
+}
+
+type openClawRunMeta struct {
+	FinalAssistantVisibleText string `json:"finalAssistantVisibleText"`
+	FinalAssistantRawText     string `json:"finalAssistantRawText"`
 }
 
 type openClawAgentRunResult struct {
 	Payloads []openClawAgentPayload `json:"payloads"`
+	Meta     openClawRunMeta        `json:"meta"`
 }
 
 type openClawAgentPayload struct {
@@ -492,7 +495,19 @@ func openClawFinalText(report openClawAgentRunReport) string {
 	if text := strings.TrimSpace(report.Meta.FinalAssistantVisibleText); text != "" {
 		return text
 	}
-	return strings.TrimSpace(report.Meta.FinalAssistantRawText)
+	if text := strings.TrimSpace(report.Meta.FinalAssistantRawText); text != "" {
+		return text
+	}
+	var result openClawAgentRunResult
+	if len(report.Result) > 0 && json.Unmarshal(report.Result, &result) == nil {
+		if text := strings.TrimSpace(result.Meta.FinalAssistantVisibleText); text != "" {
+			return text
+		}
+		if text := strings.TrimSpace(result.Meta.FinalAssistantRawText); text != "" {
+			return text
+		}
+	}
+	return ""
 }
 
 func openClawPayloads(result json.RawMessage) []openClawAgentPayload {
