@@ -205,6 +205,12 @@ peers, and changelog stay aligned.
    commands can legitimately show no live config unless they read the same
    `esp.sqlite`.
 
+   For an agent that should publish a routable Pilot endpoint instead of using
+   hidden/TURN mode, set `PILOT_PUBLIC=1` in that install's `runtime.env` before
+   running the generated stack helper. `ENTMOOT_HIDE_IP=true` remains the
+   stronger setting and takes precedence by starting Pilot with
+   `-no-registry-endpoint -outbound-turn-only`.
+
 7. Verify every peer reports:
 
    ```sh
