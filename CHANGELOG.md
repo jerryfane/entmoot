@@ -14,6 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Public Pilot stack helpers.** Generated runtime helpers now support
   `PILOT_PUBLIC=1`, propagating it through `/data` agent-user handoff and
   launching Pilot with `-public` when hidden/TURN mode is not enabled.
+- **Pilot fork release pin.** Release artifacts now build against Pilot fork
+  `v1.9.0-jf.15.29`, including the trust-key backfill required by mixed
+  live-agent peer state.
 
 ## [1.5.67] - 2026-05-20
 
