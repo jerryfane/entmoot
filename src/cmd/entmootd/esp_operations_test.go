@@ -2854,6 +2854,85 @@ func TestESPOpenInviteStoresAndRedeemsBootstrapPeers(t *testing.T) {
 	}
 }
 
+func TestESPOpenInviteAllowsUnlimitedMaxUses(t *testing.T) {
+	ctx := context.Background()
+	gid := testESPGroupID(20)
+	state := esphttp.NewMemoryStateStore()
+	sock := testUnixSocketPath(t)
+	reqCh := make(chan *ipc.InviteCreateReq, 2)
+	stop := serveESPInviteCreateIPC(t, sock, gid, reqCh)
+	defer stop()
+	exec := espOperationExecutor{stateStore: state, socketPath: sock, timeout: time.Second}
+	raw, err := exec.ExecuteSignRequest(ctx, esphttp.SignRequest{
+		Kind:     "open_invite_create",
+		GroupID:  gid,
+		DeviceID: "ios-1",
+		Payload:  json.RawMessage(`{"max_uses":0,"valid_for":"24h"}`),
+	}, nil)
+	if err != nil {
+		t.Fatalf("open_invite_create unlimited: %v", err)
+	}
+	var created struct {
+		Token   string `json:"token"`
+		MaxUses int    `json:"max_uses"`
+	}
+	if err := json.Unmarshal(raw, &created); err != nil {
+		t.Fatalf("unmarshal created: %v", err)
+	}
+	if created.Token == "" || created.MaxUses != esphttp.OpenInviteUnlimitedMaxUses {
+		t.Fatalf("created unlimited open invite = %+v", created)
+	}
+
+	firstPilotPub, firstPilotPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey first pilot: %v", err)
+	}
+	firstPayload := openInviteRedeemPayloadForTest(t, exec, ctx, created.Token, 45981, firstPilotPub, firstPilotPriv, bytes.Repeat([]byte{0x61}, 32))
+	if _, err := exec.RedeemOpenInvite(ctx, created.Token, firstPayload); err != nil {
+		t.Fatalf("first RedeemOpenInvite: %v", err)
+	}
+	select {
+	case <-reqCh:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for first invite create IPC request")
+	}
+
+	secondPilotPub, secondPilotPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey second pilot: %v", err)
+	}
+	secondPayload := openInviteRedeemPayloadForTest(t, exec, ctx, created.Token, 45982, secondPilotPub, secondPilotPriv, bytes.Repeat([]byte{0x62}, 32))
+	if _, err := exec.RedeemOpenInvite(ctx, created.Token, secondPayload); err != nil {
+		t.Fatalf("second RedeemOpenInvite: %v", err)
+	}
+	select {
+	case <-reqCh:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for second invite create IPC request")
+	}
+	rec, ok, err := state.GetOpenInviteByTokenHash(ctx, esphttp.HashOpenInviteToken(created.Token))
+	if err != nil || !ok {
+		t.Fatalf("GetOpenInviteByTokenHash err/ok = %v/%v", err, ok)
+	}
+	if rec.MaxUses != esphttp.OpenInviteUnlimitedMaxUses || rec.UseCount != 2 {
+		t.Fatalf("stored unlimited open invite = %+v", rec)
+	}
+}
+
+func TestESPOpenInviteCreateRequiresExplicitMaxUses(t *testing.T) {
+	ctx := context.Background()
+	exec := espOperationExecutor{stateStore: esphttp.NewMemoryStateStore(), timeout: time.Second}
+	_, err := exec.ExecuteSignRequest(ctx, esphttp.SignRequest{
+		Kind:    "open_invite_create",
+		GroupID: testESPGroupID(21),
+		Payload: json.RawMessage(`{"valid_for":"24h"}`),
+	}, nil)
+	var opErr *esphttp.OperationError
+	if !errors.As(err, &opErr) || opErr.HTTPStatus != http.StatusBadRequest || opErr.Code != "bad_request" || opErr.Message != "max_uses is required" {
+		t.Fatalf("open_invite_create missing max_uses err = %v, want 400 max_uses is required", err)
+	}
+}
+
 func TestESPOpenInviteAcceptRedeemsViaIssuerAndJoinsGroup(t *testing.T) {
 	ctx := context.Background()
 	gid := testESPGroupID(27)
@@ -3637,6 +3716,16 @@ func TestESPOpenInviteChallengeCapsActiveRedeemers(t *testing.T) {
 	var opErr *esphttp.OperationError
 	if !errors.As(err, &opErr) || opErr.HTTPStatus != http.StatusTooManyRequests || opErr.Code != "open_invite_challenge_limit" {
 		t.Fatalf("overflow CreateOpenInviteChallenge err = %v, want 429 open_invite_challenge_limit", err)
+	}
+}
+
+func TestOpenInviteChallengeCapTreatsUnlimitedUsesAsMaxCap(t *testing.T) {
+	rec := esphttp.OpenInviteRecord{
+		MaxUses:  esphttp.OpenInviteUnlimitedMaxUses,
+		UseCount: 512,
+	}
+	if got := openInviteChallengeCap(rec); got != maxOpenInviteActiveChallenges {
+		t.Fatalf("openInviteChallengeCap(unlimited) = %d, want %d", got, maxOpenInviteActiveChallenges)
 	}
 }
 

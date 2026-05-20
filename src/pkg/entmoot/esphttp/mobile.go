@@ -144,7 +144,7 @@ func OpenInviteSummaryFromRecord(rec OpenInviteRecord, nowMS int64) OpenInviteSu
 		status = "revoked"
 	} else if rec.ExpiresAtMS > 0 && rec.ExpiresAtMS <= nowMS {
 		status = "expired"
-	} else if rec.MaxUses > 0 && rec.UseCount >= rec.MaxUses {
+	} else if OpenInviteUseLimitReached(rec) {
 		status = "exhausted"
 	}
 	return OpenInviteSummary{
@@ -261,6 +261,9 @@ const (
 	signRequestRejected   = "rejected"
 	defaultSignRequestTTL = 15 * time.Minute
 	defaultIdempotencyTTL = 24 * time.Hour
+
+	// OpenInviteUnlimitedMaxUses marks an open invite as unlimited.
+	OpenInviteUnlimitedMaxUses = 0
 )
 
 var (
@@ -272,6 +275,19 @@ var (
 	ErrOpenInviteChallengeLimit   = errors.New("esphttp: open invite challenge limit reached")
 	ErrFleetNotActive             = errors.New("esphttp: fleet is not active")
 )
+
+// ValidateOpenInviteMaxUses accepts zero as unlimited and rejects negatives.
+func ValidateOpenInviteMaxUses(maxUses int) error {
+	if maxUses < OpenInviteUnlimitedMaxUses {
+		return errors.New("esphttp: open invite max_uses must be non-negative")
+	}
+	return nil
+}
+
+// OpenInviteUseLimitReached reports whether a capped open invite is exhausted.
+func OpenInviteUseLimitReached(rec OpenInviteRecord) bool {
+	return rec.MaxUses > OpenInviteUnlimitedMaxUses && rec.UseCount >= rec.MaxUses
+}
 
 // MemoryStateStore is useful for tests and dev-mode ESP handlers.
 type MemoryStateStore struct {
@@ -470,8 +486,8 @@ func (s *MemoryStateStore) CreateOpenInvite(_ context.Context, rec OpenInviteRec
 		rec.CreatedAtMS = now
 	}
 	rec.UpdatedAtMS = now
-	if rec.MaxUses <= 0 {
-		return OpenInviteRecord{}, errors.New("esphttp: open invite max_uses must be positive")
+	if err := ValidateOpenInviteMaxUses(rec.MaxUses); err != nil {
+		return OpenInviteRecord{}, err
 	}
 	s.invites[rec.TokenHash] = cloneOpenInviteRecord(rec)
 	if s.redeems[rec.TokenHash] == nil {
@@ -545,7 +561,7 @@ func (s *MemoryStateStore) RedeemOpenInvite(_ context.Context, tokenHash string,
 	if existing, ok := redeemers[redemption.RedeemerKey]; ok {
 		return cloneOpenInviteRecord(rec), cloneOpenInviteRedemption(existing), true, nil
 	}
-	if rec.MaxUses > 0 && rec.UseCount >= rec.MaxUses {
+	if OpenInviteUseLimitReached(rec) {
 		return OpenInviteRecord{}, OpenInviteRedemption{}, false, ErrOpenInviteExhausted
 	}
 	rec.UseCount++
@@ -1841,8 +1857,8 @@ func (s *SQLiteStateStore) CreateOpenInvite(ctx context.Context, rec OpenInviteR
 		rec.CreatedAtMS = now
 	}
 	rec.UpdatedAtMS = now
-	if rec.MaxUses <= 0 {
-		return OpenInviteRecord{}, errors.New("esphttp: open invite max_uses must be positive")
+	if err := ValidateOpenInviteMaxUses(rec.MaxUses); err != nil {
+		return OpenInviteRecord{}, err
 	}
 	bootstrapPeers, err := encodeBootstrapPeers(rec.BootstrapPeers)
 	if err != nil {
@@ -1952,7 +1968,7 @@ SET use_count = use_count + 1, updated_at_ms = ?
 WHERE token_hash = ?
   AND revoked = 0
   AND (expires_at_ms = 0 OR expires_at_ms > ?)
-  AND (max_uses <= 0 OR use_count < max_uses)`, nowMS, tokenHash, nowMS)
+  AND (max_uses = 0 OR use_count < max_uses)`, nowMS, tokenHash, nowMS)
 	if err != nil {
 		return OpenInviteRecord{}, OpenInviteRedemption{}, false, err
 	}
