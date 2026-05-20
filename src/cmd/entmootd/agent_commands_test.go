@@ -364,6 +364,51 @@ func TestRunAgentCommandRunnerOpenClawCompactsRunReport(t *testing.T) {
 	}
 }
 
+func TestRunAgentCommandRunnerOpenClawCompactsNestedResultMeta(t *testing.T) {
+	clearOpenClawRunnerEnv(t)
+	runner := filepath.Join(t.TempDir(), "openclaw")
+	report := `{
+  "runId": "run-1",
+  "status": "ok",
+  "summary": "completed",
+  "result": {
+    "payloads": [
+      {
+        "text": "message received",
+        "mediaUrl": null
+      }
+    ],
+    "meta": {
+      "finalAssistantVisibleText": "message from nested meta",
+      "systemPromptReport": {
+        "tools": {
+          "schemaChars": 27210
+        }
+      }
+    }
+  }
+}`
+	script := "#!/bin/sh\ncat <<'JSON'\n" + report + "\nJSON\n"
+	if err := os.WriteFile(runner, []byte(script), 0o700); err != nil {
+		t.Fatalf("WriteFile runner: %v", err)
+	}
+	t.Setenv("OPENCLAW_BIN", runner)
+	result := runAgentCommandRunner(context.Background(), "openclaw", t.TempDir(), testCommandPayload("cmd-openclaw-nested-report"))
+	if result.status != esphttp.FleetCommandStatusCompleted {
+		t.Fatalf("result = %+v, want completed OpenClaw result", result)
+	}
+	if strings.Contains(result.output, "systemPromptReport") || strings.Contains(result.output, "schemaChars") {
+		t.Fatalf("output leaked verbose OpenClaw metadata: %s", result.output)
+	}
+	var compact openClawAgentCompactOutput
+	if err := json.Unmarshal([]byte(result.output), &compact); err != nil {
+		t.Fatalf("compact output JSON: %v; output=%s", err, result.output)
+	}
+	if compact.FinalText != "message from nested meta" {
+		t.Fatalf("compact final text = %q, want nested meta text", compact.FinalText)
+	}
+}
+
 func TestOpenClawAgentSelectorPrecedence(t *testing.T) {
 	tests := []struct {
 		name string
