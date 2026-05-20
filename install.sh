@@ -174,7 +174,7 @@ if [ -z "\${ENTMOOT_CONTROL_SOCKET+x}" ]; then ENTMOOT_CONTROL_SOCKET=$(shell_qu
 if [ -z "\${PILOT_DIR+x}" ]; then PILOT_DIR=$(shell_quote "$PILOT_DIR"); fi
 if [ -z "\${PILOT_BIN_DIR+x}" ]; then PILOT_BIN_DIR=$(shell_quote "$PILOT_BIN_DIR"); fi
 if [ -z "\${PILOT_SOCKET+x}" ]; then PILOT_SOCKET=$(shell_quote "$PILOT_SOCKET_DEFAULT"); fi
-if [ -z "\${ENTMOOT_HIDE_IP+x}" ]; then ENTMOOT_HIDE_IP=0; fi
+if [ -z "\${ENTMOOT_HIDE_IP+x}" ]; then ENTMOOT_HIDE_IP=$(shell_quote "${ENTMOOT_HIDE_IP:-0}"); fi
 if [ -z "\${PILOT_PUBLIC+x}" ]; then PILOT_PUBLIC=$(shell_quote "${PILOT_PUBLIC:-0}"); fi
 if [ -z "\${ENTMOOT_START_TIMEOUT+x}" ]; then ENTMOOT_START_TIMEOUT=90; fi
 EOF
