@@ -31,19 +31,21 @@ type bootstrapAgentOptions struct {
 	actions           repeatedStringFlag
 	maxActionsPerScan int
 	maxActionBytes    int
+	defaultMoot       string
 }
 
 type bootstrapAgentReport struct {
-	DryRun            bool                     `json:"dry_run"`
-	Applied           bool                     `json:"applied"`
-	Runner            string                   `json:"runner"`
-	RunnerCommand     string                   `json:"runner_command,omitempty"`
-	AgentInstructions bool                     `json:"agent_instructions"`
-	Live              bootstrapAgentLiveReport `json:"live"`
-	Commands          []string                 `json:"commands,omitempty"`
-	Warnings          []string                 `json:"warnings,omitempty"`
-	Runtime           runtimeReport            `json:"runtime"`
-	AppliedLiveConfig *esphttp.LiveAgentConfig `json:"applied_live_config,omitempty"`
+	DryRun            bool                       `json:"dry_run"`
+	Applied           bool                       `json:"applied"`
+	Runner            string                     `json:"runner"`
+	RunnerCommand     string                     `json:"runner_command,omitempty"`
+	AgentInstructions bool                       `json:"agent_instructions"`
+	Live              bootstrapAgentLiveReport   `json:"live"`
+	DefaultMoot       bootstrapDefaultMootReport `json:"default_moot"`
+	Commands          []string                   `json:"commands,omitempty"`
+	Warnings          []string                   `json:"warnings,omitempty"`
+	Runtime           runtimeReport              `json:"runtime"`
+	AppliedLiveConfig *esphttp.LiveAgentConfig   `json:"applied_live_config,omitempty"`
 }
 
 type bootstrapAgentLiveReport struct {
@@ -56,6 +58,12 @@ type bootstrapAgentLiveReport struct {
 	AllowedActions    []string `json:"allowed_actions,omitempty"`
 	MaxActionsPerScan int      `json:"max_actions_per_scan,omitempty"`
 	MaxActionBytes    int      `json:"max_action_bytes,omitempty"`
+}
+
+type bootstrapDefaultMootReport struct {
+	Choice   string   `json:"choice"`
+	Commands []string `json:"commands,omitempty"`
+	Warnings []string `json:"warnings,omitempty"`
 }
 
 func cmdBootstrap(gf *globalFlags, args []string) int {
@@ -96,6 +104,7 @@ func cmdBootstrapAgent(gf *globalFlags, args []string) int {
 	fs.Var(&cfg.actions, "action", "operator action; may be repeated")
 	fs.IntVar(&cfg.maxActionsPerScan, "max-actions", 0, "optional maximum live actions per scan; 0 means unlimited")
 	fs.IntVar(&cfg.maxActionBytes, "max-action-bytes", 0, "optional maximum bytes per live action message; 0 means unlimited")
+	fs.StringVar(&cfg.defaultMoot, "default-moot", "skip", "The Ent Moot owner choice: skip, join, or decline")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return exitOK
@@ -114,6 +123,11 @@ func cmdBootstrapAgent(gf *globalFlags, args []string) int {
 			return exitInvalidArgument
 		}
 	}
+	if !validBootstrapDefaultMootChoice(cfg.defaultMoot) {
+		fmt.Fprintln(os.Stderr, "bootstrap agent: --default-moot must be skip, join, or decline")
+		return exitInvalidArgument
+	}
+	cfg.defaultMoot = normalizeBootstrapDefaultMootChoice(cfg.defaultMoot)
 	report, gid, nodeID, err := buildBootstrapAgentReport(gf, cfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "bootstrap agent: %v\n", err)
@@ -143,6 +157,18 @@ func cmdBootstrapAgent(gf *globalFlags, args []string) int {
 		report.AppliedLiveConfig = &rec
 	} else {
 		report.Applied = false
+	}
+	if !cfg.dryRun && cfg.defaultMoot == defaultMootConsentDeclined {
+		declinedState, err := defaultMootDeclinedLocalState(context.Background(), gf.data)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "bootstrap agent: default moot decline: %v\n", err)
+			return exitTransport
+		}
+		if err := saveDefaultMootLocalState(gf.data, declinedState); err != nil {
+			fmt.Fprintf(os.Stderr, "bootstrap agent: default moot decline: %v\n", err)
+			return exitTransport
+		}
+		report.Applied = true
 	}
 	if cfg.json {
 		return printJSON(report)
@@ -183,12 +209,14 @@ func buildBootstrapAgentReport(gf *globalFlags, cfg bootstrapAgentOptions) (boot
 		return bootstrapAgentReport{}, gid, nodeID, fmt.Errorf("unknown --action value(s): %s", strings.Join(unknown, ", "))
 	}
 	runnerCommand := agentRunnerCommand(runner, cfg.runnerCommand)
+	runtime := collectRuntimeReport(gf, gf.data)
 	report := bootstrapAgentReport{
 		DryRun:            cfg.dryRun,
 		Runner:            runner,
 		RunnerCommand:     runnerCommand,
 		AgentInstructions: cfg.agentInstructions,
-		Runtime:           collectRuntimeReport(gf, gf.data),
+		Runtime:           runtime,
+		DefaultMoot:       buildBootstrapDefaultMootReport(gf, runtime, cfg.defaultMoot),
 	}
 	if cfg.agentInstructions {
 		report.Warnings = append(report.Warnings, "run entmootd serve with ENTMOOT_AGENT_INSTRUCTIONS=1; bootstrap cannot change the environment of an already-running daemon")
@@ -229,6 +257,7 @@ func buildBootstrapAgentReport(gf *globalFlags, cfg bootstrapAgentOptions) (boot
 
 func bootstrapAgentCommands(gf *globalFlags, report bootstrapAgentReport) []string {
 	var out []string
+	out = append(out, report.DefaultMoot.Commands...)
 	serve := entmootCommand(gf, report.Runtime, "serve")
 	if report.AgentInstructions {
 		serve = "ENTMOOT_AGENT_INSTRUCTIONS=1 " + serve
@@ -245,6 +274,39 @@ func bootstrapAgentCommands(gf *globalFlags, report bootstrapAgentReport) []stri
 		out = append(out, stackGatedCommand(bootstrapStackHelper(gf, report), bootstrapStackHelperEnv(gf, report), entmootCommand(gf, report.Runtime, parts...)))
 	}
 	return out
+}
+
+func buildBootstrapDefaultMootReport(gf *globalFlags, runtime runtimeReport, choice string) bootstrapDefaultMootReport {
+	choice = normalizeBootstrapDefaultMootChoice(choice)
+	if choice == "" {
+		choice = "skip"
+	}
+	report := bootstrapDefaultMootReport{Choice: choice}
+	switch choice {
+	case "join":
+		report.Commands = append(report.Commands, entmootCommand(gf, runtime, "default-moot", "join"))
+		report.Warnings = append(report.Warnings, "joining The Ent Moot is owner-approved but not performed implicitly by bootstrap output; run the command after reviewing descriptor and hide-IP/TURN status")
+	case defaultMootConsentDeclined:
+		report.Commands = append(report.Commands, entmootCommand(gf, runtime, "default-moot", "decline"))
+	}
+	return report
+}
+
+func validBootstrapDefaultMootChoice(choice string) bool {
+	switch normalizeBootstrapDefaultMootChoice(choice) {
+	case "skip", "join", defaultMootConsentDeclined:
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizeBootstrapDefaultMootChoice(choice string) string {
+	choice = strings.TrimSpace(strings.ToLower(choice))
+	if choice == "decline" {
+		return defaultMootConsentDeclined
+	}
+	return choice
 }
 
 func bootstrapStackHelper(gf *globalFlags, report bootstrapAgentReport) string {
@@ -377,6 +439,10 @@ func printBootstrapAgentReport(report bootstrapAgentReport) {
 	for _, warning := range report.Warnings {
 		fmt.Printf("warning: %s\n", warning)
 	}
+	fmt.Printf("default_moot: %s\n", report.DefaultMoot.Choice)
+	for _, warning := range report.DefaultMoot.Warnings {
+		fmt.Printf("warning: %s\n", warning)
+	}
 	for _, command := range report.Commands {
 		fmt.Printf("command: %s\n", command)
 	}
@@ -399,6 +465,15 @@ func promptBootstrapAgentOptions(cfg bootstrapAgentOptions) (bootstrapAgentOptio
 		}
 	}
 	cfg.agentInstructions, err = promptBool(reader, "enable instruction commands", cfg.agentInstructions)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.defaultMoot, err = promptChoice(reader, "The Ent Moot [skip/join/decline]", cfg.defaultMoot, map[string]bool{
+		"skip":                     true,
+		"join":                     true,
+		"decline":                  true,
+		defaultMootConsentDeclined: true,
+	})
 	if err != nil {
 		return cfg, err
 	}

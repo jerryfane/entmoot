@@ -86,6 +86,7 @@ func cmdServe(gf *globalFlags, args []string) int {
 }
 
 func selectServeGroupIDs(dataRoot string, selected []string, logger *slog.Logger) ([]entmoot.GroupID, error) {
+	declinedDefaultMoot, hasDeclinedDefaultMoot := defaultMootDeclinedGroupID(dataRoot)
 	if len(selected) > 0 {
 		out := make([]entmoot.GroupID, 0, len(selected))
 		seen := make(map[entmoot.GroupID]struct{}, len(selected))
@@ -93,6 +94,13 @@ func selectServeGroupIDs(dataRoot string, selected []string, logger *slog.Logger
 			gid, err := decodeGroupID(raw)
 			if err != nil {
 				return nil, fmt.Errorf("%w: %v", errServeInvalidGroupID, err)
+			}
+			if hasDeclinedDefaultMoot && gid == declinedDefaultMoot {
+				if logger != nil {
+					logger.Warn("serve: skipping declined default moot",
+						slog.String("group_id", gid.String()))
+				}
+				continue
 			}
 			if _, ok := seen[gid]; ok {
 				continue
@@ -103,6 +111,9 @@ func selectServeGroupIDs(dataRoot string, selected []string, logger *slog.Logger
 			seen[gid] = struct{}{}
 			out = append(out, gid)
 		}
+		if len(out) == 0 {
+			return nil, errServeNoGroups
+		}
 		return out, nil
 	}
 
@@ -112,6 +123,13 @@ func selectServeGroupIDs(dataRoot string, selected []string, logger *slog.Logger
 	}
 	out := make([]entmoot.GroupID, 0, len(gids))
 	for _, gid := range gids {
+		if hasDeclinedDefaultMoot && gid == declinedDefaultMoot {
+			if logger != nil {
+				logger.Warn("serve: skipping declined default moot",
+					slog.String("group_id", gid.String()))
+			}
+			continue
+		}
 		if !rosterFileExists(dataRoot, gid) {
 			if logger != nil {
 				logger.Warn("serve: skipping group without roster",
