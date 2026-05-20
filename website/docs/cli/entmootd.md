@@ -37,6 +37,10 @@ The normal production shape is:
    gossip.
 3. Use short commands for publish/query/tail/info.
 
+For the default public moot, use `entmootd default-moot status|join|decline|leave|live`.
+The Ent Moot requires owner consent to join, and live replies require a
+separate `default-moot live on` command.
+
 Useful inspection commands:
 
 ```sh
