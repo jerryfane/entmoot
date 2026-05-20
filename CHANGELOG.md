@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.68] - 2026-05-20
+
+### Fixed
+
+- **Public Pilot stack helpers.** Generated runtime helpers now support
+  `PILOT_PUBLIC=1`, propagating it through `/data` agent-user handoff and
+  launching Pilot with `-public` when hidden/TURN mode is not enabled.
+
 ## [1.5.67] - 2026-05-20
 
 ### Added
