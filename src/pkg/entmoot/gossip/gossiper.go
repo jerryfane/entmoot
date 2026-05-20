@@ -993,6 +993,8 @@ func (g *Gossiper) requestResponseWithAttemptTimeout(ctx context.Context, peer e
 		err = wire.EncodeAndWrite(conn, req)
 		if err != nil {
 			classification := g.classifyStreamError(attemptCtx, err)
+			transportClassification := g.classifyTransportStreamError(err)
+			classification = classifyAttemptTimeout(ctx, attemptCtx, classification, transportClassification)
 			stopCancelClose()
 			_ = conn.Close()
 			if cancel != nil {
@@ -1019,6 +1021,8 @@ func (g *Gossiper) requestResponseWithAttemptTimeout(ctx context.Context, peer e
 		}
 		if err != nil {
 			classification := g.classifyStreamError(attemptCtx, err)
+			transportClassification := g.classifyTransportStreamError(err)
+			classification = classifyAttemptTimeout(ctx, attemptCtx, classification, transportClassification)
 			lastErr = fmt.Errorf("%s: read: %w", op, err)
 			if shouldRetryStreamFailure(classification, attempt, ctx, attemptTimeout) {
 				if shouldDropPeerSessionAfterResponseFailure(classification, ctx) {

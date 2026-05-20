@@ -85,6 +85,17 @@ func shouldRetryStreamFailure(c StreamErrorClassification, attempt int, parentCt
 	return attemptTimeout > 0 || parentCtx.Err() == nil
 }
 
+func classifyAttemptTimeout(parentCtx, attemptCtx context.Context, c, transport StreamErrorClassification) StreamErrorClassification {
+	if attemptCtx == nil || attemptCtx.Err() == nil || parentCtx.Err() != nil {
+		return c
+	}
+	c.Retryable = true
+	c.Timeout = true
+	c.LocalContext = false
+	c.StaleSession = transport.StaleSession
+	return c
+}
+
 func shouldDropPeerSessionAfterStreamFailure(c StreamErrorClassification, attempt int, parentCtx context.Context) bool {
 	if parentCtx.Err() != nil {
 		return false

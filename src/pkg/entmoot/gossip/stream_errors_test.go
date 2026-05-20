@@ -94,6 +94,46 @@ func TestGenericStreamErrorCanceledContextIsLocal(t *testing.T) {
 	}
 }
 
+func TestClassifyAttemptTimeoutClearsGenericLocalClose(t *testing.T) {
+	t.Parallel()
+
+	parent := context.Background()
+	attemptCtx, cancel := context.WithTimeout(parent, time.Nanosecond)
+	defer cancel()
+	<-attemptCtx.Done()
+
+	got := classifyAttemptTimeout(
+		parent,
+		attemptCtx,
+		StreamErrorClassification{Retryable: true, StaleSession: true},
+		StreamErrorClassification{},
+	)
+	want := StreamErrorClassification{Retryable: true, Timeout: true}
+	if got != want {
+		t.Fatalf("classification = %+v, want %+v", got, want)
+	}
+}
+
+func TestClassifyAttemptTimeoutPreservesTransportStaleSession(t *testing.T) {
+	t.Parallel()
+
+	parent := context.Background()
+	attemptCtx, cancel := context.WithTimeout(parent, time.Nanosecond)
+	defer cancel()
+	<-attemptCtx.Done()
+
+	got := classifyAttemptTimeout(
+		parent,
+		attemptCtx,
+		StreamErrorClassification{Retryable: true, StaleSession: true},
+		StreamErrorClassification{Retryable: true, StaleSession: true},
+	)
+	want := StreamErrorClassification{Retryable: true, StaleSession: true, Timeout: true}
+	if got != want {
+		t.Fatalf("classification = %+v, want %+v", got, want)
+	}
+}
+
 func TestStreamErrorDecisionHelpers(t *testing.T) {
 	t.Parallel()
 
