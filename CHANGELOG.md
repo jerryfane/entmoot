@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.69] - 2026-05-20
+
+### Fixed
+
+- **Public Pilot install persistence.** Installing with `PILOT_PUBLIC=1` now
+  persists that default into generated `runtime.env`, so peer upgrades keep
+  public Pilot launch intent without a post-install manual edit.
+
 ## [1.5.68] - 2026-05-20
 
 ### Fixed
