@@ -20,9 +20,11 @@ import (
 
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/canonical"
+	"entmoot/pkg/entmoot/defaultmoot"
 	"entmoot/pkg/entmoot/esphttp"
 	"entmoot/pkg/entmoot/ipc"
 	"entmoot/pkg/entmoot/keystore"
+	"entmoot/pkg/entmoot/policy"
 	"entmoot/pkg/entmoot/transport/pilot/ipcclient"
 )
 
@@ -99,6 +101,120 @@ func TestLoadJoinInputClassifiesOpenInviteDescriptor(t *testing.T) {
 	}
 	if input.openInvite.IssuerURL != "https://esp.example.com/base" || input.openInvite.Token != "open-token" {
 		t.Fatalf("open invite = %+v", input.openInvite)
+	}
+}
+
+func TestLoadJoinInputVerifiesDefaultMootDescriptor(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	t.Setenv(defaultmoot.EnvDescriptorPubKey, base64.StdEncoding.EncodeToString(pub))
+
+	desc := defaultmoot.Descriptor{
+		Type:    defaultmoot.DescriptorType,
+		Name:    defaultmoot.Name,
+		GroupID: testESPGroupID(91),
+		OpenInvite: defaultmoot.OpenInviteDescriptor{
+			IssuerURL: "https://esp.example.com/base",
+			Token:     "open-token",
+		},
+		Issuer: entmoot.NodeInfo{
+			PilotNodeID:   45491,
+			EntmootPubKey: make([]byte, ed25519.PublicKeySize),
+		},
+		DefaultTopics: []string{"chat/general", "introductions"},
+		RecommendedLiveConfig: defaultmoot.RecommendedLiveConfig{
+			Mode:           "converse",
+			AllowedActions: []string{"reply"},
+			MaxActions:     policy.DefaultLiveMaxActionsPerScan,
+			MaxActionBytes: policy.DefaultLiveMaxActionBytes,
+		},
+		Policy:     policy.TheEntMootDefault(),
+		IssuedAtMS: 1_700_000_000_000,
+	}
+	signed, err := defaultmoot.Sign(desc, priv)
+	if err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+	raw, err := json.Marshal(signed)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "the-ent-moot.json")
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	input, err := loadJoinInput(path)
+	if err != nil {
+		t.Fatalf("loadJoinInput: %v", err)
+	}
+	if input.openInvite == nil || input.openInvite.IssuerURL != "https://esp.example.com/base" || input.openInvite.Token != "open-token" {
+		t.Fatalf("open invite = %+v", input.openInvite)
+	}
+	if input.expectedGroup == nil || *input.expectedGroup != desc.GroupID {
+		t.Fatalf("expected group = %v, want %s", input.expectedGroup, desc.GroupID)
+	}
+	if input.expectedIssuer == nil || !nodeInfoEqual(*input.expectedIssuer, desc.Issuer) {
+		t.Fatalf("expected issuer = %+v, want %+v", input.expectedIssuer, desc.Issuer)
+	}
+	if input.groupPolicy == nil || input.groupPolicy.MaxMessageBytes != policy.DefaultMaxMessageBytes {
+		t.Fatalf("group policy = %+v, want default moot policy", input.groupPolicy)
+	}
+	if !bytes.Contains(input.groupMetadata, []byte(`"name":"The Ent Moot"`)) {
+		t.Fatalf("group metadata = %s, want default moot name", input.groupMetadata)
+	}
+}
+
+func TestLoadJoinInputRejectsDefaultMootDescriptorWrongKey(t *testing.T) {
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey signer: %v", err)
+	}
+	wrongPub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey wrong: %v", err)
+	}
+	t.Setenv(defaultmoot.EnvDescriptorPubKey, base64.StdEncoding.EncodeToString(wrongPub))
+
+	desc := defaultmoot.Descriptor{
+		Type:    defaultmoot.DescriptorType,
+		Name:    defaultmoot.Name,
+		GroupID: testESPGroupID(92),
+		OpenInvite: defaultmoot.OpenInviteDescriptor{
+			Link: "entmoot://open-invite?issuer=https://esp.example.com/base&token=open-token",
+		},
+		Issuer: entmoot.NodeInfo{
+			PilotNodeID:   45491,
+			EntmootPubKey: make([]byte, ed25519.PublicKeySize),
+		},
+		DefaultTopics: []string{"chat/general", "introductions"},
+		RecommendedLiveConfig: defaultmoot.RecommendedLiveConfig{
+			Mode:           "converse",
+			AllowedActions: []string{"reply"},
+			MaxActions:     policy.DefaultLiveMaxActionsPerScan,
+			MaxActionBytes: policy.DefaultLiveMaxActionBytes,
+		},
+		Policy:     policy.TheEntMootDefault(),
+		IssuedAtMS: 1_700_000_000_000,
+	}
+	signed, err := defaultmoot.Sign(desc, priv)
+	if err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+	raw, err := json.Marshal(signed)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "the-ent-moot.json")
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = loadJoinInput(path)
+	if err == nil || !errors.Is(err, defaultmoot.ErrDescriptorSignature) {
+		t.Fatalf("loadJoinInput err = %v, want ErrDescriptorSignature", err)
 	}
 }
 
@@ -368,6 +484,11 @@ func TestJoinInputOverIPCSendsOpenInviteDescriptor(t *testing.T) {
 	defer ln.Close()
 
 	gid := testESPGroupID(79)
+	expectedIssuer := entmoot.NodeInfo{
+		PilotNodeID:   45491,
+		EntmootPubKey: []byte("issuer-key"),
+	}
+	groupPolicy := policy.TheEntMootDefault()
 	reqCh := make(chan *ipc.JoinGroupReq, 1)
 	errCh := make(chan error, 1)
 	go func() {
@@ -388,7 +509,7 @@ func TestJoinInputOverIPCSendsOpenInviteDescriptor(t *testing.T) {
 			return
 		}
 		reqCh <- req
-		_ = ipc.EncodeAndWrite(conn, &ipc.JoinGroupResp{Status: "joined", GroupID: gid, Members: 2})
+		_ = ipc.EncodeAndWrite(conn, &ipc.JoinGroupResp{Status: "joined", GroupID: gid, Issuer: &expectedIssuer, Members: 2})
 	}()
 
 	resp, frame, err := joinInputOverIPC(context.Background(), sock, joinInput{
@@ -397,6 +518,9 @@ func TestJoinInputOverIPCSendsOpenInviteDescriptor(t *testing.T) {
 			IssuerURL: "https://esp.example.com",
 			Token:     "open-token",
 		},
+		expectedGroup:  &gid,
+		expectedIssuer: &expectedIssuer,
+		groupPolicy:    &groupPolicy,
 	}, time.Second)
 	if err != nil {
 		t.Fatalf("joinInputOverIPC: %v", err)
@@ -421,10 +545,155 @@ func TestJoinInputOverIPCSendsOpenInviteDescriptor(t *testing.T) {
 		if req.OpenInvite.IssuerURL != "https://esp.example.com" || req.OpenInvite.Token != "open-token" {
 			t.Fatalf("req.OpenInvite = %+v", req.OpenInvite)
 		}
+		if req.OpenInvite.ExpectedGroupID == nil || *req.OpenInvite.ExpectedGroupID != gid {
+			t.Fatalf("req.OpenInvite.ExpectedGroupID = %v, want %s", req.OpenInvite.ExpectedGroupID, gid)
+		}
+		if req.OpenInvite.ExpectedIssuer == nil || !nodeInfoEqual(*req.OpenInvite.ExpectedIssuer, expectedIssuer) {
+			t.Fatalf("req.OpenInvite.ExpectedIssuer = %+v, want %+v", req.OpenInvite.ExpectedIssuer, expectedIssuer)
+		}
+		if req.GroupPolicy == nil || req.GroupPolicy.LiveTriggerRate != groupPolicy.LiveTriggerRate {
+			t.Fatalf("req.GroupPolicy = %+v, want %+v", req.GroupPolicy, groupPolicy)
+		}
 	case err := <-errCh:
 		t.Fatalf("server error: %v", err)
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for join request")
+	}
+}
+
+func TestJoinInputOverIPCRejectsUnexpectedDefaultMootGroup(t *testing.T) {
+	sock := shortTestUnixSocket(t)
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatalf("listen unix: %v", err)
+	}
+	defer ln.Close()
+
+	wantGID := testESPGroupID(77)
+	gotGID := testESPGroupID(78)
+	errCh := make(chan error, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			errCh <- err
+			return
+		}
+		defer conn.Close()
+		if _, _, err := ipc.ReadAndDecode(conn); err != nil {
+			errCh <- err
+			return
+		}
+		_ = ipc.EncodeAndWrite(conn, &ipc.JoinGroupResp{Status: "joined", GroupID: gotGID, Members: 2})
+	}()
+
+	resp, frame, err := joinInputOverIPC(context.Background(), sock, joinInput{
+		source: "default-moot",
+		openInvite: &openInviteAcceptPayload{
+			IssuerURL: "https://esp.example.com",
+			Token:     "open-token",
+		},
+		expectedGroup: &wantGID,
+	}, time.Second)
+	if err == nil || !errors.Is(err, errInviteMalformed) || !strings.Contains(err.Error(), "want signed descriptor group") {
+		t.Fatalf("joinInputOverIPC err = %v, want expected group mismatch", err)
+	}
+	if resp != nil || frame != nil {
+		t.Fatalf("resp/frame = %+v/%+v, want nil on mismatch", resp, frame)
+	}
+	select {
+	case err := <-errCh:
+		t.Fatalf("server error: %v", err)
+	default:
+	}
+}
+
+func TestJoinInputOverIPCRejectsMissingExpectedDefaultMootIssuer(t *testing.T) {
+	sock := shortTestUnixSocket(t)
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatalf("listen unix: %v", err)
+	}
+	defer ln.Close()
+
+	gid := testESPGroupID(83)
+	expectedIssuer := entmoot.NodeInfo{PilotNodeID: 45491, EntmootPubKey: []byte("issuer-key")}
+	errCh := make(chan error, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			errCh <- err
+			return
+		}
+		defer conn.Close()
+		if _, _, err := ipc.ReadAndDecode(conn); err != nil {
+			errCh <- err
+			return
+		}
+		_ = ipc.EncodeAndWrite(conn, &ipc.JoinGroupResp{Status: "joined", GroupID: gid, Members: 2})
+	}()
+
+	resp, frame, err := joinInputOverIPC(context.Background(), sock, joinInput{
+		source: "default-moot",
+		openInvite: &openInviteAcceptPayload{
+			IssuerURL: "https://esp.example.com",
+			Token:     "open-token",
+		},
+		expectedGroup:  &gid,
+		expectedIssuer: &expectedIssuer,
+	}, time.Second)
+	if err == nil || !errors.Is(err, errInviteMalformed) || !strings.Contains(err.Error(), "issuer does not match signed descriptor issuer") {
+		t.Fatalf("joinInputOverIPC err = %v, want expected issuer mismatch", err)
+	}
+	if resp != nil || frame != nil {
+		t.Fatalf("resp/frame = %+v/%+v, want nil on mismatch", resp, frame)
+	}
+	select {
+	case err := <-errCh:
+		t.Fatalf("server error: %v", err)
+	default:
+	}
+}
+
+func TestJoinInputsOverIPCClassifiesUnexpectedDefaultMootGroupAsInvalidArgument(t *testing.T) {
+	sock := shortTestUnixSocket(t)
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatalf("listen unix: %v", err)
+	}
+	defer ln.Close()
+
+	wantGID := testESPGroupID(81)
+	gotGID := testESPGroupID(82)
+	errCh := make(chan error, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			errCh <- err
+			return
+		}
+		defer conn.Close()
+		if _, _, err := ipc.ReadAndDecode(conn); err != nil {
+			errCh <- err
+			return
+		}
+		_ = ipc.EncodeAndWrite(conn, &ipc.JoinGroupResp{Status: "joined", GroupID: gotGID, Members: 2})
+	}()
+
+	code := joinInputsOverIPC(sock, []joinInput{{
+		source: "default-moot",
+		openInvite: &openInviteAcceptPayload{
+			IssuerURL: "https://esp.example.com",
+			Token:     "open-token",
+		},
+		expectedGroup: &wantGID,
+	}}, time.Second)
+	if code != exitInvalidArgument {
+		t.Fatalf("joinInputsOverIPC exit = %d, want %d", code, exitInvalidArgument)
+	}
+	select {
+	case err := <-errCh:
+		t.Fatalf("server error: %v", err)
+	default:
 	}
 }
 
@@ -550,6 +819,30 @@ func TestIPCServerResolveJoinGroupInviteRedeemsOpenInviteWithDaemonIdentity(t *t
 	}
 	if invite.GroupID != gid {
 		t.Fatalf("invite.GroupID = %s, want %s", invite.GroupID, gid)
+	}
+
+	wrongGID := testESPGroupID(81)
+	_, err = resolveJoinGroupInviteWithContext(context.Background(), &ipc.JoinGroupReq{
+		OpenInvite: &ipc.OpenInviteJoin{
+			IssuerURL:       issuer.URL,
+			Token:           "open-token",
+			ExpectedGroupID: &wrongGID,
+		},
+	}, daemonIdentity, pilot, "/daemon/pilot.sock")
+	if err == nil || !errors.Is(err, errInviteMalformed) || !strings.Contains(err.Error(), "want signed descriptor group") {
+		t.Fatalf("resolveJoinGroupInvite wrong expected group err = %v, want malformed group mismatch", err)
+	}
+
+	expectedIssuer := entmoot.NodeInfo{PilotNodeID: 45491, EntmootPubKey: []byte("issuer-key")}
+	_, err = resolveJoinGroupInviteWithContext(context.Background(), &ipc.JoinGroupReq{
+		OpenInvite: &ipc.OpenInviteJoin{
+			IssuerURL:      issuer.URL,
+			Token:          "open-token",
+			ExpectedIssuer: &expectedIssuer,
+		},
+	}, daemonIdentity, pilot, "/daemon/pilot.sock")
+	if err == nil || !errors.Is(err, errInviteMalformed) || !strings.Contains(err.Error(), "issuer does not match signed descriptor issuer") {
+		t.Fatalf("resolveJoinGroupInvite wrong expected issuer err = %v, want malformed issuer mismatch", err)
 	}
 }
 

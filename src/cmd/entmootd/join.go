@@ -23,10 +23,12 @@ import (
 	"time"
 
 	"entmoot/pkg/entmoot"
+	"entmoot/pkg/entmoot/defaultmoot"
 	"entmoot/pkg/entmoot/esphttp"
 	"entmoot/pkg/entmoot/events"
 	"entmoot/pkg/entmoot/ipc"
 	"entmoot/pkg/entmoot/keystore"
+	entpolicy "entmoot/pkg/entmoot/policy"
 	"entmoot/pkg/entmoot/roster"
 	"entmoot/pkg/entmoot/signing"
 	"entmoot/pkg/entmoot/store"
@@ -190,6 +192,7 @@ func cmdJoin(gf *globalFlags, args []string) int {
 				}
 				addInvite := runtime.AddInviteWithOptions
 				addOpts := addInviteOptions{scheduleOnboarding: true, bootstrapTimeout: *ipcTimeout}
+				addOpts.groupPolicy = clonePolicyPtr(input.groupPolicy)
 				if exitAfterLoad {
 					addOpts.scheduleOnboarding = false
 				}
@@ -242,6 +245,9 @@ func resolveJoinInput(ctx context.Context, input joinInput, loadCtx groupDaemonL
 		if err != nil {
 			return nil, classifyJoinOpenInviteError(err), fmt.Errorf("redeem open invite %s: %w", input.source, err)
 		}
+		if err := validateExpectedJoinInvite(input.source, input.expectedGroup, input.expectedIssuer, redeemed); err != nil {
+			return nil, exitInvalidArgument, err
+		}
 		invite = redeemed
 	}
 	if invite == nil {
@@ -257,6 +263,9 @@ func joinInputsOverIPC(sockPath string, inputs []joinInput, timeout time.Duratio
 		resp, frame, err := joinInputOverIPC(ctx, sockPath, input, timeout)
 		if err != nil {
 			slog.Error("join: live daemon join", slog.String("err", err.Error()))
+			if errors.Is(err, errInviteMalformed) {
+				return exitInvalidArgument
+			}
 			return exitTransport
 		}
 		if frame != nil {
@@ -284,14 +293,31 @@ func joinInputOverIPC(ctx context.Context, sockPath string, input joinInput, tim
 		req.Invite = *input.invite
 	case input.openInvite != nil:
 		req.OpenInvite = &ipc.OpenInviteJoin{
-			IssuerURL: input.openInvite.IssuerURL,
-			Token:     input.openInvite.Token,
+			IssuerURL:       input.openInvite.IssuerURL,
+			Token:           input.openInvite.Token,
+			ExpectedGroupID: cloneGroupIDPtr(input.expectedGroup),
+			ExpectedIssuer:  cloneNodeInfoPtr(input.expectedIssuer),
 		}
 	default:
 		return nil, nil, fmt.Errorf("invite %s: no signed invite or open invite descriptor", input.source)
 	}
 	req.GroupMetadata = append(json.RawMessage(nil), input.groupMetadata...)
-	return joinGroupReqOverIPC(ctx, sockPath, req, timeout)
+	req.GroupPolicy = clonePolicyPtr(input.groupPolicy)
+	resp, frame, err := joinGroupReqOverIPC(ctx, sockPath, req, timeout)
+	if err != nil || frame != nil {
+		return resp, frame, err
+	}
+	if resp == nil {
+		return nil, nil, fmt.Errorf("invite %s: no join response", input.source)
+	}
+	invite := &entmoot.Invite{GroupID: resp.GroupID}
+	if resp.Issuer != nil {
+		invite.Issuer = *resp.Issuer
+	}
+	if err := validateExpectedJoinInvite(input.source, input.expectedGroup, input.expectedIssuer, invite); err != nil {
+		return nil, nil, err
+	}
+	return resp, nil, nil
 }
 
 func joinGroupReqOverIPC(ctx context.Context, sockPath string, req *ipc.JoinGroupReq, timeout time.Duration) (*ipc.JoinGroupResp, *ipc.ErrorFrame, error) {
@@ -376,7 +402,7 @@ func classifyJoinOpenInviteError(err error) int {
 
 func classifyJoinAddInviteError(err error) int {
 	switch {
-	case errors.Is(err, entmoot.ErrInviteExpired), errors.Is(err, entmoot.ErrSigInvalid):
+	case errors.Is(err, entmoot.ErrInviteExpired), errors.Is(err, entmoot.ErrSigInvalid), errors.Is(err, errInviteMalformed):
 		return exitInvalidArgument
 	case errors.Is(err, errLocalGroupNotMember), errors.Is(err, errLocalGroupIdentityMismatch):
 		return exitNotMember
@@ -733,10 +759,13 @@ var errInviteMalformed = errors.New("invite malformed")
 var errFetchFailed = errors.New("invite fetch failed")
 
 type joinInput struct {
-	source        string
-	invite        *entmoot.Invite
-	openInvite    *openInviteAcceptPayload
-	groupMetadata json.RawMessage
+	source         string
+	invite         *entmoot.Invite
+	openInvite     *openInviteAcceptPayload
+	expectedGroup  *entmoot.GroupID
+	expectedIssuer *entmoot.NodeInfo
+	groupPolicy    *entpolicy.Policy
+	groupMetadata  json.RawMessage
 }
 
 // loadJoinInput reads a join input from arg (file path, http(s) URL, or
@@ -752,6 +781,13 @@ func loadJoinInput(arg string) (joinInput, error) {
 	raw, err := readJoinInputBytes(arg)
 	if err != nil {
 		return joinInput{}, err
+	}
+	if input, ok, err := parseDefaultMootDescriptor(raw); ok || err != nil {
+		if err != nil {
+			return joinInput{}, err
+		}
+		input.source = arg
+		return input, nil
 	}
 	if payload, ok, err := parseOpenInviteDescriptor(raw); ok || err != nil {
 		if err != nil {
@@ -901,6 +937,97 @@ func parseFleetInviteDescriptor(raw []byte) (joinInput, bool, error) {
 	}
 	invite := desc.Invite
 	return joinInput{invite: &invite, groupMetadata: metadata}, true, nil
+}
+
+func parseDefaultMootDescriptor(raw []byte) (joinInput, bool, error) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return joinInput{}, false, nil
+	}
+	if !hasJSONField(fields, "type") {
+		return joinInput{}, false, nil
+	}
+	var probe struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(raw, &probe); err != nil {
+		return joinInput{}, false, nil
+	}
+	if probe.Type != defaultmoot.DescriptorType {
+		return joinInput{}, false, nil
+	}
+	desc, err := defaultmoot.Parse(raw)
+	if err != nil {
+		return joinInput{}, true, err
+	}
+	pub, err := defaultMootPinnedPublicKey()
+	if err != nil {
+		return joinInput{}, true, err
+	}
+	if err := defaultmoot.Verify(desc, pub); err != nil {
+		return joinInput{}, true, err
+	}
+	payload, err := openInvitePayloadFromDefaultMootDescriptor(desc)
+	if err != nil {
+		return joinInput{}, true, err
+	}
+	metadata, err := defaultMootGroupMetadata(desc)
+	if err != nil {
+		return joinInput{}, true, err
+	}
+	return joinInput{openInvite: payload, expectedGroup: &desc.GroupID, expectedIssuer: &desc.Issuer, groupPolicy: &desc.Policy, groupMetadata: metadata}, true, nil
+}
+
+func defaultMootPinnedPublicKey() (ed25519.PublicKey, error) {
+	cfg, err := defaultmoot.LoadConfigFromEnv()
+	if err != nil {
+		return nil, err
+	}
+	return cfg.PinnedPublicKey, nil
+}
+
+func openInvitePayloadFromDefaultMootDescriptor(desc defaultmoot.Descriptor) (*openInviteAcceptPayload, error) {
+	var out *openInviteAcceptPayload
+	if strings.TrimSpace(desc.OpenInvite.IssuerURL) != "" || strings.TrimSpace(desc.OpenInvite.Token) != "" {
+		payload, err := normalizeOpenInviteAcceptPayload(openInviteAcceptPayload{
+			IssuerURL: desc.OpenInvite.IssuerURL,
+			Token:     desc.OpenInvite.Token,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("%w: default moot open invite: %v", errInviteMalformed, err)
+		}
+		out = payload
+	}
+	for _, rawLink := range []string{desc.OpenInvite.Link, desc.OpenInviteLink} {
+		if strings.TrimSpace(rawLink) == "" {
+			continue
+		}
+		payload, err := parseOpenInviteLink(rawLink)
+		if err != nil {
+			return nil, fmt.Errorf("%w: default moot open invite link: %v", errInviteMalformed, err)
+		}
+		if out != nil && (out.IssuerURL != payload.IssuerURL || out.Token != payload.Token) {
+			return nil, fmt.Errorf("%w: default moot open invite link does not match issuer_url/token fields", errInviteMalformed)
+		}
+		out = payload
+	}
+	if out == nil {
+		return nil, fmt.Errorf("%w: default moot descriptor has no open invite", errInviteMalformed)
+	}
+	return out, nil
+}
+
+func defaultMootGroupMetadata(desc defaultmoot.Descriptor) (json.RawMessage, error) {
+	raw, err := json.Marshal(map[string]any{
+		"name":         desc.Name,
+		"description":  "Official default public Entmoot moot",
+		"tags":         []string{"default", "public", "entmoot"},
+		"default_moot": true,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return esphttp.NormalizeGroupMetadata(raw)
 }
 
 func parseOpenInviteDescriptor(raw []byte) (*openInviteAcceptPayload, bool, error) {
@@ -1600,10 +1727,11 @@ func (s *ipcServer) handleJoinGroup(ctx context.Context, c net.Conn, req *ipc.Jo
 		scheduleOnboarding: true,
 		bootstrapTimeout:   bootstrapTimeout,
 		sessionParent:      ctx,
+		groupPolicy:        req.GroupPolicy,
 	})
 	if err != nil {
 		code := ipc.CodeInternal
-		if errors.Is(err, entmoot.ErrInviteExpired) || errors.Is(err, entmoot.ErrSigInvalid) {
+		if errors.Is(err, entmoot.ErrInviteExpired) || errors.Is(err, entmoot.ErrSigInvalid) || errors.Is(err, errInviteMalformed) {
 			code = ipc.CodeInvalidArgument
 		}
 		gid := invite.GroupID
@@ -1629,9 +1757,11 @@ func (s *ipcServer) handleJoinGroup(ctx context.Context, c net.Conn, req *ipc.Jo
 		status = "joined"
 	}
 	s.runtime.RecordJoinHealthInvite(invite)
+	issuer := invite.Issuer
 	_ = ipc.EncodeAndWrite(c, &ipc.JoinGroupResp{
 		Status:    status,
 		GroupID:   sess.groupID,
+		Issuer:    &issuer,
 		Members:   len(sess.roster.Members()),
 		Readiness: s.joinReadinessEvent(ctx),
 	})
@@ -1677,7 +1807,55 @@ func resolveJoinGroupInviteWithContext(ctx context.Context, req *ipc.JoinGroupRe
 	if invite == nil {
 		return entmoot.Invite{}, fmt.Errorf("%w: open invite redemption returned no signed invite", errInviteMalformed)
 	}
+	if err := validateExpectedJoinInvite("open invite", req.OpenInvite.ExpectedGroupID, req.OpenInvite.ExpectedIssuer, invite); err != nil {
+		return entmoot.Invite{}, err
+	}
 	return *invite, nil
+}
+
+func validateExpectedJoinInvite(source string, expectedGroup *entmoot.GroupID, expectedIssuer *entmoot.NodeInfo, invite *entmoot.Invite) error {
+	if expectedGroup == nil && expectedIssuer == nil {
+		return nil
+	}
+	if invite == nil {
+		return fmt.Errorf("%w: %s produced no signed invite matching signed descriptor", errInviteMalformed, source)
+	}
+	if expectedGroup != nil && invite.GroupID != *expectedGroup {
+		return fmt.Errorf("%w: %s redeemed group %s, want signed descriptor group %s", errInviteMalformed, source, invite.GroupID.String(), expectedGroup.String())
+	}
+	if expectedIssuer != nil && !nodeInfoEqual(invite.Issuer, *expectedIssuer) {
+		return fmt.Errorf("%w: %s redeemed issuer does not match signed descriptor issuer", errInviteMalformed, source)
+	}
+	return nil
+}
+
+func cloneGroupIDPtr(in *entmoot.GroupID) *entmoot.GroupID {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	return &out
+}
+
+func cloneNodeInfoPtr(in *entmoot.NodeInfo) *entmoot.NodeInfo {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	out.EntmootPubKey = append([]byte(nil), in.EntmootPubKey...)
+	return &out
+}
+
+func clonePolicyPtr(in *entpolicy.Policy) *entpolicy.Policy {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	return &out
+}
+
+func nodeInfoEqual(a, b entmoot.NodeInfo) bool {
+	return a.PilotNodeID == b.PilotNodeID && bytes.Equal(a.EntmootPubKey, b.EntmootPubKey)
 }
 
 func ipcCodeForJoinResolveError(err error) ipc.ErrorCode {

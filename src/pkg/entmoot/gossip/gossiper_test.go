@@ -445,6 +445,29 @@ func TestPolicyOversizedInboundMessageRejectedBeforeStorage(t *testing.T) {
 	}
 }
 
+func TestSetGroupPolicyAppliesToRunningGossiper(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, []entmoot.NodeID{10, 20})
+	defer f.closeTransports()
+
+	beforePolicy := f.buildMessage(10, "allowed-before-policy", 2_000)
+	f.nodes[20].gossip.onGossip(context.Background(), 10, f.signedInlineGossip(10, beforePolicy))
+	if has, err := f.nodes[20].storeM.Has(context.Background(), f.groupID, beforePolicy.ID); err != nil || !has {
+		t.Fatalf("before policy stored has/err = %v/%v, want true/nil", has, err)
+	}
+
+	p := policy.TheEntMootDefault()
+	p.MaxMessageBytes = 3
+	if err := f.nodes[20].gossip.SetGroupPolicy(p); err != nil {
+		t.Fatalf("SetGroupPolicy: %v", err)
+	}
+	afterPolicy := f.buildMessage(10, "too-large-after-policy", 2_001)
+	f.nodes[20].gossip.onGossip(context.Background(), 10, f.signedInlineGossip(10, afterPolicy))
+	if has, err := f.nodes[20].storeM.Has(context.Background(), f.groupID, afterPolicy.ID); err != nil || has {
+		t.Fatalf("after policy stored has/err = %v/%v, want false/nil", has, err)
+	}
+}
+
 func TestPolicyRetentionPrunesConfiguredGroup(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t, []entmoot.NodeID{10, 20})
