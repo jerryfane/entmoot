@@ -246,6 +246,49 @@ func (s *SQLite) Put(ctx context.Context, m entmoot.Message) error {
 	return nil
 }
 
+// PruneBefore removes messages in groupID older than beforeMillis.
+func (s *SQLite) PruneBefore(ctx context.Context, groupID entmoot.GroupID, beforeMillis int64) (int64, error) {
+	if beforeMillis <= 0 {
+		return 0, nil
+	}
+	db, err := s.dbFor(groupID)
+	if err != nil {
+		return 0, err
+	}
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("store: begin prune tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM message_topics
+		WHERE message_id IN (
+		  SELECT message_id FROM messages
+		  WHERE group_id = ? AND timestamp_ms < ?
+		);`,
+		groupID[:], beforeMillis,
+	); err != nil {
+		return 0, fmt.Errorf("store: prune topics: %w", err)
+	}
+	res, err := tx.ExecContext(ctx, `
+		DELETE FROM messages
+		WHERE group_id = ? AND timestamp_ms < ?;`,
+		groupID[:], beforeMillis,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("store: prune messages: %w", err)
+	}
+	pruned, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("store: prune rows affected: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("store: commit prune: %w", err)
+	}
+	return pruned, nil
+}
+
 // Get implements MessageStore.Get.
 func (s *SQLite) Get(ctx context.Context, groupID entmoot.GroupID, id entmoot.MessageID) (entmoot.Message, error) {
 	db, err := s.dbFor(groupID)

@@ -17,6 +17,7 @@ import (
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/gossip"
 	"entmoot/pkg/entmoot/keystore"
+	entpolicy "entmoot/pkg/entmoot/policy"
 	"entmoot/pkg/entmoot/ratelimit"
 	"entmoot/pkg/entmoot/roster"
 	"entmoot/pkg/entmoot/store"
@@ -64,6 +65,7 @@ type groupRuntime struct {
 	hideIP         bool
 	traceReconcile bool
 	logger         *slog.Logger
+	policyStore    *entpolicy.FileStore
 
 	mux *groupMuxTransport
 
@@ -191,6 +193,10 @@ func newGroupRuntime(cfg groupRuntimeConfig) (*groupRuntime, error) {
 	if cfg.EndpointsChanged != nil {
 		endpointFanout = newEndpointChangeFanout(cfg.EndpointsChanged)
 	}
+	policyStore, err := entpolicy.OpenFileStore(cfg.DataDir)
+	if err != nil {
+		return nil, err
+	}
 	return &groupRuntime{
 		nodeID:                cfg.NodeID,
 		identity:              cfg.Identity,
@@ -204,6 +210,7 @@ func newGroupRuntime(cfg groupRuntimeConfig) (*groupRuntime, error) {
 		hideIP:                cfg.HideIP,
 		traceReconcile:        cfg.TraceReconcile,
 		logger:                logger,
+		policyStore:           policyStore,
 		mux:                   newGroupMuxTransport(cfg.Transport, logger),
 		sessions:              make(map[entmoot.GroupID]*groupSession),
 		joining:               make(map[entmoot.GroupID]chan struct{}),
@@ -239,6 +246,20 @@ type addInviteOptions struct {
 	scheduleOnboarding bool
 	bootstrapTimeout   time.Duration
 	sessionParent      context.Context
+}
+
+func (r *groupRuntime) groupPolicy(ctx context.Context, groupID entmoot.GroupID) (*entpolicy.Policy, error) {
+	if r.policyStore == nil {
+		return nil, nil
+	}
+	p, ok, err := r.policyStore.Get(ctx, groupID)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, nil
+	}
+	return &p, nil
 }
 
 func (r *groupRuntime) AddInvite(ctx context.Context, invite entmoot.Invite) (*groupSession, bool, error) {
@@ -326,6 +347,12 @@ func (r *groupRuntime) addGroup(ctx context.Context, groupID entmoot.GroupID, bo
 			return nil, false, err
 		}
 	}
+	groupPolicy, err := r.groupPolicy(ctx, groupID)
+	if err != nil {
+		_ = rlog.Close()
+		cleanupGroup()
+		return nil, false, err
+	}
 	g, err := gossip.New(gossip.Config{
 		LocalNode:          r.nodeID,
 		Identity:           r.identity,
@@ -336,7 +363,8 @@ func (r *groupRuntime) addGroup(ctx context.Context, groupID entmoot.GroupID, bo
 		Logger:             r.logger,
 		TransportAdStore:   r.store,
 		MemberProfileStore: r.store,
-		RateLimiter:        ratelimit.New(ratelimit.DefaultLimits(), nil),
+		RateLimiter:        ratelimit.New(entpolicy.SystemLimits(groupPolicy), nil),
+		GroupPolicy:        groupPolicy,
 		LocalEndpoints:     r.localEndpoints,
 		LocalHostname:      r.localHostname,
 		EndpointsChanged:   endpointsChanged,

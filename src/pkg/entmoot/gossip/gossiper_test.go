@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -16,6 +17,7 @@ import (
 	"entmoot/pkg/entmoot/canonical"
 	"entmoot/pkg/entmoot/clock"
 	"entmoot/pkg/entmoot/keystore"
+	"entmoot/pkg/entmoot/policy"
 	"entmoot/pkg/entmoot/roster"
 	"entmoot/pkg/entmoot/store"
 	"entmoot/pkg/entmoot/wire"
@@ -309,6 +311,44 @@ func (f *fixture) buildMessage(author entmoot.NodeID, content string, ts int64) 
 	return msg
 }
 
+func (f *fixture) replaceGossiperWithPolicy(node entmoot.NodeID, p *policy.Policy, clk clock.Clock) {
+	f.t.Helper()
+	ns := f.nodes[node]
+	if clk == nil {
+		clk = ns.gossip.clk
+	}
+	g, err := New(Config{
+		LocalNode:   node,
+		Identity:    ns.id,
+		Roster:      ns.rost,
+		Store:       ns.storeM,
+		Transport:   f.transports[node],
+		GroupID:     f.groupID,
+		Fanout:      defaultFanout,
+		Clock:       clk,
+		Logger:      slog.Default(),
+		GroupPolicy: p,
+	})
+	if err != nil {
+		f.t.Fatalf("gossip.New with policy for %d: %v", node, err)
+	}
+	ns.gossip = g
+}
+
+func (f *fixture) signedInlineGossip(relay entmoot.NodeID, msg entmoot.Message) *wire.Gossip {
+	f.t.Helper()
+	frame := &wire.Gossip{
+		GroupID:   f.groupID,
+		IDs:       []entmoot.MessageID{msg.ID},
+		Body:      &msg,
+		Timestamp: msg.Timestamp,
+	}
+	if err := signGossip(frame, f.nodes[relay].id); err != nil {
+		f.t.Fatalf("signGossip: %v", err)
+	}
+	return frame
+}
+
 // waitUntil polls fn at a small interval until it returns true or timeout
 // elapses. Returns true on success and fails the test with msg on timeout.
 func waitUntil(t *testing.T, timeout time.Duration, msg string, fn func() bool) {
@@ -366,6 +406,166 @@ func TestPublishTwoNode(t *testing.T) {
 		has, _ := f.nodes[20].storeM.Has(ctx, f.groupID, msg.ID)
 		return has
 	})
+}
+
+func TestPolicyInboundContentLimitUsesAuthorAcrossRelays(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, []entmoot.NodeID{10, 20, 30, 40})
+	defer f.closeTransports()
+	p := policy.TheEntMootDefault()
+	p.MessageRatePerAuthor = "1/hour"
+	p.MessageBurstPerAuthor = 1
+	f.replaceGossiperWithPolicy(40, &p, nil)
+
+	first := f.buildMessage(10, "first", 2_000)
+	second := f.buildMessage(10, "second", 2_001)
+	f.nodes[40].gossip.onGossip(context.Background(), 20, f.signedInlineGossip(20, first))
+	f.nodes[40].gossip.onGossip(context.Background(), 30, f.signedInlineGossip(30, second))
+
+	if has, err := f.nodes[40].storeM.Has(context.Background(), f.groupID, first.ID); err != nil || !has {
+		t.Fatalf("first stored has/err = %v/%v, want true/nil", has, err)
+	}
+	if has, err := f.nodes[40].storeM.Has(context.Background(), f.groupID, second.ID); err != nil || has {
+		t.Fatalf("second stored has/err = %v/%v, want false/nil", has, err)
+	}
+}
+
+func TestPolicyOversizedInboundMessageRejectedBeforeStorage(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, []entmoot.NodeID{10, 20})
+	defer f.closeTransports()
+	p := policy.TheEntMootDefault()
+	p.MaxMessageBytes = 3
+	f.replaceGossiperWithPolicy(20, &p, nil)
+
+	msg := f.buildMessage(10, "too-large", 2_000)
+	f.nodes[20].gossip.onGossip(context.Background(), 10, f.signedInlineGossip(10, msg))
+	if has, err := f.nodes[20].storeM.Has(context.Background(), f.groupID, msg.ID); err != nil || has {
+		t.Fatalf("oversized stored has/err = %v/%v, want false/nil", has, err)
+	}
+}
+
+func TestPolicyRetentionPrunesConfiguredGroup(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, []entmoot.NodeID{10, 20})
+	defer f.closeTransports()
+	const dayMS = int64(24 * time.Hour / time.Millisecond)
+	clk := clock.NewFake(time.UnixMilli(3 * dayMS))
+	p := policy.TheEntMootDefault()
+	p.RetentionDays = 1
+	f.replaceGossiperWithPolicy(20, &p, clk)
+
+	old := f.buildMessage(10, "old", dayMS)
+	newer := f.buildMessage(10, "new", 3*dayMS)
+	if err := f.nodes[20].storeM.Put(context.Background(), old); err != nil {
+		t.Fatalf("Put old: %v", err)
+	}
+	f.nodes[20].gossip.onGossip(context.Background(), 10, f.signedInlineGossip(10, newer))
+
+	if has, err := f.nodes[20].storeM.Has(context.Background(), f.groupID, old.ID); err != nil || has {
+		t.Fatalf("old retained has/err = %v/%v, want false/nil", has, err)
+	}
+	if has, err := f.nodes[20].storeM.Has(context.Background(), f.groupID, newer.ID); err != nil || !has {
+		t.Fatalf("new retained has/err = %v/%v, want true/nil", has, err)
+	}
+}
+
+func TestPolicyExpiredInboundDoesNotConsumeAuthorQuota(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, []entmoot.NodeID{10, 20})
+	defer f.closeTransports()
+	const dayMS = int64(24 * time.Hour / time.Millisecond)
+	clk := clock.NewFake(time.UnixMilli(3 * dayMS))
+	p := policy.TheEntMootDefault()
+	p.MessageRatePerAuthor = "1/hour"
+	p.MessageBurstPerAuthor = 1
+	p.RetentionDays = 1
+	f.replaceGossiperWithPolicy(20, &p, clk)
+
+	expired := f.buildMessage(10, "expired", dayMS)
+	fresh := f.buildMessage(10, "fresh", 3*dayMS)
+	f.nodes[20].gossip.onGossip(context.Background(), 10, f.signedInlineGossip(10, expired))
+	f.nodes[20].gossip.onGossip(context.Background(), 10, f.signedInlineGossip(10, fresh))
+
+	if has, err := f.nodes[20].storeM.Has(context.Background(), f.groupID, expired.ID); err != nil || has {
+		t.Fatalf("expired stored has/err = %v/%v, want false/nil", has, err)
+	}
+	if has, err := f.nodes[20].storeM.Has(context.Background(), f.groupID, fresh.ID); err != nil || !has {
+		t.Fatalf("fresh stored has/err = %v/%v, want true/nil", has, err)
+	}
+}
+
+func TestPolicyExpiredLocalPublishRejectedBeforeStorage(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, []entmoot.NodeID{10})
+	defer f.closeTransports()
+	const dayMS = int64(24 * time.Hour / time.Millisecond)
+	clk := clock.NewFake(time.UnixMilli(3 * dayMS))
+	p := policy.TheEntMootDefault()
+	p.RetentionDays = 1
+	f.replaceGossiperWithPolicy(10, &p, clk)
+
+	expired := f.buildMessage(10, "expired local", dayMS)
+	if err := f.nodes[10].gossip.Publish(context.Background(), expired); err == nil {
+		t.Fatal("Publish expired returned nil, want error")
+	}
+	if has, err := f.nodes[10].storeM.Has(context.Background(), f.groupID, expired.ID); err != nil || has {
+		t.Fatalf("expired local stored has/err = %v/%v, want false/nil", has, err)
+	}
+}
+
+func TestPolicyOversizedLocalPublishRejectedBeforeStorage(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, []entmoot.NodeID{10})
+	defer f.closeTransports()
+	p := policy.TheEntMootDefault()
+	p.MaxMessageBytes = 3
+	f.replaceGossiperWithPolicy(10, &p, nil)
+
+	msg := f.buildMessage(10, "too-large", 2_000)
+	if err := f.nodes[10].gossip.Publish(context.Background(), msg); err == nil {
+		t.Fatal("Publish oversized returned nil, want error")
+	}
+	if has, err := f.nodes[10].storeM.Has(context.Background(), f.groupID, msg.ID); err != nil || has {
+		t.Fatalf("oversized local stored has/err = %v/%v, want false/nil", has, err)
+	}
+}
+
+func TestPolicyLocalPublishConsumesAuthorQuota(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, []entmoot.NodeID{10})
+	defer f.closeTransports()
+	p := policy.TheEntMootDefault()
+	p.MessageRatePerAuthor = "1/hour"
+	p.MessageBurstPerAuthor = 1
+	f.replaceGossiperWithPolicy(10, &p, nil)
+
+	first := f.buildMessage(10, "first", 2_000)
+	second := f.buildMessage(10, "second", 2_001)
+	if err := f.nodes[10].gossip.Publish(context.Background(), first); err != nil {
+		t.Fatalf("Publish first: %v", err)
+	}
+	if err := f.nodes[10].gossip.Publish(context.Background(), second); err == nil {
+		t.Fatal("Publish second returned nil, want rate limit error")
+	}
+	if has, err := f.nodes[10].storeM.Has(context.Background(), f.groupID, first.ID); err != nil || !has {
+		t.Fatalf("first local stored has/err = %v/%v, want true/nil", has, err)
+	}
+	if has, err := f.nodes[10].storeM.Has(context.Background(), f.groupID, second.ID); err != nil || has {
+		t.Fatalf("second local stored has/err = %v/%v, want false/nil", has, err)
+	}
+}
+
+func TestNoGroupPolicyPreservesExistingInboundBehavior(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, []entmoot.NodeID{10, 20})
+	defer f.closeTransports()
+
+	msg := f.buildMessage(10, strings.Repeat("x", policy.DefaultMaxMessageBytes+1), 2_000)
+	f.nodes[20].gossip.onGossip(context.Background(), 10, f.signedInlineGossip(10, msg))
+	if has, err := f.nodes[20].storeM.Has(context.Background(), f.groupID, msg.ID); err != nil || !has {
+		t.Fatalf("message stored has/err = %v/%v, want true/nil", has, err)
+	}
 }
 
 // 3. Three-node: A publishes, both B and C receive (fanout covers both).

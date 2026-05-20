@@ -17,9 +17,19 @@ import (
 	"entmoot/pkg/entmoot/esphttp"
 	"entmoot/pkg/entmoot/ipc"
 	"entmoot/pkg/entmoot/keystore"
+	entpolicy "entmoot/pkg/entmoot/policy"
 	"entmoot/pkg/entmoot/roster"
 	"entmoot/pkg/entmoot/store"
 )
+
+type testLivePolicyStore struct {
+	policies map[entmoot.GroupID]entpolicy.Policy
+}
+
+func (s testLivePolicyStore) Get(_ context.Context, groupID entmoot.GroupID) (entpolicy.Policy, bool, error) {
+	p, ok := s.policies[groupID]
+	return p, ok, nil
+}
 
 func TestRunAgentLiveScanListenAdvancesCursorWithoutRunner(t *testing.T) {
 	ctx := context.Background()
@@ -2620,6 +2630,85 @@ printf '%s' '{"status":"completed","summary":"done"}'
 	}
 	if _, ok, err := state.GetLiveAgentCursor(ctx, gid, nodeID); err != nil || ok {
 		t.Fatalf("GetLiveAgentCursor ok/err = %v/%v, want no consumed cursor", ok, err)
+	}
+}
+
+func TestRunAgentLiveScanPolicyTriggerLimiterSkipsRunnerWithoutAdvancingCursor(t *testing.T) {
+	ctx := context.Background()
+	gid := testAgentLiveGroupID(57)
+	nodeID := entmoot.NodeID(7)
+	state := esphttp.NewMemoryStateStore()
+	msgStore := store.NewMemory()
+	first := testAgentLiveMessage(gid, 11, 100, "chat", "first")
+	second := testAgentLiveMessage(gid, 12, 200, "chat", "second")
+	if err := msgStore.Put(ctx, first); err != nil {
+		t.Fatalf("Put first: %v", err)
+	}
+	cfg, err := state.UpsertLiveAgentConfig(ctx, esphttp.LiveAgentConfig{
+		GroupID:      gid,
+		NodeID:       nodeID,
+		Enabled:      true,
+		Mode:         esphttp.LiveModeConverse,
+		TopicFilters: []string{"chat"},
+		UpdatedAtMS:  1,
+	})
+	if err != nil {
+		t.Fatalf("UpsertLiveAgentConfig: %v", err)
+	}
+	dir := t.TempDir()
+	runner := filepath.Join(dir, "runner.sh")
+	if err := os.WriteFile(runner, []byte(`#!/bin/sh
+count="$ENTMOOT_TEST_DIR/count"
+if [ -f "$count" ]; then n=$(cat "$count"); else n=0; fi
+n=$((n + 1))
+printf '%s' "$n" > "$count"
+printf '{"actions":[]}'
+`), 0o700); err != nil {
+		t.Fatalf("WriteFile runner: %v", err)
+	}
+	p := entpolicy.TheEntMootDefault()
+	p.LiveTriggerRate = "1/hour"
+	p.LiveTriggerBurst = 1
+	runCfg := agentLiveRuntimeConfig{
+		nodeID:         nodeID,
+		runner:         runner,
+		timeout:        time.Second,
+		limit:          10,
+		policies:       testLivePolicyStore{policies: map[entmoot.GroupID]entpolicy.Policy{gid: p}},
+		triggerLimiter: newAgentLiveTriggerLimiter(nil),
+	}
+	t.Setenv("ENTMOOT_TEST_DIR", dir)
+
+	firstResult, err := runAgentLiveScan(ctx, &globalFlags{}, state, msgStore, cfg, runCfg)
+	if err != nil {
+		t.Fatalf("runAgentLiveScan first: %v", err)
+	}
+	if firstResult.Status != agentLiveScanStatusOK || firstResult.Matched != 1 {
+		t.Fatalf("first result = %+v, want ok matched", firstResult)
+	}
+	if err := msgStore.Put(ctx, second); err != nil {
+		t.Fatalf("Put second: %v", err)
+	}
+	secondResult, err := runAgentLiveScan(ctx, &globalFlags{}, state, msgStore, cfg, runCfg)
+	if err != nil {
+		t.Fatalf("runAgentLiveScan second: %v", err)
+	}
+	if secondResult.Status != agentLiveScanStatusError || secondResult.ErrorKind != liveRecoverableTriggerRateLimit {
+		t.Fatalf("second result = %+v, want trigger rate limit", secondResult)
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, "count"))
+	if err != nil {
+		t.Fatalf("ReadFile count: %v", err)
+	}
+	if strings.TrimSpace(string(raw)) != "1" {
+		t.Fatalf("runner count = %q, want 1", raw)
+	}
+	cursor, ok, err := state.GetLiveAgentCursor(ctx, gid, nodeID)
+	if err != nil || !ok {
+		t.Fatalf("GetLiveAgentCursor ok/err = %v/%v, want cursor", ok, err)
+	}
+	if cursor.LastSeenMessageID != first.ID {
+		t.Fatalf("cursor.LastSeenMessageID = %s, want first %s", cursor.LastSeenMessageID, first.ID)
 	}
 }
 

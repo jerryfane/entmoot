@@ -19,6 +19,7 @@ import (
 	"entmoot/pkg/entmoot/canonical"
 	"entmoot/pkg/entmoot/clock"
 	"entmoot/pkg/entmoot/keystore"
+	"entmoot/pkg/entmoot/policy"
 	"entmoot/pkg/entmoot/ratelimit"
 	"entmoot/pkg/entmoot/reconcile"
 	"entmoot/pkg/entmoot/roster"
@@ -446,6 +447,10 @@ type Config struct {
 	// TraceReconcile enables high-volume structured anti-entropy lifecycle
 	// logs. Intended for operational debugging of reconcile convergence.
 	TraceReconcile bool
+
+	// GroupPolicy, when set, applies local content-message budgets for this
+	// group. nil preserves existing behavior for groups without policy.
+	GroupPolicy *policy.Policy
 }
 
 // Gossiper runs the accept loop, publishes local messages, and fetches
@@ -559,6 +564,10 @@ type Gossiper struct {
 	// scheduler is holding pendMu.
 	dialMu       sync.Mutex
 	dialBackoffs map[entmoot.NodeID]*peerDialState
+
+	contentLimiter  *ratelimit.Limiter
+	maxMessageBytes int64
+	retentionDays   int
 }
 
 // peerDialState tracks the per-peer dial-backoff state. nextAllowed
@@ -614,6 +623,21 @@ func New(cfg Config) (*Gossiper, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	var contentLimiter *ratelimit.Limiter
+	var maxMessageBytes int64
+	var retentionDays int
+	if cfg.GroupPolicy != nil {
+		if err := cfg.GroupPolicy.Validate(); err != nil {
+			return nil, fmt.Errorf("gossip: group policy: %w", err)
+		}
+		contentLimits, err := policy.ContentLimits(*cfg.GroupPolicy)
+		if err != nil {
+			return nil, fmt.Errorf("gossip: content limits: %w", err)
+		}
+		contentLimiter = ratelimit.New(contentLimits, clk)
+		maxMessageBytes = cfg.GroupPolicy.MaxMessageBytes
+		retentionDays = cfg.GroupPolicy.RetentionDays
+	}
 	// Seed off the clock so Fake-clock tests stay deterministic.
 	// Mirrors the getPicker seeding pattern (same file, below) so
 	// both rand sources advance predictably in tests.
@@ -633,6 +657,9 @@ func New(cfg Config) (*Gossiper, error) {
 		profilePullSlots:  make(chan struct{}, memberProfileSnapshotMaxConcurrent),
 		lastKnownPeerRoot: make(map[entmoot.NodeID]wire.MerkleRoot),
 		rng:               rng,
+		contentLimiter:    contentLimiter,
+		maxMessageBytes:   maxMessageBytes,
+		retentionDays:     retentionDays,
 		// Plumtree peer-set maps and pending-graft timer map are
 		// lazily populated. Per paper convention, eagerPushPeers
 		// starts with every current non-self roster member at first
@@ -1631,7 +1658,7 @@ func (g *Gossiper) onGossip(ctx context.Context, remote entmoot.NodeID, gos *wir
 					slog.String("err", err.Error()))
 				continue
 			}
-			if err := g.cfg.Store.Put(ctx, msg); err != nil {
+			if err := g.acceptInboundMessage(ctx, remote, msg); err != nil {
 				g.logger.Warn("gossip: inline body store put",
 					slog.Uint64("remote", uint64(remote)),
 					slog.String("id", id.String()),
@@ -1880,7 +1907,7 @@ func (g *Gossiper) fetchFrom(ctx context.Context, peer entmoot.NodeID, id entmoo
 	if err := g.verifyMessage(*resp.Message); err != nil {
 		return err
 	}
-	if err := g.cfg.Store.Put(ctx, *resp.Message); err != nil {
+	if err := g.acceptInboundMessage(ctx, peer, *resp.Message); err != nil {
 		return fmt.Errorf("store put: %w", err)
 	}
 	// Plumtree "first-seen → forward" rule (v1.0.5). A message we just
@@ -1906,6 +1933,57 @@ func (g *Gossiper) fetchFrom(ctx context.Context, peer entmoot.NodeID, id entmoo
 	// cooldown-gated reconcile so anti-entropy catches anything else they
 	// have that we don't (patch 7).
 	g.maybeReconcile(ctx, peer)
+	return nil
+}
+
+func (g *Gossiper) acceptInboundMessage(ctx context.Context, relay entmoot.NodeID, msg entmoot.Message) error {
+	if err := g.checkContentPolicy(relay, msg); err != nil {
+		return err
+	}
+	if err := g.cfg.Store.Put(ctx, msg); err != nil {
+		return err
+	}
+	return g.prunePolicyRetention(ctx)
+}
+
+func (g *Gossiper) checkContentPolicy(relay entmoot.NodeID, msg entmoot.Message) error {
+	if g.maxMessageBytes > 0 && int64(len(msg.Content)) > g.maxMessageBytes {
+		return fmt.Errorf("message content is %d bytes, exceeds group max %d", len(msg.Content), g.maxMessageBytes)
+	}
+	if err := g.checkRetentionWindow(msg); err != nil {
+		return err
+	}
+	if g.contentLimiter != nil {
+		if err := g.contentLimiter.Allow(msg.Author.PilotNodeID, len(msg.Content)); err != nil {
+			return fmt.Errorf("content budget for author %d via relay %d: %w", msg.Author.PilotNodeID, relay, err)
+		}
+	}
+	return nil
+}
+
+func (g *Gossiper) prunePolicyRetention(ctx context.Context) error {
+	if g.retentionDays <= 0 {
+		return nil
+	}
+	cutoff := g.retentionCutoff()
+	if cutoff <= 0 {
+		return nil
+	}
+	_, err := store.PruneBefore(ctx, g.cfg.Store, g.cfg.GroupID, cutoff)
+	return err
+}
+
+func (g *Gossiper) retentionCutoff() int64 {
+	if g.retentionDays <= 0 {
+		return 0
+	}
+	return g.clk.Now().Add(-time.Duration(g.retentionDays) * 24 * time.Hour).UnixMilli()
+}
+
+func (g *Gossiper) checkRetentionWindow(msg entmoot.Message) error {
+	if cutoff := g.retentionCutoff(); cutoff > 0 && msg.Timestamp < cutoff {
+		return fmt.Errorf("message timestamp %d is older than retention cutoff %d", msg.Timestamp, cutoff)
+	}
 	return nil
 }
 
@@ -1958,8 +2036,14 @@ func (g *Gossiper) Publish(ctx context.Context, msg entmoot.Message) error {
 	if err := g.verifyMessage(msg); err != nil {
 		return err
 	}
+	if err := g.checkContentPolicy(g.cfg.LocalNode, msg); err != nil {
+		return err
+	}
 	if err := g.cfg.Store.Put(ctx, msg); err != nil {
 		return fmt.Errorf("gossip: store put: %w", err)
+	}
+	if err := g.prunePolicyRetention(ctx); err != nil {
+		return fmt.Errorf("gossip: prune retention: %w", err)
 	}
 
 	// v1.0.3 publish semantics: local-durable accept is the contract.

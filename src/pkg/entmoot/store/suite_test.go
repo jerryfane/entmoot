@@ -433,6 +433,44 @@ func runStoreSuite(t *testing.T, newStore func(t *testing.T) MessageStore) {
 		testIterMessageIDsInIDRange(t, newStore)
 	})
 
+	t.Run("PruneBeforeBoundsGroupContent", func(t *testing.T) {
+		s := newStore(t)
+		gid := randGroupID(t)
+		other := randGroupID(t)
+		old := mkMsg(t, gid, testAuthor(1, 0x01), 10, "old")
+		edge := mkMsg(t, gid, testAuthor(1, 0x01), 20, "edge")
+		newer := mkMsg(t, gid, testAuthor(1, 0x01), 30, "new")
+		otherOld := mkMsg(t, other, testAuthor(1, 0x01), 10, "other")
+		for _, m := range []entmoot.Message{old, edge, newer, otherOld} {
+			if err := s.Put(ctx, m); err != nil {
+				t.Fatalf("Put: %v", err)
+			}
+		}
+
+		pruned, err := PruneBefore(ctx, s, gid, 20)
+		if err != nil {
+			t.Fatalf("PruneBefore: %v", err)
+		}
+		if pruned != 1 {
+			t.Fatalf("PruneBefore pruned = %d, want 1", pruned)
+		}
+		if _, err := s.Get(ctx, gid, old.ID); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("Get old err = %v, want ErrNotFound", err)
+		}
+		for _, m := range []entmoot.Message{edge, newer, otherOld} {
+			if _, err := s.Get(ctx, m.GroupID, m.ID); err != nil {
+				t.Fatalf("Get retained %s: %v", m.ID, err)
+			}
+		}
+		got, err := s.Range(ctx, gid, 0, 0)
+		if err != nil {
+			t.Fatalf("Range: %v", err)
+		}
+		if len(got) != 2 || got[0].ID != edge.ID || got[1].ID != newer.ID {
+			t.Fatalf("Range after prune got %v, want edge,newer", idsOf(got))
+		}
+	})
+
 	t.Run("ConcurrentPuts", func(t *testing.T) {
 		s := newStore(t)
 		gid := randGroupID(t)
