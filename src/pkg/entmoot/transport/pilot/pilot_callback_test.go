@@ -280,57 +280,8 @@ func TestPilotTransport_DialUsesDedicatedIPCDriver(t *testing.T) {
 	)
 	srv := newPilotMultiConnServer(t)
 	defer srv.Close()
-
-	done := make(chan struct{})
+	done, openErrs := servePilotTransportOpen(t, srv)
 	defer close(done)
-	errCh := make(chan error, 2)
-	go func() {
-		c, err := srv.acceptConn()
-		if err != nil {
-			errCh <- err
-			return
-		}
-		defer c.Close()
-		frame, err := readPilotTestFrame(c)
-		if err != nil {
-			errCh <- err
-			return
-		}
-		if len(frame) == 0 || frame[0] != 0x0D {
-			errCh <- io.ErrUnexpectedEOF
-			return
-		}
-		if err := writePilotTestFrame(c, append([]byte{0x0E}, []byte(`{"node_id":777,"capabilities":["stream_send_result_v2"]}`)...)); err != nil {
-			errCh <- err
-			return
-		}
-		frame, err = readPilotTestFrame(c)
-		if err != nil {
-			errCh <- err
-			return
-		}
-		if len(frame) == 0 || frame[0] != 0x01 {
-			errCh <- io.ErrUnexpectedEOF
-			return
-		}
-		var bindOK [3]byte
-		bindOK[0] = 0x02
-		binary.BigEndian.PutUint16(bindOK[1:3], 1004)
-		if err := writePilotTestFrame(c, bindOK[:]); err != nil {
-			errCh <- err
-			return
-		}
-		<-done
-	}()
-	go func() {
-		c, err := srv.acceptConn()
-		if err != nil {
-			errCh <- err
-			return
-		}
-		defer c.Close()
-		<-done
-	}()
 
 	tr, err := Open(Config{SocketPath: srv.path, ListenPort: 1004, Logger: slog.Default()})
 	if err != nil {
@@ -406,7 +357,7 @@ func TestPilotTransport_DialUsesDedicatedIPCDriver(t *testing.T) {
 		t.Fatal("dial driver was not used")
 	}
 	select {
-	case err := <-errCh:
+	case err := <-openErrs:
 		if err != nil {
 			t.Fatalf("server: %v", err)
 		}
