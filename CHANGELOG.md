@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.67] - 2026-05-20
+
+### Added
+
+- **Live route verification.** `scripts/verify-agent-runtime.sh` can now run
+  `doctor` for a target group, actively probe peer routes, and fail on any
+  non-`ok` peer diagnosis so half-alive live-agent runtimes are caught before
+  operators trust conversation mode.
+- **Pilot privacy diagnostics.** `entmootd doctor --json` now reports the
+  Pilot daemon's TURN endpoint, outbound-TURN-only state, and registry-endpoint
+  suppression state.
+
+### Fixed
+
+- **Gossip attempt timeout classification.** Request/response attempt
+  deadlines now arm dial backoff when repeated read/write attempts expire,
+  while preserving transport-specific stale-session handling.
+- **Pilot transport test stability.** The dedicated IPC-driver test now reuses
+  the shared Pilot open harness so listener/control connection ordering is
+  deterministic.
+
 ## [1.5.66] - 2026-05-19
 
 ### Changed
