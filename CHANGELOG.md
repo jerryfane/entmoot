@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.73] - 2026-05-21
+
+### Added
+
+- **Public moot policy and visibility flow.** Added policy presets,
+  founder-managed policy status/set/clear CLI commands, founder-signed policy
+  update propagation, and `group create` metadata flags for visibility,
+  join mode, tags, description, and safe default policies.
+- **Public moot descriptors.** Added founder-signed
+  `entmoot.public_moot.v1` descriptor generation and publishing commands for
+  directory listing without automatically enabling message/history indexing.
+- **ESP public directory API.** Added persistent public moot directory storage
+  and `GET`, `POST`, and operator status endpoints under `/v1/public-moots`.
+
+### Changed
+
+- **Public directory documentation.** README, operations docs, CLI docs, and
+  website reference docs now describe public listing, open invites, ESP
+  membership, message-history indexing, local policy enforcement, delisting,
+  and live replies as separate operator choices.
+
 ## [1.5.72] - 2026-05-20
 
 ### Added
