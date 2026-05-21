@@ -172,20 +172,16 @@ func TestCreateGroupLocalStatePublicMetadata(t *testing.T) {
 	}
 }
 
-func TestGroupPublicPublishFailsUntilImplemented(t *testing.T) {
+func TestGroupPublicPublishRequiresESPURL(t *testing.T) {
 	gid := testGroupCreateID(0x6b)
 	code, stdout, stderr := captureCommandOutput(t, func() int {
-		return cmdGroupPublic(&globalFlags{}, []string{"publish", "-group", gid.String(), "-esp-url", "https://esp.example.com", "--json"})
+		return cmdGroupPublic(&globalFlags{}, []string{"publish", "-group", gid.String(), "--json"})
 	})
-	if code == exitOK || stderr != "" {
-		t.Fatalf("cmdGroupPublic code=%d stderr=%q, want JSON failure", code, stderr)
+	if code != exitInvalidArgument {
+		t.Fatalf("cmdGroupPublic code=%d, want %d; stderr=%q", code, exitInvalidArgument, stderr)
 	}
-	var got map[string]any
-	if err := json.Unmarshal([]byte(stdout), &got); err != nil {
-		t.Fatalf("group public JSON: %v; stdout=%q", err, stdout)
-	}
-	if got["status"] != "not_implemented" || got["group_id"] != gid.String() {
-		t.Fatalf("group public output = %#v", got)
+	if stdout != "" || !strings.Contains(stderr, "-esp-url is required") {
+		t.Fatalf("stdout=%q stderr=%q, want required esp-url error", stdout, stderr)
 	}
 }
 

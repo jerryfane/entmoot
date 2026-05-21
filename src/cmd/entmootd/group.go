@@ -111,58 +111,6 @@ func cmdGroup(gf *globalFlags, args []string) int {
 	}
 }
 
-func cmdGroupPublic(_ *globalFlags, args []string) int {
-	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "group public: missing op (want: descriptor, publish)")
-		return exitInvalidArgument
-	}
-	op := args[0]
-	switch op {
-	case "descriptor", "publish":
-	default:
-		fmt.Fprintf(os.Stderr, "group public: unknown op %q\n", op)
-		return exitInvalidArgument
-	}
-	fs := flag.NewFlagSet("group public "+op, flag.ContinueOnError)
-	groupRaw := fs.String("group", "", "group id")
-	espURL := fs.String("esp-url", "", "ESP URL")
-	jsonOut := fs.Bool("json", false, "print JSON")
-	if err := fs.Parse(args[1:]); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			return exitOK
-		}
-		return exitInvalidArgument
-	}
-	gid, err := decodeGroupID(*groupRaw)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "group public %s: -group: %v\n", op, err)
-		return exitInvalidArgument
-	}
-	if op == "publish" && strings.TrimSpace(*espURL) == "" {
-		fmt.Fprintf(os.Stderr, "group public publish: -esp-url is required\n")
-		return exitInvalidArgument
-	}
-	out := map[string]any{
-		"status":   "not_implemented",
-		"group_id": gid,
-		"message":  "public descriptor signing and publishing lands in the public descriptor task",
-	}
-	if op == "publish" {
-		out["esp_url"] = strings.TrimSpace(*espURL)
-	}
-	if *jsonOut {
-		data, err := json.Marshal(out)
-		if err != nil {
-			slog.Error("group public: marshal", slog.String("err", err.Error()))
-			return exitTransport
-		}
-		fmt.Println(string(data))
-		return exitInvalidArgument
-	}
-	fmt.Fprintf(os.Stderr, "group public %s: public descriptor signing and publishing lands in the public descriptor task\n", op)
-	return exitInvalidArgument
-}
-
 // cmdGroupCreate generates a fresh GroupID, opens an empty roster and
 // SQLite store for it, and writes the genesis entry. Emits a JSON object
 // on stdout carrying the new group id plus founder NodeInfo.
@@ -562,7 +510,46 @@ func maybeCreateGroupOpenInvite(ctx context.Context, gf *globalFlags, state grou
 		MaxUses:     rec.MaxUses,
 		ExpiresAtMS: rec.ExpiresAtMS,
 	}
+	if groupCreateStateVisibility(state) == groupVisibilityPublic {
+		if err := persistGroupCreatePublicOpenInvite(ctx, espState, state, out); err != nil {
+			_, _, _ = espState.RevokeOpenInvite(context.Background(), rec.TokenHash, time.Now().UnixMilli())
+			return nil, cleanupActivated(fmt.Errorf("persist public open invite descriptor metadata: %w", err))
+		}
+	}
 	return out, nil
+}
+
+func groupCreateStateVisibility(state groupCreateState) string {
+	var meta map[string]any
+	if err := json.Unmarshal(state.Metadata, &meta); err != nil {
+		return ""
+	}
+	visibility, _ := meta["visibility"].(string)
+	return visibility
+}
+
+func persistGroupCreatePublicOpenInvite(ctx context.Context, espState *esphttp.SQLiteStateStore, state groupCreateState, invite *groupCreateOpenInviteOutput) error {
+	if espState == nil || invite == nil {
+		return errors.New("open invite metadata store is not configured")
+	}
+	meta, err := decodeGroupMetadataObject(state.Metadata)
+	if err != nil {
+		return err
+	}
+	meta["open_invite"] = map[string]any{
+		"issuer_url": invite.IssuerURL,
+		"token":      invite.Token,
+		"link":       invite.Link,
+	}
+	raw, err := json.Marshal(meta)
+	if err != nil {
+		return err
+	}
+	normalized, err := esphttp.NormalizeGroupMetadata(raw)
+	if err != nil {
+		return err
+	}
+	return espState.SetGroupMetadata(ctx, state.GroupID, normalized)
 }
 
 func groupCreateOpenInviteIssuerURL() (string, error) {
