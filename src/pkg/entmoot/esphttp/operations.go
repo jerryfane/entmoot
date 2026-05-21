@@ -4,12 +4,18 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+
+	"entmoot/pkg/entmoot"
 )
 
 // OperationExecutor runs phone-approved ESP operations after the sign request
 // signature has been verified by the HTTP layer.
 type OperationExecutor interface {
 	ExecuteSignRequest(context.Context, SignRequest, []byte) (json.RawMessage, error)
+}
+
+type GroupPolicyReporter interface {
+	GroupPolicyReport(context.Context, entmoot.GroupID) (json.RawMessage, error)
 }
 
 type OpenInviteRedeemer interface {
@@ -51,6 +57,9 @@ func executableOperationKind(kind string) bool {
 	switch kind {
 	case signRequestKindGroupCreate,
 		signRequestKindGroupUpdate,
+		signRequestKindGroupPolicyUpdate,
+		signRequestKindGroupPolicyClear,
+		signRequestKindGroupPublicPublish,
 		signRequestKindInviteCreate,
 		signRequestKindInviteAccept,
 		signRequestKindOpenInviteCreate,
@@ -70,6 +79,9 @@ func executableOperationKind(kind string) bool {
 func requiresGroupAdmin(kind string) bool {
 	switch kind {
 	case signRequestKindGroupUpdate,
+		signRequestKindGroupPolicyUpdate,
+		signRequestKindGroupPolicyClear,
+		signRequestKindGroupPublicPublish,
 		signRequestKindInviteCreate,
 		signRequestKindOpenInviteCreate,
 		signRequestKindMemberRemove,

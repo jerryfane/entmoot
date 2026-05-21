@@ -187,30 +187,37 @@ func parseRequiredPolicyGroup(prefix, raw string) (entmoot.GroupID, bool) {
 }
 
 func loadGroupPolicyReport(gf *globalFlags, gid entmoot.GroupID) (groupPolicyReport, int) {
-	store, err := entpolicy.OpenFileStore(gf.data)
-	if err != nil {
-		slog.Error("group policy status: open store", slog.String("err", err.Error()))
-		return groupPolicyReport{}, exitTransport
-	}
 	ctx, cancel := withBackgroundTimeout()
 	defer cancel()
+	report, err := loadGroupPolicyReportFromStore(ctx, gf.data, gid)
+	if err != nil {
+		slog.Error("group policy status", slog.String("err", err.Error()))
+		return groupPolicyReport{}, exitTransport
+	}
+	return report, exitOK
+}
+
+func loadGroupPolicyReportFromStore(ctx context.Context, dataDir string, gid entmoot.GroupID) (groupPolicyReport, error) {
+	store, err := entpolicy.OpenFileStore(dataDir)
+	if err != nil {
+		return groupPolicyReport{}, fmt.Errorf("open store: %w", err)
+	}
 	p, ok, err := store.Get(ctx, gid)
 	if err != nil {
-		slog.Error("group policy status: get", slog.String("err", err.Error()))
-		return groupPolicyReport{}, exitTransport
+		return groupPolicyReport{}, fmt.Errorf("get: %w", err)
 	}
 	if !ok {
 		report := buildGroupPolicyReport(gid, nil, false)
 		if seq, hasSeq, err := store.Sequence(ctx, gid); err == nil && hasSeq {
 			report.Sequence = seq
 		}
-		return report, exitOK
+		return report, nil
 	}
 	report := buildGroupPolicyReport(gid, &p, true)
 	if seq, hasSeq, err := store.Sequence(ctx, gid); err == nil && hasSeq {
 		report.Sequence = seq
 	}
-	return report, exitOK
+	return report, nil
 }
 
 func buildGroupPolicyReport(gid entmoot.GroupID, p *entpolicy.Policy, configured bool) groupPolicyReport {
@@ -253,6 +260,10 @@ func printGroupPolicyReport(report groupPolicyReport) {
 }
 
 func publishGroupPolicyUpdate(ctx context.Context, gf *globalFlags, store *entpolicy.FileStore, gid entmoot.GroupID, p *entpolicy.Policy) (groupPolicyReport, error) {
+	return publishGroupPolicyUpdateToSocket(ctx, controlSocketPath(gf.data), store, gid, p)
+}
+
+func publishGroupPolicyUpdateToSocket(ctx context.Context, socketPath string, store *entpolicy.FileStore, gid entmoot.GroupID, p *entpolicy.Policy) (groupPolicyReport, error) {
 	update, err := buildNextPolicyUpdate(ctx, store, gid, p)
 	if err != nil {
 		return groupPolicyReport{}, err
@@ -261,7 +272,7 @@ func publishGroupPolicyUpdate(ctx context.Context, gf *globalFlags, store *entpo
 	if err != nil {
 		return groupPolicyReport{}, fmt.Errorf("marshal update: %w", err)
 	}
-	if err := publishIPCMessage(ctx, gf, gid, []string{entpolicy.UpdateTopic}, body); err != nil {
+	if err := publishIPCMessageToSocket(ctx, socketPath, gid, []string{entpolicy.UpdateTopic}, body); err != nil {
 		return groupPolicyReport{}, err
 	}
 	report := buildGroupPolicyReport(gid, p, p != nil)

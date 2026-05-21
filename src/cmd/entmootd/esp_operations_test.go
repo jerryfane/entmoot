@@ -23,6 +23,8 @@ import (
 	"entmoot/pkg/entmoot/esphttp"
 	"entmoot/pkg/entmoot/ipc"
 	"entmoot/pkg/entmoot/keystore"
+	entpolicy "entmoot/pkg/entmoot/policy"
+	"entmoot/pkg/entmoot/publicmoot"
 	"entmoot/pkg/entmoot/roster"
 	"entmoot/pkg/entmoot/wire"
 )
@@ -60,6 +62,232 @@ func TestESPOperationCreateGroupRejectsNonObjectMetadataBeforeDaemonLookup(t *te
 	var opErr *esphttp.OperationError
 	if !errors.As(err, &opErr) || opErr.HTTPStatus != http.StatusBadRequest || opErr.Code != "bad_request" {
 		t.Fatalf("ExecuteSignRequest err = %v, want metadata 400 bad_request", err)
+	}
+}
+
+func TestESPGroupCreatePayloadDefaultsVisibilityJoinModeAndPolicy(t *testing.T) {
+	metadata, err := normalizeGroupMetadata(groupCreatePayload{Name: "Ops"})
+	if err != nil {
+		t.Fatalf("normalizeGroupMetadata: %v", err)
+	}
+	var meta map[string]any
+	if err := json.Unmarshal(metadata, &meta); err != nil {
+		t.Fatalf("metadata JSON: %v", err)
+	}
+	if meta["visibility"] != groupVisibilityPrivate || meta["join_mode"] != groupJoinModeInviteOnly {
+		t.Fatalf("metadata = %+v, want private invite_only defaults", meta)
+	}
+	resolved, err := resolveESPGroupCreatePolicy(groupCreatePayload{})
+	if err != nil {
+		t.Fatalf("resolveESPGroupCreatePolicy: %v", err)
+	}
+	if resolved.Policy == nil || *resolved.Policy != entpolicy.Standard() || resolved.Source != "preset:standard" {
+		t.Fatalf("resolved policy = %+v, want standard default", resolved)
+	}
+	if _, err := resolveESPGroupCreatePolicy(groupCreatePayload{PolicySource: "file:/tmp/policy.json"}); err == nil {
+		t.Fatal("resolveESPGroupCreatePolicy file source succeeded, want error")
+	}
+}
+
+func TestESPPolicyPayloadRejectsFileSourceAndConflictingSelectors(t *testing.T) {
+	if _, err := resolveESPGroupPolicyPayload(groupPolicyPayload{PolicySource: "file:/tmp/policy.json"}); err == nil {
+		t.Fatal("resolveESPGroupPolicyPayload file source succeeded, want error")
+	}
+	if _, err := resolveESPGroupPolicyPayload(groupPolicyPayload{PolicySource: "preset:standard", Preset: "relaxed"}); err == nil {
+		t.Fatal("resolveESPGroupPolicyPayload conflicting selectors succeeded, want error")
+	}
+	resolved, err := resolveESPGroupPolicyPayload(groupPolicyPayload{Preset: "relaxed"})
+	if err != nil {
+		t.Fatalf("resolveESPGroupPolicyPayload relaxed: %v", err)
+	}
+	if resolved.Policy == nil || *resolved.Policy != entpolicy.Relaxed() || resolved.Source != "preset:relaxed" {
+		t.Fatalf("resolved policy = %+v, want relaxed preset", resolved)
+	}
+}
+
+func TestESPOperationGroupPolicyReportUpdateAndClear(t *testing.T) {
+	ctx := context.Background()
+	gid := testESPGroupID(3)
+	dataDir := t.TempDir()
+	exec := espOperationExecutor{dataDir: dataDir}
+
+	raw, err := exec.GroupPolicyReport(ctx, gid)
+	if err != nil {
+		t.Fatalf("GroupPolicyReport initial: %v", err)
+	}
+	var initial groupPolicyReport
+	if err := json.Unmarshal(raw, &initial); err != nil {
+		t.Fatalf("initial report JSON: %v", err)
+	}
+	if initial.PolicyConfigured || initial.EffectiveMode != groupPolicyModeLegacy {
+		t.Fatalf("initial report = %+v, want legacy unconfigured", initial)
+	}
+
+	updatedRaw, err := exec.ExecuteSignRequest(ctx, esphttp.SignRequest{
+		Kind:    "group_policy_update",
+		GroupID: gid,
+		Payload: json.RawMessage(`{"preset":"standard"}`),
+	}, nil)
+	if err != nil {
+		t.Fatalf("group_policy_update: %v", err)
+	}
+	var updated groupPolicyReport
+	if err := json.Unmarshal(updatedRaw, &updated); err != nil {
+		t.Fatalf("updated report JSON: %v", err)
+	}
+	if !updated.PolicyConfigured || updated.Policy == nil || *updated.Policy != entpolicy.Standard() || updated.Source != "preset:standard" {
+		t.Fatalf("updated report = %+v, want standard configured", updated)
+	}
+
+	clearedRaw, err := exec.ExecuteSignRequest(ctx, esphttp.SignRequest{
+		Kind:    "group_policy_clear",
+		GroupID: gid,
+		Payload: json.RawMessage(`{}`),
+	}, nil)
+	if err != nil {
+		t.Fatalf("group_policy_clear: %v", err)
+	}
+	var cleared groupPolicyReport
+	if err := json.Unmarshal(clearedRaw, &cleared); err != nil {
+		t.Fatalf("cleared report JSON: %v", err)
+	}
+	if cleared.PolicyConfigured || cleared.Source != "clear" || cleared.EffectiveMode != groupPolicyModeLegacy {
+		t.Fatalf("cleared report = %+v, want clear legacy", cleared)
+	}
+}
+
+func TestESPOperationGroupPolicyUpdatePublishesToConfiguredSocket(t *testing.T) {
+	ctx := context.Background()
+	gid := testESPGroupID(4)
+	dataDir := t.TempDir()
+	sock := testUnixSocketPath(t)
+	publishReqCh := make(chan *ipc.PublishReq, 1)
+	stop := serveESPPublishIPC(t, sock, publishReqCh)
+	defer stop()
+	exec := espOperationExecutor{dataDir: dataDir, socketPath: sock}
+
+	raw, err := exec.ExecuteSignRequest(ctx, esphttp.SignRequest{
+		Kind:    "group_policy_update",
+		GroupID: gid,
+		Payload: json.RawMessage(`{"preset":"standard"}`),
+	}, nil)
+	if err != nil {
+		t.Fatalf("group_policy_update: %v", err)
+	}
+	var report groupPolicyReport
+	if err := json.Unmarshal(raw, &report); err != nil {
+		t.Fatalf("report JSON: %v", err)
+	}
+	if !report.Published || !report.RuntimeAppliedKnown {
+		t.Fatalf("report = %+v, want published runtime-applied report", report)
+	}
+	select {
+	case req := <-publishReqCh:
+		if req.GroupID == nil || *req.GroupID != gid {
+			t.Fatalf("publish group = %v, want %s", req.GroupID, gid)
+		}
+		if len(req.Topics) != 1 || req.Topics[0] != entpolicy.UpdateTopic {
+			t.Fatalf("publish topics = %v, want [%s]", req.Topics, entpolicy.UpdateTopic)
+		}
+		var update entpolicy.Update
+		if err := json.Unmarshal(req.Content, &update); err != nil {
+			t.Fatalf("policy update JSON: %v", err)
+		}
+		if update.GroupID != gid || update.Policy == nil || *update.Policy != entpolicy.Standard() {
+			t.Fatalf("policy update = %+v, want standard update for %s", update, gid)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for publish on configured socket")
+	}
+}
+
+func TestESPOperationPublicPublishRequiresESPURL(t *testing.T) {
+	_, err := espOperationExecutor{}.ExecuteSignRequest(context.Background(), esphttp.SignRequest{
+		Kind:    "group_public_publish",
+		GroupID: testESPGroupID(5),
+		Payload: json.RawMessage(`{}`),
+	}, nil)
+	var opErr *esphttp.OperationError
+	if !errors.As(err, &opErr) || opErr.HTTPStatus != http.StatusBadRequest || opErr.Code != "bad_request" {
+		t.Fatalf("group_public_publish err = %v, want 400 bad_request", err)
+	}
+}
+
+func TestESPOperationPublicPublishUsesExecutorIdentity(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	gid := testESPGroupID(5)
+	id, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	founder := entmoot.NodeInfo{PilotNodeID: 45491, EntmootPubKey: append([]byte(nil), id.PublicKey...)}
+	createTestRoster(t, dataDir, gid, id, founder)
+
+	state, err := esphttp.OpenSQLiteStateStore(dataDir)
+	if err != nil {
+		t.Fatalf("OpenSQLiteStateStore: %v", err)
+	}
+	defer state.Close()
+	if err := state.SetGroupMetadata(ctx, gid, json.RawMessage(`{"name":"Public Agents","visibility":"public","join_mode":"invite_only","tags":["ios"]}`)); err != nil {
+		t.Fatalf("SetGroupMetadata: %v", err)
+	}
+	policyStore, err := entpolicy.OpenFileStore(dataDir)
+	if err != nil {
+		t.Fatalf("OpenFileStore: %v", err)
+	}
+	policy := entpolicy.Standard()
+	if err := policyStore.Put(ctx, gid, policy); err != nil {
+		t.Fatalf("policy Put: %v", err)
+	}
+
+	var posted publicmoot.Descriptor
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/public-moots" {
+			t.Fatalf("request = %s %s, want POST /v1/public-moots", r.Method, r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&posted); err != nil {
+			t.Fatalf("decode descriptor: %v", err)
+		}
+		if err := publicmoot.Verify(posted); err != nil {
+			t.Fatalf("Verify descriptor: %v", err)
+		}
+		if posted.GroupID != gid || !bytes.Equal(posted.Founder.EntmootPubKey, id.PublicKey) {
+			t.Fatalf("posted descriptor group/founder = %s/%x, want %s/%x", posted.GroupID, posted.Founder.EntmootPubKey, gid, id.PublicKey)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"indexed"}`))
+	}))
+	defer server.Close()
+
+	raw, err := espOperationExecutor{dataDir: dataDir, identity: id}.ExecuteSignRequest(ctx, esphttp.SignRequest{
+		Kind:    "group_public_publish",
+		GroupID: gid,
+		Payload: json.RawMessage(fmt.Sprintf(`{"esp_url":%q}`, server.URL)),
+	}, nil)
+	if err != nil {
+		t.Fatalf("group_public_publish: %v", err)
+	}
+	var result groupPublicPublishResult
+	if err := json.Unmarshal(raw, &result); err != nil {
+		t.Fatalf("publish result JSON: %v", err)
+	}
+	if result.Status != "published" || result.GroupID != gid || result.ESPURL != server.URL || !json.Valid(result.Response) {
+		t.Fatalf("publish result = %+v, want published response", result)
+	}
+	if len(posted.Signature) == 0 {
+		t.Fatal("posted descriptor signature is empty")
+	}
+}
+
+func TestGroupCreateOpenInviteIssuerURLForUsesEnvFallback(t *testing.T) {
+	t.Setenv("ENTMOOT_ESP_URL", "http://127.0.0.1:8911")
+	issuer, err := groupCreateOpenInviteIssuerURLFor("")
+	if err != nil {
+		t.Fatalf("groupCreateOpenInviteIssuerURLFor env fallback: %v", err)
+	}
+	if issuer != "http://127.0.0.1:8911" {
+		t.Fatalf("issuer = %q, want env fallback", issuer)
 	}
 }
 
@@ -405,6 +633,49 @@ func TestESPCreateGroupRollsBackLocalStateOnJoinFailure(t *testing.T) {
 	devices := loaded.Snapshot()
 	if len(devices) != 1 || len(devices[0].Groups) != 0 || len(devices[0].AdminGroups) != 0 {
 		t.Fatalf("devices after rollback = %+v, want no regular or admin grants", devices)
+	}
+}
+
+func TestESPCreateGroupOpenInviteJoinFailureRevokesPreparedInvite(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	id, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	sock := testUnixSocketPath(t)
+	stop := serveESPGroupCreateIPC(t, sock, id.PublicKey, false)
+	defer stop()
+	state := esphttp.NewMemoryStateStore()
+	req := testGroupCreateRequest("req-open-invite-join-rollback")
+	req.Payload = json.RawMessage(`{"name":"ops","visibility":"public","join_mode":"open_invite","issuer_url":"http://127.0.0.1:8911"}`)
+	exec := espOperationExecutor{
+		dataDir:       dataDir,
+		identity:      id,
+		socketPath:    sock,
+		timeout:       time.Second,
+		metadataStore: state,
+		stateStore:    state,
+	}
+	gid, err := groupIDForCreateRequest(req)
+	if err != nil {
+		t.Fatalf("groupIDForCreateRequest: %v", err)
+	}
+	_, err = exec.ExecuteSignRequest(ctx, req, nil)
+	if err == nil {
+		t.Fatal("ExecuteSignRequest succeeded, want join failure")
+	}
+	invites, err := state.ListOpenInvitesByGroup(ctx, gid)
+	if err != nil {
+		t.Fatalf("ListOpenInvitesByGroup: %v", err)
+	}
+	if len(invites) != 1 || !invites[0].Revoked {
+		t.Fatalf("open invites after rollback = %+v, want one revoked prepared invite", invites)
+	}
+	if _, ok, err := state.GetGroupMetadata(ctx, gid); err != nil {
+		t.Fatalf("GetGroupMetadata: %v", err)
+	} else if ok {
+		t.Fatal("metadata still present after rollback")
 	}
 }
 
@@ -4059,10 +4330,60 @@ func serveESPGroupCreateIPC(t *testing.T, sock string, pub []byte, joinOK bool) 
 					EntmootPubKey: append([]byte(nil), pub...),
 					Running:       true,
 				})
+			case *ipc.InviteAuthorityCheckReq:
+				_ = ipc.EncodeAndWrite(conn, &ipc.InviteAuthorityCheckResp{
+					Status:     "ok",
+					GroupID:    v.GroupID,
+					RosterHead: entmoot.RosterEntryID{},
+					Members:    1,
+				})
 			case *ipc.JoinGroupReq:
 				if joinOK {
 					_ = ipc.EncodeAndWrite(conn, &ipc.JoinGroupResp{Status: "joined", GroupID: v.Invite.GroupID, Members: 1})
 				}
+			}
+			_ = conn.Close()
+		}
+	}()
+	return func() {
+		_ = ln.Close()
+		<-done
+	}
+}
+
+func serveESPPublishIPC(t *testing.T, sock string, publishReqCh chan<- *ipc.PublishReq) func() {
+	t.Helper()
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatalf("listen unix: %v", err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer ln.Close()
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			_, payload, err := ipc.ReadAndDecode(conn)
+			if err != nil {
+				_ = conn.Close()
+				continue
+			}
+			switch v := payload.(type) {
+			case *ipc.PublishReq:
+				if publishReqCh != nil {
+					req := *v
+					publishReqCh <- &req
+				}
+				groupID := entmoot.GroupID{}
+				if v.GroupID != nil {
+					groupID = *v.GroupID
+				}
+				_ = ipc.EncodeAndWrite(conn, &ipc.PublishResp{GroupID: groupID, TimestampMS: time.Now().UnixMilli()})
+			default:
+				_ = ipc.EncodeAndWrite(conn, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInvalidArgument, Message: "unexpected request"})
 			}
 			_ = conn.Close()
 		}
