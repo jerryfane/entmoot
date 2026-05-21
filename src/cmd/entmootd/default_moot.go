@@ -540,8 +540,7 @@ func writeDefaultMootJoinInput(desc defaultmoot.Descriptor) (string, func(), err
 }
 
 func defaultMootPolicySummary(p entpolicy.Policy) string {
-	return fmt.Sprintf("message_rate=%s burst=%d max_message_bytes=%d live_rate=%s live_burst=%d retention_days=%d",
-		p.MessageRatePerAuthor, p.MessageBurstPerAuthor, p.MaxMessageBytes, p.LiveTriggerRate, p.LiveTriggerBurst, p.RetentionDays)
+	return entpolicy.Summary(p)
 }
 
 func defaultMootJoined(gf *globalFlags, gid entmoot.GroupID) bool {

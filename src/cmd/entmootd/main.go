@@ -101,6 +101,8 @@ func run() int {
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "Founder subcommands:")
 		fmt.Fprintln(os.Stderr, "  group create -name N    Create a new group.")
+		fmt.Fprintln(os.Stderr, "  group policy <status|set|clear>")
+		fmt.Fprintln(os.Stderr, "                          Manage local group enforcement policy.")
 		fmt.Fprintln(os.Stderr, "  invite create -group GID [-peers ...] [-valid-for DUR]")
 		fmt.Fprintln(os.Stderr, "                          Emit a signed invite JSON bundle.")
 		fmt.Fprintln(os.Stderr, "  roster add -group GID -node NODEID -pubkey PUBKEY_B64")

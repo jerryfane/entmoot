@@ -15,15 +15,17 @@ import (
 	"entmoot/pkg/entmoot/store"
 )
 
-// cmdGroup dispatches `group <op>`. v1 only recognizes `group create`.
+// cmdGroup dispatches `group <op>`.
 func cmdGroup(gf *globalFlags, args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "group: missing op (want: create)")
+		fmt.Fprintln(os.Stderr, "group: missing op (want: create, policy)")
 		return exitInvalidArgument
 	}
 	switch args[0] {
 	case "create":
 		return cmdGroupCreate(gf, args[1:])
+	case "policy":
+		return cmdGroupPolicy(gf, args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "group: unknown op %q\n", args[0])
 		return exitInvalidArgument
