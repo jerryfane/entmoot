@@ -67,6 +67,11 @@ const (
 	MsgDiagProbeReq MsgType = 0x21
 	// MsgDiagProbeResp returns per-peer probe results.
 	MsgDiagProbeResp MsgType = 0x22
+	// MsgGroupDeactivateReq asks the daemon to stop a group session without
+	// changing roster membership.
+	MsgGroupDeactivateReq MsgType = 0x23
+	// MsgGroupDeactivateResp acknowledges that the group session was stopped.
+	MsgGroupDeactivateResp MsgType = 0x24
 	// MsgError carries a structured error frame. 0x1F is kept stable so
 	// existing logs and clients can continue spotting error frames.
 	MsgError MsgType = 0x1F
@@ -112,6 +117,10 @@ func (t MsgType) String() string {
 		return "diag_probe_req"
 	case MsgDiagProbeResp:
 		return "diag_probe_resp"
+	case MsgGroupDeactivateReq:
+		return "group_deactivate_req"
+	case MsgGroupDeactivateResp:
+		return "group_deactivate_resp"
 	case MsgError:
 		return "error"
 	default:
@@ -221,7 +230,8 @@ type InviteCreateResp struct {
 }
 
 type InviteAuthorityCheckReq struct {
-	GroupID entmoot.GroupID `json:"group_id"`
+	GroupID         entmoot.GroupID `json:"group_id"`
+	CandidateInvite *entmoot.Invite `json:"candidate_invite,omitempty"`
 }
 
 type InviteAuthorityCheckResp struct {
@@ -241,6 +251,15 @@ type MemberRemoveResp struct {
 	GroupID    entmoot.GroupID       `json:"group_id"`
 	RosterHead entmoot.RosterEntryID `json:"roster_head"`
 	Members    int                   `json:"members"`
+}
+
+type GroupDeactivateReq struct {
+	GroupID entmoot.GroupID `json:"group_id"`
+}
+
+type GroupDeactivateResp struct {
+	Status  string          `json:"status"`
+	GroupID entmoot.GroupID `json:"group_id"`
 }
 
 type DiagProbeReq struct {

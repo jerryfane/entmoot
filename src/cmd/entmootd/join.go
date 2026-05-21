@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"entmoot/pkg/entmoot"
+	"entmoot/pkg/entmoot/canonical"
 	"entmoot/pkg/entmoot/defaultmoot"
 	"entmoot/pkg/entmoot/esphttp"
 	"entmoot/pkg/entmoot/events"
@@ -1438,6 +1439,8 @@ func (s *ipcServer) handleConn(ctx context.Context, c net.Conn) {
 		s.handleInviteAuthorityCheck(ctx, c, v)
 	case *ipc.MemberRemoveReq:
 		s.handleMemberRemove(ctx, c, v)
+	case *ipc.GroupDeactivateReq:
+		s.handleGroupDeactivate(c, v)
 	case *ipc.DiagProbeReq:
 		s.handleDiagProbe(ctx, c, v)
 	case *ipc.InfoReq:
@@ -2086,6 +2089,10 @@ func (s *ipcServer) handleInviteAuthorityCheck(ctx context.Context, c net.Conn, 
 	}
 	sess, ok := s.runtime.Get(gid)
 	if !ok {
+		if req.CandidateInvite != nil {
+			s.handleCandidateInviteAuthorityCheck(ctx, c, gid, req.CandidateInvite)
+			return
+		}
 		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
 			Type:    "error",
 			Code:    ipc.CodeGroupNotFound,
@@ -2132,6 +2139,108 @@ func (s *ipcServer) handleInviteAuthorityCheck(ctx context.Context, c net.Conn, 
 		RosterHead: sess.roster.Head(),
 		Members:    len(sess.roster.Members()),
 	})
+}
+
+func (s *ipcServer) handleCandidateInviteAuthorityCheck(ctx context.Context, c net.Conn, gid entmoot.GroupID, invite *entmoot.Invite) {
+	if invite == nil {
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
+			Type:    "error",
+			Code:    ipc.CodeInvalidArgument,
+			GroupID: &gid,
+			Message: "candidate invite is required",
+		})
+		return
+	}
+	if invite.GroupID != gid {
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
+			Type:    "error",
+			Code:    ipc.CodeInvalidArgument,
+			GroupID: &gid,
+			Message: "candidate invite group_id does not match request",
+		})
+		return
+	}
+	if invite.Founder.PilotNodeID != s.nodeID || !bytes.Equal(invite.Founder.EntmootPubKey, s.identity.PublicKey) {
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
+			Type:    "error",
+			Code:    ipc.CodeNotMember,
+			GroupID: &gid,
+			Message: "invite_create requires the local founder identity",
+		})
+		return
+	}
+	if invite.Issuer.PilotNodeID != s.nodeID || !bytes.Equal(invite.Issuer.EntmootPubKey, s.identity.PublicKey) {
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
+			Type:    "error",
+			Code:    ipc.CodeNotMember,
+			GroupID: &gid,
+			Message: "candidate invite requires the local issuer identity",
+		})
+		return
+	}
+	signing := *invite
+	signing.Signature = nil
+	sigInput, err := canonical.Encode(signing)
+	if err != nil || !keystore.Verify(invite.Issuer.EntmootPubKey, sigInput, invite.Signature) {
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
+			Type:    "error",
+			Code:    ipc.CodeInvalidArgument,
+			GroupID: &gid,
+			Message: "candidate invite signature is invalid",
+		})
+		return
+	}
+	if s.store == nil {
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
+			Type:    "error",
+			Code:    ipc.CodeInternal,
+			GroupID: &gid,
+			Message: "store is not configured",
+		})
+		return
+	}
+	root, err := s.store.MerkleRoot(ctx, gid)
+	if err != nil {
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
+			Type:    "error",
+			Code:    ipc.CodeInternal,
+			GroupID: &gid,
+			Message: "merkle root: " + err.Error(),
+		})
+		return
+	}
+	if root != invite.MerkleRoot {
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
+			Type:    "error",
+			Code:    ipc.CodeInvalidArgument,
+			GroupID: &gid,
+			Message: "candidate invite merkle root does not match local store",
+		})
+		return
+	}
+	if !s.pilotLookupNodeSupported {
+		_ = ipc.EncodeAndWrite(c, s.pilotLookupUnavailableError(gid))
+		return
+	}
+	_ = ipc.EncodeAndWrite(c, &ipc.InviteAuthorityCheckResp{
+		Status:     "ok",
+		GroupID:    gid,
+		RosterHead: invite.RosterHead,
+		Members:    1,
+	})
+}
+
+func (s *ipcServer) handleGroupDeactivate(c net.Conn, req *ipc.GroupDeactivateReq) {
+	gid := req.GroupID
+	if gid == (entmoot.GroupID{}) {
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInvalidArgument, Message: "group_deactivate requires group_id"})
+		return
+	}
+	if s.runtime == nil || !s.runtime.RemoveGroup(gid) {
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeGroupNotFound, GroupID: &gid, Message: "group not joined"})
+		return
+	}
+	_ = ipc.EncodeAndWrite(c, &ipc.GroupDeactivateResp{Status: "deactivated", GroupID: gid})
 }
 
 func inviteCreateNeedsPilotLookup(req *ipc.InviteCreateReq) bool {

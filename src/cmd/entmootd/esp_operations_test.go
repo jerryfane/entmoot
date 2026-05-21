@@ -294,6 +294,37 @@ func TestNormalizeGroupMetadataMergesDisplayFields(t *testing.T) {
 	}
 }
 
+func TestNormalizeGroupMetadataValidatesVisibilityAndJoinMode(t *testing.T) {
+	raw, err := normalizeGroupMetadata(groupCreatePayload{
+		Visibility: "PUBLIC",
+		JoinMode:   groupJoinModeOpenInvite,
+	})
+	if err != nil {
+		t.Fatalf("normalizeGroupMetadata valid enums: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if got["visibility"] != groupVisibilityPublic || got["join_mode"] != groupJoinModeOpenInvite {
+		t.Fatalf("metadata = %#v, want normalized visibility/join_mode", got)
+	}
+
+	for _, tc := range []struct {
+		name    string
+		payload groupCreatePayload
+	}{
+		{name: "visibility", payload: groupCreatePayload{Visibility: "friends"}},
+		{name: "join_mode", payload: groupCreatePayload{JoinMode: "openInvite"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := normalizeGroupMetadata(tc.payload); err == nil {
+				t.Fatal("normalizeGroupMetadata succeeded, want error")
+			}
+		})
+	}
+}
+
 func TestNormalizeGroupMetadataPreservesJSONNumbers(t *testing.T) {
 	raw, err := normalizeGroupMetadata(groupCreatePayload{
 		Name: "Agents",
