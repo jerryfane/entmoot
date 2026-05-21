@@ -483,6 +483,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if h.handleOpenInviteRedeem(w, r) {
 		return
 	}
+	if h.handlePublicMootRoute(w, r) {
+		return
+	}
 	auth, ok := h.authorize(w, r)
 	if !ok {
 		return
