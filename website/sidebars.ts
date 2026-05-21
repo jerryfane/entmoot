@@ -20,6 +20,7 @@ const sidebars: SidebarsConfig = {
         'concepts/what-entmoot-is',
         'concepts/pilot-integration',
         'concepts/groups-rosters-invites',
+        'concepts/public-moot-directory',
         'concepts/messages-topics-merkle',
         'concepts/gossip-reconciliation',
         'concepts/transport-hide-ip-turn-rendezvous',
