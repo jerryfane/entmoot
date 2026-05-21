@@ -249,6 +249,10 @@ type StateStore interface {
 	ListLiveAgentPresence(context.Context, entmoot.GroupID) ([]LiveAgentPresence, error)
 	GetLiveAgentCursor(context.Context, entmoot.GroupID, entmoot.NodeID) (LiveAgentCursor, bool, error)
 	UpsertLiveAgentCursor(context.Context, LiveAgentCursor) (LiveAgentCursor, error)
+	UpsertPublicMoot(context.Context, PublicMootRecord, int64) (PublicMootRecord, bool, error)
+	ListPublicMoots(context.Context, PublicMootListFilter) ([]PublicMootRecord, error)
+	GetPublicMoot(context.Context, entmoot.GroupID) (PublicMootRecord, bool, error)
+	UpdatePublicMootIndexStatus(context.Context, entmoot.GroupID, string, int64) (PublicMootRecord, bool, error)
 	UpsertFleetTaskSubmission(context.Context, FleetTaskSubmissionRecord) (FleetTaskSubmissionRecord, error)
 	GetFleetTaskSubmission(context.Context, string, string, string) (FleetTaskSubmissionRecord, bool, error)
 	ListFleetTaskSubmissions(context.Context, string, string) ([]FleetTaskSubmissionRecord, error)
@@ -310,6 +314,7 @@ type MemoryStateStore struct {
 	liveAgentConfigs    map[entmoot.GroupID]map[entmoot.NodeID]LiveAgentConfig
 	liveAgentPresence   map[entmoot.GroupID]map[entmoot.NodeID]LiveAgentPresence
 	liveAgentCursors    map[entmoot.GroupID]map[entmoot.NodeID]LiveAgentCursor
+	publicMoots         map[entmoot.GroupID]PublicMootRecord
 	clock               func() time.Time
 }
 
@@ -333,6 +338,7 @@ func NewMemoryStateStore() *MemoryStateStore {
 		liveAgentConfigs:    make(map[entmoot.GroupID]map[entmoot.NodeID]LiveAgentConfig),
 		liveAgentPresence:   make(map[entmoot.GroupID]map[entmoot.NodeID]LiveAgentPresence),
 		liveAgentCursors:    make(map[entmoot.GroupID]map[entmoot.NodeID]LiveAgentCursor),
+		publicMoots:         make(map[entmoot.GroupID]PublicMootRecord),
 		clock:               time.Now,
 	}
 }
@@ -1380,6 +1386,22 @@ CREATE INDEX IF NOT EXISTS idx_open_invite_challenges_token_active
 
 CREATE INDEX IF NOT EXISTS idx_open_invite_challenges_redeemer
   ON esp_open_invite_challenges(token_hash, pilot_node_id, pilot_pubkey, entmoot_pubkey, used_at_ms, expires_at_ms);
+
+CREATE TABLE IF NOT EXISTS esp_public_moots (
+  group_id             BLOB PRIMARY KEY,
+  founder_pubkey       TEXT NOT NULL,
+  descriptor           BLOB NOT NULL,
+  descriptor_updated_at_ms INTEGER NOT NULL,
+  status               TEXT NOT NULL,
+  indexed_at_ms        INTEGER NOT NULL,
+  status_updated_at_ms INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_public_moots_status_updated
+  ON esp_public_moots(status, descriptor_updated_at_ms DESC);
+
+CREATE INDEX IF NOT EXISTS idx_public_moots_founder_status
+  ON esp_public_moots(founder_pubkey, status);
 
 CREATE TABLE IF NOT EXISTS esp_fleets (
   fleet_id TEXT PRIMARY KEY,
@@ -2753,9 +2775,20 @@ func migrateSQLiteState(db *sql.DB) error {
 	for _, stmt := range []string{
 		`CREATE INDEX IF NOT EXISTS idx_open_invite_challenges_token_active ON esp_open_invite_challenges(token_hash, used_at_ms, expires_at_ms)`,
 		`CREATE INDEX IF NOT EXISTS idx_open_invite_challenges_redeemer ON esp_open_invite_challenges(token_hash, pilot_node_id, pilot_pubkey, entmoot_pubkey, used_at_ms, expires_at_ms)`,
+		`CREATE TABLE IF NOT EXISTS esp_public_moots (
+		  group_id BLOB PRIMARY KEY,
+		  founder_pubkey TEXT NOT NULL,
+		  descriptor BLOB NOT NULL,
+		  descriptor_updated_at_ms INTEGER NOT NULL,
+		  status TEXT NOT NULL,
+		  indexed_at_ms INTEGER NOT NULL,
+		  status_updated_at_ms INTEGER NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_public_moots_status_updated ON esp_public_moots(status, descriptor_updated_at_ms DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_public_moots_founder_status ON esp_public_moots(founder_pubkey, status)`,
 	} {
 		if _, err := db.Exec(stmt); err != nil {
-			return fmt.Errorf("esphttp: migrate state schema add open invite challenge index: %w", err)
+			return fmt.Errorf("esphttp: migrate state schema add public/open invite state: %w", err)
 		}
 	}
 	fleetCols, err := tableColumns(db, "esp_fleets")
