@@ -3,12 +3,15 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"entmoot/pkg/entmoot"
+	"entmoot/pkg/entmoot/ipc"
 	entpolicy "entmoot/pkg/entmoot/policy"
 )
 
@@ -107,6 +110,212 @@ func TestCmdGroupPolicySetFromFileAndPresetNone(t *testing.T) {
 	}
 	if !strings.Contains(stdout, "policy_configured: false") || !strings.Contains(stdout, "source: preset:none") {
 		t.Fatalf("set none stdout = %q", stdout)
+	}
+}
+
+func TestCmdGroupPolicySetPublishesThroughActiveDaemon(t *testing.T) {
+	dataDir, err := os.MkdirTemp("/tmp", "entmoot-policy-")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dataDir) })
+	gf := &globalFlags{data: dataDir}
+	gid := testCmdGroupPolicyID(0x54)
+	ln, err := net.Listen("unix", controlSocketPath(gf.data))
+	if err != nil {
+		t.Fatalf("listen control socket: %v", err)
+	}
+	defer ln.Close()
+	defer os.Remove(controlSocketPath(gf.data))
+
+	reqCh := make(chan *ipc.PublishReq, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				errCh <- err
+				return
+			}
+			_, payload, err := ipc.ReadAndDecode(conn)
+			if err != nil {
+				_ = conn.Close()
+				continue
+			}
+			req, ok := payload.(*ipc.PublishReq)
+			if !ok {
+				_ = conn.Close()
+				errCh <- fmt.Errorf("payload = %T, want *ipc.PublishReq", payload)
+				return
+			}
+			reqCh <- req
+			var mid entmoot.MessageID
+			mid[0] = 1
+			_ = ipc.EncodeAndWrite(conn, &ipc.PublishResp{MessageID: mid, GroupID: gid, TimestampMS: 1_000})
+			_ = conn.Close()
+			errCh <- nil
+			return
+		}
+	}()
+
+	code, stdout, stderr := captureCommandOutput(t, func() int {
+		return cmdGroupPolicy(gf, []string{"set", "-group", gid.String(), "-preset", "standard", "--json"})
+	})
+	if code != exitOK || stderr != "" {
+		t.Fatalf("set code/stderr = %d/%q", code, stderr)
+	}
+	if err := <-errCh; err != nil {
+		t.Fatalf("daemon handler: %v", err)
+	}
+	req := <-reqCh
+	if req.GroupID == nil || *req.GroupID != gid {
+		t.Fatalf("req.GroupID = %+v, want %s", req.GroupID, gid)
+	}
+	if len(req.Topics) != 1 || req.Topics[0] != entpolicy.UpdateTopic {
+		t.Fatalf("topics = %v, want policy update topic", req.Topics)
+	}
+	update, err := entpolicy.ParseUpdate(req.Content)
+	if err != nil {
+		t.Fatalf("ParseUpdate: %v", err)
+	}
+	if update.GroupID != gid || update.Policy == nil || update.Policy.RetentionDays != entpolicy.DefaultRetentionDays || update.Sequence == 0 {
+		t.Fatalf("update = %+v, want standard policy for group", update)
+	}
+	var out groupPolicyReport
+	if err := json.Unmarshal([]byte(stdout), &out); err != nil {
+		t.Fatalf("stdout JSON: %v\n%s", err, stdout)
+	}
+	if !out.Published || !out.RuntimeAppliedKnown || out.Sequence != update.Sequence {
+		t.Fatalf("report = %+v, want published runtime-applied sequence", out)
+	}
+}
+
+func TestCmdGroupPolicySetPreservesIPCErrorExitCode(t *testing.T) {
+	dataDir, err := os.MkdirTemp("/tmp", "entmoot-policy-")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dataDir) })
+	gf := &globalFlags{data: dataDir}
+	gid := testCmdGroupPolicyID(0x55)
+	ln, err := net.Listen("unix", controlSocketPath(gf.data))
+	if err != nil {
+		t.Fatalf("listen control socket: %v", err)
+	}
+	defer ln.Close()
+	defer os.Remove(controlSocketPath(gf.data))
+
+	errCh := make(chan error, 1)
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				errCh <- err
+				return
+			}
+			_, payload, err := ipc.ReadAndDecode(conn)
+			if err != nil {
+				_ = conn.Close()
+				continue
+			}
+			if _, ok := payload.(*ipc.PublishReq); !ok {
+				_ = conn.Close()
+				errCh <- fmt.Errorf("payload = %T, want *ipc.PublishReq", payload)
+				return
+			}
+			_ = ipc.EncodeAndWrite(conn, &ipc.ErrorFrame{
+				Type:    "error",
+				Code:    ipc.CodeConflict,
+				GroupID: &gid,
+				Message: "policy update sequence is not newer",
+			})
+			_ = conn.Close()
+			errCh <- nil
+			return
+		}
+	}()
+
+	code, _, stderr := captureCommandOutput(t, func() int {
+		return cmdGroupPolicy(gf, []string{"set", "-group", gid.String(), "-preset", "standard", "--json"})
+	})
+	if code != ipc.ExitCode(ipc.CodeConflict) {
+		t.Fatalf("set code = %d, want conflict exit %d; stderr=%q", code, ipc.ExitCode(ipc.CodeConflict), stderr)
+	}
+	if !strings.Contains(stderr, "ipc error CONFLICT") {
+		t.Fatalf("stderr = %q, want IPC conflict", stderr)
+	}
+	if err := <-errCh; err != nil {
+		t.Fatalf("daemon handler: %v", err)
+	}
+}
+
+func TestCmdGroupPolicySetFallsBackLocalWhenDaemonLacksGroup(t *testing.T) {
+	dataDir, err := os.MkdirTemp("/tmp", "entmoot-policy-")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dataDir) })
+	gf := &globalFlags{data: dataDir}
+	gid := testCmdGroupPolicyID(0x56)
+	ln, err := net.Listen("unix", controlSocketPath(gf.data))
+	if err != nil {
+		t.Fatalf("listen control socket: %v", err)
+	}
+	defer ln.Close()
+	defer os.Remove(controlSocketPath(gf.data))
+
+	errCh := make(chan error, 1)
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				errCh <- err
+				return
+			}
+			_, payload, err := ipc.ReadAndDecode(conn)
+			if err != nil {
+				_ = conn.Close()
+				continue
+			}
+			if _, ok := payload.(*ipc.PublishReq); !ok {
+				_ = conn.Close()
+				errCh <- fmt.Errorf("payload = %T, want *ipc.PublishReq", payload)
+				return
+			}
+			errCh <- ipc.EncodeAndWrite(conn, &ipc.ErrorFrame{
+				Type:    "error",
+				Code:    ipc.CodeGroupNotFound,
+				GroupID: &gid,
+				Message: "group not joined",
+			})
+			_ = conn.Close()
+			return
+		}
+	}()
+
+	code, stdout, stderr := captureCommandOutput(t, func() int {
+		return cmdGroupPolicy(gf, []string{"set", "-group", gid.String(), "-preset", "standard", "--json"})
+	})
+	if code != exitOK || stderr != "" {
+		t.Fatalf("set code/stderr = %d/%q, want ok/empty", code, stderr)
+	}
+	if err := <-errCh; err != nil {
+		t.Fatalf("daemon handler: %v", err)
+	}
+	var out groupPolicyReport
+	if err := json.Unmarshal([]byte(stdout), &out); err != nil {
+		t.Fatalf("stdout JSON: %v\n%s", err, stdout)
+	}
+	if out.Published || !out.PolicyConfigured || out.Sequence == 0 {
+		t.Fatalf("report = %+v, want local configured policy with sequence", out)
+	}
+	store, err := entpolicy.OpenFileStore(gf.data)
+	if err != nil {
+		t.Fatalf("OpenFileStore: %v", err)
+	}
+	got, ok, err := store.Get(withTestContext(t), gid)
+	if err != nil || !ok || got != entpolicy.Standard() {
+		t.Fatalf("stored policy = %+v ok=%t err=%v, want standard", got, ok, err)
 	}
 }
 

@@ -153,8 +153,153 @@ func (s *FileStore) List(ctx context.Context) (map[entmoot.GroupID]Policy, error
 }
 
 type storeData struct {
-	Version  int               `json:"version"`
-	Policies map[string]Policy `json:"policies"`
+	Version   int               `json:"version"`
+	Policies  map[string]Policy `json:"policies"`
+	Sequences map[string]uint64 `json:"sequences,omitempty"`
+}
+
+type UpdateSnapshot struct {
+	Policy      Policy
+	HasPolicy   bool
+	Sequence    uint64
+	HasSequence bool
+}
+
+type UpdateApplyResult struct {
+	Accepted bool
+	Snapshot UpdateSnapshot
+}
+
+// SnapshotUpdate returns the policy and sequence state needed to roll back a
+// policy update if the matching gossip message fails to commit durably.
+func (s *FileStore) SnapshotUpdate(ctx context.Context, groupID entmoot.GroupID) (UpdateSnapshot, error) {
+	if err := validateStoreCall(ctx, s, groupID); err != nil {
+		return UpdateSnapshot{}, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var snap UpdateSnapshot
+	if err := s.withFileLockLocked(false, func() error {
+		data, err := s.loadLocked()
+		if err != nil {
+			return err
+		}
+		encoded := groupID.String()
+		snap.Policy, snap.HasPolicy = data.Policies[encoded]
+		snap.Sequence, snap.HasSequence = data.Sequences[encoded]
+		return nil
+	}); err != nil {
+		return UpdateSnapshot{}, err
+	}
+	return snap, nil
+}
+
+// RestoreUpdateSnapshot restores a snapshot produced by SnapshotUpdate only if
+// the current sequence still equals appliedSequence. It returns false when a
+// newer update has already superseded the failed update.
+func (s *FileStore) RestoreUpdateSnapshot(ctx context.Context, groupID entmoot.GroupID, snap UpdateSnapshot, appliedSequence uint64) (bool, error) {
+	if err := validateStoreCall(ctx, s, groupID); err != nil {
+		return false, err
+	}
+	if snap.HasPolicy {
+		if err := snap.Policy.Validate(); err != nil {
+			return false, fmt.Errorf("policy: validate rollback snapshot: %w", err)
+		}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var restored bool
+	if err := s.withFileLockLocked(true, func() error {
+		data, err := s.loadLocked()
+		if err != nil {
+			return err
+		}
+		encoded := groupID.String()
+		if data.Sequences[encoded] != appliedSequence {
+			return nil
+		}
+		if snap.HasPolicy {
+			data.Policies[encoded] = snap.Policy
+		} else {
+			delete(data.Policies, encoded)
+		}
+		if snap.HasSequence {
+			data.Sequences[encoded] = snap.Sequence
+		} else {
+			delete(data.Sequences, encoded)
+		}
+		restored = true
+		return s.saveLocked(data)
+	}); err != nil {
+		return false, err
+	}
+	return restored, nil
+}
+
+// Sequence returns the last accepted founder policy-update sequence for groupID.
+func (s *FileStore) Sequence(ctx context.Context, groupID entmoot.GroupID) (uint64, bool, error) {
+	if err := validateStoreCall(ctx, s, groupID); err != nil {
+		return 0, false, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var (
+		seq uint64
+		ok  bool
+	)
+	if err := s.withFileLockLocked(false, func() error {
+		data, err := s.loadLocked()
+		if err != nil {
+			return err
+		}
+		seq, ok = data.Sequences[groupID.String()]
+		return nil
+	}); err != nil {
+		return 0, false, err
+	}
+	return seq, ok, nil
+}
+
+// ApplyUpdate atomically accepts a newer founder policy update and returns the
+// exact prior state captured under the same file lock as the mutation. Accepted
+// is false with no mutation when update.Sequence is not newer than the stored one.
+func (s *FileStore) ApplyUpdate(ctx context.Context, update Update) (UpdateApplyResult, error) {
+	if err := validateStoreCall(ctx, s, update.GroupID); err != nil {
+		return UpdateApplyResult{}, err
+	}
+	if err := update.Validate(); err != nil {
+		return UpdateApplyResult{}, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var result UpdateApplyResult
+	if err := s.withFileLockLocked(true, func() error {
+		data, err := s.loadLocked()
+		if err != nil {
+			return err
+		}
+		encoded := update.GroupID.String()
+		result.Snapshot.Policy, result.Snapshot.HasPolicy = data.Policies[encoded]
+		result.Snapshot.Sequence, result.Snapshot.HasSequence = data.Sequences[encoded]
+		if current := data.Sequences[encoded]; current >= update.Sequence {
+			return nil
+		}
+		if update.Policy == nil {
+			delete(data.Policies, encoded)
+		} else {
+			data.Policies[encoded] = *update.Policy
+		}
+		data.Sequences[encoded] = update.Sequence
+		result.Accepted = true
+		return s.saveLocked(data)
+	}); err != nil {
+		return UpdateApplyResult{}, err
+	}
+	return result, nil
 }
 
 func (s *FileStore) loadLocked() (storeData, error) {
@@ -178,12 +323,20 @@ func (s *FileStore) loadLocked() (storeData, error) {
 	if data.Policies == nil {
 		data.Policies = make(map[string]Policy)
 	}
+	if data.Sequences == nil {
+		data.Sequences = make(map[string]uint64)
+	}
 	for encoded, p := range data.Policies {
 		if _, err := decodeGroupID(encoded); err != nil {
 			return storeData{}, err
 		}
 		if err := p.Validate(); err != nil {
 			return storeData{}, fmt.Errorf("policy: validate group %q: %w", encoded, err)
+		}
+	}
+	for encoded := range data.Sequences {
+		if _, err := decodeGroupID(encoded); err != nil {
+			return storeData{}, err
 		}
 	}
 	return data, nil
@@ -196,12 +349,20 @@ func (s *FileStore) saveLocked(data storeData) error {
 	if data.Policies == nil {
 		data.Policies = make(map[string]Policy)
 	}
+	if data.Sequences == nil {
+		data.Sequences = make(map[string]uint64)
+	}
 	for encoded, p := range data.Policies {
 		if _, err := decodeGroupID(encoded); err != nil {
 			return err
 		}
 		if err := p.Validate(); err != nil {
 			return fmt.Errorf("policy: validate group %q: %w", encoded, err)
+		}
+	}
+	for encoded := range data.Sequences {
+		if _, err := decodeGroupID(encoded); err != nil {
+			return err
 		}
 	}
 	raw, err := json.MarshalIndent(data, "", "  ")
@@ -278,8 +439,9 @@ func syncDir(dir string) {
 
 func newStoreData() storeData {
 	return storeData{
-		Version:  storeVersion,
-		Policies: make(map[string]Policy),
+		Version:   storeVersion,
+		Policies:  make(map[string]Policy),
+		Sequences: make(map[string]uint64),
 	}
 }
 

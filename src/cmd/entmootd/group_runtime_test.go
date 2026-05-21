@@ -637,6 +637,43 @@ func TestIPCInviteAuthorityCheckRequiresPilotLookupCapability(t *testing.T) {
 	}
 }
 
+func TestPublishErrorCodeMapsPolicyConflict(t *testing.T) {
+	if got := publishErrorCode(gossip.ErrPolicyUpdateStale); got != ipc.CodeConflict {
+		t.Fatalf("publishErrorCode(stale) = %s, want %s", got, ipc.CodeConflict)
+	}
+}
+
+func TestNotifyingStoreForwardsTopicAwarePrune(t *testing.T) {
+	ctx := context.Background()
+	gid := testRuntimeGroupID(0xB4)
+	inner := store.NewMemory()
+	notify := newNotifyingStore(inner, events.NopSink{})
+	author := entmoot.NodeInfo{PilotNodeID: 1}
+	oldContent := entmoot.Message{GroupID: gid, Author: author, Timestamp: 10, Content: []byte("old")}
+	oldContent.ID = canonical.MessageID(oldContent)
+	oldPolicy := entmoot.Message{GroupID: gid, Author: author, Timestamp: 10, Topics: []string{entpolicy.UpdateTopic}, Content: []byte("policy")}
+	oldPolicy.ID = canonical.MessageID(oldPolicy)
+	for _, msg := range []entmoot.Message{oldContent, oldPolicy} {
+		if err := notify.Put(ctx, msg); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+	}
+
+	pruned, err := notify.PruneBeforeExceptTopics(ctx, gid, 20, []string{entpolicy.UpdateTopic})
+	if err != nil {
+		t.Fatalf("PruneBeforeExceptTopics: %v", err)
+	}
+	if pruned != 1 {
+		t.Fatalf("pruned = %d, want 1", pruned)
+	}
+	if has, err := inner.Has(ctx, gid, oldContent.ID); err != nil || has {
+		t.Fatalf("old content has/err = %t/%v, want false/nil", has, err)
+	}
+	if has, err := inner.Has(ctx, gid, oldPolicy.ID); err != nil || !has {
+		t.Fatalf("old policy has/err = %t/%v, want true/nil", has, err)
+	}
+}
+
 func TestGroupRuntimeAddLocalGroupRejectsNonMember(t *testing.T) {
 	ctx := context.Background()
 	dataDir := t.TempDir()

@@ -3,6 +3,7 @@ package gossip
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -50,6 +51,134 @@ type nodeState struct {
 	storeM  store.MessageStore
 	gossip  *Gossiper
 	running atomic.Bool
+}
+
+type fakePolicyUpdateStore struct {
+	mu       sync.Mutex
+	seq      map[entmoot.GroupID]uint64
+	policies map[entmoot.GroupID]policy.Policy
+	accepted int
+}
+
+func newFakePolicyUpdateStore() *fakePolicyUpdateStore {
+	return &fakePolicyUpdateStore{
+		seq:      make(map[entmoot.GroupID]uint64),
+		policies: make(map[entmoot.GroupID]policy.Policy),
+	}
+}
+
+func (s *fakePolicyUpdateStore) ApplyUpdate(_ context.Context, update policy.Update) (policy.UpdateApplyResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p, hasPolicy := s.policies[update.GroupID]
+	seq, hasSequence := s.seq[update.GroupID]
+	result := policy.UpdateApplyResult{
+		Snapshot: policy.UpdateSnapshot{
+			Policy:      p,
+			HasPolicy:   hasPolicy,
+			Sequence:    seq,
+			HasSequence: hasSequence,
+		},
+	}
+	if s.seq[update.GroupID] >= update.Sequence {
+		return result, nil
+	}
+	if update.Policy == nil {
+		delete(s.policies, update.GroupID)
+	} else {
+		s.policies[update.GroupID] = *update.Policy
+	}
+	s.seq[update.GroupID] = update.Sequence
+	s.accepted++
+	result.Accepted = true
+	return result, nil
+}
+
+func (s *fakePolicyUpdateStore) RestoreUpdateSnapshot(_ context.Context, groupID entmoot.GroupID, snap policy.UpdateSnapshot, appliedSequence uint64) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.seq[groupID] != appliedSequence {
+		return false, nil
+	}
+	if snap.HasPolicy {
+		s.policies[groupID] = snap.Policy
+	} else {
+		delete(s.policies, groupID)
+	}
+	if snap.HasSequence {
+		s.seq[groupID] = snap.Sequence
+	} else {
+		delete(s.seq, groupID)
+	}
+	return true, nil
+}
+
+func (s *fakePolicyUpdateStore) policy(groupID entmoot.GroupID) (policy.Policy, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p, ok := s.policies[groupID]
+	return p, ok
+}
+
+func (s *fakePolicyUpdateStore) acceptedCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.accepted
+}
+
+func (s *fakePolicyUpdateStore) sequence(groupID entmoot.GroupID) (uint64, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	seq, ok := s.seq[groupID]
+	return seq, ok
+}
+
+type failingPutStore struct {
+	store.MessageStore
+	err error
+}
+
+func (s failingPutStore) Put(context.Context, entmoot.Message) error {
+	return s.err
+}
+
+type cancelingFailPutStore struct {
+	store.MessageStore
+	cancel context.CancelFunc
+	err    error
+}
+
+func (s cancelingFailPutStore) Put(context.Context, entmoot.Message) error {
+	s.cancel()
+	return s.err
+}
+
+type blockingPolicyPutStore struct {
+	store.MessageStore
+	mu      sync.Mutex
+	blocked bool
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (s *blockingPolicyPutStore) Put(ctx context.Context, msg entmoot.Message) error {
+	if messageHasTopic(msg, policy.UpdateTopic) {
+		s.mu.Lock()
+		shouldBlock := !s.blocked
+		if shouldBlock {
+			s.blocked = true
+			close(s.entered)
+		}
+		s.mu.Unlock()
+		if shouldBlock {
+			select {
+			case <-s.release:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+	}
+	return s.MessageStore.Put(ctx, msg)
 }
 
 type failFirstDialTransport struct {
@@ -311,6 +440,26 @@ func (f *fixture) buildMessage(author entmoot.NodeID, content string, ts int64) 
 	return msg
 }
 
+func (f *fixture) buildPolicyUpdateMessage(author entmoot.NodeID, p *policy.Policy, sequence uint64, ts int64) entmoot.Message {
+	update := policy.NewUpdate(f.groupID, p, ts, sequence)
+	body, err := json.Marshal(update)
+	if err != nil {
+		f.t.Fatalf("marshal policy update: %v", err)
+	}
+	msg := f.buildMessage(author, string(body), ts)
+	msg.Topics = []string{policy.UpdateTopic}
+	signing := msg
+	signing.ID = entmoot.MessageID{}
+	signing.Signature = nil
+	sigInput, err := canonical.Encode(signing)
+	if err != nil {
+		f.t.Fatalf("canonical encode policy update message: %v", err)
+	}
+	msg.Signature = f.nodes[author].id.Sign(sigInput)
+	msg.ID = canonical.MessageID(msg)
+	return msg
+}
+
 func (f *fixture) replaceGossiperWithPolicy(node entmoot.NodeID, p *policy.Policy, clk clock.Clock) {
 	f.t.Helper()
 	ns := f.nodes[node]
@@ -331,6 +480,27 @@ func (f *fixture) replaceGossiperWithPolicy(node entmoot.NodeID, p *policy.Polic
 	})
 	if err != nil {
 		f.t.Fatalf("gossip.New with policy for %d: %v", node, err)
+	}
+	ns.gossip = g
+}
+
+func (f *fixture) replaceGossiperWithPolicyUpdates(node entmoot.NodeID, updates PolicyUpdateStore) {
+	f.t.Helper()
+	ns := f.nodes[node]
+	g, err := New(Config{
+		LocalNode:         node,
+		Identity:          ns.id,
+		Roster:            ns.rost,
+		Store:             ns.storeM,
+		Transport:         f.transports[node],
+		GroupID:           f.groupID,
+		Fanout:            defaultFanout,
+		Clock:             ns.gossip.clk,
+		Logger:            slog.Default(),
+		PolicyUpdateStore: updates,
+	})
+	if err != nil {
+		f.t.Fatalf("gossip.New with policy updates for %d: %v", node, err)
 	}
 	ns.gossip = g
 }
@@ -468,6 +638,245 @@ func TestSetGroupPolicyAppliesToRunningGossiper(t *testing.T) {
 	}
 }
 
+func TestFounderPolicyUpdateAppliesAndPersists(t *testing.T) {
+	f := newFixture(t, []entmoot.NodeID{10, 20})
+	defer f.closeTransports()
+	updates := newFakePolicyUpdateStore()
+	f.replaceGossiperWithPolicyUpdates(20, updates)
+
+	p := policy.Standard()
+	p.MaxMessageBytes = 3
+	update := f.buildPolicyUpdateMessage(10, &p, 10, 2_000)
+	f.nodes[20].gossip.onGossip(context.Background(), 10, f.signedInlineGossip(10, update))
+	if got, ok := updates.policy(f.groupID); !ok || got.MaxMessageBytes != 3 {
+		t.Fatalf("stored policy = %+v ok=%t, want max 3", got, ok)
+	}
+	if updates.acceptedCount() != 1 {
+		t.Fatalf("accepted updates = %d, want 1", updates.acceptedCount())
+	}
+
+	tooLarge := f.buildMessage(10, "too-large", 2_001)
+	f.nodes[20].gossip.onGossip(context.Background(), 10, f.signedInlineGossip(10, tooLarge))
+	if has, err := f.nodes[20].storeM.Has(context.Background(), f.groupID, tooLarge.ID); err != nil || has {
+		t.Fatalf("too-large stored has/err = %v/%v, want false/nil", has, err)
+	}
+}
+
+func TestNonFounderPolicyUpdateRejected(t *testing.T) {
+	f := newFixture(t, []entmoot.NodeID{10, 20})
+	defer f.closeTransports()
+	updates := newFakePolicyUpdateStore()
+	f.replaceGossiperWithPolicyUpdates(10, updates)
+
+	p := policy.Relaxed()
+	update := f.buildPolicyUpdateMessage(20, &p, 10, 2_000)
+	f.nodes[10].gossip.onGossip(context.Background(), 20, f.signedInlineGossip(20, update))
+	if updates.acceptedCount() != 0 {
+		t.Fatalf("accepted updates = %d, want 0", updates.acceptedCount())
+	}
+	if has, err := f.nodes[10].storeM.Has(context.Background(), f.groupID, update.ID); err != nil || has {
+		t.Fatalf("non-founder update stored has/err = %v/%v, want false/nil", has, err)
+	}
+}
+
+func TestRejectedPolicyUpdateStillUsesContentPolicy(t *testing.T) {
+	f := newFixture(t, []entmoot.NodeID{10, 20})
+	defer f.closeTransports()
+	updates := newFakePolicyUpdateStore()
+	strict := policy.Standard()
+	strict.MaxMessageBytes = 3
+	f.replaceGossiperWithPolicy(10, &strict, nil)
+	f.nodes[10].gossip.cfg.PolicyUpdateStore = updates
+
+	p := policy.Relaxed()
+	update := f.buildPolicyUpdateMessage(20, &p, 10, 2_000)
+	err := f.nodes[10].gossip.acceptInboundMessage(context.Background(), 20, update)
+	if err == nil || !strings.Contains(err.Error(), "exceeds group max") {
+		t.Fatalf("acceptInboundMessage err = %v, want content policy max-size rejection", err)
+	}
+	if updates.acceptedCount() != 0 {
+		t.Fatalf("accepted updates = %d, want 0", updates.acceptedCount())
+	}
+	if has, err := f.nodes[10].storeM.Has(context.Background(), f.groupID, update.ID); err != nil || has {
+		t.Fatalf("rejected update stored has/err = %v/%v, want false/nil", has, err)
+	}
+}
+
+func TestStaleFounderPolicyUpdateDoesNotAlterRuntime(t *testing.T) {
+	f := newFixture(t, []entmoot.NodeID{10, 20})
+	defer f.closeTransports()
+	updates := newFakePolicyUpdateStore()
+	f.replaceGossiperWithPolicyUpdates(20, updates)
+
+	strict := policy.Standard()
+	strict.MaxMessageBytes = 3
+	first := f.buildPolicyUpdateMessage(10, &strict, 10, 2_000)
+	f.nodes[20].gossip.onGossip(context.Background(), 10, f.signedInlineGossip(10, first))
+
+	relaxed := policy.Relaxed()
+	stale := f.buildPolicyUpdateMessage(10, &relaxed, 10, 2_001)
+	f.nodes[20].gossip.onGossip(context.Background(), 10, f.signedInlineGossip(10, stale))
+	if updates.acceptedCount() != 1 {
+		t.Fatalf("accepted updates = %d, want 1", updates.acceptedCount())
+	}
+	if got, ok := updates.policy(f.groupID); !ok || got.MaxMessageBytes != 3 {
+		t.Fatalf("stored policy after stale = %+v ok=%t, want strict", got, ok)
+	}
+	if has, err := f.nodes[20].storeM.Has(context.Background(), f.groupID, stale.ID); err != nil || !has {
+		t.Fatalf("stale update message stored has/err = %v/%v, want true/nil", has, err)
+	}
+
+	tooLarge := f.buildMessage(10, "too-large", 2_002)
+	f.nodes[20].gossip.onGossip(context.Background(), 10, f.signedInlineGossip(10, tooLarge))
+	if has, err := f.nodes[20].storeM.Has(context.Background(), f.groupID, tooLarge.ID); err != nil || has {
+		t.Fatalf("too-large stored after stale has/err = %v/%v, want false/nil", has, err)
+	}
+}
+
+func TestStaleFounderPolicyUpdatePublishReturnsConflict(t *testing.T) {
+	f := newFixture(t, []entmoot.NodeID{10})
+	defer f.closeTransports()
+	updates := newFakePolicyUpdateStore()
+	f.replaceGossiperWithPolicyUpdates(10, updates)
+
+	strict := policy.Standard()
+	first := f.buildPolicyUpdateMessage(10, &strict, 10, 2_000)
+	if err := f.nodes[10].gossip.Publish(context.Background(), first); err != nil {
+		t.Fatalf("first Publish: %v", err)
+	}
+	if err := f.nodes[10].gossip.Publish(context.Background(), first); err != nil {
+		t.Fatalf("duplicate Publish: %v", err)
+	}
+
+	relaxed := policy.Relaxed()
+	stale := f.buildPolicyUpdateMessage(10, &relaxed, 10, 2_001)
+	if err := f.nodes[10].gossip.Publish(context.Background(), stale); !errors.Is(err, ErrPolicyUpdateStale) {
+		t.Fatalf("stale Publish err = %v, want ErrPolicyUpdateStale", err)
+	}
+	if updates.acceptedCount() != 1 {
+		t.Fatalf("accepted updates = %d, want 1", updates.acceptedCount())
+	}
+}
+
+func TestFounderPolicyUpdateRollsBackWhenMessageStoreFails(t *testing.T) {
+	f := newFixture(t, []entmoot.NodeID{10})
+	defer f.closeTransports()
+	updates := newFakePolicyUpdateStore()
+	f.replaceGossiperWithPolicyUpdates(10, updates)
+	f.nodes[10].gossip.cfg.Store = failingPutStore{
+		MessageStore: f.nodes[10].storeM,
+		err:          errors.New("scripted store put failure"),
+	}
+
+	strict := policy.Standard()
+	update := f.buildPolicyUpdateMessage(10, &strict, 10, 2_000)
+	if err := f.nodes[10].gossip.Publish(context.Background(), update); err == nil {
+		t.Fatal("Publish returned nil error, want store failure")
+	}
+	if _, ok := updates.policy(f.groupID); ok {
+		t.Fatal("policy persisted after message store failure, want rollback")
+	}
+	if seq, ok := updates.sequence(f.groupID); ok {
+		t.Fatalf("sequence after rollback = %d, want absent", seq)
+	}
+}
+
+func TestFounderPolicyUpdateRollsBackWithCanceledPublishContext(t *testing.T) {
+	f := newFixture(t, []entmoot.NodeID{10})
+	defer f.closeTransports()
+	updates := newFakePolicyUpdateStore()
+	f.replaceGossiperWithPolicyUpdates(10, updates)
+	ctx, cancel := context.WithCancel(context.Background())
+	f.nodes[10].gossip.cfg.Store = cancelingFailPutStore{
+		MessageStore: f.nodes[10].storeM,
+		cancel:       cancel,
+		err:          context.Canceled,
+	}
+
+	strict := policy.Standard()
+	update := f.buildPolicyUpdateMessage(10, &strict, 10, 2_000)
+	if err := f.nodes[10].gossip.Publish(ctx, update); err == nil {
+		t.Fatal("Publish returned nil error, want store failure")
+	}
+	if _, ok := updates.policy(f.groupID); ok {
+		t.Fatal("policy persisted after canceled message store failure, want rollback")
+	}
+	if seq, ok := updates.sequence(f.groupID); ok {
+		t.Fatalf("sequence after canceled rollback = %d, want absent", seq)
+	}
+}
+
+func TestConcurrentFounderPolicyUpdatesLeaveRuntimeAtNewest(t *testing.T) {
+	f := newFixture(t, []entmoot.NodeID{10})
+	defer f.closeTransports()
+	updates := newFakePolicyUpdateStore()
+	f.replaceGossiperWithPolicyUpdates(10, updates)
+	blocker := &blockingPolicyPutStore{
+		MessageStore: f.nodes[10].storeM,
+		entered:      make(chan struct{}),
+		release:      make(chan struct{}),
+	}
+	f.nodes[10].gossip.cfg.Store = blocker
+
+	strict := policy.Standard()
+	strict.MaxMessageBytes = 3
+	first := f.buildPolicyUpdateMessage(10, &strict, 10, 2_000)
+	firstErr := make(chan error, 1)
+	go func() {
+		firstErr <- f.nodes[10].gossip.Publish(context.Background(), first)
+	}()
+	select {
+	case <-blocker.entered:
+	case <-time.After(time.Second):
+		t.Fatal("first policy update did not reach store")
+	}
+
+	relaxed := policy.Relaxed()
+	second := f.buildPolicyUpdateMessage(10, &relaxed, 11, 2_001)
+	secondErr := make(chan error, 1)
+	go func() {
+		secondErr <- f.nodes[10].gossip.Publish(context.Background(), second)
+	}()
+	select {
+	case err := <-secondErr:
+		t.Fatalf("second policy update completed before first durable store: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(blocker.release)
+	if err := <-firstErr; err != nil {
+		t.Fatalf("first Publish: %v", err)
+	}
+	if err := <-secondErr; err != nil {
+		t.Fatalf("second Publish: %v", err)
+	}
+
+	large := f.buildMessage(10, "larger-than-three", 2_002)
+	if err := f.nodes[10].gossip.Publish(context.Background(), large); err != nil {
+		t.Fatalf("large publish after serialized updates: %v", err)
+	}
+}
+
+func TestFounderPolicyClearRestoresLegacyRuntime(t *testing.T) {
+	f := newFixture(t, []entmoot.NodeID{10, 20})
+	defer f.closeTransports()
+	updates := newFakePolicyUpdateStore()
+	f.replaceGossiperWithPolicyUpdates(20, updates)
+
+	strict := policy.Standard()
+	strict.MaxMessageBytes = 3
+	set := f.buildPolicyUpdateMessage(10, &strict, 10, 2_000)
+	f.nodes[20].gossip.onGossip(context.Background(), 10, f.signedInlineGossip(10, set))
+	clear := f.buildPolicyUpdateMessage(10, nil, 11, 2_001)
+	f.nodes[20].gossip.onGossip(context.Background(), 10, f.signedInlineGossip(10, clear))
+
+	large := f.buildMessage(10, "allowed-after-clear", 2_002)
+	f.nodes[20].gossip.onGossip(context.Background(), 10, f.signedInlineGossip(10, large))
+	if has, err := f.nodes[20].storeM.Has(context.Background(), f.groupID, large.ID); err != nil || !has {
+		t.Fatalf("large after clear stored has/err = %v/%v, want true/nil", has, err)
+	}
+}
+
 func TestPolicyRetentionPrunesConfiguredGroup(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t, []entmoot.NodeID{10, 20})
@@ -490,6 +899,27 @@ func TestPolicyRetentionPrunesConfiguredGroup(t *testing.T) {
 	}
 	if has, err := f.nodes[20].storeM.Has(context.Background(), f.groupID, newer.ID); err != nil || !has {
 		t.Fatalf("new retained has/err = %v/%v, want true/nil", has, err)
+	}
+}
+
+func TestPolicyRetentionPreservesPolicyUpdateMessages(t *testing.T) {
+	f := newFixture(t, []entmoot.NodeID{10, 20})
+	defer f.closeTransports()
+	const dayMS = int64(24 * time.Hour / time.Millisecond)
+	clk := clock.NewFake(time.UnixMilli(3 * dayMS))
+	active := policy.TheEntMootDefault()
+	active.RetentionDays = 1
+	f.replaceGossiperWithPolicy(20, &active, clk)
+	updates := newFakePolicyUpdateStore()
+	f.nodes[20].gossip.cfg.PolicyUpdateStore = updates
+
+	next := active
+	next.MaxMessageBytes = active.MaxMessageBytes + 1
+	update := f.buildPolicyUpdateMessage(10, &next, 10, dayMS)
+	f.nodes[20].gossip.onGossip(context.Background(), 10, f.signedInlineGossip(10, update))
+
+	if has, err := f.nodes[20].storeM.Has(context.Background(), f.groupID, update.ID); err != nil || !has {
+		t.Fatalf("policy update retained has/err = %v/%v, want true/nil", has, err)
 	}
 }
 
