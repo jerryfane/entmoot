@@ -2010,6 +2010,29 @@ func (h *Handler) handleGroupSubroute(w http.ResponseWriter, r *http.Request) bo
 		default:
 			methodNotAllowed(w, http.MethodGet+", "+http.MethodPatch)
 		}
+	case "policy":
+		switch r.Method {
+		case http.MethodGet:
+			h.handleGetGroupPolicy(w, r, groupID)
+		case http.MethodPut:
+			h.withIdempotency(w, r, "group_policy_update:"+groupID.String(), func(w http.ResponseWriter, r *http.Request) {
+				h.createSignRequestFromHTTP(w, r, signRequestKindGroupPolicyUpdate, groupID)
+			})
+		case http.MethodDelete:
+			h.withIdempotency(w, r, "group_policy_clear:"+groupID.String(), func(w http.ResponseWriter, r *http.Request) {
+				h.createSignRequestFromHTTP(w, r, signRequestKindGroupPolicyClear, groupID)
+			})
+		default:
+			methodNotAllowed(w, http.MethodGet+", "+http.MethodPut+", "+http.MethodDelete)
+		}
+	case "public-moot/publish":
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w, http.MethodPost)
+			return true
+		}
+		h.withIdempotency(w, r, "group_public_publish:"+groupID.String(), func(w http.ResponseWriter, r *http.Request) {
+			h.createSignRequestFromHTTP(w, r, signRequestKindGroupPublicPublish, groupID)
+		})
 	case "members":
 		if r.Method != http.MethodGet {
 			methodNotAllowed(w, http.MethodGet)
@@ -2101,6 +2124,26 @@ func (h *Handler) handleGetGroup(w http.ResponseWriter, r *http.Request, groupID
 		return
 	}
 	writeJSON(w, http.StatusOK, group)
+}
+
+func (h *Handler) handleGetGroupPolicy(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID) {
+	if !h.checkDeviceGroupRead(w, r, groupID) {
+		return
+	}
+	reporter, ok := h.operations.(GroupPolicyReporter)
+	if !ok || reporter == nil {
+		writeError(w, http.StatusServiceUnavailable, "policy_unavailable", "group policy reporter is not configured")
+		return
+	}
+	raw, err := reporter.GroupPolicyReport(r.Context(), groupID)
+	if err != nil {
+		h.writeOperationError(w, "group policy status", "group policy status failed", err)
+		return
+	}
+	if len(bytes.TrimSpace(raw)) == 0 {
+		raw = json.RawMessage(`{}`)
+	}
+	writeJSON(w, http.StatusOK, raw)
 }
 
 func (h *Handler) handleListMembers(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID) {
@@ -3769,19 +3812,28 @@ func (h *Handler) completeExecutableSignRequest(w http.ResponseWriter, r *http.R
 	}
 	result, err := h.operations.ExecuteSignRequest(r.Context(), req, signature)
 	if err != nil {
-		var opErr *OperationError
-		if errors.As(err, &opErr) {
-			writeError(w, opErr.HTTPStatus, opErr.Code, opErr.Message)
-			return nil, false
-		}
-		h.logger.Error("esphttp: execute sign request", slog.String("kind", req.Kind), slog.String("err", err.Error()))
-		writeError(w, http.StatusInternalServerError, "internal_error", "operation execution failed")
+		h.writeOperationError(w, "execute sign request", "operation execution failed", err, slog.String("kind", req.Kind))
 		return nil, false
 	}
 	if len(result) == 0 {
 		result = json.RawMessage(`{}`)
 	}
 	return append(json.RawMessage(nil), result...), true
+}
+
+func (h *Handler) writeOperationError(w http.ResponseWriter, op, fallback string, err error, attrs ...slog.Attr) {
+	var opErr *OperationError
+	if errors.As(err, &opErr) {
+		writeError(w, opErr.HTTPStatus, opErr.Code, opErr.Message)
+		return
+	}
+	args := make([]any, 0, 2+len(attrs))
+	for _, attr := range attrs {
+		args = append(args, attr)
+	}
+	args = append(args, slog.String("err", err.Error()))
+	h.logger.Error("esphttp: "+op, args...)
+	writeError(w, http.StatusInternalServerError, "internal_error", fallback)
 }
 
 func (h *Handler) checkSignRequestDeviceRights(w http.ResponseWriter, req SignRequest) bool {

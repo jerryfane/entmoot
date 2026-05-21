@@ -17,6 +17,7 @@ import (
 
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/esphttp"
+	"entmoot/pkg/entmoot/keystore"
 	"entmoot/pkg/entmoot/policy"
 	"entmoot/pkg/entmoot/publicmoot"
 	"entmoot/pkg/entmoot/roster"
@@ -113,17 +114,24 @@ func parseGroupPublicOptions(op string, args []string) (groupPublicOptions, int)
 }
 
 func buildPublicMootDescriptor(ctx context.Context, gf *globalFlags, gid entmoot.GroupID, nowMS int64) (publicmoot.Descriptor, error) {
-	if nowMS <= 0 {
-		nowMS = time.Now().UnixMilli()
-	}
 	s, err := setup(gf)
 	if err != nil {
 		return publicmoot.Descriptor{}, err
 	}
-	if !pathExists(groupDirPath(s.dataDir, gid)) {
+	return buildPublicMootDescriptorWithIdentity(ctx, s.dataDir, s.identity, gid, nowMS)
+}
+
+func buildPublicMootDescriptorWithIdentity(ctx context.Context, dataDir string, identity *keystore.Identity, gid entmoot.GroupID, nowMS int64) (publicmoot.Descriptor, error) {
+	if identity == nil {
+		return publicmoot.Descriptor{}, errors.New("public moot descriptor signer is not configured")
+	}
+	if nowMS <= 0 {
+		nowMS = time.Now().UnixMilli()
+	}
+	if !pathExists(groupDirPath(dataDir, gid)) {
 		return publicmoot.Descriptor{}, fmt.Errorf("%w: group directory is missing", errGroupPublicNotFound)
 	}
-	r, err := roster.OpenJSONL(s.dataDir, gid)
+	r, err := roster.OpenJSONL(dataDir, gid)
 	if err != nil {
 		return publicmoot.Descriptor{}, err
 	}
@@ -132,10 +140,10 @@ func buildPublicMootDescriptor(ctx context.Context, gf *globalFlags, gid entmoot
 	if !ok {
 		return publicmoot.Descriptor{}, fmt.Errorf("%w: roster founder is missing", errGroupPublicNotFound)
 	}
-	if !bytes.Equal(founder.EntmootPubKey, s.identity.PublicKey) {
+	if !bytes.Equal(founder.EntmootPubKey, identity.PublicKey) {
 		return publicmoot.Descriptor{}, fmt.Errorf("%w: local identity is not the group founder", errGroupPublicForbidden)
 	}
-	meta, err := loadGroupPublicMetadata(ctx, s.dataDir, gid)
+	meta, err := loadGroupPublicMetadata(ctx, dataDir, gid)
 	if err != nil {
 		return publicmoot.Descriptor{}, err
 	}
@@ -154,7 +162,7 @@ func buildPublicMootDescriptor(ctx context.Context, gf *globalFlags, gid entmoot
 	if normalizeGroupJoinMode(joinMode) == "" {
 		return publicmoot.Descriptor{}, fmt.Errorf("%w: invalid join_mode %q", errGroupPublicInvalid, joinMode)
 	}
-	policyStore, err := policy.OpenFileStore(s.dataDir)
+	policyStore, err := policy.OpenFileStore(dataDir)
 	if err != nil {
 		return publicmoot.Descriptor{}, err
 	}
@@ -186,7 +194,7 @@ func buildPublicMootDescriptor(ctx context.Context, gf *globalFlags, gid entmoot
 		},
 		UpdatedAtMS: nowMS,
 	}
-	signed, err := publicmoot.Sign(desc, s.identity)
+	signed, err := publicmoot.Sign(desc, identity)
 	if err != nil {
 		return publicmoot.Descriptor{}, err
 	}
