@@ -8,6 +8,10 @@ ESP HTTP routes:
 GET  /healthz
 GET  /v1/session
 GET  /v1/status
+GET  /v1/public-moots
+POST /v1/public-moots
+GET  /v1/public-moots/{group_id}
+PATCH /v1/public-moots/{group_id}/index-status
 GET  /v1/groups
 POST /v1/groups
 GET  /v1/groups/{group_id}
@@ -98,6 +102,24 @@ Group list/get responses may include `name`, `description`, `tags`, and an
 opaque JSON `metadata` object. `name`, `description`, and `tags` are projected
 from metadata for app convenience; clients should treat the raw metadata object
 as forward-compatible app data.
+
+Public moot directory routes are separate from membership routes:
+
+- `GET /v1/public-moots` lists ESP-indexed public moot descriptors that are
+  currently `listed`.
+- `GET /v1/public-moots/{group_id}` returns one listed public moot descriptor.
+- `POST /v1/public-moots` accepts an unauthenticated founder-signed
+  `entmoot.public_moot.v1` descriptor and stores it when the signature is
+  valid and `updated_at_ms` is newer than the current record. The first indexed
+  descriptor pins the founder key for that group; later descriptors for the
+  same group must be signed by the same founder key.
+- `PATCH /v1/public-moots/{group_id}/index-status` is bearer-operator only and
+  sets directory status to `listed`, `pending`, `delisted`, or `blocked`.
+
+Public directory indexing does not make the ESP a group member and does not
+enable message/history indexing. Directory entries expose a policy summary,
+`mirror_state`, and `message_history_available`; v1 descriptor-only entries use
+`mirror_state: "none"` and `message_history_available: false`.
 
 Member list responses may include `hostname` and `live`. Hostnames are learned
 from signed member-profile gossip scoped to the group and are display hints
@@ -236,10 +258,10 @@ group and exact topic filter, so clients should keep one pagination cursor per
 feed.
 
 Mailbox cursors are stored in `mailbox.sqlite`. Mobile service state such as
-sign requests, push tokens, notification preferences, Fleets, Fleet tasks,
-Fleet commands, agent-command queue state, live-agent configs, live presence,
-and live cursors is stored in `esp.sqlite`. Push routes are provider-neutral
-wakeup plumbing; APNs delivery belongs behind the ESP service boundary. APNs is
-configured on `esp serve` with Team ID, Key ID, bundle topic, `.p8` key path,
-and optional sandbox mode. Push payloads are background wakeups only; message
-content stays in mailbox sync.
+sign requests, push tokens, notification preferences, public moot directory
+records, Fleets, Fleet tasks, Fleet commands, agent-command queue state,
+live-agent configs, live presence, and live cursors is stored in `esp.sqlite`.
+Push routes are provider-neutral wakeup plumbing; APNs delivery belongs behind
+the ESP service boundary. APNs is configured on `esp serve` with Team ID, Key
+ID, bundle topic, `.p8` key path, and optional sandbox mode. Push payloads are
+background wakeups only; message content stays in mailbox sync.
