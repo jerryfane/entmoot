@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -248,6 +249,12 @@ func (s *SQLite) Put(ctx context.Context, m entmoot.Message) error {
 
 // PruneBefore removes messages in groupID older than beforeMillis.
 func (s *SQLite) PruneBefore(ctx context.Context, groupID entmoot.GroupID, beforeMillis int64) (int64, error) {
+	return s.PruneBeforeExceptTopics(ctx, groupID, beforeMillis, nil)
+}
+
+// PruneBeforeExceptTopics removes old content messages but preserves messages
+// carrying exemptTopics.
+func (s *SQLite) PruneBeforeExceptTopics(ctx context.Context, groupID entmoot.GroupID, beforeMillis int64, exemptTopics []string) (int64, error) {
 	if beforeMillis <= 0 {
 		return 0, nil
 	}
@@ -261,20 +268,23 @@ func (s *SQLite) PruneBefore(ctx context.Context, groupID entmoot.GroupID, befor
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	exemptClause, exemptArgs := pruneExemptTopicClause(exemptTopics)
+	args := append([]any{groupID[:], beforeMillis}, exemptArgs...)
 	if _, err := tx.ExecContext(ctx, `
 		DELETE FROM message_topics
 		WHERE message_id IN (
 		  SELECT message_id FROM messages
-		  WHERE group_id = ? AND timestamp_ms < ?
+		  WHERE group_id = ? AND timestamp_ms < ?`+exemptClause+`
 		);`,
-		groupID[:], beforeMillis,
+		args...,
 	); err != nil {
 		return 0, fmt.Errorf("store: prune topics: %w", err)
 	}
+	args = append([]any{groupID[:], beforeMillis}, exemptArgs...)
 	res, err := tx.ExecContext(ctx, `
 		DELETE FROM messages
-		WHERE group_id = ? AND timestamp_ms < ?;`,
-		groupID[:], beforeMillis,
+		WHERE group_id = ? AND timestamp_ms < ?`+exemptClause+`;`,
+		args...,
 	)
 	if err != nil {
 		return 0, fmt.Errorf("store: prune messages: %w", err)
@@ -287,6 +297,23 @@ func (s *SQLite) PruneBefore(ctx context.Context, groupID entmoot.GroupID, befor
 		return 0, fmt.Errorf("store: commit prune: %w", err)
 	}
 	return pruned, nil
+}
+
+func pruneExemptTopicClause(topics []string) (string, []any) {
+	if len(topics) == 0 {
+		return "", nil
+	}
+	placeholders := strings.TrimRight(strings.Repeat("?,", len(topics)), ",")
+	args := make([]any, 0, len(topics))
+	for _, topic := range topics {
+		args = append(args, topic)
+	}
+	return `
+		  AND NOT EXISTS (
+		    SELECT 1 FROM message_topics keep
+		    WHERE keep.message_id = messages.message_id
+		      AND keep.topic IN (` + placeholders + `)
+		  )`, args
 }
 
 // Get implements MessageStore.Get.

@@ -28,6 +28,10 @@ import (
 	"entmoot/pkg/entmoot/wire"
 )
 
+// ErrPolicyUpdateStale is returned when a founder policy update is validly
+// signed but its sequence is not newer than the last accepted update.
+var ErrPolicyUpdateStale = errors.New("gossip: policy update sequence is not newer")
+
 // Retry backoff parameters (v1.0.7). Previously a deterministic
 // array [1s, 2s, 4s, 8s, 16s, 30s, 60s×4]; now a decorrelated-
 // jitter schedule matching Marc Brooker's AWS pattern (2015).
@@ -360,6 +364,20 @@ type MemberProfileStore interface {
 	GCExpiredMemberProfileAds(ctx context.Context, now time.Time) (int64, error)
 }
 
+type PolicyUpdateStore interface {
+	RestoreUpdateSnapshot(ctx context.Context, groupID entmoot.GroupID, snap policy.UpdateSnapshot, appliedSequence uint64) (bool, error)
+	ApplyUpdate(ctx context.Context, update policy.Update) (policy.UpdateApplyResult, error)
+}
+
+type pendingPolicyUpdate struct {
+	update          policy.Update
+	snapshot        policy.UpdateSnapshot
+	accepted        bool
+	contentLimiter  *ratelimit.Limiter
+	maxMessageBytes int64
+	retentionDays   int
+}
+
 // Config parameterizes a Gossiper. Every field except Fanout, Clock, and
 // Logger is required; New returns an error if a required field is nil or
 // zero. Construct one Gossiper per group per process.
@@ -451,6 +469,10 @@ type Config struct {
 	// GroupPolicy, when set, applies local content-message budgets for this
 	// group. nil preserves existing behavior for groups without policy.
 	GroupPolicy *policy.Policy
+
+	// PolicyUpdateStore persists accepted founder policy updates. nil drops
+	// policy-update system messages instead of applying them.
+	PolicyUpdateStore PolicyUpdateStore
 }
 
 // Gossiper runs the accept loop, publishes local messages, and fetches
@@ -569,6 +591,8 @@ type Gossiper struct {
 	contentLimiter  *ratelimit.Limiter
 	maxMessageBytes int64
 	retentionDays   int
+
+	policyUpdateMu sync.Mutex
 }
 
 // peerDialState tracks the per-peer dial-backoff state. nextAllowed
@@ -694,6 +718,14 @@ func (g *Gossiper) SetGroupPolicy(p policy.Policy) error {
 	g.retentionDays = retentionDays
 	g.policyMu.Unlock()
 	return nil
+}
+
+func (g *Gossiper) ClearGroupPolicy() {
+	g.policyMu.Lock()
+	g.contentLimiter = nil
+	g.maxMessageBytes = 0
+	g.retentionDays = 0
+	g.policyMu.Unlock()
 }
 
 // seedPlumtreeLocked populates eagerPushPeers with every current roster
@@ -1957,6 +1989,9 @@ func (g *Gossiper) fetchFrom(ctx context.Context, peer entmoot.NodeID, id entmoo
 }
 
 func (g *Gossiper) acceptInboundMessage(ctx context.Context, relay entmoot.NodeID, msg entmoot.Message) error {
+	if messageHasTopic(msg, policy.UpdateTopic) {
+		return g.storePolicyUpdateMessage(ctx, relay, msg, false)
+	}
 	if err := g.checkContentPolicy(relay, msg); err != nil {
 		return err
 	}
@@ -1964,6 +1999,130 @@ func (g *Gossiper) acceptInboundMessage(ctx context.Context, relay entmoot.NodeI
 		return err
 	}
 	return g.prunePolicyRetention(ctx)
+}
+
+func (g *Gossiper) storePolicyUpdateMessage(ctx context.Context, relay entmoot.NodeID, msg entmoot.Message, rejectStale bool) error {
+	g.policyUpdateMu.Lock()
+	defer g.policyUpdateMu.Unlock()
+
+	if rejectStale {
+		if has, err := g.cfg.Store.Has(ctx, msg.GroupID, msg.ID); err != nil {
+			return err
+		} else if has {
+			return g.prunePolicyRetention(ctx)
+		}
+	}
+	update, err := g.preparePolicyUpdateMessage(ctx, msg, rejectStale)
+	if err != nil {
+		if policyErr := g.checkContentPolicy(relay, msg); policyErr != nil {
+			return policyErr
+		}
+		return err
+	}
+	if err := g.cfg.Store.Put(ctx, msg); err != nil {
+		g.rollbackPolicyUpdate(context.Background(), update)
+		return err
+	}
+	if err := g.applyPreparedPolicyUpdate(update); err != nil {
+		return err
+	}
+	return g.prunePolicyRetention(ctx)
+}
+
+func (g *Gossiper) preparePolicyUpdateMessage(ctx context.Context, msg entmoot.Message, rejectStale bool) (*pendingPolicyUpdate, error) {
+	if !messageHasTopic(msg, policy.UpdateTopic) {
+		return nil, nil
+	}
+	if g.cfg.PolicyUpdateStore == nil {
+		return nil, errors.New("policy update store is not configured")
+	}
+	founder, ok := g.cfg.Roster.Founder()
+	if !ok {
+		return nil, errors.New("policy update rejected: group founder is unknown")
+	}
+	if msg.Author.PilotNodeID != founder.PilotNodeID || !bytes.Equal(msg.Author.EntmootPubKey, founder.EntmootPubKey) {
+		return nil, fmt.Errorf("policy update rejected: author %d is not founder %d", msg.Author.PilotNodeID, founder.PilotNodeID)
+	}
+	update, err := policy.ParseUpdate(msg.Content)
+	if err != nil {
+		return nil, fmt.Errorf("policy update rejected: %w", err)
+	}
+	if update.GroupID != g.cfg.GroupID || update.GroupID != msg.GroupID {
+		return nil, errors.New("policy update rejected: group_id mismatch")
+	}
+	var (
+		contentLimiter  *ratelimit.Limiter
+		maxMessageBytes int64
+		retentionDays   int
+	)
+	if update.Policy != nil {
+		contentLimiter, maxMessageBytes, retentionDays, err = contentPolicyRuntime(update.Policy, g.clk)
+		if err != nil {
+			return nil, fmt.Errorf("policy update rejected: %w", err)
+		}
+	}
+	result, err := g.cfg.PolicyUpdateStore.ApplyUpdate(ctx, update)
+	if err != nil {
+		return nil, fmt.Errorf("policy update rejected: %w", err)
+	}
+	if !result.Accepted {
+		if rejectStale {
+			return nil, ErrPolicyUpdateStale
+		}
+		return &pendingPolicyUpdate{update: update, snapshot: result.Snapshot}, nil
+	}
+	return &pendingPolicyUpdate{
+		update:          update,
+		snapshot:        result.Snapshot,
+		accepted:        true,
+		contentLimiter:  contentLimiter,
+		maxMessageBytes: maxMessageBytes,
+		retentionDays:   retentionDays,
+	}, nil
+}
+
+func (g *Gossiper) rollbackPolicyUpdate(ctx context.Context, update *pendingPolicyUpdate) {
+	if update == nil || !update.accepted || g.cfg.PolicyUpdateStore == nil {
+		return
+	}
+	restored, err := g.cfg.PolicyUpdateStore.RestoreUpdateSnapshot(ctx, update.update.GroupID, update.snapshot, update.update.Sequence)
+	if err != nil {
+		g.logger.Warn("gossip: policy update rollback failed",
+			slog.String("group_id", update.update.GroupID.String()),
+			slog.Uint64("sequence", update.update.Sequence),
+			slog.String("err", err.Error()))
+		return
+	}
+	if !restored {
+		g.logger.Debug("gossip: policy update rollback skipped after newer sequence",
+			slog.String("group_id", update.update.GroupID.String()),
+			slog.Uint64("sequence", update.update.Sequence))
+	}
+}
+
+func (g *Gossiper) applyPreparedPolicyUpdate(update *pendingPolicyUpdate) error {
+	if update == nil || !update.accepted {
+		return nil
+	}
+	if update.update.Policy == nil {
+		g.ClearGroupPolicy()
+		return nil
+	}
+	g.policyMu.Lock()
+	g.contentLimiter = update.contentLimiter
+	g.maxMessageBytes = update.maxMessageBytes
+	g.retentionDays = update.retentionDays
+	g.policyMu.Unlock()
+	return nil
+}
+
+func messageHasTopic(msg entmoot.Message, want string) bool {
+	for _, topic := range msg.Topics {
+		if topic == want {
+			return true
+		}
+	}
+	return false
 }
 
 func (g *Gossiper) checkContentPolicy(relay entmoot.NodeID, msg entmoot.Message) error {
@@ -1997,7 +2156,7 @@ func (g *Gossiper) prunePolicyRetention(ctx context.Context) error {
 	if cutoff <= 0 {
 		return nil
 	}
-	_, err := store.PruneBefore(ctx, g.cfg.Store, g.cfg.GroupID, cutoff)
+	_, err := store.PruneBeforeExceptTopics(ctx, g.cfg.Store, g.cfg.GroupID, cutoff, []string{policy.UpdateTopic})
 	return err
 }
 
@@ -2064,14 +2223,20 @@ func (g *Gossiper) Publish(ctx context.Context, msg entmoot.Message) error {
 	if err := g.verifyMessage(msg); err != nil {
 		return err
 	}
-	if err := g.checkContentPolicy(g.cfg.LocalNode, msg); err != nil {
-		return err
-	}
-	if err := g.cfg.Store.Put(ctx, msg); err != nil {
-		return fmt.Errorf("gossip: store put: %w", err)
-	}
-	if err := g.prunePolicyRetention(ctx); err != nil {
-		return fmt.Errorf("gossip: prune retention: %w", err)
+	if messageHasTopic(msg, policy.UpdateTopic) {
+		if err := g.storePolicyUpdateMessage(ctx, g.cfg.LocalNode, msg, true); err != nil {
+			return err
+		}
+	} else {
+		if err := g.checkContentPolicy(g.cfg.LocalNode, msg); err != nil {
+			return err
+		}
+		if err := g.cfg.Store.Put(ctx, msg); err != nil {
+			return fmt.Errorf("gossip: store put: %w", err)
+		}
+		if err := g.prunePolicyRetention(ctx); err != nil {
+			return fmt.Errorf("gossip: prune retention: %w", err)
+		}
 	}
 
 	// v1.0.3 publish semantics: local-durable accept is the contract.

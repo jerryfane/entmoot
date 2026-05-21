@@ -122,11 +122,38 @@ type RetentionPruner interface {
 // retention pruning. Stores that do not implement RetentionPruner are left
 // unchanged so older test doubles keep current behavior.
 func PruneBefore(ctx context.Context, st MessageStore, groupID entmoot.GroupID, beforeMillis int64) (int64, error) {
+	return PruneBeforeExceptTopics(ctx, st, groupID, beforeMillis, nil)
+}
+
+// RetentionPrunerWithExemptTopics is implemented by stores that can keep
+// control-plane messages while pruning old content history.
+type RetentionPrunerWithExemptTopics interface {
+	PruneBeforeExceptTopics(ctx context.Context, groupID entmoot.GroupID, beforeMillis int64, exemptTopics []string) (int64, error)
+}
+
+// PruneBeforeExceptTopics removes old messages except messages carrying one of
+// exemptTopics. Stores without topic-aware pruning only prune when no exemption
+// is requested, preserving the old interface contract for test doubles.
+func PruneBeforeExceptTopics(ctx context.Context, st MessageStore, groupID entmoot.GroupID, beforeMillis int64, exemptTopics []string) (int64, error) {
+	if pruner, ok := st.(RetentionPrunerWithExemptTopics); ok {
+		return pruner.PruneBeforeExceptTopics(ctx, groupID, beforeMillis, exemptTopics)
+	}
 	pruner, ok := st.(RetentionPruner)
-	if !ok || beforeMillis <= 0 {
+	if !ok || beforeMillis <= 0 || len(exemptTopics) > 0 {
 		return 0, nil
 	}
 	return pruner.PruneBefore(ctx, groupID, beforeMillis)
+}
+
+func hasAnyTopic(m entmoot.Message, topics []string) bool {
+	for _, msgTopic := range m.Topics {
+		for _, topic := range topics {
+			if msgTopic == topic {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // isZeroGroupID reports whether g is the zero GroupID.

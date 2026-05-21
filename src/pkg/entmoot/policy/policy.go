@@ -4,6 +4,7 @@ package policy
 import (
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -56,6 +57,9 @@ func (p Policy) Validate() error {
 	}
 	if p.ByteBurstPerAuthor <= 0 {
 		return errors.New("byte_burst_per_author must be positive")
+	}
+	if p.ByteBurstPerAuthor > int64(math.MaxInt) {
+		return fmt.Errorf("byte_burst_per_author %d overflows int", p.ByteBurstPerAuthor)
 	}
 	if p.MaxMessageBytes <= 0 {
 		return errors.New("max_message_bytes must be positive")

@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"entmoot/pkg/entmoot"
 )
 
 func TestTheEntMootDefaultPolicy(t *testing.T) {
@@ -240,5 +242,40 @@ func TestPolicySummary(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Fatalf("Summary = %q, missing %q", got, want)
 		}
+	}
+}
+
+func TestPolicyUpdateParseAndValidate(t *testing.T) {
+	var gid entmoot.GroupID
+	for i := range gid {
+		gid[i] = 0x61
+	}
+	p := Standard()
+	update := NewUpdate(gid, &p, 1_000, 1)
+	raw, err := json.Marshal(update)
+	if err != nil {
+		t.Fatalf("Marshal update: %v", err)
+	}
+	parsed, err := ParseUpdate(raw)
+	if err != nil {
+		t.Fatalf("ParseUpdate: %v", err)
+	}
+	if parsed.Type != UpdateType || parsed.GroupID != gid || parsed.Policy == nil || *parsed.Policy != p || parsed.Sequence != 1 {
+		t.Fatalf("parsed update = %+v, want original", parsed)
+	}
+	clear := NewUpdate(gid, nil, 1_001, 2)
+	raw, err = json.Marshal(clear)
+	if err != nil {
+		t.Fatalf("Marshal clear: %v", err)
+	}
+	parsed, err = ParseUpdate(raw)
+	if err != nil {
+		t.Fatalf("ParseUpdate clear: %v", err)
+	}
+	if parsed.Policy != nil || parsed.Sequence != 2 {
+		t.Fatalf("parsed clear = %+v, want nil policy seq 2", parsed)
+	}
+	if _, err := ParseUpdate([]byte(`{"type":"wrong"}`)); err == nil {
+		t.Fatal("ParseUpdate invalid returned nil error")
 	}
 }

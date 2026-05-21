@@ -26,6 +26,7 @@ import (
 	"entmoot/pkg/entmoot/defaultmoot"
 	"entmoot/pkg/entmoot/esphttp"
 	"entmoot/pkg/entmoot/events"
+	"entmoot/pkg/entmoot/gossip"
 	"entmoot/pkg/entmoot/ipc"
 	"entmoot/pkg/entmoot/keystore"
 	entpolicy "entmoot/pkg/entmoot/policy"
@@ -1349,6 +1350,12 @@ func (n *notifyingStore) MerkleRoot(ctx context.Context, gid entmoot.GroupID) ([
 func (n *notifyingStore) IterMessageIDsInIDRange(ctx context.Context, gid entmoot.GroupID, loID, hiID entmoot.MessageID) ([]entmoot.MessageID, error) {
 	return n.inner.IterMessageIDsInIDRange(ctx, gid, loID, hiID)
 }
+func (n *notifyingStore) PruneBefore(ctx context.Context, gid entmoot.GroupID, beforeMillis int64) (int64, error) {
+	return store.PruneBefore(ctx, n.inner, gid, beforeMillis)
+}
+func (n *notifyingStore) PruneBeforeExceptTopics(ctx context.Context, gid entmoot.GroupID, beforeMillis int64, exemptTopics []string) (int64, error) {
+	return store.PruneBeforeExceptTopics(ctx, n.inner, gid, beforeMillis, exemptTopics)
+}
 func (n *notifyingStore) Close() error { return n.inner.Close() }
 
 // ipcServer bundles the state IPC handlers need. All fields are
@@ -1466,16 +1473,9 @@ func (s *ipcServer) handleSignedPublish(ctx context.Context, c net.Conn, req *ip
 		return
 	}
 	if err := sess.gossip.Publish(ctx, msg); err != nil {
-		code := ipc.CodeInternal
-		switch {
-		case errors.Is(err, entmoot.ErrNotMember):
-			code = ipc.CodeNotMember
-		case errors.Is(err, entmoot.ErrSigInvalid):
-			code = ipc.CodeInvalidArgument
-		}
 		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
 			Type:    "error",
-			Code:    code,
+			Code:    publishErrorCode(err),
 			GroupID: &gid,
 			Message: "signed publish: " + err.Error(),
 		})
@@ -1596,7 +1596,7 @@ func (s *ipcServer) publishLocalMessage(ctx context.Context, gid entmoot.GroupID
 	if err := sess.gossip.Publish(ctx, msg); err != nil {
 		return nil, &ipc.ErrorFrame{
 			Type:    "error",
-			Code:    ipc.CodeInternal,
+			Code:    publishErrorCode(err),
 			Message: "gossiper.Publish: " + err.Error(),
 		}
 	}
@@ -1606,6 +1606,19 @@ func (s *ipcServer) publishLocalMessage(ctx context.Context, gid entmoot.GroupID
 		GroupID:     gid,
 		TimestampMS: now,
 	}, nil
+}
+
+func publishErrorCode(err error) ipc.ErrorCode {
+	switch {
+	case errors.Is(err, entmoot.ErrNotMember):
+		return ipc.CodeNotMember
+	case errors.Is(err, entmoot.ErrSigInvalid):
+		return ipc.CodeInvalidArgument
+	case errors.Is(err, gossip.ErrPolicyUpdateStale):
+		return ipc.CodeConflict
+	default:
+		return ipc.CodeInternal
+	}
 }
 
 func (s *ipcServer) handleDiagProbe(ctx context.Context, c net.Conn, req *ipc.DiagProbeReq) {
