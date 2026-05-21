@@ -72,6 +72,7 @@ type groupRuntime struct {
 	mu                    sync.RWMutex
 	sessions              map[entmoot.GroupID]*groupSession
 	joining               map[entmoot.GroupID]chan struct{}
+	stopping              map[entmoot.GroupID]chan struct{}
 	joinHealthInvites     map[entmoot.GroupID]entmoot.Invite
 	handshakeApprovalWake chan struct{}
 	wg                    sync.WaitGroup
@@ -82,7 +83,9 @@ type groupSession struct {
 	ctx                  context.Context
 	roster               *roster.RosterLog
 	gossip               *gossip.Gossiper
+	transport            *groupTransport
 	cancel               context.CancelFunc
+	done                 chan struct{}
 	unsubscribeEndpoints func()
 	unsubscribeRoster    func()
 }
@@ -214,6 +217,7 @@ func newGroupRuntime(cfg groupRuntimeConfig) (*groupRuntime, error) {
 		mux:                   newGroupMuxTransport(cfg.Transport, logger),
 		sessions:              make(map[entmoot.GroupID]*groupSession),
 		joining:               make(map[entmoot.GroupID]chan struct{}),
+		stopping:              make(map[entmoot.GroupID]chan struct{}),
 		handshakeApprovalWake: make(chan struct{}, 1),
 	}, nil
 }
@@ -339,6 +343,15 @@ func (r *groupRuntime) addGroup(ctx context.Context, groupID entmoot.GroupID, bo
 	var joinDone chan struct{}
 	for {
 		r.mu.Lock()
+		if ch, ok := r.stopping[groupID]; ok {
+			r.mu.Unlock()
+			select {
+			case <-ch:
+				continue
+			case <-ctx.Done():
+				return nil, false, ctx.Err()
+			}
+		}
 		if sess, ok := r.sessions[groupID]; ok {
 			r.mu.Unlock()
 			return sess, false, nil
@@ -371,7 +384,7 @@ func (r *groupRuntime) addGroup(ctx context.Context, groupID entmoot.GroupID, bo
 	cleanupGroup := func() {
 		unsubscribeEndpoints()
 		if createdGroup {
-			r.mux.RemoveGroup(groupID)
+			r.mux.RemoveGroupIfCurrent(groupID, groupTransport)
 		}
 	}
 	diskState := snapshotGroupDiskState(r.dataDir, groupID)
@@ -446,7 +459,9 @@ func (r *groupRuntime) addGroup(ctx context.Context, groupID entmoot.GroupID, bo
 		ctx:                  sessCtx,
 		roster:               rlog,
 		gossip:               g,
+		transport:            groupTransport,
 		cancel:               sessCancel,
+		done:                 make(chan struct{}),
 		unsubscribeEndpoints: unsubscribeEndpoints,
 	}
 
@@ -464,6 +479,7 @@ func (r *groupRuntime) addGroup(ctx context.Context, groupID entmoot.GroupID, bo
 	r.wg.Add(1)
 	go func() {
 		defer r.wg.Done()
+		defer close(sess.done)
 		if err := g.Start(sessCtx); err != nil {
 			r.logger.Warn("group runtime: group gossiper stopped",
 				slog.String("group_id", groupID.String()),
@@ -594,6 +610,36 @@ func (r *groupRuntime) Get(groupID entmoot.GroupID) (*groupSession, bool) {
 	return sess, ok
 }
 
+func (r *groupRuntime) RemoveGroup(groupID entmoot.GroupID) bool {
+	stopDone := make(chan struct{})
+	r.mu.Lock()
+	sess, ok := r.sessions[groupID]
+	if ok {
+		if r.stopping == nil {
+			r.stopping = make(map[entmoot.GroupID]chan struct{})
+		}
+		r.stopping[groupID] = stopDone
+	}
+	if ok {
+		delete(r.sessions, groupID)
+		delete(r.joinHealthInvites, groupID)
+	}
+	r.mu.Unlock()
+	if !ok {
+		return false
+	}
+	defer func() {
+		r.mu.Lock()
+		if r.stopping[groupID] == stopDone {
+			delete(r.stopping, groupID)
+			close(stopDone)
+		}
+		r.mu.Unlock()
+	}()
+	r.stopSession(sess)
+	return true
+}
+
 func (r *groupRuntime) ActiveGroupIDs() []entmoot.GroupID {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -661,17 +707,25 @@ func (r *groupRuntime) Close() {
 	}
 	r.mu.RUnlock()
 	for _, sess := range sessions {
-		sess.cancel()
-		if sess.unsubscribeEndpoints != nil {
-			sess.unsubscribeEndpoints()
-		}
-		if sess.unsubscribeRoster != nil {
-			sess.unsubscribeRoster()
-		}
+		r.stopSession(sess)
 	}
 	r.wg.Wait()
-	for _, sess := range sessions {
-		_ = sess.roster.Close()
+}
+
+func (r *groupRuntime) stopSession(sess *groupSession) {
+	sess.cancel()
+	if sess.unsubscribeEndpoints != nil {
+		sess.unsubscribeEndpoints()
+	}
+	if sess.unsubscribeRoster != nil {
+		sess.unsubscribeRoster()
+	}
+	if sess.done != nil {
+		<-sess.done
+	}
+	_ = sess.roster.Close()
+	if sess.transport != nil {
+		r.mux.RemoveGroupIfCurrent(sess.groupID, sess.transport)
 	}
 }
 
@@ -715,6 +769,16 @@ func (m *groupMuxTransport) Group(groupID entmoot.GroupID) (*groupTransport, boo
 func (m *groupMuxTransport) RemoveGroup(groupID entmoot.GroupID) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	delete(m.groups, groupID)
+	delete(m.cbs, groupID)
+}
+
+func (m *groupMuxTransport) RemoveGroupIfCurrent(groupID entmoot.GroupID, tr *groupTransport) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if current, ok := m.groups[groupID]; !ok || current != tr {
+		return
+	}
 	delete(m.groups, groupID)
 	delete(m.cbs, groupID)
 }
@@ -1005,7 +1069,7 @@ func (t *groupTransport) ClassifyStreamError(err error) gossip.StreamErrorClassi
 }
 
 func (t *groupTransport) Close() error {
-	t.parent.RemoveGroup(t.groupID)
+	t.parent.RemoveGroupIfCurrent(t.groupID, t)
 	return nil
 }
 

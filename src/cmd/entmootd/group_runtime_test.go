@@ -637,6 +637,188 @@ func TestIPCInviteAuthorityCheckRequiresPilotLookupCapability(t *testing.T) {
 	}
 }
 
+func TestIPCInviteAuthorityCheckAcceptsCandidateInviteWithoutJoining(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	dataDir := t.TempDir()
+	identity, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate identity: %v", err)
+	}
+	st, err := store.OpenSQLite(dataDir)
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	defer st.Close()
+	rt, err := newGroupRuntime(groupRuntimeConfig{
+		NodeID:    45491,
+		Identity:  identity,
+		DataDir:   dataDir,
+		Store:     st,
+		Notify:    newNotifyingStore(st, events.NewBus()),
+		Transport: newRuntimeFakeTransport(),
+	})
+	if err != nil {
+		t.Fatalf("newGroupRuntime: %v", err)
+	}
+	defer rt.Close()
+
+	gid := testRuntimeGroupID(0xB5)
+	invite := selfInvite(t, dataDir, st, identity, 45491, gid)
+	server := &ipcServer{runtime: rt, nodeID: 45491, identity: identity, store: st, pilotLookupNodeSupported: true}
+	payload := callInviteAuthorityCheckHandler(t, ctx, server, &ipc.InviteAuthorityCheckReq{
+		GroupID:         gid,
+		CandidateInvite: &invite,
+	})
+	resp, ok := payload.(*ipc.InviteAuthorityCheckResp)
+	if !ok {
+		t.Fatalf("payload = %T, want *InviteAuthorityCheckResp", payload)
+	}
+	if resp.GroupID != gid || resp.Members != 1 || resp.RosterHead != invite.RosterHead {
+		t.Fatalf("response = %+v, want candidate invite authority", resp)
+	}
+	if _, ok := rt.Get(gid); ok {
+		t.Fatal("candidate authority check joined the group")
+	}
+}
+
+func TestIPCGroupDeactivateStopsRuntimeSession(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	dataDir := t.TempDir()
+	identity, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate identity: %v", err)
+	}
+	st, err := store.OpenSQLite(dataDir)
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	defer st.Close()
+	rt, err := newGroupRuntime(groupRuntimeConfig{
+		NodeID:    45491,
+		Identity:  identity,
+		DataDir:   dataDir,
+		Store:     st,
+		Notify:    newNotifyingStore(st, events.NewBus()),
+		Transport: newRuntimeFakeTransport(),
+	})
+	if err != nil {
+		t.Fatalf("newGroupRuntime: %v", err)
+	}
+	defer rt.Close()
+
+	gid := testRuntimeGroupID(0xB6)
+	invite := selfInvite(t, dataDir, st, identity, 45491, gid)
+	if _, created, err := rt.AddInvite(ctx, invite); err != nil || !created {
+		t.Fatalf("AddInvite created/err = %v/%v, want true/nil", created, err)
+	}
+	server := &ipcServer{runtime: rt}
+	payload := callGroupDeactivateHandler(t, server, &ipc.GroupDeactivateReq{GroupID: gid})
+	resp, ok := payload.(*ipc.GroupDeactivateResp)
+	if !ok {
+		t.Fatalf("payload = %T, want *GroupDeactivateResp", payload)
+	}
+	if resp.Status != "deactivated" || resp.GroupID != gid {
+		t.Fatalf("response = %+v", resp)
+	}
+	if _, ok := rt.Get(gid); ok {
+		t.Fatal("group remained active after deactivation")
+	}
+}
+
+func TestGroupRuntimeAddInviteWaitsForStoppingGroup(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	dataDir := t.TempDir()
+	identity, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate identity: %v", err)
+	}
+	st, err := store.OpenSQLite(dataDir)
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	defer st.Close()
+	rt, err := newGroupRuntime(groupRuntimeConfig{
+		NodeID:    45491,
+		Identity:  identity,
+		DataDir:   dataDir,
+		Store:     st,
+		Notify:    newNotifyingStore(st, events.NewBus()),
+		Transport: newRuntimeFakeTransport(),
+	})
+	if err != nil {
+		t.Fatalf("newGroupRuntime: %v", err)
+	}
+	defer rt.Close()
+
+	gid := testRuntimeGroupID(0xB8)
+	invite := selfInvite(t, dataDir, st, identity, 45491, gid)
+	stopDone := make(chan struct{})
+	rt.mu.Lock()
+	rt.stopping[gid] = stopDone
+	rt.mu.Unlock()
+
+	type addResult struct {
+		created bool
+		err     error
+	}
+	resultCh := make(chan addResult, 1)
+	go func() {
+		_, created, err := rt.AddInvite(ctx, invite)
+		resultCh <- addResult{created: created, err: err}
+	}()
+
+	select {
+	case result := <-resultCh:
+		t.Fatalf("AddInvite returned while group was stopping: created=%v err=%v", result.created, result.err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	rt.mu.Lock()
+	if rt.stopping[gid] == stopDone {
+		delete(rt.stopping, gid)
+		close(stopDone)
+	}
+	rt.mu.Unlock()
+
+	select {
+	case result := <-resultCh:
+		if result.err != nil || !result.created {
+			t.Fatalf("AddInvite after stopping created/err = %v/%v, want true/nil", result.created, result.err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("AddInvite did not complete after stopping finished: %v", ctx.Err())
+	}
+}
+
+func TestGroupMuxRemoveGroupIfCurrentPreservesRejoinedTransport(t *testing.T) {
+	base := newRuntimeFakeTransport()
+	mux := newGroupMuxTransport(base, nil)
+	gid := testRuntimeGroupID(0xB7)
+	oldTransport, oldCreated := mux.Group(gid)
+	if !oldCreated {
+		t.Fatal("first mux group was not created")
+	}
+	mux.RemoveGroupIfCurrent(gid, oldTransport)
+	newTransport, newCreated := mux.Group(gid)
+	if !newCreated {
+		t.Fatal("new mux group was not created after old removal")
+	}
+	mux.RemoveGroupIfCurrent(gid, oldTransport)
+	got, created := mux.Group(gid)
+	if created {
+		t.Fatal("old transport removal deleted the rejoined mux group")
+	}
+	if got != newTransport {
+		t.Fatalf("mux group = %p, want rejoined transport %p", got, newTransport)
+	}
+}
+
 func TestPublishErrorCodeMapsPolicyConflict(t *testing.T) {
 	if got := publishErrorCode(gossip.ErrPolicyUpdateStale); got != ipc.CodeConflict {
 		t.Fatalf("publishErrorCode(stale) = %s, want %s", got, ipc.CodeConflict)
@@ -1371,6 +1553,24 @@ func callInviteAuthorityCheckHandler(t *testing.T, ctx context.Context, server *
 	_, payload, err := ipc.ReadAndDecode(client)
 	if err != nil {
 		t.Fatalf("ReadAndDecode invite authority response: %v", err)
+	}
+	<-done
+	return payload
+}
+
+func callGroupDeactivateHandler(t *testing.T, server *ipcServer, req *ipc.GroupDeactivateReq) any {
+	t.Helper()
+	client, daemon := net.Pipe()
+	defer client.Close()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer daemon.Close()
+		server.handleGroupDeactivate(daemon, req)
+	}()
+	_, payload, err := ipc.ReadAndDecode(client)
+	if err != nil {
+		t.Fatalf("ReadAndDecode group deactivate response: %v", err)
 	}
 	<-done
 	return payload

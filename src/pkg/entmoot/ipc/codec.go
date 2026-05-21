@@ -14,7 +14,8 @@ import (
 // *SignedPublishReq, *SignedPublishResp, *JoinGroupReq, *JoinGroupResp,
 // *InviteCreateReq, *InviteCreateResp, *InviteAuthorityCheckReq,
 // *InviteAuthorityCheckResp, *MemberRemoveReq, *MemberRemoveResp,
-// *TailSubscribe, *TailEvent, *InfoReq, *InfoResp, *ErrorFrame.
+// *GroupDeactivateReq, *GroupDeactivateResp, *TailSubscribe, *TailEvent,
+// *InfoReq, *InfoResp, *ErrorFrame.
 // Anything else returns ErrUnknownMessage.
 //
 // As a convenience, Encode fills in ErrorFrame.Type = "error" when the
@@ -51,6 +52,10 @@ func Encode(v any) (MsgType, []byte, error) {
 		t = MsgDiagProbeReq
 	case *DiagProbeResp:
 		t = MsgDiagProbeResp
+	case *GroupDeactivateReq:
+		t = MsgGroupDeactivateReq
+	case *GroupDeactivateResp:
+		t = MsgGroupDeactivateResp
 	case *TailSubscribe:
 		t = MsgTailSubscribe
 	case *TailEvent:
@@ -115,6 +120,10 @@ func Decode(t MsgType, body []byte) (any, error) {
 		return decodeAs[DiagProbeReq](t, body)
 	case MsgDiagProbeResp:
 		return decodeAs[DiagProbeResp](t, body)
+	case MsgGroupDeactivateReq:
+		return decodeAs[GroupDeactivateReq](t, body)
+	case MsgGroupDeactivateResp:
+		return decodeAs[GroupDeactivateResp](t, body)
 	case MsgTailSubscribe:
 		return decodeAs[TailSubscribe](t, body)
 	case MsgTailEvent:

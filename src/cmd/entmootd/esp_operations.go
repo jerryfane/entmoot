@@ -99,6 +99,8 @@ type groupCreatePayload struct {
 	Name        string          `json:"name,omitempty"`
 	Description string          `json:"description,omitempty"`
 	Tags        []string        `json:"tags,omitempty"`
+	Visibility  string          `json:"visibility,omitempty"`
+	JoinMode    string          `json:"join_mode,omitempty"`
 	Metadata    json.RawMessage `json:"metadata,omitempty"`
 }
 
@@ -2379,6 +2381,39 @@ func (e espOperationExecutor) checkInviteAuthorityOverIPC(ctx context.Context, r
 	}
 }
 
+func (e espOperationExecutor) deactivateGroupOverIPC(ctx context.Context, req *ipc.GroupDeactivateReq) (*ipc.GroupDeactivateResp, error) {
+	timeout := e.timeout
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	dialCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer cancel()
+	var dialer net.Dialer
+	conn, err := dialer.DialContext(dialCtx, "unix", e.socketPath)
+	if err != nil {
+		return nil, joinUnavailableError(err)
+	}
+	defer conn.Close()
+	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+		return nil, err
+	}
+	if err := ipc.EncodeAndWrite(conn, req); err != nil {
+		return nil, err
+	}
+	_, payload, err := ipc.ReadAndDecode(conn)
+	if err != nil {
+		return nil, err
+	}
+	switch v := payload.(type) {
+	case *ipc.GroupDeactivateResp:
+		return v, nil
+	case *ipc.ErrorFrame:
+		return nil, operationIPCError(v)
+	default:
+		return nil, fmt.Errorf("unexpected group deactivate response %T", payload)
+	}
+}
+
 func (e espOperationExecutor) removeMemberOverIPC(ctx context.Context, req *ipc.MemberRemoveReq) (*memberRemoveIPCResult, error) {
 	timeout := e.timeout
 	if timeout <= 0 {
@@ -2498,6 +2533,20 @@ func normalizeGroupMetadata(payload groupCreatePayload) (json.RawMessage, error)
 	}
 	if len(payload.Tags) > 0 {
 		meta["tags"] = normalizeGroupTags(payload.Tags)
+	}
+	if payload.Visibility != "" {
+		visibility := normalizeGroupVisibility(payload.Visibility)
+		if visibility == "" {
+			return nil, fmt.Errorf("invalid visibility %q", payload.Visibility)
+		}
+		meta["visibility"] = visibility
+	}
+	if payload.JoinMode != "" {
+		joinMode := normalizeGroupJoinMode(payload.JoinMode)
+		if joinMode == "" {
+			return nil, fmt.Errorf("invalid join_mode %q", payload.JoinMode)
+		}
+		meta["join_mode"] = joinMode
 	}
 	data, err := json.Marshal(meta)
 	if err != nil {
