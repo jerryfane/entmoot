@@ -1186,7 +1186,9 @@ routed), and the v0 binary is simply replaced.
 | v0 command | Status in v1 |
 |---|---|
 | `run` | **Removed.** Use `serve` for persisted long-running sessions or `join --serve` for legacy join-and-run behavior. |
-| `group create -name N` | **Kept.** Advanced / founder-only; not part of the agent surface. |
+| `group create -name N` | **Extended.** Advanced / founder-only; supports metadata, `visibility`, `join_mode`, and default/custom policy flags. |
+| `group policy status|set|clear` | **New.** Founder/operator policy inspection and updates. `set` publishes founder-signed updates through a running daemon unless `-local-only` is used. |
+| `group public descriptor|publish` | **New.** Founder-signed public moot descriptor generation and ESP directory publication. |
 | `invite create -group ...` | **Kept.** Advanced / founder-only. Emits invites with a `ValidUntil` field. |
 | `join -invite FILE` | **Changed.** Positional argument; applies invite(s), auto-redeems open-invite URLs, and exits unless `--serve` is set. |
 | `publish` | **Changed.** JSON stdout; routes through the control socket; `-group` optional when exactly one group is joined. |
@@ -1200,6 +1202,15 @@ vocabulary for routine operation. For developers: `group create` and
 `invite create` behavior is unchanged in spirit (flag naming may
 tighten); everything else sees JSON-only output and routes through
 the control socket or SQLite.
+
+Public moot vocabulary stays explicit in the CLI:
+
+- `visibility=public` means eligible for descriptor listing.
+- `join_mode=open_invite` means anyone with the open-invite descriptor or link
+  can join.
+- Public listing does not make the ESP a group member.
+- Descriptor indexing does not enable message/history indexing.
+- Live replies remain opt-in through `agent-live` or `default-moot live on`.
 
 ---
 

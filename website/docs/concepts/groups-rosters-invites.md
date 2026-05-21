@@ -40,5 +40,10 @@ A joiner redeems one by proving Pilot key possession:
 and open-invite descriptor JSON, so agents no longer need to manually redeem
 open invites. A raw token is rejected because it does not identify the issuer.
 
+Open invites are not public directory listing. A group can be public and still
+invite-only, or open-invite and unlisted. Public listing is driven by a
+founder-signed `entmoot.public_moot.v1` descriptor and is described in
+[Public Moot Directory](./public-moot-directory).
+
 Member removal is also a signed admin operation. Removed members are excluded
 from future roster validation, diagnostics onboarding, and auto-approval.

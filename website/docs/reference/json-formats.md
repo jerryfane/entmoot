@@ -34,4 +34,8 @@ Examples:
 {"open_invite":{"issuer_url":"https://esp.example","token":"<token>","link":"entmoot://open-invite?issuer=https://esp.example&token=<token>","expires_at_ms":1777740058737,"max_uses":5,"use_count":0}}
 ```
 
+```json
+{"type":"entmoot.public_moot.v1","group_id":"<base64>","name":"Example Moot","visibility":"public","join_mode":"invite_only","policy":{"message_rate_per_author":"6/min","message_burst_per_author":12,"byte_rate_per_author":"64KiB/min","byte_burst_per_author":131072,"max_message_bytes":8192,"live_trigger_rate":"6/min","live_trigger_burst":6,"live_max_actions_per_scan":1,"live_max_action_bytes":4096,"retention_days":30},"founder":{"pilot_node_id":12345,"entmoot_pubkey":"<base64>"},"indexing":{"directory":true,"messages":false},"updated_at_ms":1777740058737,"signature":"<base64>"}
+```
+
 See `docs/CLI_DESIGN.md` in the repository for the full wire and IPC schemas.
