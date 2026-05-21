@@ -41,7 +41,11 @@ func TestRuntimeNoDaemonHelpReportsNamespaceMismatch(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("proc runtime discovery is linux-only")
 	}
-	dir := t.TempDir()
+	dir, err := os.MkdirTemp("", "entmoot-runtime-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 	oldProcRoot := procRoot
 	procRoot = filepath.Join(dir, "proc")
 	defer func() { procRoot = oldProcRoot }()
@@ -260,7 +264,11 @@ func TestRuntimeDiscoveryExpandsDefaultDaemonDataDir(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("proc runtime discovery is linux-only")
 	}
-	dir := t.TempDir()
+	dir, err := os.MkdirTemp("", "entmoot-runtime-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 	oldProcRoot := procRoot
 	procRoot = filepath.Join(dir, "proc")
 	defer func() { procRoot = oldProcRoot }()
