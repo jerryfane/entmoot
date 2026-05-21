@@ -40,18 +40,7 @@ type Policy struct {
 
 // TheEntMootDefault returns the default local policy for The Ent Moot.
 func TheEntMootDefault() Policy {
-	return Policy{
-		MessageRatePerAuthor:  DefaultMessageRatePerAuthor,
-		MessageBurstPerAuthor: DefaultMessageBurstPerAuthor,
-		ByteRatePerAuthor:     DefaultByteRatePerAuthor,
-		ByteBurstPerAuthor:    DefaultByteBurstPerAuthor,
-		MaxMessageBytes:       DefaultMaxMessageBytes,
-		LiveTriggerRate:       DefaultLiveTriggerRate,
-		LiveTriggerBurst:      DefaultLiveTriggerBurst,
-		LiveMaxActionsPerScan: DefaultLiveMaxActionsPerScan,
-		LiveMaxActionBytes:    DefaultLiveMaxActionBytes,
-		RetentionDays:         DefaultRetentionDays,
-	}
+	return Standard()
 }
 
 // Validate checks that p can be converted into concrete runtime limits.
