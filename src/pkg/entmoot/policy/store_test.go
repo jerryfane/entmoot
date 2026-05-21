@@ -143,6 +143,87 @@ func TestFileStoreDeleteAndValidation(t *testing.T) {
 	}
 }
 
+func TestFileStoreApplyUpdateSequencesAndClear(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenFileStore: %v", err)
+	}
+	gid := testGroupID(0x47)
+	standard := Standard()
+	update := NewUpdate(gid, &standard, 1_000, 10)
+	result, err := store.ApplyUpdate(ctx, update)
+	if err != nil || !result.Accepted {
+		t.Fatalf("ApplyUpdate accepted/err = %t/%v, want true/nil", result.Accepted, err)
+	}
+	if result.Snapshot.HasPolicy || result.Snapshot.HasSequence {
+		t.Fatalf("initial ApplyUpdate snapshot = %+v, want empty", result.Snapshot)
+	}
+	got, ok, err := store.Get(ctx, gid)
+	if err != nil || !ok {
+		t.Fatalf("Get applied ok/err = %t/%v, want true/nil", ok, err)
+	}
+	if got != standard {
+		t.Fatalf("policy = %+v, want standard", got)
+	}
+	if seq, ok, err := store.Sequence(ctx, gid); err != nil || !ok || seq != 10 {
+		t.Fatalf("Sequence = %d/%t/%v, want 10/true/nil", seq, ok, err)
+	}
+
+	snap, err := store.SnapshotUpdate(ctx, gid)
+	if err != nil {
+		t.Fatalf("SnapshotUpdate: %v", err)
+	}
+	relaxed := Relaxed()
+	result, err = store.ApplyUpdate(ctx, NewUpdate(gid, &relaxed, 1_100, 11))
+	if err != nil || !result.Accepted {
+		t.Fatalf("newer ApplyUpdate accepted/err = %t/%v, want true/nil", result.Accepted, err)
+	}
+	if !result.Snapshot.HasPolicy || result.Snapshot.Policy != standard || !result.Snapshot.HasSequence || result.Snapshot.Sequence != 10 {
+		t.Fatalf("newer ApplyUpdate snapshot = %+v, want standard/10", result.Snapshot)
+	}
+	if restored, err := store.RestoreUpdateSnapshot(ctx, gid, snap, 10); err != nil || restored {
+		t.Fatalf("stale RestoreUpdateSnapshot restored/err = %t/%v, want false/nil", restored, err)
+	}
+	got, ok, err = store.Get(ctx, gid)
+	if err != nil || !ok || got != relaxed {
+		t.Fatalf("policy after skipped restore = %+v ok=%t err=%v, want relaxed", got, ok, err)
+	}
+	if restored, err := store.RestoreUpdateSnapshot(ctx, gid, snap, 11); err != nil || !restored {
+		t.Fatalf("RestoreUpdateSnapshot restored/err = %t/%v, want true/nil", restored, err)
+	}
+	got, ok, err = store.Get(ctx, gid)
+	if err != nil || !ok || got != standard {
+		t.Fatalf("policy after restore = %+v ok=%t err=%v, want standard", got, ok, err)
+	}
+	if seq, ok, err := store.Sequence(ctx, gid); err != nil || !ok || seq != 10 {
+		t.Fatalf("Sequence after restore = %d/%t/%v, want 10/true/nil", seq, ok, err)
+	}
+
+	result, err = store.ApplyUpdate(ctx, NewUpdate(gid, &relaxed, 1_100, 10))
+	if err != nil || result.Accepted {
+		t.Fatalf("stale ApplyUpdate accepted/err = %t/%v, want false/nil", result.Accepted, err)
+	}
+	if !result.Snapshot.HasPolicy || result.Snapshot.Policy != standard || !result.Snapshot.HasSequence || result.Snapshot.Sequence != 10 {
+		t.Fatalf("stale ApplyUpdate snapshot = %+v, want current standard/10", result.Snapshot)
+	}
+	got, ok, err = store.Get(ctx, gid)
+	if err != nil || !ok || got != standard {
+		t.Fatalf("policy after stale = %+v ok=%t err=%v, want standard", got, ok, err)
+	}
+
+	result, err = store.ApplyUpdate(ctx, NewUpdate(gid, nil, 1_200, 12))
+	if err != nil || !result.Accepted {
+		t.Fatalf("clear ApplyUpdate accepted/err = %t/%v, want true/nil", result.Accepted, err)
+	}
+	if _, ok, err := store.Get(ctx, gid); err != nil || ok {
+		t.Fatalf("Get after clear ok/err = %t/%v, want false/nil", ok, err)
+	}
+	if seq, ok, err := store.Sequence(ctx, gid); err != nil || !ok || seq != 12 {
+		t.Fatalf("Sequence after clear = %d/%t/%v, want 12/true/nil", seq, ok, err)
+	}
+}
+
 func TestFileStoreConcurrentInstancesPreserveUpdates(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()

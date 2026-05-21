@@ -11,6 +11,7 @@ import (
 
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/canonical"
+	entpolicy "entmoot/pkg/entmoot/policy"
 )
 
 // mkMsg constructs a Message with a canonical-encoding-derived ID. Parents
@@ -468,6 +469,37 @@ func runStoreSuite(t *testing.T, newStore func(t *testing.T) MessageStore) {
 		}
 		if len(got) != 2 || got[0].ID != edge.ID || got[1].ID != newer.ID {
 			t.Fatalf("Range after prune got %v, want edge,newer", idsOf(got))
+		}
+	})
+
+	t.Run("PruneBeforeExceptTopicsPreservesPolicyUpdates", func(t *testing.T) {
+		s := newStore(t)
+		gid := randGroupID(t)
+		oldContent := mkMsg(t, gid, testAuthor(1, 0x01), 10, "old")
+		oldPolicy := mkMsg(t, gid, testAuthor(1, 0x01), 10, "policy")
+		oldPolicy.Topics = []string{entpolicy.UpdateTopic}
+		oldPolicy.ID = canonical.MessageID(oldPolicy)
+		newContent := mkMsg(t, gid, testAuthor(1, 0x01), 30, "new")
+		for _, m := range []entmoot.Message{oldContent, oldPolicy, newContent} {
+			if err := s.Put(ctx, m); err != nil {
+				t.Fatalf("Put: %v", err)
+			}
+		}
+
+		pruned, err := PruneBeforeExceptTopics(ctx, s, gid, 20, []string{entpolicy.UpdateTopic})
+		if err != nil {
+			t.Fatalf("PruneBeforeExceptTopics: %v", err)
+		}
+		if pruned != 1 {
+			t.Fatalf("PruneBeforeExceptTopics pruned = %d, want 1", pruned)
+		}
+		if _, err := s.Get(ctx, gid, oldContent.ID); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("Get old content err = %v, want ErrNotFound", err)
+		}
+		for _, m := range []entmoot.Message{oldPolicy, newContent} {
+			if _, err := s.Get(ctx, gid, m.ID); err != nil {
+				t.Fatalf("Get retained %s: %v", m.ID, err)
+			}
 		}
 	})
 

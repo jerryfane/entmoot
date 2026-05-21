@@ -57,6 +57,12 @@ func (s *Memory) Put(_ context.Context, m entmoot.Message) error {
 
 // PruneBefore removes messages in groupID older than beforeMillis.
 func (s *Memory) PruneBefore(_ context.Context, groupID entmoot.GroupID, beforeMillis int64) (int64, error) {
+	return s.PruneBeforeExceptTopics(context.Background(), groupID, beforeMillis, nil)
+}
+
+// PruneBeforeExceptTopics removes old content messages but preserves messages
+// carrying exemptTopics.
+func (s *Memory) PruneBeforeExceptTopics(_ context.Context, groupID entmoot.GroupID, beforeMillis int64, exemptTopics []string) (int64, error) {
 	if beforeMillis <= 0 {
 		return 0, nil
 	}
@@ -69,6 +75,9 @@ func (s *Memory) PruneBefore(_ context.Context, groupID entmoot.GroupID, beforeM
 	}
 	var pruned int64
 	for id, msg := range bucket {
+		if hasAnyTopic(msg, exemptTopics) {
+			continue
+		}
 		if msg.Timestamp < beforeMillis {
 			delete(bucket, id)
 			pruned++

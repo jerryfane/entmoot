@@ -171,6 +171,12 @@ func (s *JSONL) Put(_ context.Context, m entmoot.Message) error {
 // PruneBefore removes messages in groupID older than beforeMillis and rewrites
 // that group's JSONL file to match the bounded in-memory index.
 func (s *JSONL) PruneBefore(_ context.Context, groupID entmoot.GroupID, beforeMillis int64) (int64, error) {
+	return s.PruneBeforeExceptTopics(context.Background(), groupID, beforeMillis, nil)
+}
+
+// PruneBeforeExceptTopics removes old content messages but preserves messages
+// carrying exemptTopics.
+func (s *JSONL) PruneBeforeExceptTopics(_ context.Context, groupID entmoot.GroupID, beforeMillis int64, exemptTopics []string) (int64, error) {
 	if beforeMillis <= 0 {
 		return 0, nil
 	}
@@ -184,7 +190,7 @@ func (s *JSONL) PruneBefore(_ context.Context, groupID entmoot.GroupID, beforeMi
 	kept := make(map[entmoot.MessageID]entmoot.Message, len(gs.msgs))
 	var pruned int64
 	for id, msg := range gs.msgs {
-		if msg.Timestamp < beforeMillis {
+		if msg.Timestamp < beforeMillis && !hasAnyTopic(msg, exemptTopics) {
 			pruned++
 			continue
 		}

@@ -405,6 +405,7 @@ func (r *groupRuntime) addGroup(ctx context.Context, groupID entmoot.GroupID, bo
 		MemberProfileStore: r.store,
 		RateLimiter:        ratelimit.New(entpolicy.SystemLimits(groupPolicy), nil),
 		GroupPolicy:        groupPolicy,
+		PolicyUpdateStore:  r.policyStore,
 		LocalEndpoints:     r.localEndpoints,
 		LocalHostname:      r.localHostname,
 		EndpointsChanged:   endpointsChanged,
