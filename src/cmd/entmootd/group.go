@@ -529,12 +529,17 @@ func groupCreateStateVisibility(state groupCreateState) string {
 }
 
 func persistGroupCreatePublicOpenInvite(ctx context.Context, espState *esphttp.SQLiteStateStore, state groupCreateState, invite *groupCreateOpenInviteOutput) error {
-	if espState == nil || invite == nil {
-		return errors.New("open invite metadata store is not configured")
+	_, err := persistGroupCreatePublicOpenInviteMetadata(ctx, espState, state.GroupID, state.Metadata, invite)
+	return err
+}
+
+func persistGroupCreatePublicOpenInviteMetadata(ctx context.Context, metadataStore esphttp.GroupMetadataStore, groupID entmoot.GroupID, metadata json.RawMessage, invite *groupCreateOpenInviteOutput) (json.RawMessage, error) {
+	if metadataStore == nil || invite == nil {
+		return nil, errors.New("open invite metadata store is not configured")
 	}
-	meta, err := decodeGroupMetadataObject(state.Metadata)
+	meta, err := decodeGroupMetadataObject(metadata)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	meta["open_invite"] = map[string]any{
 		"issuer_url": invite.IssuerURL,
@@ -543,17 +548,27 @@ func persistGroupCreatePublicOpenInvite(ctx context.Context, espState *esphttp.S
 	}
 	raw, err := json.Marshal(meta)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	normalized, err := esphttp.NormalizeGroupMetadata(raw)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return espState.SetGroupMetadata(ctx, state.GroupID, normalized)
+	if err := metadataStore.SetGroupMetadata(ctx, groupID, normalized); err != nil {
+		return nil, err
+	}
+	return normalized, nil
 }
 
 func groupCreateOpenInviteIssuerURL() (string, error) {
-	raw := strings.TrimSpace(os.Getenv("ENTMOOT_ESP_URL"))
+	return groupCreateOpenInviteIssuerURLFor(strings.TrimSpace(os.Getenv("ENTMOOT_ESP_URL")))
+}
+
+func groupCreateOpenInviteIssuerURLFor(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		raw = strings.TrimSpace(os.Getenv("ENTMOOT_ESP_URL"))
+	}
 	if raw == "" {
 		return "", errors.New("open_invite join mode requires ENTMOOT_ESP_URL so the CLI can emit a redeemable open-invite link")
 	}
@@ -562,7 +577,7 @@ func groupCreateOpenInviteIssuerURL() (string, error) {
 		Token:     "validation-token",
 	})
 	if err != nil {
-		return "", fmt.Errorf("open_invite join mode requires ENTMOOT_ESP_URL to be redeemable by entmoot join: %w", err)
+		return "", fmt.Errorf("open_invite join mode requires a redeemable issuer URL: %w", err)
 	}
 	return strings.TrimRight(issuer.String(), "/"), nil
 }

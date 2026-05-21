@@ -16,6 +16,10 @@ GET  /v1/groups
 POST /v1/groups
 GET  /v1/groups/{group_id}
 PATCH /v1/groups/{group_id}
+GET  /v1/groups/{group_id}/policy
+PUT  /v1/groups/{group_id}/policy
+DELETE /v1/groups/{group_id}/policy
+POST /v1/groups/{group_id}/public-moot/publish
 GET  /v1/groups/{group_id}/members
 DELETE /v1/groups/{group_id}/members/{node_id}
 GET  /v1/groups/{group_id}/live-agents
@@ -85,13 +89,15 @@ Entmoot message signing bytes. Complete the request with the returned
 `signing_payload_sha256` plus the author `signature`; the ESP verifies both and
 forwards the resulting message through signed publish.
 
-`group_create`, `group_update`, `invite_create`, `open_invite_create`,
-`invite_accept`, `open_invite_accept`, and `member_remove` are executable when
-`esp serve` is connected to a running `join` daemon. Device sign requests
-verify the completion signature with the registered device key. Completion
-stores the operation response in `result`; `message_publish` also keeps
-`publish_result` for compatibility. If the ESP has no operation executor
-configured, executable operation completion fails with `operation_unavailable`.
+`group_create`, `group_update`, `group_policy_update`,
+`group_policy_clear`, `group_public_publish`, `invite_create`,
+`open_invite_create`, `invite_accept`, `open_invite_accept`, and
+`member_remove` are executable when `esp serve` is connected to a running
+`join` daemon. Device sign requests verify the completion signature with the
+registered device key. Completion stores the operation response in `result`;
+`message_publish` also keeps `publish_result` for compatibility. If the ESP has
+no operation executor configured, executable operation completion fails with
+`operation_unavailable`.
 
 Group updates are ESP-local display metadata. They do not mutate Entmoot's
 roster protocol. Device-auth callers for admin-scoped operations must have the
@@ -102,6 +108,30 @@ Group list/get responses may include `name`, `description`, `tags`, and an
 opaque JSON `metadata` object. `name`, `description`, and `tags` are projected
 from metadata for app convenience; clients should treat the raw metadata object
 as forward-compatible app data.
+
+Group policy routes:
+
+- `GET /v1/groups/{group_id}/policy` returns the stored/effective policy report
+  for the group.
+- `PUT /v1/groups/{group_id}/policy` creates a `group_policy_update` sign
+  request. The body accepts `preset`, `policy_source`, or a full custom
+  `policy` object.
+- `DELETE /v1/groups/{group_id}/policy` creates a `group_policy_clear` sign
+  request and restores legacy no-policy behavior for cooperating nodes.
+
+Policy update and clear operations require the device to be authorized for the
+group and listed in `admin_groups`.
+
+Public listing publish:
+
+- `POST /v1/groups/{group_id}/public-moot/publish` creates a
+  `group_public_publish` sign request. The body requires `esp_url`, the ESP
+  directory base URL to publish to.
+
+The phone only authorizes public publishing. The local Entmoot identity builds,
+signs, verifies, and publishes the `entmoot.public_moot.v1` descriptor. Public
+publish requires group admin rights and fails unless the local identity is the
+group founder and the group metadata is public.
 
 Public moot directory routes are separate from membership routes:
 

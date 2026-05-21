@@ -1881,6 +1881,53 @@ func TestHandlerExecutableOperationSignRequestExecutes(t *testing.T) {
 	}
 }
 
+func TestHandlerGroupPolicyAndPublicPublishRoutes(t *testing.T) {
+	gid := testGroupID(1)
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	reg, err := NewDeviceRegistry([]Device{{
+		ID:          "ios-1-device",
+		PublicKey:   pub,
+		Groups:      []entmoot.GroupID{gid},
+		AdminGroups: []entmoot.GroupID{gid},
+		ClientIDs:   []string{"ios-1"},
+	}})
+	if err != nil {
+		t.Fatalf("NewDeviceRegistry: %v", err)
+	}
+	op := &fakeOperationExecutor{policyReport: json.RawMessage(`{"policy_configured":true}`)}
+	handler := testMobileHandlerFull(t, gid, reg, &fakeCatalog{groups: []GroupSummary{{GroupID: gid}}}, func() time.Time {
+		return time.UnixMilli(1_234_000)
+	}, nil, NewMemoryStateStore(), nil)
+	handler.(*Handler).operations = op
+
+	policy := doSignedJSONRequest[map[string]any](t, handler, priv, http.MethodGet, "/v1/groups/"+gid.String()+"/policy", nil, http.StatusOK, 1_234_000, "nonce-policy-get")
+	if policy["policy_configured"] != true {
+		t.Fatalf("policy = %+v, want configured report", policy)
+	}
+	for _, tc := range []struct {
+		name   string
+		method string
+		path   string
+		body   any
+		kind   string
+		nonce  string
+	}{
+		{"policy update", http.MethodPut, "/v1/groups/" + gid.String() + "/policy", map[string]any{"preset": "standard"}, signRequestKindGroupPolicyUpdate, "nonce-policy-put"},
+		{"policy clear", http.MethodDelete, "/v1/groups/" + gid.String() + "/policy", nil, signRequestKindGroupPolicyClear, "nonce-policy-delete"},
+		{"public publish", http.MethodPost, "/v1/groups/" + gid.String() + "/public-moot/publish", map[string]any{"esp_url": "https://esp.example"}, signRequestKindGroupPublicPublish, "nonce-public-publish"},
+	} {
+		created := doSignedJSONRequest[struct {
+			SignRequest SignRequest `json:"sign_request"`
+		}](t, handler, priv, tc.method, tc.path, tc.body, http.StatusAccepted, 1_235_000, tc.nonce)
+		if created.SignRequest.Kind != tc.kind || created.SignRequest.GroupID != gid {
+			t.Fatalf("%s sign request = %+v, want kind %s group %s", tc.name, created.SignRequest, tc.kind, gid)
+		}
+	}
+}
+
 func TestHandlerAdminOperationsRequireAdminAtCreation(t *testing.T) {
 	gid := testGroupID(1)
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
@@ -1907,6 +1954,14 @@ func TestHandlerAdminOperationsRequireAdminAtCreation(t *testing.T) {
 	inviteErr := doSignedJSONRequest[errorEnvelope](t, handler, priv, http.MethodPost, "/v1/groups/"+gid.String()+"/invites", map[string]any{}, http.StatusForbidden, 1_235_000, "nonce-invite")
 	if inviteErr.Error.Code != "forbidden" {
 		t.Fatalf("invite_create code = %q, want forbidden", inviteErr.Error.Code)
+	}
+	policyErr := doSignedJSONRequest[errorEnvelope](t, handler, priv, http.MethodPut, "/v1/groups/"+gid.String()+"/policy", map[string]any{"preset": "standard"}, http.StatusForbidden, 1_236_000, "nonce-policy")
+	if policyErr.Error.Code != "forbidden" {
+		t.Fatalf("group_policy_update code = %q, want forbidden", policyErr.Error.Code)
+	}
+	publishErr := doSignedJSONRequest[errorEnvelope](t, handler, priv, http.MethodPost, "/v1/groups/"+gid.String()+"/public-moot/publish", map[string]any{"esp_url": "https://esp.example"}, http.StatusForbidden, 1_237_000, "nonce-public")
+	if publishErr.Error.Code != "forbidden" {
+		t.Fatalf("group_public_publish code = %q, want forbidden", publishErr.Error.Code)
 	}
 }
 
@@ -1936,6 +1991,14 @@ func TestHandlerAdminOperationsRequireGroupMembershipAtCreation(t *testing.T) {
 	inviteErr := doSignedJSONRequest[errorEnvelope](t, handler, priv, http.MethodPost, "/v1/groups/"+gid.String()+"/invites", map[string]any{}, http.StatusForbidden, 1_235_000, "nonce-invite")
 	if inviteErr.Error.Code != "forbidden" {
 		t.Fatalf("invite_create code = %q, want forbidden", inviteErr.Error.Code)
+	}
+	policyErr := doSignedJSONRequest[errorEnvelope](t, handler, priv, http.MethodPut, "/v1/groups/"+gid.String()+"/policy", map[string]any{"preset": "standard"}, http.StatusForbidden, 1_236_000, "nonce-policy")
+	if policyErr.Error.Code != "forbidden" {
+		t.Fatalf("group_policy_update code = %q, want forbidden", policyErr.Error.Code)
+	}
+	publishErr := doSignedJSONRequest[errorEnvelope](t, handler, priv, http.MethodPost, "/v1/groups/"+gid.String()+"/public-moot/publish", map[string]any{"esp_url": "https://esp.example"}, http.StatusForbidden, 1_237_000, "nonce-public")
+	if publishErr.Error.Code != "forbidden" {
+		t.Fatalf("group_public_publish code = %q, want forbidden", publishErr.Error.Code)
 	}
 }
 
@@ -2595,10 +2658,12 @@ type fakeTaskEvent struct {
 }
 
 type fakeOperationExecutor struct {
-	result    json.RawMessage
-	err       error
-	req       SignRequest
-	signature []byte
+	result       json.RawMessage
+	err          error
+	req          SignRequest
+	signature    []byte
+	policyReport json.RawMessage
+	policyErr    error
 }
 
 func (e *fakeOperationExecutor) ExecuteSignRequest(_ context.Context, req SignRequest, signature []byte) (json.RawMessage, error) {
@@ -2608,6 +2673,13 @@ func (e *fakeOperationExecutor) ExecuteSignRequest(_ context.Context, req SignRe
 		return nil, e.err
 	}
 	return append(json.RawMessage(nil), e.result...), nil
+}
+
+func (e *fakeOperationExecutor) GroupPolicyReport(context.Context, entmoot.GroupID) (json.RawMessage, error) {
+	if e.policyErr != nil {
+		return nil, e.policyErr
+	}
+	return append(json.RawMessage(nil), e.policyReport...), nil
 }
 
 type fakeNotifier struct {

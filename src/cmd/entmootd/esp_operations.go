@@ -27,6 +27,8 @@ import (
 	"entmoot/pkg/entmoot/esphttp"
 	"entmoot/pkg/entmoot/ipc"
 	"entmoot/pkg/entmoot/keystore"
+	entpolicy "entmoot/pkg/entmoot/policy"
+	"entmoot/pkg/entmoot/publicmoot"
 	"entmoot/pkg/entmoot/roster"
 	"entmoot/pkg/entmoot/store"
 	"entmoot/pkg/entmoot/transport/pilot/ipcclient"
@@ -96,12 +98,16 @@ func lockFleetMutation(fleetID string) func() {
 }
 
 type groupCreatePayload struct {
-	Name        string          `json:"name,omitempty"`
-	Description string          `json:"description,omitempty"`
-	Tags        []string        `json:"tags,omitempty"`
-	Visibility  string          `json:"visibility,omitempty"`
-	JoinMode    string          `json:"join_mode,omitempty"`
-	Metadata    json.RawMessage `json:"metadata,omitempty"`
+	Name              string            `json:"name,omitempty"`
+	Description       string            `json:"description,omitempty"`
+	Tags              []string          `json:"tags,omitempty"`
+	Visibility        string            `json:"visibility,omitempty"`
+	JoinMode          string            `json:"join_mode,omitempty"`
+	PolicySource      string            `json:"policy_source,omitempty"`
+	Policy            *entpolicy.Policy `json:"policy,omitempty"`
+	IssuerURL         string            `json:"issuer_url,omitempty"`
+	OpenInviteMaxUses *int              `json:"open_invite_max_uses,omitempty"`
+	Metadata          json.RawMessage   `json:"metadata,omitempty"`
 }
 
 type inviteTargetPayload struct {
@@ -130,6 +136,16 @@ type openInviteCreatePayload struct {
 type openInviteAcceptPayload struct {
 	IssuerURL string `json:"issuer_url"`
 	Token     string `json:"token"`
+}
+
+type groupPolicyPayload struct {
+	Preset       string            `json:"preset,omitempty"`
+	PolicySource string            `json:"policy_source,omitempty"`
+	Policy       *entpolicy.Policy `json:"policy,omitempty"`
+}
+
+type groupPublicPublishPayload struct {
+	ESPURL string `json:"esp_url"`
 }
 
 type fleetCreatePayload struct {
@@ -211,9 +227,23 @@ func (e espOperationExecutor) ExecuteSignRequest(ctx context.Context, req esphtt
 		return e.createGroup(ctx, req)
 	case "group_update":
 		return e.updateGroup(ctx, req)
+	case "group_policy_update":
+		return e.updateGroupPolicy(ctx, req)
+	case "group_policy_clear":
+		return e.clearGroupPolicy(ctx, req)
+	case "group_public_publish":
+		return e.publishPublicMoot(ctx, req)
 	default:
 		return nil, &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "unsupported_operation", Message: "unsupported sign request kind"}
 	}
+}
+
+func (e espOperationExecutor) GroupPolicyReport(ctx context.Context, groupID entmoot.GroupID) (json.RawMessage, error) {
+	report, err := loadGroupPolicyReportFromStore(ctx, e.dataDir, groupID)
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(report)
 }
 
 func (e espOperationExecutor) CreateOpenInviteChallenge(ctx context.Context, token string, raw json.RawMessage) (json.RawMessage, error) {
@@ -945,6 +975,13 @@ func (e espOperationExecutor) createGroup(ctx context.Context, req esphttp.SignR
 	if err != nil {
 		return nil, &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request", Message: err.Error()}
 	}
+	policyResolution, err := resolveESPGroupCreatePolicy(payload)
+	if err != nil {
+		return nil, &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request", Message: err.Error()}
+	}
+	if err := validateESPGroupCreateOpenInvite(payload, metadata); err != nil {
+		return nil, &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request", Message: err.Error()}
+	}
 	info, err := e.daemonInfo()
 	if err != nil {
 		return nil, joinUnavailableError(err)
@@ -960,6 +997,10 @@ func (e espOperationExecutor) createGroup(ctx context.Context, req esphttp.SignR
 	metadataWritten := false
 	var previousMetadata json.RawMessage
 	metadataHadPrevious := false
+	var previousPolicy entpolicy.Policy
+	policyHadPrevious := false
+	policyWritten := false
+	var openInvite *groupCreateOpenInviteOutput
 	deviceGroupGranted := false
 	deviceAdminGroupGranted := false
 	var st *store.SQLite
@@ -983,6 +1024,24 @@ func (e espOperationExecutor) createGroup(ctx context.Context, req esphttp.SignR
 			}
 			if err != nil {
 				slog.Warn("esp group_create rollback: restore metadata failed", slog.String("group_id", gid.String()), slog.String("err", err.Error()))
+			}
+		}
+		if policyWritten {
+			policyStore, err := entpolicy.OpenFileStore(e.dataDir)
+			if err == nil {
+				if policyHadPrevious {
+					err = policyStore.Put(context.Background(), gid, previousPolicy)
+				} else {
+					err = policyStore.Delete(context.Background(), gid)
+				}
+			}
+			if err != nil {
+				slog.Warn("esp group_create rollback: restore policy failed", slog.String("group_id", gid.String()), slog.String("err", err.Error()))
+			}
+		}
+		if openInvite != nil && e.stateStore != nil {
+			if _, _, err := e.stateStore.RevokeOpenInvite(context.Background(), openInvite.TokenHash, time.Now().UnixMilli()); err != nil {
+				slog.Warn("esp group_create rollback: revoke open invite failed", slog.String("group_id", gid.String()), slog.String("token_hash", openInvite.TokenHash), slog.String("err", err.Error()))
 			}
 		}
 		if deviceGroupGranted && e.deviceGroups != nil {
@@ -1048,6 +1107,22 @@ func (e espOperationExecutor) createGroup(ctx context.Context, req esphttp.SignR
 		}
 		metadataWritten = true
 	}
+	policyStore, err := entpolicy.OpenFileStore(e.dataDir)
+	if err != nil {
+		return nil, err
+	}
+	previousPolicy, policyHadPrevious, err = policyStore.Get(ctx, gid)
+	if err != nil {
+		return nil, err
+	}
+	if policyResolution.Policy != nil {
+		if err := policyStore.Put(ctx, gid, *policyResolution.Policy); err != nil {
+			return nil, err
+		}
+	} else if err := policyStore.Delete(ctx, gid); err != nil {
+		return nil, err
+	}
+	policyWritten = true
 	root, err := st.MerkleRoot(ctx, gid)
 	if err != nil {
 		return nil, err
@@ -1072,22 +1147,132 @@ func (e espOperationExecutor) createGroup(ctx context.Context, req esphttp.SignR
 		return nil, err
 	}
 	st = nil
+	openInvite, metadata, err = e.maybeCreateGroupOpenInvite(ctx, req, payload, gid, metadata, &invite)
+	if err != nil {
+		return nil, err
+	}
 	resp, err := e.joinGroup(ctx, invite)
 	if err != nil {
 		return nil, err
 	}
 	result, err := json.Marshal(map[string]any{
-		"status":   resp.Status,
-		"group_id": gid,
-		"members":  resp.Members,
-		"founder":  founder,
-		"metadata": json.RawMessage(metadata),
+		"status":            resp.Status,
+		"group_id":          gid,
+		"members":           resp.Members,
+		"founder":           founder,
+		"metadata":          json.RawMessage(metadata),
+		"policy_configured": policyResolution.Policy != nil,
+		"policy_source":     policyResolution.Source,
+		"policy_summary":    policySummary(policyResolution.Policy),
+		"open_invite":       openInvite,
 	})
 	if err != nil {
 		return nil, err
 	}
 	committed = true
 	return result, nil
+}
+
+func resolveESPGroupCreatePolicy(payload groupCreatePayload) (entpolicy.SourceResolution, error) {
+	if payload.Policy != nil {
+		if strings.TrimSpace(payload.PolicySource) != "" {
+			return entpolicy.SourceResolution{}, errors.New("choose either policy_source or policy, not both")
+		}
+		if err := payload.Policy.Validate(); err != nil {
+			return entpolicy.SourceResolution{}, fmt.Errorf("policy: %w", err)
+		}
+		p := *payload.Policy
+		return entpolicy.SourceResolution{Policy: &p, Source: "custom"}, nil
+	}
+	source := strings.TrimSpace(payload.PolicySource)
+	if source == "" {
+		source = "preset:" + entpolicy.PresetStandard
+	}
+	return resolveESPPolicySource(source)
+}
+
+func validateESPGroupCreateOpenInvite(payload groupCreatePayload, metadata json.RawMessage) error {
+	meta, err := decodeGroupMetadataObject(metadata)
+	if err != nil {
+		return err
+	}
+	joinMode, _ := meta["join_mode"].(string)
+	if joinMode != groupJoinModeOpenInvite {
+		return nil
+	}
+	if payload.OpenInviteMaxUses != nil {
+		if err := esphttp.ValidateOpenInviteMaxUses(*payload.OpenInviteMaxUses); err != nil || *payload.OpenInviteMaxUses > 100 {
+			return errors.New("open_invite_max_uses must be between 0 and 100 (0 means unlimited)")
+		}
+	}
+	if strings.TrimSpace(payload.IssuerURL) == "" && strings.TrimSpace(os.Getenv("ENTMOOT_ESP_URL")) == "" {
+		return errors.New("open_invite join mode requires issuer_url or ENTMOOT_ESP_URL")
+	}
+	return nil
+}
+
+func policySummary(p *entpolicy.Policy) string {
+	if p == nil {
+		return ""
+	}
+	return entpolicy.Summary(*p)
+}
+
+func (e espOperationExecutor) maybeCreateGroupOpenInvite(ctx context.Context, req esphttp.SignRequest, payload groupCreatePayload, gid entmoot.GroupID, metadata json.RawMessage, invite *entmoot.Invite) (*groupCreateOpenInviteOutput, json.RawMessage, error) {
+	var meta map[string]any
+	if err := json.Unmarshal(metadata, &meta); err != nil {
+		return nil, metadata, err
+	}
+	joinMode, _ := meta["join_mode"].(string)
+	if joinMode != groupJoinModeOpenInvite {
+		return nil, metadata, nil
+	}
+	if e.stateStore == nil {
+		return nil, metadata, &esphttp.OperationError{HTTPStatus: http.StatusServiceUnavailable, Code: "open_invite_unavailable", Message: "open invite store is not configured"}
+	}
+	issuerURL, err := groupCreateOpenInviteIssuerURLFor(strings.TrimSpace(payload.IssuerURL))
+	if err != nil {
+		return nil, metadata, err
+	}
+	if _, err := e.checkInviteAuthorityOverIPC(ctx, &ipc.InviteAuthorityCheckReq{GroupID: gid, CandidateInvite: invite}); err != nil {
+		return nil, metadata, fmt.Errorf("open invite authority unavailable: %w", err)
+	}
+	maxUses := esphttp.OpenInviteUnlimitedMaxUses
+	if payload.OpenInviteMaxUses != nil {
+		maxUses = *payload.OpenInviteMaxUses
+	}
+	token, tokenHash, err := esphttp.NewOpenInviteToken()
+	if err != nil {
+		return nil, metadata, err
+	}
+	now := time.Now().UnixMilli()
+	rec, err := e.stateStore.CreateOpenInvite(ctx, esphttp.OpenInviteRecord{
+		TokenHash:   tokenHash,
+		GroupID:     gid,
+		DeviceID:    req.DeviceID,
+		MaxUses:     maxUses,
+		CreatedAtMS: now,
+	})
+	if err != nil {
+		return nil, metadata, err
+	}
+	out := &groupCreateOpenInviteOutput{
+		Token:       token,
+		TokenHash:   rec.TokenHash,
+		Link:        fmt.Sprintf("entmoot://open-invite?issuer=%s&token=%s", url.QueryEscape(issuerURL), url.QueryEscape(token)),
+		IssuerURL:   issuerURL,
+		MaxUses:     rec.MaxUses,
+		ExpiresAtMS: rec.ExpiresAtMS,
+	}
+	if visibility, _ := meta["visibility"].(string); visibility == groupVisibilityPublic {
+		updated, err := persistGroupCreatePublicOpenInviteMetadata(ctx, e.metadataStore, gid, metadata, out)
+		if err != nil {
+			_, _, _ = e.stateStore.RevokeOpenInvite(context.Background(), rec.TokenHash, time.Now().UnixMilli())
+			return nil, metadata, fmt.Errorf("persist public open invite descriptor metadata: %w", err)
+		}
+		metadata = updated
+	}
+	return out, metadata, nil
 }
 
 func (e espOperationExecutor) createFleetControlGroup(ctx context.Context, controlGID entmoot.GroupID, fleetID, name string, founder entmoot.NodeInfo, createdAtMS int64) (entmoot.GroupID, error) {
@@ -1252,6 +1437,144 @@ func (e espOperationExecutor) updateGroup(ctx context.Context, req esphttp.SignR
 		"group_id": req.GroupID,
 		"metadata": json.RawMessage(metadata),
 	})
+}
+
+func (e espOperationExecutor) updateGroupPolicy(ctx context.Context, req esphttp.SignRequest) (json.RawMessage, error) {
+	if req.GroupID == (entmoot.GroupID{}) {
+		return nil, &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request", Message: "group_policy_update requires group_id"}
+	}
+	var payload groupPolicyPayload
+	if err := json.Unmarshal(req.Payload, &payload); err != nil {
+		return nil, &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request", Message: "invalid group_policy_update payload"}
+	}
+	resolved, err := resolveESPGroupPolicyPayload(payload)
+	if err != nil {
+		return nil, &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request", Message: err.Error()}
+	}
+	report, err := e.applyGroupPolicy(ctx, req.GroupID, resolved.Policy)
+	if err != nil {
+		return nil, err
+	}
+	report.Source = resolved.Source
+	return json.Marshal(report)
+}
+
+func (e espOperationExecutor) clearGroupPolicy(ctx context.Context, req esphttp.SignRequest) (json.RawMessage, error) {
+	if req.GroupID == (entmoot.GroupID{}) {
+		return nil, &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request", Message: "group_policy_clear requires group_id"}
+	}
+	report, err := e.applyGroupPolicy(ctx, req.GroupID, nil)
+	if err != nil {
+		return nil, err
+	}
+	report.Source = "clear"
+	return json.Marshal(report)
+}
+
+func resolveESPGroupPolicyPayload(payload groupPolicyPayload) (entpolicy.SourceResolution, error) {
+	if payload.Policy != nil {
+		if strings.TrimSpace(payload.PolicySource) != "" || strings.TrimSpace(payload.Preset) != "" {
+			return entpolicy.SourceResolution{}, errors.New("choose either preset, policy_source, or policy")
+		}
+		if err := payload.Policy.Validate(); err != nil {
+			return entpolicy.SourceResolution{}, fmt.Errorf("policy: %w", err)
+		}
+		p := *payload.Policy
+		return entpolicy.SourceResolution{Policy: &p, Source: "custom"}, nil
+	}
+	source := strings.TrimSpace(payload.PolicySource)
+	preset := strings.TrimSpace(payload.Preset)
+	if source != "" && preset != "" {
+		return entpolicy.SourceResolution{}, errors.New("choose either preset, policy_source, or policy")
+	}
+	if source == "" && preset != "" {
+		source = "preset:" + preset
+	}
+	if source == "" {
+		return entpolicy.SourceResolution{}, errors.New("choose preset, policy_source, or policy")
+	}
+	return resolveESPPolicySource(source)
+}
+
+func resolveESPPolicySource(raw string) (entpolicy.SourceResolution, error) {
+	raw = strings.TrimSpace(raw)
+	switch {
+	case strings.HasPrefix(raw, "preset:"):
+		return entpolicy.ResolveSource(strings.TrimSpace(strings.TrimPrefix(raw, "preset:")), "")
+	case raw == entpolicy.PresetNone:
+		return entpolicy.ResolveSource(entpolicy.PresetNone, "")
+	case strings.HasPrefix(raw, "file:"):
+		return entpolicy.SourceResolution{}, errors.New("file policy sources are not supported over ESP")
+	default:
+		return entpolicy.SourceResolution{}, fmt.Errorf("unsupported policy source %q (want: preset:standard, preset:relaxed, none, or inline policy)", raw)
+	}
+}
+
+func (e espOperationExecutor) applyGroupPolicy(ctx context.Context, gid entmoot.GroupID, p *entpolicy.Policy) (groupPolicyReport, error) {
+	store, err := entpolicy.OpenFileStore(e.dataDir)
+	if err != nil {
+		return groupPolicyReport{}, err
+	}
+	socketPath := e.socketPath
+	if socketPath == "" {
+		socketPath = controlSocketPath(e.dataDir)
+	}
+	if controlSocketAlive(socketPath, 200*time.Millisecond) {
+		report, err := publishGroupPolicyUpdateToSocket(ctx, socketPath, store, gid, p)
+		if err == nil {
+			return report, nil
+		}
+		if publishIPCErrorCode(err) != ipc.CodeGroupNotFound {
+			return groupPolicyReport{}, err
+		}
+	}
+	return applyGroupPolicyUpdateLocal(ctx, store, gid, p)
+}
+
+func (e espOperationExecutor) publishPublicMoot(ctx context.Context, req esphttp.SignRequest) (json.RawMessage, error) {
+	if req.GroupID == (entmoot.GroupID{}) {
+		return nil, &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request", Message: "group_public_publish requires group_id"}
+	}
+	var payload groupPublicPublishPayload
+	if err := json.Unmarshal(req.Payload, &payload); err != nil {
+		return nil, &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request", Message: "invalid group_public_publish payload"}
+	}
+	espURL := strings.TrimSpace(payload.ESPURL)
+	if espURL == "" {
+		return nil, &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request", Message: "esp_url is required"}
+	}
+	desc, err := buildPublicMootDescriptorWithIdentity(ctx, e.dataDir, e.identity, req.GroupID, time.Now().UnixMilli())
+	if err != nil {
+		return nil, groupPublicOperationError(err)
+	}
+	resp, err := publishPublicMootDescriptor(ctx, espURL, desc)
+	if err != nil {
+		return nil, groupPublicOperationError(err)
+	}
+	return json.Marshal(groupPublicPublishResult{
+		Status:     "published",
+		GroupID:    desc.GroupID,
+		ESPURL:     espURL,
+		Descriptor: desc,
+		Response:   resp,
+	})
+}
+
+func groupPublicOperationError(err error) error {
+	switch {
+	case errors.Is(err, errGroupPublicNotFound):
+		return &esphttp.OperationError{HTTPStatus: http.StatusNotFound, Code: "group_not_found", Message: err.Error()}
+	case errors.Is(err, errGroupPublicForbidden):
+		return &esphttp.OperationError{HTTPStatus: http.StatusForbidden, Code: "forbidden", Message: err.Error()}
+	case errors.Is(err, errGroupPublicInvalid), errors.Is(err, publicmoot.ErrInvalidDescriptor), errors.Is(err, publicmoot.ErrDescriptorSignature):
+		return &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "invalid_public_moot", Message: err.Error()}
+	case strings.Contains(err.Error(), "esp-url") || strings.Contains(err.Error(), "absolute http"):
+		return &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request", Message: err.Error()}
+	case strings.HasPrefix(err.Error(), "ESP "):
+		return &esphttp.OperationError{HTTPStatus: http.StatusBadGateway, Code: "directory_publish_failed", Message: err.Error()}
+	default:
+		return err
+	}
 }
 
 type fleetInviteAcceptancePlan struct {
@@ -2547,6 +2870,12 @@ func normalizeGroupMetadata(payload groupCreatePayload) (json.RawMessage, error)
 			return nil, fmt.Errorf("invalid join_mode %q", payload.JoinMode)
 		}
 		meta["join_mode"] = joinMode
+	}
+	if _, ok := meta["visibility"]; !ok {
+		meta["visibility"] = groupVisibilityPrivate
+	}
+	if _, ok := meta["join_mode"]; !ok {
+		meta["join_mode"] = groupJoinModeInviteOnly
 	}
 	data, err := json.Marshal(meta)
 	if err != nil {

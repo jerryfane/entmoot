@@ -36,9 +36,13 @@ func publishIPCErrorCode(err error) ipc.ErrorCode {
 }
 
 func publishIPCMessage(ctx context.Context, gf *globalFlags, groupID entmoot.GroupID, topics []string, content []byte) error {
+	return publishIPCMessageToSocket(ctx, controlSocketPath(gf.data), groupID, topics, content)
+}
+
+func publishIPCMessageToSocket(ctx context.Context, socketPath string, groupID entmoot.GroupID, topics []string, content []byte) error {
 	dialCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
 	defer cancel()
-	conn, err := (&net.Dialer{}).DialContext(dialCtx, "unix", controlSocketPath(gf.data))
+	conn, err := (&net.Dialer{}).DialContext(dialCtx, "unix", socketPath)
 	if err != nil {
 		return err
 	}
