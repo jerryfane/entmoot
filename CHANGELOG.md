@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.74] - 2026-05-23
+
+### Added
+
+- **Mobile ESP policy and public publish APIs.** Added signed ESP routes for
+  group policy status/update/clear, mobile group creation with visibility,
+  join-mode and policy payloads, and founder-signed public moot publish support
+  for iOS clients.
+
 ## [1.5.73] - 2026-05-21
 
 ### Added
