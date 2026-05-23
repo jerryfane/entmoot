@@ -395,21 +395,22 @@ func (e *PublishError) Error() string {
 
 // Handler serves the ESP mailbox API.
 type Handler struct {
-	token       string
-	authMode    AuthMode
-	devices     *DeviceRegistry
-	nonceCache  *nonceCache
-	clock       func() time.Time
-	service     *mailbox.Service
-	publisher   Publisher
-	taskEvents  TaskEventPublisher
-	operations  OperationExecutor
-	notifier    espnotify.Notifier
-	state       StateStore
-	groups      GroupCatalog
-	diagnostics DiagnosticsProvider
-	groupExists GroupExistsFunc
-	logger      *slog.Logger
+	token                 string
+	authMode              AuthMode
+	devices               *DeviceRegistry
+	nonceCache            *nonceCache
+	clock                 func() time.Time
+	service               *mailbox.Service
+	publisher             Publisher
+	taskEvents            TaskEventPublisher
+	operations            OperationExecutor
+	notifier              espnotify.Notifier
+	state                 StateStore
+	groups                GroupCatalog
+	diagnostics           DiagnosticsProvider
+	groupExists           GroupExistsFunc
+	groupExistsConfigured bool
+	logger                *slog.Logger
 }
 
 // NewHandler returns an HTTP handler for the ESP mailbox API.
@@ -440,6 +441,7 @@ func NewHandler(cfg Config) (*Handler, error) {
 	if clock == nil {
 		clock = time.Now
 	}
+	groupExistsConfigured := cfg.GroupExists != nil
 	groupExists := cfg.GroupExists
 	if groupExists == nil {
 		groupExists = func(context.Context, entmoot.GroupID) (bool, error) { return true, nil }
@@ -449,21 +451,22 @@ func NewHandler(cfg Config) (*Handler, error) {
 		logger = slog.Default()
 	}
 	return &Handler{
-		token:       cfg.Token,
-		authMode:    authMode,
-		devices:     cfg.Devices,
-		nonceCache:  newNonceCache(clock),
-		clock:       clock,
-		service:     cfg.Service,
-		publisher:   cfg.Publisher,
-		taskEvents:  cfg.TaskEvents,
-		operations:  cfg.Operations,
-		notifier:    cfg.Notifier,
-		state:       state,
-		groups:      cfg.Groups,
-		diagnostics: cfg.Diagnostics,
-		groupExists: groupExists,
-		logger:      logger,
+		token:                 cfg.Token,
+		authMode:              authMode,
+		devices:               cfg.Devices,
+		nonceCache:            newNonceCache(clock),
+		clock:                 clock,
+		service:               cfg.Service,
+		publisher:             cfg.Publisher,
+		taskEvents:            cfg.TaskEvents,
+		operations:            cfg.Operations,
+		notifier:              cfg.Notifier,
+		state:                 state,
+		groups:                cfg.Groups,
+		diagnostics:           cfg.Diagnostics,
+		groupExists:           groupExists,
+		groupExistsConfigured: groupExistsConfigured,
+		logger:                logger,
 	}, nil
 }
 
