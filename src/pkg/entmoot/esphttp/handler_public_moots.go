@@ -1,6 +1,7 @@
 package esphttp
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -79,7 +80,13 @@ func (h *Handler) handleListPublicMoots(w http.ResponseWriter, r *http.Request) 
 		if publicMootDescriptorExpired(rec.Descriptor, nowMS) {
 			continue
 		}
-		entries = append(entries, PublicMootEntryFromRecord(rec))
+		entry, err := h.publicMootEntry(r.Context(), rec)
+		if err != nil {
+			h.logger.Error("esphttp: public moot mirror state", slog.String("err", err.Error()))
+			writeError(w, http.StatusInternalServerError, "internal_error", "public moot mirror lookup failed")
+			return
+		}
+		entries = append(entries, entry)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"public_moots": entries})
 }
@@ -95,7 +102,13 @@ func (h *Handler) handleGetPublicMoot(w http.ResponseWriter, r *http.Request, gr
 		writeError(w, http.StatusNotFound, "public_moot_not_found", "public moot not found")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"public_moot": PublicMootEntryFromRecord(rec)})
+	entry, err := h.publicMootEntry(r.Context(), rec)
+	if err != nil {
+		h.logger.Error("esphttp: public moot mirror state", slog.String("err", err.Error()))
+		writeError(w, http.StatusInternalServerError, "internal_error", "public moot mirror lookup failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"public_moot": entry})
 }
 
 func (h *Handler) handlePostPublicMoot(w http.ResponseWriter, r *http.Request) {
@@ -111,6 +124,10 @@ func (h *Handler) handlePostPublicMoot(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := publicmoot.Verify(desc); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_public_moot", err.Error())
+		return
+	}
+	if publicMootDescriptorExpired(desc, h.clock().UnixMilli()) {
+		writeError(w, http.StatusBadRequest, "invalid_public_moot", "public moot descriptor is expired")
 		return
 	}
 	rec, changed, err := h.state.UpsertPublicMoot(r.Context(), PublicMootRecord{Descriptor: desc}, h.clock().UnixMilli())
@@ -133,9 +150,15 @@ func (h *Handler) handlePostPublicMoot(w http.ResponseWriter, r *http.Request) {
 		status = "stale_ignored"
 		code = http.StatusOK
 	}
+	entry, err := h.publicMootEntry(r.Context(), rec)
+	if err != nil {
+		h.logger.Error("esphttp: public moot mirror state", slog.String("err", err.Error()))
+		writeError(w, http.StatusInternalServerError, "internal_error", "public moot mirror lookup failed")
+		return
+	}
 	writeJSON(w, code, map[string]any{
 		"status":      status,
-		"public_moot": PublicMootEntryFromRecord(rec),
+		"public_moot": entry,
 	})
 }
 
@@ -172,7 +195,13 @@ func (h *Handler) handlePatchPublicMootIndexStatus(w http.ResponseWriter, r *htt
 		writeError(w, http.StatusNotFound, "public_moot_not_found", "public moot not found")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"public_moot": PublicMootEntryFromRecord(rec)})
+	entry, err := h.publicMootEntry(r.Context(), rec)
+	if err != nil {
+		h.logger.Error("esphttp: public moot mirror state", slog.String("err", err.Error()))
+		writeError(w, http.StatusInternalServerError, "internal_error", "public moot mirror lookup failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"public_moot": entry})
 }
 
 func readPublicMootRequestBody(w http.ResponseWriter, r *http.Request) ([]byte, error) {
@@ -189,4 +218,20 @@ func readPublicMootRequestBody(w http.ResponseWriter, r *http.Request) ([]byte, 
 
 func publicMootDescriptorExpired(desc publicmoot.Descriptor, nowMS int64) bool {
 	return desc.ExpiresAtMS > 0 && desc.ExpiresAtMS <= nowMS
+}
+
+func (h *Handler) publicMootEntry(ctx context.Context, rec PublicMootRecord) (PublicMootDirectoryEntry, error) {
+	entry := PublicMootEntryFromRecord(rec)
+	if rec.Descriptor.GroupID == (entmoot.GroupID{}) || !h.groupExistsConfigured {
+		return entry, nil
+	}
+	exists, err := h.groupExists(ctx, rec.Descriptor.GroupID)
+	if err != nil {
+		return entry, err
+	}
+	if exists {
+		entry.MirrorState = PublicMootMirrorMember
+		entry.MessageHistoryAvailable = true
+	}
+	return entry, nil
 }
