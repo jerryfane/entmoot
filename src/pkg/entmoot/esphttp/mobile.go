@@ -1389,9 +1389,9 @@ CREATE INDEX IF NOT EXISTS idx_open_invite_challenges_redeemer
 
 CREATE TABLE IF NOT EXISTS esp_public_moots (
   group_id             BLOB PRIMARY KEY,
-  founder_pubkey       TEXT NOT NULL,
-  descriptor           BLOB NOT NULL,
-  descriptor_updated_at_ms INTEGER NOT NULL,
+  founder_pubkey       TEXT NOT NULL DEFAULT '',
+  descriptor           BLOB,
+  descriptor_updated_at_ms INTEGER NOT NULL DEFAULT 0,
   status               TEXT NOT NULL,
   indexed_at_ms        INTEGER NOT NULL,
   status_updated_at_ms INTEGER NOT NULL
@@ -2777,9 +2777,9 @@ func migrateSQLiteState(db *sql.DB) error {
 		`CREATE INDEX IF NOT EXISTS idx_open_invite_challenges_redeemer ON esp_open_invite_challenges(token_hash, pilot_node_id, pilot_pubkey, entmoot_pubkey, used_at_ms, expires_at_ms)`,
 		`CREATE TABLE IF NOT EXISTS esp_public_moots (
 		  group_id BLOB PRIMARY KEY,
-		  founder_pubkey TEXT NOT NULL,
-		  descriptor BLOB NOT NULL,
-		  descriptor_updated_at_ms INTEGER NOT NULL,
+		  founder_pubkey TEXT NOT NULL DEFAULT '',
+		  descriptor BLOB,
+		  descriptor_updated_at_ms INTEGER NOT NULL DEFAULT 0,
 		  status TEXT NOT NULL,
 		  indexed_at_ms INTEGER NOT NULL,
 		  status_updated_at_ms INTEGER NOT NULL
@@ -2790,6 +2790,9 @@ func migrateSQLiteState(db *sql.DB) error {
 		if _, err := db.Exec(stmt); err != nil {
 			return fmt.Errorf("esphttp: migrate state schema add public/open invite state: %w", err)
 		}
+	}
+	if err := migratePublicMootSchema(db); err != nil {
+		return err
 	}
 	fleetCols, err := tableColumns(db, "esp_fleets")
 	if err != nil {
@@ -2973,6 +2976,69 @@ func tableColumns(db *sql.DB, table string) (map[string]bool, error) {
 		return nil, fmt.Errorf("esphttp: inspect state schema %s: %w", table, err)
 	}
 	return cols, nil
+}
+
+func migratePublicMootSchema(db *sql.DB) error {
+	rows, err := db.Query(`PRAGMA table_info(esp_public_moots)`)
+	if err != nil {
+		return fmt.Errorf("esphttp: inspect public moot schema: %w", err)
+	}
+	descriptorNotNull := false
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notNull int
+		var defaultValue interface{}
+		var pk int
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("esphttp: scan public moot schema: %w", err)
+		}
+		if name == "descriptor" {
+			descriptorNotNull = notNull != 0
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("esphttp: inspect public moot schema: %w", err)
+	}
+	if !descriptorNotNull {
+		return nil
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("esphttp: begin public moot schema migration: %w", err)
+	}
+	defer tx.Rollback()
+	for _, stmt := range []string{
+		`DROP INDEX IF EXISTS idx_public_moots_status_updated`,
+		`DROP INDEX IF EXISTS idx_public_moots_founder_status`,
+		`ALTER TABLE esp_public_moots RENAME TO esp_public_moots_old`,
+		`CREATE TABLE esp_public_moots (
+		  group_id BLOB PRIMARY KEY,
+		  founder_pubkey TEXT NOT NULL DEFAULT '',
+		  descriptor BLOB,
+		  descriptor_updated_at_ms INTEGER NOT NULL DEFAULT 0,
+		  status TEXT NOT NULL,
+		  indexed_at_ms INTEGER NOT NULL,
+		  status_updated_at_ms INTEGER NOT NULL
+		)`,
+		`INSERT INTO esp_public_moots (
+		  group_id, founder_pubkey, descriptor, descriptor_updated_at_ms,
+		  status, indexed_at_ms, status_updated_at_ms
+		)
+		SELECT group_id, COALESCE(founder_pubkey, ''), descriptor,
+		  COALESCE(descriptor_updated_at_ms, 0), status, indexed_at_ms,
+		  status_updated_at_ms
+		FROM esp_public_moots_old`,
+		`DROP TABLE esp_public_moots_old`,
+		`CREATE INDEX IF NOT EXISTS idx_public_moots_status_updated ON esp_public_moots(status, descriptor_updated_at_ms DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_public_moots_founder_status ON esp_public_moots(founder_pubkey, status)`,
+	} {
+		if _, err := tx.Exec(stmt); err != nil {
+			return fmt.Errorf("esphttp: migrate public moot schema: %w", err)
+		}
+	}
+	return tx.Commit()
 }
 
 type signRequestScanner interface {

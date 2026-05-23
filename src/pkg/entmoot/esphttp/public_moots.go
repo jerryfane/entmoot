@@ -22,7 +22,9 @@ const (
 	PublicMootStatusDelisted = "delisted"
 	PublicMootStatusBlocked  = "blocked"
 
-	PublicMootMirrorNone = "none"
+	PublicMootMirrorNone   = "none"
+	PublicMootMirrorMember = "member"
+	PublicMootMirrorHosted = "hosted"
 )
 
 var (
@@ -102,7 +104,14 @@ func clonePublicMootDescriptor(desc publicmoot.Descriptor) publicmoot.Descriptor
 }
 
 func publicMootFounderKey(desc publicmoot.Descriptor) string {
+	if len(desc.Founder.EntmootPubKey) == 0 {
+		return ""
+	}
 	return base64.StdEncoding.EncodeToString(desc.Founder.EntmootPubKey)
+}
+
+func publicMootRecordHasDescriptor(rec PublicMootRecord) bool {
+	return rec.Descriptor.Type == publicmoot.DescriptorType && rec.Descriptor.GroupID != (entmoot.GroupID{})
 }
 
 func publicMootStatusSet(filter PublicMootListFilter) map[string]struct{} {
@@ -147,7 +156,7 @@ func (s *MemoryStateStore) UpsertPublicMoot(_ context.Context, rec PublicMootRec
 		return clonePublicMootRecord(existing), false, ErrPublicMootBlocked
 	}
 	founder := publicMootFounderKey(rec.Descriptor)
-	if exists && publicMootFounderKey(existing.Descriptor) != founder {
+	if exists && publicMootRecordHasDescriptor(existing) && publicMootFounderKey(existing.Descriptor) != founder {
 		return clonePublicMootRecord(existing), false, ErrPublicMootFounderMismatch
 	}
 	for _, other := range s.publicMoots {
@@ -203,13 +212,19 @@ func (s *MemoryStateStore) UpdatePublicMootIndexStatus(_ context.Context, groupI
 		return PublicMootRecord{}, false, fmt.Errorf("esphttp: invalid public moot status %q", status)
 	}
 	rec, ok := s.publicMoots[groupID]
-	if !ok {
+	if !ok && status != PublicMootStatusBlocked {
 		return PublicMootRecord{}, false, nil
 	}
 	if nowMS <= 0 {
 		nowMS = s.nowMS()
 	}
+	if rec.Descriptor.GroupID == (entmoot.GroupID{}) {
+		rec.Descriptor.GroupID = groupID
+	}
 	rec.Status = status
+	if rec.IndexedAtMS == 0 {
+		rec.IndexedAtMS = nowMS
+	}
 	rec.StatusUpdatedAtMS = nowMS
 	s.publicMoots[groupID] = clonePublicMootRecord(rec)
 	return clonePublicMootRecord(rec), true, nil
@@ -227,36 +242,17 @@ func (s *SQLiteStateStore) UpsertPublicMoot(ctx context.Context, rec PublicMootR
 	if !validPublicMootStatus(rec.Status) {
 		return PublicMootRecord{}, false, fmt.Errorf("esphttp: invalid public moot status %q", rec.Status)
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return PublicMootRecord{}, false, fmt.Errorf("esphttp: begin public moot upsert: %w", err)
-	}
-	defer tx.Rollback()
-	existing, exists, err := getPublicMootTx(ctx, tx, rec.Descriptor.GroupID)
-	if err != nil {
-		return PublicMootRecord{}, false, err
-	}
-	if exists && normalizePublicMootStatus(existing.Status) == PublicMootStatusBlocked {
-		return existing, false, ErrPublicMootBlocked
-	}
 	founder := publicMootFounderKey(rec.Descriptor)
-	if exists && publicMootFounderKey(existing.Descriptor) != founder {
-		return existing, false, ErrPublicMootFounderMismatch
-	}
-	blockedFounder, err := publicMootBlockedFounderTx(ctx, tx, founder)
+	blockedFounder, err := s.publicMootBlockedFounder(ctx, founder)
 	if err != nil {
 		return PublicMootRecord{}, false, err
 	}
 	if blockedFounder != nil {
 		return *blockedFounder, false, ErrPublicMootBlocked
 	}
-	if exists && existing.Descriptor.UpdatedAtMS >= rec.Descriptor.UpdatedAtMS {
-		return existing, false, tx.Commit()
-	}
-	if exists {
-		rec.Status = defaultPublicMootStatus(existing.Status)
-		rec.IndexedAtMS = existing.IndexedAtMS
-		rec.StatusUpdatedAtMS = existing.StatusUpdatedAtMS
+	raw, err := json.Marshal(rec.Descriptor)
+	if err != nil {
+		return PublicMootRecord{}, false, fmt.Errorf("esphttp: marshal public moot descriptor: %w", err)
 	}
 	if rec.IndexedAtMS == 0 {
 		rec.IndexedAtMS = nowMS
@@ -264,34 +260,53 @@ func (s *SQLiteStateStore) UpsertPublicMoot(ctx context.Context, rec PublicMootR
 	if rec.StatusUpdatedAtMS == 0 {
 		rec.StatusUpdatedAtMS = nowMS
 	}
-	raw, err := json.Marshal(rec.Descriptor)
-	if err != nil {
-		return PublicMootRecord{}, false, fmt.Errorf("esphttp: marshal public moot descriptor: %w", err)
-	}
-	_, err = tx.ExecContext(ctx, `
+	result, err := s.db.ExecContext(ctx, `
 INSERT INTO esp_public_moots
   (group_id, founder_pubkey, descriptor, descriptor_updated_at_ms, status, indexed_at_ms, status_updated_at_ms)
 VALUES (?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(group_id) DO UPDATE SET
-  founder_pubkey = excluded.founder_pubkey,
+  founder_pubkey = CASE
+    WHEN esp_public_moots.founder_pubkey = '' THEN excluded.founder_pubkey
+    ELSE esp_public_moots.founder_pubkey
+  END,
   descriptor = excluded.descriptor,
   descriptor_updated_at_ms = excluded.descriptor_updated_at_ms,
-  status = excluded.status,
-  indexed_at_ms = excluded.indexed_at_ms,
-  status_updated_at_ms = excluded.status_updated_at_ms`,
-		rec.Descriptor.GroupID[:], publicMootFounderKey(rec.Descriptor), raw, rec.Descriptor.UpdatedAtMS, rec.Status, rec.IndexedAtMS, rec.StatusUpdatedAtMS)
+  indexed_at_ms = CASE
+    WHEN esp_public_moots.indexed_at_ms = 0 THEN excluded.indexed_at_ms
+    ELSE esp_public_moots.indexed_at_ms
+  END
+WHERE esp_public_moots.status <> ?
+  AND excluded.descriptor_updated_at_ms > esp_public_moots.descriptor_updated_at_ms
+  AND (esp_public_moots.founder_pubkey = '' OR esp_public_moots.founder_pubkey = excluded.founder_pubkey)`,
+		rec.Descriptor.GroupID[:], publicMootFounderKey(rec.Descriptor), raw, rec.Descriptor.UpdatedAtMS, rec.Status, rec.IndexedAtMS, rec.StatusUpdatedAtMS, PublicMootStatusBlocked)
 	if err != nil {
 		return PublicMootRecord{}, false, fmt.Errorf("esphttp: upsert public moot: %w", err)
 	}
-	if err := tx.Commit(); err != nil {
+	changed, err := result.RowsAffected()
+	if err != nil {
 		return PublicMootRecord{}, false, err
 	}
-	return clonePublicMootRecord(rec), true, nil
+	stored, ok, err := s.GetPublicMoot(ctx, rec.Descriptor.GroupID)
+	if err != nil {
+		return PublicMootRecord{}, false, err
+	}
+	if !ok {
+		return PublicMootRecord{}, false, sql.ErrNoRows
+	}
+	if changed == 0 {
+		if normalizePublicMootStatus(stored.Status) == PublicMootStatusBlocked {
+			return stored, false, ErrPublicMootBlocked
+		}
+		if publicMootRecordHasDescriptor(stored) && publicMootFounderKey(stored.Descriptor) != founder {
+			return stored, false, ErrPublicMootFounderMismatch
+		}
+	}
+	return stored, changed > 0, nil
 }
 
 func (s *SQLiteStateStore) ListPublicMoots(ctx context.Context, filter PublicMootListFilter) ([]PublicMootRecord, error) {
 	statuses := publicMootStatusSet(filter)
-	query := `SELECT descriptor, status, indexed_at_ms, status_updated_at_ms FROM esp_public_moots`
+	query := `SELECT group_id, descriptor, status, indexed_at_ms, status_updated_at_ms FROM esp_public_moots`
 	args := []any{}
 	if len(statuses) > 0 {
 		parts := make([]string, 0, len(statuses))
@@ -324,7 +339,7 @@ func (s *SQLiteStateStore) ListPublicMoots(ctx context.Context, filter PublicMoo
 }
 
 func (s *SQLiteStateStore) GetPublicMoot(ctx context.Context, groupID entmoot.GroupID) (PublicMootRecord, bool, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT descriptor, status, indexed_at_ms, status_updated_at_ms FROM esp_public_moots WHERE group_id = ?`, groupID[:])
+	row := s.db.QueryRowContext(ctx, `SELECT group_id, descriptor, status, indexed_at_ms, status_updated_at_ms FROM esp_public_moots WHERE group_id = ?`, groupID[:])
 	return scanPublicMootRow(row)
 }
 
@@ -336,7 +351,19 @@ func (s *SQLiteStateStore) UpdatePublicMootIndexStatus(ctx context.Context, grou
 	if nowMS <= 0 {
 		nowMS = time.Now().UnixMilli()
 	}
-	result, err := s.db.ExecContext(ctx, `UPDATE esp_public_moots SET status = ?, status_updated_at_ms = ? WHERE group_id = ?`, status, nowMS, groupID[:])
+	var result sql.Result
+	var err error
+	if status == PublicMootStatusBlocked {
+		result, err = s.db.ExecContext(ctx, `
+INSERT INTO esp_public_moots (group_id, founder_pubkey, status, indexed_at_ms, status_updated_at_ms)
+VALUES (?, '', ?, ?, ?)
+ON CONFLICT(group_id) DO UPDATE SET
+  status = excluded.status,
+  status_updated_at_ms = excluded.status_updated_at_ms`,
+			groupID[:], status, nowMS, nowMS)
+	} else {
+		result, err = s.db.ExecContext(ctx, `UPDATE esp_public_moots SET status = ?, status_updated_at_ms = ? WHERE group_id = ?`, status, nowMS, groupID[:])
+	}
 	if err != nil {
 		return PublicMootRecord{}, false, fmt.Errorf("esphttp: update public moot status: %w", err)
 	}
@@ -367,26 +394,28 @@ func scanPublicMootRow(row publicMootScanner) (PublicMootRecord, bool, error) {
 }
 
 func scanPublicMootRecord(row publicMootScanner) (PublicMootRecord, error) {
+	var groupRaw []byte
 	var raw []byte
 	var rec PublicMootRecord
-	if err := row.Scan(&raw, &rec.Status, &rec.IndexedAtMS, &rec.StatusUpdatedAtMS); err != nil {
+	if err := row.Scan(&groupRaw, &raw, &rec.Status, &rec.IndexedAtMS, &rec.StatusUpdatedAtMS); err != nil {
 		return PublicMootRecord{}, err
 	}
-	desc, err := publicmoot.Parse(raw)
-	if err != nil {
-		return PublicMootRecord{}, err
+	if len(groupRaw) != len(rec.Descriptor.GroupID) {
+		return PublicMootRecord{}, fmt.Errorf("esphttp: public moot group_id length %d", len(groupRaw))
 	}
-	rec.Descriptor = desc
+	copy(rec.Descriptor.GroupID[:], groupRaw)
+	if len(raw) > 0 {
+		desc, err := publicmoot.Parse(raw)
+		if err != nil {
+			return PublicMootRecord{}, err
+		}
+		rec.Descriptor = desc
+	}
 	return clonePublicMootRecord(rec), nil
 }
 
-func getPublicMootTx(ctx context.Context, tx *sql.Tx, groupID entmoot.GroupID) (PublicMootRecord, bool, error) {
-	row := tx.QueryRowContext(ctx, `SELECT descriptor, status, indexed_at_ms, status_updated_at_ms FROM esp_public_moots WHERE group_id = ?`, groupID[:])
-	return scanPublicMootRow(row)
-}
-
-func publicMootBlockedFounderTx(ctx context.Context, tx *sql.Tx, founder string) (*PublicMootRecord, error) {
-	row := tx.QueryRowContext(ctx, `SELECT descriptor, status, indexed_at_ms, status_updated_at_ms FROM esp_public_moots WHERE founder_pubkey = ? AND status = ? LIMIT 1`, founder, PublicMootStatusBlocked)
+func (s *SQLiteStateStore) publicMootBlockedFounder(ctx context.Context, founder string) (*PublicMootRecord, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT group_id, descriptor, status, indexed_at_ms, status_updated_at_ms FROM esp_public_moots WHERE founder_pubkey = ? AND status = ? LIMIT 1`, founder, PublicMootStatusBlocked)
 	rec, ok, err := scanPublicMootRow(row)
 	if err != nil || !ok {
 		return nil, err
