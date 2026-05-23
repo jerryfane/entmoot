@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.75] - 2026-05-23
+
+### Changed
+
+- **ESP public directory hardening.** Public directory responses now report
+  member mirror state and history availability only when backed by a configured
+  local group-membership check, reject expired descriptors at publish time,
+  preserve founder identity and moderation state during SQLite descriptor
+  refreshes, and support preemptive descriptorless group blocks.
+
 ## [1.5.74] - 2026-05-23
 
 ### Added
