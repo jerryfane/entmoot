@@ -252,6 +252,10 @@ type StateStore interface {
 	UpsertFleetTaskSubmission(context.Context, FleetTaskSubmissionRecord) (FleetTaskSubmissionRecord, error)
 	GetFleetTaskSubmission(context.Context, string, string, string) (FleetTaskSubmissionRecord, bool, error)
 	ListFleetTaskSubmissions(context.Context, string, string) ([]FleetTaskSubmissionRecord, error)
+	UpsertPublicMootDescriptor(context.Context, PublicMootRecord, int64) (PublicMootRecord, bool, error)
+	GetPublicMoot(context.Context, entmoot.GroupID) (PublicMootRecord, bool, error)
+	ListPublicMoots(context.Context, string) ([]PublicMootRecord, error)
+	SetPublicMootIndexStatus(context.Context, entmoot.GroupID, string, int64) (PublicMootRecord, bool, error)
 	Close() error
 }
 
@@ -310,6 +314,7 @@ type MemoryStateStore struct {
 	liveAgentConfigs    map[entmoot.GroupID]map[entmoot.NodeID]LiveAgentConfig
 	liveAgentPresence   map[entmoot.GroupID]map[entmoot.NodeID]LiveAgentPresence
 	liveAgentCursors    map[entmoot.GroupID]map[entmoot.NodeID]LiveAgentCursor
+	publicMoots         map[entmoot.GroupID]PublicMootRecord
 	clock               func() time.Time
 }
 
@@ -333,6 +338,7 @@ func NewMemoryStateStore() *MemoryStateStore {
 		liveAgentConfigs:    make(map[entmoot.GroupID]map[entmoot.NodeID]LiveAgentConfig),
 		liveAgentPresence:   make(map[entmoot.GroupID]map[entmoot.NodeID]LiveAgentPresence),
 		liveAgentCursors:    make(map[entmoot.GroupID]map[entmoot.NodeID]LiveAgentCursor),
+		publicMoots:         make(map[entmoot.GroupID]PublicMootRecord),
 		clock:               time.Now,
 	}
 }
@@ -1593,6 +1599,23 @@ CREATE TABLE IF NOT EXISTS esp_live_agent_cursors (
   updated_at_ms INTEGER NOT NULL,
   PRIMARY KEY(group_id, node_id)
 );
+
+CREATE TABLE IF NOT EXISTS esp_public_moots (
+  group_id BLOB PRIMARY KEY,
+  founder_pubkey BLOB NOT NULL DEFAULT x'',
+  status TEXT NOT NULL,
+  descriptor BLOB,
+  descriptor_updated_at_ms INTEGER NOT NULL DEFAULT 0,
+  created_at_ms INTEGER NOT NULL,
+  updated_at_ms INTEGER NOT NULL,
+  status_updated_at_ms INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_public_moots_status_updated
+  ON esp_public_moots(status, descriptor_updated_at_ms DESC, group_id);
+
+CREATE INDEX IF NOT EXISTS idx_public_moots_founder_status
+  ON esp_public_moots(founder_pubkey, status);
 `
 
 func OpenSQLiteStateStore(dataDir string) (*SQLiteStateStore, error) {
@@ -2872,6 +2895,18 @@ func migrateSQLiteState(db *sql.DB) error {
 		  updated_at_ms INTEGER NOT NULL,
 		  PRIMARY KEY(group_id, node_id)
 		)`,
+		`CREATE TABLE IF NOT EXISTS esp_public_moots (
+		  group_id BLOB PRIMARY KEY,
+		  founder_pubkey BLOB NOT NULL DEFAULT x'',
+		  status TEXT NOT NULL,
+		  descriptor BLOB,
+		  descriptor_updated_at_ms INTEGER NOT NULL DEFAULT 0,
+		  created_at_ms INTEGER NOT NULL,
+		  updated_at_ms INTEGER NOT NULL,
+		  status_updated_at_ms INTEGER NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_public_moots_status_updated ON esp_public_moots(status, descriptor_updated_at_ms DESC, group_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_public_moots_founder_status ON esp_public_moots(founder_pubkey, status)`,
 	} {
 		if _, err := db.Exec(stmt); err != nil {
 			return fmt.Errorf("esphttp: migrate state schema add agent commands: %w", err)

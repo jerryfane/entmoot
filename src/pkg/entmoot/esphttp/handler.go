@@ -483,6 +483,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if h.handleOpenInviteRedeem(w, r) {
 		return
 	}
+	if h.handlePublicMootRoute(w, r, false) {
+		return
+	}
 	auth, ok := h.authorize(w, r)
 	if !ok {
 		return
@@ -527,6 +530,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if h.handleSignRequestSubroute(w, r) {
+			return
+		}
+		if h.handlePublicMootRoute(w, r, true) {
 			return
 		}
 		writeError(w, http.StatusNotFound, "not_found", "not found")
