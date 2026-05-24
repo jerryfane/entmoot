@@ -110,13 +110,11 @@ func EnrichMemberDisplayNames(ctx context.Context, state StateStore, groupID ent
 	return out, nil
 }
 
-func nodeProfileVisibleForMember(profile NodeProfileRecord, groupID entmoot.GroupID, entmootPubKey string) bool {
+func nodeProfileVisibleForMember(profile NodeProfileRecord, _ entmoot.GroupID, entmootPubKey string) bool {
 	if profile.Source != NodeProfileSourceMemberProfile {
 		return true
 	}
-	return profile.SourceGroupID != nil &&
-		*profile.SourceGroupID == groupID &&
-		strings.TrimSpace(profile.EntmootPubKey) != "" &&
+	return strings.TrimSpace(profile.EntmootPubKey) != "" &&
 		strings.TrimSpace(profile.EntmootPubKey) == strings.TrimSpace(entmootPubKey)
 }
 
