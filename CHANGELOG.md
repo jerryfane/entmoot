@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.76] - 2026-05-24
+
+### Added
+
+- **ESP-local node display names.** ESP state now tracks hostname observations
+  from member profiles, Fleet members, Fleet invites, and local Pilot context
+  with source precedence and expiry handling, then exposes
+  `global_hostname` and stable `display_name` fields in member API responses.
+
+### Changed
+
+- **Member display enrichment.** Group member responses keep the existing
+  group-local `hostname` contract while adding ESP-local fallback display
+  labels such as `hermes#155760`, so older clients continue to work and newer
+  clients can show consistent node labels across moots.
+
 ## [1.5.75] - 2026-05-23
 
 ### Changed
