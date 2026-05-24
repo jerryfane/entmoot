@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.77] - 2026-05-24
+
+### Fixed
+
+- **ESP member-profile display fallback.** Member-profile hostname observations
+  can now populate `global_hostname` across visible moots when the Pilot node ID
+  and Entmoot public key match, so labels such as `hermes#155760` are reused
+  without leaking missing or mismatched identities.
+
 ## [1.5.76] - 2026-05-24
 
 ### Added
