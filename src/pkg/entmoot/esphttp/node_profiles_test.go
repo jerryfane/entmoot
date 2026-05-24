@@ -200,6 +200,25 @@ func TestStateStoresNodeProfilesPrecedenceTieBreakAndExpiry(t *testing.T) {
 			if got := memberProfiles[133056]; got.Hostname != "member-profile" || got.EntmootPubKey != memberPub {
 				t.Fatalf("matching member profile = %+v", got)
 			}
+			otherGroupID := testGroupID(2)
+			if _, _, err := store.UpsertNodeProfile(ctx, NodeProfileRecord{
+				NodeID:        133058,
+				EntmootPubKey: memberPub,
+				Hostname:      "other-group-same-identity",
+				Source:        NodeProfileSourceMemberProfile,
+				ObservedAtMS:  20,
+				ExpiresAtMS:   futureMS,
+				SourceGroupID: &otherGroupID,
+			}); err != nil {
+				t.Fatalf("UpsertNodeProfile other group same identity: %v", err)
+			}
+			memberProfiles, err = memberLister.ListNodeProfilesForMembers(ctx, groupID, map[entmoot.NodeID]string{133058: memberPub})
+			if err != nil {
+				t.Fatalf("ListNodeProfilesForMembers other group same identity: %v", err)
+			}
+			if got := memberProfiles[133058]; got.Hostname != "other-group-same-identity" || got.EntmootPubKey != memberPub {
+				t.Fatalf("other group same identity member profile = %+v", got)
+			}
 			memberProfiles, err = memberLister.ListNodeProfilesForMembers(ctx, groupID, map[entmoot.NodeID]string{133056: base64.StdEncoding.EncodeToString([]byte("new-member-pub"))})
 			if err != nil {
 				t.Fatalf("ListNodeProfilesForMembers mismatch: %v", err)
