@@ -204,12 +204,18 @@ Example public directory entry shape:
 Operators may set a listed descriptor to `pending`, `delisted`, or `blocked`
 for Entmoot-operated surfaces without changing the group roster.
 
-Member list responses may include `hostname` and `live`. Hostnames are learned
-from signed member-profile gossip scoped to the group and are display hints
-only. The ESP only exposes a profile when the profile author's Entmoot key
-still matches the current roster entry for that Pilot node id. `live` is
-ESP-local state with `enabled`, `status`, `mode`, topic filters, allowed
-actions, lease, and timestamps.
+Member list responses include `display_name` and may include `hostname`,
+`global_hostname`, and `live`. `hostname` is learned from signed member-profile
+gossip scoped to the group and remains the highest-confidence display hint for
+that group. The ESP only exposes a group profile when the profile author's
+Entmoot key still matches the current roster entry for that Pilot node id.
+`global_hostname` is an ESP-local fallback learned from same-group cached member
+profiles, Fleet, invite, or local Pilot context; it is not a global identity
+authority.
+`display_name` is always stable for clients: `<hostname>#<node_id>` when either
+hostname field is available, otherwise `node-<node_id>`. `live` is ESP-local
+state with `enabled`, `status`, `mode`, topic filters, allowed actions, lease,
+and timestamps.
 
 Live-agent config routes:
 

@@ -417,7 +417,8 @@ func (c localGroupCatalog) ListMembers(ctx context.Context, gid entmoot.GroupID)
 			Founder:       founder.PilotNodeID == nodeID,
 		}
 		if c.profiles != nil {
-			ad, ok, err := c.profiles.GetMemberProfileAd(ctx, gid, nodeID, time.Now())
+			now := time.Now()
+			ad, ok, err := c.profiles.GetMemberProfileAd(ctx, gid, nodeID, now)
 			if err != nil {
 				slog.Warn("esp group member profile ignored",
 					slog.String("group_id", gid.String()),
@@ -426,6 +427,12 @@ func (c localGroupCatalog) ListMembers(ctx context.Context, gid entmoot.GroupID)
 			} else if ok {
 				if memberProfileMatchesRosterInfo(ad, info) {
 					member.Hostname = ad.Hostname
+					if err := esphttp.ObserveMemberProfileNodeProfile(ctx, c.state, gid, nodeID, encodeBase64(info.EntmootPubKey), ad.Hostname, ad.IssuedAt, ad.NotAfter); err != nil {
+						slog.Warn("esp group member profile cache update failed",
+							slog.String("group_id", gid.String()),
+							slog.Uint64("node_id", uint64(nodeID)),
+							slog.String("err", err.Error()))
+					}
 				} else {
 					slog.Debug("esp group member profile ignored: identity mismatch",
 						slog.String("group_id", gid.String()),
