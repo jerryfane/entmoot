@@ -729,6 +729,9 @@ func (h *Handler) handleListFleetMembers(w http.ResponseWriter, r *http.Request,
 	if members == nil {
 		members = []FleetMemberRecord{}
 	}
+	if NormalizeFleetStatus(fleet.Status) == FleetStatusActive {
+		h.observeFleetMemberProfiles(r.Context(), members)
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"members": members})
 }
 
@@ -750,6 +753,9 @@ func (h *Handler) handleListFleetInvites(w http.ResponseWriter, r *http.Request,
 	}
 	if invites == nil {
 		invites = []FleetInviteRecord{}
+	}
+	if NormalizeFleetStatus(fleet.Status) == FleetStatusActive {
+		h.observeFleetInviteProfiles(r.Context(), invites)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"invites": invites})
 }
@@ -2163,7 +2169,47 @@ func (h *Handler) handleListMembers(w http.ResponseWriter, r *http.Request, grou
 		writeError(w, http.StatusInternalServerError, "internal_error", "member listing failed")
 		return
 	}
+	members, err = EnrichMemberDisplayNames(r.Context(), h.state, groupID, members)
+	if err != nil {
+		h.logger.Error("esphttp: enrich members", slog.String("err", err.Error()))
+		writeError(w, http.StatusInternalServerError, "internal_error", "member listing failed")
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"members": members})
+}
+
+func (h *Handler) observeFleetMemberProfiles(ctx context.Context, members []FleetMemberRecord) {
+	if h.state == nil {
+		return
+	}
+	for _, member := range members {
+		profile, ok := nodeProfileFromFleetMember(member)
+		if !ok {
+			continue
+		}
+		if _, _, err := h.state.UpsertNodeProfile(ctx, profile); err != nil {
+			h.logger.Warn("esphttp: fleet member profile cache update failed",
+				slog.Uint64("node_id", uint64(member.NodeID)),
+				slog.String("err", err.Error()))
+		}
+	}
+}
+
+func (h *Handler) observeFleetInviteProfiles(ctx context.Context, invites []FleetInviteRecord) {
+	if h.state == nil {
+		return
+	}
+	for _, invite := range invites {
+		profile, ok := nodeProfileFromFleetInvite(invite)
+		if !ok {
+			continue
+		}
+		if _, _, err := h.state.UpsertNodeProfile(ctx, profile); err != nil {
+			h.logger.Warn("esphttp: fleet invite profile cache update failed",
+				slog.Uint64("node_id", uint64(invite.NodeID)),
+				slog.String("err", err.Error()))
+		}
+	}
 }
 
 type liveAgentConfigHTTPPayload struct {

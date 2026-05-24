@@ -20,6 +20,7 @@ import (
 	"entmoot/pkg/entmoot/ipc"
 	"entmoot/pkg/entmoot/mailbox"
 	"entmoot/pkg/entmoot/store"
+	"entmoot/pkg/entmoot/transport/pilot/ipcclient"
 
 	"github.com/grandcat/zeroconf"
 )
@@ -185,6 +186,7 @@ func runESPServe(gf *globalFlags, cfg espServeConfig) int {
 	}
 	metadataStore, _ := resources.espState.(esphttp.GroupMetadataStore)
 	profileStore, _ := resources.store.(*store.SQLite)
+	observeLocalPilotNodeProfile(context.Background(), gf.socket, resources.espState)
 	var deviceGroups deviceGroupAuthorizer
 	if devices != nil {
 		deviceGroups = &fileBackedDeviceGroupAuthorizer{path: deviceRegistryPath, registry: devices}
@@ -437,6 +439,39 @@ func publishHTTPError(frame *ipc.ErrorFrame) error {
 		HTTPStatus: status,
 		Code:       code,
 		Message:    frame.Message,
+	}
+}
+
+func observeLocalPilotNodeProfile(ctx context.Context, socketPath string, state esphttp.StateStore) {
+	if state == nil {
+		return
+	}
+	drv, err := ipcclient.Connect(socketPath)
+	if err != nil {
+		slog.Debug("esp serve: local pilot profile lookup failed", slog.String("err", err.Error()))
+		return
+	}
+	defer func() { _ = drv.Close() }()
+	infoCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	info, err := drv.InfoStruct(infoCtx)
+	if err != nil {
+		slog.Debug("esp serve: local pilot profile lookup failed", slog.String("err", err.Error()))
+		return
+	}
+	hostname, ok := esphttp.NormalizeNodeProfileHostname(info.Hostname)
+	if !ok || info.NodeID == 0 {
+		return
+	}
+	if _, _, err := state.UpsertNodeProfile(ctx, esphttp.NodeProfileRecord{
+		NodeID:       entmoot.NodeID(info.NodeID),
+		Hostname:     hostname,
+		Source:       esphttp.NodeProfileSourcePilotInfo,
+		ObservedAtMS: time.Now().UnixMilli(),
+	}); err != nil {
+		slog.Warn("esp serve: local pilot profile cache update failed",
+			slog.Uint64("node_id", uint64(info.NodeID)),
+			slog.String("err", err.Error()))
 	}
 }
 
