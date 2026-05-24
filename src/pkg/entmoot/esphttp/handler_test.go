@@ -327,6 +327,146 @@ func TestHandlerMobileGroupsAndSignRequests(t *testing.T) {
 	}
 }
 
+func TestHandlerListMembersEnrichesDisplayNames(t *testing.T) {
+	gid := testGroupID(1)
+	otherGID := testGroupID(2)
+	state := NewMemoryStateStore()
+	state.clock = func() time.Time { return time.UnixMilli(2_000) }
+	if _, _, err := state.UpsertNodeProfile(context.Background(), NodeProfileRecord{
+		NodeID:       45492,
+		Hostname:     "hermes",
+		Source:       NodeProfileSourceFleetMember,
+		ObservedAtMS: 1_000,
+		ExpiresAtMS:  10_000,
+	}); err != nil {
+		t.Fatalf("UpsertNodeProfile global: %v", err)
+	}
+	if _, _, err := state.UpsertNodeProfile(context.Background(), NodeProfileRecord{
+		NodeID:       45493,
+		Hostname:     "expired",
+		Source:       NodeProfileSourceFleetMember,
+		ObservedAtMS: 1_000,
+		ExpiresAtMS:  1_500,
+	}); err != nil {
+		t.Fatalf("UpsertNodeProfile expired: %v", err)
+	}
+	if _, _, err := state.UpsertNodeProfile(context.Background(), NodeProfileRecord{
+		NodeID:        45494,
+		Hostname:      "private-other-group",
+		Source:        NodeProfileSourceMemberProfile,
+		ObservedAtMS:  1_000,
+		ExpiresAtMS:   10_000,
+		SourceGroupID: &otherGID,
+	}); err != nil {
+		t.Fatalf("UpsertNodeProfile other group: %v", err)
+	}
+	if _, _, err := state.UpsertNodeProfile(context.Background(), NodeProfileRecord{
+		NodeID:       45495,
+		Hostname:     "fleet-visible",
+		Source:       NodeProfileSourceFleetMember,
+		ObservedAtMS: 1_000,
+		ExpiresAtMS:  10_000,
+	}); err != nil {
+		t.Fatalf("UpsertNodeProfile visible global: %v", err)
+	}
+	if _, _, err := state.UpsertNodeProfile(context.Background(), NodeProfileRecord{
+		NodeID:        45495,
+		Hostname:      "private-other-group-newer",
+		Source:        NodeProfileSourceMemberProfile,
+		ObservedAtMS:  2_000,
+		ExpiresAtMS:   10_000,
+		SourceGroupID: &otherGID,
+	}); err != nil {
+		t.Fatalf("UpsertNodeProfile other group over global: %v", err)
+	}
+	if _, _, err := state.UpsertNodeProfile(context.Background(), NodeProfileRecord{
+		NodeID:       45496,
+		Hostname:     "fleet-lower",
+		Source:       NodeProfileSourceFleetMember,
+		ObservedAtMS: 1_000,
+		ExpiresAtMS:  10_000,
+	}); err != nil {
+		t.Fatalf("UpsertNodeProfile same group global: %v", err)
+	}
+	if _, _, err := state.UpsertNodeProfile(context.Background(), NodeProfileRecord{
+		NodeID:        45496,
+		EntmootPubKey: base64.StdEncoding.EncodeToString([]byte("same-group-pub")),
+		Hostname:      "signed-same-group",
+		Source:        NodeProfileSourceMemberProfile,
+		ObservedAtMS:  1_500,
+		ExpiresAtMS:   10_000,
+		SourceGroupID: &gid,
+	}); err != nil {
+		t.Fatalf("UpsertNodeProfile same group member: %v", err)
+	}
+	if _, _, err := state.UpsertNodeProfile(context.Background(), NodeProfileRecord{
+		NodeID:        45497,
+		EntmootPubKey: base64.StdEncoding.EncodeToString([]byte("old-same-group-pub")),
+		Hostname:      "stale-same-group",
+		Source:        NodeProfileSourceMemberProfile,
+		ObservedAtMS:  1_500,
+		ExpiresAtMS:   10_000,
+		SourceGroupID: &gid,
+	}); err != nil {
+		t.Fatalf("UpsertNodeProfile stale same group member: %v", err)
+	}
+	catalog := fakeCatalog{
+		groups: []GroupSummary{{GroupID: gid, Members: 7}},
+		members: []MemberSummary{{
+			NodeID:        45491,
+			EntmootPubKey: base64.StdEncoding.EncodeToString([]byte("mars-pub")),
+			Hostname:      "mars",
+		}, {
+			NodeID:        45492,
+			EntmootPubKey: base64.StdEncoding.EncodeToString([]byte("hermes-pub")),
+		}, {
+			NodeID:        45493,
+			EntmootPubKey: base64.StdEncoding.EncodeToString([]byte("expired-pub")),
+		}, {
+			NodeID:        45494,
+			EntmootPubKey: base64.StdEncoding.EncodeToString([]byte("other-group-pub")),
+		}, {
+			NodeID:        45495,
+			EntmootPubKey: base64.StdEncoding.EncodeToString([]byte("visible-pub")),
+		}, {
+			NodeID:        45496,
+			EntmootPubKey: base64.StdEncoding.EncodeToString([]byte("same-group-pub")),
+		}, {
+			NodeID:        45497,
+			EntmootPubKey: base64.StdEncoding.EncodeToString([]byte("new-same-group-pub")),
+		}},
+	}
+	handler := testMobileHandlerFull(t, gid, nil, &catalog, nil, nil, state, nil)
+
+	members := doJSONRequest[struct {
+		Members []MemberSummary `json:"members"`
+	}](t, handler, http.MethodGet, "/v1/groups/"+gid.String()+"/members", nil, http.StatusOK)
+	if len(members.Members) != 7 {
+		t.Fatalf("members = %+v, want seven", members.Members)
+	}
+	if got := members.Members[0]; got.Hostname != "mars" || got.GlobalHostname != "" || got.DisplayName != "mars#45491" {
+		t.Fatalf("local profile member = %+v", got)
+	}
+	if got := members.Members[1]; got.Hostname != "" || got.GlobalHostname != "hermes" || got.DisplayName != "hermes#45492" {
+		t.Fatalf("global fallback member = %+v", got)
+	}
+	if got := members.Members[2]; got.Hostname != "" || got.GlobalHostname != "" || got.DisplayName != "node-45493" {
+		t.Fatalf("expired fallback member = %+v", got)
+	}
+	if got := members.Members[3]; got.Hostname != "" || got.GlobalHostname != "" || got.DisplayName != "node-45494" {
+		t.Fatalf("other group profile member = %+v", got)
+	}
+	if got := members.Members[4]; got.Hostname != "" || got.GlobalHostname != "fleet-visible" || got.DisplayName != "fleet-visible#45495" {
+		t.Fatalf("other group profile over global member = %+v", got)
+	}
+	if got := members.Members[5]; got.Hostname != "" || got.GlobalHostname != "signed-same-group" || got.DisplayName != "signed-same-group#45496" {
+		t.Fatalf("same group profile over global member = %+v", got)
+	}
+	if got := members.Members[6]; got.Hostname != "" || got.GlobalHostname != "" || got.DisplayName != "node-45497" {
+		t.Fatalf("stale same group profile member = %+v", got)
+	}
+}
+
 func TestHandlerLiveAgentConfigDeviceAndMemberPolicy(t *testing.T) {
 	gid := testGroupID(1)
 	adminPub, adminPriv, err := ed25519.GenerateKey(rand.Reader)
