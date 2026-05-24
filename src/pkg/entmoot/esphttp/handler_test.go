@@ -410,8 +410,19 @@ func TestHandlerListMembersEnrichesDisplayNames(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("UpsertNodeProfile stale same group member: %v", err)
 	}
+	if _, _, err := state.UpsertNodeProfile(context.Background(), NodeProfileRecord{
+		NodeID:        45498,
+		EntmootPubKey: base64.StdEncoding.EncodeToString([]byte("other-group-same-pub")),
+		Hostname:      "signed-other-group-same-identity",
+		Source:        NodeProfileSourceMemberProfile,
+		ObservedAtMS:  1_500,
+		ExpiresAtMS:   10_000,
+		SourceGroupID: &otherGID,
+	}); err != nil {
+		t.Fatalf("UpsertNodeProfile other group same identity member: %v", err)
+	}
 	catalog := fakeCatalog{
-		groups: []GroupSummary{{GroupID: gid, Members: 7}},
+		groups: []GroupSummary{{GroupID: gid, Members: 8}},
 		members: []MemberSummary{{
 			NodeID:        45491,
 			EntmootPubKey: base64.StdEncoding.EncodeToString([]byte("mars-pub")),
@@ -434,6 +445,9 @@ func TestHandlerListMembersEnrichesDisplayNames(t *testing.T) {
 		}, {
 			NodeID:        45497,
 			EntmootPubKey: base64.StdEncoding.EncodeToString([]byte("new-same-group-pub")),
+		}, {
+			NodeID:        45498,
+			EntmootPubKey: base64.StdEncoding.EncodeToString([]byte("other-group-same-pub")),
 		}},
 	}
 	handler := testMobileHandlerFull(t, gid, nil, &catalog, nil, nil, state, nil)
@@ -441,8 +455,8 @@ func TestHandlerListMembersEnrichesDisplayNames(t *testing.T) {
 	members := doJSONRequest[struct {
 		Members []MemberSummary `json:"members"`
 	}](t, handler, http.MethodGet, "/v1/groups/"+gid.String()+"/members", nil, http.StatusOK)
-	if len(members.Members) != 7 {
-		t.Fatalf("members = %+v, want seven", members.Members)
+	if len(members.Members) != 8 {
+		t.Fatalf("members = %+v, want eight", members.Members)
 	}
 	if got := members.Members[0]; got.Hostname != "mars" || got.GlobalHostname != "" || got.DisplayName != "mars#45491" {
 		t.Fatalf("local profile member = %+v", got)
@@ -464,6 +478,9 @@ func TestHandlerListMembersEnrichesDisplayNames(t *testing.T) {
 	}
 	if got := members.Members[6]; got.Hostname != "" || got.GlobalHostname != "" || got.DisplayName != "node-45497" {
 		t.Fatalf("stale same group profile member = %+v", got)
+	}
+	if got := members.Members[7]; got.Hostname != "" || got.GlobalHostname != "signed-other-group-same-identity" || got.DisplayName != "signed-other-group-same-identity#45498" {
+		t.Fatalf("other group same identity profile member = %+v", got)
 	}
 }
 
