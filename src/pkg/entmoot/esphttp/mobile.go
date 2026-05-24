@@ -253,6 +253,9 @@ type StateStore interface {
 	ListPublicMoots(context.Context, PublicMootListFilter) ([]PublicMootRecord, error)
 	GetPublicMoot(context.Context, entmoot.GroupID) (PublicMootRecord, bool, error)
 	UpdatePublicMootIndexStatus(context.Context, entmoot.GroupID, string, int64) (PublicMootRecord, bool, error)
+	UpsertNodeProfile(context.Context, NodeProfileRecord) (NodeProfileRecord, bool, error)
+	GetNodeProfile(context.Context, entmoot.NodeID) (NodeProfileRecord, bool, error)
+	ListNodeProfiles(context.Context, []entmoot.NodeID) (map[entmoot.NodeID]NodeProfileRecord, error)
 	UpsertFleetTaskSubmission(context.Context, FleetTaskSubmissionRecord) (FleetTaskSubmissionRecord, error)
 	GetFleetTaskSubmission(context.Context, string, string, string) (FleetTaskSubmissionRecord, bool, error)
 	ListFleetTaskSubmissions(context.Context, string, string) ([]FleetTaskSubmissionRecord, error)
@@ -315,6 +318,7 @@ type MemoryStateStore struct {
 	liveAgentPresence   map[entmoot.GroupID]map[entmoot.NodeID]LiveAgentPresence
 	liveAgentCursors    map[entmoot.GroupID]map[entmoot.NodeID]LiveAgentCursor
 	publicMoots         map[entmoot.GroupID]PublicMootRecord
+	nodeProfiles        map[entmoot.NodeID]NodeProfileRecord
 	clock               func() time.Time
 }
 
@@ -339,6 +343,7 @@ func NewMemoryStateStore() *MemoryStateStore {
 		liveAgentPresence:   make(map[entmoot.GroupID]map[entmoot.NodeID]LiveAgentPresence),
 		liveAgentCursors:    make(map[entmoot.GroupID]map[entmoot.NodeID]LiveAgentCursor),
 		publicMoots:         make(map[entmoot.GroupID]PublicMootRecord),
+		nodeProfiles:        make(map[entmoot.NodeID]NodeProfileRecord),
 		clock:               time.Now,
 	}
 }
@@ -1402,6 +1407,19 @@ CREATE INDEX IF NOT EXISTS idx_public_moots_status_updated
 
 CREATE INDEX IF NOT EXISTS idx_public_moots_founder_status
   ON esp_public_moots(founder_pubkey, status);
+
+CREATE TABLE IF NOT EXISTS esp_node_profiles (
+  node_id INTEGER PRIMARY KEY,
+  hostname TEXT NOT NULL,
+  source TEXT NOT NULL,
+  confidence INTEGER NOT NULL,
+  observed_at_ms INTEGER NOT NULL,
+  expires_at_ms INTEGER NOT NULL DEFAULT 0,
+  source_group_id BLOB
+);
+
+CREATE INDEX IF NOT EXISTS idx_node_profiles_expires
+  ON esp_node_profiles(expires_at_ms);
 
 CREATE TABLE IF NOT EXISTS esp_fleets (
   fleet_id TEXT PRIMARY KEY,
@@ -2786,9 +2804,19 @@ func migrateSQLiteState(db *sql.DB) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_public_moots_status_updated ON esp_public_moots(status, descriptor_updated_at_ms DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_public_moots_founder_status ON esp_public_moots(founder_pubkey, status)`,
+		`CREATE TABLE IF NOT EXISTS esp_node_profiles (
+		  node_id INTEGER PRIMARY KEY,
+		  hostname TEXT NOT NULL,
+		  source TEXT NOT NULL,
+		  confidence INTEGER NOT NULL,
+		  observed_at_ms INTEGER NOT NULL,
+		  expires_at_ms INTEGER NOT NULL DEFAULT 0,
+		  source_group_id BLOB
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_node_profiles_expires ON esp_node_profiles(expires_at_ms)`,
 	} {
 		if _, err := db.Exec(stmt); err != nil {
-			return fmt.Errorf("esphttp: migrate state schema add public/open invite state: %w", err)
+			return fmt.Errorf("esphttp: migrate state schema add public/profile state: %w", err)
 		}
 	}
 	if err := migratePublicMootSchema(db); err != nil {
