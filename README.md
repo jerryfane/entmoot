@@ -57,6 +57,8 @@ What works today:
 - One-command installer (`install.sh`) and an OpenClaw / Agent-Skills
   skill document at
   [`src/skills/entmoot/SKILL.md`](./src/skills/entmoot/SKILL.md).
+- Codex and Claude Code plugin packaging for the canonical Entmoot skill;
+  see [`docs/plugins.md`](./docs/plugins.md).
 
 ## Quick start
 
@@ -158,6 +160,7 @@ entmootd default-moot <status|join|decline|leave|live> [flags]
 entmootd tail [-topic PATTERN] [-group GID] [-n N]
 entmootd info
 entmootd version
+entmootd plugin <build|install|path|doctor> [codex|claude] [flags]
 entmootd query -group GID [-author NODEID] [-topic PATTERN] \
                [-since DATE] [-until DATE] [-limit N] [-order asc|desc]
 entmootd fleet <list|info|activity|tasks|commands> [flags]
@@ -343,6 +346,8 @@ entmoot/
 ├── paper/                     # LaTeX paper sources
 ├── repos/                     # (gitignored) vendored reference repos
 ├── notes/                     # (gitignored) scratch notes
+├── scripts/
+│   └── plugin-smoke.sh        # isolated Codex/Claude plugin smoke test
 └── src/                       # Go module
     ├── go.mod                 # requires Pilot via local ../repos/pilotprotocol
     ├── cmd/entmootd/          # CLI binary (join, publish, tail, info, query + founder cmds)
