@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	entfeatures "entmoot/pkg/entmoot/features"
 )
 
 const (
@@ -32,26 +34,27 @@ const (
 var procRoot = "/proc"
 
 type runtimeReport struct {
-	Binary                 string               `json:"binary,omitempty"`
-	UID                    int                  `json:"uid"`
-	GID                    int                  `json:"gid"`
-	RuntimeStatus          string               `json:"runtime_status"`
-	RuntimeStatusReason    string               `json:"runtime_status_reason,omitempty"`
-	DataDir                string               `json:"data_dir"`
-	IdentityPath           string               `json:"identity_path"`
-	PilotSocket            string               `json:"pilot_socket"`
-	PilotSocketReachable   bool                 `json:"pilot_socket_reachable"`
-	ControlSocket          string               `json:"control_socket"`
-	ControlSocketReachable bool                 `json:"control_socket_reachable"`
-	PublishPathHealthy     bool                 `json:"publish_path_healthy"`
-	AgentWrapper           string               `json:"agent_wrapper,omitempty"`
-	PilotWrapper           string               `json:"pilot_wrapper,omitempty"`
-	StackHelper            string               `json:"stack_helper,omitempty"`
-	RunningDaemon          *runtimeDaemonReport `json:"running_daemon,omitempty"`
-	NamespaceWarning       string               `json:"namespace_warning,omitempty"`
-	Suggestions            []string             `json:"suggestions,omitempty"`
-	Recommended            map[string]string    `json:"recommended,omitempty"`
-	Platform               map[string]string    `json:"platform,omitempty"`
+	Binary                 string                   `json:"binary,omitempty"`
+	UID                    int                      `json:"uid"`
+	GID                    int                      `json:"gid"`
+	RuntimeStatus          string                   `json:"runtime_status"`
+	RuntimeStatusReason    string                   `json:"runtime_status_reason,omitempty"`
+	Features               entfeatures.Capabilities `json:"features"`
+	DataDir                string                   `json:"data_dir"`
+	IdentityPath           string                   `json:"identity_path"`
+	PilotSocket            string                   `json:"pilot_socket"`
+	PilotSocketReachable   bool                     `json:"pilot_socket_reachable"`
+	ControlSocket          string                   `json:"control_socket"`
+	ControlSocketReachable bool                     `json:"control_socket_reachable"`
+	PublishPathHealthy     bool                     `json:"publish_path_healthy"`
+	AgentWrapper           string                   `json:"agent_wrapper,omitempty"`
+	PilotWrapper           string                   `json:"pilot_wrapper,omitempty"`
+	StackHelper            string                   `json:"stack_helper,omitempty"`
+	RunningDaemon          *runtimeDaemonReport     `json:"running_daemon,omitempty"`
+	NamespaceWarning       string                   `json:"namespace_warning,omitempty"`
+	Suggestions            []string                 `json:"suggestions,omitempty"`
+	Recommended            map[string]string        `json:"recommended,omitempty"`
+	Platform               map[string]string        `json:"platform,omitempty"`
 }
 
 type runtimeDaemonReport struct {
@@ -143,6 +146,7 @@ func collectRuntimeReport(gf *globalFlags, dataDir string) runtimeReport {
 		GID:                    os.Getgid(),
 		DataDir:                dataDir,
 		IdentityPath:           gf.identity,
+		Features:               featureFlags(gf).Capabilities(),
 		PublishPathHealthy:     controlSocket.Reachable,
 		PilotSocket:            gf.socket,
 		PilotSocketReachable:   pilotSocket.Reachable,
@@ -205,6 +209,7 @@ func printRuntimeReport(report runtimeReport) {
 	fmt.Printf("binary: %s\n", report.Binary)
 	fmt.Printf("uid: %d gid: %d\n", report.UID, report.GID)
 	fmt.Printf("runtime_status: %s\n", report.RuntimeStatus)
+	fmt.Printf("features: fleet_enabled=%t tasks_enabled=%t\n", report.Features.FleetEnabled, report.Features.TasksEnabled)
 	if report.RuntimeStatusReason != "" {
 		fmt.Printf("runtime_status_reason: %s\n", report.RuntimeStatusReason)
 	}

@@ -526,6 +526,42 @@ entmoot_hide_ip_enabled() {
   esac
 }
 
+entmoot_feature_value() {
+  printf '%s' "\${1:-0}" | tr '[:upper:]' '[:lower:]'
+}
+
+validate_entmoot_feature_flag() {
+  name="\$1"
+  value=\$(entmoot_feature_value "\$2")
+  case "\$value" in
+    ""|1|true|yes|on|0|false|no|off) return 0 ;;
+    *)
+      echo "\$name must be one of 1,true,yes,on,0,false,no,off" >&2
+      return 1
+      ;;
+  esac
+}
+
+validate_entmoot_feature_flags() {
+  validate_entmoot_feature_flag ENTMOOT_ENABLE_FLEET "\${ENTMOOT_ENABLE_FLEET:-}" || return 1
+  validate_entmoot_feature_flag ENTMOOT_ENABLE_TASKS "\${ENTMOOT_ENABLE_TASKS:-}" || return 1
+}
+
+entmoot_fleet_enabled() {
+  case "\$(entmoot_feature_value "\${ENTMOOT_ENABLE_FLEET:-0}")" in
+    1|true|yes|on) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+entmoot_tasks_enabled() {
+  entmoot_fleet_enabled || return 1
+  case "\$(entmoot_feature_value "\${ENTMOOT_ENABLE_TASKS:-0}")" in
+    1|true|yes|on) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 pilot_public_enabled() {
   case "\${PILOT_PUBLIC:-0}" in
     1|true|yes) return 0 ;;
@@ -579,7 +615,7 @@ check_stack() {
     check_pidfile_for_kind pilot "\$PILOT_PIDFILE" || status=1
   fi
   check_pidfile_for_kind entmoot "\$ENTMOOT_PIDFILE" || status=1
-  if [ -n "\${ENTMOOT_AGENT_RUNNER:-}" ]; then
+  if [ -n "\${ENTMOOT_AGENT_RUNNER:-}" ] && entmoot_tasks_enabled; then
     check_pidfile_for_kind agent-watcher "\$RUN_DIR/agent-commands-watch.pid" || status=1
   fi
   return "\$status"
@@ -617,6 +653,7 @@ runner_command_available() {
 }
 
 validate_agent_command_runner() {
+  entmoot_tasks_enabled || return 0
   runner="\${ENTMOOT_AGENT_RUNNER:-}"
   [ -n "\$runner" ] || return 0
   if [ "\$runner" = "openclaw" ]; then
@@ -634,6 +671,7 @@ validate_agent_command_runner() {
 start_agent_command_watcher() {
   validate_agent_command_runner || return 1
   stop_agent_command_watcher
+  entmoot_tasks_enabled || return 0
   runner="\${ENTMOOT_AGENT_RUNNER:-}"
   [ -n "\$runner" ] || return 0
   interval="\${ENTMOOT_AGENT_WATCH_INTERVAL:-10s}"
@@ -645,7 +683,7 @@ start_agent_command_watcher() {
 if [ "\$(id -u)" = "0" ] && [ -d /data ] && is_data_agent_layout; then
   if STACK_RUN_USER=\$(select_stack_run_user); then
     envs="ENTMOOT_RUNTIME_ENV=\$(quote "\$RUNTIME_ENV")"
-    for name in ENTMOOT_BIN ENTMOOT_DATA ENTMOOT_IDENTITY ENTMOOT_CONTROL_SOCKET ENTMOOT_HIDE_IP ENTMOOT_START_TIMEOUT ENTMOOT_RUN_DIR ENTMOOT_RUN_USER ENTMOOT_AGENT_INSTRUCTIONS ENTMOOT_AGENT_RUNNER ENTMOOT_AGENT_WATCH_INTERVAL ENTMOOT_OPENCLAW_AGENT ENTMOOT_OPENCLAW_SESSION_ID ENTMOOT_OPENCLAW_TO OPENCLAW_AGENT_ID OPENCLAW_SESSION_ID OPENCLAW_TO OPENCLAW_BIN PILOT_DIR PILOT_BIN_DIR PILOT_SOCKET TMP_PILOT_SOCKET PILOT_PUBLIC PILOT_DAEMON_BIN PILOTCTL_BIN PILOT_REGISTRY PILOT_BEACON PILOT_HOSTNAME PILOT_EMAIL PILOT_TURN_PROVIDER PILOT_CLOUDFLARE_TURN_CREDS_FILE PILOT_RENDEZVOUS_URL; do
+    for name in ENTMOOT_BIN ENTMOOT_DATA ENTMOOT_IDENTITY ENTMOOT_CONTROL_SOCKET ENTMOOT_HIDE_IP ENTMOOT_START_TIMEOUT ENTMOOT_RUN_DIR ENTMOOT_RUN_USER ENTMOOT_ENABLE_FLEET ENTMOOT_ENABLE_TASKS ENTMOOT_AGENT_INSTRUCTIONS ENTMOOT_AGENT_RUNNER ENTMOOT_AGENT_WATCH_INTERVAL ENTMOOT_OPENCLAW_AGENT ENTMOOT_OPENCLAW_SESSION_ID ENTMOOT_OPENCLAW_TO OPENCLAW_AGENT_ID OPENCLAW_SESSION_ID OPENCLAW_TO OPENCLAW_BIN PILOT_DIR PILOT_BIN_DIR PILOT_SOCKET TMP_PILOT_SOCKET PILOT_PUBLIC PILOT_DAEMON_BIN PILOTCTL_BIN PILOT_REGISTRY PILOT_BEACON PILOT_HOSTNAME PILOT_EMAIL PILOT_TURN_PROVIDER PILOT_CLOUDFLARE_TURN_CREDS_FILE PILOT_RENDEZVOUS_URL; do
       eval "value=\\\${\$name-}"
       if [ -n "\$value" ]; then
         envs="\$envs \$name=\$(quote "\$value")"
@@ -679,6 +717,7 @@ fi
 PILOT_DAEMON_BIN=\$(resolve_pilot_binary pilot-daemon "\${PILOT_DAEMON_BIN:-}" daemon)
 
 mkdir -p "\$RUN_DIR"
+validate_entmoot_feature_flags || exit 1
 validate_agent_command_runner || exit 1
 stop_agent_command_watcher || true
 stop_pidfile entmoot "\$ENTMOOT_PIDFILE" || true

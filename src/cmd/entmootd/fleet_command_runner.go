@@ -14,6 +14,7 @@ import (
 
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/esphttp"
+	entfeatures "entmoot/pkg/entmoot/features"
 )
 
 type fleetCommandRunner struct {
@@ -311,6 +312,16 @@ func (r *fleetCommandRunner) dispatchAgentInstruction(ctx context.Context, comma
 		return fleetCommandExecution{
 			status:  esphttp.FleetCommandStatusRejected,
 			summary: "Agent instruction rejected: local agent instructions are not enabled",
+		}, nil
+	}
+	flags, err := entfeatures.FromEnv()
+	if err != nil {
+		return fleetCommandExecution{}, err
+	}
+	if err := flags.RequireTasks(); err != nil {
+		return fleetCommandExecution{
+			status:  esphttp.FleetCommandStatusRejected,
+			summary: "Agent instruction rejected: task coordination is disabled",
 		}, nil
 	}
 	spec, err := esphttp.FleetCommandInstructionSpecFromArgs(cmd.Args)

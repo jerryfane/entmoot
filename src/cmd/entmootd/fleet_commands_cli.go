@@ -54,6 +54,12 @@ func cmdFleetCommands(gf *globalFlags, args []string) int {
 		return exitOK
 	}
 	switch args[0] {
+	case "send", "result":
+		if code := requireTaskFeature(gf, "fleet commands"); code != exitOK {
+			return code
+		}
+	}
+	switch args[0] {
 	case "catalog":
 		return printJSON(map[string]any{"commands": esphttp.FleetCommandCatalog()})
 	case "send":

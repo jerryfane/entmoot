@@ -105,11 +105,15 @@ const (
 func cmdAgentCommands(gf *globalFlags, args []string) int {
 	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
 		fmt.Fprintln(os.Stderr, "usage: entmootd agent-commands <watch|run-once|status> [flags]")
+		fmt.Fprintln(os.Stderr, "agent command processing requires ENTMOOT_ENABLE_FLEET=1 and ENTMOOT_ENABLE_TASKS=1.")
 		if len(args) == 0 {
 			fmt.Fprintln(os.Stderr, "agent-commands: missing op")
 			return exitInvalidArgument
 		}
 		return exitOK
+	}
+	if code := requireTaskFeature(gf, "agent-commands"); code != exitOK {
+		return code
 	}
 	switch args[0] {
 	case "watch":

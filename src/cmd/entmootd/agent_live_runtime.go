@@ -313,15 +313,16 @@ func runAgentLiveScan(ctx context.Context, gf *globalFlags, state esphttp.StateS
 		result.Error = "live trigger rate limit reached"
 		return result, nil
 	}
+	allowedActions := liveAllowedActionsForConfig(cfg, featureFlags(gf))
 	runnerCtx := liveAgentRunnerContext{
 		GroupID:        cfg.GroupID,
 		NodeID:         cfg.NodeID,
 		Mode:           cfg.Mode,
 		TopicFilters:   append([]string(nil), cfg.TopicFilters...),
-		AllowedActions: append([]string(nil), cfg.AllowedActions...),
+		AllowedActions: append([]string(nil), allowedActions...),
 		Trigger:        liveTriggerForMode(cfg.Mode),
 		Events:         events,
-		Instructions:   "Return JSON only: {\"actions\":[{\"kind\":\"reply\",\"message\":\"...\"}]}. Supported local actions include reply, message.summarize, alert.owner, task.create with title, description, mode, fleet_id, and assignee_node_id, task.comment with fleet_id, task_id, and content, task.assign_self with fleet_id and task_id, task.update_own with fleet_id, task_id, and content, task.assign_others with fleet_id, task_id, and assignee_node_id, command.request with action, args, target, target_node_id, instruction, timeout_ms, and expires_at_ms, command.send with action, args, target, target_node_id, instruction, timeout_ms, expires_at_ms, and auto_accept, invite.create with fleet_id, target_node_id, target_pilot_pubkey, target_entmoot_pubkey, hostname, valid_for, and valid_until_ms, member.remove with fleet_id and target_node_id, metadata.update with a metadata JSON object, and external.message.send with fleet_id, target_node_id, channel, external_target, message, external_action_id, timeout_ms, and expires_at_ms. Entmoot will validate and apply allowed actions. Do not claim that you posted anything yourself.",
+		Instructions:   "Return JSON only: {\"actions\":[{\"kind\":\"reply\",\"message\":\"...\"}]}. Only use action kinds listed in allowed_actions. Entmoot will validate and apply allowed actions. Do not claim that you posted anything yourself.",
 	}
 	output, err := runLiveAgentRunner(ctx, runCfg, runnerCtx)
 	if err != nil {
@@ -561,6 +562,24 @@ func knownLiveActionKind(kind string) bool {
 	}
 }
 
+func liveActionRequiresTasks(kind string) bool {
+	switch strings.TrimSpace(strings.ToLower(kind)) {
+	case liveActionTaskCreate,
+		liveActionTaskComment,
+		liveActionTaskAssignSelf,
+		liveActionTaskUpdateOwn,
+		liveActionTaskAssignOthers,
+		liveActionCommandRequest,
+		liveActionCommandSend,
+		liveActionInviteCreate,
+		liveActionMemberRemove,
+		liveActionExternalMessage:
+		return true
+	default:
+		return false
+	}
+}
+
 func openClawLiveFinalText(stdout string) string {
 	var report openClawAgentRunReport
 	if err := json.Unmarshal([]byte(stdout), &report); err == nil {
@@ -575,6 +594,11 @@ func applyLiveAgentAction(ctx context.Context, gf *globalFlags, state esphttp.St
 	kind := strings.TrimSpace(strings.ToLower(action.Kind))
 	if !liveActionAllowed(cfg, kind) {
 		return false, fmt.Errorf("live action %q is not allowed", kind)
+	}
+	if liveActionRequiresTasks(kind) {
+		if err := featureFlags(gf).RequireTasks(); err != nil {
+			return false, fmt.Errorf("live action %q requires ENTMOOT_ENABLE_FLEET=1 and ENTMOOT_ENABLE_TASKS=1", kind)
+		}
 	}
 	switch kind {
 	case liveActionReply, liveActionMessageSummarize, liveActionAlertOwner:

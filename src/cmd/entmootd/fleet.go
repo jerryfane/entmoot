@@ -15,6 +15,18 @@ import (
 )
 
 func cmdFleet(gf *globalFlags, args []string) int {
+	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
+		fmt.Fprintln(os.Stderr, "usage: entmootd fleet <list|info|activity|tasks|commands> [flags]")
+		fmt.Fprintf(os.Stderr, "fleet coordination requires %s=1.\n", "ENTMOOT_ENABLE_FLEET")
+		if len(args) == 0 {
+			fmt.Fprintln(os.Stderr, "fleet: missing op (want: list, info, activity, tasks, commands)")
+			return exitInvalidArgument
+		}
+		return exitOK
+	}
+	if code := requireFleetFeature(gf, "fleet"); code != exitOK {
+		return code
+	}
 	if len(args) == 0 {
 		fmt.Fprintln(os.Stderr, "fleet: missing op (want: list, info, activity, tasks, commands)")
 		return exitInvalidArgument
@@ -27,6 +39,9 @@ func cmdFleet(gf *globalFlags, args []string) int {
 	case "activity":
 		return cmdFleetActivity(gf, args[1:])
 	case "tasks":
+		if code := requireTaskFeature(gf, "fleet tasks"); code != exitOK {
+			return code
+		}
 		return cmdFleetTasks(gf, args[1:])
 	case "commands":
 		return cmdFleetCommands(gf, args[1:])
