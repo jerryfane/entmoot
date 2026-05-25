@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.78] - 2026-05-25
+
+### Added
+
+- **Codex and Claude Code plugin packaging.** Added `entmootd plugin`
+  build/install/path/doctor commands, generated Codex and Claude plugin
+  packages, local marketplace registration, Claude validation, Codex runtime
+  integration, isolated smoke tests, and operator documentation.
+- **Agent Skills canonical package.** Aligned the Entmoot skill with the Agent
+  Skills spec, moved it into the Go module under `src/skills/entmoot`, embedded
+  it for release/package builders, and included the full skill tree in release
+  archives.
+
 ## [1.5.77] - 2026-05-24
 
 ### Fixed
