@@ -17,6 +17,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,6 +26,7 @@ import (
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/canonical"
 	"entmoot/pkg/entmoot/espnotify"
+	entfeatures "entmoot/pkg/entmoot/features"
 	"entmoot/pkg/entmoot/mailbox"
 	"entmoot/pkg/entmoot/signing"
 	"entmoot/pkg/entmoot/store"
@@ -51,6 +53,7 @@ type Config struct {
 	Operations  OperationExecutor
 	Notifier    espnotify.Notifier
 	State       StateStore
+	Features    entfeatures.Flags
 	Groups      GroupCatalog
 	Diagnostics DiagnosticsProvider
 	GroupExists GroupExistsFunc
@@ -406,6 +409,7 @@ type Handler struct {
 	operations            OperationExecutor
 	notifier              espnotify.Notifier
 	state                 StateStore
+	features              entfeatures.Flags
 	groups                GroupCatalog
 	diagnostics           DiagnosticsProvider
 	groupExists           GroupExistsFunc
@@ -462,6 +466,7 @@ func NewHandler(cfg Config) (*Handler, error) {
 		operations:            cfg.Operations,
 		notifier:              cfg.Notifier,
 		state:                 state,
+		features:              cfg.Features.Normalize(),
 		groups:                cfg.Groups,
 		diagnostics:           cfg.Diagnostics,
 		groupExists:           groupExists,
@@ -487,6 +492,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if h.handlePublicMootRoute(w, r) {
+		return
+	}
+	if h.handleCapabilities(w, r) {
+		return
+	}
+	if h.handleDisabledCoordinationRoute(w, r) {
 		return
 	}
 	auth, ok := h.authorize(w, r)
@@ -537,6 +548,65 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		writeError(w, http.StatusNotFound, "not_found", "not found")
 	}
+}
+
+func (h *Handler) handleCapabilities(w http.ResponseWriter, r *http.Request) bool {
+	if r.URL.Path != "/v1/capabilities" {
+		return false
+	}
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w, http.MethodGet)
+		return true
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"features": h.features.Capabilities()})
+	return true
+}
+
+func (h *Handler) handleDisabledCoordinationRoute(w http.ResponseWriter, r *http.Request) bool {
+	feature, disabled := h.disabledCoordinationFeature(r.URL.Path)
+	if !disabled {
+		return false
+	}
+	h.writeFeatureDisabled(w, feature)
+	return true
+}
+
+func (h *Handler) disabledCoordinationFeature(path string) (string, bool) {
+	if path == "/v1/fleets" || strings.HasPrefix(path, "/v1/fleets/") {
+		if err := h.features.RequireFleet(); err != nil {
+			return entfeatures.FeatureFleet, true
+		}
+		if fleetPathRequiresTasks(path) {
+			if err := h.features.RequireTasks(); err != nil {
+				return entfeatures.FeatureTasks, true
+			}
+		}
+	}
+	return "", false
+}
+
+func fleetPathRequiresTasks(path string) bool {
+	const prefix = "/v1/fleets/"
+	if !strings.HasPrefix(path, prefix) {
+		return false
+	}
+	rest := strings.TrimPrefix(path, prefix)
+	_, suffix, ok := strings.Cut(rest, "/")
+	if !ok {
+		return false
+	}
+	return suffix == "tasks" ||
+		strings.HasPrefix(suffix, "tasks/") ||
+		suffix == "commands" ||
+		strings.HasPrefix(suffix, "commands/")
+}
+
+func (h *Handler) writeFeatureDisabled(w http.ResponseWriter, feature string) {
+	writeJSON(w, http.StatusNotFound, errorEnvelope{Error: errorBody{
+		Code:    "feature_disabled",
+		Message: feature + " feature is disabled",
+		Feature: feature,
+	}})
 }
 
 func (h *Handler) handleFleets(w http.ResponseWriter, r *http.Request) {
@@ -1863,6 +1933,7 @@ func (h *Handler) handleSession(w http.ResponseWriter, r *http.Request) {
 	resp := map[string]any{
 		"authenticated": true,
 		"auth_mode":     h.authMode,
+		"features":      h.features.Capabilities(),
 	}
 	if auth.device != nil {
 		resp["device"] = deviceView(*auth.device)
@@ -1887,6 +1958,7 @@ func (h *Handler) handleStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":          "ok",
 		"auth_mode":       h.authMode,
+		"features":        h.features.Capabilities(),
 		"groups":          groups,
 		"mailbox_enabled": h.service != nil,
 		"publisher":       h.publisher != nil,
@@ -2270,6 +2342,10 @@ func (h *Handler) handleUpsertLiveAgentConfig(w http.ResponseWriter, r *http.Req
 		writeError(w, http.StatusBadRequest, "bad_request", "unknown live actions: "+strings.Join(unknown, ", "))
 		return
 	}
+	actions, ok := h.liveActionsForHTTPPayload(w, mode, payload.AllowedActions)
+	if !ok {
+		return
+	}
 	if payload.MaxActionsPerScan < 0 || payload.MaxActionBytes < 0 {
 		writeError(w, http.StatusBadRequest, "bad_request", "live spam controls must be non-negative")
 		return
@@ -2280,7 +2356,7 @@ func (h *Handler) handleUpsertLiveAgentConfig(w http.ResponseWriter, r *http.Req
 		Enabled:           enabled,
 		Mode:              mode,
 		TopicFilters:      topicFilters,
-		AllowedActions:    payload.AllowedActions,
+		AllowedActions:    actions,
 		MaxActionsPerScan: payload.MaxActionsPerScan,
 		MaxActionBytes:    payload.MaxActionBytes,
 		UpdatedAtMS:       h.clock().UnixMilli(),
@@ -2290,6 +2366,61 @@ func (h *Handler) handleUpsertLiveAgentConfig(w http.ResponseWriter, r *http.Req
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"config": cfg})
+}
+
+func (h *Handler) liveActionsForHTTPPayload(w http.ResponseWriter, mode string, raw []string) ([]string, bool) {
+	actionsExplicit := raw != nil
+	actions := NormalizeLiveActions(raw)
+	if actionsExplicit && len(actions) == 0 {
+		writeError(w, http.StatusBadRequest, "bad_request", "live action list cannot be empty")
+		return nil, false
+	}
+	if mode == LiveModeOperator && len(actions) == 0 && !actionsExplicit {
+		actions = DefaultLiveActions()
+	}
+	disabled := liveActionsDisabledByFeatures(actions, h.features)
+	if len(disabled) == 0 {
+		return actions, true
+	}
+	if actionsExplicit {
+		writeError(w, http.StatusBadRequest, "feature_disabled", "live action(s) require ENTMOOT_ENABLE_FLEET=1 and ENTMOOT_ENABLE_TASKS=1: "+strings.Join(disabled, ", "))
+		return nil, false
+	}
+	return filterLiveActionsDisabledByFeatures(actions, h.features), true
+}
+
+func liveActionsDisabledByFeatures(actions []string, flags entfeatures.Flags) []string {
+	if flags.RequireTasks() == nil {
+		return nil
+	}
+	var disabled []string
+	for _, action := range actions {
+		action = strings.TrimSpace(strings.ToLower(action))
+		if LiveActionRequiresTasks(action) {
+			disabled = append(disabled, action)
+		}
+	}
+	sort.Strings(disabled)
+	return disabled
+}
+
+func filterLiveActionsDisabledByFeatures(actions []string, flags entfeatures.Flags) []string {
+	disabled := liveActionsDisabledByFeatures(actions, flags)
+	if len(disabled) == 0 {
+		return actions
+	}
+	blocked := make(map[string]struct{}, len(disabled))
+	for _, action := range disabled {
+		blocked[action] = struct{}{}
+	}
+	out := make([]string, 0, len(actions)-len(disabled))
+	for _, action := range actions {
+		if _, ok := blocked[strings.TrimSpace(strings.ToLower(action))]; ok {
+			continue
+		}
+		out = append(out, action)
+	}
+	return out
 }
 
 func (h *Handler) handleDeleteLiveAgentConfig(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID, nodeID entmoot.NodeID) {
@@ -2677,6 +2808,7 @@ func (h *Handler) handleSignRequests(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "internal_error", "sign request listing failed")
 		return
 	}
+	requests = h.filterDisabledSignRequests(requests)
 	writeJSON(w, http.StatusOK, map[string]any{"sign_requests": requests})
 }
 
@@ -2745,6 +2877,10 @@ func (h *Handler) handleCompleteSignRequest(w http.ResponseWriter, r *http.Reque
 	if !h.signRequestVisible(w, r, req) {
 		return
 	}
+	if feature, disabled := h.disabledSignRequestFeature(req); disabled {
+		h.writeFeatureDisabled(w, feature)
+		return
+	}
 	if !h.checkSignRequestPending(w, req) {
 		return
 	}
@@ -2801,6 +2937,10 @@ func (h *Handler) handleRejectSignRequest(w http.ResponseWriter, r *http.Request
 		return
 	}
 	if !h.signRequestVisible(w, r, req) {
+		return
+	}
+	if feature, disabled := h.disabledSignRequestFeature(req); disabled {
+		h.writeFeatureDisabled(w, feature)
 		return
 	}
 	if !h.checkSignRequestPending(w, req) {
@@ -3962,6 +4102,10 @@ func (h *Handler) writeSignRequestLookup(w http.ResponseWriter, r *http.Request,
 	if !h.signRequestVisible(w, r, req) {
 		return
 	}
+	if feature, disabled := h.disabledSignRequestFeature(req); disabled {
+		h.writeFeatureDisabled(w, feature)
+		return
+	}
 	writeJSON(w, http.StatusOK, req)
 }
 
@@ -4010,6 +4154,51 @@ func (h *Handler) signRequestVisible(w http.ResponseWriter, r *http.Request, req
 		}
 	}
 	return true
+}
+
+func (h *Handler) filterDisabledSignRequests(requests []SignRequest) []SignRequest {
+	if len(requests) == 0 {
+		return requests
+	}
+	out := requests[:0]
+	for _, req := range requests {
+		if _, disabled := h.disabledSignRequestFeature(req); disabled {
+			continue
+		}
+		out = append(out, req)
+	}
+	return out
+}
+
+func (h *Handler) disabledSignRequestFeature(req SignRequest) (string, bool) {
+	feature, ok := signRequestKindFeature(req.Kind)
+	if !ok {
+		return "", false
+	}
+	switch feature {
+	case entfeatures.FeatureFleet:
+		if err := h.features.RequireFleet(); err != nil {
+			return feature, true
+		}
+	case entfeatures.FeatureTasks:
+		if err := h.features.RequireTasks(); err != nil {
+			return feature, true
+		}
+	}
+	return "", false
+}
+
+func signRequestKindFeature(kind string) (string, bool) {
+	switch strings.TrimSpace(kind) {
+	case signRequestKindFleetCreate,
+		signRequestKindFleetInviteCreate,
+		signRequestKindFleetMemberRemove,
+		signRequestKindFleetArchive,
+		signRequestKindFleetRestore:
+		return entfeatures.FeatureFleet, true
+	default:
+		return "", false
+	}
 }
 
 func (h *Handler) withIdempotency(w http.ResponseWriter, r *http.Request, scope string, next func(http.ResponseWriter, *http.Request)) {
@@ -4232,6 +4421,7 @@ type errorEnvelope struct {
 type errorBody struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
+	Feature string `json:"feature,omitempty"`
 }
 
 func writeError(w http.ResponseWriter, status int, code, message string) {

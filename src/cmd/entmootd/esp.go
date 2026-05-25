@@ -214,6 +214,7 @@ func runESPServe(gf *globalFlags, cfg espServeConfig) int {
 		},
 		Notifier:    notifier,
 		State:       resources.espState,
+		Features:    featureFlags(gf),
 		Groups:      localGroupCatalog{dataDir: gf.data, metadata: metadataStore, profiles: profileStore, state: resources.espState},
 		Diagnostics: espDiagnosticsProvider{flags: *gf},
 		GroupExists: espGroupExists(gf.data),
@@ -235,7 +236,11 @@ func runESPServe(gf *globalFlags, cfg espServeConfig) int {
 	} else if closer != nil {
 		defer closer.Shutdown()
 	}
-	slog.Info("esp serve: listening", slog.String("addr", cfg.addr))
+	features := featureFlags(gf).Capabilities()
+	slog.Info("esp serve: listening",
+		slog.String("addr", cfg.addr),
+		slog.Bool("fleet_enabled", features.FleetEnabled),
+		slog.Bool("tasks_enabled", features.TasksEnabled))
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		slog.Error("esp serve: http server", slog.String("err", err.Error()))
 		return exitTransport
