@@ -563,21 +563,7 @@ func knownLiveActionKind(kind string) bool {
 }
 
 func liveActionRequiresTasks(kind string) bool {
-	switch strings.TrimSpace(strings.ToLower(kind)) {
-	case liveActionTaskCreate,
-		liveActionTaskComment,
-		liveActionTaskAssignSelf,
-		liveActionTaskUpdateOwn,
-		liveActionTaskAssignOthers,
-		liveActionCommandRequest,
-		liveActionCommandSend,
-		liveActionInviteCreate,
-		liveActionMemberRemove,
-		liveActionExternalMessage:
-		return true
-	default:
-		return false
-	}
+	return esphttp.LiveActionRequiresTasks(kind)
 }
 
 func openClawLiveFinalText(stdout string) string {
