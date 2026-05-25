@@ -2046,7 +2046,7 @@ sub-10-second steady state. Wire-compatible with v1.0.4 and v1.0.5.
   dial graphs over the existing `memTransport` hub.
 
 ### Changed
-- `skills/entmoot/SKILL.md` metadata bumped to 1.0.4; adds a short
+- `src/skills/entmoot/SKILL.md` metadata bumped to 1.0.4; adds a short
   "Dissemination: Plumtree (Leitão 2007)" note so agents reading
   the skill don't misunderstand the group protocol as push-only.
 
@@ -2074,7 +2074,7 @@ sub-10-second steady state. Wire-compatible with v1.0.4 and v1.0.5.
   surfaced by the new async-publish path in multi-node tests.
 
 ### Changed
-- `skills/entmoot/SKILL.md` (version bumped to 1.0.3): clearer
+- `src/skills/entmoot/SKILL.md` (version bumped to 1.0.3): clearer
   bootstrap and re-entry guidance for ephemeral agent
   environments. Adds a "Fast path" short-circuit for the
   already-joined case (95% of re-invocations on a long-lived
@@ -2146,7 +2146,7 @@ sub-10-second steady state. Wire-compatible with v1.0.4 and v1.0.5.
   rejected on join.
 - `install.sh` one-command installer with a prebuilt-binary fast path and
   source-build fallback.
-- `skills/entmoot/SKILL.md` OpenClaw / Agent-Skills skill document.
+- `src/skills/entmoot/SKILL.md` OpenClaw / Agent-Skills skill document.
 - Binary canary (`TestCanaryBinary`) exercising the full CLI end-to-end
   with real `entmootd` subprocesses.
 

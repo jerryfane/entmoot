@@ -10,7 +10,7 @@ For every Entmoot tag:
 4. Tag and push.
 5. Verify the GitHub release archives.
 6. Check docs parity for new CLI/API/config behavior. README, website CLI
-   pages, reference docs, operations docs, and `skills/entmoot/SKILL.md`
+   pages, reference docs, operations docs, and `src/skills/entmoot/SKILL.md`
    should match the changelog entry.
 7. Update Pilot too when Entmoot depends on new Pilot capabilities.
 8. Update peers when the release is meant to deploy. Use service-scoped
