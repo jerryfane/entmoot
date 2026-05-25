@@ -146,6 +146,7 @@ func cmdBootstrapAgent(gf *globalFlags, args []string) int {
 			mode:              report.Live.Mode,
 			topics:            report.Live.TopicFilters,
 			actions:           report.Live.AllowedActions,
+			features:          featureFlags(gf),
 			maxActionsPerScan: report.Live.MaxActionsPerScan,
 			maxActionBytes:    report.Live.MaxActionBytes,
 		})
@@ -208,6 +209,11 @@ func buildBootstrapAgentReport(gf *globalFlags, cfg bootstrapAgentOptions) (boot
 	if unknown := esphttp.UnknownLiveActions([]string(cfg.actions)); len(unknown) > 0 {
 		return bootstrapAgentReport{}, gid, nodeID, fmt.Errorf("unknown --action value(s): %s", strings.Join(unknown, ", "))
 	}
+	if cfg.agentInstructions {
+		if err := featureFlags(gf).RequireTasks(); err != nil {
+			return bootstrapAgentReport{}, gid, nodeID, fmt.Errorf("agent instruction commands require ENTMOOT_ENABLE_FLEET=1 and ENTMOOT_ENABLE_TASKS=1")
+		}
+	}
 	runnerCommand := agentRunnerCommand(runner, cfg.runnerCommand)
 	runtime := collectRuntimeReport(gf, gf.data)
 	report := bootstrapAgentReport{
@@ -232,9 +238,19 @@ func buildBootstrapAgentReport(gf *globalFlags, cfg bootstrapAgentOptions) (boot
 		if len(topics) == 0 {
 			topics = []string{"#"}
 		}
-		actions := esphttp.NormalizeLiveActions([]string(cfg.actions))
-		if liveMode == esphttp.LiveModeOperator && len(actions) == 0 {
+		rawActions := []string(cfg.actions)
+		actions := esphttp.NormalizeLiveActions(rawActions)
+		if len(rawActions) > 0 && len(actions) == 0 {
+			return bootstrapAgentReport{}, gid, nodeID, fmt.Errorf("live action list cannot be empty")
+		}
+		if liveMode == esphttp.LiveModeOperator && len(actions) == 0 && len(rawActions) == 0 {
 			actions = esphttp.DefaultLiveActions()
+		}
+		if disabled := coordinationLiveActions(actions, featureFlags(gf)); len(disabled) > 0 {
+			if len(rawActions) > 0 {
+				return bootstrapAgentReport{}, gid, nodeID, fmt.Errorf("live action(s) require ENTMOOT_ENABLE_FLEET=1 and ENTMOOT_ENABLE_TASKS=1: %s", strings.Join(disabled, ", "))
+			}
+			actions = filterDisabledLiveActions(actions, featureFlags(gf))
 		}
 		report.Live = bootstrapAgentLiveReport{
 			Enabled:           true,
@@ -258,20 +274,19 @@ func buildBootstrapAgentReport(gf *globalFlags, cfg bootstrapAgentOptions) (boot
 func bootstrapAgentCommands(gf *globalFlags, report bootstrapAgentReport) []string {
 	var out []string
 	out = append(out, report.DefaultMoot.Commands...)
-	serve := entmootCommand(gf, report.Runtime, "serve")
-	if report.AgentInstructions {
-		serve = "ENTMOOT_AGENT_INSTRUCTIONS=1 " + serve
-	}
+	coordinationEnv := bootstrapCoordinationEnv(gf, report)
+	serve := envPrefixedCommand(coordinationEnv, entmootCommand(gf, report.Runtime, "serve"))
 	out = append(out, serve)
-	if report.Runner != agentRunnerNone {
-		out = append(out, entmootCommand(gf, report.Runtime, "agent-commands", "watch", "-runner", report.RunnerCommand))
+	if report.AgentInstructions && report.Runner != agentRunnerNone && featureFlags(gf).RequireTasks() == nil {
+		out = append(out, envPrefixedCommand(coordinationEnv, entmootCommand(gf, report.Runtime, "agent-commands", "watch", "-runner", report.RunnerCommand)))
 	}
 	if report.Live.Enabled {
 		parts := []string{"agent-live", "run", "-group", report.Live.Group, "-node", strconv.FormatUint(report.Live.NodeID, 10)}
 		if report.Runner != agentRunnerNone {
 			parts = append(parts, "-runner", report.RunnerCommand)
 		}
-		out = append(out, stackGatedCommand(bootstrapStackHelper(gf, report), bootstrapStackHelperEnv(gf, report), entmootCommand(gf, report.Runtime, parts...)))
+		command := envPrefixedCommand(coordinationEnv, entmootCommand(gf, report.Runtime, parts...))
+		out = append(out, stackGatedCommand(bootstrapStackHelper(gf, report), bootstrapStackHelperEnv(gf, report), command))
 	}
 	return out
 }
@@ -342,10 +357,38 @@ func bootstrapStackHelperEnv(gf *globalFlags, report bootstrapAgentReport) []str
 	if report.AgentInstructions {
 		env = append(env, "ENTMOOT_AGENT_INSTRUCTIONS=1")
 	}
+	env = append(env, featureFlagEnv(gf)...)
 	if report.Runner != agentRunnerNone && report.RunnerCommand != "" {
 		env = append(env, shellEnvAssignment("ENTMOOT_AGENT_RUNNER", report.RunnerCommand))
 	}
 	return env
+}
+
+func bootstrapCoordinationEnv(gf *globalFlags, report bootstrapAgentReport) []string {
+	var env []string
+	if report.AgentInstructions {
+		env = append(env, "ENTMOOT_AGENT_INSTRUCTIONS=1")
+	}
+	env = append(env, featureFlagEnv(gf)...)
+	return env
+}
+
+func featureFlagEnv(gf *globalFlags) []string {
+	var env []string
+	if featureFlags(gf).FleetEnabled {
+		env = append(env, "ENTMOOT_ENABLE_FLEET=1")
+	}
+	if featureFlags(gf).TasksEnabled {
+		env = append(env, "ENTMOOT_ENABLE_TASKS=1")
+	}
+	return env
+}
+
+func envPrefixedCommand(env []string, command string) string {
+	if len(env) == 0 {
+		return command
+	}
+	return strings.Join(append(append([]string{}, env...), command), " ")
 }
 
 func shellEnvAssignment(name, value string) string {

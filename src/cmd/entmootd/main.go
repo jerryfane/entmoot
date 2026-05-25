@@ -16,6 +16,8 @@ import (
 	"log/slog"
 	"os"
 	"time"
+
+	entfeatures "entmoot/pkg/entmoot/features"
 )
 
 // Exit codes per CLI_DESIGN §6.
@@ -49,6 +51,7 @@ type globalFlags struct {
 
 	traceGossipTransport bool
 	traceReconcile       bool
+	features             entfeatures.Flags
 }
 
 func main() {
@@ -84,10 +87,6 @@ func run() int {
 		fmt.Fprintln(os.Stderr, "                          SQLite backfill + live subscription from the control socket.")
 		fmt.Fprintln(os.Stderr, "  info                    Print a JSON snapshot (reads SQLite directly).")
 		fmt.Fprintln(os.Stderr, "  query -group GID [...]  Historical SQLite query with JSON-line output.")
-		fmt.Fprintln(os.Stderr, "  fleet <list|info|activity|tasks|commands>")
-		fmt.Fprintln(os.Stderr, "                          Inspect local Fleet control-plane state.")
-		fmt.Fprintln(os.Stderr, "  agent-commands <watch|run-once|status>")
-		fmt.Fprintln(os.Stderr, "                          Process queued local agent instructions.")
 		fmt.Fprintln(os.Stderr, "  agent-live <enable|disable|status|run>")
 		fmt.Fprintln(os.Stderr, "                          Manage live agent participation presence.")
 		fmt.Fprintln(os.Stderr, "  mailbox <pull|ack|cursor>")
@@ -111,6 +110,12 @@ func run() int {
 		fmt.Fprintln(os.Stderr, "                          Admit a new member to the roster (founder-only).")
 		fmt.Fprintln(os.Stderr, "  roster remove -group GID -node NODEID -pubkey PUBKEY_B64")
 		fmt.Fprintln(os.Stderr, "                          Remove a member from the roster (founder-only).")
+		fmt.Fprintln(os.Stderr, "")
+		fmt.Fprintln(os.Stderr, "Opt-in coordination subcommands:")
+		fmt.Fprintln(os.Stderr, "  fleet <list|info|activity|tasks|commands>")
+		fmt.Fprintln(os.Stderr, "                          Inspect Fleet state. Requires ENTMOOT_ENABLE_FLEET=1.")
+		fmt.Fprintln(os.Stderr, "  agent-commands <watch|run-once|status>")
+		fmt.Fprintln(os.Stderr, "                          Process queued instructions. Requires ENTMOOT_ENABLE_FLEET=1 and ENTMOOT_ENABLE_TASKS=1.")
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "Global flags:")
 		fs.PrintDefaults()
@@ -167,6 +172,12 @@ func run() int {
 		fmt.Fprintf(os.Stderr, "entmootd: %v\n", err)
 		return exitInvalidArgument
 	}
+	featureFlags, err := entfeatures.FromEnv()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "entmootd: %v\n", err)
+		return exitInvalidArgument
+	}
+	gf.features = featureFlags
 
 	args := fs.Args()
 	if len(args) == 0 {

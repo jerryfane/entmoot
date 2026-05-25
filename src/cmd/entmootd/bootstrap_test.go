@@ -56,11 +56,30 @@ func TestBootstrapAgentDefaultYesJSONIsNotApplied(t *testing.T) {
 	}
 }
 
+func TestBootstrapAgentInstructionsRequireTaskFeature(t *testing.T) {
+	runner := testExecutableRunner(t)
+	code, _, stderr := captureCommandOutput(t, func() int {
+		return cmdBootstrapAgent(testBootstrapGlobalFlags(t), []string{
+			"--dry-run",
+			"--runner", "custom",
+			"--runner-command", runner,
+			"--agent-instructions",
+		})
+	})
+	if code != exitInvalidArgument {
+		t.Fatalf("cmdBootstrapAgent code = %d stderr=%s", code, stderr)
+	}
+	if !strings.Contains(stderr, "ENTMOOT_ENABLE_TASKS") {
+		t.Fatalf("stderr = %q, want task feature guidance", stderr)
+	}
+}
+
 func TestBootstrapAgentCustomRunnerLiveDryRun(t *testing.T) {
 	runner := testExecutableRunner(t)
 	gid := testAgentLiveGroupID(0x71)
+	gf := enableCoordinationFeatures(testBootstrapGlobalFlags(t))
 	code, stdout, stderr := captureCommandOutput(t, func() int {
-		return cmdBootstrapAgent(testBootstrapGlobalFlags(t), []string{
+		return cmdBootstrapAgent(gf, []string{
 			"--dry-run",
 			"--json",
 			"--runner", "custom",
@@ -94,7 +113,7 @@ func TestBootstrapAgentCustomRunnerLiveDryRun(t *testing.T) {
 		t.Fatalf("allowed actions = %q", got)
 	}
 	joined := strings.Join(report.Commands, "\n")
-	for _, want := range []string{"ENTMOOT_AGENT_INSTRUCTIONS=1", "agent-commands watch", "agent-live run", runner} {
+	for _, want := range []string{"ENTMOOT_AGENT_INSTRUCTIONS=1", "ENTMOOT_ENABLE_FLEET=1", "ENTMOOT_ENABLE_TASKS=1", "agent-commands watch", "agent-live run", runner} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("commands = %q, missing %q", joined, want)
 		}
@@ -109,6 +128,7 @@ func TestBootstrapAgentCommandsGateLiveRunWithStackHelper(t *testing.T) {
 		hideIP:   true,
 		logLevel: "info",
 	}
+	enableCoordinationFeatures(gf)
 	report := bootstrapAgentReport{
 		Runner:            agentRunnerCustom,
 		RunnerCommand:     "/tmp/runner",
@@ -128,6 +148,13 @@ func TestBootstrapAgentCommandsGateLiveRunWithStackHelper(t *testing.T) {
 	if len(commands) != 3 {
 		t.Fatalf("commands = %#v, want serve, watcher, live", commands)
 	}
+	for i, command := range commands {
+		for _, want := range []string{"ENTMOOT_AGENT_INSTRUCTIONS=1", "ENTMOOT_ENABLE_FLEET=1", "ENTMOOT_ENABLE_TASKS=1"} {
+			if !strings.Contains(command, want) {
+				t.Fatalf("commands[%d] = %q, missing %q", i, command, want)
+			}
+		}
+	}
 	for _, command := range commands[:2] {
 		if strings.Contains(command, "start-entmoot-stack.sh") {
 			t.Fatalf("non-live command is stack gated: %q", command)
@@ -140,6 +167,8 @@ func TestBootstrapAgentCommandsGateLiveRunWithStackHelper(t *testing.T) {
 		"PILOT_SOCKET=/data/.pilot/pilot.sock",
 		"ENTMOOT_HIDE_IP=true",
 		"ENTMOOT_AGENT_INSTRUCTIONS=1",
+		"ENTMOOT_ENABLE_FLEET=1",
+		"ENTMOOT_ENABLE_TASKS=1",
 		"ENTMOOT_AGENT_RUNNER=/tmp/runner",
 		"/data/.pilot/start-entmoot-stack.sh ensure",
 		"/data/.pilot/start-entmoot-stack.sh check",
@@ -172,11 +201,11 @@ func TestBootstrapAgentCommandsSkipStackGateForMismatchedRuntime(t *testing.T) {
 	}
 
 	commands := bootstrapAgentCommands(gf, report)
-	if len(commands) != 3 {
-		t.Fatalf("commands = %#v, want serve, watcher, live", commands)
+	if len(commands) != 2 {
+		t.Fatalf("commands = %#v, want serve and live", commands)
 	}
-	if strings.Contains(commands[2], "start-entmoot-stack.sh") {
-		t.Fatalf("mismatched runtime command should not be stack gated: %q", commands[2])
+	if strings.Contains(commands[1], "start-entmoot-stack.sh") {
+		t.Fatalf("mismatched runtime command should not be stack gated: %q", commands[1])
 	}
 }
 
@@ -264,12 +293,16 @@ func TestBootstrapAgentRejectsOpenClawRunnerCommand(t *testing.T) {
 
 func TestBootstrapAgentAcceptsRunnerPathWithSpaces(t *testing.T) {
 	runner := testExecutableRunnerInDir(t, "Hermes Runner")
+	gid := testAgentLiveGroupID(0x79)
 	code, stdout, stderr := captureCommandOutput(t, func() int {
 		return cmdBootstrapAgent(testBootstrapGlobalFlags(t), []string{
 			"--dry-run",
 			"--json",
 			"--runner", "custom",
 			"--runner-command", runner,
+			"--live-mode", "listen",
+			"--group", gid.String(),
+			"--node", "155760",
 		})
 	})
 	if code != exitOK {
