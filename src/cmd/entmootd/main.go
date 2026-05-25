@@ -98,6 +98,8 @@ func run() int {
 		fmt.Fprintln(os.Stderr, "  version                 Print build metadata as JSON.")
 		fmt.Fprintln(os.Stderr, "  update [--check] [--restart] [--json]")
 		fmt.Fprintln(os.Stderr, "                          Update entmootd from the latest GitHub Release.")
+		fmt.Fprintln(os.Stderr, "  plugin <build|install|path|doctor>")
+		fmt.Fprintln(os.Stderr, "                          Build, install, locate, and diagnose agent plugins.")
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "Founder subcommands:")
 		fmt.Fprintln(os.Stderr, "  group create -name N    Create a new group.")
@@ -209,6 +211,8 @@ func run() int {
 		return cmdVersion(gf, args[1:])
 	case "update":
 		return cmdUpdate(gf, args[1:])
+	case "plugin":
+		return cmdPlugin(gf, args[1:])
 	case "group":
 		return cmdGroup(gf, args[1:])
 	case "invite":
