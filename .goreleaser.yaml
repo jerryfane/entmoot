@@ -29,8 +29,10 @@ archives:
     files:
       - README.md
       - ARCHITECTURE.md
-      - src: skills/entmoot/SKILL.md
+      - src: src/skills/entmoot/SKILL.md
         dst: SKILL.md
+      - src: src/skills/entmoot/references
+        dst: references
 
 checksum:
   name_template: "checksums.txt"
