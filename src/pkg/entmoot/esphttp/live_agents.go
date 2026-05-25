@@ -94,6 +94,24 @@ func DefaultLiveActions() []string {
 	return append([]string(nil), defaultLiveActions...)
 }
 
+func LiveActionRequiresTasks(kind string) bool {
+	switch strings.TrimSpace(strings.ToLower(kind)) {
+	case "task.create",
+		"task.comment",
+		"task.assign_self",
+		"task.update_own",
+		"task.assign_others",
+		"command.request",
+		"command.send",
+		"invite.create",
+		"member.remove",
+		"external.message.send":
+		return true
+	default:
+		return false
+	}
+}
+
 func NormalizeLiveMode(mode string) string {
 	switch strings.TrimSpace(strings.ToLower(mode)) {
 	case LiveModeListen:

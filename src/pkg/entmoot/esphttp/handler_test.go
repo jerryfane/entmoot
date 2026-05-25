@@ -19,6 +19,7 @@ import (
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/canonical"
 	"entmoot/pkg/entmoot/espnotify"
+	entfeatures "entmoot/pkg/entmoot/features"
 	"entmoot/pkg/entmoot/mailbox"
 	"entmoot/pkg/entmoot/signing"
 	"entmoot/pkg/entmoot/store"
@@ -104,6 +105,37 @@ func TestHandlerHealthzDoesNotRequireAuth(t *testing.T) {
 	handler.ServeHTTP(resp, req)
 	if resp.Code != http.StatusOK {
 		t.Fatalf("healthz status = %d, want %d", resp.Code, http.StatusOK)
+	}
+}
+
+func TestHandlerCapabilitiesExposeDefaultDisabledFeatures(t *testing.T) {
+	gid := testGroupID(1)
+	handler, err := NewHandler(Config{
+		Token:   "secret",
+		Service: mustMailboxService(t, gid),
+	})
+	if err != nil {
+		t.Fatalf("NewHandler: %v", err)
+	}
+
+	unauth := httptest.NewRecorder()
+	handler.ServeHTTP(unauth, httptest.NewRequest(http.MethodGet, "/v1/capabilities", nil))
+	if unauth.Code != http.StatusOK {
+		t.Fatalf("unauth capabilities status = %d, want %d body=%s", unauth.Code, http.StatusOK, unauth.Body.String())
+	}
+
+	caps := doJSONRequest[struct {
+		Features entfeatures.Capabilities `json:"features"`
+	}](t, handler, http.MethodGet, "/v1/capabilities", nil, http.StatusOK)
+	if caps.Features.FleetEnabled || caps.Features.TasksEnabled {
+		t.Fatalf("capabilities = %+v, want default disabled", caps.Features)
+	}
+
+	status := doJSONRequest[struct {
+		Features entfeatures.Capabilities `json:"features"`
+	}](t, handler, http.MethodGet, "/v1/status", nil, http.StatusOK)
+	if status.Features.FleetEnabled || status.Features.TasksEnabled {
+		t.Fatalf("status features = %+v, want default disabled", status.Features)
 	}
 }
 
@@ -569,6 +601,71 @@ func TestHandlerLiveAgentConfigDeviceAndMemberPolicy(t *testing.T) {
 	}
 }
 
+func TestHandlerLiveAgentConfigFiltersCoordinationActionsByDefault(t *testing.T) {
+	gid := testGroupID(2)
+	adminPub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("Generate admin key: %v", err)
+	}
+	agentPub, agentPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("Generate agent key: %v", err)
+	}
+	reg, err := NewDeviceRegistry([]Device{{
+		ID:          "ios-1-device",
+		PublicKey:   adminPub,
+		Groups:      []entmoot.GroupID{gid},
+		AdminGroups: []entmoot.GroupID{gid},
+		ClientIDs:   []string{"ios-1"},
+	}})
+	if err != nil {
+		t.Fatalf("NewDeviceRegistry: %v", err)
+	}
+	state := NewMemoryStateStore()
+	catalog := fakeCatalog{
+		groups: []GroupSummary{{GroupID: gid, Members: 1}},
+		members: []MemberSummary{
+			{NodeID: 45491, EntmootPubKey: base64.StdEncoding.EncodeToString(agentPub), Founder: true},
+		},
+	}
+	handler, err := NewHandler(Config{
+		AuthMode: AuthModeDevice,
+		Devices:  reg,
+		Service:  mustMailboxService(t, gid),
+		State:    state,
+		Groups:   &catalog,
+		Clock:    func() time.Time { return time.UnixMilli(40_000) },
+		GroupExists: func(_ context.Context, got entmoot.GroupID) (bool, error) {
+			return got == gid, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewHandler: %v", err)
+	}
+
+	rejected := doMemberSignedJSONRequest[errorEnvelope](t, handler, 45491, agentPriv, http.MethodPut, "/v1/groups/"+gid.String()+"/live-agents/45491", map[string]any{
+		"mode":            LiveModeOperator,
+		"allowed_actions": []string{"reply", "command.send"},
+	}, http.StatusBadRequest, 40_100, "nonce-live-agent-disabled-action")
+	if rejected.Error.Code != "feature_disabled" {
+		t.Fatalf("rejected error = %+v, want feature_disabled", rejected.Error)
+	}
+
+	created := doMemberSignedJSONRequest[struct {
+		Config LiveAgentConfig `json:"config"`
+	}](t, handler, 45491, agentPriv, http.MethodPut, "/v1/groups/"+gid.String()+"/live-agents/45491", map[string]any{
+		"mode": LiveModeOperator,
+	}, http.StatusOK, 40_101, "nonce-live-agent-default-actions")
+	for _, action := range created.Config.AllowedActions {
+		if LiveActionRequiresTasks(action) {
+			t.Fatalf("default live actions include task action %q: %+v", action, created.Config.AllowedActions)
+		}
+	}
+	if len(created.Config.AllowedActions) == 0 {
+		t.Fatalf("default live actions empty, want social actions")
+	}
+}
+
 func TestLiveAgentConfigReadHonorsBearerBeforeMember(t *testing.T) {
 	gid := testGroupID(9)
 	req := httptest.NewRequest(http.MethodGet, "/v1/groups/"+gid.String()+"/live-agents", nil)
@@ -733,6 +830,118 @@ func TestHandlerFleetReadsRequireCoordinatorDevice(t *testing.T) {
 	errResp := doSignedJSONRequestFor[errorEnvelope](t, handler, "other-device", otherPriv, http.MethodGet, "/v1/fleets/fleet-a/invites", nil, http.StatusForbidden, 10_005, "nonce-other-invites")
 	if errResp.Error.Code != "forbidden" {
 		t.Fatalf("other invite error code = %q, want forbidden", errResp.Error.Code)
+	}
+}
+
+func TestHandlerFleetRoutesAreDisabledByDefault(t *testing.T) {
+	gid := testGroupID(91)
+	_, coordinatorPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey coordinator: %v", err)
+	}
+	reg, err := NewDeviceRegistry([]Device{{
+		ID:        "ios-1-device",
+		PublicKey: coordinatorPriv.Public().(ed25519.PublicKey),
+		ClientIDs: []string{"ios-1"},
+	}})
+	if err != nil {
+		t.Fatalf("NewDeviceRegistry: %v", err)
+	}
+	state := NewMemoryStateStore()
+	if _, err := state.CreateFleet(context.Background(), FleetRecord{
+		FleetID:             "fleet-disabled",
+		Name:                "Fleet Disabled",
+		CoordinatorDeviceID: "ios-1-device",
+		CreatedAtMS:         1,
+	}); err != nil {
+		t.Fatalf("CreateFleet: %v", err)
+	}
+	handler, err := NewHandler(Config{
+		AuthMode: AuthModeDevice,
+		Devices:  reg,
+		Service:  mustMailboxService(t, gid),
+		State:    state,
+		Clock:    func() time.Time { return time.UnixMilli(10_000) },
+	})
+	if err != nil {
+		t.Fatalf("NewHandler: %v", err)
+	}
+
+	disabled := doSignedJSONRequest[errorEnvelope](t, handler, coordinatorPriv, http.MethodGet, "/v1/fleets", nil, http.StatusNotFound, 10_000, "nonce-fleet-disabled")
+	if disabled.Error.Code != "feature_disabled" || disabled.Error.Feature != entfeatures.FeatureFleet {
+		t.Fatalf("disabled fleet response = %+v", disabled)
+	}
+
+	taskDisabledHandler, err := NewHandler(Config{
+		AuthMode: AuthModeDevice,
+		Devices:  reg,
+		Service:  mustMailboxService(t, gid),
+		State:    state,
+		Features: entfeatures.Flags{FleetEnabled: true},
+	})
+	if err != nil {
+		t.Fatalf("NewHandler task-disabled: %v", err)
+	}
+	tasksDisabled := doSignedJSONRequest[errorEnvelope](t, taskDisabledHandler, coordinatorPriv, http.MethodGet, "/v1/fleets/fleet-disabled/tasks", nil, http.StatusNotFound, 10_001, "nonce-tasks-disabled")
+	if tasksDisabled.Error.Code != "feature_disabled" || tasksDisabled.Error.Feature != entfeatures.FeatureTasks {
+		t.Fatalf("disabled tasks response = %+v", tasksDisabled)
+	}
+}
+
+func TestHandlerFleetSignRequestsAreHiddenWhenFleetDisabled(t *testing.T) {
+	gid := testGroupID(92)
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	reg, err := NewDeviceRegistry([]Device{{
+		ID:          "ios-1-device",
+		PublicKey:   priv.Public().(ed25519.PublicKey),
+		Groups:      []entmoot.GroupID{gid},
+		AdminGroups: []entmoot.GroupID{gid},
+		ClientIDs:   []string{"ios-1"},
+	}})
+	if err != nil {
+		t.Fatalf("NewDeviceRegistry: %v", err)
+	}
+	state := NewMemoryStateStore()
+	fleetReq, err := state.CreateSignRequest(context.Background(), SignRequest{
+		DeviceID: "ios-1-device",
+		Kind:     signRequestKindFleetCreate,
+		Payload:  json.RawMessage(`{"name":"Fleet"}`),
+	})
+	if err != nil {
+		t.Fatalf("CreateSignRequest fleet: %v", err)
+	}
+	groupReq, err := state.CreateSignRequest(context.Background(), SignRequest{
+		DeviceID: "ios-1-device",
+		Kind:     signRequestKindGroupCreate,
+		GroupID:  gid,
+		Payload:  json.RawMessage(`{"name":"Group"}`),
+	})
+	if err != nil {
+		t.Fatalf("CreateSignRequest group: %v", err)
+	}
+	handler, err := NewHandler(Config{
+		AuthMode: AuthModeDevice,
+		Devices:  reg,
+		Service:  mustMailboxService(t, gid),
+		State:    state,
+		Clock:    func() time.Time { return time.UnixMilli(10_000) },
+	})
+	if err != nil {
+		t.Fatalf("NewHandler: %v", err)
+	}
+
+	list := doSignedJSONRequest[struct {
+		SignRequests []SignRequest `json:"sign_requests"`
+	}](t, handler, priv, http.MethodGet, "/v1/sign-requests", nil, http.StatusOK, 10_000, "nonce-sign-requests")
+	if len(list.SignRequests) != 1 || list.SignRequests[0].ID != groupReq.ID {
+		t.Fatalf("sign requests = %+v, want only group request %s", list.SignRequests, groupReq.ID)
+	}
+	hidden := doSignedJSONRequest[errorEnvelope](t, handler, priv, http.MethodGet, "/v1/sign-requests/"+fleetReq.ID, nil, http.StatusNotFound, 10_001, "nonce-fleet-sign-request")
+	if hidden.Error.Code != "feature_disabled" || hidden.Error.Feature != entfeatures.FeatureFleet {
+		t.Fatalf("hidden fleet sign request response = %+v", hidden)
 	}
 }
 
@@ -1398,6 +1607,7 @@ func TestHandlerFleetControlGroupDiagnosticsAllowsCoordinatorDevice(t *testing.T
 		Devices:     reg,
 		Service:     mustMailboxService(t, controlGID),
 		State:       state,
+		Features:    testCoordinationFeatures(),
 		Diagnostics: diagnostics,
 		GroupExists: func(_ context.Context, got entmoot.GroupID) (bool, error) {
 			return got == controlGID, nil
@@ -1472,6 +1682,7 @@ func TestHandlerFleetDiagnosticsAllowsCoordinatorDevice(t *testing.T) {
 		Devices:     reg,
 		Service:     mustMailboxService(t, controlGID),
 		State:       state,
+		Features:    testCoordinationFeatures(),
 		Diagnostics: diagnostics,
 		GroupExists: func(_ context.Context, got entmoot.GroupID) (bool, error) {
 			return got == controlGID, nil
@@ -2756,6 +2967,7 @@ func testMobileHandlerFull(t *testing.T, gid entmoot.GroupID, reg *DeviceRegistr
 		Publisher: publisher,
 		Notifier:  notifier,
 		State:     state,
+		Features:  testCoordinationFeatures(),
 		Groups:    catalog,
 		Clock:     clock,
 		GroupExists: func(_ context.Context, got entmoot.GroupID) (bool, error) {
@@ -2766,6 +2978,10 @@ func testMobileHandlerFull(t *testing.T, gid entmoot.GroupID, reg *DeviceRegistr
 		t.Fatalf("NewHandler: %v", err)
 	}
 	return handler
+}
+
+func testCoordinationFeatures() entfeatures.Flags {
+	return entfeatures.Flags{FleetEnabled: true, TasksEnabled: true}
 }
 
 func testDeviceHandler(t *testing.T, gid entmoot.GroupID, reg *DeviceRegistry, now time.Time) http.Handler {
