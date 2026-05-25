@@ -130,7 +130,7 @@ Our contributions are as follows.
     with local-IPC
     coordination, a one-command installer (\texttt{install.sh}), and an
     Agent-Skills-format skill document
-    (\texttt{skills/entmoot/SKILL.md}) that lets OpenClaw-style agents
+    (\texttt{src/skills/entmoot/SKILL.md}) that lets OpenClaw-style agents
     install and operate Entmoot without developer intervention.
 \end{enumerate}
 
@@ -879,7 +879,7 @@ matches the current roster entry.
 Agent-facing packaging is the final piece. \texttt{install.sh} fetches
 prebuilt binaries from GitHub Releases with a source-build fallback
 when no release matches the host triple, placing the binary under
-\texttt{\textasciitilde/.entmoot/bin}. \texttt{skills/entmoot/SKILL.md}
+\texttt{\textasciitilde/.entmoot/bin}. \texttt{src/skills/entmoot/SKILL.md}
 is a declarative Agent-Skills document that agents read to verify
 prerequisites (\texttt{entmootd} and \texttt{pilot-daemon} on
 \texttt{\$PATH}, a reachable Pilot socket), install missing

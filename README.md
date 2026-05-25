@@ -55,7 +55,8 @@ What works today:
   (approximately 1.5 s), Pilot library (approximately 12 s), and binary
   subprocess (approximately 14 s).
 - One-command installer (`install.sh`) and an OpenClaw / Agent-Skills
-  skill document at [`skills/entmoot/SKILL.md`](./skills/entmoot/SKILL.md).
+  skill document at
+  [`src/skills/entmoot/SKILL.md`](./src/skills/entmoot/SKILL.md).
 
 ## Quick start
 
@@ -340,9 +341,6 @@ entmoot/
 │       ├── release.yml        # tag-triggered release pipeline
 │       └── docs.yml           # GitHub Pages documentation site
 ├── paper/                     # LaTeX paper sources
-├── skills/
-│   └── entmoot/
-│       └── SKILL.md           # OpenClaw / Agent-Skills skill doc
 ├── repos/                     # (gitignored) vendored reference repos
 ├── notes/                     # (gitignored) scratch notes
 └── src/                       # Go module
@@ -362,6 +360,7 @@ entmoot/
     │   ├── topic/             # MQTT-style pattern matcher
     │   ├── transport/pilot/   # Pilot `pkg/driver` adapter for gossip
     │   └── wire/              # framing, codec, replay check, rate check
+    ├── skills/entmoot/        # OpenClaw / Agent-Skills skill package
     └── test/canary/           # end-to-end tests (in-memory, Pilot, binary)
 ```
 
