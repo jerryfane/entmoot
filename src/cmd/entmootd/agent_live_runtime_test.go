@@ -328,7 +328,7 @@ func TestRunAgentLiveScanPublishFailureKeepsCursor(t *testing.T) {
 	if err := os.WriteFile(runner, []byte("#!/bin/sh\nprintf '{\"actions\":[{\"kind\":\"reply\",\"message\":\"ok\"}]}'\n"), 0o700); err != nil {
 		t.Fatalf("WriteFile runner: %v", err)
 	}
-	_, err = runAgentLiveScan(ctx, &globalFlags{data: t.TempDir()}, state, msgStore, cfg, agentLiveRuntimeConfig{
+	_, err = runAgentLiveScan(ctx, enableCoordinationFeatures(&globalFlags{data: t.TempDir()}), state, msgStore, cfg, agentLiveRuntimeConfig{
 		groupID: gid,
 		nodeID:  nodeID,
 		runner:  runner,
@@ -375,7 +375,7 @@ func TestRunAgentLiveScanPartialPublishFailurePersistsCursor(t *testing.T) {
 	t.Cleanup(func() { _ = os.RemoveAll(dataDir) })
 	stop := serveLivePublishOnceThenFail(t, controlSocketPath(dataDir))
 	defer stop()
-	result, err := runAgentLiveScan(ctx, &globalFlags{data: dataDir}, state, msgStore, cfg, agentLiveRuntimeConfig{
+	result, err := runAgentLiveScan(ctx, enableCoordinationFeatures(&globalFlags{data: dataDir}), state, msgStore, cfg, agentLiveRuntimeConfig{
 		groupID: gid,
 		nodeID:  nodeID,
 		runner:  runner,
@@ -431,7 +431,7 @@ func TestRunAgentLiveScanHonorsMaxActionsPerScan(t *testing.T) {
 	topicsCh := make(chan []string, 1)
 	stop := serveLivePublishCapture(t, controlSocketPath(dataDir), topicsCh)
 	defer stop()
-	result, err := runAgentLiveScan(ctx, &globalFlags{data: dataDir}, state, msgStore, cfg, agentLiveRuntimeConfig{
+	result, err := runAgentLiveScan(ctx, enableCoordinationFeatures(&globalFlags{data: dataDir}), state, msgStore, cfg, agentLiveRuntimeConfig{
 		groupID: gid,
 		nodeID:  nodeID,
 		runner:  runner,
@@ -484,7 +484,7 @@ JSON
 	topicsCh := make(chan []string, 1)
 	stop := serveLivePublishCapture(t, controlSocketPath(dataDir), topicsCh)
 	defer stop()
-	result, err := runAgentLiveScan(ctx, &globalFlags{data: dataDir}, state, msgStore, cfg, agentLiveRuntimeConfig{
+	result, err := runAgentLiveScan(ctx, enableCoordinationFeatures(&globalFlags{data: dataDir}), state, msgStore, cfg, agentLiveRuntimeConfig{
 		groupID: gid,
 		nodeID:  nodeID,
 		runner:  runner,
@@ -573,7 +573,7 @@ func TestApplyLiveAgentActionAllowsOwnerAlertOutsideFilters(t *testing.T) {
 		TopicFilters:   []string{"tasks/#"},
 		AllowedActions: []string{liveActionAlertOwner},
 	}
-	_, err := applyLiveAgentAction(ctx, &globalFlags{data: t.TempDir()}, esphttp.NewMemoryStateStore(), cfg, nil, liveAgentAction{
+	_, err := applyLiveAgentAction(ctx, enableCoordinationFeatures(&globalFlags{data: t.TempDir()}), esphttp.NewMemoryStateStore(), cfg, nil, liveAgentAction{
 		Kind:    liveActionAlertOwner,
 		Message: "owner check",
 	})
@@ -601,7 +601,7 @@ func TestApplyLiveAgentActionDefaultsWhitespaceOwnerAlertTopic(t *testing.T) {
 	topicsCh := make(chan []string, 1)
 	stop := serveLivePublishCapture(t, controlSocketPath(dataDir), topicsCh)
 	defer stop()
-	applied, err := applyLiveAgentAction(ctx, &globalFlags{data: dataDir}, esphttp.NewMemoryStateStore(), cfg, []liveAgentRunnerMessage{{
+	applied, err := applyLiveAgentAction(ctx, enableCoordinationFeatures(&globalFlags{data: dataDir}), esphttp.NewMemoryStateStore(), cfg, []liveAgentRunnerMessage{{
 		Topics: []string{"tasks/incident"},
 	}}, liveAgentAction{
 		Kind:    liveActionAlertOwner,
@@ -638,7 +638,7 @@ func TestApplyLiveAgentActionDefaultsToMatchedReplyTopic(t *testing.T) {
 	topicsCh := make(chan []string, 1)
 	stop := serveLivePublishCapture(t, controlSocketPath(dataDir), topicsCh)
 	defer stop()
-	applied, err := applyLiveAgentAction(ctx, &globalFlags{data: dataDir}, esphttp.NewMemoryStateStore(), cfg, []liveAgentRunnerMessage{{
+	applied, err := applyLiveAgentAction(ctx, enableCoordinationFeatures(&globalFlags{data: dataDir}), esphttp.NewMemoryStateStore(), cfg, []liveAgentRunnerMessage{{
 		Topics: []string{"noise", "ops"},
 	}}, liveAgentAction{
 		Kind:    liveActionReply,
@@ -667,7 +667,7 @@ func TestApplyLiveAgentActionRejectsOversizedMessage(t *testing.T) {
 		TopicFilters:   []string{"chat"},
 		MaxActionBytes: 3,
 	}
-	applied, err := applyLiveAgentAction(ctx, &globalFlags{data: t.TempDir()}, esphttp.NewMemoryStateStore(), cfg, []liveAgentRunnerMessage{{
+	applied, err := applyLiveAgentAction(ctx, enableCoordinationFeatures(&globalFlags{data: t.TempDir()}), esphttp.NewMemoryStateStore(), cfg, []liveAgentRunnerMessage{{
 		Topics: []string{"chat"},
 	}}, liveAgentAction{
 		Kind:    liveActionReply,
@@ -716,7 +716,7 @@ func TestApplyLiveAgentActionCreatesFleetTask(t *testing.T) {
 		TopicFilters:   []string{"fleet/#"},
 		AllowedActions: []string{liveActionTaskCreate},
 	}
-	applied, err := applyLiveAgentAction(ctx, &globalFlags{data: t.TempDir()}, state, cfg, nil, liveAgentAction{
+	applied, err := applyLiveAgentAction(ctx, enableCoordinationFeatures(&globalFlags{data: t.TempDir()}), state, cfg, nil, liveAgentAction{
 		Kind:        liveActionTaskCreate,
 		Title:       "Audit deploy",
 		Description: "Check live agent rollout",
@@ -744,7 +744,7 @@ func TestApplyLiveAgentActionCreatesFleetTask(t *testing.T) {
 	}
 	cappedCfg := cfg
 	cappedCfg.MaxActionBytes = 10
-	applied, err = applyLiveAgentAction(ctx, &globalFlags{data: t.TempDir()}, state, cappedCfg, nil, liveAgentAction{
+	applied, err = applyLiveAgentAction(ctx, enableCoordinationFeatures(&globalFlags{data: t.TempDir()}), state, cappedCfg, nil, liveAgentAction{
 		Kind:        liveActionTaskCreate,
 		Title:       "Small",
 		Description: "this description is too long",
@@ -761,6 +761,29 @@ func TestApplyLiveAgentActionCreatesFleetTask(t *testing.T) {
 	}
 	if len(tasks) != 1 {
 		t.Fatalf("tasks after capped task = %+v, want original task only", tasks)
+	}
+}
+
+func TestApplyLiveAgentTaskActionRequiresFeatureFlags(t *testing.T) {
+	ctx := context.Background()
+	cfg := esphttp.LiveAgentConfig{
+		GroupID:        testAgentLiveGroupID(0x40),
+		NodeID:         45491,
+		Mode:           esphttp.LiveModeOperator,
+		AllowedActions: []string{liveActionTaskCreate},
+	}
+	applied, err := applyLiveAgentAction(ctx, &globalFlags{data: t.TempDir()}, esphttp.NewMemoryStateStore(), cfg, nil, liveAgentAction{
+		Kind:  liveActionTaskCreate,
+		Title: "Coordinate this",
+	})
+	if err == nil {
+		t.Fatal("applyLiveAgentAction err = nil, want feature disabled")
+	}
+	if applied {
+		t.Fatal("applied = true, want false")
+	}
+	if !strings.Contains(err.Error(), "ENTMOOT_ENABLE_TASKS") {
+		t.Fatalf("err = %v, want feature flag guidance", err)
 	}
 }
 
@@ -824,7 +847,7 @@ func TestApplyLiveAgentActionAssignsFleetTasks(t *testing.T) {
 		Mode:           esphttp.LiveModeOperator,
 		AllowedActions: []string{liveActionTaskAssignSelf},
 	}
-	applied, err := applyLiveAgentAction(ctx, &globalFlags{data: t.TempDir()}, state, agentCfg, nil, liveAgentAction{
+	applied, err := applyLiveAgentAction(ctx, enableCoordinationFeatures(&globalFlags{data: t.TempDir()}), state, agentCfg, nil, liveAgentAction{
 		Kind:   liveActionTaskAssignSelf,
 		TaskID: "task-claim",
 	})
@@ -848,7 +871,7 @@ func TestApplyLiveAgentActionAssignsFleetTasks(t *testing.T) {
 		Mode:           esphttp.LiveModeOperator,
 		AllowedActions: []string{liveActionTaskAssignOthers},
 	}
-	applied, err = applyLiveAgentAction(ctx, &globalFlags{data: t.TempDir()}, state, coordinatorCfg, nil, liveAgentAction{
+	applied, err = applyLiveAgentAction(ctx, enableCoordinationFeatures(&globalFlags{data: t.TempDir()}), state, coordinatorCfg, nil, liveAgentAction{
 		Kind:           liveActionTaskAssignOthers,
 		TaskID:         "task-assign",
 		AssigneeNodeID: uint64(agentNodeID),
@@ -925,7 +948,7 @@ func TestApplyLiveAgentActionUpdatesOwnFleetTask(t *testing.T) {
 		Mode:           esphttp.LiveModeOperator,
 		AllowedActions: []string{liveActionTaskUpdateOwn},
 	}
-	applied, err := applyLiveAgentAction(ctx, &globalFlags{data: t.TempDir()}, state, cfg, nil, liveAgentAction{
+	applied, err := applyLiveAgentAction(ctx, enableCoordinationFeatures(&globalFlags{data: t.TempDir()}), state, cfg, nil, liveAgentAction{
 		Kind:    liveActionTaskUpdateOwn,
 		TaskID:  "task-owned",
 		Content: "Finished the assigned check",
@@ -952,7 +975,7 @@ func TestApplyLiveAgentActionUpdatesOwnFleetTask(t *testing.T) {
 	}
 	cappedCfg := cfg
 	cappedCfg.MaxActionBytes = 4
-	applied, err = applyLiveAgentAction(ctx, &globalFlags{data: t.TempDir()}, state, cappedCfg, nil, liveAgentAction{
+	applied, err = applyLiveAgentAction(ctx, enableCoordinationFeatures(&globalFlags{data: t.TempDir()}), state, cappedCfg, nil, liveAgentAction{
 		Kind:    liveActionTaskUpdateOwn,
 		TaskID:  "task-owned",
 		Content: "too long",
@@ -1014,7 +1037,7 @@ func TestApplyLiveAgentActionCommentsOnFleetTask(t *testing.T) {
 		Mode:           esphttp.LiveModeOperator,
 		AllowedActions: []string{liveActionTaskComment},
 	}
-	applied, err := applyLiveAgentAction(ctx, &globalFlags{data: t.TempDir()}, state, cfg, nil, liveAgentAction{
+	applied, err := applyLiveAgentAction(ctx, enableCoordinationFeatures(&globalFlags{data: t.TempDir()}), state, cfg, nil, liveAgentAction{
 		Kind:    liveActionTaskComment,
 		TaskID:  "task-comment",
 		Content: "Blocked until the invite is accepted",
@@ -1052,7 +1075,7 @@ func TestApplyLiveAgentActionCommentsOnFleetTask(t *testing.T) {
 	}
 	cappedCfg := cfg
 	cappedCfg.MaxActionBytes = 4
-	applied, err = applyLiveAgentAction(ctx, &globalFlags{data: t.TempDir()}, state, cappedCfg, nil, liveAgentAction{
+	applied, err = applyLiveAgentAction(ctx, enableCoordinationFeatures(&globalFlags{data: t.TempDir()}), state, cappedCfg, nil, liveAgentAction{
 		Kind:    liveActionTaskComment,
 		TaskID:  "task-comment",
 		Content: "too long",
@@ -1096,7 +1119,7 @@ func TestApplyLiveAgentActionUpdatesGroupMetadata(t *testing.T) {
 		Mode:           esphttp.LiveModeOperator,
 		AllowedActions: []string{liveActionMetadataUpdate},
 	}
-	applied, err := applyLiveAgentAction(ctx, &globalFlags{data: dataDir}, state, cfg, nil, liveAgentAction{
+	applied, err := applyLiveAgentAction(ctx, enableCoordinationFeatures(&globalFlags{data: dataDir}), state, cfg, nil, liveAgentAction{
 		Kind:     liveActionMetadataUpdate,
 		Metadata: json.RawMessage(`{"name":"Ops","tags":["live","fleet"],"custom":{"level":2}}`),
 	})
@@ -1124,7 +1147,7 @@ func TestApplyLiveAgentActionUpdatesGroupMetadata(t *testing.T) {
 	}
 	cappedCfg := cfg
 	cappedCfg.MaxActionBytes = 4
-	applied, err = applyLiveAgentAction(ctx, &globalFlags{data: dataDir}, state, cappedCfg, nil, liveAgentAction{
+	applied, err = applyLiveAgentAction(ctx, enableCoordinationFeatures(&globalFlags{data: dataDir}), state, cappedCfg, nil, liveAgentAction{
 		Kind:     liveActionMetadataUpdate,
 		Metadata: json.RawMessage(`{"name":"Too long"}`),
 	})
@@ -1173,7 +1196,7 @@ func TestApplyLiveAgentActionRejectsMetadataUpdateByNonFounder(t *testing.T) {
 		Mode:           esphttp.LiveModeOperator,
 		AllowedActions: []string{liveActionMetadataUpdate},
 	}
-	applied, err := applyLiveAgentAction(ctx, &globalFlags{data: dataDir}, state, cfg, nil, liveAgentAction{
+	applied, err := applyLiveAgentAction(ctx, enableCoordinationFeatures(&globalFlags{data: dataDir}), state, cfg, nil, liveAgentAction{
 		Kind:     liveActionMetadataUpdate,
 		Metadata: json.RawMessage(`{"name":"Nope"}`),
 	})
@@ -1217,7 +1240,7 @@ func TestApplyLiveAgentActionRejectsMetadataUpdateWithoutCreatingRoster(t *testi
 		Mode:           esphttp.LiveModeOperator,
 		AllowedActions: []string{liveActionMetadataUpdate},
 	}
-	applied, err := applyLiveAgentAction(ctx, &globalFlags{data: dataDir}, state, cfg, nil, liveAgentAction{
+	applied, err := applyLiveAgentAction(ctx, enableCoordinationFeatures(&globalFlags{data: dataDir}), state, cfg, nil, liveAgentAction{
 		Kind:     liveActionMetadataUpdate,
 		Metadata: json.RawMessage(`{"name":"Missing roster"}`),
 	})
@@ -1282,7 +1305,7 @@ func TestApplyLiveAgentActionUpdatesOpenSubmissionTaskUsesSubmissionTime(t *test
 		Mode:           esphttp.LiveModeOperator,
 		AllowedActions: []string{liveActionTaskUpdateOwn},
 	}
-	applied, err := applyLiveAgentAction(ctx, &globalFlags{data: t.TempDir()}, state, cfg, nil, liveAgentAction{
+	applied, err := applyLiveAgentAction(ctx, enableCoordinationFeatures(&globalFlags{data: t.TempDir()}), state, cfg, nil, liveAgentAction{
 		Kind:    liveActionTaskUpdateOwn,
 		TaskID:  "task-open",
 		Content: "Open task submission",
@@ -1349,7 +1372,7 @@ func TestApplyLiveAgentActionRejectsForeignOrArchivedFleetTask(t *testing.T) {
 		AllowedActions: []string{liveActionTaskCreate},
 	}
 	for _, fleetID := range []string{"fleet-foreign", "fleet-archived"} {
-		applied, err := applyLiveAgentAction(ctx, &globalFlags{data: t.TempDir()}, state, cfg, nil, liveAgentAction{
+		applied, err := applyLiveAgentAction(ctx, enableCoordinationFeatures(&globalFlags{data: t.TempDir()}), state, cfg, nil, liveAgentAction{
 			Kind:    liveActionTaskCreate,
 			FleetID: fleetID,
 			Title:   "Should not persist",
@@ -1402,7 +1425,7 @@ func TestApplyLiveAgentActionRejectsUnauthorizedDirectAssignmentBeforePersist(t 
 		Mode:           esphttp.LiveModeOperator,
 		AllowedActions: []string{liveActionTaskCreate},
 	}
-	applied, err := applyLiveAgentAction(ctx, &globalFlags{data: t.TempDir()}, state, cfg, nil, liveAgentAction{
+	applied, err := applyLiveAgentAction(ctx, enableCoordinationFeatures(&globalFlags{data: t.TempDir()}), state, cfg, nil, liveAgentAction{
 		Kind:           liveActionTaskCreate,
 		Title:          "Unauthorized direct task",
 		Mode:           esphttp.FleetTaskModeDirectAssignment,
@@ -1467,7 +1490,7 @@ func TestApplyLiveAgentActionSendsFleetCommand(t *testing.T) {
 		Mode:           esphttp.LiveModeOperator,
 		AllowedActions: []string{liveActionCommandSend},
 	}
-	applied, err := applyLiveAgentAction(ctx, &globalFlags{data: dataDir}, state, cfg, nil, liveAgentAction{
+	applied, err := applyLiveAgentAction(ctx, enableCoordinationFeatures(&globalFlags{data: dataDir}), state, cfg, nil, liveAgentAction{
 		Kind:         liveActionCommandSend,
 		Action:       esphttp.FleetCommandActionEntmootVersion,
 		Target:       esphttp.FleetCommandTargetNode,
@@ -1551,7 +1574,7 @@ func TestApplyLiveAgentActionRequestsFleetCommand(t *testing.T) {
 		AllowedActions: []string{liveActionCommandRequest},
 	}
 	autoAccept := true
-	applied, err := applyLiveAgentAction(ctx, &globalFlags{data: dataDir}, state, cfg, nil, liveAgentAction{
+	applied, err := applyLiveAgentAction(ctx, enableCoordinationFeatures(&globalFlags{data: dataDir}), state, cfg, nil, liveAgentAction{
 		Kind:         liveActionCommandRequest,
 		Action:       esphttp.FleetCommandActionEntmootVersion,
 		Target:       esphttp.FleetCommandTargetNode,
@@ -1585,7 +1608,7 @@ func TestApplyLiveAgentActionRequestsFleetCommand(t *testing.T) {
 	if !detail.Command.AutoAccept {
 		t.Fatalf("stored command AutoAccept = false, want true")
 	}
-	applied, err = applyLiveAgentAction(ctx, &globalFlags{data: dataDir}, state, cfg, nil, liveAgentAction{
+	applied, err = applyLiveAgentAction(ctx, enableCoordinationFeatures(&globalFlags{data: dataDir}), state, cfg, nil, liveAgentAction{
 		Kind:         liveActionCommandRequest,
 		Action:       esphttp.FleetCommandActionAgentInstruction,
 		Target:       esphttp.FleetCommandTargetNode,
@@ -1614,7 +1637,7 @@ func TestApplyLiveAgentActionRequestsFleetCommand(t *testing.T) {
 	}
 	sendCfg := cfg
 	sendCfg.AllowedActions = []string{liveActionCommandSend}
-	applied, err = applyLiveAgentAction(ctx, &globalFlags{data: dataDir}, state, sendCfg, nil, liveAgentAction{
+	applied, err = applyLiveAgentAction(ctx, enableCoordinationFeatures(&globalFlags{data: dataDir}), state, sendCfg, nil, liveAgentAction{
 		Kind:         liveActionCommandSend,
 		Action:       esphttp.FleetCommandActionAgentInstruction,
 		Target:       esphttp.FleetCommandTargetNode,
@@ -1679,7 +1702,7 @@ func TestApplyLiveAgentActionQueuesExternalMessageSend(t *testing.T) {
 		Mode:           esphttp.LiveModeOperator,
 		AllowedActions: []string{liveActionExternalMessage},
 	}
-	applied, err := applyLiveAgentAction(ctx, &globalFlags{data: dataDir}, state, cfg, nil, liveAgentAction{
+	applied, err := applyLiveAgentAction(ctx, enableCoordinationFeatures(&globalFlags{data: dataDir}), state, cfg, nil, liveAgentAction{
 		Kind:             liveActionExternalMessage,
 		FleetID:          "fleet-live",
 		TargetNodeID:     uint64(targetNodeID),
@@ -1772,7 +1795,7 @@ func TestApplyLiveAgentActionRejectsExternalMessageBeforePublish(t *testing.T) {
 		Mode:           esphttp.LiveModeOperator,
 		AllowedActions: []string{liveActionExternalMessage},
 	}
-	applied, err := applyLiveAgentAction(ctx, &globalFlags{data: dataDir}, state, cfg, nil, liveAgentAction{
+	applied, err := applyLiveAgentAction(ctx, enableCoordinationFeatures(&globalFlags{data: dataDir}), state, cfg, nil, liveAgentAction{
 		Kind:           liveActionExternalMessage,
 		FleetID:        "fleet-live",
 		TargetNodeID:   uint64(nodeID),
@@ -1844,7 +1867,7 @@ func TestApplyLiveAgentActionRejectsCommandSendBeforePublish(t *testing.T) {
 		AllowedActions: []string{liveActionCommandSend},
 		MaxActionBytes: 10,
 	}
-	applied, err := applyLiveAgentAction(ctx, &globalFlags{data: dataDir}, state, cfg, nil, liveAgentAction{
+	applied, err := applyLiveAgentAction(ctx, enableCoordinationFeatures(&globalFlags{data: dataDir}), state, cfg, nil, liveAgentAction{
 		Kind:   liveActionCommandSend,
 		Action: esphttp.FleetCommandActionEntmootVersion,
 	})
@@ -1859,7 +1882,7 @@ func TestApplyLiveAgentActionRejectsCommandSendBeforePublish(t *testing.T) {
 		t.Fatalf("unexpected publish topics = %+v", topics)
 	case <-time.After(50 * time.Millisecond):
 	}
-	applied, err = applyLiveAgentAction(ctx, &globalFlags{data: dataDir}, state, cfg, nil, liveAgentAction{
+	applied, err = applyLiveAgentAction(ctx, enableCoordinationFeatures(&globalFlags{data: dataDir}), state, cfg, nil, liveAgentAction{
 		Kind:         liveActionCommandSend,
 		Action:       esphttp.FleetCommandActionEntmootVersion,
 		TargetNodeID: 8,
@@ -1931,7 +1954,7 @@ func TestApplyLiveAgentActionCreatesFleetInvite(t *testing.T) {
 		Mode:           esphttp.LiveModeOperator,
 		AllowedActions: []string{liveActionInviteCreate},
 	}
-	applied, err := applyLiveAgentAction(ctx, &globalFlags{data: dataDir}, state, cfg, nil, liveAgentAction{
+	applied, err := applyLiveAgentAction(ctx, enableCoordinationFeatures(&globalFlags{data: dataDir}), state, cfg, nil, liveAgentAction{
 		Kind:           liveActionInviteCreate,
 		TargetNodeID:   uint64(targetNodeID),
 		TargetPilotKey: base64.StdEncoding.EncodeToString(targetPilotPub),
@@ -2012,7 +2035,7 @@ func TestApplyLiveAgentActionRejectsInviteCreateByNonCoordinator(t *testing.T) {
 		Mode:           esphttp.LiveModeOperator,
 		AllowedActions: []string{liveActionInviteCreate},
 	}
-	applied, err := applyLiveAgentAction(ctx, &globalFlags{data: t.TempDir()}, state, cfg, nil, liveAgentAction{
+	applied, err := applyLiveAgentAction(ctx, enableCoordinationFeatures(&globalFlags{data: t.TempDir()}), state, cfg, nil, liveAgentAction{
 		Kind:           liveActionInviteCreate,
 		TargetNodeID:   9,
 		TargetPilotKey: base64.StdEncoding.EncodeToString([]byte(strings.Repeat("p", 32))),
@@ -2088,7 +2111,7 @@ func TestApplyLiveAgentActionRemovesFleetMember(t *testing.T) {
 		Mode:           esphttp.LiveModeOperator,
 		AllowedActions: []string{liveActionMemberRemove},
 	}
-	applied, err := applyLiveAgentAction(ctx, &globalFlags{data: dataDir}, state, cfg, nil, liveAgentAction{
+	applied, err := applyLiveAgentAction(ctx, enableCoordinationFeatures(&globalFlags{data: dataDir}), state, cfg, nil, liveAgentAction{
 		Kind:         liveActionMemberRemove,
 		TargetNodeID: uint64(targetNodeID),
 	})
@@ -2174,7 +2197,7 @@ func TestApplyLiveAgentActionMemberRemoveRetriesDroppedIPC(t *testing.T) {
 		Mode:           esphttp.LiveModeOperator,
 		AllowedActions: []string{liveActionMemberRemove},
 	}
-	applied, err := applyLiveAgentAction(ctx, &globalFlags{data: dataDir}, state, cfg, nil, liveAgentAction{
+	applied, err := applyLiveAgentAction(ctx, enableCoordinationFeatures(&globalFlags{data: dataDir}), state, cfg, nil, liveAgentAction{
 		Kind:         liveActionMemberRemove,
 		TargetNodeID: uint64(targetNodeID),
 	})
@@ -2224,7 +2247,7 @@ func TestApplyLiveAgentActionRejectsMemberRemoveByNonCoordinator(t *testing.T) {
 		Mode:           esphttp.LiveModeOperator,
 		AllowedActions: []string{liveActionMemberRemove},
 	}
-	applied, err := applyLiveAgentAction(ctx, &globalFlags{data: t.TempDir()}, state, cfg, nil, liveAgentAction{
+	applied, err := applyLiveAgentAction(ctx, enableCoordinationFeatures(&globalFlags{data: t.TempDir()}), state, cfg, nil, liveAgentAction{
 		Kind:         liveActionMemberRemove,
 		TargetNodeID: uint64(targetNodeID),
 	})
@@ -2570,7 +2593,7 @@ func TestScanAgentLiveRunGroupsActionTransportDegrades(t *testing.T) {
 	if err := os.WriteFile(runner, []byte("#!/bin/sh\nprintf '{\"actions\":[{\"kind\":\"reply\",\"message\":\"ok\"}]}'\n"), 0o700); err != nil {
 		t.Fatalf("WriteFile runner: %v", err)
 	}
-	bindings, scans, err := scanAgentLiveRunGroups(ctx, &globalFlags{data: t.TempDir()}, state, msgStore, []agentLiveRunGroup{{GroupID: gid, Mode: esphttp.LiveModeConverse}}, nodeID, time.Second, true, agentLiveRuntimeConfig{
+	bindings, scans, err := scanAgentLiveRunGroups(ctx, enableCoordinationFeatures(&globalFlags{data: t.TempDir()}), state, msgStore, []agentLiveRunGroup{{GroupID: gid, Mode: esphttp.LiveModeConverse}}, nodeID, time.Second, true, agentLiveRuntimeConfig{
 		nodeID:  nodeID,
 		runner:  runner,
 		timeout: time.Second,
@@ -2888,7 +2911,7 @@ func TestPrintAgentLiveRunJSONPreservesSingleGroupShape(t *testing.T) {
 
 func TestCmdAgentLiveRunMalformedGroupIsInvalidArgument(t *testing.T) {
 	code, _, stderr := captureCommandOutput(t, func() int {
-		return cmdAgentLiveRun(&globalFlags{data: t.TempDir()}, []string{"-group", "not-a-group", "-node", "7", "-once"})
+		return cmdAgentLiveRun(enableCoordinationFeatures(&globalFlags{data: t.TempDir()}), []string{"-group", "not-a-group", "-node", "7", "-once"})
 	})
 	if code != exitInvalidArgument {
 		t.Fatalf("cmdAgentLiveRun code = %d, want %d; stderr=%s", code, exitInvalidArgument, stderr)

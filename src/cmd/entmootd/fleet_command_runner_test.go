@@ -228,9 +228,26 @@ func TestFleetCommandAgentInstructionRequiresOptIn(t *testing.T) {
 	}
 }
 
+func TestFleetCommandAgentInstructionRequiresTaskFeature(t *testing.T) {
+	runner, commandCtx, cmd := testFleetCommandInstructionRunner(t)
+	t.Setenv("ENTMOOT_AGENT_INSTRUCTIONS", "1")
+	result, err := runner.execute(context.Background(), commandCtx, cmd)
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if result.status != esphttp.FleetCommandStatusRejected {
+		t.Fatalf("status = %q, want rejected", result.status)
+	}
+	if !strings.Contains(result.summary, "task coordination is disabled") {
+		t.Fatalf("summary = %q, want task feature rejection", result.summary)
+	}
+}
+
 func TestFleetCommandAgentInstructionQueuesSQLite(t *testing.T) {
 	runner, commandCtx, cmd := testFleetCommandInstructionRunner(t)
 	t.Setenv("ENTMOOT_AGENT_INSTRUCTIONS", "1")
+	t.Setenv("ENTMOOT_ENABLE_FLEET", "1")
+	t.Setenv("ENTMOOT_ENABLE_TASKS", "1")
 	result, err := runner.execute(context.Background(), commandCtx, cmd)
 	if err != nil {
 		t.Fatalf("execute: %v", err)
@@ -259,6 +276,8 @@ func TestFleetCommandAgentInstructionQueuesSQLite(t *testing.T) {
 func TestFleetCommandAgentInstructionDoesNotRequeueExistingCommand(t *testing.T) {
 	runner, commandCtx, cmd := testFleetCommandInstructionRunner(t)
 	t.Setenv("ENTMOOT_AGENT_INSTRUCTIONS", "1")
+	t.Setenv("ENTMOOT_ENABLE_FLEET", "1")
+	t.Setenv("ENTMOOT_ENABLE_TASKS", "1")
 	receivedAt := int64(9999)
 	payload := esphttp.NewAgentInstructionPayload(cmd, commandCtx.local.NodeID, "existing", nil, 60000, receivedAt)
 	if _, created, err := runner.state.EnqueueAgentCommand(context.Background(), payload); err != nil || !created {
@@ -284,6 +303,8 @@ func TestFleetCommandAgentInstructionStoresUnsafeCommandIDWithoutPathWrite(t *te
 	runner, commandCtx, cmd := testFleetCommandInstructionRunner(t)
 	cmd.CommandID = "../../somefile"
 	t.Setenv("ENTMOOT_AGENT_INSTRUCTIONS", "1")
+	t.Setenv("ENTMOOT_ENABLE_FLEET", "1")
+	t.Setenv("ENTMOOT_ENABLE_TASKS", "1")
 	result, err := runner.execute(context.Background(), commandCtx, cmd)
 	if err != nil {
 		t.Fatalf("execute: %v", err)

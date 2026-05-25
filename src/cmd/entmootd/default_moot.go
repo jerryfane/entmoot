@@ -292,6 +292,7 @@ func cmdDefaultMootLiveOn(gf *globalFlags, args []string) int {
 		mode:              desc.RecommendedLiveConfig.Mode,
 		topics:            []string{"chat/general"},
 		actions:           desc.RecommendedLiveConfig.AllowedActions,
+		features:          featureFlags(gf),
 		maxActionsPerScan: desc.RecommendedLiveConfig.MaxActions,
 		maxActionBytes:    int(desc.RecommendedLiveConfig.MaxActionBytes),
 	})

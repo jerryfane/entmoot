@@ -18,6 +18,7 @@ import (
 
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/esphttp"
+	entfeatures "entmoot/pkg/entmoot/features"
 	entpolicy "entmoot/pkg/entmoot/policy"
 	"entmoot/pkg/entmoot/store"
 )
@@ -141,6 +142,10 @@ func cmdAgentLiveEnable(gf *globalFlags, args []string) int {
 		fmt.Fprintf(os.Stderr, "agent-live enable: unknown -action value(s): %s\n", strings.Join(unknown, ", "))
 		return exitInvalidArgument
 	}
+	if disabled := coordinationLiveActions([]string(cfg.actions), featureFlags(gf)); len(disabled) > 0 {
+		fmt.Fprintf(os.Stderr, "agent-live enable: live action(s) require ENTMOOT_ENABLE_FLEET=1 and ENTMOOT_ENABLE_TASKS=1: %s\n", strings.Join(disabled, ", "))
+		return exitInvalidArgument
+	}
 	state, err := esphttp.OpenSQLiteStateStore(gf.data)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "agent-live enable: %v\n", err)
@@ -153,6 +158,7 @@ func cmdAgentLiveEnable(gf *globalFlags, args []string) int {
 		mode:              mode,
 		topics:            topics,
 		actions:           []string(cfg.actions),
+		features:          featureFlags(gf),
 		maxActionsPerScan: cfg.maxActionsPerScan,
 		maxActionBytes:    cfg.maxActionBytes,
 	})
@@ -173,14 +179,25 @@ type enableAgentLiveConfigOptions struct {
 	mode              string
 	topics            []string
 	actions           []string
+	features          entfeatures.Flags
 	maxActionsPerScan int
 	maxActionBytes    int
 }
 
 func enableAgentLiveConfig(ctx context.Context, state esphttp.StateStore, opts enableAgentLiveConfigOptions) (esphttp.LiveAgentConfig, error) {
+	actionsExplicit := len(opts.actions) > 0
 	actions := esphttp.NormalizeLiveActions(opts.actions)
-	if opts.mode == esphttp.LiveModeOperator && len(actions) == 0 {
+	if actionsExplicit && len(actions) == 0 {
+		return esphttp.LiveAgentConfig{}, fmt.Errorf("live action list cannot be empty")
+	}
+	if opts.mode == esphttp.LiveModeOperator && len(actions) == 0 && !actionsExplicit {
 		actions = esphttp.DefaultLiveActions()
+	}
+	if disabled := coordinationLiveActions(actions, opts.features); len(disabled) > 0 {
+		if actionsExplicit {
+			return esphttp.LiveAgentConfig{}, fmt.Errorf("live action(s) require ENTMOOT_ENABLE_FLEET=1 and ENTMOOT_ENABLE_TASKS=1: %s", strings.Join(disabled, ", "))
+		}
+		actions = filterDisabledLiveActions(actions, opts.features)
 	}
 	return state.UpsertLiveAgentConfig(ctx, esphttp.LiveAgentConfig{
 		GroupID:           opts.groupID,
