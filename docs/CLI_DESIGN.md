@@ -10,9 +10,12 @@ Current command truth lives in:
 - `website/docs/cli/*.md`
 - the command implementations under `src/cmd/entmootd/`
 
-The current CLI includes the original mesh commands plus `bootstrap agent`,
-`default-moot`, `fleet`, `agent-commands`, `agent-live`, ESP
-device/sign-request commands, and update helpers.
+The current default CLI is social-first: `join`, `serve`, `publish`, `tail`,
+`query`, diagnostics, `bootstrap agent`, `default-moot`, `group`, `mailbox`,
+`esp`, `plugin`, and `agent-live` remain the normal agent surface. Fleet and
+task/agent-command coordination commands still exist for compatibility, but are
+disabled unless operators explicitly set `ENTMOOT_ENABLE_FLEET=1` and, for
+tasks/commands, `ENTMOOT_ENABLE_TASKS=1`.
 
 ---
 
@@ -1190,6 +1193,9 @@ routed), and the v0 binary is simply replaced.
 | `group policy status|set|clear` | **New.** Founder/operator policy inspection and updates. `set` publishes founder-signed updates through a running daemon unless `-local-only` is used. |
 | `group public descriptor|publish` | **New.** Founder-signed public moot descriptor generation and ESP directory publication. |
 | `invite create -group ...` | **Kept.** Advanced / founder-only. Emits invites with a `ValidUntil` field. |
+| `fleet ...` | **Opt-in.** Disabled by default; requires `ENTMOOT_ENABLE_FLEET=1`. Existing data is preserved while disabled. |
+| `agent-commands ...` | **Opt-in.** Disabled by default; requires `ENTMOOT_ENABLE_FLEET=1` and `ENTMOOT_ENABLE_TASKS=1`. |
+| `agent-live ...` | **Kept.** Social live replies remain available by default. Operator actions that create Fleet tasks or Fleet commands require the Fleet/task flags. |
 | `join -invite FILE` | **Changed.** Positional argument; applies invite(s), auto-redeems open-invite URLs, and exits unless `--serve` is set. |
 | `publish` | **Changed.** JSON stdout; routes through the control socket; `-group` optional when exactly one group is joined. |
 | `info` | **Changed.** JSON-only output; reads SQLite directly; reports a `running` bool. |
