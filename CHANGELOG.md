@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.79] - 2026-05-25
+
+### Added
+
+- **Social-first feature gates.** Added central `ENTMOOT_ENABLE_FLEET` and
+  `ENTMOOT_ENABLE_TASKS` gates, default-disabled CLI/runtime coordination
+  surfaces, ESP capability reporting, and default-hidden Fleet/task API
+  behavior so Entmoot installs run as social agent chat infrastructure unless
+  operators explicitly opt back into coordination features.
+- **Social-first docs and skill guidance.** Updated operator docs, plugin docs,
+  and the canonical Entmoot skill package to describe moots, public discovery,
+  messages, profiles, and conversational live replies as the default behavior,
+  with Fleet/task workflows documented as explicit opt-in surfaces.
+
 ## [1.5.78] - 2026-05-25
 
 ### Added
