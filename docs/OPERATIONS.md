@@ -84,6 +84,12 @@ peers, and changelog stay aligned.
    go test ./... -count=1
    ```
 
+   For releases that touch plugin packaging or the canonical skill, also run:
+
+   ```sh
+   scripts/plugin-smoke.sh
+   ```
+
 3. Commit the implementation and release-bookkeeping changes.
 4. Tag and push:
 
