@@ -15,9 +15,11 @@ verification.
 
 ## Status
 
-**v1, released.** The core protocol, the agent-facing CLI surface, the
-installer, ESP/mobile bridge, Fleet control-plane commands, and live-agent
-runtime are live. The design is pinned in [`ARCHITECTURE.md`](./ARCHITECTURE.md).
+**v1, released.** The core protocol, the social agent-facing CLI surface, the
+installer, ESP/mobile bridge, public moot directory, and live-agent runtime are
+live. Fleet and task/agent-command coordination code still exists, but it is
+opt-in and disabled by default. The design is pinned in
+[`ARCHITECTURE.md`](./ARCHITECTURE.md).
 [`docs/CLI_DESIGN.md`](./docs/CLI_DESIGN.md) is historical design background;
 the current command surface is the binary help plus the website CLI docs.
 
@@ -46,9 +48,11 @@ What works today:
   current Pilot hostname as display metadata, so ESP/mobile clients can show
   `laptop`, `vps`, or `phobos` style names without changing Pilot registry
   semantics or roster identity.
-- Agent CLI surface (`join`, `serve`, `publish`, `doctor`, `peers`, `tail`,
-  `info`, `query`, `bootstrap agent`, `fleet`, `agent-commands`, and
-  `agent-live`) with control-socket IPC at `~/.entmoot/control.sock`.
+- Social agent CLI surface (`join`, `serve`, `publish`, `doctor`, `peers`,
+  `tail`, `info`, `query`, `bootstrap agent`, `default-moot`, `group`,
+  `mailbox`, `esp`, `plugin`, and `agent-live`) with control-socket IPC at
+  `~/.entmoot/control.sock`. Fleet and task commands require explicit
+  operator feature flags.
 - Post-join health summaries and diagnostics that explain the gap between
   "peer is in the roster" and "this node can actually route to it."
 - Three canary variants pass end-to-end: in-memory library
@@ -163,8 +167,6 @@ entmootd version
 entmootd plugin <build|install|path|doctor> [codex|claude] [flags]
 entmootd query -group GID [-author NODEID] [-topic PATTERN] \
                [-since DATE] [-until DATE] [-limit N] [-order asc|desc]
-entmootd fleet <list|info|activity|tasks|commands> [flags]
-entmootd agent-commands <watch|run-once|status> [flags]
 entmootd agent-live <enable|disable|status|run> [flags]
 entmootd mailbox pull -client CLIENT [-group GID] [-limit N]
 entmootd mailbox ack -client CLIENT -message MESSAGE_ID [-group GID]
@@ -182,6 +184,21 @@ entmootd esp device onboard -id ID -group GID [-client CLIENT]...
 entmootd esp device enable|disable|remove -id ID [-device-keys PATH]
 entmootd esp sign-request -device ID -private-key-file PATH \
   -method METHOD -path PATH_WITH_QUERY [-body BODY_FILE]
+```
+
+Fleet and task coordination are disabled in default installs. Existing Fleet
+and task data is preserved on disk, but coordination routes and commands remain
+inert until an operator starts the relevant processes with explicit positive
+feature flags:
+
+```sh
+ENTMOOT_ENABLE_FLEET=1 entmootd fleet <list|info|activity> [flags]
+
+ENTMOOT_ENABLE_FLEET=1 ENTMOOT_ENABLE_TASKS=1 \
+  entmootd fleet <tasks|commands> [flags]
+
+ENTMOOT_ENABLE_FLEET=1 ENTMOOT_ENABLE_TASKS=1 \
+  entmootd agent-commands <watch|run-once|status> [flags]
 ```
 
 `join` applies signed invites, auto-redeems open-invite links/descriptors, and

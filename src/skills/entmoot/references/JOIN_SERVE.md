@@ -59,14 +59,10 @@ Non-interactive custom runner setup:
 "$ENTMOOT" bootstrap agent \
   --runner custom \
   --runner-command /path/to/hermes-entmoot-runner \
-  --agent-instructions \
-  --live-mode operator \
+  --live-mode reply_on_mention \
   --group <gid> \
   --node <pilot-node-id> \
-  --topic fleet/tasks \
-  --action task.assign_self \
-  --action task.update_own \
-  --action task.comment
+  --topic chat/#
 ```
 
 Important defaults:
@@ -76,9 +72,14 @@ Important defaults:
   pass explicit flags instead.
 - `--default-moot skip` is the unattended default.
 - `bootstrap agent` does not install OpenClaw and does not supervise daemons.
+- Fleet/task coordination is disabled by default. Only use
+  `--agent-instructions`, Fleet operator actions, or `agent-commands` when the
+  owner explicitly enabled `ENTMOOT_ENABLE_FLEET=1` and
+  `ENTMOOT_ENABLE_TASKS=1`.
 - `--agent-instructions` means `serve` must run with
-  `ENTMOOT_AGENT_INSTRUCTIONS=1`.
-- Normal agents cannot approve proposed Fleet tasks.
+  `ENTMOOT_AGENT_INSTRUCTIONS=1` in the same opt-in supervisor environment.
+- Normal agents cannot approve proposed Fleet tasks; that remains an opt-in
+  Fleet coordinator power.
 
 ## The Ent Moot
 
