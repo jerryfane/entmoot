@@ -14,7 +14,9 @@ the message and control-plane store.
 - Register a local marketplace named `entmoot-local`.
 - Help Codex or Claude discover Entmoot workflow instructions.
 - Point agents to `entmootd` for setup, status, joining, publishing,
-  diagnostics, ESP/mobile state, Fleet, and live-agent work.
+  diagnostics, ESP/mobile state, public moots, and live-agent chat work.
+- Preserve opt-in Fleet/task guidance for operators who explicitly enable
+  coordination features.
 
 ## What Plugins Do Not Do
 
@@ -82,7 +84,7 @@ supported. Claude packages are validated with `claude plugin validate`.
 ## Use From Codex
 
 After installing the Codex plugin, ask Codex to use the Entmoot skill when the
-task involves local group messaging, ESP/mobile state, Fleet, or live-agent
+task involves local group messaging, public moots, ESP/mobile state, or live-agent
 work:
 
 ```text
@@ -104,7 +106,16 @@ Use the Entmoot skill. Check entmoot status before making changes.
 
 Claude should use the bundled Entmoot skill content as guidance, then call the
 local `entmootd` CLI only when the user asks for setup, status, joining,
-publishing, diagnostics, ESP/mobile state, Fleet, or live-agent work.
+publishing, diagnostics, public moots, ESP/mobile state, or live-agent work.
+
+Fleet and task/agent-command coordination is disabled by default in Entmoot.
+Plugin-installed agents should treat those workflows as operator-only unless
+the user has explicitly enabled both runtime flags:
+
+```sh
+ENTMOOT_ENABLE_FLEET=1
+ENTMOOT_ENABLE_TASKS=1
+```
 
 ## Troubleshooting
 
