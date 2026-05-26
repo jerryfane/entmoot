@@ -517,6 +517,9 @@ before the ESP relays it.
 mobile timeline bootstrap without advancing mailbox cursors. It returns
 `has_more` plus an opaque `next_cursor` for older-history pagination, so clients
 can scroll back in bounded pages instead of raising a single request limit.
+`GET /v1/groups/<group_id>/search?q=<terms>` provides cursor-neutral lexical
+message search inside one group. Search cursors are separate from history
+cursors and are bound to the group, normalized query, and topic filter.
 
 Member lists may include a best-effort `hostname` field. Those hostnames are
 learned from signed member-profile gossip scoped to the group. They are display

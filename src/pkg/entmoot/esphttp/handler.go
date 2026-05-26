@@ -10,6 +10,7 @@ import (
 	"crypto/subtle"
 	"database/sql"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -2168,6 +2169,12 @@ func (h *Handler) handleGroupSubroute(w http.ResponseWriter, r *http.Request) bo
 			return true
 		}
 		h.handleGroupHistory(w, r, groupID)
+	case "search":
+		if r.Method != http.MethodGet {
+			methodNotAllowed(w, http.MethodGet)
+			return true
+		}
+		h.handleGroupSearch(w, r, groupID)
 	case "topics":
 		if r.Method != http.MethodGet {
 			methodNotAllowed(w, http.MethodGet)
@@ -2593,6 +2600,49 @@ func (h *Handler) handleGroupHistory(w http.ResponseWriter, r *http.Request, gro
 	h.writeMailboxResult(w, "group history", result, err)
 }
 
+func (h *Handler) handleGroupSearch(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID) {
+	clientID := strings.TrimSpace(r.URL.Query().Get("client_id"))
+	if clientID == "" {
+		if auth, _ := r.Context().Value(authContextKey{}).(authContext); auth.device != nil {
+			clientID = auth.device.ID
+		}
+	}
+	if clientID == "" {
+		writeError(w, http.StatusBadRequest, "bad_request", "client_id is required")
+		return
+	}
+	if !h.checkDeviceClientRead(w, r, groupID, clientID) {
+		return
+	}
+	query := strings.TrimSpace(r.URL.Query().Get("q"))
+	normalized, err := store.NormalizeSearchQuery(query)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+	limit := 50
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 || n > maxListLimit {
+			writeError(w, http.StatusBadRequest, "bad_request", fmt.Sprintf("limit must be between 1 and %d", maxListLimit))
+			return
+		}
+		limit = n
+	}
+	topic := strings.TrimSpace(r.URL.Query().Get("topic"))
+	queryHash := searchQueryHash(normalized.Query)
+	boundary, err := parseSearchCursor(strings.TrimSpace(r.URL.Query().Get("cursor")), groupID, topic, queryHash)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+	result, err := h.service.Search(r.Context(), groupID, normalized.Query, limit, boundary, topic)
+	if err == nil {
+		result.NextCursor = encodeSearchCursor(groupID, topic, queryHash, result.NextCursorBoundary)
+	}
+	h.writeMailboxResult(w, "group search", result, err)
+}
+
 type historyCursorPayload struct {
 	Version      int               `json:"v"`
 	GroupID      entmoot.GroupID   `json:"group_id"`
@@ -2646,6 +2696,68 @@ func encodeHistoryCursor(groupID entmoot.GroupID, topic string, boundary *store.
 		return ""
 	}
 	return base64.RawURLEncoding.EncodeToString(data)
+}
+
+type searchCursorPayload struct {
+	Version      int               `json:"v"`
+	GroupID      entmoot.GroupID   `json:"group_id"`
+	Topic        string            `json:"topic,omitempty"`
+	QueryHash    string            `json:"query_hash"`
+	TimestampMS  int64             `json:"timestamp_ms"`
+	AuthorNodeID entmoot.NodeID    `json:"author_node_id"`
+	MessageID    entmoot.MessageID `json:"message_id"`
+}
+
+func parseSearchCursor(raw string, groupID entmoot.GroupID, topic, queryHash string) (*store.SearchBoundary, error) {
+	if raw == "" {
+		return nil, nil
+	}
+	data, err := base64.RawURLEncoding.DecodeString(raw)
+	if err != nil {
+		return nil, fmt.Errorf("invalid search cursor")
+	}
+	var payload searchCursorPayload
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return nil, fmt.Errorf("invalid search cursor")
+	}
+	if payload.Version != 1 {
+		return nil, fmt.Errorf("unsupported search cursor")
+	}
+	if payload.GroupID != groupID || payload.Topic != topic || payload.QueryHash != queryHash {
+		return nil, fmt.Errorf("search cursor does not match requested group, topic, or query")
+	}
+	if payload.MessageID == (entmoot.MessageID{}) {
+		return nil, fmt.Errorf("invalid search cursor")
+	}
+	return &store.SearchBoundary{
+		TimestampMS:  payload.TimestampMS,
+		AuthorNodeID: payload.AuthorNodeID,
+		MessageID:    payload.MessageID,
+	}, nil
+}
+
+func encodeSearchCursor(groupID entmoot.GroupID, topic, queryHash string, boundary *store.SearchBoundary) string {
+	if boundary == nil {
+		return ""
+	}
+	data, err := json.Marshal(searchCursorPayload{
+		Version:      1,
+		GroupID:      groupID,
+		Topic:        topic,
+		QueryHash:    queryHash,
+		TimestampMS:  boundary.TimestampMS,
+		AuthorNodeID: boundary.AuthorNodeID,
+		MessageID:    boundary.MessageID,
+	})
+	if err != nil {
+		return ""
+	}
+	return base64.RawURLEncoding.EncodeToString(data)
+}
+
+func searchQueryHash(query string) string {
+	sum := sha256.Sum256([]byte(query))
+	return hex.EncodeToString(sum[:])
 }
 
 func (h *Handler) handleGroupTopics(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID) {
@@ -3282,6 +3394,8 @@ func (h *Handler) writeMailboxResult(w http.ResponseWriter, op string, result an
 	}
 	switch {
 	case errors.Is(err, mailbox.ErrInvalidClient):
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+	case errors.Is(err, store.ErrInvalidSearchQuery):
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 	case errors.Is(err, store.ErrNotFound):
 		writeError(w, http.StatusBadRequest, "message_not_found", "message not found")

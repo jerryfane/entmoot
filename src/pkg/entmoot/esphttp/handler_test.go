@@ -274,11 +274,25 @@ func TestHandlerDeviceAuth(t *testing.T) {
 		t.Fatalf("history status = %d, want 200 body=%s", resp.Code, resp.Body.String())
 	}
 
+	search := signedDeviceRequest(t, priv, http.MethodGet, "/v1/groups/"+gid.String()+"/search?client_id=ios-1&q=hello&limit=1", nil, 1_000_000, "nonce-search")
+	resp = httptest.NewRecorder()
+	handler.ServeHTTP(resp, search)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("search status = %d, want 200 body=%s", resp.Code, resp.Body.String())
+	}
+
 	badHistoryClient := signedDeviceRequest(t, priv, http.MethodGet, "/v1/groups/"+gid.String()+"/history?client_id=other&limit=1", nil, 1_000_000, "nonce-4")
 	resp = httptest.NewRecorder()
 	handler.ServeHTTP(resp, badHistoryClient)
 	if resp.Code != http.StatusForbidden {
 		t.Fatalf("bad history client status = %d, want 403 body=%s", resp.Code, resp.Body.String())
+	}
+
+	badSearchClient := signedDeviceRequest(t, priv, http.MethodGet, "/v1/groups/"+gid.String()+"/search?client_id=other&q=hello&limit=1", nil, 1_000_000, "nonce-5")
+	resp = httptest.NewRecorder()
+	handler.ServeHTTP(resp, badSearchClient)
+	if resp.Code != http.StatusForbidden {
+		t.Fatalf("bad search client status = %d, want 403 body=%s", resp.Code, resp.Body.String())
 	}
 }
 
@@ -1994,6 +2008,89 @@ func TestHandlerGroupHistoryReturnsLatestWithoutAdvancingCursor(t *testing.T) {
 	}
 	if cursor.Cursor.TimestampMS != 2 {
 		t.Fatalf("cursor timestamp = %d, want unchanged 2", cursor.Cursor.TimestampMS)
+	}
+}
+
+func TestHandlerGroupSearchReturnsPagedResults(t *testing.T) {
+	gid := testGroupIDWithSlash()
+	st := store.NewMemory()
+	withTopics := func(ts int64, content string, topics ...string) entmoot.Message {
+		msg := testMessage(gid, ts, content)
+		msg.Topics = topics
+		msg.ID = canonical.MessageID(msg)
+		return msg
+	}
+	oldOps := withTopics(1, "mars policy limits old", "ops")
+	midChat := withTopics(2, "mars policy limits middle", "chat")
+	newOps := withTopics(3, "mars policy limits newest", "ops")
+	missingTerm := withTopics(4, "mars policy only", "ops")
+	for _, msg := range []entmoot.Message{oldOps, midChat, newOps, missingTerm} {
+		if err := st.Put(context.Background(), msg); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+	}
+	svc, err := mailbox.New(st, nil)
+	if err != nil {
+		t.Fatalf("mailbox.New: %v", err)
+	}
+	if err := svc.AckCursorContext(context.Background(), gid, "ios-1", mailbox.Cursor{
+		MessageID:   midChat.ID,
+		TimestampMS: midChat.Timestamp,
+	}); err != nil {
+		t.Fatalf("AckCursorContext: %v", err)
+	}
+	handler, err := NewHandler(Config{
+		Token:   "secret",
+		Service: svc,
+		GroupExists: func(_ context.Context, got entmoot.GroupID) (bool, error) {
+			return got == gid, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewHandler: %v", err)
+	}
+	basePath := "/v1/groups/" + url.PathEscape(gid.String()) + "/search"
+
+	search := doJSONRequest[mailbox.SearchResult](t, handler, http.MethodGet, basePath+"?client_id=ios-1&q="+url.QueryEscape("policy limits")+"&limit=2", nil, http.StatusOK)
+	if search.Query != "policy limits" || search.Count != 2 || len(search.Results) != 2 {
+		t.Fatalf("search = %+v, want two normalized hits", search)
+	}
+	if !search.HasMore || search.NextCursor == "" {
+		t.Fatalf("search has_more/cursor = %v/%q, want cursor", search.HasMore, search.NextCursor)
+	}
+	if search.Results[0].Message.MessageID != newOps.ID || search.Results[1].Message.MessageID != midChat.ID {
+		t.Fatalf("search ids = %v,%v want newOps,midChat", search.Results[0].Message.MessageID, search.Results[1].Message.MessageID)
+	}
+
+	older := doJSONRequest[mailbox.SearchResult](t, handler, http.MethodGet, basePath+"?client_id=ios-1&q="+url.QueryEscape("policy limits")+"&limit=2&cursor="+url.QueryEscape(search.NextCursor), nil, http.StatusOK)
+	if older.HasMore || older.Count != 1 || older.Results[0].Message.MessageID != oldOps.ID {
+		t.Fatalf("older search = %+v, want oldOps only", older)
+	}
+
+	topicSearch := doJSONRequest[mailbox.SearchResult](t, handler, http.MethodGet, basePath+"?client_id=ios-1&q="+url.QueryEscape("policy limits")+"&topic=ops&limit=10", nil, http.StatusOK)
+	if topicSearch.Count != 2 || topicSearch.Results[0].Message.MessageID != newOps.ID || topicSearch.Results[1].Message.MessageID != oldOps.ID {
+		t.Fatalf("topic search = %+v, want newOps,oldOps", topicSearch.Results)
+	}
+
+	errResp := doJSONRequest[errorEnvelope](t, handler, http.MethodGet, basePath+"?client_id=ios-1&q=other&limit=2&cursor="+url.QueryEscape(search.NextCursor), nil, http.StatusBadRequest)
+	if errResp.Error.Code != "bad_request" || !strings.Contains(errResp.Error.Message, "search cursor") {
+		t.Fatalf("cursor mismatch error = %+v", errResp.Error)
+	}
+	errResp = doJSONRequest[errorEnvelope](t, handler, http.MethodGet, basePath+"?client_id=ios-1&q=---&limit=2", nil, http.StatusBadRequest)
+	if errResp.Error.Code != "bad_request" {
+		t.Fatalf("bad query error = %+v", errResp.Error)
+	}
+	errResp = doJSONRequest[errorEnvelope](t, handler, http.MethodGet, basePath+"?client_id=ios-1&q=policy&limit=0", nil, http.StatusBadRequest)
+	if errResp.Error.Code != "bad_request" || !strings.Contains(errResp.Error.Message, "between 1 and") {
+		t.Fatalf("bad limit error = %+v", errResp.Error)
+	}
+
+	cursor, err := svc.CursorStatus(context.Background(), gid, "ios-1")
+	if err != nil {
+		t.Fatalf("CursorStatus: %v", err)
+	}
+	if cursor.Cursor.TimestampMS != midChat.Timestamp {
+		t.Fatalf("cursor timestamp = %d, want unchanged %d", cursor.Cursor.TimestampMS, midChat.Timestamp)
 	}
 }
 
