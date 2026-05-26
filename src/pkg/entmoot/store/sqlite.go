@@ -62,6 +62,45 @@ CREATE TABLE IF NOT EXISTS message_topics (
 CREATE INDEX IF NOT EXISTS idx_topic_lookup
   ON message_topics(topic, message_id);
 
+CREATE TABLE IF NOT EXISTS message_search_docs (
+  doc_id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  message_id     BLOB NOT NULL UNIQUE,
+  group_id       BLOB NOT NULL,
+  author_node_id INTEGER NOT NULL,
+  timestamp_ms   INTEGER NOT NULL,
+  content_text   TEXT NOT NULL,
+  topics_text    TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_message_search_docs_group_latest
+  ON message_search_docs(group_id, timestamp_ms DESC, author_node_id DESC, message_id DESC);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS message_search_fts USING fts5(
+  content_text,
+  content='message_search_docs',
+  content_rowid='doc_id'
+);
+
+CREATE TRIGGER IF NOT EXISTS message_search_docs_ai
+AFTER INSERT ON message_search_docs BEGIN
+  INSERT INTO message_search_fts(rowid, content_text)
+  VALUES (new.doc_id, new.content_text);
+END;
+
+CREATE TRIGGER IF NOT EXISTS message_search_docs_ad
+AFTER DELETE ON message_search_docs BEGIN
+  INSERT INTO message_search_fts(message_search_fts, rowid, content_text)
+  VALUES ('delete', old.doc_id, old.content_text);
+END;
+
+CREATE TRIGGER IF NOT EXISTS message_search_docs_au
+AFTER UPDATE ON message_search_docs BEGIN
+  INSERT INTO message_search_fts(message_search_fts, rowid, content_text)
+  VALUES ('delete', old.doc_id, old.content_text);
+  INSERT INTO message_search_fts(rowid, content_text)
+  VALUES (new.doc_id, new.content_text);
+END;
+
 -- transport_ads holds the LWW-Register set of peer transport
 -- advertisements we have received and verified. One row per
 -- (group, author). The canonical column is the full JSON-encoded
@@ -240,6 +279,9 @@ func (s *SQLite) Put(ctx context.Context, m entmoot.Message) error {
 			return fmt.Errorf("store: insert topic: %w", err)
 		}
 	}
+	if err := insertMessageSearchDocTx(ctx, tx, m); err != nil {
+		return err
+	}
 
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("store: commit: %w", err)
@@ -275,10 +317,21 @@ func (s *SQLite) PruneBeforeExceptTopics(ctx context.Context, groupID entmoot.Gr
 		WHERE message_id IN (
 		  SELECT message_id FROM messages
 		  WHERE group_id = ? AND timestamp_ms < ?`+exemptClause+`
-		);`,
+	);`,
 		args...,
 	); err != nil {
 		return 0, fmt.Errorf("store: prune topics: %w", err)
+	}
+	args = append([]any{groupID[:], beforeMillis}, exemptArgs...)
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM message_search_docs
+		WHERE message_id IN (
+		  SELECT message_id FROM messages
+		  WHERE group_id = ? AND timestamp_ms < ?`+exemptClause+`
+		);`,
+		args...,
+	); err != nil {
+		return 0, fmt.Errorf("store: prune search docs: %w", err)
 	}
 	args = append([]any{groupID[:], beforeMillis}, exemptArgs...)
 	res, err := tx.ExecContext(ctx, `
@@ -640,6 +693,95 @@ func (s *SQLite) LatestByTopicBefore(ctx context.Context, groupID entmoot.GroupI
 	return topoOrder(candidates)
 }
 
+// SearchMessages implements MessageSearcher using SQLite FTS5.
+func (s *SQLite) SearchMessages(ctx context.Context, groupID entmoot.GroupID, query SearchQuery, opts SearchOptions) (SearchResult, error) {
+	if opts.Limit <= 0 {
+		return SearchResult{Hits: []SearchHit{}}, nil
+	}
+	db, err := s.dbFor(groupID)
+	if err != nil {
+		return SearchResult{}, err
+	}
+
+	args := []any{groupID[:], query.FTS5}
+	where := strings.Builder{}
+	where.WriteString(`
+		WHERE d.group_id = ?
+		  AND message_search_fts MATCH ?`)
+	if opts.Topic != "" {
+		where.WriteString(`
+		  AND EXISTS (
+		    SELECT 1 FROM message_topics mt
+		    WHERE mt.message_id = d.message_id AND mt.topic = ?
+		  )`)
+		args = append(args, opts.Topic)
+	}
+	if opts.CursorBoundary != nil {
+		where.WriteString(`
+		  AND (
+		    d.timestamp_ms < ?
+		    OR (d.timestamp_ms = ? AND d.author_node_id < ?)
+		    OR (d.timestamp_ms = ? AND d.author_node_id = ? AND d.message_id < ?)
+		  )`)
+		boundary := opts.CursorBoundary
+		args = append(args,
+			boundary.TimestampMS,
+			boundary.TimestampMS, uint32(boundary.AuthorNodeID),
+			boundary.TimestampMS, uint32(boundary.AuthorNodeID), boundary.MessageID[:],
+		)
+	}
+	args = append(args, opts.Limit+1)
+
+	rows, err := db.QueryContext(ctx, `
+		SELECT m.canonical_bytes,
+		       snippet(message_search_fts, 0, '[', ']', '...', 12) AS snippet
+		FROM message_search_fts
+		JOIN message_search_docs d ON d.doc_id = message_search_fts.rowid
+		JOIN messages m ON m.message_id = d.message_id AND m.group_id = d.group_id
+		`+where.String()+`
+		ORDER BY d.timestamp_ms DESC, d.author_node_id DESC, d.message_id DESC
+		LIMIT ?;`,
+		args...,
+	)
+	if err != nil {
+		return SearchResult{}, fmt.Errorf("store: search query: %w", err)
+	}
+	defer rows.Close()
+
+	hits := make([]SearchHit, 0, opts.Limit)
+	for rows.Next() {
+		var (
+			canonBytes []byte
+			snippet    string
+		)
+		if err := rows.Scan(&canonBytes, &snippet); err != nil {
+			return SearchResult{}, fmt.Errorf("store: search scan: %w", err)
+		}
+		msg, err := decodeMessage(canonBytes)
+		if err != nil {
+			return SearchResult{}, err
+		}
+		hits = append(hits, SearchHit{Message: msg, Snippet: snippet})
+	}
+	if err := rows.Err(); err != nil {
+		return SearchResult{}, fmt.Errorf("store: search iterate: %w", err)
+	}
+
+	result := SearchResult{Hits: hits}
+	if len(result.Hits) > opts.Limit {
+		result.HasMore = true
+		result.Hits = result.Hits[:opts.Limit]
+	}
+	if result.HasMore && len(result.Hits) > 0 {
+		boundary := searchBoundaryFromMessage(result.Hits[len(result.Hits)-1].Message)
+		result.NextCursorBoundary = &boundary
+	}
+	if result.Hits == nil {
+		result.Hits = []SearchHit{}
+	}
+	return result, nil
+}
+
 // IterMessageIDsInIDRange implements MessageStore.IterMessageIDsInIDRange.
 // Uses the PRIMARY KEY index on messages.message_id. Verified via
 // EXPLAIN QUERY PLAN to issue "SEARCH messages USING INTEGER PRIMARY KEY"
@@ -818,7 +960,75 @@ func openGroupDB(groupsDir string, groupID entmoot.GroupID) (*sql.DB, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("store: apply schema: %w", err)
 	}
+	if err := backfillMessageSearchDocs(context.Background(), db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	return db, nil
+}
+
+func insertMessageSearchDocTx(ctx context.Context, tx *sql.Tx, m entmoot.Message) error {
+	if _, err := tx.ExecContext(ctx, `
+		INSERT OR IGNORE INTO message_search_docs
+		  (message_id, group_id, author_node_id, timestamp_ms, content_text, topics_text)
+		VALUES (?, ?, ?, ?, ?, ?);`,
+		m.ID[:],
+		m.GroupID[:],
+		int64(m.Author.PilotNodeID),
+		m.Timestamp,
+		string(m.Content),
+		strings.Join(m.Topics, "\n"),
+	); err != nil {
+		return fmt.Errorf("store: insert search doc: %w", err)
+	}
+	return nil
+}
+
+func backfillMessageSearchDocs(ctx context.Context, db *sql.DB) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("store: begin search backfill tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	rows, err := tx.QueryContext(ctx, `
+		SELECT m.canonical_bytes
+		FROM messages m
+		LEFT JOIN message_search_docs d ON d.message_id = m.message_id
+		WHERE d.message_id IS NULL
+		ORDER BY m.timestamp_ms, m.author_node_id, m.message_id;`)
+	if err != nil {
+		return fmt.Errorf("store: search backfill query: %w", err)
+	}
+	defer rows.Close()
+
+	var messages []entmoot.Message
+	for rows.Next() {
+		var canonBytes []byte
+		if err := rows.Scan(&canonBytes); err != nil {
+			return fmt.Errorf("store: search backfill scan: %w", err)
+		}
+		msg, err := decodeMessage(canonBytes)
+		if err != nil {
+			return err
+		}
+		messages = append(messages, msg)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("store: search backfill iterate: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("store: search backfill close rows: %w", err)
+	}
+	for _, msg := range messages {
+		if err := insertMessageSearchDocTx(ctx, tx, msg); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("store: commit search backfill: %w", err)
+	}
+	return nil
 }
 
 // parentsBlob packs 0..N parent message ids into a flat byte slice of

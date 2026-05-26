@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"strings"
 	"testing"
@@ -53,6 +54,27 @@ func TestNormalizeSearchQuery(t *testing.T) {
 	})
 }
 
+func TestSQLiteFTS5Available(t *testing.T) {
+	db, err := sql.Open(sqliteDriver, ":memory:")
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`CREATE VIRTUAL TABLE messages_fts USING fts5(content);`); err != nil {
+		t.Fatalf("create FTS5 table: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO messages_fts(content) VALUES (?);`, "mars hub policy limits"); err != nil {
+		t.Fatalf("insert FTS5 row: %v", err)
+	}
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH ?;`, `"policy"`).Scan(&count); err != nil {
+		t.Fatalf("match FTS5 row: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("FTS5 count = %d, want 1", count)
+	}
+}
+
 func TestSearchMessagesFallback(t *testing.T) {
 	run := func(t *testing.T, newStore func(t *testing.T) MessageStore) {
 		t.Helper()
@@ -60,19 +82,13 @@ func TestSearchMessagesFallback(t *testing.T) {
 		s := newStore(t)
 		gid := randGroupID(t)
 		author := testAuthor(1, 0xAA)
-		withTopics := func(ts int64, content string, topics ...string) entmoot.Message {
-			m := mkMsg(t, gid, author, ts, content)
-			m.Topics = topics
-			m.ID = canonical.MessageID(m)
-			return m
-		}
 
-		old := withTopics(10, "mars hub policy limits old", "ops")
-		middle := withTopics(20, "mars hub policy limits middle", "ops")
-		newest := withTopics(30, "mars hub policy limits newest", "chat")
-		missingTerm := withTopics(40, "mars hub policy only", "ops")
-		otherTopic := withTopics(50, "mars hub policy limits other topic", "other")
-		embeddedTerm := withTopics(60, "mars hub xpolicyx limits", "ops")
+		old := mkSearchMsg(t, gid, author, 10, "mars hub policy limits old", "ops")
+		middle := mkSearchMsg(t, gid, author, 20, "mars hub policy limits middle", "ops")
+		newest := mkSearchMsg(t, gid, author, 30, "mars hub policy limits newest", "chat")
+		missingTerm := mkSearchMsg(t, gid, author, 40, "mars hub policy only", "ops")
+		otherTopic := mkSearchMsg(t, gid, author, 50, "mars hub policy limits other topic", "other")
+		embeddedTerm := mkSearchMsg(t, gid, author, 60, "mars hub xpolicyx limits", "ops")
 		for _, msg := range []entmoot.Message{old, middle, newest, missingTerm, otherTopic, embeddedTerm} {
 			if err := s.Put(ctx, msg); err != nil {
 				t.Fatalf("Put: %v", err)
@@ -131,6 +147,123 @@ func TestSearchMessagesFallback(t *testing.T) {
 			return s
 		})
 	})
+	t.Run("sqlite", func(t *testing.T) {
+		run(t, func(t *testing.T) MessageStore {
+			s, err := OpenSQLite(t.TempDir())
+			if err != nil {
+				t.Fatalf("OpenSQLite: %v", err)
+			}
+			t.Cleanup(func() { _ = s.Close() })
+			return s
+		})
+	})
+}
+
+func TestSQLiteSearchIndexMaintenance(t *testing.T) {
+	ctx := context.Background()
+	s, err := OpenSQLite(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	gid := randGroupID(t)
+	author := testAuthor(1, 0xAA)
+	pruned := mkSearchMsg(t, gid, author, 10, "mars hub policy limits old", "ops")
+	kept := mkSearchMsg(t, gid, author, 20, "mars hub policy limits keep", "keep")
+	missingTerm := mkSearchMsg(t, gid, author, 30, "mars hub policy only", "keep")
+	for _, msg := range []entmoot.Message{pruned, kept, missingTerm, kept} {
+		if err := s.Put(ctx, msg); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+	}
+
+	result, err := SearchMessages(ctx, s, gid, "policy limits", SearchOptions{Limit: 10})
+	if err != nil {
+		t.Fatalf("SearchMessages: %v", err)
+	}
+	if len(result.Hits) != 2 || result.Hits[0].Message.ID != kept.ID || result.Hits[1].Message.ID != pruned.ID {
+		t.Fatalf("search ids = %v, want kept,pruned", hitIDs(result.Hits))
+	}
+	if !strings.Contains(result.Hits[0].Snippet, "[policy]") {
+		t.Fatalf("snippet = %q, want highlighted policy", result.Hits[0].Snippet)
+	}
+
+	andResult, err := SearchMessages(ctx, s, gid, "policy missing", SearchOptions{Limit: 10})
+	if err != nil {
+		t.Fatalf("SearchMessages AND: %v", err)
+	}
+	if len(andResult.Hits) != 0 {
+		t.Fatalf("AND hits = %d, want 0", len(andResult.Hits))
+	}
+
+	topicResult, err := SearchMessages(ctx, s, gid, "policy limits", SearchOptions{Limit: 10, Topic: "keep"})
+	if err != nil {
+		t.Fatalf("SearchMessages topic: %v", err)
+	}
+	if len(topicResult.Hits) != 1 || topicResult.Hits[0].Message.ID != kept.ID {
+		t.Fatalf("topic ids = %v, want kept", hitIDs(topicResult.Hits))
+	}
+
+	prunedCount, err := s.PruneBeforeExceptTopics(ctx, gid, 30, []string{"keep"})
+	if err != nil {
+		t.Fatalf("PruneBeforeExceptTopics: %v", err)
+	}
+	if prunedCount != 1 {
+		t.Fatalf("pruned = %d, want 1", prunedCount)
+	}
+	afterPrune, err := SearchMessages(ctx, s, gid, "policy limits", SearchOptions{Limit: 10})
+	if err != nil {
+		t.Fatalf("SearchMessages after prune: %v", err)
+	}
+	if len(afterPrune.Hits) != 1 || afterPrune.Hits[0].Message.ID != kept.ID {
+		t.Fatalf("after prune ids = %v, want kept", hitIDs(afterPrune.Hits))
+	}
+}
+
+func TestSQLiteSearchBackfillsMissingDocsOnReopen(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	s, err := OpenSQLite(root)
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+
+	gid := randGroupID(t)
+	msg := mkSearchMsg(t, gid, testAuthor(1, 0xAA), 10, "mars hub policy limits backfill", "ops")
+	if err := s.Put(ctx, msg); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	db, err := s.dbFor(gid)
+	if err != nil {
+		t.Fatalf("dbFor: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `DELETE FROM message_search_docs WHERE message_id = ?;`, msg.ID[:]); err != nil {
+		t.Fatalf("delete search doc: %v", err)
+	}
+	empty, err := SearchMessages(ctx, s, gid, "policy limits", SearchOptions{Limit: 10})
+	if err != nil {
+		t.Fatalf("SearchMessages empty: %v", err)
+	}
+	if len(empty.Hits) != 0 {
+		t.Fatalf("hits before reopen = %d, want 0", len(empty.Hits))
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	s2, err := OpenSQLite(root)
+	if err != nil {
+		t.Fatalf("OpenSQLite #2: %v", err)
+	}
+	t.Cleanup(func() { _ = s2.Close() })
+	backfilled, err := SearchMessages(ctx, s2, gid, "policy limits", SearchOptions{Limit: 10})
+	if err != nil {
+		t.Fatalf("SearchMessages backfilled: %v", err)
+	}
+	if len(backfilled.Hits) != 1 || backfilled.Hits[0].Message.ID != msg.ID {
+		t.Fatalf("backfilled ids = %v, want msg", hitIDs(backfilled.Hits))
+	}
 }
 
 func hitIDs(hits []SearchHit) []entmoot.MessageID {
@@ -139,4 +272,12 @@ func hitIDs(hits []SearchHit) []entmoot.MessageID {
 		out[i] = hit.Message.ID
 	}
 	return out
+}
+
+func mkSearchMsg(t *testing.T, gid entmoot.GroupID, author entmoot.NodeInfo, ts int64, content string, topics ...string) entmoot.Message {
+	t.Helper()
+	m := mkMsg(t, gid, author, ts, content)
+	m.Topics = topics
+	m.ID = canonical.MessageID(m)
+	return m
 }
