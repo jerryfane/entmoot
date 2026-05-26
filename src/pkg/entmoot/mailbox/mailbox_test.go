@@ -121,6 +121,66 @@ func TestHistoryReturnsLatestTopologicalPage(t *testing.T) {
 	}
 }
 
+func TestSearchReturnsNewestFirstWithoutAdvancingCursor(t *testing.T) {
+	ctx := context.Background()
+	st := store.NewMemory()
+	gid := groupID(1)
+	old := messageWithContent(gid, 1, "mars policy limits old", "ops")
+	mid := messageWithContent(gid, 2, "mars policy limits middle", "chat")
+	newest := messageWithContent(gid, 3, "mars policy limits newest", "ops")
+	missing := messageWithContent(gid, 4, "mars policy only", "ops")
+	for _, msg := range []entmoot.Message{old, mid, newest, missing} {
+		if err := st.Put(ctx, msg); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+	}
+	svc, err := New(st, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := svc.AckCursorContext(ctx, gid, "ios-1", Cursor{MessageID: mid.ID, TimestampMS: mid.Timestamp}); err != nil {
+		t.Fatalf("AckCursorContext: %v", err)
+	}
+
+	result, err := svc.Search(ctx, gid, "policy limits", 2, nil, "")
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if result.Query != "policy limits" || result.Count != 2 || len(result.Results) != 2 {
+		t.Fatalf("search result = %+v, want two normalized hits", result)
+	}
+	if !result.HasMore || result.NextCursorBoundary == nil {
+		t.Fatalf("search has_more/cursor = %v/%v, want cursor", result.HasMore, result.NextCursorBoundary)
+	}
+	if got := []string{result.Results[0].Message.Content, result.Results[1].Message.Content}; got[0] != "mars policy limits newest" || got[1] != "mars policy limits middle" {
+		t.Fatalf("search contents = %q, want newest,middle", got)
+	}
+
+	next, err := svc.Search(ctx, gid, "policy limits", 2, result.NextCursorBoundary, "")
+	if err != nil {
+		t.Fatalf("Search next: %v", err)
+	}
+	if next.HasMore || len(next.Results) != 1 || next.Results[0].Message.Content != "mars policy limits old" {
+		t.Fatalf("next search = %+v, want old only", next)
+	}
+
+	topic, err := svc.Search(ctx, gid, "policy limits", 10, nil, "ops")
+	if err != nil {
+		t.Fatalf("Search topic: %v", err)
+	}
+	if len(topic.Results) != 2 || topic.Results[0].Message.Content != "mars policy limits newest" || topic.Results[1].Message.Content != "mars policy limits old" {
+		t.Fatalf("topic search = %+v, want newest,old", topic.Results)
+	}
+
+	cursor, err := svc.CursorStatus(ctx, gid, "ios-1")
+	if err != nil {
+		t.Fatalf("CursorStatus: %v", err)
+	}
+	if cursor.Cursor.MessageID != mid.ID || cursor.Cursor.TimestampMS != mid.Timestamp {
+		t.Fatalf("cursor = %+v, want unchanged mid cursor", cursor.Cursor)
+	}
+}
+
 func TestMemoryCursorStoreIsMonotonic(t *testing.T) {
 	ctx := context.Background()
 	cursors := NewMemoryCursorStore()
@@ -185,6 +245,14 @@ func message(gid entmoot.GroupID, ts int64) entmoot.Message {
 		Topics:    []string{"t"},
 		Content:   []byte{byte(ts)},
 	}
+	m.ID = canonical.MessageID(m)
+	return m
+}
+
+func messageWithContent(gid entmoot.GroupID, ts int64, content string, topics ...string) entmoot.Message {
+	m := message(gid, ts)
+	m.Content = []byte(content)
+	m.Topics = topics
 	m.ID = canonical.MessageID(m)
 	return m
 }

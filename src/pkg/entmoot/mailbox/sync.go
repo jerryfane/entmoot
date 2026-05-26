@@ -42,6 +42,24 @@ type HistoryResult struct {
 	NextCursorBoundary *store.PageBoundary `json:"-"`
 }
 
+// SearchHit is one read-only message search result.
+type SearchHit struct {
+	Message SyncMessage `json:"message"`
+	Snippet string      `json:"snippet,omitempty"`
+}
+
+// SearchResult is returned by read-only message search APIs. It does not
+// include or update a per-client cursor.
+type SearchResult struct {
+	GroupID            entmoot.GroupID       `json:"group_id"`
+	Query              string                `json:"query"`
+	Count              int                   `json:"count"`
+	HasMore            bool                  `json:"has_more"`
+	NextCursor         string                `json:"next_cursor,omitempty"`
+	Results            []SearchHit           `json:"results"`
+	NextCursorBoundary *store.SearchBoundary `json:"-"`
+}
+
 // TopicSummary describes one topic's message volume and latest activity.
 type TopicSummary struct {
 	Topic             string `json:"topic"`
@@ -151,6 +169,44 @@ func (s *Service) TopicHistoryBefore(ctx context.Context, groupID entmoot.GroupI
 		return HistoryResult{}, err
 	}
 	return historyResultFromMessages(groupID, msgs, limit)
+}
+
+// Search returns one newest-first read-only message search page.
+func (s *Service) Search(ctx context.Context, groupID entmoot.GroupID, query string, limit int, boundary *store.SearchBoundary, topic string) (SearchResult, error) {
+	normalized, err := store.NormalizeSearchQuery(query)
+	if err != nil {
+		return SearchResult{}, err
+	}
+	if limit <= 0 {
+		return SearchResult{
+			GroupID: groupID,
+			Query:   normalized.Query,
+			Results: []SearchHit{},
+		}, nil
+	}
+	result, err := store.SearchMessages(ctx, s.store, groupID, normalized.Query, store.SearchOptions{
+		Limit:          limit,
+		CursorBoundary: boundary,
+		Topic:          topic,
+	})
+	if err != nil {
+		return SearchResult{}, err
+	}
+	hits := make([]SearchHit, 0, len(result.Hits))
+	for _, hit := range result.Hits {
+		hits = append(hits, SearchHit{
+			Message: MessageView(hit.Message),
+			Snippet: hit.Snippet,
+		})
+	}
+	return SearchResult{
+		GroupID:            groupID,
+		Query:              normalized.Query,
+		Count:              len(hits),
+		HasMore:            result.HasMore,
+		Results:            hits,
+		NextCursorBoundary: result.NextCursorBoundary,
+	}, nil
 }
 
 func historyResultFromMessages(groupID entmoot.GroupID, msgs []entmoot.Message, limit int) (HistoryResult, error) {

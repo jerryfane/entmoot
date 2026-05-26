@@ -32,6 +32,7 @@ POST /v1/open-invites/accept
 POST /v1/open-invites/{token}/challenge
 POST /v1/open-invites/{token}/redeem
 GET  /v1/groups/{group_id}/history
+GET  /v1/groups/{group_id}/search
 GET  /v1/groups/{group_id}/messages
 POST /v1/groups/{group_id}/messages
 GET  /v1/mailbox/pull
@@ -345,6 +346,21 @@ history is available, an opaque `next_cursor`. Pass that cursor back as
 `cursor=<next_cursor>` to fetch the next older page. The cursor is bound to the
 group and exact topic filter, so clients should keep one pagination cursor per
 feed.
+
+Search message text inside one group without advancing a mailbox cursor:
+
+```http
+GET /v1/groups/<group_id>/search?client_id=ios-1&q=policy%20limits&limit=50
+```
+
+`q` is required and is normalized as lexical terms. `limit` must be between 1
+and 200 and defaults to 50. Optional `topic=<topic>` restricts results to
+messages with that exact topic. Results are newest-first and returned as
+`results`, each with `{ "message": <mailbox message>, "snippet": "<context>" }`.
+When more matches are available, pass the opaque `next_cursor` back as
+`cursor=<next_cursor>`. Search cursors are bound to the group, normalized query,
+and topic filter, so clients should keep search pagination separate from normal
+history pagination and from other search queries.
 
 Mailbox cursors are stored in `mailbox.sqlite`. Mobile service state such as
 sign requests, push tokens, notification preferences, public moot directory
