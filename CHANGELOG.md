@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.80] - 2026-05-26
+
+### Added
+
+- **Lexical moot message search.** Added a first-class message search contract,
+  SQLite FTS5 indexing/backfill, ESP `/v1/groups/<group_id>/search` read APIs,
+  cursor-separated search pagination, and documentation for clients to search
+  mirrored moot history without advancing mailbox cursors.
+
 ## [1.5.79] - 2026-05-25
 
 ### Added
