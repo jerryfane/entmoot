@@ -33,6 +33,7 @@ POST /v1/open-invites/{token}/challenge
 POST /v1/open-invites/{token}/redeem
 GET  /v1/groups/{group_id}/history
 GET  /v1/groups/{group_id}/search
+GET  /v1/groups/{group_id}/message-context
 GET  /v1/groups/{group_id}/messages
 POST /v1/groups/{group_id}/messages
 GET  /v1/mailbox/pull
@@ -361,6 +362,21 @@ When more matches are available, pass the opaque `next_cursor` back as
 `cursor=<next_cursor>`. Search cursors are bound to the group, normalized query,
 and topic filter, so clients should keep search pagination separate from normal
 history pagination and from other search queries.
+
+Open one message in conversation context without advancing a mailbox cursor:
+
+```http
+GET /v1/groups/<group_id>/message-context?client_id=ios-1&message_id=<base64-message-id>&before=25&after=25
+```
+
+`message_id` is required and is passed as a query parameter so standard base64
+message ids do not need path-segment escaping. `before` and `after` each accept
+values from 0 through 100 and default to 25. Optional `topic=<topic>` restricts
+the context window to messages with that exact topic; if the target message is
+not in that topic, the endpoint returns `404 message_not_found`. The response is
+oldest-to-newest, includes the target once, and returns `has_more_older` plus
+`older_cursor` when clients can continue scrolling older messages through the
+history endpoint.
 
 Mailbox cursors are stored in `mailbox.sqlite`. Mobile service state such as
 sign requests, push tokens, notification preferences, public moot directory
