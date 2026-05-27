@@ -2,6 +2,7 @@ package mailbox
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"entmoot/pkg/entmoot"
@@ -178,6 +179,61 @@ func TestSearchReturnsNewestFirstWithoutAdvancingCursor(t *testing.T) {
 	}
 	if cursor.Cursor.MessageID != mid.ID || cursor.Cursor.TimestampMS != mid.Timestamp {
 		t.Fatalf("cursor = %+v, want unchanged mid cursor", cursor.Cursor)
+	}
+}
+
+func TestMessageContextReturnsConversationWindowWithoutAdvancingCursor(t *testing.T) {
+	ctx := context.Background()
+	st := store.NewMemory()
+	gid := groupID(1)
+	old := messageWithContent(gid, 10, "old", "ops")
+	target := messageWithContent(gid, 20, "target", "ops")
+	newer := messageWithContent(gid, 30, "newer", "ops")
+	newest := messageWithContent(gid, 40, "newest", "ops")
+	otherTopic := messageWithContent(gid, 50, "other topic", "chat")
+	for _, msg := range []entmoot.Message{newest, target, otherTopic, old, newer} {
+		if err := st.Put(ctx, msg); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+	}
+	svc, err := New(st, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := svc.AckCursorContext(ctx, gid, "ios-1", Cursor{MessageID: target.ID, TimestampMS: target.Timestamp}); err != nil {
+		t.Fatalf("AckCursorContext: %v", err)
+	}
+
+	result, err := svc.MessageContext(ctx, gid, target.ID, 1, 2, "ops")
+	if err != nil {
+		t.Fatalf("MessageContext: %v", err)
+	}
+	if result.GroupID != gid || result.MessageID != target.ID || result.TargetMessageID != target.ID {
+		t.Fatalf("result ids = group %v message %v target %v, want target", result.GroupID, result.MessageID, result.TargetMessageID)
+	}
+	if result.Topic != "ops" || result.Before != 1 || result.After != 2 {
+		t.Fatalf("result options = topic %q before %d after %d, want ops/1/2", result.Topic, result.Before, result.After)
+	}
+	if result.Count != 4 || len(result.Messages) != 4 {
+		t.Fatalf("result count/messages = %d/%d, want 4/4", result.Count, len(result.Messages))
+	}
+	if got := []string{result.Messages[0].Content, result.Messages[1].Content, result.Messages[2].Content, result.Messages[3].Content}; got[0] != "old" || got[1] != "target" || got[2] != "newer" || got[3] != "newest" {
+		t.Fatalf("context contents = %q, want old,target,newer,newest", got)
+	}
+	if result.HasMoreOlder || result.OlderCursorBoundary != nil {
+		t.Fatalf("has_more_older/cursor = %v/%v, want exhausted", result.HasMoreOlder, result.OlderCursorBoundary)
+	}
+
+	cursor, err := svc.CursorStatus(ctx, gid, "ios-1")
+	if err != nil {
+		t.Fatalf("CursorStatus: %v", err)
+	}
+	if cursor.Cursor.MessageID != target.ID || cursor.Cursor.TimestampMS != target.Timestamp {
+		t.Fatalf("cursor = %+v, want unchanged target cursor", cursor.Cursor)
+	}
+
+	if _, err := svc.MessageContext(ctx, gid, otherTopic.ID, 1, 1, "ops"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("topic miss err = %v, want ErrNotFound", err)
 	}
 }
 

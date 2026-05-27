@@ -693,6 +693,178 @@ func (s *SQLite) LatestByTopicBefore(ctx context.Context, groupID entmoot.GroupI
 	return topoOrder(candidates)
 }
 
+// MessageContext implements MessageContexter using keyset lookups around the
+// target row.
+func (s *SQLite) MessageContext(ctx context.Context, groupID entmoot.GroupID, messageID entmoot.MessageID, opts MessageContextOptions) (MessageContextResult, error) {
+	opts = NormalizeMessageContextOptions(opts)
+	db, err := s.dbFor(groupID)
+	if err != nil {
+		return MessageContextResult{}, err
+	}
+
+	target, err := s.messageContextTarget(ctx, db, groupID, messageID, opts.Topic)
+	if err != nil {
+		return MessageContextResult{}, err
+	}
+
+	olderLimit := opts.Before + 1
+	older, err := s.messageContextOlder(ctx, db, groupID, target, opts.Topic, olderLimit)
+	if err != nil {
+		return MessageContextResult{}, err
+	}
+	hasMoreOlder := len(older) > opts.Before
+	if hasMoreOlder {
+		older = older[:opts.Before]
+	}
+	sortMessagesOldestFirst(older)
+
+	newer, err := s.messageContextNewer(ctx, db, groupID, target, opts.Topic, opts.After)
+	if err != nil {
+		return MessageContextResult{}, err
+	}
+	sortMessagesOldestFirst(newer)
+
+	messages := make([]entmoot.Message, 0, len(older)+1+len(newer))
+	messages = append(messages, older...)
+	messages = append(messages, target)
+	messages = append(messages, newer...)
+	return messageContextResult(target, messages, hasMoreOlder), nil
+}
+
+func (s *SQLite) messageContextTarget(ctx context.Context, db *sql.DB, groupID entmoot.GroupID, messageID entmoot.MessageID, topic string) (entmoot.Message, error) {
+	args := []any{groupID[:], messageID[:]}
+	where := strings.Builder{}
+	where.WriteString(`WHERE m.group_id = ? AND m.message_id = ?`)
+	if topic != "" {
+		where.WriteString(`
+		  AND EXISTS (
+		    SELECT 1 FROM message_topics mt
+		    WHERE mt.message_id = m.message_id AND mt.topic = ?
+		  )`)
+		args = append(args, topic)
+	}
+	var canonBytes []byte
+	err := db.QueryRowContext(ctx, `
+		SELECT m.canonical_bytes FROM messages m
+		`+where.String()+`
+		LIMIT 1;`,
+		args...,
+	).Scan(&canonBytes)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return entmoot.Message{}, ErrNotFound
+		}
+		return entmoot.Message{}, fmt.Errorf("store: message context target scan: %w", err)
+	}
+	return decodeMessage(canonBytes)
+}
+
+func (s *SQLite) messageContextOlder(ctx context.Context, db *sql.DB, groupID entmoot.GroupID, target entmoot.Message, topic string, limit int) ([]entmoot.Message, error) {
+	if limit <= 0 {
+		return []entmoot.Message{}, nil
+	}
+	args := []any{
+		groupID[:],
+		target.Timestamp,
+		target.Timestamp, uint32(target.Author.PilotNodeID),
+		target.Timestamp, uint32(target.Author.PilotNodeID), target.ID[:],
+	}
+	where := strings.Builder{}
+	where.WriteString(`
+		WHERE m.group_id = ?
+		  AND (
+		    m.timestamp_ms < ?
+		    OR (m.timestamp_ms = ? AND m.author_node_id < ?)
+		    OR (m.timestamp_ms = ? AND m.author_node_id = ? AND m.message_id < ?)
+		  )`)
+	if topic != "" {
+		where.WriteString(`
+		  AND EXISTS (
+		    SELECT 1 FROM message_topics mt
+		    WHERE mt.message_id = m.message_id AND mt.topic = ?
+		  )`)
+		args = append(args, topic)
+	}
+	args = append(args, limit)
+
+	rows, err := db.QueryContext(ctx, `
+		SELECT m.canonical_bytes FROM messages m
+		`+where.String()+`
+		ORDER BY m.timestamp_ms DESC, m.author_node_id DESC, m.message_id DESC
+		LIMIT ?;`,
+		args...,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("store: message context older query: %w", err)
+	}
+	defer rows.Close()
+	return decodeMessageRows(rows, "message context older")
+}
+
+func (s *SQLite) messageContextNewer(ctx context.Context, db *sql.DB, groupID entmoot.GroupID, target entmoot.Message, topic string, limit int) ([]entmoot.Message, error) {
+	if limit <= 0 {
+		return []entmoot.Message{}, nil
+	}
+	args := []any{
+		groupID[:],
+		target.Timestamp,
+		target.Timestamp, uint32(target.Author.PilotNodeID),
+		target.Timestamp, uint32(target.Author.PilotNodeID), target.ID[:],
+	}
+	where := strings.Builder{}
+	where.WriteString(`
+		WHERE m.group_id = ?
+		  AND (
+		    m.timestamp_ms > ?
+		    OR (m.timestamp_ms = ? AND m.author_node_id > ?)
+		    OR (m.timestamp_ms = ? AND m.author_node_id = ? AND m.message_id > ?)
+		  )`)
+	if topic != "" {
+		where.WriteString(`
+		  AND EXISTS (
+		    SELECT 1 FROM message_topics mt
+		    WHERE mt.message_id = m.message_id AND mt.topic = ?
+		  )`)
+		args = append(args, topic)
+	}
+	args = append(args, limit)
+
+	rows, err := db.QueryContext(ctx, `
+		SELECT m.canonical_bytes FROM messages m
+		`+where.String()+`
+		ORDER BY m.timestamp_ms ASC, m.author_node_id ASC, m.message_id ASC
+		LIMIT ?;`,
+		args...,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("store: message context newer query: %w", err)
+	}
+	defer rows.Close()
+	return decodeMessageRows(rows, "message context newer")
+}
+
+func decodeMessageRows(rows *sql.Rows, label string) ([]entmoot.Message, error) {
+	var out []entmoot.Message
+	for rows.Next() {
+		var canonBytes []byte
+		if err := rows.Scan(&canonBytes); err != nil {
+			return nil, fmt.Errorf("store: %s scan: %w", label, err)
+		}
+		msg, err := decodeMessage(canonBytes)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, msg)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: %s iterate: %w", label, err)
+	}
+	if out == nil {
+		out = []entmoot.Message{}
+	}
+	return out, nil
+}
+
 // SearchMessages implements MessageSearcher using SQLite FTS5.
 func (s *SQLite) SearchMessages(ctx context.Context, groupID entmoot.GroupID, query SearchQuery, opts SearchOptions) (SearchResult, error) {
 	if opts.Limit <= 0 {

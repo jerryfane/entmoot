@@ -60,6 +60,22 @@ type SearchResult struct {
 	NextCursorBoundary *store.SearchBoundary `json:"-"`
 }
 
+// MessageContextResult is returned by read-only search-result jump APIs. It
+// does not include or update a per-client cursor.
+type MessageContextResult struct {
+	GroupID             entmoot.GroupID     `json:"group_id"`
+	MessageID           entmoot.MessageID   `json:"message_id"`
+	TargetMessageID     entmoot.MessageID   `json:"target_message_id"`
+	Topic               string              `json:"topic,omitempty"`
+	Before              int                 `json:"before"`
+	After               int                 `json:"after"`
+	Count               int                 `json:"count"`
+	HasMoreOlder        bool                `json:"has_more_older"`
+	OlderCursor         string              `json:"older_cursor,omitempty"`
+	Messages            []SyncMessage       `json:"messages"`
+	OlderCursorBoundary *store.PageBoundary `json:"-"`
+}
+
 // TopicSummary describes one topic's message volume and latest activity.
 type TopicSummary struct {
 	Topic             string `json:"topic"`
@@ -206,6 +222,32 @@ func (s *Service) Search(ctx context.Context, groupID entmoot.GroupID, query str
 		HasMore:            result.HasMore,
 		Results:            hits,
 		NextCursorBoundary: result.NextCursorBoundary,
+	}, nil
+}
+
+// MessageContext returns a bounded read-only conversation window around
+// messageID without touching mailbox cursors.
+func (s *Service) MessageContext(ctx context.Context, groupID entmoot.GroupID, messageID entmoot.MessageID, before, after int, topic string) (MessageContextResult, error) {
+	opts := store.NormalizeMessageContextOptions(store.MessageContextOptions{
+		Before: before,
+		After:  after,
+		Topic:  topic,
+	})
+	result, err := store.MessageContext(ctx, s.store, groupID, messageID, opts)
+	if err != nil {
+		return MessageContextResult{}, err
+	}
+	return MessageContextResult{
+		GroupID:             groupID,
+		MessageID:           messageID,
+		TargetMessageID:     result.Target.ID,
+		Topic:               opts.Topic,
+		Before:              opts.Before,
+		After:               opts.After,
+		Count:               len(result.Messages),
+		HasMoreOlder:        result.HasMoreOlder,
+		Messages:            MessagesView(result.Messages),
+		OlderCursorBoundary: result.OlderCursorBoundary,
 	}, nil
 }
 
