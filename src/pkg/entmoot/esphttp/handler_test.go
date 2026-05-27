@@ -2094,6 +2094,102 @@ func TestHandlerGroupSearchReturnsPagedResults(t *testing.T) {
 	}
 }
 
+func TestHandlerGroupMessageContextReturnsTargetWindow(t *testing.T) {
+	gid := testGroupIDWithSlash()
+	st := store.NewMemory()
+	withTopics := func(ts int64, content string, topics ...string) entmoot.Message {
+		msg := testMessage(gid, ts, content)
+		msg.Topics = topics
+		msg.ID = canonical.MessageID(msg)
+		return msg
+	}
+	oldest := withTopics(1, "oldest", "ops")
+	older := withTopics(2, "older", "ops")
+	target := withTopics(3, "target", "ops")
+	target.ID[0] = 0xff
+	newer := withTopics(4, "newer", "ops")
+	newest := withTopics(5, "newest", "ops")
+	chat := withTopics(6, "chat", "chat")
+	for _, msg := range []entmoot.Message{newest, target, chat, oldest, newer, older} {
+		if err := st.Put(context.Background(), msg); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+	}
+	svc, err := mailbox.New(st, nil)
+	if err != nil {
+		t.Fatalf("mailbox.New: %v", err)
+	}
+	if err := svc.AckCursorContext(context.Background(), gid, "ios-1", mailbox.Cursor{
+		MessageID:   target.ID,
+		TimestampMS: target.Timestamp,
+	}); err != nil {
+		t.Fatalf("AckCursorContext: %v", err)
+	}
+	handler, err := NewHandler(Config{
+		Token:   "secret",
+		Service: svc,
+		GroupExists: func(_ context.Context, got entmoot.GroupID) (bool, error) {
+			return got == gid, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewHandler: %v", err)
+	}
+	basePath := "/v1/groups/" + url.PathEscape(gid.String()) + "/message-context"
+	targetQuery := "client_id=ios-1&message_id=" + url.QueryEscape(target.ID.String()) + "&before=1&after=1&topic=ops"
+
+	result := doJSONRequest[mailbox.MessageContextResult](t, handler, http.MethodGet, basePath+"?"+targetQuery, nil, http.StatusOK)
+	if result.GroupID != gid || result.MessageID != target.ID || result.TargetMessageID != target.ID {
+		t.Fatalf("result ids = group %v message %v target %v, want target", result.GroupID, result.MessageID, result.TargetMessageID)
+	}
+	if result.Topic != "ops" || result.Before != 1 || result.After != 1 {
+		t.Fatalf("options = topic %q before %d after %d, want ops/1/1", result.Topic, result.Before, result.After)
+	}
+	if result.Count != 3 || len(result.Messages) != 3 {
+		t.Fatalf("count/messages = %d/%d, want 3/3", result.Count, len(result.Messages))
+	}
+	if got := []string{result.Messages[0].Content, result.Messages[1].Content, result.Messages[2].Content}; got[0] != "older" || got[1] != "target" || got[2] != "newer" {
+		t.Fatalf("context contents = %q, want older,target,newer", got)
+	}
+	if !result.HasMoreOlder || result.OlderCursor == "" {
+		t.Fatalf("has_more_older/older_cursor = %v/%q, want cursor", result.HasMoreOlder, result.OlderCursor)
+	}
+	olderPage := doJSONRequest[mailbox.HistoryResult](t, handler, http.MethodGet, "/v1/groups/"+url.PathEscape(gid.String())+"/history?client_id=ios-1&topic=ops&limit=10&cursor="+url.QueryEscape(result.OlderCursor), nil, http.StatusOK)
+	if olderPage.Count != 1 || len(olderPage.Messages) != 1 || olderPage.Messages[0].MessageID != oldest.ID {
+		t.Fatalf("older page = %+v, want oldest only", olderPage)
+	}
+	cursor, err := svc.CursorStatus(context.Background(), gid, "ios-1")
+	if err != nil {
+		t.Fatalf("CursorStatus: %v", err)
+	}
+	if cursor.Cursor.MessageID != target.ID || cursor.Cursor.TimestampMS != target.Timestamp {
+		t.Fatalf("cursor = %+v, want unchanged target cursor", cursor.Cursor)
+	}
+
+	errResp := doJSONRequest[errorEnvelope](t, handler, http.MethodGet, basePath+"?client_id=ios-1&before=1", nil, http.StatusBadRequest)
+	if errResp.Error.Code != "bad_request" || !strings.Contains(errResp.Error.Message, "message_id") {
+		t.Fatalf("missing message_id error = %+v", errResp.Error)
+	}
+	errResp = doJSONRequest[errorEnvelope](t, handler, http.MethodGet, basePath+"?client_id=ios-1&message_id=bad&before=1", nil, http.StatusBadRequest)
+	if errResp.Error.Code != "bad_request" || !strings.Contains(errResp.Error.Message, "base64") {
+		t.Fatalf("bad message_id error = %+v", errResp.Error)
+	}
+	errResp = doJSONRequest[errorEnvelope](t, handler, http.MethodGet, basePath+"?client_id=ios-1&message_id="+url.QueryEscape(target.ID.String())+"&after=101", nil, http.StatusBadRequest)
+	if errResp.Error.Code != "bad_request" || !strings.Contains(errResp.Error.Message, "after must be between 0 and") {
+		t.Fatalf("bad after error = %+v", errResp.Error)
+	}
+	errResp = doJSONRequest[errorEnvelope](t, handler, http.MethodGet, basePath+"?client_id=ios-1&message_id="+url.QueryEscape(chat.ID.String())+"&topic=ops", nil, http.StatusNotFound)
+	if errResp.Error.Code != "message_not_found" {
+		t.Fatalf("topic miss error = %+v", errResp.Error)
+	}
+	var missing entmoot.MessageID
+	missing[0] = 0x42
+	errResp = doJSONRequest[errorEnvelope](t, handler, http.MethodGet, basePath+"?client_id=ios-1&message_id="+url.QueryEscape(missing.String()), nil, http.StatusNotFound)
+	if errResp.Error.Code != "message_not_found" {
+		t.Fatalf("missing message error = %+v", errResp.Error)
+	}
+}
+
 func TestHistoryCursorAcceptsZeroBoundaryFields(t *testing.T) {
 	gid := testGroupID(1)
 	var msgID entmoot.MessageID

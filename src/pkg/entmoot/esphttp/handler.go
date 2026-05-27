@@ -2169,6 +2169,12 @@ func (h *Handler) handleGroupSubroute(w http.ResponseWriter, r *http.Request) bo
 			return true
 		}
 		h.handleGroupHistory(w, r, groupID)
+	case "message-context":
+		if r.Method != http.MethodGet {
+			methodNotAllowed(w, http.MethodGet)
+			return true
+		}
+		h.handleGroupMessageContext(w, r, groupID)
 	case "search":
 		if r.Method != http.MethodGet {
 			methodNotAllowed(w, http.MethodGet)
@@ -2641,6 +2647,85 @@ func (h *Handler) handleGroupSearch(w http.ResponseWriter, r *http.Request, grou
 		result.NextCursor = encodeSearchCursor(groupID, topic, queryHash, result.NextCursorBoundary)
 	}
 	h.writeMailboxResult(w, "group search", result, err)
+}
+
+func (h *Handler) handleGroupMessageContext(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID) {
+	clientID := strings.TrimSpace(r.URL.Query().Get("client_id"))
+	if clientID == "" {
+		if auth, _ := r.Context().Value(authContextKey{}).(authContext); auth.device != nil {
+			clientID = auth.device.ID
+		}
+	}
+	if clientID == "" {
+		writeError(w, http.StatusBadRequest, "bad_request", "client_id is required")
+		return
+	}
+	if !h.checkDeviceClientRead(w, r, groupID, clientID) {
+		return
+	}
+	messageID, ok := parseMessageIDQuery(w, r.URL.Query().Get("message_id"))
+	if !ok {
+		return
+	}
+	before, ok := parseContextSideQuery(w, r, "before", store.DefaultMessageContextBefore)
+	if !ok {
+		return
+	}
+	after, ok := parseContextSideQuery(w, r, "after", store.DefaultMessageContextAfter)
+	if !ok {
+		return
+	}
+	topic := strings.TrimSpace(r.URL.Query().Get("topic"))
+	result, err := h.service.MessageContext(r.Context(), groupID, messageID, before, after, topic)
+	if err == nil {
+		result.OlderCursor = encodeHistoryCursor(groupID, topic, result.OlderCursorBoundary)
+	}
+	h.writeMessageContextResult(w, result, err)
+}
+
+func parseMessageIDQuery(w http.ResponseWriter, raw string) (entmoot.MessageID, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		writeError(w, http.StatusBadRequest, "bad_request", "message_id is required")
+		return entmoot.MessageID{}, false
+	}
+	decoded, err := base64.StdEncoding.DecodeString(raw)
+	if err != nil || len(decoded) != 32 {
+		writeError(w, http.StatusBadRequest, "bad_request", "message_id must be a base64-encoded 32-byte id")
+		return entmoot.MessageID{}, false
+	}
+	var id entmoot.MessageID
+	copy(id[:], decoded)
+	return id, true
+}
+
+func parseContextSideQuery(w http.ResponseWriter, r *http.Request, name string, fallback int) (int, bool) {
+	raw := strings.TrimSpace(r.URL.Query().Get(name))
+	if raw == "" {
+		return fallback, true
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 0 || n > store.MaxMessageContextSide {
+		writeError(w, http.StatusBadRequest, "bad_request", fmt.Sprintf("%s must be between 0 and %d", name, store.MaxMessageContextSide))
+		return 0, false
+	}
+	return n, true
+}
+
+func (h *Handler) writeMessageContextResult(w http.ResponseWriter, result mailbox.MessageContextResult, err error) {
+	if err == nil {
+		writeJSON(w, http.StatusOK, result)
+		return
+	}
+	switch {
+	case errors.Is(err, mailbox.ErrInvalidClient):
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+	case errors.Is(err, store.ErrNotFound):
+		writeError(w, http.StatusNotFound, "message_not_found", "message not found")
+	default:
+		h.logger.Error("esphttp: group message context", slog.String("err", err.Error()))
+		writeError(w, http.StatusInternalServerError, "internal_error", "mailbox operation failed")
+	}
 }
 
 type historyCursorPayload struct {
