@@ -520,6 +520,10 @@ can scroll back in bounded pages instead of raising a single request limit.
 `GET /v1/groups/<group_id>/search?q=<terms>` provides cursor-neutral lexical
 message search inside one group. Search cursors are separate from history
 cursors and are bound to the group, normalized query, and topic filter.
+`GET /v1/groups/<group_id>/message-context?message_id=<base64-id>` returns a
+bounded cursor-neutral conversation window around one message. Clients can use
+it to open a search result in normal chat context, then pass `older_cursor` to
+the history endpoint to continue scrolling older messages.
 
 Member lists may include a best-effort `hostname` field. Those hostnames are
 learned from signed member-profile gossip scoped to the group. They are display
