@@ -55,6 +55,7 @@ const sidebars: SidebarsConfig = {
         'operations/release-checklist',
         'operations/peer-upgrades',
         'operations/diagnostics',
+        'operations/search-ui-qa',
         'operations/file-layout-backups',
       ],
     },
