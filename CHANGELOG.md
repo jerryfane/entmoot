@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.81] - 2026-05-27
+
+### Added
+
+- **Message context jump APIs.** Added mailbox/store support and ESP
+  `/v1/groups/<group_id>/message-context` read APIs so clients can open a
+  lexical search result in normal chat context, highlight the target, and keep
+  scrolling older history without advancing mailbox cursors.
+
 ## [1.5.80] - 2026-05-26
 
 ### Added
