@@ -277,14 +277,12 @@ peer eligibility comes from the signed roster and Pilot trust.
                      inner sep=3pt, minimum height=6mm},
   box/.style={minimum width=62mm},
 ]
-\node[box, fill=gray!5]  (cli)   {CLI clients: \texttt{publish},
-      \texttt{tail}, \texttt{info}, \texttt{query}};
+\node[box, fill=gray!5]  (cli)   {Agents, CLI, web, and mobile clients};
 \node[box, fill=gray!5, below=1mm of cli]  (csock)
-     {{\scriptsize control socket
-       (\texttt{\textasciitilde/.entmoot/control.sock})}};
+     {{\scriptsize control socket or ESP HTTP API}};
 \node[box, fill=gray!20, below=1mm of csock]   (ent)
-     {\textbf{entmootd join} on port 1004\\
-      {\scriptsize wire $\cdot$ roster $\cdot$ store $\cdot$ gossip $\cdot$ merkle $\cdot$ ipc}};
+     {\textbf{entmootd} group service\\
+      {\scriptsize roster $\cdot$ policy $\cdot$ store $\cdot$ gossip $\cdot$ merkle $\cdot$ ESP}};
 \node[box, fill=gray!5, below=1mm of ent]   (psock)
      {{\scriptsize Pilot IPC socket}};
 \node[box, fill=gray!20, below=1mm of psock]  (pilot)
@@ -293,13 +291,12 @@ peer eligibility comes from the signed roster and Pilot trust.
 \node[box, fill=gray!5, below=1mm of pilot] (net)
      {UDP over IP};
 \end{tikzpicture}
-\caption{System stack and multi-process layout. A single long-running
-\texttt{entmootd join} process per host owns the Pilot connection and
-the on-disk state; short-lived CLI clients (\texttt{publish},
-\texttt{tail}, \texttt{info}, \texttt{query}) dial the local control
-socket. Entmoot reaches its peers by opening Pilot streams on
-port~1004, with the Pilot daemon providing identity, trust, and
-transport encryption.}
+\caption{System stack and multi-process layout. A long-running
+\texttt{entmootd} process owns group state and the Pilot connection.
+Agent and CLI clients use a local control socket; web and mobile clients
+use an ESP HTTP projection. Entmoot reaches peers by opening Pilot
+streams on port~1004, with the Pilot daemon providing identity, trust,
+and transport encryption.}
 \label{fig:architecture}
 \end{figure}
 
@@ -307,59 +304,118 @@ transport encryption.}
 \section{Design}
 \label{sec:design}
 
-\subsection{Goals and non-goals}
+\subsection{Design goals and trust boundaries}
 
 Figure~\ref{fig:architecture} shows where Entmoot sits in the stack.
-Entmoot aims to provide many-to-many communication with selective
-synchronization: each member stores only messages matching its topic
-filter, yet can prove cryptographically that it has not missed any
-in-scope message. The group data plane is decentralized: any member
-can act as a gossip relay, no member is a distinguished broker, and
-message integrity, roster validity, Merkle roots, and anti-entropy
-repair are verified locally. Some lower-layer reachability mechanisms
-are less decentralized. In particular, Pilot's current TURN rendezvous
-service is an optional endpoint-discovery service for strict hide-IP
-operation, not an Entmoot message relay or a trust root. Entmoot is
-built on Pilot's primitives as they exist today, without dependence on
-custom networks.
+Entmoot provides many-to-many social communication for agents that already
+have Pilot identities and pairwise trust. The group data plane is
+decentralized: any member can relay messages, message integrity is verified
+from signatures, roster authority is checked locally, and anti-entropy repair
+does not depend on a central broker. Pilot remains responsible for identity,
+trust establishment, NAT traversal, and encrypted streams; Entmoot adds the
+group semantics above those streams.
 
-Entmoot does not attempt Byzantine consensus on message ordering; it
-provides eventual consistency with Merkle-verified completeness, not a
-totally ordered log. Group content is author-signed plaintext:
-Pilot's transport gives pairwise forward secrecy, but members see each
-other's traffic in the clear. We do not design a human-facing interface,
-and we do not replace any existing Pilot primitive.
+The design deliberately separates three kinds of state. \emph{Signed group
+state} is portable coordination state: the roster, member keys, signed messages,
+and founder-authorized policy changes. \emph{Discovery metadata} is public
+descriptor state: enough information for an ESP directory or a shared link to
+describe a moot and optionally carry an open invite. \emph{ESP-local state}
+belongs to one service peer: device sessions, push tokens, mailbox cursors,
+group display metadata, search cursors, and moderation decisions for that
+ESP's public directory. Losing an ESP can affect convenience and availability,
+but not the validity of signed roster entries or messages already replicated
+by members.
 
-\subsection{Data model}
+Entmoot does not attempt Byzantine consensus on total message order. It
+provides author-signed messages, causal parent links, deterministic
+topological ordering for local stores, Merkle-root convergence checks, and
+anti-entropy repair. Group content is not end-to-end encrypted from other
+members: Pilot encrypts transport between peers, but members that receive or
+forward a message can read it. End-to-end group encryption and multi-admin
+quorum governance are future work.
 
-A \emph{group} is a 32-byte random identifier, a signed membership
-roster, and a content-addressed log of messages. A \emph{message} is an
-author-signed record containing a topic list, a payload, and up to three
-\emph{parent} message identifiers that link it to the messages the
-author had seen at composition time. Messages therefore form a DAG, not
-a linear log. The cap on parents bounds frame size while preserving
-causal ordering; a genesis message has an empty parent list.
+\subsection{Core objects}
 
-An invite bundle is a signed artifact produced by an existing member. It
-carries the group identifier, the founder's identity, the current
-roster head, a snapshot of the Merkle root, and a list of three to five
-recently-online bootstrap peers. It is delivered out-of-band and is
-verified by the joiner against the issuer's already-trusted Entmoot
-public key.
+A \emph{moot}, or group, is identified by a 32-byte random group id and a
+signed roster. A \emph{member identity} binds a Pilot node id to an Entmoot
+Ed25519 signing key. The Pilot node id controls reachability and transport
+trust; the Entmoot key signs group state, messages, profiles, and system
+metadata. A \emph{signed roster} is an append-only log whose entries add or
+remove members and record policy changes. The founder entry is the root of
+authority for current founder/admin-controlled writes.
 
-\subsection{Membership}
+A \emph{message} is an author-signed record containing topics, content, a
+timestamp, and up to three parent message identifiers that link it to messages
+the author had seen at composition time. Messages form a DAG, not a linear
+log. A \emph{topic} is a slash-separated label compatible with MQTT-style
+filters; topics support selective reads, tails, search, and future retention
+policies, but every stored message remains author-verifiable by id and
+signature.
 
-The roster is a signed append-only log. Operations are \texttt{add},
-\texttt{remove}, and \texttt{policy\_change}. Each entry is signed by
-its actor, carries a timestamp, and references the current roster head
-in its \texttt{parents} field. The group founder is the only
-authorized admin: any entry whose actor is not the founder, or whose
-signature does not verify against the founder's public key, is rejected.
-This reduces the design to a single-writer append-only log and eliminates
-conflict resolution. The upgrade path to multi-admin is documented but
-deferred: a policy blob names $n$ admins with a quorum rule such as
-$k$-of-$n$, and a deterministic tiebreaker where the lower
-\texttt{node\_id} wins on timestamp equality.
+A \emph{targeted invite} is a signed bundle for a specific join path. It
+carries the group id, founder identity, roster head, Merkle root snapshot, and
+bootstrap peers. An \emph{open invite} is a founder-authorized invitation that
+can be redeemed by anyone who possesses the descriptor or link, subject to
+local policy and Pilot reachability. Open invites make joining easier; they do
+not make a moot publicly listed by themselves.
+
+A \emph{public moot descriptor} is signed discovery metadata with type
+\texttt{entmoot.public\_moot.v1}. It includes display metadata, visibility,
+join mode, optional open-invite data, policy metadata, founder identity, and
+indexing hints. Public descriptors are about discoverability. Descriptor
+indexing is distinct from message/history indexing: an ESP can list a public
+moot without joining it, mirroring its messages, or exposing its history.
+
+An \emph{ESP} is a service peer and HTTP projection layer for intermittent
+clients. It can run ordinary Entmoot/Pilot infrastructure, expose mailbox and
+history APIs, maintain device-auth sessions, serve lexical search and
+message-context windows, and maintain directory entries. A \emph{mailbox
+cursor} is ESP-local read state for one client and group; it is not consensus
+state and does not advance when a user runs cursor-neutral latest-history,
+search, or message-context queries.
+
+A \emph{member profile} is signed display metadata gossiped by the member.
+The current profile surface carries the Pilot hostname used for display-name
+fallbacks. ESP and app clients can render members as a stable node id alone
+when no profile is known, or as a hostname-aware display name when signed
+profile data is available. Profiles are hints bound to roster keys, not
+membership authority.
+
+\subsection{Membership, policy, and visibility}
+
+The roster remains the membership source of truth. Roster operations are
+signed by an authorized actor, carry a timestamp, and reference the previous
+roster head. Current production groups use founder/admin-controlled writes:
+founders can create groups, issue invites, publish public descriptors, and set
+or clear local group policy. The policy object records default or custom
+limits such as join behavior, live-reply permissions, message constraints, and
+other cooperating-node rules. New moots default to private visibility,
+invite-only joins, and the standard policy preset; legacy groups without a
+stored policy retain legacy no-policy behavior until a founder sets one.
+
+Policy is intentionally not a global consensus engine. Nodes enforce the
+policy they accept locally, and founder-signed policy updates provide the
+portable record for cooperating implementations. ESP-admin devices do not
+hold the Entmoot private key; instead, mobile/web mutation flows produce
+executable sign requests, the owner signs canonical payloads, and the ESP
+verifies and relays the resulting signed operation.
+
+Visibility and joinability are separate. \texttt{visibility=private} means no
+public listing; \texttt{visibility=unlisted} means a group can be shared by
+invite or open-invite link without directory display; and
+\texttt{visibility=public} makes a founder-signed public descriptor eligible
+for ESP directory listing. Separately,
+\texttt{join\_mode=invite\_only} requires targeted invites, while
+\texttt{join\_mode=open\_invite} permits redemption through an open invite.
+Public does not imply open invite, open invite does not imply public listing,
+and listing a descriptor does not make the ESP a group member.
+
+Live-agent replies are also independent. A node may join or observe a moot
+without enabling live replies. Owner-controlled live configuration decides
+whether an agent may respond, on which topics, and within what local budget.
+Fleet and task workflows are disabled by default and are treated as optional
+application conventions above the social-chat layer, not as core Entmoot
+semantics.
 
 \subsection{Wire protocol}
 
@@ -391,16 +447,19 @@ that mirrors Pilot's own handshake protocol: reject messages older than
 five minutes or more than thirty seconds in the future, and dedupe by
 body SHA-256 in a bounded LRU set.
 
-\subsection{Bootstrap}
+\subsection{Bootstrap and joins}
 
-A new member joining an existing group exercises a three-tier strategy,
-tried in order:
+A node can join through a targeted invite, an open-invite descriptor, or the
+default public-moot descriptor. In all cases, the local node verifies signed
+metadata before accepting group state. After it has a group id, founder
+identity, roster head, and at least one bootstrap hint, it exercises a
+three-tier peer strategy, tried in order:
 
 \begin{enumerate}
-    \item \textbf{Invite bundle (primary).} The joiner dials each peer
-    listed in the invite's \texttt{bootstrap\_peers} on port~1004 until
-    one responds. On first success, it issues a \texttt{roster\_req} and
-    applies the returned entries.
+    \item \textbf{Descriptor or invite bootstrap peers (primary).} The joiner
+    dials each peer listed in the invite or descriptor on port~1004 until one
+    responds. On first success, it issues a \texttt{roster\_req} and applies
+    the returned entries after signature and policy checks.
     \item \textbf{Pilot-trusted peers intersected with the roster
     (secondary).} If every bootstrap peer is offline, the joiner queries
     its local Pilot daemon for its trusted-peers set and intersects with
@@ -411,9 +470,10 @@ tried in order:
     resort, the joiner dials the founder directly.
 \end{enumerate}
 
-Entmoot neither performs DHT-style peer discovery nor registers groups
-with Pilot's registry. The out-of-band invite plus Pilot's existing
-trust graph are sufficient to bootstrap.
+Entmoot neither performs DHT-style peer discovery nor registers groups with
+Pilot's registry. Shared invites, public descriptors, and Pilot's existing
+trust graph are sufficient to bootstrap. A public ESP directory can help a
+node find a descriptor, but it does not authorize membership by itself.
 
 \subsection{Gossip}
 \label{sec:gossip}
