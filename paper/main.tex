@@ -214,31 +214,60 @@ in~\S\ref{sec:design}.
 \subsection{Autonomous agent networks}
 
 Classical multi-agent systems literature~\citep{wooldridge2009,shohamleyton2008,dorri2018}
-studies small populations with pre-specified communication protocols,
-agent architectures, and hard-coded interaction topologies.
-\citet{calin2026emergent} observed that autonomous agents on Pilot, given
-only a trust-gated transport, self-organize into structures with
-statistical signatures familiar from human social networks: heavy-tailed
-degree distribution consistent with preferential
+models agents, strategies, and coordination protocols, but it usually assumes
+that the interaction topology and communication substrate are already given.
+\citet{calin2026emergent} instead observes a deployed agent population on
+Pilot, where the topology itself emerges from trust and discovery decisions:
+agents form heavy-tailed degree distributions consistent with preferential
 attachment~\citep{barabasi1999}, clustering coefficient $\sim$47$\times$
 above random, and small-world
-properties~\citep{watts1998small}. Functional clusters (data/analytics,
-wellness, career, engineering) emerge without coordination. That study
-explicitly flags cross-network community structure as out of reach because
-no such structure yet exists in the observed data: all 626 agents were on
-network~0. Entmoot instantiates the missing substrate.
+properties~\citep{watts1998small}. Functional clusters such as
+data/analytics, wellness, career, and engineering emerge without a global
+planner. That study also identifies a limit: all observed agents remain on
+Pilot network~0, so community structure beyond pairwise trust is not yet a
+first-class protocol object. Entmoot instantiates that missing group substrate.
 
-\subsection{Primitives we build on}
+\subsection{Group messaging, pub/sub, and social protocols}
 
-We reuse ideas from several well-understood distributed-systems
-primitives. Topic syntax follows the slash-separated hierarchical form
-with \texttt{+} and \texttt{\#} wildcards defined by
-MQTT~\citep{mqtt5}. Our Merkle log construction is directly influenced
-by Certificate Transparency, including domain-separated leaf and internal
-hashes~\citep{laurie2013ct}. Content-addressing by hash echoes
-IPFS~\citep{benet2014ipfs}. For comparison to structured peer-to-peer
-overlays we cite Kademlia~\citep{maymounkov2002kademlia}, though
-Entmoot does not use a DHT.
+Existing messaging systems supply useful contrasts. MQTT defines hierarchical
+topics and wildcard filters~\citep{mqtt5}; NATS uses subject-based
+publish/subscribe for one-to-many distribution~\citep{natsPubSub}; Matrix
+specifies federated rooms, event graphs, and client/server access
+patterns~\citep{matrixSpec}; and ActivityPub standardizes federated social
+inbox/outbox delivery~\citep{activitypub}. Entmoot borrows the idea that
+messages need addressable topics and client-facing projections, but differs in
+where authority sits. It is not a brokered pub/sub system like MQTT or NATS,
+and its ESP layer is not the canonical home server of a Matrix-style room.
+Signed rosters, signed messages, public descriptors, and reconciliation remain
+verifiable outside the service that presents them to a web or mobile client.
+Compared with ActivityPub, Entmoot is less a federated object-delivery protocol
+than a trust-gated group log for autonomous agents already connected by Pilot.
+
+\subsection{Gossip, logs, and reconciliation}
+
+Entmoot's dissemination layer follows the long line of epidemic
+replication~\citep{demers1987epidemic} and gossip broadcast. Plumtree supplies
+the eager/lazy tree-repair pattern~\citep{leitao2007plumtree}; libp2p
+GossipSub adapts mesh gossip and peer scoring for large public
+networks~\citep{gossipsubSpec,vyzovitis2020gossipsub}. Entmoot uses the same
+general separation between fast-path push and repair, but at smaller
+trust-scoped group boundaries and over Pilot streams rather than libp2p
+connections. Secure Scuttlebutt is a closer log-structured peer: it uses
+per-identity signed append-only logs and gossip repair~\citep{tarr2019ssb}.
+Entmoot differs by making the group, not only the author, a signed object with
+membership, invite, policy, and public-discovery state.
+
+Merkle logs and content addressing provide the audit vocabulary. Certificate
+Transparency demonstrates domain-separated Merkle log commitments and
+inclusion-oriented verification~\citep{laurie2013ct}; IPFS demonstrates
+content-addressed data naming~\citep{benet2014ipfs}; and Range-Based Set
+Reconciliation provides an efficient repair primitive for divergent
+sets~\citep{meyer2023rbsr}. Entmoot combines these ideas into a group chat
+system: message identifiers are content-derived, Merkle roots summarize local
+history, and anti-entropy exchanges repair missed messages after partitions or
+slow starts. We cite Kademlia~\citep{maymounkov2002kademlia} as a comparison
+point for structured peer-to-peer overlays, but Entmoot does not use a DHT;
+peer eligibility comes from the signed roster and Pilot trust.
 
 \begin{figure}[t]
 \centering
@@ -1284,40 +1313,49 @@ follow-up work.
 \section{Related Work}
 \label{sec:related}
 
-\citet{calin2026emergent} is the direct empirical peer of this work.
-It establishes that self-organizing agent networks of nontrivial size
-exist on Pilot today and that their social structure is analyzable from
-metadata alone under strong content encryption. Entmoot instantiates a
-primitive (group membership with gossip) that the Calin study
-explicitly flags as a gap in Pilot's existing surface and a prerequisite
-for the cross-network analyses it proposes as future work.
+Entmoot sits between agent-network research, distributed messaging, and
+peer-to-peer replication. The direct empirical peer is
+\citet{calin2026emergent}: it establishes that a nontrivial Pilot agent
+population exists and that its social structure is measurable even when
+content remains encrypted. Entmoot contributes the group layer that such a
+population lacks. It does not replace Pilot's identity or tunnel layer, and it
+does not prescribe a planning or game-theoretic coordination model of the kind
+studied in classical multi-agent systems
+literature~\citep{wooldridge2009,shohamleyton2008,dorri2018}. Instead, it
+provides the shared rooms, history, discovery, and policy surface that agents
+can use before any higher-level coordination protocol begins.
 
-Secure Scuttlebutt~\citep{tarr2019ssb} is the closest published prior
-art: a per-identity append-only signed log disseminated by gossip with
-anti-entropy repair. Entmoot differs in scope (groups of
-trust-gated participants rather than a global pub-sub feed) and in
-integrating natively with Pilot's authenticated transport, but the
-per-identity signed-log primitive and the gossip+anti-entropy split are
-directly analogous. IPFS~\citep{benet2014ipfs} shares with Entmoot both
-content-addressing and a DAG-structured history, but it is oriented
-toward open distribution of immutable blobs and has no notion of group
-scope or trust-gated participation. Certificate Transparency~\citep{laurie2013ct}
-directly influences our Merkle log layer: we adopt its domain-separation
-convention and the discipline of proving inclusion rather than
-recomputing the whole log. We reuse MQTT's topic syntax~\citep{mqtt5}
-verbatim, but MQTT's semantics are broker-mediated and a poor fit for a
-decentralized overlay. We cite Kademlia~\citep{maymounkov2002kademlia}
-as a comparison point for structured peer-to-peer overlays; Entmoot
-avoids a DHT and relies on Pilot's pairwise trust for peer discovery.
+Brokered pub/sub systems and federated chat systems solve adjacent problems
+with different trust assumptions. MQTT and NATS provide efficient topic or
+subject fanout~\citep{mqtt5,natsPubSub}, but they assume a broker or server
+cluster that mediates delivery. Matrix provides federated room state and
+client/server access~\citep{matrixSpec}; ActivityPub provides federated social
+object delivery through inboxes and outboxes~\citep{activitypub}. Entmoot
+borrows the user-facing shape of rooms, topics, and intermittent clients, but
+the signed group state remains portable across ESPs. The ESP can index public
+descriptors, serve mobile clients, cache cursors, and expose search, yet it is
+not the source of membership truth.
 
-Classical multi-agent systems
-literature~\citep{wooldridge2009,shohamleyton2008,dorri2018} provides
-foundational models of agent coordination and game-theoretic
-equilibria. It does not directly address the regime Calin documents:
-heterogeneous, autonomous populations on a shared overlay where
-interaction topologies form without a designer. Entmoot is not a
-coordination protocol in that sense; it is a communication substrate
-that such coordination can later sit on top of.
+Peer-to-peer replication systems are closer to Entmoot's failure model.
+Secure Scuttlebutt~\citep{tarr2019ssb} is the nearest published analogue: a
+signed append-only log per identity, disseminated by gossip and repaired by
+anti-entropy. Entmoot keeps that signed-log discipline but changes the unit of
+organization from global social feeds to trust-scoped moots with explicit
+membership, invites, policy, and public discovery metadata. IPFS shares
+content-addressing~\citep{benet2014ipfs}; Certificate Transparency supplies
+Merkle-log verification vocabulary~\citep{laurie2013ct}; and Range-Based Set
+Reconciliation supplies the repair pattern for divergent message
+sets~\citep{meyer2023rbsr}. Plumtree and GossipSub motivate the split between
+fast-path push, lazy announcements, and repair~\citep{leitao2007plumtree,gossipsubSpec,vyzovitis2020gossipsub}.
+The main difference is scope: Entmoot gossips inside signed, Pilot-trusted
+groups rather than across an open pub/sub mesh.
+
+Finally, Entmoot is intentionally not a task orchestration system. Fleet and
+task workflows can be built as opt-in application conventions on top of moots,
+but the default protocol purpose is social chat and shared memory. That choice
+keeps the core comparable to communication systems rather than schedulers:
+membership, delivery, reconciliation, search, and public discovery are the
+paper's system concerns; planning and task allocation are downstream uses.
 
 % === 7. Discussion and Future Work ===
 \section{Discussion and Future Work}
