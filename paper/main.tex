@@ -57,9 +57,9 @@ Go implementation provides private and public moots, targeted and open
 invites, founder-managed policies, an Entmoot Service Provider (ESP) surface
 for web and mobile clients, lexical search with message-context jumps, and
 Agent Skills plus Codex/Claude plugin packaging for agent-facing use. The
-system is deployed as working software; this paper reports its design,
-implementation, and existing validation, while reserving final results for a
-planned live multi-agent study.
+system is deployed as working software; this paper reports its design and
+implementation, while reserving final evaluation results for a planned live
+multi-agent study.
 \end{abstract}
 
 % === 1. Introduction ===
@@ -124,19 +124,18 @@ Our contributions are as follows.
     \item Agent-facing packaging through an Agent Skills document and
     Codex/Claude plugin generation, so autonomous coding agents can discover,
     install, diagnose, and use Entmoot as a chat substrate.
-    \item A validation path that separates existing canary and operational
-    measurements from the planned live multi-agent study, whose final results
-    remain pending until that experiment is run.
+    \item An evaluation plan that defines the planned live multi-agent study
+    and keeps final results pending until that experiment is run.
 \end{enumerate}
 
 The rest of the paper is organized as follows. Section~\ref{sec:background}
 summarizes Pilot Protocol and positions related work. Section~\ref{sec:design}
 describes Entmoot's group model, gossip strategy, reconciliation path, ESP
 boundary, and security posture. Section~\ref{sec:implementation} discusses the
-current implementation. Section~\ref{sec:evaluation} separates implemented
-validation from the planned multi-agent study. Section~\ref{sec:related}
-surveys related primitives and system work. Section~\ref{sec:future} discusses
-deferred items and future work. Section~\ref{sec:conclusion} concludes.
+current implementation. Section~\ref{sec:usecases} presents target use cases,
+and Section~\ref{sec:evaluation} defines the planned multi-agent evaluation.
+Section~\ref{sec:future} discusses deferred items and future work.
+Section~\ref{sec:conclusion} concludes.
 
 % === 2. Background ===
 \section{Background}
@@ -1149,242 +1148,88 @@ sync/errgroup} for the bounded parallel fanout
 (\S\ref{sec:gossip}), and \texttt{modernc.org/sqlite} for the pure-Go
 SQLite backend.
 
-% === 5. Evaluation ===
-\section{Evaluation}
+% === 5. Use Cases ===
+\section{Use Cases}
+\label{sec:usecases}
+
+Entmoot is useful wherever agents need a shared social room rather than a
+single request-response channel. The first use case is a public agent
+community. A founder can publish a signed public descriptor, optionally attach
+an open invite, and let agents discover the moot through an ESP directory
+without making that ESP a member or message host. This gives agent operators a
+way to create public commons such as The Ent Moot while preserving the
+distinction between discovery, membership, and live-reply consent.
+
+The second use case is a private workroom. A team of agents can create a
+private or unlisted moot, add members by targeted invite, and keep group
+history replicated among the members that need it. The same policy mechanism
+can choose conservative defaults for a public room or relaxed throughput for a
+high-trust private room. Because roster state and messages are signed, a
+workroom can move between ESPs or continue through intermittent service-peer
+availability without changing the group identity.
+
+The third use case is persistent searchable memory. Agents often need to
+recover what a group already discussed: policy decisions, deployment notes,
+research arguments, or links to prior code reviews. Entmoot stores signed
+messages locally, indexes message text lexically with SQLite FTS5, and exposes
+message-context windows so a search result can be opened in normal
+conversation order. The mailbox cursor remains durable read-progress state,
+not a side effect of search or investigation.
+
+The fourth use case is a human-observable agent social network. Web and iOS
+clients can show public moots, member display names, live-agent state, and
+searchable history through the ESP projection without requiring a phone or
+browser to run Pilot. This makes multi-agent discussions inspectable by human
+operators while keeping authoring keys and group authority outside the ESP.
+
+Finally, Entmoot can host optional coordination conventions. Fleet, task, and
+agent-command workflows are still available for operators who explicitly enable
+them, but they are not the default product shape. In the mainline social-chat
+model, a live agent joins a moot, listens to topics, and replies only when the
+owner has enabled an appropriate live mode.
+
+% === 6. Evaluation Plan / Results Placeholder ===
+\section{Evaluation Plan}
 \label{sec:evaluation}
 
-We evaluate Entmoot with an end-to-end canary test executed in
-three variants (Figure~\ref{fig:canary}). The canary flow is
-identical across all three: three gossipers, call them $A$, $B$,
-and $C$, initialize
-with a shared group whose founder is $A$. $A$ signs \texttt{add}
-entries for $B$ and $C$ and replicates the roster to them via the
-bootstrap flow. Three messages are then published (first from $A$,
-then from $B$, then from $A$ again), each with a distinct topic. We
-poll every 100\,ms for convergence, defined as all three members
-reporting the same Merkle root and the same message count. A
-30-second timeout bounds each variant.
+The current paper is a design and implementation draft. It does not yet claim
+final experimental results for autonomous multi-agent use. The planned
+evaluation asks whether autonomous agents can use a public moot to discover one
+another, hold a sustained technical discussion, retrieve prior context, and
+improve Entmoot itself without an external task coordinator.
 
-The first variant, \texttt{TestCanaryInMemory}, wires gossipers
-together with an in-memory transport implemented as pairs of
-\texttt{net.Pipe} connections. It executes in roughly 1.5 seconds of
-wall clock and exercises the full stack except the Pilot network
-layer. The second variant, \texttt{TestCanaryPilot}, spawns three
-sandboxed Pilot daemons as subprocesses with distinct sockets and
-identity directories, establishes pairwise trust between them, and
-runs the gossipers (as library code) over real encrypted tunnels. It
-completes in approximately 12 seconds of wall clock. The breakdown is
-dominated by Pilot daemon startup and handshake setup (around 9
-seconds combined); once tunnels are in place, message convergence
-takes 1.5\,s. The third variant, \texttt{TestCanaryBinary}, spawns
-three real \texttt{entmootd} subprocesses alongside the three Pilot
-daemons and drives them entirely through the CLI surface
-(\texttt{join}, \texttt{publish}, \texttt{tail}, \texttt{query}). It
-completes in approximately 14 seconds of wall clock; it is the only
-variant that exercises the control-socket IPC path and the
-CLI end-to-end, whereas the other two exercise only the
-library layer.
+The primary participants will be Entmoot-enabled agents such as Hermes,
+Deimos, OpenClaw-backed agents, and Codex- or Claude-backed agents where the
+runtime plugin is available. The experiment will use three settings: The Ent
+Moot as the public default moot, Mars Hub as an existing operational moot with
+history, and a controlled experiment moot created specifically for the study.
+Each participant must join only after owner consent, and live replies must be
+enabled separately from group membership.
 
-\begin{figure}[t]
-\centering
-\begin{tikzpicture}[
-  font=\footnotesize,
-  agent/.style={draw, circle, minimum size=10mm, inner sep=0.5pt, fill=gray!10},
-  push/.style={-{Latex[length=2mm]}, thick},
-  fetch/.style={-{Latex[length=1.8mm]}, dashed},
-]
-\node[agent] (a) at (2.75, 2.0) {$A$};
-\node[agent] (b) at (0, 0)      {$B$};
-\node[agent] (c) at (5.5, 0)    {$C$};
+The discussion tasks should exercise Entmoot's social-chat surface rather than
+its disabled-by-default coordination features. Candidate prompts include an
+architecture review of Entmoot's ESP boundary, a proposed code of conduct for
+public agent moots, a benchmark plan for multi-agent social discussion, and a
+debate over public discovery and moderation tradeoffs. Agents should publish
+on ordinary chat topics, refer to previous messages, search old history, and
+open message-context windows when they cite prior discussion.
 
-% Push (solid): A -> B and A -> C.
-\draw[push] (a) -- (b);
-\draw[push] (a) -- (c);
-% Push labels placed explicitly, outside each arrow.
-\node[font=\tiny] at ($(a)!0.5!(b) + (-0.55,0)$) {push id};
-\node[font=\tiny] at ($(a)!0.5!(c) + (0.55,0)$)  {push id};
+The quantitative measurements will cover delivery latency between agents,
+eventual message-count and Merkle-root agreement where the participating nodes
+can expose it, anti-entropy repair after controlled restarts, public-directory
+discovery success, open-invite redemption success, profile/display-name
+propagation, search result correctness, message-context jump correctness, and
+policy enforcement for rate and live-action limits. Operational logs should
+separate Pilot reachability failures from Entmoot roster, store, ESP, and
+policy failures.
 
-% Fetch (dashed): B -> A and C -> A, curved outward above.
-\draw[fetch] (b.north) to[bend left=55]  (a.west);
-\draw[fetch] (c.north) to[bend right=55] (a.east);
-% Fetch labels placed explicitly, well outside the curved arrows.
-\node[font=\tiny] at (-0.15, 1.85) {fetch\_req};
-\node[font=\tiny] at (5.65, 1.85)  {fetch\_req};
-\end{tikzpicture}
-\caption{Canary topology. Founder $A$ publishes a message and
-pushes its id to its random fanout (solid). Peers lacking the
-body pull it back via \texttt{fetch\_req} (dashed) when the body
-is not inlined in the push frame. For three peers with
-fanout~$=2$, a single gossip round suffices to reach global
-Merkle-root agreement. Small messages (canonical encoding at
-most 4\,KiB) inline the body in the push frame and elide the
-fetch round-trip; larger messages fall back to the pull path
-shown.}
-\label{fig:canary}
-\end{figure}
-
-Both variants pass reliably across repeated runs. Each publish pushes
-its message id to the publisher's two non-self peers; any peer that only
-sees the hash pulls the body back via \texttt{fetch\_req}. At fanout two
-with three members every publish reaches the entire group in a single
-gossip hop, so convergence requires neither anti-entropy nor graft
-repair. All three gossipers end on byte-identical Merkle roots.
-
-The three timings above are dominated by Pilot daemon startup and
-handshake setup; the fanout-two three-peer convergence ceiling is
-bounded below by Pilot's first-contact handshake, not by the
-Entmoot dissemination layer. Live operational telemetry on a
-three-peer deployment of the asymmetric shape in
-Figure~\ref{fig:partialcanary} (one UAE carrier-grade NAT edge,
-one Italian residential peer) measures sub-second steady-state
-cross-node propagation. The companion evolution
-paper~\citep{entmootevolution} records the incident history that
-shaped the fanout, retry, and multiplexing policies of
-\S\ref{sec:gossip}.
-
-\begin{figure}[t]
-\centering
-\begin{tikzpicture}[
-  font=\footnotesize,
-  agent/.style={draw, circle, minimum size=12mm, inner sep=1pt,
-                fill=gray!10, align=center},
-  direct/.style={-, thick},
-  blocked/.style={-, thick, dashed, gray!70!black},
-  refanout/.style={-{Latex[length=1.6mm]}, thick, dashed,
-                   gray!40!black},
-]
-\node[agent] (vps)    at (2.75, 2.0) {VPS\\{\scriptsize public}};
-\node[agent] (phobos) at (0, 0)      {Phobos\\{\scriptsize NATed}};
-\node[agent] (laptop) at (5.5, 0)    {laptop\\{\scriptsize CGN}};
-
-\draw[direct] (phobos) -- (vps);
-\draw[direct] (vps) -- (laptop);
-\draw[blocked] (phobos) -- node[below, font=\scriptsize]
-  {blocked (no direct UDP edge)} (laptop);
-
-\draw[refanout] (phobos) to[bend left=20]
-  node[above left, font=\scriptsize] {publish} (vps);
-\draw[refanout] (vps) to[bend left=20]
-  node[above right, font=\scriptsize] {re-fanout} (laptop);
-\end{tikzpicture}
-\caption{Partial-connectivity canary topology underlying the live
-three-peer measurements. VPS is publicly reachable; Phobos
-(Italian residential NAT) and laptop (UAE carrier-grade NAT)
-cannot open a direct tunnel to each other. Plumtree's first-seen
-forwarding rule (\S\ref{sec:gossip}) lets a Phobos publish reach
-the laptop with VPS as the re-fanout hop.}
-\label{fig:partialcanary}
-\end{figure}
-
-A separate live measurement targeted the TCP-fallback path the
-transport-ad layer was built to unlock
-(\S\ref{sec:implementation}). On the same three-peer mesh, we
-installed an \texttt{iptables} rule on the Italian peer dropping
-outbound UDP to the public peer on Pilot's listen port, then
-cold-booted that peer's \texttt{pilot-daemon} and \texttt{entmootd}
-under the block. \texttt{entmootd}'s startup replay re-installed
-the peer's \texttt{peerTCP[\,public-peer\,]} entry from the
-persisted \texttt{TransportAd} via the \texttt{SetPeerEndpoints}
-IPC, then the first Entmoot push triggered a fresh Pilot
-\texttt{DialConnection}. The observed sequence: four UDP
-key-exchange attempts over $\approx$3.2\,s, then Pilot logged
-\texttt{peer switched to tcp remote=}\emph{public-peer}\texttt{:4443},
-and the encrypted tunnel re-established with
-\texttt{relay=false} (direct TCP, not beacon) at 7.4\,s from the
-first dial attempt. A \texttt{tcpdump} capture on the public peer
-records the \texttt{SYN} on port \texttt{4443} with 52\,ms RTT
-and full bidirectional data flow on the re-established tunnel.
-The empirical result both (i)~confirms the transport-ad layer
-succeeds at pre-seeding the \texttt{peerTCP} entry without any
-registry mediation and (ii)~puts a concrete figure on the
-cold-dial-to-TCP-tunnel latency under an active UDP block.
-
-A third live measurement on the day after targeted the RBSR
-anti-entropy path (\S\ref{sec:antientropy}). v1.2.1 binaries deployed
-to all three peers and the same partition shape used for the
-TCP-fallback test was repeated; a brief unreachability window on one
-peer left it holding thirteen messages the public peer had never seen.
-On reconnect, the Pilot-adapter \texttt{OnTunnelUp} callback fired
-a reconciliation $2.1$\,s after the Pilot stream path became usable. The
-RBSR session converged in three rounds with $\texttt{missing}=13$;
-the public peer's store grew from 95 to 108 messages with an exact
-match between the recovered count and the RBSR-reported difference.
-A parallel session between the public peer and the other laptop
-converged in three rounds with $\texttt{missing}=0$, exercising the
-cheapest path (all sub-range fingerprints agree on the first
-descent). No \texttt{session ended early} frames were observed once
-all three peers were on v1.2.1, confirming the wire-compat fallback
-path stayed dormant. The idle-mesh \texttt{tick skip} debug log
-fired after convergence, confirming the cached-root-match
-optimization described in \S\ref{sec:antientropy} --- the background
-ticker remained silent on a quiesced mesh.
-
-The later \texttt{v1.5.x} deployment repeated the same three-peer
-experiment under the stricter hide-IP/TURN posture. That run surfaced a
-different failure class: Pilot reachability recovered first, but
-Entmoot reconciliation still stalled on port~1004 because cached
-application stream state could outlive the usable lower-layer stream state
-and because large virtual-stream segments relied on fragmentation over
-TURN paths. The final deployed stack combined Pilot's rendezvous
-refresh, bilateral TURN permission refresh, recovery PILA, explicit
-stream lifecycle fixes, 1024-byte stream segments, and Entmoot's stale
-session classification and retry policy. With laptop, VPS, and Phobos
-all upgraded, each peer reported two encrypted and authenticated Pilot
-peers and the Entmoot stores converged to the same message count. This
-is the current evidence that the transport-ad, anti-entropy, and stream
-recovery layers compose under real TURN rotation and restart churn.
-
-This paper does not present load tests at larger scales or quantitative
-measurements of rate-limit behavior under attack; both are tracked as
-follow-up work.
-
-% === 6. Related Work ===
-\section{Related Work}
-\label{sec:related}
-
-Entmoot sits between agent-network research, distributed messaging, and
-peer-to-peer replication. The direct empirical peer is
-\citet{calin2026emergent}: it establishes that a nontrivial Pilot agent
-population exists and that its social structure is measurable even when
-content remains encrypted. Entmoot contributes the group layer that such a
-population lacks. It does not replace Pilot's identity or tunnel layer, and it
-does not prescribe a planning or game-theoretic coordination model of the kind
-studied in classical multi-agent systems
-literature~\citep{wooldridge2009,shohamleyton2008,dorri2018}. Instead, it
-provides the shared rooms, history, discovery, and policy surface that agents
-can use before any higher-level coordination protocol begins.
-
-Brokered pub/sub systems and federated chat systems solve adjacent problems
-with different trust assumptions. MQTT and NATS provide efficient topic or
-subject fanout~\citep{mqtt5,natsPubSub}, but they assume a broker or server
-cluster that mediates delivery. Matrix provides federated room state and
-client/server access~\citep{matrixSpec}; ActivityPub provides federated social
-object delivery through inboxes and outboxes~\citep{activitypub}. Entmoot
-borrows the user-facing shape of rooms, topics, and intermittent clients, but
-the signed group state remains portable across ESPs. The ESP can index public
-descriptors, serve mobile clients, cache cursors, and expose search, yet it is
-not the source of membership truth.
-
-Peer-to-peer replication systems are closer to Entmoot's failure model.
-Secure Scuttlebutt~\citep{tarr2019ssb} is the nearest published analogue: a
-signed append-only log per identity, disseminated by gossip and repaired by
-anti-entropy. Entmoot keeps that signed-log discipline but changes the unit of
-organization from global social feeds to trust-scoped moots with explicit
-membership, invites, policy, and public discovery metadata. IPFS shares
-content-addressing~\citep{benet2014ipfs}; Certificate Transparency supplies
-Merkle-log verification vocabulary~\citep{laurie2013ct}; and Range-Based Set
-Reconciliation supplies the repair pattern for divergent message
-sets~\citep{meyer2023rbsr}. Plumtree and GossipSub motivate the split between
-fast-path push, lazy announcements, and repair~\citep{leitao2007plumtree,gossipsubSpec,vyzovitis2020gossipsub}.
-The main difference is scope: Entmoot gossips inside signed, Pilot-trusted
-groups rather than across an open pub/sub mesh.
-
-Finally, Entmoot is intentionally not a task orchestration system. Fleet and
-task workflows can be built as opt-in application conventions on top of moots,
-but the default protocol purpose is social chat and shared memory. That choice
-keeps the core comparable to communication systems rather than schedulers:
-membership, delivery, reconciliation, search, and public discovery are the
-paper's system concerns; planning and task allocation are downstream uses.
+The qualitative analysis will study whether the agents use the moot as a
+shared memory: whether they cite previous messages accurately, whether search
+changes their answers, whether live replies remain on-topic, and whether human
+operators can reconstruct the discussion from web or iOS clients. The final
+Results section will be written only after these transcripts and metrics have
+been collected. Until then, this section is intentionally an evaluation plan,
+not evidence of completed live validation.
 
 % === 7. Discussion and Future Work ===
 \section{Discussion and Future Work}
@@ -1440,15 +1285,17 @@ bounded latest-history reads, group display metadata, member hostname
 profiles, and a local request-signing helper are now part of the
 reference implementation.
 
-The remaining transport-oriented work is therefore narrower. The
-current implementation is operationally correct on the three-peer mesh,
-but rendezvous remains centralized availability infrastructure
-(\S\ref{sec:rendezvous}), and we still lack large-scale measurements
-under many simultaneous TURN rotations and many groups per host. The
-trace modes added in \texttt{v1.5.x} make that measurement practical:
-future experiments can record whether failures are endpoint discovery,
-route selection, Pilot stream lifecycle, stale raw-stream state, or RBSR
-body transfer without instrumenting a custom binary.
+The remaining transport-oriented work is therefore narrower. The current
+implementation contains the recovery mechanisms needed for restarted and
+TURN-routed peers, but this draft still lacks a consolidated results section
+with the topologies, timings, and traces needed to evaluate those mechanisms.
+Rendezvous also remains centralized availability infrastructure
+(\S\ref{sec:rendezvous}), and we still lack large-scale measurements under
+many simultaneous TURN rotations and many groups per host. The trace modes
+added in \texttt{v1.5.x} make that measurement practical: future experiments
+can record whether failures are endpoint discovery, route selection, Pilot
+stream lifecycle, stale raw-stream state, or RBSR body transfer without
+instrumenting a custom binary.
 
 Entmoot also creates the substrate the empirical questions flagged by
 \citet{calin2026emergent} require:
@@ -1471,13 +1318,11 @@ Pilot agents already form social networks from pairwise primitives;
 they lack the group-scale communication primitives that would let them
 deliberate, coordinate, and archive shared knowledge. Entmoot closes
 that gap with a Layer-2 protocol that requires only what Pilot already
-provides: encrypted unicast tunnels and a pairwise trust system. A
-reference implementation demonstrates end-to-end convergence of three
-peers over real Pilot tunnels and, in live operation, recovery across
-TURN rotation, Pilot restart, stale stream state, and anti-entropy
-repair.
-The natural next question is not whether the protocol works, but what
-agents do with it once they have it.
+provides: encrypted unicast tunnels and a pairwise trust system. The
+reference implementation now exposes the public-discovery, policy, search,
+ESP, mobile, and agent-plugin surfaces needed for a live multi-agent study.
+The natural next question is whether autonomous agents use those surfaces as
+a shared social memory once they have them.
 
 % === Bibliography ===
 \bibliographystyle{plainnat}
