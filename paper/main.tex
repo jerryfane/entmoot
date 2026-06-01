@@ -134,8 +134,8 @@ describes Entmoot's group model, gossip strategy, reconciliation path, ESP
 boundary, and security posture. Section~\ref{sec:implementation} discusses the
 current implementation. Section~\ref{sec:usecases} presents target use cases,
 and Section~\ref{sec:evaluation} defines the planned multi-agent evaluation.
-Section~\ref{sec:future} discusses deferred items and future work.
-Section~\ref{sec:conclusion} concludes.
+Section~\ref{sec:discussion} discusses limitations, Section~\ref{sec:future}
+summarizes future work, and Section~\ref{sec:conclusion} concludes.
 
 % === 2. Background ===
 \section{Background}
@@ -1231,86 +1231,114 @@ Results section will be written only after these transcripts and metrics have
 been collected. Until then, this section is intentionally an evaluation plan,
 not evidence of completed live validation.
 
-% === 7. Discussion and Future Work ===
-\section{Discussion and Future Work}
+% === 7. Discussion and Limitations ===
+\section{Discussion and Limitations}
+\label{sec:discussion}
+
+Entmoot demonstrates that Pilot's pairwise trust and encrypted streams are
+enough to host a signed group-chat layer. The current implementation has the
+objects and operational surfaces needed for agent social rooms: founder-signed
+rosters, invites, public descriptors, policy records, gossip and repair,
+local search, message-context jumps, ESP projection, mobile signing flows, and
+Agent Skills plus plugin packaging. This is stronger than a paper design: the
+system is usable software with concrete CLI, daemon, ESP, web, and mobile
+interfaces.
+
+The main unproven claim is behavioral. Entmoot provides the substrate for
+autonomous agents to discover one another, remember prior discussion, and
+participate in public or private moots, but this draft does not yet show that
+agents use that substrate well in a sustained multi-agent setting. The
+evaluation plan in Section~\ref{sec:evaluation} is therefore part of the
+paper's contribution boundary: final claims about deliberation quality,
+transcript usefulness, live-reply behavior, and collaborative improvement must
+wait for collected transcripts and metrics.
+
+The ESP boundary is another central tradeoff. The ESP makes Entmoot usable
+from web and mobile clients, provides public directory indexing, and gives
+intermittent users mailbox and search APIs. At the same time, it is
+centralized availability infrastructure for those conveniences. A failed or
+malicious ESP cannot forge signed roster entries or messages, but it can hide
+directory entries, delay projected history, bias search results, lose local
+cursors, or withhold mobile sign requests. This makes the signed group log
+portable, but not every user experience around it fully decentralized.
+
+Entmoot also exposes metadata. Pilot encrypts pairwise transport and hides
+private endpoints from non-trusted peers, but group membership, public
+descriptors, topics, message timing, display names, and ESP directory entries
+can still reveal social structure. Public moots intentionally trade some of
+that metadata privacy for discoverability. Private and unlisted moots reduce
+public exposure, but members and service peers still see enough metadata to
+route, search, and display the conversation.
+
+Moderation remains mostly social and administrative. A public descriptor can
+declare visibility, join mode, and policy metadata, and an ESP can choose
+which public moots to index. Those controls are useful for directory hygiene,
+but they are not a global abuse-prevention system. Founder-admin authority can
+set policies and issue or revoke invites, while ESP operators can delist or
+hide entries from their directory. A hostile member that is already admitted
+can still publish unwanted messages until local enforcement, removal, or
+social moderation catches up.
+
+Policy enforcement is likewise cooperative rather than Byzantine consensus.
+Founder-signed policies give implementations a portable record of expected
+limits, and local nodes can reject messages or joins that violate the policy
+they accept. Entmoot does not yet prove global fairness under adversarial
+members, nor does it provide quorum governance for disputed founder actions.
+This matches the current social-chat goal, but it limits the protocol's use as
+a hard security boundary for high-stakes coordination.
+
+Finally, the implementation is not yet a large-scale public network. The
+design uses bounded gossip, Merkle roots, and anti-entropy repair, but the
+paper still lacks measurements for many simultaneous moots, many service
+peers, high-churn public rooms, large media histories, and many clients
+searching through the same ESP. Those measurements are especially important
+because agent communities can become noisy: a small public moot may behave
+like chat, while a popular one may need moderation queues, spam controls, and
+directory-level reputation.
+
+% === 8. Future Work ===
+\section{Future Work}
 \label{sec:future}
 
-Entmoot ships a deliberately narrow subset of the full design.
-The items deferred, with their upgrade paths, are: near-peer
-sampling informed by subscriber interest overlap, replacing the
-current uniform-random peer sample; cooldown and soft-penalty
-schemes on rate-limit breach, replacing hard-disconnect;
-DHT-assigned message keepers for retention beyond subscriber
-interest, extending the current model where each member stores
-only what it cares about; Merkle absence proofs for filtered
-subscriber views, extending the positive-inclusion proofs the
-implementation provides today; end-to-end group encryption with
-shared-key rotation on churn, extending the current plaintext
-group content (pairwise tunnels remain encrypted by Pilot); and
-multi-admin or quorum-based rosters, relaxing the founder-only
-admin rule. Eager-push with lazy
-\texttt{ihave}/\texttt{graft}/\texttt{prune} tree repair
-(Plumtree; \S\ref{sec:gossip}) and anti-entropy reconciliation
-(\S\ref{sec:antientropy}) together close the dissemination gap
-flagged in earlier drafts: the former ships messages on the happy
-path, the latter heals divergence after partition or slow-start.
+The first future item is the planned live evaluation. We need transcripts,
+latency measurements, convergence checks, search/context-jump checks, and
+operator observations from multiple autonomous agents participating in The Ent
+Moot, Mars Hub, and a controlled experiment moot. That experiment should
+produce the final Results section rather than treating operational anecdotes as
+evidence.
 
-When Pilot Networks stabilise beyond early access, the membership
-interface can be backed by network membership instead of our signed
-roster without protocol-level changes. Whether we adopt that backend
-will depend on the shape of Pilot's eventual API and on whether
-network membership provides the authorization semantics we need --- in
-particular, Pilot Networks' registry-mediated membership lacks the
-offline-verifiable signed history Entmoot's roster log provides today,
-so a pure substitution would require an auxiliary proof-of-membership
-mechanism if offline bootstrap is still a goal. The abstraction is
-already in place on the Entmoot side.
+A second direction is multi-ESP operation. Public descriptors already separate
+signed discovery metadata from ESP-local directory state, which makes it
+natural to replicate or federate directories across ESPs. Future work should
+define how ESPs exchange descriptor indexes, how clients compare competing
+directory views, and how public moot delisting or moderation decisions remain
+transparent without requiring a single canonical ESP.
 
-Several items that earlier drafts listed as future work have since
-shipped. Entmoot no longer depends on a fork-built registry for
-transport endpoint propagation: signed transport ads install TCP and
-TURN endpoints through Pilot IPC. TURN rotation detection no longer
-requires steady-state polling against modern Pilot daemons:
-\texttt{Subscribe}/\texttt{Notify} pushes the change. Pilot restart
-ordering no longer requires manual sleeps: \texttt{join} waits for
-local Pilot readiness. Stale Entmoot-over-Pilot stream state no longer poisons
-anti-entropy indefinitely: typed error classification, bounded stream
-deadlines, raw stream close, and single retry on a fresh stream are
-part of the current design.
-The mobile service-peer substrate has also shipped in first form:
-external signer abstractions, message ingest events, durable mailbox
-cursors, the ESP HTTP bridge, device-authenticated requests,
-phone-signed publish forwarding, executable group/invite sign requests,
-bounded latest-history reads, group display metadata, member hostname
-profiles, and a local request-signing helper are now part of the
-reference implementation.
+A third direction is stronger privacy and governance. End-to-end group
+encryption would protect content from non-member service peers, but requires
+group-key rotation on membership churn and careful treatment of search. Multi
+admin or quorum-based rosters would reduce founder centrality, but require
+clear conflict rules for offline edits, admin removal, and policy updates.
+Public moots also need stronger moderation tools: abuse reports, rate
+penalties short of disconnect, spam-resistant open invites, and directory
+policies that are visible to users.
 
-The remaining transport-oriented work is therefore narrower. The current
-implementation contains the recovery mechanisms needed for restarted and
-TURN-routed peers, but this draft still lacks a consolidated results section
-with the topologies, timings, and traces needed to evaluate those mechanisms.
-Rendezvous also remains centralized availability infrastructure
-(\S\ref{sec:rendezvous}), and we still lack large-scale measurements under
-many simultaneous TURN rotations and many groups per host. The trace modes
-added in \texttt{v1.5.x} make that measurement practical: future experiments
-can record whether failures are endpoint discovery, route selection, Pilot
-stream lifecycle, stale raw-stream state, or RBSR body transfer without
-instrumenting a custom binary.
+A fourth direction is search quality. Lexical FTS5 search is predictable,
+local, and cheap, which makes it a good first implementation. Semantic search
+over moot history could help agents recover concepts even when wording
+differs, but it introduces embedding storage, model choice, privacy, ranking,
+and reproducibility questions. A clean semantic layer should sit beside the
+lexical index rather than replacing it, so agents can distinguish exact
+evidence from approximate retrieval.
 
-Entmoot also creates the substrate the empirical questions flagged by
-\citet{calin2026emergent} require:
-longitudinal analysis of group-membership dynamics, homophily on
-topic filters, and community structure beyond the Pilot backbone.
-A first natural measurement study would be to deploy Entmoot to a
-fraction of the existing Pilot population and observe how rosters
-grow, how gossip fanout behaves under real loads, and how topic
-filters correlate with agents' declared capability tags. The
-Agent-Skills-format skill document shipped alongside the installer
-is the concrete enabler for the question ``what do agents do with it
-once they have it'': it is the interface agents actually install and
-call, rather than a library surface waiting for a developer.
+Finally, Entmoot should be studied as an agent-network substrate. The Pilot
+network already exhibits social graph structure~\citep{calin2026emergent};
+Entmoot makes group membership and group discussion first-class data. A
+longitudinal deployment could measure how public moots grow, whether topic
+filters reveal community structure, how agents cite shared history, and
+whether public agent rooms produce useful collaboration or just more traffic.
 
-% === 8. Conclusion ===
+% === 9. Conclusion ===
 \section{Conclusion}
 \label{sec:conclusion}
 
@@ -1318,11 +1346,12 @@ Pilot agents already form social networks from pairwise primitives;
 they lack the group-scale communication primitives that would let them
 deliberate, coordinate, and archive shared knowledge. Entmoot closes
 that gap with a Layer-2 protocol that requires only what Pilot already
-provides: encrypted unicast tunnels and a pairwise trust system. The
-reference implementation now exposes the public-discovery, policy, search,
-ESP, mobile, and agent-plugin surfaces needed for a live multi-agent study.
-The natural next question is whether autonomous agents use those surfaces as
-a shared social memory once they have them.
+provides: encrypted unicast tunnels and a pairwise trust system. The reference
+implementation turns that protocol into usable infrastructure: private and
+public moots, signed policies, ESP-backed clients, searchable history, and
+agent-facing skill/plugin packaging. The remaining question is empirical: once
+agents can join shared rooms and remember their conversations, what kinds of
+social organization do they build?
 
 % === Bibliography ===
 \bibliographystyle{plainnat}
