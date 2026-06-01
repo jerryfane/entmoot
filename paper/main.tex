@@ -28,9 +28,9 @@
 }
 
 % === Front matter ===
-\title{Entmoot: Layer-2 Group Communication \\
-       for AI Agents \\
-       with Merkle-Verified Completeness}
+\title{Entmoot: Social Group Communication \\
+       for Autonomous Agents \\
+       over Pilot Protocol}
 
 \author{%
   Jerry Fanelli\\
@@ -43,106 +43,100 @@
 \maketitle
 
 \begin{abstract}
-Recent empirical analysis of the Pilot Protocol agent network shows that 626
+Recent empirical analysis of the Pilot Protocol agent network shows that
 autonomous agents can self-organize into a small-world social graph on
-pairwise trust alone~\citep{calin2026emergent}. Yet the protocol provides
-no primitive for group-scale communication: no broadcast, no shared topic
-log, no proof that a subscriber has seen every message in a topic of
-interest. We present \emph{Entmoot}, a Layer-2 protocol that closes this gap.
-It adds multi-party gossip, topic-based subscription, signed group
-membership, and Merkle-verified message completeness on top of Pilot's
-existing unicast primitives, without waiting for Pilot's in-progress
-``custom networks'' feature. We describe the design, a reference Go
-implementation across the current \texttt{v1.5.35} codebase, and
-end-to-end canary tests that show three sandboxed Pilot nodes
-converging to byte-identical Merkle roots over real encrypted tunnels.
-Entmoot ships a one-command installer and an Agent-Skills-format
-skill document, so the protocol is directly consumable by autonomous
-agents. Dissemination follows a Plumtree-style eager/lazy spanning
-tree with IHAVE/GRAFT/PRUNE repair; anti-entropy uses Range-Based Set
-Reconciliation; and gossip frames run as short-lived Pilot streams
-with explicit per-peer dial budgets. The live three-peer deployment that
-motivated the implementation now runs through TURN rotation, Pilot
-restart, and stale-stream recovery while preserving convergence across
-asymmetric consumer networks.
+pairwise trust alone~\citep{calin2026emergent}. Pilot supplies identity,
+trust, discovery, NAT traversal, and encrypted pairwise transport, but it
+does not provide durable group communication: no signed shared roster, no
+topic log, no public discovery mechanism, no policy layer, and no searchable
+history for intermittent clients. We present \emph{Entmoot}, a social group
+communication layer for autonomous agents over Pilot. Entmoot represents a
+group, or \emph{moot}, as signed membership state plus signed messages
+propagated by gossip and repaired by anti-entropy reconciliation. A reference
+Go implementation provides private and public moots, targeted and open
+invites, founder-managed policies, an Entmoot Service Provider (ESP) surface
+for web and mobile clients, lexical search with message-context jumps, and
+Agent Skills plus Codex/Claude plugin packaging for agent-facing use. The
+system is deployed as working software; this paper reports its design,
+implementation, and existing validation, while reserving final results for a
+planned live multi-agent study.
 \end{abstract}
 
 % === 1. Introduction ===
 \section{Introduction}
 \label{sec:introduction}
 
-Six hundred and twenty-six autonomous AI agents found each other without
-human intervention on the Pilot Protocol in early 2026. They registered,
-handshook, exchanged trust, and formed a network topology with
-heavy-tailed degree distribution, 47$\times$ higher clustering than random,
-and a giant component spanning two-thirds of the
-population~\citep{calin2026emergent}. Nobody designed this. It emerged
-from pairwise primitives: each agent could discover an address, negotiate
-a trust relationship, and open an encrypted 1-to-1 tunnel to any trusted
-peer. What agents did with those tunnels was their own business.
+Autonomous agents already form social structure. In an empirical study of
+the Pilot Protocol network, agents registered, handshook, exchanged trust,
+and formed a topology with heavy-tailed degree distribution, 47$\times$
+higher clustering than random, and a giant component spanning two-thirds
+of the population~\citep{calin2026emergent}. That result is striking
+because Pilot offers pairwise primitives rather than an application-level
+social substrate: each agent can discover another node, negotiate trust, and
+open an encrypted 1-to-1 tunnel. What persists across more than two peers is
+left to applications.
 
-The protocol that sustains that network is deliberately narrow. Pilot
-provides an overlay of virtual addresses, reliable encrypted transport,
-NAT traversal~\citep{rfc5128}, and a pairwise trust
-store~\citep{pilotprotocol}. It does
-not provide a group primitive. An agent wishing to address a dozen peers
-at once must either maintain a trust edge with each one (a graph whose
-edge count scales quadratically in the group size) or rely on a
-centralized relay, reintroducing the single point of failure the overlay
-was designed to avoid. The Pilot daemon's own \texttt{broadcast} command
-today returns, verbatim: ``broadcast is not available yet; custom
-networks are WIP.''
+The missing primitive is a durable group conversation. A pairwise overlay can
+connect agents, but it does not by itself answer group questions: who belongs
+to a room, who may invite new members, which messages were sent on a topic,
+how intermittent clients catch up, how a public room is discovered, or how an
+agent searches shared history after the fact. An agent that wants to address a
+dozen peers can maintain individual relationships with all of them, or it can
+delegate group state to a centralized service. The first approach scales
+poorly as a social practice; the second undermines the decentralized trust
+model that made the Pilot graph interesting in the first place.
 
-This paper presents \emph{Entmoot}, a Layer-2 protocol that adds group
-communication to Pilot without modifying it and without waiting for the
-in-progress custom-networks feature. An Entmoot group is a signed
-append-only roster of member identities, a content-addressable log of
-signed messages, and a gossip protocol that fans messages out over
-pairwise Pilot streams to random peers drawn from the roster. Every
-member maintains a Merkle tree over the messages it holds in a
-deterministic topological order; two members with the same set of
-messages compute byte-identical roots, so convergence is checkable in
-constant space. Subscribers can declare an MQTT-style topic filter and,
-in a later version of the protocol, receive a cryptographic proof that
-no matching messages are missing.
+Entmoot adds that group layer without replacing Pilot. A group, or
+\emph{moot}, consists of signed roster state, signed messages, optional
+invites, policy metadata, and a gossip/reconciliation protocol that moves data
+over ordinary Pilot streams. Members can participate directly, while an
+Entmoot Service Provider (ESP) can project the same group state to web and
+mobile clients without becoming the source of group truth. Public moot
+descriptors make opt-in communities discoverable, but public visibility is
+separate from message history, live replies, and membership consent.
+
+The current implementation is social-first. It supports private and public
+moots, default and founder-customized policies, searchable history,
+message-context jumps from search results back into chat, member profiles and
+display names, owner-controlled live-agent replies, and an Agent
+Skills-compatible packaging surface for Codex, Claude, and OpenClaw-style
+agents. Fleet and task coordination exist only as opt-in extensions and are
+disabled by default. This framing matters: Entmoot is not primarily a job
+orchestrator. It is a shared social memory and conversation layer for agents.
 
 Our contributions are as follows.
 
 \begin{enumerate}
-    \item A design for Layer-2 group communication on Pilot that relies
-    only on primitives Pilot already provides. Group membership
-    is captured in signed rosters above the transport, not in Pilot's
-    own (in-progress) network membership mechanism.
-    \item A Go reference implementation, \texttt{entmootd}, comprising
-    the current \texttt{v1.5.35} codebase, including framing, replay
-    protection, rate limiting, gossip, Merkle trees, Range-Based Set
-    Reconciliation, an independent Pilot IPC client, a Pilot-daemon
-    adapter, explicit trace modes for transport and reconcile
-    debugging, Entmoot Service Provider primitives for mobile
-    clients, hostname-aware member profiles, open-invite redemption,
-    automatic Pilot onboarding handshakes, and route diagnostics.
-    End-to-end tests and live three-peer deployments show
-    convergence over real encrypted Pilot tunnels, including recovery
-    from Pilot restarts, TURN rotations, and stale port-1004 streams.
-    \item An agent-facing CLI surface (\texttt{join}, \texttt{serve},
-    \texttt{publish}, \texttt{doctor}, \texttt{peers}, \texttt{tail},
-    \texttt{info}, \texttt{query}, \texttt{version})
-    with local-IPC
-    coordination, a one-command installer (\texttt{install.sh}), and an
-    Agent-Skills-format skill document
-    (\texttt{src/skills/entmoot/SKILL.md}) that lets OpenClaw-style agents
-    install and operate Entmoot without developer intervention.
+    \item A signed moot model for group communication over Pilot, including
+    member identities, rosters, targeted invites, open invites, signed
+    messages, topic routing, and founder/admin authority.
+    \item A dissemination and repair design that combines Pilot streams,
+    gossip fanout, replay protection, rate limiting, Merkle roots, and
+    anti-entropy reconciliation to make group history durable across
+    intermittently connected agents.
+    \item An ESP architecture that exposes group state to web and mobile
+    clients while preserving the distinction between signed group state and
+    ESP-local convenience state such as device auth, cursors, profiles, and
+    display names.
+    \item Public discovery and governance mechanisms: public moot descriptors,
+    ESP directory indexing, consent-first joins, default policies, and
+    founder-managed policy updates.
+    \item Agent-facing packaging through an Agent Skills document and
+    Codex/Claude plugin generation, so autonomous coding agents can discover,
+    install, diagnose, and use Entmoot as a chat substrate.
+    \item A validation path that separates existing canary and operational
+    measurements from the planned live multi-agent study, whose final results
+    remain pending until that experiment is run.
 \end{enumerate}
 
 The rest of the paper is organized as follows. Section~\ref{sec:background}
 summarizes Pilot Protocol and positions related work. Section~\ref{sec:design}
-describes Entmoot's data model, wire protocol, gossip strategy, and
-security posture. Section~\ref{sec:implementation} discusses the
-implementation and integration with Pilot's driver API.
-Section~\ref{sec:evaluation} presents the canary results.
-Section~\ref{sec:related} surveys related primitives and system work.
-Section~\ref{sec:future} discusses deferred items and future work.
-Section~\ref{sec:conclusion} concludes.
+describes Entmoot's group model, gossip strategy, reconciliation path, ESP
+boundary, and security posture. Section~\ref{sec:implementation} discusses the
+current implementation. Section~\ref{sec:evaluation} separates implemented
+validation from the planned multi-agent study. Section~\ref{sec:related}
+surveys related primitives and system work. Section~\ref{sec:future} discusses
+deferred items and future work. Section~\ref{sec:conclusion} concludes.
 
 % === 2. Background ===
 \section{Background}
