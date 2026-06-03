@@ -160,6 +160,42 @@ eval_run_capture() {
   return "$status"
 }
 
+eval_run_capture_stdin() {
+  local label="$1"
+  local out_dir="$2"
+  local input="$3"
+  shift 3
+
+  local stdout_path="$out_dir/$label.stdout"
+  local stderr_path="$out_dir/$label.stderr"
+  local status_path="$out_dir/$label.status"
+  local meta_path="$out_dir/$label.meta"
+  local start_ts end_ts status
+
+  start_ts="$(eval_timestamp_utc)"
+  if printf '%s' "$input" | "$@" >"$stdout_path" 2>"$stderr_path"; then
+    status=0
+  else
+    status=$?
+  fi
+  end_ts="$(eval_timestamp_utc)"
+
+  printf '%s\n' "$status" >"$status_path"
+  eval_write_command_meta "$meta_path" "$label" "$start_ts" "$end_ts" "$status" "$@"
+  return "$status"
+}
+
+eval_sha256_text() {
+  local value="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    printf '%s' "$value" | sha256sum | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    printf '%s' "$value" | shasum -a 256 | awk '{print $1}'
+  else
+    printf '%s\n' unavailable
+  fi
+}
+
 eval_write_run_metadata() {
   local out_dir="$1"
   local node_label="$2"
