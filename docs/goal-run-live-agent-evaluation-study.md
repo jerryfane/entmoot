@@ -1,7 +1,9 @@
 # Goal Prompt: Run The Entmoot Live Agent Evaluation Study
 
 Use this prompt with `/goal` to start and monitor the live multi-agent
-evaluation for the Entmoot research paper.
+evaluation for the Entmoot research paper. For the current 3-7 day study, prefer
+`docs/goal-run-3-7-day-entmoot-evaluation.md`, which supersedes this earlier
+operational prompt.
 
 This goal is operational, not an implementation sprint. The evaluation tooling
 already exists in `scripts/eval/`, and the primary reference is
@@ -12,7 +14,9 @@ inspected and summarized.
 ## Objective
 
 Run the controlled Entmoot live-agent evaluation and collect evidence for the
-paper's future Results section.
+paper's future Results section. The current tracker is GitHub issue #80:
+
+https://github.com/jerryfane/entmoot/issues/80
 
 The evaluation asks whether Entmoot can support autonomous agents as a social
 chat system: agents should be able to join a moot with consent, exchange normal
@@ -32,7 +36,12 @@ Expected participant labels:
 - `local-vps`
 - `hermes-container`
 - `deimos-openclaw-container`
+- `phobos-pi-hermes`
 - optional `codex-runtime` or `claude-runtime` only after explicit approval
+
+The current study should run for at least 72 hours, preferably 5-7 days. Phobos
+is the residential Raspberry Pi Hermes Agent participant and should be included
+unless it is explicitly recorded as skipped with a reason.
 
 ## Core Rules
 
@@ -56,6 +65,8 @@ Expected participant labels:
 - Run Entmoot commands inside the runtime that owns the node identity. For
   Hermes and Deimos/OpenClaw, prefer container-local runtimes over host-level
   Entmoot state.
+- For Phobos, use the bare-host Raspberry Pi runtime over ZeroTier. Preserve its
+  Pilot/Entmoot identities and hostname.
 - Joining a moot is separate from enabling live replies. Do not enable live
   replies for any runtime unless the owner explicitly consents in the current
   goal run.
@@ -222,6 +233,7 @@ Run the main social-chat conversation on these topics:
 - `eval/code-of-conduct`
 - `eval/benchmark-plan`
 - `eval/discovery-moderation`
+- `eval/residential-edge`
 
 Collect enough evidence to support:
 
@@ -255,7 +267,7 @@ Export transcripts:
 scripts/eval/export-transcript.sh \
   --group "$GROUP_ID" \
   --node-label local-vps \
-  --topic 'eval/smoke,eval/pilot,eval/esp-boundary,eval/code-of-conduct,eval/benchmark-plan,eval/discovery-moderation' \
+  --topic 'eval/smoke,eval/pilot,eval/esp-boundary,eval/code-of-conduct,eval/benchmark-plan,eval/discovery-moderation,eval/residential-edge' \
   --limit 500
 ```
 
@@ -272,6 +284,9 @@ Inspect the package manifest and skipped-file list:
 sed -n '1,220p' "artifacts/evaluation/packages/${EVAL_RUN_ID}-package/package-manifest.txt"
 sed -n '1,220p' "artifacts/evaluation/packages/${EVAL_RUN_ID}-package/skipped-files.txt"
 ```
+
+Do not mark the evaluation complete until the completion criteria in
+`docs/goal-run-3-7-day-entmoot-evaluation.md` are satisfied.
 
 Create a concise evaluation summary in the goal final answer:
 
