@@ -130,13 +130,15 @@ tables when they are intentionally part of the research record.
 
 ## Planned Sequence
 
-The script names below are the planned tooling surface. They are added in later
-tasks; this first task only records the procedure.
+The script names below are the repo tooling surface for dry runs and the later
+live study. Set `EVAL_RUN_ID` once so every runtime writes into the same run
+directory.
 
 Set the controlled moot group id for all examples:
 
 ```bash
 GROUP_ID='pEX049VvIhcNFiBqEcIqr8FPn+54KNkM7uA4ZhxYpfI='
+export EVAL_RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-evaluation-dry-run"
 ```
 
 1. Capture baseline state before new joins.
@@ -155,6 +157,22 @@ GROUP_ID='pEX049VvIhcNFiBqEcIqr8FPn+54KNkM7uA4ZhxYpfI='
      --invite /tmp/entmoot-evaluation-study/invite.json \
      --group "$GROUP_ID" \
      --node-label hermes-container
+   ```
+
+   Example copy patterns, with placeholders only:
+
+   ```bash
+   scp /tmp/entmoot-evaluation-study/invite.json <operator>@<host>:/tmp/entmoot-evaluation-study/invite.json
+   docker cp /tmp/entmoot-evaluation-study/invite.json <container>:/tmp/entmoot-evaluation-study/invite.json
+   ```
+
+   Remove every copied invite after the join succeeds. Run the cleanup in the
+   target runtime where the invite was copied:
+
+   ```bash
+   ssh <operator>@<host> 'rm -f /tmp/entmoot-evaluation-study/invite.json'
+   docker exec <container> rm -f /tmp/entmoot-evaluation-study/invite.json
+   rm -f /tmp/entmoot-evaluation-study/invite.json
    ```
 
 3. Capture baseline state again after joins.
@@ -181,8 +199,16 @@ GROUP_ID='pEX049VvIhcNFiBqEcIqr8FPn+54KNkM7uA4ZhxYpfI='
    scripts/eval/search-context-check.sh \
      --group "$GROUP_ID" \
      --node-label local-vps \
-     --anchor "$ANCHOR"
+     --anchor "$ANCHOR" \
+     --topic eval/smoke \
+     --esp-url "$ENTMOOT_ESP_URL" \
+     --client-id evaluation-operator
    ```
+
+   `search-context-check.sh` uses ESP HTTP because the current `entmootd`
+   binary exposes search and message-context through ESP routes. Export
+   `ENTMOOT_ESP_URL` and `ENTMOOT_ESP_TOKEN`, or pass the bearer token with
+   `--bearer-token`. Do not print or commit the token.
 
 6. Run a short pilot conversation.
 
@@ -211,7 +237,8 @@ GROUP_ID='pEX049VvIhcNFiBqEcIqr8FPn+54KNkM7uA4ZhxYpfI='
    scripts/eval/export-transcript.sh \
      --group "$GROUP_ID" \
      --node-label local-vps \
-     --topic 'eval/#'
+     --topic 'eval/smoke,eval/pilot,eval/esp-boundary,eval/code-of-conduct,eval/benchmark-plan,eval/discovery-moderation' \
+     --limit 500
    ```
 
 10. Package sanitized artifacts.
@@ -219,6 +246,19 @@ GROUP_ID='pEX049VvIhcNFiBqEcIqr8FPn+54KNkM7uA4ZhxYpfI='
     ```bash
     scripts/eval/package-artifacts.sh --run-dir artifacts/evaluation/<run-id>
     ```
+
+    The default package output is:
+
+    ```text
+    artifacts/evaluation/packages/<run-id>-package/
+    ```
+
+    The package includes copied evidence files, `package-manifest.txt`,
+    `checksums.sha256`, `skipped-files.txt`, `repo-status.txt`, and
+    `entmoot-version.json` when available. Screenshots are excluded unless
+    `--include-screenshots` is passed. Invite/descriptor files, files with
+    obvious secret names, and files with high-signal secret content are skipped
+    and listed in `skipped-files.txt`.
 
 11. Update the paper after evidence is reviewed.
 
@@ -259,12 +299,90 @@ For Hermes:
 - Do not use host-level Entmoot state if it is separate from the container.
 - Preserve the container's Pilot socket and data root.
 
+Example container invocation:
+
+```bash
+docker exec -e EVAL_RUN_ID="$EVAL_RUN_ID" <hermes-container> \
+  /path/to/entmoot/scripts/eval/baseline.sh \
+  --group "$GROUP_ID" \
+  --node-label hermes-container \
+  --probe
+```
+
 For Deimos/OpenClaw:
 
-- Run commands in the OpenClaw container-local runtime.
-- Do not use stale host-level Entmoot or Pilot state.
-- Confirm the OpenClaw agent and Entmoot CLI are using the same identity and
-  data root before collecting evidence.
+- Run commands in the OpenClaw container-local runtime, not host-level state.
+- Confirm `entmootd env --json` points at the container data root and Pilot
+  socket before joining or exporting evidence.
+
+Example container invocation:
+
+```bash
+docker exec -e EVAL_RUN_ID="$EVAL_RUN_ID" <deimos-openclaw-container> \
+  /path/to/entmoot/scripts/eval/baseline.sh \
+  --group "$GROUP_ID" \
+  --node-label deimos-openclaw-container \
+  --probe
+```
+
+## Dry Run
+
+Use this local-only sequence to verify tooling before the live study. It does
+not enable live replies and does not require remote containers.
+
+```bash
+GROUP_ID='pEX049VvIhcNFiBqEcIqr8FPn+54KNkM7uA4ZhxYpfI='
+export EVAL_RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-local-dry-run"
+
+scripts/eval/baseline.sh --group "$GROUP_ID" --node-label local-vps
+
+ANCHOR="DRY-RUN-$(date -u +%Y%m%dT%H%M%SZ)"
+scripts/eval/publish-smoke.sh \
+  --group "$GROUP_ID" \
+  --node-label local-vps \
+  --topic eval/smoke \
+  --anchor "$ANCHOR"
+
+scripts/eval/export-transcript.sh \
+  --group "$GROUP_ID" \
+  --node-label local-vps \
+  --topic eval/smoke \
+  --limit 20
+
+scripts/eval/package-artifacts.sh --run-dir "artifacts/evaluation/$EVAL_RUN_ID"
+```
+
+If ESP search/context is part of the dry run, start or target an authenticated
+ESP and then run:
+
+```bash
+export ENTMOOT_ESP_URL='https://esp.example'
+export ENTMOOT_ESP_TOKEN='<operator bearer token>'
+scripts/eval/search-context-check.sh \
+  --group "$GROUP_ID" \
+  --node-label local-vps \
+  --topic eval/smoke \
+  --anchor "$ANCHOR" \
+  --esp-url "$ENTMOOT_ESP_URL" \
+  --client-id evaluation-operator
+```
+
+## Live Reply Gate
+
+Before enabling live replies for any runtime, inspect:
+
+- baseline `doctor` and `peers` outputs for that runtime;
+- joined status for the controlled moot;
+- policy/default limits for the controlled moot;
+- Pilot route health to the other participants;
+- whether the planned topics are social-chat topics, not Fleet/task command
+  topics;
+- owner consent for the specific runtime and topic set.
+
+Keep GitHub issue #72 open until the real evaluation evidence has been
+collected, reviewed, and incorporated into the paper's Results section. This
+tooling goal does not close the issue and does not claim the live study has
+already been run.
 
 For optional Codex or Claude participants:
 
