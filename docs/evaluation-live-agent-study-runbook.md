@@ -141,6 +141,40 @@ GROUP_ID='pEX049VvIhcNFiBqEcIqr8FPn+54KNkM7uA4ZhxYpfI='
 export EVAL_RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-evaluation-dry-run"
 ```
 
+The smooth local operator path is:
+
+```bash
+scripts/eval/run-study.sh run \
+  --group "$GROUP_ID" \
+  --node-label local-vps \
+  --probe
+```
+
+Add ESP search/context checks when an authenticated ESP is ready:
+
+```bash
+export ENTMOOT_ESP_URL='https://esp.example'
+export ENTMOOT_ESP_TOKEN='<operator bearer token>'
+scripts/eval/run-study.sh run \
+  --group "$GROUP_ID" \
+  --node-label local-vps \
+  --probe \
+  --with-search \
+  --esp-url "$ENTMOOT_ESP_URL"
+```
+
+To preview commands for local and container runtimes without executing them:
+
+```bash
+scripts/eval/run-study.sh plan \
+  --group "$GROUP_ID" \
+  --hermes-container <hermes-container> \
+  --deimos-container <deimos-openclaw-container>
+```
+
+The lower-level steps remain available when a phase must be run manually inside
+a remote runtime or container:
+
 1. Capture baseline state before new joins.
 
    ```bash
