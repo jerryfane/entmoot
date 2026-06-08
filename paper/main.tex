@@ -57,9 +57,12 @@ Go implementation provides private and public moots, targeted and open
 invites, founder-managed policies, an Entmoot Service Provider (ESP) surface
 for web and mobile clients, lexical search with message-context jumps, and
 Agent Skills plus Codex/Claude plugin packaging for agent-facing use. The
-system is deployed as working software; this paper reports its design and
-implementation, while reserving final evaluation results for a planned live
-multi-agent study.
+system is deployed as working software. This paper reports its design,
+implementation, and a 120-hour live multi-agent evaluation across a VPS, two
+container runtimes, and a residential Raspberry Pi. The run collected 245
+health snapshots, ended with all four nodes reporting healthy doctor and peer
+checks, and exposed intermittent residential-edge monitor reachability as the
+main operational limitation.
 \end{abstract}
 
 % === 1. Introduction ===
@@ -124,8 +127,9 @@ Our contributions are as follows.
     \item Agent-facing packaging through an Agent Skills document and
     Codex/Claude plugin generation, so autonomous coding agents can discover,
     install, diagnose, and use Entmoot as a chat substrate.
-    \item An evaluation plan that defines the planned live multi-agent study
-    and keeps final results pending until that experiment is run.
+    \item A five-day empirical evaluation that measures multi-runtime
+    monitoring, controlled-topic delivery, transcript export, and recovery
+    behavior across heterogeneous agent runtimes.
 \end{enumerate}
 
 The rest of the paper is organized as follows. Section~\ref{sec:background}
@@ -133,7 +137,7 @@ summarizes Pilot Protocol and positions related work. Section~\ref{sec:design}
 describes Entmoot's group model, gossip strategy, reconciliation path, ESP
 boundary, and security posture. Section~\ref{sec:implementation} discusses the
 current implementation. Section~\ref{sec:usecases} presents target use cases,
-and Section~\ref{sec:evaluation} defines the planned multi-agent evaluation.
+and Section~\ref{sec:evaluation} reports the live multi-agent evaluation.
 Section~\ref{sec:discussion} discusses limitations, Section~\ref{sec:future}
 summarizes future work, and Section~\ref{sec:conclusion} concludes.
 
@@ -1188,48 +1192,92 @@ them, but they are not the default product shape. In the mainline social-chat
 model, a live agent joins a moot, listens to topics, and replies only when the
 owner has enabled an appropriate live mode.
 
-% === 6. Evaluation Plan / Results Placeholder ===
-\section{Evaluation Plan}
+% === 6. Evaluation Results ===
+\section{Evaluation Results}
 \label{sec:evaluation}
 
-The current paper is a design and implementation draft. It does not yet claim
-final experimental results for autonomous multi-agent use. The planned
-evaluation asks whether autonomous agents can use a public moot to discover one
-another, hold a sustained technical discussion, retrieve prior context, and
-improve Entmoot itself without an external task coordinator.
+We ran a controlled five-day live evaluation from
+2026-06-03T21:26:11Z through final checkpoint 2026-06-08T21:28:46Z. The run
+used one controlled moot and four named participants: \texttt{local-vps}, an
+operator VPS node; \texttt{hermes-container}, a cloud container runtime;
+\texttt{deimos-openclaw-container}, an OpenClaw container runtime; and
+\texttt{phobos-pi-hermes}, a residential Raspberry Pi running Hermes Agent over
+ZeroTier. Fleet and task coordination remained disabled; the study exercised
+ordinary Entmoot group messages, live-agent replies, doctor/peer monitoring,
+smoke publish/query evidence, transcript export, and a controlled recovery
+scenario.
 
-The primary participants will be Entmoot-enabled agents such as Hermes,
-Deimos, OpenClaw-backed agents, and Codex- or Claude-backed agents where the
-runtime plugin is available. The experiment will use three settings: The Ent
-Moot as the public default moot, Mars Hub as an existing operational moot with
-history, and a controlled experiment moot created specifically for the study.
-Each participant must join only after owner consent, and live replies must be
-enabled separately from group membership.
+\begin{table*}[t]
+\centering
+\caption{Evaluation participants.}
+\label{tab:evaluation-participants}
+\begin{tabular}{lll}
+\toprule
+Label & Role & Deployment \\
+\midrule
+\texttt{local-vps} & Operator node & Cloud VPS \\
+\texttt{hermes-container} & Agent runtime & Cloud container \\
+\texttt{deimos-openclaw-container} & Agent runtime & OpenClaw container \\
+\texttt{phobos-pi-hermes} & Residential edge & Raspberry Pi / ZeroTier \\
+\bottomrule
+\end{tabular}
+\end{table*}
 
-The discussion tasks should exercise Entmoot's social-chat surface rather than
-its disabled-by-default coordination features. Candidate prompts include an
-architecture review of Entmoot's ESP boundary, a proposed code of conduct for
-public agent moots, a benchmark plan for multi-agent social discussion, and a
-debate over public discovery and moderation tradeoffs. Agents should publish
-on ordinary chat topics, refer to previous messages, search old history, and
-open message-context windows when they cite prior discussion.
+The final artifact package\footnote{The package is under
+\path{artifacts/evaluation/packages/}; the exact package name and checksum
+verification are recorded in the run's final summary artifacts.}
+records 245 processed health snapshots over approximately 120.04 hours. At
+the final checkpoint, all four participants reported \texttt{doctor=0} and
+\texttt{peers=0}. Each participant also reported four controlled-group members
+and 78 controlled-topic messages. The four-node smoke requery evidence
+completed with status~0 from all participants, showing that deterministic
+smoke messages were visible after roster repair from the VPS, both containers,
+and the residential Pi.
 
-The quantitative measurements will cover delivery latency between agents,
-eventual message-count and Merkle-root agreement where the participating nodes
-can expose it, anti-entropy repair after controlled restarts, public-directory
-discovery success, open-invite redemption success, profile/display-name
-propagation, search result correctness, message-context jump correctness, and
-policy enforcement for rate and live-action limits. Operational logs should
-separate Pilot reachability failures from Entmoot roster, store, ESP, and
-policy failures.
+\begin{table}[t]
+\centering
+\caption{Final evaluation metrics.}
+\label{tab:evaluation-metrics}
+\begin{tabular}{lr}
+\toprule
+Metric & Value \\
+\midrule
+Duration & 120.04 h \\
+Processed health snapshots & 245 \\
+Final healthy participants & 4 / 4 \\
+Final controlled-group members & 4 \\
+Final controlled-topic messages & 78 \\
+Final transcript topics exported & 7 \\
+\bottomrule
+\end{tabular}
+\end{table}
 
-The qualitative analysis will study whether the agents use the moot as a
-shared memory: whether they cite previous messages accurately, whether search
-changes their answers, whether live replies remain on-topic, and whether human
-operators can reconstruct the discussion from web or iOS clients. The final
-Results section will be written only after these transcripts and metrics have
-been collected. Until then, this section is intentionally an evaluation plan,
-not evidence of completed live validation.
+Final transcript export from the local observer succeeded for all seven
+evaluation topics. The exported counts were: \texttt{eval/smoke} 25,
+\texttt{eval/pilot} 9, \texttt{eval/esp-boundary} 7,
+\texttt{eval/code-of-conduct} 7, \texttt{eval/benchmark-plan} 13,
+\texttt{eval/discovery-moderation} 11, and \texttt{eval/residential-edge} 2.
+The paper does not quote raw transcript content; the raw JSONL and rendered
+Markdown exports remain in the ignored evaluation artifact tree and in the
+final package checksums.
+
+The run also included a controlled recovery scenario: the Phobos Entmoot
+service was restarted, after which a scheduled checkpoint confirmed recovery.
+Later, the dominant operational incident was not an Entmoot store or roster
+failure but intermittent ZeroTier/SSH reachability for direct Phobos monitor
+capture. In the processed health table, Phobos had 101 rows with
+\texttt{doctor=0}, 102 rows with \texttt{peers=0}, and 144 rows where either
+\texttt{doctor} or \texttt{peers} failed; the sequence contained 122
+health-state transitions. The final checkpoint recovered to healthy
+\texttt{doctor} and \texttt{peers} status on Phobos, and reachable participants
+continued to report the same four-member, 78-message controlled-group state.
+
+These results support a bounded claim: Entmoot operated as a multi-runtime
+social-message substrate across heterogeneous nodes for five days, produced
+inspectable monitoring and transcript artifacts, and recovered from a
+controlled service restart. The run does not prove continuous residential-edge
+reachability, low-latency delivery under all network conditions, or large-scale
+public-room behavior.
 
 % === 7. Discussion and Limitations ===
 \section{Discussion and Limitations}
@@ -1244,14 +1292,13 @@ Agent Skills plus plugin packaging. This is stronger than a paper design: the
 system is usable software with concrete CLI, daemon, ESP, web, and mobile
 interfaces.
 
-The main unproven claim is behavioral. Entmoot provides the substrate for
-autonomous agents to discover one another, remember prior discussion, and
-participate in public or private moots, but this draft does not yet show that
-agents use that substrate well in a sustained multi-agent setting. The
-evaluation plan in Section~\ref{sec:evaluation} is therefore part of the
-paper's contribution boundary: final claims about deliberation quality,
-transcript usefulness, live-reply behavior, and collaborative improvement must
-wait for collected transcripts and metrics.
+The evaluation in Section~\ref{sec:evaluation} answers the narrower systems
+question: can Entmoot keep a heterogeneous group of agent runtimes observable,
+queryable, and recoverable over a multi-day window? It does not fully answer
+the behavioral question of whether agents use shared history well enough to
+produce high-quality deliberation or collaborative improvement. The run
+produced transcripts and aggregate counts, but this paper intentionally avoids
+claiming qualitative success beyond what the saved artifacts support.
 
 The ESP boundary is another central tradeoff. The ESP makes Entmoot usable
 from web and mobile clients, provides public directory indexing, and gives
@@ -1288,6 +1335,7 @@ This matches the current social-chat goal, but it limits the protocol's use as
 a hard security boundary for high-stakes coordination.
 
 Finally, the implementation is not yet a large-scale public network. The
+five-day evaluation covered four participants in one controlled moot. The
 design uses bounded gossip, Merkle roots, and anti-entropy repair, but the
 paper still lacks measurements for many simultaneous moots, many service
 peers, high-churn public rooms, large media histories, and many clients
@@ -1300,12 +1348,13 @@ directory-level reputation.
 \section{Future Work}
 \label{sec:future}
 
-The first future item is the planned live evaluation. We need transcripts,
-latency measurements, convergence checks, search/context-jump checks, and
-operator observations from multiple autonomous agents participating in The Ent
-Moot, Mars Hub, and a controlled experiment moot. That experiment should
-produce the final Results section rather than treating operational anecdotes as
-evidence.
+The first future item is a broader live evaluation. The five-day controlled run
+reported here produced final transcripts, monitoring data, and recovery
+evidence, but did not measure every behavior originally planned. Future studies
+should add explicit latency measurements, Merkle-root convergence checks,
+search/context-jump correctness checks, richer transcript coding, and
+operator observations from multiple autonomous agents participating in public
+and operational moots as well as controlled experiment moots.
 
 A second direction is multi-ESP operation. Public descriptors already separate
 signed discovery metadata from ESP-local directory state, which makes it
@@ -1349,9 +1398,12 @@ that gap with a Layer-2 protocol that requires only what Pilot already
 provides: encrypted unicast tunnels and a pairwise trust system. The reference
 implementation turns that protocol into usable infrastructure: private and
 public moots, signed policies, ESP-backed clients, searchable history, and
-agent-facing skill/plugin packaging. The remaining question is empirical: once
-agents can join shared rooms and remember their conversations, what kinds of
-social organization do they build?
+agent-facing skill/plugin packaging. A five-day evaluation shows that this
+infrastructure can sustain a small heterogeneous agent moot, produce final
+doctor/peer and transcript evidence, and recover from controlled disruption,
+while also revealing residential-edge reachability as a practical limit. The
+remaining empirical question is social: once agents can join shared rooms and
+remember their conversations, what kinds of organization do they build?
 
 % === Bibliography ===
 \bibliographystyle{plainnat}
