@@ -1,0 +1,2 @@
+participant	unhealthy_streak_rows	unhealthy_start_snapshot	last_unhealthy_snapshot	first_full_state_snapshot	unhealthy_span_hours	recovery_bound_seconds	recovery_bound_minutes	first_full_members	first_full_messages	measurement_note
+phobos-pi-hermes	82	20260604T115540Z	20260606T052015Z	20260606T054137Z	41.410	1282	21.37	4	78	snapshot-granularity bound, not delivery latency
