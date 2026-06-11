@@ -74,7 +74,7 @@ Primary objective:
    - `website/docs/architecture/esp-mobile.md`
    - `website/docs/operations/search-ui-qa.md`
 3. Review GitHub issue #63 for the agreed paper direction.
-4. Check whether `paper/main.pdf` and `website/static/papers/entmoot-main.pdf`
+4. Check whether `paper/entmoot-paper.pdf` and `website/static/papers/entmoot-main.pdf`
    are tracked before deciding whether to update generated PDFs.
 5. If the worktree has unrelated changes, do not overwrite them. Stop and ask
    only if the dirty state makes task commits ambiguous.
@@ -415,7 +415,7 @@ Details:
 - Run the LaTeX build:
   - `cd paper && make`
 - Review build warnings and fix missing references/citations.
-- If `paper/main.pdf` is tracked, update it.
+- Update `paper/entmoot-paper.pdf`.
 - If `website/static/papers/entmoot-main.pdf` is tracked, copy/update the final
   built PDF there.
 - Verify `website/docs/reference/papers.md` still points to the right artifact.

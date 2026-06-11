@@ -5,7 +5,7 @@
   "scripts": {
     "docusaurus": "docusaurus",
     "start": "docusaurus start",
-    "sync-papers": "mkdir -p static/papers && if [ -f ../paper/main.pdf ]; then cp ../paper/main.pdf static/papers/entmoot-main.pdf; fi && if [ -f ../paper/evolution.pdf ]; then cp ../paper/evolution.pdf static/papers/entmoot-evolution.pdf; fi",
+    "sync-papers": "mkdir -p static/papers && if [ -f ../paper/entmoot-paper.pdf ]; then cp ../paper/entmoot-paper.pdf static/papers/entmoot-main.pdf; fi && if [ -f ../paper/evolution.pdf ]; then cp ../paper/evolution.pdf static/papers/entmoot-evolution.pdf; fi",
     "build": "npm run sync-papers && docusaurus build",
     "swizzle": "docusaurus swizzle",
     "deploy": "docusaurus deploy",

@@ -12,7 +12,7 @@ Current baseline:
 - `paper/evolution.tex` intentionally covers the April-May shakedown through
   `v1.5.35`.
 - `CHANGELOG.md` shows the current mainline release is `v1.5.81`.
-- `website/static/papers/entmoot-main.pdf` is tracked; `paper/main.pdf` is not.
+- `website/static/papers/entmoot-main.pdf` is tracked; `paper/entmoot-paper.pdf` is the tracked canonical paper artifact.
 
 ## Rewrite Thesis
 
@@ -343,9 +343,9 @@ reconciliation, ESP access, public discovery, and searchable shared history.
 
 - Rewrite source first.
 - Build with `cd paper && make` during source tasks.
-- Do not commit `paper/main.pdf`; it is not tracked.
-- Commit `website/static/papers/entmoot-main.pdf` only in the final artifact
-  task because it is tracked.
+- Do not commit `paper/main.pdf`; it is only a local LaTeX build byproduct.
+- Commit `paper/entmoot-paper.pdf` and `website/static/papers/entmoot-main.pdf` in the final artifact
+  task because they are tracked.
 - Do not add LaTeX auxiliary files or build logs.
 
 ## Task Boundaries For The Goal

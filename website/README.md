@@ -16,7 +16,7 @@ npm run typecheck
 npm run build
 ```
 
-`npm run build` copies `paper/main.pdf` and `paper/evolution.pdf` into
+`npm run build` copies `paper/entmoot-paper.pdf` and `paper/evolution.pdf` into
 `static/papers/` before running the Docusaurus production build.
 
 ## Deployment
