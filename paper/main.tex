@@ -133,16 +133,17 @@ Our contributions are as follows.
 \end{enumerate}
 
 The rest of the paper is organized as follows. Section~\ref{sec:background}
-summarizes Pilot Protocol and positions related work. Section~\ref{sec:design}
-describes Entmoot's group model, gossip strategy, reconciliation path, ESP
-boundary, and security posture. Section~\ref{sec:implementation} discusses the
-current implementation. Section~\ref{sec:usecases} presents target use cases,
-and Section~\ref{sec:evaluation} reports the live multi-agent evaluation.
-Section~\ref{sec:discussion} discusses limitations, Section~\ref{sec:future}
-summarizes future work, and Section~\ref{sec:conclusion} concludes.
+positions Entmoot against Pilot, pub/sub, social, gossip, and log-repair
+systems. Section~\ref{sec:model} defines the system model and trust
+boundaries. Sections~\ref{sec:design} and~\ref{sec:implementation} describe
+the protocol and implementation. Sections~\ref{sec:evaluation}
+and~\ref{sec:results} separate the evaluation method from the results.
+Sections~\ref{sec:discussion},~\ref{sec:limitations},
+and~\ref{sec:artifacts} discuss the implications, limits, and artifact
+record before the future-work and conclusion sections.
 
-% === 2. Background ===
-\section{Background}
+% === 2. Background and Related Work ===
+\section{Background and Related Work}
 \label{sec:background}
 
 \subsection{Pilot Protocol}
@@ -176,8 +177,9 @@ established, nodes may open a reliable byte stream to each other on any
 port. Under the hood, Pilot runs a TCP-equivalent reliable-delivery
 protocol with X25519 key exchange~\citep{rfc7748} and AES-256-GCM
 authenticated encryption~\citep{nist80038d} per tunnel, the same
-primitives that underlie WireGuard~\citep{donenfeld2017wireguard}. The bytes that carry a tunnel move through a
-pluggable transport layer: UDP is the default byte-mover and is what
+primitives that underlie WireGuard~\citep{donenfeld2017wireguard}. The bytes
+that carry a tunnel move through a pluggable transport layer: UDP is the
+default byte-mover and is what
 UDP-capable peers use end-to-end, but the fork we build against also
 ships a TCP transport that a public-IP daemon can expose alongside UDP
 so peers on UDP-hostile networks (restrictive corporate firewalls,
@@ -272,40 +274,20 @@ slow starts. We cite Kademlia~\citep{maymounkov2002kademlia} as a comparison
 point for structured peer-to-peer overlays, but Entmoot does not use a DHT;
 peer eligibility comes from the signed roster and Pilot trust.
 
-\begin{figure}[t]
+\begin{figure*}[t]
 \centering
-\begin{tikzpicture}[
-  font=\footnotesize,
-  every node/.style={draw, rounded corners=1pt, align=center,
-                     inner sep=3pt, minimum height=6mm},
-  box/.style={minimum width=62mm},
-]
-\node[box, fill=gray!5]  (cli)   {Agents, CLI, web, and mobile clients};
-\node[box, fill=gray!5, below=1mm of cli]  (csock)
-     {{\scriptsize control socket or ESP HTTP API}};
-\node[box, fill=gray!20, below=1mm of csock]   (ent)
-     {\textbf{entmootd} group service\\
-      {\scriptsize roster $\cdot$ policy $\cdot$ store $\cdot$ gossip $\cdot$ merkle $\cdot$ ESP}};
-\node[box, fill=gray!5, below=1mm of ent]   (psock)
-     {{\scriptsize Pilot IPC socket}};
-\node[box, fill=gray!20, below=1mm of psock]  (pilot)
-     {\textbf{Pilot daemon}\\
-      {\scriptsize identity $\cdot$ trust $\cdot$ tunnels $\cdot$ NAT}};
-\node[box, fill=gray!5, below=1mm of pilot] (net)
-     {UDP over IP};
-\end{tikzpicture}
-\caption{System stack and multi-process layout. A long-running
-\texttt{entmootd} process owns group state and the Pilot connection.
-Agent and CLI clients use a local control socket; web and mobile clients
-use an ESP HTTP projection. Entmoot reaches peers by opening Pilot
-streams on port~1004, with the Pilot daemon providing identity, trust,
-and transport encryption.}
+\includegraphics[width=0.86\textwidth]{system-stack.pdf}
+\caption{System stack and trust boundary. A long-running \texttt{entmootd}
+process owns signed group state and talks to Pilot through IPC. Local agents
+use a control socket; web and mobile clients use the ESP projection. Pilot
+provides identity, trust, NAT traversal, and encrypted streams, while Entmoot
+adds signed group semantics above those streams.}
 \label{fig:architecture}
-\end{figure}
+\end{figure*}
 
-% === 3. Design ===
-\section{Design}
-\label{sec:design}
+% === 3. System Model and Goals ===
+\section{System Model and Goals}
+\label{sec:model}
 
 \subsection{Design goals and trust boundaries}
 
@@ -384,6 +366,16 @@ when no profile is known, or as a hostname-aware display name when signed
 profile data is available. Profiles are hints bound to roster keys, not
 membership authority.
 
+\begin{figure*}[t]
+\centering
+\includegraphics[width=0.82\textwidth]{moot-state.pdf}
+\caption{Entmoot separates signed group truth from ESP-local convenience
+state. Roster entries, messages, policies, descriptors, and profiles are
+verifiable by members. Sessions, mailbox cursors, search indexes, directory
+rows, and push preferences make clients usable but cannot forge group state.}
+\label{fig:mootstate}
+\end{figure*}
+
 \subsection{Membership, policy, and visibility}
 
 The roster remains the membership source of truth. Roster operations are
@@ -419,6 +411,21 @@ whether an agent may respond, on which topics, and within what local budget.
 Fleet and task workflows are disabled by default and are treated as optional
 application conventions above the social-chat layer, not as core Entmoot
 semantics.
+
+The same model supports several concrete uses without changing the protocol.
+Public agent communities can publish signed descriptors so agents discover a
+moot without granting an ESP authority over messages. Private workrooms can
+replicate signed history among a small set of trusted members and move between
+ESPs if a service peer disappears. Searchable group memory lets agents recover
+prior policy decisions, deployment notes, and research arguments with lexical
+search and message-context windows. Human-observable agent rooms use the ESP
+projection to expose public moots, profiles, live-agent state, and history to
+web or mobile clients that do not run Pilot. Optional coordination workflows
+can live above this substrate, but the default system remains social chat.
+
+% === 4. Design ===
+\section{Design}
+\label{sec:design}
 
 \subsection{Wire protocol}
 
@@ -457,6 +464,16 @@ default public-moot descriptor. In all cases, the local node verifies signed
 metadata before accepting group state. After it has a group id, founder
 identity, roster head, and at least one bootstrap hint, it exercises a
 three-tier peer strategy, tried in order:
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=0.82\textwidth]{join-flow.pdf}
+\caption{Join and initial synchronization flow. A joiner verifies the signed
+descriptor or invite, establishes or reuses Pilot trust, fetches signed roster
+state from a bootstrap member, pulls metadata snapshots, and reconciles any
+missing message history before treating the local store as caught up.}
+\label{fig:joinflow}
+\end{figure*}
 
 \begin{enumerate}
     \item \textbf{Descriptor or invite bootstrap peers (primary).} The joiner
@@ -1152,48 +1169,8 @@ sync/errgroup} for the bounded parallel fanout
 (\S\ref{sec:gossip}), and \texttt{modernc.org/sqlite} for the pure-Go
 SQLite backend.
 
-% === 5. Use Cases ===
-\section{Use Cases}
-\label{sec:usecases}
-
-Entmoot is useful wherever agents need a shared social room rather than a
-single request-response channel. The first use case is a public agent
-community. A founder can publish a signed public descriptor, optionally attach
-an open invite, and let agents discover the moot through an ESP directory
-without making that ESP a member or message host. This gives agent operators a
-way to create public commons such as The Ent Moot while preserving the
-distinction between discovery, membership, and live-reply consent.
-
-The second use case is a private workroom. A team of agents can create a
-private or unlisted moot, add members by targeted invite, and keep group
-history replicated among the members that need it. The same policy mechanism
-can choose conservative defaults for a public room or relaxed throughput for a
-high-trust private room. Because roster state and messages are signed, a
-workroom can move between ESPs or continue through intermittent service-peer
-availability without changing the group identity.
-
-The third use case is persistent searchable memory. Agents often need to
-recover what a group already discussed: policy decisions, deployment notes,
-research arguments, or links to prior code reviews. Entmoot stores signed
-messages locally, indexes message text lexically with SQLite FTS5, and exposes
-message-context windows so a search result can be opened in normal
-conversation order. The mailbox cursor remains durable read-progress state,
-not a side effect of search or investigation.
-
-The fourth use case is a human-observable agent social network. Web and iOS
-clients can show public moots, member display names, live-agent state, and
-searchable history through the ESP projection without requiring a phone or
-browser to run Pilot. This makes multi-agent discussions inspectable by human
-operators while keeping authoring keys and group authority outside the ESP.
-
-Finally, Entmoot can host optional coordination conventions. Fleet, task, and
-agent-command workflows are still available for operators who explicitly enable
-them, but they are not the default product shape. In the mainline social-chat
-model, a live agent joins a moot, listens to topics, and replies only when the
-owner has enabled an appropriate live mode.
-
-% === 6. Evaluation Results ===
-\section{Evaluation Results}
+% === 6. Evaluation Method ===
+\section{Evaluation Method}
 \label{sec:evaluation}
 
 We ran a controlled five-day live evaluation from
@@ -1223,6 +1200,32 @@ Label & Role & Deployment \\
 \end{tabular}
 \end{table*}
 
+\begin{figure*}[t]
+\centering
+\includegraphics[width=0.84\textwidth]{evaluation-pipeline.pdf}
+\caption{Evaluation evidence pipeline. Each participant contributed health,
+smoke-query, transcript, or recovery evidence into the analysis tables and
+final run package. The package and checksum record are treated as part of the
+evaluation result because they make the run independently inspectable.}
+\label{fig:evaluationpipeline}
+\end{figure*}
+
+The evaluation used topic-scoped ordinary group messages rather than a task
+or fleet orchestrator. The controlled topics covered smoke anchors, Pilot
+observations, ESP boundary discussion, code-of-conduct discussion, benchmark
+planning, discovery/moderation tradeoffs, and residential-edge observations.
+The collection process saved periodic \texttt{doctor} and \texttt{peers}
+snapshots, controlled smoke publish/query checks, daily summaries, recovery
+evidence, final transcript exports, and a checksumed package. We evaluated
+four questions: whether all participants could reach a common final group
+state, whether health and route diagnostics stayed observable over five days,
+whether a controlled service restart recovered, and whether the resulting
+artifacts were complete enough to support a paper claim.
+
+% === 7. Evaluation Results ===
+\section{Evaluation Results}
+\label{sec:results}
+
 The final artifact package\footnote{The package is under
 \path{artifacts/evaluation/packages/}; the exact package name and checksum
 verification are recorded in the run's final summary artifacts.}
@@ -1236,6 +1239,7 @@ and the residential Pi.
 
 \begin{table}[t]
 \centering
+\small
 \caption{Final evaluation metrics.}
 \label{tab:evaluation-metrics}
 \begin{tabular}{lr}
@@ -1243,14 +1247,36 @@ and the residential Pi.
 Metric & Value \\
 \midrule
 Duration & 120.04 h \\
-Processed health snapshots & 245 \\
-Final healthy participants & 4 / 4 \\
-Final controlled-group members & 4 \\
-Final controlled-topic messages & 78 \\
-Final transcript topics exported & 7 \\
+Health snapshots & 245 \\
+Final healthy nodes & 4 / 4 \\
+Final members & 4 \\
+Final messages & 78 \\
+Transcript topics & 7 \\
+Raw artifacts & 55M \\
+Final package & 57M \\
+Packaged files & 16,715 \\
+Checksums & \texttt{status=ok} \\
 \bottomrule
 \end{tabular}
 \end{table}
+
+\begin{table*}[t]
+\centering
+\small
+\caption{Operational health across processed snapshots. A fully healthy row
+has both \texttt{doctor=0} and \texttt{peers=0}.}
+\label{tab:evaluation-health}
+\begin{tabular}{lrrll}
+\toprule
+Participant & Healthy rows & Rate & Longest healthy & Longest unhealthy \\
+\midrule
+\texttt{local-vps} & 243 / 245 & 99.2\% & -- & -- \\
+\texttt{hermes-container} & 244 / 245 & 99.6\% & -- & -- \\
+\texttt{deimos-openclaw-container} & 244 / 245 & 99.6\% & -- & -- \\
+\texttt{phobos-pi-hermes} & 101 / 245 & 41.2\% & 38 rows & 82 rows \\
+\bottomrule
+\end{tabular}
+\end{table*}
 
 Final transcript export from the local observer succeeded for all seven
 evaluation topics. The exported counts were: \texttt{eval/smoke} 25,
@@ -1268,19 +1294,30 @@ failure but intermittent ZeroTier/SSH reachability for direct Phobos monitor
 capture. In the processed health table, Phobos had 101 rows with
 \texttt{doctor=0}, 102 rows with \texttt{peers=0}, and 144 rows where either
 \texttt{doctor} or \texttt{peers} failed; the sequence contained 122
-health-state transitions. The final checkpoint recovered to healthy
+health-state transitions. Its longest healthy streak ran for 38 processed
+rows, from 20260603T215636Z through 20260604T112509Z; its longest unhealthy
+streak ran for 82 rows, from 20260604T115540Z through 20260606T052015Z. In
+contrast, the VPS and container participants were fully healthy in at least
+99.2\% of processed rows. The final checkpoint recovered to healthy
 \texttt{doctor} and \texttt{peers} status on Phobos, and reachable participants
 continued to report the same four-member, 78-message controlled-group state.
+
+The artifact package is part of the result rather than only a byproduct: the
+raw run directory was 55M, the final package was 57M, and checksum verification
+covered 16,715 packaged files with \texttt{status=ok}. This makes the run
+auditable at the level of health snapshots, daily summaries, transcript
+exports, recovery evidence, and final issue-tracker notes without publishing
+raw transcript content in the paper.
 
 These results support a bounded claim: Entmoot operated as a multi-runtime
 social-message substrate across heterogeneous nodes for five days, produced
 inspectable monitoring and transcript artifacts, and recovered from a
 controlled service restart. The run does not prove continuous residential-edge
-reachability, low-latency delivery under all network conditions, or large-scale
-public-room behavior.
+reachability, latency bounds, delivery under all network conditions, or
+large-scale public-room behavior.
 
-% === 7. Discussion and Limitations ===
-\section{Discussion and Limitations}
+% === 8. Discussion ===
+\section{Discussion}
 \label{sec:discussion}
 
 Entmoot demonstrates that Pilot's pairwise trust and encrypted streams are
@@ -1334,17 +1371,61 @@ members, nor does it provide quorum governance for disputed founder actions.
 This matches the current social-chat goal, but it limits the protocol's use as
 a hard security boundary for high-stakes coordination.
 
-Finally, the implementation is not yet a large-scale public network. The
-five-day evaluation covered four participants in one controlled moot. The
-design uses bounded gossip, Merkle roots, and anti-entropy repair, but the
-paper still lacks measurements for many simultaneous moots, many service
-peers, high-churn public rooms, large media histories, and many clients
-searching through the same ESP. Those measurements are especially important
-because agent communities can become noisy: a small public moot may behave
-like chat, while a popular one may need moderation queues, spam controls, and
-directory-level reputation.
+% === 9. Limitations and Threats to Validity ===
+\section{Limitations and Threats to Validity}
+\label{sec:limitations}
 
-% === 8. Future Work ===
+The implementation is not yet a large-scale public network. The five-day
+evaluation covered four participants in one controlled moot: a VPS, two
+container runtimes, and one residential Raspberry Pi. That heterogeneity is
+useful, but it is still a small sample. The design uses bounded gossip, Merkle
+roots, and anti-entropy repair, but the paper lacks measurements for many
+simultaneous moots, many service peers, high-churn public rooms, large media
+histories, and many clients searching through the same ESP.
+
+The run measured operational health and final state more directly than
+latency. It saved timestamped snapshots and transcripts, but this paper does
+not report a propagation-latency distribution, per-message recovery latency,
+or root-by-root convergence timeline. Future runs should instrument publish,
+first receipt, query visibility, Merkle-root agreement, and search/context
+correctness as first-class metrics rather than reconstructing them from logs.
+
+The transcript evidence is also bounded. Final export was from the local
+observer, and the live structured prompt rounds were concentrated early in the
+run. The saved transcripts prove that topic-scoped messages were present and
+exportable; they do not prove broad deliberation quality, stable long-horizon
+memory use, or agent consensus formation across arbitrary conversations.
+Qualitative claims should therefore be treated as examples for future coding,
+not as results of this paper.
+
+Residential-edge instability is a strength and a limit. Phobos exposed route
+and monitor reachability churn that a cloud-only deployment would have hidden,
+but it also means the experiment does not establish continuous edge uptime.
+The final checkpoint recovered and the reachable participants agreed on the
+controlled-group state, yet the run does not prove delivery under all network
+conditions or the absence of edge-local data gaps during unreachable periods.
+
+% === 10. Artifacts and Reproducibility ===
+\section{Artifacts and Reproducibility}
+\label{sec:artifacts}
+
+The raw evaluation tree is intentionally not committed because it can contain
+hostnames, node identifiers, logs, transcripts, and operational metadata. The
+final package is recorded under \path{artifacts/evaluation/packages/} with a
+checksum file, a verification record, daily summaries, analysis tables, final
+transcript exports, recovery evidence, and issue-tracker notes. The package
+size was 57M, contained 16,715 files, and verified with
+\texttt{status=ok}. The paper quotes aggregate counts and operational facts
+from those artifacts rather than raw transcript content.
+
+The reproducibility boundary is therefore inspectability rather than a public
+benchmark release. A future artifact-badged release should publish a sanitized
+package, the scripts that generated the analysis tables, exact runtime
+versions, and a replayable subset of transcripts or synthetic equivalents.
+This paper keeps the private run evidence available locally and uses the final
+checksums to make accidental drift detectable.
+
+% === 11. Future Work ===
 \section{Future Work}
 \label{sec:future}
 

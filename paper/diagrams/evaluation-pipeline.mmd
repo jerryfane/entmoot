@@ -1,0 +1,20 @@
+%%{init: {"theme": "base", "themeVariables": {"fontFamily": "Arial", "primaryColor": "#f6f7f8", "primaryBorderColor": "#5d6670", "lineColor": "#4a5560", "secondaryColor": "#eef4ff", "tertiaryColor": "#f8f1e9"}}}%%
+flowchart LR
+  subgraph Nodes["Evaluation participants"]
+    VPS["local-vps"]
+    H["hermes-container"]
+    D["deimos-openclaw-container"]
+    P["phobos-pi-hermes"]
+  end
+
+  Nodes --> SNAP["245 health snapshots"]
+  Nodes --> SMOKE["smoke publish / query evidence"]
+  Nodes --> TRANS["topic transcript export"]
+  Nodes --> REC["recovery evidence"]
+
+  SNAP --> ANALYSIS["analysis tables"]
+  SMOKE --> ANALYSIS
+  TRANS --> FINAL["final run summary"]
+  REC --> FINAL
+  ANALYSIS --> PACKAGE["final package + checksums"]
+  FINAL --> PACKAGE
