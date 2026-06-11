@@ -9,6 +9,7 @@
 \usepackage{graphicx}
 \usepackage{xcolor}
 \usepackage{listings}
+\usepackage{needspace}
 \usepackage{url}
 \usepackage[numbers]{natbib}
 \usepackage[hidelinks]{hyperref}
@@ -297,8 +298,6 @@ peer eligibility comes from the signed roster and Pilot trust.
 \draw[arrow] (ent.south) -- (pilot.north);
 \draw[arrow] (pilot.south) -- (remote.north);
 \draw[arrow] (ent.east) -- (truth.west);
-\draw[arrow, dashed] (truth.south west) -- ++(-0.7,-0.45)
-  -- ++(-2.8,0) -- (ent.south east);
 \end{tikzpicture}
 \caption{System stack and trust boundary. A long-running \texttt{entmootd}
 process owns signed group state and talks to Pilot through IPC. Local agents
@@ -1033,6 +1032,7 @@ social chat layer remains the default product shape.
 The Pilot adapter implements a small transport interface that gossip
 uses internally:
 
+\Needspace{14\baselineskip}
 \begin{lstlisting}[language=Go,basicstyle=\ttfamily\scriptsize]
 type Transport interface {
     Dial(ctx context.Context,
