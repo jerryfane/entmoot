@@ -32,7 +32,7 @@ import (
 // by the founder identity; every member is added via Apply so roster state
 // is identical across nodes without a real bootstrap flow.
 type fixture struct {
-	t *testing.T
+	t testing.TB
 
 	groupID    entmoot.GroupID
 	founder    *keystore.Identity
@@ -268,7 +268,7 @@ func (t rosterStallTransport) Dial(ctx context.Context, peer entmoot.NodeID) (ne
 // first NodeID is treated as the founder. Every node gets its own Roster log
 // and its own Memory store, but they all share a single in-memory hub, so
 // any node can Dial any other.
-func newFixture(t *testing.T, nodeIDs []entmoot.NodeID) *fixture {
+func newFixture(t testing.TB, nodeIDs []entmoot.NodeID) *fixture {
 	t.Helper()
 
 	// Group id: deterministic per-test so log output is readable.
@@ -521,7 +521,7 @@ func (f *fixture) signedInlineGossip(relay entmoot.NodeID, msg entmoot.Message) 
 
 // waitUntil polls fn at a small interval until it returns true or timeout
 // elapses. Returns true on success and fails the test with msg on timeout.
-func waitUntil(t *testing.T, timeout time.Duration, msg string, fn func() bool) {
+func waitUntil(t testing.TB, timeout time.Duration, msg string, fn func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for {
