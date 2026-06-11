@@ -592,7 +592,7 @@ func (f *fixture) buildMemberProfileAd(author entmoot.NodeID, seq uint64, hostna
 	return buildMemberProfileAdForIdentity(f.t, f.groupID, ns.id, ns.info, seq, hostname, ts)
 }
 
-func buildMemberProfileAdForIdentity(t *testing.T, groupID entmoot.GroupID, id *keystore.Identity, info entmoot.NodeInfo, seq uint64, hostname string, ts time.Time) wire.MemberProfileAd {
+func buildMemberProfileAdForIdentity(t testing.TB, groupID entmoot.GroupID, id *keystore.Identity, info entmoot.NodeInfo, seq uint64, hostname string, ts time.Time) wire.MemberProfileAd {
 	t.Helper()
 	ad := wire.MemberProfileAd{
 		GroupID:  groupID,

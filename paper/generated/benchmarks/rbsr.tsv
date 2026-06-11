@@ -1,0 +1,6 @@
+shared_ids	extra_ids	rounds	missing_at_a	missing_at_b	frame_bytes	bytes_per_extra	ranges_sent	id_list_entries	fingerprint_ranges
+1000	0	2	0	0	326	0.000	2	0	1
+1000	1	3	1	0	10490	10490.000	65	7	33
+1000	10	3	10	0	42909	4290.900	260	48	129
+1000	100	3	100	0	117274	1172.740	615	439	273
+1000	1000	3	1000	0	217653	217.653	782	1992	273

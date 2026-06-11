@@ -1,0 +1,4 @@
+nodes	trust_degree	messages	expected_deliveries	delivered	lost	loss_rate	p50_ms	p90_ms	p95_ms	p99_ms	unique_puts	duplicate_puts	duplicate_ratio
+50	6	1	50	50	0	0.000000	13.389	20.279	21.889	28.270	50	53	1.060000
+100	6	1	100	100	0	0.000000	29.816	37.584	39.686	41.750	100	55	0.550000
+300	6	1	300	300	0	0.000000	48.587	92.428	92.433	96.700	300	88	0.293333
