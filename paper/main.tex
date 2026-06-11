@@ -144,6 +144,9 @@ Our contributions are as follows.
     \item A five-day empirical evaluation that measures multi-runtime
     monitoring, controlled-topic delivery, transcript export, and
     convergence-after-partition behavior across heterogeneous agent runtimes.
+    \item A lab-scale in-memory benchmark harness, following the GossipSub
+    evaluation template's focus on delivery distribution, duplicate delivery,
+    loss, repair bandwidth, and join catch-up~\citep{vyzovitis2020gossipsub}.
 \end{enumerate}
 
 The rest of the paper is organized as follows. Section~\ref{sec:background}
@@ -1442,7 +1445,7 @@ per-message latency trace.}
 \label{fig:convergence-timeline}
 \end{figure*}
 
-\begin{table}[t]
+\begin{table*}[t]
 \centering
 \small
 \caption{Final evaluation metrics.}
@@ -1463,7 +1466,7 @@ Packaged files & 16,715 \\
 Checksums & \texttt{status=ok} \\
 \bottomrule
 \end{tabular}
-\end{table}
+\end{table*}
 
 \begin{table*}[t]
 \centering
@@ -1529,6 +1532,100 @@ inspectable monitoring and transcript artifacts, and recovered from a
 controlled service restart. The run does not prove continuous residential-edge
 reachability, latency bounds, delivery under all network conditions, or
 large-scale public-room behavior.
+
+\subsection{Lab-Scale Protocol Benchmarks}
+\label{sec:lab-benchmarks}
+
+To complement the live run, we added a reproducible in-memory benchmark
+harness at \path{src/cmd/entmoot-protocol-bench}. The harness uses the
+production \texttt{NewMemTransports()} test transport, the real gossip,
+roster, store, signature, and RBSR code paths, and writes derived TSVs under
+\path{paper/generated/benchmarks/}. The broadcast experiment models a
+connected pairwise-trust overlay as a symmetric degree-6 ring, sends one
+first-broadcast message per network size, and records first visibility at
+each store. The reported delay is therefore an in-process protocol benchmark,
+not Pilot daemon, Internet, TURN, or residential-edge latency.
+
+\begin{table*}[t]
+\centering
+\small
+\caption{In-memory first-broadcast benchmark on degree-6 trust overlays.
+RMR is duplicate \texttt{Put} attempts divided by unique accepted messages;
+loss is missing store visibility before the harness timeout.}
+\label{tab:lab-broadcast}
+\begin{tabular}{rrrrrrrr}
+\toprule
+Nodes & Deliveries & Loss & p50 ms & p90 ms & p95 ms & p99 ms & RMR \\
+\midrule
+50 & 50 / 50 & 0.000 & 13.389 & 20.279 & 21.889 & 28.270 & 1.060 \\
+100 & 100 / 100 & 0.000 & 29.816 & 37.584 & 39.686 & 41.750 & 0.550 \\
+300 & 300 / 300 & 0.000 & 48.587 & 92.428 & 92.433 & 96.700 & 0.293 \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+Table~\ref{tab:lab-broadcast} gives the compact CDF summary requested by the
+GossipSub-style evaluation template: median, tail percentiles, duplicate
+delivery ratio, and loss. The zero-loss rows show that the current
+Plumtree-style first-broadcast path reaches all members in the connected
+degree-6 overlay up to 300 simulated members. The duplicate ratio is expected:
+the first broadcast begins with conservative eager peers and then self-prunes
+after duplicate arrivals. Later steady-state behavior after pruning is a
+separate workload and should be reported independently before making sustained
+throughput claims.
+
+\begin{table*}[t]
+\centering
+\small
+\caption{RBSR bandwidth versus one-sided symmetric difference. Each row starts
+from 1,000 shared IDs and adds the listed number of IDs only on peer B.}
+\label{tab:lab-rbsr}
+\begin{tabular}{rrrrr}
+\toprule
+Extra IDs & Rounds & Missing at A & Frame bytes & Bytes / extra \\
+\midrule
+0 & 2 & 0 & 326 & -- \\
+1 & 3 & 1 & 10,490 & 10,490.0 \\
+10 & 3 & 10 & 42,909 & 4,290.9 \\
+100 & 3 & 100 & 117,274 & 1,172.7 \\
+1,000 & 3 & 1,000 & 217,653 & 217.7 \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+Table~\ref{tab:lab-rbsr} exercises RBSR directly rather than via the live
+monitoring snapshots. The session converges in three rounds for all non-empty
+differences in this workload. Total frame bytes grow with the symmetric
+difference, while amortized bytes per missing ID fall as more missing IDs are
+packed into leaf ID-list ranges. This supports the paper's bounded claim that
+repair traffic tracks set difference more closely than full history size, but
+it is still a synthetic ID-set benchmark rather than a WAN measurement.
+
+\begin{table*}[t]
+\centering
+\small
+\caption{Join-triggered catch-up over in-memory transport. A new member joins,
+publishes one trigger message, and catches up with the founder's existing
+history via the normal reconcile/fetch path.}
+\label{tab:lab-join}
+\begin{tabular}{rrrrr}
+\toprule
+History & Join ms & Catch-up ms & Final messages & Lost \\
+\midrule
+0 & 0.858 & 100.961 & 1 & 0 \\
+100 & 0.779 & 101.264 & 101 & 0 \\
+1,000 & 0.895 & 379.244 & 1,001 & 0 \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+Table~\ref{tab:lab-join} separates roster join time from post-join history
+catch-up. Roster sync remains sub-millisecond in this local setup because it
+exchanges only the roster entries. History size appears in the catch-up phase:
+after the joiner publishes a trigger message, the normal reconcile/fetch path
+pulls the founder's existing history and reaches the expected final message
+count with zero missing messages for the measured 0, 100, and 1,000-message
+histories.
 
 % === 8. Discussion ===
 \section{Discussion}
@@ -1597,13 +1694,16 @@ roots, and anti-entropy repair, but the paper lacks measurements for many
 simultaneous moots, many service peers, high-churn public rooms, large media
 histories, and many clients searching through the same ESP.
 
-The run measured operational health and final state more directly than
-latency. It saved timestamped snapshots and transcripts, but this paper does
-not report a propagation-latency distribution, per-message recovery latency,
-or root-by-root Merkle convergence trace. The convergence timeline in
+The live run measured operational health and final state more directly than
+latency. It saved timestamped snapshots and transcripts, but it does not
+report a live propagation-latency distribution, per-message recovery latency,
+or root-by-root Merkle convergence trace. Section~\ref{sec:lab-benchmarks}
+adds local in-memory protocol measurements, but those numbers do not include
+Pilot daemon scheduling, Internet paths, TURN relay behavior, or
+residential-edge churn. The convergence timeline in
 Figure~\ref{fig:convergence-timeline} is reconstructed from monitoring
 snapshots and therefore bounds state visibility only at snapshot granularity.
-Future runs should instrument publish, first receipt, query visibility,
+Future live runs should instrument publish, first receipt, query visibility,
 Merkle-root agreement, and search/context correctness as first-class metrics
 rather than reconstructing them from logs.
 
@@ -1636,11 +1736,13 @@ size was 57M, contained 16,715 files, and verified with
 from those artifacts rather than raw transcript content.
 
 The reproducibility boundary is therefore inspectability rather than a public
-benchmark release. A future artifact-badged release should publish a sanitized
-package, the scripts that generated the analysis tables, exact runtime
-versions, and a replayable subset of transcripts or synthetic equivalents.
-This paper keeps the private run evidence available locally and uses the final
-checksums to make accidental drift detectable.
+benchmark release. The lab benchmark harness and generated TSVs are committed,
+but the five-day live artifacts remain private. A future artifact-badged
+release should publish a sanitized package, the scripts that generated the
+analysis tables, exact runtime versions, and a replayable subset of
+transcripts or synthetic equivalents. This paper keeps the private run
+evidence available locally and uses the final checksums to make accidental
+drift detectable.
 
 % === 11. Future Work ===
 \section{Future Work}
@@ -1649,7 +1751,7 @@ checksums to make accidental drift detectable.
 The first future item is a broader live evaluation. The five-day controlled run
 reported here produced final transcripts, monitoring data, and recovery
 evidence, but did not measure every behavior originally planned. Future studies
-should add explicit latency measurements, Merkle-root convergence checks,
+should add explicit live latency measurements, Merkle-root convergence checks,
 search/context-jump correctness checks, richer transcript coding, and
 operator observations from multiple autonomous agents participating in public
 and operational moots as well as controlled experiment moots.
