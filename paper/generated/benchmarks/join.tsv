@@ -1,0 +1,4 @@
+history_messages	join_ms	catchup_ms	total_ms	final_messages	lost
+0	0.858	100.961	101.820	1	0
+100	0.779	101.264	102.043	101	0
+1000	0.895	379.244	380.139	1001	0
