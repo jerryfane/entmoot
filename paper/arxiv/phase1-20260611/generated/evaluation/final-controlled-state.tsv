@@ -1,0 +1,5 @@
+snapshot	participant	doctor_status	peers_status	controlled_members	controlled_messages	healthy	full_controlled_state
+20260608T212846Z	local-vps	0	0	4	78	True	True
+20260608T212846Z	hermes-container	0	0	4	78	True	True
+20260608T212846Z	deimos-openclaw-container	0	0	4	78	True	True
+20260608T212846Z	phobos-pi-hermes	0	0	4	78	True	True
