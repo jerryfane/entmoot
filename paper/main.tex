@@ -280,26 +280,25 @@ peer eligibility comes from the signed roster and Pilot trust.
   font=\footnotesize,
   box/.style={draw, rounded corners=1pt, align=center,
               minimum height=8mm, inner sep=3pt},
-  stack/.style={box, minimum width=44mm, fill=gray!10},
-  state/.style={box, minimum width=35mm, fill=gray!5},
+  stack/.style={box, minimum width=43mm, fill=gray!10},
+  state/.style={box, minimum width=40mm, fill=gray!5},
   arrow/.style={-{Latex[length=1.8mm]}, thick},
-  note/.style={font=\scriptsize, align=center},
 ]
-\node[stack] (clients) at (0, 2.4) {CLI and local agents\\web and iOS clients};
-\node[stack, fill=gray!18] (ent) at (0, 1.0) {\textbf{entmootd}\\signed group service};
-\node[stack] (pilot) at (0, -0.4) {\textbf{Pilot daemon}\\identity, trust, NAT, streams};
-\node[stack] (remote) at (0, -1.8) {remote Pilot daemons\\remote \texttt{entmootd} peers};
+\node[stack] (clients) at (-4.4, 1.9) {CLI and local agents\\web and iOS clients};
+\node[state] (esp) at (-4.4, 0.45) {ESP projection\\HTTP, sessions, cursors};
+\node[stack, fill=gray!18] (ent) at (0.3, 0.45) {\textbf{entmootd}\\signed group service};
+\node[stack] (pilot) at (0.3, -1.05) {\textbf{Pilot daemon}\\identity, trust, NAT, streams};
+\node[stack] (remote) at (0.3, -2.55) {remote Pilot daemons\\remote \texttt{entmootd} peers};
+\node[state] (truth) at (5.7, 0.45) {signed moot state\\rosters, messages, policies};
 
-\node[state] (truth) at (5.1, 1.0) {signed moot state\\rosters, messages, policies};
-\node[state] (esp) at (-5.1, 1.0) {ESP projection\\HTTP, sessions, cursors};
-
-\draw[arrow] (clients) -- node[right, note] {control socket} (ent);
-\draw[arrow] (clients.west) -- ++(-1.2,0) |- node[left, note, pos=0.25] {HTTP} (esp.north);
-\draw[arrow] (esp) -- node[above, note] {sign requests\\history, search} (ent);
-\draw[arrow] (ent) -- node[right, note] {Pilot IPC} (pilot);
-\draw[arrow] (pilot) -- node[right, note] {encrypted streams} (remote);
-\draw[arrow] (ent) -- node[above, note] {verify/project} (truth);
-\draw[arrow, dashed] (truth) -- node[below, note] {portable truth} (ent);
+\draw[arrow] (clients.east) -- (ent.north west);
+\draw[arrow] (clients.south) -- (esp.north);
+\draw[arrow] (esp.east) -- (ent.west);
+\draw[arrow] (ent.south) -- (pilot.north);
+\draw[arrow] (pilot.south) -- (remote.north);
+\draw[arrow] (ent.east) -- (truth.west);
+\draw[arrow, dashed] (truth.south west) -- ++(-0.7,-0.45)
+  -- ++(-2.8,0) -- (ent.south east);
 \end{tikzpicture}
 \caption{System stack and trust boundary. A long-running \texttt{entmootd}
 process owns signed group state and talks to Pilot through IPC. Local agents
@@ -399,32 +398,26 @@ membership authority.
   signed/.style={item, fill=gray!12},
   local/.style={item, fill=gray!5},
   arrow/.style={-{Latex[length=1.8mm]}, thick},
+  note/.style={font=\scriptsize, align=center},
 ]
-\node[signed] (roster) at (0, 1.8) {roster\\and roles};
-\node[signed] (msgs) at (3.0, 1.8) {author-signed\\messages};
-\node[signed] (policy) at (6.0, 1.8) {founder-signed\\policies};
-\node[signed] (desc) at (1.5, 0.6) {public\\descriptors};
-\node[signed] (profile) at (4.5, 0.6) {member\\profiles};
+\node[signed] (roster) at (-3.7, 1.35) {roster\\and roles};
+\node[signed] (msgs) at (0, 1.35) {author-signed\\messages};
+\node[signed] (policy) at (3.7, 1.35) {founder-signed\\policies};
+\node[signed] (desc) at (-1.85, 0.25) {public\\descriptors};
+\node[signed] (profile) at (1.85, 0.25) {member\\profiles};
 
-\node[local] (sessions) at (0, -1.0) {device\\sessions};
-\node[local] (cursors) at (3.0, -1.0) {mailbox\\cursors};
-\node[local] (search) at (6.0, -1.0) {search\\index};
-\node[local] (dir) at (1.5, -2.2) {directory\\rows};
-\node[local] (push) at (4.5, -2.2) {push\\preferences};
+\node[local] (sessions) at (-3.7, -1.45) {device\\sessions};
+\node[local] (cursors) at (0, -1.45) {mailbox\\cursors};
+\node[local] (search) at (3.7, -1.45) {search\\index};
+\node[local] (dir) at (-1.85, -2.55) {directory\\rows};
+\node[local] (push) at (1.85, -2.55) {push\\preferences};
 
 \node[draw, rounded corners=2pt, fit=(roster)(msgs)(policy)(desc)(profile),
-      inner sep=4pt, label={[font=\scriptsize]above:Signed group state}] {};
+      inner sep=5pt, label={[font=\scriptsize]above:Signed group state}] {};
 \node[draw, rounded corners=2pt, fit=(sessions)(cursors)(search)(dir)(push),
-      inner sep=4pt, label={[font=\scriptsize]below:ESP-local projection}] {};
+      inner sep=5pt, label={[font=\scriptsize]below:ESP-local projection}] {};
 
-\draw[arrow] (roster) -- (msgs);
-\draw[arrow] (policy) -- (roster);
-\draw[arrow] (desc) -- (roster);
-\draw[arrow] (profile) -- (roster);
-\draw[arrow] (msgs) -- (search);
-\draw[arrow] (roster) -- (sessions);
-\draw[arrow] (desc) -- (dir);
-\draw[arrow, dashed] (search) -- node[right, font=\scriptsize] {cannot forge} (msgs);
+\draw[arrow] (0,-0.35) -- node[right, note] {projected views} (0,-0.95);
 \end{tikzpicture}
 \caption{Entmoot separates signed group truth from ESP-local convenience
 state. Roster entries, messages, policies, descriptors, and profiles are
@@ -531,20 +524,19 @@ three-tier peer strategy, tried in order:
                    fill=gray!10},
   arrow/.style={-{Latex[length=1.8mm]}, thick},
 ]
-\node[joinstep] (verify) at (0, 1.6) {verify signed\\invite/descriptor};
-\node[joinstep] (trust) at (3.7, 1.6) {establish or reuse\\Pilot trust};
-\node[joinstep] (roster) at (7.4, 1.6) {request signed\\roster};
-\node[joinstep] (apply) at (7.4, 0.1) {apply roster\\and policy checks};
-\node[joinstep] (snap) at (3.7, 0.1) {pull profile and\\transport snapshots};
-\node[joinstep] (sync) at (0, 0.1) {reconcile missing\\message history};
+\node[joinstep] (verify) at (0, 1.75) {verify signed\\invite/descriptor};
+\node[joinstep] (trust) at (3.9, 1.75) {establish or reuse\\Pilot trust};
+\node[joinstep] (roster) at (7.8, 1.75) {request signed\\roster};
+\node[joinstep] (apply) at (7.8, -0.15) {apply roster\\and policy checks};
+\node[joinstep] (snap) at (3.9, -0.15) {pull profile and\\transport snapshots};
+\node[joinstep] (sync) at (0, -0.15) {reconcile missing\\message history};
 
 \draw[arrow] (verify) -- (trust);
 \draw[arrow] (trust) -- (roster);
 \draw[arrow] (roster) -- (apply);
 \draw[arrow] (apply) -- (snap);
 \draw[arrow] (snap) -- (sync);
-\draw[arrow, dashed] (sync.west) -- ++(-0.7,0) |- node[left, font=\scriptsize]
-  {caught up} (verify.west);
+\draw[arrow, dashed] (sync.west) -- ++(-0.95,0) |- (verify.west);
 \end{tikzpicture}
 \caption{Join and initial synchronization flow. A joiner verifies the signed
 descriptor or invite, establishes or reuses Pilot trust, fetches signed roster
