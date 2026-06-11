@@ -110,6 +110,51 @@ def final_state(rows: list[dict[str, str]]) -> list[dict[str, object]]:
     return sorted(output, key=lambda r: PARTICIPANT_ORDER.index(str(r["participant"])))
 
 
+def longest_streak(
+    rows: list[dict[str, str]], predicate
+) -> tuple[int, str, str]:
+    best: list[dict[str, str]] = []
+    current: list[dict[str, str]] = []
+    for row in rows:
+        if predicate(row):
+            current.append(row)
+        else:
+            if len(current) > len(best):
+                best = current
+            current = []
+    if len(current) > len(best):
+        best = current
+    if not best:
+        return 0, "--", "--"
+    return len(best), best[0]["snapshot"], best[-1]["snapshot"]
+
+
+def health_streaks(rows: list[dict[str, str]]) -> list[dict[str, object]]:
+    output: list[dict[str, object]] = []
+    for participant in PARTICIPANT_ORDER:
+        part_rows = [row for row in rows if row["participant"] == participant]
+        healthy_rows = sum(1 for row in part_rows if is_healthy(row))
+        healthy_len, healthy_start, healthy_end = longest_streak(part_rows, is_healthy)
+        unhealthy_len, unhealthy_start, unhealthy_end = longest_streak(
+            part_rows, lambda row: not is_healthy(row)
+        )
+        output.append(
+            {
+                "participant": participant,
+                "healthy_rows": healthy_rows,
+                "total_rows": len(part_rows),
+                "healthy_rate": f"{healthy_rows / len(part_rows):.3f}",
+                "longest_healthy_rows": healthy_len,
+                "longest_healthy_start": healthy_start,
+                "longest_healthy_end": healthy_end,
+                "longest_unhealthy_rows": unhealthy_len,
+                "longest_unhealthy_start": unhealthy_start,
+                "longest_unhealthy_end": unhealthy_end,
+            }
+        )
+    return output
+
+
 def convergence_plot(rows: list[dict[str, str]]) -> list[dict[str, object]]:
     first_ts = min(parse_snapshot(row["snapshot"]) for row in rows)
     by_snapshot: dict[str, dict[str, str]] = defaultdict(dict)
@@ -296,6 +341,22 @@ def main() -> None:
             "full_controlled_state",
         ],
         final_state(snapshots),
+    )
+    write_tsv(
+        args.out_dir / "health-streaks.tsv",
+        [
+            "participant",
+            "healthy_rows",
+            "total_rows",
+            "healthy_rate",
+            "longest_healthy_rows",
+            "longest_healthy_start",
+            "longest_healthy_end",
+            "longest_unhealthy_rows",
+            "longest_unhealthy_start",
+            "longest_unhealthy_end",
+        ],
+        health_streaks(snapshots),
     )
     write_tsv(
         args.out_dir / "convergence-plot.tsv",

@@ -1244,15 +1244,9 @@ endpoints signed end-to-end under the inviter's signature, and a
 \texttt{TransportSnapshotReq} to the bootstrap peer immediately
 after the roster sync completes.
 
-One operational footnote is worth flagging for readers who will
-run \texttt{entmootd} or \texttt{pilot-daemon} on recent macOS.
-Ad-hoc-signed Go binaries on macOS~26 (Tahoe) stall at
-\texttt{\_dyld\_start} on first interactive launch until the local
-\texttt{com.apple.quarantine} extended attribute is cleared. The
-fork's \texttt{install.sh} re-signs the installed binaries with
-the host's ad-hoc identity and runs \texttt{xattr -cr} on the
-binary directory as a post-install step, so the Gatekeeper
-first-launch gate passes without user interaction.
+Appendix~\ref{app:operational-notes} records two implementation
+footnotes from long-running operator use: macOS Gatekeeper first-launch
+handling and IPC write-deadline fail-closed behavior.
 
 A subtlety surfaced by long-running canaries deserves a mention.
 Pilot's encrypted tunnels are rekeyed periodically (at Pilot's
@@ -1276,12 +1270,6 @@ interaction, explicit close or reset, and bounded concurrency. Entmoot
 therefore relies on Pilot for stream identity and reachability, while
 the adapter owns only per-peer dial limiting, deadline propagation, and
 typed stale-stream classification.
-
-The current IPC client also treats write deadlines as connection-health
-signals. If a length-prefixed write to the shared Pilot daemon socket
-times out, the driver closes the IPC connection rather than appending
-later frames after a partial write. That fail-closed rule avoids
-desynchronising the local daemon protocol under backpressure.
 
 \begin{figure}[t]
 \centering
@@ -1417,6 +1405,12 @@ four questions: whether all participants could reach a common final group
 state, whether health and route diagnostics stayed observable over five days,
 whether a controlled service restart recovered, and whether the resulting
 artifacts were complete enough to support a paper claim.
+\texttt{doctor} is the Entmoot diagnostic command for a local node and group:
+in this run, \texttt{doctor=0} means the command exited successfully after
+checking local daemon state and group health. \texttt{peers} is the companion
+per-group peer diagnostic; \texttt{peers=0} means the command exited
+successfully after enumerating the group's peer view. A fully healthy snapshot
+row therefore requires both exit statuses to be zero.
 
 % === 7. Evaluation Results ===
 \section{Evaluation Results}
@@ -1507,15 +1501,16 @@ Checksums & \texttt{status=ok} \\
 \centering
 \small
 \caption{Operational health across processed snapshots. A fully healthy row
-has both \texttt{doctor=0} and \texttt{peers=0}.}
+has both \texttt{doctor=0} and \texttt{peers=0}; streak values are generated in
+the committed \texttt{health-streaks.tsv} table.}
 \label{tab:evaluation-health}
 \begin{tabular}{lrrll}
 \toprule
 Participant & Healthy rows & Rate & Longest healthy & Longest unhealthy \\
 \midrule
-\texttt{local-vps} & 243 / 245 & 99.2\% & -- & -- \\
-\texttt{hermes-container} & 244 / 245 & 99.6\% & -- & -- \\
-\texttt{deimos-openclaw-container} & 244 / 245 & 99.6\% & -- & -- \\
+\texttt{local-vps} & 243 / 245 & 99.2\% & 241 rows & 2 rows \\
+\texttt{hermes-container} & 244 / 245 & 99.6\% & 244 rows & 1 row \\
+\texttt{deimos-openclaw-container} & 244 / 245 & 99.6\% & 244 rows & 1 row \\
 \texttt{phobos-pi-hermes} & 101 / 245 & 41.2\% & 38 rows & 82 rows \\
 \bottomrule
 \end{tabular}
@@ -1839,6 +1834,25 @@ doctor/peer and transcript evidence, and recover from controlled disruption,
 while also revealing residential-edge reachability as a practical limit. The
 remaining empirical question is social: once agents can join shared rooms and
 remember their conversations, what kinds of organization do they build?
+
+\appendix
+\section{Operational Notes}
+\label{app:operational-notes}
+
+One operational footnote is worth flagging for readers who will run
+\texttt{entmootd} or \texttt{pilot-daemon} on recent macOS. Ad-hoc-signed Go
+binaries on macOS~26 (Tahoe) stall at \texttt{\_dyld\_start} on first
+interactive launch until the local \texttt{com.apple.quarantine} extended
+attribute is cleared. The fork's \texttt{install.sh} re-signs the installed
+binaries with the host's ad-hoc identity and runs \texttt{xattr -cr} on the
+binary directory as a post-install step, so the Gatekeeper first-launch gate
+passes without user interaction.
+
+The current IPC client also treats write deadlines as connection-health
+signals. If a length-prefixed write to the shared Pilot daemon socket times out,
+the driver closes the IPC connection rather than appending later frames after a
+partial write. That fail-closed rule avoids desynchronising the local daemon
+protocol under backpressure.
 
 % === Bibliography ===
 \bibliographystyle{plainnat}
