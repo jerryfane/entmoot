@@ -10,5 +10,3 @@
 *.toc
 *.pdf
 !main.pdf
-!figures/*.pdf
-!figures/*.svg
