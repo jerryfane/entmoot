@@ -1,0 +1,4 @@
+scenario	enforcement_path	evidence	outcome	limit
+non-member remote	Server accept checks Roster.IsMember(remote) before dispatch	src/pkg/entmoot/gossip/gossiper_test.go:TestStartRejectsNonMemberRemote	non-member stream closed before frame dispatch	connection-level demo over in-memory transport
+replayed frame	wire.ReplayChecker timestamp window and bounded body-hash LRU	src/pkg/entmoot/wire/replay_test.go:TestVerifyFresh_DuplicateBodyRejected; TestVerifyFresh_RejectsOldTimestamp; TestVerifyFresh_RejectsFarFuture	errors wrap entmoot.ErrReplay	wire-level primitive test, not a full gossip-session replay trace
+rate-limit breach	per-peer topic bucket before TransportAd store/signature acceptance	src/pkg/entmoot/gossip/transport_ad_test.go:TestTransportAdRateLimited	over-quota ads are dropped before PutTransportAd; accepted sequence stops at burst	this is drop/one-shot stream close, not a long-lived peer ban
