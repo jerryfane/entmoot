@@ -976,8 +976,43 @@ non-members are disconnected before any application logic runs.
 
 Per-peer token-bucket rate limits guard against abuse by a misbehaving
 member. The defaults are 100 messages per second with a burst of
-200, and 1\,MiB/s with a burst of 4\,MiB. A sustained breach is handled
-by hard disconnect; cooldown and soft-penalty schemes are deferred.
+200, and 1\,MiB/s with a burst of 4\,MiB. Over-quota frames are dropped
+on the relevant receive path and the one-frame stream closes when the
+handler returns; long-lived peer bans, cooldowns, and soft-penalty schemes
+are deferred.
+
+\begin{table*}[t]
+\centering
+\scriptsize
+\caption{Adversarial enforcement demos. The evidence rows are generated from
+the committed adversarial TSV and point to focused tests for the existing code
+paths.}
+\label{tab:adversarial-demos}
+\begin{tabular}{p{0.17\textwidth}p{0.27\textwidth}p{0.24\textwidth}p{0.15\textwidth}}
+\toprule
+Scenario & Enforcement path & Test evidence & Outcome \\
+\midrule
+Non-member remote &
+Server accept checks \texttt{Roster.IsMember(remote)} before dispatch &
+Non-member remote test &
+Stream closed before frame dispatch \\
+Replayed frame &
+\texttt{wire.ReplayChecker} applies timestamp window and body-hash LRU &
+Replay duplicate, stale, and future-window tests &
+\texttt{ErrReplay} rejection \\
+Rate-limit breach &
+Per-peer topic bucket runs before \texttt{TransportAd} store/signature accept &
+Transport-ad rate-limit test &
+Over-quota ads dropped; one-shot stream closes \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+Table~\ref{tab:adversarial-demos} exercises the security posture without
+changing protocol behavior. The rate-limit row is deliberately narrow: the
+current implementation drops over-quota transport advertisements and the
+one-frame stream closes when the handler returns; it does not yet impose a
+long-lived peer ban.
 
 Group content is \emph{not} encrypted from other members. Pilot's
 transport encryption protects content from outsiders and relays, but

@@ -1143,6 +1143,66 @@ func (t blockingTrustedPeersTransport) TrustedPeers(ctx context.Context) ([]entm
 	return nil, ctx.Err()
 }
 
+type singleAcceptTransport struct {
+	Transport
+	conn     net.Conn
+	remote   entmoot.NodeID
+	accepted chan struct{}
+	once     sync.Once
+}
+
+func (t *singleAcceptTransport) Accept(ctx context.Context) (net.Conn, entmoot.NodeID, error) {
+	var first bool
+	t.once.Do(func() {
+		first = true
+		close(t.accepted)
+	})
+	if first {
+		return t.conn, t.remote, nil
+	}
+	<-ctx.Done()
+	return nil, 0, ctx.Err()
+}
+
+func TestStartRejectsNonMemberRemote(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, []entmoot.NodeID{10, 20})
+	defer f.closeTransports()
+
+	client, server := net.Pipe()
+	defer client.Close()
+	tr := &singleAcceptTransport{
+		Transport: f.transports[10],
+		conn:      server,
+		remote:    99,
+		accepted:  make(chan struct{}),
+	}
+	f.nodes[10].gossip.cfg.Transport = tr
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- f.nodes[10].gossip.Start(ctx) }()
+	<-tr.accepted
+
+	if err := client.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		cancel()
+		if err := <-done; err != nil {
+			t.Fatalf("Start returned error: %v", err)
+		}
+		return
+	}
+	buf := make([]byte, 1)
+	_, err := client.Read(buf)
+	if err == nil {
+		t.Fatal("non-member stream remained readable; want server-side close")
+	}
+
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Start returned error: %v", err)
+	}
+}
+
 // 4. Publish from a non-member: forge a message with an author that is not
 // in the roster. Publish must reject with entmoot.ErrNotMember.
 func TestPublishNonMemberRejected(t *testing.T) {
