@@ -27,9 +27,9 @@ var ErrUnknownMessage = errors.New("entmoot: unknown message type")
 // parsing or JSON unmarshaling.
 var ErrMalformedFrame = errors.New("entmoot: malformed frame")
 
-// ErrOversized is returned by the wire codec when a frame's declared length
-// exceeds the 16 MiB hard cap.
-var ErrOversized = errors.New("entmoot: frame exceeds 16 MiB cap")
+// ErrOversized is returned when a frame or decoded collection exceeds its
+// configured global or per-type bound.
+var ErrOversized = errors.New("entmoot: size limit exceeded")
 
 // ErrNotMember is returned by the delivery layer when a message is authored
 // by a node that is not a current roster member.

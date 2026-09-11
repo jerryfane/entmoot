@@ -532,3 +532,26 @@ func TestNew_NilClockUsesSystem(t *testing.T) {
 		t.Fatalf("third: expected ErrRateLimited, got %v", err)
 	}
 }
+
+func TestAllowTopicOnlyDoesNotDoubleChargeGlobalBucket(t *testing.T) {
+	fk := clock.NewFake(anchor)
+	lim := ratelimit.New(ratelimit.Limits{
+		MsgRate:    1,
+		MsgBurst:   1,
+		BytesRate:  1024,
+		BytesBurst: 1024,
+		TopicLimits: map[string]ratelimit.TopicLimit{
+			"system": {MsgRate: 1, MsgBurst: 1},
+		},
+	}, fk)
+	peer := entmoot.NodeID(7)
+	if err := lim.AllowTopicOnly(peer, "system"); err != nil {
+		t.Fatalf("AllowTopicOnly: %v", err)
+	}
+	if err := lim.Allow(peer, 1); err != nil {
+		t.Fatalf("global bucket was charged by AllowTopicOnly: %v", err)
+	}
+	if err := lim.AllowTopicOnly(peer, "system"); !errors.Is(err, entmoot.ErrRateLimited) {
+		t.Fatalf("second AllowTopicOnly = %v, want ErrRateLimited", err)
+	}
+}

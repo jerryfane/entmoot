@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Bounded inbound gossip resources.** Wire frames now use symmetric per-type
+  byte and collection caps before body allocation, bounded chunked reads,
+  per-peer rate admission, global/per-peer handler and retry-queue limits, and
+  deadlines for every inbound handler class.
+- **Message shape validation.** Local publish and network ingest now share
+  limits for parents, concrete topics, references, canonical encoded size, and
+  future clock skew while preserving locally stored legacy records.
 - **Bounded transport startup and shutdown.** Pilot IPC connections no longer
   close a receive channel while the shared demuxer can send to it, Pilot startup
   now honors caller deadlines, and gossip transport closure cancels owned

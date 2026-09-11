@@ -20,6 +20,7 @@ import (
 	"entmoot/pkg/entmoot/clock"
 	"entmoot/pkg/entmoot/keystore"
 	"entmoot/pkg/entmoot/policy"
+	"entmoot/pkg/entmoot/ratelimit"
 	"entmoot/pkg/entmoot/roster"
 	"entmoot/pkg/entmoot/store"
 	"entmoot/pkg/entmoot/wire"
@@ -502,6 +503,133 @@ func TestStartShutdownRejectsConcurrentBackgroundAdmission(t *testing.T) {
 	}
 }
 
+func TestInboundPerPeerLimitDoesNotStarveAnotherPeer(t *testing.T) {
+	f := newFixture(t, []entmoot.NodeID{10, 20, 30})
+	defer f.closeTransports()
+	ctx, cancel := context.WithCancel(context.Background())
+	startDone := make(chan error, 1)
+	go func() { startDone <- f.nodes[20].gossip.Start(ctx) }()
+
+	var blocked []net.Conn
+	defer func() {
+		for _, conn := range blocked {
+			_ = conn.Close()
+		}
+		cancel()
+		select {
+		case err := <-startDone:
+			if err != nil {
+				t.Errorf("Start: %v", err)
+			}
+		case <-time.After(time.Second):
+			t.Error("Start did not stop")
+		}
+	}()
+	for i := 0; i < maxInboundHandlersPerPeer; i++ {
+		conn, err := f.transports[10].Dial(ctx, 20)
+		if err != nil {
+			t.Fatalf("Dial %d: %v", i, err)
+		}
+		blocked = append(blocked, conn)
+	}
+	waitUntil(t, time.Second, "peer reaches handler cap", func() bool {
+		g := f.nodes[20].gossip
+		g.handlerMu.Lock()
+		defer g.handlerMu.Unlock()
+		return g.handlersByPeer[10] == maxInboundHandlersPerPeer
+	})
+
+	pingCtx, pingCancel := context.WithTimeout(ctx, time.Second)
+	defer pingCancel()
+	resp, err := f.nodes[30].gossip.DiagnosticPing(pingCtx, 20, []byte("other-peer"))
+	if err != nil {
+		t.Fatalf("other peer DiagnosticPing: %v", err)
+	}
+	if string(resp.Nonce) != "other-peer" {
+		t.Fatalf("nonce = %q, want other-peer", resp.Nonce)
+	}
+}
+
+func TestInboundFrameRateLimitIsPerPeer(t *testing.T) {
+	f := newFixture(t, []entmoot.NodeID{10, 20, 30})
+	defer f.closeTransports()
+	g := f.nodes[20].gossip
+	g.cfg.RateLimiter = ratelimit.New(ratelimit.Limits{
+		MsgRate:    1,
+		MsgBurst:   2,
+		BytesRate:  1 << 20,
+		BytesBurst: 1 << 20,
+	}, g.clk)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	startDone := make(chan error, 1)
+	go func() { startDone <- g.Start(ctx) }()
+	defer func() {
+		cancel()
+		select {
+		case err := <-startDone:
+			if err != nil {
+				t.Errorf("Start: %v", err)
+			}
+		case <-time.After(time.Second):
+			t.Error("Start did not stop")
+		}
+	}()
+
+	for i := 0; i < 2; i++ {
+		pingCtx, pingCancel := context.WithTimeout(ctx, time.Second)
+		_, err := f.nodes[10].gossip.DiagnosticPing(pingCtx, 20, []byte{byte(i)})
+		pingCancel()
+		if err != nil {
+			t.Fatalf("peer 10 ping %d: %v", i, err)
+		}
+	}
+	pingCtx, pingCancel := context.WithTimeout(ctx, time.Second)
+	_, err := f.nodes[10].gossip.DiagnosticPing(pingCtx, 20, []byte("limited"))
+	pingCancel()
+	if err == nil {
+		t.Fatal("peer 10 exceeded frame burst without rejection")
+	}
+
+	pingCtx, pingCancel = context.WithTimeout(ctx, time.Second)
+	_, err = f.nodes[30].gossip.DiagnosticPing(pingCtx, 20, []byte("independent"))
+	pingCancel()
+	if err != nil {
+		t.Fatalf("peer 30 was starved by peer 10: %v", err)
+	}
+}
+
+func TestRetryQueueBoundsPerPeerAndGlobally(t *testing.T) {
+	f := newFixture(t, []entmoot.NodeID{10})
+	defer f.closeTransports()
+	g := f.nodes[10].gossip
+	for i := 0; i < maxPendingRetriesPerPeer+1; i++ {
+		var id entmoot.MessageID
+		id[0] = byte(i)
+		id[1] = byte(i >> 8)
+		g.enqueueRetry(retryKey{peer: 20, id: id, op: opFetch}, nil)
+	}
+	if got := len(g.pending); got != maxPendingRetriesPerPeer {
+		t.Fatalf("per-peer pending = %d, want %d", got, maxPendingRetriesPerPeer)
+	}
+	g.enqueueRetry(retryKey{peer: 21, id: entmoot.MessageID{1}, op: opFetch}, nil)
+	if got := len(g.pending); got != maxPendingRetriesPerPeer+1 {
+		t.Fatalf("independent peer pending = %d, want %d", got, maxPendingRetriesPerPeer+1)
+	}
+
+	g.pending = make(map[retryKey]*retryState)
+	for i := 0; i < maxPendingRetries+1; i++ {
+		var id entmoot.MessageID
+		id[0] = byte(i)
+		id[1] = byte(i >> 8)
+		g.enqueueRetry(retryKey{peer: entmoot.NodeID(100 + i/32), id: id, op: opFetch}, nil)
+	}
+	if got := len(g.pending); got != maxPendingRetries {
+		t.Fatalf("global pending = %d, want %d", got, maxPendingRetries)
+	}
+}
+
 // buildMessage builds and signs a message authored by the supplied node.
 // The message has a single topic, no parents, and a deterministic timestamp.
 func (f *fixture) buildMessage(author entmoot.NodeID, content string, ts int64) entmoot.Message {
@@ -693,6 +821,72 @@ func TestPolicyOversizedInboundMessageRejectedBeforeStorage(t *testing.T) {
 	f.nodes[20].gossip.onGossip(context.Background(), 10, f.signedInlineGossip(10, msg))
 	if has, err := f.nodes[20].storeM.Has(context.Background(), f.groupID, msg.ID); err != nil || has {
 		t.Fatalf("oversized stored has/err = %v/%v, want false/nil", has, err)
+	}
+}
+
+func TestMessageParentLimitLocalAndInbound(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, []entmoot.NodeID{10, 20})
+	defer f.closeTransports()
+	ctx := context.Background()
+
+	allowed := f.buildMessage(10, "three parents", 2_000)
+	allowed.Parents = make([]entmoot.MessageID, MaxMessageParents)
+	allowed = f.signMessage(10, allowed)
+	if err := f.nodes[10].gossip.Publish(ctx, allowed); err != nil {
+		t.Fatalf("Publish with %d parents: %v", MaxMessageParents, err)
+	}
+
+	rejected := f.buildMessage(10, "four parents", 2_001)
+	rejected.Parents = make([]entmoot.MessageID, MaxMessageParents+1)
+	rejected = f.signMessage(10, rejected)
+	if err := f.nodes[10].gossip.Publish(ctx, rejected); err == nil {
+		t.Fatalf("Publish with %d parents succeeded", MaxMessageParents+1)
+	}
+	if has, err := f.nodes[10].storeM.Has(ctx, f.groupID, rejected.ID); err != nil || has {
+		t.Fatalf("local rejected message stored has/err = %v/%v", has, err)
+	}
+
+	f.nodes[20].gossip.onGossip(ctx, 10, f.signedInlineGossip(10, rejected))
+	if has, err := f.nodes[20].storeM.Has(ctx, f.groupID, rejected.ID); err != nil || has {
+		t.Fatalf("inbound rejected message stored has/err = %v/%v", has, err)
+	}
+}
+
+func TestMessageFutureSkewBoundary(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, []entmoot.NodeID{10})
+	defer f.closeTransports()
+	now := f.nodes[10].gossip.clk.Now()
+
+	allowed := f.buildMessage(10, "clock boundary", now.Add(MaxMessageFutureSkew).UnixMilli())
+	if err := f.nodes[10].gossip.Publish(context.Background(), allowed); err != nil {
+		t.Fatalf("Publish at future-skew boundary: %v", err)
+	}
+	rejected := f.buildMessage(10, "clock beyond boundary", now.Add(MaxMessageFutureSkew).Add(time.Millisecond).UnixMilli())
+	if err := f.nodes[10].gossip.Publish(context.Background(), rejected); err == nil {
+		t.Fatal("Publish beyond future-skew boundary succeeded")
+	}
+}
+
+func TestMessageTopicAndReferenceLimits(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, []entmoot.NodeID{10})
+	defer f.closeTransports()
+	now := f.nodes[10].gossip.clk.Now()
+
+	msg := f.buildMessage(10, "shape", now.UnixMilli())
+	msg.Topics = []string{"invalid/+"}
+	msg = f.signMessage(10, msg)
+	if err := f.nodes[10].gossip.Publish(context.Background(), msg); err == nil {
+		t.Fatal("Publish with wildcard topic succeeded")
+	}
+
+	msg = f.buildMessage(10, "shape", now.UnixMilli())
+	msg.References = make([]entmoot.MessageID, MaxMessageReferences+1)
+	msg = f.signMessage(10, msg)
+	if err := f.nodes[10].gossip.Publish(context.Background(), msg); err == nil {
+		t.Fatal("Publish over reference cap succeeded")
 	}
 }
 

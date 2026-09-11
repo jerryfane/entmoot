@@ -112,6 +112,13 @@ message ids the author has seen for the group at compose time. Genesis messages
 have `parents = []`. Bound keeps message size predictable while preserving
 causal ordering. Peers receiving a message with `len(parents) > 3` reject it.
 
+All new publish and network-ingest paths also enforce at most 16 concrete
+topics (256 bytes each), at most 64 references, a 256 KiB canonical encoded
+message, and no timestamp more than 2 minutes in the future. Topic names are
+printable ASCII with non-empty `/`-separated segments and no `+` or `#`
+wildcards. Existing local legacy records remain readable, but an over-limit
+legacy record is not re-admitted from the network.
+
 ### 3.3 Membership roster
 
 A roster is itself a signed append-only log:
@@ -174,7 +181,9 @@ Connections are plain Pilot streams to a peer's `:1004`. Framing:
 └────────────────┴────────────────┴────────────┘
 ```
 
-4-byte big-endian length is body size in bytes (max 16 MiB per frame for v0).
+The length prefix covers the type byte plus body. The global cap is 512 KiB;
+the shared wire cap table applies tighter limits by type before body allocation
+or transmission. Readers consume accepted bodies in 32 KiB chunks.
 JSON body keeps parity with Pilot's `HandshakeMsg` style — debuggable,
 extensible. We can switch to a binary codec later if it matters.
 
@@ -364,21 +373,21 @@ IPFS DAG-CBOR chunking. Not novel; just correctly applied.
 - **Authorship**: every message is Ed25519-signed by its author, verified
   against the roster's current pubkey for that node. Unsigned or wrong-sig
   messages are silently dropped.
-- **Replay**: same 5-minute / 30-second window as Pilot's handshake protocol,
-  plus hash dedupe.
+- **Replay**: authenticated Hello frames use the bounded timestamp and
+  per-peer replay set. Content-addressed messages use atomic MessageID
+  insertion deduplication. Repeatable query frames remain legal within their
+  resource budgets.
 - **Membership**: messages from non-members are dropped before they reach
   application logic.
-- **Denial of service**: v0 ships **per-peer token-bucket rate limits** on
-  every `:1004` connection. Two buckets per peer: a message-rate bucket
-  (default 100 msg/s, burst 200) and a byte-rate bucket (default 1 MiB/s,
-  burst 4 MiB). Exceeding the bucket causes backpressure first (reads stall);
-  sustained violation for >30 s drops the connection and records a
-  soft-penalty on the peer (exponential cooldown before reconnects are
-  accepted, starting 10 s, capped at 1 hour). No per-group or per-topic
-  buckets in v0 — one global pair per connection is enough to contain a
-  misbehaving member. Proof-of-work on joins is a v1+ concern; in v0 the
-  roster gate (non-members can't reach `:1004` in the first place, because
-  Pilot rejects untrusted dials) does most of the work.
+- **Denial of service**: every inbound frame is charged before body allocation
+  to per-peer token buckets: 100 frames/s with burst 200 and 1 MiB/s with
+  burst 4 MiB. Per-type byte caps and decoded collection caps bound follow-on
+  work. Bodies are read in 32 KiB chunks under a 5-second first-frame deadline.
+  At most 64 handlers run globally and 8 for one peer; excess streams are
+  closed without launching a goroutine. Ordinary handlers have a 10-second
+  budget, reconcile sessions 30 seconds, and large responses 45 seconds.
+  Retry state is capped at 1,024 entries globally and 64 per peer. Rare system
+  topics add a topic bucket without charging the global frame budget twice.
 - **Eclipse attacks**: the random-peer pool is intended as the defense.
   Details pending.
 - **Privacy**: group membership and topic filters are observable to peers you

@@ -26,13 +26,44 @@ import (
 
 // MaxFrameSize is the hard cap on a single frame's payload, measured as the
 // 4-byte length prefix's value. It covers the 1-byte msg_type plus the JSON
-// body. Frames larger than this are rejected on both encode and decode with
-// entmoot.ErrOversized.
-const MaxFrameSize = 16 * 1024 * 1024
+// body. Per-type caps below are normally tighter. Readers and writers enforce
+// both limits before allocating or emitting a body.
+const MaxFrameSize = 512 * 1024
 
 // lengthPrefixSize is the number of bytes used for the big-endian length
 // prefix at the start of every frame.
 const lengthPrefixSize = 4
+
+// FrameReadChunkSize bounds the first allocation made after a frame header is
+// accepted. Larger allowed bodies grow only as bytes actually arrive.
+const FrameReadChunkSize = 32 * 1024
+
+// MaxFrameBodySize returns the maximum JSON body size for t. The table is the
+// shared ingress/egress contract, so a writer cannot emit a frame a reader
+// would reject. Unknown frame types are rejected before their body is read.
+func MaxFrameBodySize(t MsgType) (int, bool) {
+	switch t {
+	case MsgHello:
+		return 16 * 1024, true
+	case MsgRosterReq, MsgRangeReq:
+		return 8 * 1024, true
+	case MsgRosterResp, MsgTransportSnapshotResp, MsgMemberProfileSnapshotResp:
+		return MaxFrameSize - 1, true
+	case MsgGossip, MsgFetchResp:
+		return 384 * 1024, true
+	case MsgFetchReq, MsgMerkleReq, MsgPrune, MsgTransportSnapshotReq,
+		MsgMemberProfileSnapshotReq, MsgDiagPingReq, MsgDiagPingResp:
+		return 4 * 1024, true
+	case MsgMerkleResp, MsgTransportAd, MsgMemberProfileAd:
+		return 64 * 1024, true
+	case MsgRangeResp, MsgReconcile:
+		return 128 * 1024, true
+	case MsgIHave, MsgGraft:
+		return 32 * 1024, true
+	default:
+		return 0, false
+	}
+}
 
 // WriteFrame encodes and writes a single frame to w. body must be the JSON
 // body bytes with no framing of its own. The function writes
@@ -44,6 +75,13 @@ const lengthPrefixSize = 4
 // implementations that do not fully consume the buffer — callers that wrap w
 // with their own Writer must honor io.Writer's contract.
 func WriteFrame(w io.Writer, t MsgType, body []byte) error {
+	maxBody, ok := MaxFrameBodySize(t)
+	if !ok {
+		return fmt.Errorf("wire: frame type %s: %w", t, entmoot.ErrUnknownMessage)
+	}
+	if len(body) > maxBody {
+		return fmt.Errorf("wire: %s body %d exceeds cap %d: %w", t, len(body), maxBody, entmoot.ErrOversized)
+	}
 	// length field covers (msg_type byte + body bytes).
 	payloadLen := 1 + len(body)
 	if payloadLen > MaxFrameSize {
@@ -70,26 +108,23 @@ func WriteFrame(w io.Writer, t MsgType, body []byte) error {
 	return nil
 }
 
-// ReadFrame reads exactly one frame from r and returns the msg_type byte plus
-// the JSON body. Common error conditions:
-//
-//   - io.EOF when r reports EOF before any of the 4-byte length prefix is
-//     read (clean end-of-stream).
-//   - io.ErrUnexpectedEOF when r reports EOF partway through the length
-//     prefix, the type byte, or the body (truncated frame).
-//   - entmoot.ErrOversized when the decoded length exceeds MaxFrameSize.
-//   - entmoot.ErrMalformedFrame when the declared length is zero (a frame
-//     must contain at least the 1-byte msg_type).
-//
-// Any other error from r.Read is surfaced as-is (wrapped with context).
-// ReadFrame does not parse the body; it returns the raw bytes so callers can
-// choose codec dispatch or replay checks before unmarshaling.
+// FrameAdmission runs after the length and type have been read and validated,
+// but before any body allocation or read. frameSize is the complete wire size:
+// length prefix, type byte, and declared body.
+type FrameAdmission func(t MsgType, frameSize int) error
+
+// ReadFrame reads one frame without an external admission check.
 func ReadFrame(r io.Reader) (MsgType, []byte, error) {
+	return ReadFrameWithAdmission(r, nil)
+}
+
+// ReadFrameWithAdmission reads exactly one frame. Per-type size validation and
+// admission happen before body allocation. Accepted bodies are read in bounded
+// chunks so a stalled peer cannot force allocation of its full declaration.
+func ReadFrameWithAdmission(r io.Reader, admit FrameAdmission) (MsgType, []byte, error) {
 	var lengthBuf [lengthPrefixSize]byte
 	n, err := io.ReadFull(r, lengthBuf[:])
 	if err != nil {
-		// io.ReadFull returns io.EOF if zero bytes were read and
-		// io.ErrUnexpectedEOF if some but not all bytes were read.
 		if errors.Is(err, io.EOF) && n == 0 {
 			return 0, nil, io.EOF
 		}
@@ -107,15 +142,53 @@ func ReadFrame(r io.Reader) (MsgType, []byte, error) {
 		return 0, nil, fmt.Errorf("wire: frame length %d: %w", length, entmoot.ErrOversized)
 	}
 
-	payload := make([]byte, length)
-	if _, err := io.ReadFull(r, payload); err != nil {
+	var typeBuf [1]byte
+	if _, err := io.ReadFull(r, typeBuf[:]); err != nil {
 		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 			return 0, nil, io.ErrUnexpectedEOF
 		}
-		return 0, nil, fmt.Errorf("wire: read frame body: %w", err)
+		return 0, nil, fmt.Errorf("wire: read frame type: %w", err)
+	}
+	t := MsgType(typeBuf[0])
+	maxBody, ok := MaxFrameBodySize(t)
+	if !ok {
+		return 0, nil, fmt.Errorf("wire: frame type %s: %w", t, entmoot.ErrUnknownMessage)
+	}
+	bodyLen := int(length) - 1
+	if bodyLen > maxBody {
+		return 0, nil, fmt.Errorf("wire: %s body %d exceeds cap %d: %w", t, bodyLen, maxBody, entmoot.ErrOversized)
+	}
+	if admit != nil {
+		if err := admit(t, lengthPrefixSize+int(length)); err != nil {
+			return 0, nil, err
+		}
+	}
+	if bodyLen == 0 {
+		return t, nil, nil
 	}
 
-	// payload[0] is msg_type, payload[1:] is body. A valid frame therefore
-	// has len(body) == length-1 (possibly zero).
-	return MsgType(payload[0]), payload[1:], nil
+	initialCapacity := bodyLen
+	if initialCapacity > FrameReadChunkSize {
+		initialCapacity = FrameReadChunkSize
+	}
+	body := make([]byte, 0, initialCapacity)
+	var chunk [FrameReadChunkSize]byte
+	for remaining := bodyLen; remaining > 0; {
+		next := remaining
+		if next > len(chunk) {
+			next = len(chunk)
+		}
+		readN, err := io.ReadFull(r, chunk[:next])
+		if readN > 0 {
+			body = append(body, chunk[:readN]...)
+			remaining -= readN
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+				return 0, nil, io.ErrUnexpectedEOF
+			}
+			return 0, nil, fmt.Errorf("wire: read frame body: %w", err)
+		}
+	}
+	return t, body, nil
 }

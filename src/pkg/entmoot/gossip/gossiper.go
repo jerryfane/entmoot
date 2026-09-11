@@ -166,7 +166,14 @@ const (
 	memberProfileSnapshotMaxConcurrent = 2
 )
 
-const inboundFirstFrameTimeout = 5 * time.Second
+const (
+	inboundFirstFrameTimeout  = 5 * time.Second
+	inboundHandlerTimeout     = 10 * time.Second
+	maxInboundHandlers        = 64
+	maxInboundHandlersPerPeer = 8
+	maxPendingRetries         = 1024
+	maxPendingRetriesPerPeer  = 64
+)
 
 // reconcileSessionTimeout bounds the wallclock budget of a single RBSR
 // reconciliation control session — the full multi-frame exchange between
@@ -175,12 +182,12 @@ const inboundFirstFrameTimeout = 5 * time.Second
 // near the wire cap.
 // If the control session exceeds this budget the initiator tears the
 // connection down and the next reconcileCooldown expiry retries. (v1.2.1)
-const reconcileSessionTimeout = 15 * time.Second
+const reconcileSessionTimeout = 30 * time.Second
 
 // largeFrameResponseTimeout bounds a single large response transfer. FetchResp
 // can carry a full message body, and snapshot responses can carry O(N) profile
 // or transport ads; none should inherit the shorter reconcile control timeout.
-const largeFrameResponseTimeout = reconcileAttemptTimeout
+const largeFrameResponseTimeout = 45 * time.Second
 
 // Plumtree GRAFT timeout (v1.0.4). After receiving an IHave advertising
 // an unknown id, wait this long for the body to arrive via eager push
@@ -507,6 +514,18 @@ type Gossiper struct {
 	lifeCtx     context.Context
 	lifeStarted bool
 
+	// Inbound handler admission is fail-fast and bounded globally and per
+	// authenticated peer. Counts are reserved before launching a goroutine.
+	handlerMu      sync.Mutex
+	activeHandlers int
+	handlersByPeer map[entmoot.NodeID]int
+
+	// Hello replay state is per authenticated transport peer. Repeatable
+	// query frames and content-addressed messages do not use raw-body replay
+	// rejection.
+	helloReplayMu sync.Mutex
+	helloReplay   map[entmoot.NodeID]*wire.ReplayChecker
+
 	// rosterApplyMu serializes all roster mutations initiated by gossip
 	// request/response paths. roster.RosterLog.Apply intentionally validates
 	// outside its internal write lock, so callers must serialize mutating use.
@@ -659,6 +678,8 @@ func New(cfg Config) (*Gossiper, error) {
 		logger:            logger,
 		clk:               clk,
 		fanout:            fanout,
+		handlersByPeer:    make(map[entmoot.NodeID]int),
+		helloReplay:       make(map[entmoot.NodeID]*wire.ReplayChecker),
 		pending:           make(map[retryKey]*retryState),
 		lastReconciled:    make(map[entmoot.NodeID]reconcileState),
 		reconcileInFlight: make(map[entmoot.NodeID]struct{}),
@@ -1258,12 +1279,19 @@ func (g *Gossiper) Start(ctx context.Context) error {
 			_ = conn.Close()
 			continue
 		}
+		if !g.tryBeginInboundHandler(remote) {
+			g.logger.Warn("gossip: inbound handler limit reached",
+				slog.Uint64("remote", uint64(remote)))
+			_ = conn.Close()
+			continue
+		}
 		// A verified inbound connection clears stale dial backoff before
 		// dispatch; handlers may need to dial the sender while processing.
 		g.recordDialSuccess(remote)
 		g.wg.Add(1)
 		go func(c net.Conn, r entmoot.NodeID) {
 			defer g.wg.Done()
+			defer g.endInboundHandler(r)
 			defer c.Close()
 			processed := g.handleConn(workerCtx, c, r)
 			if processed {
@@ -1273,14 +1301,63 @@ func (g *Gossiper) Start(ctx context.Context) error {
 	}
 }
 
+func (g *Gossiper) tryBeginInboundHandler(peer entmoot.NodeID) bool {
+	g.handlerMu.Lock()
+	defer g.handlerMu.Unlock()
+	if g.activeHandlers >= maxInboundHandlers ||
+		g.handlersByPeer[peer] >= maxInboundHandlersPerPeer {
+		return false
+	}
+	g.activeHandlers++
+	g.handlersByPeer[peer]++
+	return true
+}
+
+func (g *Gossiper) endInboundHandler(peer entmoot.NodeID) {
+	g.handlerMu.Lock()
+	g.activeHandlers--
+	if g.handlersByPeer[peer] <= 1 {
+		delete(g.handlersByPeer, peer)
+	} else {
+		g.handlersByPeer[peer]--
+	}
+	g.handlerMu.Unlock()
+}
+
+func (g *Gossiper) verifyHelloFresh(peer entmoot.NodeID, body []byte) error {
+	g.helloReplayMu.Lock()
+	checker := g.helloReplay[peer]
+	if checker == nil {
+		checker = wire.NewReplayChecker(g.clk, 0)
+		g.helloReplay[peer] = checker
+	}
+	g.helloReplayMu.Unlock()
+	return checker.VerifyFresh(wire.MsgHello, body)
+}
+
 // handleConn reads one frame from c and dispatches on type. v0 is stateless
 // per connection: exactly one request-response, then close. Errors are
 // logged and the connection is dropped (hard-disconnect per the plan).
 func (g *Gossiper) handleConn(ctx context.Context, c net.Conn, remote entmoot.NodeID) bool {
 	start := time.Now()
 	_ = c.SetReadDeadline(start.Add(inboundFirstFrameTimeout))
-	t, payload, err := wire.ReadAndDecode(c)
+	t, body, err := wire.ReadFrameWithAdmission(c, func(frameType wire.MsgType, frameSize int) error {
+		if g.cfg.RateLimiter == nil {
+			return nil
+		}
+		if err := wire.CheckFrameRate(remote, frameSize, g.cfg.RateLimiter); err != nil {
+			return fmt.Errorf("gossip: %s from peer %d: %w", frameType, remote, err)
+		}
+		return nil
+	})
 	clearConnReadDeadline(c)
+	if err == nil && t == wire.MsgHello {
+		err = g.verifyHelloFresh(remote, body)
+	}
+	var payload any
+	if err == nil {
+		payload, err = wire.Decode(t, body)
+	}
 	if err != nil {
 		if errors.Is(err, io.EOF) {
 			return false
@@ -1294,59 +1371,49 @@ func (g *Gossiper) handleConn(ctx context.Context, c net.Conn, remote entmoot.No
 	g.logger.Debug("gossip: inbound frame",
 		slog.Uint64("remote", uint64(remote)),
 		slog.String("type", t.String()))
+
+	handlerCtx, cancelHandler := context.WithTimeout(ctx, inboundHandlerTimeout)
+	defer cancelHandler()
 	switch v := payload.(type) {
 	case *wire.RosterReq:
-		reqCtx, cancel := g.inboundOneShotContext(ctx)
-		defer cancel()
-		g.onRosterReq(reqCtx, c, remote, v)
+		g.onRosterReq(handlerCtx, c, remote, v)
 	case *wire.RosterResp:
-		g.onRosterResp(ctx, remote, v)
+		g.onRosterResp(handlerCtx, remote, v)
 	case *wire.FetchReq:
 		reqCtx, cancel := g.inboundLargeFrameResponseContext(ctx)
 		defer cancel()
 		g.onFetchReq(reqCtx, c, remote, v)
 	case *wire.MerkleReq:
-		reqCtx, cancel := g.inboundOneShotContext(ctx)
-		defer cancel()
-		g.onMerkleReq(reqCtx, c, remote, v)
+		g.onMerkleReq(handlerCtx, c, remote, v)
 	case *wire.RangeReq:
-		reqCtx, cancel := g.inboundOneShotContext(ctx)
-		defer cancel()
-		g.onRangeReq(reqCtx, c, remote, v)
+		g.onRangeReq(handlerCtx, c, remote, v)
 	case *wire.Gossip:
-		g.onGossip(ctx, remote, v)
+		g.onGossip(handlerCtx, remote, v)
 	case *wire.IHave:
-		g.onIHave(ctx, remote, v)
+		g.onIHave(handlerCtx, remote, v)
 	case *wire.Graft:
-		g.onGraft(ctx, remote, v)
+		g.onGraft(handlerCtx, remote, v)
 	case *wire.Prune:
 		g.onPrune(remote, v)
 	case *wire.TransportAd:
-		g.onTransportAd(ctx, remote, v)
+		g.onTransportAd(handlerCtx, remote, v)
 	case *wire.MemberProfileAd:
-		g.onMemberProfileAd(ctx, remote, v)
+		g.onMemberProfileAd(handlerCtx, remote, v)
 	case *wire.MemberProfileSnapshotReq:
 		reqCtx, cancel := g.inboundLargeFrameResponseContext(ctx)
 		defer cancel()
 		g.onMemberProfileSnapshotReq(reqCtx, c, remote, v)
 	case *wire.DiagPingReq:
-		reqCtx, cancel := g.inboundOneShotContext(ctx)
-		defer cancel()
-		g.onDiagPingReq(reqCtx, c, remote, v)
+		g.onDiagPingReq(handlerCtx, c, remote, v)
 	case *wire.TransportSnapshotReq:
 		reqCtx, cancel := g.inboundLargeFrameResponseContext(ctx)
 		defer cancel()
 		g.onTransportSnapshotReq(reqCtx, c, remote, v)
 	case *wire.Reconcile:
-		// Convention-break (v1.2.1): onReconcileReq holds c open for the
-		// full multi-frame RBSR session, unlike every other handler that
-		// does "read one frame, respond, return". The caller's defer
-		// c.Close() still fires when onReconcileReq eventually returns.
-		g.onReconcileReq(ctx, c, remote, v)
+		reconcileCtx, cancel := context.WithTimeout(ctx, reconcileSessionTimeout)
+		defer cancel()
+		g.onReconcileReq(reconcileCtx, c, remote, v)
 	case *wire.Hello:
-		// v0 drops Hello: Pilot's tunnel already authenticates the remote.
-		// The codec still recognizes the type (kept for future use), so we
-		// simply log and move on.
 		g.logger.Debug("gossip: ignoring hello frame (v0 skips handshake)",
 			slog.Uint64("remote", uint64(remote)))
 	default:
@@ -2468,6 +2535,9 @@ func (g *Gossiper) getPicker() *PeerPicker {
 // msg.ID matches canonical.MessageID of msg (id/sig zeroed). Returns
 // entmoot.ErrNotMember or entmoot.ErrSigInvalid on failure.
 func (g *Gossiper) verifyMessage(msg entmoot.Message) error {
+	if err := ValidateMessageShape(msg, g.clk.Now()); err != nil {
+		return err
+	}
 	author, ok := g.cfg.Roster.MemberInfo(msg.Author.PilotNodeID)
 	if !ok {
 		return fmt.Errorf("%w: author %d", entmoot.ErrNotMember, msg.Author.PilotNodeID)
@@ -2731,6 +2801,22 @@ func (g *Gossiper) markReconcileTickTouched(peer entmoot.NodeID) {
 	g.lastReconciled[peer] = s
 }
 
+func (g *Gossiper) retryQueueHasCapacityLocked(key retryKey) bool {
+	if _, exists := g.pending[key]; exists {
+		return true
+	}
+	if len(g.pending) >= maxPendingRetries {
+		return false
+	}
+	perPeer := 0
+	for existing := range g.pending {
+		if existing.peer == key.peer {
+			perPeer++
+		}
+	}
+	return perPeer < maxPendingRetriesPerPeer
+}
+
 // enqueueAdRetry inserts (or refreshes) a pending retry slot for a
 // failed transport-ad fanout. Approach 1 (the discriminator approach
 // from the v1.4.1 plan): shares the existing retry scheduler with
@@ -2766,6 +2852,11 @@ func (g *Gossiper) enqueueAdRetry(peerID entmoot.NodeID, ad *wire.TransportAd) {
 	defer g.pendMu.Unlock()
 	now := g.clk.Now()
 	key := retryKey{peer: peerID, author: ad.Author.PilotNodeID, op: opTransportAd}
+	if !g.retryQueueHasCapacityLocked(key) {
+		g.logger.Warn("gossip: retry queue full",
+			slog.Uint64("peer", uint64(key.peer)))
+		return
+	}
 	state, ok := g.pending[key]
 	if !ok {
 		state = &retryState{attempts: 1, ad: ad, seq: ad.Seq, firstTry: now}
@@ -2815,6 +2906,11 @@ func (g *Gossiper) enqueueMemberProfileRetry(peerID entmoot.NodeID, ad *wire.Mem
 	defer g.pendMu.Unlock()
 	now := g.clk.Now()
 	key := retryKey{peer: peerID, author: ad.Author.PilotNodeID, op: opMemberProfileAd}
+	if !g.retryQueueHasCapacityLocked(key) {
+		g.logger.Warn("gossip: retry queue full",
+			slog.Uint64("peer", uint64(key.peer)))
+		return
+	}
 	state, ok := g.pending[key]
 	if !ok {
 		state = &retryState{attempts: 1, profileAd: ad, seq: ad.Seq, firstTry: now}
@@ -2855,6 +2951,11 @@ func (g *Gossiper) enqueueRosterRetry(peerID entmoot.NodeID, entries []entmoot.R
 	g.pendMu.Lock()
 	defer g.pendMu.Unlock()
 	key := retryKey{peer: peerID, op: opRosterUpdate}
+	if !g.retryQueueHasCapacityLocked(key) {
+		g.logger.Warn("gossip: retry queue full",
+			slog.Uint64("peer", uint64(key.peer)))
+		return
+	}
 	state, ok := g.pending[key]
 	if !ok {
 		state = &retryState{attempts: 1}
@@ -2884,6 +2985,11 @@ func (g *Gossiper) enqueueRetry(key retryKey, frame *wire.Gossip) {
 	g.pendMu.Lock()
 	defer g.pendMu.Unlock()
 	now := g.clk.Now()
+	if !g.retryQueueHasCapacityLocked(key) {
+		g.logger.Warn("gossip: retry queue full",
+			slog.Uint64("peer", uint64(key.peer)))
+		return
+	}
 	state, ok := g.pending[key]
 	if !ok {
 		state = &retryState{attempts: 1, frame: frame}
@@ -3736,7 +3842,7 @@ func (g *Gossiper) onTransportAd(ctx context.Context, remote entmoot.NodeID, ad 
 
 	// 4. Per-(peer, topic) rate limit. Not a disconnect — just a drop.
 	if g.cfg.RateLimiter != nil {
-		if err := g.cfg.RateLimiter.AllowTopic(remote, transportAdTopic, len(sigInput)); err != nil {
+		if err := g.cfg.RateLimiter.AllowTopicOnly(remote, transportAdTopic); err != nil {
 			g.logger.Warn("gossip: transport_ad rate-limited",
 				slog.Uint64("remote", uint64(remote)),
 				slog.String("err", err.Error()))
@@ -3860,7 +3966,7 @@ func (g *Gossiper) ingestMemberProfileAd(ctx context.Context, remote entmoot.Nod
 		return
 	}
 	if enforceRateLimit && g.cfg.RateLimiter != nil {
-		if err := g.cfg.RateLimiter.AllowTopic(remote, memberProfileTopic, len(sigInput)); err != nil {
+		if err := g.cfg.RateLimiter.AllowTopicOnly(remote, memberProfileTopic); err != nil {
 			g.logger.Warn("gossip: member_profile_ad rate-limited",
 				slog.Uint64("remote", uint64(remote)),
 				slog.String("err", err.Error()))

@@ -70,6 +70,10 @@ func Encode(v any) (MsgType, []byte, error) {
 		return 0, nil, fmt.Errorf("wire: encode %T: %w", v, entmoot.ErrUnknownMessage)
 	}
 
+	if err := ValidatePayloadLimits(v); err != nil {
+		return 0, nil, err
+	}
+
 	body, err := json.Marshal(v)
 	if err != nil {
 		return 0, nil, fmt.Errorf("wire: marshal %s: %w", t, err)
@@ -148,6 +152,9 @@ func decodeAs[T any](t MsgType, body []byte) (any, error) {
 	out := new(T)
 	if err := json.Unmarshal(body, out); err != nil {
 		return nil, fmt.Errorf("wire: unmarshal %s: %w: %v", t, entmoot.ErrMalformedFrame, err)
+	}
+	if err := ValidatePayloadLimits(out); err != nil {
+		return nil, err
 	}
 	return out, nil
 }

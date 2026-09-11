@@ -330,3 +330,24 @@ func (l *Limiter) AllowTopic(peer entmoot.NodeID, topic string, nbytes int) erro
 	}
 	return nil
 }
+
+// AllowTopicOnly charges only the optional per-(peer, topic) message bucket.
+// Use it when the caller already charged the frame to the global peer buckets.
+func (l *Limiter) AllowTopicOnly(peer entmoot.NodeID, topic string) error {
+	now := l.clk.Now()
+	l.mu.Lock()
+	tb := l.topicBucketFor(peer, topic)
+	l.mu.Unlock()
+	if tb == nil {
+		return nil
+	}
+	res := tb.ReserveN(now, 1)
+	if !res.OK() {
+		return entmoot.ErrRateLimited
+	}
+	if res.DelayFrom(now) > 0 {
+		res.CancelAt(now)
+		return entmoot.ErrRateLimited
+	}
+	return nil
+}

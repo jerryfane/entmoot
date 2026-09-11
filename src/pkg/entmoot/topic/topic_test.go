@@ -46,6 +46,26 @@ func TestValidPattern(t *testing.T) {
 	}
 }
 
+func TestValidTopicRejectsPatternsAndNonASCII(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		topic   string
+		wantErr bool
+	}{
+		{topic: "ops/build", wantErr: false},
+		{topic: "ops/+", wantErr: true},
+		{topic: "ops/#", wantErr: true},
+		{topic: "ops//build", wantErr: true},
+		{topic: "ops/café", wantErr: true},
+		{topic: "ops/ build", wantErr: true},
+	} {
+		err := ValidTopic(tc.topic)
+		if (err != nil) != tc.wantErr {
+			t.Errorf("ValidTopic(%q) = %v, wantErr=%t", tc.topic, err, tc.wantErr)
+		}
+	}
+}
+
 func TestMatch(t *testing.T) {
 	t.Parallel()
 	cases := []struct {

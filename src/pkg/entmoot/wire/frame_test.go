@@ -11,12 +11,10 @@ import (
 	entmoot "entmoot/pkg/entmoot"
 )
 
-// TestWriteReadFrameRoundTrip covers writing then reading frames of
-// realistic sizes: a 1-byte body, a 100-byte body, a 1 KiB body, and a
-// 1 MiB body. Each must come back with the same msg_type and byte-identical
-// body.
+// TestWriteReadFrameRoundTrip covers realistic sizes through the largest
+// allowed Gossip body. Each must come back byte-identical.
 func TestWriteReadFrameRoundTrip(t *testing.T) {
-	sizes := []int{1, 100, 1024, 1024 * 1024}
+	sizes := []int{1, 100, 1024, 384 * 1024}
 	for _, sz := range sizes {
 		body := make([]byte, sz)
 		for i := range body {
@@ -47,14 +45,11 @@ func TestWriteReadFrameRoundTrip(t *testing.T) {
 	}
 }
 
-// TestWriteFrameRejectsOversized verifies that WriteFrame returns
-// entmoot.ErrOversized when the payload would exceed MaxFrameSize.
+// TestWriteFrameRejectsOversized verifies the global payload cap.
 func TestWriteFrameRejectsOversized(t *testing.T) {
-	// payload = 1 + len(body). We need 1+len(body) > MaxFrameSize.
-	// Simplest: len(body) == MaxFrameSize, so payload == MaxFrameSize+1.
 	body := make([]byte, MaxFrameSize)
 	var buf bytes.Buffer
-	err := WriteFrame(&buf, MsgGossip, body)
+	err := WriteFrame(&buf, MsgRosterResp, body)
 	if !errors.Is(err, entmoot.ErrOversized) {
 		t.Fatalf("err = %v, want ErrOversized", err)
 	}
@@ -63,19 +58,18 @@ func TestWriteFrameRejectsOversized(t *testing.T) {
 	}
 }
 
-// TestWriteFrameAtExactMaxSize confirms the boundary — a frame whose
-// (1 + body) equals MaxFrameSize is accepted.
+// TestWriteFrameAtExactMaxSize confirms the global boundary.
 func TestWriteFrameAtExactMaxSize(t *testing.T) {
 	body := make([]byte, MaxFrameSize-1)
 	var buf bytes.Buffer
-	if err := WriteFrame(&buf, MsgGossip, body); err != nil {
+	if err := WriteFrame(&buf, MsgRosterResp, body); err != nil {
 		t.Fatalf("at-max WriteFrame: %v", err)
 	}
 	gotType, gotBody, err := ReadFrame(&buf)
 	if err != nil {
 		t.Fatalf("at-max ReadFrame: %v", err)
 	}
-	if gotType != MsgGossip || len(gotBody) != len(body) {
+	if gotType != MsgRosterResp || len(gotBody) != len(body) {
 		t.Fatalf("at-max round-trip mismatch (type=%v, body=%d)", gotType, len(gotBody))
 	}
 }
@@ -93,9 +87,60 @@ func TestReadFrameRejectsOversizedLengthPrefix(t *testing.T) {
 	}
 }
 
+// TestReadFrameRejectsPerTypeOversizeBeforeBodyRead proves a type-specific
+// rejection consumes only the header and type byte.
+func TestReadFrameRejectsPerTypeOversizeBeforeBodyRead(t *testing.T) {
+	maxBody, ok := MaxFrameBodySize(MsgFetchReq)
+	if !ok {
+		t.Fatal("MsgFetchReq has no configured cap")
+	}
+	bodyLen := maxBody + 1
+	var frame bytes.Buffer
+	var header [4]byte
+	binary.BigEndian.PutUint32(header[:], uint32(1+bodyLen))
+	frame.Write(header[:])
+	frame.WriteByte(byte(MsgFetchReq))
+	frame.Write(make([]byte, bodyLen))
+
+	r := bytes.NewReader(frame.Bytes())
+	_, _, err := ReadFrame(r)
+	if !errors.Is(err, entmoot.ErrOversized) {
+		t.Fatalf("err = %v, want ErrOversized", err)
+	}
+	if r.Len() != bodyLen {
+		t.Fatalf("reader consumed body: %d bytes remain, want %d", r.Len(), bodyLen)
+	}
+}
+
+// TestReadFrameAdmissionRunsBeforeBodyRead proves rate admission can reject a
+// declared frame without reading or allocating its body.
+
+func TestReadFrameAdmissionRunsBeforeBodyRead(t *testing.T) {
+	body := bytes.Repeat([]byte{'x'}, 100)
+	var frame bytes.Buffer
+	if err := WriteFrame(&frame, MsgFetchReq, body); err != nil {
+		t.Fatalf("WriteFrame: %v", err)
+	}
+	r := bytes.NewReader(frame.Bytes())
+	_, _, err := ReadFrameWithAdmission(r, func(gotType MsgType, frameSize int) error {
+		if gotType != MsgFetchReq {
+			t.Fatalf("type = %v, want %v", gotType, MsgFetchReq)
+		}
+		if frameSize != 4+1+len(body) {
+			t.Fatalf("frame size = %d, want %d", frameSize, 4+1+len(body))
+		}
+		return entmoot.ErrRateLimited
+	})
+	if !errors.Is(err, entmoot.ErrRateLimited) {
+		t.Fatalf("err = %v, want ErrRateLimited", err)
+	}
+	if r.Len() != len(body) {
+		t.Fatalf("reader consumed body: %d bytes remain, want %d", r.Len(), len(body))
+	}
+}
+
 // TestReadFrameRejectsZeroLength verifies that a length prefix of 0 is
-// rejected with entmoot.ErrMalformedFrame — a frame must contain at least
-// the 1-byte msg_type.
+// rejected with entmoot.ErrMalformedFrame.
 func TestReadFrameRejectsZeroLength(t *testing.T) {
 	var header [4]byte
 	// length == 0 means no type byte either; malformed.
@@ -154,7 +199,7 @@ func TestPartialWritesViaPipe(t *testing.T) {
 	defer pr.Close()
 	defer pw.Close()
 
-	body := bytes.Repeat([]byte{0xAB}, 8192)
+	body := bytes.Repeat([]byte{0xAB}, 4096)
 
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -204,5 +249,36 @@ func TestMsgTypeString(t *testing.T) {
 	}
 	if got := MsgType(0xFF).String(); got != "unknown(0xff)" {
 		t.Errorf("0xFF String() = %q", got)
+	}
+}
+
+type maxReadSizeReader struct {
+	r   io.Reader
+	max int
+}
+
+func (r *maxReadSizeReader) Read(p []byte) (int, error) {
+	if len(p) > r.max {
+		r.max = len(p)
+	}
+	return r.r.Read(p)
+}
+
+func TestReadFrameReadsAllowedBodyInBoundedChunks(t *testing.T) {
+	body := bytes.Repeat([]byte{'x'}, 128*1024)
+	var frame bytes.Buffer
+	if err := WriteFrame(&frame, MsgGossip, body); err != nil {
+		t.Fatalf("WriteFrame: %v", err)
+	}
+	reader := &maxReadSizeReader{r: bytes.NewReader(frame.Bytes())}
+	gotType, gotBody, err := ReadFrame(reader)
+	if err != nil {
+		t.Fatalf("ReadFrame: %v", err)
+	}
+	if gotType != MsgGossip || !bytes.Equal(gotBody, body) {
+		t.Fatal("round trip mismatch")
+	}
+	if reader.max > FrameReadChunkSize {
+		t.Fatalf("largest read = %d, cap is %d", reader.max, FrameReadChunkSize)
 	}
 }
