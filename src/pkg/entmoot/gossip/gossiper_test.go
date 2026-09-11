@@ -670,6 +670,43 @@ func TestFounderPolicyUpdateAppliesAndPersists(t *testing.T) {
 	}
 }
 
+func TestConcurrentDuplicatePolicyUpdateAppliesOnce(t *testing.T) {
+	f := newFixture(t, []entmoot.NodeID{10, 20})
+	defer f.closeTransports()
+	updates := newFakePolicyUpdateStore()
+	f.replaceGossiperWithPolicyUpdates(20, updates)
+
+	p := policy.Standard()
+	update := f.buildPolicyUpdateMessage(10, &p, 10, 2_000)
+	type acceptResult struct {
+		inserted bool
+		err      error
+	}
+	results := make(chan acceptResult, 2)
+	for range 2 {
+		go func() {
+			inserted, err := f.nodes[20].gossip.acceptInboundMessage(context.Background(), 10, update)
+			results <- acceptResult{inserted: inserted, err: err}
+		}()
+	}
+	insertions := 0
+	for range 2 {
+		result := <-results
+		if result.err != nil {
+			t.Fatalf("acceptInboundMessage: %v", result.err)
+		}
+		if result.inserted {
+			insertions++
+		}
+	}
+	if insertions != 1 {
+		t.Fatalf("insertions = %d, want 1", insertions)
+	}
+	if updates.acceptedCount() != 1 {
+		t.Fatalf("accepted updates = %d, want 1", updates.acceptedCount())
+	}
+}
+
 func TestNonFounderPolicyUpdateRejected(t *testing.T) {
 	f := newFixture(t, []entmoot.NodeID{10, 20})
 	defer f.closeTransports()
@@ -698,7 +735,7 @@ func TestRejectedPolicyUpdateStillUsesContentPolicy(t *testing.T) {
 
 	p := policy.Relaxed()
 	update := f.buildPolicyUpdateMessage(20, &p, 10, 2_000)
-	err := f.nodes[10].gossip.acceptInboundMessage(context.Background(), 20, update)
+	_, err := f.nodes[10].gossip.acceptInboundMessage(context.Background(), 20, update)
 	if err == nil || !strings.Contains(err.Error(), "exceeds group max") {
 		t.Fatalf("acceptInboundMessage err = %v, want content policy max-size rejection", err)
 	}
@@ -1271,7 +1308,7 @@ func TestInboundWrongGroupMessageRejected(t *testing.T) {
 	content = f.signMessage(10, content)
 
 	t.Run("direct", func(t *testing.T) {
-		if err := f.nodes[20].gossip.acceptInboundMessage(ctx, 10, content); err == nil {
+		if _, err := f.nodes[20].gossip.acceptInboundMessage(ctx, 10, content); err == nil {
 			t.Fatal("acceptInboundMessage accepted wrong-group content")
 		}
 	})
@@ -1295,7 +1332,7 @@ func TestInboundWrongGroupMessageRejected(t *testing.T) {
 				Message: &content,
 			},
 		}
-		if err := receiver.fetchFrom(ctx, 10, content.ID); err == nil {
+		if _, err := receiver.fetchFrom(ctx, 10, content.ID); err == nil {
 			t.Fatal("fetchFrom accepted wrong-group content")
 		}
 	})
@@ -1305,7 +1342,7 @@ func TestInboundWrongGroupMessageRejected(t *testing.T) {
 		msg := f.buildPolicyUpdateMessage(10, &p, 1, 2_100)
 		msg.GroupID = foreignGroup
 		msg = f.signMessage(10, msg)
-		if err := f.nodes[20].gossip.acceptInboundMessage(ctx, 10, msg); err == nil {
+		if _, err := f.nodes[20].gossip.acceptInboundMessage(ctx, 10, msg); err == nil {
 			t.Fatal("acceptInboundMessage accepted wrong-group policy update")
 		}
 		if has, err := f.nodes[20].storeM.Has(ctx, foreignGroup, msg.ID); err != nil {
@@ -1393,7 +1430,7 @@ func TestFetchForgedBodyRejected(t *testing.T) {
 	// Now have B fetch from A. fetchFrom verifies the signature against
 	// A's entmoot pubkey (known via the roster); the garbage signature
 	// will fail and the body will not be stored on B.
-	if err := f.nodes[20].gossip.fetchFrom(ctx, 10, forged.ID); err == nil {
+	if _, err := f.nodes[20].gossip.fetchFrom(ctx, 10, forged.ID); err == nil {
 		t.Fatalf("expected error fetching forged body")
 	}
 	has, err := f.nodes[20].storeM.Has(ctx, f.groupID, forged.ID)

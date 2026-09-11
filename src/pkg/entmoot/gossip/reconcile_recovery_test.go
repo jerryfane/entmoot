@@ -820,7 +820,7 @@ func TestFetchFromUsesLargeFrameAttemptBudget(t *testing.T) {
 	}
 	f.nodes[20].gossip.cfg.Transport = tr
 
-	if err := f.nodes[20].gossip.fetchFrom(ctx, 10, msg.ID); err != nil {
+	if _, err := f.nodes[20].gossip.fetchFrom(ctx, 10, msg.ID); err != nil {
 		t.Fatalf("fetchFrom failed: %v", err)
 	}
 	deadline := tr.deadlineSnapshot()

@@ -865,6 +865,50 @@ func TestNotifyingStoreBroadcastsOnlyNewInsertions(t *testing.T) {
 	}
 }
 
+func TestNotifyingStoreDuplicateAfterRestartDoesNotBroadcast(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	gid := testRuntimeGroupID(0xB4)
+	msg := entmoot.Message{
+		GroupID:   gid,
+		Author:    entmoot.NodeInfo{PilotNodeID: 1},
+		Timestamp: 10,
+		Content:   []byte("persisted"),
+	}
+	msg.ID = canonical.MessageID(msg)
+
+	first, err := store.OpenSQLite(root)
+	if err != nil {
+		t.Fatalf("OpenSQLite first: %v", err)
+	}
+	if inserted, err := first.Put(ctx, gid, msg); err != nil || !inserted {
+		t.Fatalf("first Put inserted/err = %t/%v, want true/nil", inserted, err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatalf("Close first: %v", err)
+	}
+
+	reopened, err := store.OpenSQLite(root)
+	if err != nil {
+		t.Fatalf("OpenSQLite reopened: %v", err)
+	}
+	defer reopened.Close()
+	notify := newNotifyingStore(reopened, events.NopSink{})
+	ch := make(chan entmoot.Message, 1)
+	unsubscribe := notify.subscribe(ch)
+	defer unsubscribe()
+
+	inserted, err := notify.Put(ctx, gid, msg)
+	if err != nil || inserted {
+		t.Fatalf("replayed Put inserted/err = %t/%v, want false/nil", inserted, err)
+	}
+	select {
+	case <-ch:
+		t.Fatal("duplicate after restart broadcast an event")
+	default:
+	}
+}
+
 func TestNotifyingStoreForwardsTopicAwarePrune(t *testing.T) {
 	ctx := context.Background()
 	gid := testRuntimeGroupID(0xB4)

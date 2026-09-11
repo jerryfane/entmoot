@@ -1716,21 +1716,23 @@ func (g *Gossiper) onGossip(ctx context.Context, remote entmoot.NodeID, gos *wir
 					slog.String("err", err.Error()))
 				continue
 			}
-			if err := g.acceptInboundMessage(ctx, remote, msg); err != nil {
+			inserted, err := g.acceptInboundMessage(ctx, remote, msg)
+			if err != nil {
 				g.logger.Warn("gossip: inline body store put",
 					slog.Uint64("remote", uint64(remote)),
 					slog.String("id", id.String()),
 					slog.String("err", err.Error()))
 				continue
 			}
-			// Same post-Put trio as fetchFrom (the v1.0.5 refanout hook).
-			g.plumCancelGraftsFor(id)
-			g.refanout(ctx, remote, id)
+			if inserted {
+				g.plumCancelGraftsFor(id)
+				g.refanout(ctx, remote, id)
+			}
 			g.maybeReconcile(ctx, remote)
 			continue
 		}
 
-		if err := g.fetchFrom(ctx, remote, id); err != nil {
+		if _, err := g.fetchFrom(ctx, remote, id); err != nil {
 			// Patch 6: queue a retry instead of dropping. Transient Pilot
 			// errors (dial timeout, stream EOF, NAT flap) would otherwise
 			// permanently lose the message — the retry loop gives ~5 min of
@@ -1942,107 +1944,92 @@ func (g *Gossiper) onPrune(remote entmoot.NodeID, pr *wire.Prune) {
 	g.plumDemoteToLazy(remote)
 }
 
-// fetchFrom opens a fresh connection to peer, sends FetchReq for id, and
-// stores the response body after verifying its signature against the
-// author's pubkey from the local roster. Returns an error on dial failure,
-// codec failure, NotFound, or signature verification failure.
-func (g *Gossiper) fetchFrom(ctx context.Context, peer entmoot.NodeID, id entmoot.MessageID) error {
+// fetchFrom opens a fresh connection to peer, validates and stores FetchResp,
+// and reports whether this call inserted the message. Only a new insertion is
+// re-fanned out; duplicates still count as a successful fetch.
+func (g *Gossiper) fetchFrom(ctx context.Context, peer entmoot.NodeID, id entmoot.MessageID) (bool, error) {
 	req := &wire.FetchReq{GroupID: g.cfg.GroupID, ID: id}
 	payload, err := g.requestResponseWithAttemptTimeout(ctx, peer, req, wire.MsgFetchResp, "fetch_req", largeFrameResponseTimeout)
 	if err != nil {
-		return err
+		return false, err
 	}
 	resp, ok := payload.(*wire.FetchResp)
 	if !ok {
-		return fmt.Errorf("fetch: unexpected response type")
+		return false, fmt.Errorf("fetch: unexpected response type")
 	}
 	if resp.NotFound || resp.Message == nil {
-		return fmt.Errorf("fetch: peer %d reports not-found for %s", peer, id)
+		return false, fmt.Errorf("fetch: peer %d reports not-found for %s", peer, id)
 	}
 	if resp.Message.GroupID != g.cfg.GroupID {
-		return fmt.Errorf("fetch: response for wrong group %s", resp.Message.GroupID)
+		return false, fmt.Errorf("fetch: response for wrong group %s", resp.Message.GroupID)
 	}
 	if resp.Message.ID != id {
-		return fmt.Errorf("fetch: response id mismatch")
+		return false, fmt.Errorf("fetch: response id mismatch")
 	}
 	if err := g.verifyMessage(*resp.Message); err != nil {
-		return err
+		return false, err
 	}
-	if err := g.acceptInboundMessage(ctx, peer, *resp.Message); err != nil {
-		return fmt.Errorf("store put: %w", err)
+	inserted, err := g.acceptInboundMessage(ctx, peer, *resp.Message)
+	if err != nil {
+		return false, fmt.Errorf("store put: %w", err)
 	}
-	// Plumtree "first-seen → forward" rule (v1.0.5). A message we just
-	// acquired is new to our store by construction: every caller of
-	// fetchFrom gates on Store.Has first. Forward it through the spanning
-	// tree regardless of which acquisition path led us here — gossip push
-	// (onGossip), queued retry (executeRetry/opFetch), or anti-entropy
-	// pull (reconcileWith). Previously only onGossip called refanout
-	// afterwards, so messages acquired via retry or reconcile silently
-	// terminated at this node — breaking propagation when, e.g., a hub
-	// acquires an edge-node's message via reconcile (because the edge's
-	// direct push was flaky) and the hub's other edge never hears. This
-	// matches GossipSub v1.0's forwarding rule ("not seen before →
-	// forward to mesh, irrespective of arrival method").
-	//
-	// plumCancelGraftsFor clears any outstanding GRAFT timers for this id
-	// (the body arrived, nothing to graft-request anymore). refanout pushes
-	// to eagerPushPeers \ {peer} and IHave-advertises to lazyPushPeers \
-	// {peer}.
-	g.plumCancelGraftsFor(id)
-	g.refanout(ctx, peer, id)
-	// Successful fetch also implies the peer is reachable; trigger a
-	// cooldown-gated reconcile so anti-entropy catches anything else they
-	// have that we don't (patch 7).
+	if inserted {
+		g.plumCancelGraftsFor(id)
+		g.refanout(ctx, peer, id)
+	}
 	g.maybeReconcile(ctx, peer)
-	return nil
+	return inserted, nil
 }
 
-func (g *Gossiper) acceptInboundMessage(ctx context.Context, relay entmoot.NodeID, msg entmoot.Message) error {
+func (g *Gossiper) acceptInboundMessage(ctx context.Context, relay entmoot.NodeID, msg entmoot.Message) (bool, error) {
 	if msg.GroupID != g.cfg.GroupID {
-		return fmt.Errorf("gossip: message for wrong group %s", msg.GroupID)
+		return false, fmt.Errorf("gossip: message for wrong group %s", msg.GroupID)
 	}
 	if messageHasTopic(msg, policy.UpdateTopic) {
 		return g.storePolicyUpdateMessage(ctx, relay, msg, false)
 	}
 	if err := g.checkContentPolicy(relay, msg); err != nil {
-		return err
+		return false, err
 	}
-	if _, err := g.cfg.Store.Put(ctx, g.cfg.GroupID, msg); err != nil {
-		return err
+	inserted, err := g.cfg.Store.Put(ctx, g.cfg.GroupID, msg)
+	if err != nil {
+		return false, err
 	}
-	return g.prunePolicyRetention(ctx)
+	return inserted, g.prunePolicyRetention(ctx)
 }
 
-func (g *Gossiper) storePolicyUpdateMessage(ctx context.Context, relay entmoot.NodeID, msg entmoot.Message, rejectStale bool) error {
+func (g *Gossiper) storePolicyUpdateMessage(ctx context.Context, relay entmoot.NodeID, msg entmoot.Message, rejectStale bool) (bool, error) {
 	if msg.GroupID != g.cfg.GroupID {
-		return fmt.Errorf("gossip: policy update for wrong group %s", msg.GroupID)
+		return false, fmt.Errorf("gossip: policy update for wrong group %s", msg.GroupID)
 	}
 
 	g.policyUpdateMu.Lock()
 	defer g.policyUpdateMu.Unlock()
 
-	if rejectStale {
-		if has, err := g.cfg.Store.Has(ctx, g.cfg.GroupID, msg.ID); err != nil {
-			return err
-		} else if has {
-			return g.prunePolicyRetention(ctx)
-		}
+	has, err := g.cfg.Store.Has(ctx, g.cfg.GroupID, msg.ID)
+	if err != nil {
+		return false, err
 	}
+	if has {
+		return false, g.prunePolicyRetention(ctx)
+	}
+
 	update, err := g.preparePolicyUpdateMessage(ctx, msg, rejectStale)
 	if err != nil {
 		if policyErr := g.checkContentPolicy(relay, msg); policyErr != nil {
-			return policyErr
+			return false, policyErr
 		}
-		return err
+		return false, err
 	}
-	if _, err := g.cfg.Store.Put(ctx, g.cfg.GroupID, msg); err != nil {
+	inserted, err := g.cfg.Store.Put(ctx, g.cfg.GroupID, msg)
+	if err != nil || !inserted {
 		g.rollbackPolicyUpdate(context.Background(), update)
-		return err
+		return false, err
 	}
 	if err := g.applyPreparedPolicyUpdate(update); err != nil {
-		return err
+		return false, err
 	}
-	return g.prunePolicyRetention(ctx)
+	return true, g.prunePolicyRetention(ctx)
 }
 
 func (g *Gossiper) preparePolicyUpdateMessage(ctx context.Context, msg entmoot.Message, rejectStale bool) (*pendingPolicyUpdate, error) {
@@ -2211,11 +2198,14 @@ func (g *Gossiper) fetchMissingFrom(ctx context.Context, peer entmoot.NodeID, id
 			skipped++
 			continue
 		}
-		if ferr := g.fetchFrom(ctx, peer, id); ferr != nil {
+		inserted, ferr := g.fetchFrom(ctx, peer, id)
+		if ferr != nil {
 			failed++
 			g.enqueueRetry(retryKey{peer: peer, id: id, op: opFetch}, nil)
-		} else {
+		} else if inserted {
 			fetched++
+		} else {
+			skipped++
 		}
 	}
 	g.traceReconcile(peer, "body_fetch_done",
@@ -2239,20 +2229,28 @@ func (g *Gossiper) Publish(ctx context.Context, msg entmoot.Message) error {
 	if err := g.verifyMessage(msg); err != nil {
 		return err
 	}
+	inserted := false
 	if messageHasTopic(msg, policy.UpdateTopic) {
-		if err := g.storePolicyUpdateMessage(ctx, g.cfg.LocalNode, msg, true); err != nil {
+		var err error
+		inserted, err = g.storePolicyUpdateMessage(ctx, g.cfg.LocalNode, msg, true)
+		if err != nil {
 			return err
 		}
 	} else {
 		if err := g.checkContentPolicy(g.cfg.LocalNode, msg); err != nil {
 			return err
 		}
-		if _, err := g.cfg.Store.Put(ctx, g.cfg.GroupID, msg); err != nil {
+		var err error
+		inserted, err = g.cfg.Store.Put(ctx, g.cfg.GroupID, msg)
+		if err != nil {
 			return fmt.Errorf("gossip: store put: %w", err)
 		}
 		if err := g.prunePolicyRetention(ctx); err != nil {
 			return fmt.Errorf("gossip: prune retention: %w", err)
 		}
+	}
+	if !inserted {
+		return nil
 	}
 
 	// v1.0.3 publish semantics: local-durable accept is the contract.
@@ -3105,7 +3103,12 @@ func (g *Gossiper) executeRetry(ctx context.Context, key retryKey, state *retryS
 		}
 		return g.pushGossip(ctx, key.peer, state.frame)
 	case opFetch:
-		return g.fetchFrom(ctx, key.peer, key.id)
+		has, err := g.cfg.Store.Has(ctx, g.cfg.GroupID, key.id)
+		if err != nil || has {
+			return err
+		}
+		_, err = g.fetchFrom(ctx, key.peer, key.id)
+		return err
 	case opIHave:
 		// Plumtree IHave is a single-id advertisement; retry re-dials
 		// and re-sends. We don't stash the frame on the retry state

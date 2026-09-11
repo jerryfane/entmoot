@@ -378,37 +378,45 @@ func TestPlumtreeOnPruneDemotesSender(t *testing.T) {
 // After fetchFrom returns, refanout must push to C, which should store
 // the message.
 func TestPlumtreeRefanoutOnFetchFrom(t *testing.T) {
-	t.Parallel()
 	f := newFixture(t, []entmoot.NodeID{10, 20, 30})
 	defer f.closeTransports()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	f.startAll(ctx)
+	for _, node := range []entmoot.NodeID{20, 30} {
+		go func() { _ = f.nodes[node].gossip.Start(ctx) }()
+	}
 
-	// Put a B-authored message directly in B's store without
-	// publishing. This simulates the state after reconcileWith has
-	// located the id on peer B via RangeReq: A about to fetchFrom B.
 	msg := f.buildMessage(20, "B-authored, never gossiped", 2_000)
 	if _, err := f.nodes[20].storeM.Put(ctx, msg.GroupID, msg); err != nil {
 		t.Fatalf("seed B store: %v", err)
 	}
 
-	// Drive A's fetchFrom directly — mirrors what reconcileWith or
-	// executeRetry(opFetch) would do on the post-1.0.5 code path.
-	if err := f.nodes[10].gossip.fetchFrom(ctx, 20, msg.ID); err != nil {
-		t.Fatalf("fetchFrom on A: %v", err)
+	type fetchResult struct {
+		inserted bool
+		err      error
+	}
+	results := make(chan fetchResult, 2)
+	for range 2 {
+		go func() {
+			inserted, err := f.nodes[10].gossip.fetchFrom(ctx, 20, msg.ID)
+			results <- fetchResult{inserted: inserted, err: err}
+		}()
+	}
+	insertions := 0
+	for range 2 {
+		result := <-results
+		if result.err != nil {
+			t.Fatalf("fetchFrom on A: %v", result.err)
+		}
+		if result.inserted {
+			insertions++
+		}
+	}
+	if insertions != 1 {
+		t.Fatalf("successful insertions = %d, want 1", insertions)
 	}
 
-	// A must now have the message locally (Put side-effect).
-	has, _ := f.nodes[10].storeM.Has(ctx, f.groupID, msg.ID)
-	if !has {
-		t.Fatalf("A did not store message after fetchFrom")
-	}
-
-	// And A's refanout must have propagated to C. One A→C eager push
-	// over net.Pipe is sub-millisecond; budget 2 s for scheduler
-	// slack.
 	waitUntil(t, 2*time.Second, "C stores message via A's post-fetch refanout", func() bool {
 		has, _ := f.nodes[30].storeM.Has(ctx, f.groupID, msg.ID)
 		return has
