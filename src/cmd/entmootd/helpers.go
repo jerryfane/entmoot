@@ -15,6 +15,7 @@ import (
 
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/keystore"
+	"entmoot/pkg/entmoot/roster"
 	"entmoot/pkg/entmoot/transport/pilot"
 )
 
@@ -211,6 +212,14 @@ func groupsDir(dataRoot string) string {
 
 func groupRosterPath(dataRoot string, gid entmoot.GroupID) string {
 	return filepath.Join(groupDirPath(dataRoot, gid), "roster.jsonl")
+}
+
+func groupRosterSQLitePath(dataRoot string, gid entmoot.GroupID) string {
+	return filepath.Join(groupDirPath(dataRoot, gid), "roster.sqlite")
+}
+
+func groupRosterExists(dataRoot string, gid entmoot.GroupID) bool {
+	return roster.Exists(dataRoot, gid)
 }
 
 // controlSocketPath returns the canonical control-socket path under the

@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"path/filepath"
 	"sort"
 	"sync"
 	"time"
@@ -30,10 +31,12 @@ var (
 )
 
 type groupDiskState struct {
-	groupDir          string
-	rosterPath        string
-	groupDirExisted   bool
-	rosterFileExisted bool
+	groupDir           string
+	rosterPath         string
+	rosterDBPath       string
+	groupDirExisted    bool
+	rosterFileExisted  bool
+	rosterDBFileExists bool
 }
 
 type groupRuntimeConfig struct {
@@ -394,6 +397,11 @@ func (r *groupRuntime) addGroup(ctx context.Context, groupID entmoot.GroupID, bo
 		return nil, false, fmt.Errorf("open roster: %w", err)
 	}
 	if bootstrap == nil {
+		if err := rlog.ClaimWriter(); err != nil {
+			_ = rlog.Close()
+			cleanupGroup()
+			return nil, false, fmt.Errorf("claim roster writer: %w", err)
+		}
 		if err := r.validateLocalMembership(rlog); err != nil {
 			_ = rlog.Close()
 			cleanupGroup()
@@ -443,6 +451,12 @@ func (r *groupRuntime) addGroup(ctx context.Context, groupID entmoot.GroupID, bo
 			rollbackCreatedGroupState(diskState, r.logger)
 			cleanupGroup()
 			return nil, false, err
+		}
+		if err := rlog.ClaimWriter(); err != nil {
+			_ = rlog.Close()
+			rollbackCreatedGroupState(diskState, r.logger)
+			cleanupGroup()
+			return nil, false, fmt.Errorf("claim roster writer: %w", err)
 		}
 		if err := r.validateLocalMembership(rlog); err != nil {
 			_ = rlog.Close()
@@ -517,27 +531,25 @@ func rosterHasLocalIdentityPubKey(rlog *roster.RosterLog, pubKey []byte) bool {
 }
 
 func openExistingRosterLog(dataDir string, groupID entmoot.GroupID) (*roster.RosterLog, bool, error) {
-	info, err := os.Stat(groupRosterPath(dataDir, groupID))
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, false, nil
-		}
-		return nil, false, err
-	}
-	if info.IsDir() || info.Size() == 0 {
+	if !groupRosterExists(dataDir, groupID) {
 		return nil, false, nil
 	}
 	rlog, err := roster.OpenJSONL(dataDir, groupID)
 	if err != nil {
 		return nil, false, err
 	}
+	if len(rlog.Entries()) == 0 {
+		_ = rlog.Close()
+		return nil, false, nil
+	}
 	return rlog, true, nil
 }
 
 func snapshotGroupDiskState(dataDir string, groupID entmoot.GroupID) groupDiskState {
 	state := groupDiskState{
-		groupDir:   groupDirPath(dataDir, groupID),
-		rosterPath: groupRosterPath(dataDir, groupID),
+		groupDir:     groupDirPath(dataDir, groupID),
+		rosterPath:   groupRosterPath(dataDir, groupID),
+		rosterDBPath: groupRosterSQLitePath(dataDir, groupID),
 	}
 	if info, err := os.Stat(state.groupDir); err == nil && info.IsDir() {
 		state.groupDirExisted = true
@@ -548,6 +560,11 @@ func snapshotGroupDiskState(dataDir string, groupID entmoot.GroupID) groupDiskSt
 		state.rosterFileExisted = true
 	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
 		state.rosterFileExisted = true
+	}
+	if info, err := os.Stat(state.rosterDBPath); err == nil && !info.IsDir() {
+		state.rosterDBFileExists = true
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		state.rosterDBFileExists = true
 	}
 	return state
 }
@@ -568,6 +585,22 @@ func rollbackCreatedGroupState(state groupDiskState, logger *slog.Logger) {
 		if err := os.Remove(state.rosterPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 			logger.Warn("join: rollback created roster",
 				slog.String("path", state.rosterPath),
+				slog.String("err", err.Error()))
+		}
+	}
+	if !state.rosterDBFileExists {
+		for _, suffix := range []string{"", "-wal", "-shm"} {
+			path := state.rosterDBPath + suffix
+			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				logger.Warn("join: rollback created roster database",
+					slog.String("path", path),
+					slog.String("err", err.Error()))
+			}
+		}
+		lockPath := filepath.Join(state.groupDir, "roster.writer.lock")
+		if err := os.Remove(lockPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			logger.Warn("join: rollback created roster lock",
+				slog.String("path", lockPath),
 				slog.String("err", err.Error()))
 		}
 	}

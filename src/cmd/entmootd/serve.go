@@ -146,7 +146,5 @@ func selectServeGroupIDs(dataRoot string, selected []string, logger *slog.Logger
 }
 
 func rosterFileExists(dataRoot string, gid entmoot.GroupID) bool {
-	path := groupRosterPath(dataRoot, gid)
-	info, err := os.Stat(path)
-	return err == nil && !info.IsDir() && info.Size() > 0
+	return groupRosterExists(dataRoot, gid)
 }

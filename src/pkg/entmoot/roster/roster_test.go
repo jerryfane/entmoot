@@ -1,10 +1,17 @@
 package roster
 
 import (
+	"bufio"
+	"bytes"
 	"errors"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -335,73 +342,77 @@ func TestJSONLRoundTrip(t *testing.T) {
 	}
 }
 
-//  10. OpenJSONL with a malformed line in the middle skips it, loads valid
-//     entries before and after.
-func TestJSONLSkipsMalformedLine(t *testing.T) {
+// OpenJSONL fails closed when any legacy line is malformed and preserves the
+// source file byte-for-byte for explicit repair.
+func TestJSONLRejectsMalformedLineWithoutChangingSource(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	gid := testGroupID()
 	founder, founderInfo := newFounder(t, 100)
 	_, bobInfo := newFounder(t, 200)
 
-	// Produce two valid entries via a first open, then inject a malformed
-	// line between them and append a third valid line.
-	r, err := OpenJSONL(dir, gid)
-	if err != nil {
-		t.Fatalf("OpenJSONL: %v", err)
-	}
-	if err := r.Genesis(founder, founderInfo, 1_000); err != nil {
+	source := New(gid)
+	if err := source.Genesis(founder, founderInfo, 1_000); err != nil {
 		t.Fatalf("Genesis: %v", err)
 	}
 	addBob := mkEntry(t, founder, founderInfo.PilotNodeID, "add", bobInfo, 2_000,
-		[]entmoot.RosterEntryID{r.Head()})
-	if err := r.Apply(addBob); err != nil {
+		[]entmoot.RosterEntryID{source.Head()})
+	if err := source.Apply(addBob); err != nil {
 		t.Fatalf("Apply addBob: %v", err)
 	}
-	// Build a third valid entry keyed off the current head BEFORE we corrupt
-	// the file, then inject garbage between lines 2 and 3.
 	removeBob := mkEntry(t, founder, founderInfo.PilotNodeID, "remove", bobInfo, 3_000,
-		[]entmoot.RosterEntryID{r.Head()})
-	if err := r.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
+		[]entmoot.RosterEntryID{source.Head()})
+	entries := source.Entries()
 
-	path := filepath.Join(dir, "groups", encodeGroupDirName(gid), rosterFileName)
-
-	// Append a malformed line directly, then append the encoded valid entry.
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
-	if err != nil {
-		t.Fatalf("OpenFile: %v", err)
+	groupDir := filepath.Join(dir, "groups", encodeGroupDirName(gid))
+	if err := os.MkdirAll(groupDir, 0o700); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
 	}
-	if _, err := f.Write([]byte("{this is not json\n")); err != nil {
-		t.Fatalf("write garbage: %v", err)
+	path := filepath.Join(groupDir, rosterFileName)
+	var raw []byte
+	for _, entry := range entries {
+		encoded, err := canonical.Encode(entry)
+		if err != nil {
+			t.Fatalf("canonical.Encode: %v", err)
+		}
+		raw = append(raw, encoded...)
+		raw = append(raw, '\n')
 	}
+	validPrefixLen := len(raw)
+	raw = append(raw, []byte("{this is not json\n")...)
 	encoded, err := canonical.Encode(removeBob)
 	if err != nil {
-		t.Fatalf("canonical.Encode: %v", err)
+		t.Fatalf("canonical.Encode remove: %v", err)
 	}
-	if _, err := f.Write(append(encoded, '\n')); err != nil {
-		t.Fatalf("write valid: %v", err)
-	}
-	if err := f.Close(); err != nil {
-		t.Fatalf("Close inject: %v", err)
+	raw = append(raw, encoded...)
+	raw = append(raw, '\n')
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
 	}
 
-	r2, err := OpenJSONL(dir, gid)
+	if _, err := OpenJSONL(dir, gid); err == nil || !strings.Contains(err.Error(), "line 3") {
+		t.Fatalf("OpenJSONL malformed error = %v, want line 3 diagnostic", err)
+	}
+	after, err := os.ReadFile(path)
 	if err != nil {
-		t.Fatalf("OpenJSONL reopen: %v", err)
+		t.Fatalf("ReadFile after failure: %v", err)
 	}
-	defer r2.Close()
-	// All three valid entries should be present despite the garbage line.
-	got := r2.Entries()
-	if len(got) != 3 {
-		t.Fatalf("reopened Entries() len = %d, want 3", len(got))
+	if !bytes.Equal(after, raw) {
+		t.Fatal("failed import changed legacy source")
 	}
-	if r2.Head() != removeBob.ID {
-		t.Fatalf("Head() = %x, want removeBob.ID = %x", r2.Head(), removeBob.ID)
+	repaired := append([]byte(nil), raw[:validPrefixLen]...)
+	repaired = append(repaired, encoded...)
+	repaired = append(repaired, '\n')
+	if err := os.WriteFile(path, repaired, 0o600); err != nil {
+		t.Fatalf("repair WriteFile: %v", err)
 	}
-	if r2.IsMember(200) {
-		t.Fatalf("bob should not be a member after replayed remove")
+	imported, err := OpenJSONL(dir, gid)
+	if err != nil {
+		t.Fatalf("OpenJSONL after repair: %v", err)
+	}
+	defer imported.Close()
+	if got := len(imported.Entries()); got != 3 {
+		t.Fatalf("repaired import entries = %d, want 3", got)
 	}
 }
 
@@ -464,6 +475,7 @@ func TestSubscribeCancelIdempotent(t *testing.T) {
 	_, bobInfo := newFounder(t, 200)
 
 	r := New(testGroupID())
+
 	ch, cancel := r.Subscribe()
 
 	if err := r.Genesis(founder, founderInfo, 1_000); err != nil {
@@ -494,6 +506,266 @@ func TestSubscribeCancelIdempotent(t *testing.T) {
 		[]entmoot.RosterEntryID{r.Head()})
 	if err := r.Apply(add); err != nil {
 		t.Fatalf("Apply after cancel: %v", err)
+	}
+}
+func TestConcurrentApplyAcceptsOneChildAndPersistsHead(t *testing.T) {
+	dir := t.TempDir()
+	gid := testGroupID()
+	founder, founderInfo := newFounder(t, 100)
+	_, memberInfo := newFounder(t, 200)
+	r, err := OpenJSONL(dir, gid)
+	if err != nil {
+		t.Fatalf("OpenJSONL: %v", err)
+	}
+	if err := r.Genesis(founder, founderInfo, 1_000); err != nil {
+		t.Fatalf("Genesis: %v", err)
+	}
+	parent := r.Head()
+
+	const contenders = 64
+	entries := make([]entmoot.RosterEntry, contenders)
+	for i := range entries {
+		subject := memberInfo
+		subject.PilotNodeID += entmoot.NodeID(i)
+		entries[i] = mkEntry(t, founder, founderInfo.PilotNodeID, "add", subject, int64(2_000+i),
+			[]entmoot.RosterEntryID{parent})
+	}
+	var accepted atomic.Int32
+	var wg sync.WaitGroup
+	for i := range entries {
+		wg.Add(1)
+		go func(entry entmoot.RosterEntry) {
+			defer wg.Done()
+			if err := r.Apply(entry); err == nil {
+				accepted.Add(1)
+			} else if !errors.Is(err, entmoot.ErrRosterReject) {
+				t.Errorf("Apply unexpected error: %v", err)
+			}
+		}(entries[i])
+	}
+	wg.Wait()
+	if got := accepted.Load(); got != 1 {
+		t.Fatalf("accepted = %d, want 1", got)
+	}
+	wantHead := r.Head()
+	if err := r.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	reopened, err := OpenJSONL(dir, gid)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reopened.Close()
+	if reopened.Head() != wantHead || len(reopened.Entries()) != 2 {
+		t.Fatalf("reopened head/entries = (%s, %d), want (%s, 2)", reopened.Head(), len(reopened.Entries()), wantHead)
+	}
+}
+
+func TestPersistentWriterLeaseFailsPromptlyAndAllowsReaders(t *testing.T) {
+	dir := t.TempDir()
+	gid := testGroupID()
+	founder, founderInfo := newFounder(t, 100)
+	writer, err := OpenJSONL(dir, gid)
+	if err != nil {
+		t.Fatalf("OpenJSONL writer: %v", err)
+	}
+	if err := writer.Genesis(founder, founderInfo, 1_000); err != nil {
+		t.Fatalf("Genesis: %v", err)
+	}
+	reader, err := OpenJSONL(dir, gid)
+	if err != nil {
+		t.Fatalf("OpenJSONL reader: %v", err)
+	}
+	defer reader.Close()
+	if got, ok := reader.Founder(); !ok || got.PilotNodeID != founderInfo.PilotNodeID {
+		t.Fatalf("reader Founder = (%+v, %v)", got, ok)
+	}
+	start := time.Now()
+	if err := reader.ClaimWriter(); !errors.Is(err, ErrWriterActive) {
+		t.Fatalf("second ClaimWriter = %v, want ErrWriterActive", err)
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("second ClaimWriter blocked for %s", elapsed)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("writer Close: %v", err)
+	}
+}
+
+func TestLegacyImportRejectsTruncatedEntryAndPreservesSource(t *testing.T) {
+	dir := t.TempDir()
+	gid := testGroupID()
+	founder, founderInfo := newFounder(t, 100)
+	source := New(gid)
+	if err := source.Genesis(founder, founderInfo, 1_000); err != nil {
+		t.Fatalf("Genesis: %v", err)
+	}
+	encoded, err := canonical.Encode(source.Entries()[0])
+	if err != nil {
+		t.Fatalf("canonical.Encode: %v", err)
+	}
+	groupDir := filepath.Join(dir, "groups", encodeGroupDirName(gid))
+	if err := os.MkdirAll(groupDir, 0o700); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	path := filepath.Join(groupDir, rosterFileName)
+	if err := os.WriteFile(path, encoded, 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if _, err := OpenJSONL(dir, gid); err == nil || !strings.Contains(err.Error(), "truncated legacy log") {
+		t.Fatalf("OpenJSONL truncated error = %v", err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if !bytes.Equal(after, encoded) {
+		t.Fatal("truncated import changed source")
+	}
+}
+
+func TestLegacyImportRetainsExactSignedEntries(t *testing.T) {
+	dir := t.TempDir()
+	gid := testGroupID()
+	founder, founderInfo := newFounder(t, 100)
+	_, memberInfo := newFounder(t, 200)
+	source := New(gid)
+	if err := source.Genesis(founder, founderInfo, 1_000); err != nil {
+		t.Fatalf("Genesis: %v", err)
+	}
+	entry := mkEntry(t, founder, founderInfo.PilotNodeID, "add", memberInfo, 2_000,
+		[]entmoot.RosterEntryID{source.Head()})
+	if err := source.Apply(entry); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	groupDir := filepath.Join(dir, "groups", encodeGroupDirName(gid))
+	if err := os.MkdirAll(groupDir, 0o700); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	path := filepath.Join(groupDir, rosterFileName)
+	var original []byte
+	for _, item := range source.Entries() {
+		encoded, err := canonical.Encode(item)
+		if err != nil {
+			t.Fatalf("canonical.Encode: %v", err)
+		}
+		original = append(original, encoded...)
+		original = append(original, '\n')
+	}
+	if err := os.WriteFile(path, original, 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	imported, err := OpenJSONL(dir, gid)
+	if err != nil {
+		t.Fatalf("OpenJSONL import: %v", err)
+	}
+	defer imported.Close()
+	got := imported.Entries()
+	want := source.Entries()
+	if len(got) != len(want) {
+		t.Fatalf("imported entries = %d, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i].ID != want[i].ID || !bytes.Equal(got[i].Signature, want[i].Signature) {
+			t.Fatalf("entry %d changed across import", i)
+		}
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if !bytes.Equal(after, original) {
+		t.Fatal("valid import changed legacy source")
+	}
+}
+
+func TestPersistFailureDoesNotAdvanceProjection(t *testing.T) {
+	gid := testGroupID()
+	founder, founderInfo := newFounder(t, 100)
+	_, memberInfo := newFounder(t, 200)
+	r := New(gid)
+	if err := r.Genesis(founder, founderInfo, 1_000); err != nil {
+		t.Fatalf("Genesis: %v", err)
+	}
+	head := r.Head()
+	entry := mkEntry(t, founder, founderInfo.PilotNodeID, "add", memberInfo, 2_000,
+		[]entmoot.RosterEntryID{head})
+	r.persist = func(entmoot.RosterEntry) error { return errors.New("injected commit failure") }
+
+	if err := r.Apply(entry); err == nil || !strings.Contains(err.Error(), "injected commit failure") {
+		t.Fatalf("Apply error = %v, want injected failure", err)
+	}
+	if r.Head() != head || r.IsMember(memberInfo.PilotNodeID) || len(r.Entries()) != 1 {
+		t.Fatal("persist failure advanced in-memory roster")
+	}
+}
+
+func TestPersistentWriterLeaseAcrossProcesses(t *testing.T) {
+	if root := os.Getenv("ENTMOOT_ROSTER_LOCK_HELPER"); root != "" {
+		r, err := OpenJSONL(root, testGroupID())
+		if err != nil {
+			t.Fatalf("child OpenJSONL: %v", err)
+		}
+		defer r.Close()
+		if err := r.ClaimWriter(); err != nil {
+			t.Fatalf("child ClaimWriter: %v", err)
+		}
+		fmt.Fprintln(os.Stdout, "ready")
+		_, _ = bufio.NewReader(os.Stdin).ReadByte()
+		return
+	}
+
+	dir := t.TempDir()
+	gid := testGroupID()
+	founder, founderInfo := newFounder(t, 100)
+	seed, err := OpenJSONL(dir, gid)
+	if err != nil {
+		t.Fatalf("seed OpenJSONL: %v", err)
+	}
+	if err := seed.Genesis(founder, founderInfo, 1_000); err != nil {
+		t.Fatalf("seed Genesis: %v", err)
+	}
+	if err := seed.Close(); err != nil {
+		t.Fatalf("seed Close: %v", err)
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run=^TestPersistentWriterLeaseAcrossProcesses$")
+	cmd.Env = append(os.Environ(), "ENTMOOT_ROSTER_LOCK_HELPER="+dir)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatalf("StdoutPipe: %v", err)
+	}
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatalf("StdinPipe: %v", err)
+	}
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("Start child: %v", err)
+	}
+	t.Cleanup(func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+	})
+	line, err := bufio.NewReader(stdout).ReadString('\n')
+	if err != nil || strings.TrimSpace(line) != "ready" {
+		t.Fatalf("child ready = (%q, %v)", line, err)
+	}
+
+	reader, err := OpenJSONL(dir, gid)
+	if err != nil {
+		t.Fatalf("parent reader OpenJSONL: %v", err)
+	}
+	if err := reader.ClaimWriter(); !errors.Is(err, ErrWriterActive) {
+		t.Fatalf("parent ClaimWriter = %v, want ErrWriterActive", err)
+	}
+	_ = reader.Close()
+	if _, err := stdin.Write([]byte{'\n'}); err != nil {
+		t.Fatalf("release child: %v", err)
+	}
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("child Wait: %v", err)
 	}
 }
 

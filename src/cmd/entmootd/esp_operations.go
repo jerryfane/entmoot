@@ -2361,11 +2361,8 @@ func (e espOperationExecutor) resolveInviteTarget(ctx context.Context, req espht
 	if !ok {
 		return nil, &esphttp.OperationError{HTTPStatus: http.StatusForbidden, Code: "forbidden", Message: "device is not authorized for source group"}
 	}
-	if _, err := os.Stat(groupRosterPath(e.dataDir, sourceGroupID)); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, &esphttp.OperationError{HTTPStatus: http.StatusNotFound, Code: "source_group_not_found", Message: "source group not joined"}
-		}
-		return nil, err
+	if !groupRosterExists(e.dataDir, sourceGroupID) {
+		return nil, &esphttp.OperationError{HTTPStatus: http.StatusNotFound, Code: "source_group_not_found", Message: "source group not joined"}
 	}
 	rlog, err := roster.OpenJSONL(e.dataDir, sourceGroupID)
 	if err != nil {

@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Transactional roster persistence.** Roster mutations now serialize
+  validation, SQLite entry/head/version/projection commits, and in-memory
+  updates under one writer boundary. Group-scoped nonblocking writer leases
+  keep daemon and offline maintenance writers exclusive while committed
+  readers remain available. Legacy JSONL imports validate the complete exact
+  signed chain and fail closed without changing the source.
 - **Scalable history synchronization.** SQLite now versions message-set
   mutations, caches Merkle roots with generation compare-and-swap, enumerates
   bounded keyset pages, compares roots over an explicit shared retention

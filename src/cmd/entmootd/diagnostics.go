@@ -234,11 +234,8 @@ func buildDoctorReport(ctx context.Context, gf *globalFlags, groupFilter *entmoo
 		return nil, err
 	}
 	if groupFilter != nil {
-		if _, err := os.Stat(groupRosterPath(s.dataDir, *groupFilter)); err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				return report, nil
-			}
-			return nil, fmt.Errorf("stat roster %s: %w", *groupFilter, err)
+		if !groupRosterExists(s.dataDir, *groupFilter) {
+			return report, nil
 		}
 		gids = []entmoot.GroupID{*groupFilter}
 	}
@@ -257,11 +254,11 @@ func buildDoctorReport(ctx context.Context, gf *globalFlags, groupFilter *entmoo
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		if _, err := os.Stat(groupRosterPath(s.dataDir, gid)); err != nil {
-			if groupFilter != nil && errors.Is(err, os.ErrNotExist) {
+		if !groupRosterExists(s.dataDir, gid) {
+			if groupFilter != nil {
 				continue
 			}
-			return nil, fmt.Errorf("stat roster %s: %w", gid, err)
+			continue
 		}
 		r, err := roster.OpenJSONL(s.dataDir, gid)
 		if err != nil {

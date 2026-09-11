@@ -107,6 +107,12 @@ func setupFounderRoster(gf *globalFlags, command string, gid entmoot.GroupID) (f
 		slog.Error(command+": open roster", slog.String("err", err.Error()))
 		return founderRosterContext{}, exitTransport, false
 	}
+	if err := r.ClaimWriter(); err != nil {
+		_ = r.Close()
+		tr.Close()
+		slog.Error(command+": roster writer", slog.String("err", err.Error()))
+		return founderRosterContext{}, exitTransport, false
+	}
 
 	founder, ok := r.Founder()
 	if !ok {
@@ -136,9 +142,9 @@ func setupFounderRoster(gf *globalFlags, command string, gid entmoot.GroupID) (f
 }
 
 // cmdRosterAdd admits a new member to a group's roster. Founder-only: the
-// local identity must match the roster's declared founder, and the signed
-// entry is applied to the on-disk roster JSONL. The new member can then
-// run `entmootd join <invite>` and participate in gossip.
+// local identity must match the declared founder. This offline maintenance
+// command acquires the roster writer lease and fails promptly while the daemon
+// owns it.
 func cmdRosterAdd(gf *globalFlags, args []string) int {
 	fs := flag.NewFlagSet("roster add", flag.ContinueOnError)
 	memberFlags := addRosterMemberFlags(fs)

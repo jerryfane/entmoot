@@ -163,7 +163,9 @@ roster member whose Pilot key matches the roster.
 
 - Creates `~/.entmoot/` (mode 0700) if absent.
 - Creates `~/.entmoot/identity.json` (mode 0600) if absent.
-- Creates `~/.entmoot/groups/<gid>/` with `roster.jsonl`, `messages.jsonl`.
+- Creates `~/.entmoot/groups/<gid>/` with `roster.sqlite` and
+  `messages.sqlite`; an existing `roster.jsonl` remains as an immutable import
+  source.
 - Creates `~/.entmoot/control.sock` (mode 0600) for IPC.
 - Removes the control socket on clean shutdown.
 
@@ -1009,12 +1011,11 @@ at any scale.
 
 ### 4.1 Layout
 
-One SQLite database per group, at
-`${data}/groups/<base64url(gid)>/messages.sqlite`. Separate files keep
-permissions, backup, and per-group encryption (a v2 concern) clean.
-The roster stays as `roster.jsonl` alongside; the roster is
-append-only, tiny, and easy to read with `cat`, so it doesn't benefit
-from moving.
+Each group uses `${data}/groups/<base64url(gid)>/messages.sqlite` for
+messages and `roster.sqlite` for the signed membership chain. Separate files
+keep permissions, backup, and transaction ownership clear. A legacy
+`roster.jsonl` alongside them is validated and imported once, then preserved
+unchanged for audit or explicit repair.
 
 ### 4.2 Schema
 
@@ -1043,15 +1044,48 @@ CREATE TABLE message_topics (
 CREATE INDEX idx_topic_lookup ON message_topics(topic, message_id);
 ```
 
+The roster database stores:
+
+```sql
+CREATE TABLE roster_meta (
+  group_id BLOB PRIMARY KEY,
+  version INTEGER NOT NULL,
+  head_id BLOB NOT NULL,
+  founder_node_id INTEGER NOT NULL,
+  founder_pubkey BLOB NOT NULL,
+  import_complete INTEGER NOT NULL
+);
+CREATE TABLE roster_entries (
+  entry_id BLOB PRIMARY KEY,
+  group_id BLOB NOT NULL,
+  sequence INTEGER NOT NULL,
+  parent_id BLOB,
+  canonical_bytes BLOB NOT NULL,
+  op TEXT NOT NULL,
+  actor_node_id INTEGER NOT NULL,
+  timestamp_ms INTEGER NOT NULL,
+  UNIQUE (group_id, sequence)
+);
+CREATE TABLE roster_members (
+  group_id BLOB NOT NULL,
+  node_id INTEGER NOT NULL,
+  pubkey BLOB NOT NULL,
+  active INTEGER NOT NULL,
+  last_entry_id BLOB NOT NULL,
+  PRIMARY KEY (group_id, node_id)
+);
+```
+
 FTS5 (full-text search) and `prune` (retention) are v2; the schema
 above is v1.
 
 ### 4.3 Concurrency model
 
-WAL mode. The `join` process writes on every `Put`; `query`, `info`,
-and `tail`'s backfill read with a shared lock. Reads never block
-writes and vice-versa under WAL. No cross-process locking beyond what
-SQLite provides.
+Both databases use WAL. The daemon owns each active group's nonblocking roster
+writer lease; separate handles and processes may read committed snapshots.
+Offline roster mutation is admitted only while that lease is free. Roster
+validation, entry/head/version persistence, and membership projection changes
+commit in one transaction before memory advances.
 
 ### 4.4 Integration with the rest of the system
 

@@ -1309,11 +1309,8 @@ func liveActionRequireGroupFounderPublisher(ctx context.Context, gf *globalFlags
 	if info.PilotNodeID != nodeID {
 		return fmt.Errorf("live action metadata.update requires the local publisher to match live node %d", nodeID)
 	}
-	if _, err := os.Stat(groupRosterPath(gf.data, groupID)); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("live action metadata.update requires group roster")
-		}
-		return err
+	if !groupRosterExists(gf.data, groupID) {
+		return fmt.Errorf("live action metadata.update requires group roster")
 	}
 	rlog, err := roster.OpenJSONL(gf.data, groupID)
 	if err != nil {

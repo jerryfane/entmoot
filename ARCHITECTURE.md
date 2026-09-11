@@ -55,10 +55,11 @@ the shape of the design space, not to freeze implementation choices.
    signed roster entries.
 6. **Local control-socket IPC boundary.** v1 introduces a local IPC
    boundary between the long-running `join` process and the short-lived
-   CLI invocations that operate against it. Exactly one `join` or `serve` process
-   per host owns the single Pilot connection and is the only writer to
-   the SQLite message store. Short-lived CLI invocations (`publish`,
-   `doctor`, `peers`, `tail`, `info`, `query`) communicate with the daemon via a
+   CLI invocations that operate against it. Exactly one `join` or `serve`
+   process per host owns the single Pilot connection and the writer leases for
+   the SQLite message and roster stores.
+   Short-lived CLI invocations (`publish`, `doctor`, `peers`, `tail`, `info`,
+   `query`) communicate with the daemon via a
    Unix domain socket at `${data}/control.sock` (mode `0600`, same
    owner). The control-socket codec lives in its own package
    (`src/pkg/entmoot/ipc/`), deliberately separate from the peer wire
@@ -141,6 +142,19 @@ entries remain authoritative. ESP-admin devices can request group metadata,
 invite, open-invite, and member-removal operations, but completion still routes
 through the running daemon and founder/admin authorization checks. Multi-admin
 quorum rosters are a later policy extension.
+
+Roster persistence is transactional SQLite at
+`${data}/groups/<gid>/roster.sqlite`. One process holds a nonblocking
+group-scoped writer lease; other handles can read committed WAL snapshots.
+Validation, entry insertion, head/version advancement, and membership
+projection updates form one serialized mutation. An unsuccessful commit never
+advances the in-memory projection.
+
+Legacy `roster.jsonl` files are immutable import sources. Import requires every
+non-empty line to be exact canonical JSON and validates the complete signed,
+linear chain before one transaction records entries, head, version, and member
+projections. Malformed, noncanonical, forked, or truncated input fails with its
+line diagnostic and remains untouched.
 
 ### 3.4 Topics
 

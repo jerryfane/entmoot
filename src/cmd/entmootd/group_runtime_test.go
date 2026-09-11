@@ -1097,6 +1097,9 @@ func TestGroupRuntimeRejectedJoinPreservesExistingGroupDir(t *testing.T) {
 	if _, err := os.Stat(groupRosterPath(dataDir, gid)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("created roster still exists after rejected join: %v", err)
 	}
+	if _, err := os.Stat(groupRosterSQLitePath(dataDir, gid)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("created roster database still exists after rejected join: %v", err)
+	}
 }
 
 func TestSelectServeGroupIDsFiltersGroupsWithoutRoster(t *testing.T) {
