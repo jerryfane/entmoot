@@ -1384,6 +1384,8 @@ func (g *Gossiper) handleConn(ctx context.Context, c net.Conn, remote entmoot.No
 		reqCtx, cancel := g.inboundLargeFrameResponseContext(ctx)
 		defer cancel()
 		g.onFetchReq(reqCtx, c, remote, v)
+	case *wire.AcceptanceReq:
+		g.onAcceptanceReq(handlerCtx, c, remote, v)
 	case *wire.MerkleReq:
 		g.onMerkleReq(handlerCtx, c, remote, v)
 	case *wire.RangeReq:
@@ -1858,6 +1860,9 @@ func (g *Gossiper) onGossip(ctx context.Context, remote entmoot.NodeID, gos *wir
 					slog.Uint64("remote", uint64(remote)),
 					slog.String("id", id.String()),
 					slog.String("err", err.Error()))
+				if errors.Is(err, entmoot.ErrRosterHeadUnknown) {
+					g.enqueueRetry(retryKey{peer: remote, id: id, op: opFetch}, nil)
+				}
 				continue
 			}
 			inserted, err := g.acceptInboundMessage(ctx, remote, msg)
@@ -1877,25 +1882,17 @@ func (g *Gossiper) onGossip(ctx context.Context, remote entmoot.NodeID, gos *wir
 		}
 
 		if _, err := g.fetchFrom(ctx, remote, id); err != nil {
-			// Patch 6: queue a retry instead of dropping. Transient Pilot
-			// errors (dial timeout, stream EOF, NAT flap) would otherwise
-			// permanently lose the message — the retry loop gives ~5 min of
-			// exponential-backoff attempts before giving up, and patch 7's
-			// reconciliation-on-reconnect catches anything that still slips
-			// through. When the retry later succeeds, fetchFrom itself
-			// drives the Plumtree re-fanout (v1.0.5).
 			g.logger.Warn("gossip: fetch",
 				slog.Uint64("remote", uint64(remote)),
 				slog.String("id", id.String()),
 				slog.Int("attempt", 1),
 				slog.String("err", err.Error()))
-			g.enqueueRetry(retryKey{peer: remote, id: id, op: opFetch}, nil)
+			if !errors.Is(err, entmoot.ErrRosterHeadUnrelated) {
+				g.enqueueRetry(retryKey{peer: remote, id: id, op: opFetch}, nil)
+			}
 			continue
 		}
-		// Plumtree re-fanout and graft-timer cancellation happen inside
-		// fetchFrom on successful Put (v1.0.5). Centralizing the hook
-		// there means retry-fetch and reconcile-fetch acquisitions also
-		// propagate; prior to v1.0.5 only this gossip-push path did.
+		// Re-fanout and graft cancellation happen inside fetchFrom.
 	}
 }
 
@@ -2111,7 +2108,21 @@ func (g *Gossiper) fetchFrom(ctx context.Context, peer entmoot.NodeID, id entmoo
 		return false, fmt.Errorf("fetch: response id mismatch")
 	}
 	if err := g.verifyMessage(*resp.Message); err != nil {
-		return false, err
+		if !errors.Is(err, entmoot.ErrRosterHeadUnknown) {
+			return false, err
+		}
+		if syncErr := g.pullRosterUpdate(ctx, peer); syncErr != nil {
+			if errors.Is(syncErr, errRosterResponseMissingLocalHead) {
+				return false, fmt.Errorf("%w: %v", entmoot.ErrRosterHeadUnrelated, syncErr)
+			}
+			return false, fmt.Errorf("%w: roster sync failed: %v", err, syncErr)
+		}
+		if head, ok := messageAuthorizationHead(*resp.Message); ok && !g.cfg.Roster.HasEntry(head) {
+			return false, fmt.Errorf("%w: %s", entmoot.ErrRosterHeadUnrelated, head)
+		}
+		if err := g.verifyMessage(*resp.Message); err != nil {
+			return false, err
+		}
 	}
 	inserted, err := g.acceptInboundMessage(ctx, peer, *resp.Message)
 	if err != nil {
@@ -2123,6 +2134,25 @@ func (g *Gossiper) fetchFrom(ctx context.Context, peer entmoot.NodeID, id entmoo
 	}
 	g.maybeReconcile(ctx, peer)
 	return inserted, nil
+}
+
+func (g *Gossiper) pullRosterUpdate(ctx context.Context, peer entmoot.NodeID) error {
+	payload, err := g.requestResponseWithAttemptTimeout(
+		ctx,
+		peer,
+		&wire.RosterReq{GroupID: g.cfg.GroupID},
+		wire.MsgRosterResp,
+		"roster_req",
+		largeFrameResponseTimeout,
+	)
+	if err != nil {
+		return err
+	}
+	resp, ok := payload.(*wire.RosterResp)
+	if !ok || resp.GroupID != g.cfg.GroupID || len(resp.Entries) == 0 {
+		return fmt.Errorf("roster sync: malformed response")
+	}
+	return g.applyEntries(resp.Entries)
 }
 
 func (g *Gossiper) acceptInboundMessage(ctx context.Context, relay entmoot.NodeID, msg entmoot.Message) (bool, error) {
@@ -2401,6 +2431,14 @@ func (g *Gossiper) Publish(ctx context.Context, msg entmoot.Message) error {
 	if msg.GroupID != g.cfg.GroupID {
 		return fmt.Errorf("gossip: publish for wrong group %s", msg.GroupID.String())
 	}
+	if err := g.verifyLiveMessage(msg); err != nil {
+		return err
+	}
+	certified, err := g.certifyMessage(ctx, msg)
+	if err != nil {
+		return err
+	}
+	msg = certified
 	if err := g.verifyMessage(msg); err != nil {
 		return err
 	}
@@ -2649,22 +2687,177 @@ func (g *Gossiper) getPicker() *PeerPicker {
 	return g.picker
 }
 
-// verifyMessage checks that msg.Author is a current roster member, that
-// msg.Signature verifies against the author's roster pubkey, and that
-// msg.ID matches canonical.MessageID of msg (id/sig zeroed). Returns
-// entmoot.ErrNotMember or entmoot.ErrSigInvalid on failure.
+// messageAuthorizationHead returns the roster checkpoint that authorizes a
+// message. Version-2 messages carry it directly; migrated legacy messages
+// carry it only in the founder certificate so their signed bytes remain exact.
+func messageAuthorizationHead(msg entmoot.Message) (entmoot.RosterEntryID, bool) {
+	if msg.RosterHead != nil {
+		return *msg.RosterHead, true
+	}
+	if msg.Acceptance != nil {
+		return msg.Acceptance.RosterHead, true
+	}
+	return entmoot.RosterEntryID{}, false
+}
+
+// verifyMessage checks author authenticity at the certified roster head.
+// Uncertified legacy messages remain admissible only while their author is a
+// current member. A founder certificate can migrate an exact legacy message
+// ID without changing its original signing bytes, signature, or ID.
 func (g *Gossiper) verifyMessage(msg entmoot.Message) error {
 	if err := ValidateMessageShape(msg, g.clk.Now()); err != nil {
 		return err
+	}
+	head, certified := messageAuthorizationHead(msg)
+	if !certified {
+		author, ok := g.cfg.Roster.MemberInfo(msg.Author.PilotNodeID)
+		if !ok {
+			return fmt.Errorf("%w: legacy author %d", entmoot.ErrNotMember, msg.Author.PilotNodeID)
+		}
+		return signing.VerifyMessage(msg, author)
+	}
+	author, member, known := g.cfg.Roster.MemberInfoAt(msg.Author.PilotNodeID, head)
+	if !known {
+		return fmt.Errorf("%w: %s", entmoot.ErrRosterHeadUnknown, head)
+	}
+	if !member {
+		return fmt.Errorf("%w: author %d at roster head %s", entmoot.ErrNotMember, msg.Author.PilotNodeID, head)
+	}
+	if err := signing.VerifyMessage(msg, author); err != nil {
+		return err
+	}
+	return g.verifyAcceptance(msg)
+}
+
+func (g *Gossiper) verifyLiveMessage(msg entmoot.Message) error {
+	if err := ValidateMessageShape(msg, g.clk.Now()); err != nil {
+		return err
+	}
+	if msg.RosterHead == nil || *msg.RosterHead != g.cfg.Roster.Head() {
+		return fmt.Errorf("%w: live message must name the current roster head", entmoot.ErrNotMember)
 	}
 	author, ok := g.cfg.Roster.MemberInfo(msg.Author.PilotNodeID)
 	if !ok {
 		return fmt.Errorf("%w: author %d", entmoot.ErrNotMember, msg.Author.PilotNodeID)
 	}
-	// The roster's stored pubkey wins over whatever the message carries in
-	// Author.EntmootPubKey: a forged message could put a valid-looking key
-	// in the author slot and sign with its matching private key.
 	return signing.VerifyMessage(msg, author)
+}
+
+func (g *Gossiper) verifyAcceptance(msg entmoot.Message) error {
+	if msg.Acceptance == nil {
+		return fmt.Errorf("%w: message has no roster acceptance certificate", entmoot.ErrSigInvalid)
+	}
+	acceptance := msg.Acceptance
+	if acceptance.Version != 1 ||
+		acceptance.GroupID != msg.GroupID ||
+		acceptance.MessageID != msg.ID ||
+		(msg.RosterHead != nil && acceptance.RosterHead != *msg.RosterHead) {
+		return fmt.Errorf("%w: acceptance certificate does not match message", entmoot.ErrSigInvalid)
+	}
+	founder, ok := g.cfg.Roster.Founder()
+	if !ok ||
+		acceptance.Authority.PilotNodeID != founder.PilotNodeID ||
+		!bytes.Equal(acceptance.Authority.EntmootPubKey, founder.EntmootPubKey) {
+		return fmt.Errorf("%w: acceptance authority is not the founder", entmoot.ErrSigInvalid)
+	}
+	if _, active, known := g.cfg.Roster.MemberInfoAt(founder.PilotNodeID, acceptance.RosterHead); !known {
+		return fmt.Errorf("%w: acceptance head %s", entmoot.ErrRosterHeadUnknown, acceptance.RosterHead)
+	} else if !active {
+		return fmt.Errorf("%w: founder inactive at acceptance head", entmoot.ErrSigInvalid)
+	}
+	sigInput, err := canonical.MessageAcceptanceSigningBytes(*acceptance)
+	if err != nil {
+		return fmt.Errorf("%w: canonical acceptance: %v", entmoot.ErrSigInvalid, err)
+	}
+	if !keystore.Verify(founder.EntmootPubKey, sigInput, acceptance.Signature) {
+		return fmt.Errorf("%w: acceptance signature does not verify", entmoot.ErrSigInvalid)
+	}
+	return nil
+}
+
+func (g *Gossiper) issueAcceptance(msg entmoot.Message) (*entmoot.MessageAcceptance, error) {
+	founder, ok := g.cfg.Roster.Founder()
+	if !ok ||
+		founder.PilotNodeID != g.cfg.LocalNode ||
+		!bytes.Equal(founder.EntmootPubKey, g.cfg.Identity.PublicKey) {
+		return nil, fmt.Errorf("%w: local node is not roster founder", entmoot.ErrNotMember)
+	}
+	if err := g.verifyLiveMessage(msg); err != nil {
+		return nil, err
+	}
+	acceptance := &entmoot.MessageAcceptance{
+		Version:    1,
+		GroupID:    msg.GroupID,
+		MessageID:  msg.ID,
+		RosterHead: *msg.RosterHead,
+		Authority:  founder,
+	}
+	sigInput, err := canonical.MessageAcceptanceSigningBytes(*acceptance)
+	if err != nil {
+		return nil, err
+	}
+	acceptance.Signature = g.cfg.Identity.Sign(sigInput)
+	return acceptance, nil
+}
+
+func (g *Gossiper) certifyMessage(ctx context.Context, msg entmoot.Message) (entmoot.Message, error) {
+	if msg.Acceptance != nil {
+		if err := g.verifyAcceptance(msg); err != nil {
+			return entmoot.Message{}, err
+		}
+		return msg, nil
+	}
+	founder, ok := g.cfg.Roster.Founder()
+	if !ok {
+		return entmoot.Message{}, fmt.Errorf("gossip: roster has no founder")
+	}
+	if founder.PilotNodeID == g.cfg.LocalNode {
+		acceptance, err := g.issueAcceptance(msg)
+		if err != nil {
+			return entmoot.Message{}, err
+		}
+		msg.Acceptance = acceptance
+		return msg, nil
+	}
+	payload, err := g.requestResponseWithAttemptTimeout(
+		ctx,
+		founder.PilotNodeID,
+		&wire.AcceptanceReq{GroupID: g.cfg.GroupID, Message: msg},
+		wire.MsgAcceptanceResp,
+		"acceptance_req",
+		largeFrameResponseTimeout,
+	)
+	if err != nil {
+		return entmoot.Message{}, fmt.Errorf("gossip: request message acceptance: %w", err)
+	}
+	resp, ok := payload.(*wire.AcceptanceResp)
+	if !ok || resp.GroupID != g.cfg.GroupID || resp.MessageID != msg.ID || resp.Acceptance == nil {
+		return entmoot.Message{}, fmt.Errorf("gossip: malformed message acceptance response")
+	}
+	msg.Acceptance = resp.Acceptance
+	if err := g.verifyAcceptance(msg); err != nil {
+		return entmoot.Message{}, err
+	}
+	return msg, nil
+}
+
+func (g *Gossiper) onAcceptanceReq(ctx context.Context, c net.Conn, remote entmoot.NodeID, req *wire.AcceptanceReq) {
+	if req.GroupID != g.cfg.GroupID || req.Message.GroupID != g.cfg.GroupID ||
+		req.Message.Author.PilotNodeID != remote {
+		return
+	}
+	acceptance, err := g.issueAcceptance(req.Message)
+	if err != nil {
+		g.logger.Warn("gossip: reject acceptance request",
+			slog.Uint64("remote", uint64(remote)),
+			slog.String("err", err.Error()))
+		return
+	}
+	_ = wire.EncodeAndWrite(c, &wire.AcceptanceResp{
+		GroupID:    g.cfg.GroupID,
+		MessageID:  req.Message.ID,
+		Acceptance: acceptance,
+	})
 }
 
 // maybeInlineBody attaches msg to a single-id Gossip frame when the

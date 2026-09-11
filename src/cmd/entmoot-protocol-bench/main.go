@@ -428,16 +428,16 @@ func buildAddEntry(rlog *roster.RosterLog, founder *keystore.Identity, founderIn
 
 func buildMessage(author *benchNode, groupID entmoot.GroupID, content string, ts int64) (entmoot.Message, error) {
 	msg := entmoot.Message{
+		Version:   2,
 		GroupID:   groupID,
 		Author:    author.info,
 		Timestamp: ts,
 		Topics:    []string{"bench"},
 		Content:   []byte(content),
 	}
-	signing := msg
-	signing.ID = entmoot.MessageID{}
-	signing.Signature = nil
-	sigInput, err := canonical.Encode(signing)
+	head := author.roster.Head()
+	msg.RosterHead = &head
+	sigInput, err := canonical.MessageSigningBytes(msg)
 	if err != nil {
 		return entmoot.Message{}, err
 	}

@@ -25,6 +25,18 @@ const (
 // ValidateMessageShape performs cheap count and topic checks before canonical
 // encoding. It intentionally does not verify membership or signatures.
 func ValidateMessageShape(msg entmoot.Message, now time.Time) error {
+	switch msg.Version {
+	case 0:
+		if msg.RosterHead != nil {
+			return fmt.Errorf("gossip: legacy message must not carry roster_head")
+		}
+	case 2:
+		if msg.RosterHead == nil {
+			return fmt.Errorf("gossip: version-2 message requires roster_head")
+		}
+	default:
+		return fmt.Errorf("gossip: unsupported message version %d", msg.Version)
+	}
 	if len(msg.Parents) > MaxMessageParents {
 		return fmt.Errorf("gossip: message has %d parents, cap is %d", len(msg.Parents), MaxMessageParents)
 	}

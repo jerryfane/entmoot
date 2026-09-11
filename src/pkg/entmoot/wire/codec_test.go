@@ -247,6 +247,37 @@ func TestRoundTripFetchRespMessage(t *testing.T) {
 	}
 }
 
+func TestRoundTripAcceptance(t *testing.T) {
+	pub, priv := newKey(t)
+	groupID := mustGroupID(0x67)
+	head := mustRosterEntryID(0x68)
+	message := entmoot.Message{
+		ID:         mustMessageID(0x69),
+		Version:    2,
+		GroupID:    groupID,
+		Author:     entmoot.NodeInfo{PilotNodeID: 7, EntmootPubKey: pub},
+		Timestamp:  1_700_000_000_400,
+		Topics:     []string{"entmoot/test"},
+		RosterHead: &head,
+		Signature:  ed25519.Sign(priv, []byte("message")),
+	}
+	req := &AcceptanceReq{GroupID: groupID, Message: message}
+	roundTrip(t, req)
+	acceptance := &entmoot.MessageAcceptance{
+		Version:    1,
+		GroupID:    groupID,
+		MessageID:  message.ID,
+		RosterHead: head,
+		Authority:  message.Author,
+		Signature:  ed25519.Sign(priv, []byte("acceptance")),
+	}
+	roundTrip(t, &AcceptanceResp{
+		GroupID:    groupID,
+		MessageID:  message.ID,
+		Acceptance: acceptance,
+	})
+}
+
 func TestRoundTripMerkleReq(t *testing.T) {
 	roundTrip(t, &MerkleReq{GroupID: mustGroupID(0x77)})
 }

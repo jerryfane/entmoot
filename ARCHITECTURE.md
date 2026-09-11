@@ -92,21 +92,47 @@ ids. Name collisions are a UI/discovery problem, not a protocol problem.
 ### 3.2 Message
 
 ```
-Message
-├── id:            sha256(author || timestamp || content || parent_hashes)
+Message v2
+├── id:            sha256("entmoot/message/v2\0" + canonical signed fields)
+├── version:       2
 ├── group_id:
-├── author:        Pilot node_id + signature
+├── author:        Pilot node_id + Entmoot public key
 ├── timestamp:     unix millis
 ├── topics:        []string — for subscriber filtering
 ├── parents:       []message_id — for causal ordering and Merkle chaining
 ├── content:       opaque bytes
-└── references:    []message_id — optional soft links (replies, invalidates)
+├── references:    []message_id — optional soft links (replies, invalidates)
+├── roster_head:   roster checkpoint used to authorize the author
+├── signature:     author's Ed25519 signature
+└── acceptance:    founder certificate over group_id, message_id, and roster_head
 ```
 
 Messages form a DAG, not a linear log. `parents` is what the author had seen
 when composing; `references` is application-level semantics (reply, correction,
 obsoletes). The Merkle tree is built over message ids in a deterministic
 topological order.
+
+The author signs the message with `roster_head` present. The founder then
+attaches a domain-separated acceptance certificate. The certificate is not
+part of the message id or author signature, so it can be attached after the
+message is authored without changing its identity.
+
+Verification resolves the author's key and membership at the certified roster
+head, not at the receiver's current head. Normal issuance only certifies the
+current head. Once issued, that certificate keeps the exact message admissible
+after a later removal. A draft left offline or otherwise uncertified before the
+head advances is not accepted history; its timestamp and old head are not a
+substitute for founder acceptance. A removed member cannot certify new traffic.
+If a peer does not know a claimed head, it performs bounded authenticated
+roster sync before deciding; a head outside its accepted linear chain is
+rejected.
+
+Legacy messages without a roster head remain readable from local storage and
+can be admitted while their author is current. Migration may attach a founder
+certificate naming the exact legacy message id and an accepted historical
+roster head; because acceptance is outside the author-signed form, legacy
+bytes, signatures, and ids stay unchanged. An uncertified legacy message from
+a removed author remains inadmissible. There is no epoch-only fallback.
 
 **`parents` rule (v0):** at most 3 entries, chosen as the 3 highest-timestamped
 message ids the author has seen for the group at compose time. Genesis messages
@@ -221,6 +247,8 @@ Message types (v0):
 | `gossip` | → peer | push one or more message ids (just hashes) |
 | `fetch_req` | → peer | request full message body by id |
 | `fetch_resp` | ← peer | message body |
+| `acceptance_req` | → founder | request founder certification of one live message |
+| `acceptance_resp` | ← founder | message with attached founder certificate |
 | `merkle_req` | → peer | request Merkle proof for a topic filter + range |
 | `merkle_resp` | ← peer | proof + list of in-range ids |
 | `range_req` / `range_resp` | ↔ peer | legacy timestamp-range anti-entropy |

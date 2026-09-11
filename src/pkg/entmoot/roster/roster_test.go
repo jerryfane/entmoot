@@ -137,6 +137,44 @@ func TestVersion2RosterEntryRejectedInAnotherGroup(t *testing.T) {
 	}
 }
 
+func TestMemberInfoAtPreservesHistoricalKeyAfterRemoval(t *testing.T) {
+	t.Parallel()
+	founder, founderInfo := newFounder(t, 100)
+	_, memberInfo := newFounder(t, 200)
+	r := New(testGroupID())
+	if err := r.Genesis(founder, founderInfo, 1_000); err != nil {
+		t.Fatalf("Genesis: %v", err)
+	}
+	add, err := r.SignEntry(founder, "add", memberInfo, nil, founderInfo.PilotNodeID, 2_000)
+	if err != nil {
+		t.Fatalf("SignEntry add: %v", err)
+	}
+	if err := r.Apply(add); err != nil {
+		t.Fatalf("Apply add: %v", err)
+	}
+	historicalHead := r.Head()
+	remove, err := r.SignEntry(founder, "remove", memberInfo, nil, founderInfo.PilotNodeID, 3_000)
+	if err != nil {
+		t.Fatalf("SignEntry remove: %v", err)
+	}
+	if err := r.Apply(remove); err != nil {
+		t.Fatalf("Apply remove: %v", err)
+	}
+	if _, current := r.MemberInfo(memberInfo.PilotNodeID); current {
+		t.Fatal("removed member remains current")
+	}
+	got, historical, known := r.MemberInfoAt(memberInfo.PilotNodeID, historicalHead)
+	if !known || !historical || !bytes.Equal(got.EntmootPubKey, memberInfo.EntmootPubKey) {
+		t.Fatalf("historical lookup = (%+v, %v, %v)", got, historical, known)
+	}
+	if _, historical, known := r.MemberInfoAt(memberInfo.PilotNodeID, r.Head()); !known || historical {
+		t.Fatalf("post-removal lookup = member %v known %v", historical, known)
+	}
+	if _, _, known := r.MemberInfoAt(memberInfo.PilotNodeID, entmoot.RosterEntryID{0xFF}); known {
+		t.Fatal("unknown head reported known")
+	}
+}
+
 // 2. Genesis twice returns an error and leaves the log unchanged.
 func TestGenesisTwiceRejected(t *testing.T) {
 	t.Parallel()

@@ -49,12 +49,12 @@ func MaxFrameBodySize(t MsgType) (int, bool) {
 		return 8 * 1024, true
 	case MsgRosterResp, MsgTransportSnapshotResp, MsgMemberProfileSnapshotResp:
 		return MaxFrameSize - 1, true
-	case MsgGossip, MsgFetchResp:
+	case MsgGossip, MsgFetchResp, MsgAcceptanceReq:
 		return 384 * 1024, true
 	case MsgFetchReq, MsgMerkleReq, MsgPrune, MsgTransportSnapshotReq,
 		MsgMemberProfileSnapshotReq, MsgDiagPingReq, MsgDiagPingResp:
 		return 4 * 1024, true
-	case MsgMerkleResp, MsgTransportAd, MsgMemberProfileAd:
+	case MsgMerkleResp, MsgTransportAd, MsgMemberProfileAd, MsgAcceptanceResp:
 		return 64 * 1024, true
 	case MsgRangeResp, MsgReconcile:
 		return 128 * 1024, true

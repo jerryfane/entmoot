@@ -164,11 +164,14 @@ func TestESPDeviceSignedPublishThroughControlSocket(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewLocalSigner: %v", err)
 	}
+	head := rost.Head()
 	msg, err := signing.SignMessage(ctx, msgSigner, entmoot.Message{
-		GroupID:   gid,
-		Timestamp: 1_001,
-		Topics:    []string{"esp/integration"},
-		Content:   []byte("phone signed integration publish"),
+		Version:    2,
+		GroupID:    gid,
+		RosterHead: &head,
+		Timestamp:  1_001,
+		Topics:     []string{"esp/integration"},
+		Content:    []byte("phone signed integration publish"),
 	})
 	if err != nil {
 		t.Fatalf("SignMessage: %v", err)
@@ -185,6 +188,9 @@ func TestESPDeviceSignedPublishThroughControlSocket(t *testing.T) {
 	got, err := st.Get(ctx, gid, msg.ID)
 	if err != nil {
 		t.Fatalf("store.Get published message: %v", err)
+	}
+	if got.Acceptance == nil {
+		t.Fatal("stored message has no founder acceptance certificate")
 	}
 	if string(got.Content) != string(msg.Content) {
 		t.Fatalf("stored content = %q, want %q", got.Content, msg.Content)

@@ -16,6 +16,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   authority there, permits valid descendants, and installs nothing on
   validation failure. Legacy signed bytes and IDs remain unchanged and
   read-only pending an authenticated upgrade checkpoint.
+- **Historical message authorization.** New messages use a domain-separated
+  version-2 signing form that binds the author to a roster head and carry a
+  founder acceptance certificate.
+  Receivers authorize the historical author key at that certified checkpoint,
+  recover unknown related heads with bounded roster sync, and reject unrelated
+  heads. Founder certificates preserve only the exact accepted message and can
+  migrate legacy message ids without changing their bytes or signatures;
+  uncertified removed-author history has no fallback.
 
 - **Transactional roster persistence.** Roster mutations now serialize
   validation, SQLite entry/head/version/projection commits, and in-memory

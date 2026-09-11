@@ -53,26 +53,24 @@ func mkMessage(
 	author *keystore.Identity,
 	authorInfo entmoot.NodeInfo,
 	groupID entmoot.GroupID,
+	rosterHead entmoot.RosterEntryID,
 	topic string,
 	content string,
 	ts int64,
 ) entmoot.Message {
 	t.Helper()
 	msg := entmoot.Message{
+		Version:   2,
 		GroupID:   groupID,
 		Author:    authorInfo,
 		Timestamp: ts,
 		Topics:    []string{topic},
 		Content:   []byte(content),
 	}
-	// Compute-then-sign: zero ID and Signature in the signing form so the
-	// signature commits to the canonical bytes that MessageID will hash.
-	signing := msg
-	signing.ID = entmoot.MessageID{}
-	signing.Signature = nil
-	sigInput, err := canonical.Encode(signing)
+	msg.RosterHead = &rosterHead
+	sigInput, err := canonical.MessageSigningBytes(msg)
 	if err != nil {
-		t.Fatalf("canonical.Encode message: %v", err)
+		t.Fatalf("canonical message signing bytes: %v", err)
 	}
 	msg.Signature = author.Sign(sigInput)
 	msg.ID = canonical.MessageID(msg)

@@ -2299,8 +2299,9 @@ func TestHandlerMessagePublishSignRequestExecutes(t *testing.T) {
 			PilotNodeID:   45491,
 			EntmootPubKey: pub,
 		},
-		"topics":  []string{"chat"},
-		"content": []byte("hello from phone"),
+		"roster_head": entmoot.RosterEntryID{1},
+		"topics":      []string{"chat"},
+		"content":     []byte("hello from phone"),
 	}, http.StatusAccepted)
 	req := created.SignRequest
 	if req.Kind != signRequestKindMessagePublish || req.CanonicalType != canonicalTypeMessageV1 ||
@@ -2314,6 +2315,10 @@ func TestHandlerMessagePublishSignRequestExecutes(t *testing.T) {
 	var payload messagePublishPayload
 	if err := json.Unmarshal(req.Payload, &payload); err != nil {
 		t.Fatalf("unmarshal payload: %v", err)
+	}
+	if payload.Message.Version != 2 || payload.Message.RosterHead == nil ||
+		*payload.Message.RosterHead != (entmoot.RosterEntryID{1}) {
+		t.Fatalf("message version/head = %d/%v", payload.Message.Version, payload.Message.RosterHead)
 	}
 	wantSigningPayload, err := signing.MessageSigningBytes(payload.Message)
 	if err != nil {
@@ -2351,8 +2356,9 @@ func TestHandlerMessagePublishSignRequestRejectsDigestMismatch(t *testing.T) {
 	created := doJSONRequest[struct {
 		SignRequest SignRequest `json:"sign_request"`
 	}](t, handler, http.MethodPost, "/v1/groups/"+gid.String()+"/messages", map[string]any{
-		"author": entmoot.NodeInfo{PilotNodeID: 45491, EntmootPubKey: pub},
-		"topics": []string{"chat"},
+		"author":      entmoot.NodeInfo{PilotNodeID: 45491, EntmootPubKey: pub},
+		"roster_head": entmoot.RosterEntryID{1},
+		"topics":      []string{"chat"},
 	}, http.StatusAccepted)
 	signingPayload, err := base64.StdEncoding.DecodeString(created.SignRequest.SigningPayload)
 	if err != nil {
@@ -2375,8 +2381,9 @@ func TestHandlerIdempotencyReplaysSignRequestCreation(t *testing.T) {
 	}
 	handler := testMobileHandlerWithPublisher(t, gid, &fakePublisher{}, func() time.Time { return time.UnixMilli(1_234_000) })
 	body := map[string]any{
-		"author": entmoot.NodeInfo{PilotNodeID: 45491, EntmootPubKey: pub},
-		"topics": []string{"chat"},
+		"author":      entmoot.NodeInfo{PilotNodeID: 45491, EntmootPubKey: pub},
+		"roster_head": entmoot.RosterEntryID{1},
+		"topics":      []string{"chat"},
 	}
 	first := doJSONRequestWithHeaders[struct {
 		SignRequest SignRequest `json:"sign_request"`
@@ -2388,8 +2395,9 @@ func TestHandlerIdempotencyReplaysSignRequestCreation(t *testing.T) {
 		t.Fatalf("idempotency replay ids = %q/%q", first.SignRequest.ID, second.SignRequest.ID)
 	}
 	errResp := doJSONRequestWithHeaders[errorEnvelope](t, handler, http.MethodPost, "/v1/groups/"+gid.String()+"/messages", map[string]any{
-		"author": entmoot.NodeInfo{PilotNodeID: 45491, EntmootPubKey: pub},
-		"topics": []string{"different"},
+		"author":      entmoot.NodeInfo{PilotNodeID: 45491, EntmootPubKey: pub},
+		"roster_head": entmoot.RosterEntryID{1},
+		"topics":      []string{"different"},
 	}, map[string]string{idempotencyHeader: "idem-1"}, http.StatusConflict)
 	if errResp.Error.Code != "idempotency_conflict" {
 		t.Fatalf("error code = %q, want idempotency_conflict", errResp.Error.Code)
@@ -2413,8 +2421,9 @@ func TestHandlerIdempotencyDoesNotCacheFailedMutation(t *testing.T) {
 	}](
 		t, handler, http.MethodPost, path,
 		map[string]any{
-			"author": entmoot.NodeInfo{PilotNodeID: 45491, EntmootPubKey: pub},
-			"topics": []string{"chat"},
+			"author":      entmoot.NodeInfo{PilotNodeID: 45491, EntmootPubKey: pub},
+			"roster_head": entmoot.RosterEntryID{1},
+			"topics":      []string{"chat"},
 		},
 		headers,
 		http.StatusAccepted,
@@ -2466,8 +2475,9 @@ func TestHandlerIdempotencyScopesReplayToCurrentAuthorizedPrincipal(t *testing.T
 		nil,
 	)
 	body := map[string]any{
-		"author": entmoot.NodeInfo{PilotNodeID: 45491, EntmootPubKey: pubA},
-		"topics": []string{"chat"},
+		"author":      entmoot.NodeInfo{PilotNodeID: 45491, EntmootPubKey: pubA},
+		"roster_head": entmoot.RosterEntryID{1},
+		"topics":      []string{"chat"},
 	}
 	type response struct {
 		SignRequest SignRequest `json:"sign_request"`

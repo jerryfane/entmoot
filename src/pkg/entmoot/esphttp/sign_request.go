@@ -35,11 +35,12 @@ const (
 )
 
 type messagePublishDraft struct {
-	Author     entmoot.NodeInfo    `json:"author"`
-	Topics     []string            `json:"topics,omitempty"`
-	Content    []byte              `json:"content,omitempty"`
-	Parents    []entmoot.MessageID `json:"parents,omitempty"`
-	References []entmoot.MessageID `json:"references,omitempty"`
+	Author     entmoot.NodeInfo       `json:"author"`
+	RosterHead *entmoot.RosterEntryID `json:"roster_head"`
+	Topics     []string               `json:"topics,omitempty"`
+	Content    []byte                 `json:"content,omitempty"`
+	Parents    []entmoot.MessageID    `json:"parents,omitempty"`
+	References []entmoot.MessageID    `json:"references,omitempty"`
 }
 
 type messagePublishPayload struct {
@@ -63,7 +64,11 @@ func buildMessagePublishSignRequest(deviceID string, groupID entmoot.GroupID, dr
 	if len(draft.Author.EntmootPubKey) != 32 {
 		return SignRequest{}, fmt.Errorf("author.entmoot_pubkey must be 32 bytes")
 	}
+	if draft.RosterHead == nil {
+		return SignRequest{}, fmt.Errorf("roster_head is required")
+	}
 	msg := entmoot.Message{
+		Version:    2,
 		GroupID:    groupID,
 		Author:     cloneNodeInfo(draft.Author),
 		Timestamp:  timestampMS,
@@ -71,6 +76,7 @@ func buildMessagePublishSignRequest(deviceID string, groupID entmoot.GroupID, dr
 		Parents:    append([]entmoot.MessageID(nil), draft.Parents...),
 		Content:    append([]byte(nil), draft.Content...),
 		References: append([]entmoot.MessageID(nil), draft.References...),
+		RosterHead: draft.RosterHead,
 	}
 	payload, err := json.Marshal(messagePublishPayload{Message: msg})
 	if err != nil {

@@ -1560,12 +1560,15 @@ func (s *ipcServer) publishLocalMessage(ctx context.Context, gid entmoot.GroupID
 	}
 
 	msg := entmoot.Message{
+		Version:   2,
 		GroupID:   gid,
 		Author:    author,
 		Timestamp: now,
 		Topics:    append([]string(nil), topics...),
 		Content:   append([]byte(nil), content...),
 	}
+	head := sess.roster.Head()
+	msg.RosterHead = &head
 
 	// Parent selection mirrors v0's cmdPublish: include up to 3 of
 	// the most-recent messages we have.

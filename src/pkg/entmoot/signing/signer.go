@@ -10,6 +10,7 @@ package signing
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 
@@ -115,27 +116,24 @@ func VerifyMessage(msg entmoot.Message, author entmoot.NodeInfo) error {
 	if !keystore.Verify(author.EntmootPubKey, signingBytes, msg.Signature) {
 		return fmt.Errorf("%w: message %s", entmoot.ErrSigInvalid, msg.ID)
 	}
-	if canonical.MessageID(msg) != msg.ID {
+	if entmoot.MessageID(sha256.Sum256(signingBytes)) != msg.ID {
 		return fmt.Errorf("%w: message id does not match canonical hash", entmoot.ErrSigInvalid)
 	}
 	return nil
 }
 
-// MessageSigningBytes returns the canonical bytes covered by a message
-// signature.
+// MessageSigningBytes returns the canonical bytes covered by an author's
+// message signature.
 func MessageSigningBytes(msg entmoot.Message) ([]byte, error) {
-	signing := msg
-	signing.ID = entmoot.MessageID{}
-	signing.Signature = nil
-	return canonical.Encode(signing)
+	return canonical.MessageSigningBytes(msg)
 }
 
 func signWith(msg entmoot.Message, sign func([]byte) ([]byte, error)) (entmoot.Message, error) {
-	msg.ID = canonical.MessageID(msg)
 	signingBytes, err := MessageSigningBytes(msg)
 	if err != nil {
 		return entmoot.Message{}, err
 	}
+	msg.ID = entmoot.MessageID(sha256.Sum256(signingBytes))
 	msg.Signature, err = sign(signingBytes)
 	if err != nil {
 		return entmoot.Message{}, fmt.Errorf("signing: sign: %w", err)

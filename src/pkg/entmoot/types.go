@@ -134,8 +134,12 @@ func (g *Group) UnmarshalJSON(data []byte) error {
 
 // Message is a single group message. Messages form a DAG via Parents.
 type Message struct {
-	// ID is sha256(canonical(message with ID and Signature zeroed)).
+	// ID is sha256(canonical author-signed form with ID, Signature, and
+	// Acceptance zeroed).
 	ID MessageID `json:"id"`
+	// Version is zero for legacy messages and 2 for the group-bound signing
+	// form.
+	Version uint8 `json:"version,omitempty"`
 	// GroupID is the owning group.
 	GroupID GroupID `json:"group_id"`
 	// Author carries the author's Pilot node id and Ed25519 pubkey.
@@ -152,9 +156,27 @@ type Message struct {
 	Content []byte `json:"content,omitempty"`
 	// References are soft application-level links (reply, correction, etc).
 	References []MessageID `json:"references,omitempty"`
-	// Signature is the Ed25519 signature over the canonical encoding of the
-	// message with ID and Signature zeroed.
+	// RosterHead is the group-bound roster checkpoint under which the author
+	// was admitted. It is absent only on legacy v1 messages.
+	RosterHead *RosterEntryID `json:"roster_head,omitempty"`
+	// Signature authenticates the message signing form, including RosterHead
+	// but excluding Acceptance.
 	Signature []byte `json:"signature,omitempty"`
+	// Acceptance proves that the roster authority accepted this exact message
+	// under a named roster checkpoint. It is attached after author signing and
+	// does not change the message ID.
+	Acceptance *MessageAcceptance `json:"acceptance,omitempty"`
+}
+
+// MessageAcceptance is a founder-signed admission certificate for one exact
+// message under one group-bound roster head.
+type MessageAcceptance struct {
+	Version    uint8         `json:"version"`
+	GroupID    GroupID       `json:"group_id"`
+	MessageID  MessageID     `json:"message_id"`
+	RosterHead RosterEntryID `json:"roster_head"`
+	Authority  NodeInfo      `json:"authority"`
+	Signature  []byte        `json:"signature,omitempty"`
 }
 
 // RosterEntry is one signed record in a group's append-only roster log.

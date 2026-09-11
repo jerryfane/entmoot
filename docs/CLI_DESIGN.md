@@ -287,8 +287,10 @@ entmootd publish -topic TOPICS (-content STRING|-file PATH| -file -) [-group GID
 
 **Blocking behavior**
 
-Exits immediately after the control-socket round-trip completes.
-Expected duration: well under a second.
+The local founder certifies its message immediately. A non-founder publish
+also makes one bounded round trip to the founder for an acceptance certificate,
+so it can fail when the founder is unreachable. The `-timeout` deadline covers
+both certification and the control-socket round trip.
 
 **Stdout**
 
@@ -314,6 +316,9 @@ One JSON object:
 
 - Appends the message to the running `join` process's MessageStore.
   No direct disk write from the `publish` process.
+- The stored and gossiped message includes the current roster head in the
+  author's signed bytes and a founder acceptance certificate. ESP clients that
+  create message-publish sign requests must supply that current `roster_head`.
 
 ---
 
@@ -866,11 +871,11 @@ require the requested `client_id` to be listed for that device.
   - If the body contains `{"message": ...}` with a fully signed Entmoot
     message, forwards it like `POST /v1/messages`.
   - Otherwise creates a `message_publish` sign request from the draft body.
-    The sign request exposes canonical signing metadata for the exact message
-    the phone must authorize:
+    The draft must include the current `roster_head`. The sign request exposes
+    canonical signing metadata for the exact message the phone must authorize:
 
     ```json
-    {"sign_request":{"id":"<id>","kind":"message_publish","group_id":"<base64>","payload":{"message":{"group_id":"<base64>","author":{"pilot_node_id":45491,"entmoot_pubkey":"<base64-ed25519-pubkey>"},"timestamp":1777392000000,"topics":["chat"],"content":"aGVsbG8="}},"signing_payload":"<base64 canonical message signing bytes>","signing_payload_sha256":"<sha256>","status":"pending"}}
+    {"sign_request":{"id":"<id>","kind":"message_publish","group_id":"<base64>","payload":{"message":{"id":"<base64>","version":2,"group_id":"<base64>","author":{"pilot_node_id":45491,"entmoot_pubkey":"<base64-ed25519-pubkey>"},"timestamp":1777392000000,"topics":["chat"],"content":"aGVsbG8=","roster_head":"<base64>"}},"signing_payload":"<base64 domain-separated message-v2 signing bytes>","signing_payload_sha256":"<sha256>","status":"pending"}}
     ```
 
   - `payload` is draft/debug material for display and retry context. It is not
@@ -900,12 +905,13 @@ require the requested `client_id` to be listed for that device.
   - Body contains a full already-signed Entmoot message:
 
     ```json
-    {"message":{"id":"<base64>","group_id":"<base64>","author":{"pilot_node_id":45491,"entmoot_pubkey":"<base64>"},"timestamp":1713369600000,"topics":["chat"],"content":"<base64>","signature":"<base64>"}}
+    {"message":{"id":"<base64>","version":2,"group_id":"<base64>","author":{"pilot_node_id":45491,"entmoot_pubkey":"<base64>"},"timestamp":1713369600000,"topics":["chat"],"content":"<base64>","roster_head":"<base64>","signature":"<base64>"}}
     ```
 
   - The ESP forwards the message to the running `join` daemon. The daemon
-    verifies current roster membership, signature, canonical message id,
-    then persists and gossips it through the normal publish path.
+    requires the current roster head, verifies current membership, author
+    signature, and canonical message id, obtains a founder acceptance
+    certificate, then persists and gossips the certified message.
   - Success returns `202 Accepted`:
 
     ```json

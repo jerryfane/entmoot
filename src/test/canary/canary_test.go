@@ -207,15 +207,15 @@ func TestCanaryInMemory(t *testing.T) {
 	})
 
 	// ---- Step 7: three messages.
-	msg1 := mkMessage(t, idA, infoA, gid, "canary", "hello from A", tsBase+1_000)
+	msg1 := mkMessage(t, idA, infoA, gid, rosterA.Head(), "canary", "hello from A", tsBase+1_000)
 	if err := gA.Publish(ctx, msg1); err != nil {
 		t.Fatalf("gA.Publish msg1: %v", err)
 	}
-	msg2 := mkMessage(t, idB, infoB, gid, "canary", "hello from B", tsBase+1_100)
+	msg2 := mkMessage(t, idB, infoB, gid, rosterA.Head(), "canary", "hello from B", tsBase+1_100)
 	if err := gB.Publish(ctx, msg2); err != nil {
 		t.Fatalf("gB.Publish msg2: %v", err)
 	}
-	msg3 := mkMessage(t, idA, infoA, gid, "canary", "A again", tsBase+1_200)
+	msg3 := mkMessage(t, idA, infoA, gid, rosterA.Head(), "canary", "A again", tsBase+1_200)
 	if err := gA.Publish(ctx, msg3); err != nil {
 		t.Fatalf("gA.Publish msg3: %v", err)
 	}
@@ -515,19 +515,19 @@ func TestCanaryPilot(t *testing.T) {
 	})
 
 	logger.Info("pilot canary: gossipers started; publishing 3 messages")
-	msg1 := mkMessage(t, idA, infoA, gid, "canary", "hello from A", tsBase+1_000)
+	msg1 := mkMessage(t, idA, infoA, gid, rosterA.Head(), "canary", "hello from A", tsBase+1_000)
 	if err := gA.Publish(ctx, msg1); err != nil {
 		t.Fatalf("gA.Publish msg1: %v", err)
 	}
 	// Pilot's first dial is slow: space the sends slightly so each Publish
 	// gets at least a moment to fan out before the next one races it.
 	time.Sleep(500 * time.Millisecond)
-	msg2 := mkMessage(t, idB, infoB, gid, "canary", "hello from B", tsBase+1_100)
+	msg2 := mkMessage(t, idB, infoB, gid, rosterA.Head(), "canary", "hello from B", tsBase+1_100)
 	if err := gB.Publish(ctx, msg2); err != nil {
 		t.Fatalf("gB.Publish msg2: %v", err)
 	}
 	time.Sleep(500 * time.Millisecond)
-	msg3 := mkMessage(t, idA, infoA, gid, "canary", "A again", tsBase+1_200)
+	msg3 := mkMessage(t, idA, infoA, gid, rosterA.Head(), "canary", "A again", tsBase+1_200)
 	if err := gA.Publish(ctx, msg3); err != nil {
 		t.Fatalf("gA.Publish msg3: %v", err)
 	}

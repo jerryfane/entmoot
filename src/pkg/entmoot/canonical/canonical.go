@@ -14,10 +14,10 @@
 //   - stripping the trailing newline that encoding/json.Encoder appends after
 //     each value so the output is exactly the encoded value's bytes.
 //
-// MessageID computes sha256 over the canonical encoding of the signing form
-// of a Message: the message with its ID and Signature fields zeroed. Every
-// other field (group_id, author, timestamp, topics, parents, content,
-// references) contributes to the id.
+// MessageID computes sha256 over MessageSigningBytes. Legacy messages keep
+// their exact canonical bytes; version-2 messages use a domain-separated form
+// that binds version, group, roster head, author, and content fields. ID,
+// Signature, and Acceptance never contribute.
 package canonical
 
 import (
@@ -30,7 +30,11 @@ import (
 	"entmoot/pkg/entmoot"
 )
 
-const rosterEntryV2Domain = "entmoot/roster-entry/v2\x00"
+const (
+	messageV2Domain           = "entmoot/message/v2\x00"
+	rosterEntryV2Domain       = "entmoot/roster-entry/v2\x00"
+	messageAcceptanceV1Domain = "entmoot/message-acceptance/v1\x00"
+)
 
 // Encode returns the deterministic canonical JSON encoding of v.
 //
@@ -158,26 +162,53 @@ func (s sortedObject) MarshalJSON() ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// MessageID returns sha256(Encode(signing form of m)).
-//
-// The signing form is m with ID and Signature zeroed. Every other field
-// contributes: GroupID, Author, Timestamp, Topics, Parents, Content,
-// References. A single bit flip in any of those changes the MessageID.
-func MessageID(m entmoot.Message) entmoot.MessageID {
+// MessageSigningBytes returns the exact author-signed form. Acceptance is
+// attached later by the roster authority and therefore excluded from both the
+// author signature and content-addressed message ID.
+func MessageSigningBytes(m entmoot.Message) ([]byte, error) {
 	signing := m
 	signing.ID = entmoot.MessageID{}
 	signing.Signature = nil
-
+	signing.Acceptance = nil
 	encoded, err := Encode(signing)
 	if err != nil {
-		// Encoding a Message value should never fail: it contains only
-		// types supported by encoding/json. If it somehow does, we do not
-		// have a meaningful recovery path for callers and returning a
-		// zeroed id would silently mask the failure. Panic is the
-		// principled choice here; callers pass well-formed Messages.
+		return nil, err
+	}
+	switch signing.Version {
+	case 0:
+		return encoded, nil
+	case 2:
+		out := make([]byte, 0, len(messageV2Domain)+len(encoded))
+		out = append(out, messageV2Domain...)
+		out = append(out, encoded...)
+		return out, nil
+	default:
+		return nil, fmt.Errorf("canonical: unsupported message version %d", signing.Version)
+	}
+}
+
+// MessageID returns sha256(MessageSigningBytes(m)).
+func MessageID(m entmoot.Message) entmoot.MessageID {
+	encoded, err := MessageSigningBytes(m)
+	if err != nil {
 		panic(fmt.Sprintf("canonical.MessageID: encoding message failed: %v", err))
 	}
 	return entmoot.MessageID(sha256.Sum256(encoded))
+}
+
+// MessageAcceptanceSigningBytes returns the domain-separated bytes signed by
+// the roster authority for an acceptance certificate.
+func MessageAcceptanceSigningBytes(a entmoot.MessageAcceptance) ([]byte, error) {
+	signing := a
+	signing.Signature = nil
+	encoded, err := Encode(signing)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]byte, 0, len(messageAcceptanceV1Domain)+len(encoded))
+	out = append(out, messageAcceptanceV1Domain...)
+	out = append(out, encoded...)
+	return out, nil
 }
 
 // RosterEntrySigningBytes returns the exact bytes covered by a roster

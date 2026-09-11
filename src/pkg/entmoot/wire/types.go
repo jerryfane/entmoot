@@ -97,6 +97,11 @@ const (
 	MsgDiagPingReq MsgType = 0x15
 	// MsgDiagPingResp echoes MsgDiagPingReq's nonce and records the responder.
 	MsgDiagPingResp MsgType = 0x16
+	// MsgAcceptanceReq asks the roster founder to certify one current,
+	// author-signed message.
+	MsgAcceptanceReq MsgType = 0x17
+	// MsgAcceptanceResp returns the founder's certificate.
+	MsgAcceptanceResp MsgType = 0x18
 )
 
 // String returns the human-readable wire name for t, suitable for logs. It
@@ -147,6 +152,10 @@ func (t MsgType) String() string {
 		return "diag_ping_req"
 	case MsgDiagPingResp:
 		return "diag_ping_resp"
+	case MsgAcceptanceReq:
+		return "acceptance_req"
+	case MsgAcceptanceResp:
+		return "acceptance_resp"
 	default:
 		return fmt.Sprintf("unknown(0x%02x)", uint8(t))
 	}
@@ -278,6 +287,20 @@ type FetchResp struct {
 	Message *entmoot.Message `json:"message,omitempty"`
 	// NotFound is true when the responder does not have ID for this group.
 	NotFound bool `json:"not_found,omitempty"`
+}
+
+// AcceptanceReq asks the current founder to admit an author-signed message at
+// the message's asserted current roster head.
+type AcceptanceReq struct {
+	GroupID entmoot.GroupID `json:"group_id"`
+	Message entmoot.Message `json:"message"`
+}
+
+// AcceptanceResp returns an admission certificate for MessageID.
+type AcceptanceResp struct {
+	GroupID    entmoot.GroupID            `json:"group_id"`
+	MessageID  entmoot.MessageID          `json:"message_id"`
+	Acceptance *entmoot.MessageAcceptance `json:"acceptance,omitempty"`
 }
 
 // MerkleReq asks for the current Merkle root over a group's messages.

@@ -629,6 +629,7 @@ func (f *fixture) buildMessage(author entmoot.NodeID, content string, ts int64) 
 		f.t.Fatalf("unknown author %d", author)
 	}
 	return f.signMessage(author, entmoot.Message{
+		Version:   2,
 		GroupID:   f.groupID,
 		Author:    ns.info,
 		Timestamp: ts,
@@ -638,14 +639,32 @@ func (f *fixture) buildMessage(author entmoot.NodeID, content string, ts int64) 
 }
 
 func (f *fixture) signMessage(author entmoot.NodeID, msg entmoot.Message) entmoot.Message {
+	if msg.RosterHead == nil {
+		head := f.nodes[author].rost.Head()
+		msg.RosterHead = &head
+	}
 	msg.ID = entmoot.MessageID{}
 	msg.Signature = nil
-	sigInput, err := canonical.Encode(msg)
+	msg.Acceptance = nil
+	sigInput, err := canonical.MessageSigningBytes(msg)
 	if err != nil {
 		f.t.Fatalf("canonical encode message: %v", err)
 	}
 	msg.Signature = f.nodes[author].id.Sign(sigInput)
 	msg.ID = canonical.MessageID(msg)
+	acceptance := &entmoot.MessageAcceptance{
+		Version:    1,
+		GroupID:    msg.GroupID,
+		MessageID:  msg.ID,
+		RosterHead: *msg.RosterHead,
+		Authority:  f.founderInf,
+	}
+	acceptanceBytes, err := canonical.MessageAcceptanceSigningBytes(*acceptance)
+	if err != nil {
+		f.t.Fatalf("canonical acceptance: %v", err)
+	}
+	acceptance.Signature = f.founder.Sign(acceptanceBytes)
+	msg.Acceptance = acceptance
 	return msg
 }
 
@@ -812,6 +831,26 @@ func TestPolicyOversizedInboundMessageRejectedBeforeStorage(t *testing.T) {
 	f.nodes[20].gossip.onGossip(context.Background(), 10, f.signedInlineGossip(10, msg))
 	if has, err := f.nodes[20].storeM.Has(context.Background(), f.groupID, msg.ID); err != nil || has {
 		t.Fatalf("oversized stored has/err = %v/%v, want false/nil", has, err)
+	}
+}
+
+func TestMessageVersionRequiresMatchingRosterHead(t *testing.T) {
+	now := time.UnixMilli(1_000)
+	head := entmoot.RosterEntryID{1}
+	tests := []struct {
+		name string
+		msg  entmoot.Message
+	}{
+		{name: "legacy with roster head", msg: entmoot.Message{RosterHead: &head}},
+		{name: "version 2 without roster head", msg: entmoot.Message{Version: 2}},
+		{name: "unknown version", msg: entmoot.Message{Version: 3, RosterHead: &head}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := ValidateMessageShape(tt.msg, now); err == nil {
+				t.Fatal("ValidateMessageShape succeeded")
+			}
+		})
 	}
 }
 
@@ -1489,8 +1528,8 @@ func TestStartRejectsNonMemberRemote(t *testing.T) {
 
 	if err := client.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
 		cancel()
-		if err := <-done; err != nil {
-			t.Fatalf("Start returned error: %v", err)
+		if startErr := <-done; startErr != nil {
+			t.Fatalf("Start returned error after stream close: %v", startErr)
 		}
 		return
 	}
@@ -1503,6 +1542,194 @@ func TestStartRejectsNonMemberRemote(t *testing.T) {
 	cancel()
 	if err := <-done; err != nil {
 		t.Fatalf("Start returned error: %v", err)
+	}
+}
+
+func TestHistoricalMessageCertificateSurvivesAuthorRemoval(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, []entmoot.NodeID{10, 20})
+	defer f.closeTransports()
+	historical := f.buildMessage(20, "accepted before removal", f.founderTS)
+	oldHead := *historical.RosterHead
+	legacy := entmoot.Message{
+		GroupID:   f.groupID,
+		Author:    f.nodes[20].info,
+		Timestamp: f.founderTS,
+		Topics:    []string{"test"},
+		Content:   []byte("legacy accepted before removal"),
+	}
+	legacySigInput, err := canonical.MessageSigningBytes(legacy)
+	if err != nil {
+		t.Fatalf("legacy message signing bytes: %v", err)
+	}
+	legacy.Signature = f.nodes[20].id.Sign(legacySigInput)
+	legacy.ID = canonical.MessageID(legacy)
+	legacy.Acceptance = &entmoot.MessageAcceptance{
+		Version:    1,
+		GroupID:    f.groupID,
+		MessageID:  legacy.ID,
+		RosterHead: oldHead,
+		Authority:  f.founderInf,
+	}
+	acceptanceSigInput, err := canonical.MessageAcceptanceSigningBytes(*legacy.Acceptance)
+	if err != nil {
+		t.Fatalf("legacy acceptance signing bytes: %v", err)
+	}
+	legacy.Acceptance.Signature = f.founder.Sign(acceptanceSigInput)
+
+	f.founderTS++
+	for _, nodeID := range []entmoot.NodeID{10, 20} {
+		rlog := f.nodes[nodeID].rost
+		entry, err := rlog.SignEntry(f.founder, "remove", f.nodes[20].info, nil, f.founderInf.PilotNodeID, f.founderTS)
+		if err != nil {
+			t.Fatalf("SignEntry remove on %d: %v", nodeID, err)
+		}
+		if err := rlog.Apply(entry); err != nil {
+			t.Fatalf("Apply remove on %d: %v", nodeID, err)
+		}
+	}
+	if err := f.nodes[10].gossip.verifyMessage(historical); err != nil {
+		t.Fatalf("historical accepted message rejected after removal: %v", err)
+	}
+	if err := f.nodes[10].gossip.verifyMessage(legacy); err != nil {
+		t.Fatalf("certified legacy message rejected after removal: %v", err)
+	}
+	legacyUncertified := legacy
+	legacyUncertified.Acceptance = nil
+	if err := f.nodes[10].gossip.verifyMessage(legacyUncertified); !errors.Is(err, entmoot.ErrNotMember) {
+		t.Fatalf("uncertified legacy message = %v, want ErrNotMember", err)
+	}
+	copiedCertificate := legacy
+	copiedCertificate.Content = []byte("new message with copied certificate")
+	copiedSigInput, err := canonical.MessageSigningBytes(copiedCertificate)
+	if err != nil {
+		t.Fatalf("copied-certificate signing bytes: %v", err)
+	}
+	copiedCertificate.Signature = f.nodes[20].id.Sign(copiedSigInput)
+	copiedCertificate.ID = canonical.MessageID(copiedCertificate)
+	if err := f.nodes[10].gossip.verifyMessage(copiedCertificate); !errors.Is(err, entmoot.ErrSigInvalid) {
+		t.Fatalf("copied legacy certificate = %v, want ErrSigInvalid", err)
+	}
+
+	uncertified := entmoot.Message{
+		Version:    2,
+		GroupID:    f.groupID,
+		Author:     f.nodes[20].info,
+		Timestamp:  f.founderTS,
+		Topics:     []string{"test"},
+		Content:    []byte("composed after removal with claimed old head"),
+		RosterHead: &oldHead,
+	}
+	sigInput, err := canonical.MessageSigningBytes(uncertified)
+	if err != nil {
+		t.Fatalf("message signing bytes: %v", err)
+	}
+	uncertified.Signature = f.nodes[20].id.Sign(sigInput)
+	uncertified.ID = canonical.MessageID(uncertified)
+	if err := f.nodes[10].gossip.verifyMessage(uncertified); !errors.Is(err, entmoot.ErrSigInvalid) {
+		t.Fatalf("uncertified old-head message = %v, want ErrSigInvalid", err)
+	}
+	if err := f.nodes[20].gossip.Publish(context.Background(), uncertified); !errors.Is(err, entmoot.ErrNotMember) {
+		t.Fatalf("removed member live Publish = %v, want ErrNotMember", err)
+	}
+}
+
+func TestMemberPublishObtainsFounderAcceptance(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, []entmoot.NodeID{10, 20})
+	defer f.closeTransports()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = f.nodes[10].gossip.Start(ctx) }()
+
+	msg := f.buildMessage(20, "needs founder certificate", f.founderTS)
+	msg.Acceptance = nil
+	if err := f.nodes[20].gossip.Publish(ctx, msg); err != nil {
+		t.Fatalf("member Publish: %v", err)
+	}
+	stored, err := f.nodes[20].storeM.Get(ctx, f.groupID, msg.ID)
+	if err != nil {
+		t.Fatalf("Get published message: %v", err)
+	}
+	if stored.Acceptance == nil {
+		t.Fatal("published message has no founder acceptance")
+	}
+	if err := f.nodes[20].gossip.verifyMessage(stored); err != nil {
+		t.Fatalf("stored certificate: %v", err)
+	}
+}
+
+func TestFetchUnknownRosterHeadSynchronizesBeforeAccepting(t *testing.T) {
+	t.Parallel()
+	f := newFixtureWithGenesisOnly(t, []entmoot.NodeID{10, 20, 99}, 99)
+	defer f.closeTransports()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	msg := f.buildMessage(20, "history beyond joiner roster", f.founderTS)
+	if _, err := f.nodes[10].storeM.Put(ctx, f.groupID, msg); err != nil {
+		t.Fatalf("seed message: %v", err)
+	}
+	go func() { _ = f.nodes[10].gossip.Start(ctx) }()
+
+	if f.nodes[99].rost.HasEntry(*msg.RosterHead) {
+		t.Fatal("joiner unexpectedly knows message roster head")
+	}
+	inserted, err := f.nodes[99].gossip.fetchFrom(ctx, 10, msg.ID)
+	if err != nil {
+		t.Fatalf("fetchFrom: %v", err)
+	}
+	if !inserted || !f.nodes[99].rost.HasEntry(*msg.RosterHead) {
+		t.Fatalf("inserted=%v roster_head_known=%v", inserted, f.nodes[99].rost.HasEntry(*msg.RosterHead))
+	}
+}
+
+func TestUnrelatedRosterHeadFailsWithoutRetry(t *testing.T) {
+	t.Parallel()
+	f := newFixtureWithGenesisOnly(t, []entmoot.NodeID{10, 20, 99}, 99)
+	defer f.closeTransports()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	msg := f.buildMessage(20, "unrelated roster claim", f.founderTS)
+	unrelated := entmoot.RosterEntryID{0xFF}
+	msg.RosterHead = &unrelated
+	msg.Acceptance = nil
+	sigInput, err := canonical.MessageSigningBytes(msg)
+	if err != nil {
+		t.Fatalf("message signing bytes: %v", err)
+	}
+	msg.Signature = f.nodes[20].id.Sign(sigInput)
+	msg.ID = canonical.MessageID(msg)
+	acceptance := &entmoot.MessageAcceptance{
+		Version:    1,
+		GroupID:    f.groupID,
+		MessageID:  msg.ID,
+		RosterHead: unrelated,
+		Authority:  f.founderInf,
+	}
+	acceptanceBytes, err := canonical.MessageAcceptanceSigningBytes(*acceptance)
+	if err != nil {
+		t.Fatalf("acceptance signing bytes: %v", err)
+	}
+	acceptance.Signature = f.founder.Sign(acceptanceBytes)
+	msg.Acceptance = acceptance
+	if _, err := f.nodes[10].storeM.Put(ctx, f.groupID, msg); err != nil {
+		t.Fatalf("seed message: %v", err)
+	}
+	go func() { _ = f.nodes[10].gossip.Start(ctx) }()
+
+	f.nodes[99].gossip.onGossip(ctx, 10, &wire.Gossip{
+		GroupID: f.groupID,
+		IDs:     []entmoot.MessageID{msg.ID},
+	})
+	f.nodes[99].gossip.pendMu.Lock()
+	pending := len(f.nodes[99].gossip.pending)
+	f.nodes[99].gossip.pendMu.Unlock()
+	if pending != 0 {
+		t.Fatalf("unrelated roster head queued %d retries", pending)
+	}
+	if has, err := f.nodes[99].storeM.Has(ctx, f.groupID, msg.ID); err != nil || has {
+		t.Fatalf("unrelated message stored=%v err=%v", has, err)
 	}
 }
 
