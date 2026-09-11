@@ -126,6 +126,7 @@ func TestCanaryBinary(t *testing.T) {
 		"-socket", a.Socket,
 		"-identity", idPathA,
 		"-data", dataA,
+		"-allow-new-identity",
 		"-listen-port", "1004",
 		"-log-level", "info",
 	}
@@ -133,6 +134,7 @@ func TestCanaryBinary(t *testing.T) {
 		"-socket", b.Socket,
 		"-identity", idPathB,
 		"-data", dataB,
+		"-allow-new-identity",
 		"-listen-port", "1004",
 		"-log-level", "info",
 	}
@@ -140,6 +142,7 @@ func TestCanaryBinary(t *testing.T) {
 		"-socket", c.Socket,
 		"-identity", idPathC,
 		"-data", dataC,
+		"-allow-new-identity",
 		"-listen-port", "1004",
 		"-log-level", "info",
 	}
