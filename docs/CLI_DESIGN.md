@@ -875,12 +875,13 @@ require the requested `client_id` to be listed for that device.
     canonical signing metadata for the exact message the phone must authorize:
 
     ```json
-    {"sign_request":{"id":"<id>","kind":"message_publish","group_id":"<base64>","payload":{"message":{"id":"<base64>","version":2,"group_id":"<base64>","author":{"pilot_node_id":45491,"entmoot_pubkey":"<base64-ed25519-pubkey>"},"timestamp":1777392000000,"topics":["chat"],"content":"aGVsbG8=","roster_head":"<base64>"}},"signing_payload":"<base64 domain-separated message-v2 signing bytes>","signing_payload_sha256":"<sha256>","status":"pending"}}
+    {"sign_request":{"id":"<id>","kind":"message_publish","group_id":"<base64>","payload":{"message":{"id":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","version":2,"group_id":"<base64>","author":{"pilot_node_id":45491,"entmoot_pubkey":"<base64-ed25519-pubkey>"},"timestamp":1777392000000,"topics":["chat"],"content":"aGVsbG8=","roster_head":"<base64>"}},"signing_payload":"<base64 domain-separated message-v2 signing bytes>","signing_payload_sha256":"<sha256>","status":"pending"}}
     ```
 
-  - `payload` is draft/debug material for display and retry context. It is not
-    the signing payload. The phone base64-decodes `signing_payload` and signs
-    those bytes with the Entmoot author key.
+  - `payload` is draft/debug material for display and retry context. Its
+    all-zero `id` is the canonical signing placeholder, not the final message
+    id. The phone base64-decodes `signing_payload` and signs those exact bytes
+    with the Entmoot author key.
   - Supports `Idempotency-Key`.
 - `GET /v1/mailbox/pull?client_id=CLIENT&group_id=GID&limit=N`
   - Requires ESP auth.

@@ -521,12 +521,6 @@ type Gossiper struct {
 	activeHandlers int
 	handlersByPeer map[entmoot.NodeID]int
 
-	// Hello replay state is per authenticated transport peer. Repeatable
-	// query frames and content-addressed messages do not use raw-body replay
-	// rejection.
-	helloReplayMu sync.Mutex
-	helloReplay   map[entmoot.NodeID]*wire.ReplayChecker
-
 	// rosterApplyMu serializes all roster mutations initiated by gossip
 	// request/response paths. roster.RosterLog.Apply intentionally validates
 	// outside its internal write lock, so callers must serialize mutating use.
@@ -680,7 +674,6 @@ func New(cfg Config) (*Gossiper, error) {
 		clk:               clk,
 		fanout:            fanout,
 		handlersByPeer:    make(map[entmoot.NodeID]int),
-		helloReplay:       make(map[entmoot.NodeID]*wire.ReplayChecker),
 		pending:           make(map[retryKey]*retryState),
 		lastReconciled:    make(map[entmoot.NodeID]reconcileState),
 		reconcileInFlight: make(map[entmoot.NodeID]struct{}),
@@ -1325,17 +1318,6 @@ func (g *Gossiper) endInboundHandler(peer entmoot.NodeID) {
 	g.handlerMu.Unlock()
 }
 
-func (g *Gossiper) verifyHelloFresh(peer entmoot.NodeID, body []byte) error {
-	g.helloReplayMu.Lock()
-	checker := g.helloReplay[peer]
-	if checker == nil {
-		checker = wire.NewReplayChecker(g.clk, 0)
-		g.helloReplay[peer] = checker
-	}
-	g.helloReplayMu.Unlock()
-	return checker.VerifyFresh(wire.MsgHello, body)
-}
-
 // handleConn reads one frame from c and dispatches on type. v0 is stateless
 // per connection: exactly one request-response, then close. Errors are
 // logged and the connection is dropped (hard-disconnect per the plan).
@@ -1352,9 +1334,6 @@ func (g *Gossiper) handleConn(ctx context.Context, c net.Conn, remote entmoot.No
 		return nil
 	})
 	clearConnReadDeadline(c)
-	if err == nil && t == wire.MsgHello {
-		err = g.verifyHelloFresh(remote, body)
-	}
 	var payload any
 	if err == nil {
 		payload, err = wire.Decode(t, body)
