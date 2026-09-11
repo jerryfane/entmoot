@@ -345,10 +345,15 @@ func TestBootstrapPromptWritesToStderr(t *testing.T) {
 func testBootstrapGlobalFlags(t *testing.T) *globalFlags {
 	t.Helper()
 	dir := t.TempDir()
+	dataDir := filepath.Join(dir, "data")
+	if err := os.Mkdir(dataDir, 0o700); err != nil {
+		t.Fatalf("mkdir data: %v", err)
+	}
 	return &globalFlags{
-		socket:   filepath.Join(dir, "pilot.sock"),
-		identity: filepath.Join(dir, "identity.json"),
-		data:     filepath.Join(dir, "data"),
+		socket:           filepath.Join(dir, "pilot.sock"),
+		identity:         filepath.Join(dir, "identity.json"),
+		data:             dataDir,
+		allowNewIdentity: true,
 	}
 }
 

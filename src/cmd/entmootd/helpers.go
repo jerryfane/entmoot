@@ -26,17 +26,58 @@ type setupResult struct {
 	dataDir  string
 }
 
-// setup performs the common boilerplate: mkdir the data root, load or
-// generate the identity. Subcommands that need Pilot dial it separately.
+// setup validates the data root and loads the identity. Identity creation is
+// explicit so a bad runtime path cannot silently create a different node.
 func setup(gf *globalFlags) (*setupResult, error) {
-	if err := os.MkdirAll(gf.data, 0o700); err != nil {
-		return nil, fmt.Errorf("mkdir data %q: %w", gf.data, err)
+	if strings.TrimSpace(gf.data) == "" {
+		return nil, errors.New("entmootd: data root is empty")
 	}
-	id, err := keystore.LoadOrGenerate(gf.identity)
+	if strings.TrimSpace(gf.identity) == "" {
+		return nil, errors.New("entmootd: identity path is empty")
+	}
+	dataDir, err := filepath.Abs(gf.data)
 	if err != nil {
-		return nil, fmt.Errorf("load identity: %w", err)
+		return nil, fmt.Errorf("entmootd: resolve data root %q: %w", gf.data, err)
 	}
-	return &setupResult{identity: id, dataDir: gf.data}, nil
+	identityPath, err := filepath.Abs(gf.identity)
+	if err != nil {
+		return nil, fmt.Errorf("entmootd: resolve identity %q: %w", gf.identity, err)
+	}
+	info, err := os.Stat(dataDir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("entmootd: data root %q does not exist", dataDir)
+		}
+		return nil, fmt.Errorf("entmootd: stat data root %q: %w", dataDir, err)
+	}
+	if !info.IsDir() {
+		return nil, fmt.Errorf("entmootd: data root %q is not a directory", dataDir)
+	}
+
+	id, err := keystore.Load(identityPath)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("load identity: %w", err)
+		}
+		if !gf.allowNewIdentity {
+			return nil, fmt.Errorf(
+				"entmootd: identity %q does not exist; pass -allow-new-identity to create it",
+				identityPath,
+			)
+		}
+		id, err = keystore.Generate()
+		if err != nil {
+			return nil, fmt.Errorf("generate identity: %w", err)
+		}
+		slog.Info("entmootd: creating new identity", slog.String("path", identityPath))
+		if err := id.Save(identityPath); err != nil {
+			return nil, fmt.Errorf("save identity: %w", err)
+		}
+	}
+	slog.Info("entmootd: using runtime paths",
+		slog.String("data", dataDir),
+		slog.String("identity", identityPath))
+	return &setupResult{identity: id, dataDir: dataDir}, nil
 }
 
 // expandHome returns path with a leading "~" or "~/" expanded to the

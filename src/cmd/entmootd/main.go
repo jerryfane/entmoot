@@ -36,6 +36,7 @@ type globalFlags struct {
 	socket             string
 	identity           string
 	data               string
+	allowNewIdentity   bool
 	listenPort         uint
 	logLevel           string
 	pilotWaitTimeout   time.Duration
@@ -125,6 +126,8 @@ func run() int {
 	fs.StringVar(&gf.socket, "socket", "/tmp/pilot.sock", "Pilot daemon IPC socket path")
 	fs.StringVar(&gf.identity, "identity", "~/.entmoot/identity.json", "Entmoot identity file")
 	fs.StringVar(&gf.data, "data", defaultEntmootDataDir, "Entmoot data root")
+	fs.BoolVar(&gf.allowNewIdentity, "allow-new-identity", false,
+		"allow first-time Entmoot identity creation when the identity file is absent")
 	fs.UintVar(&gf.listenPort, "listen-port", 1004, "Entmoot listen port")
 	fs.StringVar(&gf.logLevel, "log-level", "info", "slog level: debug|info|warn|error")
 	fs.DurationVar(&gf.pilotWaitTimeout, "pilot-wait-timeout", 45*time.Second,

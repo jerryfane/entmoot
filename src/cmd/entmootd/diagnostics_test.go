@@ -227,6 +227,13 @@ func TestFleetDiagnosticsDoesNotCreateMissingControlRoster(t *testing.T) {
 		identity: filepath.Join(dataDir, "identity.json"),
 		data:     dataDir,
 	}}
+	identity, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate identity: %v", err)
+	}
+	if err := identity.Save(provider.flags.identity); err != nil {
+		t.Fatalf("Save identity: %v", err)
+	}
 	fleet := esphttp.FleetRecord{FleetID: "fleet-a", Name: "Fleet A", ControlGroupID: controlGID}
 
 	report, err := provider.FleetDiagnostics(context.Background(), fleet, nil, false, time.Second)
