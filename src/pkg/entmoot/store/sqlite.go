@@ -672,6 +672,12 @@ func (s *SQLite) Range(ctx context.Context, groupID entmoot.GroupID, sinceMillis
 // SnapshotChanged and must restart rather than silently skip a concurrent
 // insert or prune.
 func (s *SQLite) MessageIDsPage(ctx context.Context, groupID entmoot.GroupID, sinceMillis int64, after *RangeCursor, expectedGeneration uint64, limit int) (MessageIDPage, error) {
+	return s.MessageIDsPageWindow(ctx, groupID, sinceMillis, 0, after, expectedGeneration, limit)
+}
+
+// MessageIDsPageWindow is MessageIDsPage constrained to [sinceMillis,
+// untilMillis). Zero untilMillis has no upper bound.
+func (s *SQLite) MessageIDsPageWindow(ctx context.Context, groupID entmoot.GroupID, sinceMillis, untilMillis int64, after *RangeCursor, expectedGeneration uint64, limit int) (MessageIDPage, error) {
 	db, exists, err := s.dbForExisting(groupID)
 	if err != nil {
 		return MessageIDPage{}, err
@@ -721,15 +727,17 @@ func (s *SQLite) MessageIDsPage(ctx context.Context, groupID entmoot.GroupID, si
 			SELECT message_id, timestamp_ms, author_node_id
 			FROM messages
 			WHERE group_id = ? AND timestamp_ms >= ?
+			  AND (? = 0 OR timestamp_ms < ?)
 			ORDER BY timestamp_ms, author_node_id, message_id
 			LIMIT ?;`,
-			groupID[:], sinceMillis, limit+1,
+			groupID[:], sinceMillis, untilMillis, untilMillis, limit+1,
 		)
 	} else {
 		rows, err = tx.QueryContext(ctx, `
 			SELECT message_id, timestamp_ms, author_node_id
 			FROM messages
 			WHERE group_id = ? AND timestamp_ms >= ?
+			  AND (? = 0 OR timestamp_ms < ?)
 			  AND (
 			    timestamp_ms > ?
 			    OR (timestamp_ms = ? AND author_node_id > ?)
@@ -737,7 +745,7 @@ func (s *SQLite) MessageIDsPage(ctx context.Context, groupID entmoot.GroupID, si
 			  )
 			ORDER BY timestamp_ms, author_node_id, message_id
 			LIMIT ?;`,
-			groupID[:], sinceMillis,
+			groupID[:], sinceMillis, untilMillis, untilMillis,
 			after.TimestampMS,
 			after.TimestampMS, int64(after.Author),
 			after.TimestampMS, int64(after.Author), after.ID[:],

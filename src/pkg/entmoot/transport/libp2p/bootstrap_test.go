@@ -89,6 +89,49 @@ func TestBootstrapCapabilityRejectsInvalidPeerBinding(t *testing.T) {
 	}
 }
 
+func TestBootstrapCapabilityReplayRejectedAfterRestart(t *testing.T) {
+	founder := mustIdentity(t)
+	target := mustIdentity(t)
+	targetBinding, err := BindingFromPublicKey(target.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.UnixMilli(30_000)
+	capability := BootstrapCapability{
+		TargetPublicKey: target.PublicKey,
+		TargetMemberID:  targetBinding.MemberID,
+		TargetPeerID:    targetBinding.PeerID.String(),
+		Founder:         entmoot.NodeInfo{EntmootPubKey: founder.PublicKey},
+		AllowedPeerIDs:  []string{targetBinding.PeerID.String()},
+		IssuedAtMS:      now.Add(-time.Minute).UnixMilli(),
+		ExpiresAtMS:     now.Add(time.Minute).UnixMilli(),
+	}
+	capability.GroupID[0] = 4
+	capability.Nonce[0] = 5
+	if err := SignBootstrapCapability(founder, &capability); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	first, err := OpenPersistentBootstrapAdmission(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Authorize(capability, targetBinding.PeerID, EnrollmentProtocol, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	second, err := OpenPersistentBootstrapAdmission(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	if err := second.Authorize(capability, targetBinding.PeerID, EnrollmentProtocol, now); err == nil {
+		t.Fatal("capability replay succeeded after admission restart")
+	}
+}
+
 func mustIdentity(t *testing.T) *keystore.Identity {
 	t.Helper()
 	identity, err := keystore.Generate()

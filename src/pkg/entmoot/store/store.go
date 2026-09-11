@@ -140,6 +140,12 @@ type PagedMessageIDStore interface {
 	MessageIDsPage(ctx context.Context, groupID entmoot.GroupID, sinceMillis int64, after *RangeCursor, expectedGeneration uint64, limit int) (MessageIDPage, error)
 }
 
+// WindowedPagedMessageIDStore constrains enumeration to an explicit
+// [sinceMillis, untilMillis) coverage window.
+type WindowedPagedMessageIDStore interface {
+	MessageIDsPageWindow(ctx context.Context, groupID entmoot.GroupID, sinceMillis, untilMillis int64, after *RangeCursor, expectedGeneration uint64, limit int) (MessageIDPage, error)
+}
+
 // TombstoneStore reports exact IDs intentionally removed by retention.
 type TombstoneStore interface {
 	HasTombstone(ctx context.Context, groupID entmoot.GroupID, id entmoot.MessageID) (bool, error)

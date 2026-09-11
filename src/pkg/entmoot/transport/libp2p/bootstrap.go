@@ -112,12 +112,13 @@ type capabilityKey struct {
 	Nonce   [32]byte
 }
 
-// BootstrapAdmission atomically consumes valid capabilities. A process restart
-// must replace the memory store with a persisted implementation before serving
-// remote enrollment; this type is for bounded tests and ephemeral callers.
+// BootstrapAdmission atomically consumes valid capabilities. The in-memory
+// constructor is intended for tests; OpenPersistentBootstrapAdmission must be
+// used by a restartable remote service.
 type BootstrapAdmission struct {
-	mu   sync.Mutex
-	used map[capabilityKey]struct{}
+	mu      sync.Mutex
+	used    map[capabilityKey]struct{}
+	consume func(capabilityKey) (bool, error)
 }
 
 func NewBootstrapAdmission() *BootstrapAdmission {
@@ -136,6 +137,16 @@ func (a *BootstrapAdmission) Authorize(capability BootstrapCapability, remotePee
 		return err
 	}
 	key := capabilityKey{GroupID: capability.GroupID, Nonce: capability.Nonce}
+	if a.consume != nil {
+		consumed, err := a.consume(key)
+		if err != nil {
+			return fmt.Errorf("%w: persist nonce: %v", ErrBootstrapDenied, err)
+		}
+		if !consumed {
+			return fmt.Errorf("%w: capability already used", ErrBootstrapDenied)
+		}
+		return nil
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if _, exists := a.used[key]; exists {
