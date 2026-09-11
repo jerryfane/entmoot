@@ -71,7 +71,7 @@ func Enroll(ctx context.Context, h host.Host, remote peer.AddrInfo, capability B
 	if err := h.Connect(ctx, remote); err != nil {
 		return EnrollmentResponse{}, fmt.Errorf("libp2p: connect enrollment peer: %w", err)
 	}
-	stream, err := h.NewStream(ctx, remote.ID, EnrollmentProtocol)
+	stream, err := h.NewStream(network.WithAllowLimitedConn(ctx, "Entmoot enrollment"), remote.ID, EnrollmentProtocol)
 	if err != nil {
 		return EnrollmentResponse{}, fmt.Errorf("libp2p: open enrollment stream: %w", err)
 	}
