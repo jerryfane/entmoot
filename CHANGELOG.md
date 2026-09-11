@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Scalable history synchronization.** SQLite now versions message-set
+  mutations, caches Merkle roots with generation compare-and-swap, enumerates
+  bounded keyset pages, compares roots over an explicit shared retention
+  window, records exact-ID tombstones, and prevents pruned messages from being
+  fetched back. Deterministic topological ordering now uses a heap instead of
+  repeatedly scanning the ready set.
 - **Bounded inbound gossip resources.** Wire frames now use symmetric per-type
   byte and collection caps before body allocation, bounded chunked reads,
   per-peer rate admission, global/per-peer handler and retry-queue limits, and

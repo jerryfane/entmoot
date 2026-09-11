@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"net"
+	"sort"
 	"strconv"
 	"sync"
 	"time"
@@ -1526,7 +1527,18 @@ func (g *Gossiper) onMerkleReq(ctx context.Context, c net.Conn, remote entmoot.N
 			slog.String("got", req.GroupID.String()))
 		return
 	}
-	root, err := g.cfg.Store.MerkleRoot(ctx, req.GroupID)
+	coverageFloor, err := store.CoverageFloor(ctx, g.cfg.Store, req.GroupID)
+	if err != nil {
+		g.logger.Warn("gossip: coverage floor",
+			slog.Uint64("remote", uint64(remote)),
+			slog.String("err", err.Error()))
+		return
+	}
+	comparedSince := req.SinceMillis
+	if coverageFloor > comparedSince {
+		comparedSince = coverageFloor
+	}
+	root, err := store.MerkleRootSince(ctx, g.cfg.Store, req.GroupID, comparedSince)
 	if err != nil {
 		g.logger.Warn("gossip: merkle root",
 			slog.Uint64("remote", uint64(remote)),
@@ -1534,17 +1546,17 @@ func (g *Gossiper) onMerkleReq(ctx context.Context, c net.Conn, remote entmoot.N
 		return
 	}
 	resp := &wire.MerkleResp{
-		GroupID: g.cfg.GroupID,
-		Root:    wire.MerkleRoot(root),
+		GroupID:             g.cfg.GroupID,
+		Root:                wire.MerkleRoot(root),
+		CoverageFloorMS:     coverageFloor,
+		ComparedSinceMillis: comparedSince,
 	}
 	_ = g.writeOneShotResponse(ctx, c, remote, "merkle_resp", resp)
 }
 
-// onRangeReq responds with the message ids we hold in this group whose
-// Timestamp falls at or after SinceMillis. Bodies are pulled separately by
-// the caller via FetchReq; this endpoint intentionally only carries ids so
-// a bulk reconciliation never has to transmit a large signed payload in a
-// single frame.
+// onRangeReq returns one generation-bound keyset page of message IDs at or
+// after SinceMillis. Bodies are pulled separately via FetchReq. Paging keeps
+// every response within the wire caps and detects concurrent inserts/prunes.
 func (g *Gossiper) onRangeReq(ctx context.Context, c net.Conn, remote entmoot.NodeID, req *wire.RangeReq) {
 	if req.GroupID != g.cfg.GroupID {
 		g.logger.Warn("gossip: range_req for wrong group",
@@ -1552,19 +1564,95 @@ func (g *Gossiper) onRangeReq(ctx context.Context, c net.Conn, remote entmoot.No
 			slog.String("got", req.GroupID.String()))
 		return
 	}
-	msgs, err := g.cfg.Store.Range(ctx, req.GroupID, req.SinceMillis, 0)
+	limit := req.Limit
+	if limit <= 0 || limit > wire.MaxRangeIDs {
+		limit = wire.MaxRangeIDs
+	}
+	var after *store.RangeCursor
+	if req.AfterID != nil {
+		after = &store.RangeCursor{
+			TimestampMS: req.AfterTimestampMS,
+			Author:      req.AfterAuthor,
+			ID:          *req.AfterID,
+		}
+	}
+
+	var page store.MessageIDPage
+	var err error
+	if paged, ok := g.cfg.Store.(store.PagedMessageIDStore); ok {
+		page, err = paged.MessageIDsPage(ctx, req.GroupID, req.SinceMillis, after, req.Generation, limit)
+	} else {
+		page, err = messageIDsPageFallback(ctx, g.cfg.Store, req.GroupID, req.SinceMillis, after, limit)
+	}
 	if err != nil {
-		g.logger.Warn("gossip: store.Range",
+		g.logger.Warn("gossip: store message-id page",
 			slog.Uint64("remote", uint64(remote)),
 			slog.String("err", err.Error()))
 		return
 	}
-	ids := make([]entmoot.MessageID, 0, len(msgs))
-	for _, m := range msgs {
-		ids = append(ids, m.ID)
+	resp := &wire.RangeResp{
+		GroupID:         g.cfg.GroupID,
+		IDs:             page.IDs,
+		Generation:      page.Generation,
+		HasMore:         page.HasMore,
+		SnapshotChanged: page.SnapshotChanged,
+		CoverageFloorMS: page.CoverageFloorMS,
 	}
-	resp := &wire.RangeResp{GroupID: g.cfg.GroupID, IDs: ids}
+	if page.Next != nil {
+		nextID := page.Next.ID
+		resp.NextTimestampMS = page.Next.TimestampMS
+		resp.NextAuthor = page.Next.Author
+		resp.NextID = &nextID
+	}
 	_ = g.writeOneShotResponse(ctx, c, remote, "range_resp", resp)
+}
+
+func messageIDsPageFallback(ctx context.Context, st store.MessageStore, groupID entmoot.GroupID, sinceMillis int64, after *store.RangeCursor, limit int) (store.MessageIDPage, error) {
+	msgs, err := st.Range(ctx, groupID, sinceMillis, 0)
+	if err != nil {
+		return store.MessageIDPage{}, err
+	}
+	sort.Slice(msgs, func(i, j int) bool {
+		if msgs[i].Timestamp != msgs[j].Timestamp {
+			return msgs[i].Timestamp < msgs[j].Timestamp
+		}
+		if msgs[i].Author.PilotNodeID != msgs[j].Author.PilotNodeID {
+			return msgs[i].Author.PilotNodeID < msgs[j].Author.PilotNodeID
+		}
+		return bytes.Compare(msgs[i].ID[:], msgs[j].ID[:]) < 0
+	})
+	start := 0
+	if after != nil {
+		start = sort.Search(len(msgs), func(i int) bool {
+			if msgs[i].Timestamp != after.TimestampMS {
+				return msgs[i].Timestamp > after.TimestampMS
+			}
+			if msgs[i].Author.PilotNodeID != after.Author {
+				return msgs[i].Author.PilotNodeID > after.Author
+			}
+			return bytes.Compare(msgs[i].ID[:], after.ID[:]) > 0
+		})
+	}
+	end := start + limit
+	if end > len(msgs) {
+		end = len(msgs)
+	}
+	page := store.MessageIDPage{
+		IDs:     make([]entmoot.MessageID, end-start),
+		HasMore: end < len(msgs),
+	}
+	for i := start; i < end; i++ {
+		page.IDs[i-start] = msgs[i].ID
+	}
+	if page.HasMore && end > start {
+		last := msgs[end-1]
+		page.Next = &store.RangeCursor{
+			TimestampMS: last.Timestamp,
+			Author:      last.Author.PilotNodeID,
+			ID:          last.ID,
+		}
+	}
+	return page, nil
 }
 
 // onReconcileReq drives the responder side of an RBSR session over a
@@ -2041,8 +2129,24 @@ func (g *Gossiper) acceptInboundMessage(ctx context.Context, relay entmoot.NodeI
 	if msg.GroupID != g.cfg.GroupID {
 		return false, fmt.Errorf("gossip: message for wrong group %s", msg.GroupID)
 	}
+	if tombstones, ok := g.cfg.Store.(store.TombstoneStore); ok {
+		pruned, err := tombstones.HasTombstone(ctx, g.cfg.GroupID, msg.ID)
+		if err != nil {
+			return false, fmt.Errorf("gossip: check tombstone: %w", err)
+		}
+		if pruned {
+			return false, fmt.Errorf("%w: %s", store.ErrPruned, msg.ID)
+		}
+	}
 	if messageHasTopic(msg, policy.UpdateTopic) {
 		return g.storePolicyUpdateMessage(ctx, relay, msg, false)
+	}
+	coverageFloor, err := store.CoverageFloor(ctx, g.cfg.Store, g.cfg.GroupID)
+	if err != nil {
+		return false, fmt.Errorf("gossip: read coverage floor: %w", err)
+	}
+	if coverageFloor > 0 && msg.Timestamp < coverageFloor {
+		return false, fmt.Errorf("%w: timestamp %d below coverage floor %d", store.ErrPruned, msg.Timestamp, coverageFloor)
 	}
 	if err := g.checkContentPolicy(relay, msg); err != nil {
 		return false, err
@@ -2254,8 +2358,23 @@ func (g *Gossiper) fetchMissingFrom(ctx context.Context, peer entmoot.NodeID, id
 			skipped++
 			continue
 		}
+		if tombstones, ok := g.cfg.Store.(store.TombstoneStore); ok {
+			pruned, err := tombstones.HasTombstone(ctx, g.cfg.GroupID, id)
+			if err != nil {
+				failed++
+				continue
+			}
+			if pruned {
+				skipped++
+				continue
+			}
+		}
 		inserted, ferr := g.fetchFrom(ctx, peer, id)
 		if ferr != nil {
+			if errors.Is(ferr, store.ErrPruned) {
+				skipped++
+				continue
+			}
 			failed++
 			g.enqueueRetry(retryKey{peer: peer, id: id, op: opFetch}, nil)
 		} else if inserted {
@@ -3382,28 +3501,94 @@ func (g *Gossiper) finishReconcile(peer entmoot.NodeID, success bool) {
 func (g *Gossiper) reconcileWith(ctx context.Context, peer entmoot.NodeID) bool {
 	start := time.Now()
 	g.traceReconcile(peer, "start")
-	// Step 1: Merkle root short-circuit. Uses its own conn; returns
-	// early with cached root on match so steady-state anti-entropy
-	// costs a single RTT.
-	peerRoot, ok := g.fetchPeerRoot(ctx, peer)
+
+	peerState, ok := g.fetchPeerRoot(ctx, peer, 0)
 	if !ok {
 		g.traceReconcile(peer, "root_failed", since(start))
 		return false
 	}
-	localRoot, err := g.cfg.Store.MerkleRoot(ctx, g.cfg.GroupID)
-	if err != nil {
-		g.traceReconcile(peer, "local_root_failed",
-			slog.String("err", err.Error()),
-			since(start))
-		g.logger.Warn("gossip: reconcile: local merkle root",
-			slog.Uint64("peer", uint64(peer)),
-			slog.String("err", err.Error()))
+	var (
+		localRoot   [32]byte
+		localFloor  int64
+		agreedFloor int64
+		rootStable  bool
+	)
+	for attempt := 0; attempt < 3; attempt++ {
+		var err error
+		localFloor, err = store.CoverageFloor(ctx, g.cfg.Store, g.cfg.GroupID)
+		if err != nil {
+			g.traceReconcile(peer, "local_coverage_failed",
+				slog.String("err", err.Error()),
+				since(start))
+			return false
+		}
+		agreedFloor = localFloor
+		if peerState.CoverageFloorMS > agreedFloor {
+			agreedFloor = peerState.CoverageFloorMS
+		}
+		if peerState.ComparedSinceMillis != agreedFloor {
+			peerState, ok = g.fetchPeerRoot(ctx, peer, agreedFloor)
+			if !ok {
+				g.traceReconcile(peer, "coverage_root_failed", since(start))
+				return false
+			}
+			continue
+		}
+		localRoot, err = store.MerkleRootSince(ctx, g.cfg.Store, g.cfg.GroupID, agreedFloor)
+		if err != nil {
+			g.traceReconcile(peer, "local_root_failed",
+				slog.String("err", err.Error()),
+				since(start))
+			g.logger.Warn("gossip: reconcile: local merkle root",
+				slog.Uint64("peer", uint64(peer)),
+				slog.String("err", err.Error()))
+			return false
+		}
+		currentFloor, err := store.CoverageFloor(ctx, g.cfg.Store, g.cfg.GroupID)
+		if err != nil {
+			return false
+		}
+		if currentFloor > agreedFloor {
+			agreedFloor = currentFloor
+			peerState, ok = g.fetchPeerRoot(ctx, peer, agreedFloor)
+			if !ok {
+				return false
+			}
+			continue
+		}
+		rootStable = true
+		break
+	}
+	if !rootStable {
+		g.traceReconcile(peer, "coverage_changed_repeatedly", since(start))
 		return false
 	}
-	if [32]byte(peerRoot) == localRoot {
-		g.rememberPeerRoot(peer, peerRoot)
-		g.traceReconcile(peer, "root_match", since(start))
+
+	partialCoverage := agreedFloor > 0
+	if [32]byte(peerState.Root) == localRoot {
+		if !partialCoverage {
+			g.rememberPeerRoot(peer, peerState.Root)
+			g.traceReconcile(peer, "root_match", since(start))
+		} else {
+			g.traceReconcile(peer, "coverage_match",
+				slog.Int64("local_floor_ms", localFloor),
+				slog.Int64("peer_floor_ms", peerState.CoverageFloorMS),
+				slog.Int64("compared_since_ms", agreedFloor),
+				since(start))
+		}
 		return true
+	}
+	if partialCoverage {
+		g.traceReconcile(peer, "coverage_diff",
+			slog.Int64("local_floor_ms", localFloor),
+			slog.Int64("peer_floor_ms", peerState.CoverageFloorMS),
+			slog.Int64("compared_since_ms", agreedFloor))
+		ok = g.fetchFullRangeFallback(ctx, peer, peerState.Root, agreedFloor)
+		g.traceReconcile(peer, "done",
+			slog.Bool("success", ok),
+			slog.Bool("partial_coverage", true),
+			since(start))
+		return ok
 	}
 	g.traceReconcile(peer, "root_diff")
 
@@ -3420,7 +3605,7 @@ func (g *Gossiper) reconcileWith(ctx context.Context, peer entmoot.NodeID) bool 
 			fetchCtx, fetchCancel := context.WithTimeout(ctx, largeFrameResponseTimeout)
 			g.fetchMissingFrom(fetchCtx, peer, missingIDs)
 			fetchCancel()
-			g.rememberPeerRoot(peer, peerRoot)
+			g.rememberPeerRoot(peer, peerState.Root)
 			g.traceReconcile(peer, "session_complete",
 				slog.Int("attempt", attempt),
 				slog.Int("rounds", int(rounds)),
@@ -3450,7 +3635,7 @@ func (g *Gossiper) reconcileWith(ctx context.Context, peer entmoot.NodeID) bool 
 			slog.Uint64("peer", uint64(peer)),
 			slog.String("err", lastErr.Error()))
 	}
-	ok = g.fetchFullRangeFallback(ctx, peer, peerRoot)
+	ok = g.fetchFullRangeFallback(ctx, peer, peerState.Root, 0)
 	g.traceReconcile(peer, "done", slog.Bool("success", ok), since(start))
 	return ok
 }
@@ -3627,56 +3812,129 @@ func (g *Gossiper) runReconcileSession(ctx context.Context, peer entmoot.NodeID)
 	return missingIDs, round, nil
 }
 
-func (g *Gossiper) fetchFullRangeFallback(ctx context.Context, peer entmoot.NodeID, peerRoot wire.MerkleRoot) bool {
+func (g *Gossiper) fetchFullRangeFallback(ctx context.Context, peer entmoot.NodeID, peerRoot wire.MerkleRoot, sinceMillis int64) bool {
+	const (
+		maxSnapshotRestarts = 3
+		maxRangePages       = 128
+	)
 	start := time.Now()
 	g.traceReconcile(peer, "fallback_start")
-	payload, err := g.requestResponseWithAttemptTimeout(ctx, peer, &wire.RangeReq{GroupID: g.cfg.GroupID, SinceMillis: 0}, wire.MsgRangeResp, "range_req", reconcileSessionTimeout)
-	if err != nil {
-		g.traceReconcile(peer, "fallback_failed",
-			slog.String("err", err.Error()),
-			since(start))
-		g.logger.Warn("gossip: reconcile: full-range fallback failed",
-			slog.Uint64("peer", uint64(peer)),
-			slog.String("err", err.Error()))
-		return false
-	}
-	resp, ok := payload.(*wire.RangeResp)
-	if !ok {
-		g.traceReconcile(peer, "fallback_decode_mismatch", since(start))
-		g.logger.Warn("gossip: reconcile: full-range fallback decode mismatch",
-			slog.Uint64("peer", uint64(peer)))
-		return false
-	}
-	fctx, cancel := context.WithTimeout(ctx, largeFrameResponseTimeout)
-	defer cancel()
-	g.fetchMissingFrom(fctx, peer, resp.IDs)
-	localRoot, err := g.cfg.Store.MerkleRoot(fctx, g.cfg.GroupID)
-	if err == nil && [32]byte(peerRoot) == localRoot {
-		g.rememberPeerRoot(peer, peerRoot)
-		g.traceReconcile(peer, "fallback_complete",
-			slog.Int("ids", len(resp.IDs)),
-			since(start))
-		g.logger.Debug("gossip: reconcile: full-range fallback complete",
-			slog.Uint64("peer", uint64(peer)),
-			slog.Int("ids", len(resp.IDs)))
+
+	for attempt := 0; attempt < maxSnapshotRestarts; attempt++ {
+		var (
+			after      *store.RangeCursor
+			generation uint64
+			fetched    int
+			complete   bool
+			restart    bool
+		)
+		for pageIndex := 0; pageIndex < maxRangePages; pageIndex++ {
+			req := &wire.RangeReq{
+				GroupID:     g.cfg.GroupID,
+				SinceMillis: sinceMillis,
+				Generation:  generation,
+				Limit:       wire.MaxRangeIDs,
+			}
+			if after != nil {
+				afterID := after.ID
+				req.AfterTimestampMS = after.TimestampMS
+				req.AfterAuthor = after.Author
+				req.AfterID = &afterID
+			}
+			payload, err := g.requestResponseWithAttemptTimeout(ctx, peer, req, wire.MsgRangeResp, "range_req", reconcileSessionTimeout)
+			if err != nil {
+				g.traceReconcile(peer, "fallback_failed",
+					slog.String("err", err.Error()),
+					slog.Duration("duration", time.Since(start)))
+				return false
+			}
+			resp, ok := payload.(*wire.RangeResp)
+			if !ok {
+				g.logger.Warn("gossip: unexpected range_resp payload during fallback")
+				return false
+			}
+			if resp.GroupID != g.cfg.GroupID {
+				g.logger.Warn("gossip: range_resp for wrong group during fallback")
+				return false
+			}
+			if resp.CoverageFloorMS > sinceMillis {
+				g.traceReconcile(peer, "fallback_coverage_advanced",
+					slog.Int64("requested_since_ms", sinceMillis),
+					slog.Int64("peer_floor_ms", resp.CoverageFloorMS))
+				return false
+			}
+			if resp.SnapshotChanged || (generation != 0 && resp.Generation != generation) {
+				restart = true
+				break
+			}
+			if generation == 0 {
+				generation = resp.Generation
+			}
+			fetched += len(resp.IDs)
+			g.fetchMissingFrom(ctx, peer, resp.IDs)
+			if !resp.HasMore {
+				complete = true
+				break
+			}
+			if resp.NextID == nil {
+				g.logger.Warn("gossip: paged range response omitted continuation cursor")
+				return false
+			}
+			next := store.RangeCursor{
+				TimestampMS: resp.NextTimestampMS,
+				Author:      resp.NextAuthor,
+				ID:          *resp.NextID,
+			}
+			if after != nil && !rangeCursorAfter(next, *after) {
+				g.logger.Warn("gossip: paged range response did not advance cursor")
+				return false
+			}
+			after = &next
+		}
+		if restart {
+			continue
+		}
+		if !complete {
+			g.logger.Warn("gossip: full-range fallback exceeded page budget",
+				slog.Int("max_pages", maxRangePages))
+			return false
+		}
+
+		root, err := store.MerkleRootSince(ctx, g.cfg.Store, g.cfg.GroupID, sinceMillis)
+		if err != nil {
+			g.logger.Warn("gossip: merkle root after fallback", slog.String("err", err.Error()))
+			return false
+		}
+		if wire.MerkleRoot(root) != peerRoot {
+			g.traceReconcile(peer, "fallback_root_mismatch",
+				slog.Int("ids", fetched),
+				slog.Duration("duration", time.Since(start)))
+			return false
+		}
+		event := "fallback_complete"
+		if sinceMillis > 0 {
+			event = "fallback_partial_coverage_complete"
+		}
+		g.traceReconcile(peer, event,
+			slog.Int("ids", fetched),
+			slog.Int64("compared_since_ms", sinceMillis),
+			slog.Duration("duration", time.Since(start)))
 		return true
 	}
-	if err != nil {
-		g.traceReconcile(peer, "fallback_local_root_failed",
-			slog.String("err", err.Error()),
-			since(start))
-		g.logger.Warn("gossip: reconcile: full-range fallback local merkle root",
-			slog.Uint64("peer", uint64(peer)),
-			slog.String("err", err.Error()))
-	} else {
-		g.traceReconcile(peer, "fallback_root_still_differs",
-			slog.Int("ids", len(resp.IDs)),
-			since(start))
-		g.logger.Debug("gossip: reconcile: full-range fallback root still differs",
-			slog.Uint64("peer", uint64(peer)),
-			slog.Int("ids", len(resp.IDs)))
-	}
+
+	g.logger.Warn("gossip: full-range fallback snapshot kept changing",
+		slog.Int("attempts", maxSnapshotRestarts))
 	return false
+}
+
+func rangeCursorAfter(next, previous store.RangeCursor) bool {
+	if next.TimestampMS != previous.TimestampMS {
+		return next.TimestampMS > previous.TimestampMS
+	}
+	if next.Author != previous.Author {
+		return next.Author > previous.Author
+	}
+	return bytes.Compare(next.ID[:], previous.ID[:]) > 0
 }
 
 // rememberPeerRoot stashes the peer's most recently observed Merkle root
@@ -3698,13 +3956,16 @@ func (g *Gossiper) readLastKnownPeerRoot(peer entmoot.NodeID) (wire.MerkleRoot, 
 	return r, ok
 }
 
-// fetchPeerRoot opens a connection to peer and sends MerkleReq. Returns the
-// peer's root + ok on success, zero + !ok on any error so the caller can
-// abort cleanly.
-func (g *Gossiper) fetchPeerRoot(ctx context.Context, peer entmoot.NodeID) (wire.MerkleRoot, bool) {
+// fetchPeerRoot requests the peer's root for sinceMillis. The response reports
+// both the peer's retention floor and the exact window it compared.
+func (g *Gossiper) fetchPeerRoot(ctx context.Context, peer entmoot.NodeID, sinceMillis int64) (*wire.MerkleResp, bool) {
 	start := time.Now()
-	g.traceReconcile(peer, "root_request_start")
-	payload, err := g.requestResponseWithAttemptTimeout(ctx, peer, &wire.MerkleReq{GroupID: g.cfg.GroupID}, wire.MsgMerkleResp, "merkle_req", reconcileSessionTimeout)
+	g.traceReconcile(peer, "root_request_start",
+		slog.Int64("requested_since_ms", sinceMillis))
+	payload, err := g.requestResponseWithAttemptTimeout(ctx, peer, &wire.MerkleReq{
+		GroupID:     g.cfg.GroupID,
+		SinceMillis: sinceMillis,
+	}, wire.MsgMerkleResp, "merkle_req", reconcileSessionTimeout)
 	if err != nil {
 		g.traceReconcile(peer, "root_request_failed",
 			slog.String("err", err.Error()),
@@ -3712,17 +3973,19 @@ func (g *Gossiper) fetchPeerRoot(ctx context.Context, peer entmoot.NodeID) (wire
 		g.logger.Debug("gossip: reconcile: dial for root",
 			slog.Uint64("peer", uint64(peer)),
 			slog.String("err", err.Error()))
-		return wire.MerkleRoot{}, false
+		return nil, false
 	}
 	resp, ok := payload.(*wire.MerkleResp)
-	if !ok {
+	if !ok || resp.GroupID != g.cfg.GroupID {
 		g.traceReconcile(peer, "root_decode_mismatch", since(start))
-		return wire.MerkleRoot{}, false
+		return nil, false
 	}
 	g.traceReconcile(peer, "root_response",
 		slog.Int("message_count", resp.MessageCount),
+		slog.Int64("coverage_floor_ms", resp.CoverageFloorMS),
+		slog.Int64("compared_since_ms", resp.ComparedSinceMillis),
 		since(start))
-	return resp.Root, true
+	return resp, true
 }
 
 // onTransportAd validates and installs an inbound TransportAd (v1.2.0).

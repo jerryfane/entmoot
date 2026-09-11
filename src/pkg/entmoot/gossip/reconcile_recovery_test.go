@@ -2,6 +2,7 @@ package gossip
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -138,6 +139,24 @@ func newScriptedRecoveryGossiper(gid entmoot.GroupID, tr Transport) *Gossiper {
 	}
 }
 
+type tombstoneMessageStore struct {
+	*store.Memory
+	id entmoot.MessageID
+}
+
+func (s *tombstoneMessageStore) HasTombstone(_ context.Context, _ entmoot.GroupID, id entmoot.MessageID) (bool, error) {
+	return id == s.id, nil
+}
+
+type coverageMessageStore struct {
+	*store.Memory
+	floor int64
+}
+
+func (s *coverageMessageStore) CoverageFloor(context.Context, entmoot.GroupID) (int64, error) {
+	return s.floor, nil
+}
+
 func TestTransportClassifiedStaleStreamErrorsAreRetryable(t *testing.T) {
 	t.Parallel()
 
@@ -171,11 +190,11 @@ func TestFetchPeerRootDropsSessionAndRetriesOnEOF(t *testing.T) {
 	}
 	g := newScriptedRecoveryGossiper(gid, tr)
 
-	got, ok := g.fetchPeerRoot(context.Background(), 20)
+	got, ok := g.fetchPeerRoot(context.Background(), 20, 0)
 	if !ok {
 		t.Fatalf("fetchPeerRoot failed after retry")
 	}
-	if got != root {
+	if got.Root != root {
 		t.Fatalf("root mismatch: got %x want %x", got, root)
 	}
 	dials, drops := tr.counts()
@@ -184,6 +203,98 @@ func TestFetchPeerRootDropsSessionAndRetriesOnEOF(t *testing.T) {
 	}
 	if drops != 1 {
 		t.Fatalf("drops = %d, want 1", drops)
+	}
+}
+
+func TestFetchPeerRootCarriesCoverageWindow(t *testing.T) {
+	t.Parallel()
+
+	var gid entmoot.GroupID
+	gid[0] = 1
+	var root wire.MerkleRoot
+	root[0] = 43
+	seenSince := make(chan int64, 1)
+	tr := &scriptedTransport{handlers: []func(net.Conn){
+		func(c net.Conn) {
+			defer c.Close()
+			_, payload, err := wire.ReadAndDecode(c)
+			if err != nil {
+				return
+			}
+			req, ok := payload.(*wire.MerkleReq)
+			if !ok {
+				return
+			}
+			seenSince <- req.SinceMillis
+			_ = wire.EncodeAndWrite(c, &wire.MerkleResp{
+				GroupID:             gid,
+				Root:                root,
+				CoverageFloorMS:     20,
+				ComparedSinceMillis: req.SinceMillis,
+			})
+		},
+	}}
+	g := newScriptedRecoveryGossiper(gid, tr)
+
+	got, ok := g.fetchPeerRoot(context.Background(), 20, 42)
+	if !ok {
+		t.Fatal("fetchPeerRoot failed")
+	}
+	if got.Root != root || got.CoverageFloorMS != 20 || got.ComparedSinceMillis != 42 {
+		t.Fatalf("response = %+v, want root/floor/window %x/20/42", got, root)
+	}
+	select {
+	case since := <-seenSince:
+		if since != 42 {
+			t.Fatalf("request since = %d, want 42", since)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("server did not observe Merkle request")
+	}
+}
+
+func TestMerkleResponseReportsPartialCoverageWindow(t *testing.T) {
+	t.Parallel()
+
+	var gid entmoot.GroupID
+	gid[0] = 1
+	st := &coverageMessageStore{Memory: store.NewMemory(), floor: 20}
+	old := entmoot.Message{GroupID: gid, Timestamp: 10}
+	old.ID[0] = 1
+	recent := entmoot.Message{GroupID: gid, Timestamp: 30}
+	recent.ID[0] = 2
+	if _, err := st.Put(context.Background(), gid, old); err != nil {
+		t.Fatalf("Put old: %v", err)
+	}
+	if _, err := st.Put(context.Background(), gid, recent); err != nil {
+		t.Fatalf("Put recent: %v", err)
+	}
+	g := newScriptedRecoveryGossiper(gid, &scriptedTransport{})
+	g.cfg.Store = st
+	server, client := net.Pipe()
+	defer client.Close()
+	go func() {
+		defer server.Close()
+		g.onMerkleReq(context.Background(), server, 20, &wire.MerkleReq{GroupID: gid})
+	}()
+
+	_, payload, err := wire.ReadAndDecode(client)
+	if err != nil {
+		t.Fatalf("ReadAndDecode: %v", err)
+	}
+	resp, ok := payload.(*wire.MerkleResp)
+	if !ok {
+		t.Fatalf("payload type = %T, want *wire.MerkleResp", payload)
+	}
+	want, err := store.MerkleRootSince(context.Background(), st, gid, 20)
+	if err != nil {
+		t.Fatalf("MerkleRootSince: %v", err)
+	}
+	if resp.Root != wire.MerkleRoot(want) || resp.CoverageFloorMS != 20 || resp.ComparedSinceMillis != 20 {
+		t.Fatalf("response = %+v, want root %x at coverage floor 20", resp, want)
+	}
+	if inserted, err := g.acceptInboundMessage(context.Background(), 20, old); inserted || !errors.Is(err, store.ErrPruned) {
+		t.Fatalf("accept below coverage floor = (%v, %v), want (false, ErrPruned)", inserted, err)
 	}
 }
 
@@ -202,11 +313,11 @@ func TestFetchPeerRootDropsSessionAndRetriesPilotConnectionNotFoundDial(t *testi
 	}}
 	g := newScriptedRecoveryGossiper(gid, tr)
 
-	got, ok := g.fetchPeerRoot(context.Background(), 20)
+	got, ok := g.fetchPeerRoot(context.Background(), 20, 0)
 	if !ok {
 		t.Fatalf("fetchPeerRoot failed after stale Pilot session retry")
 	}
-	if got != root {
+	if got.Root != root {
 		t.Fatalf("root mismatch: got %x want %x", got, root)
 	}
 	dials, drops := tr.counts()
@@ -236,11 +347,11 @@ func TestFetchPeerRootRetriesPilotConnectionClosingDial(t *testing.T) {
 	}}
 	g := newScriptedRecoveryGossiper(gid, tr)
 
-	got, ok := g.fetchPeerRoot(context.Background(), 20)
+	got, ok := g.fetchPeerRoot(context.Background(), 20, 0)
 	if !ok {
 		t.Fatalf("fetchPeerRoot failed after stale Pilot closing retry")
 	}
-	if got != root {
+	if got.Root != root {
 		t.Fatalf("root mismatch: got %x want %x", got, root)
 	}
 	dials, drops := tr.counts()
@@ -908,6 +1019,27 @@ func TestScheduledMemberProfileSnapshotUsesLargeFrameAttemptBudget(t *testing.T)
 	}
 }
 
+func TestFetchMissingSkipsTombstonedID(t *testing.T) {
+	t.Parallel()
+	var gid entmoot.GroupID
+	gid[0] = 1
+	var id entmoot.MessageID
+	id[0] = 9
+	tr := &scriptedTransport{}
+	g := newScriptedRecoveryGossiper(gid, tr)
+	g.cfg.Store = &tombstoneMessageStore{Memory: store.NewMemory(), id: id}
+
+	g.fetchMissingFrom(context.Background(), 20, []entmoot.MessageID{id})
+
+	dials, _ := tr.counts()
+	if dials != 0 {
+		t.Fatalf("tombstoned id triggered %d fetch dials", dials)
+	}
+	msg := entmoot.Message{ID: id, GroupID: gid}
+	if inserted, err := g.acceptInboundMessage(context.Background(), 20, msg); inserted || !errors.Is(err, store.ErrPruned) {
+		t.Fatalf("accept tombstoned message = (%v, %v), want (false, ErrPruned)", inserted, err)
+	}
+}
 func TestFullRangeFallbackFetchesMissingIDs(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t, []entmoot.NodeID{10, 20})
@@ -933,7 +1065,7 @@ func TestFullRangeFallbackFetchesMissingIDs(t *testing.T) {
 	aG := f.nodes[10].gossip
 	aG.cfg.Transport = tr
 
-	if ok := aG.fetchFullRangeFallback(ctx, 20, peerRoot); !ok {
+	if ok := aG.fetchFullRangeFallback(ctx, 20, peerRoot, 0); !ok {
 		t.Fatalf("full-range fallback failed")
 	}
 	has, err := f.nodes[10].storeM.Has(ctx, f.groupID, msg.ID)
@@ -942,5 +1074,120 @@ func TestFullRangeFallbackFetchesMissingIDs(t *testing.T) {
 	}
 	if !has {
 		t.Fatalf("fallback did not fetch missing peer message")
+	}
+}
+
+func TestFullRangeFallbackContinuesAcrossPages(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, []entmoot.NodeID{10, 20})
+	defer f.closeTransports()
+
+	ctx := context.Background()
+	first := f.buildMessage(20, "peer-page-1", 2_000)
+	second := f.buildMessage(20, "peer-page-2", 3_000)
+	for _, msg := range []entmoot.Message{first, second} {
+		if _, err := f.nodes[20].storeM.Put(ctx, msg.GroupID, msg); err != nil {
+			t.Fatalf("seed peer message: %v", err)
+		}
+		if _, err := f.nodes[10].storeM.Put(ctx, msg.GroupID, msg); err != nil {
+			t.Fatalf("seed local message: %v", err)
+		}
+	}
+	peerRootBytes, err := f.nodes[20].storeM.MerkleRoot(ctx, f.groupID)
+	if err != nil {
+		t.Fatalf("peer MerkleRoot: %v", err)
+	}
+	nextID := first.ID
+	continuation := make(chan *wire.RangeReq, 1)
+	tr := &scriptedTransport{
+		handlers: []func(net.Conn){
+			respondAfterRequest(&wire.RangeResp{
+				GroupID:         f.groupID,
+				IDs:             []entmoot.MessageID{first.ID},
+				Generation:      7,
+				NextTimestampMS: first.Timestamp,
+				NextAuthor:      first.Author.PilotNodeID,
+				NextID:          &nextID,
+				HasMore:         true,
+			}),
+			func(c net.Conn) {
+				defer c.Close()
+				_, payload, err := wire.ReadAndDecode(c)
+				if err != nil {
+					return
+				}
+				req, ok := payload.(*wire.RangeReq)
+				if !ok {
+					return
+				}
+				continuation <- req
+				_ = wire.EncodeAndWrite(c, &wire.RangeResp{
+					GroupID:    f.groupID,
+					IDs:        []entmoot.MessageID{second.ID},
+					Generation: 7,
+				})
+			},
+		},
+	}
+	aG := f.nodes[10].gossip
+	aG.cfg.Transport = tr
+
+	if ok := aG.fetchFullRangeFallback(ctx, 20, wire.MerkleRoot(peerRootBytes), 0); !ok {
+		t.Fatal("paged full-range fallback failed")
+	}
+	for _, msg := range []entmoot.Message{first, second} {
+		has, err := f.nodes[10].storeM.Has(ctx, f.groupID, msg.ID)
+		if err != nil || !has {
+			t.Fatalf("local Has(%s) = (%v, %v), want true", msg.ID, has, err)
+		}
+	}
+	select {
+	case req := <-continuation:
+		if req.Generation != 7 || req.AfterID == nil || *req.AfterID != first.ID ||
+			req.AfterTimestampMS != first.Timestamp || req.AfterAuthor != first.Author.PilotNodeID {
+			t.Fatalf("continuation request = %+v, want generation 7 after first message", req)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("second range page was not requested")
+	}
+}
+
+func TestFullRangeFallbackRestartsChangedSnapshot(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, []entmoot.NodeID{10, 20})
+	defer f.closeTransports()
+
+	ctx := context.Background()
+	msg := f.buildMessage(20, "peer-restart", 2_000)
+	for _, nodeID := range []entmoot.NodeID{10, 20} {
+		if _, err := f.nodes[nodeID].storeM.Put(ctx, msg.GroupID, msg); err != nil {
+			t.Fatalf("seed node %d: %v", nodeID, err)
+		}
+	}
+	peerRoot, err := f.nodes[20].storeM.MerkleRoot(ctx, f.groupID)
+	if err != nil {
+		t.Fatalf("peer MerkleRoot: %v", err)
+	}
+	tr := &scriptedTransport{handlers: []func(net.Conn){
+		respondAfterRequest(&wire.RangeResp{
+			GroupID:         f.groupID,
+			Generation:      8,
+			SnapshotChanged: true,
+		}),
+		respondAfterRequest(&wire.RangeResp{
+			GroupID:    f.groupID,
+			IDs:        []entmoot.MessageID{msg.ID},
+			Generation: 8,
+		}),
+	}}
+	g := f.nodes[10].gossip
+	g.cfg.Transport = tr
+
+	if ok := g.fetchFullRangeFallback(ctx, 20, wire.MerkleRoot(peerRoot), 0); !ok {
+		t.Fatal("fallback did not recover from changed snapshot")
+	}
+	dials, _ := tr.counts()
+	if dials != 2 {
+		t.Fatalf("range dials = %d, want 2 after one restart", dials)
 	}
 }

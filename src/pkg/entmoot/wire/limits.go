@@ -32,6 +32,11 @@ func ValidatePayloadLimits(v any) error {
 		field, got, max = "roster entries", len(p.Entries), MaxRosterEntries
 	case *Gossip:
 		field, got, max = "gossip ids", len(p.IDs), MaxGossipIDs
+	case *RangeReq:
+		if p.Limit < 0 {
+			return fmt.Errorf("wire: negative range limit: %w", entmoot.ErrMalformedFrame)
+		}
+		field, got, max = "range limit", p.Limit, MaxRangeIDs
 	case *RangeResp:
 		field, got, max = "range ids", len(p.IDs), MaxRangeIDs
 	case *IHave:

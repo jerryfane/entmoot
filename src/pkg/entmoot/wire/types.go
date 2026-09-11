@@ -284,11 +284,14 @@ type FetchResp struct {
 type MerkleReq struct {
 	// GroupID identifies the owning group.
 	GroupID entmoot.GroupID `json:"group_id"`
+	// SinceMillis requests a root over messages at or after an agreed
+	// retention floor. Zero requests the responder's full retained set.
+	SinceMillis int64 `json:"since_millis,omitempty"`
 }
 
-// MerkleResp returns the current Merkle root and the number of messages the
-// responder considers part of that tree. v0 does not include proofs; the
-// canary compares roots directly. Subsequent fetches resolve any diff.
+// MerkleResp returns the current Merkle root for ComparedSinceMillis and the
+// responder's retained-history floor. MessageCount remains optional because
+// counting is not required for root reconciliation.
 type MerkleResp struct {
 	// GroupID identifies the owning group.
 	GroupID entmoot.GroupID `json:"group_id"`
@@ -297,6 +300,11 @@ type MerkleResp struct {
 	Root MerkleRoot `json:"root"`
 	// MessageCount is the number of message ids that went into Root.
 	MessageCount int `json:"message_count"`
+	// CoverageFloorMS is the earliest timestamp for which the responder
+	// claims retained history coverage.
+	CoverageFloorMS int64 `json:"coverage_floor_ms,omitempty"`
+	// ComparedSinceMillis identifies the exact root window.
+	ComparedSinceMillis int64 `json:"compared_since_millis,omitempty"`
 }
 
 // RangeReq asks a peer for the list of message ids it holds whose
@@ -310,6 +318,15 @@ type RangeReq struct {
 	// SinceMillis is the inclusive lower bound on message Timestamp. 0
 	// means "give me everything the peer has."
 	SinceMillis int64 `json:"since_millis"`
+	// Generation binds continuation pages to one committed store generation.
+	// Zero starts a new enumeration.
+	Generation uint64 `json:"generation,omitempty"`
+	// After* is the exclusive keyset boundary from the previous response.
+	AfterTimestampMS int64              `json:"after_timestamp_ms,omitempty"`
+	AfterAuthor      entmoot.NodeID     `json:"after_author,omitempty"`
+	AfterID          *entmoot.MessageID `json:"after_id,omitempty"`
+	// Limit is capped by the responder. Zero selects its default.
+	Limit int `json:"limit,omitempty"`
 }
 
 // RangeResp carries the ids selected by RangeReq. Bodies are pulled via
@@ -319,7 +336,14 @@ type RangeResp struct {
 	// GroupID identifies the owning group.
 	GroupID entmoot.GroupID `json:"group_id"`
 	// IDs is the list of matching message ids.
-	IDs []entmoot.MessageID `json:"ids"`
+	IDs             []entmoot.MessageID `json:"ids"`
+	Generation      uint64              `json:"generation,omitempty"`
+	NextTimestampMS int64               `json:"next_timestamp_ms,omitempty"`
+	NextAuthor      entmoot.NodeID      `json:"next_author,omitempty"`
+	NextID          *entmoot.MessageID  `json:"next_id,omitempty"`
+	HasMore         bool                `json:"has_more,omitempty"`
+	SnapshotChanged bool                `json:"snapshot_changed,omitempty"`
+	CoverageFloorMS int64               `json:"coverage_floor_ms,omitempty"`
 }
 
 // IHave is a lazy message-id advertisement (Plumtree-style). The sender

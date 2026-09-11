@@ -215,6 +215,38 @@ Transport and member-profile system frames are also signed and roster-checked,
 but they do not mutate consensus state: they update local reachability or
 display metadata caches.
 
+### 4.1 Bounded history synchronization
+
+SQLite assigns each group a monotonically increasing generation. Database
+triggers cover direct imports as well as normal inserts and deletes;
+retention-floor-only changes increment it explicitly. Every increment
+invalidates the cached Merkle root in the same transaction. Root computation
+reads one SQLite snapshot and publishes its cache with a generation
+compare-and-swap, so a concurrent writer cannot make a stale root appear
+current.
+
+`range_req` enumerates IDs in `(timestamp, author node id, message id)` order.
+Responses contain at most 1,024 IDs and 128 KiB, plus the generation and an
+exclusive continuation cursor. A generation mismatch tells the requester to
+restart; reconciliation permits three restarts and 128 pages per attempt.
+
+Retention records exact-ID tombstones and a group coverage floor in the prune
+transaction. Tombstones live for at least 90 days, are capped at one million
+per group, and prevent fetched or directly pushed old messages from being
+reinserted. After tombstone collection, normal message ingest still rejects
+timestamps below the durable coverage floor. The floor states the earliest
+history the peer still claims to cover; it is not proof that older history
+never existed.
+
+Peers compare roots from the later of their two coverage floors. A match in
+that window is reported as partial coverage and is not cached as a full-history
+match. A floor change during paging aborts the attempt instead of labeling
+different retention windows converged.
+
+Deterministic DAG ordering uses Kahn's algorithm with a heap for ready
+messages. Parent-before-child order is unchanged while independent-message
+selection is $O(\log n)$ instead of a linear scan.
+
 ## 5. Bootstrap and peer discovery
 
 When a node comes online with a roster for a group, it needs to find at least

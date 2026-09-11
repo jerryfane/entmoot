@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"errors"
+	"fmt"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -1062,5 +1064,267 @@ func TestSQLiteGroupDBUsesSingleConnection(t *testing.T) {
 	}
 	if got := db.Stats().MaxOpenConnections; got != 1 {
 		t.Fatalf("MaxOpenConnections = %d, want 1", got)
+	}
+}
+
+func TestSQLiteMessageIDsPageEnumeratesMoreThanWirePage(t *testing.T) {
+	ctx := context.Background()
+	s, err := OpenSQLite(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	gid := randGroupID(t)
+	const messageCount = 1029
+	want := make(map[entmoot.MessageID]struct{}, messageCount)
+	for i := 0; i < messageCount; i++ {
+		msg := mkMsg(t, gid, testAuthor(uint32(i%7+1), byte(i)), int64(i/3+1), fmt.Sprintf("page-%d", i))
+		if _, err := s.Put(ctx, gid, msg); err != nil {
+			t.Fatalf("Put %d: %v", i, err)
+		}
+		want[msg.ID] = struct{}{}
+	}
+
+	var (
+		cursor     *RangeCursor
+		generation uint64
+		got        = make(map[entmoot.MessageID]struct{}, messageCount)
+	)
+	for pageNumber := 0; ; pageNumber++ {
+		page, err := s.MessageIDsPage(ctx, gid, 0, cursor, generation, 113)
+		if err != nil {
+			t.Fatalf("MessageIDsPage %d: %v", pageNumber, err)
+		}
+		if page.SnapshotChanged {
+			t.Fatalf("MessageIDsPage %d unexpectedly changed snapshot", pageNumber)
+		}
+		if generation == 0 {
+			generation = page.Generation
+		} else if page.Generation != generation {
+			t.Fatalf("page generation = %d, want %d", page.Generation, generation)
+		}
+		for _, id := range page.IDs {
+			if _, duplicate := got[id]; duplicate {
+				t.Fatalf("duplicate id %s", id)
+			}
+			if _, known := want[id]; !known {
+				t.Fatalf("unknown id %s", id)
+			}
+			got[id] = struct{}{}
+		}
+		if !page.HasMore {
+			break
+		}
+		if page.Next == nil {
+			t.Fatalf("page %d has_more without cursor", pageNumber)
+		}
+		cursor = page.Next
+	}
+	if len(got) != messageCount {
+		t.Fatalf("enumerated %d ids, want %d", len(got), messageCount)
+	}
+
+	first, err := s.MessageIDsPage(ctx, gid, 0, nil, 0, 10)
+	if err != nil {
+		t.Fatalf("first mutation page: %v", err)
+	}
+	newMessage := mkMsg(t, gid, testAuthor(99, 0x99), messageCount+1, "generation-change")
+	if _, err := s.Put(ctx, gid, newMessage); err != nil {
+		t.Fatalf("Put generation change: %v", err)
+	}
+	changed, err := s.MessageIDsPage(ctx, gid, 0, first.Next, first.Generation, 10)
+	if err != nil {
+		t.Fatalf("changed mutation page: %v", err)
+	}
+	if !changed.SnapshotChanged {
+		t.Fatalf("continuation across mutation did not report snapshot change")
+	}
+
+	want[newMessage.ID] = struct{}{}
+	cursor = nil
+	generation = 0
+	resumed := make(map[entmoot.MessageID]struct{}, messageCount+1)
+	for pageNumber := 0; ; pageNumber++ {
+		page, err := s.MessageIDsPage(ctx, gid, 0, cursor, generation, 127)
+		if err != nil {
+			t.Fatalf("resumed MessageIDsPage %d: %v", pageNumber, err)
+		}
+		if page.SnapshotChanged {
+			t.Fatalf("resumed MessageIDsPage %d unexpectedly changed", pageNumber)
+		}
+		if generation == 0 {
+			generation = page.Generation
+		}
+		for _, id := range page.IDs {
+			if _, duplicate := resumed[id]; duplicate {
+				t.Fatalf("resumed duplicate id %s", id)
+			}
+			if _, known := want[id]; !known {
+				t.Fatalf("resumed unknown id %s", id)
+			}
+			resumed[id] = struct{}{}
+		}
+		if !page.HasMore {
+			break
+		}
+		if page.Next == nil {
+			t.Fatalf("resumed page %d has_more without cursor", pageNumber)
+		}
+		cursor = page.Next
+	}
+	if len(resumed) != messageCount+1 {
+		t.Fatalf("resumed enumeration = %d ids, want %d", len(resumed), messageCount+1)
+	}
+}
+
+func TestSQLitePruneTombstonePreventsResurrection(t *testing.T) {
+	ctx := context.Background()
+	s, err := OpenSQLite(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	gid := randGroupID(t)
+	msg := mkMsg(t, gid, testAuthor(1, 0x01), 10, "prune-me")
+	if _, err := s.Put(ctx, gid, msg); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	recent := mkMsg(t, gid, testAuthor(2, 0x02), 30, "keep-me")
+	if _, err := s.Put(ctx, gid, recent); err != nil {
+		t.Fatalf("Put recent: %v", err)
+	}
+	beforePrune, err := s.MessageIDsPage(ctx, gid, 0, nil, 0, 1)
+	if err != nil {
+		t.Fatalf("MessageIDsPage before prune: %v", err)
+	}
+	pruned, err := s.PruneBefore(ctx, gid, 20)
+	if err != nil {
+		t.Fatalf("PruneBefore: %v", err)
+	}
+	if pruned != 1 {
+		t.Fatalf("pruned = %d, want 1", pruned)
+	}
+	hasTombstone, err := s.HasTombstone(ctx, gid, msg.ID)
+	if err != nil {
+		t.Fatalf("HasTombstone: %v", err)
+	}
+	if !hasTombstone {
+		t.Fatal("pruned message has no tombstone")
+	}
+	changed, err := s.MessageIDsPage(ctx, gid, 0, beforePrune.Next, beforePrune.Generation, 1)
+	if err != nil {
+		t.Fatalf("MessageIDsPage after prune: %v", err)
+	}
+	if !changed.SnapshotChanged {
+		t.Fatal("continuation across prune did not report snapshot change")
+	}
+	if inserted, err := s.Put(ctx, gid, msg); inserted || !errors.Is(err, ErrPruned) {
+		t.Fatalf("Put pruned message = (%v, %v), want (false, ErrPruned)", inserted, err)
+	}
+	page, err := s.MessageIDsPage(ctx, gid, 0, nil, 0, 10)
+	if err != nil {
+		t.Fatalf("MessageIDsPage: %v", err)
+	}
+	if page.CoverageFloorMS != 20 {
+		t.Fatalf("coverage floor = %d, want 20", page.CoverageFloorMS)
+	}
+	if len(page.IDs) != 1 || page.IDs[0] != recent.ID {
+		t.Fatalf("page IDs = %v, want retained id %s", page.IDs, recent.ID)
+	}
+}
+
+func TestSQLiteMerkleCacheTracksCommittedGeneration(t *testing.T) {
+	ctx := context.Background()
+	s, err := OpenSQLite(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	gid := randGroupID(t)
+	first := mkMsg(t, gid, testAuthor(1, 0x01), 10, "first")
+	if _, err := s.Put(ctx, gid, first); err != nil {
+		t.Fatalf("Put first: %v", err)
+	}
+	firstRoot, err := s.MerkleRoot(ctx, gid)
+	if err != nil {
+		t.Fatalf("MerkleRoot first: %v", err)
+	}
+	db, exists, err := s.dbForExisting(gid)
+	if err != nil || !exists {
+		t.Fatalf("dbForExisting = (%v, %v)", exists, err)
+	}
+	var generation, rootGeneration int64
+	var cached []byte
+	if err := db.QueryRowContext(ctx, `
+		SELECT generation, root_generation, merkle_root
+		FROM group_sync_state WHERE group_id = ?;`,
+		gid[:],
+	).Scan(&generation, &rootGeneration, &cached); err != nil {
+		t.Fatalf("read first cache: %v", err)
+	}
+	if rootGeneration != generation || !bytes.Equal(cached, firstRoot[:]) {
+		t.Fatalf("first cache generation/root = (%d, %d, %x), want current %x", generation, rootGeneration, cached, firstRoot)
+	}
+
+	second := mkMsg(t, gid, testAuthor(2, 0x02), 20, "second")
+	if _, err := s.Put(ctx, gid, second); err != nil {
+		t.Fatalf("Put second: %v", err)
+	}
+	var changedGeneration, staleRootGeneration int64
+	if err := db.QueryRowContext(ctx, `
+		SELECT generation, root_generation
+		FROM group_sync_state WHERE group_id = ?;`,
+		gid[:],
+	).Scan(&changedGeneration, &staleRootGeneration); err != nil {
+		t.Fatalf("read invalidated cache: %v", err)
+	}
+	if changedGeneration <= generation || staleRootGeneration == changedGeneration {
+		t.Fatalf("cache was not invalidated: generation=%d root_generation=%d prior=%d", changedGeneration, staleRootGeneration, generation)
+	}
+	secondRoot, err := s.MerkleRoot(ctx, gid)
+	if err != nil {
+		t.Fatalf("MerkleRoot second: %v", err)
+	}
+	if secondRoot == firstRoot {
+		t.Fatal("Merkle root did not change after insert")
+	}
+	if err := db.QueryRowContext(ctx, `
+		SELECT generation, root_generation, merkle_root
+		FROM group_sync_state WHERE group_id = ?;`,
+		gid[:],
+	).Scan(&generation, &rootGeneration, &cached); err != nil {
+		t.Fatalf("read refreshed cache: %v", err)
+	}
+	if rootGeneration != generation || !bytes.Equal(cached, secondRoot[:]) {
+		t.Fatalf("refreshed cache generation/root = (%d, %d, %x), want current %x", generation, rootGeneration, cached, secondRoot)
+	}
+
+	third := mkMsg(t, gid, testAuthor(3, 0x03), 30, "direct-import")
+	encoded, err := canonical.Encode(third)
+	if err != nil {
+		t.Fatalf("canonical encode third: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO messages
+		  (message_id, group_id, author_node_id, timestamp_ms,
+		   content, parents, signature, canonical_bytes)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?);`,
+		third.ID[:], gid[:], int64(third.Author.PilotNodeID), third.Timestamp,
+		notNilBytes(third.Content), parentsBlob(third.Parents), notNilBytes(third.Signature), encoded,
+	); err != nil {
+		t.Fatalf("direct import insert: %v", err)
+	}
+	if err := db.QueryRowContext(ctx, `
+		SELECT generation, root_generation
+		FROM group_sync_state WHERE group_id = ?;`,
+		gid[:],
+	).Scan(&changedGeneration, &staleRootGeneration); err != nil {
+		t.Fatalf("read direct-import invalidation: %v", err)
+	}
+	if changedGeneration <= generation || staleRootGeneration == changedGeneration {
+		t.Fatalf("direct import bypassed cache invalidation: generation=%d root_generation=%d prior=%d", changedGeneration, staleRootGeneration, generation)
 	}
 }

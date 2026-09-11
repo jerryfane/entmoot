@@ -27,6 +27,12 @@ import (
 // sqliteDriver is the database/sql driver name registered by modernc.org/sqlite.
 const sqliteDriver = "sqlite"
 
+const (
+	maxLiveTombstonesPerGroup = 1_000_000
+	tombstoneMinimumAge       = 90 * 24 * time.Hour
+	tombstoneCleanupBatch     = 4096
+)
+
 // sqliteSchema is applied idempotently on first open of every per-group
 // database. Mirrors docs/CLI_DESIGN.md §4.2 exactly.
 const sqliteSchema = `
@@ -152,6 +158,51 @@ CREATE TABLE IF NOT EXISTS member_profile_ad_seqs (
   seq            INTEGER NOT NULL,
   PRIMARY KEY (group_id, author_node_id)
 );
+
+CREATE TABLE IF NOT EXISTS group_sync_state (
+  group_id          BLOB PRIMARY KEY,
+  generation        INTEGER NOT NULL DEFAULT 0,
+  root_generation   INTEGER NOT NULL DEFAULT -1,
+  merkle_root       BLOB,
+  coverage_floor_ms INTEGER NOT NULL DEFAULT 0
+);
+
+-- Generation invalidation is enforced in SQLite so future bulk import and
+-- conversion writers cannot bypass the cache contract.
+CREATE TRIGGER IF NOT EXISTS messages_sync_insert
+AFTER INSERT ON messages
+BEGIN
+  INSERT OR IGNORE INTO group_sync_state
+    (group_id, generation, root_generation, coverage_floor_ms)
+    VALUES (NEW.group_id, 0, -1, 0);
+  UPDATE group_sync_state
+    SET generation = generation + 1,
+        root_generation = -1,
+        merkle_root = NULL
+    WHERE group_id = NEW.group_id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS messages_sync_delete
+AFTER DELETE ON messages
+BEGIN
+  INSERT OR IGNORE INTO group_sync_state
+    (group_id, generation, root_generation, coverage_floor_ms)
+    VALUES (OLD.group_id, 0, -1, 0);
+  UPDATE group_sync_state
+    SET generation = generation + 1,
+        root_generation = -1,
+        merkle_root = NULL
+    WHERE group_id = OLD.group_id;
+END;
+
+CREATE TABLE IF NOT EXISTS message_tombstones (
+  message_id    BLOB PRIMARY KEY,
+  group_id      BLOB NOT NULL,
+  timestamp_ms  INTEGER NOT NULL,
+  pruned_at_ms  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_message_tombstones_group_time
+  ON message_tombstones(group_id, timestamp_ms, pruned_at_ms);
 `
 
 // SQLite is a MessageStore backed by one SQLite database per group,
@@ -248,6 +299,21 @@ func (s *SQLite) Put(ctx context.Context, expectedGroup entmoot.GroupID, m entmo
 		return false, fmt.Errorf("store: begin tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	if err := ensureGroupSyncStateTx(ctx, tx, m.GroupID); err != nil {
+		return false, err
+	}
+	var tombstoned int
+	err = tx.QueryRowContext(ctx, `
+		SELECT 1 FROM message_tombstones
+		WHERE group_id = ? AND message_id = ?;`,
+		m.GroupID[:], m.ID[:],
+	).Scan(&tombstoned)
+	if err == nil {
+		return false, fmt.Errorf("%w: %s", ErrPruned, m.ID)
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return false, fmt.Errorf("store: check tombstone: %w", err)
+	}
 
 	result, err := tx.ExecContext(ctx, `
 		INSERT OR IGNORE INTO messages
@@ -296,6 +362,54 @@ func (s *SQLite) Put(ctx context.Context, expectedGroup entmoot.GroupID, m entmo
 	return true, nil
 }
 
+func ensureGroupSyncStateTx(ctx context.Context, tx *sql.Tx, groupID entmoot.GroupID) error {
+	if _, err := tx.ExecContext(ctx, `
+		INSERT OR IGNORE INTO group_sync_state
+		  (group_id, generation, root_generation, coverage_floor_ms)
+		VALUES (
+		  ?,
+		  CASE WHEN EXISTS (SELECT 1 FROM messages WHERE group_id = ?) THEN 1 ELSE 0 END,
+		  -1,
+		  0
+		);`,
+		groupID[:], groupID[:],
+	); err != nil {
+		return fmt.Errorf("store: ensure group sync state: %w", err)
+	}
+	return nil
+}
+
+func ensureGroupSyncStateDB(ctx context.Context, db *sql.DB, groupID entmoot.GroupID) error {
+	if _, err := db.ExecContext(ctx, `
+		INSERT OR IGNORE INTO group_sync_state
+		  (group_id, generation, root_generation, coverage_floor_ms)
+		VALUES (
+		  ?,
+		  CASE WHEN EXISTS (SELECT 1 FROM messages WHERE group_id = ?) THEN 1 ELSE 0 END,
+		  -1,
+		  0
+		);`,
+		groupID[:], groupID[:],
+	); err != nil {
+		return fmt.Errorf("store: ensure group sync state: %w", err)
+	}
+	return nil
+}
+func bumpGroupGenerationTx(ctx context.Context, tx *sql.Tx, groupID entmoot.GroupID) error {
+	if err := ensureGroupSyncStateTx(ctx, tx, groupID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE group_sync_state
+		SET generation = generation + 1, root_generation = -1, merkle_root = NULL
+		WHERE group_id = ?;`,
+		groupID[:],
+	); err != nil {
+		return fmt.Errorf("store: bump group generation: %w", err)
+	}
+	return nil
+}
+
 // PruneBefore removes messages in groupID older than beforeMillis.
 func (s *SQLite) PruneBefore(ctx context.Context, groupID entmoot.GroupID, beforeMillis int64) (int64, error) {
 	return s.PruneBeforeExceptTopics(ctx, groupID, beforeMillis, nil)
@@ -316,35 +430,101 @@ func (s *SQLite) PruneBeforeExceptTopics(ctx context.Context, groupID entmoot.Gr
 		return 0, fmt.Errorf("store: begin prune tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	if err := ensureGroupSyncStateTx(ctx, tx, groupID); err != nil {
+		return 0, err
+	}
+
+	var oldCoverageFloor int64
+	if err := tx.QueryRowContext(ctx, `
+		SELECT coverage_floor_ms FROM group_sync_state WHERE group_id = ?;`,
+		groupID[:],
+	).Scan(&oldCoverageFloor); err != nil {
+		return 0, fmt.Errorf("store: read coverage floor: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE group_sync_state
+		SET coverage_floor_ms = MAX(coverage_floor_ms, ?)
+		WHERE group_id = ?;`,
+		beforeMillis, groupID[:],
+	); err != nil {
+		return 0, fmt.Errorf("store: advance coverage floor: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM message_tombstones
+		WHERE message_id IN (
+		  SELECT message_id FROM message_tombstones
+		  WHERE group_id = ? AND timestamp_ms < ? AND pruned_at_ms < ?
+		  ORDER BY pruned_at_ms
+		  LIMIT ?
+		);`,
+		groupID[:], beforeMillis, time.Now().Add(-tombstoneMinimumAge).UnixMilli(), tombstoneCleanupBatch,
+	); err != nil {
+		return 0, fmt.Errorf("store: clean tombstones: %w", err)
+	}
 
 	exemptClause, exemptArgs := pruneExemptTopicClause(exemptTopics)
-	args := append([]any{groupID[:], beforeMillis}, exemptArgs...)
+	var liveTombstones, newTombstones int
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM message_tombstones WHERE group_id = ?;`,
+		groupID[:],
+	).Scan(&liveTombstones); err != nil {
+		return 0, fmt.Errorf("store: count tombstones: %w", err)
+	}
+	countArgs := append([]any{groupID[:], beforeMillis}, exemptArgs...)
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM messages
+		WHERE group_id = ? AND timestamp_ms < ?`+exemptClause+`
+		  AND NOT EXISTS (
+		    SELECT 1 FROM message_tombstones tomb
+		    WHERE tomb.message_id = messages.message_id
+		  );`,
+		countArgs...,
+	).Scan(&newTombstones); err != nil {
+		return 0, fmt.Errorf("store: count new tombstones: %w", err)
+	}
+	if liveTombstones+newTombstones > maxLiveTombstonesPerGroup {
+		return 0, fmt.Errorf("store: prune would exceed tombstone cap %d", maxLiveTombstonesPerGroup)
+	}
+
+	insertArgs := append([]any{time.Now().UnixMilli(), groupID[:], beforeMillis}, exemptArgs...)
+	if _, err := tx.ExecContext(ctx, `
+		INSERT OR IGNORE INTO message_tombstones
+		  (message_id, group_id, timestamp_ms, pruned_at_ms)
+		SELECT message_id, group_id, timestamp_ms, ?
+		FROM messages
+		WHERE group_id = ? AND timestamp_ms < ?`+exemptClause+`;`,
+		insertArgs...,
+	); err != nil {
+		return 0, fmt.Errorf("store: insert tombstones: %w", err)
+	}
+
+	deleteArgs := append([]any{groupID[:], beforeMillis}, exemptArgs...)
 	if _, err := tx.ExecContext(ctx, `
 		DELETE FROM message_topics
 		WHERE message_id IN (
 		  SELECT message_id FROM messages
 		  WHERE group_id = ? AND timestamp_ms < ?`+exemptClause+`
-	);`,
-		args...,
+		);`,
+		deleteArgs...,
 	); err != nil {
 		return 0, fmt.Errorf("store: prune topics: %w", err)
 	}
-	args = append([]any{groupID[:], beforeMillis}, exemptArgs...)
+	deleteArgs = append([]any{groupID[:], beforeMillis}, exemptArgs...)
 	if _, err := tx.ExecContext(ctx, `
 		DELETE FROM message_search_docs
 		WHERE message_id IN (
 		  SELECT message_id FROM messages
 		  WHERE group_id = ? AND timestamp_ms < ?`+exemptClause+`
 		);`,
-		args...,
+		deleteArgs...,
 	); err != nil {
 		return 0, fmt.Errorf("store: prune search docs: %w", err)
 	}
-	args = append([]any{groupID[:], beforeMillis}, exemptArgs...)
+	deleteArgs = append([]any{groupID[:], beforeMillis}, exemptArgs...)
 	res, err := tx.ExecContext(ctx, `
 		DELETE FROM messages
 		WHERE group_id = ? AND timestamp_ms < ?`+exemptClause+`;`,
-		args...,
+		deleteArgs...,
 	)
 	if err != nil {
 		return 0, fmt.Errorf("store: prune messages: %w", err)
@@ -352,6 +532,13 @@ func (s *SQLite) PruneBeforeExceptTopics(ctx context.Context, groupID entmoot.Gr
 	pruned, err := res.RowsAffected()
 	if err != nil {
 		return 0, fmt.Errorf("store: prune rows affected: %w", err)
+	}
+	// Row deletes already advance generation through messages_sync_delete.
+	// Advance it explicitly only when the coverage metadata changed alone.
+	if pruned == 0 && beforeMillis > oldCoverageFloor {
+		if err := bumpGroupGenerationTx(ctx, tx, groupID); err != nil {
+			return 0, err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return 0, fmt.Errorf("store: commit prune: %w", err)
@@ -478,6 +665,185 @@ func (s *SQLite) Range(ctx context.Context, groupID entmoot.GroupID, sinceMillis
 	}
 
 	return topoOrder(candidates)
+}
+
+// MessageIDsPage returns one timestamp/author/id keyset page from a committed
+// group generation. A caller continuing an older generation receives
+// SnapshotChanged and must restart rather than silently skip a concurrent
+// insert or prune.
+func (s *SQLite) MessageIDsPage(ctx context.Context, groupID entmoot.GroupID, sinceMillis int64, after *RangeCursor, expectedGeneration uint64, limit int) (MessageIDPage, error) {
+	db, exists, err := s.dbForExisting(groupID)
+	if err != nil {
+		return MessageIDPage{}, err
+	}
+	if !exists {
+		return MessageIDPage{IDs: []entmoot.MessageID{}}, nil
+	}
+	if limit <= 0 {
+		limit = 256
+	}
+	if limit > 1024 {
+		limit = 1024
+	}
+	if err := ensureGroupSyncStateDB(ctx, db, groupID); err != nil {
+		return MessageIDPage{}, err
+	}
+
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return MessageIDPage{}, fmt.Errorf("store: begin message-id page: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	var generation uint64
+	var coverageFloor int64
+	if err := tx.QueryRowContext(ctx, `
+		SELECT generation, coverage_floor_ms
+		FROM group_sync_state WHERE group_id = ?;`,
+		groupID[:],
+	).Scan(&generation, &coverageFloor); err != nil {
+		return MessageIDPage{}, fmt.Errorf("store: read message-id page generation: %w", err)
+	}
+	if expectedGeneration != 0 && expectedGeneration != generation {
+		if err := tx.Commit(); err != nil {
+			return MessageIDPage{}, fmt.Errorf("store: finish changed message-id page: %w", err)
+		}
+		return MessageIDPage{
+			IDs:             []entmoot.MessageID{},
+			Generation:      generation,
+			SnapshotChanged: true,
+			CoverageFloorMS: coverageFloor,
+		}, nil
+	}
+
+	var rows *sql.Rows
+	if after == nil {
+		rows, err = tx.QueryContext(ctx, `
+			SELECT message_id, timestamp_ms, author_node_id
+			FROM messages
+			WHERE group_id = ? AND timestamp_ms >= ?
+			ORDER BY timestamp_ms, author_node_id, message_id
+			LIMIT ?;`,
+			groupID[:], sinceMillis, limit+1,
+		)
+	} else {
+		rows, err = tx.QueryContext(ctx, `
+			SELECT message_id, timestamp_ms, author_node_id
+			FROM messages
+			WHERE group_id = ? AND timestamp_ms >= ?
+			  AND (
+			    timestamp_ms > ?
+			    OR (timestamp_ms = ? AND author_node_id > ?)
+			    OR (timestamp_ms = ? AND author_node_id = ? AND message_id > ?)
+			  )
+			ORDER BY timestamp_ms, author_node_id, message_id
+			LIMIT ?;`,
+			groupID[:], sinceMillis,
+			after.TimestampMS,
+			after.TimestampMS, int64(after.Author),
+			after.TimestampMS, int64(after.Author), after.ID[:],
+			limit+1,
+		)
+	}
+	if err != nil {
+		return MessageIDPage{}, fmt.Errorf("store: message-id page query: %w", err)
+	}
+
+	type pageRow struct {
+		id        entmoot.MessageID
+		timestamp int64
+		author    entmoot.NodeID
+	}
+	pageRows := make([]pageRow, 0, limit+1)
+	for rows.Next() {
+		var rawID []byte
+		var row pageRow
+		var author int64
+		if err := rows.Scan(&rawID, &row.timestamp, &author); err != nil {
+			_ = rows.Close()
+			return MessageIDPage{}, fmt.Errorf("store: message-id page scan: %w", err)
+		}
+		if len(rawID) != len(row.id) {
+			_ = rows.Close()
+			return MessageIDPage{}, fmt.Errorf("store: message-id page id has %d bytes", len(rawID))
+		}
+		copy(row.id[:], rawID)
+		row.author = entmoot.NodeID(author)
+		pageRows = append(pageRows, row)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return MessageIDPage{}, fmt.Errorf("store: message-id page iterate: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return MessageIDPage{}, fmt.Errorf("store: close message-id page: %w", err)
+	}
+	hasMore := len(pageRows) > limit
+	if hasMore {
+		pageRows = pageRows[:limit]
+	}
+	page := MessageIDPage{
+		IDs:             make([]entmoot.MessageID, len(pageRows)),
+		Generation:      generation,
+		HasMore:         hasMore,
+		CoverageFloorMS: coverageFloor,
+	}
+	for i := range pageRows {
+		page.IDs[i] = pageRows[i].id
+	}
+	if hasMore && len(pageRows) > 0 {
+		last := pageRows[len(pageRows)-1]
+		page.Next = &RangeCursor{TimestampMS: last.timestamp, Author: last.author, ID: last.id}
+	}
+	if err := tx.Commit(); err != nil {
+		return MessageIDPage{}, fmt.Errorf("store: finish message-id page: %w", err)
+	}
+	return page, nil
+}
+
+func (s *SQLite) HasTombstone(ctx context.Context, groupID entmoot.GroupID, id entmoot.MessageID) (bool, error) {
+	db, exists, err := s.dbForExisting(groupID)
+	if err != nil {
+		return false, err
+	}
+	if !exists {
+		return false, nil
+	}
+	var found int
+	err = db.QueryRowContext(ctx, `
+		SELECT 1 FROM message_tombstones
+		WHERE group_id = ? AND message_id = ?
+		LIMIT 1;`,
+		groupID[:], id[:],
+	).Scan(&found)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("store: query tombstone: %w", err)
+	}
+	return true, nil
+}
+
+func (s *SQLite) CoverageFloor(ctx context.Context, groupID entmoot.GroupID) (int64, error) {
+	db, exists, err := s.dbForExisting(groupID)
+	if err != nil {
+		return 0, err
+	}
+	if !exists {
+		return 0, nil
+	}
+	if err := ensureGroupSyncStateDB(ctx, db, groupID); err != nil {
+		return 0, err
+	}
+	var floor int64
+	if err := db.QueryRowContext(ctx, `
+		SELECT coverage_floor_ms FROM group_sync_state
+		WHERE group_id = ?;`,
+		groupID[:],
+	).Scan(&floor); err != nil {
+		return 0, fmt.Errorf("store: query coverage floor: %w", err)
+	}
+	return floor, nil
 }
 
 // Latest implements MessageStore.Latest.
@@ -1053,8 +1419,76 @@ func (s *SQLite) MerkleRoot(ctx context.Context, groupID entmoot.GroupID) ([32]b
 	if !exists {
 		return [32]byte{}, nil
 	}
+	if err := ensureGroupSyncStateDB(ctx, db, groupID); err != nil {
+		return [32]byte{}, err
+	}
 
-	rows, err := db.QueryContext(ctx, `
+	for attempt := 0; attempt < 8; attempt++ {
+		tx, err := db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+		if err != nil {
+			return [32]byte{}, fmt.Errorf("store: begin merkle snapshot: %w", err)
+		}
+		var generation, rootGeneration int64
+		var cached []byte
+		err = tx.QueryRowContext(ctx, `
+			SELECT generation, root_generation, merkle_root
+			FROM group_sync_state WHERE group_id = ?;`,
+			groupID[:],
+		).Scan(&generation, &rootGeneration, &cached)
+		if errors.Is(err, sql.ErrNoRows) {
+			generation, rootGeneration, cached = 0, -1, nil
+		} else if err != nil {
+			_ = tx.Rollback()
+			return [32]byte{}, fmt.Errorf("store: read merkle cache: %w", err)
+		}
+		if rootGeneration == generation && len(cached) == 32 {
+			var root [32]byte
+			copy(root[:], cached)
+			if err := tx.Commit(); err != nil {
+				return [32]byte{}, fmt.Errorf("store: finish merkle snapshot: %w", err)
+			}
+			return root, nil
+		}
+
+		root, err := merkleRootTx(ctx, tx, groupID)
+		if err != nil {
+			_ = tx.Rollback()
+			return [32]byte{}, err
+		}
+		if err := tx.Commit(); err != nil {
+			return [32]byte{}, fmt.Errorf("store: finish merkle snapshot: %w", err)
+		}
+
+		if _, err := db.ExecContext(ctx, `
+			INSERT OR IGNORE INTO group_sync_state
+			  (group_id, generation, root_generation, coverage_floor_ms)
+			VALUES (?, 0, -1, 0);`,
+			groupID[:],
+		); err != nil {
+			return [32]byte{}, fmt.Errorf("store: initialize merkle cache: %w", err)
+		}
+		result, err := db.ExecContext(ctx, `
+			UPDATE group_sync_state
+			SET merkle_root = ?, root_generation = ?
+			WHERE group_id = ? AND generation = ?;`,
+			root[:], generation, groupID[:], generation,
+		)
+		if err != nil {
+			return [32]byte{}, fmt.Errorf("store: update merkle cache: %w", err)
+		}
+		updated, err := result.RowsAffected()
+		if err != nil {
+			return [32]byte{}, fmt.Errorf("store: inspect merkle cache update: %w", err)
+		}
+		if updated == 1 {
+			return root, nil
+		}
+	}
+	return [32]byte{}, errors.New("store: merkle snapshot changed repeatedly")
+}
+
+func merkleRootTx(ctx context.Context, tx *sql.Tx, groupID entmoot.GroupID) ([32]byte, error) {
+	rows, err := tx.QueryContext(ctx, `
 		SELECT canonical_bytes FROM messages
 		WHERE group_id = ?
 		ORDER BY timestamp_ms, author_node_id, message_id;`,
@@ -1080,7 +1514,6 @@ func (s *SQLite) MerkleRoot(ctx context.Context, groupID entmoot.GroupID) ([32]b
 	if err := rows.Err(); err != nil {
 		return [32]byte{}, fmt.Errorf("store: merkle iterate: %w", err)
 	}
-
 	if len(all) == 0 {
 		return [32]byte{}, nil
 	}

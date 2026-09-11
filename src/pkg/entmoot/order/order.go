@@ -26,6 +26,7 @@ package order
 
 import (
 	"bytes"
+	"container/heap"
 	"fmt"
 
 	"entmoot/pkg/entmoot"
@@ -70,37 +71,22 @@ func Topological(msgs []entmoot.Message) ([]entmoot.MessageID, error) {
 		}
 	}
 
-	// Ready set: messages with in-degree 0 right now. We keep it sorted by
-	// the tie-breaker rule every time we pick the next emission; with a
-	// small v0 canary this is fine and keeps the code obvious. Swap for a
-	// heap if we ever need it.
-	ready := make([]entmoot.MessageID, 0)
-	for id, d := range inDegree {
-		if d == 0 {
-			ready = append(ready, id)
+	ready := &messageHeap{index: index}
+	for id, degree := range inDegree {
+		if degree == 0 {
+			heap.Push(ready, id)
 		}
 	}
 
-	out := make([]entmoot.MessageID, 0, len(msgs))
-	for len(ready) > 0 {
-		// Select the ready id with the smallest (timestamp, node_id, id).
-		pickIdx := 0
-		for i := 1; i < len(ready); i++ {
-			if less(index[ready[i]], index[ready[pickIdx]]) {
-				pickIdx = i
-			}
-		}
-		chosenID := ready[pickIdx]
-		// Remove ready[pickIdx] by swapping with last.
-		ready[pickIdx] = ready[len(ready)-1]
-		ready = ready[:len(ready)-1]
-
+	out := make([]entmoot.MessageID, 0, len(index))
+	for ready.Len() > 0 {
+		chosenID := heap.Pop(ready).(entmoot.MessageID)
 		out = append(out, chosenID)
 
 		for _, child := range children[chosenID] {
 			inDegree[child]--
 			if inDegree[child] == 0 {
-				ready = append(ready, child)
+				heap.Push(ready, child)
 			}
 		}
 	}
@@ -120,4 +106,30 @@ func less(a, b entmoot.Message) bool {
 		return a.Author.PilotNodeID < b.Author.PilotNodeID
 	}
 	return bytes.Compare(a.ID[:], b.ID[:]) < 0
+}
+
+type messageHeap struct {
+	ids   []entmoot.MessageID
+	index map[entmoot.MessageID]entmoot.Message
+}
+
+func (h messageHeap) Len() int { return len(h.ids) }
+
+func (h messageHeap) Less(i, j int) bool {
+	return less(h.index[h.ids[i]], h.index[h.ids[j]])
+}
+
+func (h messageHeap) Swap(i, j int) {
+	h.ids[i], h.ids[j] = h.ids[j], h.ids[i]
+}
+
+func (h *messageHeap) Push(value any) {
+	h.ids = append(h.ids, value.(entmoot.MessageID))
+}
+
+func (h *messageHeap) Pop() any {
+	last := len(h.ids) - 1
+	value := h.ids[last]
+	h.ids = h.ids[:last]
+	return value
 }

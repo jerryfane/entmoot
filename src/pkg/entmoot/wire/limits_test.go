@@ -31,3 +31,18 @@ func TestDecodeRejectsCollectionOverLimit(t *testing.T) {
 		t.Fatalf("Decode over gossip id cap = %v, want ErrOversized", err)
 	}
 }
+
+func TestRangeRequestLimitBoundary(t *testing.T) {
+	allowed := &RangeReq{Limit: MaxRangeIDs}
+	if _, _, err := Encode(allowed); err != nil {
+		t.Fatalf("Encode at range limit: %v", err)
+	}
+	oversized := &RangeReq{Limit: MaxRangeIDs + 1}
+	if _, _, err := Encode(oversized); !errors.Is(err, entmoot.ErrOversized) {
+		t.Fatalf("Encode over range limit = %v, want ErrOversized", err)
+	}
+	negative := &RangeReq{Limit: -1}
+	if _, _, err := Encode(negative); !errors.Is(err, entmoot.ErrMalformedFrame) {
+		t.Fatalf("Encode negative range limit = %v, want ErrMalformedFrame", err)
+	}
+}
