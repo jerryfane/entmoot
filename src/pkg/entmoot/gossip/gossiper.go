@@ -499,16 +499,13 @@ type Gossiper struct {
 	// shutdown when its context is cancelled.
 	wg sync.WaitGroup
 
-	// lifeCtx is the gossiper's lifetime context (set by Start). Async
-	// work that outlives a per-request handler — notably publish fanout
-	// now that Publish returns on local-durable accept rather than
-	// blocking on peer delivery — uses this so shutdown cancels it,
-	// but IPC handler teardown does not. nil before Start runs;
-	// publishers that race Start into a pre-started gossiper fall back
-	// to inline fanout in that case. Guarded by lifeMu since tests
-	// may call Start and Publish from concurrent goroutines.
-	lifeMu  sync.Mutex
-	lifeCtx context.Context
+	// lifeCtx is the gossiper's lifetime context while Start is running.
+	// lifeStarted distinguishes "not started yet" from "shutdown began" so
+	// request paths cannot admit new background work after Start begins its
+	// WaitGroup drain. Guarded by lifeMu.
+	lifeMu      sync.Mutex
+	lifeCtx     context.Context
+	lifeStarted bool
 
 	// rosterApplyMu serializes all roster mutations initiated by gossip
 	// request/response paths. roster.RosterLog.Apply intentionally validates
@@ -1193,43 +1190,40 @@ func (g *Gossiper) dialAndWrite(ctx context.Context, peer entmoot.NodeID, frame 
 // returns. The returned error is nil on clean shutdown (ctx cancelled or
 // transport closed); it is a wrapped Accept error otherwise.
 func (g *Gossiper) Start(ctx context.Context) error {
-	// Stash the long-lived context so async workers spawned from
-	// per-request entry points (Publish's fanout goroutine) can use
-	// it instead of the request-scoped ctx that dies when the IPC
-	// caller disconnects.
+	// Derive a worker context so an early Accept failure cancels every
+	// background loop even when the caller's context remains live.
+	workerCtx, cancelWorkers := context.WithCancel(ctx)
 	g.lifeMu.Lock()
-	g.lifeCtx = ctx
+	g.lifeCtx = workerCtx
+	g.lifeStarted = true
 	g.lifeMu.Unlock()
+	defer func() {
+		g.lifeMu.Lock()
+		g.lifeCtx = nil
+		cancelWorkers()
+		g.lifeMu.Unlock()
+		g.wg.Wait()
+	}()
 
-	// Background workers (patch 6, patch 7). retryLoop drains the
-	// exponential-backoff queue for push/fetch attempts that failed their
-	// initial try. Both live under g.wg so Start's drain on shutdown also
-	// covers them.
+	// retryLoop drains the backoff queue for failed push and fetch attempts.
+	// It is tracked so Start does not return while retry work is still live.
 	g.wg.Add(1)
 	go func() {
 		defer g.wg.Done()
-		g.retryLoop(ctx)
+		g.retryLoop(workerCtx)
 	}()
 
-	// Background anti-entropy ticker (v1.2.1, Part E). Picks the
-	// least-recently-reconciled peer each tick and fires a reconcile
-	// against them — unless their cached root matches ours, in which
-	// case the tick is a silent no-op. Paired with the reactive
-	// maybeReconcile triggers so a partitioned peer with no chatty
-	// messages still converges on the next tick after partition heals.
+	// The anti-entropy ticker repairs idle peers after partitions heal.
 	g.wg.Add(1)
-	go g.reconcilerLoop(ctx)
+	go g.reconcilerLoop(workerCtx)
 
-	// Transport-ad advertiser loop (v1.2.0). Publishes this node's own
-	// TransportAd on startup, on EndpointsChanged, and on a weekly
-	// safety-net ticker. Only runs when TransportAdStore and
-	// LocalEndpoints are both configured — otherwise the receive path
-	// still works (for peers that run it) but we emit nothing.
+	// Advertise local endpoints on startup, endpoint changes, and the weekly
+	// safety tick only when both required providers are configured.
 	if g.cfg.TransportAdStore != nil && g.cfg.LocalEndpoints != nil {
 		g.wg.Add(1)
 		go func() {
 			defer g.wg.Done()
-			g.advertiserLoop(ctx)
+			g.advertiserLoop(workerCtx)
 		}()
 	}
 
@@ -1237,18 +1231,17 @@ func (g *Gossiper) Start(ctx context.Context) error {
 		g.wg.Add(1)
 		go func() {
 			defer g.wg.Done()
-			g.memberProfileLoop(ctx)
+			g.memberProfileLoop(workerCtx)
 		}()
 	}
 	if g.cfg.MemberProfileStore != nil {
 		g.wg.Add(1)
-		go g.memberProfileSnapshotLoop(ctx)
+		go g.memberProfileSnapshotLoop(workerCtx)
 	}
 
 	for {
-		conn, remote, err := g.cfg.Transport.Accept(ctx)
+		conn, remote, err := g.cfg.Transport.Accept(workerCtx)
 		if err != nil {
-			g.wg.Wait()
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return nil
 			}
@@ -1257,7 +1250,7 @@ func (g *Gossiper) Start(ctx context.Context) error {
 			}
 			return fmt.Errorf("gossip: accept: %w", err)
 		}
-		// Server-side membership gate (replaces the v0-dropped Hello).
+		// Reject inbound connections before reading frames from non-members.
 		if !g.cfg.Roster.IsMember(remote) {
 			g.logger.Warn("gossip: reject non-member",
 				slog.Uint64("remote", uint64(remote)),
@@ -1265,20 +1258,16 @@ func (g *Gossiper) Start(ctx context.Context) error {
 			_ = conn.Close()
 			continue
 		}
-		// An inbound frame from a roster-verified peer is the most reliable
-		// signal we have that the peer is reachable again. Clear stale dial
-		// backoff before dispatch so handlers that need to dial the sender
-		// during processing (e.g. FetchReq after non-inlined Gossip) are not
-		// blocked by old failures. Reconcile remains deferred below so it does
-		// not contend with request/response handlers while the caller waits.
+		// A verified inbound connection clears stale dial backoff before
+		// dispatch; handlers may need to dial the sender while processing.
 		g.recordDialSuccess(remote)
 		g.wg.Add(1)
 		go func(c net.Conn, r entmoot.NodeID) {
 			defer g.wg.Done()
 			defer c.Close()
-			processed := g.handleConn(ctx, c, r)
+			processed := g.handleConn(workerCtx, c, r)
 			if processed {
-				g.maybeReconcile(ctx, r)
+				g.maybeReconcile(workerCtx, r)
 			}
 		}(conn, remote)
 	}
@@ -2269,12 +2258,21 @@ func (g *Gossiper) Publish(ctx context.Context, msg entmoot.Message) error {
 	// don't drop messages on the floor.
 	g.lifeMu.Lock()
 	lifeCtx := g.lifeCtx
-	g.lifeMu.Unlock()
+	lifeStarted := g.lifeStarted
 	if lifeCtx == nil {
+		g.lifeMu.Unlock()
+		if lifeStarted {
+			return nil
+		}
 		g.fanoutPublishedMessage(ctx, msg)
 		return nil
 	}
+	if lifeCtx.Err() != nil {
+		g.lifeMu.Unlock()
+		return nil
+	}
 	g.wg.Add(1)
+	g.lifeMu.Unlock()
 	go func() {
 		defer g.wg.Done()
 		g.fanoutPublishedMessage(lifeCtx, msg)
@@ -3148,6 +3146,24 @@ func (g *Gossiper) executeRetry(ctx context.Context, key retryKey, state *retryS
 	}
 }
 
+// beginBackgroundWorker makes WaitGroup admission atomic with lifecycle
+// shutdown. Before the first Start, tests and bootstrap paths may still launch
+// tracked work under their caller context; after shutdown begins, admission is
+// closed permanently until a later Start installs a new lifeCtx.
+func (g *Gossiper) beginBackgroundWorker(ctx context.Context) bool {
+	g.lifeMu.Lock()
+	defer g.lifeMu.Unlock()
+	if g.lifeCtx != nil {
+		if g.lifeCtx.Err() != nil {
+			return false
+		}
+	} else if g.lifeStarted || ctx == nil || ctx.Err() != nil {
+		return false
+	}
+	g.wg.Add(1)
+	return true
+}
+
 // maybeReconcile fires reconcileWith in a goroutine iff the per-peer
 // cooldown has elapsed. Trigger sites call this after handled inbound frames
 // and successful outbound one-way writes so anti-entropy happens whenever tunnel
@@ -3203,7 +3219,13 @@ func (g *Gossiper) maybeReconcile(ctx context.Context, peer entmoot.NodeID) {
 	g.pendMu.Unlock()
 	g.traceReconcile(peer, "trigger_fire")
 
-	g.wg.Add(1)
+	if !g.beginBackgroundWorker(parent) {
+		g.pendMu.Lock()
+		delete(g.reconcileInFlight, peer)
+		g.pendMu.Unlock()
+		g.traceReconcile(peer, "trigger_skip", slog.String("reason", "lifecycle_closed"))
+		return
+	}
 	go func() {
 		defer g.wg.Done()
 		attemptCtx, cancel := context.WithTimeout(parent, reconcileAttemptTimeout)
@@ -4245,7 +4267,12 @@ func (g *Gossiper) scheduleMemberProfileSnapshotPull(ctx context.Context, peer e
 	g.profilePullLast[peer] = now
 	g.pendMu.Unlock()
 
-	g.wg.Add(1)
+	if !g.beginBackgroundWorker(parent) {
+		g.pendMu.Lock()
+		delete(g.profilePulls, peer)
+		g.pendMu.Unlock()
+		return false
+	}
 	go func() {
 		defer g.wg.Done()
 		defer func() {

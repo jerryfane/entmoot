@@ -29,13 +29,16 @@ type pilotConn struct {
 	drv     *Driver
 	network string // "pilot", the net.Addr network name
 
-	// recvCh receives payloads from Recv frames for this conn_id. The
-	// demuxer owns the send side; Close closes it (exactly once) to
-	// unblock any goroutine sitting in Read.
+	// recvCh is never closed: the demuxer is its sole sender and may be
+	// blocked in pushRecv while a connection closes.
 	recvCh chan []byte
-	// recvClose guards the channel-close so Close is idempotent even
-	// if the daemon independently sends a peer-close indication.
-	recvClose   sync.Once
+
+	remoteEOF      chan struct{}
+	remoteEOFOnce  sync.Once
+	localClose     chan struct{}
+	localCloseOnce sync.Once
+
+	// closeCh signals any close to writers and blocked demux delivery.
 	closeNotify sync.Once
 	closeCh     chan struct{}
 	// recvBuf holds leftover bytes from the previous Recv frame when
@@ -75,6 +78,8 @@ func newConn(drv *Driver, id uint32, local, remote SocketAddr) *pilotConn {
 		drv:             drv,
 		network:         "pilot",
 		recvCh:          make(chan []byte, 256),
+		remoteEOF:       make(chan struct{}),
+		localClose:      make(chan struct{}),
 		closeCh:         make(chan struct{}),
 		readDeadlineCh:  make(chan struct{}),
 		writeDeadlineCh: make(chan struct{}),
@@ -101,17 +106,22 @@ func (c *pilotConn) pushRecv(data []byte) bool {
 	select {
 	case c.recvCh <- buf:
 		return true
+	case <-c.closeCh:
+		return false
 	case <-c.drv.closedCh:
 		return false
 	}
 }
 
-// closeRecv is called by the demuxer when the daemon confirms this
-// conn is gone (CloseOK for this conn_id) or when the driver shuts
-// down. Closing recvCh lets any blocked Read observe io.EOF.
-func (c *pilotConn) closeRecv() {
-	c.recvClose.Do(func() {
-		close(c.recvCh)
+// closeRemote records daemon-side EOF. Read drains payloads already accepted
+// into recvCh before returning io.EOF.
+func (c *pilotConn) closeRemote() {
+	c.stateMu.Lock()
+	c.closed = true
+	c.stateMu.Unlock()
+	c.notifyClosed()
+	c.remoteEOFOnce.Do(func() {
+		close(c.remoteEOF)
 	})
 }
 
@@ -121,21 +131,27 @@ func (c *pilotConn) notifyClosed() {
 	})
 }
 
-// closeLocal marks this conn closed without sending a Close frame to
-// the daemon. It is used when the daemon has already told us the conn
-// is gone, so future writes fail locally instead of emitting stale
-// Send frames.
+// closeLocal aborts local use without closing recvCh, which may still have a
+// demux sender blocked on it.
 func (c *pilotConn) closeLocal() {
 	c.stateMu.Lock()
 	c.closed = true
 	c.stateMu.Unlock()
 	c.notifyClosed()
-	c.closeRecv()
+	c.localCloseOnce.Do(func() {
+		close(c.localClose)
+	})
 }
 
-// Read satisfies net.Conn.Read. Returns io.EOF after Close or a
-// daemon-side close, and os.ErrDeadlineExceeded if a read deadline has
-// been set and fires before data arrives.
+func (c *pilotConn) closeDriver() {
+	c.stateMu.Lock()
+	c.closed = true
+	c.stateMu.Unlock()
+	c.notifyClosed()
+}
+
+// Read satisfies net.Conn.Read. Remote EOF drains queued payloads first;
+// local Close returns EOF immediately. Driver shutdown returns ErrClosed.
 func (c *pilotConn) Read(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
@@ -143,11 +159,8 @@ func (c *pilotConn) Read(p []byte) (int, error) {
 	c.readMu.Lock()
 	defer c.readMu.Unlock()
 
-	// Serve leftover from a previously-partially-consumed frame.
 	if len(c.recvBuf) > 0 {
-		n := copy(p, c.recvBuf)
-		c.recvBuf = c.recvBuf[n:]
-		return n, nil
+		return c.readPayload(p, c.recvBuf)
 	}
 
 	for {
@@ -168,27 +181,32 @@ func (c *pilotConn) Read(p []byte) (int, error) {
 		}
 
 		select {
-		case data, ok := <-c.recvCh:
+		case data := <-c.recvCh:
 			if timer != nil {
 				timer.Stop()
 			}
-			if !ok {
+			return c.readPayload(p, data)
+		case <-c.remoteEOF:
+			if timer != nil {
+				timer.Stop()
+			}
+			select {
+			case data := <-c.recvCh:
+				return c.readPayload(p, data)
+			default:
 				return 0, io.EOF
 			}
-			n := copy(p, data)
-			if n < len(data) {
-				c.recvBuf = data[n:]
+		case <-c.localClose:
+			if timer != nil {
+				timer.Stop()
 			}
-			return n, nil
+			return 0, io.EOF
 		case <-timerCh:
 			return 0, os.ErrDeadlineExceeded
 		case <-dch:
 			if timer != nil {
 				timer.Stop()
 			}
-			// A deadline update is not necessarily an expired deadline. Re-check
-			// current state so clearing/extending a deadline preserves net.Conn
-			// semantics for blocked readers.
 			continue
 		case <-c.drv.closedCh:
 			if timer != nil {
@@ -197,6 +215,16 @@ func (c *pilotConn) Read(p []byte) (int, error) {
 			return 0, ErrClosed
 		}
 	}
+}
+
+func (c *pilotConn) readPayload(p, data []byte) (int, error) {
+	n := copy(p, data)
+	if n < len(data) {
+		c.recvBuf = data[n:]
+	} else {
+		c.recvBuf = nil
+	}
+	return n, nil
 }
 
 // Write satisfies net.Conn.Write. Serializes a Send frame onto the IPC
@@ -339,10 +367,9 @@ func receiveSendResult(ch chan sendResult) (sendResult, bool) {
 	}
 }
 
-// Close satisfies net.Conn.Close. Sends a Close frame to the daemon
-// (best-effort; a concurrent socket teardown turns this into a no-op),
-// unregisters this conn from the demuxer, and closes the recv channel
-// so any blocked Read returns io.EOF. Idempotent.
+// Close satisfies net.Conn.Close. It unregisters before signaling local EOF,
+// so a demux send blocked on a full receive queue is released without a
+// send-on-closed-channel race.
 func (c *pilotConn) Close() error {
 	c.stateMu.Lock()
 	if c.closed {
@@ -352,6 +379,9 @@ func (c *pilotConn) Close() error {
 	c.closed = true
 	c.stateMu.Unlock()
 	c.notifyClosed()
+	c.localCloseOnce.Do(func() {
+		close(c.localClose)
+	})
 
 	// Unregister first so any Recv frame still in flight after the
 	// daemon receives our Close is dropped rather than queued on a
@@ -362,8 +392,6 @@ func (c *pilotConn) Close() error {
 	frame[0] = byte(opClose)
 	binary.BigEndian.PutUint32(frame[1:5], c.id)
 	writeErr := c.drv.writeFrame(frame)
-
-	c.closeRecv()
 
 	if writeErr != nil && !errors.Is(writeErr, ErrClosed) {
 		// Emit the error only if it is not "driver already closed" —

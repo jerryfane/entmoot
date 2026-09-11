@@ -138,29 +138,24 @@ type Transport struct {
 	onTunnelUp atomic.Value
 }
 
-// Open connects to the Pilot daemon at cfg.SocketPath, discovers the local
-// node id via ipcclient.Driver.Info, and binds a listener on cfg.ListenPort.
-// The returned Transport is ready to Dial / Accept immediately.
-//
-// On any failure mid-way (e.g. bind fails after connect), previously-acquired
-// resources are released before returning.
-func Open(cfg Config) (*Transport, error) {
+// Open connects to the Pilot daemon, discovers the local node id, and binds a
+// listener. ctx bounds every startup dial and Info/Listen exchange;
+// cancellation releases every partially acquired resource.
+func Open(ctx context.Context, cfg Config) (*Transport, error) {
+	if ctx == nil {
+		return nil, errors.New("pilot: nil startup context")
+	}
 	logger := cfg.Logger
 	if logger == nil {
 		logger = slog.Default()
 	}
 
-	listenerDriver, err := ipcclient.Connect(cfg.SocketPath)
+	listenerDriver, err := ipcclient.ConnectContext(ctx, cfg.SocketPath)
 	if err != nil {
 		return nil, fmt.Errorf("pilot: connect %q: %w", cfg.SocketPath, err)
 	}
 
-	// Open is synchronous on callers' expectation; a background context
-	// scoped to the brief Info/Listen exchanges is the right fit. Pilot's
-	// IPC is local and responses arrive in milliseconds.
-	openCtx := context.Background()
-
-	info, err := listenerDriver.InfoStruct(openCtx)
+	info, err := listenerDriver.InfoStruct(ctx)
 	if err != nil {
 		_ = listenerDriver.Close()
 		return nil, fmt.Errorf("pilot: info: %w", err)
@@ -174,12 +169,12 @@ func Open(cfg Config) (*Transport, error) {
 		return nil, fmt.Errorf("%w: stream_send_result_v2", ErrRequiredCapabilityMissing)
 	}
 
-	ln, err := listenerDriver.Listen(openCtx, cfg.ListenPort)
+	ln, err := listenerDriver.Listen(ctx, cfg.ListenPort)
 	if err != nil {
 		_ = listenerDriver.Close()
 		return nil, fmt.Errorf("pilot: listen :%d: %w", cfg.ListenPort, err)
 	}
-	controlDriver, err := ipcclient.Connect(cfg.SocketPath)
+	controlDriver, err := ipcclient.ConnectContext(ctx, cfg.SocketPath)
 	if err != nil {
 		_ = ln.Close()
 		_ = listenerDriver.Close()

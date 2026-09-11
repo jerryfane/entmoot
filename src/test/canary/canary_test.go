@@ -419,17 +419,17 @@ func TestCanaryPilot(t *testing.T) {
 	// ---- Pilot-backed transports. Each Open call connects to the
 	// corresponding daemon socket, reads NodeID via driver.Info, and binds
 	// :1004 for inbound.
-	trA, err := pilot.Open(pilot.Config{SocketPath: a.Socket, ListenPort: 1004, Logger: logger})
+	trA, err := pilot.Open(context.Background(), pilot.Config{SocketPath: a.Socket, ListenPort: 1004, Logger: logger})
 	if err != nil {
 		t.Fatalf("pilot.Open A: %v", err)
 	}
 	t.Cleanup(func() { _ = trA.Close() })
-	trB, err := pilot.Open(pilot.Config{SocketPath: b.Socket, ListenPort: 1004, Logger: logger})
+	trB, err := pilot.Open(context.Background(), pilot.Config{SocketPath: b.Socket, ListenPort: 1004, Logger: logger})
 	if err != nil {
 		t.Fatalf("pilot.Open B: %v", err)
 	}
 	t.Cleanup(func() { _ = trB.Close() })
-	trC, err := pilot.Open(pilot.Config{SocketPath: c.Socket, ListenPort: 1004, Logger: logger})
+	trC, err := pilot.Open(context.Background(), pilot.Config{SocketPath: c.Socket, ListenPort: 1004, Logger: logger})
 	if err != nil {
 		t.Fatalf("pilot.Open C: %v", err)
 	}

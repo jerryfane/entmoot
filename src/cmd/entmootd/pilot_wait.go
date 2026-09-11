@@ -34,18 +34,18 @@ func openPilotForJoin(gf *globalFlags) (*pilot.Transport, error) {
 		MaxDelay:  gf.pilotWaitMaxDelay,
 		Logger:    slog.Default(),
 	}
-	return openPilotWithRetry(context.Background(), opts, func() (*pilot.Transport, error) {
-		return openPilot(gf)
+	return openPilotWithRetry(context.Background(), opts, func(ctx context.Context) (*pilot.Transport, error) {
+		return openPilotContext(ctx, gf)
 	})
 }
 
-func openPilotWithRetry[T closeablePilot](parent context.Context, opts pilotWaitOptions, open func() (T, error)) (T, error) {
+func openPilotWithRetry[T closeablePilot](parent context.Context, opts pilotWaitOptions, open func(context.Context) (T, error)) (T, error) {
 	var zero T
 	if open == nil {
 		return zero, errors.New("pilot wait: nil opener")
 	}
 	if opts.Timeout <= 0 {
-		return open()
+		return open(parent)
 	}
 	if opts.BaseDelay <= 0 {
 		opts.BaseDelay = 250 * time.Millisecond
@@ -71,7 +71,7 @@ func openPilotWithRetry[T closeablePilot](parent context.Context, opts pilotWait
 
 	start := opts.Now()
 	deadline := start.Add(opts.Timeout)
-	ctx, cancel := context.WithDeadline(parent, deadline)
+	ctx, cancel := context.WithTimeout(parent, opts.Timeout)
 	defer cancel()
 
 	delay := opts.BaseDelay
@@ -80,7 +80,7 @@ func openPilotWithRetry[T closeablePilot](parent context.Context, opts pilotWait
 		if attempt > 1 && !opts.Now().Before(deadline) {
 			break
 		}
-		tr, err := open()
+		tr, err := open(ctx)
 		if err == nil {
 			opts.Logger.Info("join: pilot ready",
 				slog.Int("attempt", attempt),

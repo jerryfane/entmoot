@@ -316,11 +316,20 @@ func encodeBase64(b []byte) string {
 	return base64.StdEncoding.EncodeToString(b)
 }
 
-// openPilot dials the Pilot daemon and binds the listen port. Every
-// subcommand that needs a Pilot transport goes through this single
-// helper so the Config is consistent.
+// openPilot bounds the initial daemon handshake with the configured wait
+// timeout. Join retries share one outer deadline through openPilotContext.
 func openPilot(gf *globalFlags) (*pilot.Transport, error) {
-	return pilot.Open(pilot.Config{
+	ctx := context.Background()
+	cancel := func() {}
+	if gf.pilotWaitTimeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, gf.pilotWaitTimeout)
+	}
+	defer cancel()
+	return openPilotContext(ctx, gf)
+}
+
+func openPilotContext(ctx context.Context, gf *globalFlags) (*pilot.Transport, error) {
+	return pilot.Open(ctx, pilot.Config{
 		SocketPath:           gf.socket,
 		ListenPort:           uint16(gf.listenPort),
 		Logger:               slog.Default(),

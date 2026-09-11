@@ -18,6 +18,44 @@ import (
 	"entmoot/pkg/entmoot/transport/pilot/ipcclient"
 )
 
+func TestOpenHonorsStartupContextAgainstSilentPeer(t *testing.T) {
+	socketPath := filepath.Join(t.TempDir(), "pilot.sock")
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer listener.Close()
+
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		conn, acceptErr := listener.Accept()
+		if acceptErr == nil {
+			accepted <- conn
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err = Open(ctx, Config{SocketPath: socketPath, ListenPort: 1004, Logger: slog.Default()})
+	if err == nil {
+		t.Fatal("Open against silent peer returned nil error")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Open error = %v, want context deadline exceeded", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("Open returned after %s, want within 1s", elapsed)
+	}
+
+	select {
+	case conn := <-accepted:
+		_ = conn.Close()
+	case <-time.After(time.Second):
+		t.Fatal("silent peer did not accept startup connection")
+	}
+}
+
 // TestPilotTransport_SetOnTunnelUpStorageAndDispatch exercises the
 // SetOnTunnelUp / fireOnTunnelUp plumbing on a Transport struct
 // constructed by hand (without Open, which would require a running
@@ -233,7 +271,7 @@ func TestPilotTransport_InboundAcceptFiresOnTunnelUp(t *testing.T) {
 		serverDone <- nil
 	}()
 
-	tp, err := Open(Config{SocketPath: srv.path, ListenPort: 1004, Logger: slog.Default()})
+	tp, err := Open(context.Background(), Config{SocketPath: srv.path, ListenPort: 1004, Logger: slog.Default()})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -283,7 +321,7 @@ func TestPilotTransport_DialUsesDedicatedIPCDriver(t *testing.T) {
 	done, openErrs := servePilotTransportOpen(t, srv)
 	defer close(done)
 
-	tr, err := Open(Config{SocketPath: srv.path, ListenPort: 1004, Logger: slog.Default()})
+	tr, err := Open(context.Background(), Config{SocketPath: srv.path, ListenPort: 1004, Logger: slog.Default()})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -377,7 +415,7 @@ func TestPilotTransport_CloseClosesActiveOutboundStreams(t *testing.T) {
 	done, openErrs := servePilotTransportOpen(t, srv)
 	defer close(done)
 
-	tr, err := Open(Config{SocketPath: srv.path, ListenPort: 1004, Logger: slog.Default()})
+	tr, err := Open(context.Background(), Config{SocketPath: srv.path, ListenPort: 1004, Logger: slog.Default()})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -482,7 +520,7 @@ func TestPilotTransport_OutboundCloseUnregistersBeforeTransportClose(t *testing.
 	done, openErrs := servePilotTransportOpen(t, srv)
 	defer close(done)
 
-	tr, err := Open(Config{SocketPath: srv.path, ListenPort: 1004, Logger: slog.Default()})
+	tr, err := Open(context.Background(), Config{SocketPath: srv.path, ListenPort: 1004, Logger: slog.Default()})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}

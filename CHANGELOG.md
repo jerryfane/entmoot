@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Bounded transport startup and shutdown.** Pilot IPC connections no longer
+  close a receive channel while the shared demuxer can send to it, Pilot startup
+  now honors caller deadlines, and gossip transport closure cancels owned
+  workers before waiting for them.
+
 ## [1.5.81] - 2026-05-27
 
 ### Added

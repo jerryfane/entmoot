@@ -56,8 +56,7 @@ type Driver struct {
 	pendingRecv map[uint32][][]byte
 	// pendingClose remembers CloseOK frames that arrive in the same
 	// DialOK/AcceptedConn race window. Without it, a peer that accepts
-	// and closes immediately can leave the caller with a registered conn
-	// whose recv channel never closes.
+	// and closes immediately can leave the caller's reads blocked forever.
 	pendingClose map[uint32]struct{}
 	// localClose remembers conn_ids that this process closed locally and
 	// unregistered before the daemon's CloseOK acknowledgement arrived.
@@ -154,13 +153,22 @@ type sendResult struct {
 	err     error
 }
 
-// Connect dials the Unix-domain socket at socketPath and starts the
-// demuxer goroutine. If socketPath is empty, DefaultSocketPath is used.
+// Connect dials the Unix-domain socket at socketPath and starts the demuxer
+// goroutine without a caller deadline.
 func Connect(socketPath string) (*Driver, error) {
+	return ConnectContext(context.Background(), socketPath)
+}
+
+// ConnectContext is Connect with cancellation for startup dialing.
+func ConnectContext(ctx context.Context, socketPath string) (*Driver, error) {
+	if ctx == nil {
+		return nil, errors.New("ipcclient: nil connect context")
+	}
 	if socketPath == "" {
 		socketPath = DefaultSocketPath
 	}
-	c, err := net.Dial("unix", socketPath)
+	var dialer net.Dialer
+	c, err := dialer.DialContext(ctx, "unix", socketPath)
 	if err != nil {
 		return nil, fmt.Errorf("ipcclient: dial %q: %w", socketPath, err)
 	}
@@ -235,11 +243,11 @@ func (d *Driver) Close() error {
 			sub.closeMu.Unlock()
 		}
 
-		// Close every conn's recv channel so any blocked Read returns
-		// io.EOF — it would otherwise block on the channel forever.
+		// Wake every connection without closing its receive queue; a demux
+		// sender may still be unwinding on another goroutine.
 		d.connsMu.Lock()
 		for id, c := range d.conns {
-			c.closeRecv()
+			c.closeDriver()
 			delete(d.conns, id)
 		}
 		for id := range d.pendingRecv {
@@ -371,7 +379,7 @@ func (d *Driver) registerConn(id uint32, c *pilotConn) {
 		c.pushRecv(data)
 	}
 	if closed {
-		c.closeLocal()
+		c.closeRemote()
 	}
 }
 
@@ -516,8 +524,8 @@ func (d *Driver) demux() {
 			}
 		case opCloseOK:
 			// Daemon-initiated close confirmation. Payload: [4B conn_id].
-			// We mirror the app-initiated-close bookkeeping: close the
-			// recv chan so any blocked Read returns EOF.
+			// Signal remote EOF without closing recvCh so a concurrent
+			// Recv delivery cannot panic and queued payloads remain readable.
 			if len(payload) >= 4 {
 				id := binary.BigEndian.Uint32(payload[0:4])
 				d.connsMu.Lock()
@@ -532,7 +540,7 @@ func (d *Driver) demux() {
 				}
 				d.connsMu.Unlock()
 				if ok {
-					c.closeLocal()
+					c.closeRemote()
 				}
 			}
 			// Also deliver to any pending command that waits on

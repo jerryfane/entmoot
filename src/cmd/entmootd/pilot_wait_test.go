@@ -35,7 +35,7 @@ func TestOpenPilotWithRetrySucceedsAfterTransientFailures(t *testing.T) {
 			return nil
 		},
 		Jitter: func(d time.Duration) time.Duration { return d },
-	}, func() (fakePilotHandle, error) {
+	}, func(context.Context) (fakePilotHandle, error) {
 		attempts++
 		if attempts < 3 {
 			return fakePilotHandle{}, errors.New("pilot not listening yet")
@@ -67,7 +67,7 @@ func TestOpenPilotWithRetryZeroTimeoutSingleAttempt(t *testing.T) {
 	_, err := openPilotWithRetry(context.Background(), pilotWaitOptions{
 		Timeout: 0,
 		Logger:  discardLogger(),
-	}, func() (fakePilotHandle, error) {
+	}, func(context.Context) (fakePilotHandle, error) {
 		attempts++
 		return fakePilotHandle{}, errors.New("pilot unavailable")
 	})
@@ -94,7 +94,7 @@ func TestOpenPilotWithRetryTimesOutWithLastError(t *testing.T) {
 			return nil
 		},
 		Jitter: func(d time.Duration) time.Duration { return d },
-	}, func() (fakePilotHandle, error) {
+	}, func(context.Context) (fakePilotHandle, error) {
 		attempts++
 		return fakePilotHandle{}, errors.New("listen refused")
 	})
@@ -107,6 +107,26 @@ func TestOpenPilotWithRetryTimesOutWithLastError(t *testing.T) {
 	}
 	if attempts != 3 {
 		t.Fatalf("attempts = %d, want 3", attempts)
+	}
+}
+
+func TestOpenPilotWithRetryBoundsBlockedStartup(t *testing.T) {
+	const timeout = 30 * time.Millisecond
+	start := time.Now()
+	_, err := openPilotWithRetry(context.Background(), pilotWaitOptions{
+		Timeout:   timeout,
+		BaseDelay: time.Millisecond,
+		MaxDelay:  time.Millisecond,
+		Logger:    discardLogger(),
+	}, func(ctx context.Context) (fakePilotHandle, error) {
+		<-ctx.Done()
+		return fakePilotHandle{}, ctx.Err()
+	})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want context deadline exceeded", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("blocked startup returned after %s, want within 1s", elapsed)
 	}
 }
 

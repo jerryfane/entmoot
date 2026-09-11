@@ -1374,6 +1374,82 @@ func TestConnCloseIdempotent(t *testing.T) {
 	}
 }
 
+func TestConnRemoteEOFDrainsQueuedPayloads(t *testing.T) {
+	t.Parallel()
+	drv, _, cleanup := newTestDriver(t)
+	defer cleanup()
+	c := newConn(drv, 1, SocketAddr{}, SocketAddr{})
+
+	for _, payload := range [][]byte{[]byte("first"), []byte("second")} {
+		if !c.pushRecv(payload) {
+			t.Fatal("pushRecv rejected payload before remote EOF")
+		}
+	}
+	c.closeRemote()
+
+	buf := make([]byte, 16)
+	for _, want := range []string{"first", "second"} {
+		n, err := c.Read(buf)
+		if err != nil {
+			t.Fatalf("Read %q: %v", want, err)
+		}
+		if got := string(buf[:n]); got != want {
+			t.Fatalf("Read = %q, want %q", got, want)
+		}
+	}
+	if _, err := c.Read(buf); !errors.Is(err, io.EOF) {
+		t.Fatalf("Read after queued payloads = %v, want io.EOF", err)
+	}
+}
+
+func TestConnCloseUnblocksFullReceiveQueue(t *testing.T) {
+	t.Parallel()
+	drv, srv, cleanup := newTestDriver(t)
+	defer cleanup()
+	c := newConn(drv, 1, SocketAddr{}, SocketAddr{})
+	drv.registerConn(1, c)
+
+	for i := 0; i < cap(c.recvCh); i++ {
+		if !c.pushRecv([]byte{byte(i)}) {
+			t.Fatalf("pushRecv %d rejected before close", i)
+		}
+	}
+	blocked := make(chan bool, 1)
+	go func() {
+		blocked <- c.pushRecv([]byte("blocked"))
+	}()
+	select {
+	case <-blocked:
+		t.Fatal("pushRecv returned while receive queue was full")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	frameRead := make(chan error, 1)
+	go func() {
+		_, err := srv.readFrame()
+		frameRead <- err
+	}()
+	if err := c.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := <-frameRead; err != nil {
+		t.Fatalf("read Close frame: %v", err)
+	}
+	select {
+	case delivered := <-blocked:
+		if delivered {
+			t.Fatal("blocked pushRecv reported delivery after Close")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close did not unblock full receive queue")
+	}
+
+	other := newConn(drv, 2, SocketAddr{}, SocketAddr{})
+	if !other.pushRecv([]byte("other")) {
+		t.Fatal("another connection remained blocked after first connection closed")
+	}
+}
+
 func TestConnCloseOKActiveClosesReadAndWrite(t *testing.T) {
 	t.Parallel()
 	drv, srv, cleanup := newTestDriver(t)

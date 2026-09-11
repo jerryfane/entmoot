@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -426,6 +427,78 @@ func (f *fixture) startAll(ctx context.Context) {
 func (f *fixture) closeTransports() {
 	for _, tr := range f.transports {
 		_ = tr.Close()
+	}
+}
+
+func TestStartReturnsWhenTransportAlreadyClosed(t *testing.T) {
+	f := newFixture(t, []entmoot.NodeID{10})
+	defer f.closeTransports()
+	if err := f.transports[10].Close(); err != nil {
+		t.Fatalf("Close transport: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- f.nodes[10].gossip.Start(context.Background())
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Start returned error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Start did not stop workers after transport closed")
+	}
+}
+func TestStartShutdownRejectsConcurrentBackgroundAdmission(t *testing.T) {
+	f := newFixture(t, []entmoot.NodeID{10, 20})
+	defer f.closeTransports()
+
+	startDone := make(chan error, 1)
+	go func() {
+		startDone <- f.nodes[10].gossip.Start(context.Background())
+	}()
+	waitUntil(t, time.Second, "gossip start context installed", func() bool {
+		f.nodes[10].gossip.lifeMu.Lock()
+		defer f.nodes[10].gossip.lifeMu.Unlock()
+		return f.nodes[10].gossip.lifeCtx != nil
+	})
+
+	const publishCount = 32
+	messages := make([]entmoot.Message, publishCount)
+	for i := range messages {
+		messages[i] = f.buildMessage(10, fmt.Sprintf("shutdown-race-%d", i), int64(10_000+i))
+	}
+	release := make(chan struct{})
+	errCh := make(chan error, publishCount)
+	var publishers sync.WaitGroup
+	for i := range messages {
+		msg := messages[i]
+		publishers.Add(1)
+		go func() {
+			defer publishers.Done()
+			<-release
+			errCh <- f.nodes[10].gossip.Publish(context.Background(), msg)
+		}()
+	}
+	close(release)
+	if err := f.transports[10].Close(); err != nil {
+		t.Fatalf("Close transport: %v", err)
+	}
+	publishers.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Fatalf("Publish during shutdown: %v", err)
+		}
+	}
+	select {
+	case err := <-startDone:
+		if err != nil {
+			t.Fatalf("Start returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Start did not finish after concurrent publish shutdown")
 	}
 }
 

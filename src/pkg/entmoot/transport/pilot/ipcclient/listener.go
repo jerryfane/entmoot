@@ -70,11 +70,11 @@ func (l *Listener) pushAccept(payload []byte) bool {
 		return true
 	case <-l.closed:
 		l.drv.unregisterConn(c.id)
-		c.closeRecv()
+		c.closeLocal()
 		return false
 	case <-l.drv.closedCh:
 		l.drv.unregisterConn(c.id)
-		c.closeRecv()
+		c.closeDriver()
 		return false
 	}
 }
