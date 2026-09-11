@@ -551,6 +551,30 @@ func (r *RosterLog) MemberInfoAt(nodeID entmoot.NodeID, head entmoot.RosterEntry
 	return entmoot.NodeInfo{}, false, true
 }
 
+// MemberInfoAtID resolves a full-width identity in the membership projection
+// at head. The third result distinguishes a known head from an unresolved hash.
+func (r *RosterLog) MemberInfoAtID(memberID entmoot.MemberID, head entmoot.RosterEntryID) (entmoot.NodeInfo, bool, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	index, known := r.byID[head]
+	if !known {
+		return entmoot.NodeInfo{}, false, false
+	}
+	for i := index; i >= 0; i-- {
+		entry := r.entries[i]
+		if entry.Subject.MemberID == nil || *entry.Subject.MemberID != memberID {
+			continue
+		}
+		switch entry.Op {
+		case "remove":
+			return entmoot.NodeInfo{}, false, true
+		case "add":
+			return cloneNodeInfo(entry.Subject), true, true
+		}
+	}
+	return entmoot.NodeInfo{}, false, true
+}
+
 // HasEntry reports whether id is on this log's accepted linear chain.
 func (r *RosterLog) HasEntry(id entmoot.RosterEntryID) bool {
 	r.mu.RLock()
