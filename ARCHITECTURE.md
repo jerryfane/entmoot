@@ -240,7 +240,7 @@ Message types (v0):
 
 | Type | Direction | Purpose |
 |------|-----------|---------|
-| `hello` | bidirectional | announce node + supported groups |
+| `hello` | bidirectional | legacy compatibility frame; bounded-decode and ignore |
 | `announce_group` | → peer | broadcast availability of group_id |
 | `roster_req` | → peer | request current roster head for a group |
 | `roster_resp` | ← peer | signed roster snapshot |
@@ -259,12 +259,14 @@ Message types (v0):
 | `member_profile_ad` | → peer | signed app-facing member profile metadata |
 | `member_profile_snapshot_req` / `member_profile_snapshot_resp` | ↔ peer | join-time member profile snapshot |
 
-All messages that mutate state are signed by their author with Ed25519 keys
-bound to Pilot node ids. We reuse the replay-protection pattern from Pilot's
-`HandshakeMsg`: 5-minute max age, 30-second future clock skew, hash-set dedupe.
-Transport and member-profile system frames are also signed and roster-checked,
-but they do not mutate consensus state: they update local reachability or
-display metadata caches.
+Messages that mutate state are signed by their author with Ed25519 keys bound
+to roster identity. Timestamp-bearing signed frame handlers apply their replay
+rules after authentication; repeatable queries do not populate replay state.
+The legacy `hello` frame is non-authoritative: the active v0 path takes
+`remote` from the authenticated Transport and ignores Hello's claimed identity
+fields and signature. Transport and member-profile system frames are signed
+and roster-checked, but only update local reachability or display metadata
+caches.
 
 ### 4.1 Bounded history synchronization
 

@@ -197,24 +197,22 @@ func (r *MerkleRoot) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// Hello announces the sender's identity and the groups it participates in.
-// It is the first message on every connection and is signed by the sender's
-// Entmoot Ed25519 pubkey (not Pilot's — see ARCHITECTURE §2.5 / plan
-// assumption 2). Receivers verify the signature over the canonical encoding
-// of the Hello with Signature zeroed.
+// Hello is a legacy compatibility frame. The active v0 transport authenticates
+// the remote peer before Accept returns, and gossip ignores Hello after bounded
+// decoding. Its identity fields and signature are therefore not an
+// authorization source. New protocols must bind application identity to their
+// authenticated transport directly rather than reviving this frame implicitly.
 type Hello struct {
-	// NodeID is the sender's Pilot node id.
+	// NodeID is the sender's claimed legacy Pilot node id.
 	NodeID entmoot.NodeID `json:"node_id"`
-	// PubKey is the sender's raw Ed25519 Entmoot public key (32 bytes).
+	// PubKey is the sender's claimed raw Ed25519 Entmoot public key.
 	PubKey []byte `json:"pubkey"`
-	// Groups is the list of groups the sender participates in and is willing
-	// to exchange roster / gossip / fetch messages for on this connection.
+	// Groups is the claimed group list.
 	Groups []entmoot.GroupID `json:"groups"`
-	// Timestamp is unix milliseconds at send time. Replay protection in B2
-	// uses this against the 5-minute past / 30-second future window.
+	// Timestamp is the claimed unix-millisecond send time.
 	Timestamp int64 `json:"timestamp"`
-	// Signature is Ed25519 over the canonical encoding of the Hello with
-	// Signature zeroed.
+	// Signature is retained for byte-level compatibility but is not consumed by
+	// the active v0 handshake path.
 	Signature []byte `json:"signature"`
 }
 
