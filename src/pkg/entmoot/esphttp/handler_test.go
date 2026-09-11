@@ -2395,6 +2395,128 @@ func TestHandlerIdempotencyReplaysSignRequestCreation(t *testing.T) {
 		t.Fatalf("error code = %q, want idempotency_conflict", errResp.Error.Code)
 	}
 }
+func TestHandlerIdempotencyDoesNotCacheFailedMutation(t *testing.T) {
+	gid := testGroupID(1)
+	pub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	handler := testMobileHandlerWithPublisher(t, gid, &fakePublisher{}, func() time.Time { return time.UnixMilli(1_234_000) })
+	path := "/v1/groups/" + gid.String() + "/messages"
+	headers := map[string]string{idempotencyHeader: "retry-after-failure"}
+	doJSONRequestWithHeaders[errorEnvelope](
+		t, handler, http.MethodPost, path,
+		map[string]any{"message": "invalid"}, headers, http.StatusBadRequest,
+	)
+	created := doJSONRequestWithHeaders[struct {
+		SignRequest SignRequest `json:"sign_request"`
+	}](
+		t, handler, http.MethodPost, path,
+		map[string]any{
+			"author": entmoot.NodeInfo{PilotNodeID: 45491, EntmootPubKey: pub},
+			"topics": []string{"chat"},
+		},
+		headers,
+		http.StatusAccepted,
+	)
+	if created.SignRequest.ID == "" {
+		t.Fatal("successful retry did not create a sign request")
+	}
+}
+
+func TestHandlerIdempotencyScopesReplayToCurrentAuthorizedPrincipal(t *testing.T) {
+	gid := testGroupID(1)
+	pubA, privA, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey A: %v", err)
+	}
+	pubB, privB, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey B: %v", err)
+	}
+	newRegistry := func(aGroups, bGroups []entmoot.GroupID) *DeviceRegistry {
+		reg, regErr := NewDeviceRegistry([]Device{
+			{ID: "device-a", PublicKey: pubA, Groups: aGroups},
+			{ID: "device-b", PublicKey: pubB, Groups: bGroups},
+		})
+		if regErr != nil {
+			t.Fatalf("NewDeviceRegistry: %v", regErr)
+		}
+		return reg
+	}
+	reg := newRegistry([]entmoot.GroupID{gid}, nil)
+	state := NewMemoryStateStore()
+	if err := state.SaveIdempotencyRecord(context.Background(), IdempotencyRecord{
+		Scope:       "message_publish:" + gid.String(),
+		Key:         "shared-key",
+		RequestHash: "legacy-request-hash",
+		StatusCode:  http.StatusAccepted,
+		Response:    json.RawMessage(`{"sign_request":{"id":"legacy-secret"}}`),
+	}); err != nil {
+		t.Fatalf("SaveIdempotencyRecord: %v", err)
+	}
+	handler := testMobileHandlerFull(
+		t,
+		gid,
+		reg,
+		nil,
+		func() time.Time { return time.UnixMilli(20_000) },
+		&fakePublisher{},
+		state,
+		nil,
+	)
+	body := map[string]any{
+		"author": entmoot.NodeInfo{PilotNodeID: 45491, EntmootPubKey: pubA},
+		"topics": []string{"chat"},
+	}
+	type response struct {
+		SignRequest SignRequest `json:"sign_request"`
+	}
+	firstA := doSignedJSONRequestForWithIdempotency[response](
+		t, handler, "device-a", privA, http.MethodPost,
+		"/v1/groups/"+gid.String()+"/messages", body,
+		http.StatusAccepted, 20_000, "nonce-device-a-first", "shared-key",
+	)
+	if firstA.SignRequest.ID == "" || firstA.SignRequest.ID == "legacy-secret" {
+		t.Fatalf("device A received legacy idempotency record: %+v", firstA.SignRequest)
+	}
+	replayedA := doSignedJSONRequestForWithIdempotency[response](
+		t, handler, "device-a", privA, http.MethodPost,
+		"/v1/groups/"+gid.String()+"/messages", body,
+		http.StatusAccepted, 20_000, "nonce-device-a-replay", "shared-key",
+	)
+	if replayedA.SignRequest.ID != firstA.SignRequest.ID {
+		t.Fatalf("device A replay ids = %q/%q", firstA.SignRequest.ID, replayedA.SignRequest.ID)
+	}
+	deniedB := doSignedJSONRequestForWithIdempotency[errorEnvelope](
+		t, handler, "device-b", privB, http.MethodPost,
+		"/v1/groups/"+gid.String()+"/messages", body,
+		http.StatusForbidden, 20_000, "nonce-device-b-denied", "shared-key",
+	)
+	if deniedB.Error.Code != "forbidden" {
+		t.Fatalf("device B error = %+v", deniedB.Error)
+	}
+
+	reg.Replace(newRegistry([]entmoot.GroupID{gid}, []entmoot.GroupID{gid}))
+	firstB := doSignedJSONRequestForWithIdempotency[response](
+		t, handler, "device-b", privB, http.MethodPost,
+		"/v1/groups/"+gid.String()+"/messages", body,
+		http.StatusAccepted, 20_000, "nonce-device-b-granted", "shared-key",
+	)
+	if firstB.SignRequest.ID == "" || firstB.SignRequest.ID == firstA.SignRequest.ID {
+		t.Fatalf("principal-scoped ids = A %q, B %q", firstA.SignRequest.ID, firstB.SignRequest.ID)
+	}
+
+	reg.Replace(newRegistry(nil, []entmoot.GroupID{gid}))
+	revokedA := doSignedJSONRequestForWithIdempotency[errorEnvelope](
+		t, handler, "device-a", privA, http.MethodPost,
+		"/v1/groups/"+gid.String()+"/messages", body,
+		http.StatusForbidden, 20_000, "nonce-device-a-revoked", "shared-key",
+	)
+	if revokedA.Error.Code != "forbidden" {
+		t.Fatalf("revoked device A error = %+v", revokedA.Error)
+	}
+}
 
 func TestHandlerExecutableOperationSignRequestExecutes(t *testing.T) {
 	gid := testGroupID(1)

@@ -265,11 +265,14 @@ type StateStore interface {
 }
 
 const (
-	signRequestPending    = "pending"
-	signRequestCompleted  = "completed"
-	signRequestRejected   = "rejected"
-	defaultSignRequestTTL = 15 * time.Minute
-	defaultIdempotencyTTL = 24 * time.Hour
+	signRequestPending             = "pending"
+	signRequestCompleted           = "completed"
+	signRequestRejected            = "rejected"
+	defaultSignRequestTTL          = 15 * time.Minute
+	defaultIdempotencyTTL          = 24 * time.Hour
+	idempotencyCleanupInterval     = 15 * time.Minute
+	idempotencyCleanupBatchSize    = 256
+	memoryIdempotencyCleanupChecks = 64
 
 	// OpenInviteUnlimitedMaxUses marks an open invite as unlimited.
 	OpenInviteUnlimitedMaxUses = 0
@@ -469,8 +472,13 @@ func (s *MemoryStateStore) PatchNotificationPreferences(_ context.Context, devic
 func (s *MemoryStateStore) GetIdempotencyRecord(_ context.Context, scope, key string) (IdempotencyRecord, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rec, ok := s.idem[idempotencyMapKey(scope, key)]
-	if !ok || (rec.ExpiresAtMS > 0 && rec.ExpiresAtMS <= s.nowMS()) {
+	mapKey := idempotencyMapKey(scope, key)
+	rec, ok := s.idem[mapKey]
+	if !ok {
+		return IdempotencyRecord{}, false, nil
+	}
+	if rec.ExpiresAtMS > 0 && rec.ExpiresAtMS <= s.nowMS() {
+		delete(s.idem, mapKey)
 		return IdempotencyRecord{}, false, nil
 	}
 	return cloneIdempotencyRecord(rec), true, nil
@@ -487,8 +495,21 @@ func (s *MemoryStateStore) SaveIdempotencyRecord(_ context.Context, rec Idempote
 	if rec.ExpiresAtMS == 0 {
 		rec.ExpiresAtMS = time.UnixMilli(now).Add(defaultIdempotencyTTL).UnixMilli()
 	}
+	s.cleanupExpiredIdempotencyLocked(now, memoryIdempotencyCleanupChecks)
 	s.idem[idempotencyMapKey(rec.Scope, rec.Key)] = cloneIdempotencyRecord(rec)
 	return nil
+}
+func (s *MemoryStateStore) cleanupExpiredIdempotencyLocked(now int64, maxChecks int) {
+	checked := 0
+	for key, rec := range s.idem {
+		if checked >= maxChecks {
+			return
+		}
+		checked++
+		if rec.ExpiresAtMS > 0 && rec.ExpiresAtMS <= now {
+			delete(s.idem, key)
+		}
+	}
 }
 
 func (s *MemoryStateStore) CreateOpenInvite(_ context.Context, rec OpenInviteRecord) (OpenInviteRecord, error) {
@@ -1377,7 +1398,9 @@ func (s *MemoryStateStore) nowMS() int64 {
 
 // SQLiteStateStore persists ESP-local state in <data>/esp.sqlite.
 type SQLiteStateStore struct {
-	db *sql.DB
+	db            *sql.DB
+	cleanupCancel context.CancelFunc
+	cleanupWG     sync.WaitGroup
 }
 
 const sqliteStateSchema = `
@@ -1772,6 +1795,11 @@ func OpenSQLiteStateStore(dataDir string) (*SQLiteStateStore, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	cleanupCtx, cleanupCancel := context.WithCancel(context.Background())
+	store.cleanupCancel = cleanupCancel
+	_, _ = store.deleteExpiredIdempotency(cleanupCtx, idempotencyCleanupBatchSize)
+	store.cleanupWG.Add(1)
+	go store.runIdempotencyCleanup(cleanupCtx)
 	return store, nil
 }
 
@@ -1994,6 +2022,42 @@ ON CONFLICT(scope, key) DO UPDATE SET
 		return fmt.Errorf("esphttp: save idempotency record: %w", err)
 	}
 	return nil
+}
+func (s *SQLiteStateStore) runIdempotencyCleanup(ctx context.Context) {
+	defer s.cleanupWG.Done()
+	ticker := time.NewTicker(idempotencyCleanupInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			_, _ = s.deleteExpiredIdempotency(ctx, idempotencyCleanupBatchSize)
+		}
+	}
+}
+
+func (s *SQLiteStateStore) deleteExpiredIdempotency(ctx context.Context, limit int) (int64, error) {
+	if limit <= 0 {
+		return 0, nil
+	}
+	result, err := s.db.ExecContext(ctx, `
+DELETE FROM esp_idempotency
+WHERE rowid IN (
+  SELECT rowid
+  FROM esp_idempotency
+  WHERE expires_at_ms <= ?
+  ORDER BY expires_at_ms
+  LIMIT ?
+)`, time.Now().UnixMilli(), limit)
+	if err != nil {
+		return 0, fmt.Errorf("esphttp: delete expired idempotency records: %w", err)
+	}
+	deleted, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("esphttp: count deleted idempotency records: %w", err)
+	}
+	return deleted, nil
 }
 
 func (s *SQLiteStateStore) CreateOpenInvite(ctx context.Context, rec OpenInviteRecord) (OpenInviteRecord, error) {
@@ -2923,6 +2987,10 @@ func (s *SQLiteStateStore) DeleteFleetActivity(ctx context.Context, fleetID stri
 }
 
 func (s *SQLiteStateStore) Close() error {
+	if s.cleanupCancel != nil {
+		s.cleanupCancel()
+		s.cleanupWG.Wait()
+	}
 	if _, err := s.db.Exec("PRAGMA wal_checkpoint(TRUNCATE);"); err != nil {
 		return fmt.Errorf("esphttp: state wal_checkpoint: %w", err)
 	}

@@ -6,9 +6,11 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/url"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"entmoot/pkg/entmoot"
 )
@@ -1041,6 +1043,44 @@ type openInviteStoreCase struct {
 	store  StateStore
 	close  func()
 	revoke func(*testing.T, string)
+}
+
+func TestSQLiteIdempotencyCleanupDeletesOneBoundedBatch(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenSQLiteStateStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenSQLiteStateStore: %v", err)
+	}
+	defer store.Close()
+
+	const extra = 10
+	expiresAt := time.Now().Add(-time.Minute).UnixMilli()
+	for i := 0; i < idempotencyCleanupBatchSize+extra; i++ {
+		if err := store.SaveIdempotencyRecord(ctx, IdempotencyRecord{
+			Scope:       "legacy-unscoped",
+			Key:         fmt.Sprintf("key-%d", i),
+			RequestHash: "hash",
+			StatusCode:  200,
+			Response:    json.RawMessage(`{}`),
+			ExpiresAtMS: expiresAt,
+		}); err != nil {
+			t.Fatalf("SaveIdempotencyRecord %d: %v", i, err)
+		}
+	}
+	deleted, err := store.deleteExpiredIdempotency(ctx, idempotencyCleanupBatchSize)
+	if err != nil {
+		t.Fatalf("deleteExpiredIdempotency: %v", err)
+	}
+	if deleted != idempotencyCleanupBatchSize {
+		t.Fatalf("deleted = %d, want %d", deleted, idempotencyCleanupBatchSize)
+	}
+	var remaining int
+	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM esp_idempotency`).Scan(&remaining); err != nil {
+		t.Fatalf("count remaining records: %v", err)
+	}
+	if remaining != extra {
+		t.Fatalf("remaining = %d, want %d", remaining, extra)
+	}
 }
 
 func openInviteStateStores(t *testing.T) []openInviteStoreCase {

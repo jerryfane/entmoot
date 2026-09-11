@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   close a receive channel while the shared demuxer can send to it, Pilot startup
   now honors caller deadlines, and gossip transport closure cancels owned
   workers before waiting for them.
+- **Principal-scoped ESP idempotency.** Mutation replays now use versioned
+  device, member, or bearer scopes, recheck current route authorization, cache
+  only successful responses, ignore legacy unscoped rows, and clean expired
+  SQLite records in bounded cancellable batches.
 
 ## [1.5.81] - 2026-05-27
 

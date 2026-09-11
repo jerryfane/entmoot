@@ -655,7 +655,9 @@ func (h *Handler) handleFleets(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"fleets": visible})
 	case http.MethodPost:
-		h.withIdempotency(w, r, "fleet_create", func(w http.ResponseWriter, r *http.Request) {
+		h.withIdempotency(w, r, "fleet_create", func(w http.ResponseWriter, r *http.Request) bool {
+			return h.authorizeSignRequestCreation(w, r, signRequestKindFleetCreate, entmoot.GroupID{})
+		}, func(w http.ResponseWriter, r *http.Request) {
 			h.createSignRequestFromHTTP(w, r, signRequestKindFleetCreate, entmoot.GroupID{})
 		})
 	default:
@@ -682,7 +684,9 @@ func (h *Handler) handleFleetSubroute(w http.ResponseWriter, r *http.Request) bo
 		case http.MethodGet:
 			h.handleGetFleet(w, r, fleetID)
 		case http.MethodDelete:
-			h.withIdempotency(w, r, "fleet_archive:"+fleetID, func(w http.ResponseWriter, r *http.Request) {
+			h.withIdempotency(w, r, "fleet_archive:"+fleetID, func(w http.ResponseWriter, r *http.Request) bool {
+				return h.checkDeviceActiveFleetAdmin(w, r, fleetID, true)
+			}, func(w http.ResponseWriter, r *http.Request) {
 				h.createFleetSignRequestFromHTTP(w, r, signRequestKindFleetArchive, fleetID)
 			})
 		default:
@@ -694,7 +698,9 @@ func (h *Handler) handleFleetSubroute(w http.ResponseWriter, r *http.Request) bo
 			methodNotAllowed(w, http.MethodPost)
 			return true
 		}
-		h.withIdempotency(w, r, "fleet_restore:"+fleetID, func(w http.ResponseWriter, r *http.Request) {
+		h.withIdempotency(w, r, "fleet_restore:"+fleetID, func(w http.ResponseWriter, r *http.Request) bool {
+			return h.checkDeviceActiveFleetAdmin(w, r, fleetID, true)
+		}, func(w http.ResponseWriter, r *http.Request) {
 			h.createFleetSignRequestFromHTTP(w, r, signRequestKindFleetRestore, fleetID)
 		})
 	case "members":
@@ -708,7 +714,9 @@ func (h *Handler) handleFleetSubroute(w http.ResponseWriter, r *http.Request) bo
 		case http.MethodGet:
 			h.handleListFleetInvites(w, r, fleetID)
 		case http.MethodPost:
-			h.withIdempotency(w, r, "fleet_invite_create:"+fleetID, func(w http.ResponseWriter, r *http.Request) {
+			h.withIdempotency(w, r, "fleet_invite_create:"+fleetID, func(w http.ResponseWriter, r *http.Request) bool {
+				return h.checkDeviceActiveFleetAdmin(w, r, fleetID, false)
+			}, func(w http.ResponseWriter, r *http.Request) {
 				h.createFleetSignRequestFromHTTP(w, r, signRequestKindFleetInviteCreate, fleetID)
 			})
 		default:
@@ -725,7 +733,9 @@ func (h *Handler) handleFleetSubroute(w http.ResponseWriter, r *http.Request) bo
 		case http.MethodGet:
 			h.handleListFleetTasks(w, r, fleetID)
 		case http.MethodPost:
-			h.withIdempotency(w, r, fleetTaskIdempotencyScope(r, "fleet_task_create:"+fleetID), func(w http.ResponseWriter, r *http.Request) {
+			h.withIdempotency(w, r, "fleet_task_create:"+fleetID, func(w http.ResponseWriter, r *http.Request) bool {
+				return h.authorizeFleetTaskActor(w, r, fleetID)
+			}, func(w http.ResponseWriter, r *http.Request) {
 				h.handleCreateFleetTask(w, r, fleetID)
 			})
 		default:
@@ -736,7 +746,9 @@ func (h *Handler) handleFleetSubroute(w http.ResponseWriter, r *http.Request) bo
 		case http.MethodGet:
 			h.handleListFleetCommands(w, r, fleetID)
 		case http.MethodPost:
-			h.withIdempotency(w, r, fleetTaskIdempotencyScope(r, "fleet_command_create:"+fleetID), func(w http.ResponseWriter, r *http.Request) {
+			h.withIdempotency(w, r, "fleet_command_create:"+fleetID, func(w http.ResponseWriter, r *http.Request) bool {
+				return h.authorizeFleetTaskCoordinator(w, r, fleetID)
+			}, func(w http.ResponseWriter, r *http.Request) {
 				h.handleCreateFleetCommand(w, r, fleetID)
 			})
 		default:
@@ -755,7 +767,9 @@ func (h *Handler) handleFleetSubroute(w http.ResponseWriter, r *http.Request) bo
 				return true
 			}
 			trimmed := strings.TrimSuffix(strings.TrimPrefix(suffix, "members/"), "/remove")
-			h.withIdempotency(w, r, "fleet_member_remove:"+fleetID+":"+trimmed, func(w http.ResponseWriter, r *http.Request) {
+			h.withIdempotency(w, r, "fleet_member_remove:"+fleetID+":"+trimmed, func(w http.ResponseWriter, r *http.Request) bool {
+				return h.checkDeviceActiveFleetAdmin(w, r, fleetID, false)
+			}, func(w http.ResponseWriter, r *http.Request) {
 				h.createFleetMemberRemoveSignRequest(w, r, fleetID, trimmed)
 			})
 			return true
@@ -1031,27 +1045,11 @@ func (h *Handler) handleFleetTaskSubroute(w http.ResponseWriter, r *http.Request
 		methodNotAllowed(w, http.MethodPost)
 		return
 	}
-	h.withIdempotency(w, r, fleetTaskIdempotencyScope(r, "fleet_task_"+action+":"+fleetID+":"+taskID), func(w http.ResponseWriter, r *http.Request) {
+	h.withIdempotency(w, r, "fleet_task_"+action+":"+fleetID+":"+taskID, func(w http.ResponseWriter, r *http.Request) bool {
+		return h.authorizeFleetTaskActor(w, r, fleetID)
+	}, func(w http.ResponseWriter, r *http.Request) {
 		h.handleMutateFleetTask(w, r, fleetID, taskID, action)
 	})
-}
-
-func fleetTaskIdempotencyScope(r *http.Request, base string) string {
-	auth := authFromContext(r)
-	if auth.device != nil {
-		if deviceID := strings.TrimSpace(auth.device.ID); deviceID != "" {
-			return base + ":device:" + deviceID
-		}
-	}
-	if auth.member != nil {
-		return base + ":member:" +
-			strconv.FormatUint(uint64(auth.member.NodeID), 10) + ":" +
-			base64.StdEncoding.EncodeToString(auth.member.EntmootPubKey)
-	}
-	if auth.bearer {
-		return base + ":bearer"
-	}
-	return base + ":auth:anonymous"
 }
 
 func (h *Handler) handleGetFleetTask(w http.ResponseWriter, r *http.Request, fleetID, taskID string) {
@@ -1167,26 +1165,63 @@ func (h *Handler) fleetTaskCoordinator(w http.ResponseWriter, r *http.Request, f
 }
 
 func (h *Handler) fleetTaskActor(w http.ResponseWriter, r *http.Request, fleetID string) (FleetRecord, FleetMemberRecord, bool) {
-	auth := authFromContext(r)
+	fleet, ok := h.activeFleetForTask(w, r, fleetID)
+	if !ok {
+		return FleetRecord{}, FleetMemberRecord{}, false
+	}
+	h.reconcileFleetAcceptance(r.Context(), fleet)
+	return h.fleetTaskActorForFleet(w, r, fleet)
+}
+
+func (h *Handler) authorizeFleetTaskActor(w http.ResponseWriter, r *http.Request, fleetID string) bool {
+	fleet, ok := h.activeFleetForTask(w, r, fleetID)
+	if !ok {
+		return false
+	}
+	_, _, ok = h.fleetTaskActorForFleet(w, r, fleet)
+	return ok
+}
+
+func (h *Handler) authorizeFleetTaskCoordinator(w http.ResponseWriter, r *http.Request, fleetID string) bool {
+	fleet, ok := h.activeFleetForTask(w, r, fleetID)
+	if !ok {
+		return false
+	}
+	_, member, ok := h.fleetTaskActorForFleet(w, r, fleet)
+	if !ok {
+		return false
+	}
+	if !FleetTaskIsCoordinator(member) {
+		writeError(w, http.StatusForbidden, "forbidden", "fleet task requires coordinator access")
+		return false
+	}
+	return true
+}
+
+func (h *Handler) activeFleetForTask(w http.ResponseWriter, r *http.Request, fleetID string) (FleetRecord, bool) {
 	if h.state == nil {
 		writeError(w, http.StatusServiceUnavailable, "fleet_unavailable", "fleet store is not configured")
-		return FleetRecord{}, FleetMemberRecord{}, false
+		return FleetRecord{}, false
 	}
 	fleet, found, err := h.state.GetFleet(r.Context(), fleetID)
 	if err != nil {
 		h.logger.Error("esphttp: check fleet task access", slog.String("err", err.Error()))
 		writeError(w, http.StatusInternalServerError, "internal_error", "fleet lookup failed")
-		return FleetRecord{}, FleetMemberRecord{}, false
+		return FleetRecord{}, false
 	}
 	if !found {
 		writeError(w, http.StatusNotFound, "fleet_not_found", "fleet not found")
-		return FleetRecord{}, FleetMemberRecord{}, false
+		return FleetRecord{}, false
 	}
 	if fleet.Status != FleetStatusActive {
 		writeError(w, http.StatusConflict, "fleet_archived", "fleet is archived")
-		return FleetRecord{}, FleetMemberRecord{}, false
+		return FleetRecord{}, false
 	}
-	h.reconcileFleetAcceptance(r.Context(), fleet)
+	return fleet, true
+}
+
+func (h *Handler) fleetTaskActorForFleet(w http.ResponseWriter, r *http.Request, fleet FleetRecord) (FleetRecord, FleetMemberRecord, bool) {
+	auth := authFromContext(r)
 	if auth.member != nil {
 		member, found, err := h.fleetMemberByNode(r.Context(), fleet.FleetID, auth.member.NodeID)
 		if err != nil {
@@ -1971,7 +2006,9 @@ func (h *Handler) handleGroups(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		h.handleListGroups(w, r)
 	case http.MethodPost:
-		h.withIdempotency(w, r, "group_create", func(w http.ResponseWriter, r *http.Request) {
+		h.withIdempotency(w, r, "group_create", func(w http.ResponseWriter, r *http.Request) bool {
+			return h.authorizeSignRequestCreation(w, r, "group_create", entmoot.GroupID{})
+		}, func(w http.ResponseWriter, r *http.Request) {
 			h.createSignRequestFromHTTP(w, r, "group_create", entmoot.GroupID{})
 		})
 	default:
@@ -2039,7 +2076,9 @@ func (h *Handler) handleGroupSubroute(w http.ResponseWriter, r *http.Request) bo
 			return true
 		}
 		escapedMember := strings.TrimPrefix(suffix, "members/")
-		h.withIdempotency(w, r, "member_remove:"+groupID.String()+":"+escapedMember, func(w http.ResponseWriter, r *http.Request) {
+		h.withIdempotency(w, r, "member_remove:"+groupID.String()+":"+escapedMember, func(w http.ResponseWriter, r *http.Request) bool {
+			return h.authorizeSignRequestCreation(w, r, "member_remove", groupID)
+		}, func(w http.ResponseWriter, r *http.Request) {
 			h.createMemberRemoveSignRequest(w, r, groupID, escapedMember)
 		})
 		return true
@@ -2052,11 +2091,15 @@ func (h *Handler) handleGroupSubroute(w http.ResponseWriter, r *http.Request) bo
 		}
 		switch r.Method {
 		case http.MethodPut:
-			h.withIdempotency(w, r, "live_agent_config:"+groupID.String()+":"+strconv.FormatUint(uint64(nodeID), 10), func(w http.ResponseWriter, r *http.Request) {
+			h.withIdempotency(w, r, "live_agent_config:"+groupID.String()+":"+strconv.FormatUint(uint64(nodeID), 10), func(w http.ResponseWriter, r *http.Request) bool {
+				return h.checkLiveAgentConfigWrite(w, r, groupID, nodeID)
+			}, func(w http.ResponseWriter, r *http.Request) {
 				h.handleUpsertLiveAgentConfig(w, r, groupID, nodeID)
 			})
 		case http.MethodDelete:
-			h.withIdempotency(w, r, "live_agent_config_delete:"+groupID.String()+":"+strconv.FormatUint(uint64(nodeID), 10), func(w http.ResponseWriter, r *http.Request) {
+			h.withIdempotency(w, r, "live_agent_config_delete:"+groupID.String()+":"+strconv.FormatUint(uint64(nodeID), 10), func(w http.ResponseWriter, r *http.Request) bool {
+				return h.checkLiveAgentConfigWrite(w, r, groupID, nodeID)
+			}, func(w http.ResponseWriter, r *http.Request) {
 				h.handleDeleteLiveAgentConfig(w, r, groupID, nodeID)
 			})
 		default:
@@ -2075,7 +2118,9 @@ func (h *Handler) handleGroupSubroute(w http.ResponseWriter, r *http.Request) bo
 			methodNotAllowed(w, http.MethodPost)
 			return true
 		}
-		h.withIdempotency(w, r, "open_invite_revoke:"+groupID.String()+":"+escapedInvite, func(w http.ResponseWriter, r *http.Request) {
+		h.withIdempotency(w, r, "open_invite_revoke:"+groupID.String()+":"+escapedInvite, func(w http.ResponseWriter, r *http.Request) bool {
+			return h.checkDeviceGroupAdmin(w, r, groupID)
+		}, func(w http.ResponseWriter, r *http.Request) {
 			h.handleRevokeOpenInvite(w, r, groupID, escapedInvite)
 		})
 		return true
@@ -2086,7 +2131,9 @@ func (h *Handler) handleGroupSubroute(w http.ResponseWriter, r *http.Request) bo
 		case http.MethodGet:
 			h.handleGetGroup(w, r, groupID)
 		case http.MethodPatch:
-			h.withIdempotency(w, r, "group_update:"+groupID.String(), func(w http.ResponseWriter, r *http.Request) {
+			h.withIdempotency(w, r, "group_update:"+groupID.String(), func(w http.ResponseWriter, r *http.Request) bool {
+				return h.authorizeSignRequestCreation(w, r, "group_update", groupID)
+			}, func(w http.ResponseWriter, r *http.Request) {
 				h.createSignRequestFromHTTP(w, r, "group_update", groupID)
 			})
 		default:
@@ -2097,11 +2144,15 @@ func (h *Handler) handleGroupSubroute(w http.ResponseWriter, r *http.Request) bo
 		case http.MethodGet:
 			h.handleGetGroupPolicy(w, r, groupID)
 		case http.MethodPut:
-			h.withIdempotency(w, r, "group_policy_update:"+groupID.String(), func(w http.ResponseWriter, r *http.Request) {
+			h.withIdempotency(w, r, "group_policy_update:"+groupID.String(), func(w http.ResponseWriter, r *http.Request) bool {
+				return h.authorizeSignRequestCreation(w, r, signRequestKindGroupPolicyUpdate, groupID)
+			}, func(w http.ResponseWriter, r *http.Request) {
 				h.createSignRequestFromHTTP(w, r, signRequestKindGroupPolicyUpdate, groupID)
 			})
 		case http.MethodDelete:
-			h.withIdempotency(w, r, "group_policy_clear:"+groupID.String(), func(w http.ResponseWriter, r *http.Request) {
+			h.withIdempotency(w, r, "group_policy_clear:"+groupID.String(), func(w http.ResponseWriter, r *http.Request) bool {
+				return h.authorizeSignRequestCreation(w, r, signRequestKindGroupPolicyClear, groupID)
+			}, func(w http.ResponseWriter, r *http.Request) {
 				h.createSignRequestFromHTTP(w, r, signRequestKindGroupPolicyClear, groupID)
 			})
 		default:
@@ -2112,7 +2163,9 @@ func (h *Handler) handleGroupSubroute(w http.ResponseWriter, r *http.Request) bo
 			methodNotAllowed(w, http.MethodPost)
 			return true
 		}
-		h.withIdempotency(w, r, "group_public_publish:"+groupID.String(), func(w http.ResponseWriter, r *http.Request) {
+		h.withIdempotency(w, r, "group_public_publish:"+groupID.String(), func(w http.ResponseWriter, r *http.Request) bool {
+			return h.authorizeSignRequestCreation(w, r, signRequestKindGroupPublicPublish, groupID)
+		}, func(w http.ResponseWriter, r *http.Request) {
 			h.createSignRequestFromHTTP(w, r, signRequestKindGroupPublicPublish, groupID)
 		})
 	case "members":
@@ -2132,7 +2185,9 @@ func (h *Handler) handleGroupSubroute(w http.ResponseWriter, r *http.Request) bo
 			methodNotAllowed(w, http.MethodPost)
 			return true
 		}
-		h.withIdempotency(w, r, "invite_create:"+groupID.String(), func(w http.ResponseWriter, r *http.Request) {
+		h.withIdempotency(w, r, "invite_create:"+groupID.String(), func(w http.ResponseWriter, r *http.Request) bool {
+			return h.authorizeSignRequestCreation(w, r, "invite_create", groupID)
+		}, func(w http.ResponseWriter, r *http.Request) {
 			h.createSignRequestFromHTTP(w, r, "invite_create", groupID)
 		})
 	case "open-invites":
@@ -2140,7 +2195,9 @@ func (h *Handler) handleGroupSubroute(w http.ResponseWriter, r *http.Request) bo
 		case http.MethodGet:
 			h.handleListOpenInvites(w, r, groupID)
 		case http.MethodPost:
-			h.withIdempotency(w, r, "open_invite_create:"+groupID.String(), func(w http.ResponseWriter, r *http.Request) {
+			h.withIdempotency(w, r, "open_invite_create:"+groupID.String(), func(w http.ResponseWriter, r *http.Request) bool {
+				return h.authorizeSignRequestCreation(w, r, "open_invite_create", groupID)
+			}, func(w http.ResponseWriter, r *http.Request) {
 				h.createSignRequestFromHTTP(w, r, "open_invite_create", groupID)
 			})
 		default:
@@ -2157,7 +2214,9 @@ func (h *Handler) handleGroupSubroute(w http.ResponseWriter, r *http.Request) bo
 		case http.MethodGet:
 			h.handleGroupMessages(w, r, groupID)
 		case http.MethodPost:
-			h.withIdempotency(w, r, "message_publish:"+groupID.String(), func(w http.ResponseWriter, r *http.Request) {
+			h.withIdempotency(w, r, "message_publish:"+groupID.String(), func(w http.ResponseWriter, r *http.Request) bool {
+				return h.checkDeviceGroup(w, r, groupID)
+			}, func(w http.ResponseWriter, r *http.Request) {
 				h.handleGroupMessagePublish(w, r, groupID)
 			})
 		default:
@@ -2912,7 +2971,9 @@ func (h *Handler) handleInviteAccept(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w, http.MethodPost)
 		return
 	}
-	h.withIdempotency(w, r, "invite_accept", func(w http.ResponseWriter, r *http.Request) {
+	h.withIdempotency(w, r, "invite_accept", func(w http.ResponseWriter, r *http.Request) bool {
+		return h.authorizeSignRequestCreation(w, r, "invite_accept", entmoot.GroupID{})
+	}, func(w http.ResponseWriter, r *http.Request) {
 		h.createSignRequestFromHTTP(w, r, "invite_accept", entmoot.GroupID{})
 	})
 }
@@ -2922,7 +2983,9 @@ func (h *Handler) handleOpenInviteAccept(w http.ResponseWriter, r *http.Request)
 		methodNotAllowed(w, http.MethodPost)
 		return
 	}
-	h.withIdempotency(w, r, "open_invite_accept", func(w http.ResponseWriter, r *http.Request) {
+	h.withIdempotency(w, r, "open_invite_accept", func(w http.ResponseWriter, r *http.Request) bool {
+		return h.authorizeSignRequestCreation(w, r, "open_invite_accept", entmoot.GroupID{})
+	}, func(w http.ResponseWriter, r *http.Request) {
 		h.createSignRequestFromHTTP(w, r, "open_invite_accept", entmoot.GroupID{})
 	})
 }
@@ -3034,7 +3097,9 @@ func (h *Handler) handleSignRequestSubroute(w http.ResponseWriter, r *http.Reque
 			methodNotAllowed(w, http.MethodPost)
 			return true
 		}
-		h.withIdempotency(w, r, "sign_request_complete:"+id, func(w http.ResponseWriter, r *http.Request) {
+		h.withIdempotency(w, r, "sign_request_complete:"+id, func(w http.ResponseWriter, r *http.Request) bool {
+			return h.authorizeSignRequestCompletion(w, r, id)
+		}, func(w http.ResponseWriter, r *http.Request) {
 			h.handleCompleteSignRequest(w, r, id)
 		})
 	case "reject":
@@ -3045,6 +3110,26 @@ func (h *Handler) handleSignRequestSubroute(w http.ResponseWriter, r *http.Reque
 		h.handleRejectSignRequest(w, r, id)
 	default:
 		writeError(w, http.StatusNotFound, "not_found", "not found")
+	}
+	return true
+}
+
+func (h *Handler) authorizeSignRequestCompletion(w http.ResponseWriter, r *http.Request, id string) bool {
+	req, found, err := h.state.GetSignRequest(r.Context(), id)
+	if err != nil {
+		h.writeSignRequestMutation(w, SignRequest{}, err)
+		return false
+	}
+	if !found {
+		h.writeSignRequestMutation(w, SignRequest{}, sql.ErrNoRows)
+		return false
+	}
+	if !h.signRequestVisible(w, r, req) {
+		return false
+	}
+	if feature, disabled := h.disabledSignRequestFeature(req); disabled {
+		h.writeFeatureDisabled(w, feature)
+		return false
 	}
 	return true
 }
@@ -3171,13 +3256,20 @@ func (h *Handler) handlePushToken(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w, http.MethodPut)
 		return
 	}
-	h.withIdempotency(w, r, "push_token:"+deviceIDForRequest(authFromContext(r)), h.handlePushTokenMutation)
+	h.withIdempotency(w, r, "push_token", h.authorizePushTokenMutation, h.handlePushTokenMutation)
+}
+
+func (h *Handler) authorizePushTokenMutation(w http.ResponseWriter, r *http.Request) bool {
+	if authFromContext(r).device == nil {
+		writeError(w, http.StatusForbidden, "forbidden", "device auth is required")
+		return false
+	}
+	return true
 }
 
 func (h *Handler) handlePushTokenMutation(w http.ResponseWriter, r *http.Request) {
-	auth, _ := r.Context().Value(authContextKey{}).(authContext)
-	if auth.device == nil {
-		writeError(w, http.StatusForbidden, "forbidden", "device auth is required")
+	auth := authFromContext(r)
+	if !h.authorizePushTokenMutation(w, r) {
 		return
 	}
 	var body struct {
@@ -4078,19 +4170,28 @@ func (h *Handler) createMemberRemoveSignRequest(w http.ResponseWriter, r *http.R
 	h.createSignRequest(w, r, "member_remove", groupID, payload)
 }
 
-func (h *Handler) createSignRequest(w http.ResponseWriter, r *http.Request, kind string, groupID entmoot.GroupID, payload []byte) {
-	auth, _ := r.Context().Value(authContextKey{}).(authContext)
+func (h *Handler) authorizeSignRequestCreation(w http.ResponseWriter, r *http.Request, kind string, groupID entmoot.GroupID) bool {
+	auth := authFromContext(r)
 	if executableOperationKind(kind) && auth.device == nil {
 		writeError(w, http.StatusForbidden, "device_signature_required", "operation requires a registered device signature")
-		return
+		return false
 	}
-	if groupID != (entmoot.GroupID{}) {
-		if !h.checkDeviceGroup(w, r, groupID) {
-			return
-		}
-		if requiresGroupAdmin(kind) && !h.checkDeviceGroupAdmin(w, r, groupID) {
-			return
-		}
+	if groupID == (entmoot.GroupID{}) {
+		return true
+	}
+	if !h.checkDeviceGroup(w, r, groupID) {
+		return false
+	}
+	if requiresGroupAdmin(kind) && !h.checkDeviceGroupAdmin(w, r, groupID) {
+		return false
+	}
+	return true
+}
+
+func (h *Handler) createSignRequest(w http.ResponseWriter, r *http.Request, kind string, groupID entmoot.GroupID, payload []byte) {
+	auth := authFromContext(r)
+	if !h.authorizeSignRequestCreation(w, r, kind, groupID) {
+		return
 	}
 	if len(payload) == 0 {
 		payload = []byte("{}")
@@ -4400,14 +4501,29 @@ func signRequestKindFeature(kind string) (string, bool) {
 	}
 }
 
-func (h *Handler) withIdempotency(w http.ResponseWriter, r *http.Request, scope string, next func(http.ResponseWriter, *http.Request)) {
+type idempotencyAuthorizer func(http.ResponseWriter, *http.Request) bool
+
+func (h *Handler) withIdempotency(w http.ResponseWriter, r *http.Request, routeScope string, authorize idempotencyAuthorizer, next func(http.ResponseWriter, *http.Request)) {
 	key := strings.TrimSpace(r.Header.Get(idempotencyHeader))
 	if key == "" {
 		next(w, r)
 		return
 	}
+	if authorize == nil {
+		h.logger.Error("esphttp: idempotency route missing authorizer", slog.String("path", r.URL.Path))
+		writeError(w, http.StatusInternalServerError, "internal_error", "idempotency authorization is not configured")
+		return
+	}
+	if !authorize(w, r) {
+		return
+	}
 	if len(key) > 256 {
 		writeError(w, http.StatusBadRequest, "bad_request", "Idempotency-Key is too long")
+		return
+	}
+	scope, ok := h.principalIdempotencyScope(r, routeScope)
+	if !ok {
+		writeError(w, http.StatusForbidden, "forbidden", "authenticated principal is required")
 		return
 	}
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxAuthBodyBytes))
@@ -4417,17 +4533,16 @@ func (h *Handler) withIdempotency(w http.ResponseWriter, r *http.Request, scope 
 	}
 	_ = r.Body.Close()
 	r.Body = io.NopCloser(bytes.NewReader(body))
-	sum := sha256.Sum256(body)
-	bodyHash := base64.StdEncoding.EncodeToString(sum[:])
-	rec, ok, err := h.state.GetIdempotencyRecord(r.Context(), scope, key)
+	requestHash := idempotencyRequestHash(r, body)
+	rec, found, err := h.state.GetIdempotencyRecord(r.Context(), scope, key)
 	if err != nil {
 		h.logger.Error("esphttp: idempotency lookup", slog.String("err", err.Error()))
 		writeError(w, http.StatusInternalServerError, "internal_error", "idempotency lookup failed")
 		return
 	}
-	if ok {
-		if rec.RequestHash != bodyHash {
-			writeError(w, http.StatusConflict, "idempotency_conflict", "Idempotency-Key was already used with a different request body")
+	if found {
+		if rec.RequestHash != requestHash {
+			writeError(w, http.StatusConflict, "idempotency_conflict", "Idempotency-Key was already used with a different request")
 			return
 		}
 		writeStoredJSON(w, rec.StatusCode, rec.Response)
@@ -4435,20 +4550,59 @@ func (h *Handler) withIdempotency(w http.ResponseWriter, r *http.Request, scope 
 	}
 	recorder := newCaptureResponseWriter()
 	next(recorder, r)
+	status := recorder.statusCode()
 	response := recorder.body.Bytes()
 	if len(response) == 0 {
 		response = []byte("{}")
 	}
-	if err := h.state.SaveIdempotencyRecord(r.Context(), IdempotencyRecord{
-		Scope:       scope,
-		Key:         key,
-		RequestHash: bodyHash,
-		StatusCode:  recorder.statusCode(),
-		Response:    append(json.RawMessage(nil), response...),
-	}); err != nil {
-		h.logger.Warn("esphttp: idempotency save failed", slog.String("err", err.Error()))
+	if status >= http.StatusOK && status < http.StatusMultipleChoices {
+		if err := h.state.SaveIdempotencyRecord(r.Context(), IdempotencyRecord{
+			Scope:       scope,
+			Key:         key,
+			RequestHash: requestHash,
+			StatusCode:  status,
+			Response:    append(json.RawMessage(nil), response...),
+		}); err != nil {
+			h.logger.Warn("esphttp: idempotency save failed", slog.String("err", err.Error()))
+		}
 	}
 	copyCapturedResponse(w, recorder)
+}
+
+func (h *Handler) principalIdempotencyScope(r *http.Request, routeScope string) (string, bool) {
+	auth := authFromContext(r)
+	var principal string
+	switch {
+	case auth.member != nil:
+		principal = "member\x00" +
+			strconv.FormatUint(uint64(auth.member.NodeID), 10) + "\x00" +
+			base64.StdEncoding.EncodeToString(auth.member.EntmootPubKey)
+	case auth.device != nil:
+		principal = "device\x00" + strings.TrimSpace(auth.device.ID)
+	case auth.bearer:
+		principal = "bearer\x00" + h.token
+	default:
+		return "", false
+	}
+	principalHash := sha256.Sum256([]byte(principal))
+	resourceHash := sha256.Sum256([]byte(strings.Join([]string{
+		strings.ToUpper(r.Method),
+		r.URL.EscapedPath(),
+		routeScope,
+	}, "\n")))
+	return "v2:" +
+		base64.RawURLEncoding.EncodeToString(principalHash[:]) + ":" +
+		base64.RawURLEncoding.EncodeToString(resourceHash[:]), true
+}
+
+func idempotencyRequestHash(r *http.Request, body []byte) string {
+	sum := sha256.New()
+	_, _ = io.WriteString(sum, strings.ToUpper(r.Method))
+	_, _ = io.WriteString(sum, "\n")
+	_, _ = io.WriteString(sum, r.URL.RequestURI())
+	_, _ = io.WriteString(sum, "\n")
+	_, _ = sum.Write(body)
+	return base64.StdEncoding.EncodeToString(sum.Sum(nil))
 }
 
 func decodeRawBody(w http.ResponseWriter, r *http.Request, maxBytes int64, dst any) ([]byte, bool) {
