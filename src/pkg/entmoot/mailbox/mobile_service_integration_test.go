@@ -83,7 +83,7 @@ func TestMobileServiceExternalSignerMailboxFlow(t *testing.T) {
 		t.Fatalf("VerifyMessage: %v", err)
 	}
 
-	if err := st.Put(ctx, msg); err != nil {
+	if _, err := st.Put(ctx, msg.GroupID, msg); err != nil {
 		t.Fatalf("store.Put: %v", err)
 	}
 	bus.Emit(events.Event{

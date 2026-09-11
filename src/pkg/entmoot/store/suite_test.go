@@ -60,7 +60,7 @@ func runStoreSuite(t *testing.T, newStore func(t *testing.T) MessageStore) {
 		s := newStore(t)
 		gid := randGroupID(t)
 		m := mkMsg(t, gid, testAuthor(1, 0xAA), 1_000, "hello")
-		if err := s.Put(ctx, m); err != nil {
+		if _, err := s.Put(ctx, m.GroupID, m); err != nil {
 			t.Fatalf("Put: %v", err)
 		}
 		got, err := s.Get(ctx, gid, m.ID)
@@ -96,7 +96,7 @@ func runStoreSuite(t *testing.T, newStore func(t *testing.T) MessageStore) {
 		if has {
 			t.Fatal("Has=true before Put")
 		}
-		if err := s.Put(ctx, m); err != nil {
+		if _, err := s.Put(ctx, m.GroupID, m); err != nil {
 			t.Fatalf("Put: %v", err)
 		}
 		has, err = s.Has(ctx, gid, m.ID)
@@ -124,11 +124,19 @@ func runStoreSuite(t *testing.T, newStore func(t *testing.T) MessageStore) {
 		s := newStore(t)
 		gid := randGroupID(t)
 		m := mkMsg(t, gid, testAuthor(1, 0xCC), 3_000, "dup")
-		if err := s.Put(ctx, m); err != nil {
+		inserted, err := s.Put(ctx, gid, m)
+		if err != nil {
 			t.Fatalf("Put #1: %v", err)
 		}
-		if err := s.Put(ctx, m); err != nil {
+		if !inserted {
+			t.Fatal("Put #1 inserted=false, want true")
+		}
+		inserted, err = s.Put(ctx, gid, m)
+		if err != nil {
 			t.Fatalf("Put #2: %v", err)
+		}
+		if inserted {
+			t.Fatal("Put #2 inserted=true, want false")
 		}
 		msgs, err := s.Range(ctx, gid, 0, 0)
 		if err != nil {
@@ -139,13 +147,34 @@ func runStoreSuite(t *testing.T, newStore func(t *testing.T) MessageStore) {
 		}
 	})
 
+	t.Run("PutRejectsExpectedGroupMismatch", func(t *testing.T) {
+		s := newStore(t)
+		trustedGroup := randGroupID(t)
+		foreignGroup := randGroupID(t)
+		m := mkMsg(t, foreignGroup, testAuthor(1, 0xCD), 3_100, "foreign")
+		inserted, err := s.Put(ctx, trustedGroup, m)
+		if err == nil {
+			t.Fatal("Put mismatch returned nil error")
+		}
+		if inserted {
+			t.Fatal("Put mismatch inserted=true")
+		}
+		has, hasErr := s.Has(ctx, foreignGroup, m.ID)
+		if hasErr != nil {
+			t.Fatalf("Has foreign group: %v", hasErr)
+		}
+		if has {
+			t.Fatal("mismatched message was stored")
+		}
+	})
+
 	t.Run("MultipleMessagesSameGroup", func(t *testing.T) {
 		s := newStore(t)
 		gid := randGroupID(t)
 		m1 := mkMsg(t, gid, testAuthor(1, 0x11), 1_000, "a")
 		m2 := mkMsg(t, gid, testAuthor(2, 0x22), 2_000, "b")
 		for _, m := range []entmoot.Message{m1, m2} {
-			if err := s.Put(ctx, m); err != nil {
+			if _, err := s.Put(ctx, m.GroupID, m); err != nil {
 				t.Fatalf("Put: %v", err)
 			}
 		}
@@ -162,7 +191,7 @@ func runStoreSuite(t *testing.T, newStore func(t *testing.T) MessageStore) {
 		gidA := randGroupID(t)
 		gidB := randGroupID(t)
 		m := mkMsg(t, gidA, testAuthor(1, 0xDD), 1_000, "only-in-a")
-		if err := s.Put(ctx, m); err != nil {
+		if _, err := s.Put(ctx, m.GroupID, m); err != nil {
 			t.Fatalf("Put: %v", err)
 		}
 		_, err := s.Get(ctx, gidB, m.ID)
@@ -187,7 +216,7 @@ func runStoreSuite(t *testing.T, newStore func(t *testing.T) MessageStore) {
 		m2 := mkMsg(t, gid, testAuthor(1, 0x01), 20, "two")
 		m3 := mkMsg(t, gid, testAuthor(1, 0x01), 30, "three")
 		for _, m := range []entmoot.Message{m3, m1, m2} { // insert out of order
-			if err := s.Put(ctx, m); err != nil {
+			if _, err := s.Put(ctx, m.GroupID, m); err != nil {
 				t.Fatalf("Put: %v", err)
 			}
 		}
@@ -213,7 +242,7 @@ func runStoreSuite(t *testing.T, newStore func(t *testing.T) MessageStore) {
 		m2 := mkMsg(t, gid, testAuthor(1, 0x01), 20, "b")
 		m3 := mkMsg(t, gid, testAuthor(1, 0x01), 30, "c")
 		for _, m := range []entmoot.Message{m1, m2, m3} {
-			if err := s.Put(ctx, m); err != nil {
+			if _, err := s.Put(ctx, m.GroupID, m); err != nil {
 				t.Fatalf("Put: %v", err)
 			}
 		}
@@ -242,7 +271,7 @@ func runStoreSuite(t *testing.T, newStore func(t *testing.T) MessageStore) {
 		m2 := mkMsg(t, gid, testAuthor(1, 0x01), 20, "middle")
 		m3 := mkMsg(t, gid, testAuthor(1, 0x01), 30, "new")
 		for _, m := range []entmoot.Message{m3, m1, m2} {
-			if err := s.Put(ctx, m); err != nil {
+			if _, err := s.Put(ctx, m.GroupID, m); err != nil {
 				t.Fatalf("Put: %v", err)
 			}
 		}
@@ -273,7 +302,7 @@ func runStoreSuite(t *testing.T, newStore func(t *testing.T) MessageStore) {
 		child.ID = canonical.MessageID(child)
 		old := mkMsg(t, gid, testAuthor(1, 0x01), 10, "old")
 		for _, m := range []entmoot.Message{child, old, parent} {
-			if err := s.Put(ctx, m); err != nil {
+			if _, err := s.Put(ctx, m.GroupID, m); err != nil {
 				t.Fatalf("Put: %v", err)
 			}
 		}
@@ -295,7 +324,7 @@ func runStoreSuite(t *testing.T, newStore func(t *testing.T) MessageStore) {
 		m3 := mkMsg(t, gid, testAuthor(2, 0x02), 20, "middle newer author")
 		m4 := mkMsg(t, gid, testAuthor(1, 0x01), 30, "new")
 		for _, m := range []entmoot.Message{m4, m1, m3, m2} {
-			if err := s.Put(ctx, m); err != nil {
+			if _, err := s.Put(ctx, m.GroupID, m); err != nil {
 				t.Fatalf("Put: %v", err)
 			}
 		}
@@ -326,7 +355,7 @@ func runStoreSuite(t *testing.T, newStore func(t *testing.T) MessageStore) {
 		newResearchOps := withTopics(20, "new research ops", "research", "ops")
 		chat := withTopics(30, "chat", "chat")
 		for _, m := range []entmoot.Message{chat, oldOps, newResearchOps} {
-			if err := s.Put(ctx, m); err != nil {
+			if _, err := s.Put(ctx, m.GroupID, m); err != nil {
 				t.Fatalf("Put: %v", err)
 			}
 		}
@@ -383,7 +412,7 @@ func runStoreSuite(t *testing.T, newStore func(t *testing.T) MessageStore) {
 		gid := randGroupID(t)
 		for i := 0; i < 3; i++ {
 			m := mkMsg(t, gid, testAuthor(uint32(i+1), byte(i+1)), int64(100+i*10), "m")
-			if err := s.Put(ctx, m); err != nil {
+			if _, err := s.Put(ctx, m.GroupID, m); err != nil {
 				t.Fatalf("Put: %v", err)
 			}
 		}
@@ -410,7 +439,7 @@ func runStoreSuite(t *testing.T, newStore func(t *testing.T) MessageStore) {
 		m.GroupID = zero
 		// Recompute ID under the zeroed GroupID so the id is valid shape.
 		m.ID = canonical.MessageID(m)
-		if err := s.Put(ctx, m); err == nil {
+		if _, err := s.Put(ctx, m.GroupID, m); err == nil {
 			t.Fatal("Put with zero GroupID returned nil, want error")
 		}
 	})
@@ -425,7 +454,7 @@ func runStoreSuite(t *testing.T, newStore func(t *testing.T) MessageStore) {
 			Content:   []byte("x"),
 			// ID deliberately left zero.
 		}
-		if err := s.Put(ctx, m); err == nil {
+		if _, err := s.Put(ctx, m.GroupID, m); err == nil {
 			t.Fatal("Put with zero MessageID returned nil, want error")
 		}
 	})
@@ -443,7 +472,7 @@ func runStoreSuite(t *testing.T, newStore func(t *testing.T) MessageStore) {
 		newer := mkMsg(t, gid, testAuthor(1, 0x01), 30, "new")
 		otherOld := mkMsg(t, other, testAuthor(1, 0x01), 10, "other")
 		for _, m := range []entmoot.Message{old, edge, newer, otherOld} {
-			if err := s.Put(ctx, m); err != nil {
+			if _, err := s.Put(ctx, m.GroupID, m); err != nil {
 				t.Fatalf("Put: %v", err)
 			}
 		}
@@ -481,7 +510,7 @@ func runStoreSuite(t *testing.T, newStore func(t *testing.T) MessageStore) {
 		oldPolicy.ID = canonical.MessageID(oldPolicy)
 		newContent := mkMsg(t, gid, testAuthor(1, 0x01), 30, "new")
 		for _, m := range []entmoot.Message{oldContent, oldPolicy, newContent} {
-			if err := s.Put(ctx, m); err != nil {
+			if _, err := s.Put(ctx, m.GroupID, m); err != nil {
 				t.Fatalf("Put: %v", err)
 			}
 		}
@@ -517,7 +546,7 @@ func runStoreSuite(t *testing.T, newStore func(t *testing.T) MessageStore) {
 				defer wg.Done()
 				for i := 0; i < perG; i++ {
 					m := mkMsg(t, gid, testAuthor(author, byte(author)), int64(author)*1000+int64(i), "c")
-					if err := s.Put(ctx, m); err != nil {
+					if _, err := s.Put(ctx, m.GroupID, m); err != nil {
 						errCh <- err
 						return
 					}
@@ -617,7 +646,7 @@ func testIterMessageIDsInIDRange(t *testing.T, newStore func(t *testing.T) Messa
 		t.Helper()
 		for i, id := range ids {
 			m := mkMsgWithID(gid, id, testAuthor(uint32(i+1), byte(i+1)), int64(1000+i), "c")
-			if err := s.Put(ctx, m); err != nil {
+			if _, err := s.Put(ctx, m.GroupID, m); err != nil {
 				t.Fatalf("Put %d: %v", i, err)
 			}
 		}

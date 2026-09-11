@@ -390,7 +390,7 @@ func TestPlumtreeRefanoutOnFetchFrom(t *testing.T) {
 	// publishing. This simulates the state after reconcileWith has
 	// located the id on peer B via RangeReq: A about to fetchFrom B.
 	msg := f.buildMessage(20, "B-authored, never gossiped", 2_000)
-	if err := f.nodes[20].storeM.Put(ctx, msg); err != nil {
+	if _, err := f.nodes[20].storeM.Put(ctx, msg.GroupID, msg); err != nil {
 		t.Fatalf("seed B store: %v", err)
 	}
 
@@ -757,7 +757,7 @@ func TestGossipInlineBodySkipsFetch(t *testing.T) {
 	// produce. maybeInlineBody attaches the body because the
 	// canonical encoding is well under inlineBodyThreshold (4 KiB).
 	msg := f.buildMessage(10, "inline me", 2_000)
-	if err := f.nodes[10].storeM.Put(ctx, msg); err != nil {
+	if _, err := f.nodes[10].storeM.Put(ctx, msg.GroupID, msg); err != nil {
 		t.Fatalf("seed A store: %v", err)
 	}
 	frame := &wire.Gossip{
@@ -880,7 +880,7 @@ func TestGossipInlineBodyBackwardCompat(t *testing.T) {
 	// want to bypass inlining entirely and prove the v1.0.6 shape
 	// still works, so Put directly.
 	msg := f.buildMessage(10, "no inline — v1.0.6 shape", 2_000)
-	if err := f.nodes[10].storeM.Put(ctx, msg); err != nil {
+	if _, err := f.nodes[10].storeM.Put(ctx, msg.GroupID, msg); err != nil {
 		t.Fatalf("seed A store: %v", err)
 	}
 
@@ -920,7 +920,7 @@ func TestInboundGossipClearsBackoffBeforeFetch(t *testing.T) {
 	f.startAll(ctx)
 
 	msg := f.buildMessage(10, "inbound clears stale backoff before fetch", 2_000)
-	if err := f.nodes[10].storeM.Put(ctx, msg); err != nil {
+	if _, err := f.nodes[10].storeM.Put(ctx, msg.GroupID, msg); err != nil {
 		t.Fatalf("seed A store: %v", err)
 	}
 

@@ -31,12 +31,15 @@ func NewMemory() *Memory {
 }
 
 // Put implements MessageStore.Put.
-func (s *Memory) Put(_ context.Context, m entmoot.Message) error {
+func (s *Memory) Put(_ context.Context, expectedGroup entmoot.GroupID, m entmoot.Message) (bool, error) {
+	if expectedGroup != m.GroupID {
+		return false, fmt.Errorf("%w: expected group %s, got %s", ErrInvalidMessage, expectedGroup, m.GroupID)
+	}
 	if isZeroGroupID(m.GroupID) {
-		return fmt.Errorf("%w: zero group id", ErrInvalidMessage)
+		return false, fmt.Errorf("%w: zero group id", ErrInvalidMessage)
 	}
 	if isZeroMessageID(m.ID) {
-		return fmt.Errorf("%w: zero message id", ErrInvalidMessage)
+		return false, fmt.Errorf("%w: zero message id", ErrInvalidMessage)
 	}
 
 	s.mu.Lock()
@@ -48,11 +51,10 @@ func (s *Memory) Put(_ context.Context, m entmoot.Message) error {
 		s.groups[m.GroupID] = bucket
 	}
 	if _, exists := bucket[m.ID]; exists {
-		// Idempotent: same id already present, no-op.
-		return nil
+		return false, nil
 	}
 	bucket[m.ID] = m
-	return nil
+	return true, nil
 }
 
 // PruneBefore removes messages in groupID older than beforeMillis.

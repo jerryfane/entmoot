@@ -324,10 +324,10 @@ func TestReconcilerLoop_TickSkipOnEqualRoots(t *testing.T) {
 	// the first millisecond of their lifetimes.
 	for i := 0; i < 5; i++ {
 		m := f.buildMessage(10, fmt.Sprintf("seed-%d", i), int64(2_000+i))
-		if err := f.nodes[10].storeM.Put(ctx, m); err != nil {
+		if _, err := f.nodes[10].storeM.Put(ctx, m.GroupID, m); err != nil {
 			t.Fatalf("seed A: %v", err)
 		}
-		if err := f.nodes[20].storeM.Put(ctx, m); err != nil {
+		if _, err := f.nodes[20].storeM.Put(ctx, m.GroupID, m); err != nil {
 			t.Fatalf("seed B: %v", err)
 		}
 	}

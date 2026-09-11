@@ -221,39 +221,35 @@ func (s *SQLite) Close() error {
 }
 
 // Put implements MessageStore.Put. Inserts the row and its topic rows inside
-// a single transaction, using INSERT OR IGNORE so duplicates are silently
-// accepted (idempotent per the interface contract).
-func (s *SQLite) Put(ctx context.Context, m entmoot.Message) error {
+// a single transaction. Duplicates are no-ops and return inserted=false.
+func (s *SQLite) Put(ctx context.Context, expectedGroup entmoot.GroupID, m entmoot.Message) (bool, error) {
+	if expectedGroup != m.GroupID {
+		return false, fmt.Errorf("%w: expected group %s, got %s", ErrInvalidMessage, expectedGroup, m.GroupID)
+	}
 	if isZeroGroupID(m.GroupID) {
-		return fmt.Errorf("%w: zero group id", ErrInvalidMessage)
+		return false, fmt.Errorf("%w: zero group id", ErrInvalidMessage)
 	}
 	if isZeroMessageID(m.ID) {
-		return fmt.Errorf("%w: zero message id", ErrInvalidMessage)
+		return false, fmt.Errorf("%w: zero message id", ErrInvalidMessage)
 	}
 
 	encoded, err := canonical.Encode(m)
 	if err != nil {
-		return fmt.Errorf("store: canonical encode: %w", err)
+		return false, fmt.Errorf("store: canonical encode: %w", err)
 	}
 
 	db, err := s.dbFor(m.GroupID)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("store: begin tx: %w", err)
+		return false, fmt.Errorf("store: begin tx: %w", err)
 	}
-	// Ensure a rollback runs if we don't commit. Rollback after Commit is a
-	// harmless no-op that returns sql.ErrTxDone, which we deliberately ignore.
 	defer func() { _ = tx.Rollback() }()
 
-	// SQLite's database/sql driver maps a nil []byte to NULL, which would
-	// violate the NOT NULL constraints on content/parents/signature (and
-	// silently no-op under INSERT OR IGNORE). Coerce nil slices to an empty,
-	// non-nil slice so an empty blob is stored as zero-length bytes.
-	if _, err := tx.ExecContext(ctx, `
+	result, err := tx.ExecContext(ctx, `
 		INSERT OR IGNORE INTO messages
 		  (message_id, group_id, author_node_id, timestamp_ms,
 		   content, parents, signature, canonical_bytes)
@@ -266,8 +262,19 @@ func (s *SQLite) Put(ctx context.Context, m entmoot.Message) error {
 		parentsBlob(m.Parents),
 		notNilBytes(m.Signature),
 		encoded,
-	); err != nil {
-		return fmt.Errorf("store: insert message: %w", err)
+	)
+	if err != nil {
+		return false, fmt.Errorf("store: insert message: %w", err)
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("store: determine insert result: %w", err)
+	}
+	if rowsAffected == 0 {
+		if err := tx.Commit(); err != nil {
+			return false, fmt.Errorf("store: commit duplicate: %w", err)
+		}
+		return false, nil
 	}
 
 	for _, topic := range m.Topics {
@@ -276,17 +283,17 @@ func (s *SQLite) Put(ctx context.Context, m entmoot.Message) error {
 			VALUES (?, ?);`,
 			m.ID[:], topic,
 		); err != nil {
-			return fmt.Errorf("store: insert topic: %w", err)
+			return false, fmt.Errorf("store: insert topic: %w", err)
 		}
 	}
 	if err := insertMessageSearchDocTx(ctx, tx, m); err != nil {
-		return err
+		return false, err
 	}
 
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("store: commit: %w", err)
+		return false, fmt.Errorf("store: commit: %w", err)
 	}
-	return nil
+	return true, nil
 }
 
 // PruneBefore removes messages in groupID older than beforeMillis.
@@ -371,9 +378,12 @@ func pruneExemptTopicClause(topics []string) (string, []any) {
 
 // Get implements MessageStore.Get.
 func (s *SQLite) Get(ctx context.Context, groupID entmoot.GroupID, id entmoot.MessageID) (entmoot.Message, error) {
-	db, err := s.dbFor(groupID)
+	db, exists, err := s.dbForExisting(groupID)
 	if err != nil {
 		return entmoot.Message{}, err
+	}
+	if !exists {
+		return entmoot.Message{}, ErrNotFound
 	}
 
 	row := db.QueryRowContext(ctx, `
@@ -393,9 +403,12 @@ func (s *SQLite) Get(ctx context.Context, groupID entmoot.GroupID, id entmoot.Me
 
 // Has implements MessageStore.Has. Never returns ErrNotFound.
 func (s *SQLite) Has(ctx context.Context, groupID entmoot.GroupID, id entmoot.MessageID) (bool, error) {
-	db, err := s.dbFor(groupID)
+	db, exists, err := s.dbForExisting(groupID)
 	if err != nil {
 		return false, err
+	}
+	if !exists {
+		return false, nil
 	}
 	var n int
 	if err := db.QueryRowContext(ctx, `
@@ -416,9 +429,12 @@ func (s *SQLite) Has(ctx context.Context, groupID entmoot.GroupID, id entmoot.Me
 // lock; in WAL mode they never block concurrent writers. The returned slice
 // is passed through order.Topological before being returned.
 func (s *SQLite) Range(ctx context.Context, groupID entmoot.GroupID, sinceMillis, untilMillis int64) ([]entmoot.Message, error) {
-	db, err := s.dbFor(groupID)
+	db, exists, err := s.dbForExisting(groupID)
 	if err != nil {
 		return nil, err
+	}
+	if !exists {
+		return []entmoot.Message{}, nil
 	}
 
 	// "No upper bound" sentinel is untilMillis == 0 per the interface docs.
@@ -469,9 +485,12 @@ func (s *SQLite) Latest(ctx context.Context, groupID entmoot.GroupID, limit int)
 	if limit <= 0 {
 		return []entmoot.Message{}, nil
 	}
-	db, err := s.dbFor(groupID)
+	db, exists, err := s.dbForExisting(groupID)
 	if err != nil {
 		return nil, err
+	}
+	if !exists {
+		return []entmoot.Message{}, nil
 	}
 
 	rows, err := db.QueryContext(ctx, `
@@ -513,9 +532,12 @@ func (s *SQLite) LatestBefore(ctx context.Context, groupID entmoot.GroupID, limi
 	if boundary == nil {
 		return s.Latest(ctx, groupID, limit)
 	}
-	db, err := s.dbFor(groupID)
+	db, exists, err := s.dbForExisting(groupID)
 	if err != nil {
 		return nil, err
+	}
+	if !exists {
+		return []entmoot.Message{}, nil
 	}
 
 	rows, err := db.QueryContext(ctx, `
@@ -563,9 +585,12 @@ func (s *SQLite) Topics(ctx context.Context, groupID entmoot.GroupID, limit int)
 	if limit <= 0 {
 		return []TopicSummary{}, nil
 	}
-	db, err := s.dbFor(groupID)
+	db, exists, err := s.dbForExisting(groupID)
 	if err != nil {
 		return nil, err
+	}
+	if !exists {
+		return []TopicSummary{}, nil
 	}
 
 	rows, err := db.QueryContext(ctx, `
@@ -602,9 +627,12 @@ func (s *SQLite) LatestByTopic(ctx context.Context, groupID entmoot.GroupID, top
 	if limit <= 0 || topic == "" {
 		return []entmoot.Message{}, nil
 	}
-	db, err := s.dbFor(groupID)
+	db, exists, err := s.dbForExisting(groupID)
 	if err != nil {
 		return nil, err
+	}
+	if !exists {
+		return []entmoot.Message{}, nil
 	}
 
 	rows, err := db.QueryContext(ctx, `
@@ -647,9 +675,12 @@ func (s *SQLite) LatestByTopicBefore(ctx context.Context, groupID entmoot.GroupI
 	if boundary == nil {
 		return s.LatestByTopic(ctx, groupID, topic, limit)
 	}
-	db, err := s.dbFor(groupID)
+	db, exists, err := s.dbForExisting(groupID)
 	if err != nil {
 		return nil, err
+	}
+	if !exists {
+		return []entmoot.Message{}, nil
 	}
 
 	rows, err := db.QueryContext(ctx, `
@@ -697,9 +728,12 @@ func (s *SQLite) LatestByTopicBefore(ctx context.Context, groupID entmoot.GroupI
 // target row.
 func (s *SQLite) MessageContext(ctx context.Context, groupID entmoot.GroupID, messageID entmoot.MessageID, opts MessageContextOptions) (MessageContextResult, error) {
 	opts = NormalizeMessageContextOptions(opts)
-	db, err := s.dbFor(groupID)
+	db, exists, err := s.dbForExisting(groupID)
 	if err != nil {
 		return MessageContextResult{}, err
+	}
+	if !exists {
+		return MessageContextResult{}, ErrNotFound
 	}
 
 	target, err := s.messageContextTarget(ctx, db, groupID, messageID, opts.Topic)
@@ -870,9 +904,12 @@ func (s *SQLite) SearchMessages(ctx context.Context, groupID entmoot.GroupID, qu
 	if opts.Limit <= 0 {
 		return SearchResult{Hits: []SearchHit{}}, nil
 	}
-	db, err := s.dbFor(groupID)
+	db, exists, err := s.dbForExisting(groupID)
 	if err != nil {
 		return SearchResult{}, err
+	}
+	if !exists {
+		return SearchResult{Hits: []SearchHit{}}, nil
 	}
 
 	args := []any{groupID[:], query.FTS5}
@@ -959,9 +996,12 @@ func (s *SQLite) SearchMessages(ctx context.Context, groupID entmoot.GroupID, qu
 // EXPLAIN QUERY PLAN to issue "SEARCH messages USING INTEGER PRIMARY KEY"
 // (or the BLOB-PK equivalent) during development.
 func (s *SQLite) IterMessageIDsInIDRange(ctx context.Context, groupID entmoot.GroupID, loID, hiID entmoot.MessageID) ([]entmoot.MessageID, error) {
-	db, err := s.dbFor(groupID)
+	db, exists, err := s.dbForExisting(groupID)
 	if err != nil {
 		return nil, err
+	}
+	if !exists {
+		return []entmoot.MessageID{}, nil
 	}
 
 	var rows *sql.Rows
@@ -1006,9 +1046,12 @@ func (s *SQLite) IterMessageIDsInIDRange(ctx context.Context, groupID entmoot.Gr
 
 // MerkleRoot implements MessageStore.MerkleRoot.
 func (s *SQLite) MerkleRoot(ctx context.Context, groupID entmoot.GroupID) ([32]byte, error) {
-	db, err := s.dbFor(groupID)
+	db, exists, err := s.dbForExisting(groupID)
 	if err != nil {
 		return [32]byte{}, err
+	}
+	if !exists {
+		return [32]byte{}, nil
 	}
 
 	rows, err := db.QueryContext(ctx, `
@@ -1048,9 +1091,7 @@ func (s *SQLite) MerkleRoot(ctx context.Context, groupID entmoot.GroupID) ([32]b
 	return merkle.New(ids).Root(), nil
 }
 
-// dbFor returns the *sql.DB for groupID, opening it on first access.
-// Safe for concurrent use via a read-lock fast path and a write-locked
-// double-check on cache miss.
+// dbFor returns the database for groupID, creating it on first write.
 func (s *SQLite) dbFor(groupID entmoot.GroupID) (*sql.DB, error) {
 	s.mu.RLock()
 	db, ok := s.dbs[groupID]
@@ -1073,41 +1114,63 @@ func (s *SQLite) dbFor(groupID entmoot.GroupID) (*sql.DB, error) {
 	return db, nil
 }
 
-// openGroupDB opens or creates the messages.sqlite for groupID, applies the
-// schema, and enables WAL + NORMAL sync. The group directory is created with
-// 0700 and the database file with 0600 if freshly created.
+// dbForExisting returns the database for groupID without creating a group
+// directory or database on a read miss.
+func (s *SQLite) dbForExisting(groupID entmoot.GroupID) (*sql.DB, bool, error) {
+	s.mu.RLock()
+	db, ok := s.dbs[groupID]
+	s.mu.RUnlock()
+	if ok {
+		return db, true, nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if db, ok := s.dbs[groupID]; ok {
+		return db, true, nil
+	}
+
+	dbPath := filepath.Join(s.groupsDir, encodeGroupDirName(groupID), "messages.sqlite")
+	if _, err := os.Stat(dbPath); errors.Is(err, os.ErrNotExist) {
+		return nil, false, nil
+	} else if err != nil {
+		return nil, false, fmt.Errorf("store: stat %q: %w", dbPath, err)
+	}
+
+	db, err := openSQLiteDB(dbPath)
+	if err != nil {
+		return nil, false, err
+	}
+	s.dbs[groupID] = db
+	return db, true, nil
+}
+
+// openGroupDB opens or creates the messages.sqlite for groupID.
 func openGroupDB(groupsDir string, groupID entmoot.GroupID) (*sql.DB, error) {
 	dir := filepath.Join(groupsDir, encodeGroupDirName(groupID))
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("store: mkdir group %q: %w", dir, err)
 	}
 	dbPath := filepath.Join(dir, "messages.sqlite")
-
-	// Pre-create the database file with 0600 if it doesn't exist, so modernc
-	// opens an existing file rather than creating one with the process
-	// default umask. This makes the permission contract explicit regardless
-	// of umask.
 	if _, err := os.Stat(dbPath); errors.Is(err, os.ErrNotExist) {
-		f, err := os.OpenFile(dbPath, os.O_CREATE|os.O_WRONLY, 0o600)
-		if err != nil {
-			return nil, fmt.Errorf("store: precreate %q: %w", dbPath, err)
+		f, createErr := os.OpenFile(dbPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if createErr != nil && !errors.Is(createErr, os.ErrExist) {
+			return nil, fmt.Errorf("store: precreate %q: %w", dbPath, createErr)
 		}
-		if err := f.Close(); err != nil {
-			return nil, fmt.Errorf("store: close precreate %q: %w", dbPath, err)
+		if f != nil {
+			if err := f.Close(); err != nil {
+				return nil, fmt.Errorf("store: close precreate %q: %w", dbPath, err)
+			}
 		}
 	} else if err != nil {
 		return nil, fmt.Errorf("store: stat %q: %w", dbPath, err)
 	}
+	return openSQLiteDB(dbPath)
+}
 
-	// Build the DSN with pragma URL params. modernc.org/sqlite runs each
-	// _pragma=... value as a PRAGMA statement after opening.
-	//
-	// busy_timeout gives the SQLite library up to 5 s to acquire the writer
-	// lock before returning SQLITE_BUSY. Under WAL the only writer-writer
-	// contention comes from simultaneous Put calls in the same process, and
-	// those serialize quickly; the timeout is a generous safety margin so
-	// genuine concurrency tests don't spuriously trip the error.
+func openSQLiteDB(dbPath string) (*sql.DB, error) {
 	q := url.Values{}
+	q.Set("mode", "rw")
 	q.Add("_pragma", "journal_mode(WAL)")
 	q.Add("_pragma", "synchronous(NORMAL)")
 	q.Add("_pragma", "busy_timeout(5000)")
@@ -1117,13 +1180,8 @@ func openGroupDB(groupsDir string, groupID entmoot.GroupID) (*sql.DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("store: open sqlite %q: %w", dbPath, err)
 	}
-	// SQLite has one writer per database file. Keep database/sql from opening
-	// parallel connections for the same embedded DB so concurrent goroutines
-	// queue in Go instead of racing into SQLITE_BUSY/LOCKED inside SQLite.
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
-	// Ping to force the driver to actually open the file and run the pragmas
-	// so we surface errors here rather than deep in a query path.
 	if err := db.Ping(); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("store: ping sqlite %q: %w", dbPath, err)
@@ -1331,9 +1389,12 @@ func (s *SQLite) PutTransportAd(ctx context.Context, ad wire.TransportAd) (bool,
 // (TransportAd{}, false, nil) if none exists. Does NOT filter expired —
 // caller decides.
 func (s *SQLite) GetTransportAd(ctx context.Context, groupID entmoot.GroupID, authorNodeID entmoot.NodeID) (wire.TransportAd, bool, error) {
-	db, err := s.dbFor(groupID)
+	db, exists, err := s.dbForExisting(groupID)
 	if err != nil {
 		return wire.TransportAd{}, false, err
+	}
+	if !exists {
+		return wire.TransportAd{}, false, nil
 	}
 	var encoded []byte
 	if err := db.QueryRowContext(ctx, `
@@ -1358,9 +1419,12 @@ func (s *SQLite) GetTransportAd(ctx context.Context, groupID entmoot.GroupID, au
 // false (the common case). Used by the TransportSnapshotResp handler.
 // Sorted by author_node_id for determinism. (v1.2.0)
 func (s *SQLite) GetAllTransportAds(ctx context.Context, groupID entmoot.GroupID, now time.Time, includeExpired bool) ([]wire.TransportAd, error) {
-	db, err := s.dbFor(groupID)
+	db, exists, err := s.dbForExisting(groupID)
 	if err != nil {
 		return nil, err
+	}
+	if !exists {
+		return []wire.TransportAd{}, nil
 	}
 
 	var rows *sql.Rows
@@ -1549,9 +1613,12 @@ func (s *SQLite) PutMemberProfileAd(ctx context.Context, ad wire.MemberProfileAd
 
 // GetMemberProfileAd returns the latest member profile ad for a group member.
 func (s *SQLite) GetMemberProfileAd(ctx context.Context, groupID entmoot.GroupID, authorNodeID entmoot.NodeID, now time.Time) (wire.MemberProfileAd, bool, error) {
-	db, err := s.dbFor(groupID)
+	db, exists, err := s.dbForExisting(groupID)
 	if err != nil {
 		return wire.MemberProfileAd{}, false, err
+	}
+	if !exists {
+		return wire.MemberProfileAd{}, false, nil
 	}
 	var encoded []byte
 	if err := db.QueryRowContext(ctx, `
@@ -1574,9 +1641,12 @@ func (s *SQLite) GetMemberProfileAd(ctx context.Context, groupID entmoot.GroupID
 // GetAllMemberProfileAds returns every profile ad currently stored for the
 // group. Expired ads are excluded iff includeExpired is false.
 func (s *SQLite) GetAllMemberProfileAds(ctx context.Context, groupID entmoot.GroupID, now time.Time, includeExpired bool) ([]wire.MemberProfileAd, error) {
-	db, err := s.dbFor(groupID)
+	db, exists, err := s.dbForExisting(groupID)
 	if err != nil {
 		return nil, err
+	}
+	if !exists {
+		return []wire.MemberProfileAd{}, nil
 	}
 
 	var rows *sql.Rows

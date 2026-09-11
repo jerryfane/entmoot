@@ -49,23 +49,20 @@ func newCountingStore() *countingStore {
 	return &countingStore{inner: store.NewMemory()}
 }
 
-func (s *countingStore) Put(ctx context.Context, m entmoot.Message) error {
+func (s *countingStore) Put(ctx context.Context, expectedGroup entmoot.GroupID, m entmoot.Message) (bool, error) {
+	inserted, err := s.inner.Put(ctx, expectedGroup, m)
+	if err != nil {
+		return false, err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	exists, err := s.inner.Has(ctx, m.GroupID, m.ID)
-	if err != nil {
-		return err
-	}
-	if err := s.inner.Put(ctx, m); err != nil {
-		return err
-	}
 	s.putCalls++
-	if exists {
-		s.duplicates++
-	} else {
+	if inserted {
 		s.uniquePuts++
+	} else {
+		s.duplicates++
 	}
-	return nil
+	return inserted, nil
 }
 
 func (s *countingStore) Get(ctx context.Context, groupID entmoot.GroupID, id entmoot.MessageID) (entmoot.Message, error) {
@@ -731,7 +728,7 @@ func newJoinNetwork(historyMessages int) ([]*benchNode, entmoot.GroupID, *entmoo
 		if err != nil {
 			return nil, groupID, nil, nil, err
 		}
-		if err := founder.store.Put(context.Background(), msg); err != nil {
+		if _, err := founder.store.Put(context.Background(), msg.GroupID, msg); err != nil {
 			return nil, groupID, nil, nil, err
 		}
 	}

@@ -177,7 +177,7 @@ func mailboxTestData(t *testing.T, gids []entmoot.GroupID) (*globalFlags, entmoo
 			mailboxTestMessage(gid, 2, "second"),
 		}
 		for _, msg := range msgs {
-			if err := st.Put(context.Background(), msg); err != nil {
+			if _, err := st.Put(context.Background(), msg.GroupID, msg); err != nil {
 				t.Fatalf("Put: %v", err)
 			}
 		}

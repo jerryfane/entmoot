@@ -138,8 +138,8 @@ type failingPutStore struct {
 	err error
 }
 
-func (s failingPutStore) Put(context.Context, entmoot.Message) error {
-	return s.err
+func (s failingPutStore) Put(context.Context, entmoot.GroupID, entmoot.Message) (bool, error) {
+	return false, s.err
 }
 
 type cancelingFailPutStore struct {
@@ -148,9 +148,9 @@ type cancelingFailPutStore struct {
 	err    error
 }
 
-func (s cancelingFailPutStore) Put(context.Context, entmoot.Message) error {
+func (s cancelingFailPutStore) Put(context.Context, entmoot.GroupID, entmoot.Message) (bool, error) {
 	s.cancel()
-	return s.err
+	return false, s.err
 }
 
 type blockingPolicyPutStore struct {
@@ -161,7 +161,7 @@ type blockingPolicyPutStore struct {
 	release chan struct{}
 }
 
-func (s *blockingPolicyPutStore) Put(ctx context.Context, msg entmoot.Message) error {
+func (s *blockingPolicyPutStore) Put(ctx context.Context, expectedGroup entmoot.GroupID, msg entmoot.Message) (bool, error) {
 	if messageHasTopic(msg, policy.UpdateTopic) {
 		s.mu.Lock()
 		shouldBlock := !s.blocked
@@ -174,11 +174,11 @@ func (s *blockingPolicyPutStore) Put(ctx context.Context, msg entmoot.Message) e
 			select {
 			case <-s.release:
 			case <-ctx.Done():
-				return ctx.Err()
+				return false, ctx.Err()
 			}
 		}
 	}
-	return s.MessageStore.Put(ctx, msg)
+	return s.MessageStore.Put(ctx, expectedGroup, msg)
 }
 
 type failFirstDialTransport struct {
@@ -210,6 +210,21 @@ func (t *rosterRespTransport) Dial(ctx context.Context, peer entmoot.NodeID) (ne
 	t.dials++
 	t.mu.Unlock()
 
+	client, server := net.Pipe()
+	go func() {
+		defer server.Close()
+		_, _, _ = wire.ReadAndDecode(server)
+		_ = wire.EncodeAndWrite(server, t.resp)
+	}()
+	return client, nil
+}
+
+type fetchRespTransport struct {
+	Transport
+	resp *wire.FetchResp
+}
+
+func (t fetchRespTransport) Dial(context.Context, entmoot.NodeID) (net.Conn, error) {
 	client, server := net.Pipe()
 	go func() {
 		defer server.Close()
@@ -421,21 +436,23 @@ func (f *fixture) buildMessage(author entmoot.NodeID, content string, ts int64) 
 	if !ok {
 		f.t.Fatalf("unknown author %d", author)
 	}
-	msg := entmoot.Message{
+	return f.signMessage(author, entmoot.Message{
 		GroupID:   f.groupID,
 		Author:    ns.info,
 		Timestamp: ts,
 		Topics:    []string{"test"},
 		Content:   []byte(content),
-	}
-	signing := msg
-	signing.ID = entmoot.MessageID{}
-	signing.Signature = nil
-	sigInput, err := canonical.Encode(signing)
+	})
+}
+
+func (f *fixture) signMessage(author entmoot.NodeID, msg entmoot.Message) entmoot.Message {
+	msg.ID = entmoot.MessageID{}
+	msg.Signature = nil
+	sigInput, err := canonical.Encode(msg)
 	if err != nil {
 		f.t.Fatalf("canonical encode message: %v", err)
 	}
-	msg.Signature = ns.id.Sign(sigInput)
+	msg.Signature = f.nodes[author].id.Sign(sigInput)
 	msg.ID = canonical.MessageID(msg)
 	return msg
 }
@@ -448,16 +465,7 @@ func (f *fixture) buildPolicyUpdateMessage(author entmoot.NodeID, p *policy.Poli
 	}
 	msg := f.buildMessage(author, string(body), ts)
 	msg.Topics = []string{policy.UpdateTopic}
-	signing := msg
-	signing.ID = entmoot.MessageID{}
-	signing.Signature = nil
-	sigInput, err := canonical.Encode(signing)
-	if err != nil {
-		f.t.Fatalf("canonical encode policy update message: %v", err)
-	}
-	msg.Signature = f.nodes[author].id.Sign(sigInput)
-	msg.ID = canonical.MessageID(msg)
-	return msg
+	return f.signMessage(author, msg)
 }
 
 func (f *fixture) replaceGossiperWithPolicy(node entmoot.NodeID, p *policy.Policy, clk clock.Clock) {
@@ -889,7 +897,7 @@ func TestPolicyRetentionPrunesConfiguredGroup(t *testing.T) {
 
 	old := f.buildMessage(10, "old", dayMS)
 	newer := f.buildMessage(10, "new", 3*dayMS)
-	if err := f.nodes[20].storeM.Put(context.Background(), old); err != nil {
+	if _, err := f.nodes[20].storeM.Put(context.Background(), old.GroupID, old); err != nil {
 		t.Fatalf("Put old: %v", err)
 	}
 	f.nodes[20].gossip.onGossip(context.Background(), 10, f.signedInlineGossip(10, newer))
@@ -1251,6 +1259,63 @@ func TestPublishCanonicalIDMismatchRejected(t *testing.T) {
 	}
 }
 
+func TestInboundWrongGroupMessageRejected(t *testing.T) {
+	f := newFixture(t, []entmoot.NodeID{10, 20})
+	defer f.closeTransports()
+	ctx := context.Background()
+
+	foreignGroup := f.groupID
+	foreignGroup[0] ^= 0xff
+	content := f.buildMessage(10, "foreign content", 2_000)
+	content.GroupID = foreignGroup
+	content = f.signMessage(10, content)
+
+	t.Run("direct", func(t *testing.T) {
+		if err := f.nodes[20].gossip.acceptInboundMessage(ctx, 10, content); err == nil {
+			t.Fatal("acceptInboundMessage accepted wrong-group content")
+		}
+	})
+
+	t.Run("inline", func(t *testing.T) {
+		f.nodes[20].gossip.onGossip(ctx, 10, f.signedInlineGossip(10, content))
+		if has, err := f.nodes[20].storeM.Has(ctx, foreignGroup, content.ID); err != nil {
+			t.Fatalf("Has foreign group: %v", err)
+		} else if has {
+			t.Fatal("inline path stored wrong-group content")
+		}
+	})
+
+	t.Run("fetch", func(t *testing.T) {
+		receiver := f.nodes[20].gossip
+		receiver.cfg.Transport = fetchRespTransport{
+			Transport: receiver.cfg.Transport,
+			resp: &wire.FetchResp{
+				GroupID: f.groupID,
+				ID:      content.ID,
+				Message: &content,
+			},
+		}
+		if err := receiver.fetchFrom(ctx, 10, content.ID); err == nil {
+			t.Fatal("fetchFrom accepted wrong-group content")
+		}
+	})
+
+	t.Run("policy update", func(t *testing.T) {
+		p := policy.Standard()
+		msg := f.buildPolicyUpdateMessage(10, &p, 1, 2_100)
+		msg.GroupID = foreignGroup
+		msg = f.signMessage(10, msg)
+		if err := f.nodes[20].gossip.acceptInboundMessage(ctx, 10, msg); err == nil {
+			t.Fatal("acceptInboundMessage accepted wrong-group policy update")
+		}
+		if has, err := f.nodes[20].storeM.Has(ctx, foreignGroup, msg.ID); err != nil {
+			t.Fatalf("Has foreign policy group: %v", err)
+		} else if has {
+			t.Fatal("policy path stored wrong-group update")
+		}
+	})
+}
+
 // 5. FetchReq for unknown id returns FetchResp{NotFound: true}.
 func TestFetchReqUnknown(t *testing.T) {
 	t.Parallel()
@@ -1321,7 +1386,7 @@ func TestFetchForgedBodyRejected(t *testing.T) {
 	}
 	// Inject the forged message directly into A's store via Put. The Memory
 	// store accepts any non-zero ID/GroupID.
-	if err := f.nodes[10].storeM.Put(ctx, forged); err != nil {
+	if _, err := f.nodes[10].storeM.Put(ctx, forged.GroupID, forged); err != nil {
 		t.Fatalf("seed forged in A: %v", err)
 	}
 
@@ -1703,10 +1768,10 @@ func TestMerkleReq(t *testing.T) {
 	mb := f.buildMessage(10, "two", 2_100)
 	// Put the same messages on both nodes.
 	for _, m := range []entmoot.Message{ma, mb} {
-		if err := f.nodes[10].storeM.Put(ctx, m); err != nil {
+		if _, err := f.nodes[10].storeM.Put(ctx, m.GroupID, m); err != nil {
 			t.Fatalf("seed A: %v", err)
 		}
-		if err := f.nodes[20].storeM.Put(ctx, m); err != nil {
+		if _, err := f.nodes[20].storeM.Put(ctx, m.GroupID, m); err != nil {
 			t.Fatalf("seed B: %v", err)
 		}
 	}
@@ -1721,7 +1786,7 @@ func TestMerkleReq(t *testing.T) {
 
 	// Diverge B: add a third message only on B. Roots must now differ.
 	extra := f.buildMessage(10, "only-B", 2_200)
-	if err := f.nodes[20].storeM.Put(ctx, extra); err != nil {
+	if _, err := f.nodes[20].storeM.Put(ctx, extra.GroupID, extra); err != nil {
 		t.Fatalf("seed extra on B: %v", err)
 	}
 	rootBafter := f.requestMerkle(ctx, 10, 20)

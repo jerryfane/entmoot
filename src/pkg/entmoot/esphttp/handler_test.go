@@ -1514,7 +1514,7 @@ func TestHandlerFleetCommandHistoryRejectsSpoofedTopicMessages(t *testing.T) {
 		testTopicMessage(t, gid, 52_000, entmoot.NodeInfo{PilotNodeID: 45494, EntmootPubKey: otherPub}, []string{"fleet/commands/results"}, spoofedResult),
 		testTopicMessage(t, gid, 53_000, entmoot.NodeInfo{PilotNodeID: 45494, EntmootPubKey: otherPub}, []string{"fleet/commands/results"}, untargetedResult),
 	} {
-		if err := mbox.Put(context.Background(), msg); err != nil {
+		if _, err := mbox.Put(context.Background(), msg.GroupID, msg); err != nil {
 			t.Fatalf("Put topic message: %v", err)
 		}
 	}
@@ -1960,7 +1960,7 @@ func TestHandlerGroupHistoryReturnsLatestWithoutAdvancingCursor(t *testing.T) {
 		testMessage(gid, 2, "second"),
 		testMessage(gid, 3, "third"),
 	} {
-		if err := st.Put(context.Background(), msg); err != nil {
+		if _, err := st.Put(context.Background(), msg.GroupID, msg); err != nil {
 			t.Fatalf("Put: %v", err)
 		}
 	}
@@ -2025,7 +2025,7 @@ func TestHandlerGroupSearchReturnsPagedResults(t *testing.T) {
 	newOps := withTopics(3, "mars policy limits newest", "ops")
 	missingTerm := withTopics(4, "mars policy only", "ops")
 	for _, msg := range []entmoot.Message{oldOps, midChat, newOps, missingTerm} {
-		if err := st.Put(context.Background(), msg); err != nil {
+		if _, err := st.Put(context.Background(), msg.GroupID, msg); err != nil {
 			t.Fatalf("Put: %v", err)
 		}
 	}
@@ -2111,7 +2111,7 @@ func TestHandlerGroupMessageContextReturnsTargetWindow(t *testing.T) {
 	newest := withTopics(5, "newest", "ops")
 	chat := withTopics(6, "chat", "chat")
 	for _, msg := range []entmoot.Message{newest, target, chat, oldest, newer, older} {
-		if err := st.Put(context.Background(), msg); err != nil {
+		if _, err := st.Put(context.Background(), msg.GroupID, msg); err != nil {
 			t.Fatalf("Put: %v", err)
 		}
 	}
@@ -2224,7 +2224,7 @@ func TestHandlerGroupTopicsAndTopicHistory(t *testing.T) {
 	researchOps := withTopics(2, "research ops", "research", "ops")
 	chat := withTopics(3, "chat", "chat")
 	for _, msg := range []entmoot.Message{chat, oldOps, researchOps} {
-		if err := st.Put(context.Background(), msg); err != nil {
+		if _, err := st.Put(context.Background(), msg.GroupID, msg); err != nil {
 			t.Fatalf("Put: %v", err)
 		}
 	}
@@ -3010,7 +3010,7 @@ func TestHandlerDualAuthAcceptsBearerAndDevice(t *testing.T) {
 		t.Fatalf("NewDeviceRegistry: %v", err)
 	}
 	st := store.NewMemory()
-	if err := st.Put(context.Background(), testMessage(gid, 1, "first")); err != nil {
+	if _, err := st.Put(context.Background(), testMessage(gid, 1, "first").GroupID, testMessage(gid, 1, "first")); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
 	svc, err := mailbox.New(st, nil)
@@ -3081,7 +3081,7 @@ func testHandler(t *testing.T) (entmoot.GroupID, []entmoot.Message, http.Handler
 	}
 	st := store.NewMemory()
 	for _, msg := range msgs {
-		if err := st.Put(context.Background(), msg); err != nil {
+		if _, err := st.Put(context.Background(), msg.GroupID, msg); err != nil {
 			t.Fatalf("Put: %v", err)
 		}
 	}
@@ -3137,7 +3137,7 @@ func testMobileHandlerFull(t *testing.T, gid entmoot.GroupID, reg *DeviceRegistr
 	t.Helper()
 	st := store.NewMemory()
 	for _, msg := range []entmoot.Message{testMessage(gid, 1, "first")} {
-		if err := st.Put(context.Background(), msg); err != nil {
+		if _, err := st.Put(context.Background(), msg.GroupID, msg); err != nil {
 			t.Fatalf("Put: %v", err)
 		}
 	}
@@ -3181,7 +3181,7 @@ func testDeviceHandler(t *testing.T, gid entmoot.GroupID, reg *DeviceRegistry, n
 	t.Helper()
 	st := store.NewMemory()
 	for _, msg := range []entmoot.Message{testMessage(gid, 1, "first")} {
-		if err := st.Put(context.Background(), msg); err != nil {
+		if _, err := st.Put(context.Background(), msg.GroupID, msg); err != nil {
 			t.Fatalf("Put: %v", err)
 		}
 	}
@@ -3333,7 +3333,7 @@ func (p *fakeTaskEventPublisher) LocalNodeInfo(_ context.Context) (entmoot.NodeI
 func mustMailboxService(t *testing.T, gid entmoot.GroupID) *mailbox.Service {
 	t.Helper()
 	st := store.NewMemory()
-	if err := st.Put(context.Background(), testMessage(gid, 1, "first")); err != nil {
+	if _, err := st.Put(context.Background(), testMessage(gid, 1, "first").GroupID, testMessage(gid, 1, "first")); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
 	svc, err := mailbox.New(st, nil)

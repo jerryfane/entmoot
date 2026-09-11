@@ -825,6 +825,46 @@ func TestPublishErrorCodeMapsPolicyConflict(t *testing.T) {
 	}
 }
 
+func TestNotifyingStoreBroadcastsOnlyNewInsertions(t *testing.T) {
+	ctx := context.Background()
+	gid := testRuntimeGroupID(0xB3)
+	notify := newNotifyingStore(store.NewMemory(), events.NopSink{})
+	ch := make(chan entmoot.Message, 2)
+	unsubscribe := notify.subscribe(ch)
+	defer unsubscribe()
+
+	msg := entmoot.Message{
+		GroupID:   gid,
+		Author:    entmoot.NodeInfo{PilotNodeID: 1},
+		Timestamp: 10,
+		Content:   []byte("once"),
+	}
+	msg.ID = canonical.MessageID(msg)
+
+	inserted, err := notify.Put(ctx, gid, msg)
+	if err != nil || !inserted {
+		t.Fatalf("first Put inserted/err = %t/%v, want true/nil", inserted, err)
+	}
+	select {
+	case got := <-ch:
+		if got.ID != msg.ID {
+			t.Fatalf("broadcast ID = %s, want %s", got.ID, msg.ID)
+		}
+	default:
+		t.Fatal("first Put did not broadcast")
+	}
+
+	inserted, err = notify.Put(ctx, gid, msg)
+	if err != nil || inserted {
+		t.Fatalf("duplicate Put inserted/err = %t/%v, want false/nil", inserted, err)
+	}
+	select {
+	case <-ch:
+		t.Fatal("duplicate Put broadcast a second event")
+	default:
+	}
+}
+
 func TestNotifyingStoreForwardsTopicAwarePrune(t *testing.T) {
 	ctx := context.Background()
 	gid := testRuntimeGroupID(0xB4)
@@ -836,7 +876,7 @@ func TestNotifyingStoreForwardsTopicAwarePrune(t *testing.T) {
 	oldPolicy := entmoot.Message{GroupID: gid, Author: author, Timestamp: 10, Topics: []string{entpolicy.UpdateTopic}, Content: []byte("policy")}
 	oldPolicy.ID = canonical.MessageID(oldPolicy)
 	for _, msg := range []entmoot.Message{oldContent, oldPolicy} {
-		if err := notify.Put(ctx, msg); err != nil {
+		if _, err := notify.Put(ctx, msg.GroupID, msg); err != nil {
 			t.Fatalf("Put: %v", err)
 		}
 	}

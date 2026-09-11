@@ -1303,12 +1303,12 @@ func (n *notifyingStore) broadcast(m entmoot.Message) {
 	}
 }
 
-// Put implements store.MessageStore. On success we broadcast; on
-// failure subscribers see nothing (consistent with "only delivered
-// messages are visible").
-func (n *notifyingStore) Put(ctx context.Context, m entmoot.Message) error {
-	if err := n.inner.Put(ctx, m); err != nil {
-		return err
+// Put implements store.MessageStore. A newly inserted message is broadcast;
+// duplicates and failures are not observable to subscribers.
+func (n *notifyingStore) Put(ctx context.Context, expectedGroup entmoot.GroupID, m entmoot.Message) (bool, error) {
+	inserted, err := n.inner.Put(ctx, expectedGroup, m)
+	if err != nil || !inserted {
+		return inserted, err
 	}
 	n.sink.Emit(events.Event{
 		Type:      events.TypeMessageIngested,
@@ -1318,7 +1318,7 @@ func (n *notifyingStore) Put(ctx context.Context, m entmoot.Message) error {
 		At:        time.Now(),
 	})
 	n.broadcast(m)
-	return nil
+	return true, nil
 }
 
 func (n *notifyingStore) Get(ctx context.Context, gid entmoot.GroupID, id entmoot.MessageID) (entmoot.Message, error) {

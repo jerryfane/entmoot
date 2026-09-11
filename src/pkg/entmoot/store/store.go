@@ -50,10 +50,10 @@ type PageBoundary struct {
 // MessageStore persists messages grouped by GroupID. All methods are safe for
 // concurrent use.
 type MessageStore interface {
-	// Put stores m. If a message with the same ID already exists, Put is a
-	// no-op and returns nil (idempotent). Returns a non-nil error if m is
-	// malformed (e.g., zero GroupID, zero ID).
-	Put(ctx context.Context, m entmoot.Message) error
+	// Put stores m for expectedGroup. It rejects a mismatch before touching
+	// storage. The returned bool reports whether this call inserted the
+	// message; duplicates return false, nil.
+	Put(ctx context.Context, expectedGroup entmoot.GroupID, m entmoot.Message) (inserted bool, err error)
 
 	// Get retrieves a message by id. Returns ErrNotFound if missing.
 	Get(ctx context.Context, groupID entmoot.GroupID, id entmoot.MessageID) (entmoot.Message, error)

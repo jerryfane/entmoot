@@ -62,6 +62,38 @@ func mkMemberProfileAdWithKey(gid entmoot.GroupID, authorNodeID entmoot.NodeID, 
 	return ad
 }
 
+func TestSQLiteReadMissAndPutMismatchDoNotCreateGroups(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	s, err := OpenSQLite(root)
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	trustedGroup := randGroupID(t)
+	foreignGroup := randGroupID(t)
+	m := mkMsg(t, foreignGroup, testAuthor(1, 0xEF), 1_000, "foreign")
+
+	has, err := s.Has(ctx, foreignGroup, m.ID)
+	if err != nil {
+		t.Fatalf("Has missing group: %v", err)
+	}
+	if has {
+		t.Fatal("Has missing group=true")
+	}
+	if _, err := s.Put(ctx, trustedGroup, m); err == nil {
+		t.Fatal("Put mismatch returned nil error")
+	}
+
+	for _, gid := range []entmoot.GroupID{trustedGroup, foreignGroup} {
+		groupDir := filepath.Join(root, "groups", encodeGroupDirName(gid))
+		if _, err := os.Stat(groupDir); !os.IsNotExist(err) {
+			t.Fatalf("group directory %q exists after read miss or rejected Put: %v", groupDir, err)
+		}
+	}
+}
+
 func TestTransportAdPutAndGet(t *testing.T) {
 	ctx := context.Background()
 	s, err := OpenSQLite(t.TempDir())
@@ -566,7 +598,7 @@ func TestSQLiteWALMode(t *testing.T) {
 	// Put forces the lazy open so the file exists on disk.
 	gid := randGroupID(t)
 	m := mkMsg(t, gid, testAuthor(1, 0xAA), 1_000, "wal-check")
-	if err := s.Put(ctx, m); err != nil {
+	if _, err := s.Put(ctx, m.GroupID, m); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
 
@@ -607,7 +639,7 @@ func TestSQLiteReopen(t *testing.T) {
 	}
 	gid := randGroupID(t)
 	m := mkMsg(t, gid, testAuthor(1, 0xAA), 1_000, "persisted")
-	if err := s.Put(ctx, m); err != nil {
+	if _, err := s.Put(ctx, m.GroupID, m); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
 	if err := s.Close(); err != nil {
@@ -676,7 +708,7 @@ func TestSQLiteConcurrentReaderWriter(t *testing.T) {
 		defer wg.Done()
 		defer stop.Store(true)
 		for _, m := range msgs {
-			if err := s.Put(ctx, m); err != nil {
+			if _, err := s.Put(ctx, m.GroupID, m); err != nil {
 				captureErr(err)
 				return
 			}
@@ -744,7 +776,7 @@ func TestSQLiteMerkleRootStable(t *testing.T) {
 	gid := randGroupID(t)
 	for i := 0; i < 5; i++ {
 		m := mkMsg(t, gid, testAuthor(uint32(i+1), byte(i+1)), int64(100+i*10), "m")
-		if err := s.Put(ctx, m); err != nil {
+		if _, err := s.Put(ctx, m.GroupID, m); err != nil {
 			t.Fatalf("Put %d: %v", i, err)
 		}
 	}
@@ -809,10 +841,10 @@ func TestSQLiteTopologicalOrder(t *testing.T) {
 	}
 	// Recompute id with parents set.
 	child.ID = canonical.MessageID(child)
-	if err := s.Put(ctx, child); err != nil {
+	if _, err := s.Put(ctx, child.GroupID, child); err != nil {
 		t.Fatalf("Put child: %v", err)
 	}
-	if err := s.Put(ctx, genesis); err != nil {
+	if _, err := s.Put(ctx, genesis.GroupID, genesis); err != nil {
 		t.Fatalf("Put genesis: %v", err)
 	}
 
@@ -853,7 +885,7 @@ func TestSQLiteIterMessageIDsInIDRangeUsesIndex(t *testing.T) {
 	// schema exist.
 	gid := randGroupID(t)
 	m := mkMsg(t, gid, testAuthor(1, 0xAA), 1_000, "seed")
-	if err := s.Put(ctx, m); err != nil {
+	if _, err := s.Put(ctx, m.GroupID, m); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
 
@@ -937,7 +969,7 @@ func TestSQLiteLatestUsesBoundedIndexOrder(t *testing.T) {
 	gid := randGroupID(t)
 	for i := 0; i < 3; i++ {
 		m := mkMsg(t, gid, testAuthor(uint32(i+1), byte(i+1)), int64(1_000+i), "seed")
-		if err := s.Put(ctx, m); err != nil {
+		if _, err := s.Put(ctx, m.GroupID, m); err != nil {
 			t.Fatalf("Put: %v", err)
 		}
 	}
@@ -1003,7 +1035,7 @@ func TestSQLiteFilePermissions(t *testing.T) {
 
 	gid := randGroupID(t)
 	m := mkMsg(t, gid, testAuthor(1, 0x01), 1_000, "perm")
-	if err := s.Put(ctx, m); err != nil {
+	if _, err := s.Put(ctx, m.GroupID, m); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
 

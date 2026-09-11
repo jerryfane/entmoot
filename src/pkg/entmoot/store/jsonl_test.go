@@ -22,7 +22,7 @@ func TestJSONL_ReopenPersistence(t *testing.T) {
 	}
 	gid := randGroupID(t)
 	m := mkMsg(t, gid, testAuthor(1, 0x01), 1_000, "persist-me")
-	if err := s.Put(ctx, m); err != nil {
+	if _, err := s.Put(ctx, m.GroupID, m); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
 	if err := s.Close(); err != nil {
@@ -61,7 +61,7 @@ func TestJSONL_MalformedLineSkipped(t *testing.T) {
 	}
 	gid := randGroupID(t)
 	good1 := mkMsg(t, gid, testAuthor(1, 0x01), 1_000, "good1")
-	if err := s.Put(ctx, good1); err != nil {
+	if _, err := s.Put(ctx, good1.GroupID, good1); err != nil {
 		t.Fatalf("Put good1: %v", err)
 	}
 	if err := s.Close(); err != nil {
@@ -87,7 +87,7 @@ func TestJSONL_MalformedLineSkipped(t *testing.T) {
 		t.Fatalf("OpenJSONL #2: %v", err)
 	}
 	good2 := mkMsg(t, gid, testAuthor(1, 0x01), 2_000, "good2")
-	if err := s2.Put(ctx, good2); err != nil {
+	if _, err := s2.Put(ctx, good2.GroupID, good2); err != nil {
 		t.Fatalf("Put good2: %v", err)
 	}
 	if err := s2.Close(); err != nil {
@@ -133,7 +133,7 @@ func TestJSONL_FilePermissions(t *testing.T) {
 
 	gid := randGroupID(t)
 	m := mkMsg(t, gid, testAuthor(1, 0x01), 1, "perm")
-	if err := s.Put(ctx, m); err != nil {
+	if _, err := s.Put(ctx, m.GroupID, m); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
 

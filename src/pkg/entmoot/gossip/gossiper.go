@@ -1697,6 +1697,12 @@ func (g *Gossiper) onGossip(ctx context.Context, remote entmoot.NodeID, gos *wir
 		// through to the v1.0.6 fetch path on any mismatch/failure.
 		if gos.Body != nil && len(gos.IDs) == 1 && gos.Body.ID == id {
 			msg := *gos.Body
+			if msg.GroupID != g.cfg.GroupID {
+				g.logger.Warn("gossip: inline body for wrong group",
+					slog.Uint64("remote", uint64(remote)),
+					slog.String("got", msg.GroupID.String()))
+				continue
+			}
 			if canonical.MessageID(msg) != id {
 				g.logger.Warn("gossip: inline body hash mismatch",
 					slog.Uint64("remote", uint64(remote)),
@@ -1953,6 +1959,9 @@ func (g *Gossiper) fetchFrom(ctx context.Context, peer entmoot.NodeID, id entmoo
 	if resp.NotFound || resp.Message == nil {
 		return fmt.Errorf("fetch: peer %d reports not-found for %s", peer, id)
 	}
+	if resp.Message.GroupID != g.cfg.GroupID {
+		return fmt.Errorf("fetch: response for wrong group %s", resp.Message.GroupID)
+	}
 	if resp.Message.ID != id {
 		return fmt.Errorf("fetch: response id mismatch")
 	}
@@ -1989,24 +1998,31 @@ func (g *Gossiper) fetchFrom(ctx context.Context, peer entmoot.NodeID, id entmoo
 }
 
 func (g *Gossiper) acceptInboundMessage(ctx context.Context, relay entmoot.NodeID, msg entmoot.Message) error {
+	if msg.GroupID != g.cfg.GroupID {
+		return fmt.Errorf("gossip: message for wrong group %s", msg.GroupID)
+	}
 	if messageHasTopic(msg, policy.UpdateTopic) {
 		return g.storePolicyUpdateMessage(ctx, relay, msg, false)
 	}
 	if err := g.checkContentPolicy(relay, msg); err != nil {
 		return err
 	}
-	if err := g.cfg.Store.Put(ctx, msg); err != nil {
+	if _, err := g.cfg.Store.Put(ctx, g.cfg.GroupID, msg); err != nil {
 		return err
 	}
 	return g.prunePolicyRetention(ctx)
 }
 
 func (g *Gossiper) storePolicyUpdateMessage(ctx context.Context, relay entmoot.NodeID, msg entmoot.Message, rejectStale bool) error {
+	if msg.GroupID != g.cfg.GroupID {
+		return fmt.Errorf("gossip: policy update for wrong group %s", msg.GroupID)
+	}
+
 	g.policyUpdateMu.Lock()
 	defer g.policyUpdateMu.Unlock()
 
 	if rejectStale {
-		if has, err := g.cfg.Store.Has(ctx, msg.GroupID, msg.ID); err != nil {
+		if has, err := g.cfg.Store.Has(ctx, g.cfg.GroupID, msg.ID); err != nil {
 			return err
 		} else if has {
 			return g.prunePolicyRetention(ctx)
@@ -2019,7 +2035,7 @@ func (g *Gossiper) storePolicyUpdateMessage(ctx context.Context, relay entmoot.N
 		}
 		return err
 	}
-	if err := g.cfg.Store.Put(ctx, msg); err != nil {
+	if _, err := g.cfg.Store.Put(ctx, g.cfg.GroupID, msg); err != nil {
 		g.rollbackPolicyUpdate(context.Background(), update)
 		return err
 	}
@@ -2231,7 +2247,7 @@ func (g *Gossiper) Publish(ctx context.Context, msg entmoot.Message) error {
 		if err := g.checkContentPolicy(g.cfg.LocalNode, msg); err != nil {
 			return err
 		}
-		if err := g.cfg.Store.Put(ctx, msg); err != nil {
+		if _, err := g.cfg.Store.Put(ctx, g.cfg.GroupID, msg); err != nil {
 			return fmt.Errorf("gossip: store put: %w", err)
 		}
 		if err := g.prunePolicyRetention(ctx); err != nil {

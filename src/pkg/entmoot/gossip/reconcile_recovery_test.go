@@ -713,7 +713,7 @@ func TestInboundFetchResponseUsesLargeFrameWriteBudget(t *testing.T) {
 
 	ctx := context.Background()
 	msg := f.buildMessage(10, "fetch body deadline", 2_000)
-	if err := f.nodes[10].storeM.Put(ctx, msg); err != nil {
+	if _, err := f.nodes[10].storeM.Put(ctx, msg.GroupID, msg); err != nil {
 		t.Fatalf("seed message: %v", err)
 	}
 
@@ -915,7 +915,7 @@ func TestFullRangeFallbackFetchesMissingIDs(t *testing.T) {
 
 	ctx := context.Background()
 	msg := f.buildMessage(20, "peer-only", 2_000)
-	if err := f.nodes[20].storeM.Put(ctx, msg); err != nil {
+	if _, err := f.nodes[20].storeM.Put(ctx, msg.GroupID, msg); err != nil {
 		t.Fatalf("seed peer message: %v", err)
 	}
 	peerRootBytes, err := f.nodes[20].storeM.MerkleRoot(ctx, f.groupID)

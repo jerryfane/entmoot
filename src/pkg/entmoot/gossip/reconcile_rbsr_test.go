@@ -151,10 +151,10 @@ func TestReconcileViaRBSR_NoDiff(t *testing.T) {
 
 	for i := 0; i < 20; i++ {
 		msg := f.buildMessage(10, fmt.Sprintf("msg-%d", i), int64(2_000+i))
-		if err := f.nodes[10].storeM.Put(ctx, msg); err != nil {
+		if _, err := f.nodes[10].storeM.Put(ctx, msg.GroupID, msg); err != nil {
 			t.Fatalf("seed A: %v", err)
 		}
-		if err := f.nodes[20].storeM.Put(ctx, msg); err != nil {
+		if _, err := f.nodes[20].storeM.Put(ctx, msg.GroupID, msg); err != nil {
 			t.Fatalf("seed B: %v", err)
 		}
 	}
@@ -266,18 +266,18 @@ func TestReconcileViaRBSR_GapInMiddle(t *testing.T) {
 
 	// Seed A's store with the base set.
 	for _, m := range base {
-		if err := f.nodes[10].storeM.Put(ctx, m); err != nil {
+		if _, err := f.nodes[10].storeM.Put(ctx, m.GroupID, m); err != nil {
 			t.Fatalf("seed A: %v", err)
 		}
 	}
 	// Seed B's store with base + extras.
 	for _, m := range base {
-		if err := f.nodes[20].storeM.Put(ctx, m); err != nil {
+		if _, err := f.nodes[20].storeM.Put(ctx, m.GroupID, m); err != nil {
 			t.Fatalf("seed B base: %v", err)
 		}
 	}
 	for _, m := range extras {
-		if err := f.nodes[20].storeM.Put(ctx, m); err != nil {
+		if _, err := f.nodes[20].storeM.Put(ctx, m.GroupID, m); err != nil {
 			t.Fatalf("seed B extra: %v", err)
 		}
 	}
@@ -342,15 +342,15 @@ func TestReconcileViaRBSR_ResponderFetchesInitiatorExtras(t *testing.T) {
 	}
 
 	for _, m := range base {
-		if err := f.nodes[10].storeM.Put(ctx, m); err != nil {
+		if _, err := f.nodes[10].storeM.Put(ctx, m.GroupID, m); err != nil {
 			t.Fatalf("seed A base: %v", err)
 		}
-		if err := f.nodes[20].storeM.Put(ctx, m); err != nil {
+		if _, err := f.nodes[20].storeM.Put(ctx, m.GroupID, m); err != nil {
 			t.Fatalf("seed B base: %v", err)
 		}
 	}
 	for _, m := range extras {
-		if err := f.nodes[10].storeM.Put(ctx, m); err != nil {
+		if _, err := f.nodes[10].storeM.Put(ctx, m.GroupID, m); err != nil {
 			t.Fatalf("seed A extra: %v", err)
 		}
 	}
@@ -466,11 +466,11 @@ func TestReconcileViaRBSR_PeerReturnsUnknownOpcode(t *testing.T) {
 	var bOnly []entmoot.Message
 	for i := 0; i < 5; i++ {
 		mA := f.buildMessage(10, fmt.Sprintf("A-%d", i), int64(2_000+i))
-		if err := f.nodes[10].storeM.Put(ctx, mA); err != nil {
+		if _, err := f.nodes[10].storeM.Put(ctx, mA.GroupID, mA); err != nil {
 			t.Fatalf("seed A: %v", err)
 		}
 		mB := f.buildMessage(10, fmt.Sprintf("B-%d", i), int64(3_000+i))
-		if err := f.nodes[20].storeM.Put(ctx, mB); err != nil {
+		if _, err := f.nodes[20].storeM.Put(ctx, mB.GroupID, mB); err != nil {
 			t.Fatalf("seed B: %v", err)
 		}
 		bOnly = append(bOnly, mB)
