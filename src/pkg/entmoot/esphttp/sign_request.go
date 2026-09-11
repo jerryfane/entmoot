@@ -140,5 +140,9 @@ func setSignRequestSigningPayload(req *SignRequest, canonicalType string, signin
 func cloneNodeInfo(in entmoot.NodeInfo) entmoot.NodeInfo {
 	out := in
 	out.EntmootPubKey = append([]byte(nil), in.EntmootPubKey...)
+	if in.MemberID != nil {
+		memberID := *in.MemberID
+		out.MemberID = &memberID
+	}
 	return out
 }

@@ -15,6 +15,22 @@ import (
 // NodeID is a typed alias for Pilot's 32-bit node identifier.
 type NodeID uint32
 
+// MemberID is the Pilot-independent, full-width application identity derived
+// from an Entmoot Ed25519 public key. NodeID remains legacy-only.
+type MemberID [32]byte
+
+func (m MemberID) String() string {
+	return base64.StdEncoding.EncodeToString(m[:])
+}
+
+func (m MemberID) MarshalJSON() ([]byte, error) {
+	return json.Marshal(m.String())
+}
+
+func (m *MemberID) UnmarshalJSON(data []byte) error {
+	return decodeBase64Array32("MemberID", data, m[:])
+}
+
 // GroupID is the 32-byte random identifier of an Entmoot group.
 //
 // It is content-independent; two groups with the same name have distinct IDs.
@@ -85,6 +101,9 @@ type NodeInfo struct {
 	// EntmootPubKey is the raw Ed25519 public key (32 bytes). encoding/json
 	// marshals []byte as base64 automatically.
 	EntmootPubKey []byte `json:"entmoot_pubkey"`
+	// MemberID is present on Pilot-independent versioned records. Legacy
+	// records omit it and retain their exact signed representation.
+	MemberID *MemberID `json:"member_id,omitempty"`
 }
 
 // Group is the top-level record for an Entmoot group: identity, founder,

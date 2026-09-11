@@ -2,9 +2,7 @@ package main
 
 import (
 	"context"
-	"encoding/binary"
 	"encoding/json"
-	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -185,21 +183,36 @@ func TestGroupPublicPublishRequiresESPURL(t *testing.T) {
 	}
 }
 
-func TestGroupCreatePilotNodeIDUsesInfoOnly(t *testing.T) {
-	sock := testUnixSocketPath(t)
-	bindSeen, stop := serveGroupCreatePilotInfoOnly(t, sock, 45491)
-	defer stop()
-	got, err := groupCreatePilotNodeID(context.Background(), sock)
+func TestGroupCreateDoesNotRequirePilot(t *testing.T) {
+	dir := t.TempDir()
+	identity := mustGenerateGroupCreateIdentity(t)
+	identityPath := filepath.Join(dir, "identity.json")
+	if err := identity.Save(identityPath); err != nil {
+		t.Fatal(err)
+	}
+	code, stdout, stderr := captureCommandOutput(t, func() int {
+		return cmdGroupCreate(&globalFlags{
+			data:     dir,
+			identity: identityPath,
+			socket:   filepath.Join(dir, "no-pilot.sock"),
+		}, []string{"-name", "No Pilot", "-policy", "none", "--json"})
+	})
+	if code != exitOK {
+		t.Fatalf("group create code=%d stderr=%q", code, stderr)
+	}
+	var output groupCreateOutput
+	if err := json.Unmarshal([]byte(stdout), &output); err != nil {
+		t.Fatalf("decode output: %v; stdout=%q", err, stdout)
+	}
+	want, err := entmoot.MemberIDFromPublicKey(identity.PublicKey)
 	if err != nil {
-		t.Fatalf("groupCreatePilotNodeID: %v", err)
+		t.Fatal(err)
 	}
-	if got != 45491 {
-		t.Fatalf("node id = %d, want 45491", got)
+	if output.Founder.MemberID == nil || *output.Founder.MemberID != want {
+		t.Fatalf("founder member id = %v, want %s", output.Founder.MemberID, want)
 	}
-	select {
-	case <-bindSeen:
-		t.Fatal("groupCreatePilotNodeID sent a Pilot Bind request")
-	default:
+	if output.Founder.PilotNodeID != 0 {
+		t.Fatalf("fresh founder has legacy Pilot node id %d", output.Founder.PilotNodeID)
 	}
 }
 
@@ -709,62 +722,4 @@ func testGroupCreateID(seed byte) entmoot.GroupID {
 
 func ptrPolicy(p entpolicy.Policy) *entpolicy.Policy {
 	return &p
-}
-
-func serveGroupCreatePilotInfoOnly(t *testing.T, sock string, nodeID uint32) (<-chan struct{}, func()) {
-	t.Helper()
-	_ = os.Remove(sock)
-	ln, err := net.Listen("unix", sock)
-	if err != nil {
-		t.Fatalf("listen pilot unix: %v", err)
-	}
-	done := make(chan struct{})
-	bindSeen := make(chan struct{})
-	go func() {
-		defer close(done)
-		conn, err := ln.Accept()
-		if err != nil {
-			return
-		}
-		defer conn.Close()
-		_ = conn.SetDeadline(time.Now().Add(time.Second))
-		payload, err := readGroupCreatePilotTestFrame(conn)
-		if err != nil || len(payload) == 0 {
-			return
-		}
-		switch payload[0] {
-		case 0x0D: // Info
-			body, _ := json.Marshal(map[string]any{"node_id": nodeID})
-			_ = writeGroupCreatePilotTestFrame(conn, append([]byte{0x0E}, body...)) // InfoOK
-		case 0x01: // Bind
-			close(bindSeen)
-		}
-	}()
-	return bindSeen, func() {
-		_ = ln.Close()
-		<-done
-		_ = os.Remove(sock)
-	}
-}
-
-func readGroupCreatePilotTestFrame(r io.Reader) ([]byte, error) {
-	var hdr [4]byte
-	if _, err := io.ReadFull(r, hdr[:]); err != nil {
-		return nil, err
-	}
-	payload := make([]byte, binary.BigEndian.Uint32(hdr[:]))
-	if _, err := io.ReadFull(r, payload); err != nil {
-		return nil, err
-	}
-	return payload, nil
-}
-
-func writeGroupCreatePilotTestFrame(w io.Writer, payload []byte) error {
-	var hdr [4]byte
-	binary.BigEndian.PutUint32(hdr[:], uint32(len(payload)))
-	if _, err := w.Write(hdr[:]); err != nil {
-		return err
-	}
-	_, err := w.Write(payload)
-	return err
 }

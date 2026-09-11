@@ -20,7 +20,6 @@ import (
 	"entmoot/pkg/entmoot/policy"
 	"entmoot/pkg/entmoot/roster"
 	"entmoot/pkg/entmoot/store"
-	"entmoot/pkg/entmoot/transport/pilot/ipcclient"
 )
 
 const (
@@ -129,11 +128,9 @@ func cmdGroupCreate(gf *globalFlags, args []string) int {
 		return exitTransport
 	}
 
-	nodeCtx, nodeCancel := withTimeout(5 * time.Second)
-	nodeID, err := groupCreatePilotNodeID(nodeCtx, gf.socket)
-	nodeCancel()
+	memberID, err := entmoot.MemberIDFromPublicKey(s.identity.PublicKey)
 	if err != nil {
-		slog.Error("group create: pilot", slog.String("err", err.Error()))
+		slog.Error("group create: identity", slog.String("err", err.Error()))
 		return exitTransport
 	}
 
@@ -146,18 +143,18 @@ func cmdGroupCreate(gf *globalFlags, args []string) int {
 	ctx, cancel := withTimeout(10 * time.Second)
 	defer cancel()
 	state, rollback, err := createGroupLocalState(ctx, groupCreateLocalStateInput{
-		DataDir:      s.dataDir,
-		Identity:     s.identity,
-		FounderNode:  nodeID,
-		GroupID:      gid,
-		Name:         opts.Name,
-		Description:  opts.Description,
-		Tags:         opts.Tags,
-		Visibility:   opts.Visibility,
-		JoinMode:     opts.JoinMode,
-		Policy:       opts.Policy,
-		PolicySource: opts.PolicySource,
-		NowMS:        time.Now().UnixMilli(),
+		DataDir:       s.dataDir,
+		Identity:      s.identity,
+		FounderMember: &memberID,
+		GroupID:       gid,
+		Name:          opts.Name,
+		Description:   opts.Description,
+		Tags:          opts.Tags,
+		Visibility:    opts.Visibility,
+		JoinMode:      opts.JoinMode,
+		Policy:        opts.Policy,
+		PolicySource:  opts.PolicySource,
+		NowMS:         time.Now().UnixMilli(),
 	})
 	if err != nil {
 		if rollback != nil {
@@ -184,7 +181,7 @@ func cmdGroupCreate(gf *globalFlags, args []string) int {
 		slog.String("name", opts.Name),
 		slog.String("visibility", opts.Visibility),
 		slog.String("join_mode", opts.JoinMode),
-		slog.Uint64("founder", uint64(nodeID)))
+		slog.String("founder", memberID.String()))
 
 	out := groupCreateOutput{
 		GroupID:          state.GroupID,
@@ -210,22 +207,6 @@ func cmdGroupCreate(gf *globalFlags, args []string) int {
 	fmt.Println(string(data))
 	committed = true
 	return exitOK
-}
-
-func groupCreatePilotNodeID(ctx context.Context, socketPath string) (entmoot.NodeID, error) {
-	drv, err := ipcclient.Connect(socketPath)
-	if err != nil {
-		return 0, fmt.Errorf("pilot: connect %q: %w", socketPath, err)
-	}
-	defer drv.Close()
-	info, err := drv.InfoStruct(ctx)
-	if err != nil {
-		return 0, fmt.Errorf("pilot: info: %w", err)
-	}
-	if info.NodeID == 0 {
-		return 0, fmt.Errorf("pilot: info: missing node_id")
-	}
-	return entmoot.NodeID(info.NodeID), nil
 }
 
 func parseGroupCreateOptions(args []string) (groupCreateOptions, int) {
@@ -316,18 +297,19 @@ func resolveGroupCreatePolicy(raw string) (policy.SourceResolution, error) {
 }
 
 type groupCreateLocalStateInput struct {
-	DataDir      string
-	Identity     *keystore.Identity
-	FounderNode  entmoot.NodeID
-	GroupID      entmoot.GroupID
-	Name         string
-	Description  string
-	Tags         []string
-	Visibility   string
-	JoinMode     string
-	Policy       *policy.Policy
-	PolicySource string
-	NowMS        int64
+	DataDir       string
+	Identity      *keystore.Identity
+	FounderNode   entmoot.NodeID
+	FounderMember *entmoot.MemberID
+	GroupID       entmoot.GroupID
+	Name          string
+	Description   string
+	Tags          []string
+	Visibility    string
+	JoinMode      string
+	Policy        *policy.Policy
+	PolicySource  string
+	NowMS         int64
 }
 
 func createGroupLocalState(ctx context.Context, in groupCreateLocalStateInput) (groupCreateState, func(), error) {
@@ -398,6 +380,7 @@ func createGroupLocalState(ctx context.Context, in groupCreateLocalStateInput) (
 	founder := entmoot.NodeInfo{
 		PilotNodeID:   in.FounderNode,
 		EntmootPubKey: append([]byte(nil), in.Identity.PublicKey...),
+		MemberID:      in.FounderMember,
 	}
 	if err := r.Genesis(in.Identity, founder, now); err != nil {
 		return groupCreateState{}, rollback, err

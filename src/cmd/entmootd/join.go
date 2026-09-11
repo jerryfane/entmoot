@@ -1862,6 +1862,10 @@ func cloneNodeInfoPtr(in *entmoot.NodeInfo) *entmoot.NodeInfo {
 	}
 	out := *in
 	out.EntmootPubKey = append([]byte(nil), in.EntmootPubKey...)
+	if in.MemberID != nil {
+		memberID := *in.MemberID
+		out.MemberID = &memberID
+	}
 	return &out
 }
 
@@ -1874,7 +1878,13 @@ func clonePolicyPtr(in *entpolicy.Policy) *entpolicy.Policy {
 }
 
 func nodeInfoEqual(a, b entmoot.NodeInfo) bool {
-	return a.PilotNodeID == b.PilotNodeID && bytes.Equal(a.EntmootPubKey, b.EntmootPubKey)
+	if a.PilotNodeID != b.PilotNodeID || !bytes.Equal(a.EntmootPubKey, b.EntmootPubKey) {
+		return false
+	}
+	if a.MemberID == nil || b.MemberID == nil {
+		return a.MemberID == nil && b.MemberID == nil
+	}
+	return *a.MemberID == *b.MemberID
 }
 
 func ipcCodeForJoinResolveError(err error) ipc.ErrorCode {

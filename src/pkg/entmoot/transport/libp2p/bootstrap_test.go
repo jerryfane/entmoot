@@ -1,0 +1,99 @@
+package libp2ptransport
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	libp2p "github.com/libp2p/go-libp2p"
+	"github.com/libp2p/go-libp2p/core/protocol"
+
+	"entmoot/pkg/entmoot"
+	"entmoot/pkg/entmoot/keystore"
+)
+
+func TestBootstrapCapabilityAdmitsFreshNonMemberOnce(t *testing.T) {
+	founder := mustIdentity(t)
+	target := mustIdentity(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	targetHost, targetBinding, err := NewHost(ctx, target, libp2p.NoListenAddrs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer targetHost.Close()
+	founderMemberID, err := entmoot.MemberIDFromPublicKey(founder.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.UnixMilli(10_000)
+	capability := BootstrapCapability{
+		TargetPublicKey: target.PublicKey,
+		TargetMemberID:  targetBinding.MemberID,
+		TargetPeerID:    targetBinding.PeerID.String(),
+		Founder: entmoot.NodeInfo{
+			EntmootPubKey: founder.PublicKey,
+			MemberID:      &founderMemberID,
+		},
+		AllowedPeerIDs: []string{targetBinding.PeerID.String()},
+		IssuedAtMS:     now.Add(-time.Minute).UnixMilli(),
+		ExpiresAtMS:    now.Add(time.Minute).UnixMilli(),
+	}
+	capability.GroupID[0] = 1
+	capability.RosterHead[0] = 2
+	capability.Nonce[0] = 3
+	if err := SignBootstrapCapability(founder, &capability); err != nil {
+		t.Fatal(err)
+	}
+	admission := NewBootstrapAdmission()
+	if err := admission.Authorize(capability, targetHost.ID(), protocol.ID("/entmoot/gossip/2"), now); err == nil {
+		t.Fatal("pre-member gossip was authorized")
+	}
+	if err := admission.Authorize(capability, targetHost.ID(), EnrollmentProtocol, now); err != nil {
+		t.Fatalf("fresh non-member enrollment denied: %v", err)
+	}
+	if err := admission.Authorize(capability, targetHost.ID(), EnrollmentProtocol, now); err == nil {
+		t.Fatal("single-use capability was replayed")
+	}
+}
+
+func TestBootstrapCapabilityRejectsInvalidPeerBinding(t *testing.T) {
+	founder := mustIdentity(t)
+	target := mustIdentity(t)
+	attacker := mustIdentity(t)
+	targetBinding, err := BindingFromPublicKey(target.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attackerBinding, err := BindingFromPublicKey(attacker.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.UnixMilli(20_000)
+	capability := BootstrapCapability{
+		TargetPublicKey: target.PublicKey,
+		TargetMemberID:  targetBinding.MemberID,
+		TargetPeerID:    targetBinding.PeerID.String(),
+		Founder:         entmoot.NodeInfo{EntmootPubKey: founder.PublicKey},
+		AllowedPeerIDs:  []string{targetBinding.PeerID.String()},
+		IssuedAtMS:      now.Add(-time.Minute).UnixMilli(),
+		ExpiresAtMS:     now.Add(time.Minute).UnixMilli(),
+	}
+	capability.GroupID[0] = 1
+	capability.Nonce[0] = 1
+	if err := SignBootstrapCapability(founder, &capability); err != nil {
+		t.Fatal(err)
+	}
+	if err := NewBootstrapAdmission().Authorize(capability, attackerBinding.PeerID, EnrollmentProtocol, now); err == nil {
+		t.Fatal("capability accepted from a different secure transport identity")
+	}
+}
+
+func mustIdentity(t *testing.T) *keystore.Identity {
+	t.Helper()
+	identity, err := keystore.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return identity
+}

@@ -12,6 +12,7 @@
 package roster
 
 import (
+	"bytes"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -55,6 +56,8 @@ type RosterLog struct {
 	byID map[entmoot.RosterEntryID]int
 	// members is the current membership projection.
 	members map[entmoot.NodeID]entmoot.NodeInfo
+	// membersByID is the Pilot-independent current membership projection.
+	membersByID map[entmoot.MemberID]entmoot.NodeInfo
 	// founder is set on Genesis; empty until then.
 	founder entmoot.NodeInfo
 	// head is the id of the most-recently-applied entry; zero on empty log.
@@ -94,11 +97,12 @@ type subscriber struct {
 // GroupID is accepted; it is the caller's responsibility to pass a real id.
 func New(groupID entmoot.GroupID) *RosterLog {
 	return &RosterLog{
-		groupID: groupID,
-		byID:    make(map[entmoot.RosterEntryID]int),
-		members: make(map[entmoot.NodeID]entmoot.NodeInfo),
-		sinks:   make(map[*subscriber]struct{}),
-		logger:  slog.Default(),
+		groupID:     groupID,
+		byID:        make(map[entmoot.RosterEntryID]int),
+		members:     make(map[entmoot.NodeID]entmoot.NodeInfo),
+		membersByID: make(map[entmoot.MemberID]entmoot.NodeInfo),
+		sinks:       make(map[*subscriber]struct{}),
+		logger:      slog.Default(),
 	}
 }
 
@@ -308,6 +312,15 @@ func (r *RosterLog) validateLocked(entry entmoot.RosterEntry) error {
 		return err
 	}
 
+	if entry.Op == "add" && entry.Subject.MemberID != nil {
+		for _, member := range r.members {
+			if member.MemberID != nil && *member.MemberID == *entry.Subject.MemberID &&
+				!bytes.Equal(member.EntmootPubKey, entry.Subject.EntmootPubKey) {
+				return fmt.Errorf("%w: member id is already bound to another public key", entmoot.ErrRosterReject)
+			}
+		}
+	}
+
 	// Verify the signature against the founder's pubkey using the versioned
 	// signing form.
 	sigInput, err := canonical.RosterEntrySigningBytes(entry)
@@ -371,12 +384,18 @@ func validateEntryFormat(entry entmoot.RosterEntry, groupID entmoot.GroupID, seq
 		if entry.GroupID != nil || entry.Sequence != 0 {
 			return fmt.Errorf("%w: legacy entry carries version-2 fields", entmoot.ErrRosterReject)
 		}
+		if entry.Subject.MemberID != nil {
+			return fmt.Errorf("%w: legacy entry carries member_id", entmoot.ErrRosterReject)
+		}
 	case CurrentEntryVersion:
 		if entry.GroupID == nil || *entry.GroupID != groupID {
 			return fmt.Errorf("%w: version-2 entry group_id mismatch", entmoot.ErrRosterReject)
 		}
 		if entry.Sequence != sequence {
 			return fmt.Errorf("%w: version-2 entry sequence %d, want %d", entmoot.ErrRosterReject, entry.Sequence, sequence)
+		}
+		if err := entmoot.ValidateMemberInfo(entry.Subject); err != nil {
+			return fmt.Errorf("%w: %v", entmoot.ErrRosterReject, err)
 		}
 	default:
 		return fmt.Errorf("%w: unsupported roster entry version %d", entmoot.ErrRosterReject, entry.Version)
@@ -419,9 +438,19 @@ func (r *RosterLog) applyLocked(entry entmoot.RosterEntry) {
 	r.head = stored.ID
 	switch stored.Op {
 	case "add":
-		r.members[stored.Subject.PilotNodeID] = stored.Subject
+		if stored.Subject.MemberID != nil {
+			r.membersByID[*stored.Subject.MemberID] = stored.Subject
+		}
+		if stored.Subject.PilotNodeID != 0 || stored.Subject.MemberID == nil {
+			r.members[stored.Subject.PilotNodeID] = stored.Subject
+		}
 	case "remove":
-		delete(r.members, stored.Subject.PilotNodeID)
+		if stored.Subject.MemberID != nil {
+			delete(r.membersByID, *stored.Subject.MemberID)
+		}
+		if stored.Subject.PilotNodeID != 0 || stored.Subject.MemberID == nil {
+			delete(r.members, stored.Subject.PilotNodeID)
+		}
 	case "policy_change":
 		// Policy changes do not alter the membership projection.
 	}
@@ -432,6 +461,14 @@ func (r *RosterLog) IsMember(nodeID entmoot.NodeID) bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	_, ok := r.members[nodeID]
+	return ok
+}
+
+// IsMemberID reports whether the full-width identity is a current member.
+func (r *RosterLog) IsMemberID(memberID entmoot.MemberID) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	_, ok := r.membersByID[memberID]
 	return ok
 }
 
@@ -461,6 +498,31 @@ func (r *RosterLog) MemberInfo(nodeID entmoot.NodeID) (entmoot.NodeInfo, bool) {
 	out := info
 	out.EntmootPubKey = append([]byte(nil), info.EntmootPubKey...)
 	return out, true
+}
+
+// MemberInfoByID returns an independent copy of the full-width member record.
+func (r *RosterLog) MemberInfoByID(memberID entmoot.MemberID) (entmoot.NodeInfo, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	info, ok := r.membersByID[memberID]
+	if !ok {
+		return entmoot.NodeInfo{}, false
+	}
+	return cloneNodeInfo(info), true
+}
+
+// MemberIDs returns the current full-width members sorted lexicographically.
+func (r *RosterLog) MemberIDs() []entmoot.MemberID {
+	r.mu.RLock()
+	out := make([]entmoot.MemberID, 0, len(r.membersByID))
+	for id := range r.membersByID {
+		out = append(out, id)
+	}
+	r.mu.RUnlock()
+	sort.Slice(out, func(i, j int) bool {
+		return bytes.Compare(out[i][:], out[j][:]) < 0
+	})
+	return out
 }
 
 // MemberInfoAt resolves nodeID in the membership projection at head.
@@ -525,9 +587,7 @@ func (r *RosterLog) Founder() (entmoot.NodeInfo, bool) {
 	if len(r.entries) == 0 {
 		return entmoot.NodeInfo{}, false
 	}
-	out := r.founder
-	out.EntmootPubKey = append([]byte(nil), r.founder.EntmootPubKey...)
-	return out, true
+	return cloneNodeInfo(r.founder), true
 }
 
 // Entries returns a deep copy of the entry slice in apply order. Useful for
@@ -542,9 +602,19 @@ func (r *RosterLog) Entries() []entmoot.RosterEntry {
 	return out
 }
 
+func cloneNodeInfo(info entmoot.NodeInfo) entmoot.NodeInfo {
+	out := info
+	out.EntmootPubKey = append([]byte(nil), info.EntmootPubKey...)
+	if info.MemberID != nil {
+		memberID := *info.MemberID
+		out.MemberID = &memberID
+	}
+	return out
+}
+
 func cloneEntry(entry entmoot.RosterEntry) entmoot.RosterEntry {
 	out := entry
-	out.Subject.EntmootPubKey = append([]byte(nil), entry.Subject.EntmootPubKey...)
+	out.Subject = cloneNodeInfo(entry.Subject)
 	out.Policy = append([]byte(nil), entry.Policy...)
 	out.Parents = append([]entmoot.RosterEntryID(nil), entry.Parents...)
 	out.Signature = append([]byte(nil), entry.Signature...)

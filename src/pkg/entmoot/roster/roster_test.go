@@ -113,6 +113,43 @@ func TestGenesisAndSignEntryUseGroupBoundVersion2(t *testing.T) {
 	}
 }
 
+func TestFullWidthMembersDoNotCollideAtZeroLegacyNodeID(t *testing.T) {
+	t.Parallel()
+	founder, founderInfo := newFounder(t, 0)
+	founderID, err := entmoot.MemberIDFromPublicKey(founder.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	founderInfo.MemberID = &founderID
+	r := New(testGroupID())
+	if err := r.Genesis(founder, founderInfo, 1_000); err != nil {
+		t.Fatal(err)
+	}
+	member, memberInfo := newFounder(t, 0)
+	memberID, err := entmoot.MemberIDFromPublicKey(member.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	memberInfo.MemberID = &memberID
+	entry := mkEntry(t, r, founder, 0, "add", memberInfo, 2_000, nil)
+	if err := r.Apply(entry); err != nil {
+		t.Fatal(err)
+	}
+	if !r.IsMemberID(founderID) || !r.IsMemberID(memberID) {
+		t.Fatalf("full-width membership missing: %v", r.MemberIDs())
+	}
+	if got := len(r.MemberIDs()); got != 2 {
+		t.Fatalf("full-width member count = %d, want 2", got)
+	}
+	forged, forgedInfo := newFounder(t, 0)
+	_ = forged
+	forgedInfo.MemberID = &memberID
+	forgedEntry := mkEntry(t, r, founder, 0, "add", forgedInfo, 3_000, nil)
+	if err := r.Apply(forgedEntry); err == nil {
+		t.Fatal("colliding MemberID with another public key accepted")
+	}
+}
+
 func TestVersion2RosterEntryRejectedInAnotherGroup(t *testing.T) {
 	t.Parallel()
 	founder, founderInfo := newFounder(t, 100)
