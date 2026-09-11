@@ -1017,6 +1017,12 @@ keep permissions, backup, and transaction ownership clear. A legacy
 `roster.jsonl` alongside them is validated and imported once, then preserved
 unchanged for audit or explicit repair.
 
+New roster records use signed format version 2. The signature covers the
+domain `entmoot/roster-entry/v2`, group id, one-based sequence, operation,
+subject/policy, actor, timestamp, and parent. Legacy records omit the new
+fields and retain their exact historical signing bytes, IDs, and signatures;
+they are read-only until an authenticated upgrade checkpoint exists.
+
 ### 4.2 Schema
 
 ```sql
@@ -1086,6 +1092,12 @@ writer lease; separate handles and processes may read committed snapshots.
 Offline roster mutation is admitted only while that lease is free. Roster
 validation, entry/head/version persistence, and membership projection changes
 commit in one transaction before memory advances.
+
+Invite creation is founder-only and requires a group-bound v2 roster head.
+Join validates the complete fetched chain in temporary memory, matches the
+genesis founder key and identity to the signed invite, requires the advertised
+checkpoint on that chain, and checks issuer authorization there. A valid
+descendant head may be installed; validation failure installs nothing.
 
 ### 4.4 Integration with the rest of the system
 

@@ -22,35 +22,25 @@ import (
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/canonical"
 	"entmoot/pkg/entmoot/keystore"
+	"entmoot/pkg/entmoot/roster"
 	"entmoot/pkg/entmoot/store"
 )
 
-// mkRosterAdd builds, signs, and ids a founder-signed "add(subject)" roster
-// entry parented on `parent`. Used by the canary setup to seed B and C into
-// the founder's roster in-process — there is no CLI subcommand in v0 for
-// admin-side roster mutation (see Phase E gap note in the spec).
+// mkRosterAdd builds a group-bound founder-signed add entry against rlog's
+// current head.
 func mkRosterAdd(
 	t *testing.T,
+	rlog *roster.RosterLog,
 	founder *keystore.Identity,
 	founderID entmoot.NodeID,
-	parent entmoot.RosterEntryID,
 	subject entmoot.NodeInfo,
 	ts int64,
 ) entmoot.RosterEntry {
 	t.Helper()
-	entry := entmoot.RosterEntry{
-		Op:        "add",
-		Subject:   subject,
-		Actor:     founderID,
-		Timestamp: ts,
-		Parents:   []entmoot.RosterEntryID{parent},
-	}
-	sigInput, err := canonical.Encode(entry)
+	entry, err := rlog.SignEntry(founder, "add", subject, nil, founderID, ts)
 	if err != nil {
-		t.Fatalf("canonical.Encode roster entry: %v", err)
+		t.Fatalf("sign roster entry: %v", err)
 	}
-	entry.Signature = founder.Sign(sigInput)
-	entry.ID = canonical.RosterEntryID(entry)
 	return entry
 }
 

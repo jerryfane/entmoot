@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Group-bound roster and invite trust.** New roster entries use a
+  domain-separated version-2 signature over the group id and linear sequence.
+  Join now validates fetched chains in temporary state, matches the invite
+  founder, requires its advertised checkpoint, enforces founder-only issuer
+  authority there, permits valid descendants, and installs nothing on
+  validation failure. Legacy signed bytes and IDs remain unchanged and
+  read-only pending an authenticated upgrade checkpoint.
+
 - **Transactional roster persistence.** Roster mutations now serialize
   validation, SQLite entry/head/version/projection commits, and in-memory
   updates under one writer boundary. Group-scoped nonblocking writer leases

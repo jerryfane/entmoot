@@ -8,7 +8,6 @@ import (
 	"testing"
 
 	"entmoot/pkg/entmoot"
-	"entmoot/pkg/entmoot/canonical"
 	"entmoot/pkg/entmoot/esphttp"
 	"entmoot/pkg/entmoot/keystore"
 	"entmoot/pkg/entmoot/roster"
@@ -418,19 +417,10 @@ func testFleetCommandRoster(t *testing.T, dataDir string, gid entmoot.GroupID, c
 	if err := rlog.Genesis(coordinatorID, coordinator, 1_700_000_000_000); err != nil {
 		t.Fatalf("Genesis: %v", err)
 	}
-	entry := entmoot.RosterEntry{
-		Op:        "add",
-		Subject:   agent,
-		Actor:     coordinator.PilotNodeID,
-		Timestamp: 1_700_000_001_000,
-		Parents:   []entmoot.RosterEntryID{rlog.Head()},
-	}
-	sigInput, err := canonical.Encode(entry)
+	entry, err := rlog.SignEntry(coordinatorID, "add", agent, nil, coordinator.PilotNodeID, 1_700_000_001_000)
 	if err != nil {
-		t.Fatalf("canonical encode roster entry: %v", err)
+		t.Fatalf("SignEntry: %v", err)
 	}
-	entry.Signature = coordinatorID.Sign(sigInput)
-	entry.ID = canonical.RosterEntryID(entry)
 	if err := rlog.Apply(entry); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}

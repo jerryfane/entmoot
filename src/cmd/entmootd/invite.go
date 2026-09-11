@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -84,6 +85,14 @@ func cmdInviteCreate(gf *globalFlags, args []string) int {
 	if !ok {
 		fmt.Fprintln(os.Stderr, "invite create: group has no founder (empty roster)")
 		return exitGroupNotFound
+	}
+	if founder.PilotNodeID != nodeID || !bytes.Equal(founder.EntmootPubKey, s.identity.PublicKey) {
+		fmt.Fprintln(os.Stderr, "invite create: local identity is not the group founder")
+		return exitNotMember
+	}
+	if !r.HeadIsGroupBound() {
+		fmt.Fprintln(os.Stderr, "invite create: legacy roster requires an authenticated upgrade checkpoint")
+		return exitInvalidArgument
 	}
 
 	st, err := store.OpenSQLite(s.dataDir)

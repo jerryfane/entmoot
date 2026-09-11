@@ -1978,6 +1978,15 @@ func (s *ipcServer) handleInviteCreate(ctx context.Context, c net.Conn, req *ipc
 		})
 		return
 	}
+	if !sess.roster.HeadIsGroupBound() {
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
+			Type:    "error",
+			Code:    ipc.CodeConflict,
+			GroupID: &gid,
+			Message: "legacy roster requires an authenticated upgrade checkpoint",
+		})
+		return
+	}
 	root, err := s.store.MerkleRoot(ctx, gid)
 	if err != nil {
 		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{

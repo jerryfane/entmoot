@@ -125,13 +125,16 @@ legacy record is not re-admitted from the network.
 A roster is itself a signed append-only log:
 
 ```
-RosterEntry
+RosterEntry v2
 ├── op:            "add" | "remove" | "policy_change"
 ├── subject:       Pilot node_id (for add/remove) or policy blob
 ├── actor:         node_id of the signer
 ├── timestamp:
-├── parents:       []roster_entry_id  — prev heads
-└── signature:     Ed25519 over the encoded entry
+├── parents:       []roster_entry_id  — exactly the previous head
+├── version:       2
+├── group_id:      owning group
+├── sequence:      one-based linear position
+└── signature:     Ed25519 over "entmoot/roster-entry/v2\0" + canonical entry
 ```
 
 Membership is whatever the roster's current head says it is. For bootstrap,
@@ -155,6 +158,12 @@ non-empty line to be exact canonical JSON and validates the complete signed,
 linear chain before one transaction records entries, head, version, and member
 projections. Malformed, noncanonical, forked, or truncated input fails with its
 line diagnostic and remains untouched.
+
+Legacy entries omit `version`, `group_id`, and `sequence`; their canonical
+bytes, signatures, and IDs remain byte-identical. They are import-only.
+Ordinary mutation and invitation require a group-bound v2 head. A legacy
+roster needs a founder-authenticated upgrade checkpoint rather than a
+permissive or implicit rewrite.
 
 ### 3.4 Topics
 
@@ -269,27 +278,29 @@ tried in order from most-reliable to least.
 
 ### 5.1 Invite bundles (primary)
 
-An **invite bundle** is a small out-of-band blob produced by an existing group
-member (typically the founder) when they add a new member. It is delivered
-out-of-band (copy-paste, QR, messaging) — it is *not* an Entmoot wire message.
+An **invite bundle** is a small out-of-band blob produced by the founder when
+they add a new member. It is delivered out-of-band (copy-paste, QR, messaging)
+and is not an Entmoot wire message.
 
 ```
 Invite
 ├── group_id:
 ├── founder:         node_id + Ed25519 pubkey  (anchors roster-sig validation)
-├── roster_head:     roster_entry_id + merkle_path  (auth'd snapshot to diff from)
+├── roster_head:     authenticated roster checkpoint
 ├── merkle_root:     current group Merkle root
 ├── bootstrap_peers: [ {node_id, hostname?} × 3–5 ]   (recently-online members)
 ├── issued_at:       unix millis, signing time
 ├── valid_until:     unix millis, expiration (default 24 h after issued_at)
-├── issuer:          node_id of member who produced the invite
+├── issuer:          founder node_id + Ed25519 pubkey
 └── signature:       Ed25519 over the encoded bundle, signed by issuer
 ```
 
-The new node verifies the signature against the issuer's pubkey (which it
-already trusts pairwise via Pilot — that's *why* the issuer was in a position
-to invite), then attempts `:1004` dials against `bootstrap_peers` in order.
-First successful `hello` → start `roster_req` + gossip.
+The invite signature authenticates the complete bundle, including founder,
+group id, roster head, and bootstrap hints. Bootstrap roster responses are
+first validated in temporary memory. The genesis founder must exactly match
+the invite, the founder must be authorized at the advertised group-bound
+checkpoint, and that checkpoint must occur on the fetched chain. A valid
+descendant head is allowed. Only after all checks pass is the chain installed.
 
 ### 5.2 Pilot-trusted peers ∩ roster (secondary)
 

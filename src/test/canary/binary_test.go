@@ -183,7 +183,7 @@ func TestCanaryBinary(t *testing.T) {
 	founderID := a.NodeID
 	infoB := entmoot.NodeInfo{PilotNodeID: b.NodeID, EntmootPubKey: []byte(idB.PublicKey)}
 	nowMs := time.Now().UnixMilli()
-	addB := mkRosterAdd(t, idA, founderID, rosterA.Head(), infoB, nowMs+1)
+	addB := mkRosterAdd(t, rosterA, idA, founderID, infoB, nowMs+1)
 	if err := rosterA.Apply(addB); err != nil {
 		t.Fatalf("rosterA.Apply add B: %v", err)
 	}

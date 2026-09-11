@@ -2503,19 +2503,10 @@ func applyFounderRosterAdd(identity *keystore.Identity, rlog *roster.RosterLog, 
 	if len(entries) > 0 && now <= entries[len(entries)-1].Timestamp {
 		now = entries[len(entries)-1].Timestamp + 1
 	}
-	entry := entmoot.RosterEntry{
-		Op:        "add",
-		Subject:   target,
-		Actor:     founder.PilotNodeID,
-		Timestamp: now,
-		Parents:   []entmoot.RosterEntryID{rlog.Head()},
-	}
-	sigInput, err := canonical.Encode(entry)
+	entry, err := rlog.SignEntry(identity, "add", target, nil, founder.PilotNodeID, now)
 	if err != nil {
 		return err
 	}
-	entry.Signature = identity.Sign(sigInput)
-	entry.ID = canonical.RosterEntryID(entry)
 	if err := rlog.Apply(entry); err != nil {
 		if errors.Is(err, entmoot.ErrRosterReject) {
 			return &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "roster_rejected", Message: err.Error()}
@@ -2531,19 +2522,10 @@ func applyFounderRosterRemove(identity *keystore.Identity, rlog *roster.RosterLo
 	if len(entries) > 0 && now <= entries[len(entries)-1].Timestamp {
 		now = entries[len(entries)-1].Timestamp + 1
 	}
-	entry := entmoot.RosterEntry{
-		Op:        "remove",
-		Subject:   target,
-		Actor:     founder.PilotNodeID,
-		Timestamp: now,
-		Parents:   []entmoot.RosterEntryID{rlog.Head()},
-	}
-	sigInput, err := canonical.Encode(entry)
+	entry, err := rlog.SignEntry(identity, "remove", target, nil, founder.PilotNodeID, now)
 	if err != nil {
 		return err
 	}
-	entry.Signature = identity.Sign(sigInput)
-	entry.ID = canonical.RosterEntryID(entry)
 	if err := rlog.Apply(entry); err != nil {
 		if errors.Is(err, entmoot.ErrRosterReject) {
 			return &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "roster_rejected", Message: err.Error()}

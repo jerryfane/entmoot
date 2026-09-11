@@ -89,11 +89,11 @@ func TestCanaryInMemory(t *testing.T) {
 	if err := rosterA.Genesis(idA, infoA, tsBase); err != nil {
 		t.Fatalf("rosterA.Genesis: %v", err)
 	}
-	addB := mkRosterAdd(t, idA, nodeA, rosterA.Head(), infoB, tsBase+100)
+	addB := mkRosterAdd(t, rosterA, idA, nodeA, infoB, tsBase+100)
 	if err := rosterA.Apply(addB); err != nil {
 		t.Fatalf("rosterA.Apply add B: %v", err)
 	}
-	addC := mkRosterAdd(t, idA, nodeA, rosterA.Head(), infoC, tsBase+200)
+	addC := mkRosterAdd(t, rosterA, idA, nodeA, infoC, tsBase+200)
 	if err := rosterA.Apply(addC); err != nil {
 		t.Fatalf("rosterA.Apply add C: %v", err)
 	}
@@ -360,11 +360,11 @@ func TestCanaryPilot(t *testing.T) {
 	if err := rosterA.Genesis(idA, infoA, tsBase); err != nil {
 		t.Fatalf("rosterA.Genesis: %v", err)
 	}
-	addB := mkRosterAdd(t, idA, a.NodeID, rosterA.Head(), infoB, tsBase+100)
+	addB := mkRosterAdd(t, rosterA, idA, a.NodeID, infoB, tsBase+100)
 	if err := rosterA.Apply(addB); err != nil {
 		t.Fatalf("rosterA.Apply add B: %v", err)
 	}
-	addC := mkRosterAdd(t, idA, a.NodeID, rosterA.Head(), infoC, tsBase+200)
+	addC := mkRosterAdd(t, rosterA, idA, a.NodeID, infoC, tsBase+200)
 	if err := rosterA.Apply(addC); err != nil {
 		t.Fatalf("rosterA.Apply add C: %v", err)
 	}

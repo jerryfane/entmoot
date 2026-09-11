@@ -175,8 +175,16 @@ type RosterEntry struct {
 	Timestamp int64 `json:"timestamp"`
 	// Parents are previous heads being superseded.
 	Parents []RosterEntryID `json:"parents,omitempty"`
-	// Signature is the Ed25519 signature over the canonical encoding of the
-	// entry with Signature zeroed.
+	// Version selects the signed roster-entry format. Zero is the byte-exact
+	// legacy format; new entries use version 2.
+	Version uint8 `json:"version,omitempty"`
+	// GroupID binds version-2 entries to one group. It is a pointer so the
+	// field is absent from legacy JSON and legacy signatures remain stable.
+	GroupID *GroupID `json:"group_id,omitempty"`
+	// Sequence is the one-based position of a version-2 entry in its linear
+	// roster chain.
+	Sequence uint64 `json:"sequence,omitempty"`
+	// Signature is the Ed25519 signature over canonical.RosterEntrySigningBytes.
 	Signature []byte `json:"signature,omitempty"`
 }
 

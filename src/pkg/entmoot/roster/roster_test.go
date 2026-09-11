@@ -26,27 +26,19 @@ import (
 // helper so the validity of an entry tracks the validation code exactly.
 func mkEntry(
 	t *testing.T,
+	rlog *RosterLog,
 	actor *keystore.Identity,
 	actorNodeID entmoot.NodeID,
 	op string,
 	subject entmoot.NodeInfo,
 	ts int64,
-	parents []entmoot.RosterEntryID,
+	_ []entmoot.RosterEntryID,
 ) entmoot.RosterEntry {
 	t.Helper()
-	entry := entmoot.RosterEntry{
-		Op:        op,
-		Subject:   subject,
-		Actor:     actorNodeID,
-		Timestamp: ts,
-		Parents:   parents,
-	}
-	sigInput, err := canonical.Encode(entry)
+	entry, err := rlog.SignEntry(actor, op, subject, nil, actorNodeID, ts)
 	if err != nil {
-		t.Fatalf("mkEntry: canonical encode: %v", err)
+		t.Fatalf("mkEntry: %v", err)
 	}
-	entry.Signature = actor.Sign(sigInput)
-	entry.ID = canonical.RosterEntryID(entry)
 	return entry
 }
 
@@ -77,6 +69,7 @@ func TestGenesisHappyPath(t *testing.T) {
 	id, info := newFounder(t, 100)
 
 	r := New(testGroupID())
+
 	if err := r.Genesis(id, info, 1_000); err != nil {
 		t.Fatalf("Genesis: %v", err)
 	}
@@ -93,6 +86,54 @@ func TestGenesisHappyPath(t *testing.T) {
 	fi, ok := r.Founder()
 	if !ok || fi.PilotNodeID != 100 {
 		t.Fatalf("Founder() = %#v, ok=%v", fi, ok)
+	}
+}
+func TestGenesisAndSignEntryUseGroupBoundVersion2(t *testing.T) {
+	t.Parallel()
+	founder, founderInfo := newFounder(t, 100)
+	r := New(testGroupID())
+	if err := r.Genesis(founder, founderInfo, 1_000); err != nil {
+		t.Fatalf("Genesis: %v", err)
+	}
+	genesis := r.Entries()[0]
+	if genesis.Version != CurrentEntryVersion || genesis.GroupID == nil || *genesis.GroupID != testGroupID() || genesis.Sequence != 1 {
+		t.Fatalf("genesis version fields = version %d group %v sequence %d", genesis.Version, genesis.GroupID, genesis.Sequence)
+	}
+	member, memberInfo := newFounder(t, 200)
+	_ = member
+	entry, err := r.SignEntry(founder, "add", memberInfo, nil, founderInfo.PilotNodeID, 2_000)
+	if err != nil {
+		t.Fatalf("SignEntry: %v", err)
+	}
+	if entry.Version != CurrentEntryVersion || entry.GroupID == nil || *entry.GroupID != testGroupID() || entry.Sequence != 2 {
+		t.Fatalf("entry version fields = version %d group %v sequence %d", entry.Version, entry.GroupID, entry.Sequence)
+	}
+	if err := r.Apply(entry); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+}
+
+func TestVersion2RosterEntryRejectedInAnotherGroup(t *testing.T) {
+	t.Parallel()
+	founder, founderInfo := newFounder(t, 100)
+	groupA := testGroupID()
+	groupB := groupA
+	groupB[0] ^= 0xFF
+	a := New(groupA)
+	b := New(groupB)
+	if err := a.Genesis(founder, founderInfo, 1_000); err != nil {
+		t.Fatalf("Genesis A: %v", err)
+	}
+	if err := b.Genesis(founder, founderInfo, 1_000); err != nil {
+		t.Fatalf("Genesis B: %v", err)
+	}
+	_, memberInfo := newFounder(t, 200)
+	entry, err := a.SignEntry(founder, "add", memberInfo, nil, founderInfo.PilotNodeID, 2_000)
+	if err != nil {
+		t.Fatalf("SignEntry: %v", err)
+	}
+	if err := b.Apply(entry); !errors.Is(err, entmoot.ErrRosterReject) {
+		t.Fatalf("cross-group Apply = %v, want ErrRosterReject", err)
 	}
 }
 
@@ -126,7 +167,7 @@ func TestApplyAddBobByFounder(t *testing.T) {
 	if err := r.Genesis(founder, founderInfo, 1_000); err != nil {
 		t.Fatalf("Genesis: %v", err)
 	}
-	entry := mkEntry(t, founder, founderInfo.PilotNodeID, "add", bobInfo, 2_000,
+	entry := mkEntry(t, r, founder, founderInfo.PilotNodeID, "add", bobInfo, 2_000,
 		[]entmoot.RosterEntryID{r.Head()})
 	if err := r.Apply(entry); err != nil {
 		t.Fatalf("Apply: %v", err)
@@ -159,7 +200,7 @@ func TestApplyNonFounderRejected(t *testing.T) {
 		t.Fatalf("Genesis: %v", err)
 	}
 	headBefore := r.Head()
-	entry := mkEntry(t, bob, bobInfo.PilotNodeID, "add", bobInfo, 2_000,
+	entry := mkEntry(t, r, bob, bobInfo.PilotNodeID, "add", bobInfo, 2_000,
 		[]entmoot.RosterEntryID{headBefore})
 	err := r.Apply(entry)
 	if err == nil {
@@ -186,7 +227,7 @@ func TestApplyWrongIDRejected(t *testing.T) {
 	if err := r.Genesis(founder, founderInfo, 1_000); err != nil {
 		t.Fatalf("Genesis: %v", err)
 	}
-	entry := mkEntry(t, founder, founderInfo.PilotNodeID, "add", bobInfo, 2_000,
+	entry := mkEntry(t, r, founder, founderInfo.PilotNodeID, "add", bobInfo, 2_000,
 		[]entmoot.RosterEntryID{r.Head()})
 	entry.ID[0] ^= 0xFF // corrupt the id
 
@@ -211,14 +252,14 @@ func TestApplyMonotonicityRejected(t *testing.T) {
 	}
 
 	// equal timestamp: rejected.
-	eq := mkEntry(t, founder, founderInfo.PilotNodeID, "add", bobInfo, 5_000,
+	eq := mkEntry(t, r, founder, founderInfo.PilotNodeID, "add", bobInfo, 5_000,
 		[]entmoot.RosterEntryID{r.Head()})
 	if err := r.Apply(eq); !errors.Is(err, entmoot.ErrRosterReject) {
 		t.Fatalf("equal timestamp: expected ErrRosterReject, got %v", err)
 	}
 
 	// earlier timestamp: rejected.
-	earlier := mkEntry(t, founder, founderInfo.PilotNodeID, "add", bobInfo, 4_999,
+	earlier := mkEntry(t, r, founder, founderInfo.PilotNodeID, "add", bobInfo, 4_999,
 		[]entmoot.RosterEntryID{r.Head()})
 	if err := r.Apply(earlier); !errors.Is(err, entmoot.ErrRosterReject) {
 		t.Fatalf("earlier timestamp: expected ErrRosterReject, got %v", err)
@@ -239,12 +280,12 @@ func TestApplyRemoveMember(t *testing.T) {
 	if err := r.Genesis(founder, founderInfo, 1_000); err != nil {
 		t.Fatalf("Genesis: %v", err)
 	}
-	add := mkEntry(t, founder, founderInfo.PilotNodeID, "add", bobInfo, 2_000,
+	add := mkEntry(t, r, founder, founderInfo.PilotNodeID, "add", bobInfo, 2_000,
 		[]entmoot.RosterEntryID{r.Head()})
 	if err := r.Apply(add); err != nil {
 		t.Fatalf("Apply add: %v", err)
 	}
-	remove := mkEntry(t, founder, founderInfo.PilotNodeID, "remove", bobInfo, 3_000,
+	remove := mkEntry(t, r, founder, founderInfo.PilotNodeID, "remove", bobInfo, 3_000,
 		[]entmoot.RosterEntryID{r.Head()})
 	if err := r.Apply(remove); err != nil {
 		t.Fatalf("Apply remove: %v", err)
@@ -269,17 +310,17 @@ func TestHeadMatchesLastApplied(t *testing.T) {
 	if err := r.Genesis(founder, founderInfo, 1_000); err != nil {
 		t.Fatalf("Genesis: %v", err)
 	}
-	a := mkEntry(t, founder, founderInfo.PilotNodeID, "add", bobInfo, 2_000,
+	a := mkEntry(t, r, founder, founderInfo.PilotNodeID, "add", bobInfo, 2_000,
 		[]entmoot.RosterEntryID{r.Head()})
 	if err := r.Apply(a); err != nil {
 		t.Fatalf("Apply a: %v", err)
 	}
-	b := mkEntry(t, founder, founderInfo.PilotNodeID, "add", carolInfo, 3_000,
+	b := mkEntry(t, r, founder, founderInfo.PilotNodeID, "add", carolInfo, 3_000,
 		[]entmoot.RosterEntryID{r.Head()})
 	if err := r.Apply(b); err != nil {
 		t.Fatalf("Apply b: %v", err)
 	}
-	c := mkEntry(t, founder, founderInfo.PilotNodeID, "remove", bobInfo, 4_000,
+	c := mkEntry(t, r, founder, founderInfo.PilotNodeID, "remove", bobInfo, 4_000,
 		[]entmoot.RosterEntryID{r.Head()})
 	if err := r.Apply(c); err != nil {
 		t.Fatalf("Apply c: %v", err)
@@ -308,12 +349,12 @@ func TestJSONLRoundTrip(t *testing.T) {
 	if err := r.Genesis(founder, founderInfo, 1_000); err != nil {
 		t.Fatalf("Genesis: %v", err)
 	}
-	addBob := mkEntry(t, founder, founderInfo.PilotNodeID, "add", bobInfo, 2_000,
+	addBob := mkEntry(t, r, founder, founderInfo.PilotNodeID, "add", bobInfo, 2_000,
 		[]entmoot.RosterEntryID{r.Head()})
 	if err := r.Apply(addBob); err != nil {
 		t.Fatalf("Apply addBob: %v", err)
 	}
-	addCarol := mkEntry(t, founder, founderInfo.PilotNodeID, "add", carolInfo, 3_000,
+	addCarol := mkEntry(t, r, founder, founderInfo.PilotNodeID, "add", carolInfo, 3_000,
 		[]entmoot.RosterEntryID{r.Head()})
 	if err := r.Apply(addCarol); err != nil {
 		t.Fatalf("Apply addCarol: %v", err)
@@ -355,12 +396,12 @@ func TestJSONLRejectsMalformedLineWithoutChangingSource(t *testing.T) {
 	if err := source.Genesis(founder, founderInfo, 1_000); err != nil {
 		t.Fatalf("Genesis: %v", err)
 	}
-	addBob := mkEntry(t, founder, founderInfo.PilotNodeID, "add", bobInfo, 2_000,
+	addBob := mkEntry(t, source, founder, founderInfo.PilotNodeID, "add", bobInfo, 2_000,
 		[]entmoot.RosterEntryID{source.Head()})
 	if err := source.Apply(addBob); err != nil {
 		t.Fatalf("Apply addBob: %v", err)
 	}
-	removeBob := mkEntry(t, founder, founderInfo.PilotNodeID, "remove", bobInfo, 3_000,
+	removeBob := mkEntry(t, source, founder, founderInfo.PilotNodeID, "remove", bobInfo, 3_000,
 		[]entmoot.RosterEntryID{source.Head()})
 	entries := source.Entries()
 
@@ -430,12 +471,12 @@ func TestSubscribeReceivesSuccessfulApplies(t *testing.T) {
 		t.Fatalf("Genesis: %v", err)
 	}
 	// Rejected: non-founder signer.
-	bad := mkEntry(t, bob, bobInfo.PilotNodeID, "add", bobInfo, 2_000,
+	bad := mkEntry(t, r, bob, bobInfo.PilotNodeID, "add", bobInfo, 2_000,
 		[]entmoot.RosterEntryID{r.Head()})
 	if err := r.Apply(bad); !errors.Is(err, entmoot.ErrRosterReject) {
 		t.Fatalf("bad Apply expected ErrRosterReject, got %v", err)
 	}
-	good := mkEntry(t, founder, founderInfo.PilotNodeID, "add", bobInfo, 2_000,
+	good := mkEntry(t, r, founder, founderInfo.PilotNodeID, "add", bobInfo, 2_000,
 		[]entmoot.RosterEntryID{r.Head()})
 	if err := r.Apply(good); err != nil {
 		t.Fatalf("good Apply: %v", err)
@@ -502,7 +543,7 @@ func TestSubscribeCancelIdempotent(t *testing.T) {
 	}
 
 	// Further Applies must not panic even though the subscriber is gone.
-	add := mkEntry(t, founder, founderInfo.PilotNodeID, "add", bobInfo, 2_000,
+	add := mkEntry(t, r, founder, founderInfo.PilotNodeID, "add", bobInfo, 2_000,
 		[]entmoot.RosterEntryID{r.Head()})
 	if err := r.Apply(add); err != nil {
 		t.Fatalf("Apply after cancel: %v", err)
@@ -527,7 +568,7 @@ func TestConcurrentApplyAcceptsOneChildAndPersistsHead(t *testing.T) {
 	for i := range entries {
 		subject := memberInfo
 		subject.PilotNodeID += entmoot.NodeID(i)
-		entries[i] = mkEntry(t, founder, founderInfo.PilotNodeID, "add", subject, int64(2_000+i),
+		entries[i] = mkEntry(t, r, founder, founderInfo.PilotNodeID, "add", subject, int64(2_000+i),
 			[]entmoot.RosterEntryID{parent})
 	}
 	var accepted atomic.Int32
@@ -633,7 +674,7 @@ func TestLegacyImportRetainsExactSignedEntries(t *testing.T) {
 	if err := source.Genesis(founder, founderInfo, 1_000); err != nil {
 		t.Fatalf("Genesis: %v", err)
 	}
-	entry := mkEntry(t, founder, founderInfo.PilotNodeID, "add", memberInfo, 2_000,
+	entry := mkEntry(t, source, founder, founderInfo.PilotNodeID, "add", memberInfo, 2_000,
 		[]entmoot.RosterEntryID{source.Head()})
 	if err := source.Apply(entry); err != nil {
 		t.Fatalf("Apply: %v", err)
@@ -688,7 +729,7 @@ func TestPersistFailureDoesNotAdvanceProjection(t *testing.T) {
 		t.Fatalf("Genesis: %v", err)
 	}
 	head := r.Head()
-	entry := mkEntry(t, founder, founderInfo.PilotNodeID, "add", memberInfo, 2_000,
+	entry := mkEntry(t, r, founder, founderInfo.PilotNodeID, "add", memberInfo, 2_000,
 		[]entmoot.RosterEntryID{head})
 	r.persist = func(entmoot.RosterEntry) error { return errors.New("injected commit failure") }
 

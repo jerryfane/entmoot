@@ -96,7 +96,7 @@ func newFixtureWithGenesisOnly(t *testing.T, nodeIDs []entmoot.NodeID, joinerID 
 				continue
 			}
 			r := f.nodes[rn].rost
-			entry := f.buildAddEntry(subject, f.founderTS, r.Head())
+			entry := f.buildAddEntry(r, subject, f.founderTS)
 			if err := r.Apply(entry); err != nil {
 				t.Fatalf("roster.Apply add %d to roster %d: %v", n, rn, err)
 			}
@@ -113,7 +113,7 @@ func newFixtureWithGenesisOnly(t *testing.T, nodeIDs []entmoot.NodeID, joinerID 
 			continue
 		}
 		r := f.nodes[rn].rost
-		entry := f.buildAddEntry(joinerSubject, f.founderTS, r.Head())
+		entry := f.buildAddEntry(r, joinerSubject, f.founderTS)
 		if err := r.Apply(entry); err != nil {
 			t.Fatalf("roster.Apply add joiner %d to roster %d: %v", joinerID, rn, err)
 		}
@@ -162,6 +162,7 @@ func (f *fixture) buildInviteWithValidUntil(bootstrap []entmoot.NodeID, validUnt
 		GroupID:        f.groupID,
 		Founder:        f.founderInf,
 		Issuer:         f.founderInf,
+		RosterHead:     f.nodes[f.founderInf.PilotNodeID].rost.Head(),
 		BootstrapPeers: bps,
 		IssuedAt:       f.founderTS,
 		ValidUntil:     validUntil,
@@ -194,6 +195,7 @@ func (f *fixture) buildInviteWithEndpoints(bootstrap []entmoot.NodeID, eps []ent
 		GroupID:        f.groupID,
 		Founder:        f.founderInf,
 		Issuer:         f.founderInf,
+		RosterHead:     f.nodes[f.founderInf.PilotNodeID].rost.Head(),
 		BootstrapPeers: bps,
 		IssuedAt:       f.founderTS,
 		ValidUntil:     f.founderTS + 24*60*60*1000,
@@ -375,6 +377,92 @@ func TestJoinFounderCandidateWhenNotInBootstrap(t *testing.T) {
 	}
 }
 
+func TestValidateInviteRosterAllowsAuthenticatedDescendant(t *testing.T) {
+	t.Parallel()
+	f := newFixtureWithGenesisOnly(t, []entmoot.NodeID{10, 20, 99}, 99)
+	defer f.closeTransports()
+	entries := f.nodes[10].rost.Entries()
+	invite := f.buildInvite([]entmoot.NodeID{10})
+	invite.RosterHead = entries[0].ID
+	signInviteForTest(t, invite, f.founder)
+	if err := ValidateInvite(invite, time.UnixMilli(f.founderTS)); err != nil {
+		t.Fatalf("ValidateInvite: %v", err)
+	}
+	if err := validateInviteRoster(invite, entries); err != nil {
+		t.Fatalf("validate descendant roster: %v", err)
+	}
+}
+
+func TestValidateInviteRosterRejectsWrongFounderWithoutInstalling(t *testing.T) {
+	t.Parallel()
+	f := newFixtureWithGenesisOnly(t, []entmoot.NodeID{10, 20, 99}, 99)
+	defer f.closeTransports()
+	wrongKey, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate wrong founder: %v", err)
+	}
+	invite := f.buildInvite([]entmoot.NodeID{10})
+	invite.Founder = entmoot.NodeInfo{PilotNodeID: 77, EntmootPubKey: append([]byte(nil), wrongKey.PublicKey...)}
+	signInviteForTest(t, invite, f.founder)
+	if err := ValidateInvite(invite, time.UnixMilli(f.founderTS)); err != nil {
+		t.Fatalf("self-contained invite signature should verify: %v", err)
+	}
+	joiner := f.nodes[99].gossip
+	if err := joiner.applyInviteEntries(invite, f.nodes[10].rost.Entries()); err == nil {
+		t.Fatal("wrong founder roster accepted")
+	}
+	if got := joiner.cfg.Roster.Head(); got != (entmoot.RosterEntryID{}) {
+		t.Fatalf("failed validation installed roster head %s", got)
+	}
+}
+
+func TestValidateInviteRosterRejectsMissingCheckpointAndUnauthorizedIssuer(t *testing.T) {
+	t.Parallel()
+	f := newFixtureWithGenesisOnly(t, []entmoot.NodeID{10, 20, 99}, 99)
+	defer f.closeTransports()
+	entries := f.nodes[10].rost.Entries()
+
+	missing := f.buildInvite([]entmoot.NodeID{10})
+	missing.RosterHead = entmoot.RosterEntryID{0xFF}
+	signInviteForTest(t, missing, f.founder)
+	if err := validateInviteRoster(missing, entries); err == nil {
+		t.Fatal("missing advertised checkpoint accepted")
+	}
+
+	unauthorized := f.buildInvite([]entmoot.NodeID{10})
+	unauthorized.Issuer = f.nodes[20].info
+	signInviteForTest(t, unauthorized, f.nodes[20].id)
+	if err := ValidateInvite(unauthorized, time.UnixMilli(f.founderTS)); err != nil {
+		t.Fatalf("member-signed envelope should be authentic: %v", err)
+	}
+	if err := validateInviteRoster(unauthorized, entries); err == nil {
+		t.Fatal("non-founder invite issuer accepted")
+	}
+}
+
+func TestValidateInviteRosterRejectsCrossGroupReplay(t *testing.T) {
+	t.Parallel()
+	f := newFixtureWithGenesisOnly(t, []entmoot.NodeID{10, 20, 99}, 99)
+	defer f.closeTransports()
+	invite := f.buildInvite([]entmoot.NodeID{10})
+	invite.GroupID[0] ^= 0xFF
+	signInviteForTest(t, invite, f.founder)
+	if err := validateInviteRoster(invite, f.nodes[10].rost.Entries()); err == nil {
+		t.Fatal("cross-group roster replay accepted")
+	}
+}
+
+func signInviteForTest(t *testing.T, invite *entmoot.Invite, signer *keystore.Identity) {
+	t.Helper()
+	signing := *invite
+	signing.Signature = nil
+	sigInput, err := canonical.Encode(signing)
+	if err != nil {
+		t.Fatalf("canonical invite: %v", err)
+	}
+	invite.Signature = signer.Sign(sigInput)
+}
+
 // 7. Invite whose ValidUntil has elapsed relative to the gossiper's clock
 // is rejected with an error wrapping entmoot.ErrInviteExpired. The check
 // runs after signature verification, so the invite is correctly signed;
@@ -440,15 +528,10 @@ func TestJoinFreshInviteAccepted(t *testing.T) {
 	}
 }
 
-// 10. v1.2.0: Join pre-seeds Pilot's peerTCP with invite-embedded
-// endpoints before the first tryRosterSync, so the newcomer's very
-// first Dial can use TCP fallback even if UDP is blocked. We assert
-// the joiner's transport recorded a SetPeerEndpoints call for every
-// bootstrap peer listed in the invite with Endpoints populated.
-// Implementation detail: the memTransport records the call in a
-// per-peer map exposed via EndpointsFor; the test reads that map after
-// Join returns so the test does not race the call site.
-func TestJoinPreSeedsInviteEndpoints(t *testing.T) {
+// 10. Invite endpoints are installed only after the fetched roster establishes
+// the invite's founder and checkpoint. The mem transport records each
+// SetPeerEndpoints call for inspection after Join returns.
+func TestJoinInstallsAuthenticatedInviteEndpoints(t *testing.T) {
 	t.Parallel()
 	f := newFixtureWithGenesisOnly(t, []entmoot.NodeID{10, 20, 30, 99}, 99)
 	defer f.closeTransports()
@@ -487,6 +570,36 @@ func TestJoinPreSeedsInviteEndpoints(t *testing.T) {
 	// The joiner itself must NOT have been installed (self-skip).
 	if got := joiner.EndpointsFor(99); got != nil {
 		t.Fatalf("joiner (self) installed unexpectedly: %+v", got)
+	}
+}
+
+func TestJoinDoesNotInstallEndpointsFromUntrustedInvite(t *testing.T) {
+	t.Parallel()
+	f := newFixtureWithGenesisOnly(t, []entmoot.NodeID{10, 99}, 99)
+	defer f.closeTransports()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = f.nodes[10].gossip.Start(ctx) }()
+
+	invite := f.buildInviteWithEndpoints(
+		[]entmoot.NodeID{10},
+		[]entmoot.NodeEndpoint{{Network: "tcp", Addr: "198.51.100.10:4443"}},
+	)
+	wrongFounder, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate wrong founder: %v", err)
+	}
+	invite.Founder = entmoot.NodeInfo{PilotNodeID: 77, EntmootPubKey: append([]byte(nil), wrongFounder.PublicKey...)}
+	signInviteForTest(t, invite, f.founder)
+	if err := f.nodes[99].gossip.Join(ctx, invite); err == nil {
+		t.Fatal("Join accepted wrong-founder invite")
+	}
+	joiner := f.transports[99].(*memTransport)
+	if got := joiner.EndpointsFor(10); got != nil {
+		t.Fatalf("untrusted endpoint installed: %+v", got)
+	}
+	if got := f.nodes[99].rost.Head(); got != (entmoot.RosterEntryID{}) {
+		t.Fatalf("untrusted roster installed: %s", got)
 	}
 }
 

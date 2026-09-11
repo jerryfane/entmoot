@@ -1,6 +1,7 @@
 package gossip
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/canonical"
 	"entmoot/pkg/entmoot/keystore"
+	"entmoot/pkg/entmoot/roster"
 	"entmoot/pkg/entmoot/wire"
 )
 
@@ -76,38 +78,15 @@ func (g *Gossiper) Join(ctx context.Context, invite *entmoot.Invite) error {
 		return err
 	}
 
-	// Early-return for the "already synced" case. The founder's own
-	// roster already contains the invite's advertised head (by
-	// construction: the founder issued the invite), so there is nothing
-	// to fetch. Without this shortcut, the founder would try to dial
-	// every BootstrapPeer — including peers that have not started yet —
-	// and fail ErrJoinFailed. Any re-invite on a node that is already a
-	// fully-synced member hits the same path.
+	// If the invite checkpoint is already local, validate its founder and
+	// issuer authorization against the trusted chain before returning.
 	if g.cfg.Roster.Head() == invite.RosterHead &&
 		g.cfg.Roster.IsMember(g.cfg.LocalNode) {
+		if err := validateInviteRoster(invite, g.cfg.Roster.Entries()); err != nil {
+			return err
+		}
+		g.installInviteEndpoints(ctx, invite)
 		return nil
-	}
-
-	// v1.2.0: pre-seed the Pilot transport with invite-embedded
-	// endpoints so the first Join dial can use TCP fallback if UDP
-	// is blocked. Invites are signed by the founder, and
-	// verifyInvite above has already verified that signature, so
-	// endpoints carried here are authenticated end-to-end. A bad
-	// SetPeerEndpoints (pilot restarting, IPC hiccup) is
-	// non-fatal — we log at Debug and continue, falling through to
-	// the same Dial path we had in v1.1.x.
-	for _, bp := range invite.BootstrapPeers {
-		if len(bp.Endpoints) == 0 {
-			continue
-		}
-		if bp.NodeID == g.cfg.LocalNode {
-			continue
-		}
-		if err := g.cfg.Transport.SetPeerEndpoints(ctx, bp.NodeID, bp.Endpoints); err != nil {
-			g.logger.Debug("gossip: set invite endpoints",
-				slog.Uint64("peer", uint64(bp.NodeID)),
-				slog.String("err", err.Error()))
-		}
 	}
 
 	var lastErr error
@@ -234,7 +213,8 @@ func (g *Gossiper) tryJoinBootstrap(ctx context.Context, invite *entmoot.Invite)
 		if bp.NodeID == g.cfg.LocalNode {
 			continue
 		}
-		if err := g.tryRosterSync(ctx, bp.NodeID); err == nil {
+		if err := g.tryRosterSync(ctx, bp.NodeID, invite); err == nil {
+			g.installInviteEndpoints(ctx, invite)
 			g.pullJoinSnapshots(ctx, bp.NodeID)
 			return nil
 		} else {
@@ -261,7 +241,8 @@ func (g *Gossiper) tryJoinBootstrap(ctx context.Context, invite *entmoot.Invite)
 			if _, ok := bootstrapSet[peer]; !ok {
 				continue
 			}
-			if err := g.tryRosterSync(ctx, peer); err == nil {
+			if err := g.tryRosterSync(ctx, peer, invite); err == nil {
+				g.installInviteEndpoints(ctx, invite)
 				g.pullJoinSnapshots(ctx, peer)
 				return nil
 			} else {
@@ -275,7 +256,8 @@ func (g *Gossiper) tryJoinBootstrap(ctx context.Context, invite *entmoot.Invite)
 
 	// Strategy 3: founder fallback. Skip if the founder is us.
 	if invite.Founder.PilotNodeID != 0 && invite.Founder.PilotNodeID != g.cfg.LocalNode {
-		if err := g.tryRosterSync(ctx, invite.Founder.PilotNodeID); err == nil {
+		if err := g.tryRosterSync(ctx, invite.Founder.PilotNodeID, invite); err == nil {
+			g.installInviteEndpoints(ctx, invite)
 			g.pullJoinSnapshots(ctx, invite.Founder.PilotNodeID)
 			return nil
 		} else {
@@ -290,6 +272,19 @@ func (g *Gossiper) tryJoinBootstrap(ctx context.Context, invite *entmoot.Invite)
 		return firstPermanentErr
 	}
 	return ErrJoinFailed
+}
+
+func (g *Gossiper) installInviteEndpoints(ctx context.Context, invite *entmoot.Invite) {
+	for _, bp := range invite.BootstrapPeers {
+		if len(bp.Endpoints) == 0 || bp.NodeID == g.cfg.LocalNode {
+			continue
+		}
+		if err := g.cfg.Transport.SetPeerEndpoints(ctx, bp.NodeID, bp.Endpoints); err != nil {
+			g.logger.Debug("gossip: set authenticated invite endpoints",
+				slog.Uint64("peer", uint64(bp.NodeID)),
+				slog.String("err", err.Error()))
+		}
+	}
 }
 
 func (g *Gossiper) pullJoinSnapshots(ctx context.Context, peer entmoot.NodeID) {
@@ -308,9 +303,9 @@ func (g *Gossiper) pullJoinSnapshots(ctx context.Context, peer entmoot.NodeID) {
 	}
 }
 
-// tryRosterSync dials peer, sends RosterReq, reads RosterResp, and applies
-// entries to g.cfg.Roster in order.
-func (g *Gossiper) tryRosterSync(ctx context.Context, peer entmoot.NodeID) error {
+// tryRosterSync dials peer, fetches a full roster, validates the chain against
+// the invite's founder and checkpoint in temporary state, then installs it.
+func (g *Gossiper) tryRosterSync(ctx context.Context, peer entmoot.NodeID, invite *entmoot.Invite) error {
 	conn, err := g.cfg.Transport.Dial(ctx, peer)
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
@@ -342,11 +337,76 @@ func (g *Gossiper) tryRosterSync(ctx context.Context, peer entmoot.NodeID) error
 		return permanentJoinFailure(fmt.Errorf("roster sync: empty entries"))
 	}
 
-	if err := g.applyEntries(resp.Entries); err != nil {
+	if err := g.applyInviteEntries(invite, resp.Entries); err != nil {
 		if errors.Is(err, errRosterResponseMissingLocalHead) {
 			return err
 		}
 		return permanentJoinFailure(err)
+	}
+	return nil
+}
+
+func (g *Gossiper) applyInviteEntries(invite *entmoot.Invite, entries []entmoot.RosterEntry) error {
+	if err := validateInviteRoster(invite, entries); err != nil {
+		return err
+	}
+	return g.applyEntries(entries)
+}
+
+// validateInviteRoster validates an untrusted response without touching the
+// persistent roster. The founder is the trust anchor authenticated by the
+// invite; founder-only invitation authority is checked at the advertised
+// checkpoint, which may have valid descendants in the response.
+func validateInviteRoster(invite *entmoot.Invite, entries []entmoot.RosterEntry) error {
+	if invite == nil {
+		return fmt.Errorf("roster sync: invite is nil")
+	}
+	if len(entries) == 0 {
+		return fmt.Errorf("roster sync: empty entries")
+	}
+	var zero entmoot.RosterEntryID
+	if invite.RosterHead == zero {
+		return fmt.Errorf("roster sync: invite has no roster checkpoint")
+	}
+
+	candidate := roster.New(invite.GroupID)
+	if err := candidate.AcceptGenesis(entries[0]); err != nil {
+		return fmt.Errorf("roster sync: validate genesis: %w", err)
+	}
+	founder, ok := candidate.Founder()
+	if !ok ||
+		founder.PilotNodeID != invite.Founder.PilotNodeID ||
+		!bytes.Equal(founder.EntmootPubKey, invite.Founder.EntmootPubKey) {
+		return fmt.Errorf("roster sync: invite founder does not match roster genesis")
+	}
+	if invite.Issuer.PilotNodeID != founder.PilotNodeID ||
+		!bytes.Equal(invite.Issuer.EntmootPubKey, founder.EntmootPubKey) {
+		return fmt.Errorf("roster sync: invite issuer is not the founder")
+	}
+
+	checkpointFound := false
+	for i := range entries {
+		if i > 0 {
+			if err := candidate.Apply(entries[i]); err != nil {
+				return fmt.Errorf("roster sync: validate entry %s: %w", entries[i].ID, err)
+			}
+		}
+		if entries[i].ID != invite.RosterHead {
+			continue
+		}
+		if entries[i].Version != roster.CurrentEntryVersion ||
+			entries[i].GroupID == nil ||
+			*entries[i].GroupID != invite.GroupID {
+			return fmt.Errorf("roster sync: invite checkpoint is not group-bound")
+		}
+		issuer, active := candidate.MemberInfo(invite.Issuer.PilotNodeID)
+		if !active || !bytes.Equal(issuer.EntmootPubKey, invite.Issuer.EntmootPubKey) {
+			return fmt.Errorf("roster sync: invite issuer is not authorized at checkpoint")
+		}
+		checkpointFound = true
+	}
+	if !checkpointFound {
+		return fmt.Errorf("roster sync: response does not contain invite checkpoint %s", invite.RosterHead)
 	}
 	return nil
 }

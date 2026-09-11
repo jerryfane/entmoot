@@ -353,7 +353,7 @@ func newBroadcastNetwork(n, trustDegree int) ([]*benchNode, entmoot.GroupID, fun
 	for i := 1; i < n; i++ {
 		ts += 100
 		for _, node := range nodes {
-			entry, err := buildAddEntry(founderID, founderInfo, nodes[i].info, ts, node.roster.Head())
+			entry, err := buildAddEntry(node.roster, founderID, founderInfo, nodes[i].info, ts)
 			if err != nil {
 				return nil, groupID, nil, err
 			}
@@ -422,21 +422,8 @@ func startGossip(ctx context.Context, nodes []*benchNode) {
 	time.Sleep(100 * time.Millisecond)
 }
 
-func buildAddEntry(founder *keystore.Identity, founderInfo, subject entmoot.NodeInfo, ts int64, parent entmoot.RosterEntryID) (entmoot.RosterEntry, error) {
-	entry := entmoot.RosterEntry{
-		Op:        "add",
-		Subject:   subject,
-		Actor:     founderInfo.PilotNodeID,
-		Timestamp: ts,
-		Parents:   []entmoot.RosterEntryID{parent},
-	}
-	sigInput, err := canonical.Encode(entry)
-	if err != nil {
-		return entmoot.RosterEntry{}, err
-	}
-	entry.Signature = founder.Sign(sigInput)
-	entry.ID = canonical.RosterEntryID(entry)
-	return entry, nil
+func buildAddEntry(rlog *roster.RosterLog, founder *keystore.Identity, founderInfo, subject entmoot.NodeInfo, ts int64) (entmoot.RosterEntry, error) {
+	return rlog.SignEntry(founder, "add", subject, nil, founderInfo.PilotNodeID, ts)
 }
 
 func buildMessage(author *benchNode, groupID entmoot.GroupID, content string, ts int64) (entmoot.Message, error) {
@@ -689,7 +676,7 @@ func newJoinNetwork(historyMessages int) ([]*benchNode, entmoot.GroupID, *entmoo
 	if err := founderRoster.Genesis(founderID, founderInfo, 1_000); err != nil {
 		return nil, groupID, nil, nil, err
 	}
-	addJoiner, err := buildAddEntry(founderID, founderInfo, joinerInfo, 1_100, founderRoster.Head())
+	addJoiner, err := buildAddEntry(founderRoster, founderID, founderInfo, joinerInfo, 1_100)
 	if err != nil {
 		return nil, groupID, nil, nil, err
 	}

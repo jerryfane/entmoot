@@ -30,6 +30,8 @@ import (
 	"entmoot/pkg/entmoot"
 )
 
+const rosterEntryV2Domain = "entmoot/roster-entry/v2\x00"
+
 // Encode returns the deterministic canonical JSON encoding of v.
 //
 // For struct values, encoding/json's stable field order is used. For values
@@ -178,22 +180,31 @@ func MessageID(m entmoot.Message) entmoot.MessageID {
 	return entmoot.MessageID(sha256.Sum256(encoded))
 }
 
-// RosterEntryID returns sha256(Encode(signing form of e)).
-//
-// The signing form is e with ID and Signature zeroed, matching the convention
-// used by MessageID. Every other field (Op, Subject, Policy, Actor, Timestamp,
-// Parents) contributes to the id. Callers should populate ID with this result
-// after signing so the on-wire and on-disk forms are self-describing.
-func RosterEntryID(e entmoot.RosterEntry) entmoot.RosterEntryID {
+// RosterEntrySigningBytes returns the exact bytes covered by a roster
+// signature. Legacy entries retain their historical canonical JSON bytes.
+// Version-2 entries prepend a domain separator before the canonical JSON so
+// their signatures cannot be confused with another signed record type.
+func RosterEntrySigningBytes(e entmoot.RosterEntry) ([]byte, error) {
 	signing := e
 	signing.ID = entmoot.RosterEntryID{}
 	signing.Signature = nil
-
 	encoded, err := Encode(signing)
 	if err != nil {
-		// Encoding a RosterEntry value should never fail: it contains only
-		// types supported by encoding/json. Mirror MessageID's panic for
-		// consistency — callers pass well-formed entries.
+		return nil, err
+	}
+	if e.Version != 2 {
+		return encoded, nil
+	}
+	out := make([]byte, 0, len(rosterEntryV2Domain)+len(encoded))
+	out = append(out, rosterEntryV2Domain...)
+	out = append(out, encoded...)
+	return out, nil
+}
+
+// RosterEntryID returns sha256 over RosterEntrySigningBytes(e).
+func RosterEntryID(e entmoot.RosterEntry) entmoot.RosterEntryID {
+	encoded, err := RosterEntrySigningBytes(e)
+	if err != nil {
 		panic(fmt.Sprintf("canonical.RosterEntryID: encoding roster entry failed: %v", err))
 	}
 	return entmoot.RosterEntryID(sha256.Sum256(encoded))

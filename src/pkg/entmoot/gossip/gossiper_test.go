@@ -351,7 +351,7 @@ func newFixture(t testing.TB, nodeIDs []entmoot.NodeID) *fixture {
 		subject := f.nodes[n].info
 		for _, rn := range nodeIDs {
 			r := f.nodes[rn].rost
-			entry := f.buildAddEntry(subject, f.founderTS, r.Head())
+			entry := f.buildAddEntry(r, subject, f.founderTS)
 			if err := r.Apply(entry); err != nil {
 				t.Fatalf("roster.Apply add %d to roster %d: %v", n, rn, err)
 			}
@@ -384,20 +384,11 @@ func newFixture(t testing.TB, nodeIDs []entmoot.NodeID) *fixture {
 // buildAddEntry signs and returns an add(subject) roster entry with the
 // given timestamp and parents. The entry is signed by the fixture's
 // founder identity so it passes roster.Apply.
-func (f *fixture) buildAddEntry(subject entmoot.NodeInfo, ts int64, parent entmoot.RosterEntryID) entmoot.RosterEntry {
-	entry := entmoot.RosterEntry{
-		Op:        "add",
-		Subject:   subject,
-		Actor:     f.founderInf.PilotNodeID,
-		Timestamp: ts,
-		Parents:   []entmoot.RosterEntryID{parent},
-	}
-	sig, err := canonical.Encode(entry)
+func (f *fixture) buildAddEntry(rlog *roster.RosterLog, subject entmoot.NodeInfo, ts int64) entmoot.RosterEntry {
+	entry, err := rlog.SignEntry(f.founder, "add", subject, nil, f.founderInf.PilotNodeID, ts)
 	if err != nil {
-		f.t.Fatalf("canonical encode roster entry: %v", err)
+		f.t.Fatalf("sign roster entry: %v", err)
 	}
-	entry.Signature = f.founder.Sign(sig)
-	entry.ID = canonical.RosterEntryID(entry)
 	return entry
 }
 
@@ -1794,7 +1785,7 @@ func TestTryRosterSyncCancelsBlockedRead(t *testing.T) {
 	defer cancel()
 	done := make(chan error, 1)
 	go func() {
-		done <- joiner.tryRosterSync(ctx, 10)
+		done <- joiner.tryRosterSync(ctx, 10, f.buildInvite([]entmoot.NodeID{10}))
 	}()
 
 	select {
@@ -1938,7 +1929,7 @@ func TestUnsolicitedRosterRespAppliesUpdate(t *testing.T) {
 	}
 	target := entmoot.NodeInfo{PilotNodeID: 99, EntmootPubKey: append([]byte(nil), targetID.PublicKey...)}
 	f.founderTS += 100
-	entry := f.buildAddEntry(target, f.founderTS, f.nodes[10].rost.Head())
+	entry := f.buildAddEntry(f.nodes[10].rost, target, f.founderTS)
 	if err := f.nodes[10].rost.Apply(entry); err != nil {
 		t.Fatalf("founder roster apply: %v", err)
 	}
@@ -1961,7 +1952,7 @@ func TestUnsolicitedRosterRespWrongGroupIgnored(t *testing.T) {
 	}
 	target := entmoot.NodeInfo{PilotNodeID: 99, EntmootPubKey: append([]byte(nil), targetID.PublicKey...)}
 	f.founderTS += 100
-	entry := f.buildAddEntry(target, f.founderTS, f.nodes[10].rost.Head())
+	entry := f.buildAddEntry(f.nodes[10].rost, target, f.founderTS)
 	var wrong entmoot.GroupID
 	for i := range wrong {
 		wrong[i] = 0xFE
@@ -1986,7 +1977,7 @@ func TestUnsolicitedRosterRespDuplicateIsIdempotent(t *testing.T) {
 	}
 	target := entmoot.NodeInfo{PilotNodeID: 99, EntmootPubKey: append([]byte(nil), targetID.PublicKey...)}
 	f.founderTS += 100
-	entry := f.buildAddEntry(target, f.founderTS, f.nodes[10].rost.Head())
+	entry := f.buildAddEntry(f.nodes[10].rost, target, f.founderTS)
 	if err := f.nodes[10].rost.Apply(entry); err != nil {
 		t.Fatalf("founder roster apply: %v", err)
 	}
@@ -2010,7 +2001,7 @@ func TestUnsolicitedRosterRespConcurrentIsSerialized(t *testing.T) {
 	}
 	targetA := entmoot.NodeInfo{PilotNodeID: 99, EntmootPubKey: append([]byte(nil), targetAID.PublicKey...)}
 	f.founderTS += 100
-	entryA := f.buildAddEntry(targetA, f.founderTS, f.nodes[10].rost.Head())
+	entryA := f.buildAddEntry(f.nodes[10].rost, targetA, f.founderTS)
 	if err := f.nodes[10].rost.Apply(entryA); err != nil {
 		t.Fatalf("founder roster apply A: %v", err)
 	}
@@ -2022,7 +2013,7 @@ func TestUnsolicitedRosterRespConcurrentIsSerialized(t *testing.T) {
 	}
 	targetB := entmoot.NodeInfo{PilotNodeID: 100, EntmootPubKey: append([]byte(nil), targetBID.PublicKey...)}
 	f.founderTS += 100
-	entryB := f.buildAddEntry(targetB, f.founderTS, f.nodes[10].rost.Head())
+	entryB := f.buildAddEntry(f.nodes[10].rost, targetB, f.founderTS)
 	if err := f.nodes[10].rost.Apply(entryB); err != nil {
 		t.Fatalf("founder roster apply B: %v", err)
 	}

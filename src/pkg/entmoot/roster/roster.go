@@ -28,6 +28,11 @@ const subscribeBufferCap = 16
 
 // RosterEvent is emitted on state-changing Apply calls — that is, on Genesis
 // and on every subsequent Apply that succeeds.
+
+// CurrentEntryVersion is the group-bound, domain-separated roster format used
+// for every newly signed entry.
+const CurrentEntryVersion uint8 = 2
+
 type RosterEvent struct {
 	// Entry is the roster entry that was just applied.
 	Entry entmoot.RosterEntry
@@ -97,6 +102,51 @@ func New(groupID entmoot.GroupID) *RosterLog {
 	}
 }
 
+// SignEntry builds a version-2 entry against the log's current head. Apply
+// still performs authoritative validation, so a concurrent mutation can make
+// the returned entry stale and safely reject it.
+func (r *RosterLog) SignEntry(
+	signer *keystore.Identity,
+	op string,
+	subject entmoot.NodeInfo,
+	policy []byte,
+	actor entmoot.NodeID,
+	timestampMillis int64,
+) (entmoot.RosterEntry, error) {
+	if signer == nil {
+		return entmoot.RosterEntry{}, fmt.Errorf("roster: SignEntry requires a non-nil identity")
+	}
+	r.mu.RLock()
+	if len(r.entries) == 0 {
+		r.mu.RUnlock()
+		return entmoot.RosterEntry{}, fmt.Errorf("%w: SignEntry on empty log", entmoot.ErrRosterReject)
+	}
+	if r.entries[len(r.entries)-1].Version != CurrentEntryVersion {
+		r.mu.RUnlock()
+		return entmoot.RosterEntry{}, fmt.Errorf("%w: legacy roster requires an authenticated upgrade checkpoint", entmoot.ErrRosterReject)
+	}
+	groupID := r.groupID
+	entry := entmoot.RosterEntry{
+		Op:        op,
+		Subject:   subject,
+		Policy:    append([]byte(nil), policy...),
+		Actor:     actor,
+		Timestamp: timestampMillis,
+		Parents:   []entmoot.RosterEntryID{r.head},
+		Version:   CurrentEntryVersion,
+		GroupID:   &groupID,
+		Sequence:  uint64(len(r.entries) + 1),
+	}
+	r.mu.RUnlock()
+	sigInput, err := canonical.RosterEntrySigningBytes(entry)
+	if err != nil {
+		return entmoot.RosterEntry{}, fmt.Errorf("roster: canonical encode for signing: %w", err)
+	}
+	entry.Signature = signer.Sign(sigInput)
+	entry.ID = canonical.RosterEntryID(entry)
+	return entry, nil
+}
+
 // Genesis writes the founder's self-signed add(founder) entry. It must be
 // called exactly once on an empty log; a second call returns an error and does
 // not mutate the log. The supplied identity signs the entry; founderInfo is
@@ -114,14 +164,18 @@ func (r *RosterLog) Genesis(founder *keystore.Identity, founderInfo entmoot.Node
 		return fmt.Errorf("roster: Genesis requires founderInfo.EntmootPubKey")
 	}
 
+	groupID := r.groupID
 	entry := entmoot.RosterEntry{
 		Op:        "add",
 		Subject:   founderInfo,
 		Actor:     founderInfo.PilotNodeID,
 		Timestamp: timestampMillis,
 		Parents:   nil,
+		Version:   CurrentEntryVersion,
+		GroupID:   &groupID,
+		Sequence:  1,
 	}
-	sigInput, err := canonical.Encode(entry)
+	sigInput, err := canonical.RosterEntrySigningBytes(entry)
 	if err != nil {
 		return fmt.Errorf("roster: canonical encode for signing: %w", err)
 	}
@@ -167,7 +221,7 @@ func (r *RosterLog) AcceptGenesis(entry entmoot.RosterEntry) error {
 		r.mu.Unlock()
 		return fmt.Errorf("%w: AcceptGenesis on non-empty log", entmoot.ErrRosterReject)
 	}
-	if err := validateGenesis(entry); err != nil {
+	if err := validateGenesis(entry, r.groupID); err != nil {
 		r.mu.Unlock()
 		return err
 	}
@@ -250,12 +304,13 @@ func (r *RosterLog) validateLocked(entry entmoot.RosterEntry) error {
 			entmoot.ErrRosterReject)
 	}
 
-	// Verify the signature against the founder's pubkey using the signing
-	// form (id/sig zeroed).
-	signing := entry
-	signing.ID = entmoot.RosterEntryID{}
-	signing.Signature = nil
-	sigInput, err := canonical.Encode(signing)
+	if err := validateEntryFormat(entry, r.groupID, uint64(len(r.entries)+1), r.entries[len(r.entries)-1].Version == 0); err != nil {
+		return err
+	}
+
+	// Verify the signature against the founder's pubkey using the versioned
+	// signing form.
+	sigInput, err := canonical.RosterEntrySigningBytes(entry)
 	if err != nil {
 		return fmt.Errorf("%w: canonical encode: %v", entmoot.ErrRosterReject, err)
 	}
@@ -277,7 +332,7 @@ func (r *RosterLog) validateLocked(entry entmoot.RosterEntry) error {
 	return nil
 }
 
-func validateGenesis(entry entmoot.RosterEntry) error {
+func validateGenesis(entry entmoot.RosterEntry, groupID entmoot.GroupID) error {
 	if entry.Op != "add" {
 		return fmt.Errorf("%w: genesis op must be \"add\", got %q", entmoot.ErrRosterReject, entry.Op)
 	}
@@ -291,18 +346,40 @@ func validateGenesis(entry entmoot.RosterEntry) error {
 	if len(entry.Subject.EntmootPubKey) == 0 {
 		return fmt.Errorf("%w: genesis subject has no pubkey", entmoot.ErrRosterReject)
 	}
+	if err := validateEntryFormat(entry, groupID, 1, true); err != nil {
+		return err
+	}
 	if canonical.RosterEntryID(entry) != entry.ID {
 		return fmt.Errorf("%w: genesis entry id does not match canonical hash", entmoot.ErrRosterReject)
 	}
-	signing := entry
-	signing.ID = entmoot.RosterEntryID{}
-	signing.Signature = nil
-	sigInput, err := canonical.Encode(signing)
+	sigInput, err := canonical.RosterEntrySigningBytes(entry)
 	if err != nil {
 		return fmt.Errorf("%w: canonical encode: %v", entmoot.ErrRosterReject, err)
 	}
 	if !keystore.Verify(entry.Subject.EntmootPubKey, sigInput, entry.Signature) {
 		return fmt.Errorf("%w: genesis signature does not verify", entmoot.ErrRosterReject)
+	}
+	return nil
+}
+
+func validateEntryFormat(entry entmoot.RosterEntry, groupID entmoot.GroupID, sequence uint64, allowLegacy bool) error {
+	switch entry.Version {
+	case 0:
+		if !allowLegacy {
+			return fmt.Errorf("%w: legacy entry cannot follow a version-2 entry", entmoot.ErrRosterReject)
+		}
+		if entry.GroupID != nil || entry.Sequence != 0 {
+			return fmt.Errorf("%w: legacy entry carries version-2 fields", entmoot.ErrRosterReject)
+		}
+	case CurrentEntryVersion:
+		if entry.GroupID == nil || *entry.GroupID != groupID {
+			return fmt.Errorf("%w: version-2 entry group_id mismatch", entmoot.ErrRosterReject)
+		}
+		if entry.Sequence != sequence {
+			return fmt.Errorf("%w: version-2 entry sequence %d, want %d", entmoot.ErrRosterReject, entry.Sequence, sequence)
+		}
+	default:
+		return fmt.Errorf("%w: unsupported roster entry version %d", entmoot.ErrRosterReject, entry.Version)
 	}
 	return nil
 }
@@ -336,17 +413,17 @@ func (r *RosterLog) ClaimWriter() error {
 // applyLocked updates in-memory state for entry. Must be called with r.mu
 // held for writing. Does NOT emit events (callers do that after unlocking).
 func (r *RosterLog) applyLocked(entry entmoot.RosterEntry) {
-	r.byID[entry.ID] = len(r.entries)
-	r.entries = append(r.entries, entry)
-	r.head = entry.ID
-
-	switch entry.Op {
+	stored := cloneEntry(entry)
+	r.byID[stored.ID] = len(r.entries)
+	r.entries = append(r.entries, stored)
+	r.head = stored.ID
+	switch stored.Op {
 	case "add":
-		r.members[entry.Subject.PilotNodeID] = entry.Subject
+		r.members[stored.Subject.PilotNodeID] = stored.Subject
 	case "remove":
-		delete(r.members, entry.Subject.PilotNodeID)
+		delete(r.members, stored.Subject.PilotNodeID)
 	case "policy_change":
-		// v0 does not project policy_change into membership state.
+		// Policy changes do not alter the membership projection.
 	}
 }
 
@@ -394,6 +471,18 @@ func (r *RosterLog) Head() entmoot.RosterEntryID {
 	return r.head
 }
 
+// HeadIsGroupBound reports whether the current head is a version-2 entry
+// signed for this log's group.
+func (r *RosterLog) HeadIsGroupBound() bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if len(r.entries) == 0 {
+		return false
+	}
+	head := r.entries[len(r.entries)-1]
+	return head.Version == CurrentEntryVersion && head.GroupID != nil && *head.GroupID == r.groupID
+}
+
 // Founder returns the founder's NodeInfo, as recorded by Genesis. Returns
 // (zero, false) if the log is empty.
 func (r *RosterLog) Founder() (entmoot.NodeInfo, bool) {
@@ -407,14 +496,28 @@ func (r *RosterLog) Founder() (entmoot.NodeInfo, bool) {
 	return out, true
 }
 
-// Entries returns a copy of the entry slice in apply order. Useful for the
-// wire layer's roster_resp payload and for offline diagnostics. The returned
-// slice does not share the underlying storage; callers may mutate it freely.
+// Entries returns a deep copy of the entry slice in apply order. Useful for
+// wire responses and offline diagnostics.
 func (r *RosterLog) Entries() []entmoot.RosterEntry {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	out := make([]entmoot.RosterEntry, len(r.entries))
-	copy(out, r.entries)
+	for i := range r.entries {
+		out[i] = cloneEntry(r.entries[i])
+	}
+	return out
+}
+
+func cloneEntry(entry entmoot.RosterEntry) entmoot.RosterEntry {
+	out := entry
+	out.Subject.EntmootPubKey = append([]byte(nil), entry.Subject.EntmootPubKey...)
+	out.Policy = append([]byte(nil), entry.Policy...)
+	out.Parents = append([]entmoot.RosterEntryID(nil), entry.Parents...)
+	out.Signature = append([]byte(nil), entry.Signature...)
+	if entry.GroupID != nil {
+		groupID := *entry.GroupID
+		out.GroupID = &groupID
+	}
 	return out
 }
 

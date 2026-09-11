@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"entmoot/pkg/entmoot"
-	"entmoot/pkg/entmoot/canonical"
 	"entmoot/pkg/entmoot/roster"
 )
 
@@ -165,22 +164,18 @@ func cmdRosterAdd(gf *globalFlags, args []string) int {
 	}
 	defer ctx.close()
 
-	// Build the add entry, matching the signing form used by the canary's
-	// mkRosterAdd and by roster.Apply's validate path.
-	entry := entmoot.RosterEntry{
-		Op:        "add",
-		Subject:   subject,
-		Actor:     ctx.founder.PilotNodeID,
-		Timestamp: time.Now().UnixMilli(),
-		Parents:   []entmoot.RosterEntryID{ctx.roster.Head()},
-	}
-	sigInput, err := canonical.Encode(entry)
+	entry, err := ctx.roster.SignEntry(
+		ctx.setup.identity,
+		"add",
+		subject,
+		nil,
+		ctx.founder.PilotNodeID,
+		time.Now().UnixMilli(),
+	)
 	if err != nil {
-		slog.Error("roster add: canonical encode", slog.String("err", err.Error()))
+		slog.Error("roster add: sign entry", slog.String("err", err.Error()))
 		return exitTransport
 	}
-	entry.Signature = ctx.setup.identity.Sign(sigInput)
-	entry.ID = canonical.RosterEntryID(entry)
 
 	if err := ctx.roster.Apply(entry); err != nil {
 		if errors.Is(err, entmoot.ErrRosterReject) {

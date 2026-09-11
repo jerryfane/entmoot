@@ -2,6 +2,7 @@ package canonical
 
 import (
 	"bytes"
+	"encoding/hex"
 	"testing"
 
 	"entmoot/pkg/entmoot"
@@ -192,6 +193,46 @@ func TestRosterEntryIDDeterministic(t *testing.T) {
 		if got := RosterEntryID(e); got != first {
 			t.Fatalf("iteration %d: RosterEntryID not stable", i)
 		}
+	}
+}
+
+func TestLegacyRosterEntrySigningFixtureUnchanged(t *testing.T) {
+	entry := sampleRosterEntry()
+	gotBytes, err := RosterEntrySigningBytes(entry)
+	if err != nil {
+		t.Fatalf("RosterEntrySigningBytes: %v", err)
+	}
+	const wantBytes = `{"actor":42,"id":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","op":"add","parents":["AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","AgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="],"policy":{"admins":1},"subject":{"entmoot_pubkey":"yv66vg==","pilot_node_id":7},"timestamp":1700000000000}`
+	if string(gotBytes) != wantBytes {
+		t.Fatalf("legacy signing bytes changed\nwant=%s\n got=%s", wantBytes, gotBytes)
+	}
+	wantID, err := hex.DecodeString("806523f72f49705f5166908a7197cf69653944c8ce6beda932363dfd7883bdb0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotID := RosterEntryID(entry)
+	if !bytes.Equal(gotID[:], wantID) {
+		t.Fatalf("legacy roster id changed: %x", gotID)
+	}
+}
+
+func TestVersion2RosterEntryIDBindsGroupAndDomain(t *testing.T) {
+	entry := sampleRosterEntry()
+	entry.Version = 2
+	entry.Sequence = 7
+	groupA := entmoot.GroupID{1}
+	entry.GroupID = &groupA
+	idA := RosterEntryID(entry)
+	groupB := entmoot.GroupID{2}
+	entry.GroupID = &groupB
+	if idB := RosterEntryID(entry); idB == idA {
+		t.Fatal("version-2 roster id did not bind group_id")
+	}
+	entry.GroupID = &groupA
+	entry.Version = 0
+	entry.Sequence = 0
+	if legacyID := RosterEntryID(entry); legacyID == idA {
+		t.Fatal("version-2 roster id was not domain separated")
 	}
 }
 

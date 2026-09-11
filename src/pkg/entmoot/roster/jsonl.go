@@ -318,7 +318,7 @@ func readAndValidateLegacy(path string, groupID entmoot.GroupID) ([]entmoot.Rost
 		}
 		candidate.mu.Lock()
 		if len(candidate.entries) == 0 {
-			err = validateGenesis(entry)
+			err = validateGenesis(entry, groupID)
 			if err == nil {
 				candidate.founder = entry.Subject
 				candidate.applyLocked(entry)
@@ -404,7 +404,7 @@ func loadSQLite(r *RosterLog, db *sql.DB, groupID entmoot.GroupID) error {
 			return errors.New("roster: sqlite entry canonical bytes are corrupt")
 		}
 		if len(r.entries) == 0 {
-			if err := validateGenesis(entry); err != nil {
+			if err := validateGenesis(entry, r.groupID); err != nil {
 				r.mu.Unlock()
 				_ = rows.Close()
 				return fmt.Errorf("roster: validate sqlite genesis: %w", err)
