@@ -52,10 +52,52 @@ Quota pressure returns `resource_exhausted` without evicting active sessions.
 
 Completed snapshots and invalidated history generations release their slots.
 Terminal tokens are retired before writing the response, so a lost terminal
-response also requires a fresh sync rather than retrying that token. Expired,
+response requires a fresh token rather than retrying that token. Expired,
 retired, or invalid tokens return `snapshot_expired`. A changed history
 generation still requires restarting the scan; it never silently changes the
 paginated view.
+
+History catch-up retains its current page, unfinished body batch, and tuple
+cursor across transport errors and bounded passes. Expiring a token preserves
+the cursor; changing the store generation restarts the scan. Each group owns
+its catch-up state for the lifetime of that daemon session. A daemon restart
+starts a new scan but skips bodies already stored locally.
+
+The 16 MiB response budget is checked before each request, reserving room for
+the maximum permitted response frame. `BudgetExhausted` is not convergence:
+the next pass resumes the unfinished work. Keeper availability is not proof
+of complete history; catch-up logs report `converged_hints` separately.
+
+## Controlled Relays and Privacy
+
+Relay-only mode requires explicitly configured controlled relay identities and
+bootstrap multiaddrs. It uses no public DHT or rendezvous. The daemon does not
+start mDNS; SDK callers may explicitly start roster-filtered LAN discovery with
+`StartMemberMDNS` in direct mode.
+
+The configured host owns relay reservations, renews near their half-life, and
+withdraws expired or disconnected reservations. Failed attempts back off from
+one to 30 seconds. Authenticated address updates for an approved relay can move
+its endpoint without admitting another relay identity. An unavailable relay
+does not permit a direct application-peer fallback.
+
+Relay-only hosts advertise controlled circuit addresses, not direct application
+addresses. The raw peerstore filters identify updates and supplied dial hints
+at ingestion. A signed peer record containing a forbidden address is rejected
+whole; another peer's signature cannot be preserved while editing its contents.
+Accepted remote application hints have a maximum 30-minute TTL. Direct
+connections and addresses for approved relays remain permitted.
+
+**The relay operator sees connecting clients' IP addresses, including their
+NAT egress addresses. Relay-only mode is not anonymity from the relay operator.**
+
+Application hosts enforce hard admission limits of 64 total connections, eight
+connections per peer, and 64 streams per peer. Frame caps remain 8 KiB for sync
+requests, 512 KiB for roster responses, 128 KiB for history lists, and 384 KiB
+for history bodies. Relay circuit duration, byte budgets, and admission policy
+remain operator-controlled; restrictive relay policies can interrupt transfers
+or reject frames. These failures are reported rather than bypassed with direct
+dials or raised application limits.
 
 ## Social-First Feature Gates
 

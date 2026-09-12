@@ -173,15 +173,16 @@ func TestInvalidatedHistorySnapshotReleasesItsSlot(t *testing.T) {
 }
 
 type snapshotLifecycleFixture struct {
-	ctx     context.Context
-	founder *keystore.Identity
-	client  host.Host
-	remote  peer.AddrInfo
-	groups  [2]entmoot.GroupID
-	logs    map[entmoot.GroupID]*roster.RosterLog
-	store   *store.SQLite
-	ids     map[entmoot.GroupID][]entmoot.MessageID
-	elapsed atomic.Int64
+	ctx        context.Context
+	founder    *keystore.Identity
+	client     host.Host
+	serverHost host.Host
+	remote     peer.AddrInfo
+	groups     [2]entmoot.GroupID
+	logs       map[entmoot.GroupID]*roster.RosterLog
+	store      *store.SQLite
+	ids        map[entmoot.GroupID][]entmoot.MessageID
+	elapsed    atomic.Int64
 }
 
 func newSnapshotLifecycleFixture(t *testing.T) *snapshotLifecycleFixture {
@@ -206,9 +207,10 @@ func newSnapshotLifecycleFixture(t *testing.T) *snapshotLifecycleFixture {
 	t.Cleanup(func() { _ = source.Close() })
 	f := &snapshotLifecycleFixture{
 		ctx: ctx, founder: founder, client: clientHost,
-		remote: peer.AddrInfo{ID: serverHost.ID(), Addrs: serverHost.Addrs()},
-		groups: [2]entmoot.GroupID{{1}, {2}},
-		logs:   make(map[entmoot.GroupID]*roster.RosterLog), store: source,
+		serverHost: serverHost,
+		remote:     peer.AddrInfo{ID: serverHost.ID(), Addrs: serverHost.Addrs()},
+		groups:     [2]entmoot.GroupID{{1}, {2}},
+		logs:       make(map[entmoot.GroupID]*roster.RosterLog), store: source,
 		ids: make(map[entmoot.GroupID][]entmoot.MessageID),
 	}
 	for _, groupID := range f.groups {

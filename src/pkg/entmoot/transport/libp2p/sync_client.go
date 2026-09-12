@@ -176,6 +176,21 @@ type KeeperProgress struct {
 	Err              error
 }
 
+// HistorySyncState retains one bounded page per keeper across interrupted and
+// budget-limited passes. A caller must serialize access and reuse it for the
+// same group; the daemon owns one under each group's catch-up lock.
+type HistorySyncState struct {
+	groupID entmoot.GroupID
+	keepers map[peer.ID]*keeperSyncState
+}
+
+type keeperSyncState struct {
+	request       HistorySyncRequest
+	page          *HistorySyncResponse
+	offset        int
+	missingBodies int
+}
+
 type KeeperAvailability string
 
 const (
@@ -226,82 +241,120 @@ func SyncFromKeepers(
 	keepers []peer.AddrInfo,
 	destination store.MessageStore,
 	validate func(entmoot.Message, *merkle.Proof) error,
+	state *HistorySyncState,
 ) []KeeperProgress {
 	progress := make([]KeeperProgress, 0, len(keepers))
-	if destination == nil || validate == nil {
+	if destination == nil || validate == nil || state == nil {
 		for _, keeper := range keepers {
-			progress = append(progress, KeeperProgress{PeerID: keeper.ID, Err: errors.New("libp2p: destination and historical validator are required")})
+			progress = append(progress, KeeperProgress{PeerID: keeper.ID, Err: errors.New("libp2p: destination, historical validator, and sync state are required")})
 		}
 		return progress
 	}
+	if state.keepers == nil || state.groupID != groupID {
+		state.groupID = groupID
+		state.keepers = make(map[peer.ID]*keeperSyncState)
+	}
+	for id := range state.keepers {
+		present := false
+		for _, keeper := range keepers {
+			if keeper.ID == id {
+				present = true
+				break
+			}
+		}
+		if !present {
+			delete(state.keepers, id)
+		}
+	}
 	for keeperIndex, keeper := range keepers {
 		item := KeeperProgress{PeerID: keeper.ID}
+		cursor := state.keepers[keeper.ID]
+		if cursor == nil {
+			cursor = &keeperSyncState{request: HistorySyncRequest{Version: 2, GroupID: groupID, Mode: "list", Limit: 256}}
+			state.keepers[keeper.ID] = cursor
+		}
 		keeperCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		err := syncFromKeeper(keeperCtx, h, groupID, keeper, destination, validate, keeperIndex, &item)
+		err := syncFromKeeper(keeperCtx, h, groupID, keeper, destination, validate, keeperIndex, &item, cursor)
 		cancel()
 		if err != nil {
 			item.Err = err
 		} else {
 			item.Available = true
 		}
+		if item.ConvergedHint || (err == nil && cursor.page == nil && !item.BudgetExhausted) {
+			delete(state.keepers, keeper.ID)
+		} else {
+			continuation := cursor.request
+			item.Continuation = &continuation
+		}
 		progress = append(progress, item)
 	}
 	return progress
 }
 
-func syncFromKeeper(ctx context.Context, h host.Host, groupID entmoot.GroupID, keeper peer.AddrInfo, destination store.MessageStore, validate func(entmoot.Message, *merkle.Proof) error, keeperIndex int, progress *KeeperProgress) error {
-	var snapshotToken string
-	var generation uint64
-	var afterTimestamp int64
-	var afterAuthor entmoot.MemberID
-	var afterID *entmoot.MessageID
+func syncFromKeeper(ctx context.Context, h host.Host, groupID entmoot.GroupID, keeper peer.AddrInfo, destination store.MessageStore, validate func(entmoot.Message, *merkle.Proof) error, keeperIndex int, progress *KeeperProgress, cursor *keeperSyncState) error {
+	const transferBudget = 16 << 20
 	for pageNumber := 0; pageNumber < 1024; pageNumber++ {
-		requestID := fmt.Sprintf("keeper-%d-page-%d", keeperIndex, pageNumber)
-		listed, err := RequestHistoryPage(ctx, h, keeper, HistorySyncRequest{
-			Version:             2,
-			RequestID:           requestID,
-			GroupID:             groupID,
-			Mode:                "list",
-			SnapshotToken:       snapshotToken,
-			Generation:          generation,
-			AfterTimestampMS:    afterTimestamp,
-			AfterAuthorMemberID: afterAuthor,
-			AfterID:             afterID,
-			Limit:               256,
-		})
-		if err != nil {
-			return err
-		}
-		progress.TransferredBytes += encodedJSONSize(listed)
-		progress.Listed += len(listed.IDs)
-		progress.CoverageFloorMS = listed.CoverageFloorMS
-		missing := make([]entmoot.MessageID, 0, len(listed.IDs))
-		for _, id := range listed.IDs {
-			has, err := destination.Has(ctx, groupID, id)
+		if cursor.page == nil {
+			if progress.TransferredBytes+maxHistoryListBytes+1 > transferBudget {
+				progress.BudgetExhausted = true
+				return nil
+			}
+			cursor.request.RequestID = fmt.Sprintf("keeper-%d-page-%d", keeperIndex, pageNumber)
+			listed, err := RequestHistoryPage(ctx, h, keeper, cursor.request)
 			if err != nil {
+				if listed.Error == SyncSnapshotExpired {
+					// An expired token does not discard the tuple cursor. If the
+					// store changed, a fresh-token request reports that separately.
+					cursor.request.SnapshotToken = ""
+					if listed.SnapshotChanged {
+						cursor.request.Generation = 0
+						cursor.request.AfterTimestampMS = 0
+						cursor.request.AfterAuthorMemberID = entmoot.MemberID{}
+						cursor.request.AfterID = nil
+						cursor.missingBodies = 0
+					}
+				}
 				return err
 			}
-			if !has {
-				missing = append(missing, id)
-			}
+			progress.TransferredBytes += encodedJSONSize(listed) + 1
+			progress.Listed += len(listed.IDs)
+			cursor.page = &listed
+			cursor.offset = 0
 		}
-		for start := 0; start < len(missing); start += maxHistoryBodyItems {
-			end := start + maxHistoryBodyItems
-			if end > len(missing) {
-				end = len(missing)
+		listed := cursor.page
+		progress.CoverageFloorMS = listed.CoverageFloorMS
+		for cursor.offset < len(listed.IDs) {
+			if progress.TransferredBytes+maxHistoryBodyBytes+1 > transferBudget {
+				progress.BudgetExhausted = true
+				return nil
+			}
+			end := min(cursor.offset+maxHistoryBodyItems, len(listed.IDs))
+			missing := make([]entmoot.MessageID, 0, end-cursor.offset)
+			for _, id := range listed.IDs[cursor.offset:end] {
+				has, err := destination.Has(ctx, groupID, id)
+				if err != nil {
+					return err
+				}
+				if !has {
+					missing = append(missing, id)
+				}
+			}
+			if len(missing) == 0 {
+				cursor.offset = end
+				continue
 			}
 			bodies, err := RequestHistoryPage(ctx, h, keeper, HistorySyncRequest{
 				Version:   2,
-				RequestID: fmt.Sprintf("keeper-%d-bodies-%d-%d", keeperIndex, pageNumber, start),
-				GroupID:   groupID,
-				Mode:      "bodies",
-				IDs:       missing[start:end],
+				RequestID: fmt.Sprintf("keeper-%d-bodies-%d-%d", keeperIndex, pageNumber, cursor.offset),
+				GroupID:   groupID, Mode: "bodies", IDs: missing,
 			})
 			if err != nil {
 				return err
 			}
-			progress.TransferredBytes += encodedJSONSize(bodies)
+			progress.TransferredBytes += encodedJSONSize(bodies) + 1
 			progress.MissingBodies += len(bodies.Missing)
+			cursor.missingBodies += len(bodies.Missing)
 			proofs := make(map[entmoot.MessageID]merkle.Proof, len(bodies.LegacyProofs))
 			for _, item := range bodies.LegacyProofs {
 				proofs[item.MessageID] = item.Proof
@@ -328,33 +381,21 @@ func syncFromKeeper(ctx context.Context, h host.Host, groupID entmoot.GroupID, k
 					progress.Inserted++
 				}
 			}
+			cursor.offset = end
 		}
+		cursor.page = nil
 		if !listed.HasMore {
-			progress.ConvergedHint = progress.MissingBodies == 0
+			progress.ConvergedHint = cursor.missingBodies == 0
 			return nil
 		}
-		if progress.TransferredBytes >= 16<<20 {
-			progress.BudgetExhausted = true
-			progress.Continuation = &HistorySyncRequest{
-				Version:             2,
-				GroupID:             groupID,
-				Mode:                "list",
-				SnapshotToken:       listed.SnapshotToken,
-				Generation:          listed.Generation,
-				AfterTimestampMS:    listed.NextTimestampMS,
-				AfterAuthorMemberID: listed.NextAuthorMemberID,
-				AfterID:             listed.NextID,
-				Limit:               256,
-			}
-			return nil
-		}
-		snapshotToken = listed.SnapshotToken
-		generation = listed.Generation
-		afterTimestamp = listed.NextTimestampMS
-		afterAuthor = listed.NextAuthorMemberID
-		afterID = listed.NextID
+		cursor.request.SnapshotToken = listed.SnapshotToken
+		cursor.request.Generation = listed.Generation
+		cursor.request.AfterTimestampMS = listed.NextTimestampMS
+		cursor.request.AfterAuthorMemberID = listed.NextAuthorMemberID
+		cursor.request.AfterID = listed.NextID
 	}
-	return errors.New("libp2p: keeper page budget exhausted")
+	progress.BudgetExhausted = true
+	return nil
 }
 
 func encodedJSONSize(value any) int {

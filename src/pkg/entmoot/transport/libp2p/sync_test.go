@@ -187,7 +187,7 @@ func TestHistorySyncContinuesAfterWithholdingKeeperAndResumesPages(t *testing.T)
 		{ID: serverHost.ID(), Addrs: serverHost.Addrs()},
 	}, destination, func(message entmoot.Message, _ *merkle.Proof) error {
 		return signing.VerifyMessage(message, message.Author)
-	})
+	}, &HistorySyncState{})
 	if len(progress) != 2 || !progress[0].Available || progress[0].MissingBodies != 300 || progress[0].ConvergedHint || !progress[1].Available {
 		t.Fatalf("keeper progress = %+v", progress)
 	}

@@ -87,7 +87,7 @@ func TestHistorySyncAcrossSeparateProcessWithoutPilot(t *testing.T) {
 	groupID := processSyncGroupID()
 	progress := SyncFromKeepers(ctx, clientHost, groupID, []peer.AddrInfo{remote}, destination, func(message entmoot.Message, _ *merkle.Proof) error {
 		return signing.VerifyMessage(message, message.Author)
-	})
+	}, &HistorySyncState{})
 	if len(progress) != 1 || progress[0].Err != nil || progress[0].Inserted != 12 {
 		body, _ := io.ReadAll(stderr)
 		t.Fatalf("separate-process progress=%+v stderr=%s", progress, body)

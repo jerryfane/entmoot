@@ -4,14 +4,19 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	libp2p "github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/control"
+	"github.com/libp2p/go-libp2p/core/event"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/peerstore"
 	mdns "github.com/libp2p/go-libp2p/p2p/discovery/mdns"
+	"github.com/libp2p/go-libp2p/p2p/host/eventbus"
+	rcmgr "github.com/libp2p/go-libp2p/p2p/host/resource-manager"
 	connmgr "github.com/libp2p/go-libp2p/p2p/net/connmgr"
 	relayclient "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/client"
 	multiaddr "github.com/multiformats/go-multiaddr"
@@ -28,6 +33,12 @@ const (
 	RelayOnlyConnectivity ConnectivityMode = "relay_only"
 )
 
+const (
+	maxHostConnections = 64
+	maxPeerConnections = 8
+	maxPeerStreams     = 64
+)
+
 type HostConfig struct {
 	Mode             ConnectivityMode
 	ListenAddrs      []string
@@ -38,36 +49,83 @@ type HostConfig struct {
 // never enables mDNS, public discovery, hole punching, AutoNAT service, or a
 // direct application listener.
 func NewConfiguredHost(ctx context.Context, identity *keystore.Identity, cfg HostConfig) (host.Host, Binding, error) {
-	manager, err := connmgr.NewConnManager(48, 64)
+	if cfg.Mode != "" && cfg.Mode != DirectConnectivity && cfg.Mode != RelayOnlyConnectivity {
+		return nil, Binding{}, fmt.Errorf("libp2p: unsupported connectivity mode %q", cfg.Mode)
+	}
+	if cfg.Mode == RelayOnlyConnectivity && len(cfg.ControlledRelays) == 0 {
+		return nil, Binding{}, errors.New("libp2p: relay-only mode requires a controlled relay")
+	}
+	manager, err := connmgr.NewConnManager(maxHostConnections*3/4, maxHostConnections)
 	if err != nil {
 		return nil, Binding{}, err
 	}
-	options := []libp2p.Option{libp2p.ConnectionManager(manager)}
+	limits := rcmgr.PartialLimitConfig{
+		System: rcmgr.ResourceLimits{
+			Conns: maxHostConnections, ConnsInbound: maxHostConnections, ConnsOutbound: maxHostConnections,
+		},
+		PeerDefault: rcmgr.ResourceLimits{
+			Conns: maxPeerConnections, ConnsInbound: maxPeerConnections, ConnsOutbound: maxPeerConnections,
+			Streams: maxPeerStreams, StreamsInbound: maxPeerStreams, StreamsOutbound: maxPeerStreams,
+		},
+	}
+	resources, err := rcmgr.NewResourceManager(rcmgr.NewFixedLimiter(limits.Build(rcmgr.DefaultLimits.AutoScale())))
+	if err != nil {
+		_ = manager.Close()
+		return nil, Binding{}, err
+	}
+	options := []libp2p.Option{libp2p.ConnectionManager(manager), libp2p.ResourceManager(resources)}
+	var privateAddresses *relayOnlyPeerstore
 	switch cfg.Mode {
 	case "", DirectConnectivity:
 		if len(cfg.ListenAddrs) > 0 {
 			options = append(options, libp2p.ListenAddrStrings(cfg.ListenAddrs...))
 		}
 	case RelayOnlyConnectivity:
-		if len(cfg.ControlledRelays) == 0 {
-			return nil, Binding{}, errors.New("libp2p: relay-only mode requires a controlled relay")
-		}
 		gater := newRelayOnlyGater(cfg.ControlledRelays)
+		privateAddresses, err = newRelayOnlyPeerstore(gater.relays)
+		if err != nil {
+			_ = manager.Close()
+			_ = resources.Close()
+			return nil, Binding{}, err
+		}
 		options = append(options,
 			libp2p.NoListenAddrs,
 			libp2p.DisableIdentifyAddressDiscovery(),
 			libp2p.ForceReachabilityPrivate(),
 			libp2p.EnableRelay(),
-			libp2p.EnableAutoRelayWithStaticRelays(cfg.ControlledRelays),
 			libp2p.ConnectionGater(gater),
+			libp2p.Peerstore(privateAddresses),
 			libp2p.AddrsFactory(func(addresses []multiaddr.Multiaddr) []multiaddr.Multiaddr {
 				return filterControlledCircuitAddresses(addresses, gater.relays)
 			}),
 		)
-	default:
-		return nil, Binding{}, fmt.Errorf("libp2p: unsupported connectivity mode %q", cfg.Mode)
 	}
-	return NewHost(ctx, identity, options...)
+	hostCtx := ctx
+	var cancel context.CancelFunc
+	if privateAddresses != nil {
+		hostCtx, cancel = context.WithCancel(ctx)
+	}
+	h, binding, err := NewHost(hostCtx, identity, options...)
+	if err != nil {
+		if cancel != nil {
+			cancel()
+		}
+		_ = manager.Close()
+		_ = resources.Close()
+		if privateAddresses != nil {
+			_ = privateAddresses.Close()
+		}
+		return nil, Binding{}, err
+	}
+	if privateAddresses != nil {
+		h = &relayOnlyHost{Host: h, addresses: privateAddresses, cancel: cancel}
+		reservations := &RelayReservationManager{Host: h, Relays: cfg.ControlledRelays}
+		if err := reservations.Run(hostCtx); err != nil {
+			_ = h.Close()
+			return nil, Binding{}, err
+		}
+	}
+	return h, binding, err
 }
 
 // InstallVerifiedPeer accepts invite/static/identify hints only after the
@@ -79,8 +137,8 @@ func InstallVerifiedPeer(h host.Host, r *roster.RosterLog, member entmoot.NodeIn
 	if err := VerifyBinding(member.EntmootPubKey, *member.MemberID, peerID); err != nil {
 		return err
 	}
-	if ttl <= 0 || ttl > 30*time.Minute {
-		ttl = 30 * time.Minute
+	if ttl <= 0 || ttl > maxPeerAddressAge {
+		ttl = maxPeerAddressAge
 	}
 	if mode == RelayOnlyConnectivity {
 		allowed := make(map[peer.ID]struct{}, len(controlledRelays))
@@ -144,7 +202,7 @@ func (n *memberMDNSNotifee) HandlePeerFound(info peer.AddrInfo) {
 	if !peerIsMember(n.host, n.roster, info.ID) {
 		return
 	}
-	n.host.Peerstore().AddAddrs(info.ID, info.Addrs, 30*time.Minute)
+	n.host.Peerstore().AddAddrs(info.ID, info.Addrs, maxPeerAddressAge)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_ = n.host.Connect(ctx, info)
@@ -245,52 +303,175 @@ type RelayReservationManager struct {
 	OnError func(peer.ID, error)
 }
 
+type relayReservationUpdate struct {
+	peer      peer.ID
+	expires   time.Time
+	addresses []multiaddr.Multiaddr
+	remove    bool
+}
+
 func (m *RelayReservationManager) Run(ctx context.Context) error {
 	if m == nil || m.Host == nil || len(m.Relays) == 0 {
 		return errors.New("libp2p: relay reservation manager is not configured")
 	}
+	emitter, err := m.Host.EventBus().Emitter(new(event.EvtAutoRelayAddrsUpdated), eventbus.Stateful)
+	if err != nil {
+		return err
+	}
+	relays := make(map[peer.ID]peer.AddrInfo, len(m.Relays))
+	order := make([]peer.ID, 0, len(m.Relays))
+	wake := make(map[peer.ID]chan struct{}, len(m.Relays))
 	for _, relay := range m.Relays {
-		relay := relay
-		go m.renew(ctx, relay)
+		current, exists := relays[relay.ID]
+		if !exists {
+			order = append(order, relay.ID)
+			wake[relay.ID] = make(chan struct{}, 1)
+		}
+		current.ID = relay.ID
+		current.Addrs = append(current.Addrs, relay.Addrs...)
+		relays[relay.ID] = current
+	}
+	updates := make(chan relayReservationUpdate, len(order))
+	notifiee := &network.NotifyBundle{DisconnectedF: func(_ network.Network, connection network.Conn) {
+		if signal, ok := wake[connection.RemotePeer()]; ok {
+			select {
+			case signal <- struct{}{}:
+			default:
+			}
+		}
+	}}
+	m.Host.Network().Notify(notifiee)
+	go func() {
+		defer emitter.Close()
+		defer m.Host.Network().StopNotify(notifiee)
+		defer func() {
+			for _, id := range order {
+				m.Host.ConnManager().Unprotect(id, "entmoot-relay")
+			}
+		}()
+		active := make(map[peer.ID]relayReservationUpdate, len(order))
+		for {
+			var update relayReservationUpdate
+			select {
+			case <-ctx.Done():
+				return
+			case update = <-updates:
+			}
+			previous, exists := active[update.peer]
+			if update.remove {
+				// An old expiry timer must not retire a refreshed reservation.
+				if !exists || (!update.expires.IsZero() && !previous.expires.Equal(update.expires)) {
+					continue
+				}
+				delete(active, update.peer)
+				m.Host.ConnManager().Unprotect(update.peer, "entmoot-relay")
+			} else {
+				if m.Host.Network().Connectedness(update.peer) != network.Connected {
+					continue
+				}
+				active[update.peer] = update
+				m.Host.ConnManager().Protect(update.peer, "entmoot-relay")
+				if exists && slices.EqualFunc(previous.addresses, update.addresses, multiaddr.Multiaddr.Equal) {
+					continue
+				}
+			}
+			addresses := make([]multiaddr.Multiaddr, 0, len(active))
+			for _, id := range order {
+				addresses = append(addresses, active[id].addresses...)
+			}
+			_ = emitter.Emit(event.EvtAutoRelayAddrsUpdated{RelayAddrs: addresses})
+		}
+	}()
+	for _, id := range order {
+		relay := relays[id]
+		m.Host.Peerstore().AddAddrs(id, relay.Addrs, peerstore.PermanentAddrTTL)
+		go m.renew(ctx, relay, wake[id], updates)
 	}
 	return nil
 }
 
-func (m *RelayReservationManager) renew(ctx context.Context, relay peer.AddrInfo) {
+func sendRelayUpdate(ctx context.Context, updates chan<- relayReservationUpdate, update relayReservationUpdate) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case updates <- update:
+		return true
+	}
+}
+
+func (m *RelayReservationManager) renew(ctx context.Context, relay peer.AddrInfo, wake <-chan struct{}, updates chan<- relayReservationUpdate) {
 	backoff := time.Second
+	var expiryTimer *time.Timer
+	defer func() {
+		if expiryTimer != nil {
+			expiryTimer.Stop()
+		}
+	}()
 	for ctx.Err() == nil {
-		reservation, err := relayclient.Reserve(ctx, m.Host, relay)
+		if m.Host.Network().Connectedness(relay.ID) != network.Connected {
+			if !sendRelayUpdate(ctx, updates, relayReservationUpdate{peer: relay.ID, remove: true}) {
+				return
+			}
+		}
+		attempt, cancel := context.WithTimeout(ctx, 10*time.Second)
+		reservation, err := relayclient.Reserve(attempt, m.Host, peer.AddrInfo{ID: relay.ID})
+		cancel()
+		delay := backoff
 		if err != nil {
 			if m.OnError != nil {
 				m.OnError(relay.ID, err)
 			}
-			if !sleepContext(ctx, backoff) {
+			backoff = min(2*backoff, 30*time.Second)
+		} else {
+			backoff = time.Second
+			update := relayReservationUpdate{
+				peer: relay.ID, expires: reservation.Expiration,
+				addresses: reservationCircuitAddresses(relay, reservation),
+			}
+			if !sendRelayUpdate(ctx, updates, update) {
 				return
 			}
-			backoff *= 2
-			if backoff > 30*time.Second {
-				backoff = 30 * time.Second
+			if expiryTimer != nil {
+				expiryTimer.Stop()
 			}
-			continue
+			expires := reservation.Expiration
+			expiryTimer = time.AfterFunc(time.Until(expires), func() {
+				sendRelayUpdate(ctx, updates, relayReservationUpdate{peer: relay.ID, expires: expires, remove: true})
+			})
+			delay = time.Until(expires) / 2
+			if delay <= 0 {
+				delay = time.Second
+			}
 		}
-		backoff = time.Second
-		delay := time.Until(reservation.Expiration) / 2
-		if delay <= 0 {
-			delay = time.Second
-		}
-		if !sleepContext(ctx, delay) {
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
 			return
+		case <-wake:
+			timer.Stop()
+		case <-timer.C:
 		}
 	}
 }
 
-func sleepContext(ctx context.Context, delay time.Duration) bool {
-	timer := time.NewTimer(delay)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return false
-	case <-timer.C:
-		return true
+func reservationCircuitAddresses(relay peer.AddrInfo, reservation *relayclient.Reservation) []multiaddr.Multiaddr {
+	suffix := multiaddr.StringCast("/p2p/" + relay.ID.String() + "/p2p-circuit")
+	addresses := make([]multiaddr.Multiaddr, 0, len(reservation.Addrs))
+	for _, address := range reservation.Addrs {
+		info, err := peer.AddrInfoFromP2pAddr(address)
+		if err != nil || info.ID != relay.ID {
+			continue
+		}
+		for _, base := range info.Addrs {
+			addresses = append(addresses, base.Encapsulate(suffix))
+		}
 	}
+	if len(addresses) == 0 {
+		// Explicitly configured private relays need not advertise public addrs.
+		for _, address := range relay.Addrs {
+			addresses = append(addresses, address.Encapsulate(suffix))
+		}
+	}
+	return multiaddr.Unique(addresses)
 }

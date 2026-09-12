@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Controlled-relay recovery and privacy.** Configured hosts now renew relay
+  reservations near half-life and refresh advertised circuit endpoints after
+  relay address changes. Relay-only peerstores reject direct application hints,
+  including identify updates and mixed signed address records. Hard resource
+  admission enforces 64 total connections, eight per peer, and 64 streams per
+  peer. History catch-up retains unfinished pages and cursors across circuit
+  resets and bounded passes without raising frame or transfer budgets.
 - **Multi-group snapshot recovery.** Completed roster/history pages immediately
   release their active snapshot slots; invalidated history generations release
   their token, and abandoned pages remain reclaimable at the original expiry.

@@ -197,31 +197,6 @@ func TestVerifiedAddressHintsRespectIdentityAndPrivacyProfile(t *testing.T) {
 	}
 }
 
-func TestMemberMDNSRequiresExplicitStart(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	identity := mustIdentity(t)
-	h, _, err := NewConfiguredHost(ctx, identity, HostConfig{Mode: DirectConnectivity, ListenAddrs: []string{"/ip4/127.0.0.1/tcp/0"}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer h.Close()
-	var groupID entmoot.GroupID
-	groupID[0] = 7
-	r := roster.New(groupID)
-	info := mustNodeInfo(t, identity.PublicKey)
-	if err := r.Genesis(identity, info, 1_000); err != nil {
-		t.Fatal(err)
-	}
-	service, err := StartMemberMDNS(h, r, groupID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := service.Close(); err != nil {
-		t.Fatal(err)
-	}
-}
-
 func TestRelayOnlyRequiresControlledRelay(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

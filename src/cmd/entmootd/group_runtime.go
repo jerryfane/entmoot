@@ -68,6 +68,7 @@ type groupSession struct {
 	legacyHistory *merkle.Tree
 	cancel        context.CancelFunc
 	catchup       sync.Mutex
+	history       libp2ptransport.HistorySyncState
 }
 type groupPolicyEnforcer struct {
 	mu          sync.Mutex
@@ -645,7 +646,7 @@ retry:
 				return err
 			}
 			return r.enforceGroupPolicy(ctx, session.groupID, message)
-		})
+		}, &session.history)
 		summary = libp2ptransport.SummarizeKeeperProgress(progress)
 		if len(progress) > 0 && progress[0].Err != nil {
 			lastErr = progress[0].Err.Error()
@@ -666,6 +667,7 @@ retry:
 		slog.Int("keepers", summary.Eligible),
 		slog.Int("available", summary.Available),
 		slog.Int("inserted", summary.Inserted),
+		slog.Int("converged_hints", summary.ConvergedHints),
 		slog.String("last_error", lastErr))
 }
 
