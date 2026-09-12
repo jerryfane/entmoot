@@ -101,14 +101,15 @@ func NewConfiguredHost(ctx context.Context, identity *keystore.Identity, cfg Hos
 		)
 	}
 	hostCtx := ctx
-	var cancel context.CancelFunc
+	var privateHost *relayOnlyHost
 	if privateAddresses != nil {
-		hostCtx, cancel = context.WithCancel(ctx)
+		privateHost = &relayOnlyHost{addresses: privateAddresses}
+		hostCtx, privateHost.cancel = context.WithCancel(ctx)
 	}
 	h, binding, err := NewHost(hostCtx, identity, options...)
 	if err != nil {
-		if cancel != nil {
-			cancel()
+		if privateHost != nil {
+			privateHost.cancel()
 		}
 		_ = manager.Close()
 		_ = resources.Close()
@@ -117,8 +118,9 @@ func NewConfiguredHost(ctx context.Context, identity *keystore.Identity, cfg Hos
 		}
 		return nil, Binding{}, err
 	}
-	if privateAddresses != nil {
-		h = &relayOnlyHost{Host: h, addresses: privateAddresses, cancel: cancel}
+	if privateHost != nil {
+		privateHost.Host = h
+		h = privateHost
 		reservations := &RelayReservationManager{Host: h, Relays: cfg.ControlledRelays}
 		if err := reservations.Run(hostCtx); err != nil {
 			_ = h.Close()
