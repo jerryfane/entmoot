@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Multi-group snapshot recovery.** Completed roster/history pages immediately
+  release their active snapshot slots; invalidated history generations release
+  their token, and abandoned pages remain reclaimable at the original expiry.
+  Active sessions retain their pinned state and unchanged resource limits.
+  Full active quotas now report `resource_exhausted`, not `snapshot_expired`.
 - **Concurrent completed-root startup.** Conversion and journal reads now share
   a cross-process root lock. Completed roots no longer checkpoint or scan live
   operational databases during routine commands.

@@ -225,9 +225,9 @@ func (s *SyncServer) handleRoster(stream network.Stream) {
 		return
 	}
 	entries := r.Entries()
-	snapshot, token, err := s.rosterSnapshot(stream.Conn().RemotePeer(), request, len(entries))
-	if err != nil {
-		response.Error = SyncSnapshotExpired
+	snapshot, token, snapshotErr := s.rosterSnapshot(stream.Conn().RemotePeer(), request, len(entries))
+	if snapshotErr != "" {
+		response.Error = snapshotErr
 		s.writeRoster(stream, response)
 		return
 	}
@@ -238,6 +238,9 @@ func (s *SyncServer) handleRoster(stream network.Stream) {
 	start := int(request.AfterSequence)
 	if start > len(entries) {
 		response.Error = SyncMalformed
+		if request.SnapshotToken == "" {
+			s.releaseSnapshot(token)
+		}
 		s.writeRoster(stream, response)
 		return
 	}
@@ -250,6 +253,9 @@ func (s *SyncServer) handleRoster(stream network.Stream) {
 	response.Complete = end == len(entries)
 	response.SnapshotToken = token
 	response.CommittedHead = entries[len(entries)-1].ID
+	if response.Complete {
+		s.releaseSnapshot(token)
+	}
 	s.writeRoster(stream, response)
 }
 
@@ -319,8 +325,8 @@ func (s *SyncServer) handleHistoryList(stream network.Stream, request HistorySyn
 		return
 	}
 	_, token, snapshotErr := s.historySnapshot(stream.Conn().RemotePeer(), request, page.Generation)
-	if snapshotErr != nil {
-		response.Error = SyncSnapshotExpired
+	if snapshotErr != "" {
+		response.Error = snapshotErr
 		s.writeHistory(stream, response, maxHistoryListBytes)
 		return
 	}
@@ -338,6 +344,9 @@ func (s *SyncServer) handleHistoryList(stream network.Stream, request HistorySyn
 	}
 	if page.SnapshotChanged {
 		response.Error = SyncSnapshotExpired
+	}
+	if !page.HasMore || page.SnapshotChanged {
+		s.releaseSnapshot(token)
 	}
 	s.writeHistory(stream, response, maxHistoryListBytes)
 }
@@ -394,15 +403,15 @@ func boundedLimit(value, fallback, maximum int) int {
 	return value
 }
 
-func (s *SyncServer) rosterSnapshot(peerID peer.ID, request RosterSyncRequest, size int) (syncSnapshot, string, error) {
+func (s *SyncServer) rosterSnapshot(peerID peer.ID, request RosterSyncRequest, size int) (syncSnapshot, string, SyncErrorCode) {
 	return s.snapshot(peerID, request.GroupID, rosterSnapshot, request.SnapshotToken, size, 0)
 }
 
-func (s *SyncServer) historySnapshot(peerID peer.ID, request HistorySyncRequest, generation uint64) (syncSnapshot, string, error) {
+func (s *SyncServer) historySnapshot(peerID peer.ID, request HistorySyncRequest, generation uint64) (syncSnapshot, string, SyncErrorCode) {
 	return s.snapshot(peerID, request.GroupID, historySnapshot, request.SnapshotToken, 0, generation)
 }
 
-func (s *SyncServer) snapshot(peerID peer.ID, groupID entmoot.GroupID, kind protocolKind, token string, rosterSize int, generation uint64) (syncSnapshot, string, error) {
+func (s *SyncServer) snapshot(peerID peer.ID, groupID entmoot.GroupID, kind protocolKind, token string, rosterSize int, generation uint64) (syncSnapshot, string, SyncErrorCode) {
 	now := s.now()
 	s.snapshotMu.Lock()
 	defer s.snapshotMu.Unlock()
@@ -414,12 +423,13 @@ func (s *SyncServer) snapshot(peerID peer.ID, groupID entmoot.GroupID, kind prot
 	if token != "" {
 		value, ok := s.snapshots[token]
 		if !ok || value.peerID != peerID || value.groupID != groupID || value.kind != kind || !value.expires.After(now) {
-			return syncSnapshot{}, "", ErrBootstrapDenied
+			return syncSnapshot{}, "", SyncSnapshotExpired
 		}
 		if kind == historySnapshot && value.generation != generation {
-			return syncSnapshot{}, "", ErrBootstrapDenied
+			delete(s.snapshots, token)
+			return syncSnapshot{}, "", SyncSnapshotExpired
 		}
-		return value, token, nil
+		return value, token, ""
 	}
 	peerCount := 0
 	for _, value := range s.snapshots {
@@ -428,16 +438,24 @@ func (s *SyncServer) snapshot(peerID peer.ID, groupID entmoot.GroupID, kind prot
 		}
 	}
 	if peerCount >= maxPeerSnapshots || len(s.snapshots) >= maxGlobalSnapshots {
-		return syncSnapshot{}, "", errors.New("snapshot capacity exhausted")
+		return syncSnapshot{}, "", SyncResourceExhausted
 	}
 	var random [24]byte
 	if _, err := rand.Read(random[:]); err != nil {
-		return syncSnapshot{}, "", err
+		return syncSnapshot{}, "", SyncInternal
 	}
 	token = base64.RawURLEncoding.EncodeToString(random[:])
 	value := syncSnapshot{peerID: peerID, groupID: groupID, kind: kind, expires: now.Add(syncSnapshotLifetime), rosterSize: rosterSize, generation: generation}
 	s.snapshots[token] = value
-	return value, token, nil
+	return value, token, ""
+}
+
+// Retire terminal tokens before writing the response so the next request can
+// immediately reuse the slot. Retrying a retired token requires a fresh sync.
+func (s *SyncServer) releaseSnapshot(token string) {
+	s.snapshotMu.Lock()
+	defer s.snapshotMu.Unlock()
+	delete(s.snapshots, token)
 }
 
 func (s *SyncServer) writeRoster(stream network.Stream, response RosterSyncResponse) {

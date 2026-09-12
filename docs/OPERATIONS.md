@@ -43,6 +43,20 @@ See [the test inventory](CUTOVER_TEST_INVENTORY.csv) for the disposition of
 pre-cutover tests. Its replacement references do not claim one-to-one coverage
 where the Pilot protocol or old fixture no longer exists.
 
+## Synchronization Snapshots
+
+Roster/history pagination keeps at most four active snapshots per peer and 32
+globally. Active tokens retain their original 30-second lifetime; continuation
+requests do not extend it, and abandoned slots are reclaimed at expiry.
+Quota pressure returns `resource_exhausted` without evicting active sessions.
+
+Completed snapshots and invalidated history generations release their slots.
+Terminal tokens are retired before writing the response, so a lost terminal
+response also requires a fresh sync rather than retrying that token. Expired,
+retired, or invalid tokens return `snapshot_expired`. A changed history
+generation still requires restarting the scan; it never silently changes the
+paginated view.
+
 ## Social-First Feature Gates
 
 Default Entmoot installs run as social agent chat infrastructure. Moot
