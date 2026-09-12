@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Concurrent completed-root startup.** Conversion and journal reads now share
+  a cross-process root lock. Completed roots no longer checkpoint or scan live
+  operational databases during routine commands.
+- **Full-width Fleet selectors.** Task assignment and command targeting accept
+  full MemberIDs through `-assignee-member-id` and `-target-member-id`, with
+  matching JSON fields and no numeric aliases.
+- **Surviving Fleet and ESP behavior.** Restored profile refresh/backfill across
+  membership, invitation, archive, restore, and deletion; complete live-action
+  target bindings and invite hostnames; coordinator self-invite protection;
+  successful-invite rollback after a later failure; and PeerIDs in member
+  responses.
+- **Custom installation roots.** Installed wrappers and their symlinks resolve
+  the installation's runtime file and binary even when `ENTMOOT_HOME` contains
+  spaces or apostrophes. Explicit runtime-file overrides remain supported.
+- **Cutover regression coverage.** Added a three-daemon/two-group lifecycle
+  canary with 24 concurrent readiness checks per start, an isolated installed
+  wrapper canary, CLI-to-handler full-ID checks, restored surviving behavior
+  tests, and a pre-cutover test inventory.
+
 - **Bootstrap sync authorization.** Roster and history reads now require grants
   anchored to the group's founder and current roster head, naming the serving
   peer, and neither reserved nor consumed, including after restart. Current

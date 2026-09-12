@@ -265,21 +265,66 @@ func (s *MemoryStateStore) listNodeProfilesForGroup(ids []entmoot.MemberID, gid 
 	return out
 }
 func (s *MemoryStateStore) observeFleetMemberNodeProfileLocked(rec FleetMemberRecord) error {
-	if profile, ok := nodeProfileFromFleetMember(rec); ok {
-		_, _, err := s.upsertNodeProfileLocked(profile, s.nowMS())
-		return err
-	}
-	return nil
+	return s.refreshFleetMemberNodeProfileLocked(rec.MemberID)
 }
 func (s *MemoryStateStore) observeFleetInviteNodeProfileLocked(rec FleetInviteRecord) error {
-	if profile, ok := nodeProfileFromFleetInvite(rec); ok {
-		_, _, err := s.upsertNodeProfileLocked(profile, s.nowMS())
-		return err
-	}
-	return nil
+	return s.refreshFleetInviteNodeProfileLocked(rec.MemberID)
 }
-func (s *MemoryStateStore) refreshFleetMemberNodeProfileLocked(entmoot.MemberID) error { return nil }
-func (s *MemoryStateStore) refreshFleetInviteNodeProfileLocked(entmoot.MemberID) error { return nil }
+func (s *MemoryStateStore) refreshFleetMemberNodeProfileLocked(id entmoot.MemberID) error {
+	var best NodeProfileRecord
+	now := s.nowMS()
+	for fleetID, members := range s.fleetMembers {
+		if !s.fleetActiveLocked(fleetID) {
+			continue
+		}
+		if profile, ok := nodeProfileFromFleetMember(members[id]); ok && shouldReplaceNodeProfile(best, profile, now) {
+			best = profile
+		}
+	}
+	return s.replaceFleetNodeProfileLocked(id, NodeProfileSourceFleetMember, best)
+}
+
+func (s *MemoryStateStore) refreshFleetInviteNodeProfileLocked(id entmoot.MemberID) error {
+	var best NodeProfileRecord
+	now := s.nowMS()
+	for fleetID, invites := range s.fleetInvites {
+		if !s.fleetActiveLocked(fleetID) {
+			continue
+		}
+		for _, invite := range invites {
+			if invite.MemberID != id {
+				continue
+			}
+			if profile, ok := nodeProfileFromFleetInvite(invite); ok && !nodeProfileExpired(profile, now) && shouldReplaceNodeProfile(best, profile, now) {
+				best = profile
+			}
+		}
+	}
+	return s.replaceFleetNodeProfileLocked(id, NodeProfileSourceFleetInvite, best)
+}
+
+func (s *MemoryStateStore) replaceFleetNodeProfileLocked(id entmoot.MemberID, source string, best NodeProfileRecord) error {
+	records := s.nodeProfiles[id]
+	delete(records, source)
+	if len(records) == 0 {
+		delete(s.nodeProfiles, id)
+	}
+	if best.MemberID == (entmoot.MemberID{}) {
+		return nil
+	}
+	_, _, err := s.upsertNodeProfileLocked(best, s.nowMS())
+	return err
+}
+
+// Call before dropping a fleet's rows, after changing its active status.
+func (s *MemoryStateStore) refreshFleetNodeProfilesLocked(fleetID string) {
+	for id := range s.fleetMembers[fleetID] {
+		_ = s.refreshFleetMemberNodeProfileLocked(id)
+	}
+	for _, invite := range s.fleetInvites[fleetID] {
+		_ = s.refreshFleetInviteNodeProfileLocked(invite.MemberID)
+	}
+}
 
 func (s *SQLiteStateStore) UpsertNodeProfile(ctx context.Context, rec NodeProfileRecord) (NodeProfileRecord, bool, error) {
 	nowMS := time.Now().UnixMilli()
@@ -334,26 +379,129 @@ func (s *SQLiteStateStore) listNodeProfilesForGroup(ctx context.Context, ids []e
 	return out, nil
 }
 func (s *SQLiteStateStore) observeFleetMemberNodeProfile(ctx context.Context, rec FleetMemberRecord) error {
-	if profile, ok := nodeProfileFromFleetMember(rec); ok {
-		_, _, err := s.UpsertNodeProfile(ctx, profile)
-		return err
-	}
-	return nil
+	return s.refreshFleetMemberNodeProfile(ctx, rec.MemberID)
 }
 func (s *SQLiteStateStore) observeFleetInviteNodeProfile(ctx context.Context, rec FleetInviteRecord) error {
-	if profile, ok := nodeProfileFromFleetInvite(rec); ok {
-		_, _, err := s.UpsertNodeProfile(ctx, profile)
+	return s.refreshFleetInviteNodeProfile(ctx, rec.MemberID)
+}
+func (s *SQLiteStateStore) refreshFleetMemberNodeProfile(ctx context.Context, id entmoot.MemberID) error {
+	return s.refreshFleetNodeProfile(ctx, id, NodeProfileSourceFleetMember, `
+SELECT m.entmoot_pubkey, m.hostname, m.updated_at_ms, 0
+FROM esp_fleet_members m JOIN esp_fleets f ON f.fleet_id = m.fleet_id
+WHERE m.member_id = ? AND f.status = 'active' AND m.status = 'active'`)
+}
+
+func (s *SQLiteStateStore) refreshFleetInviteNodeProfile(ctx context.Context, id entmoot.MemberID) error {
+	return s.refreshFleetNodeProfile(ctx, id, NodeProfileSourceFleetInvite, `
+SELECT i.entmoot_pubkey, i.hostname, i.updated_at_ms, i.expires_at_ms
+FROM esp_fleet_invites i JOIN esp_fleets f ON f.fleet_id = i.fleet_id
+WHERE i.member_id = ? AND f.status = 'active' AND i.status = 'invited'`)
+}
+
+func (s *SQLiteStateStore) refreshFleetNodeProfile(ctx context.Context, id entmoot.MemberID, source, query string) error {
+	if id == (entmoot.MemberID{}) {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
 		return err
+	}
+	defer tx.Rollback()
+	// Take the SQLite writer lock before reading authoritative Fleet rows.
+	// Concurrent refreshers then cannot reinsert an older membership snapshot.
+	if _, err := tx.ExecContext(ctx, `DELETE FROM esp_node_profile_sources WHERE member_id = ? AND source = ?`, id[:], source); err != nil {
+		return err
+	}
+	rows, err := tx.QueryContext(ctx, query, id[:])
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	now := time.Now().UnixMilli()
+	var best NodeProfileRecord
+	for rows.Next() {
+		profile := NodeProfileRecord{MemberID: id, Source: source}
+		if err := rows.Scan(&profile.EntmootPubKey, &profile.Hostname, &profile.ObservedAtMS, &profile.ExpiresAtMS); err != nil {
+			return err
+		}
+		profile, valid, err := normalizeNodeProfileRecord(profile, now)
+		if err != nil {
+			return err
+		}
+		if valid && !nodeProfileExpired(profile, now) && shouldReplaceNodeProfile(best, profile, now) {
+			best = profile
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if best.MemberID != (entmoot.MemberID{}) {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO esp_node_profile_sources
+(member_id, entmoot_pubkey, source, source_key, hostname, confidence, observed_at_ms, expires_at_ms)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, id[:], best.EntmootPubKey, source, source, best.Hostname, best.Confidence, best.ObservedAtMS, best.ExpiresAtMS); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func nodeProfileMemberIDs(ctx context.Context, q nodeProfileQuerier, query string, args ...any) ([]entmoot.MemberID, error) {
+	rows, err := q.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []entmoot.MemberID
+	for rows.Next() {
+		var raw []byte
+		if err := rows.Scan(&raw); err != nil {
+			return nil, err
+		}
+		var id entmoot.MemberID
+		if len(raw) != len(id) {
+			return nil, errors.New("esphttp: profile member id must be full-width")
+		}
+		copy(id[:], raw)
+		if id != (entmoot.MemberID{}) {
+			ids = append(ids, id)
+		}
+	}
+	return ids, rows.Err()
+}
+
+func fleetProfileMemberIDs(ctx context.Context, q nodeProfileQuerier, fleetID string) ([]entmoot.MemberID, error) {
+	return nodeProfileMemberIDs(ctx, q, `
+SELECT member_id FROM esp_fleet_members WHERE fleet_id = ?
+UNION SELECT member_id FROM esp_fleet_invites WHERE fleet_id = ?`, fleetID, fleetID)
+}
+
+func (s *SQLiteStateStore) refreshFleetNodeProfiles(ctx context.Context, ids []entmoot.MemberID) error {
+	for _, id := range ids {
+		if err := s.refreshFleetMemberNodeProfile(ctx, id); err != nil {
+			return err
+		}
+		if err := s.refreshFleetInviteNodeProfile(ctx, id); err != nil {
+			return err
+		}
 	}
 	return nil
 }
-func (s *SQLiteStateStore) refreshFleetMemberNodeProfile(context.Context, entmoot.MemberID) error {
-	return nil
+
+func (s *SQLiteStateStore) backfillFleetNodeProfiles(ctx context.Context) error {
+	ids, err := nodeProfileMemberIDs(ctx, s.db, `
+SELECT member_id FROM esp_node_profile_sources WHERE source IN ('fleet_member', 'fleet_invite')
+UNION SELECT m.member_id FROM esp_fleet_members m JOIN esp_fleets f ON f.fleet_id = m.fleet_id
+WHERE f.status = 'active' AND m.status = 'active' AND trim(m.hostname) != ''
+UNION SELECT i.member_id FROM esp_fleet_invites i JOIN esp_fleets f ON f.fleet_id = i.fleet_id
+WHERE f.status = 'active' AND i.status = 'invited' AND trim(i.hostname) != ''`)
+	if err != nil {
+		return err
+	}
+	return s.refreshFleetNodeProfiles(ctx, ids)
 }
-func (s *SQLiteStateStore) refreshFleetInviteNodeProfile(context.Context, entmoot.MemberID) error {
-	return nil
-}
-func (s *SQLiteStateStore) backfillFleetNodeProfiles(context.Context) error { return nil }
 
 type nodeProfileQuerier interface {
 	QueryContext(context.Context, string, ...interface{}) (*sql.Rows, error)

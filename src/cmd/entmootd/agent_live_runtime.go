@@ -1144,9 +1144,18 @@ func applyLiveAgentInviteCreate(ctx context.Context, gf *globalFlags, state esph
 	if err != nil {
 		return false, err
 	}
+	targetMemberID, err := liveActionTargetMemberID(action, liveActionInviteCreate)
+	if err != nil {
+		return false, err
+	}
+	targetPeerID, err := entmoot.PeerIDFromPublicKey(entPub)
+	if err != nil {
+		return false, err
+	}
 	body, err := json.Marshal(fleetInviteCreatePayload{
 		FleetID:      fleet.FleetID,
-		Target:       &inviteTargetPayload{EntmootPubKey: entPub},
+		Target:       &inviteTargetPayload{MemberID: targetMemberID, PeerID: targetPeerID, EntmootPubKey: entPub},
+		Hostname:     strings.TrimSpace(action.Hostname),
 		ValidFor:     strings.TrimSpace(action.ValidFor),
 		ValidUntilMS: action.ValidUntilMS,
 	})
@@ -1198,7 +1207,7 @@ func applyLiveAgentMemberRemove(ctx context.Context, gf *globalFlags, state esph
 	}
 	body, err := json.Marshal(fleetMemberRemovePayload{
 		FleetID: fleet.FleetID,
-		Target:  &inviteTargetPayload{EntmootPubKey: targetPub},
+		Target:  &inviteTargetPayload{MemberID: targetMember.MemberID, PeerID: targetMember.PeerID, EntmootPubKey: targetPub},
 	})
 	if err != nil {
 		return false, err

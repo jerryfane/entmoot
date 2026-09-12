@@ -24,7 +24,7 @@ type fleetCommandsFlags struct {
 	fleet                          string
 	group                          string
 	target                         string
-	targetNodeID                   uint64
+	targetMemberID                 entmoot.MemberID
 	action                         string
 	argsJSON                       string
 	instruction                    string
@@ -80,7 +80,9 @@ func cmdFleetCommandsSend(gf *globalFlags, args []string) int {
 	fs.StringVar(&cfg.fleet, "fleet", "", "fleet id")
 	fs.StringVar(&cfg.group, "group", "", "fleet control group id")
 	fs.StringVar(&cfg.target, "target", esphttp.FleetCommandTargetAll, "target: all or node")
-	fs.Uint64Var(&cfg.targetNodeID, "target-node-id", 0, "target node id when -target node")
+	fs.Func("target-member-id", "full-width member id when -target node", func(raw string) error {
+		return decodeMemberIDFlag(raw, &cfg.targetMemberID)
+	})
 	fs.StringVar(&cfg.action, "action", "", "safe command action")
 	fs.StringVar(&cfg.argsJSON, "args-json", "", "optional command args JSON object")
 	fs.StringVar(&cfg.instruction, "instruction", "", "natural-language instruction for agent.instruction")
@@ -97,6 +99,10 @@ func cmdFleetCommandsSend(gf *globalFlags, args []string) int {
 		if errors.Is(err, flag.ErrHelp) {
 			return exitOK
 		}
+		return exitInvalidArgument
+	}
+	if cfg.target == esphttp.FleetCommandTargetNode && cfg.targetMemberID == (entmoot.MemberID{}) {
+		fmt.Fprintln(os.Stderr, "fleet commands send: -target-member-id is required when -target node")
 		return exitInvalidArgument
 	}
 	if strings.TrimSpace(cfg.action) == "" && strings.TrimSpace(cfg.instruction) != "" {
@@ -124,8 +130,8 @@ func cmdFleetCommandsSend(gf *globalFlags, args []string) int {
 		"action":      cfg.action,
 		"auto_accept": cfg.autoAccept,
 	}
-	if cfg.targetNodeID != 0 {
-		body["target_node_id"] = cfg.targetNodeID
+	if cfg.targetMemberID != (entmoot.MemberID{}) {
+		body["target_member_id"] = cfg.targetMemberID
 	}
 	if cfg.expiresAtMS != 0 {
 		body["expires_at_ms"] = cfg.expiresAtMS

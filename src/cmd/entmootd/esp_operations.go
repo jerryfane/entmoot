@@ -151,6 +151,7 @@ type fleetScopedPayload struct {
 type fleetInviteCreatePayload struct {
 	FleetID             string               `json:"fleet_id"`
 	Target              *inviteTargetPayload `json:"target,omitempty"`
+	Hostname            string               `json:"hostname,omitempty"`
 	BootstrapMultiaddrs []string             `json:"bootstrap_multiaddrs,omitempty"`
 	ValidFor            string               `json:"valid_for,omitempty"`
 	ValidUntilMS        int64                `json:"valid_until_ms,omitempty"`
@@ -1655,6 +1656,7 @@ func (e espOperationExecutor) createFleetInvite(ctx context.Context, req esphttp
 		return nil, err
 	}
 	if bytes.Equal(target.EntmootPubKey, fleet.Coordinator.EntmootPubKey) {
+		return nil, &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request", Message: "fleet invite target is already the coordinator"}
 	}
 	members, err := e.stateStore.ListFleetMembers(ctx, fleet.FleetID)
 	if err != nil {
@@ -1728,7 +1730,7 @@ func (e espOperationExecutor) createFleetInvite(ctx context.Context, req esphttp
 		MemberID:      targetBinding.MemberID,
 		PeerID:        targetBinding.PeerID.String(),
 		EntmootPubKey: encodeBase64(target.EntmootPubKey),
-		Hostname:      "",
+		Hostname:      strings.TrimSpace(payload.Hostname),
 		Role:          esphttp.FleetRoleAgent,
 		Status:        esphttp.FleetMemberInvited,
 		InvitedAtMS:   time.Now().UnixMilli(),
@@ -1758,6 +1760,7 @@ func (e espOperationExecutor) createFleetInvite(ctx context.Context, req esphttp
 		}
 		return nil, err
 	}
+	controlInviteApplied = true
 	inviteRaw, err := json.Marshal(resp.Capability)
 	if err != nil {
 		return nil, err
@@ -1767,7 +1770,7 @@ func (e espOperationExecutor) createFleetInvite(ctx context.Context, req esphttp
 		MemberID:      targetBinding.MemberID,
 		PeerID:        targetBinding.PeerID.String(),
 		EntmootPubKey: encodeBase64(target.EntmootPubKey),
-		Hostname:      "",
+		Hostname:      strings.TrimSpace(payload.Hostname),
 		Status:        esphttp.FleetMemberInvited,
 		Capability:    inviteRaw,
 		CreatedAtMS:   now,

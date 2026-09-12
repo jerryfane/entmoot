@@ -25,16 +25,16 @@ import (
 )
 
 type fleetTasksFlags struct {
-	espURL string
-	fleet  string
-	group  string
-	status string
-	task   string
-	title  string
-	desc   string
-	mode   string
-	nodeID uint64
-	text   string
+	espURL           string
+	fleet            string
+	group            string
+	status           string
+	task             string
+	title            string
+	desc             string
+	mode             string
+	assigneeMemberID entmoot.MemberID
+	text             string
 }
 
 type fleetTasksClient struct {
@@ -43,6 +43,16 @@ type fleetTasksClient struct {
 	peerID   string
 	identity *keystore.Identity
 	client   *http.Client
+}
+
+func decodeMemberIDFlag(raw string, memberID *entmoot.MemberID) error {
+	if err := json.Unmarshal([]byte(strconv.Quote(strings.TrimSpace(raw))), memberID); err != nil {
+		return err
+	}
+	if *memberID == (entmoot.MemberID{}) {
+		return errors.New("member id must not be zero")
+	}
+	return nil
 }
 
 func cmdFleetTasks(gf *globalFlags, args []string) int {
@@ -114,12 +124,18 @@ func cmdFleetTasksCreate(gf *globalFlags, args []string) int {
 	fs.StringVar(&cfg.title, "title", "", "task title")
 	fs.StringVar(&cfg.desc, "description", "", "task description")
 	fs.StringVar(&cfg.mode, "mode", esphttp.FleetTaskModeOpenSubmission, "task mode: open_submission, first_claim, or direct_assignee")
-	fs.Uint64Var(&cfg.nodeID, "assignee-node-id", 0, "active member node id for direct tasks")
+	fs.Func("assignee-member-id", "full-width member id for direct tasks", func(raw string) error {
+		return decodeMemberIDFlag(raw, &cfg.assigneeMemberID)
+	})
 	if code, ok := parseFleetTasksFlags(fs, args); !ok {
 		return code
 	}
 	if strings.TrimSpace(cfg.title) == "" {
 		fmt.Fprintln(os.Stderr, "fleet tasks create: -title is required")
+		return exitInvalidArgument
+	}
+	if cfg.mode == esphttp.FleetTaskModeDirectAssignment && cfg.assigneeMemberID == (entmoot.MemberID{}) {
+		fmt.Fprintln(os.Stderr, "fleet tasks create: -assignee-member-id is required for direct_assignee")
 		return exitInvalidArgument
 	}
 	client, fleetID, code, ok := prepareFleetTasksClient(gf, cfg)
@@ -131,8 +147,8 @@ func cmdFleetTasksCreate(gf *globalFlags, args []string) int {
 		"description": cfg.desc,
 		"mode":        cfg.mode,
 	}
-	if cfg.nodeID != 0 {
-		body["assignee_node_id"] = cfg.nodeID
+	if cfg.assigneeMemberID != (entmoot.MemberID{}) {
+		body["assignee_member_id"] = cfg.assigneeMemberID
 	}
 	path := "/v1/fleets/" + url.PathEscape(fleetID) + "/tasks"
 	return client.doAndPrint(context.Background(), http.MethodPost, path, nil, body, randomIdempotencyKey("fleet-task-create"))
@@ -142,7 +158,9 @@ func cmdFleetTasksMutate(gf *globalFlags, action string, args []string) int {
 	fs, cfg := newFleetTasksFlagSet("fleet tasks " + action)
 	fs.StringVar(&cfg.task, "task", "", "task id")
 	if action == esphttp.FleetTaskActionAssign {
-		fs.Uint64Var(&cfg.nodeID, "assignee-node-id", 0, "active member node id")
+		fs.Func("assignee-member-id", "full-width active member id", func(raw string) error {
+			return decodeMemberIDFlag(raw, &cfg.assigneeMemberID)
+		})
 	}
 	if action == esphttp.FleetTaskActionSubmit {
 		fs.StringVar(&cfg.text, "content", "", "submission content")
@@ -157,11 +175,11 @@ func cmdFleetTasksMutate(gf *globalFlags, action string, args []string) int {
 	body := map[string]any{}
 	switch action {
 	case esphttp.FleetTaskActionAssign:
-		if cfg.nodeID == 0 {
-			fmt.Fprintln(os.Stderr, "fleet tasks assign: -assignee-node-id is required")
+		if cfg.assigneeMemberID == (entmoot.MemberID{}) {
+			fmt.Fprintln(os.Stderr, "fleet tasks assign: -assignee-member-id is required")
 			return exitInvalidArgument
 		}
-		body["assignee_node_id"] = cfg.nodeID
+		body["assignee_member_id"] = cfg.assigneeMemberID
 	case esphttp.FleetTaskActionSubmit:
 		if strings.TrimSpace(cfg.text) == "" {
 			fmt.Fprintln(os.Stderr, "fleet tasks submit: -content is required")

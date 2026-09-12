@@ -81,23 +81,37 @@ cp "$TMPDIR/entmootd" "$BIN_DIR/.entmootd.tmp.$$"
 chmod 755 "$BIN_DIR/.entmootd.tmp.$$"
 mv -f "$BIN_DIR/.entmootd.tmp.$$" "$BIN_DIR/entmootd"
 
-cat > "$INSTALL_DIR/runtime.env" <<EOF
-ENTMOOT_BIN=${BIN_DIR}/entmootd
-ENTMOOT_DATA=${INSTALL_DIR}
-ENTMOOT_IDENTITY=${INSTALL_DIR}/identity.json
-ENTMOOT_LISTEN_PORT=${ENTMOOT_LISTEN_PORT:-1004}
-EOF
+write_runtime_var() {
+    printf "%s='" "$1"
+    printf "%s" "$2" | sed "s/'/'\\\\''/g"
+    printf "'\n"
+}
+{
+    write_runtime_var ENTMOOT_BIN "$BIN_DIR/entmootd"
+    write_runtime_var ENTMOOT_DATA "$INSTALL_DIR"
+    write_runtime_var ENTMOOT_IDENTITY "$INSTALL_DIR/identity.json"
+    write_runtime_var ENTMOOT_LISTEN_PORT "${ENTMOOT_LISTEN_PORT:-1004}"
+} > "$INSTALL_DIR/runtime.env"
 
 cat > "$INSTALL_DIR/entmoot" <<'EOF'
 #!/bin/sh
 set -eu
-RUNTIME_ENV=${ENTMOOT_RUNTIME_ENV:-$HOME/.entmoot/runtime.env}
+WRAPPER=$0
+while [ -L "$WRAPPER" ]; do
+    LINK=$(readlink "$WRAPPER")
+    case "$LINK" in
+        /*) WRAPPER=$LINK ;;
+        *) WRAPPER=$(dirname "$WRAPPER")/$LINK ;;
+    esac
+done
+INSTALL_DIR=$(CDPATH= cd -P "$(dirname "$WRAPPER")" && pwd)
+RUNTIME_ENV=${ENTMOOT_RUNTIME_ENV:-$INSTALL_DIR/runtime.env}
 if [ -f "$RUNTIME_ENV" ]; then
     # shellcheck disable=SC1090
     . "$RUNTIME_ENV"
 fi
-ENTMOOT_BIN=${ENTMOOT_BIN:-$HOME/.entmoot/bin/entmootd}
-ENTMOOT_DATA=${ENTMOOT_DATA:-$HOME/.entmoot}
+ENTMOOT_BIN=${ENTMOOT_BIN:-$INSTALL_DIR/bin/entmootd}
+ENTMOOT_DATA=${ENTMOOT_DATA:-$INSTALL_DIR}
 ENTMOOT_IDENTITY=${ENTMOOT_IDENTITY:-$ENTMOOT_DATA/identity.json}
 ENTMOOT_LISTEN_PORT=${ENTMOOT_LISTEN_PORT:-1004}
 exec "$ENTMOOT_BIN" -identity "$ENTMOOT_IDENTITY" -data "$ENTMOOT_DATA" -listen-port "$ENTMOOT_LISTEN_PORT" "$@"

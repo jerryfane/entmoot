@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"entmoot/pkg/entmoot"
@@ -84,9 +85,11 @@ type Status struct {
 	BackupSHA256 string
 }
 
-// Run completes or resumes conversion. Legacy roots require the current
-// founder identity so upgrade mappings can be signed. No operational file is
-// modified until preflight, a byte-for-byte backup, and its hashes succeed.
+// Run completes or resumes conversion under a cross-process data-root lock.
+// Completed roots only read their journal; normal command startup must not
+// checkpoint or reconfigure databases owned by a serving daemon.
+// Legacy roots require the founder identity to sign upgrade mappings. No
+// operational file changes before preflight and a verified byte-for-byte backup.
 func Run(root string, founder *keystore.Identity) error {
 	absRoot, err := filepath.Abs(root)
 	if err != nil {
@@ -95,13 +98,24 @@ func Run(root string, founder *keystore.Identity) error {
 	if err := os.MkdirAll(absRoot, 0o700); err != nil {
 		return fmt.Errorf("conversion: create data root: %w", err)
 	}
+	lock, err := os.OpenFile(filepath.Join(absRoot, "conversion.lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return fmt.Errorf("conversion: open data-root lock: %w", err)
+	}
+	defer lock.Close()
+	// Even read-only SQLite opens can contend while initializing WAL shared
+	// memory. Serialize journal access as well as mutating conversion work.
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+		return fmt.Errorf("conversion: lock data root: %w", err)
+	}
+	defer func() { _ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN) }()
 	journalPath := filepath.Join(absRoot, journalName)
 	status, exists, err := readStatus(journalPath)
 	if err != nil {
 		return err
 	}
 	if exists && status.Stage == StageComplete {
-		return validateOperationalRoot(absRoot)
+		return nil
 	}
 
 	var files []fileRecord
@@ -244,7 +258,7 @@ func readStatus(path string) (Status, bool, error) {
 	} else if err != nil {
 		return Status{}, false, err
 	}
-	db, err := openJournal(path)
+	db, err := sql.Open("sqlite", "file:"+path+"?mode=ro")
 	if err != nil {
 		return Status{}, false, err
 	}

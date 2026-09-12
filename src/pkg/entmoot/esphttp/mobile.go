@@ -729,6 +729,7 @@ func (s *MemoryStateStore) ArchiveFleet(_ context.Context, fleetID string, archi
 		rec.UpdatedAtMS = archivedAtMS
 		s.fleets[fleetID] = cloneFleetRecord(rec)
 	}
+	s.refreshFleetNodeProfilesLocked(fleetID)
 	delete(s.fleetInvites, fleetID)
 	return cloneFleetRecord(rec), true, nil
 }
@@ -751,6 +752,7 @@ func (s *MemoryStateStore) RestoreFleet(_ context.Context, fleetID string, resto
 		s.fleets[fleetID] = cloneFleetRecord(rec)
 	}
 
+	s.refreshFleetNodeProfilesLocked(fleetID)
 	return cloneFleetRecord(rec), true, nil
 }
 
@@ -759,6 +761,7 @@ func (s *MemoryStateStore) DeleteFleet(_ context.Context, fleetID string) error 
 	defer s.mu.Unlock()
 
 	delete(s.fleets, fleetID)
+	s.refreshFleetNodeProfilesLocked(fleetID)
 	delete(s.fleetMembers, fleetID)
 	delete(s.fleetInvites, fleetID)
 	delete(s.fleetActivity, fleetID)
@@ -831,6 +834,8 @@ func (s *MemoryStateStore) ReconcileFleetInviteAcceptance(_ context.Context, fle
 		s.fleetInvites[fleetID] = append([]FleetInviteRecord(nil), remainingInvites...)
 	}
 	s.fleetActivity[fleetID] = append(s.fleetActivity[fleetID], cloneFleetActivityRecord(activity))
+	_ = s.observeFleetMemberNodeProfileLocked(member)
+	_ = s.refreshFleetInviteNodeProfileLocked(memberID)
 	return cloneFleetMemberRecord(member), cloneFleetActivityRecord(activity), true, nil
 }
 
@@ -847,6 +852,7 @@ func (s *MemoryStateStore) upsertFleetMemberLocked(rec FleetMemberRecord) (Fleet
 	rec.Status = NormalizeFleetMemberStatus(rec.Status)
 	rec.UpdatedAtMS = s.nowMS()
 	s.fleetMembers[rec.FleetID][rec.MemberID] = cloneFleetMemberRecord(rec)
+	_ = s.observeFleetMemberNodeProfileLocked(rec)
 	return cloneFleetMemberRecord(rec), nil
 }
 
@@ -876,6 +882,7 @@ func (s *MemoryStateStore) DeleteFleetMember(_ context.Context, fleetID string, 
 			delete(s.fleetMembers, fleetID)
 		}
 	}
+	_ = s.refreshFleetMemberNodeProfileLocked(memberID)
 	return nil
 }
 
@@ -912,6 +919,7 @@ func (s *MemoryStateStore) createFleetInviteLocked(rec FleetInviteRecord) (Fleet
 		rec.Status = FleetMemberInvited
 	}
 	s.fleetInvites[rec.FleetID] = append(s.fleetInvites[rec.FleetID], cloneFleetInviteRecord(rec))
+	_ = s.observeFleetInviteNodeProfileLocked(rec)
 	return cloneFleetInviteRecord(rec), nil
 }
 
@@ -934,11 +942,14 @@ func (s *MemoryStateStore) ListFleetInvites(_ context.Context, fleetID string) (
 func (s *MemoryStateStore) DeleteFleetInvite(_ context.Context, inviteID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	removed := make(map[entmoot.MemberID]struct{})
 	for fleetID, invites := range s.fleetInvites {
 		dst := invites[:0]
 		for _, invite := range invites {
 			if invite.InviteID != inviteID {
 				dst = append(dst, invite)
+			} else {
+				removed[invite.MemberID] = struct{}{}
 			}
 		}
 		if len(dst) == 0 {
@@ -946,6 +957,9 @@ func (s *MemoryStateStore) DeleteFleetInvite(_ context.Context, inviteID string)
 		} else {
 			s.fleetInvites[fleetID] = append([]FleetInviteRecord(nil), dst...)
 		}
+	}
+	for id := range removed {
+		_ = s.refreshFleetInviteNodeProfileLocked(id)
 	}
 	return nil
 }
@@ -2195,6 +2209,10 @@ func (s *SQLiteStateStore) ArchiveFleet(ctx context.Context, fleetID string, arc
 	if err != nil {
 		return FleetRecord{}, false, fmt.Errorf("esphttp: archive fleet affected rows: %w", err)
 	}
+	profileMembers, err := fleetProfileMemberIDs(ctx, tx, fleetID)
+	if err != nil {
+		return FleetRecord{}, false, fmt.Errorf("esphttp: archive fleet profiles: %w", err)
+	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM esp_fleet_invites WHERE fleet_id = ?`, fleetID); err != nil {
 		return FleetRecord{}, false, fmt.Errorf("esphttp: archive fleet invites: %w", err)
 	}
@@ -2209,6 +2227,7 @@ func (s *SQLiteStateStore) ArchiveFleet(ctx context.Context, fleetID string, arc
 	if err := tx.Commit(); err != nil {
 		return FleetRecord{}, false, fmt.Errorf("esphttp: archive fleet commit: %w", err)
 	}
+	_ = s.refreshFleetNodeProfiles(ctx, profileMembers)
 	if affected == 0 && rec.Status != FleetStatusArchived {
 		return FleetRecord{}, false, nil
 	}
@@ -2233,6 +2252,10 @@ func (s *SQLiteStateStore) RestoreFleet(ctx context.Context, fleetID string, res
 	if err != nil {
 		return FleetRecord{}, false, fmt.Errorf("esphttp: restore fleet affected rows: %w", err)
 	}
+	profileMembers, err := fleetProfileMemberIDs(ctx, tx, fleetID)
+	if err != nil {
+		return FleetRecord{}, false, fmt.Errorf("esphttp: restore fleet profiles: %w", err)
+	}
 	row := tx.QueryRowContext(ctx, `SELECT fleet_id, name, control_group_id, coordinator_member_id, coordinator_peer_id, coordinator_pubkey, coordinator_device_id, status, created_at_ms, updated_at_ms, archived_at_ms, deleted_at_ms FROM esp_fleets WHERE fleet_id = ?`, fleetID)
 	rec, err := scanFleetRecord(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -2244,6 +2267,7 @@ func (s *SQLiteStateStore) RestoreFleet(ctx context.Context, fleetID string, res
 	if err := tx.Commit(); err != nil {
 		return FleetRecord{}, false, fmt.Errorf("esphttp: restore fleet commit: %w", err)
 	}
+	_ = s.refreshFleetNodeProfiles(ctx, profileMembers)
 	if affected == 0 && rec.Status != FleetStatusActive {
 		return FleetRecord{}, false, nil
 	}
@@ -2251,30 +2275,43 @@ func (s *SQLiteStateStore) RestoreFleet(ctx context.Context, fleetID string, res
 }
 
 func (s *SQLiteStateStore) DeleteFleet(ctx context.Context, fleetID string) error {
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM esp_fleet_command_results WHERE fleet_id = ?`, fleetID); err != nil {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("esphttp: delete fleet begin: %w", err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM esp_fleet_command_results WHERE fleet_id = ?`, fleetID); err != nil {
 		return fmt.Errorf("esphttp: delete fleet command results: %w", err)
 	}
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM esp_fleet_commands WHERE fleet_id = ?`, fleetID); err != nil {
+	profileMembers, err := fleetProfileMemberIDs(ctx, tx, fleetID)
+	if err != nil {
+		return fmt.Errorf("esphttp: delete fleet profiles: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM esp_fleet_commands WHERE fleet_id = ?`, fleetID); err != nil {
 		return fmt.Errorf("esphttp: delete fleet commands: %w", err)
 	}
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM esp_fleet_task_submissions WHERE fleet_id = ?`, fleetID); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM esp_fleet_task_submissions WHERE fleet_id = ?`, fleetID); err != nil {
 		return fmt.Errorf("esphttp: delete fleet task submissions: %w", err)
 	}
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM esp_fleet_tasks WHERE fleet_id = ?`, fleetID); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM esp_fleet_tasks WHERE fleet_id = ?`, fleetID); err != nil {
 		return fmt.Errorf("esphttp: delete fleet tasks: %w", err)
 	}
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM esp_fleet_activity WHERE fleet_id = ?`, fleetID); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM esp_fleet_activity WHERE fleet_id = ?`, fleetID); err != nil {
 		return fmt.Errorf("esphttp: delete fleet activity: %w", err)
 	}
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM esp_fleet_invites WHERE fleet_id = ?`, fleetID); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM esp_fleet_invites WHERE fleet_id = ?`, fleetID); err != nil {
 		return fmt.Errorf("esphttp: delete fleet invites: %w", err)
 	}
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM esp_fleet_members WHERE fleet_id = ?`, fleetID); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM esp_fleet_members WHERE fleet_id = ?`, fleetID); err != nil {
 		return fmt.Errorf("esphttp: delete fleet members: %w", err)
 	}
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM esp_fleets WHERE fleet_id = ?`, fleetID); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM esp_fleets WHERE fleet_id = ?`, fleetID); err != nil {
 		return fmt.Errorf("esphttp: delete fleet: %w", err)
 	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("esphttp: delete fleet commit: %w", err)
+	}
+	_ = s.refreshFleetNodeProfiles(ctx, profileMembers)
 	return nil
 }
 
@@ -2452,6 +2489,7 @@ func (s *SQLiteStateStore) DeleteFleetMember(ctx context.Context, fleetID string
 	if _, err := s.db.ExecContext(ctx, `DELETE FROM esp_fleet_members WHERE fleet_id = ? AND member_id = ?`, fleetID, memberID[:]); err != nil {
 		return fmt.Errorf("esphttp: delete fleet member: %w", err)
 	}
+	_ = s.refreshFleetMemberNodeProfile(ctx, memberID)
 	return nil
 }
 
@@ -2526,8 +2564,12 @@ func (s *SQLiteStateStore) ListFleetInvites(ctx context.Context, fleetID string)
 }
 
 func (s *SQLiteStateStore) DeleteFleetInvite(ctx context.Context, inviteID string) error {
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM esp_fleet_invites WHERE invite_id = ?`, inviteID); err != nil {
+	ids, err := nodeProfileMemberIDs(ctx, s.db, `DELETE FROM esp_fleet_invites WHERE invite_id = ? RETURNING member_id`, inviteID)
+	if err != nil {
 		return fmt.Errorf("esphttp: delete fleet invite: %w", err)
+	}
+	for _, id := range ids {
+		_ = s.refreshFleetInviteNodeProfile(ctx, id)
 	}
 	return nil
 }

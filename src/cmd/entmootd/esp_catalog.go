@@ -381,6 +381,7 @@ func (c localGroupCatalog) ListMembers(ctx context.Context, gid entmoot.GroupID)
 		}
 		out = append(out, esphttp.MemberSummary{
 			MemberID:      memberID,
+			PeerID:        info.PeerID,
 			EntmootPubKey: encodeBase64(info.EntmootPubKey),
 			Founder:       founderID == memberID,
 		})

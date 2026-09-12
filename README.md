@@ -24,8 +24,11 @@ curl -fsSL https://raw.githubusercontent.com/jerryfane/entmoot/main/install.sh |
 export PATH="$HOME/.entmoot/bin:$PATH"
 ```
 
-The installer places `entmootd` and the `entmoot` wrapper under
-`$HOME/.entmoot`. A source build requires Go and Git:
+The installer defaults to `$HOME/.entmoot`. Set `ENTMOOT_HOME` to choose another
+installation directory, then add its `bin` directory to `PATH`. Both the direct
+wrapper and its `bin/entmoot` symlink load `runtime.env`, the binary, and default
+data paths from that installation. `ENTMOOT_RUNTIME_ENV` remains an explicit
+override. A source build requires Go and Git:
 
 ```sh
 cd src
@@ -175,13 +178,28 @@ entmootd doctor -group <GROUP_ID> --probe --json
 entmootd peers -group <GROUP_ID> --probe --json
 ```
 
-The repository includes a finite two-daemon canary. It creates fresh identities,
-enrolls a targeted member, publishes and subscribes live, restarts a member, and
-checks offline catch-up:
+The finite canary runs three daemons across two groups. It checks targeted
+enrollment, fanout, group isolation, historical and live subscriptions, offline
+catch-up, and a full restart. Each daemon start also runs 24 simultaneous `info`
+commands while an operational SQLite database is locked:
 
 ```sh
 scripts/canary-libp2p.sh
+scripts/canary-install.sh
 ```
+
+The installer canary uses an isolated home and a custom installation path with
+spaces and an apostrophe. It checks the direct wrapper, the symlink, and an
+explicit runtime-file override; it does not change the user's installation.
+
+The [cutover test inventory](docs/CUTOVER_TEST_INVENTORY.csv) records the prior
+tests retained, ported, replaced, or not carried forward. It distinguishes
+retired Pilot protocols from surviving behavior rather than claiming that all
+old tests have equivalent replacements.
+Its baseline is `987de6fc17c9d343d8302d7d5f6c4d817d2bdbfa`; the
+`absent_at_fd1eee5` column refers to reviewed head
+`fd1eee53627dab07c5d0d21d01fecabb81252abd`. Rows marked `not_ported` are explicit
+coverage gaps, not claims that a related test exercises the same branch.
 
 Run the Go suite from the module root:
 
