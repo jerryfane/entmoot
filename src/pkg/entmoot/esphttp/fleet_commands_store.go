@@ -1,6 +1,7 @@
 package esphttp
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -14,10 +15,10 @@ import (
 )
 
 type FleetCommandListFilter struct {
-	Status      string
-	Action      string
-	AgentNodeID entmoot.NodeID
-	Limit       int
+	Status        string
+	Action        string
+	AgentMemberID entmoot.MemberID
+	Limit         int
 }
 
 func (s *MemoryStateStore) UpsertFleetCommand(_ context.Context, cmd FleetCommandEnvelope) (FleetCommandSummaryRecord, error) {
@@ -42,12 +43,12 @@ func (s *MemoryStateStore) UpsertFleetCommandResult(_ context.Context, result Fl
 		return err
 	}
 	if s.fleetCommandResults[result.FleetID] == nil {
-		s.fleetCommandResults[result.FleetID] = make(map[string]map[entmoot.NodeID]FleetCommandResultEnvelope)
+		s.fleetCommandResults[result.FleetID] = make(map[string]map[entmoot.MemberID]FleetCommandResultEnvelope)
 	}
 	if s.fleetCommandResults[result.FleetID][result.CommandID] == nil {
-		s.fleetCommandResults[result.FleetID][result.CommandID] = make(map[entmoot.NodeID]FleetCommandResultEnvelope)
+		s.fleetCommandResults[result.FleetID][result.CommandID] = make(map[entmoot.MemberID]FleetCommandResultEnvelope)
 	}
-	s.fleetCommandResults[result.FleetID][result.CommandID][result.AgentNodeID] = cloneFleetCommandResultEnvelope(result)
+	s.fleetCommandResults[result.FleetID][result.CommandID][result.AgentMemberID] = cloneFleetCommandResultEnvelope(result)
 	return nil
 }
 
@@ -121,12 +122,13 @@ func (s *SQLiteStateStore) UpsertFleetCommand(ctx context.Context, cmd FleetComm
 	}
 	_, err := s.db.ExecContext(ctx, `
 INSERT INTO esp_fleet_commands (
-  command_id, fleet_id, issuer_node_id, target, action, args, auto_accept,
+  command_id, fleet_id, issuer_member_id, issuer_peer_id, target, action, args, auto_accept,
   created_at_ms, expires_at_ms, command, updated_at_ms
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(command_id) DO UPDATE SET
   fleet_id = excluded.fleet_id,
-  issuer_node_id = excluded.issuer_node_id,
+  issuer_member_id = excluded.issuer_member_id,
+  issuer_peer_id = excluded.issuer_peer_id,
   target = excluded.target,
   action = excluded.action,
   args = excluded.args,
@@ -135,7 +137,7 @@ ON CONFLICT(command_id) DO UPDATE SET
   expires_at_ms = excluded.expires_at_ms,
   command = excluded.command,
   updated_at_ms = excluded.updated_at_ms`,
-		cmd.CommandID, cmd.FleetID, cmd.IssuerNodeID, targetJSON, cmd.Action, nullableJSON(argsJSON),
+		cmd.CommandID, cmd.FleetID, cmd.IssuerMemberID[:], cmd.IssuerPeerID, targetJSON, cmd.Action, nullableJSON(argsJSON),
 		autoAccept, cmd.CreatedAtMS, cmd.ExpiresAtMS, commandJSON, cmd.CreatedAtMS)
 	if err != nil {
 		return FleetCommandSummaryRecord{}, fmt.Errorf("esphttp: upsert fleet command: %w", err)
@@ -162,11 +164,12 @@ func (s *SQLiteStateStore) UpsertFleetCommandResult(ctx context.Context, result 
 	}
 	_, err := s.db.ExecContext(ctx, `
 INSERT INTO esp_fleet_command_results (
-  command_id, fleet_id, agent_node_id, action, status, summary, output,
+  command_id, fleet_id, agent_member_id, agent_peer_id, action, status, summary, output,
   started_at_ms, completed_at_ms, result, updated_at_ms
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-ON CONFLICT(command_id, agent_node_id) DO UPDATE SET
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(command_id, agent_member_id) DO UPDATE SET
   fleet_id = excluded.fleet_id,
+  agent_peer_id = excluded.agent_peer_id,
   action = excluded.action,
   status = excluded.status,
   summary = excluded.summary,
@@ -175,7 +178,7 @@ ON CONFLICT(command_id, agent_node_id) DO UPDATE SET
   completed_at_ms = excluded.completed_at_ms,
   result = excluded.result,
   updated_at_ms = excluded.updated_at_ms`,
-		result.CommandID, result.FleetID, result.AgentNodeID, result.Action, result.Status,
+		result.CommandID, result.FleetID, result.AgentMemberID[:], result.AgentPeerID, result.Action, result.Status,
 		result.Summary, result.Output, result.StartedAtMS, result.CompletedAtMS, resultJSON, updatedAtMS)
 	if err != nil {
 		return fmt.Errorf("esphttp: upsert fleet command result: %w", err)
@@ -258,11 +261,11 @@ func (s *SQLiteStateStore) ListFleetCommands(ctx context.Context, fleetID string
 func (s *SQLiteStateStore) listFleetCommandResults(ctx context.Context, fleetID, commandID string, filter FleetCommandListFilter) ([]FleetCommandResultEnvelope, error) {
 	query := `SELECT result FROM esp_fleet_command_results WHERE fleet_id = ? AND command_id = ?`
 	args := []any{fleetID, commandID}
-	if filter.AgentNodeID != 0 {
-		query += ` AND agent_node_id = ?`
-		args = append(args, filter.AgentNodeID)
+	if filter.AgentMemberID != (entmoot.MemberID{}) {
+		query += ` AND agent_member_id = ?`
+		args = append(args, filter.AgentMemberID[:])
 	}
-	query += ` ORDER BY updated_at_ms DESC, agent_node_id ASC`
+	query += ` ORDER BY updated_at_ms DESC, agent_member_id ASC`
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("esphttp: list fleet command results: %w", err)
@@ -313,11 +316,11 @@ func fleetCommandSummaryMatches(summary FleetCommandSummaryRecord, results []Fle
 	if filter.Status != "" && strings.TrimSpace(strings.ToLower(summary.Status)) != filter.Status {
 		return false
 	}
-	if filter.AgentNodeID == 0 {
+	if filter.AgentMemberID == (entmoot.MemberID{}) {
 		return true
 	}
 	for _, result := range results {
-		if result.AgentNodeID == filter.AgentNodeID {
+		if result.AgentMemberID == filter.AgentMemberID {
 			return true
 		}
 	}
@@ -325,12 +328,12 @@ func fleetCommandSummaryMatches(summary FleetCommandSummaryRecord, results []Fle
 }
 
 func fleetCommandResultsForFilter(results []FleetCommandResultEnvelope, filter FleetCommandListFilter) []FleetCommandResultEnvelope {
-	if filter.AgentNodeID == 0 {
+	if filter.AgentMemberID == (entmoot.MemberID{}) {
 		return results
 	}
 	out := make([]FleetCommandResultEnvelope, 0, len(results))
 	for _, result := range results {
-		if result.AgentNodeID == filter.AgentNodeID {
+		if result.AgentMemberID == filter.AgentMemberID {
 			out = append(out, result)
 		}
 	}
@@ -391,8 +394,8 @@ func validateFleetCommandResultRecord(result FleetCommandResultEnvelope) error {
 	if result.FleetID == "" {
 		return errors.New("esphttp: fleet command result fleet id is required")
 	}
-	if result.AgentNodeID == 0 {
-		return errors.New("esphttp: fleet command result agent node id is required")
+	if result.AgentMemberID == (entmoot.MemberID{}) || strings.TrimSpace(result.AgentPeerID) == "" {
+		return errors.New("esphttp: fleet command result agent identity is required")
 	}
 	if result.Status == "" {
 		return errors.New("esphttp: fleet command result status is required")
@@ -486,7 +489,7 @@ func sortFleetCommandResults(results []FleetCommandResultEnvelope) {
 		left := fleetCommandResultUpdatedAt(results[i])
 		right := fleetCommandResultUpdatedAt(results[j])
 		if left == right {
-			return results[i].AgentNodeID < results[j].AgentNodeID
+			return bytes.Compare(results[i].AgentMemberID[:], results[j].AgentMemberID[:]) < 0
 		}
 		return left > right
 	})

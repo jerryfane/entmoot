@@ -12,7 +12,7 @@
 //  2. When two messages are not ordered by the DAG (siblings, or unrelated
 //     nodes at the same topological level), they are tie-broken by, in order:
 //     a. Timestamp ascending (earlier first),
-//     b. Author.PilotNodeID ascending,
+//     b. Author MemberID ascending,
 //     c. Message ID lexicographically ascending (byte-wise compare over the
 //     32-byte id).
 //  3. Messages whose Parents reference IDs not present in M are still included
@@ -27,6 +27,7 @@ package order
 import (
 	"bytes"
 	"container/heap"
+	"encoding/binary"
 	"fmt"
 
 	"entmoot/pkg/entmoot"
@@ -47,8 +48,10 @@ func Topological(msgs []entmoot.Message) ([]entmoot.MessageID, error) {
 	// wins — callers shouldn't pass duplicates but we don't error on them
 	// because that's not a cycle.
 	index := make(map[entmoot.MessageID]entmoot.Message, len(msgs))
+	authors := make(map[entmoot.MessageID]entmoot.MemberID, len(msgs))
 	for _, m := range msgs {
 		index[m.ID] = m
+		authors[m.ID] = authorOrderID(m.Author)
 	}
 
 	// For Kahn's algorithm we need in-degree (only counting edges whose
@@ -71,7 +74,7 @@ func Topological(msgs []entmoot.Message) ([]entmoot.MessageID, error) {
 		}
 	}
 
-	ready := &messageHeap{index: index}
+	ready := &messageHeap{index: index, authors: authors}
 	for id, degree := range inDegree {
 		if degree == 0 {
 			heap.Push(ready, id)
@@ -98,25 +101,39 @@ func Topological(msgs []entmoot.Message) ([]entmoot.MessageID, error) {
 }
 
 // less reports whether a sorts before b under the tie-breaker rule.
-func less(a, b entmoot.Message) bool {
+func less(a, b entmoot.Message, authorA, authorB entmoot.MemberID) bool {
 	if a.Timestamp != b.Timestamp {
 		return a.Timestamp < b.Timestamp
 	}
-	if a.Author.PilotNodeID != b.Author.PilotNodeID {
-		return a.Author.PilotNodeID < b.Author.PilotNodeID
+	if authorA != authorB {
+		return bytes.Compare(authorA[:], authorB[:]) < 0
 	}
 	return bytes.Compare(a.ID[:], b.ID[:]) < 0
 }
 
+func authorOrderID(author entmoot.NodeInfo) entmoot.MemberID {
+	if memberID, err := entmoot.ResolvedMemberID(author); err == nil {
+		return memberID
+	}
+	// Immutable legacy fixtures and records without a usable public key retain
+	// the original numeric tie-break. Operational version-2 messages are
+	// validated before reaching the orderer and always take the branch above.
+	var legacy entmoot.MemberID
+	binary.BigEndian.PutUint32(legacy[len(legacy)-4:], uint32(author.PilotNodeID))
+	return legacy
+}
+
 type messageHeap struct {
-	ids   []entmoot.MessageID
-	index map[entmoot.MessageID]entmoot.Message
+	ids     []entmoot.MessageID
+	index   map[entmoot.MessageID]entmoot.Message
+	authors map[entmoot.MessageID]entmoot.MemberID
 }
 
 func (h messageHeap) Len() int { return len(h.ids) }
 
 func (h messageHeap) Less(i, j int) bool {
-	return less(h.index[h.ids[i]], h.index[h.ids[j]])
+	a, b := h.ids[i], h.ids[j]
+	return less(h.index[a], h.index[b], h.authors[a], h.authors[b])
 }
 
 func (h messageHeap) Swap(i, j int) {

@@ -354,8 +354,9 @@ func messageOlderThan(m entmoot.Message, boundary PageBoundary) bool {
 	if m.Timestamp != boundary.TimestampMS {
 		return m.Timestamp < boundary.TimestampMS
 	}
-	if m.Author.PilotNodeID != boundary.AuthorNodeID {
-		return m.Author.PilotNodeID < boundary.AuthorNodeID
+	author := messageMemberID(m)
+	if author != boundary.AuthorMemberID {
+		return bytes.Compare(author[:], boundary.AuthorMemberID[:]) < 0
 	}
 	return bytes.Compare(m.ID[:], boundary.MessageID[:]) < 0
 }
@@ -368,8 +369,9 @@ func latestMessages(msgs []entmoot.Message, limit int) ([]entmoot.Message, error
 		if msgs[i].Timestamp != msgs[j].Timestamp {
 			return msgs[i].Timestamp > msgs[j].Timestamp
 		}
-		if msgs[i].Author.PilotNodeID != msgs[j].Author.PilotNodeID {
-			return msgs[i].Author.PilotNodeID > msgs[j].Author.PilotNodeID
+		left, right := messageMemberID(msgs[i]), messageMemberID(msgs[j])
+		if left != right {
+			return bytes.Compare(left[:], right[:]) > 0
 		}
 		return bytes.Compare(msgs[i].ID[:], msgs[j].ID[:]) > 0
 	})

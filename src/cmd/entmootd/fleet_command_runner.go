@@ -15,6 +15,7 @@ import (
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/esphttp"
 	entfeatures "entmoot/pkg/entmoot/features"
+	libp2ptransport "entmoot/pkg/entmoot/transport/libp2p"
 )
 
 type fleetCommandRunner struct {
@@ -200,7 +201,11 @@ func (r *fleetCommandRunner) commandContextForCommand(ctx context.Context, group
 		if err != nil {
 			return fleetCommandContext{}, false, err
 		}
-		local, ok := fleetCommandMemberForNode(members, r.server.nodeID)
+		localBinding, err := libp2ptransport.BindingFromPublicKey(r.server.identity.PublicKey)
+		if err != nil {
+			return fleetCommandContext{}, false, err
+		}
+		local, ok := fleetCommandMemberForNode(members, localBinding.MemberID)
 		if !ok {
 			return fleetCommandContext{}, false, nil
 		}
@@ -227,7 +232,11 @@ func (r *fleetCommandRunner) commandContextFromControlRoster(ctx context.Context
 		return fleetCommandContext{}, false, err
 	}
 	defer rlog.Close()
-	localInfo, ok := rlog.MemberInfo(r.server.nodeID)
+	localBinding, err := libp2ptransport.BindingFromPublicKey(r.server.identity.PublicKey)
+	if err != nil {
+		return fleetCommandContext{}, false, err
+	}
+	localInfo, ok := rlog.MemberInfoByID(localBinding.MemberID)
 	if !ok || !bytes.Equal(localInfo.EntmootPubKey, r.server.identity.PublicKey) {
 		return fleetCommandContext{}, false, nil
 	}
@@ -236,7 +245,7 @@ func (r *fleetCommandRunner) commandContextFromControlRoster(ctx context.Context
 		return fleetCommandContext{}, false, nil
 	}
 	role := esphttp.FleetRoleAgent
-	if founder.PilotNodeID == localInfo.PilotNodeID && bytes.Equal(founder.EntmootPubKey, localInfo.EntmootPubKey) {
+	if bytes.Equal(founder.EntmootPubKey, localInfo.EntmootPubKey) {
 		role = esphttp.FleetRoleCoordinator
 	}
 	return fleetCommandContext{
@@ -248,12 +257,13 @@ func (r *fleetCommandRunner) commandContextFromControlRoster(ctx context.Context
 		},
 		local: esphttp.FleetMemberRecord{
 			FleetID:       cmd.FleetID,
-			NodeID:        localInfo.PilotNodeID,
+			MemberID:      localBinding.MemberID,
+			PeerID:        localBinding.PeerID.String(),
 			EntmootPubKey: encodeBase64(localInfo.EntmootPubKey),
 			Role:          role,
 			Status:        esphttp.FleetMemberActive,
 		},
-		memberCount: len(rlog.Members()),
+		memberCount: len(rlog.MemberIDs()),
 		source:      "control_roster",
 	}, true, nil
 }
@@ -284,12 +294,6 @@ func (r *fleetCommandRunner) execute(ctx context.Context, commandCtx fleetComman
 		return marshalCommandExecution(r.localInfo())
 	case esphttp.FleetCommandActionEntmootDoctor:
 		return marshalCommandExecution(r.localFleetState(ctx, commandCtx))
-	case esphttp.FleetCommandActionPilotInfo:
-		info, err := r.server.pilot.Info(ctx)
-		if err != nil {
-			return fleetCommandExecution{}, err
-		}
-		return marshalCommandExecution(redactCommandMap(info))
 	case esphttp.FleetCommandActionFleetLocalState:
 		return marshalCommandExecution(r.localFleetState(ctx, commandCtx))
 	case esphttp.FleetCommandActionAgentInstruction:
@@ -329,7 +333,7 @@ func (r *fleetCommandRunner) dispatchAgentInstruction(ctx context.Context, comma
 		return fleetCommandExecution{}, err
 	}
 	receivedAt := time.Now().UnixMilli()
-	payload := esphttp.NewAgentInstructionPayload(cmd, commandCtx.local.NodeID, spec.Instruction, spec.Context, spec.TimeoutMS, receivedAt)
+	payload := esphttp.NewAgentInstructionPayload(cmd, commandCtx.local.MemberID, commandCtx.local.PeerID, spec.Instruction, spec.Context, spec.TimeoutMS, receivedAt)
 	payload.Actions = spec.Actions
 	_, created, err := r.state.EnqueueAgentCommand(ctx, payload)
 	if err != nil {
@@ -355,11 +359,12 @@ func (r *fleetCommandRunner) localInfo() map[string]any {
 	for _, gid := range groups {
 		out = append(out, gid.String())
 	}
+	binding, _ := libp2ptransport.BindingFromPublicKey(r.server.identity.PublicKey)
 	return map[string]any{
-		"pilot_node_id": r.server.nodeID,
-		"data_dir":      r.server.dataDir,
-		"groups":        out,
-		"running":       true,
+		"member_id": binding.MemberID,
+		"data_dir":  r.server.dataDir,
+		"groups":    out,
+		"running":   true,
 	}
 }
 
@@ -375,24 +380,29 @@ func (r *fleetCommandRunner) localFleetState(ctx context.Context, commandCtx fle
 	return map[string]any{
 		"fleet_id":         commandCtx.fleet.FleetID,
 		"control_group_id": commandCtx.fleet.ControlGroupID,
-		"local_node_id":    r.server.nodeID,
+		"local_member_id":  commandCtx.local.MemberID,
 		"members":          memberCount,
 		"source":           source,
 	}
 }
 
 func (r *fleetCommandRunner) publishResult(ctx context.Context, groupID entmoot.GroupID, cmd esphttp.FleetCommandEnvelope, status, summary, output string, startedAtMS int64) {
+	binding, err := libp2ptransport.BindingFromPublicKey(r.server.identity.PublicKey)
+	if err != nil {
+		return
+	}
 	result := esphttp.FleetCommandResultEnvelope{
-		Type:        esphttp.FleetCommandResultType,
-		Version:     1,
-		CommandID:   cmd.CommandID,
-		FleetID:     cmd.FleetID,
-		AgentNodeID: r.server.nodeID,
-		Action:      cmd.Action,
-		Status:      status,
-		Summary:     summary,
-		Output:      output,
-		StartedAtMS: startedAtMS,
+		Type:          esphttp.FleetCommandResultType,
+		Version:       2,
+		CommandID:     cmd.CommandID,
+		FleetID:       cmd.FleetID,
+		AgentMemberID: binding.MemberID,
+		AgentPeerID:   binding.PeerID.String(),
+		Action:        cmd.Action,
+		Status:        status,
+		Summary:       summary,
+		Output:        output,
+		StartedAtMS:   startedAtMS,
 	}
 	if fleetCommandStatusIsTerminal(status) {
 		result.CompletedAtMS = time.Now().UnixMilli()
@@ -419,31 +429,30 @@ func fleetCommandStatusIsTerminal(status string) bool {
 	}
 }
 
-func fleetCommandMemberForNode(members []esphttp.FleetMemberRecord, nodeID entmoot.NodeID) (esphttp.FleetMemberRecord, bool) {
+func fleetCommandMemberForNode(members []esphttp.FleetMemberRecord, memberID entmoot.MemberID) (esphttp.FleetMemberRecord, bool) {
 	for _, member := range members {
-		if member.NodeID == nodeID {
+		if member.MemberID == memberID {
 			return member, true
 		}
 	}
 	return esphttp.FleetMemberRecord{}, false
 }
-
 func fleetCommandTargetsLocal(cmd esphttp.FleetCommandEnvelope, local esphttp.FleetMemberRecord) bool {
 	switch esphttp.NormalizeFleetCommandTarget(cmd.Target.Kind) {
 	case esphttp.FleetCommandTargetAll:
 		return true
 	case esphttp.FleetCommandTargetNode:
-		return cmd.Target.PilotNodeID == local.NodeID
+		return cmd.Target.MemberID == local.MemberID && cmd.Target.PeerID == local.PeerID
 	default:
 		return false
 	}
 }
 
 func fleetCommandIssuedByCoordinator(msg entmoot.Message, cmd esphttp.FleetCommandEnvelope, fleet esphttp.FleetRecord) bool {
-	if cmd.IssuerNodeID != fleet.Coordinator.PilotNodeID {
+	if fleet.Coordinator.MemberID == nil || cmd.IssuerMemberID != *fleet.Coordinator.MemberID {
 		return false
 	}
-	if msg.Author.PilotNodeID == fleet.Coordinator.PilotNodeID &&
+	if msg.Author.MemberID != nil && *msg.Author.MemberID == *fleet.Coordinator.MemberID &&
 		base64.StdEncoding.EncodeToString(msg.Author.EntmootPubKey) == base64.StdEncoding.EncodeToString(fleet.Coordinator.EntmootPubKey) {
 		return true
 	}

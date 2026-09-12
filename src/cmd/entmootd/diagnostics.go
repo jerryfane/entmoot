@@ -1,39 +1,26 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
-	"net"
 	"os"
 	"sort"
-	"strings"
-	"text/tabwriter"
 	"time"
 
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/ipc"
 	"entmoot/pkg/entmoot/roster"
 	"entmoot/pkg/entmoot/store"
-	"entmoot/pkg/entmoot/transport/pilot/ipcclient"
+	libp2ptransport "entmoot/pkg/entmoot/transport/libp2p"
 )
 
+const doctorSchemaVersion = 3
+
 const (
-	doctorSchemaVersion = 1
-
-	diagProbeMaxPeersPerRequest = 256
-	diagProbeConcurrency        = 4
-	diagProbeMinTimeout         = 250 * time.Millisecond
-	diagProbeDefaultTimeout     = 3 * time.Second
-	diagProbeMaxTimeout         = 30 * time.Second
-	diagProbeServerSlack        = 2 * time.Second
-	diagProbeClientSlack        = 5 * time.Second
-
 	doctorLocalMemberOK               = "ok"
-	doctorLocalMemberPilotUnknown     = "pilot_unknown"
 	doctorLocalMemberNotInRoster      = "not_in_roster"
 	doctorLocalMemberIdentityMismatch = "identity_mismatch"
 )
@@ -42,93 +29,67 @@ type doctorReport struct {
 	SchemaVersion int                 `json:"schema_version"`
 	GeneratedAt   string              `json:"generated_at"`
 	Runtime       *runtimeReport      `json:"runtime,omitempty"`
-	Pilot         doctorPilotReport   `json:"pilot"`
 	Entmoot       doctorEntmootReport `json:"entmoot"`
 	Groups        []doctorGroupReport `json:"groups"`
 }
 
-type doctorPilotReport struct {
-	Reachable          bool             `json:"reachable"`
-	Error              string           `json:"error,omitempty"`
-	NodeID             entmoot.NodeID   `json:"node_id,omitempty"`
-	Hostname           string           `json:"hostname,omitempty"`
-	TURNEndpoint       string           `json:"turn_endpoint,omitempty"`
-	OutboundTURNOnly   bool             `json:"outbound_turn_only"`
-	NoRegistryEndpoint bool             `json:"no_registry_endpoint"`
-	Capabilities       []string         `json:"capabilities,omitempty"`
-	TrustedQueryOK     bool             `json:"trusted_query_ok"`
-	TrustedError       string           `json:"trusted_error,omitempty"`
-	Trusted            []entmoot.NodeID `json:"trusted,omitempty"`
-	PendingQueryOK     bool             `json:"pending_query_ok"`
-	PendingError       string           `json:"pending_error,omitempty"`
-	Pending            []entmoot.NodeID `json:"pending,omitempty"`
-}
-
 type doctorEntmootReport struct {
-	Running    bool           `json:"running"`
-	Error      string         `json:"error,omitempty"`
-	NodeID     entmoot.NodeID `json:"node_id,omitempty"`
-	ListenPort uint16         `json:"listen_port,omitempty"`
-	DataDir    string         `json:"data_dir"`
+	Running    bool             `json:"running"`
+	Error      string           `json:"error,omitempty"`
+	MemberID   entmoot.MemberID `json:"member_id"`
+	PeerID     string           `json:"peer_id"`
+	ListenPort uint16           `json:"listen_port,omitempty"`
+	DataDir    string           `json:"data_dir"`
 }
 
 type doctorGroupReport struct {
 	GroupID           entmoot.GroupID    `json:"group_id"`
+	Running           bool               `json:"running"`
 	LocalMember       bool               `json:"local_member"`
 	LocalMemberStatus string             `json:"local_member_status"`
 	Members           int                `json:"members"`
 	Messages          int                `json:"messages"`
-	Suggestion        string             `json:"suggestion,omitempty"`
-	NextCommand       string             `json:"next_command,omitempty"`
+	MerkleRoot        *[32]byte          `json:"merkle_root,omitempty"`
 	Peers             []doctorPeerReport `json:"peers"`
+	Error             string             `json:"error,omitempty"`
+	Suggestion        string             `json:"suggestion,omitempty"`
 }
 
 type doctorPeerReport struct {
-	NodeID      entmoot.NodeID `json:"node_id"`
-	Hostname    string         `json:"hostname,omitempty"`
-	Roster      bool           `json:"roster"`
-	Profile     string         `json:"profile"`
-	Transport   string         `json:"transport"`
-	Trust       string         `json:"trust"`
-	Route       string         `json:"route"`
-	RTTMS       int64          `json:"rtt_ms,omitempty"`
-	Error       string         `json:"error,omitempty"`
-	Diagnosis   string         `json:"diagnosis"`
-	Suggestion  string         `json:"suggestion,omitempty"`
-	NextCommand string         `json:"next_command,omitempty"`
+	MemberID entmoot.MemberID `json:"member_id"`
+	PeerID   string           `json:"peer_id"`
+	Self     bool             `json:"self"`
+	Roster   bool             `json:"roster"`
+	Error    string           `json:"error,omitempty"`
 }
 
 func cmdDoctor(gf *globalFlags, args []string) int {
 	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
 	groupStr := fs.String("group", "", "base64 group id (optional; defaults to all groups)")
-	probe := fs.Bool("probe", false, "actively probe Entmoot streams to peers")
-	timeout := fs.Duration("timeout", 3*time.Second, "per-peer probe timeout")
-	jsonOut := fs.Bool("json", false, "emit JSON instead of a human summary")
-	redact := fs.Bool("redact", false, "omit sensitive fields from JSON output")
+	probe := fs.Bool("probe", false, "include live daemon status")
+	timeout := fs.Duration("timeout", 3*time.Second, "diagnostic timeout")
+	jsonOutput := fs.Bool("json", false, "print JSON")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return exitOK
 		}
 		return exitInvalidArgument
 	}
-	var gid *entmoot.GroupID
+	var groupID *entmoot.GroupID
 	if *groupStr != "" {
 		parsed, err := decodeGroupID(*groupStr)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "doctor: %v\n", err)
 			return exitInvalidArgument
 		}
-		gid = &parsed
+		groupID = &parsed
 	}
-	report, err := buildDoctorReport(context.Background(), gf, gid, *probe, *timeout)
+	report, err := buildDoctorReport(context.Background(), gf, groupID, *probe, *timeout)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "doctor: %v\n", err)
 		return exitTransport
 	}
-	if *redact {
-		redactDoctorReport(report)
-	}
-	if *jsonOut {
+	if *jsonOutput {
 		data, err := json.Marshal(report)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "doctor: marshal: %v\n", err)
@@ -144,9 +105,9 @@ func cmdDoctor(gf *globalFlags, args []string) int {
 func cmdPeers(gf *globalFlags, args []string) int {
 	fs := flag.NewFlagSet("peers", flag.ContinueOnError)
 	groupStr := fs.String("group", "", "base64 group id (required)")
-	probe := fs.Bool("probe", false, "actively probe Entmoot streams to peers")
-	timeout := fs.Duration("timeout", 3*time.Second, "per-peer probe timeout")
-	jsonOut := fs.Bool("json", false, "emit JSON instead of a table")
+	probe := fs.Bool("probe", false, "include live daemon status")
+	timeout := fs.Duration("timeout", 3*time.Second, "diagnostic timeout")
+	jsonOutput := fs.Bool("json", false, "print JSON")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return exitOK
@@ -168,10 +129,10 @@ func cmdPeers(gf *globalFlags, args []string) int {
 		return exitTransport
 	}
 	if len(report.Groups) == 0 {
-		fmt.Fprintf(os.Stderr, "peers: group %s not joined\n", gid)
+		fmt.Fprintln(os.Stderr, "peers: group not found")
 		return exitGroupNotFound
 	}
-	if *jsonOut {
+	if *jsonOutput {
 		data, err := json.Marshal(report.Groups[0].Peers)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "peers: marshal: %v\n", err)
@@ -184,622 +145,133 @@ func cmdPeers(gf *globalFlags, args []string) int {
 	return exitOK
 }
 
-func buildDoctorReport(ctx context.Context, gf *globalFlags, groupFilter *entmoot.GroupID, probe bool, probeTimeout time.Duration) (*doctorReport, error) {
-	s, err := setup(gf)
+func buildDoctorReport(ctx context.Context, gf *globalFlags, groupFilter *entmoot.GroupID, _ bool, _ time.Duration) (*doctorReport, error) {
+	setupResult, err := setup(gf)
 	if err != nil {
 		return nil, err
 	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
+	binding, err := libp2ptransport.BindingFromPublicKey(setupResult.identity.PublicKey)
+	if err != nil {
+		return nil, fmt.Errorf("derive local identity binding: %w", err)
 	}
-	runtime := collectRuntimeReport(gf, s.dataDir)
+	runtimeReport := collectRuntimeReport(gf, setupResult.dataDir)
 	report := &doctorReport{
 		SchemaVersion: doctorSchemaVersion,
 		GeneratedAt:   time.Now().UTC().Format(time.RFC3339Nano),
-		Runtime:       &runtime,
+		Runtime:       &runtimeReport,
 		Entmoot: doctorEntmootReport{
-			DataDir: s.dataDir,
+			MemberID: binding.MemberID,
+			PeerID:   binding.PeerID.String(),
+			DataDir:  setupResult.dataDir,
 		},
+		Groups: []doctorGroupReport{},
 	}
-
-	trusted := map[entmoot.NodeID]struct{}{}
-	pending := map[entmoot.NodeID]struct{}{}
-	if pilotInfo, t, p, err := loadPilotDoctorState(ctx, gf.socket); err != nil {
-		report.Pilot.Error = err.Error()
-	} else {
-		report.Pilot = pilotInfo
-		trusted = t
-		pending = p
-	}
-
-	running := controlSocketAlive(controlSocketPath(s.dataDir), 500*time.Millisecond)
-	report.Entmoot.Running = running
-	liveInfoByGroup := map[entmoot.GroupID]ipc.GroupInfo{}
-	if running {
-		if live, err := infoOverIPCContext(ctx, controlSocketPath(s.dataDir)); err == nil {
-			report.Entmoot.NodeID = live.PilotNodeID
-			report.Entmoot.ListenPort = live.ListenPort
-			report.Entmoot.DataDir = live.DataDir
-			for _, gi := range live.Groups {
-				liveInfoByGroup[gi.GroupID] = gi
-			}
+	liveByGroup := make(map[entmoot.GroupID]ipc.GroupInfo)
+	if controlSocketAlive(controlSocketPath(setupResult.dataDir), 500*time.Millisecond) {
+		live, liveErr := infoOverIPCContext(ctx, controlSocketPath(setupResult.dataDir))
+		if liveErr != nil {
+			report.Entmoot.Error = liveErr.Error()
 		} else {
-			report.Entmoot.Error = err.Error()
-			report.Entmoot.Running = false
+			report.Entmoot.Running = true
+			report.Entmoot.ListenPort = live.ListenPort
+			for _, group := range live.Groups {
+				liveByGroup[group.GroupID] = group
+			}
 		}
 	}
-
-	gids, err := listGroupIDs(s.dataDir, nil)
+	groups, err := listGroupIDs(setupResult.dataDir, nil)
 	if err != nil {
 		return nil, err
 	}
 	if groupFilter != nil {
-		if !groupRosterExists(s.dataDir, *groupFilter) {
-			return report, nil
-		}
-		gids = []entmoot.GroupID{*groupFilter}
+		groups = []entmoot.GroupID{*groupFilter}
 	}
-	sort.Slice(gids, func(i, j int) bool { return gids[i].String() < gids[j].String() })
-
-	st, err := store.OpenSQLite(s.dataDir)
-	if err != nil && len(gids) > 0 {
-		return nil, fmt.Errorf("open store: %w", err)
+	messageStore, err := store.OpenSQLite(setupResult.dataDir)
+	if err != nil {
+		return nil, err
 	}
-	if st != nil {
-		defer func() { _ = st.Close() }()
+	defer messageStore.Close()
+	for _, gid := range groups {
+		report.Groups = append(report.Groups, buildDoctorGroup(ctx, messageStore, setupResult.dataDir, gid, binding.MemberID, liveByGroup[gid]))
 	}
-	storeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	for _, gid := range gids {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		if !groupRosterExists(s.dataDir, gid) {
-			if groupFilter != nil {
-				continue
-			}
-			continue
-		}
-		r, err := roster.OpenJSONL(s.dataDir, gid)
-		if err != nil {
-			return nil, fmt.Errorf("open roster %s: %w", gid, err)
-		}
-		localNode := report.Entmoot.NodeID
-		if localNode == 0 {
-			localNode = report.Pilot.NodeID
-		}
-		group := buildDoctorGroup(storeCtx, st, r, gid, localNode, s.identity.PublicKey, report.Pilot, trusted, pending, liveInfoByGroup[gid])
-		_ = r.Close()
-		report.Groups = append(report.Groups, group)
-	}
-	if probe {
-		if err := applyDoctorProbes(ctx, report, s.dataDir, probeTimeout); err != nil {
-			return nil, err
-		}
-	}
-	populateDoctorSuggestions(report, gf)
 	return report, nil
 }
 
-func loadPilotDoctorState(ctx context.Context, socketPath string) (doctorPilotReport, map[entmoot.NodeID]struct{}, map[entmoot.NodeID]struct{}, error) {
-	drv, err := ipcclient.Connect(socketPath)
+func buildDoctorGroup(ctx context.Context, messageStore *store.SQLite, dataDir string, gid entmoot.GroupID, localMemberID entmoot.MemberID, live ipc.GroupInfo) doctorGroupReport {
+	group := doctorGroupReport{GroupID: gid, Running: live.GroupID == gid, Peers: []doctorPeerReport{}}
+	rlog, err := roster.OpenJSONL(dataDir, gid)
 	if err != nil {
-		return doctorPilotReport{}, nil, nil, fmt.Errorf("connect %s: %w", socketPath, err)
+		group.Error = err.Error()
+		return group
 	}
-	defer func() { _ = drv.Close() }()
-	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
-	info, err := drv.InfoStruct(ctx)
-	if err != nil {
-		return doctorPilotReport{}, nil, nil, err
-	}
-	report := doctorPilotReport{
-		Reachable:          true,
-		NodeID:             entmoot.NodeID(info.NodeID),
-		Hostname:           info.Hostname,
-		TURNEndpoint:       info.TURNEndpoint,
-		OutboundTURNOnly:   info.OutboundTURNOnly,
-		NoRegistryEndpoint: info.NoRegistryEndpoint,
-		Capabilities:       append([]string(nil), info.Capabilities...),
-	}
-	trusted := map[entmoot.NodeID]struct{}{}
-	if resp, err := drv.TrustedPeers(ctx); err == nil {
-		report.TrustedQueryOK = true
-		report.Trusted = parseTrustedNodeIDs(resp)
-		for _, id := range report.Trusted {
-			trusted[id] = struct{}{}
-		}
+	defer rlog.Close()
+	group.Members = len(rlog.MemberIDs())
+	group.LocalMember = rlog.IsMemberID(localMemberID)
+	if group.LocalMember {
+		group.LocalMemberStatus = doctorLocalMemberOK
 	} else {
-		report.TrustedError = err.Error()
+		group.LocalMemberStatus = doctorLocalMemberNotInRoster
+		group.Suggestion = "join this group with a target-bound bootstrap capability"
 	}
-	pending := map[entmoot.NodeID]struct{}{}
-	if list, err := drv.PendingHandshakes(ctx); err == nil {
-		report.PendingQueryOK = true
-		for _, p := range list {
-			id := entmoot.NodeID(p.NodeID)
-			report.Pending = append(report.Pending, id)
-			pending[id] = struct{}{}
-		}
-		sort.Slice(report.Pending, func(i, j int) bool { return report.Pending[i] < report.Pending[j] })
-	} else {
-		report.PendingError = err.Error()
-	}
-	return report, trusted, pending, nil
-}
-
-func buildDoctorGroup(ctx context.Context, st *store.SQLite, r *roster.RosterLog, gid entmoot.GroupID, localNode entmoot.NodeID, localPub []byte, pilotReport doctorPilotReport, trusted, pending map[entmoot.NodeID]struct{}, live ipc.GroupInfo) doctorGroupReport {
-	members := r.Members()
-	group := doctorGroupReport{
-		GroupID: gid,
-		Members: len(members),
-	}
-	group.LocalMember, group.LocalMemberStatus = doctorLocalMembership(r, localNode, localPub)
-	if live.Messages > 0 {
-		group.Messages = live.Messages
-	} else if st != nil {
-		if msgs, err := st.Range(ctx, gid, 0, 0); err == nil {
-			group.Messages = len(msgs)
-		}
-	}
-	now := time.Now()
-	for _, id := range members {
-		info, _ := r.MemberInfo(id)
-		peer := doctorPeerReport{
-			NodeID:    id,
-			Roster:    true,
-			Profile:   "missing",
-			Transport: "missing",
-			Trust:     doctorPeerTrust(localNode, id, pilotReport, trusted, pending),
-			Route:     "not_checked",
-		}
-		if localNode != 0 && id == localNode {
-			peer.Route = "self"
-		}
-		if st != nil {
-			if ad, ok, err := st.GetMemberProfileAd(ctx, gid, id, now); err == nil && ok && memberProfileMatchesRosterInfo(ad, info) {
-				peer.Profile = "ok"
-				peer.Hostname = ad.Hostname
-			}
-			if ad, ok, err := st.GetTransportAd(ctx, gid, id); err == nil && ok {
-				if ad.NotAfter > now.UnixMilli() {
-					peer.Transport = "ok"
-				} else {
-					peer.Transport = "stale"
-				}
+	memberIDs := rlog.MemberIDs()
+	sort.Slice(memberIDs, func(i, j int) bool { return memberIDs[i].String() < memberIDs[j].String() })
+	for _, memberID := range memberIDs {
+		peerReport := doctorPeerReport{MemberID: memberID, Self: memberID == localMemberID, Roster: true}
+		if info, ok := rlog.MemberInfoByID(memberID); ok {
+			if remoteBinding, bindErr := libp2ptransport.BindingFromPublicKey(info.EntmootPubKey); bindErr == nil {
+				peerReport.PeerID = remoteBinding.PeerID.String()
+			} else {
+				peerReport.Error = bindErr.Error()
 			}
 		}
-		peer.Diagnosis = diagnosePeer(peer, false)
-		group.Peers = append(group.Peers, peer)
+		group.Peers = append(group.Peers, peerReport)
+	}
+	messages, err := messageStore.Range(ctx, gid, 0, 0)
+	if err != nil {
+		group.Error = err.Error()
+		return group
+	}
+	group.Messages = len(messages)
+	if root, err := messageStore.MerkleRoot(ctx, gid); err == nil {
+		group.MerkleRoot = &root
+	} else {
+		group.Error = err.Error()
 	}
 	return group
-}
-
-func doctorLocalMembership(r *roster.RosterLog, localNode entmoot.NodeID, localPub []byte) (bool, string) {
-	if localNode == 0 {
-		return false, doctorLocalMemberPilotUnknown
-	}
-	info, ok := r.MemberInfo(localNode)
-	if !ok {
-		return false, doctorLocalMemberNotInRoster
-	}
-	if !bytes.Equal(info.EntmootPubKey, localPub) {
-		return false, doctorLocalMemberIdentityMismatch
-	}
-	return true, doctorLocalMemberOK
-}
-
-func doctorPeerTrust(localNode, nodeID entmoot.NodeID, pilotReport doctorPilotReport, trusted, pending map[entmoot.NodeID]struct{}) string {
-	if localNode != 0 && nodeID == localNode {
-		return "self"
-	}
-	if _, ok := trusted[nodeID]; ok {
-		return "trusted"
-	}
-	if _, ok := pending[nodeID]; ok {
-		return "pending"
-	}
-	if !pilotReport.Reachable || !pilotReport.TrustedQueryOK || !pilotReport.PendingQueryOK {
-		return "unknown"
-	}
-	return "missing"
-}
-
-func applyDoctorProbes(ctx context.Context, report *doctorReport, dataDir string, timeout time.Duration) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if !report.Entmoot.Running {
-		for gi := range report.Groups {
-			for pi := range report.Groups[gi].Peers {
-				report.Groups[gi].Peers[pi].Route = "daemon_down"
-				report.Groups[gi].Peers[pi].Diagnosis = diagnosePeer(report.Groups[gi].Peers[pi], true)
-			}
-		}
-		return nil
-	}
-	for gi := range report.Groups {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		group := &report.Groups[gi]
-		peers := make([]entmoot.NodeID, 0, len(group.Peers))
-		peerIndexes := make(map[entmoot.NodeID]int, len(group.Peers))
-		for i, p := range group.Peers {
-			peerIndexes[p.NodeID] = i
-			if p.NodeID != report.Entmoot.NodeID {
-				peers = append(peers, p.NodeID)
-			}
-		}
-		for _, chunk := range chunkDiagProbePeers(peers) {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			results, err := diagProbeOverIPC(ctx, controlSocketPath(dataDir), group.GroupID, chunk, timeout)
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return ctxErr
-			}
-			for _, nodeID := range chunk {
-				pi, ok := peerIndexes[nodeID]
-				if !ok {
-					continue
-				}
-				peer := &group.Peers[pi]
-				if err != nil {
-					peer.Route = "probe_failed"
-					peer.Error = err.Error()
-					peer.Diagnosis = diagnosePeer(*peer, true)
-					continue
-				}
-				res, ok := results[nodeID]
-				if !ok {
-					peer.Route = "unknown"
-					peer.Diagnosis = diagnosePeer(*peer, true)
-					continue
-				}
-				if res.OK {
-					peer.Route = "ok"
-					peer.RTTMS = res.RTTMS
-					peer.Error = ""
-				} else {
-					peer.Route = classifyProbeError(res.Error)
-					peer.Error = res.Error
-				}
-				peer.Diagnosis = diagnosePeer(*peer, true)
-			}
-		}
-		for pi := range group.Peers {
-			peer := &group.Peers[pi]
-			if peer.NodeID == report.Entmoot.NodeID {
-				peer.Route = "self"
-				peer.Diagnosis = diagnoseLocalPeer(*group, *peer, true)
-				continue
-			}
-			if peer.Route == "not_checked" {
-				peer.Route = "unknown"
-			}
-			peer.Diagnosis = diagnosePeer(*peer, true)
-		}
-	}
-	return nil
-}
-
-func diagProbeOverIPC(ctx context.Context, sockPath string, gid entmoot.GroupID, peers []entmoot.NodeID, timeout time.Duration) (map[entmoot.NodeID]ipc.DiagProbePeer, error) {
-	timeout = clampDiagProbeTimeout(timeout)
-	dialCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
-	defer cancel()
-	conn, err := (&net.Dialer{}).DialContext(dialCtx, "unix", sockPath)
-	if err != nil {
-		return nil, err
-	}
-	defer conn.Close()
-	stopCancelWake := context.AfterFunc(ctx, func() {
-		_ = conn.SetDeadline(time.Now())
-		_ = conn.Close()
-	})
-	defer stopCancelWake()
-	deadline := time.Now().Add(diagProbeBudget(timeout, len(peers)) + diagProbeClientSlack)
-	_ = conn.SetDeadline(deadline)
-	if err := ipc.EncodeAndWrite(conn, &ipc.DiagProbeReq{GroupID: gid, Peers: peers, TimeoutMS: timeout.Milliseconds()}); err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return nil, ctxErr
-		}
-		return nil, err
-	}
-	_, payload, err := ipc.ReadAndDecode(conn)
-	if err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return nil, ctxErr
-		}
-		return nil, err
-	}
-	switch v := payload.(type) {
-	case *ipc.DiagProbeResp:
-		out := make(map[entmoot.NodeID]ipc.DiagProbePeer, len(v.Peers))
-		for _, p := range v.Peers {
-			out[p.NodeID] = p
-		}
-		return out, nil
-	case *ipc.ErrorFrame:
-		return nil, fmt.Errorf("%s: %s", v.Code, v.Message)
-	default:
-		return nil, fmt.Errorf("unexpected response %T", payload)
-	}
-}
-
-func clampDiagProbeTimeout(timeout time.Duration) time.Duration {
-	if timeout <= 0 {
-		return diagProbeDefaultTimeout
-	}
-	if timeout < diagProbeMinTimeout {
-		return diagProbeMinTimeout
-	}
-	if timeout > diagProbeMaxTimeout {
-		return diagProbeMaxTimeout
-	}
-	return timeout
-}
-
-func diagProbeBatchCount(peerCount int) int {
-	if peerCount <= 0 {
-		return 1
-	}
-	return (peerCount + diagProbeConcurrency - 1) / diagProbeConcurrency
-}
-
-func diagProbeBudget(timeout time.Duration, peerCount int) time.Duration {
-	return clampDiagProbeTimeout(timeout)*time.Duration(diagProbeBatchCount(peerCount)) + diagProbeServerSlack
-}
-
-func chunkDiagProbePeers(peers []entmoot.NodeID) [][]entmoot.NodeID {
-	if len(peers) == 0 {
-		return nil
-	}
-	chunks := make([][]entmoot.NodeID, 0, (len(peers)+diagProbeMaxPeersPerRequest-1)/diagProbeMaxPeersPerRequest)
-	for start := 0; start < len(peers); start += diagProbeMaxPeersPerRequest {
-		end := start + diagProbeMaxPeersPerRequest
-		if end > len(peers) {
-			end = len(peers)
-		}
-		chunks = append(chunks, peers[start:end])
-	}
-	return chunks
-}
-
-func diagnosePeer(p doctorPeerReport, probed bool) string {
-	switch {
-	case !p.Roster:
-		return "not_in_roster"
-	case p.Trust == "pending":
-		return "trust_pending"
-	case p.Trust == "missing":
-		return "trust_missing"
-	case p.Trust == "unknown":
-		return "unknown"
-	case p.Profile == "missing":
-		return "profile_missing"
-	case p.Transport == "missing":
-		return "transport_missing"
-	case p.Transport == "stale":
-		return "transport_stale"
-	case probed && p.Route != "ok" && p.Route != "self":
-		return p.Route
-	default:
-		return "ok"
-	}
-}
-
-func diagnoseLocalPeer(group doctorGroupReport, p doctorPeerReport, probed bool) string {
-	if !group.LocalMember {
-		if group.LocalMemberStatus != "" {
-			return group.LocalMemberStatus
-		}
-		return doctorLocalMemberNotInRoster
-	}
-	return diagnosePeer(p, probed)
-}
-
-func populateDoctorSuggestions(report *doctorReport, gf *globalFlags) {
-	for gi := range report.Groups {
-		group := &report.Groups[gi]
-		if group.Suggestion == "" && !group.LocalMember {
-			group.Suggestion = localMembershipSuggestion(group.LocalMemberStatus)
-			if !report.Entmoot.Running {
-				group.NextCommand = serveGroupNextCommand(gf, group.GroupID)
-			}
-		}
-		if !report.Entmoot.Running {
-			group.Suggestion = "local Entmoot daemon is not running; start the joined group before probing peers"
-			group.NextCommand = serveGroupNextCommand(gf, group.GroupID)
-		}
-		for pi := range group.Peers {
-			peer := &group.Peers[pi]
-			peer.Suggestion, peer.NextCommand = peerSuggestion(gf, group.GroupID, report.Entmoot.Running, *group, *peer)
-		}
-	}
-}
-
-func localMembershipSuggestion(status string) string {
-	switch status {
-	case doctorLocalMemberPilotUnknown:
-		return "local Pilot node id is unavailable; check that pilot-daemon is running and that entmootd is using the intended Pilot socket"
-	case doctorLocalMemberNotInRoster:
-		return "current Pilot node is not in this roster; rejoin the group or use the data/identity directory that belongs to this node"
-	case doctorLocalMemberIdentityMismatch:
-		return "current Pilot node is in the roster with a different Entmoot key; use the matching identity file or rejoin with the current identity"
-	default:
-		return "local membership could not be verified; check the data directory, identity file, and Pilot socket"
-	}
-}
-
-func peerSuggestion(gf *globalFlags, gid entmoot.GroupID, daemonRunning bool, group doctorGroupReport, peer doctorPeerReport) (string, string) {
-	if peer.Diagnosis == "ok" {
-		return "", ""
-	}
-	if peer.Trust == "self" && !group.LocalMember {
-		return localMembershipSuggestion(group.LocalMemberStatus), ""
-	}
-	switch peer.Diagnosis {
-	case "not_in_roster":
-		return "peer is not in the local roster; sync the roster or verify the group id", ""
-	case "trust_pending":
-		return "Pilot trust is pending; approve the incoming handshake if this peer should connect", pilotctlCommand(gf, "approve", fmt.Sprint(peer.NodeID))
-	case "trust_missing":
-		return "Pilot trust is missing; send a handshake to this peer", pilotctlCommand(gf, "handshake", fmt.Sprint(peer.NodeID), fmt.Sprintf("entmoot group %s", gid.String()))
-	case "unknown":
-		return "Pilot trust state could not be queried; check pilot-daemon and rerun doctor", ""
-	case "profile_missing":
-		return "peer has not published a member profile yet; restart or wait for that peer's entmootd", ""
-	case "transport_missing":
-		return "peer has no current Entmoot transport advertisement; check that the peer daemon is running and joined to this group", ""
-	case "transport_stale":
-		return "peer transport advertisement is stale; restart or wait for that peer's entmootd to republish", ""
-	case "daemon_down":
-		return "local Entmoot daemon is not running; start the joined group before probing peers", serveGroupNextCommand(gf, gid)
-	case "route_timeout":
-		return "Entmoot stream probe timed out; verify the Pilot route and peer daemon", pilotctlCommand(gf, "ping", fmt.Sprint(peer.NodeID))
-	case "route_refused":
-		return "Entmoot stream was refused or closed; check that the peer entmootd is serving the group", ""
-	case "probe_unsupported":
-		return "peer or daemon does not support diagnostic probes; update Entmoot on both sides", ""
-	case doctorLocalMemberPilotUnknown, doctorLocalMemberIdentityMismatch:
-		return localMembershipSuggestion(peer.Diagnosis), ""
-	default:
-		if daemonRunning {
-			return "diagnostic state is not healthy; inspect the row fields and rerun with --probe", ""
-		}
-		return "local Entmoot daemon is not running; start the joined group before probing peers", serveGroupNextCommand(gf, gid)
-	}
-}
-
-func pilotctlCommand(gf *globalFlags, args ...string) string {
-	parts := []string{"pilotctl"}
-	if gf != nil && strings.TrimSpace(gf.socket) != "" {
-		parts = append(parts, "-socket", gf.socket)
-	}
-	parts = append(parts, args...)
-	for i, part := range parts {
-		parts[i] = shellQuoteArg(part)
-	}
-	return strings.Join(parts, " ")
-}
-
-func serveGroupNextCommand(gf *globalFlags, gid entmoot.GroupID) string {
-	args := []string{
-		"entmootd",
-		"-socket", gf.socket,
-		"-identity", gf.identity,
-		"-data", gf.data,
-		"serve",
-		"-group", gid.String(),
-	}
-	for i, arg := range args {
-		args[i] = shellQuoteArg(arg)
-	}
-	return strings.Join(args, " ")
-}
-
-func classifyProbeError(err string) string {
-	lower := strings.ToLower(err)
-	switch {
-	case strings.Contains(lower, "timeout"), strings.Contains(lower, "deadline"):
-		return "route_timeout"
-	case strings.Contains(lower, "not found"), strings.Contains(lower, "refused"), strings.Contains(lower, "closed"):
-		return "route_refused"
-	case strings.Contains(lower, "unknown"):
-		return "probe_unsupported"
-	default:
-		return "unknown"
-	}
-}
-
-func parseTrustedNodeIDs(resp map[string]interface{}) []entmoot.NodeID {
-	raw, ok := resp["trusted"].([]interface{})
-	if !ok {
-		return nil
-	}
-	out := make([]entmoot.NodeID, 0, len(raw))
-	for _, item := range raw {
-		obj, ok := item.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		n, ok := obj["node_id"].(float64)
-		if !ok || n < 0 {
-			continue
-		}
-		out = append(out, entmoot.NodeID(uint32(n)))
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
-	return out
 }
 
 func printDoctorHuman(report *doctorReport) {
 	if report.Runtime != nil && report.Runtime.NamespaceWarning != "" {
 		fmt.Printf("runtime: warning %s\n", report.Runtime.NamespaceWarning)
-		for _, suggestion := range report.Runtime.Suggestions {
-			fmt.Printf("runtime suggestion: %s\n", suggestion)
-		}
 	}
-	fmt.Printf("pilot: ")
-	if report.Pilot.Reachable {
-		fmt.Printf("ok node=%d hostname=%s\n", report.Pilot.NodeID, emptyDash(report.Pilot.Hostname))
-	} else {
-		fmt.Printf("down %s\n", report.Pilot.Error)
-	}
-	fmt.Printf("entmoot: ")
 	if report.Entmoot.Running {
-		fmt.Printf("running node=%d data=%s\n", report.Entmoot.NodeID, report.Entmoot.DataDir)
+		fmt.Printf("running member=%s peer=%s data=%s\n", report.Entmoot.MemberID.String(), report.Entmoot.PeerID, report.Entmoot.DataDir)
 	} else {
-		fmt.Printf("not_running data=%s\n", report.Entmoot.DataDir)
+		fmt.Printf("not_running member=%s peer=%s data=%s\n", report.Entmoot.MemberID.String(), report.Entmoot.PeerID, report.Entmoot.DataDir)
 	}
 	for _, group := range report.Groups {
-		fmt.Printf("\ngroup %s members=%d messages=%d local_member=%t local_member_status=%s\n",
-			group.GroupID, group.Members, group.Messages, group.LocalMember, group.LocalMemberStatus)
-		if group.Suggestion != "" {
-			fmt.Printf("suggestion: %s\n", group.Suggestion)
-			if group.NextCommand != "" {
-				fmt.Printf("next: %s\n", group.NextCommand)
-			}
+		fmt.Printf("group=%s running=%t local_member=%t members=%d messages=%d", group.GroupID.String(), group.Running, group.LocalMember, group.Members, group.Messages)
+		if group.Error != "" {
+			fmt.Printf(" error=%q", group.Error)
 		}
-		printPeersTable(group.Peers)
+		fmt.Println()
 	}
 }
 
 func printPeersTable(peers []doctorPeerReport) {
-	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "NODE\tHOSTNAME\tROSTER\tPROFILE\tTRANSPORT\tTRUST\tROUTE\tDIAGNOSIS\tSUGGESTION")
-	for _, p := range peers {
-		fmt.Fprintf(w, "%d\t%s\t%t\t%s\t%s\t%s\t%s\t%s\t%s\n",
-			p.NodeID, emptyDash(p.Hostname), p.Roster, p.Profile, p.Transport, p.Trust, routeWithRTT(p), p.Diagnosis, suggestionSummary(p))
+	for _, peer := range peers {
+		fmt.Printf("member=%s peer=%s self=%t", peer.MemberID.String(), peer.PeerID, peer.Self)
+		if peer.Error != "" {
+			fmt.Printf(" error=%q", peer.Error)
+		}
+		fmt.Println()
 	}
-	_ = w.Flush()
-}
-
-func suggestionSummary(p doctorPeerReport) string {
-	if p.NextCommand != "" {
-		return p.NextCommand
-	}
-	if p.Suggestion != "" {
-		return "see doctor"
-	}
-	return "-"
-}
-
-func routeWithRTT(p doctorPeerReport) string {
-	if p.Route == "ok" && p.RTTMS > 0 {
-		return fmt.Sprintf("ok/%dms", p.RTTMS)
-	}
-	return p.Route
-}
-
-func emptyDash(s string) string {
-	if s == "" {
-		return "-"
-	}
-	return s
 }
 
 func redactDoctorReport(report *doctorReport) {
+	if report == nil {
+		return
+	}
 	report.Runtime = nil
 	report.Entmoot.DataDir = ""
 }

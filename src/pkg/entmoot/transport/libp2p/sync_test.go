@@ -11,6 +11,7 @@ import (
 
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/keystore"
+	"entmoot/pkg/entmoot/merkle"
 	"entmoot/pkg/entmoot/roster"
 	"entmoot/pkg/entmoot/signing"
 	"entmoot/pkg/entmoot/store"
@@ -53,7 +54,7 @@ func TestRosterPagesPinSnapshotAndRequireMembership(t *testing.T) {
 	}
 	extra := mustIdentity(t)
 	extraID, _ := entmoot.MemberIDFromPublicKey(extra.PublicKey)
-	entry, err := rosterLog.SignEntry(serverIdentity, "add", entmoot.NodeInfo{EntmootPubKey: extra.PublicKey, MemberID: &extraID}, nil, 0, 3_000)
+	entry, err := rosterLog.SignEntry(serverIdentity, "add", mustNodeInfo(t, extra.PublicKey), nil, 3_000)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,7 +69,7 @@ func TestRosterPagesPinSnapshotAndRequireMembership(t *testing.T) {
 		t.Fatalf("snapshot was not pinned to original roster: %+v", second)
 	}
 	entries := append(append([]entmoot.RosterEntry(nil), first.Entries...), second.Entries...)
-	validated, err := ValidateRosterChain(groupID, entmoot.NodeInfo{EntmootPubKey: serverIdentity.PublicKey, MemberID: &serverBinding.MemberID}, first.CommittedHead, entries)
+	validated, err := ValidateRosterChain(groupID, mustNodeInfo(t, serverIdentity.PublicKey), first.CommittedHead, entries)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,16 +108,13 @@ func TestHistorySyncContinuesAfterWithholdingKeeperAndResumesPages(t *testing.T)
 	}
 	defer clientHost.Close()
 	withholdingIdentity := mustIdentity(t)
-	withholdingHost, withholdingBinding, err := NewHost(ctx, withholdingIdentity, libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"))
+	withholdingHost, _, err := NewHost(ctx, withholdingIdentity, libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer withholdingHost.Close()
 	groupID, rosterLog := syncRoster(t, serverIdentity, serverBinding.MemberID, clientIdentity, clientBinding.MemberID)
-	withholdingEntry, err := rosterLog.SignEntry(serverIdentity, "add", entmoot.NodeInfo{
-		EntmootPubKey: withholdingIdentity.PublicKey,
-		MemberID:      &withholdingBinding.MemberID,
-	}, nil, 0, 3_000)
+	withholdingEntry, err := rosterLog.SignEntry(serverIdentity, "add", mustNodeInfo(t, withholdingIdentity.PublicKey), nil, 3_000)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,7 +126,7 @@ func TestHistorySyncContinuesAfterWithholdingKeeperAndResumesPages(t *testing.T)
 		t.Fatal(err)
 	}
 	defer source.Close()
-	signer, err := signing.NewLocalSigner(entmoot.NodeInfo{EntmootPubKey: serverIdentity.PublicKey, MemberID: &serverBinding.MemberID}, serverIdentity)
+	signer, err := signing.NewLocalSigner(mustNodeInfo(t, serverIdentity.PublicKey), serverIdentity)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -187,7 +185,7 @@ func TestHistorySyncContinuesAfterWithholdingKeeperAndResumesPages(t *testing.T)
 	progress := SyncFromKeepers(ctx, clientHost, groupID, []peer.AddrInfo{
 		{ID: withholdingHost.ID(), Addrs: withholdingHost.Addrs()},
 		{ID: serverHost.ID(), Addrs: serverHost.Addrs()},
-	}, destination, func(message entmoot.Message) error {
+	}, destination, func(message entmoot.Message, _ *merkle.Proof) error {
 		return signing.VerifyMessage(message, message.Author)
 	})
 	if len(progress) != 2 || !progress[0].Available || progress[0].MissingBodies != 300 || progress[0].ConvergedHint || !progress[1].Available {
@@ -204,16 +202,88 @@ func TestHistorySyncContinuesAfterWithholdingKeeperAndResumesPages(t *testing.T)
 		t.Fatalf("destination has %d messages, want 300", len(messages))
 	}
 }
+func TestFetchRosterUpdatesAdvancesExistingMember(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	founderIdentity := mustIdentity(t)
+	memberIdentity := mustIdentity(t)
+	thirdIdentity := mustIdentity(t)
+	founderID, err := entmoot.MemberIDFromPublicKey(founderIdentity.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	memberID, err := entmoot.MemberIDFromPublicKey(memberIdentity.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	groupID, founderRoster := syncRoster(t, founderIdentity, founderID, memberIdentity, memberID)
+	stale := roster.New(groupID)
+	for index, entry := range founderRoster.Entries() {
+		if index == 0 {
+			if err := stale.AcceptGenesis(entry); err != nil {
+				t.Fatal(err)
+			}
+		} else if err := stale.Apply(entry); err != nil {
+			t.Fatal(err)
+		}
+	}
+	third := mustNodeInfo(t, thirdIdentity.PublicKey)
+	add, err := founderRoster.SignEntry(founderIdentity, "add", third, nil, time.Now().UnixMilli())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := founderRoster.Apply(add); err != nil {
+		t.Fatal(err)
+	}
+	founderHost, _, err := NewHost(ctx, founderIdentity, libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer founderHost.Close()
+	memberHost, _, err := NewHost(ctx, memberIdentity, libp2p.NoListenAddrs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer memberHost.Close()
+	messageStore := store.NewMemory()
+	defer messageStore.Close()
+	server := SyncServer{
+		Host: founderHost, Admission: NewBootstrapAdmission(), Store: messageStore,
+		Roster: func(candidate entmoot.GroupID) (*roster.RosterLog, bool) {
+			return founderRoster, candidate == groupID
+		},
+	}
+	if err := server.Install(); err != nil {
+		t.Fatal(err)
+	}
+	updates, err := FetchRosterUpdates(ctx, memberHost, peer.AddrInfo{ID: founderHost.ID(), Addrs: founderHost.Addrs()}, groupID, stale.Entries())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(updates) != 1 {
+		t.Fatalf("received %d roster updates, want 1", len(updates))
+	}
+	if err := stale.Apply(updates[0]); err != nil {
+		t.Fatal(err)
+	}
+	thirdID, err := entmoot.MemberIDFromPublicKey(thirdIdentity.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !stale.IsMemberID(thirdID) {
+		t.Fatal("existing member roster did not advance to include the new member")
+	}
+}
 
 func syncRoster(t *testing.T, founderIdentity *keystore.Identity, founderID entmoot.MemberID, memberIdentity *keystore.Identity, memberID entmoot.MemberID) (entmoot.GroupID, *roster.RosterLog) {
 	t.Helper()
 	var groupID entmoot.GroupID
 	groupID[0] = 9
 	result := roster.New(groupID)
-	if err := result.Genesis(founderIdentity, entmoot.NodeInfo{EntmootPubKey: founderIdentity.PublicKey, MemberID: &founderID}, 1_000); err != nil {
+	if err := result.Genesis(founderIdentity, mustNodeInfo(t, founderIdentity.PublicKey), 1_000); err != nil {
 		t.Fatal(err)
 	}
-	entry, err := result.SignEntry(founderIdentity, "add", entmoot.NodeInfo{EntmootPubKey: memberIdentity.PublicKey, MemberID: &memberID}, nil, 0, 2_000)
+	entry, err := result.SignEntry(founderIdentity, "add", mustNodeInfo(t, memberIdentity.PublicKey), nil, 2_000)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -229,4 +299,182 @@ type withholdingStore struct {
 
 func (*withholdingStore) Get(context.Context, entmoot.GroupID, entmoot.MessageID) (entmoot.Message, error) {
 	return entmoot.Message{}, store.ErrNotFound
+}
+
+func TestSyncBootstrapAuthorityAndMembership(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	founder, target := mustIdentity(t), mustIdentity(t)
+	serverHost, _, err := NewHost(ctx, founder, libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverHost.Close()
+	clientHost, targetBinding, err := NewHost(ctx, target, libp2p.NoListenAddrs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientHost.Close()
+	groupID := entmoot.GroupID{42}
+	log := roster.New(groupID)
+	if err := log.Genesis(founder, mustNodeInfo(t, founder.PublicKey), 1_000); err != nil {
+		t.Fatal(err)
+	}
+	source, err := store.OpenSQLite(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	signer, err := signing.NewLocalSigner(mustNodeInfo(t, founder.PublicKey), founder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	head := log.Head()
+	message, err := signer.SignMessage(ctx, entmoot.Message{
+		Version: 2, GroupID: groupID, Timestamp: 2_000, Topics: []string{"private"},
+		Content: []byte("private history"), RosterHead: &head,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := source.Put(ctx, groupID, message); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	admission, err := OpenPersistentBootstrapAdmission(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = admission.Close() }()
+	server := SyncServer{
+		Host: serverHost, Admission: admission.BootstrapAdmission, Store: source,
+		Roster: func(id entmoot.GroupID) (*roster.RosterLog, bool) { return log, id == groupID },
+	}
+	if err := server.Install(); err != nil {
+		t.Fatal(err)
+	}
+	remote := peer.AddrInfo{ID: serverHost.ID(), Addrs: serverHost.Addrs()}
+	now := time.Now()
+	grant := BootstrapCapability{
+		GroupID: groupID, RosterHead: head, Nonce: [32]byte{1},
+		Founder: mustNodeInfo(t, founder.PublicKey), TargetPublicKey: target.PublicKey,
+		TargetMemberID: targetBinding.MemberID, TargetPeerID: clientHost.ID().String(),
+		AllowedPeerIDs: []string{serverHost.ID().String()},
+		IssuedAtMS:     now.Add(-time.Minute).UnixMilli(), ExpiresAtMS: now.Add(time.Hour).UnixMilli(),
+	}
+	sign := func(capability *BootstrapCapability, identity *keystore.Identity) {
+		t.Helper()
+		if err := SignBootstrapCapability(identity, capability); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sign(&grant, founder)
+	check := func(name string, capability *BootstrapCapability, allowed bool) {
+		t.Helper()
+		t.Run(name, func(t *testing.T) {
+			response, err := RequestRosterPage(ctx, clientHost, remote, RosterSyncRequest{
+				Version: 2, RequestID: name, GroupID: groupID, Capability: capability,
+			})
+			if allowed {
+				if err != nil || response.CommittedHead != log.Head() || len(response.Entries) != len(log.Entries()) {
+					t.Fatalf("roster read: response=%+v err=%v", response, err)
+				}
+			} else if err == nil || response.Error != SyncUnauthorized || len(response.Entries) != 0 {
+				t.Fatalf("roster denial: response=%+v err=%v", response, err)
+			}
+			for _, mode := range []string{"list", "bodies"} {
+				history, err := RequestHistoryPage(ctx, clientHost, remote, HistorySyncRequest{
+					Version: 2, RequestID: name + mode, GroupID: groupID, Capability: capability,
+					Mode: mode, IDs: []entmoot.MessageID{message.ID},
+				})
+				if allowed {
+					if err != nil {
+						t.Fatal(err)
+					}
+					if mode == "bodies" && (len(history.Messages) != 1 || history.Messages[0].ID != message.ID) {
+						t.Fatalf("history read: %+v", history)
+					}
+				} else if err == nil || history.Error != SyncUnauthorized || len(history.Messages) != 0 || len(history.IDs) != 0 {
+					t.Fatalf("history denial: response=%+v err=%v", history, err)
+				}
+			}
+			t.Logf("roster and history list/bodies allowed=%t", allowed)
+		})
+	}
+	check("no_grant", nil, false)
+	wrongFounder := grant
+	wrongFounder.Founder = mustNodeInfo(t, target.PublicKey)
+	sign(&wrongFounder, target)
+	check("untrusted_founder", &wrongFounder, false)
+	wrongServer := grant
+	wrongServer.AllowedPeerIDs = []string{clientHost.ID().String()}
+	sign(&wrongServer, founder)
+	check("unlisted_server", &wrongServer, false)
+	check("fresh_grant", &grant, true)
+	if err := admission.Reserve(grant, clientHost.ID(), EnrollmentProtocol, now); err != nil {
+		t.Fatal(err)
+	}
+	check("reserved_grant", &grant, false)
+	if err := admission.Release(grant); err != nil {
+		t.Fatal(err)
+	}
+	check("released_grant", &grant, true)
+	// Consume a grant without changing the roster so nonce enforcement is
+	// tested independently of checkpoint freshness, including after restart.
+	if err := admission.Authorize(grant, clientHost.ID(), EnrollmentProtocol, now); err != nil {
+		t.Fatal(err)
+	}
+	check("consumed_grant", &grant, false)
+	if err := admission.Close(); err != nil {
+		t.Fatal(err)
+	}
+	admission, err = OpenPersistentBootstrapAdmission(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted := SyncServer{
+		Host: serverHost, Admission: admission.BootstrapAdmission, Store: source,
+		Roster: server.Roster,
+	}
+	if err := restarted.Install(); err != nil {
+		t.Fatal(err)
+	}
+	check("consumed_after_restart", &grant, false)
+	fresh := grant
+	fresh.Nonce = [32]byte{2}
+	sign(&fresh, founder)
+	enrollment := EnrollmentServer{
+		Admission: admission.BootstrapAdmission,
+		Enroll: func(context.Context, BootstrapCapability) (EnrollmentResponse, error) {
+			entry, err := log.SignEntry(founder, "add", mustNodeInfo(t, target.PublicKey), nil, 3_000)
+			if err != nil {
+				return EnrollmentResponse{}, err
+			}
+			if err := log.Apply(entry); err != nil {
+				return EnrollmentResponse{}, err
+			}
+			return EnrollmentResponse{RosterHead: log.Head(), Entries: log.Entries()}, nil
+		},
+	}
+	if err := enrollment.Install(serverHost); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Enroll(ctx, clientHost, remote, fresh); err != nil {
+		t.Fatal(err)
+	}
+	check("admitted_member", nil, true)
+	check("member_with_consumed_grant", &fresh, true)
+	entry, err := log.SignEntry(founder, "remove", mustNodeInfo(t, target.PublicKey), nil, 4_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := log.Apply(entry); err != nil {
+		t.Fatal(err)
+	}
+	check("removed_member", nil, false)
+	check("removed_consumed_grant", &fresh, false)
+	stale := fresh
+	stale.Nonce = [32]byte{3}
+	sign(&stale, founder)
+	check("stale_unused_grant", &stale, false)
 }

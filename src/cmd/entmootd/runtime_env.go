@@ -17,11 +17,8 @@ import (
 
 const (
 	defaultEntmootDataDir  = "~/.entmoot"
-	agentPilotSocketPath   = "/data/.pilot/pilot.sock"
 	agentEntmootDataPath   = "/data/.entmoot"
 	agentEntmootWrapper    = "/data/.entmoot/entmoot"
-	agentPilotWrapper      = "/data/.pilot/pilot"
-	agentStackHelper       = "/data/.pilot/start-entmoot-stack.sh"
 	runtimeProcScanTimeout = 250 * time.Millisecond
 )
 
@@ -42,14 +39,10 @@ type runtimeReport struct {
 	Features               entfeatures.Capabilities `json:"features"`
 	DataDir                string                   `json:"data_dir"`
 	IdentityPath           string                   `json:"identity_path"`
-	PilotSocket            string                   `json:"pilot_socket"`
-	PilotSocketReachable   bool                     `json:"pilot_socket_reachable"`
 	ControlSocket          string                   `json:"control_socket"`
 	ControlSocketReachable bool                     `json:"control_socket_reachable"`
 	PublishPathHealthy     bool                     `json:"publish_path_healthy"`
 	AgentWrapper           string                   `json:"agent_wrapper,omitempty"`
-	PilotWrapper           string                   `json:"pilot_wrapper,omitempty"`
-	StackHelper            string                   `json:"stack_helper,omitempty"`
 	RunningDaemon          *runtimeDaemonReport     `json:"running_daemon,omitempty"`
 	NamespaceWarning       string                   `json:"namespace_warning,omitempty"`
 	Suggestions            []string                 `json:"suggestions,omitempty"`
@@ -62,7 +55,6 @@ type runtimeDaemonReport struct {
 	Binary              string `json:"binary,omitempty"`
 	DataDir             string `json:"data_dir,omitempty"`
 	IdentityPath        string `json:"identity_path,omitempty"`
-	PilotSocket         string `json:"pilot_socket,omitempty"`
 	ControlSocket       string `json:"control_socket,omitempty"`
 	ControlSocketViaPID string `json:"control_socket_via_pid,omitempty"`
 	MountNamespace      string `json:"mount_namespace,omitempty"`
@@ -138,7 +130,6 @@ func cmdEnv(gf *globalFlags, args []string) int {
 func collectRuntimeReport(gf *globalFlags, dataDir string) runtimeReport {
 	bin, _ := os.Executable()
 	controlSock := controlSocketPath(dataDir)
-	pilotSocket := runtimeSocketProbe(gf.socket, runtimeProcScanTimeout)
 	controlSocket := runtimeSocketProbe(controlSock, runtimeProcScanTimeout)
 	report := runtimeReport{
 		Binary:                 bin,
@@ -148,13 +139,10 @@ func collectRuntimeReport(gf *globalFlags, dataDir string) runtimeReport {
 		IdentityPath:           gf.identity,
 		Features:               featureFlags(gf).Capabilities(),
 		PublishPathHealthy:     controlSocket.Reachable,
-		PilotSocket:            gf.socket,
-		PilotSocketReachable:   pilotSocket.Reachable,
 		ControlSocket:          controlSock,
 		ControlSocketReachable: controlSocket.Reachable,
 		Recommended: map[string]string{
-			"agent_pilot_socket": agentPilotSocketPath,
-			"agent_data_dir":     agentEntmootDataPath,
+			"agent_data_dir": agentEntmootDataPath,
 		},
 		Platform: map[string]string{
 			"goos":   runtime.GOOS,
@@ -164,18 +152,12 @@ func collectRuntimeReport(gf *globalFlags, dataDir string) runtimeReport {
 	if fileExists(agentEntmootWrapper) {
 		report.AgentWrapper = agentEntmootWrapper
 	}
-	if fileExists(agentPilotWrapper) {
-		report.PilotWrapper = agentPilotWrapper
-	}
-	if fileExists(agentStackHelper) {
-		report.StackHelper = agentStackHelper
-	}
 	if daemon := findBestRuntimeDaemon(dataDir, controlSock); daemon != nil {
 		report.RunningDaemon = daemon
 		if !report.ControlSocketReachable && daemon.ControlSocketViaPID != "" && controlSocketAlive(daemon.ControlSocketViaPID, runtimeProcScanTimeout) {
 			report.NamespaceWarning = fmt.Sprintf("a running entmootd daemon was found at pid %d, but its control socket is only reachable through that process namespace", daemon.PID)
 			report.Suggestions = append(report.Suggestions,
-				fmt.Sprintf("run commands in the daemon namespace: nsenter --target %d --mount -- entmootd -socket %s -identity %s -data %s <command>", daemon.PID, nonEmpty(daemon.PilotSocket, gf.socket), nonEmpty(daemon.IdentityPath, gf.identity), nonEmpty(daemon.DataDir, dataDir)),
+				fmt.Sprintf("run commands in the daemon namespace: nsenter --target %d --mount -- entmootd -identity %s -data %s <command>", daemon.PID, nonEmpty(daemon.IdentityPath, gf.identity), nonEmpty(daemon.DataDir, dataDir)),
 			)
 			if daemon.ContainerLike {
 				report.Suggestions = append(report.Suggestions, "if this daemon is inside Docker/OpenClaw, prefer: docker exec -u node <container> /data/.entmoot/entmoot <command>")
@@ -185,12 +167,6 @@ func collectRuntimeReport(gf *globalFlags, dataDir string) runtimeReport {
 	report.RuntimeStatus, report.RuntimeStatusReason = classifyRuntimeStatus(report)
 	if report.RuntimeStatus == runtimeStatusHalfAlive {
 		report.Suggestions = append(report.Suggestions, "process discovery found entmootd, but the direct publish path is not healthy; trust socket probes over process lists")
-		if report.StackHelper != "" {
-			report.Suggestions = append(report.Suggestions, fmt.Sprintf("check the managed stack without mutation: %s check", report.StackHelper))
-		}
-	}
-	if strings.HasPrefix(dataDir, "/data/") && gf.socket == "/tmp/pilot.sock" {
-		report.Suggestions = append(report.Suggestions, "for containerized agents, prefer -socket /data/.pilot/pilot.sock and keep /tmp/pilot.sock as a compatibility symlink")
 	}
 	return report
 }
@@ -216,7 +192,6 @@ func printRuntimeReport(report runtimeReport) {
 	fmt.Printf("publish_path_healthy: %t\n", report.PublishPathHealthy)
 	fmt.Printf("data: %s\n", report.DataDir)
 	fmt.Printf("identity: %s\n", report.IdentityPath)
-	fmt.Printf("pilot_socket: %s reachable=%t\n", report.PilotSocket, report.PilotSocketReachable)
 	fmt.Printf("control_socket: %s reachable=%t\n", report.ControlSocket, report.ControlSocketReachable)
 	if report.AgentWrapper != "" {
 		fmt.Printf("agent_wrapper: %s\n", report.AgentWrapper)
@@ -308,16 +283,12 @@ func discoverRuntimeDaemons() []runtimeDaemonReport {
 			Binary:         firstArg(args),
 			DataDir:        parseFlagValue(args, "-data"),
 			IdentityPath:   parseFlagValue(args, "-identity"),
-			PilotSocket:    parseFlagValue(args, "-socket"),
 			Subcommand:     daemonSubcommand(args),
 			MountNamespace: readlinkQuiet(procPath(pid, "ns/mnt")),
 			NetNamespace:   readlinkQuiet(procPath(pid, "ns/net")),
 			ContainerLike:  fileExists(procPath(pid, "root/.dockerenv")),
 		}
 		daemon.DataDir = normalizeRuntimeDataDir(daemon.DataDir)
-		if daemon.PilotSocket == "" {
-			daemon.PilotSocket = "/tmp/pilot.sock"
-		}
 		daemon.ControlSocket = controlSocketPath(daemon.DataDir)
 		if strings.HasPrefix(daemon.ControlSocket, "/") {
 			viaPID := procPath(pid, "root"+daemon.ControlSocket)
@@ -393,7 +364,7 @@ func isRuntimeDaemonSubcommand(arg string) bool {
 
 func runtimeGlobalFlagTakesValue(name string) bool {
 	switch name {
-	case "socket", "identity", "data", "listen-port", "log-level", "pilot-wait-timeout", "pilot-wait-base-delay", "pilot-wait-max-delay":
+	case "identity", "data", "listen-port", "log-level", "connectivity", "controlled-relay":
 		return true
 	default:
 		return false

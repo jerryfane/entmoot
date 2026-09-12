@@ -45,9 +45,14 @@ func testAuthor(nodeID uint32, pubTag byte) entmoot.NodeInfo {
 	for i := range pk {
 		pk[i] = pubTag
 	}
+	memberID, err := entmoot.MemberIDFromPublicKey(pk)
+	if err != nil {
+		panic(err)
+	}
 	return entmoot.NodeInfo{
 		PilotNodeID:   entmoot.NodeID(nodeID),
 		EntmootPubKey: pk,
+		MemberID:      &memberID,
 	}
 }
 
@@ -330,9 +335,9 @@ func runStoreSuite(t *testing.T, newStore func(t *testing.T) MessageStore) {
 		}
 
 		got, err := s.LatestBefore(ctx, gid, 2, &PageBoundary{
-			TimestampMS:  m3.Timestamp,
-			AuthorNodeID: m3.Author.PilotNodeID,
-			MessageID:    m3.ID,
+			TimestampMS:    m3.Timestamp,
+			AuthorMemberID: *m3.Author.MemberID,
+			MessageID:      m3.ID,
 		})
 		if err != nil {
 			t.Fatalf("LatestBefore: %v", err)
@@ -383,9 +388,9 @@ func runStoreSuite(t *testing.T, newStore func(t *testing.T) MessageStore) {
 		}
 
 		msgs, err = s.LatestByTopicBefore(ctx, gid, "ops", 1, &PageBoundary{
-			TimestampMS:  newResearchOps.Timestamp,
-			AuthorNodeID: newResearchOps.Author.PilotNodeID,
-			MessageID:    newResearchOps.ID,
+			TimestampMS:    newResearchOps.Timestamp,
+			AuthorMemberID: *newResearchOps.Author.MemberID,
+			MessageID:      newResearchOps.ID,
 		})
 		if err != nil {
 			t.Fatalf("LatestByTopicBefore: %v", err)

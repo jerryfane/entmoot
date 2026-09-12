@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"entmoot/pkg/entmoot"
-	"entmoot/pkg/entmoot/delegation"
 	"entmoot/pkg/entmoot/events"
 	"entmoot/pkg/entmoot/keystore"
 	"entmoot/pkg/entmoot/mailbox"
@@ -22,29 +21,18 @@ func TestMobileServiceExternalSignerMailboxFlow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Generate phone identity: %v", err)
 	}
+	memberID, err := entmoot.MemberIDFromPublicKey(phoneID.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	peerID, err := entmoot.PeerIDFromPublicKey(phoneID.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
 	author := entmoot.NodeInfo{
-		PilotNodeID:   45491,
 		EntmootPubKey: phoneID.PublicKey,
-	}
-	const servicePeer entmoot.NodeID = 45981
-
-	delegations := delegation.NewRegistry()
-	if err := delegations.Upsert(delegation.Record{
-		GroupID:     gid,
-		User:        author,
-		ServicePeer: servicePeer,
-		Capabilities: []delegation.Capability{
-			delegation.CapabilitySync,
-			delegation.CapabilityNotify,
-			delegation.CapabilityRelayPublish,
-		},
-		CreatedAt:  time.Now(),
-		ValidUntil: time.Now().Add(time.Hour),
-	}); err != nil {
-		t.Fatalf("delegation.Upsert: %v", err)
-	}
-	if err := delegations.Check(time.Now(), gid, author.PilotNodeID, servicePeer, delegation.CapabilitySync); err != nil {
-		t.Fatalf("delegation.Check sync: %v", err)
+		MemberID:      &memberID,
+		PeerID:        peerID,
 	}
 
 	bus := events.NewBus()
@@ -87,10 +75,10 @@ func TestMobileServiceExternalSignerMailboxFlow(t *testing.T) {
 		t.Fatalf("store.Put: %v", err)
 	}
 	bus.Emit(events.Event{
-		Type:      events.TypeMessageIngested,
-		GroupID:   gid,
-		MessageID: msg.ID,
-		PeerID:    author.PilotNodeID,
+		Type:           events.TypeMessageIngested,
+		GroupID:        gid,
+		MessageID:      msg.ID,
+		AuthorMemberID: memberID,
 	})
 	select {
 	case ev := <-eventCh:

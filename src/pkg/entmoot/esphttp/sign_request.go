@@ -58,11 +58,14 @@ type genericSignRequestEnvelope struct {
 }
 
 func buildMessagePublishSignRequest(deviceID string, groupID entmoot.GroupID, draft messagePublishDraft, timestampMS int64) (SignRequest, error) {
-	if draft.Author.PilotNodeID == 0 {
-		return SignRequest{}, fmt.Errorf("author.pilot_node_id is required")
+	if draft.Author.MemberID == nil {
+		return SignRequest{}, fmt.Errorf("author.member_id is required")
 	}
-	if len(draft.Author.EntmootPubKey) != 32 {
-		return SignRequest{}, fmt.Errorf("author.entmoot_pubkey must be 32 bytes")
+	if draft.Author.PeerID == "" {
+		return SignRequest{}, fmt.Errorf("author.peer_id is required")
+	}
+	if err := entmoot.ValidateMemberInfo(draft.Author); err != nil {
+		return SignRequest{}, fmt.Errorf("author identity: %w", err)
 	}
 	if draft.RosterHead == nil {
 		return SignRequest{}, fmt.Errorf("roster_head is required")

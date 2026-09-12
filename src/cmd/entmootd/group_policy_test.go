@@ -4,15 +4,20 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"entmoot/pkg/entmoot"
+	"entmoot/pkg/entmoot/canonical"
 	"entmoot/pkg/entmoot/ipc"
+	"entmoot/pkg/entmoot/keystore"
 	entpolicy "entmoot/pkg/entmoot/policy"
+	entstore "entmoot/pkg/entmoot/store"
 )
 
 func TestCmdGroupPolicySetStatusAndClearJSON(t *testing.T) {
@@ -342,6 +347,91 @@ func TestCmdGroupPolicyRejectsBadInput(t *testing.T) {
 				t.Fatalf("cmdGroupPolicy(%v) stderr empty", args)
 			}
 		})
+	}
+}
+
+func TestRuntimeEnforcesStoredMessagePolicy(t *testing.T) {
+	ctx := withTestContext(t)
+	groupID := testCmdGroupPolicyID(0x59)
+	policyStore, err := entpolicy.OpenFileStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	groupPolicy := entpolicy.Standard()
+	groupPolicy.MessageBurstPerAuthor = 1
+	if err := policyStore.Put(ctx, groupID, groupPolicy); err != nil {
+		t.Fatal(err)
+	}
+	identity, err := keystore.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	memberID, err := entmoot.MemberIDFromPublicKey(identity.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	peerID, err := entmoot.PeerIDFromPublicKey(identity.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	author := entmoot.NodeInfo{MemberID: &memberID, PeerID: peerID, EntmootPubKey: identity.PublicKey}
+	runtime := &groupRuntime{
+		policyStore: policyStore, policyEnforcers: make(map[entmoot.GroupID]*groupPolicyEnforcer),
+	}
+	oversized := entmoot.Message{Author: author, Content: make([]byte, groupPolicy.MaxMessageBytes+1)}
+	if err := runtime.enforceGroupPolicy(ctx, groupID, oversized); err == nil {
+		t.Fatal("runtime accepted a message larger than max_message_bytes")
+	}
+	allowed := entmoot.Message{Author: author, Content: []byte("allowed")}
+	if err := runtime.enforceGroupPolicy(ctx, groupID, allowed); err != nil {
+		t.Fatalf("first message within burst rejected: %v", err)
+	}
+	if err := runtime.enforceGroupPolicy(ctx, groupID, allowed); err == nil {
+		t.Fatal("runtime accepted a message beyond message_burst_per_author")
+	}
+}
+
+func TestRuntimePrunesExpiredContentButKeepsPolicyUpdates(t *testing.T) {
+	ctx := withTestContext(t)
+	root := t.TempDir()
+	groupID := testCmdGroupPolicyID(0x5a)
+	policyStore, err := entpolicy.OpenFileStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	groupPolicy := entpolicy.Standard()
+	groupPolicy.RetentionDays = 1
+	if err := policyStore.Put(ctx, groupID, groupPolicy); err != nil {
+		t.Fatal(err)
+	}
+	messageStore, err := entstore.OpenSQLite(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer messageStore.Close()
+	memberID := entmoot.MemberID{1}
+	now := time.Now()
+	messages := []entmoot.Message{
+		{GroupID: groupID, Author: entmoot.NodeInfo{MemberID: &memberID}, Timestamp: now.Add(-48 * time.Hour).UnixMilli(), Topics: []string{"content"}, Content: []byte("expired")},
+		{GroupID: groupID, Author: entmoot.NodeInfo{MemberID: &memberID}, Timestamp: now.Add(-48 * time.Hour).UnixMilli(), Topics: []string{entpolicy.UpdateTopic}, Content: []byte("policy")},
+		{GroupID: groupID, Author: entmoot.NodeInfo{MemberID: &memberID}, Timestamp: now.UnixMilli(), Topics: []string{"content"}, Content: []byte("current")},
+	}
+	for index := range messages {
+		messages[index].ID = canonical.MessageID(messages[index])
+		if _, err := messageStore.Put(ctx, groupID, messages[index]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	runtime := &groupRuntime{store: messageStore, policyStore: policyStore, logger: slog.Default()}
+	runtime.pruneGroup(ctx, &groupSession{groupID: groupID})
+	for index, want := range []bool{false, true, true} {
+		got, err := messageStore.Has(ctx, groupID, messages[index].ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != want {
+			t.Fatalf("message %d retained = %v, want %v", index, got, want)
+		}
 	}
 }
 

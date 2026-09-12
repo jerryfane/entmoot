@@ -1,8 +1,7 @@
 // Package keystore manages the on-disk Ed25519 identity used by an Entmoot
-// node. Identities are persisted as JSON with base64-encoded keys, mirroring
-// Pilot's identity.json shape so operators can inspect either file the same
-// way. The package provides generation, atomic save, load, and sign/verify
-// helpers; it has no runtime state or globals.
+// member. Identities are persisted as JSON with base64-encoded keys. The
+// package provides generation, atomic save, load, and sign/verify helpers; it
+// has no runtime state or globals.
 package keystore
 
 import (
@@ -26,8 +25,7 @@ type Identity struct {
 	PublicKey ed25519.PublicKey
 }
 
-// identityFile is the on-disk JSON shape. Keys are std-base64 (not URL-safe)
-// to match Pilot's identity.json for operator familiarity.
+// identityFile is the on-disk JSON shape. Keys use standard padded base64.
 type identityFile struct {
 	PrivateKey string `json:"private_key"`
 	PublicKey  string `json:"public_key"`

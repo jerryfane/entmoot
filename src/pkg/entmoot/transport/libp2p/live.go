@@ -17,7 +17,6 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 
 	"entmoot/pkg/entmoot"
-	"entmoot/pkg/entmoot/gossip"
 	"entmoot/pkg/entmoot/roster"
 	"entmoot/pkg/entmoot/store"
 )
@@ -37,12 +36,13 @@ const (
 )
 
 type LiveConfig struct {
-	Host     host.Host
-	GroupID  entmoot.GroupID
-	Roster   *roster.RosterLog
-	Store    store.MessageStore
-	OnIngest func(entmoot.Message)
-	Now      func() time.Time
+	Host      host.Host
+	GroupID   entmoot.GroupID
+	Roster    *roster.RosterLog
+	Store     store.MessageStore
+	OnIngest  func(entmoot.Message)
+	Authorize func(entmoot.Message) error
+	Now       func() time.Time
 }
 
 type validatedLiveMessage struct {
@@ -50,10 +50,23 @@ type validatedLiveMessage struct {
 	inserted bool
 }
 
-// LiveGroup owns one authorized GossipSub topic. It has no Plumtree fallback.
+// LiveRouter owns the single GossipSub instance installed on a libp2p host.
+// Group topics share this router so their protocol handlers never overwrite
+// each other.
+type LiveRouter struct {
+	host      host.Host
+	pubsub    *pubsub.PubSub
+	filter    *memberSubscriptionFilter
+	cancel    context.CancelFunc
+	closeOnce sync.Once
+}
+
+// LiveGroup owns one authorized topic on its host's shared GossipSub router.
 type LiveGroup struct {
 	cfg          LiveConfig
-	pubsub       *pubsub.PubSub
+	router       *LiveRouter
+	ownedRouter  *LiveRouter
+	topicName    string
 	topic        *pubsub.Topic
 	subscription *pubsub.Subscription
 	cancel       context.CancelFunc
@@ -68,23 +81,19 @@ func GroupTopic(groupID entmoot.GroupID) string {
 	return "/entmoot/group/2/" + base64.RawURLEncoding.EncodeToString(hash.Sum(nil))
 }
 
-func NewLiveGroup(ctx context.Context, cfg LiveConfig) (*LiveGroup, error) {
-	if cfg.Host == nil || cfg.Roster == nil || cfg.Store == nil {
-		return nil, errors.New("libp2p: host, roster and store are required for live delivery")
+func NewLiveRouter(ctx context.Context, h host.Host) (*LiveRouter, error) {
+	if h == nil {
+		return nil, errors.New("libp2p: host is required for live delivery")
 	}
-	localBinding, err := hostBinding(cfg.Host)
-	if err != nil || !cfg.Roster.IsMemberID(localBinding.MemberID) {
-		return nil, fmt.Errorf("libp2p: local host is not a current group member")
-	}
-	topicName := GroupTopic(cfg.GroupID)
+	routerCtx, cancel := context.WithCancel(ctx)
+	filter := &memberSubscriptionFilter{host: h, rosters: make(map[string]*roster.RosterLog)}
 	params := pubsub.DefaultGossipSubParams()
 	params.D = 4
 	params.Dlo = 2
 	params.Dhi = 6
 	params.Dout = 1
 	params.HeartbeatInterval = time.Second
-	filter := &memberSubscriptionFilter{host: cfg.Host, roster: cfg.Roster, topic: topicName}
-	ps, err := pubsub.NewGossipSub(ctx, cfg.Host,
+	ps, err := pubsub.NewGossipSub(routerCtx, h,
 		pubsub.WithMessageSignaturePolicy(pubsub.StrictSign),
 		pubsub.WithMessageIdFn(envelopeMessageID),
 		pubsub.WithGossipSubParams(params),
@@ -92,28 +101,47 @@ func NewLiveGroup(ctx context.Context, cfg LiveConfig) (*LiveGroup, error) {
 		pubsub.WithValidateQueueSize(128),
 		pubsub.WithPeerOutboundQueueSize(128),
 		pubsub.WithSubscriptionFilter(filter),
-		pubsub.WithPeerFilter(func(remote peer.ID, topic string) bool {
-			return topic == topicName && peerIsMember(cfg.Host, cfg.Roster, remote)
-		}),
+		pubsub.WithPeerFilter(filter.peerAllowed),
 	)
 	if err != nil {
+		cancel()
 		return nil, fmt.Errorf("libp2p: create GossipSub: %w", err)
 	}
+	return &LiveRouter{host: h, pubsub: ps, filter: filter, cancel: cancel}, nil
+}
+
+func (r *LiveRouter) AddGroup(ctx context.Context, cfg LiveConfig) (*LiveGroup, error) {
+	if r == nil || r.pubsub == nil || cfg.Host != r.host || cfg.Roster == nil || cfg.Store == nil {
+		return nil, errors.New("libp2p: router host, roster and store are required for live delivery")
+	}
+	localBinding, err := hostBinding(cfg.Host)
+	if err != nil || !cfg.Roster.IsMemberID(localBinding.MemberID) {
+		return nil, fmt.Errorf("libp2p: local host is not a current group member")
+	}
+	topicName := GroupTopic(cfg.GroupID)
+	if !r.filter.add(topicName, cfg.Roster) {
+		return nil, fmt.Errorf("libp2p: group topic is already active")
+	}
 	liveCtx, cancel := context.WithCancel(ctx)
-	group := &LiveGroup{cfg: cfg, pubsub: ps, cancel: cancel, done: make(chan struct{})}
-	if err := ps.RegisterTopicValidator(topicName, group.validate,
+	group := &LiveGroup{cfg: cfg, router: r, topicName: topicName, cancel: cancel, done: make(chan struct{})}
+	if err := r.pubsub.RegisterTopicValidator(topicName, group.validate,
 		pubsub.WithValidatorConcurrency(8)); err != nil {
+		r.filter.remove(topicName)
 		cancel()
 		return nil, fmt.Errorf("libp2p: register topic validator: %w", err)
 	}
-	topic, err := ps.Join(topicName)
+	topic, err := r.pubsub.Join(topicName)
 	if err != nil {
+		_ = r.pubsub.UnregisterTopicValidator(topicName)
+		r.filter.remove(topicName)
 		cancel()
 		return nil, fmt.Errorf("libp2p: join group topic: %w", err)
 	}
 	subscription, err := topic.Subscribe()
 	if err != nil {
 		_ = topic.Close()
+		_ = r.pubsub.UnregisterTopicValidator(topicName)
+		r.filter.remove(topicName)
 		cancel()
 		return nil, fmt.Errorf("libp2p: subscribe group topic: %w", err)
 	}
@@ -121,6 +149,30 @@ func NewLiveGroup(ctx context.Context, cfg LiveConfig) (*LiveGroup, error) {
 	group.subscription = subscription
 	go group.consume(liveCtx)
 	return group, nil
+}
+
+// NewLiveGroup is a single-group convenience used by focused callers and
+// tests. Multi-group runtimes must create one LiveRouter and call AddGroup.
+func NewLiveGroup(ctx context.Context, cfg LiveConfig) (*LiveGroup, error) {
+	router, err := NewLiveRouter(ctx, cfg.Host)
+	if err != nil {
+		return nil, err
+	}
+	group, err := router.AddGroup(ctx, cfg)
+	if err != nil {
+		_ = router.Close()
+		return nil, err
+	}
+	group.ownedRouter = router
+	return group, nil
+}
+
+func (r *LiveRouter) Close() error {
+	if r == nil {
+		return nil
+	}
+	r.closeOnce.Do(r.cancel)
+	return nil
 }
 
 func envelopeMessageID(message *pubsubpb.Message) string {
@@ -158,8 +210,13 @@ func (g *LiveGroup) validate(_ context.Context, _ peer.ID, envelope *pubsub.Mess
 	if err != nil || binding.MemberID != *message.Author.MemberID || binding.PeerID != envelope.GetFrom() {
 		return pubsub.ValidationReject
 	}
-	if err := gossip.VerifyLiveMessage(g.cfg.Roster, message, g.now()); err != nil {
+	if err := VerifyLiveMessage(g.cfg.Roster, message, g.now()); err != nil {
 		return pubsub.ValidationReject
+	}
+	if g.cfg.Authorize != nil && envelope.GetFrom() != g.cfg.Host.ID() {
+		if err := g.cfg.Authorize(message); err != nil {
+			return pubsub.ValidationReject
+		}
 	}
 	inserted, err := g.cfg.Store.Put(context.Background(), g.cfg.GroupID, message)
 	if err != nil {
@@ -191,8 +248,13 @@ func (g *LiveGroup) Publish(ctx context.Context, message entmoot.Message) (Deliv
 	if err != nil || binding.PeerID != g.cfg.Host.ID() || message.Author.MemberID == nil || binding.MemberID != *message.Author.MemberID {
 		return "", errors.New("libp2p: publisher identity does not match local host")
 	}
-	if err := gossip.VerifyLiveMessage(g.cfg.Roster, message, g.now()); err != nil {
+	if err := VerifyLiveMessage(g.cfg.Roster, message, g.now()); err != nil {
 		return "", err
+	}
+	if g.cfg.Authorize != nil {
+		if err := g.cfg.Authorize(message); err != nil {
+			return "", err
+		}
 	}
 	inserted, err := g.cfg.Store.Put(ctx, g.cfg.GroupID, message)
 	if err != nil {
@@ -223,28 +285,59 @@ func (g *LiveGroup) Close() error {
 		g.cancel()
 		g.subscription.Cancel()
 		closeErr = g.topic.Close()
+		_ = g.router.pubsub.UnregisterTopicValidator(g.topicName)
+		g.router.filter.remove(g.topicName)
 		<-g.done
+		if g.ownedRouter != nil {
+			_ = g.ownedRouter.Close()
+		}
 	})
 	return closeErr
 }
 
 type memberSubscriptionFilter struct {
-	host   host.Host
-	roster *roster.RosterLog
-	topic  string
+	mu      sync.RWMutex
+	host    host.Host
+	rosters map[string]*roster.RosterLog
+}
+
+func (f *memberSubscriptionFilter) add(topic string, groupRoster *roster.RosterLog) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, exists := f.rosters[topic]; exists {
+		return false
+	}
+	f.rosters[topic] = groupRoster
+	return true
+}
+
+func (f *memberSubscriptionFilter) remove(topic string) {
+	f.mu.Lock()
+	delete(f.rosters, topic)
+	f.mu.Unlock()
+}
+
+func (f *memberSubscriptionFilter) roster(topic string) (*roster.RosterLog, bool) {
+	f.mu.RLock()
+	groupRoster, ok := f.rosters[topic]
+	f.mu.RUnlock()
+	return groupRoster, ok
 }
 
 func (f *memberSubscriptionFilter) CanSubscribe(topic string) bool {
-	return topic == f.topic
+	_, ok := f.roster(topic)
+	return ok
+}
+
+func (f *memberSubscriptionFilter) peerAllowed(remote peer.ID, topic string) bool {
+	groupRoster, ok := f.roster(topic)
+	return ok && peerIsMember(f.host, groupRoster, remote)
 }
 
 func (f *memberSubscriptionFilter) FilterIncomingSubscriptions(remote peer.ID, subscriptions []*pubsubpb.RPC_SubOpts) ([]*pubsubpb.RPC_SubOpts, error) {
-	if !peerIsMember(f.host, f.roster, remote) {
-		return nil, nil
-	}
-	filtered := make([]*pubsubpb.RPC_SubOpts, 0, 1)
+	filtered := make([]*pubsubpb.RPC_SubOpts, 0, len(subscriptions))
 	for _, subscription := range subscriptions {
-		if subscription.GetTopicid() == f.topic {
+		if f.peerAllowed(remote, subscription.GetTopicid()) {
 			filtered = append(filtered, subscription)
 		}
 	}

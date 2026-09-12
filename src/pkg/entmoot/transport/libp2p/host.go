@@ -1,5 +1,5 @@
-// Package libp2ptransport constructs Pilot-independent libp2p hosts from the
-// existing Entmoot Ed25519 identity.
+// Package libp2ptransport constructs libp2p hosts from the Entmoot Ed25519
+// identity.
 package libp2ptransport
 
 import (

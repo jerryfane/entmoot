@@ -108,7 +108,7 @@ func TestRunAgentCommandRunnerOpenClawIncludesPayloadContext(t *testing.T) {
 		"report status",
 		"Entmoot fleet command context JSON:",
 		`"command_id":"cmd-openclaw-context"`,
-		`"agent_node_id":133053`,
+		`"agent_member_id":"kgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="`,
 		`"context":{"group":"Mars Hub","source":"fleet-command"}`,
 	} {
 		if !strings.Contains(message, want) {
@@ -684,14 +684,17 @@ func clearOpenClawRunnerEnv(t *testing.T) {
 func testCommandPayload(commandID string) esphttp.AgentInstructionPayload {
 	var gid entmoot.GroupID
 	gid[0] = 0x55
+	issuer := entmoot.MemberID{0x91}
+	target := entmoot.MemberID{0x92}
 	cmd := esphttp.FleetCommandEnvelope{
 		Type:           esphttp.FleetCommandMessageType,
 		Version:        1,
 		CommandID:      commandID,
 		FleetID:        "fleet-a",
 		ControlGroupID: gid,
-		IssuerNodeID:   45981,
-		Target:         esphttp.FleetCommandTarget{Kind: esphttp.FleetCommandTargetNode, PilotNodeID: 133053},
+		IssuerMemberID: issuer,
+		IssuerPeerID:   "12D3KooWIssuer",
+		Target:         esphttp.FleetCommandTarget{Kind: esphttp.FleetCommandTargetNode, MemberID: target, PeerID: "12D3KooWTarget"},
 		Action:         esphttp.FleetCommandActionAgentInstruction,
 		CreatedAtMS:    1_000,
 		Args: map[string]interface{}{
@@ -699,5 +702,5 @@ func testCommandPayload(commandID string) esphttp.AgentInstructionPayload {
 			"timeout_ms":  float64(60_000),
 		},
 	}
-	return esphttp.NewAgentInstructionPayload(cmd, 133053, "report status", nil, 60_000, 1_500)
+	return esphttp.NewAgentInstructionPayload(cmd, target, "12D3KooWTarget", "report status", nil, 60_000, 1_500)
 }

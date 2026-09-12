@@ -1,6 +1,7 @@
 package libp2ptransport
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
@@ -17,6 +18,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/protocol"
 
 	"entmoot/pkg/entmoot"
+	"entmoot/pkg/entmoot/merkle"
 	"entmoot/pkg/entmoot/roster"
 	"entmoot/pkg/entmoot/store"
 )
@@ -68,39 +70,44 @@ type RosterSyncResponse struct {
 }
 
 type HistorySyncRequest struct {
-	Version          uint8                `json:"version"`
-	RequestID        string               `json:"request_id"`
-	GroupID          entmoot.GroupID      `json:"group_id"`
-	Capability       *BootstrapCapability `json:"capability,omitempty"`
-	Mode             string               `json:"mode"`
-	SnapshotToken    string               `json:"snapshot_token,omitempty"`
-	Generation       uint64               `json:"generation,omitempty"`
-	CoverageFloorMS  int64                `json:"coverage_floor_ms,omitempty"`
-	CoverageCeilMS   int64                `json:"coverage_ceiling_ms,omitempty"`
-	AfterTimestampMS int64                `json:"after_timestamp_ms,omitempty"`
-	AfterAuthor      entmoot.NodeID       `json:"after_author,omitempty"`
-	AfterID          *entmoot.MessageID   `json:"after_message_id,omitempty"`
-	IDs              []entmoot.MessageID  `json:"ids,omitempty"`
-	Limit            int                  `json:"limit,omitempty"`
+	Version             uint8                `json:"version"`
+	RequestID           string               `json:"request_id"`
+	GroupID             entmoot.GroupID      `json:"group_id"`
+	Capability          *BootstrapCapability `json:"capability,omitempty"`
+	Mode                string               `json:"mode"`
+	SnapshotToken       string               `json:"snapshot_token,omitempty"`
+	Generation          uint64               `json:"generation,omitempty"`
+	CoverageFloorMS     int64                `json:"coverage_floor_ms,omitempty"`
+	CoverageCeilMS      int64                `json:"coverage_ceiling_ms,omitempty"`
+	AfterTimestampMS    int64                `json:"after_timestamp_ms,omitempty"`
+	AfterAuthorMemberID entmoot.MemberID     `json:"after_author_member_id,omitempty"`
+	AfterID             *entmoot.MessageID   `json:"after_message_id,omitempty"`
+	IDs                 []entmoot.MessageID  `json:"ids,omitempty"`
+	Limit               int                  `json:"limit,omitempty"`
+}
+type LegacyHistoryProof struct {
+	MessageID entmoot.MessageID `json:"message_id"`
+	Proof     merkle.Proof      `json:"proof"`
 }
 
 type HistorySyncResponse struct {
-	Version         uint8               `json:"version"`
-	RequestID       string              `json:"request_id"`
-	GroupID         entmoot.GroupID     `json:"group_id"`
-	IDs             []entmoot.MessageID `json:"ids,omitempty"`
-	Messages        []entmoot.Message   `json:"messages,omitempty"`
-	Missing         []entmoot.MessageID `json:"missing,omitempty"`
-	SnapshotToken   string              `json:"snapshot_token,omitempty"`
-	Generation      uint64              `json:"generation,omitempty"`
-	NextTimestampMS int64               `json:"next_timestamp_ms,omitempty"`
-	NextAuthor      entmoot.NodeID      `json:"next_author,omitempty"`
-	NextID          *entmoot.MessageID  `json:"next_message_id,omitempty"`
-	HasMore         bool                `json:"has_more,omitempty"`
-	SnapshotChanged bool                `json:"snapshot_changed,omitempty"`
-	CoverageFloorMS int64               `json:"coverage_floor_ms,omitempty"`
-	CoverageCeilMS  int64               `json:"coverage_ceiling_ms,omitempty"`
-	Error           SyncErrorCode       `json:"error,omitempty"`
+	Version            uint8                `json:"version"`
+	RequestID          string               `json:"request_id"`
+	GroupID            entmoot.GroupID      `json:"group_id"`
+	IDs                []entmoot.MessageID  `json:"ids,omitempty"`
+	Messages           []entmoot.Message    `json:"messages,omitempty"`
+	Missing            []entmoot.MessageID  `json:"missing,omitempty"`
+	LegacyProofs       []LegacyHistoryProof `json:"legacy_proofs,omitempty"`
+	SnapshotToken      string               `json:"snapshot_token,omitempty"`
+	Generation         uint64               `json:"generation,omitempty"`
+	NextTimestampMS    int64                `json:"next_timestamp_ms,omitempty"`
+	NextAuthorMemberID entmoot.MemberID     `json:"next_author_member_id,omitempty"`
+	NextID             *entmoot.MessageID   `json:"next_message_id,omitempty"`
+	HasMore            bool                 `json:"has_more,omitempty"`
+	SnapshotChanged    bool                 `json:"snapshot_changed,omitempty"`
+	CoverageFloorMS    int64                `json:"coverage_floor_ms,omitempty"`
+	CoverageCeilMS     int64                `json:"coverage_ceiling_ms,omitempty"`
+	Error              SyncErrorCode        `json:"error,omitempty"`
 }
 
 type syncSnapshot struct {
@@ -121,11 +128,12 @@ const (
 
 // SyncServer serves bounded authenticated roster and history pages.
 type SyncServer struct {
-	Host      host.Host
-	Admission *BootstrapAdmission
-	Roster    func(entmoot.GroupID) (*roster.RosterLog, bool)
-	Store     store.MessageStore
-	Now       func() time.Time
+	Host          host.Host
+	Admission     *BootstrapAdmission
+	Roster        func(entmoot.GroupID) (*roster.RosterLog, bool)
+	Store         store.MessageStore
+	LegacyHistory func(entmoot.GroupID) (*merkle.Tree, bool)
+	Now           func() time.Time
 
 	snapshotMu sync.Mutex
 	snapshots  map[string]syncSnapshot
@@ -170,10 +178,25 @@ func (s *SyncServer) authorize(stream network.Stream, groupID entmoot.GroupID, c
 	if capability == nil {
 		return ErrBootstrapDenied
 	}
-	if capability.GroupID != groupID {
+	if capability.GroupID != groupID || capability.RosterHead != r.Head() {
 		return ErrBootstrapDenied
 	}
-	return s.Admission.Authorize(*capability, remote, requested, s.now())
+	founder, ok := r.Founder()
+	if !ok || !equalMemberID(founder.MemberID, capability.Founder.MemberID) ||
+		!bytes.Equal(founder.EntmootPubKey, capability.Founder.EntmootPubKey) {
+		return ErrBootstrapDenied
+	}
+	allowedServer := false
+	for _, allowed := range capability.AllowedPeerIDs {
+		if allowed == s.Host.ID().String() {
+			allowedServer = true
+			break
+		}
+	}
+	if !allowedServer {
+		return ErrBootstrapDenied
+	}
+	return s.Admission.Verify(*capability, remote, requested, s.now())
 }
 
 func (s *SyncServer) handleRoster(stream network.Stream) {
@@ -263,7 +286,7 @@ func (s *SyncServer) handleHistory(stream network.Stream) {
 func (s *SyncServer) handleHistoryList(stream network.Stream, request HistorySyncRequest, response HistorySyncResponse) {
 	var cursor *store.RangeCursor
 	if request.AfterID != nil {
-		cursor = &store.RangeCursor{TimestampMS: request.AfterTimestampMS, Author: request.AfterAuthor, ID: *request.AfterID}
+		cursor = &store.RangeCursor{TimestampMS: request.AfterTimestampMS, AuthorMemberID: request.AfterAuthorMemberID, ID: *request.AfterID}
 	}
 	limit := boundedLimit(request.Limit, 256, maxSyncPageItems)
 	var page store.MessageIDPage
@@ -309,7 +332,7 @@ func (s *SyncServer) handleHistoryList(stream network.Stream, request HistorySyn
 	response.CoverageFloorMS = page.CoverageFloorMS
 	if page.Next != nil {
 		response.NextTimestampMS = page.Next.TimestampMS
-		response.NextAuthor = page.Next.Author
+		response.NextAuthorMemberID = page.Next.AuthorMemberID
 		next := page.Next.ID
 		response.NextID = &next
 	}
@@ -335,6 +358,26 @@ func (s *SyncServer) handleHistoryBodies(stream network.Stream, request HistoryS
 			response.Error = SyncInternal
 			s.writeHistory(stream, response, maxHistoryBodyBytes)
 			return
+		}
+		if message.Version == 0 {
+			if s.LegacyHistory == nil {
+				response.Error = SyncInternal
+				s.writeHistory(stream, response, maxHistoryBodyBytes)
+				return
+			}
+			tree, ok := s.LegacyHistory(request.GroupID)
+			if !ok || tree == nil {
+				response.Error = SyncInternal
+				s.writeHistory(stream, response, maxHistoryBodyBytes)
+				return
+			}
+			proof, proofErr := tree.Proof(message.ID)
+			if proofErr != nil {
+				response.Error = SyncInternal
+				s.writeHistory(stream, response, maxHistoryBodyBytes)
+				return
+			}
+			response.LegacyProofs = append(response.LegacyProofs, LegacyHistoryProof{MessageID: message.ID, Proof: proof})
 		}
 		response.Messages = append(response.Messages, message)
 	}

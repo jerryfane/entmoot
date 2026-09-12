@@ -9,11 +9,12 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"strconv"
 	"time"
 
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/roster"
+	libp2ptransport "entmoot/pkg/entmoot/transport/libp2p"
+	"github.com/libp2p/go-libp2p/core/peer"
 )
 
 // cmdRoster dispatches `roster <op>`.
@@ -35,15 +36,17 @@ func cmdRoster(gf *globalFlags, args []string) int {
 
 type rosterMemberFlags struct {
 	groupStr  *string
-	nodeStr   *string
+	memberStr *string
+	peerStr   *string
 	pubkeyStr *string
 }
 
 func addRosterMemberFlags(fs *flag.FlagSet) rosterMemberFlags {
 	return rosterMemberFlags{
 		groupStr:  fs.String("group", "", "base64 group id (required)"),
-		nodeStr:   fs.String("node", "", "Pilot node id of the member, uint32 (required)"),
-		pubkeyStr: fs.String("pubkey", "", "base64 Ed25519 public key of the member (required)"),
+		memberStr: fs.String("member", "", "base64 MemberID (required)"),
+		peerStr:   fs.String("peer", "", "same-key libp2p PeerID (required)"),
+		pubkeyStr: fs.String("pubkey", "", "base64 Ed25519 public key (required)"),
 	}
 }
 
@@ -53,17 +56,8 @@ func parseRosterMemberFlags(command string, flags rosterMemberFlags) (entmoot.Gr
 		fmt.Fprintf(os.Stderr, "%s: %v\n", command, err)
 		return entmoot.GroupID{}, entmoot.NodeInfo{}, exitInvalidArgument, false
 	}
-	if *flags.nodeStr == "" {
-		fmt.Fprintf(os.Stderr, "%s: -node is required\n", command)
-		return entmoot.GroupID{}, entmoot.NodeInfo{}, exitInvalidArgument, false
-	}
-	nodeU64, err := strconv.ParseUint(*flags.nodeStr, 10, 32)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s: -node %q: %v\n", command, *flags.nodeStr, err)
-		return entmoot.GroupID{}, entmoot.NodeInfo{}, exitInvalidArgument, false
-	}
-	if *flags.pubkeyStr == "" {
-		fmt.Fprintf(os.Stderr, "%s: -pubkey is required\n", command)
+	if *flags.memberStr == "" || *flags.peerStr == "" || *flags.pubkeyStr == "" {
+		fmt.Fprintf(os.Stderr, "%s: -member, -peer, and -pubkey are required\n", command)
 		return entmoot.GroupID{}, entmoot.NodeInfo{}, exitInvalidArgument, false
 	}
 	pubkey, err := decodePubkey(*flags.pubkeyStr)
@@ -71,10 +65,22 @@ func parseRosterMemberFlags(command string, flags rosterMemberFlags) (entmoot.Gr
 		fmt.Fprintf(os.Stderr, "%s: -pubkey: %v\n", command, err)
 		return entmoot.GroupID{}, entmoot.NodeInfo{}, exitInvalidArgument, false
 	}
-	return gid, entmoot.NodeInfo{
-		PilotNodeID:   entmoot.NodeID(uint32(nodeU64)),
-		EntmootPubKey: pubkey,
-	}, exitOK, true
+	binding, err := libp2ptransport.BindingFromPublicKey(pubkey)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s: identity binding: %v\n", command, err)
+		return entmoot.GroupID{}, entmoot.NodeInfo{}, exitInvalidArgument, false
+	}
+	if binding.MemberID.String() != *flags.memberStr {
+		fmt.Fprintf(os.Stderr, "%s: -member does not match -pubkey\n", command)
+		return entmoot.GroupID{}, entmoot.NodeInfo{}, exitInvalidArgument, false
+	}
+	peerID, err := peer.Decode(*flags.peerStr)
+	if err != nil || peerID != binding.PeerID {
+		fmt.Fprintf(os.Stderr, "%s: -peer does not match -pubkey\n", command)
+		return entmoot.GroupID{}, entmoot.NodeInfo{}, exitInvalidArgument, false
+	}
+	memberID := binding.MemberID
+	return gid, entmoot.NodeInfo{MemberID: &memberID, PeerID: binding.PeerID.String(), EntmootPubKey: pubkey}, exitOK, true
 }
 
 type founderRosterContext struct {
@@ -90,53 +96,37 @@ func setupFounderRoster(gf *globalFlags, command string, gid entmoot.GroupID) (f
 		slog.Error(command+": setup", slog.String("err", err.Error()))
 		return founderRosterContext{}, exitTransport, false
 	}
-
-	// We need the local Pilot node id to verify we're the founder. Open
-	// Pilot only for NodeID(); the accept loop on port 1004 is not used
-	// but Pilot.Open binds it anyway.
-	tr, err := openPilot(gf)
+	memberID, err := entmoot.MemberIDFromPublicKey(s.identity.PublicKey)
 	if err != nil {
-		slog.Error(command+": pilot", slog.String("err", err.Error()))
+		slog.Error(command+": local identity", slog.String("err", err.Error()))
 		return founderRosterContext{}, exitTransport, false
 	}
-
 	r, err := roster.OpenJSONL(s.dataDir, gid)
 	if err != nil {
-		tr.Close()
 		slog.Error(command+": open roster", slog.String("err", err.Error()))
 		return founderRosterContext{}, exitTransport, false
 	}
 	if err := r.ClaimWriter(); err != nil {
 		_ = r.Close()
-		tr.Close()
 		slog.Error(command+": roster writer", slog.String("err", err.Error()))
 		return founderRosterContext{}, exitTransport, false
 	}
-
 	founder, ok := r.Founder()
 	if !ok {
 		_ = r.Close()
-		tr.Close()
 		fmt.Fprintf(os.Stderr, "%s: group has no founder (empty roster)\n", command)
 		return founderRosterContext{}, exitGroupNotFound, false
 	}
-	if founder.PilotNodeID != tr.NodeID() {
+	if founder.MemberID == nil || *founder.MemberID != memberID || !bytes.Equal(founder.EntmootPubKey, s.identity.PublicKey) {
 		_ = r.Close()
-		tr.Close()
-		fmt.Fprintf(os.Stderr,
-			"%s: local node %d is not founder %d of group %s\n",
-			command, tr.NodeID(), founder.PilotNodeID, gid.String())
+		fmt.Fprintf(os.Stderr, "%s: local member is not founder of group %s\n", command, gid.String())
 		return founderRosterContext{}, exitNotMember, false
 	}
-
 	return founderRosterContext{
 		setup:   s,
 		roster:  r,
 		founder: founder,
-		close: func() {
-			_ = r.Close()
-			tr.Close()
-		},
+		close:   func() { _ = r.Close() },
 	}, exitOK, true
 }
 
@@ -164,14 +154,7 @@ func cmdRosterAdd(gf *globalFlags, args []string) int {
 	}
 	defer ctx.close()
 
-	entry, err := ctx.roster.SignEntry(
-		ctx.setup.identity,
-		"add",
-		subject,
-		nil,
-		ctx.founder.PilotNodeID,
-		time.Now().UnixMilli(),
-	)
+	entry, err := ctx.roster.SignEntry(ctx.setup.identity, "add", subject, nil, time.Now().UnixMilli())
 	if err != nil {
 		slog.Error("roster add: sign entry", slog.String("err", err.Error()))
 		return exitTransport
@@ -188,15 +171,17 @@ func cmdRosterAdd(gf *globalFlags, args []string) int {
 
 	slog.Info("roster add: member admitted",
 		slog.String("group_id", gid.String()),
-		slog.Uint64("node", uint64(subject.PilotNodeID)),
+		slog.String("member_id", subject.MemberID.String()),
 		slog.String("entry_id", entry.ID.String()))
 
+	binding, _ := libp2ptransport.BindingFromPublicKey(subject.EntmootPubKey)
 	out := map[string]any{
 		"entry_id": entry.ID,
 		"group_id": gid,
-		"members":  len(ctx.roster.Members()),
+		"members":  len(ctx.roster.MemberIDs()),
 		"added": map[string]any{
-			"pilot_node_id":  subject.PilotNodeID,
+			"member_id":      subject.MemberID,
+			"peer_id":        binding.PeerID.String(),
 			"entmoot_pubkey": encodeBase64(subject.EntmootPubKey),
 		},
 	}
@@ -231,7 +216,7 @@ func cmdRosterRemove(gf *globalFlags, args []string) int {
 	}
 	defer ctx.close()
 
-	existing, ok := ctx.roster.MemberInfo(target.PilotNodeID)
+	existing, ok := ctx.roster.MemberInfoByID(*target.MemberID)
 	if !ok {
 		fmt.Fprintln(os.Stderr, "roster remove: target is not a member")
 		return exitNotMember
@@ -240,7 +225,7 @@ func cmdRosterRemove(gf *globalFlags, args []string) int {
 		fmt.Fprintln(os.Stderr, "roster remove: target identity does not match current roster")
 		return exitInvalidArgument
 	}
-	if existing.PilotNodeID == ctx.founder.PilotNodeID {
+	if existing.MemberID != nil && ctx.founder.MemberID != nil && *existing.MemberID == *ctx.founder.MemberID {
 		fmt.Fprintln(os.Stderr, "roster remove: cannot remove group founder")
 		return exitInvalidArgument
 	}
@@ -255,13 +240,15 @@ func cmdRosterRemove(gf *globalFlags, args []string) int {
 
 	slog.Info("roster remove: member removed",
 		slog.String("group_id", gid.String()),
-		slog.Uint64("node", uint64(target.PilotNodeID)))
+		slog.String("member_id", target.MemberID.String()))
 
+	binding, _ := libp2ptransport.BindingFromPublicKey(target.EntmootPubKey)
 	out := map[string]any{
 		"group_id": gid,
-		"members":  len(ctx.roster.Members()),
+		"members":  len(ctx.roster.MemberIDs()),
 		"removed": map[string]any{
-			"pilot_node_id":  target.PilotNodeID,
+			"member_id":      target.MemberID,
+			"peer_id":        binding.PeerID.String(),
 			"entmoot_pubkey": encodeBase64(target.EntmootPubKey),
 		},
 	}

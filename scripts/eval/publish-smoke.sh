@@ -35,7 +35,6 @@ Environment:
   ENTMOOT_AGENT_WRAPPER  optional wrapper path (default: /data/.entmoot/entmoot)
   ENTMOOT_DATA           optional Entmoot data root passed as -data
   ENTMOOT_IDENTITY       optional Entmoot identity path passed as -identity
-  PILOT_SOCKET           optional Pilot IPC socket path passed as -socket
 USAGE
 }
 

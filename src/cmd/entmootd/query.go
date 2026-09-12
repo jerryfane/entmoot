@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -22,7 +23,7 @@ import (
 func cmdQuery(gf *globalFlags, args []string) int {
 	fs := flag.NewFlagSet("query", flag.ContinueOnError)
 	groupStr := fs.String("group", "", "base64 group id (required if multiple groups are joined)")
-	authorStr := fs.String("author", "", "exact Pilot node id (optional)")
+	authorStr := fs.String("author", "", "exact base64 MemberID (optional)")
 	topicPattern := fs.String("topic", "", "MQTT-style filter (optional)")
 	sinceStr := fs.String("since", "", "RFC3339 or unix-ms lower bound, inclusive (optional)")
 	untilStr := fs.String("until", "", "RFC3339 or unix-ms upper bound, exclusive (optional)")
@@ -67,14 +68,15 @@ func cmdQuery(gf *globalFlags, args []string) int {
 		}
 		untilMs = v
 	}
-	var authorFilter *entmoot.NodeID
+	var authorFilter *entmoot.MemberID
 	if *authorStr != "" {
-		n, err := strconv.ParseUint(*authorStr, 10, 32)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "query: -author: %v\n", err)
+		raw, err := base64.StdEncoding.DecodeString(*authorStr)
+		if err != nil || len(raw) != len(entmoot.MemberID{}) {
+			fmt.Fprintln(os.Stderr, "query: -author must be a base64 MemberID")
 			return exitInvalidArgument
 		}
-		id := entmoot.NodeID(uint32(n))
+		var id entmoot.MemberID
+		copy(id[:], raw)
 		authorFilter = &id
 	}
 
@@ -139,7 +141,15 @@ func cmdQuery(gf *globalFlags, args []string) int {
 	// Apply in-Go filters (author, topic).
 	filtered := msgs[:0]
 	for _, m := range msgs {
-		if authorFilter != nil && m.Author.PilotNodeID != *authorFilter {
+		memberID, err := entmoot.MemberIDFromPublicKey(m.Author.EntmootPubKey)
+		if err != nil {
+			slog.Error("query: invalid stored author key", slog.String("message_id", m.ID.String()), slog.String("err", err.Error()))
+			return exitTransport
+		}
+		if m.Author.MemberID != nil {
+			memberID = *m.Author.MemberID
+		}
+		if authorFilter != nil && memberID != *authorFilter {
 			continue
 		}
 		if *topicPattern != "" {
@@ -204,13 +214,17 @@ func emitMessageJSON(m entmoot.Message) error {
 }
 
 func messageJSON(m entmoot.Message) map[string]any {
+	memberID, _ := entmoot.MemberIDFromPublicKey(m.Author.EntmootPubKey)
+	if m.Author.MemberID != nil {
+		memberID = *m.Author.MemberID
+	}
 	return map[string]any{
-		"message_id":   m.ID,
-		"group_id":     m.GroupID,
-		"author":       uint32(m.Author.PilotNodeID),
-		"topic":        normTopics(m.Topics),
-		"content":      string(m.Content),
-		"timestamp_ms": m.Timestamp,
+		"message_id":       m.ID,
+		"group_id":         m.GroupID,
+		"author_member_id": memberID,
+		"topic":            normTopics(m.Topics),
+		"content":          string(m.Content),
+		"timestamp_ms":     m.Timestamp,
 	}
 }
 

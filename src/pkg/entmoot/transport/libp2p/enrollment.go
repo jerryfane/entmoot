@@ -11,6 +11,8 @@ import (
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
+
+	"entmoot/pkg/entmoot"
 )
 
 const maxEnrollmentFrameBytes = 64 << 10
@@ -18,22 +20,25 @@ const maxEnrollmentFrameBytes = 64 << 10
 // EnrollmentResponse acknowledges that the target identity is installed in
 // the group roster at RosterHead. Error is safe, typed protocol text.
 type EnrollmentResponse struct {
-	RosterHead string `json:"roster_head,omitempty"`
-	Error      string `json:"error,omitempty"`
+	RosterHead entmoot.RosterEntryID `json:"roster_head"`
+	Entries    []entmoot.RosterEntry `json:"entries,omitempty"`
+	Error      string                `json:"error,omitempty"`
 }
 
 // EnrollmentServer validates and consumes a bootstrap capability before
 // invoking the founder-owned roster mutation.
 type EnrollmentServer struct {
 	Admission *BootstrapAdmission
-	Enroll    func(context.Context, BootstrapCapability) (string, error)
+	Enroll    func(context.Context, BootstrapCapability) (EnrollmentResponse, error)
 	Now       func() time.Time
+	host      host.Host
 }
 
 func (s *EnrollmentServer) Install(h host.Host) error {
 	if h == nil || s == nil || s.Admission == nil || s.Enroll == nil {
 		return errors.New("libp2p: complete enrollment server is required")
 	}
+	s.host = h
 	h.SetStreamHandler(EnrollmentProtocol, s.handle)
 	return nil
 }
@@ -50,16 +55,33 @@ func (s *EnrollmentServer) handle(stream network.Stream) {
 	if s.Now != nil {
 		now = s.Now()
 	}
-	if err := s.Admission.Authorize(capability, stream.Conn().RemotePeer(), EnrollmentProtocol, now); err != nil {
+	allowedServer := false
+	for _, allowed := range capability.AllowedPeerIDs {
+		if allowed == s.host.ID().String() {
+			allowedServer = true
+			break
+		}
+	}
+	if !allowedServer {
+		_ = json.NewEncoder(stream).Encode(EnrollmentResponse{Error: "unauthorized_server"})
+		return
+	}
+	if err := s.Admission.Reserve(capability, stream.Conn().RemotePeer(), EnrollmentProtocol, now); err != nil {
 		_ = json.NewEncoder(stream).Encode(EnrollmentResponse{Error: "unauthorized"})
 		return
 	}
-	head, err := s.Enroll(context.Background(), capability)
+	response, err := s.Enroll(context.Background(), capability)
 	if err != nil {
+		_ = s.Admission.Release(capability)
 		_ = json.NewEncoder(stream).Encode(EnrollmentResponse{Error: "enrollment_failed"})
 		return
 	}
-	_ = json.NewEncoder(stream).Encode(EnrollmentResponse{RosterHead: head})
+	if err := s.Admission.Commit(capability); err != nil {
+		_ = s.Admission.Release(capability)
+		_ = json.NewEncoder(stream).Encode(EnrollmentResponse{Error: "admission_commit_failed"})
+		return
+	}
+	_ = json.NewEncoder(stream).Encode(response)
 }
 
 // Enroll opens the pre-membership protocol. The server authenticates the

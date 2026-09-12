@@ -47,9 +47,9 @@ type TopicSummary struct {
 // PageBoundary identifies the exclusive upper edge for older-history keyset
 // pagination in the same recency order used by Latest.
 type PageBoundary struct {
-	TimestampMS  int64
-	AuthorNodeID entmoot.NodeID
-	MessageID    entmoot.MessageID
+	TimestampMS    int64
+	AuthorMemberID entmoot.MemberID
+	MessageID      entmoot.MessageID
 }
 
 // MessageStore persists messages grouped by GroupID. All methods are safe for
@@ -73,7 +73,7 @@ type MessageStore interface {
 	Range(ctx context.Context, groupID entmoot.GroupID, sinceMillis, untilMillis int64) ([]entmoot.Message, error)
 
 	// Latest returns at most limit recent messages in groupID. The recency
-	// window is selected by descending (Timestamp, Author.PilotNodeID, ID), then
+	// window is selected by descending (Timestamp, Author MemberID, ID), then
 	// returned in topological order within that bounded window. A limit <= 0
 	// returns an empty slice.
 	Latest(ctx context.Context, groupID entmoot.GroupID, limit int) ([]entmoot.Message, error)
@@ -120,9 +120,9 @@ type MessageStore interface {
 // RangeCursor is the exclusive keyset boundary for a stable message-id page.
 // All fields participate because timestamp alone is not unique.
 type RangeCursor struct {
-	TimestampMS int64
-	Author      entmoot.NodeID
-	ID          entmoot.MessageID
+	TimestampMS    int64
+	AuthorMemberID entmoot.MemberID
+	ID             entmoot.MessageID
 }
 
 // MessageIDPage is one generation-bound page used by history synchronization.
@@ -243,3 +243,11 @@ func isZeroMessageID(id entmoot.MessageID) bool {
 // ErrInvalidMessage is returned by Put when the supplied message is missing
 // required identifying fields (zero GroupID or zero ID).
 var ErrInvalidMessage = errors.New("store: invalid message")
+
+func messageMemberID(m entmoot.Message) entmoot.MemberID {
+	if m.Author.MemberID != nil {
+		return *m.Author.MemberID
+	}
+	memberID, _ := entmoot.MemberIDFromPublicKey(m.Author.EntmootPubKey)
+	return memberID
+}

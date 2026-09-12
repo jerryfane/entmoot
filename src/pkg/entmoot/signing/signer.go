@@ -47,7 +47,11 @@ func NewLocalSigner(author entmoot.NodeInfo, id *keystore.Identity) (*LocalSigne
 	if !equalBytes(author.EntmootPubKey, id.PublicKey) {
 		return nil, fmt.Errorf("%w: author pubkey does not match local identity", ErrInvalidSigner)
 	}
-	return &LocalSigner{author: cloneNodeInfo(author), id: id}, nil
+	author, err := operationalAuthor(author)
+	if err != nil {
+		return nil, err
+	}
+	return &LocalSigner{author: author, id: id}, nil
 }
 
 func (s *LocalSigner) Author() entmoot.NodeInfo {
@@ -82,7 +86,11 @@ func NewExternalSigner(author entmoot.NodeInfo, sign SignFunc) (*ExternalSigner,
 	if sign == nil {
 		return nil, fmt.Errorf("%w: nil external sign func", ErrInvalidSigner)
 	}
-	return &ExternalSigner{author: cloneNodeInfo(author), sign: sign}, nil
+	author, err := operationalAuthor(author)
+	if err != nil {
+		return nil, err
+	}
+	return &ExternalSigner{author: author, sign: sign}, nil
 }
 
 func (s *ExternalSigner) Author() entmoot.NodeInfo {
@@ -94,6 +102,13 @@ func (s *ExternalSigner) SignMessage(ctx context.Context, msg entmoot.Message) (
 	return signWith(msg, func(payload []byte) ([]byte, error) {
 		return s.sign(ctx, payload)
 	})
+}
+
+func operationalAuthor(author entmoot.NodeInfo) (entmoot.NodeInfo, error) {
+	if err := entmoot.ValidateOperationalMemberInfo(author); err != nil {
+		return entmoot.NodeInfo{}, fmt.Errorf("%w: %v", ErrInvalidSigner, err)
+	}
+	return cloneNodeInfo(author), nil
 }
 
 // SignMessage fills Author, ID, and Signature using signer.

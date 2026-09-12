@@ -17,6 +17,7 @@ import (
 	multiaddr "github.com/multiformats/go-multiaddr"
 
 	"entmoot/pkg/entmoot"
+	"entmoot/pkg/entmoot/merkle"
 	"entmoot/pkg/entmoot/roster"
 	"entmoot/pkg/entmoot/signing"
 	"entmoot/pkg/entmoot/store"
@@ -84,7 +85,7 @@ func TestHistorySyncAcrossSeparateProcessWithoutPilot(t *testing.T) {
 	}
 	defer destination.Close()
 	groupID := processSyncGroupID()
-	progress := SyncFromKeepers(ctx, clientHost, groupID, []peer.AddrInfo{remote}, destination, func(message entmoot.Message) error {
+	progress := SyncFromKeepers(ctx, clientHost, groupID, []peer.AddrInfo{remote}, destination, func(message entmoot.Message, _ *merkle.Proof) error {
 		return signing.VerifyMessage(message, message.Author)
 	})
 	if len(progress) != 1 || progress[0].Err != nil || progress[0].Inserted != 12 {
@@ -101,15 +102,7 @@ func TestHistorySyncSeparateProcessServer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	clientMemberID, err := entmoot.MemberIDFromPublicKey(clientPublicKey)
-	if err != nil {
-		t.Fatal(err)
-	}
 	serverIdentity := mustIdentity(t)
-	serverMemberID, err := entmoot.MemberIDFromPublicKey(serverIdentity.PublicKey)
-	if err != nil {
-		t.Fatal(err)
-	}
 	ctx := context.Background()
 	serverHost, _, err := NewHost(ctx, serverIdentity, libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"))
 	if err != nil {
@@ -118,11 +111,11 @@ func TestHistorySyncSeparateProcessServer(t *testing.T) {
 	defer serverHost.Close()
 	groupID := processSyncGroupID()
 	rosterLog := roster.New(groupID)
-	founder := entmoot.NodeInfo{EntmootPubKey: serverIdentity.PublicKey, MemberID: &serverMemberID}
+	founder := mustNodeInfo(t, serverIdentity.PublicKey)
 	if err := rosterLog.Genesis(serverIdentity, founder, 1_000); err != nil {
 		t.Fatal(err)
 	}
-	entry, err := rosterLog.SignEntry(serverIdentity, "add", entmoot.NodeInfo{EntmootPubKey: clientPublicKey, MemberID: &clientMemberID}, nil, 0, 2_000)
+	entry, err := rosterLog.SignEntry(serverIdentity, "add", mustNodeInfo(t, clientPublicKey), nil, 2_000)
 	if err != nil {
 		t.Fatal(err)
 	}

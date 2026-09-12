@@ -26,6 +26,16 @@ type LegacyIdentityMapping struct {
 	Signature    []byte        `json:"signature,omitempty"`
 }
 
+// LegacyIdentityUpgradePolicy is founder-authorized by the roster entry that
+// carries it. Its Merkle commitment limits accepted version-0 history to the
+// exact messages present when the group crossed into the current protocol.
+type LegacyIdentityUpgradePolicy struct {
+	Type               string `json:"type"`
+	MappingsSHA256     string `json:"mappings_sha256"`
+	LegacyHistoryRoot  string `json:"legacy_history_root"`
+	LegacyHistoryCount int    `json:"legacy_history_count"`
+}
+
 func legacyMappingSigningBytes(mapping LegacyIdentityMapping) ([]byte, error) {
 	mapping.Signature = nil
 	payload, err := json.Marshal(mapping)

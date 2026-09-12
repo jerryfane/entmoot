@@ -1,6 +1,7 @@
 package esphttp
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -35,13 +36,14 @@ type GroupSummary struct {
 
 // MemberSummary is the mobile/API projection for one group member.
 type MemberSummary struct {
-	NodeID         entmoot.NodeID  `json:"node_id"`
-	EntmootPubKey  string          `json:"entmoot_pubkey"`
-	Founder        bool            `json:"founder,omitempty"`
-	Hostname       string          `json:"hostname,omitempty"`
-	GlobalHostname string          `json:"global_hostname,omitempty"`
-	DisplayName    string          `json:"display_name"`
-	Live           *LiveAgentState `json:"live,omitempty"`
+	MemberID       entmoot.MemberID `json:"member_id"`
+	PeerID         string           `json:"peer_id"`
+	EntmootPubKey  string           `json:"entmoot_pubkey"`
+	Founder        bool             `json:"founder,omitempty"`
+	Hostname       string           `json:"hostname,omitempty"`
+	GlobalHostname string           `json:"global_hostname,omitempty"`
+	DisplayName    string           `json:"display_name"`
+	Live           *LiveAgentState  `json:"live,omitempty"`
 }
 
 // GroupCatalog reads local group/roster state for mobile API requests.
@@ -114,30 +116,30 @@ type IdempotencyRecord struct {
 }
 
 type OpenInviteRecord struct {
-	TokenHash      string           `json:"-"`
-	GroupID        entmoot.GroupID  `json:"group_id"`
-	DeviceID       string           `json:"device_id,omitempty"`
-	MaxUses        int              `json:"max_uses"`
-	UseCount       int              `json:"use_count"`
-	Revoked        bool             `json:"revoked"`
-	BootstrapPeers []entmoot.NodeID `json:"bootstrap_peers,omitempty"`
-	CreatedAtMS    int64            `json:"created_at_ms"`
-	UpdatedAtMS    int64            `json:"updated_at_ms"`
-	ExpiresAtMS    int64            `json:"expires_at_ms"`
+	TokenHash           string          `json:"-"`
+	GroupID             entmoot.GroupID `json:"group_id"`
+	DeviceID            string          `json:"device_id,omitempty"`
+	MaxUses             int             `json:"max_uses"`
+	UseCount            int             `json:"use_count"`
+	Revoked             bool            `json:"revoked"`
+	BootstrapMultiaddrs []string        `json:"bootstrap_multiaddrs,omitempty"`
+	CreatedAtMS         int64           `json:"created_at_ms"`
+	UpdatedAtMS         int64           `json:"updated_at_ms"`
+	ExpiresAtMS         int64           `json:"expires_at_ms"`
 }
 
 type OpenInviteSummary struct {
-	ID             string           `json:"id"`
-	GroupID        entmoot.GroupID  `json:"group_id"`
-	DeviceID       string           `json:"device_id,omitempty"`
-	MaxUses        int              `json:"max_uses"`
-	UseCount       int              `json:"use_count"`
-	Revoked        bool             `json:"revoked"`
-	BootstrapPeers []entmoot.NodeID `json:"bootstrap_peers,omitempty"`
-	CreatedAtMS    int64            `json:"created_at_ms"`
-	UpdatedAtMS    int64            `json:"updated_at_ms"`
-	ExpiresAtMS    int64            `json:"expires_at_ms"`
-	Status         string           `json:"status"`
+	ID                  string          `json:"id"`
+	GroupID             entmoot.GroupID `json:"group_id"`
+	DeviceID            string          `json:"device_id,omitempty"`
+	MaxUses             int             `json:"max_uses"`
+	UseCount            int             `json:"use_count"`
+	Revoked             bool            `json:"revoked"`
+	BootstrapMultiaddrs []string        `json:"bootstrap_multiaddrs,omitempty"`
+	CreatedAtMS         int64           `json:"created_at_ms"`
+	UpdatedAtMS         int64           `json:"updated_at_ms"`
+	ExpiresAtMS         int64           `json:"expires_at_ms"`
+	Status              string          `json:"status"`
 }
 
 func OpenInviteSummaryFromRecord(rec OpenInviteRecord, nowMS int64) OpenInviteSummary {
@@ -150,41 +152,28 @@ func OpenInviteSummaryFromRecord(rec OpenInviteRecord, nowMS int64) OpenInviteSu
 		status = "exhausted"
 	}
 	return OpenInviteSummary{
-		ID:             rec.TokenHash,
-		GroupID:        rec.GroupID,
-		DeviceID:       rec.DeviceID,
-		MaxUses:        rec.MaxUses,
-		UseCount:       rec.UseCount,
-		Revoked:        rec.Revoked,
-		BootstrapPeers: append([]entmoot.NodeID(nil), rec.BootstrapPeers...),
-		CreatedAtMS:    rec.CreatedAtMS,
-		UpdatedAtMS:    rec.UpdatedAtMS,
-		ExpiresAtMS:    rec.ExpiresAtMS,
-		Status:         status,
+		ID:                  rec.TokenHash,
+		GroupID:             rec.GroupID,
+		DeviceID:            rec.DeviceID,
+		MaxUses:             rec.MaxUses,
+		UseCount:            rec.UseCount,
+		Revoked:             rec.Revoked,
+		BootstrapMultiaddrs: append([]string(nil), rec.BootstrapMultiaddrs...),
+		CreatedAtMS:         rec.CreatedAtMS,
+		UpdatedAtMS:         rec.UpdatedAtMS,
+		ExpiresAtMS:         rec.ExpiresAtMS,
+		Status:              status,
 	}
 }
 
 type OpenInviteRedemption struct {
-	TokenHash     string          `json:"-"`
-	RedeemerKey   string          `json:"redeemer_key"`
-	PilotNodeID   entmoot.NodeID  `json:"pilot_node_id"`
-	EntmootPubKey string          `json:"entmoot_pubkey"`
-	Result        json.RawMessage `json:"result,omitempty"`
-	RedeemedAtMS  int64           `json:"redeemed_at_ms"`
-}
-
-type OpenInviteChallenge struct {
-	ChallengeID    string          `json:"challenge_id"`
-	TokenHash      string          `json:"-"`
-	GroupID        entmoot.GroupID `json:"group_id"`
-	PilotNodeID    entmoot.NodeID  `json:"pilot_node_id"`
-	PilotPubKey    string          `json:"pilot_pubkey"`
-	EntmootPubKey  string          `json:"entmoot_pubkey"`
-	Nonce          string          `json:"nonce"`
-	SigningPayload string          `json:"signing_payload"`
-	CreatedAtMS    int64           `json:"created_at_ms"`
-	ExpiresAtMS    int64           `json:"expires_at_ms"`
-	UsedAtMS       int64           `json:"used_at_ms,omitempty"`
+	TokenHash     string           `json:"-"`
+	RedeemerKey   string           `json:"redeemer_key"`
+	MemberID      entmoot.MemberID `json:"member_id"`
+	PeerID        string           `json:"peer_id"`
+	EntmootPubKey string           `json:"entmoot_pubkey"`
+	Result        json.RawMessage  `json:"result,omitempty"`
+	RedeemedAtMS  int64            `json:"redeemed_at_ms"`
 }
 
 // StateStore persists ESP-local mobile service state.
@@ -208,10 +197,6 @@ type StateStore interface {
 	RedeemOpenInvite(context.Context, string, OpenInviteRedemption, int64) (OpenInviteRecord, OpenInviteRedemption, bool, error)
 	CompleteOpenInviteRedemption(context.Context, string, string, json.RawMessage, int64) error
 	ReleaseOpenInviteRedemption(context.Context, string, string, int64) error
-	CreateOpenInviteChallenge(context.Context, OpenInviteChallenge) (OpenInviteChallenge, error)
-	CreateOrReuseOpenInviteChallenge(context.Context, OpenInviteChallenge, int, int64) (OpenInviteChallenge, error)
-	GetOpenInviteChallenge(context.Context, string) (OpenInviteChallenge, bool, error)
-	ConsumeOpenInviteChallenge(context.Context, string, int64) (OpenInviteChallenge, error)
 	CreateFleet(context.Context, FleetRecord) (FleetRecord, error)
 	ListFleets(context.Context) ([]FleetRecord, error)
 	GetFleet(context.Context, string) (FleetRecord, bool, error)
@@ -221,9 +206,9 @@ type StateStore interface {
 	DeleteFleet(context.Context, string) error
 	UpsertFleetMember(context.Context, FleetMemberRecord) (FleetMemberRecord, error)
 	UpsertFleetMemberForActiveFleet(context.Context, FleetMemberRecord) (FleetMemberRecord, error)
-	ReconcileFleetInviteAcceptance(context.Context, string, entmoot.NodeID, string, int64, string) (FleetMemberRecord, FleetActivityRecord, bool, error)
+	ReconcileFleetInviteAcceptance(context.Context, string, entmoot.MemberID, string, int64, string) (FleetMemberRecord, FleetActivityRecord, bool, error)
 	ListFleetMembers(context.Context, string) ([]FleetMemberRecord, error)
-	DeleteFleetMember(context.Context, string, entmoot.NodeID) error
+	DeleteFleetMember(context.Context, string, entmoot.MemberID) error
 	CreateFleetInvite(context.Context, FleetInviteRecord) (FleetInviteRecord, error)
 	CreateFleetInviteForActiveFleet(context.Context, FleetInviteRecord) (FleetInviteRecord, error)
 	ListFleetInvites(context.Context, string) ([]FleetInviteRecord, error)
@@ -243,21 +228,21 @@ type StateStore interface {
 	GetFleetCommandDetail(context.Context, string, string) (FleetCommandDetailRecord, bool, error)
 	ListFleetCommands(context.Context, string, FleetCommandListFilter) ([]FleetCommandSummaryRecord, error)
 	UpsertLiveAgentConfig(context.Context, LiveAgentConfig) (LiveAgentConfig, error)
-	GetLiveAgentConfig(context.Context, entmoot.GroupID, entmoot.NodeID) (LiveAgentConfig, bool, error)
+	GetLiveAgentConfig(context.Context, entmoot.GroupID, entmoot.MemberID) (LiveAgentConfig, bool, error)
 	ListLiveAgentConfigs(context.Context, entmoot.GroupID) ([]LiveAgentConfig, error)
-	ListLiveAgentConfigsForNode(context.Context, entmoot.NodeID) ([]LiveAgentConfig, error)
-	DeleteLiveAgentConfig(context.Context, entmoot.GroupID, entmoot.NodeID, int64) error
+	ListLiveAgentConfigsForMember(context.Context, entmoot.MemberID) ([]LiveAgentConfig, error)
+	DeleteLiveAgentConfig(context.Context, entmoot.GroupID, entmoot.MemberID, int64) error
 	UpsertLiveAgentPresence(context.Context, LiveAgentPresence) (LiveAgentPresence, error)
 	ListLiveAgentPresence(context.Context, entmoot.GroupID) ([]LiveAgentPresence, error)
-	GetLiveAgentCursor(context.Context, entmoot.GroupID, entmoot.NodeID) (LiveAgentCursor, bool, error)
+	GetLiveAgentCursor(context.Context, entmoot.GroupID, entmoot.MemberID) (LiveAgentCursor, bool, error)
 	UpsertLiveAgentCursor(context.Context, LiveAgentCursor) (LiveAgentCursor, error)
 	UpsertPublicMoot(context.Context, PublicMootRecord, int64) (PublicMootRecord, bool, error)
 	ListPublicMoots(context.Context, PublicMootListFilter) ([]PublicMootRecord, error)
 	GetPublicMoot(context.Context, entmoot.GroupID) (PublicMootRecord, bool, error)
 	UpdatePublicMootIndexStatus(context.Context, entmoot.GroupID, string, int64) (PublicMootRecord, bool, error)
 	UpsertNodeProfile(context.Context, NodeProfileRecord) (NodeProfileRecord, bool, error)
-	GetNodeProfile(context.Context, entmoot.NodeID) (NodeProfileRecord, bool, error)
-	ListNodeProfiles(context.Context, []entmoot.NodeID) (map[entmoot.NodeID]NodeProfileRecord, error)
+	GetNodeProfile(context.Context, entmoot.MemberID) (NodeProfileRecord, bool, error)
+	ListNodeProfiles(context.Context, []entmoot.MemberID) (map[entmoot.MemberID]NodeProfileRecord, error)
 	UpsertFleetTaskSubmission(context.Context, FleetTaskSubmissionRecord) (FleetTaskSubmissionRecord, error)
 	GetFleetTaskSubmission(context.Context, string, string, string) (FleetTaskSubmissionRecord, bool, error)
 	ListFleetTaskSubmissions(context.Context, string, string) ([]FleetTaskSubmissionRecord, error)
@@ -279,13 +264,10 @@ const (
 )
 
 var (
-	ErrOpenInviteExpired          = errors.New("esphttp: open invite expired")
-	ErrOpenInviteRevoked          = errors.New("esphttp: open invite revoked")
-	ErrOpenInviteExhausted        = errors.New("esphttp: open invite exhausted")
-	ErrOpenInviteChallengeExpired = errors.New("esphttp: open invite challenge expired")
-	ErrOpenInviteChallengeUsed    = errors.New("esphttp: open invite challenge used")
-	ErrOpenInviteChallengeLimit   = errors.New("esphttp: open invite challenge limit reached")
-	ErrFleetNotActive             = errors.New("esphttp: fleet is not active")
+	ErrOpenInviteExpired   = errors.New("esphttp: open invite expired")
+	ErrOpenInviteRevoked   = errors.New("esphttp: open invite revoked")
+	ErrOpenInviteExhausted = errors.New("esphttp: open invite exhausted")
+	ErrFleetNotActive      = errors.New("esphttp: fleet is not active")
 )
 
 // ValidateOpenInviteMaxUses accepts zero as unlimited and rejects negatives.
@@ -310,20 +292,19 @@ type MemoryStateStore struct {
 	groups              map[entmoot.GroupID]json.RawMessage
 	invites             map[string]OpenInviteRecord
 	redeems             map[string]map[string]OpenInviteRedemption
-	chals               map[string]OpenInviteChallenge
 	fleets              map[string]FleetRecord
-	fleetMembers        map[string]map[entmoot.NodeID]FleetMemberRecord
+	fleetMembers        map[string]map[entmoot.MemberID]FleetMemberRecord
 	fleetInvites        map[string][]FleetInviteRecord
 	fleetActivity       map[string][]FleetActivityRecord
 	fleetTasks          map[string]map[string]FleetTaskRecord
 	fleetTaskSubs       map[string]map[string][]FleetTaskSubmissionRecord
 	fleetCommands       map[string]map[string]FleetCommandEnvelope
-	fleetCommandResults map[string]map[string]map[entmoot.NodeID]FleetCommandResultEnvelope
-	liveAgentConfigs    map[entmoot.GroupID]map[entmoot.NodeID]LiveAgentConfig
-	liveAgentPresence   map[entmoot.GroupID]map[entmoot.NodeID]LiveAgentPresence
-	liveAgentCursors    map[entmoot.GroupID]map[entmoot.NodeID]LiveAgentCursor
+	fleetCommandResults map[string]map[string]map[entmoot.MemberID]FleetCommandResultEnvelope
+	liveAgentConfigs    map[entmoot.GroupID]map[entmoot.MemberID]LiveAgentConfig
+	liveAgentPresence   map[entmoot.GroupID]map[entmoot.MemberID]LiveAgentPresence
+	liveAgentCursors    map[entmoot.GroupID]map[entmoot.MemberID]LiveAgentCursor
 	publicMoots         map[entmoot.GroupID]PublicMootRecord
-	nodeProfiles        map[entmoot.NodeID]map[string]NodeProfileRecord
+	nodeProfiles        map[entmoot.MemberID]map[string]NodeProfileRecord
 	clock               func() time.Time
 }
 
@@ -335,20 +316,19 @@ func NewMemoryStateStore() *MemoryStateStore {
 		groups:              make(map[entmoot.GroupID]json.RawMessage),
 		invites:             make(map[string]OpenInviteRecord),
 		redeems:             make(map[string]map[string]OpenInviteRedemption),
-		chals:               make(map[string]OpenInviteChallenge),
 		fleets:              make(map[string]FleetRecord),
-		fleetMembers:        make(map[string]map[entmoot.NodeID]FleetMemberRecord),
+		fleetMembers:        make(map[string]map[entmoot.MemberID]FleetMemberRecord),
 		fleetInvites:        make(map[string][]FleetInviteRecord),
 		fleetActivity:       make(map[string][]FleetActivityRecord),
 		fleetTasks:          make(map[string]map[string]FleetTaskRecord),
 		fleetTaskSubs:       make(map[string]map[string][]FleetTaskSubmissionRecord),
 		fleetCommands:       make(map[string]map[string]FleetCommandEnvelope),
-		fleetCommandResults: make(map[string]map[string]map[entmoot.NodeID]FleetCommandResultEnvelope),
-		liveAgentConfigs:    make(map[entmoot.GroupID]map[entmoot.NodeID]LiveAgentConfig),
-		liveAgentPresence:   make(map[entmoot.GroupID]map[entmoot.NodeID]LiveAgentPresence),
-		liveAgentCursors:    make(map[entmoot.GroupID]map[entmoot.NodeID]LiveAgentCursor),
+		fleetCommandResults: make(map[string]map[string]map[entmoot.MemberID]FleetCommandResultEnvelope),
+		liveAgentConfigs:    make(map[entmoot.GroupID]map[entmoot.MemberID]LiveAgentConfig),
+		liveAgentPresence:   make(map[entmoot.GroupID]map[entmoot.MemberID]LiveAgentPresence),
+		liveAgentCursors:    make(map[entmoot.GroupID]map[entmoot.MemberID]LiveAgentCursor),
 		publicMoots:         make(map[entmoot.GroupID]PublicMootRecord),
-		nodeProfiles:        make(map[entmoot.NodeID]map[string]NodeProfileRecord),
+		nodeProfiles:        make(map[entmoot.MemberID]map[string]NodeProfileRecord),
 		clock:               time.Now,
 	}
 }
@@ -654,81 +634,6 @@ func (s *MemoryStateStore) ReleaseOpenInviteRedemption(_ context.Context, tokenH
 	return nil
 }
 
-func (s *MemoryStateStore) CreateOpenInviteChallenge(_ context.Context, ch OpenInviteChallenge) (OpenInviteChallenge, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	now := s.nowMS()
-	if ch.ChallengeID == "" {
-		ch.ChallengeID = newOpenInviteChallengeID()
-	}
-	if ch.CreatedAtMS == 0 {
-		ch.CreatedAtMS = now
-	}
-	s.chals[ch.ChallengeID] = cloneOpenInviteChallenge(ch)
-	return cloneOpenInviteChallenge(ch), nil
-}
-
-func (s *MemoryStateStore) CreateOrReuseOpenInviteChallenge(_ context.Context, ch OpenInviteChallenge, activeCap int, nowMS int64) (OpenInviteChallenge, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	now := s.nowMS()
-	if nowMS > 0 {
-		now = nowMS
-	}
-	for id, existing := range s.chals {
-		if existing.TokenHash == ch.TokenHash && existing.UsedAtMS == 0 && existing.ExpiresAtMS > 0 && existing.ExpiresAtMS <= now {
-			delete(s.chals, id)
-		}
-	}
-	for _, existing := range s.chals {
-		if openInviteChallengeMatchesRedeemer(existing, ch, now) {
-			return cloneOpenInviteChallenge(existing), nil
-		}
-	}
-	active := 0
-	for _, existing := range s.chals {
-		if existing.TokenHash == ch.TokenHash && existing.UsedAtMS == 0 && (existing.ExpiresAtMS == 0 || existing.ExpiresAtMS > now) {
-			active++
-		}
-	}
-	if activeCap > 0 && active >= activeCap {
-		return OpenInviteChallenge{}, ErrOpenInviteChallengeLimit
-	}
-	if ch.ChallengeID == "" {
-		ch.ChallengeID = newOpenInviteChallengeID()
-	}
-	if ch.CreatedAtMS == 0 {
-		ch.CreatedAtMS = now
-	}
-	s.chals[ch.ChallengeID] = cloneOpenInviteChallenge(ch)
-	return cloneOpenInviteChallenge(ch), nil
-}
-
-func (s *MemoryStateStore) GetOpenInviteChallenge(_ context.Context, challengeID string) (OpenInviteChallenge, bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	ch, ok := s.chals[challengeID]
-	return cloneOpenInviteChallenge(ch), ok, nil
-}
-
-func (s *MemoryStateStore) ConsumeOpenInviteChallenge(_ context.Context, challengeID string, nowMS int64) (OpenInviteChallenge, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	ch, ok := s.chals[challengeID]
-	if !ok {
-		return OpenInviteChallenge{}, sql.ErrNoRows
-	}
-	if ch.UsedAtMS != 0 {
-		return OpenInviteChallenge{}, ErrOpenInviteChallengeUsed
-	}
-	if ch.ExpiresAtMS > 0 && ch.ExpiresAtMS <= nowMS {
-		return OpenInviteChallenge{}, ErrOpenInviteChallengeExpired
-	}
-	ch.UsedAtMS = nowMS
-	s.chals[challengeID] = ch
-	return cloneOpenInviteChallenge(ch), nil
-}
-
 func (s *MemoryStateStore) GetGroupMetadata(_ context.Context, groupID entmoot.GroupID) (json.RawMessage, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -824,25 +729,7 @@ func (s *MemoryStateStore) ArchiveFleet(_ context.Context, fleetID string, archi
 		rec.UpdatedAtMS = archivedAtMS
 		s.fleets[fleetID] = cloneFleetRecord(rec)
 	}
-	memberNodeIDs := make(map[entmoot.NodeID]struct{})
-	for nodeID := range s.fleetMembers[fleetID] {
-		memberNodeIDs[nodeID] = struct{}{}
-	}
-	inviteNodeIDs := make(map[entmoot.NodeID]struct{})
-	for _, invite := range s.fleetInvites[fleetID] {
-		inviteNodeIDs[invite.NodeID] = struct{}{}
-	}
 	delete(s.fleetInvites, fleetID)
-	for nodeID := range memberNodeIDs {
-		if err := s.refreshFleetMemberNodeProfileLocked(nodeID); err != nil {
-			return FleetRecord{}, false, err
-		}
-	}
-	for nodeID := range inviteNodeIDs {
-		if err := s.refreshFleetInviteNodeProfileLocked(nodeID); err != nil {
-			return FleetRecord{}, false, err
-		}
-	}
 	return cloneFleetRecord(rec), true, nil
 }
 
@@ -863,40 +750,14 @@ func (s *MemoryStateStore) RestoreFleet(_ context.Context, fleetID string, resto
 		rec.UpdatedAtMS = restoredAtMS
 		s.fleets[fleetID] = cloneFleetRecord(rec)
 	}
-	memberNodeIDs := make(map[entmoot.NodeID]struct{})
-	for nodeID := range s.fleetMembers[fleetID] {
-		memberNodeIDs[nodeID] = struct{}{}
-	}
-	inviteNodeIDs := make(map[entmoot.NodeID]struct{})
-	for _, invite := range s.fleetInvites[fleetID] {
-		inviteNodeIDs[invite.NodeID] = struct{}{}
-	}
-	for nodeID := range memberNodeIDs {
-		if err := s.refreshFleetMemberNodeProfileLocked(nodeID); err != nil {
-			return FleetRecord{}, false, err
-		}
-	}
-	for nodeID := range inviteNodeIDs {
-		if err := s.refreshFleetInviteNodeProfileLocked(nodeID); err != nil {
-			return FleetRecord{}, false, err
-		}
-	}
+
 	return cloneFleetRecord(rec), true, nil
 }
 
 func (s *MemoryStateStore) DeleteFleet(_ context.Context, fleetID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	memberNodeIDs := make(map[entmoot.NodeID]struct{})
-	if members := s.fleetMembers[fleetID]; members != nil {
-		for nodeID := range members {
-			memberNodeIDs[nodeID] = struct{}{}
-		}
-	}
-	inviteNodeIDs := make(map[entmoot.NodeID]struct{})
-	for _, invite := range s.fleetInvites[fleetID] {
-		inviteNodeIDs[invite.NodeID] = struct{}{}
-	}
+
 	delete(s.fleets, fleetID)
 	delete(s.fleetMembers, fleetID)
 	delete(s.fleetInvites, fleetID)
@@ -905,16 +766,7 @@ func (s *MemoryStateStore) DeleteFleet(_ context.Context, fleetID string) error 
 	delete(s.fleetTaskSubs, fleetID)
 	delete(s.fleetCommands, fleetID)
 	delete(s.fleetCommandResults, fleetID)
-	for nodeID := range memberNodeIDs {
-		if err := s.refreshFleetMemberNodeProfileLocked(nodeID); err != nil {
-			return err
-		}
-	}
-	for nodeID := range inviteNodeIDs {
-		if err := s.refreshFleetInviteNodeProfileLocked(nodeID); err != nil {
-			return err
-		}
-	}
+
 	return nil
 }
 
@@ -933,7 +785,7 @@ func (s *MemoryStateStore) UpsertFleetMemberForActiveFleet(_ context.Context, re
 	return s.upsertFleetMemberLocked(rec)
 }
 
-func (s *MemoryStateStore) ReconcileFleetInviteAcceptance(_ context.Context, fleetID string, nodeID entmoot.NodeID, entmootPubKey string, acceptedAtMS int64, hostname string) (FleetMemberRecord, FleetActivityRecord, bool, error) {
+func (s *MemoryStateStore) ReconcileFleetInviteAcceptance(_ context.Context, fleetID string, memberID entmoot.MemberID, entmootPubKey string, acceptedAtMS int64, hostname string) (FleetMemberRecord, FleetActivityRecord, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	entmootPubKey = strings.TrimSpace(entmootPubKey)
@@ -941,7 +793,7 @@ func (s *MemoryStateStore) ReconcileFleetInviteAcceptance(_ context.Context, fle
 		return FleetMemberRecord{}, FleetActivityRecord{}, false, nil
 	}
 	members := s.fleetMembers[fleetID]
-	member, ok := members[nodeID]
+	member, ok := members[memberID]
 	if !ok || member.Status != FleetMemberInvited || member.Role == FleetRoleCoordinator || member.EntmootPubKey != entmootPubKey {
 		return FleetMemberRecord{}, FleetActivityRecord{}, false, nil
 	}
@@ -952,7 +804,7 @@ func (s *MemoryStateStore) ReconcileFleetInviteAcceptance(_ context.Context, fle
 	invites := s.fleetInvites[fleetID]
 	remainingInvites := invites[:0]
 	for _, invite := range invites {
-		if invite.NodeID == nodeID && invite.EntmootPubKey == entmootPubKey && invite.Status == FleetMemberInvited {
+		if invite.MemberID == memberID && invite.EntmootPubKey == entmootPubKey && invite.Status == FleetMemberInvited {
 			hasInvite = true
 			continue
 		}
@@ -972,19 +824,13 @@ func (s *MemoryStateStore) ReconcileFleetInviteAcceptance(_ context.Context, fle
 	if err != nil {
 		return FleetMemberRecord{}, FleetActivityRecord{}, false, err
 	}
-	members[nodeID] = cloneFleetMemberRecord(member)
+	members[memberID] = cloneFleetMemberRecord(member)
 	if len(remainingInvites) == 0 {
 		delete(s.fleetInvites, fleetID)
 	} else {
 		s.fleetInvites[fleetID] = append([]FleetInviteRecord(nil), remainingInvites...)
 	}
 	s.fleetActivity[fleetID] = append(s.fleetActivity[fleetID], cloneFleetActivityRecord(activity))
-	if err := s.observeFleetMemberNodeProfileLocked(member); err != nil {
-		return FleetMemberRecord{}, FleetActivityRecord{}, false, err
-	}
-	if err := s.refreshFleetInviteNodeProfileLocked(nodeID); err != nil {
-		return FleetMemberRecord{}, FleetActivityRecord{}, false, err
-	}
 	return cloneFleetMemberRecord(member), cloneFleetActivityRecord(activity), true, nil
 }
 
@@ -995,15 +841,12 @@ func (s *MemoryStateStore) fleetActiveLocked(fleetID string) bool {
 
 func (s *MemoryStateStore) upsertFleetMemberLocked(rec FleetMemberRecord) (FleetMemberRecord, error) {
 	if s.fleetMembers[rec.FleetID] == nil {
-		s.fleetMembers[rec.FleetID] = make(map[entmoot.NodeID]FleetMemberRecord)
+		s.fleetMembers[rec.FleetID] = make(map[entmoot.MemberID]FleetMemberRecord)
 	}
 	rec.Role = NormalizeFleetMemberRole(rec.Role)
 	rec.Status = NormalizeFleetMemberStatus(rec.Status)
 	rec.UpdatedAtMS = s.nowMS()
-	s.fleetMembers[rec.FleetID][rec.NodeID] = cloneFleetMemberRecord(rec)
-	if err := s.observeFleetMemberNodeProfileLocked(rec); err != nil {
-		return FleetMemberRecord{}, err
-	}
+	s.fleetMembers[rec.FleetID][rec.MemberID] = cloneFleetMemberRecord(rec)
 	return cloneFleetMemberRecord(rec), nil
 }
 
@@ -1019,22 +862,19 @@ func (s *MemoryStateStore) ListFleetMembers(_ context.Context, fleetID string) (
 		if out[i].Role != out[j].Role {
 			return out[i].Role == FleetRoleCoordinator
 		}
-		return out[i].NodeID < out[j].NodeID
+		return out[i].MemberID.String() < out[j].MemberID.String()
 	})
 	return out, nil
 }
 
-func (s *MemoryStateStore) DeleteFleetMember(_ context.Context, fleetID string, nodeID entmoot.NodeID) error {
+func (s *MemoryStateStore) DeleteFleetMember(_ context.Context, fleetID string, memberID entmoot.MemberID) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if members := s.fleetMembers[fleetID]; members != nil {
-		delete(members, nodeID)
+		delete(members, memberID)
 		if len(members) == 0 {
 			delete(s.fleetMembers, fleetID)
 		}
-	}
-	if err := s.refreshFleetMemberNodeProfileLocked(nodeID); err != nil {
-		return err
 	}
 	return nil
 }
@@ -1072,9 +912,6 @@ func (s *MemoryStateStore) createFleetInviteLocked(rec FleetInviteRecord) (Fleet
 		rec.Status = FleetMemberInvited
 	}
 	s.fleetInvites[rec.FleetID] = append(s.fleetInvites[rec.FleetID], cloneFleetInviteRecord(rec))
-	if err := s.observeFleetInviteNodeProfileLocked(rec); err != nil {
-		return FleetInviteRecord{}, err
-	}
 	return cloneFleetInviteRecord(rec), nil
 }
 
@@ -1097,25 +934,17 @@ func (s *MemoryStateStore) ListFleetInvites(_ context.Context, fleetID string) (
 func (s *MemoryStateStore) DeleteFleetInvite(_ context.Context, inviteID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	var removedNodeIDs []entmoot.NodeID
 	for fleetID, invites := range s.fleetInvites {
 		dst := invites[:0]
 		for _, invite := range invites {
-			if invite.InviteID == inviteID {
-				removedNodeIDs = append(removedNodeIDs, invite.NodeID)
-				continue
+			if invite.InviteID != inviteID {
+				dst = append(dst, invite)
 			}
-			dst = append(dst, invite)
 		}
 		if len(dst) == 0 {
 			delete(s.fleetInvites, fleetID)
-			continue
-		}
-		s.fleetInvites[fleetID] = append([]FleetInviteRecord(nil), dst...)
-	}
-	for _, nodeID := range removedNodeIDs {
-		if err := s.refreshFleetInviteNodeProfileLocked(nodeID); err != nil {
-			return err
+		} else {
+			s.fleetInvites[fleetID] = append([]FleetInviteRecord(nil), dst...)
 		}
 	}
 	return nil
@@ -1459,7 +1288,7 @@ CREATE TABLE IF NOT EXISTS esp_open_invites (
   max_uses      INTEGER NOT NULL,
   use_count     INTEGER NOT NULL DEFAULT 0,
   revoked       INTEGER NOT NULL DEFAULT 0,
-  bootstrap_peers BLOB,
+  bootstrap_multiaddrs BLOB,
   created_at_ms INTEGER NOT NULL,
   updated_at_ms INTEGER NOT NULL,
   expires_at_ms INTEGER NOT NULL
@@ -1468,32 +1297,13 @@ CREATE TABLE IF NOT EXISTS esp_open_invites (
 CREATE TABLE IF NOT EXISTS esp_open_invite_redemptions (
   token_hash      TEXT NOT NULL,
   redeemer_key    TEXT NOT NULL,
-  pilot_node_id   INTEGER NOT NULL,
+  member_id       BLOB NOT NULL,
+  peer_id         TEXT NOT NULL,
   entmoot_pubkey  TEXT NOT NULL,
   result          BLOB,
   redeemed_at_ms  INTEGER NOT NULL,
   PRIMARY KEY(token_hash, redeemer_key)
 );
-
-CREATE TABLE IF NOT EXISTS esp_open_invite_challenges (
-  challenge_id    TEXT PRIMARY KEY,
-  token_hash      TEXT NOT NULL,
-  group_id        BLOB NOT NULL,
-  pilot_node_id   INTEGER NOT NULL,
-  pilot_pubkey    TEXT NOT NULL,
-  entmoot_pubkey  TEXT NOT NULL,
-  nonce           TEXT NOT NULL,
-  signing_payload TEXT NOT NULL,
-  created_at_ms   INTEGER NOT NULL,
-  expires_at_ms   INTEGER NOT NULL,
-  used_at_ms      INTEGER NOT NULL DEFAULT 0
-);
-
-CREATE INDEX IF NOT EXISTS idx_open_invite_challenges_token_active
-  ON esp_open_invite_challenges(token_hash, used_at_ms, expires_at_ms);
-
-CREATE INDEX IF NOT EXISTS idx_open_invite_challenges_redeemer
-  ON esp_open_invite_challenges(token_hash, pilot_node_id, pilot_pubkey, entmoot_pubkey, used_at_ms, expires_at_ms);
 
 CREATE TABLE IF NOT EXISTS esp_public_moots (
   group_id             BLOB PRIMARY KEY,
@@ -1512,7 +1322,7 @@ CREATE INDEX IF NOT EXISTS idx_public_moots_founder_status
   ON esp_public_moots(founder_pubkey, status);
 
 CREATE TABLE IF NOT EXISTS esp_node_profiles (
-  node_id INTEGER PRIMARY KEY,
+  member_id BLOB PRIMARY KEY,
   entmoot_pubkey TEXT NOT NULL DEFAULT '',
   hostname TEXT NOT NULL,
   source TEXT NOT NULL,
@@ -1526,7 +1336,7 @@ CREATE INDEX IF NOT EXISTS idx_node_profiles_expires
   ON esp_node_profiles(expires_at_ms);
 
 CREATE TABLE IF NOT EXISTS esp_node_profile_sources (
-  node_id INTEGER NOT NULL,
+  member_id BLOB NOT NULL,
   entmoot_pubkey TEXT NOT NULL DEFAULT '',
   source TEXT NOT NULL,
   source_key TEXT NOT NULL,
@@ -1535,11 +1345,11 @@ CREATE TABLE IF NOT EXISTS esp_node_profile_sources (
   observed_at_ms INTEGER NOT NULL,
   expires_at_ms INTEGER NOT NULL DEFAULT 0,
   source_group_id BLOB,
-  PRIMARY KEY(node_id, source_key)
+  PRIMARY KEY(member_id, source_key)
 );
 
 CREATE INDEX IF NOT EXISTS idx_node_profile_sources_node
-  ON esp_node_profile_sources(node_id);
+  ON esp_node_profile_sources(member_id);
 
 CREATE INDEX IF NOT EXISTS idx_node_profile_sources_expires
   ON esp_node_profile_sources(expires_at_ms);
@@ -1548,7 +1358,8 @@ CREATE TABLE IF NOT EXISTS esp_fleets (
   fleet_id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
   control_group_id BLOB,
-  coordinator_node_id INTEGER NOT NULL,
+  coordinator_member_id BLOB NOT NULL,
+  coordinator_peer_id TEXT NOT NULL,
   coordinator_pubkey TEXT NOT NULL,
   coordinator_device_id TEXT NOT NULL DEFAULT '',
   status TEXT NOT NULL DEFAULT 'active',
@@ -1560,7 +1371,8 @@ CREATE TABLE IF NOT EXISTS esp_fleets (
 
 CREATE TABLE IF NOT EXISTS esp_fleet_members (
   fleet_id TEXT NOT NULL,
-  node_id INTEGER NOT NULL,
+  member_id BLOB NOT NULL,
+  peer_id TEXT NOT NULL,
   entmoot_pubkey TEXT NOT NULL,
   hostname TEXT NOT NULL DEFAULT '',
   role TEXT NOT NULL,
@@ -1569,25 +1381,25 @@ CREATE TABLE IF NOT EXISTS esp_fleet_members (
   accepted_at_ms INTEGER NOT NULL DEFAULT 0,
   removed_at_ms INTEGER NOT NULL DEFAULT 0,
   updated_at_ms INTEGER NOT NULL,
-  PRIMARY KEY(fleet_id, node_id)
+  PRIMARY KEY(fleet_id, member_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_fleet_members_status
-  ON esp_fleet_members(fleet_id, status, role, node_id);
+  ON esp_fleet_members(fleet_id, status, role, member_id);
 
 CREATE TABLE IF NOT EXISTS esp_fleet_invites (
   invite_id TEXT PRIMARY KEY,
   fleet_id TEXT NOT NULL,
-  node_id INTEGER NOT NULL,
+  member_id BLOB NOT NULL,
+  peer_id TEXT NOT NULL,
   entmoot_pubkey TEXT NOT NULL,
   hostname TEXT NOT NULL DEFAULT '',
   status TEXT NOT NULL,
-  invite BLOB,
+  capability BLOB,
   created_at_ms INTEGER NOT NULL,
   updated_at_ms INTEGER NOT NULL,
   expires_at_ms INTEGER NOT NULL DEFAULT 0
 );
-
 CREATE INDEX IF NOT EXISTS idx_fleet_invites_fleet
   ON esp_fleet_invites(fleet_id, created_at_ms DESC);
 
@@ -1595,15 +1407,16 @@ CREATE TABLE IF NOT EXISTS esp_fleet_activity (
   event_id TEXT PRIMARY KEY,
   fleet_id TEXT NOT NULL,
   type TEXT NOT NULL,
-  actor_node_id INTEGER NOT NULL,
+  actor_member_id BLOB NOT NULL,
+  actor_peer_id TEXT NOT NULL,
   actor_pubkey TEXT NOT NULL,
-  subject_node_id INTEGER NOT NULL DEFAULT 0,
+  subject_member_id BLOB,
+  subject_peer_id TEXT NOT NULL DEFAULT '',
   subject_pubkey TEXT NOT NULL DEFAULT '',
   summary TEXT NOT NULL DEFAULT '',
   metadata BLOB,
   created_at_ms INTEGER NOT NULL
 );
-
 CREATE INDEX IF NOT EXISTS idx_fleet_activity_fleet_time
   ON esp_fleet_activity(fleet_id, created_at_ms DESC, event_id);
 
@@ -1614,9 +1427,11 @@ CREATE TABLE IF NOT EXISTS esp_fleet_tasks (
   description TEXT NOT NULL DEFAULT '',
   mode TEXT NOT NULL,
   status TEXT NOT NULL,
-  creator_node_id INTEGER NOT NULL,
+  creator_member_id BLOB NOT NULL,
+  creator_peer_id TEXT NOT NULL,
   creator_pubkey TEXT NOT NULL,
-  assignee_node_id INTEGER NOT NULL DEFAULT 0,
+  assignee_member_id BLOB,
+  assignee_peer_id TEXT NOT NULL DEFAULT '',
   assignee_pubkey TEXT NOT NULL DEFAULT '',
   created_at_ms INTEGER NOT NULL,
   updated_at_ms INTEGER NOT NULL,
@@ -1632,7 +1447,8 @@ CREATE TABLE IF NOT EXISTS esp_fleet_task_submissions (
   submission_id TEXT PRIMARY KEY,
   fleet_id TEXT NOT NULL,
   task_id TEXT NOT NULL,
-  author_node_id INTEGER NOT NULL,
+  author_member_id BLOB NOT NULL,
+  author_peer_id TEXT NOT NULL,
   author_pubkey TEXT NOT NULL,
   content TEXT NOT NULL,
   status TEXT NOT NULL,
@@ -1646,7 +1462,8 @@ CREATE INDEX IF NOT EXISTS idx_fleet_task_submissions_task
 CREATE TABLE IF NOT EXISTS esp_fleet_commands (
   command_id TEXT PRIMARY KEY,
   fleet_id TEXT NOT NULL,
-  issuer_node_id INTEGER NOT NULL,
+  issuer_member_id BLOB NOT NULL,
+  issuer_peer_id TEXT NOT NULL,
   target BLOB NOT NULL,
   action TEXT NOT NULL,
   args BLOB,
@@ -1666,7 +1483,8 @@ CREATE INDEX IF NOT EXISTS idx_fleet_commands_fleet_action
 CREATE TABLE IF NOT EXISTS esp_fleet_command_results (
   command_id TEXT NOT NULL,
   fleet_id TEXT NOT NULL,
-  agent_node_id INTEGER NOT NULL,
+  agent_member_id BLOB NOT NULL,
+  agent_peer_id TEXT NOT NULL,
   action TEXT NOT NULL,
   status TEXT NOT NULL,
   summary TEXT NOT NULL DEFAULT '',
@@ -1675,7 +1493,7 @@ CREATE TABLE IF NOT EXISTS esp_fleet_command_results (
   completed_at_ms INTEGER NOT NULL DEFAULT 0,
   result BLOB NOT NULL,
   updated_at_ms INTEGER NOT NULL,
-  PRIMARY KEY(command_id, agent_node_id)
+  PRIMARY KEY(command_id, agent_member_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_fleet_command_results_fleet_command
@@ -1685,8 +1503,10 @@ CREATE TABLE IF NOT EXISTS esp_agent_commands (
   command_id TEXT PRIMARY KEY,
   fleet_id TEXT NOT NULL,
   control_group_id BLOB NOT NULL,
-  issuer_node_id INTEGER NOT NULL,
-  agent_node_id INTEGER NOT NULL,
+  issuer_member_id BLOB NOT NULL,
+  issuer_peer_id TEXT NOT NULL,
+  agent_member_id BLOB NOT NULL,
+  agent_peer_id TEXT NOT NULL,
   action TEXT NOT NULL,
   target BLOB NOT NULL,
   instruction TEXT NOT NULL,
@@ -1716,7 +1536,7 @@ CREATE INDEX IF NOT EXISTS idx_agent_commands_lease
 
 CREATE TABLE IF NOT EXISTS esp_live_agent_configs (
   group_id BLOB NOT NULL,
-  node_id INTEGER NOT NULL,
+  member_id BLOB NOT NULL,
   enabled INTEGER NOT NULL,
   mode TEXT NOT NULL,
   topic_filters BLOB NOT NULL,
@@ -1724,38 +1544,39 @@ CREATE TABLE IF NOT EXISTS esp_live_agent_configs (
   max_actions_per_scan INTEGER NOT NULL DEFAULT 0,
   max_action_bytes INTEGER NOT NULL DEFAULT 0,
   updated_at_ms INTEGER NOT NULL,
-  PRIMARY KEY(group_id, node_id)
+  PRIMARY KEY(group_id, member_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_live_agent_configs_group
-  ON esp_live_agent_configs(group_id, enabled, node_id);
+  ON esp_live_agent_configs(group_id, enabled, member_id);
 
 CREATE TABLE IF NOT EXISTS esp_live_agent_presence (
   group_id BLOB NOT NULL,
-  node_id INTEGER NOT NULL,
+  member_id BLOB NOT NULL,
   status TEXT NOT NULL,
   mode TEXT NOT NULL,
   topic_filters BLOB NOT NULL,
   last_seen_at_ms INTEGER NOT NULL,
   lease_until_ms INTEGER NOT NULL,
   updated_at_ms INTEGER NOT NULL,
-  PRIMARY KEY(group_id, node_id)
+  PRIMARY KEY(group_id, member_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_live_agent_presence_group
-  ON esp_live_agent_presence(group_id, lease_until_ms, node_id);
+  ON esp_live_agent_presence(group_id, lease_until_ms, member_id);
 
 CREATE TABLE IF NOT EXISTS esp_live_agent_cursors (
   group_id BLOB NOT NULL,
-  node_id INTEGER NOT NULL,
+  member_id BLOB NOT NULL,
   scan_floor_at_ms INTEGER NOT NULL DEFAULT 0,
   last_seen_at_ms INTEGER NOT NULL,
-  last_seen_author_node_id INTEGER NOT NULL DEFAULT 0,
+  last_seen_author_member_id BLOB,
   last_seen_message_id BLOB NOT NULL DEFAULT x'',
   seen_message_ids BLOB NOT NULL DEFAULT '[]',
   updated_at_ms INTEGER NOT NULL,
-  PRIMARY KEY(group_id, node_id)
+  PRIMARY KEY(group_id, member_id)
 );
+
 `
 
 func OpenSQLiteStateStore(dataDir string) (*SQLiteStateStore, error) {
@@ -2069,14 +1890,14 @@ func (s *SQLiteStateStore) CreateOpenInvite(ctx context.Context, rec OpenInviteR
 	if err := ValidateOpenInviteMaxUses(rec.MaxUses); err != nil {
 		return OpenInviteRecord{}, err
 	}
-	bootstrapPeers, err := encodeBootstrapPeers(rec.BootstrapPeers)
+	bootstrapMultiaddrs, err := json.Marshal(rec.BootstrapMultiaddrs)
 	if err != nil {
 		return OpenInviteRecord{}, err
 	}
 	_, err = s.db.ExecContext(ctx, `
-INSERT INTO esp_open_invites (token_hash, group_id, device_id, max_uses, use_count, revoked, bootstrap_peers, created_at_ms, updated_at_ms, expires_at_ms)
+INSERT INTO esp_open_invites (token_hash, group_id, device_id, max_uses, use_count, revoked, bootstrap_multiaddrs, created_at_ms, updated_at_ms, expires_at_ms)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		rec.TokenHash, rec.GroupID[:], rec.DeviceID, rec.MaxUses, rec.UseCount, boolInt(rec.Revoked), bootstrapPeers, rec.CreatedAtMS, rec.UpdatedAtMS, rec.ExpiresAtMS)
+		rec.TokenHash, rec.GroupID[:], rec.DeviceID, rec.MaxUses, rec.UseCount, boolInt(rec.Revoked), bootstrapMultiaddrs, rec.CreatedAtMS, rec.UpdatedAtMS, rec.ExpiresAtMS)
 	if err != nil {
 		return OpenInviteRecord{}, fmt.Errorf("esphttp: create open invite: %w", err)
 	}
@@ -2084,7 +1905,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 }
 
 func (s *SQLiteStateStore) GetOpenInviteByTokenHash(ctx context.Context, tokenHash string) (OpenInviteRecord, bool, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT token_hash, group_id, device_id, max_uses, use_count, revoked, bootstrap_peers, created_at_ms, updated_at_ms, expires_at_ms FROM esp_open_invites WHERE token_hash = ?`, tokenHash)
+	row := s.db.QueryRowContext(ctx, `SELECT token_hash, group_id, device_id, max_uses, use_count, revoked, bootstrap_multiaddrs, created_at_ms, updated_at_ms, expires_at_ms FROM esp_open_invites WHERE token_hash = ?`, tokenHash)
 	rec, err := scanOpenInviteRecord(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return OpenInviteRecord{}, false, nil
@@ -2096,7 +1917,7 @@ func (s *SQLiteStateStore) GetOpenInviteByTokenHash(ctx context.Context, tokenHa
 }
 
 func (s *SQLiteStateStore) ListOpenInvitesByGroup(ctx context.Context, groupID entmoot.GroupID) ([]OpenInviteRecord, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT token_hash, group_id, device_id, max_uses, use_count, revoked, bootstrap_peers, created_at_ms, updated_at_ms, expires_at_ms FROM esp_open_invites WHERE group_id = ? ORDER BY created_at_ms DESC`, groupID[:])
+	rows, err := s.db.QueryContext(ctx, `SELECT token_hash, group_id, device_id, max_uses, use_count, revoked, bootstrap_multiaddrs, created_at_ms, updated_at_ms, expires_at_ms FROM esp_open_invites WHERE group_id = ? ORDER BY created_at_ms DESC`, groupID[:])
 	if err != nil {
 		return nil, fmt.Errorf("esphttp: list open invites: %w", err)
 	}
@@ -2132,7 +1953,7 @@ func (s *SQLiteStateStore) RevokeOpenInvite(ctx context.Context, tokenHash strin
 }
 
 func (s *SQLiteStateStore) GetOpenInviteRedemption(ctx context.Context, tokenHash string, redeemerKey string) (OpenInviteRedemption, bool, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT token_hash, redeemer_key, pilot_node_id, entmoot_pubkey, result, redeemed_at_ms FROM esp_open_invite_redemptions WHERE token_hash = ? AND redeemer_key = ?`, tokenHash, redeemerKey)
+	row := s.db.QueryRowContext(ctx, `SELECT token_hash, redeemer_key, member_id, peer_id, entmoot_pubkey, result, redeemed_at_ms FROM esp_open_invite_redemptions WHERE token_hash = ? AND redeemer_key = ?`, tokenHash, redeemerKey)
 	redemption, err := scanOpenInviteRedemption(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return OpenInviteRedemption{}, false, nil
@@ -2150,7 +1971,7 @@ func (s *SQLiteStateStore) RedeemOpenInvite(ctx context.Context, tokenHash strin
 	}
 	defer tx.Rollback()
 
-	row := tx.QueryRowContext(ctx, `SELECT token_hash, group_id, device_id, max_uses, use_count, revoked, bootstrap_peers, created_at_ms, updated_at_ms, expires_at_ms FROM esp_open_invites WHERE token_hash = ?`, tokenHash)
+	row := tx.QueryRowContext(ctx, `SELECT token_hash, group_id, device_id, max_uses, use_count, revoked, bootstrap_multiaddrs, created_at_ms, updated_at_ms, expires_at_ms FROM esp_open_invites WHERE token_hash = ?`, tokenHash)
 	rec, err := scanOpenInviteRecord(row)
 	if err != nil {
 		return OpenInviteRecord{}, OpenInviteRedemption{}, false, err
@@ -2188,11 +2009,11 @@ WHERE token_hash = ?
 	if rows == 0 {
 		return OpenInviteRecord{}, OpenInviteRedemption{}, false, ErrOpenInviteExhausted
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO esp_open_invite_redemptions (token_hash, redeemer_key, pilot_node_id, entmoot_pubkey, redeemed_at_ms) VALUES (?, ?, ?, ?, ?)`,
-		tokenHash, redemption.RedeemerKey, redemption.PilotNodeID, redemption.EntmootPubKey, nowMS); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO esp_open_invite_redemptions (token_hash, redeemer_key, member_id, peer_id, entmoot_pubkey, redeemed_at_ms) VALUES (?, ?, ?, ?, ?, ?)`,
+		tokenHash, redemption.RedeemerKey, redemption.MemberID[:], redemption.PeerID, redemption.EntmootPubKey, nowMS); err != nil {
 		return OpenInviteRecord{}, OpenInviteRedemption{}, false, err
 	}
-	row = tx.QueryRowContext(ctx, `SELECT token_hash, group_id, device_id, max_uses, use_count, revoked, bootstrap_peers, created_at_ms, updated_at_ms, expires_at_ms FROM esp_open_invites WHERE token_hash = ?`, tokenHash)
+	row = tx.QueryRowContext(ctx, `SELECT token_hash, group_id, device_id, max_uses, use_count, revoked, bootstrap_multiaddrs, created_at_ms, updated_at_ms, expires_at_ms FROM esp_open_invites WHERE token_hash = ?`, tokenHash)
 	rec, err = scanOpenInviteRecord(row)
 	if err != nil {
 		return OpenInviteRecord{}, OpenInviteRedemption{}, false, err
@@ -2244,125 +2065,6 @@ func (s *SQLiteStateStore) ReleaseOpenInviteRedemption(ctx context.Context, toke
 	return tx.Commit()
 }
 
-func (s *SQLiteStateStore) CreateOpenInviteChallenge(ctx context.Context, ch OpenInviteChallenge) (OpenInviteChallenge, error) {
-	now := time.Now().UnixMilli()
-	if ch.ChallengeID == "" {
-		ch.ChallengeID = newOpenInviteChallengeID()
-	}
-	if ch.CreatedAtMS == 0 {
-		ch.CreatedAtMS = now
-	}
-	if _, err := s.db.ExecContext(ctx, `
-INSERT INTO esp_open_invite_challenges
-  (challenge_id, token_hash, group_id, pilot_node_id, pilot_pubkey, entmoot_pubkey, nonce, signing_payload, created_at_ms, expires_at_ms, used_at_ms)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		ch.ChallengeID, ch.TokenHash, ch.GroupID[:], ch.PilotNodeID, ch.PilotPubKey, ch.EntmootPubKey, ch.Nonce, ch.SigningPayload, ch.CreatedAtMS, ch.ExpiresAtMS, ch.UsedAtMS); err != nil {
-		return OpenInviteChallenge{}, fmt.Errorf("esphttp: create open invite challenge: %w", err)
-	}
-	return cloneOpenInviteChallenge(ch), nil
-}
-
-func (s *SQLiteStateStore) CreateOrReuseOpenInviteChallenge(ctx context.Context, ch OpenInviteChallenge, activeCap int, nowMS int64) (OpenInviteChallenge, error) {
-	now := time.Now().UnixMilli()
-	if nowMS > 0 {
-		now = nowMS
-	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return OpenInviteChallenge{}, err
-	}
-	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, `DELETE FROM esp_open_invite_challenges WHERE token_hash = ? AND used_at_ms = 0 AND expires_at_ms > 0 AND expires_at_ms <= ?`, ch.TokenHash, now); err != nil {
-		return OpenInviteChallenge{}, err
-	}
-	row := tx.QueryRowContext(ctx, `SELECT challenge_id, token_hash, group_id, pilot_node_id, pilot_pubkey, entmoot_pubkey, nonce, signing_payload, created_at_ms, expires_at_ms, used_at_ms
-FROM esp_open_invite_challenges
-WHERE token_hash = ? AND pilot_node_id = ? AND pilot_pubkey = ? AND entmoot_pubkey = ? AND used_at_ms = 0 AND (expires_at_ms = 0 OR expires_at_ms > ?)
-ORDER BY created_at_ms DESC
-LIMIT 1`, ch.TokenHash, ch.PilotNodeID, ch.PilotPubKey, ch.EntmootPubKey, now)
-	existing, err := scanOpenInviteChallenge(row)
-	if err == nil {
-		if err := tx.Commit(); err != nil {
-			return OpenInviteChallenge{}, err
-		}
-		return existing, nil
-	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		return OpenInviteChallenge{}, err
-	}
-	var active int
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM esp_open_invite_challenges WHERE token_hash = ? AND used_at_ms = 0 AND (expires_at_ms = 0 OR expires_at_ms > ?)`, ch.TokenHash, now).Scan(&active); err != nil {
-		return OpenInviteChallenge{}, err
-	}
-	if activeCap > 0 && active >= activeCap {
-		return OpenInviteChallenge{}, ErrOpenInviteChallengeLimit
-	}
-	if ch.ChallengeID == "" {
-		ch.ChallengeID = newOpenInviteChallengeID()
-	}
-	if ch.CreatedAtMS == 0 {
-		ch.CreatedAtMS = now
-	}
-	if _, err := tx.ExecContext(ctx, `
-INSERT INTO esp_open_invite_challenges
-  (challenge_id, token_hash, group_id, pilot_node_id, pilot_pubkey, entmoot_pubkey, nonce, signing_payload, created_at_ms, expires_at_ms, used_at_ms)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		ch.ChallengeID, ch.TokenHash, ch.GroupID[:], ch.PilotNodeID, ch.PilotPubKey, ch.EntmootPubKey, ch.Nonce, ch.SigningPayload, ch.CreatedAtMS, ch.ExpiresAtMS, ch.UsedAtMS); err != nil {
-		return OpenInviteChallenge{}, fmt.Errorf("esphttp: create open invite challenge: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return OpenInviteChallenge{}, err
-	}
-	return cloneOpenInviteChallenge(ch), nil
-}
-
-func (s *SQLiteStateStore) GetOpenInviteChallenge(ctx context.Context, challengeID string) (OpenInviteChallenge, bool, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT challenge_id, token_hash, group_id, pilot_node_id, pilot_pubkey, entmoot_pubkey, nonce, signing_payload, created_at_ms, expires_at_ms, used_at_ms FROM esp_open_invite_challenges WHERE challenge_id = ?`, challengeID)
-	ch, err := scanOpenInviteChallenge(row)
-	if errors.Is(err, sql.ErrNoRows) {
-		return OpenInviteChallenge{}, false, nil
-	}
-	if err != nil {
-		return OpenInviteChallenge{}, false, fmt.Errorf("esphttp: get open invite challenge: %w", err)
-	}
-	return ch, true, nil
-}
-
-func (s *SQLiteStateStore) ConsumeOpenInviteChallenge(ctx context.Context, challengeID string, nowMS int64) (OpenInviteChallenge, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return OpenInviteChallenge{}, err
-	}
-	defer tx.Rollback()
-	row := tx.QueryRowContext(ctx, `SELECT challenge_id, token_hash, group_id, pilot_node_id, pilot_pubkey, entmoot_pubkey, nonce, signing_payload, created_at_ms, expires_at_ms, used_at_ms FROM esp_open_invite_challenges WHERE challenge_id = ?`, challengeID)
-	ch, err := scanOpenInviteChallenge(row)
-	if err != nil {
-		return OpenInviteChallenge{}, err
-	}
-	if ch.UsedAtMS != 0 {
-		return OpenInviteChallenge{}, ErrOpenInviteChallengeUsed
-	}
-	if ch.ExpiresAtMS > 0 && ch.ExpiresAtMS <= nowMS {
-		return OpenInviteChallenge{}, ErrOpenInviteChallengeExpired
-	}
-	res, err := tx.ExecContext(ctx, `UPDATE esp_open_invite_challenges SET used_at_ms = ? WHERE challenge_id = ? AND used_at_ms = 0 AND (expires_at_ms = 0 OR expires_at_ms > ?)`, nowMS, challengeID, nowMS)
-	if err != nil {
-		return OpenInviteChallenge{}, err
-	}
-	rows, err := res.RowsAffected()
-	if err != nil {
-		return OpenInviteChallenge{}, err
-	}
-	if rows == 0 {
-		return OpenInviteChallenge{}, ErrOpenInviteChallengeUsed
-	}
-	ch.UsedAtMS = nowMS
-	if err := tx.Commit(); err != nil {
-		return OpenInviteChallenge{}, err
-	}
-	return ch, nil
-}
-
 func (s *SQLiteStateStore) GetGroupMetadata(ctx context.Context, groupID entmoot.GroupID) (json.RawMessage, bool, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT metadata FROM esp_group_metadata WHERE group_id = ?`, groupID[:])
 	var metadata []byte
@@ -2408,6 +2110,12 @@ func (s *SQLiteStateStore) CreateFleet(ctx context.Context, rec FleetRecord) (Fl
 			return FleetRecord{}, err
 		}
 	}
+	if rec.Coordinator.MemberID == nil || rec.Coordinator.PeerID == "" {
+		return FleetRecord{}, errors.New("esphttp: fleet coordinator member_id and peer_id are required")
+	}
+	if err := entmoot.ValidateMemberInfo(rec.Coordinator); err != nil {
+		return FleetRecord{}, fmt.Errorf("esphttp: fleet coordinator identity: %w", err)
+	}
 	if rec.CreatedAtMS == 0 {
 		rec.CreatedAtMS = now
 	}
@@ -2418,9 +2126,9 @@ func (s *SQLiteStateStore) CreateFleet(ctx context.Context, rec FleetRecord) (Fl
 	}
 	if _, err := s.db.ExecContext(ctx, `
 INSERT INTO esp_fleets
-  (fleet_id, name, control_group_id, coordinator_node_id, coordinator_pubkey, coordinator_device_id, status, created_at_ms, updated_at_ms, archived_at_ms, deleted_at_ms)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		rec.FleetID, rec.Name, controlGroup, rec.Coordinator.PilotNodeID, base64.StdEncoding.EncodeToString(rec.Coordinator.EntmootPubKey),
+  (fleet_id, name, control_group_id, coordinator_member_id, coordinator_peer_id, coordinator_pubkey, coordinator_device_id, status, created_at_ms, updated_at_ms, archived_at_ms, deleted_at_ms)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		rec.FleetID, rec.Name, controlGroup, (*rec.Coordinator.MemberID)[:], rec.Coordinator.PeerID, base64.StdEncoding.EncodeToString(rec.Coordinator.EntmootPubKey),
 		rec.CoordinatorDeviceID, NormalizeFleetStatus(rec.Status), rec.CreatedAtMS, rec.UpdatedAtMS, rec.ArchivedAtMS, rec.DeletedAtMS); err != nil {
 		return FleetRecord{}, fmt.Errorf("esphttp: create fleet: %w", err)
 	}
@@ -2429,7 +2137,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 }
 
 func (s *SQLiteStateStore) ListFleets(ctx context.Context) ([]FleetRecord, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT fleet_id, name, control_group_id, coordinator_node_id, coordinator_pubkey, coordinator_device_id, status, created_at_ms, updated_at_ms, archived_at_ms, deleted_at_ms FROM esp_fleets ORDER BY created_at_ms DESC`)
+	rows, err := s.db.QueryContext(ctx, `SELECT fleet_id, name, control_group_id, coordinator_member_id, coordinator_peer_id, coordinator_pubkey, coordinator_device_id, status, created_at_ms, updated_at_ms, archived_at_ms, deleted_at_ms FROM esp_fleets ORDER BY created_at_ms DESC`)
 	if err != nil {
 		return nil, fmt.Errorf("esphttp: list fleets: %w", err)
 	}
@@ -2446,7 +2154,7 @@ func (s *SQLiteStateStore) ListFleets(ctx context.Context) ([]FleetRecord, error
 }
 
 func (s *SQLiteStateStore) GetFleet(ctx context.Context, fleetID string) (FleetRecord, bool, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT fleet_id, name, control_group_id, coordinator_node_id, coordinator_pubkey, coordinator_device_id, status, created_at_ms, updated_at_ms, archived_at_ms, deleted_at_ms FROM esp_fleets WHERE fleet_id = ?`, fleetID)
+	row := s.db.QueryRowContext(ctx, `SELECT fleet_id, name, control_group_id, coordinator_member_id, coordinator_peer_id, coordinator_pubkey, coordinator_device_id, status, created_at_ms, updated_at_ms, archived_at_ms, deleted_at_ms FROM esp_fleets WHERE fleet_id = ?`, fleetID)
 	rec, err := scanFleetRecord(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return FleetRecord{}, false, nil
@@ -2458,7 +2166,7 @@ func (s *SQLiteStateStore) GetFleet(ctx context.Context, fleetID string) (FleetR
 }
 
 func (s *SQLiteStateStore) GetFleetByControlGroup(ctx context.Context, groupID entmoot.GroupID) (FleetRecord, bool, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT fleet_id, name, control_group_id, coordinator_node_id, coordinator_pubkey, coordinator_device_id, status, created_at_ms, updated_at_ms, archived_at_ms, deleted_at_ms FROM esp_fleets WHERE control_group_id = ?`, groupID[:])
+	row := s.db.QueryRowContext(ctx, `SELECT fleet_id, name, control_group_id, coordinator_member_id, coordinator_peer_id, coordinator_pubkey, coordinator_device_id, status, created_at_ms, updated_at_ms, archived_at_ms, deleted_at_ms FROM esp_fleets WHERE control_group_id = ?`, groupID[:])
 	rec, err := scanFleetRecord(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return FleetRecord{}, false, nil
@@ -2478,10 +2186,6 @@ func (s *SQLiteStateStore) ArchiveFleet(ctx context.Context, fleetID string, arc
 		return FleetRecord{}, false, fmt.Errorf("esphttp: archive fleet begin: %w", err)
 	}
 	defer tx.Rollback()
-	memberNodeIDs, err := s.fleetProfileNodeIDs(ctx, `SELECT DISTINCT node_id FROM esp_fleet_members WHERE fleet_id = ?`, fleetID)
-	if err != nil {
-		return FleetRecord{}, false, err
-	}
 	res, err := tx.ExecContext(ctx, `UPDATE esp_fleets SET status = ?, archived_at_ms = CASE WHEN archived_at_ms = 0 THEN ? ELSE archived_at_ms END, updated_at_ms = ? WHERE fleet_id = ? AND status != ?`,
 		FleetStatusArchived, archivedAtMS, archivedAtMS, fleetID, FleetStatusArchived)
 	if err != nil {
@@ -2491,28 +2195,10 @@ func (s *SQLiteStateStore) ArchiveFleet(ctx context.Context, fleetID string, arc
 	if err != nil {
 		return FleetRecord{}, false, fmt.Errorf("esphttp: archive fleet affected rows: %w", err)
 	}
-	inviteNodeIDs := make(map[entmoot.NodeID]struct{})
-	rows, err := tx.QueryContext(ctx, `SELECT DISTINCT node_id FROM esp_fleet_invites WHERE fleet_id = ?`, fleetID)
-	if err != nil {
-		return FleetRecord{}, false, fmt.Errorf("esphttp: archive fleet invite nodes: %w", err)
-	}
-	for rows.Next() {
-		var nodeID int64
-		if err := rows.Scan(&nodeID); err != nil {
-			rows.Close()
-			return FleetRecord{}, false, fmt.Errorf("esphttp: archive fleet invite node: %w", err)
-		}
-		inviteNodeIDs[entmoot.NodeID(nodeID)] = struct{}{}
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return FleetRecord{}, false, fmt.Errorf("esphttp: archive fleet invite node rows: %w", err)
-	}
-	rows.Close()
 	if _, err := tx.ExecContext(ctx, `DELETE FROM esp_fleet_invites WHERE fleet_id = ?`, fleetID); err != nil {
 		return FleetRecord{}, false, fmt.Errorf("esphttp: archive fleet invites: %w", err)
 	}
-	row := tx.QueryRowContext(ctx, `SELECT fleet_id, name, control_group_id, coordinator_node_id, coordinator_pubkey, coordinator_device_id, status, created_at_ms, updated_at_ms, archived_at_ms, deleted_at_ms FROM esp_fleets WHERE fleet_id = ?`, fleetID)
+	row := tx.QueryRowContext(ctx, `SELECT fleet_id, name, control_group_id, coordinator_member_id, coordinator_peer_id, coordinator_pubkey, coordinator_device_id, status, created_at_ms, updated_at_ms, archived_at_ms, deleted_at_ms FROM esp_fleets WHERE fleet_id = ?`, fleetID)
 	rec, err := scanFleetRecord(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return FleetRecord{}, false, nil
@@ -2526,12 +2212,6 @@ func (s *SQLiteStateStore) ArchiveFleet(ctx context.Context, fleetID string, arc
 	if affected == 0 && rec.Status != FleetStatusArchived {
 		return FleetRecord{}, false, nil
 	}
-	for _, nodeID := range memberNodeIDs {
-		_ = s.refreshFleetMemberNodeProfile(ctx, nodeID)
-	}
-	for nodeID := range inviteNodeIDs {
-		_ = s.refreshFleetInviteNodeProfile(ctx, nodeID)
-	}
 	return rec, true, nil
 }
 
@@ -2544,14 +2224,6 @@ func (s *SQLiteStateStore) RestoreFleet(ctx context.Context, fleetID string, res
 		return FleetRecord{}, false, fmt.Errorf("esphttp: restore fleet begin: %w", err)
 	}
 	defer tx.Rollback()
-	memberNodeIDs, err := s.fleetProfileNodeIDs(ctx, `SELECT DISTINCT node_id FROM esp_fleet_members WHERE fleet_id = ?`, fleetID)
-	if err != nil {
-		return FleetRecord{}, false, err
-	}
-	inviteNodeIDs, err := s.fleetProfileNodeIDs(ctx, `SELECT DISTINCT node_id FROM esp_fleet_invites WHERE fleet_id = ?`, fleetID)
-	if err != nil {
-		return FleetRecord{}, false, err
-	}
 	res, err := tx.ExecContext(ctx, `UPDATE esp_fleets SET status = ?, archived_at_ms = 0, deleted_at_ms = 0, updated_at_ms = ? WHERE fleet_id = ? AND status != ?`,
 		FleetStatusActive, restoredAtMS, fleetID, FleetStatusActive)
 	if err != nil {
@@ -2561,7 +2233,7 @@ func (s *SQLiteStateStore) RestoreFleet(ctx context.Context, fleetID string, res
 	if err != nil {
 		return FleetRecord{}, false, fmt.Errorf("esphttp: restore fleet affected rows: %w", err)
 	}
-	row := tx.QueryRowContext(ctx, `SELECT fleet_id, name, control_group_id, coordinator_node_id, coordinator_pubkey, coordinator_device_id, status, created_at_ms, updated_at_ms, archived_at_ms, deleted_at_ms FROM esp_fleets WHERE fleet_id = ?`, fleetID)
+	row := tx.QueryRowContext(ctx, `SELECT fleet_id, name, control_group_id, coordinator_member_id, coordinator_peer_id, coordinator_pubkey, coordinator_device_id, status, created_at_ms, updated_at_ms, archived_at_ms, deleted_at_ms FROM esp_fleets WHERE fleet_id = ?`, fleetID)
 	rec, err := scanFleetRecord(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return FleetRecord{}, false, nil
@@ -2575,24 +2247,10 @@ func (s *SQLiteStateStore) RestoreFleet(ctx context.Context, fleetID string, res
 	if affected == 0 && rec.Status != FleetStatusActive {
 		return FleetRecord{}, false, nil
 	}
-	for _, nodeID := range memberNodeIDs {
-		_ = s.refreshFleetMemberNodeProfile(ctx, nodeID)
-	}
-	for _, nodeID := range inviteNodeIDs {
-		_ = s.refreshFleetInviteNodeProfile(ctx, nodeID)
-	}
 	return rec, true, nil
 }
 
 func (s *SQLiteStateStore) DeleteFleet(ctx context.Context, fleetID string) error {
-	memberNodeIDs, err := s.fleetProfileNodeIDs(ctx, `SELECT DISTINCT node_id FROM esp_fleet_members WHERE fleet_id = ?`, fleetID)
-	if err != nil {
-		return err
-	}
-	inviteNodeIDs, err := s.fleetProfileNodeIDs(ctx, `SELECT DISTINCT node_id FROM esp_fleet_invites WHERE fleet_id = ?`, fleetID)
-	if err != nil {
-		return err
-	}
 	if _, err := s.db.ExecContext(ctx, `DELETE FROM esp_fleet_command_results WHERE fleet_id = ?`, fleetID); err != nil {
 		return fmt.Errorf("esphttp: delete fleet command results: %w", err)
 	}
@@ -2617,35 +2275,7 @@ func (s *SQLiteStateStore) DeleteFleet(ctx context.Context, fleetID string) erro
 	if _, err := s.db.ExecContext(ctx, `DELETE FROM esp_fleets WHERE fleet_id = ?`, fleetID); err != nil {
 		return fmt.Errorf("esphttp: delete fleet: %w", err)
 	}
-	for _, nodeID := range memberNodeIDs {
-		_ = s.refreshFleetMemberNodeProfile(ctx, nodeID)
-	}
-	for _, nodeID := range inviteNodeIDs {
-		_ = s.refreshFleetInviteNodeProfile(ctx, nodeID)
-	}
 	return nil
-}
-
-func (s *SQLiteStateStore) fleetProfileNodeIDs(ctx context.Context, query string, fleetID string) ([]entmoot.NodeID, error) {
-	rows, err := s.db.QueryContext(ctx, query, fleetID)
-	if err != nil {
-		return nil, fmt.Errorf("esphttp: list fleet profile node ids: %w", err)
-	}
-	defer rows.Close()
-	var out []entmoot.NodeID
-	for rows.Next() {
-		var nodeID int64
-		if err := rows.Scan(&nodeID); err != nil {
-			return nil, fmt.Errorf("esphttp: scan fleet profile node id: %w", err)
-		}
-		if nodeID != 0 {
-			out = append(out, entmoot.NodeID(nodeID))
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("esphttp: list fleet profile node ids rows: %w", err)
-	}
-	return out, nil
 }
 
 func (s *SQLiteStateStore) UpsertFleetMember(ctx context.Context, rec FleetMemberRecord) (FleetMemberRecord, error) {
@@ -2656,7 +2286,7 @@ func (s *SQLiteStateStore) UpsertFleetMemberForActiveFleet(ctx context.Context, 
 	return s.upsertFleetMember(ctx, rec, true)
 }
 
-func (s *SQLiteStateStore) ReconcileFleetInviteAcceptance(ctx context.Context, fleetID string, nodeID entmoot.NodeID, entmootPubKey string, acceptedAtMS int64, hostname string) (FleetMemberRecord, FleetActivityRecord, bool, error) {
+func (s *SQLiteStateStore) ReconcileFleetInviteAcceptance(ctx context.Context, fleetID string, nodeID entmoot.MemberID, entmootPubKey string, acceptedAtMS int64, hostname string) (FleetMemberRecord, FleetActivityRecord, bool, error) {
 	entmootPubKey = strings.TrimSpace(entmootPubKey)
 	if acceptedAtMS == 0 {
 		acceptedAtMS = time.Now().UnixMilli()
@@ -2667,10 +2297,10 @@ func (s *SQLiteStateStore) ReconcileFleetInviteAcceptance(ctx context.Context, f
 	}
 	defer tx.Rollback()
 	row := tx.QueryRowContext(ctx, `
-SELECT m.fleet_id, m.node_id, m.entmoot_pubkey, m.hostname, m.role, m.status, m.invited_at_ms, m.accepted_at_ms, m.removed_at_ms, m.updated_at_ms
+SELECT m.fleet_id, m.member_id, m.peer_id, m.entmoot_pubkey, m.hostname, m.role, m.status, m.invited_at_ms, m.accepted_at_ms, m.removed_at_ms, m.updated_at_ms
 FROM esp_fleet_members m
 JOIN esp_fleets f ON f.fleet_id = m.fleet_id
-WHERE m.fleet_id = ? AND m.node_id = ? AND f.status = ?`, fleetID, nodeID, FleetStatusActive)
+WHERE m.fleet_id = ? AND m.member_id = ? AND f.status = ?`, fleetID, nodeID[:], FleetStatusActive)
 	member, err := scanFleetMemberRecord(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return FleetMemberRecord{}, FleetActivityRecord{}, false, nil
@@ -2685,8 +2315,8 @@ WHERE m.fleet_id = ? AND m.node_id = ? AND f.status = ?`, fleetID, nodeID, Fleet
 	if err := tx.QueryRowContext(ctx, `
 	SELECT COUNT(1)
 	FROM esp_fleet_invites
-	WHERE fleet_id = ? AND node_id = ? AND entmoot_pubkey = ? AND status = ?`,
-		fleetID, nodeID, entmootPubKey, FleetMemberInvited).Scan(&inviteCount); err != nil {
+	WHERE fleet_id = ? AND member_id = ? AND entmoot_pubkey = ? AND status = ?`,
+		fleetID, nodeID[:], entmootPubKey, FleetMemberInvited).Scan(&inviteCount); err != nil {
 		return FleetMemberRecord{}, FleetActivityRecord{}, false, fmt.Errorf("esphttp: reconcile fleet invite acceptance invites: %w", err)
 	}
 	if inviteCount == 0 {
@@ -2706,16 +2336,16 @@ WHERE m.fleet_id = ? AND m.node_id = ? AND f.status = ?`, fleetID, nodeID, Fleet
 	res, err := tx.ExecContext(ctx, `
 UPDATE esp_fleet_members
 SET hostname = ?, status = ?, accepted_at_ms = ?, removed_at_ms = 0, updated_at_ms = ?
-WHERE fleet_id = ? AND node_id = ? AND entmoot_pubkey = ? AND status = ? AND role != ?
+WHERE fleet_id = ? AND member_id = ? AND entmoot_pubkey = ? AND status = ? AND role != ?
   AND EXISTS (SELECT 1 FROM esp_fleets WHERE fleet_id = ? AND status = ?)
 	  AND EXISTS (
 	    SELECT 1 FROM esp_fleet_invites
-	    WHERE fleet_id = ? AND node_id = ? AND entmoot_pubkey = ? AND status = ?
+	    WHERE fleet_id = ? AND member_id = ? AND entmoot_pubkey = ? AND status = ?
 	  )`,
 		member.Hostname, member.Status, member.AcceptedAtMS, member.UpdatedAtMS,
-		fleetID, nodeID, entmootPubKey, FleetMemberInvited, FleetRoleCoordinator,
+		fleetID, nodeID[:], entmootPubKey, FleetMemberInvited, FleetRoleCoordinator,
 		fleetID, FleetStatusActive,
-		fleetID, nodeID, entmootPubKey, FleetMemberInvited)
+		fleetID, nodeID[:], entmootPubKey, FleetMemberInvited)
 	if err != nil {
 		return FleetMemberRecord{}, FleetActivityRecord{}, false, fmt.Errorf("esphttp: reconcile fleet invite acceptance update member: %w", err)
 	}
@@ -2728,8 +2358,8 @@ WHERE fleet_id = ? AND node_id = ? AND entmoot_pubkey = ? AND status = ? AND rol
 	}
 	if _, err := tx.ExecContext(ctx, `
 	DELETE FROM esp_fleet_invites
-	WHERE fleet_id = ? AND node_id = ? AND entmoot_pubkey = ? AND status = ?`,
-		fleetID, nodeID, entmootPubKey, FleetMemberInvited); err != nil {
+	WHERE fleet_id = ? AND member_id = ? AND entmoot_pubkey = ? AND status = ?`,
+		fleetID, nodeID[:], entmootPubKey, FleetMemberInvited); err != nil {
 		return FleetMemberRecord{}, FleetActivityRecord{}, false, fmt.Errorf("esphttp: reconcile fleet invite acceptance delete invites: %w", err)
 	}
 	if err := insertFleetActivity(ctx, tx, activity); err != nil {
@@ -2751,9 +2381,10 @@ func (s *SQLiteStateStore) upsertFleetMember(ctx context.Context, rec FleetMembe
 	rec.UpdatedAtMS = time.Now().UnixMilli()
 	query := `
 INSERT INTO esp_fleet_members
-  (fleet_id, node_id, entmoot_pubkey, hostname, role, status, invited_at_ms, accepted_at_ms, removed_at_ms, updated_at_ms)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-ON CONFLICT(fleet_id, node_id) DO UPDATE SET
+  (fleet_id, member_id, peer_id, entmoot_pubkey, hostname, role, status, invited_at_ms, accepted_at_ms, removed_at_ms, updated_at_ms)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(fleet_id, member_id) DO UPDATE SET
+  peer_id = excluded.peer_id,
   entmoot_pubkey = excluded.entmoot_pubkey,
   hostname = excluded.hostname,
   role = excluded.role,
@@ -2762,14 +2393,15 @@ ON CONFLICT(fleet_id, node_id) DO UPDATE SET
   accepted_at_ms = excluded.accepted_at_ms,
   removed_at_ms = excluded.removed_at_ms,
   updated_at_ms = excluded.updated_at_ms`
-	args := []any{rec.FleetID, rec.NodeID, rec.EntmootPubKey, rec.Hostname, rec.Role, rec.Status, rec.InvitedAtMS, rec.AcceptedAtMS, rec.RemovedAtMS, rec.UpdatedAtMS}
+	args := []any{rec.FleetID, rec.MemberID[:], rec.PeerID, rec.EntmootPubKey, rec.Hostname, rec.Role, rec.Status, rec.InvitedAtMS, rec.AcceptedAtMS, rec.RemovedAtMS, rec.UpdatedAtMS}
 	if requireActive {
 		query = `
 INSERT INTO esp_fleet_members
-  (fleet_id, node_id, entmoot_pubkey, hostname, role, status, invited_at_ms, accepted_at_ms, removed_at_ms, updated_at_ms)
-SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+  (fleet_id, member_id, peer_id, entmoot_pubkey, hostname, role, status, invited_at_ms, accepted_at_ms, removed_at_ms, updated_at_ms)
+SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
 WHERE EXISTS (SELECT 1 FROM esp_fleets WHERE fleet_id = ? AND status = ?)
-ON CONFLICT(fleet_id, node_id) DO UPDATE SET
+ON CONFLICT(fleet_id, member_id) DO UPDATE SET
+  peer_id = excluded.peer_id,
   entmoot_pubkey = excluded.entmoot_pubkey,
   hostname = excluded.hostname,
   role = excluded.role,
@@ -2800,7 +2432,7 @@ ON CONFLICT(fleet_id, node_id) DO UPDATE SET
 }
 
 func (s *SQLiteStateStore) ListFleetMembers(ctx context.Context, fleetID string) ([]FleetMemberRecord, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT fleet_id, node_id, entmoot_pubkey, hostname, role, status, invited_at_ms, accepted_at_ms, removed_at_ms, updated_at_ms FROM esp_fleet_members WHERE fleet_id = ? ORDER BY role = 'coordinator' DESC, node_id ASC`, fleetID)
+	rows, err := s.db.QueryContext(ctx, `SELECT fleet_id, member_id, peer_id, entmoot_pubkey, hostname, role, status, invited_at_ms, accepted_at_ms, removed_at_ms, updated_at_ms FROM esp_fleet_members WHERE fleet_id = ? ORDER BY role = 'coordinator' DESC, member_id ASC`, fleetID)
 	if err != nil {
 		return nil, fmt.Errorf("esphttp: list fleet members: %w", err)
 	}
@@ -2816,11 +2448,10 @@ func (s *SQLiteStateStore) ListFleetMembers(ctx context.Context, fleetID string)
 	return out, rows.Err()
 }
 
-func (s *SQLiteStateStore) DeleteFleetMember(ctx context.Context, fleetID string, nodeID entmoot.NodeID) error {
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM esp_fleet_members WHERE fleet_id = ? AND node_id = ?`, fleetID, nodeID); err != nil {
+func (s *SQLiteStateStore) DeleteFleetMember(ctx context.Context, fleetID string, memberID entmoot.MemberID) error {
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM esp_fleet_members WHERE fleet_id = ? AND member_id = ?`, fleetID, memberID[:]); err != nil {
 		return fmt.Errorf("esphttp: delete fleet member: %w", err)
 	}
-	_ = s.refreshFleetMemberNodeProfile(ctx, nodeID)
 	return nil
 }
 
@@ -2850,14 +2481,14 @@ func (s *SQLiteStateStore) createFleetInvite(ctx context.Context, rec FleetInvit
 	}
 	query := `
 INSERT INTO esp_fleet_invites
-  (invite_id, fleet_id, node_id, entmoot_pubkey, hostname, status, invite, created_at_ms, updated_at_ms, expires_at_ms)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-	args := []any{rec.InviteID, rec.FleetID, rec.NodeID, rec.EntmootPubKey, rec.Hostname, rec.Status, []byte(rec.Invite), rec.CreatedAtMS, rec.UpdatedAtMS, rec.ExpiresAtMS}
+  (invite_id, fleet_id, member_id, peer_id, entmoot_pubkey, hostname, status, capability, created_at_ms, updated_at_ms, expires_at_ms)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	args := []any{rec.InviteID, rec.FleetID, rec.MemberID[:], rec.PeerID, rec.EntmootPubKey, rec.Hostname, rec.Status, []byte(rec.Capability), rec.CreatedAtMS, rec.UpdatedAtMS, rec.ExpiresAtMS}
 	if requireActive {
 		query = `
 INSERT INTO esp_fleet_invites
-  (invite_id, fleet_id, node_id, entmoot_pubkey, hostname, status, invite, created_at_ms, updated_at_ms, expires_at_ms)
-SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+  (invite_id, fleet_id, member_id, peer_id, entmoot_pubkey, hostname, status, capability, created_at_ms, updated_at_ms, expires_at_ms)
+SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
 WHERE EXISTS (SELECT 1 FROM esp_fleets WHERE fleet_id = ? AND status = ?)`
 		args = append(args, rec.FleetID, FleetStatusActive)
 	}
@@ -2874,14 +2505,11 @@ WHERE EXISTS (SELECT 1 FROM esp_fleets WHERE fleet_id = ? AND status = ?)`
 			return FleetInviteRecord{}, ErrFleetNotActive
 		}
 	}
-	// Display profile cache writes are derived state; the invite row is
-	// authoritative and handler read paths can backfill this cache later.
 	_ = s.observeFleetInviteNodeProfile(ctx, rec)
 	return cloneFleetInviteRecord(rec), nil
 }
-
 func (s *SQLiteStateStore) ListFleetInvites(ctx context.Context, fleetID string) ([]FleetInviteRecord, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT invite_id, fleet_id, node_id, entmoot_pubkey, hostname, status, invite, created_at_ms, updated_at_ms, expires_at_ms FROM esp_fleet_invites WHERE fleet_id = ? ORDER BY created_at_ms DESC`, fleetID)
+	rows, err := s.db.QueryContext(ctx, `SELECT invite_id, fleet_id, member_id, peer_id, entmoot_pubkey, hostname, status, capability, created_at_ms, updated_at_ms, expires_at_ms FROM esp_fleet_invites WHERE fleet_id = ? ORDER BY created_at_ms DESC`, fleetID)
 	if err != nil {
 		return nil, fmt.Errorf("esphttp: list fleet invites: %w", err)
 	}
@@ -2898,15 +2526,8 @@ func (s *SQLiteStateStore) ListFleetInvites(ctx context.Context, fleetID string)
 }
 
 func (s *SQLiteStateStore) DeleteFleetInvite(ctx context.Context, inviteID string) error {
-	var nodeID int64
-	if err := s.db.QueryRowContext(ctx, `SELECT node_id FROM esp_fleet_invites WHERE invite_id = ?`, inviteID).Scan(&nodeID); err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("esphttp: delete fleet invite profile lookup: %w", err)
-	}
 	if _, err := s.db.ExecContext(ctx, `DELETE FROM esp_fleet_invites WHERE invite_id = ?`, inviteID); err != nil {
 		return fmt.Errorf("esphttp: delete fleet invite: %w", err)
-	}
-	if nodeID != 0 {
-		_ = s.refreshFleetInviteNodeProfile(ctx, entmoot.NodeID(nodeID))
 	}
 	return nil
 }
@@ -2933,18 +2554,27 @@ type fleetActivityExecer interface {
 }
 
 func insertFleetActivity(ctx context.Context, execer fleetActivityExecer, rec FleetActivityRecord) error {
-	var subjectNode entmoot.NodeID
-	var subjectPub string
+	if rec.Actor.PeerID == "" {
+		return errors.New("esphttp: fleet activity actor peer_id is required")
+	}
+	var subjectMember []byte
+	var subjectPeer, subjectPub string
 	if rec.Subject != nil {
-		subjectNode = rec.Subject.PilotNodeID
+		if rec.Subject.PeerID == "" {
+			return errors.New("esphttp: fleet activity subject peer_id is required")
+		}
+		memberID := nodeInfoMemberID(*rec.Subject)
+		subjectMember = memberID[:]
+		subjectPeer = rec.Subject.PeerID
 		subjectPub = base64.StdEncoding.EncodeToString(rec.Subject.EntmootPubKey)
 	}
+	actorMember := nodeInfoMemberID(rec.Actor)
 	_, err := execer.ExecContext(ctx, `
 INSERT OR IGNORE INTO esp_fleet_activity
-  (event_id, fleet_id, type, actor_node_id, actor_pubkey, subject_node_id, subject_pubkey, summary, metadata, created_at_ms)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		rec.EventID, rec.FleetID, rec.Type, rec.Actor.PilotNodeID, base64.StdEncoding.EncodeToString(rec.Actor.EntmootPubKey),
-		subjectNode, subjectPub, rec.Summary, []byte(rec.Metadata), rec.CreatedAtMS)
+  (event_id, fleet_id, type, actor_member_id, actor_peer_id, actor_pubkey, subject_member_id, subject_peer_id, subject_pubkey, summary, metadata, created_at_ms)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		rec.EventID, rec.FleetID, rec.Type, actorMember[:], rec.Actor.PeerID, base64.StdEncoding.EncodeToString(rec.Actor.EntmootPubKey),
+		subjectMember, subjectPeer, subjectPub, rec.Summary, []byte(rec.Metadata), rec.CreatedAtMS)
 	if err != nil {
 		return fmt.Errorf("esphttp: append fleet activity: %w", err)
 	}
@@ -2955,7 +2585,7 @@ func (s *SQLiteStateStore) ListFleetActivity(ctx context.Context, fleetID string
 	if limit <= 0 || limit > 200 {
 		limit = 50
 	}
-	query := `SELECT event_id, fleet_id, type, actor_node_id, actor_pubkey, subject_node_id, subject_pubkey, summary, metadata, created_at_ms FROM esp_fleet_activity WHERE fleet_id = ?`
+	query := `SELECT event_id, fleet_id, type, actor_member_id, actor_peer_id, actor_pubkey, subject_member_id, subject_peer_id, subject_pubkey, summary, metadata, created_at_ms FROM esp_fleet_activity WHERE fleet_id = ?`
 	args := []any{fleetID}
 	if beforeMS > 0 {
 		query += ` AND created_at_ms < ?`
@@ -3059,197 +2689,6 @@ func migrateSQLiteState(db *sql.DB) error {
 			return fmt.Errorf("esphttp: migrate state schema add result: %w", err)
 		}
 	}
-	for _, stmt := range []string{
-		`CREATE INDEX IF NOT EXISTS idx_open_invite_challenges_token_active ON esp_open_invite_challenges(token_hash, used_at_ms, expires_at_ms)`,
-		`CREATE INDEX IF NOT EXISTS idx_open_invite_challenges_redeemer ON esp_open_invite_challenges(token_hash, pilot_node_id, pilot_pubkey, entmoot_pubkey, used_at_ms, expires_at_ms)`,
-		`CREATE TABLE IF NOT EXISTS esp_public_moots (
-		  group_id BLOB PRIMARY KEY,
-		  founder_pubkey TEXT NOT NULL DEFAULT '',
-		  descriptor BLOB,
-		  descriptor_updated_at_ms INTEGER NOT NULL DEFAULT 0,
-		  status TEXT NOT NULL,
-		  indexed_at_ms INTEGER NOT NULL,
-		  status_updated_at_ms INTEGER NOT NULL
-		)`,
-		`CREATE INDEX IF NOT EXISTS idx_public_moots_status_updated ON esp_public_moots(status, descriptor_updated_at_ms DESC)`,
-		`CREATE INDEX IF NOT EXISTS idx_public_moots_founder_status ON esp_public_moots(founder_pubkey, status)`,
-		`CREATE TABLE IF NOT EXISTS esp_node_profiles (
-			  node_id INTEGER PRIMARY KEY,
-			  entmoot_pubkey TEXT NOT NULL DEFAULT '',
-			  hostname TEXT NOT NULL,
-			  source TEXT NOT NULL,
-			  confidence INTEGER NOT NULL,
-		  observed_at_ms INTEGER NOT NULL,
-		  expires_at_ms INTEGER NOT NULL DEFAULT 0,
-		  source_group_id BLOB
-		)`,
-		`CREATE INDEX IF NOT EXISTS idx_node_profiles_expires ON esp_node_profiles(expires_at_ms)`,
-		`CREATE TABLE IF NOT EXISTS esp_node_profile_sources (
-			  node_id INTEGER NOT NULL,
-			  entmoot_pubkey TEXT NOT NULL DEFAULT '',
-			  source TEXT NOT NULL,
-			  source_key TEXT NOT NULL,
-			  hostname TEXT NOT NULL,
-		  confidence INTEGER NOT NULL,
-		  observed_at_ms INTEGER NOT NULL,
-		  expires_at_ms INTEGER NOT NULL DEFAULT 0,
-		  source_group_id BLOB,
-		  PRIMARY KEY(node_id, source_key)
-		)`,
-		`CREATE INDEX IF NOT EXISTS idx_node_profile_sources_node ON esp_node_profile_sources(node_id)`,
-		`CREATE INDEX IF NOT EXISTS idx_node_profile_sources_expires ON esp_node_profile_sources(expires_at_ms)`,
-	} {
-		if _, err := db.Exec(stmt); err != nil {
-			return fmt.Errorf("esphttp: migrate state schema add public/profile state: %w", err)
-		}
-	}
-	nodeProfileCols, err := tableColumns(db, "esp_node_profiles")
-	if err != nil {
-		return err
-	}
-	if !nodeProfileCols["entmoot_pubkey"] {
-		if _, err := db.Exec(`ALTER TABLE esp_node_profiles ADD COLUMN entmoot_pubkey TEXT NOT NULL DEFAULT ''`); err != nil {
-			return fmt.Errorf("esphttp: migrate state schema add node profile entmoot_pubkey: %w", err)
-		}
-	}
-	nodeProfileSourceCols, err := tableColumns(db, "esp_node_profile_sources")
-	if err != nil {
-		return err
-	}
-	if !nodeProfileSourceCols["entmoot_pubkey"] {
-		if _, err := db.Exec(`ALTER TABLE esp_node_profile_sources ADD COLUMN entmoot_pubkey TEXT NOT NULL DEFAULT ''`); err != nil {
-			return fmt.Errorf("esphttp: migrate state schema add node profile source entmoot_pubkey: %w", err)
-		}
-	}
-	if _, err := db.Exec(`INSERT OR IGNORE INTO esp_node_profile_sources
-		  (node_id, entmoot_pubkey, source, source_key, hostname, confidence, observed_at_ms, expires_at_ms, source_group_id)
-		  SELECT node_id, entmoot_pubkey, source, source, hostname, confidence, observed_at_ms, expires_at_ms, source_group_id
-		  FROM esp_node_profiles
-		  WHERE source != 'member_profile'`); err != nil {
-		return fmt.Errorf("esphttp: migrate state schema seed node profile sources: %w", err)
-	}
-	if err := migratePublicMootSchema(db); err != nil {
-		return err
-	}
-	fleetCols, err := tableColumns(db, "esp_fleets")
-	if err != nil {
-		return err
-	}
-	for _, stmt := range []struct {
-		name string
-		sql  string
-	}{
-		{"status", `ALTER TABLE esp_fleets ADD COLUMN status TEXT NOT NULL DEFAULT 'active'`},
-		{"archived_at_ms", `ALTER TABLE esp_fleets ADD COLUMN archived_at_ms INTEGER NOT NULL DEFAULT 0`},
-		{"deleted_at_ms", `ALTER TABLE esp_fleets ADD COLUMN deleted_at_ms INTEGER NOT NULL DEFAULT 0`},
-	} {
-		if fleetCols[stmt.name] {
-			continue
-		}
-		if _, err := db.Exec(stmt.sql); err != nil {
-			return fmt.Errorf("esphttp: migrate state schema add fleet %s: %w", stmt.name, err)
-		}
-	}
-	for _, stmt := range []string{
-		`CREATE TABLE IF NOT EXISTS esp_fleet_commands (
-		  command_id TEXT PRIMARY KEY,
-		  fleet_id TEXT NOT NULL,
-		  issuer_node_id INTEGER NOT NULL,
-		  target BLOB NOT NULL,
-		  action TEXT NOT NULL,
-		  args BLOB,
-		  auto_accept INTEGER NOT NULL,
-		  created_at_ms INTEGER NOT NULL,
-		  expires_at_ms INTEGER NOT NULL DEFAULT 0,
-		  command BLOB NOT NULL,
-		  updated_at_ms INTEGER NOT NULL
-		)`,
-		`CREATE INDEX IF NOT EXISTS idx_fleet_commands_fleet_time ON esp_fleet_commands(fleet_id, updated_at_ms DESC, command_id)`,
-		`CREATE INDEX IF NOT EXISTS idx_fleet_commands_fleet_action ON esp_fleet_commands(fleet_id, action, updated_at_ms DESC)`,
-		`CREATE TABLE IF NOT EXISTS esp_fleet_command_results (
-		  command_id TEXT NOT NULL,
-		  fleet_id TEXT NOT NULL,
-		  agent_node_id INTEGER NOT NULL,
-		  action TEXT NOT NULL,
-		  status TEXT NOT NULL,
-		  summary TEXT NOT NULL DEFAULT '',
-		  output TEXT NOT NULL DEFAULT '',
-		  started_at_ms INTEGER NOT NULL DEFAULT 0,
-		  completed_at_ms INTEGER NOT NULL DEFAULT 0,
-		  result BLOB NOT NULL,
-		  updated_at_ms INTEGER NOT NULL,
-		  PRIMARY KEY(command_id, agent_node_id)
-		)`,
-		`CREATE INDEX IF NOT EXISTS idx_fleet_command_results_fleet_command ON esp_fleet_command_results(fleet_id, command_id, updated_at_ms DESC)`,
-		`CREATE TABLE IF NOT EXISTS esp_agent_commands (
-		  command_id TEXT PRIMARY KEY,
-		  fleet_id TEXT NOT NULL,
-		  control_group_id BLOB NOT NULL,
-		  issuer_node_id INTEGER NOT NULL,
-		  agent_node_id INTEGER NOT NULL,
-		  action TEXT NOT NULL,
-		  target BLOB NOT NULL,
-		  instruction TEXT NOT NULL,
-		  context BLOB,
-		  args BLOB,
-		  command BLOB NOT NULL,
-		  payload BLOB NOT NULL,
-		  status TEXT NOT NULL,
-		  attempts INTEGER NOT NULL DEFAULT 0,
-		  lease_owner TEXT NOT NULL DEFAULT '',
-		  lease_until_ms INTEGER NOT NULL DEFAULT 0,
-		  created_at_ms INTEGER NOT NULL,
-		  expires_at_ms INTEGER NOT NULL DEFAULT 0,
-		  received_at_ms INTEGER NOT NULL,
-		  started_at_ms INTEGER NOT NULL DEFAULT 0,
-		  completed_at_ms INTEGER NOT NULL DEFAULT 0,
-		  updated_at_ms INTEGER NOT NULL,
-		  result BLOB,
-		  last_error TEXT NOT NULL DEFAULT ''
-		)`,
-		`CREATE INDEX IF NOT EXISTS idx_agent_commands_status ON esp_agent_commands(status, received_at_ms)`,
-		`CREATE INDEX IF NOT EXISTS idx_agent_commands_lease ON esp_agent_commands(status, lease_until_ms)`,
-		`CREATE TABLE IF NOT EXISTS esp_live_agent_configs (
-		  group_id BLOB NOT NULL,
-		  node_id INTEGER NOT NULL,
-		  enabled INTEGER NOT NULL,
-		  mode TEXT NOT NULL,
-		  topic_filters BLOB NOT NULL,
-		  allowed_actions BLOB NOT NULL,
-		  max_actions_per_scan INTEGER NOT NULL DEFAULT 0,
-		  max_action_bytes INTEGER NOT NULL DEFAULT 0,
-		  updated_at_ms INTEGER NOT NULL,
-		  PRIMARY KEY(group_id, node_id)
-		)`,
-		`CREATE INDEX IF NOT EXISTS idx_live_agent_configs_group ON esp_live_agent_configs(group_id, enabled, node_id)`,
-		`CREATE TABLE IF NOT EXISTS esp_live_agent_presence (
-		  group_id BLOB NOT NULL,
-		  node_id INTEGER NOT NULL,
-		  status TEXT NOT NULL,
-		  mode TEXT NOT NULL,
-		  topic_filters BLOB NOT NULL,
-		  last_seen_at_ms INTEGER NOT NULL,
-		  lease_until_ms INTEGER NOT NULL,
-		  updated_at_ms INTEGER NOT NULL,
-		  PRIMARY KEY(group_id, node_id)
-		)`,
-		`CREATE INDEX IF NOT EXISTS idx_live_agent_presence_group ON esp_live_agent_presence(group_id, lease_until_ms, node_id)`,
-		`CREATE TABLE IF NOT EXISTS esp_live_agent_cursors (
-		  group_id BLOB NOT NULL,
-		  node_id INTEGER NOT NULL,
-		  scan_floor_at_ms INTEGER NOT NULL DEFAULT 0,
-		  last_seen_at_ms INTEGER NOT NULL,
-		  last_seen_author_node_id INTEGER NOT NULL DEFAULT 0,
-		  last_seen_message_id BLOB NOT NULL DEFAULT x'',
-		  seen_message_ids BLOB NOT NULL DEFAULT '[]',
-		  updated_at_ms INTEGER NOT NULL,
-		  PRIMARY KEY(group_id, node_id)
-		)`,
-	} {
-		if _, err := db.Exec(stmt); err != nil {
-			return fmt.Errorf("esphttp: migrate state schema add agent commands: %w", err)
-		}
-	}
 	liveConfigCols, err := tableColumns(db, "esp_live_agent_configs")
 	if err != nil {
 		return err
@@ -3277,7 +2716,7 @@ func migrateSQLiteState(db *sql.DB) error {
 		sql  string
 	}{
 		{"scan_floor_at_ms", `ALTER TABLE esp_live_agent_cursors ADD COLUMN scan_floor_at_ms INTEGER NOT NULL DEFAULT 0`},
-		{"last_seen_author_node_id", `ALTER TABLE esp_live_agent_cursors ADD COLUMN last_seen_author_node_id INTEGER NOT NULL DEFAULT 0`},
+		{"last_seen_author_member_id", `ALTER TABLE esp_live_agent_cursors ADD COLUMN last_seen_author_member_id BLOB`},
 		{"last_seen_message_id", `ALTER TABLE esp_live_agent_cursors ADD COLUMN last_seen_message_id BLOB NOT NULL DEFAULT x''`},
 		{"seen_message_ids", `ALTER TABLE esp_live_agent_cursors ADD COLUMN seen_message_ids BLOB NOT NULL DEFAULT '[]'`},
 	} {
@@ -3286,6 +2725,22 @@ func migrateSQLiteState(db *sql.DB) error {
 		}
 		if _, err := db.Exec(stmt.sql); err != nil {
 			return fmt.Errorf("esphttp: migrate state schema add live cursor %s: %w", stmt.name, err)
+		}
+	}
+	for _, spec := range []struct {
+		table, memberColumn, peerColumn, pubkeyColumn string
+	}{
+		{"esp_fleets", "coordinator_member_id", "coordinator_peer_id", "coordinator_pubkey"},
+		{"esp_fleet_members", "member_id", "peer_id", "entmoot_pubkey"},
+		{"esp_fleet_invites", "member_id", "peer_id", "entmoot_pubkey"},
+		{"esp_fleet_activity", "actor_member_id", "actor_peer_id", "actor_pubkey"},
+		{"esp_fleet_activity", "subject_member_id", "subject_peer_id", "subject_pubkey"},
+		{"esp_fleet_tasks", "creator_member_id", "creator_peer_id", "creator_pubkey"},
+		{"esp_fleet_tasks", "assignee_member_id", "assignee_peer_id", "assignee_pubkey"},
+		{"esp_fleet_task_submissions", "author_member_id", "author_peer_id", "author_pubkey"},
+	} {
+		if err := migrateIdentityPeerColumn(db, spec.table, spec.memberColumn, spec.peerColumn, spec.pubkeyColumn); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -3313,6 +2768,80 @@ func tableColumns(db *sql.DB, table string) (map[string]bool, error) {
 		return nil, fmt.Errorf("esphttp: inspect state schema %s: %w", table, err)
 	}
 	return cols, nil
+}
+
+func migrateIdentityPeerColumn(db *sql.DB, table, memberColumn, peerColumn, pubkeyColumn string) error {
+	cols, err := tableColumns(db, table)
+	if err != nil {
+		return err
+	}
+	if !cols[memberColumn] || !cols[pubkeyColumn] {
+		return nil
+	}
+	if !cols[peerColumn] {
+		stmt := fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s TEXT NOT NULL DEFAULT ''`, table, peerColumn)
+		if _, err := db.Exec(stmt); err != nil {
+			return fmt.Errorf("esphttp: add %s.%s: %w", table, peerColumn, err)
+		}
+	}
+	query := fmt.Sprintf(`SELECT rowid, %s, %s, %s FROM %s`, memberColumn, peerColumn, pubkeyColumn, table)
+	rows, err := db.Query(query)
+	if err != nil {
+		return fmt.Errorf("esphttp: read %s identity binding: %w", table, err)
+	}
+	type update struct {
+		rowID  int64
+		peerID string
+	}
+	var updates []update
+	for rows.Next() {
+		var rowID int64
+		var memberBytes []byte
+		var peerID, encodedPubkey string
+		if err := rows.Scan(&rowID, &memberBytes, &peerID, &encodedPubkey); err != nil {
+			rows.Close()
+			return fmt.Errorf("esphttp: scan %s identity binding: %w", table, err)
+		}
+		if len(memberBytes) == 0 && strings.TrimSpace(encodedPubkey) == "" {
+			continue
+		}
+		if len(memberBytes) != len(entmoot.MemberID{}) {
+			rows.Close()
+			return fmt.Errorf("esphttp: %s has invalid %s", table, memberColumn)
+		}
+		pubkey, err := base64.StdEncoding.DecodeString(encodedPubkey)
+		if err != nil {
+			rows.Close()
+			return fmt.Errorf("esphttp: %s has invalid %s: %w", table, pubkeyColumn, err)
+		}
+		memberID, err := entmoot.MemberIDFromPublicKey(pubkey)
+		if err != nil || !bytes.Equal(memberID[:], memberBytes) {
+			rows.Close()
+			return fmt.Errorf("esphttp: %s identity does not match %s", table, memberColumn)
+		}
+		wantPeerID, err := entmoot.PeerIDFromPublicKey(pubkey)
+		if err != nil {
+			rows.Close()
+			return fmt.Errorf("esphttp: %s peer binding: %w", table, err)
+		}
+		if peerID != "" && peerID != wantPeerID {
+			rows.Close()
+			return fmt.Errorf("esphttp: %s %s does not match signing key", table, peerColumn)
+		}
+		if peerID == "" {
+			updates = append(updates, update{rowID: rowID, peerID: wantPeerID})
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, item := range updates {
+		stmt := fmt.Sprintf(`UPDATE %s SET %s = ? WHERE rowid = ?`, table, peerColumn)
+		if _, err := db.Exec(stmt, item.peerID, item.rowID); err != nil {
+			return fmt.Errorf("esphttp: backfill %s.%s: %w", table, peerColumn, err)
+		}
+	}
+	return nil
 }
 
 func migratePublicMootSchema(db *sql.DB) error {
@@ -3418,15 +2947,21 @@ func scanSignRequest(row signRequestScanner) (SignRequest, error) {
 
 func scanFleetRecord(row fleetScanner) (FleetRecord, error) {
 	var rec FleetRecord
-	var controlGroup []byte
+	var controlGroup, coordinatorBytes []byte
 	var pub string
-	if err := row.Scan(&rec.FleetID, &rec.Name, &controlGroup, &rec.Coordinator.PilotNodeID, &pub, &rec.CoordinatorDeviceID, &rec.Status, &rec.CreatedAtMS, &rec.UpdatedAtMS, &rec.ArchivedAtMS, &rec.DeletedAtMS); err != nil {
+	if err := row.Scan(&rec.FleetID, &rec.Name, &controlGroup, &coordinatorBytes, &rec.Coordinator.PeerID, &pub, &rec.CoordinatorDeviceID, &rec.Status, &rec.CreatedAtMS, &rec.UpdatedAtMS, &rec.ArchivedAtMS, &rec.DeletedAtMS); err != nil {
 		return FleetRecord{}, err
 	}
 	rec.Status = NormalizeFleetStatus(rec.Status)
 	if len(controlGroup) == len(rec.ControlGroupID) {
 		copy(rec.ControlGroupID[:], controlGroup)
 	}
+	if len(coordinatorBytes) != len(entmoot.MemberID{}) {
+		return FleetRecord{}, errors.New("esphttp: invalid fleet coordinator member id")
+	}
+	memberID := entmoot.MemberID{}
+	copy(memberID[:], coordinatorBytes)
+	rec.Coordinator.MemberID = &memberID
 	if pub != "" {
 		raw, err := base64.StdEncoding.DecodeString(pub)
 		if err != nil {
@@ -3439,31 +2974,45 @@ func scanFleetRecord(row fleetScanner) (FleetRecord, error) {
 
 func scanFleetMemberRecord(row fleetScanner) (FleetMemberRecord, error) {
 	var rec FleetMemberRecord
-	if err := row.Scan(&rec.FleetID, &rec.NodeID, &rec.EntmootPubKey, &rec.Hostname, &rec.Role, &rec.Status, &rec.InvitedAtMS, &rec.AcceptedAtMS, &rec.RemovedAtMS, &rec.UpdatedAtMS); err != nil {
+	var memberBytes []byte
+	if err := row.Scan(&rec.FleetID, &memberBytes, &rec.PeerID, &rec.EntmootPubKey, &rec.Hostname, &rec.Role, &rec.Status, &rec.InvitedAtMS, &rec.AcceptedAtMS, &rec.RemovedAtMS, &rec.UpdatedAtMS); err != nil {
 		return FleetMemberRecord{}, err
 	}
+	if len(memberBytes) != len(rec.MemberID) {
+		return FleetMemberRecord{}, errors.New("esphttp: invalid fleet member id")
+	}
+	copy(rec.MemberID[:], memberBytes)
 	return rec, nil
 }
 
 func scanFleetInviteRecord(row fleetScanner) (FleetInviteRecord, error) {
 	var rec FleetInviteRecord
-	var invite []byte
-	if err := row.Scan(&rec.InviteID, &rec.FleetID, &rec.NodeID, &rec.EntmootPubKey, &rec.Hostname, &rec.Status, &invite, &rec.CreatedAtMS, &rec.UpdatedAtMS, &rec.ExpiresAtMS); err != nil {
+	var memberBytes, capability []byte
+	if err := row.Scan(&rec.InviteID, &rec.FleetID, &memberBytes, &rec.PeerID, &rec.EntmootPubKey, &rec.Hostname, &rec.Status, &capability, &rec.CreatedAtMS, &rec.UpdatedAtMS, &rec.ExpiresAtMS); err != nil {
 		return FleetInviteRecord{}, err
 	}
-	rec.Invite = append(json.RawMessage(nil), invite...)
+	if len(memberBytes) != len(rec.MemberID) {
+		return FleetInviteRecord{}, errors.New("esphttp: invalid fleet invite member id")
+	}
+	copy(rec.MemberID[:], memberBytes)
+	rec.Capability = append(json.RawMessage(nil), capability...)
 	return rec, nil
 }
 
 func scanFleetActivityRecord(row fleetScanner) (FleetActivityRecord, error) {
 	var rec FleetActivityRecord
-	var actorPub string
-	var subjectNode entmoot.NodeID
-	var subjectPub string
+	var actorBytes, subjectBytes []byte
+	var actorPub, subjectPeer, subjectPub string
 	var metadata []byte
-	if err := row.Scan(&rec.EventID, &rec.FleetID, &rec.Type, &rec.Actor.PilotNodeID, &actorPub, &subjectNode, &subjectPub, &rec.Summary, &metadata, &rec.CreatedAtMS); err != nil {
+	if err := row.Scan(&rec.EventID, &rec.FleetID, &rec.Type, &actorBytes, &rec.Actor.PeerID, &actorPub, &subjectBytes, &subjectPeer, &subjectPub, &rec.Summary, &metadata, &rec.CreatedAtMS); err != nil {
 		return FleetActivityRecord{}, err
 	}
+	if len(actorBytes) != len(entmoot.MemberID{}) {
+		return FleetActivityRecord{}, errors.New("esphttp: invalid fleet activity actor member id")
+	}
+	actorID := entmoot.MemberID{}
+	copy(actorID[:], actorBytes)
+	rec.Actor.MemberID = &actorID
 	if actorPub != "" {
 		raw, err := base64.StdEncoding.DecodeString(actorPub)
 		if err != nil {
@@ -3471,8 +3020,13 @@ func scanFleetActivityRecord(row fleetScanner) (FleetActivityRecord, error) {
 		}
 		rec.Actor.EntmootPubKey = raw
 	}
-	if subjectNode != 0 || subjectPub != "" {
-		subj := entmoot.NodeInfo{PilotNodeID: subjectNode}
+	if len(subjectBytes) != 0 || subjectPub != "" {
+		if len(subjectBytes) != len(entmoot.MemberID{}) {
+			return FleetActivityRecord{}, errors.New("esphttp: invalid fleet activity subject member id")
+		}
+		subjectID := entmoot.MemberID{}
+		copy(subjectID[:], subjectBytes)
+		subj := entmoot.NodeInfo{MemberID: &subjectID, PeerID: subjectPeer}
 		if subjectPub != "" {
 			raw, err := base64.StdEncoding.DecodeString(subjectPub)
 			if err != nil {
@@ -3490,36 +3044,24 @@ func scanOpenInviteRecord(row openInviteScanner) (OpenInviteRecord, error) {
 	var rec OpenInviteRecord
 	var groupBytes []byte
 	var revoked int
-	var bootstrapPeers []byte
-	if err := row.Scan(&rec.TokenHash, &groupBytes, &rec.DeviceID, &rec.MaxUses, &rec.UseCount, &revoked, &bootstrapPeers, &rec.CreatedAtMS, &rec.UpdatedAtMS, &rec.ExpiresAtMS); err != nil {
+	var bootstrapMultiaddrs []byte
+	if err := row.Scan(&rec.TokenHash, &groupBytes, &rec.DeviceID, &rec.MaxUses, &rec.UseCount, &revoked, &bootstrapMultiaddrs, &rec.CreatedAtMS, &rec.UpdatedAtMS, &rec.ExpiresAtMS); err != nil {
 		return OpenInviteRecord{}, err
 	}
 	if len(groupBytes) == len(rec.GroupID) {
 		copy(rec.GroupID[:], groupBytes)
 	}
 	rec.Revoked = revoked != 0
-	if len(bootstrapPeers) > 0 {
-		if err := json.Unmarshal(bootstrapPeers, &rec.BootstrapPeers); err != nil {
+	if len(bootstrapMultiaddrs) > 0 {
+		if err := json.Unmarshal(bootstrapMultiaddrs, &rec.BootstrapMultiaddrs); err != nil {
 			return OpenInviteRecord{}, err
 		}
 	}
 	return rec, nil
 }
 
-func scanOpenInviteChallenge(row openInviteScanner) (OpenInviteChallenge, error) {
-	var ch OpenInviteChallenge
-	var groupBytes []byte
-	if err := row.Scan(&ch.ChallengeID, &ch.TokenHash, &groupBytes, &ch.PilotNodeID, &ch.PilotPubKey, &ch.EntmootPubKey, &ch.Nonce, &ch.SigningPayload, &ch.CreatedAtMS, &ch.ExpiresAtMS, &ch.UsedAtMS); err != nil {
-		return OpenInviteChallenge{}, err
-	}
-	if len(groupBytes) == len(ch.GroupID) {
-		copy(ch.GroupID[:], groupBytes)
-	}
-	return ch, nil
-}
-
 func getOpenInviteRedemptionTx(ctx context.Context, tx *sql.Tx, tokenHash string, redeemerKey string) (OpenInviteRedemption, bool, error) {
-	row := tx.QueryRowContext(ctx, `SELECT token_hash, redeemer_key, pilot_node_id, entmoot_pubkey, result, redeemed_at_ms FROM esp_open_invite_redemptions WHERE token_hash = ? AND redeemer_key = ?`, tokenHash, redeemerKey)
+	row := tx.QueryRowContext(ctx, `SELECT token_hash, redeemer_key, member_id, peer_id, entmoot_pubkey, result, redeemed_at_ms FROM esp_open_invite_redemptions WHERE token_hash = ? AND redeemer_key = ?`, tokenHash, redeemerKey)
 	red, err := scanOpenInviteRedemption(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return OpenInviteRedemption{}, false, nil
@@ -3534,10 +3076,14 @@ func scanOpenInviteRedemption(row interface {
 	Scan(dest ...any) error
 }) (OpenInviteRedemption, error) {
 	var red OpenInviteRedemption
-	var result []byte
-	if err := row.Scan(&red.TokenHash, &red.RedeemerKey, &red.PilotNodeID, &red.EntmootPubKey, &result, &red.RedeemedAtMS); err != nil {
+	var memberID, result []byte
+	if err := row.Scan(&red.TokenHash, &red.RedeemerKey, &memberID, &red.PeerID, &red.EntmootPubKey, &result, &red.RedeemedAtMS); err != nil {
 		return OpenInviteRedemption{}, err
 	}
+	if len(memberID) != len(red.MemberID) {
+		return OpenInviteRedemption{}, errors.New("esphttp: invalid redemption member id")
+	}
+	copy(red.MemberID[:], memberID)
 	red.Result = append(json.RawMessage(nil), result...)
 	return red, nil
 }
@@ -3563,17 +3109,13 @@ func cloneIdempotencyRecord(rec IdempotencyRecord) IdempotencyRecord {
 }
 
 func cloneOpenInviteRecord(rec OpenInviteRecord) OpenInviteRecord {
-	rec.BootstrapPeers = append([]entmoot.NodeID(nil), rec.BootstrapPeers...)
+	rec.BootstrapMultiaddrs = append([]string(nil), rec.BootstrapMultiaddrs...)
 	return rec
 }
 
 func cloneOpenInviteRedemption(red OpenInviteRedemption) OpenInviteRedemption {
 	red.Result = append(json.RawMessage(nil), red.Result...)
 	return red
-}
-
-func cloneOpenInviteChallenge(ch OpenInviteChallenge) OpenInviteChallenge {
-	return ch
 }
 
 func sortOpenInviteRecords(records []OpenInviteRecord) {
@@ -3585,16 +3127,7 @@ func sortOpenInviteRecords(records []OpenInviteRecord) {
 	})
 }
 
-func openInviteChallengeMatchesRedeemer(existing OpenInviteChallenge, want OpenInviteChallenge, nowMS int64) bool {
-	return existing.TokenHash == want.TokenHash &&
-		existing.PilotNodeID == want.PilotNodeID &&
-		existing.PilotPubKey == want.PilotPubKey &&
-		existing.EntmootPubKey == want.EntmootPubKey &&
-		existing.UsedAtMS == 0 &&
-		(existing.ExpiresAtMS == 0 || existing.ExpiresAtMS > nowMS)
-}
-
-func encodeBootstrapPeers(peers []entmoot.NodeID) ([]byte, error) {
+func encodeBootstrapPeers(peers []entmoot.MemberID) ([]byte, error) {
 	if len(peers) == 0 {
 		return nil, nil
 	}
@@ -3639,22 +3172,6 @@ func NewOpenInviteToken() (string, string, error) {
 func HashOpenInviteToken(token string) string {
 	sum := sha256.Sum256([]byte(strings.TrimSpace(token)))
 	return base64.RawURLEncoding.EncodeToString(sum[:])
-}
-
-func NewOpenInviteChallengeNonce() (string, error) {
-	var raw [32]byte
-	if _, err := rand.Read(raw[:]); err != nil {
-		return "", err
-	}
-	return base64.RawURLEncoding.EncodeToString(raw[:]), nil
-}
-
-func newOpenInviteChallengeID() string {
-	var raw [16]byte
-	if _, err := rand.Read(raw[:]); err != nil {
-		return fmt.Sprintf("%d", time.Now().UnixNano())
-	}
-	return base64.RawURLEncoding.EncodeToString(raw[:])
 }
 
 func deviceIDForRequest(auth authContext) string {

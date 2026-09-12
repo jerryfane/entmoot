@@ -14,6 +14,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/protocol"
 
 	"entmoot/pkg/entmoot"
+	"entmoot/pkg/entmoot/merkle"
 	"entmoot/pkg/entmoot/roster"
 	"entmoot/pkg/entmoot/store"
 )
@@ -59,9 +60,11 @@ func ValidateRosterChain(groupID entmoot.GroupID, expectedFounder entmoot.NodeIn
 		return nil, errors.New("libp2p: empty roster chain")
 	}
 	genesisFounder := entries[0].Subject
-	if genesisFounder.PilotNodeID != expectedFounder.PilotNodeID ||
+	genesisMemberID, genesisErr := entmoot.ResolvedMemberID(genesisFounder)
+	expectedMemberID, expectedErr := entmoot.ResolvedMemberID(expectedFounder)
+	if genesisErr != nil || expectedErr != nil ||
 		!bytes.Equal(genesisFounder.EntmootPubKey, expectedFounder.EntmootPubKey) ||
-		!equalMemberID(genesisFounder.MemberID, expectedFounder.MemberID) {
+		genesisMemberID != expectedMemberID {
 		return nil, errors.New("libp2p: roster founder anchor mismatch")
 	}
 	temporary := roster.New(groupID)
@@ -77,6 +80,53 @@ func ValidateRosterChain(groupID entmoot.GroupID, expectedFounder entmoot.NodeIn
 		return nil, errors.New("libp2p: roster head mismatch")
 	}
 	return temporary, nil
+}
+
+// FetchRosterUpdates downloads one committed roster snapshot and validates the
+// complete chain before returning entries missing from the local prefix.
+func FetchRosterUpdates(ctx context.Context, h host.Host, remote peer.AddrInfo, groupID entmoot.GroupID, local []entmoot.RosterEntry) ([]entmoot.RosterEntry, error) {
+	if len(local) == 0 {
+		return nil, errors.New("libp2p: local roster is empty")
+	}
+	all := append([]entmoot.RosterEntry(nil), local...)
+	after := uint64(len(local))
+	var token string
+	var committedHead entmoot.RosterEntryID
+	for page := 0; page < 64; page++ {
+		request := RosterSyncRequest{
+			Version:       2,
+			RequestID:     fmt.Sprintf("roster-%d-%d", time.Now().UnixNano(), page),
+			GroupID:       groupID,
+			SnapshotToken: token,
+			AfterSequence: after,
+			Limit:         256,
+		}
+		response, err := RequestRosterPage(ctx, h, remote, request)
+		if err != nil {
+			return nil, err
+		}
+		if page == 0 {
+			token = response.SnapshotToken
+			committedHead = response.CommittedHead
+		} else if response.SnapshotToken != token || response.CommittedHead != committedHead {
+			return nil, errors.New("libp2p: roster snapshot changed")
+		}
+		if response.NextSequence != after+uint64(len(response.Entries)) {
+			return nil, errors.New("libp2p: invalid roster continuation")
+		}
+		all = append(all, response.Entries...)
+		after = response.NextSequence
+		if response.Complete {
+			if _, err := ValidateRosterChain(groupID, local[0].Subject, committedHead, all); err != nil {
+				return nil, err
+			}
+			return append([]entmoot.RosterEntry(nil), all[len(local):]...), nil
+		}
+		if len(response.Entries) == 0 {
+			return nil, errors.New("libp2p: empty roster continuation")
+		}
+	}
+	return nil, errors.New("libp2p: roster page budget exhausted")
 }
 
 func equalMemberID(left, right *entmoot.MemberID) bool {
@@ -175,7 +225,7 @@ func SyncFromKeepers(
 	groupID entmoot.GroupID,
 	keepers []peer.AddrInfo,
 	destination store.MessageStore,
-	validate func(entmoot.Message) error,
+	validate func(entmoot.Message, *merkle.Proof) error,
 ) []KeeperProgress {
 	progress := make([]KeeperProgress, 0, len(keepers))
 	if destination == nil || validate == nil {
@@ -199,25 +249,25 @@ func SyncFromKeepers(
 	return progress
 }
 
-func syncFromKeeper(ctx context.Context, h host.Host, groupID entmoot.GroupID, keeper peer.AddrInfo, destination store.MessageStore, validate func(entmoot.Message) error, keeperIndex int, progress *KeeperProgress) error {
+func syncFromKeeper(ctx context.Context, h host.Host, groupID entmoot.GroupID, keeper peer.AddrInfo, destination store.MessageStore, validate func(entmoot.Message, *merkle.Proof) error, keeperIndex int, progress *KeeperProgress) error {
 	var snapshotToken string
 	var generation uint64
 	var afterTimestamp int64
-	var afterAuthor entmoot.NodeID
+	var afterAuthor entmoot.MemberID
 	var afterID *entmoot.MessageID
 	for pageNumber := 0; pageNumber < 1024; pageNumber++ {
 		requestID := fmt.Sprintf("keeper-%d-page-%d", keeperIndex, pageNumber)
 		listed, err := RequestHistoryPage(ctx, h, keeper, HistorySyncRequest{
-			Version:          2,
-			RequestID:        requestID,
-			GroupID:          groupID,
-			Mode:             "list",
-			SnapshotToken:    snapshotToken,
-			Generation:       generation,
-			AfterTimestampMS: afterTimestamp,
-			AfterAuthor:      afterAuthor,
-			AfterID:          afterID,
-			Limit:            256,
+			Version:             2,
+			RequestID:           requestID,
+			GroupID:             groupID,
+			Mode:                "list",
+			SnapshotToken:       snapshotToken,
+			Generation:          generation,
+			AfterTimestampMS:    afterTimestamp,
+			AfterAuthorMemberID: afterAuthor,
+			AfterID:             afterID,
+			Limit:               256,
 		})
 		if err != nil {
 			return err
@@ -252,12 +302,21 @@ func syncFromKeeper(ctx context.Context, h host.Host, groupID entmoot.GroupID, k
 			}
 			progress.TransferredBytes += encodedJSONSize(bodies)
 			progress.MissingBodies += len(bodies.Missing)
+			proofs := make(map[entmoot.MessageID]merkle.Proof, len(bodies.LegacyProofs))
+			for _, item := range bodies.LegacyProofs {
+				proofs[item.MessageID] = item.Proof
+			}
 			for _, message := range bodies.Messages {
 				if message.GroupID != groupID {
 					return errors.New("libp2p: keeper returned a message from another group")
 				}
 				if validate != nil {
-					if err := validate(message); err != nil {
+					var proof *merkle.Proof
+					if item, ok := proofs[message.ID]; ok {
+						itemCopy := item
+						proof = &itemCopy
+					}
+					if err := validate(message, proof); err != nil {
 						return fmt.Errorf("libp2p: invalid historical message: %w", err)
 					}
 				}
@@ -277,22 +336,22 @@ func syncFromKeeper(ctx context.Context, h host.Host, groupID entmoot.GroupID, k
 		if progress.TransferredBytes >= 16<<20 {
 			progress.BudgetExhausted = true
 			progress.Continuation = &HistorySyncRequest{
-				Version:          2,
-				GroupID:          groupID,
-				Mode:             "list",
-				SnapshotToken:    listed.SnapshotToken,
-				Generation:       listed.Generation,
-				AfterTimestampMS: listed.NextTimestampMS,
-				AfterAuthor:      listed.NextAuthor,
-				AfterID:          listed.NextID,
-				Limit:            256,
+				Version:             2,
+				GroupID:             groupID,
+				Mode:                "list",
+				SnapshotToken:       listed.SnapshotToken,
+				Generation:          listed.Generation,
+				AfterTimestampMS:    listed.NextTimestampMS,
+				AfterAuthorMemberID: listed.NextAuthorMemberID,
+				AfterID:             listed.NextID,
+				Limit:               256,
 			}
 			return nil
 		}
 		snapshotToken = listed.SnapshotToken
 		generation = listed.Generation
 		afterTimestamp = listed.NextTimestampMS
-		afterAuthor = listed.NextAuthor
+		afterAuthor = listed.NextAuthorMemberID
 		afterID = listed.NextID
 	}
 	return errors.New("libp2p: keeper page budget exhausted")

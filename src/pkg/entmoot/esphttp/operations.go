@@ -22,10 +22,6 @@ type OpenInviteRedeemer interface {
 	RedeemOpenInvite(context.Context, string, json.RawMessage) (json.RawMessage, error)
 }
 
-type OpenInviteChallenger interface {
-	CreateOpenInviteChallenge(context.Context, string, json.RawMessage) (json.RawMessage, error)
-}
-
 // OperationError maps executor failures to stable ESP HTTP errors.
 type OperationError struct {
 	HTTPStatus int

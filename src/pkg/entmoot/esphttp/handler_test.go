@@ -144,11 +144,11 @@ func TestHandlerSignedPublish(t *testing.T) {
 	msg := testMessage(gid, 3, "phone signed")
 	publisher := &fakePublisher{
 		result: PublishResult{
-			Status:      "accepted",
-			MessageID:   msg.ID,
-			GroupID:     gid,
-			Author:      msg.Author.PilotNodeID,
-			TimestampMS: msg.Timestamp,
+			Status:         "accepted",
+			MessageID:      msg.ID,
+			GroupID:        gid,
+			AuthorMemberID: messageTestMemberID(msg),
+			TimestampMS:    msg.Timestamp,
 		},
 	}
 	handler := testHandlerWithPublisher(t, gid, publisher)
@@ -156,7 +156,7 @@ func TestHandlerSignedPublish(t *testing.T) {
 	result := doJSONRequest[PublishResult](t, handler, http.MethodPost, "/v1/messages", map[string]any{
 		"message": msg,
 	}, http.StatusAccepted)
-	if result.MessageID != msg.ID || result.GroupID != gid || result.Author != msg.Author.PilotNodeID {
+	if result.MessageID != msg.ID || result.GroupID != gid || result.AuthorMemberID != messageTestMemberID(msg) {
 		t.Fatalf("publish result = %+v, want accepted message metadata", result)
 	}
 	if publisher.got.ID != msg.ID {
@@ -334,7 +334,7 @@ func TestHandlerMobileGroupsAndSignRequests(t *testing.T) {
 	catalog := fakeCatalog{
 		groups: []GroupSummary{{GroupID: gid, Members: 2}},
 		members: []MemberSummary{{
-			NodeID:        45491,
+			MemberID:      testMemberID(45491),
 			EntmootPubKey: base64.StdEncoding.EncodeToString([]byte("pub")),
 			Founder:       true,
 		}},
@@ -356,7 +356,7 @@ func TestHandlerMobileGroupsAndSignRequests(t *testing.T) {
 	members := doJSONRequest[struct {
 		Members []MemberSummary `json:"members"`
 	}](t, handler, http.MethodGet, "/v1/groups/"+gid.String()+"/members", nil, http.StatusOK)
-	if len(members.Members) != 1 || members.Members[0].NodeID != 45491 {
+	if len(members.Members) != 1 || members.Members[0].MemberID != testMemberID(45491) {
 		t.Fatalf("members = %+v, want founder", members)
 	}
 
@@ -373,319 +373,12 @@ func TestHandlerMobileGroupsAndSignRequests(t *testing.T) {
 	}
 }
 
-func TestHandlerListMembersEnrichesDisplayNames(t *testing.T) {
-	gid := testGroupID(1)
-	otherGID := testGroupID(2)
-	state := NewMemoryStateStore()
-	state.clock = func() time.Time { return time.UnixMilli(2_000) }
-	if _, _, err := state.UpsertNodeProfile(context.Background(), NodeProfileRecord{
-		NodeID:       45492,
-		Hostname:     "hermes",
-		Source:       NodeProfileSourceFleetMember,
-		ObservedAtMS: 1_000,
-		ExpiresAtMS:  10_000,
-	}); err != nil {
-		t.Fatalf("UpsertNodeProfile global: %v", err)
-	}
-	if _, _, err := state.UpsertNodeProfile(context.Background(), NodeProfileRecord{
-		NodeID:       45493,
-		Hostname:     "expired",
-		Source:       NodeProfileSourceFleetMember,
-		ObservedAtMS: 1_000,
-		ExpiresAtMS:  1_500,
-	}); err != nil {
-		t.Fatalf("UpsertNodeProfile expired: %v", err)
-	}
-	if _, _, err := state.UpsertNodeProfile(context.Background(), NodeProfileRecord{
-		NodeID:        45494,
-		Hostname:      "private-other-group",
-		Source:        NodeProfileSourceMemberProfile,
-		ObservedAtMS:  1_000,
-		ExpiresAtMS:   10_000,
-		SourceGroupID: &otherGID,
-	}); err != nil {
-		t.Fatalf("UpsertNodeProfile other group: %v", err)
-	}
-	if _, _, err := state.UpsertNodeProfile(context.Background(), NodeProfileRecord{
-		NodeID:       45495,
-		Hostname:     "fleet-visible",
-		Source:       NodeProfileSourceFleetMember,
-		ObservedAtMS: 1_000,
-		ExpiresAtMS:  10_000,
-	}); err != nil {
-		t.Fatalf("UpsertNodeProfile visible global: %v", err)
-	}
-	if _, _, err := state.UpsertNodeProfile(context.Background(), NodeProfileRecord{
-		NodeID:        45495,
-		Hostname:      "private-other-group-newer",
-		Source:        NodeProfileSourceMemberProfile,
-		ObservedAtMS:  2_000,
-		ExpiresAtMS:   10_000,
-		SourceGroupID: &otherGID,
-	}); err != nil {
-		t.Fatalf("UpsertNodeProfile other group over global: %v", err)
-	}
-	if _, _, err := state.UpsertNodeProfile(context.Background(), NodeProfileRecord{
-		NodeID:       45496,
-		Hostname:     "fleet-lower",
-		Source:       NodeProfileSourceFleetMember,
-		ObservedAtMS: 1_000,
-		ExpiresAtMS:  10_000,
-	}); err != nil {
-		t.Fatalf("UpsertNodeProfile same group global: %v", err)
-	}
-	if _, _, err := state.UpsertNodeProfile(context.Background(), NodeProfileRecord{
-		NodeID:        45496,
-		EntmootPubKey: base64.StdEncoding.EncodeToString([]byte("same-group-pub")),
-		Hostname:      "signed-same-group",
-		Source:        NodeProfileSourceMemberProfile,
-		ObservedAtMS:  1_500,
-		ExpiresAtMS:   10_000,
-		SourceGroupID: &gid,
-	}); err != nil {
-		t.Fatalf("UpsertNodeProfile same group member: %v", err)
-	}
-	if _, _, err := state.UpsertNodeProfile(context.Background(), NodeProfileRecord{
-		NodeID:        45497,
-		EntmootPubKey: base64.StdEncoding.EncodeToString([]byte("old-same-group-pub")),
-		Hostname:      "stale-same-group",
-		Source:        NodeProfileSourceMemberProfile,
-		ObservedAtMS:  1_500,
-		ExpiresAtMS:   10_000,
-		SourceGroupID: &gid,
-	}); err != nil {
-		t.Fatalf("UpsertNodeProfile stale same group member: %v", err)
-	}
-	if _, _, err := state.UpsertNodeProfile(context.Background(), NodeProfileRecord{
-		NodeID:        45498,
-		EntmootPubKey: base64.StdEncoding.EncodeToString([]byte("other-group-same-pub")),
-		Hostname:      "signed-other-group-same-identity",
-		Source:        NodeProfileSourceMemberProfile,
-		ObservedAtMS:  1_500,
-		ExpiresAtMS:   10_000,
-		SourceGroupID: &otherGID,
-	}); err != nil {
-		t.Fatalf("UpsertNodeProfile other group same identity member: %v", err)
-	}
-	catalog := fakeCatalog{
-		groups: []GroupSummary{{GroupID: gid, Members: 8}},
-		members: []MemberSummary{{
-			NodeID:        45491,
-			EntmootPubKey: base64.StdEncoding.EncodeToString([]byte("mars-pub")),
-			Hostname:      "mars",
-		}, {
-			NodeID:        45492,
-			EntmootPubKey: base64.StdEncoding.EncodeToString([]byte("hermes-pub")),
-		}, {
-			NodeID:        45493,
-			EntmootPubKey: base64.StdEncoding.EncodeToString([]byte("expired-pub")),
-		}, {
-			NodeID:        45494,
-			EntmootPubKey: base64.StdEncoding.EncodeToString([]byte("other-group-pub")),
-		}, {
-			NodeID:        45495,
-			EntmootPubKey: base64.StdEncoding.EncodeToString([]byte("visible-pub")),
-		}, {
-			NodeID:        45496,
-			EntmootPubKey: base64.StdEncoding.EncodeToString([]byte("same-group-pub")),
-		}, {
-			NodeID:        45497,
-			EntmootPubKey: base64.StdEncoding.EncodeToString([]byte("new-same-group-pub")),
-		}, {
-			NodeID:        45498,
-			EntmootPubKey: base64.StdEncoding.EncodeToString([]byte("other-group-same-pub")),
-		}},
-	}
-	handler := testMobileHandlerFull(t, gid, nil, &catalog, nil, nil, state, nil)
-
-	members := doJSONRequest[struct {
-		Members []MemberSummary `json:"members"`
-	}](t, handler, http.MethodGet, "/v1/groups/"+gid.String()+"/members", nil, http.StatusOK)
-	if len(members.Members) != 8 {
-		t.Fatalf("members = %+v, want eight", members.Members)
-	}
-	if got := members.Members[0]; got.Hostname != "mars" || got.GlobalHostname != "" || got.DisplayName != "mars#45491" {
-		t.Fatalf("local profile member = %+v", got)
-	}
-	if got := members.Members[1]; got.Hostname != "" || got.GlobalHostname != "hermes" || got.DisplayName != "hermes#45492" {
-		t.Fatalf("global fallback member = %+v", got)
-	}
-	if got := members.Members[2]; got.Hostname != "" || got.GlobalHostname != "" || got.DisplayName != "node-45493" {
-		t.Fatalf("expired fallback member = %+v", got)
-	}
-	if got := members.Members[3]; got.Hostname != "" || got.GlobalHostname != "" || got.DisplayName != "node-45494" {
-		t.Fatalf("other group profile member = %+v", got)
-	}
-	if got := members.Members[4]; got.Hostname != "" || got.GlobalHostname != "fleet-visible" || got.DisplayName != "fleet-visible#45495" {
-		t.Fatalf("other group profile over global member = %+v", got)
-	}
-	if got := members.Members[5]; got.Hostname != "" || got.GlobalHostname != "signed-same-group" || got.DisplayName != "signed-same-group#45496" {
-		t.Fatalf("same group profile over global member = %+v", got)
-	}
-	if got := members.Members[6]; got.Hostname != "" || got.GlobalHostname != "" || got.DisplayName != "node-45497" {
-		t.Fatalf("stale same group profile member = %+v", got)
-	}
-	if got := members.Members[7]; got.Hostname != "" || got.GlobalHostname != "signed-other-group-same-identity" || got.DisplayName != "signed-other-group-same-identity#45498" {
-		t.Fatalf("other group same identity profile member = %+v", got)
-	}
-}
-
-func TestHandlerLiveAgentConfigDeviceAndMemberPolicy(t *testing.T) {
-	gid := testGroupID(1)
-	adminPub, adminPriv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("Generate admin key: %v", err)
-	}
-	agentPub, agentPriv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("Generate agent key: %v", err)
-	}
-	otherPub, otherPriv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("Generate other key: %v", err)
-	}
-	reg, err := NewDeviceRegistry([]Device{{
-		ID:          "ios-1-device",
-		PublicKey:   adminPub,
-		Groups:      []entmoot.GroupID{gid},
-		AdminGroups: []entmoot.GroupID{gid},
-		ClientIDs:   []string{"ios-1"},
-	}})
-	if err != nil {
-		t.Fatalf("NewDeviceRegistry: %v", err)
-	}
-	state := NewMemoryStateStore()
-	catalog := fakeCatalog{
-		groups: []GroupSummary{{GroupID: gid, Members: 2}},
-		members: []MemberSummary{
-			{NodeID: 45491, EntmootPubKey: base64.StdEncoding.EncodeToString(agentPub), Founder: true},
-			{NodeID: 45492, EntmootPubKey: base64.StdEncoding.EncodeToString(otherPub)},
-		},
-	}
-	handler := testMobileHandlerFull(t, gid, reg, &catalog, func() time.Time { return time.UnixMilli(40_000) }, nil, state, nil)
-
-	create := doMemberSignedJSONRequest[struct {
-		Config LiveAgentConfig `json:"config"`
-	}](t, handler, 45491, agentPriv, http.MethodPut, "/v1/groups/"+gid.String()+"/live-agents/45491", map[string]any{
-		"mode":                 LiveModeOperator,
-		"topic_filters":        []string{"chat", "story/#"},
-		"allowed_actions":      []string{"reply", "command.send"},
-		"max_actions_per_scan": 2,
-		"max_action_bytes":     512,
-	}, http.StatusOK, 40_000, "nonce-live-agent-create")
-	if !create.Config.Enabled || create.Config.Mode != LiveModeOperator || len(create.Config.AllowedActions) != 2 {
-		t.Fatalf("created live config = %+v", create.Config)
-	}
-
-	denied := doMemberSignedJSONRequest[errorEnvelope](t, handler, 45491, agentPriv, http.MethodPut, "/v1/groups/"+gid.String()+"/live-agents/45492", map[string]any{
-		"mode": LiveModeListen,
-	}, http.StatusForbidden, 40_001, "nonce-live-agent-wrong-node")
-	if denied.Error.Code != "forbidden" {
-		t.Fatalf("denied error = %+v, want forbidden", denied.Error)
-	}
-
-	unknown := doMemberSignedJSONRequest[errorEnvelope](t, handler, 45492, otherPriv, http.MethodPut, "/v1/groups/"+gid.String()+"/live-agents/45492", map[string]any{
-		"mode":            LiveModeOperator,
-		"allowed_actions": []string{"reply", "sudo"},
-	}, http.StatusBadRequest, 40_002, "nonce-live-agent-unknown")
-	if unknown.Error.Code != "bad_request" {
-		t.Fatalf("unknown action error = %+v, want bad_request", unknown.Error)
-	}
-
-	list := doSignedJSONRequest[struct {
-		Configs []LiveAgentConfig                 `json:"configs"`
-		Members map[entmoot.NodeID]LiveAgentState `json:"members"`
-	}](t, handler, adminPriv, http.MethodGet, "/v1/groups/"+gid.String()+"/live-agents", nil, http.StatusOK, 40_003, "nonce-live-agent-list")
-	if len(list.Configs) != 1 || list.Configs[0].NodeID != 45491 || !list.Members[45491].Enabled {
-		t.Fatalf("live config list = %+v / %+v", list.Configs, list.Members)
-	}
-
-	deleted := doSignedJSONRequest[struct {
-		Enabled bool `json:"enabled"`
-	}](t, handler, adminPriv, http.MethodDelete, "/v1/groups/"+gid.String()+"/live-agents/45491", nil, http.StatusOK, 40_004, "nonce-live-agent-delete")
-	if deleted.Enabled {
-		t.Fatal("delete response enabled = true, want false")
-	}
-	configs, err := state.ListLiveAgentConfigs(context.Background(), gid)
-	if err != nil {
-		t.Fatalf("ListLiveAgentConfigs: %v", err)
-	}
-	if len(configs) != 0 {
-		t.Fatalf("configs after delete = %+v, want none", configs)
-	}
-}
-
-func TestHandlerLiveAgentConfigFiltersCoordinationActionsByDefault(t *testing.T) {
-	gid := testGroupID(2)
-	adminPub, _, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("Generate admin key: %v", err)
-	}
-	agentPub, agentPriv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("Generate agent key: %v", err)
-	}
-	reg, err := NewDeviceRegistry([]Device{{
-		ID:          "ios-1-device",
-		PublicKey:   adminPub,
-		Groups:      []entmoot.GroupID{gid},
-		AdminGroups: []entmoot.GroupID{gid},
-		ClientIDs:   []string{"ios-1"},
-	}})
-	if err != nil {
-		t.Fatalf("NewDeviceRegistry: %v", err)
-	}
-	state := NewMemoryStateStore()
-	catalog := fakeCatalog{
-		groups: []GroupSummary{{GroupID: gid, Members: 1}},
-		members: []MemberSummary{
-			{NodeID: 45491, EntmootPubKey: base64.StdEncoding.EncodeToString(agentPub), Founder: true},
-		},
-	}
-	handler, err := NewHandler(Config{
-		AuthMode: AuthModeDevice,
-		Devices:  reg,
-		Service:  mustMailboxService(t, gid),
-		State:    state,
-		Groups:   &catalog,
-		Clock:    func() time.Time { return time.UnixMilli(40_000) },
-		GroupExists: func(_ context.Context, got entmoot.GroupID) (bool, error) {
-			return got == gid, nil
-		},
-	})
-	if err != nil {
-		t.Fatalf("NewHandler: %v", err)
-	}
-
-	rejected := doMemberSignedJSONRequest[errorEnvelope](t, handler, 45491, agentPriv, http.MethodPut, "/v1/groups/"+gid.String()+"/live-agents/45491", map[string]any{
-		"mode":            LiveModeOperator,
-		"allowed_actions": []string{"reply", "command.send"},
-	}, http.StatusBadRequest, 40_100, "nonce-live-agent-disabled-action")
-	if rejected.Error.Code != "feature_disabled" {
-		t.Fatalf("rejected error = %+v, want feature_disabled", rejected.Error)
-	}
-
-	created := doMemberSignedJSONRequest[struct {
-		Config LiveAgentConfig `json:"config"`
-	}](t, handler, 45491, agentPriv, http.MethodPut, "/v1/groups/"+gid.String()+"/live-agents/45491", map[string]any{
-		"mode": LiveModeOperator,
-	}, http.StatusOK, 40_101, "nonce-live-agent-default-actions")
-	for _, action := range created.Config.AllowedActions {
-		if LiveActionRequiresTasks(action) {
-			t.Fatalf("default live actions include task action %q: %+v", action, created.Config.AllowedActions)
-		}
-	}
-	if len(created.Config.AllowedActions) == 0 {
-		t.Fatalf("default live actions empty, want social actions")
-	}
-}
-
 func TestLiveAgentConfigReadHonorsBearerBeforeMember(t *testing.T) {
 	gid := testGroupID(9)
 	req := httptest.NewRequest(http.MethodGet, "/v1/groups/"+gid.String()+"/live-agents", nil)
 	req = req.WithContext(context.WithValue(req.Context(), authContextKey{}, authContext{
 		bearer: true,
-		member: &MemberAuth{NodeID: 45499, EntmootPubKey: []byte("not-a-group-member")},
+		member: &MemberAuth{MemberID: testMemberID(45499), EntmootPubKey: []byte("not-a-group-member")},
 	}))
 	rec := httptest.NewRecorder()
 	if !(&Handler{}).checkLiveAgentConfigRead(rec, req, gid) {
@@ -711,14 +404,14 @@ func TestHandlerOpenInviteListAndRevoke(t *testing.T) {
 	}
 	state := NewMemoryStateStore()
 	if _, err := state.CreateOpenInvite(context.Background(), OpenInviteRecord{
-		TokenHash:      "invite-id",
-		GroupID:        gid,
-		DeviceID:       "ios-1-device",
-		MaxUses:        3,
-		UseCount:       1,
-		BootstrapPeers: []entmoot.NodeID{9},
-		CreatedAtMS:    1_000,
-		ExpiresAtMS:    2_000_000,
+		TokenHash:           "invite-id",
+		GroupID:             gid,
+		DeviceID:            "ios-1-device",
+		MaxUses:             3,
+		UseCount:            1,
+		BootstrapMultiaddrs: []string{"/ip4/127.0.0.1/tcp/4001"},
+		CreatedAtMS:         1_000,
+		ExpiresAtMS:         2_000_000,
 	}); err != nil {
 		t.Fatalf("CreateOpenInvite: %v", err)
 	}
@@ -739,1163 +432,6 @@ func TestHandlerOpenInviteListAndRevoke(t *testing.T) {
 	}](t, handler, priv, http.MethodPost, "/v1/groups/"+url.PathEscape(gid.String())+"/open-invites/invite-id/revoke", nil, http.StatusOK, 10_001, "nonce-open-revoke")
 	if !revoked.OpenInvite.Revoked || revoked.OpenInvite.Status != "revoked" {
 		t.Fatalf("revoked invite = %+v", revoked.OpenInvite)
-	}
-}
-
-func TestHandlerFleetReadsRequireCoordinatorDevice(t *testing.T) {
-	gid := testGroupID(1)
-	_, coordinatorPriv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("GenerateKey coordinator: %v", err)
-	}
-	_, otherPriv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("GenerateKey other: %v", err)
-	}
-	reg, err := NewDeviceRegistry([]Device{
-		{ID: "ios-1-device", PublicKey: coordinatorPriv.Public().(ed25519.PublicKey), ClientIDs: []string{"ios-1"}},
-		{ID: "other-device", PublicKey: otherPriv.Public().(ed25519.PublicKey), ClientIDs: []string{"other"}},
-	})
-	if err != nil {
-		t.Fatalf("NewDeviceRegistry: %v", err)
-	}
-	state := NewMemoryStateStore()
-	coordinator := entmoot.NodeInfo{PilotNodeID: 45491, EntmootPubKey: []byte("coordinator")}
-	if _, err := state.CreateFleet(context.Background(), FleetRecord{
-		FleetID:             "fleet-a",
-		Name:                "Fleet A",
-		Coordinator:         coordinator,
-		CoordinatorDeviceID: "ios-1-device",
-		CreatedAtMS:         1,
-	}); err != nil {
-		t.Fatalf("CreateFleet fleet-a: %v", err)
-	}
-	if _, err := state.CreateFleet(context.Background(), FleetRecord{
-		FleetID:             "fleet-b",
-		Name:                "Fleet B",
-		Coordinator:         entmoot.NodeInfo{PilotNodeID: 45492, EntmootPubKey: []byte("other")},
-		CoordinatorDeviceID: "other-device",
-		CreatedAtMS:         2,
-	}); err != nil {
-		t.Fatalf("CreateFleet fleet-b: %v", err)
-	}
-	if _, err := state.CreateFleetInvite(context.Background(), FleetInviteRecord{
-		InviteID:      "invite-a",
-		FleetID:       "fleet-a",
-		NodeID:        45493,
-		EntmootPubKey: base64.StdEncoding.EncodeToString([]byte("invitee")),
-		Status:        FleetMemberInvited,
-		Invite:        json.RawMessage(`{"secret":"control-group-invite"}`),
-		CreatedAtMS:   3,
-	}); err != nil {
-		t.Fatalf("CreateFleetInvite: %v", err)
-	}
-	if _, err := state.UpsertFleetMember(context.Background(), FleetMemberRecord{
-		FleetID:       "fleet-a",
-		NodeID:        45491,
-		EntmootPubKey: base64.StdEncoding.EncodeToString(coordinator.EntmootPubKey),
-		Role:          FleetRoleCoordinator,
-		Status:        FleetMemberActive,
-	}); err != nil {
-		t.Fatalf("UpsertFleetMember: %v", err)
-	}
-	if _, err := state.AppendFleetActivity(context.Background(), FleetActivityRecord{
-		FleetID:     "fleet-a",
-		Type:        "fleet.created",
-		Actor:       coordinator,
-		Summary:     "Fleet created",
-		CreatedAtMS: 4,
-	}); err != nil {
-		t.Fatalf("AppendFleetActivity: %v", err)
-	}
-	handler := testMobileHandlerFull(t, gid, reg, nil, func() time.Time { return time.UnixMilli(10_000) }, nil, state, nil)
-
-	list := doSignedJSONRequest[struct {
-		Fleets []FleetRecord `json:"fleets"`
-	}](t, handler, coordinatorPriv, http.MethodGet, "/v1/fleets", nil, http.StatusOK, 10_000, "nonce-fleet-list")
-	if len(list.Fleets) != 1 || list.Fleets[0].FleetID != "fleet-a" {
-		t.Fatalf("coordinator fleets = %+v, want only fleet-a", list.Fleets)
-	}
-	invites := doSignedJSONRequest[struct {
-		Invites []FleetInviteRecord `json:"invites"`
-	}](t, handler, coordinatorPriv, http.MethodGet, "/v1/fleets/fleet-a/invites", nil, http.StatusOK, 10_001, "nonce-fleet-invites")
-	if len(invites.Invites) != 1 || !bytes.Contains(invites.Invites[0].Invite, []byte("control-group-invite")) {
-		t.Fatalf("coordinator invites = %+v", invites.Invites)
-	}
-	members := doSignedJSONRequest[struct {
-		Members []FleetMemberRecord `json:"members"`
-	}](t, handler, coordinatorPriv, http.MethodGet, "/v1/fleets/fleet-a/members", nil, http.StatusOK, 10_002, "nonce-fleet-members")
-	if len(members.Members) != 1 || members.Members[0].NodeID != 45491 {
-		t.Fatalf("coordinator members = %+v", members.Members)
-	}
-	activity := doSignedJSONRequest[struct {
-		Activity []FleetActivityRecord `json:"activity"`
-	}](t, handler, coordinatorPriv, http.MethodGet, "/v1/fleets/fleet-a/activity", nil, http.StatusOK, 10_003, "nonce-fleet-activity")
-	if len(activity.Activity) != 1 || activity.Activity[0].Type != "fleet.created" {
-		t.Fatalf("coordinator activity = %+v", activity.Activity)
-	}
-
-	otherList := doSignedJSONRequestFor[struct {
-		Fleets []FleetRecord `json:"fleets"`
-	}](t, handler, "other-device", otherPriv, http.MethodGet, "/v1/fleets", nil, http.StatusOK, 10_004, "nonce-other-list")
-	if len(otherList.Fleets) != 1 || otherList.Fleets[0].FleetID != "fleet-b" {
-		t.Fatalf("other fleets = %+v, want only fleet-b", otherList.Fleets)
-	}
-	errResp := doSignedJSONRequestFor[errorEnvelope](t, handler, "other-device", otherPriv, http.MethodGet, "/v1/fleets/fleet-a/invites", nil, http.StatusForbidden, 10_005, "nonce-other-invites")
-	if errResp.Error.Code != "forbidden" {
-		t.Fatalf("other invite error code = %q, want forbidden", errResp.Error.Code)
-	}
-}
-
-func TestHandlerFleetRoutesAreDisabledByDefault(t *testing.T) {
-	gid := testGroupID(91)
-	_, coordinatorPriv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("GenerateKey coordinator: %v", err)
-	}
-	reg, err := NewDeviceRegistry([]Device{{
-		ID:        "ios-1-device",
-		PublicKey: coordinatorPriv.Public().(ed25519.PublicKey),
-		ClientIDs: []string{"ios-1"},
-	}})
-	if err != nil {
-		t.Fatalf("NewDeviceRegistry: %v", err)
-	}
-	state := NewMemoryStateStore()
-	if _, err := state.CreateFleet(context.Background(), FleetRecord{
-		FleetID:             "fleet-disabled",
-		Name:                "Fleet Disabled",
-		CoordinatorDeviceID: "ios-1-device",
-		CreatedAtMS:         1,
-	}); err != nil {
-		t.Fatalf("CreateFleet: %v", err)
-	}
-	handler, err := NewHandler(Config{
-		AuthMode: AuthModeDevice,
-		Devices:  reg,
-		Service:  mustMailboxService(t, gid),
-		State:    state,
-		Clock:    func() time.Time { return time.UnixMilli(10_000) },
-	})
-	if err != nil {
-		t.Fatalf("NewHandler: %v", err)
-	}
-
-	disabled := doSignedJSONRequest[errorEnvelope](t, handler, coordinatorPriv, http.MethodGet, "/v1/fleets", nil, http.StatusNotFound, 10_000, "nonce-fleet-disabled")
-	if disabled.Error.Code != "feature_disabled" || disabled.Error.Feature != entfeatures.FeatureFleet {
-		t.Fatalf("disabled fleet response = %+v", disabled)
-	}
-
-	taskDisabledHandler, err := NewHandler(Config{
-		AuthMode: AuthModeDevice,
-		Devices:  reg,
-		Service:  mustMailboxService(t, gid),
-		State:    state,
-		Features: entfeatures.Flags{FleetEnabled: true},
-	})
-	if err != nil {
-		t.Fatalf("NewHandler task-disabled: %v", err)
-	}
-	tasksDisabled := doSignedJSONRequest[errorEnvelope](t, taskDisabledHandler, coordinatorPriv, http.MethodGet, "/v1/fleets/fleet-disabled/tasks", nil, http.StatusNotFound, 10_001, "nonce-tasks-disabled")
-	if tasksDisabled.Error.Code != "feature_disabled" || tasksDisabled.Error.Feature != entfeatures.FeatureTasks {
-		t.Fatalf("disabled tasks response = %+v", tasksDisabled)
-	}
-}
-
-func TestHandlerFleetSignRequestsAreHiddenWhenFleetDisabled(t *testing.T) {
-	gid := testGroupID(92)
-	_, priv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("GenerateKey: %v", err)
-	}
-	reg, err := NewDeviceRegistry([]Device{{
-		ID:          "ios-1-device",
-		PublicKey:   priv.Public().(ed25519.PublicKey),
-		Groups:      []entmoot.GroupID{gid},
-		AdminGroups: []entmoot.GroupID{gid},
-		ClientIDs:   []string{"ios-1"},
-	}})
-	if err != nil {
-		t.Fatalf("NewDeviceRegistry: %v", err)
-	}
-	state := NewMemoryStateStore()
-	fleetReq, err := state.CreateSignRequest(context.Background(), SignRequest{
-		DeviceID: "ios-1-device",
-		Kind:     signRequestKindFleetCreate,
-		Payload:  json.RawMessage(`{"name":"Fleet"}`),
-	})
-	if err != nil {
-		t.Fatalf("CreateSignRequest fleet: %v", err)
-	}
-	groupReq, err := state.CreateSignRequest(context.Background(), SignRequest{
-		DeviceID: "ios-1-device",
-		Kind:     signRequestKindGroupCreate,
-		GroupID:  gid,
-		Payload:  json.RawMessage(`{"name":"Group"}`),
-	})
-	if err != nil {
-		t.Fatalf("CreateSignRequest group: %v", err)
-	}
-	handler, err := NewHandler(Config{
-		AuthMode: AuthModeDevice,
-		Devices:  reg,
-		Service:  mustMailboxService(t, gid),
-		State:    state,
-		Clock:    func() time.Time { return time.UnixMilli(10_000) },
-	})
-	if err != nil {
-		t.Fatalf("NewHandler: %v", err)
-	}
-
-	list := doSignedJSONRequest[struct {
-		SignRequests []SignRequest `json:"sign_requests"`
-	}](t, handler, priv, http.MethodGet, "/v1/sign-requests", nil, http.StatusOK, 10_000, "nonce-sign-requests")
-	if len(list.SignRequests) != 1 || list.SignRequests[0].ID != groupReq.ID {
-		t.Fatalf("sign requests = %+v, want only group request %s", list.SignRequests, groupReq.ID)
-	}
-	hidden := doSignedJSONRequest[errorEnvelope](t, handler, priv, http.MethodGet, "/v1/sign-requests/"+fleetReq.ID, nil, http.StatusNotFound, 10_001, "nonce-fleet-sign-request")
-	if hidden.Error.Code != "feature_disabled" || hidden.Error.Feature != entfeatures.FeatureFleet {
-		t.Fatalf("hidden fleet sign request response = %+v", hidden)
-	}
-}
-
-func TestHandlerFleetTasksCreateAssignSubmitComplete(t *testing.T) {
-	gid := testGroupID(91)
-	_, coordinatorPriv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("GenerateKey coordinator: %v", err)
-	}
-	agentPub, agentPriv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("GenerateKey agent: %v", err)
-	}
-	agentTwoPub, agentTwoPriv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("GenerateKey second agent: %v", err)
-	}
-	reg, err := NewDeviceRegistry([]Device{
-		{ID: "ios-1-device", PublicKey: coordinatorPriv.Public().(ed25519.PublicKey), ClientIDs: []string{"ios-1"}},
-		{ID: "agent-device", PublicKey: agentPriv.Public().(ed25519.PublicKey), Groups: []entmoot.GroupID{gid}, PilotNodeID: 45493, EntmootPubKey: agentPub},
-		{ID: "agent-two-device", PublicKey: agentTwoPriv.Public().(ed25519.PublicKey), Groups: []entmoot.GroupID{gid}, PilotNodeID: 45494, EntmootPubKey: agentTwoPub},
-	})
-	if err != nil {
-		t.Fatalf("NewDeviceRegistry: %v", err)
-	}
-	state := NewMemoryStateStore()
-	coordinator := entmoot.NodeInfo{PilotNodeID: 45491, EntmootPubKey: []byte("coordinator")}
-	if _, err := state.CreateFleet(context.Background(), FleetRecord{
-		FleetID:             "fleet-tasks",
-		Name:                "Fleet Tasks",
-		ControlGroupID:      gid,
-		Coordinator:         coordinator,
-		CoordinatorDeviceID: "ios-1-device",
-		CreatedAtMS:         1,
-	}); err != nil {
-		t.Fatalf("CreateFleet: %v", err)
-	}
-	for _, member := range []FleetMemberRecord{
-		{FleetID: "fleet-tasks", NodeID: coordinator.PilotNodeID, EntmootPubKey: base64.StdEncoding.EncodeToString(coordinator.EntmootPubKey), Role: FleetRoleCoordinator, Status: FleetMemberActive},
-		{FleetID: "fleet-tasks", NodeID: 1, EntmootPubKey: base64.StdEncoding.EncodeToString([]byte("wrapped")), Role: FleetRoleAgent, Status: FleetMemberActive},
-		{FleetID: "fleet-tasks", NodeID: 45493, EntmootPubKey: base64.StdEncoding.EncodeToString(agentPub), Role: FleetRoleAgent, Status: FleetMemberActive},
-		{FleetID: "fleet-tasks", NodeID: 45494, EntmootPubKey: base64.StdEncoding.EncodeToString(agentTwoPub), Role: FleetRoleAgent, Status: FleetMemberActive},
-	} {
-		if _, err := state.UpsertFleetMember(context.Background(), member); err != nil {
-			t.Fatalf("UpsertFleetMember: %v", err)
-		}
-	}
-	handler := testMobileHandlerFull(t, gid, reg, nil, func() time.Time { return time.UnixMilli(20_000) }, nil, state, nil)
-
-	create := doSignedJSONRequest[struct {
-		Task     FleetTaskRecord       `json:"task"`
-		Activity []FleetActivityRecord `json:"activity"`
-	}](t, handler, coordinatorPriv, http.MethodPost, "/v1/fleets/fleet-tasks/tasks", map[string]any{
-		"title":            "Audit deploy",
-		"description":      "Check peers",
-		"mode":             FleetTaskModeDirectAssignment,
-		"assignee_node_id": 45493,
-	}, http.StatusCreated, 20_000, "nonce-task-create")
-	if create.Task.Status != FleetTaskStatusAssigned || create.Task.Assignee == nil || create.Task.Assignee.PilotNodeID != 45493 {
-		t.Fatalf("created task = %+v, want assigned to agent", create.Task)
-	}
-	if len(create.Activity) != 2 || create.Activity[0].Type != "task.opened" || create.Activity[1].Type != "task.assigned" {
-		t.Fatalf("create activity = %+v", create.Activity)
-	}
-	overflowCreate := doSignedJSONRequest[errorEnvelope](t, handler, coordinatorPriv, http.MethodPost, "/v1/fleets/fleet-tasks/tasks", map[string]any{
-		"title":            "Overflow assignee",
-		"mode":             FleetTaskModeDirectAssignment,
-		"assignee_node_id": uint64(4294967297),
-	}, http.StatusBadRequest, 20_012, "nonce-task-create-overflow")
-	if overflowCreate.Error.Code != "bad_request" {
-		t.Fatalf("overflow create error = %+v", overflowCreate.Error)
-	}
-
-	list := doSignedJSONRequest[struct {
-		Tasks []FleetTaskRecord `json:"tasks"`
-	}](t, handler, coordinatorPriv, http.MethodGet, "/v1/fleets/fleet-tasks/tasks?status=assigned", nil, http.StatusOK, 20_001, "nonce-task-list")
-	if len(list.Tasks) != 1 || list.Tasks[0].TaskID != create.Task.TaskID {
-		t.Fatalf("task list = %+v", list.Tasks)
-	}
-	overflowAssign := doSignedJSONRequest[errorEnvelope](t, handler, coordinatorPriv, http.MethodPost, "/v1/fleets/fleet-tasks/tasks/"+url.PathEscape(create.Task.TaskID)+"/assign", map[string]any{
-		"assignee_node_id": uint64(4294967297),
-	}, http.StatusBadRequest, 20_013, "nonce-task-assign-overflow")
-	if overflowAssign.Error.Code != "bad_request" {
-		t.Fatalf("overflow assign error = %+v", overflowAssign.Error)
-	}
-
-	submitAssigned := doSignedJSONRequestFor[struct {
-		Task       FleetTaskRecord           `json:"task"`
-		Submission FleetTaskSubmissionRecord `json:"submission"`
-	}](t, handler, "agent-device", agentPriv, http.MethodPost, "/v1/fleets/fleet-tasks/tasks/"+url.PathEscape(create.Task.TaskID)+"/submit", map[string]any{
-		"content": "direct done",
-	}, http.StatusOK, 20_002, "nonce-task-submit-direct")
-	if submitAssigned.Task.Status != FleetTaskStatusSubmitted || submitAssigned.Submission.Author.PilotNodeID != 45493 {
-		t.Fatalf("direct submit = %+v / %+v", submitAssigned.Task, submitAssigned.Submission)
-	}
-
-	complete := doSignedJSONRequest[struct {
-		Task FleetTaskRecord `json:"task"`
-	}](t, handler, coordinatorPriv, http.MethodPost, "/v1/fleets/fleet-tasks/tasks/"+url.PathEscape(create.Task.TaskID)+"/complete", nil, http.StatusOK, 20_003, "nonce-task-complete")
-	if complete.Task.Status != FleetTaskStatusCompleted || complete.Task.CompletedAtMS == 0 {
-		t.Fatalf("complete task = %+v", complete.Task)
-	}
-
-	claimable := doSignedJSONRequest[struct {
-		Task FleetTaskRecord `json:"task"`
-	}](t, handler, coordinatorPriv, http.MethodPost, "/v1/fleets/fleet-tasks/tasks", map[string]any{
-		"title": "Claim this",
-		"mode":  FleetTaskModeFirstClaim,
-	}, http.StatusCreated, 20_004, "nonce-task-create-claim")
-	claim := doSignedJSONRequestFor[struct {
-		Task FleetTaskRecord `json:"task"`
-	}](t, handler, "agent-device", agentPriv, http.MethodPost, "/v1/fleets/fleet-tasks/tasks/"+url.PathEscape(claimable.Task.TaskID)+"/claim", nil, http.StatusOK, 20_005, "nonce-task-claim")
-	if claim.Task.Status != FleetTaskStatusAssigned || claim.Task.Assignee == nil || claim.Task.Assignee.PilotNodeID != 45493 {
-		t.Fatalf("claim task = %+v", claim.Task)
-	}
-	claimAgain := doSignedJSONRequestFor[errorEnvelope](t, handler, "agent-device", agentPriv, http.MethodPost, "/v1/fleets/fleet-tasks/tasks/"+url.PathEscape(claimable.Task.TaskID)+"/claim", nil, http.StatusConflict, 20_010, "nonce-task-claim-again")
-	if claimAgain.Error.Code != "invalid_task_transition" {
-		t.Fatalf("claim again error = %+v", claimAgain.Error)
-	}
-
-	idempotentClaimable := doSignedJSONRequest[struct {
-		Task FleetTaskRecord `json:"task"`
-	}](t, handler, coordinatorPriv, http.MethodPost, "/v1/fleets/fleet-tasks/tasks", map[string]any{
-		"title": "Claim with shared key",
-		"mode":  FleetTaskModeFirstClaim,
-	}, http.StatusCreated, 20_014, "nonce-task-create-idem-claim")
-	firstIdempotentClaim := doSignedJSONRequestForWithIdempotency[struct {
-		Task FleetTaskRecord `json:"task"`
-	}](t, handler, "agent-device", agentPriv, http.MethodPost, "/v1/fleets/fleet-tasks/tasks/"+url.PathEscape(idempotentClaimable.Task.TaskID)+"/claim", nil, http.StatusOK, 20_015, "nonce-task-idem-claim-a", "same-task-claim")
-	if firstIdempotentClaim.Task.Assignee == nil || firstIdempotentClaim.Task.Assignee.PilotNodeID != 45493 {
-		t.Fatalf("first idempotent claim = %+v", firstIdempotentClaim.Task)
-	}
-	secondIdempotentClaim := doSignedJSONRequestForWithIdempotency[errorEnvelope](t, handler, "agent-two-device", agentTwoPriv, http.MethodPost, "/v1/fleets/fleet-tasks/tasks/"+url.PathEscape(idempotentClaimable.Task.TaskID)+"/claim", nil, http.StatusConflict, 20_016, "nonce-task-idem-claim-b", "same-task-claim")
-	if secondIdempotentClaim.Error.Code != "invalid_task_transition" {
-		t.Fatalf("second idempotent claim error = %+v", secondIdempotentClaim.Error)
-	}
-
-	errResp := doSignedJSONRequestFor[errorEnvelope](t, handler, "ios-1-device", coordinatorPriv, http.MethodPost, "/v1/fleets/fleet-tasks/tasks", map[string]any{
-		"title": "Bad mode",
-		"mode":  "frist_claim",
-	}, http.StatusBadRequest, 20_006, "nonce-task-bad-mode")
-	if errResp.Error.Code != "bad_request" {
-		t.Fatalf("bad mode error = %+v", errResp.Error)
-	}
-
-	open := doSignedJSONRequest[struct {
-		Task FleetTaskRecord `json:"task"`
-	}](t, handler, coordinatorPriv, http.MethodPost, "/v1/fleets/fleet-tasks/tasks", map[string]any{
-		"title": "Open submission",
-		"mode":  FleetTaskModeOpenSubmission,
-	}, http.StatusCreated, 20_007, "nonce-task-create-open")
-	assignOpen := doSignedJSONRequest[errorEnvelope](t, handler, coordinatorPriv, http.MethodPost, "/v1/fleets/fleet-tasks/tasks/"+url.PathEscape(open.Task.TaskID)+"/assign", map[string]any{
-		"assignee_node_id": 45493,
-	}, http.StatusConflict, 20_011, "nonce-task-assign-open")
-	if assignOpen.Error.Code != "invalid_task_transition" {
-		t.Fatalf("assign open error = %+v", assignOpen.Error)
-	}
-	submit := doSignedJSONRequest[struct {
-		Task       FleetTaskRecord           `json:"task"`
-		Submission FleetTaskSubmissionRecord `json:"submission"`
-	}](t, handler, coordinatorPriv, http.MethodPost, "/v1/fleets/fleet-tasks/tasks/"+url.PathEscape(open.Task.TaskID)+"/submit", map[string]any{
-		"content": "done",
-	}, http.StatusOK, 20_008, "nonce-task-submit")
-	if submit.Task.Status != FleetTaskStatusOpen || submit.Submission.Status != FleetTaskSubmissionPending {
-		t.Fatalf("submit = %+v / %+v", submit.Task, submit.Submission)
-	}
-	submitTwo := doSignedJSONRequestFor[struct {
-		Task       FleetTaskRecord           `json:"task"`
-		Submission FleetTaskSubmissionRecord `json:"submission"`
-	}](t, handler, "agent-two-device", agentTwoPriv, http.MethodPost, "/v1/fleets/fleet-tasks/tasks/"+url.PathEscape(open.Task.TaskID)+"/submit", map[string]any{
-		"content": "done too",
-	}, http.StatusOK, 20_017, "nonce-task-submit-open-second")
-	if submitTwo.Task.Status != FleetTaskStatusOpen || submitTwo.Submission.Author.PilotNodeID != 45494 {
-		t.Fatalf("second open submit = %+v / %+v", submitTwo.Task, submitTwo.Submission)
-	}
-
-	detail := doSignedJSONRequest[struct {
-		Task        FleetTaskRecord             `json:"task"`
-		Submissions []FleetTaskSubmissionRecord `json:"submissions"`
-	}](t, handler, coordinatorPriv, http.MethodGet, "/v1/fleets/fleet-tasks/tasks/"+url.PathEscape(open.Task.TaskID), nil, http.StatusOK, 20_009, "nonce-task-detail")
-	if detail.Task.Status != FleetTaskStatusOpen || len(detail.Submissions) != 2 {
-		t.Fatalf("detail = %+v submissions=%+v", detail.Task, detail.Submissions)
-	}
-}
-
-func TestHandlerFleetTasksMemberAuthAndEvents(t *testing.T) {
-	gid := testGroupID(92)
-	coordinatorPub, _, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("GenerateKey coordinator: %v", err)
-	}
-	agentPub, agentPriv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("GenerateKey agent: %v", err)
-	}
-	reg, err := NewDeviceRegistry([]Device{{
-		ID:        "ios-1-device",
-		PublicKey: coordinatorPub,
-	}})
-	if err != nil {
-		t.Fatalf("NewDeviceRegistry: %v", err)
-	}
-	state := NewMemoryStateStore()
-	coordinator := entmoot.NodeInfo{PilotNodeID: 45491, EntmootPubKey: coordinatorPub}
-	if _, err := state.CreateFleet(context.Background(), FleetRecord{
-		FleetID:             "fleet-member-tasks",
-		Name:                "Member Tasks",
-		ControlGroupID:      gid,
-		Coordinator:         coordinator,
-		CoordinatorDeviceID: "ios-1-device",
-		CreatedAtMS:         1,
-	}); err != nil {
-		t.Fatalf("CreateFleet: %v", err)
-	}
-	for _, member := range []FleetMemberRecord{
-		{FleetID: "fleet-member-tasks", NodeID: coordinator.PilotNodeID, EntmootPubKey: base64.StdEncoding.EncodeToString(coordinator.EntmootPubKey), Role: FleetRoleCoordinator, Status: FleetMemberActive},
-		{FleetID: "fleet-member-tasks", NodeID: 45493, EntmootPubKey: base64.StdEncoding.EncodeToString(agentPub), Role: FleetRoleAgent, Status: FleetMemberInvited, InvitedAtMS: 2},
-		{FleetID: "fleet-member-tasks", NodeID: 45494, EntmootPubKey: base64.StdEncoding.EncodeToString([]byte("removed")), Role: FleetRoleAgent, Status: FleetMemberRemoved},
-	} {
-		if _, err := state.UpsertFleetMember(context.Background(), member); err != nil {
-			t.Fatalf("UpsertFleetMember: %v", err)
-		}
-	}
-	if _, err := state.CreateFleetInvite(context.Background(), FleetInviteRecord{
-		FleetID:       "fleet-member-tasks",
-		NodeID:        45493,
-		EntmootPubKey: base64.StdEncoding.EncodeToString(agentPub),
-		Status:        FleetMemberInvited,
-		CreatedAtMS:   2,
-		UpdatedAtMS:   2,
-	}); err != nil {
-		t.Fatalf("CreateFleetInvite: %v", err)
-	}
-	taskEvents := &fakeTaskEventPublisher{localInfo: coordinator}
-	catalog := &fakeCatalog{members: []MemberSummary{
-		{NodeID: coordinator.PilotNodeID, EntmootPubKey: base64.StdEncoding.EncodeToString(coordinator.EntmootPubKey), Hostname: "vps"},
-		{NodeID: 45493, EntmootPubKey: base64.StdEncoding.EncodeToString(agentPub), Hostname: "deimos"},
-	}}
-	handler := testMobileHandlerFull(t, gid, reg, catalog, func() time.Time { return time.UnixMilli(30_000) }, nil, state, nil)
-	handler.(*Handler).taskEvents = taskEvents
-
-	signRequestsDenied := doMemberSignedJSONRequest[errorEnvelope](t, handler, 45493, agentPriv, http.MethodGet, "/v1/sign-requests", nil, http.StatusUnauthorized, 29_999, "nonce-member-sign-requests")
-	if signRequestsDenied.Error.Code != "unauthorized" {
-		t.Fatalf("member sign request list error = %+v", signRequestsDenied.Error)
-	}
-
-	session := doMemberSignedJSONRequest[struct {
-		Member MemberAuth `json:"member"`
-	}](t, handler, 45493, agentPriv, http.MethodGet, "/v1/session", nil, http.StatusOK, 29_999, "nonce-member-session")
-	if session.Member.NodeID != 45493 || !bytes.Equal(session.Member.EntmootPubKey, agentPub) {
-		t.Fatalf("member session = %+v", session.Member)
-	}
-
-	fleets := doMemberSignedJSONRequest[struct {
-		Fleets []FleetRecord `json:"fleets"`
-	}](t, handler, 45493, agentPriv, http.MethodGet, "/v1/fleets?control_group_id="+url.QueryEscape(gid.String()), nil, http.StatusOK, 30_000, "nonce-member-fleet-list")
-	if len(fleets.Fleets) != 1 || fleets.Fleets[0].FleetID != "fleet-member-tasks" {
-		t.Fatalf("member fleets = %+v", fleets.Fleets)
-	}
-
-	created := doMemberSignedJSONRequest[struct {
-		Task     FleetTaskRecord       `json:"task"`
-		Activity []FleetActivityRecord `json:"activity"`
-	}](t, handler, 45493, agentPriv, http.MethodPost, "/v1/fleets/fleet-member-tasks/tasks", map[string]any{
-		"title": "Check deploy",
-		"mode":  FleetTaskModeOpenSubmission,
-	}, http.StatusCreated, 30_001, "nonce-member-task-create")
-	if created.Task.Status != FleetTaskStatusProposed || created.Task.Creator.PilotNodeID != 45493 {
-		t.Fatalf("member-created task = %+v", created.Task)
-	}
-	if len(created.Activity) != 1 || created.Activity[0].Type != "task.proposed" {
-		t.Fatalf("created activity = %+v", created.Activity)
-	}
-	if len(taskEvents.events) != 1 || taskEvents.events[0].groupID != gid || taskEvents.events[0].topics[0] != "fleet/tasks" {
-		t.Fatalf("task events = %+v", taskEvents.events)
-	}
-
-	list := doMemberSignedJSONRequest[struct {
-		Tasks []FleetTaskRecord `json:"tasks"`
-	}](t, handler, 45493, agentPriv, http.MethodGet, "/v1/fleets/fleet-member-tasks/tasks?status=proposed", nil, http.StatusOK, 30_002, "nonce-member-task-list")
-	if len(list.Tasks) != 1 || list.Tasks[0].TaskID != created.Task.TaskID {
-		t.Fatalf("member task list = %+v", list.Tasks)
-	}
-
-	bearerModeHandler := testMobileHandlerFull(t, gid, nil, catalog, func() time.Time { return time.UnixMilli(31_000) }, nil, state, nil)
-	bearerModeList := doMemberSignedJSONRequest[struct {
-		Tasks []FleetTaskRecord `json:"tasks"`
-	}](t, bearerModeHandler, 45493, agentPriv, http.MethodGet, "/v1/fleets/fleet-member-tasks/tasks?status=proposed", nil, http.StatusOK, 31_000, "nonce-member-task-list-bearer-mode")
-	if len(bearerModeList.Tasks) != 1 || bearerModeList.Tasks[0].TaskID != created.Task.TaskID {
-		t.Fatalf("bearer-mode member task list = %+v", bearerModeList.Tasks)
-	}
-
-	reqWithBearer := signedMemberRequest(t, 45493, agentPriv, http.MethodGet, "/v1/fleets/fleet-member-tasks/tasks?status=proposed", nil, 31_001, "nonce-member-task-list-with-bearer")
-	reqWithBearer.Header.Set("Authorization", "Bearer secret")
-	respWithBearer := httptest.NewRecorder()
-	bearerModeHandler.ServeHTTP(respWithBearer, reqWithBearer)
-	if respWithBearer.Code != http.StatusOK {
-		t.Fatalf("bearer-mode member task list with bearer status = %d, want %d\nbody=%s", respWithBearer.Code, http.StatusOK, respWithBearer.Body.String())
-	}
-
-	replay := doMemberSignedJSONRequest[errorEnvelope](t, handler, 45493, agentPriv, http.MethodGet, "/v1/fleets/fleet-member-tasks/tasks", nil, http.StatusUnauthorized, 30_002, "nonce-member-task-list")
-	if replay.Error.Code != "unauthorized" {
-		t.Fatalf("replay error = %+v", replay.Error)
-	}
-
-	_, otherPriv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("GenerateKey other: %v", err)
-	}
-	forbidden := doMemberSignedJSONRequest[errorEnvelope](t, handler, 45493, otherPriv, http.MethodGet, "/v1/fleets/fleet-member-tasks/tasks", nil, http.StatusForbidden, 30_003, "nonce-member-wrong-key")
-	if forbidden.Error.Code != "forbidden" {
-		t.Fatalf("wrong key error = %+v", forbidden.Error)
-	}
-}
-
-func TestHandlerFleetCommandsCoordinatorPublishesSafeCommand(t *testing.T) {
-	gid := testGroupID(94)
-	coordinatorPub, coordinatorPriv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("GenerateKey coordinator: %v", err)
-	}
-	agentPub, _, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("GenerateKey agent: %v", err)
-	}
-	reg, err := NewDeviceRegistry([]Device{{
-		ID:        "ios-1-device",
-		PublicKey: coordinatorPub,
-	}})
-	if err != nil {
-		t.Fatalf("NewDeviceRegistry: %v", err)
-	}
-	state := NewMemoryStateStore()
-	coordinator := entmoot.NodeInfo{PilotNodeID: 45491, EntmootPubKey: coordinatorPub}
-	if _, err := state.CreateFleet(context.Background(), FleetRecord{
-		FleetID:             "fleet-commands",
-		Name:                "Fleet Commands",
-		ControlGroupID:      gid,
-		Coordinator:         coordinator,
-		CoordinatorDeviceID: "ios-1-device",
-		Status:              FleetStatusActive,
-		CreatedAtMS:         1,
-	}); err != nil {
-		t.Fatalf("CreateFleet: %v", err)
-	}
-	for _, member := range []FleetMemberRecord{
-		{FleetID: "fleet-commands", NodeID: coordinator.PilotNodeID, EntmootPubKey: base64.StdEncoding.EncodeToString(coordinator.EntmootPubKey), Role: FleetRoleCoordinator, Status: FleetMemberActive},
-		{FleetID: "fleet-commands", NodeID: 45493, EntmootPubKey: base64.StdEncoding.EncodeToString(agentPub), Role: FleetRoleAgent, Status: FleetMemberActive},
-	} {
-		if _, err := state.UpsertFleetMember(context.Background(), member); err != nil {
-			t.Fatalf("UpsertFleetMember: %v", err)
-		}
-	}
-	taskEvents := &fakeTaskEventPublisher{localInfo: coordinator}
-	handler := testMobileHandlerFull(t, gid, reg, nil, func() time.Time { return time.UnixMilli(40_000) }, nil, state, nil)
-	handler.(*Handler).taskEvents = taskEvents
-
-	created := doSignedJSONRequest[struct {
-		Command  FleetCommandEnvelope `json:"command"`
-		Activity FleetActivityRecord  `json:"activity"`
-	}](t, handler, coordinatorPriv, http.MethodPost, "/v1/fleets/fleet-commands/commands", map[string]any{
-		"target":         FleetCommandTargetNode,
-		"target_node_id": 45493,
-		"action":         FleetCommandActionEntmootInfo,
-	}, http.StatusAccepted, 40_000, "nonce-command-create")
-	if created.Command.Action != FleetCommandActionEntmootInfo || created.Command.Target.PilotNodeID != 45493 || !created.Command.AutoAccept {
-		t.Fatalf("command = %+v", created.Command)
-	}
-	if created.Activity.Type != "command.sent" {
-		t.Fatalf("activity = %+v", created.Activity)
-	}
-	ambiguousTarget := doSignedJSONRequest[errorEnvelope](t, handler, coordinatorPriv, http.MethodPost, "/v1/fleets/fleet-commands/commands", map[string]any{
-		"target_node_id": 45493,
-		"action":         FleetCommandActionEntmootInfo,
-	}, http.StatusBadRequest, 40_012, "nonce-command-ambiguous-target")
-	if ambiguousTarget.Error.Code != "bad_request" {
-		t.Fatalf("ambiguous target error = %+v", ambiguousTarget.Error)
-	}
-	if len(taskEvents.events) != 1 || taskEvents.events[0].groupID != gid || taskEvents.events[0].topics[0] != "fleet/commands" {
-		t.Fatalf("command events = %+v", taskEvents.events)
-	}
-	var event FleetCommandEnvelope
-	if err := json.Unmarshal(taskEvents.events[0].content, &event); err != nil {
-		t.Fatalf("command event decode: %v", err)
-	}
-	if event.CommandID != created.Command.CommandID || event.Type != FleetCommandMessageType {
-		t.Fatalf("command event = %+v", event)
-	}
-	if err := state.UpsertFleetCommandResult(context.Background(), FleetCommandResultEnvelope{
-		Type:          FleetCommandResultType,
-		Version:       1,
-		CommandID:     created.Command.CommandID,
-		FleetID:       created.Command.FleetID,
-		AgentNodeID:   45493,
-		Action:        created.Command.Action,
-		Status:        FleetCommandStatusCompleted,
-		Summary:       "reported info",
-		Output:        `{"finalAssistantVisibleText":"done"}`,
-		StartedAtMS:   41_000,
-		CompletedAtMS: 42_000,
-	}); err != nil {
-		t.Fatalf("UpsertFleetCommandResult: %v", err)
-	}
-	list := doSignedJSONRequest[struct {
-		Commands []FleetCommandSummaryRecord `json:"commands"`
-	}](t, handler, coordinatorPriv, http.MethodGet, "/v1/fleets/fleet-commands/commands?status=completed", nil, http.StatusOK, 40_001, "nonce-command-list")
-	if len(list.Commands) != 1 || list.Commands[0].Command.CommandID != created.Command.CommandID {
-		t.Fatalf("command list = %+v", list.Commands)
-	}
-	if list.Commands[0].Status != FleetCommandStatusCompleted || list.Commands[0].ResultCount != 1 || list.Commands[0].LatestResult == nil {
-		t.Fatalf("command summary = %+v", list.Commands[0])
-	}
-	detail := doSignedJSONRequest[struct {
-		Command     FleetCommandEnvelope         `json:"command"`
-		Status      string                       `json:"status"`
-		Results     []FleetCommandResultEnvelope `json:"results"`
-		UpdatedAtMS int64                        `json:"updated_at_ms"`
-	}](t, handler, coordinatorPriv, http.MethodGet, "/v1/fleets/fleet-commands/commands/"+url.PathEscape(created.Command.CommandID), nil, http.StatusOK, 40_002, "nonce-command-detail")
-	if detail.Command.CommandID != created.Command.CommandID || detail.Status != FleetCommandStatusCompleted || len(detail.Results) != 1 || detail.Results[0].Output == "" {
-		t.Fatalf("command detail = %+v", detail)
-	}
-	if err := state.UpsertFleetCommandResult(context.Background(), FleetCommandResultEnvelope{
-		Type:          FleetCommandResultType,
-		Version:       1,
-		CommandID:     created.Command.CommandID,
-		FleetID:       created.Command.FleetID,
-		AgentNodeID:   45494,
-		Action:        created.Command.Action,
-		Status:        FleetCommandStatusFailed,
-		Summary:       "other agent failed later",
-		StartedAtMS:   43_000,
-		CompletedAtMS: 44_000,
-	}); err != nil {
-		t.Fatalf("UpsertFleetCommandResult second agent: %v", err)
-	}
-	agentList := doSignedJSONRequest[struct {
-		Commands []FleetCommandSummaryRecord `json:"commands"`
-	}](t, handler, coordinatorPriv, http.MethodGet, "/v1/fleets/fleet-commands/commands?status=completed&agent_node_id=45493", nil, http.StatusOK, 40_003, "nonce-command-agent-list")
-	if len(agentList.Commands) != 1 || agentList.Commands[0].Command.CommandID != created.Command.CommandID {
-		t.Fatalf("agent command list = %+v", agentList.Commands)
-	}
-	if agentList.Commands[0].LatestResult == nil || agentList.Commands[0].LatestResult.AgentNodeID != 45493 {
-		t.Fatalf("agent command summary = %+v", agentList.Commands[0])
-	}
-	duplicateCommand := created.Command
-	duplicateCommand.CommandID = "cmd-duplicate"
-	duplicateCommand.CreatedAtMS = 45_000
-	if _, err := state.UpsertFleetCommand(context.Background(), duplicateCommand); err != nil {
-		t.Fatalf("UpsertFleetCommand duplicate: %v", err)
-	}
-	if err := state.UpsertFleetCommandResult(context.Background(), FleetCommandResultEnvelope{
-		Type:          FleetCommandResultType,
-		Version:       1,
-		CommandID:     duplicateCommand.CommandID,
-		FleetID:       duplicateCommand.FleetID,
-		AgentNodeID:   45493,
-		Action:        duplicateCommand.Action,
-		Status:        FleetCommandStatusDuplicate,
-		Summary:       "already handled",
-		StartedAtMS:   46_000,
-		CompletedAtMS: 47_000,
-	}); err != nil {
-		t.Fatalf("UpsertFleetCommandResult duplicate: %v", err)
-	}
-	duplicateList := doSignedJSONRequest[struct {
-		Commands []FleetCommandSummaryRecord `json:"commands"`
-	}](t, handler, coordinatorPriv, http.MethodGet, "/v1/fleets/fleet-commands/commands?status=duplicate", nil, http.StatusOK, 40_004, "nonce-command-duplicate-list")
-	if len(duplicateList.Commands) != 1 || duplicateList.Commands[0].Command.CommandID != duplicateCommand.CommandID || duplicateList.Commands[0].Status != FleetCommandStatusDuplicate {
-		t.Fatalf("duplicate command list = %+v", duplicateList.Commands)
-	}
-}
-
-func TestHandlerFleetCommandHistoryRejectsSpoofedTopicMessages(t *testing.T) {
-	gid := testGroupID(95)
-	coordinatorPub, coordinatorPriv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("GenerateKey coordinator: %v", err)
-	}
-	agentPub, _, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("GenerateKey agent: %v", err)
-	}
-	otherPub, _, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("GenerateKey other agent: %v", err)
-	}
-	reg, err := NewDeviceRegistry([]Device{{
-		ID:        "ios-1-device",
-		PublicKey: coordinatorPub,
-	}})
-	if err != nil {
-		t.Fatalf("NewDeviceRegistry: %v", err)
-	}
-	state := NewMemoryStateStore()
-	coordinator := entmoot.NodeInfo{PilotNodeID: 45491, EntmootPubKey: coordinatorPub}
-	if _, err := state.CreateFleet(context.Background(), FleetRecord{
-		FleetID:             "fleet-history-auth",
-		Name:                "Fleet History Auth",
-		ControlGroupID:      gid,
-		Coordinator:         coordinator,
-		CoordinatorDeviceID: "ios-1-device",
-		Status:              FleetStatusActive,
-		CreatedAtMS:         1,
-	}); err != nil {
-		t.Fatalf("CreateFleet: %v", err)
-	}
-	for _, member := range []FleetMemberRecord{
-		{FleetID: "fleet-history-auth", NodeID: coordinator.PilotNodeID, EntmootPubKey: base64.StdEncoding.EncodeToString(coordinator.EntmootPubKey), Role: FleetRoleCoordinator, Status: FleetMemberActive},
-		{FleetID: "fleet-history-auth", NodeID: 45493, EntmootPubKey: base64.StdEncoding.EncodeToString(agentPub), Role: FleetRoleAgent, Status: FleetMemberActive},
-		{FleetID: "fleet-history-auth", NodeID: 45494, EntmootPubKey: base64.StdEncoding.EncodeToString(otherPub), Role: FleetRoleAgent, Status: FleetMemberActive},
-	} {
-		if _, err := state.UpsertFleetMember(context.Background(), member); err != nil {
-			t.Fatalf("UpsertFleetMember: %v", err)
-		}
-	}
-	validCommand := FleetCommandEnvelope{
-		Type:           FleetCommandMessageType,
-		Version:        1,
-		CommandID:      "cmd-valid-history",
-		FleetID:        "fleet-history-auth",
-		ControlGroupID: gid,
-		IssuerNodeID:   coordinator.PilotNodeID,
-		Target:         FleetCommandTarget{Kind: FleetCommandTargetNode, PilotNodeID: 45493},
-		Action:         FleetCommandActionEntmootInfo,
-		AutoAccept:     true,
-		CreatedAtMS:    50_000,
-		ExpiresAtMS:    time.Now().Add(time.Hour).UnixMilli(),
-	}
-	if _, err := state.UpsertFleetCommand(context.Background(), validCommand); err != nil {
-		t.Fatalf("UpsertFleetCommand valid: %v", err)
-	}
-	spoofedCommand := validCommand
-	spoofedCommand.CommandID = "cmd-spoofed-history"
-	spoofedCommand.CreatedAtMS = 51_000
-	spoofedCommand.ExpiresAtMS = 61_000
-	spoofedResult := FleetCommandResultEnvelope{
-		Type:          FleetCommandResultType,
-		Version:       1,
-		CommandID:     validCommand.CommandID,
-		FleetID:       validCommand.FleetID,
-		AgentNodeID:   45493,
-		Action:        validCommand.Action,
-		Status:        FleetCommandStatusCompleted,
-		Summary:       "spoofed",
-		StartedAtMS:   52_000,
-		CompletedAtMS: 53_000,
-	}
-	untargetedResult := spoofedResult
-	untargetedResult.AgentNodeID = 45494
-	untargetedResult.Summary = "untargeted"
-	untargetedResult.StartedAtMS = 53_500
-	untargetedResult.CompletedAtMS = 53_600
-	mbox := store.NewMemory()
-	for _, msg := range []entmoot.Message{
-		testTopicMessage(t, gid, 51_000, entmoot.NodeInfo{PilotNodeID: 45493, EntmootPubKey: agentPub}, []string{"fleet/commands"}, spoofedCommand),
-		testTopicMessage(t, gid, 52_000, entmoot.NodeInfo{PilotNodeID: 45494, EntmootPubKey: otherPub}, []string{"fleet/commands/results"}, spoofedResult),
-		testTopicMessage(t, gid, 53_000, entmoot.NodeInfo{PilotNodeID: 45494, EntmootPubKey: otherPub}, []string{"fleet/commands/results"}, untargetedResult),
-	} {
-		if _, err := mbox.Put(context.Background(), msg.GroupID, msg); err != nil {
-			t.Fatalf("Put topic message: %v", err)
-		}
-	}
-	svc, err := mailbox.New(mbox, nil)
-	if err != nil {
-		t.Fatalf("mailbox.New: %v", err)
-	}
-	handler := testMobileHandlerFull(t, gid, reg, nil, func() time.Time { return time.UnixMilli(54_000) }, nil, state, nil)
-	handler.(*Handler).service = svc
-
-	sentList := doSignedJSONRequest[struct {
-		Commands []FleetCommandSummaryRecord `json:"commands"`
-	}](t, handler, coordinatorPriv, http.MethodGet, "/v1/fleets/fleet-history-auth/commands?status=sent", nil, http.StatusOK, 54_000, "nonce-history-auth-sent")
-	if len(sentList.Commands) != 1 || sentList.Commands[0].Command.CommandID != validCommand.CommandID {
-		t.Fatalf("sent commands = %+v", sentList.Commands)
-	}
-	completedList := doSignedJSONRequest[struct {
-		Commands []FleetCommandSummaryRecord `json:"commands"`
-	}](t, handler, coordinatorPriv, http.MethodGet, "/v1/fleets/fleet-history-auth/commands?status=completed", nil, http.StatusOK, 54_001, "nonce-history-auth-completed")
-	if len(completedList.Commands) != 0 {
-		t.Fatalf("completed commands = %+v", completedList.Commands)
-	}
-}
-
-func TestHandlerFleetControlGroupReadAllowsCoordinatorDevice(t *testing.T) {
-	controlGID := testGroupID(31)
-	_, coordinatorPriv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("GenerateKey coordinator: %v", err)
-	}
-	_, otherPriv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("GenerateKey other: %v", err)
-	}
-	reg, err := NewDeviceRegistry([]Device{
-		{ID: "ios-1-device", PublicKey: coordinatorPriv.Public().(ed25519.PublicKey), ClientIDs: []string{"ios-1"}},
-		{ID: "other-device", PublicKey: otherPriv.Public().(ed25519.PublicKey), ClientIDs: []string{"ios-1"}},
-	})
-	if err != nil {
-		t.Fatalf("NewDeviceRegistry: %v", err)
-	}
-	state := NewMemoryStateStore()
-	if _, err := state.CreateFleet(context.Background(), FleetRecord{
-		FleetID:             "fleet-a",
-		Name:                "Fleet A",
-		ControlGroupID:      controlGID,
-		Coordinator:         entmoot.NodeInfo{PilotNodeID: 45491, EntmootPubKey: []byte("coordinator")},
-		CoordinatorDeviceID: "ios-1-device",
-		CreatedAtMS:         1,
-	}); err != nil {
-		t.Fatalf("CreateFleet: %v", err)
-	}
-	handler := testMobileHandlerFull(t, controlGID, reg, &fakeCatalog{
-		groups:  []GroupSummary{{GroupID: controlGID, Metadata: map[string]interface{}{"fleet_control": true}}},
-		members: []MemberSummary{{NodeID: 45491}},
-	}, func() time.Time { return time.UnixMilli(10_000) }, nil, state, nil)
-
-	doSignedJSONRequest[struct {
-		Members []MemberSummary `json:"members"`
-	}](t, handler, coordinatorPriv, http.MethodGet, "/v1/groups/"+url.PathEscape(controlGID.String())+"/members", nil, http.StatusOK, 10_000, "nonce-control-members")
-	doSignedJSONRequest[struct {
-		Messages []json.RawMessage `json:"messages"`
-	}](t, handler, coordinatorPriv, http.MethodGet, "/v1/groups/"+url.PathEscape(controlGID.String())+"/history?client_id=ios-1&limit=1", nil, http.StatusOK, 10_001, "nonce-control-history")
-	errResp := doSignedJSONRequestFor[errorEnvelope](t, handler, "other-device", otherPriv, http.MethodGet, "/v1/groups/"+url.PathEscape(controlGID.String())+"/history?client_id=ios-1&limit=1", nil, http.StatusForbidden, 10_002, "nonce-other-control-history")
-	if errResp.Error.Code != "forbidden" {
-		t.Fatalf("other control history error code = %q, want forbidden", errResp.Error.Code)
-	}
-}
-
-func TestHandlerFleetControlGroupDiagnosticsAllowsCoordinatorDevice(t *testing.T) {
-	controlGID := testGroupID(35)
-	_, coordinatorPriv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("GenerateKey coordinator: %v", err)
-	}
-	_, otherPriv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("GenerateKey other: %v", err)
-	}
-	reg, err := NewDeviceRegistry([]Device{
-		{ID: "ios-1-device", PublicKey: coordinatorPriv.Public().(ed25519.PublicKey), ClientIDs: []string{"ios-1"}},
-		{ID: "other-device", PublicKey: otherPriv.Public().(ed25519.PublicKey), ClientIDs: []string{"ios-1"}},
-	})
-	if err != nil {
-		t.Fatalf("NewDeviceRegistry: %v", err)
-	}
-	state := NewMemoryStateStore()
-	if _, err := state.CreateFleet(context.Background(), FleetRecord{
-		FleetID:             "fleet-a",
-		Name:                "Fleet A",
-		ControlGroupID:      controlGID,
-		Coordinator:         entmoot.NodeInfo{PilotNodeID: 45491, EntmootPubKey: []byte("coordinator")},
-		CoordinatorDeviceID: "ios-1-device",
-		CreatedAtMS:         1,
-	}); err != nil {
-		t.Fatalf("CreateFleet: %v", err)
-	}
-	diagnostics := &fakeDiagnostics{result: map[string]any{
-		"group_id":   controlGID.String(),
-		"suggestion": "ok",
-	}}
-	handler, err := NewHandler(Config{
-		AuthMode:    AuthModeDevice,
-		Devices:     reg,
-		Service:     mustMailboxService(t, controlGID),
-		State:       state,
-		Features:    testCoordinationFeatures(),
-		Diagnostics: diagnostics,
-		GroupExists: func(_ context.Context, got entmoot.GroupID) (bool, error) {
-			return got == controlGID, nil
-		},
-		Clock: func() time.Time { return time.UnixMilli(10_000) },
-	})
-	if err != nil {
-		t.Fatalf("NewHandler: %v", err)
-	}
-
-	resp := doSignedJSONRequest[struct {
-		Group map[string]any `json:"group"`
-	}](t, handler, coordinatorPriv, http.MethodGet, "/v1/groups/"+url.PathEscape(controlGID.String())+"/diagnostics?probe=true", nil, http.StatusOK, 10_000, "nonce-control-diagnostics")
-	if diagnostics.gid != controlGID || !diagnostics.probe {
-		t.Fatalf("diagnostics args gid=%s probe=%v", diagnostics.gid, diagnostics.probe)
-	}
-	if resp.Group["suggestion"] != "ok" {
-		t.Fatalf("diagnostics response = %+v", resp.Group)
-	}
-	errResp := doSignedJSONRequestFor[errorEnvelope](t, handler, "other-device", otherPriv, http.MethodGet, "/v1/groups/"+url.PathEscape(controlGID.String())+"/diagnostics", nil, http.StatusForbidden, 10_001, "nonce-other-control-diagnostics")
-	if errResp.Error.Code != "forbidden" {
-		t.Fatalf("other control diagnostics error code = %q, want forbidden", errResp.Error.Code)
-	}
-}
-
-func TestHandlerFleetDiagnosticsAllowsCoordinatorDevice(t *testing.T) {
-	controlGID := testGroupID(36)
-	_, coordinatorPriv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("GenerateKey coordinator: %v", err)
-	}
-	_, otherPriv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("GenerateKey other: %v", err)
-	}
-	reg, err := NewDeviceRegistry([]Device{
-		{ID: "ios-1-device", PublicKey: coordinatorPriv.Public().(ed25519.PublicKey), ClientIDs: []string{"ios-1"}},
-		{ID: "other-device", PublicKey: otherPriv.Public().(ed25519.PublicKey), ClientIDs: []string{"ios-1"}},
-	})
-	if err != nil {
-		t.Fatalf("NewDeviceRegistry: %v", err)
-	}
-	state := NewMemoryStateStore()
-	if _, err := state.CreateFleet(context.Background(), FleetRecord{
-		FleetID:             "fleet-a",
-		Name:                "Fleet A",
-		ControlGroupID:      controlGID,
-		Coordinator:         entmoot.NodeInfo{PilotNodeID: 45491, EntmootPubKey: []byte("coordinator")},
-		CoordinatorDeviceID: "ios-1-device",
-		Status:              FleetStatusActive,
-		CreatedAtMS:         1,
-	}); err != nil {
-		t.Fatalf("CreateFleet: %v", err)
-	}
-	if _, err := state.UpsertFleetMember(context.Background(), FleetMemberRecord{
-		FleetID:       "fleet-a",
-		NodeID:        45493,
-		EntmootPubKey: base64.StdEncoding.EncodeToString([]byte("invitee")),
-		Hostname:      "deimos",
-		Role:          FleetRoleAgent,
-		Status:        FleetMemberActive,
-		AcceptedAtMS:  2,
-	}); err != nil {
-		t.Fatalf("UpsertFleetMember: %v", err)
-	}
-	diagnostics := &fakeDiagnostics{fleet: map[string]any{
-		"fleet_id":   "fleet-a",
-		"consistent": false,
-	}}
-	handler, err := NewHandler(Config{
-		AuthMode:    AuthModeDevice,
-		Devices:     reg,
-		Service:     mustMailboxService(t, controlGID),
-		State:       state,
-		Features:    testCoordinationFeatures(),
-		Diagnostics: diagnostics,
-		GroupExists: func(_ context.Context, got entmoot.GroupID) (bool, error) {
-			return got == controlGID, nil
-		},
-		Clock: func() time.Time { return time.UnixMilli(10_000) },
-	})
-	if err != nil {
-		t.Fatalf("NewHandler: %v", err)
-	}
-
-	resp := doSignedJSONRequest[struct {
-		Fleet map[string]any `json:"fleet"`
-	}](t, handler, coordinatorPriv, http.MethodGet, "/v1/fleets/fleet-a/diagnostics?probe=true&timeout=4s", nil, http.StatusOK, 10_000, "nonce-fleet-diagnostics")
-	if diagnostics.fleetID != "fleet-a" || !diagnostics.probe || diagnostics.timeout != 4*time.Second {
-		t.Fatalf("fleet diagnostics args fleet=%s probe=%v timeout=%s", diagnostics.fleetID, diagnostics.probe, diagnostics.timeout)
-	}
-	if resp.Fleet["consistent"] != false {
-		t.Fatalf("fleet diagnostics response = %+v", resp.Fleet)
-	}
-	errResp := doSignedJSONRequestFor[errorEnvelope](t, handler, "other-device", otherPriv, http.MethodGet, "/v1/fleets/fleet-a/diagnostics", nil, http.StatusForbidden, 10_001, "nonce-other-fleet-diagnostics")
-	if errResp.Error.Code != "forbidden" {
-		t.Fatalf("other fleet diagnostics error code = %q, want forbidden", errResp.Error.Code)
-	}
-}
-
-func TestHandlerListGroupsCanIncludeHidden(t *testing.T) {
-	gid := testGroupID(32)
-	hiddenGID := testGroupID(33)
-	controlGID := testGroupID(34)
-	_, priv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("GenerateKey: %v", err)
-	}
-	reg, err := NewDeviceRegistry([]Device{{
-		ID:          "ios-1",
-		PublicKey:   priv.Public().(ed25519.PublicKey),
-		Groups:      []entmoot.GroupID{gid, hiddenGID, controlGID},
-		AdminGroups: []entmoot.GroupID{gid, hiddenGID, controlGID},
-		ClientIDs:   []string{"ios-1"},
-	}})
-	if err != nil {
-		t.Fatalf("NewDeviceRegistry: %v", err)
-	}
-	handler := testMobileHandlerFull(t, gid, reg, &fakeCatalog{groups: []GroupSummary{
-		{GroupID: gid},
-		{GroupID: hiddenGID, Metadata: map[string]interface{}{"hidden": true}},
-		{GroupID: controlGID, Metadata: map[string]interface{}{"fleet_control": true}},
-	}}, func() time.Time { return time.UnixMilli(10_000) }, nil, NewMemoryStateStore(), nil)
-
-	active := doSignedJSONRequestFor[struct {
-		Groups []GroupSummary `json:"groups"`
-	}](t, handler, "ios-1", priv, http.MethodGet, "/v1/groups", nil, http.StatusOK, 10_000, "nonce-groups")
-	if len(active.Groups) != 1 || active.Groups[0].GroupID != gid {
-		t.Fatalf("active groups = %+v, want only visible group", active.Groups)
-	}
-	hidden := doSignedJSONRequestFor[struct {
-		Groups []GroupSummary `json:"groups"`
-	}](t, handler, "ios-1", priv, http.MethodGet, "/v1/groups?include_hidden=true", nil, http.StatusOK, 10_001, "nonce-groups-hidden")
-	if len(hidden.Groups) != 2 {
-		t.Fatalf("hidden groups = %+v, want visible plus hidden non-fleet-control", hidden.Groups)
-	}
-}
-
-func TestHandlerReconcilesAcceptedFleetInviteFromControlRoster(t *testing.T) {
-	controlGID := testGroupID(42)
-	_, coordinatorPriv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("GenerateKey coordinator: %v", err)
-	}
-	reg, err := NewDeviceRegistry([]Device{
-		{ID: "ios-1-device", PublicKey: coordinatorPriv.Public().(ed25519.PublicKey), ClientIDs: []string{"ios-1"}},
-	})
-	if err != nil {
-		t.Fatalf("NewDeviceRegistry: %v", err)
-	}
-	state := NewMemoryStateStore()
-	coordinator := entmoot.NodeInfo{PilotNodeID: 45491, EntmootPubKey: []byte("coordinator")}
-	inviteePubkey := base64.StdEncoding.EncodeToString([]byte("invitee"))
-	if _, err := state.CreateFleet(context.Background(), FleetRecord{
-		FleetID:             "fleet-a",
-		Name:                "Fleet A",
-		ControlGroupID:      controlGID,
-		Coordinator:         coordinator,
-		CoordinatorDeviceID: "ios-1-device",
-		Status:              FleetStatusActive,
-		CreatedAtMS:         1,
-	}); err != nil {
-		t.Fatalf("CreateFleet: %v", err)
-	}
-	if _, err := state.UpsertFleetMember(context.Background(), FleetMemberRecord{
-		FleetID:       "fleet-a",
-		NodeID:        45493,
-		EntmootPubKey: inviteePubkey,
-		Hostname:      "deimos",
-		Role:          FleetRoleAgent,
-		Status:        FleetMemberInvited,
-		InvitedAtMS:   2,
-	}); err != nil {
-		t.Fatalf("UpsertFleetMember: %v", err)
-	}
-	if _, err := state.CreateFleetInvite(context.Background(), FleetInviteRecord{
-		InviteID:      "invite-a",
-		FleetID:       "fleet-a",
-		NodeID:        45493,
-		EntmootPubKey: inviteePubkey,
-		Hostname:      "deimos",
-		Status:        FleetMemberInvited,
-		Invite:        json.RawMessage(`{"secret":"control-group-invite"}`),
-		CreatedAtMS:   3,
-		ExpiresAtMS:   20_000,
-	}); err != nil {
-		t.Fatalf("CreateFleetInvite: %v", err)
-	}
-	catalog := &fakeCatalog{members: []MemberSummary{
-		{NodeID: 45491, EntmootPubKey: base64.StdEncoding.EncodeToString(coordinator.EntmootPubKey), Hostname: "vps", Founder: true},
-		{NodeID: 45493, EntmootPubKey: inviteePubkey, Hostname: "deimos"},
-	}}
-	handler := testMobileHandlerFull(t, controlGID, reg, catalog, func() time.Time { return time.UnixMilli(10_000) }, nil, state, nil)
-
-	members := doSignedJSONRequest[struct {
-		Members []FleetMemberRecord `json:"members"`
-	}](t, handler, coordinatorPriv, http.MethodGet, "/v1/fleets/fleet-a/members", nil, http.StatusOK, 10_000, "nonce-reconcile-members")
-	if len(members.Members) != 1 || members.Members[0].Status != FleetMemberActive || members.Members[0].AcceptedAtMS != 10_000 {
-		t.Fatalf("reconciled members = %+v, want active invitee", members.Members)
-	}
-	invites := doSignedJSONRequest[struct {
-		Invites []FleetInviteRecord `json:"invites"`
-	}](t, handler, coordinatorPriv, http.MethodGet, "/v1/fleets/fleet-a/invites", nil, http.StatusOK, 10_001, "nonce-reconcile-invites")
-	if len(invites.Invites) != 0 {
-		t.Fatalf("reconciled invites = %+v, want none", invites.Invites)
-	}
-	activity := doSignedJSONRequest[struct {
-		Activity []FleetActivityRecord `json:"activity"`
-	}](t, handler, coordinatorPriv, http.MethodGet, "/v1/fleets/fleet-a/activity", nil, http.StatusOK, 10_002, "nonce-reconcile-activity")
-	if len(activity.Activity) != 1 || activity.Activity[0].Type != "member.accepted" || activity.Activity[0].Summary != "Agent joined Fleet" {
-		t.Fatalf("reconciled activity = %+v, want member.accepted", activity.Activity)
-	}
-	activityAgain := doSignedJSONRequest[struct {
-		Activity []FleetActivityRecord `json:"activity"`
-	}](t, handler, coordinatorPriv, http.MethodGet, "/v1/fleets/fleet-a/activity", nil, http.StatusOK, 10_003, "nonce-reconcile-activity-again")
-	if len(activityAgain.Activity) != 1 {
-		t.Fatalf("second reconcile activity = %+v, want no duplicate", activityAgain.Activity)
-	}
-}
-
-func TestHandlerFleetReadsRejectBearerOnly(t *testing.T) {
-	gid := testGroupID(1)
-	state := NewMemoryStateStore()
-	if _, err := state.CreateFleet(context.Background(), FleetRecord{
-		FleetID:             "fleet-a",
-		Name:                "Fleet A",
-		Coordinator:         entmoot.NodeInfo{PilotNodeID: 45491, EntmootPubKey: []byte("coordinator")},
-		CoordinatorDeviceID: "ios-1-device",
-		CreatedAtMS:         1,
-	}); err != nil {
-		t.Fatalf("CreateFleet: %v", err)
-	}
-	handler := testMobileHandlerFull(t, gid, nil, nil, func() time.Time { return time.UnixMilli(10_000) }, nil, state, nil)
-
-	errResp := doJSONRequest[errorEnvelope](t, handler, http.MethodGet, "/v1/fleets", nil, http.StatusForbidden)
-	if errResp.Error.Code != "device_signature_required" {
-		t.Fatalf("bearer fleet list error code = %q, want device_signature_required", errResp.Error.Code)
-	}
-
-	errResp = doJSONRequestWithHeaders[errorEnvelope](t, handler, http.MethodGet, "/v1/fleets", nil, map[string]string{
-		"X-Entmoot-Member-Node-ID": "45493",
-	}, http.StatusForbidden)
-	if errResp.Error.Code != "device_signature_required" {
-		t.Fatalf("bearer fleet list with stray member header error code = %q, want device_signature_required", errResp.Error.Code)
-	}
-}
-
-func TestHandlerFleetListReturnsEmptyArrayWhenNoFleetsVisible(t *testing.T) {
-	gid := testGroupID(1)
-	_, priv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("GenerateKey: %v", err)
-	}
-	reg, err := NewDeviceRegistry([]Device{
-		{ID: "ios-1-device", PublicKey: priv.Public().(ed25519.PublicKey), ClientIDs: []string{"ios-1"}},
-	})
-	if err != nil {
-		t.Fatalf("NewDeviceRegistry: %v", err)
-	}
-	state := NewMemoryStateStore()
-	handler := testMobileHandlerFull(t, gid, reg, nil, func() time.Time { return time.UnixMilli(10_000) }, nil, state, nil)
-
-	req := signedDeviceRequest(t, priv, http.MethodGet, "/v1/fleets", nil, 10_000, "nonce-empty-fleets")
-	resp := httptest.NewRecorder()
-	handler.ServeHTTP(resp, req)
-	if resp.Code != http.StatusOK {
-		t.Fatalf("GET /v1/fleets status = %d, want %d\nbody=%s", resp.Code, http.StatusOK, resp.Body.String())
-	}
-	var envelope map[string]json.RawMessage
-	if err := json.Unmarshal(resp.Body.Bytes(), &envelope); err != nil {
-		t.Fatalf("Unmarshal response: %v\n%s", err, resp.Body.String())
-	}
-	if got := strings.TrimSpace(string(envelope["fleets"])); got != "[]" {
-		t.Fatalf("fleets JSON = %s, want []\nbody=%s", got, resp.Body.String())
 	}
 }
 
@@ -1933,7 +469,7 @@ func TestHandlerGroupSubrouteEscapedSlashInGroupID(t *testing.T) {
 	}
 	catalog := &recordingCatalog{
 		fakeCatalog: fakeCatalog{
-			members: []MemberSummary{{NodeID: 45491}},
+			members: []MemberSummary{{MemberID: testMemberID(45491)}},
 		},
 	}
 	handler := testMobileHandler(t, gid, nil, catalog, nil)
@@ -1941,7 +477,7 @@ func TestHandlerGroupSubrouteEscapedSlashInGroupID(t *testing.T) {
 	members := doJSONRequest[struct {
 		Members []MemberSummary `json:"members"`
 	}](t, handler, http.MethodGet, "/v1/groups/"+url.PathEscape(gid.String())+"/members", nil, http.StatusOK)
-	if len(members.Members) != 1 || members.Members[0].NodeID != 45491 {
+	if len(members.Members) != 1 || members.Members[0].MemberID != testMemberID(45491) {
 		t.Fatalf("members = %+v, want escaped group member", members)
 	}
 	if catalog.listMembersCalls != 1 {
@@ -2195,9 +731,9 @@ func TestHistoryCursorAcceptsZeroBoundaryFields(t *testing.T) {
 	var msgID entmoot.MessageID
 	msgID[0] = 1
 	cursor := encodeHistoryCursor(gid, "", &store.PageBoundary{
-		TimestampMS:  0,
-		AuthorNodeID: 0,
-		MessageID:    msgID,
+		TimestampMS:    0,
+		AuthorMemberID: entmoot.MemberID{},
+		MessageID:      msgID,
 	})
 	if cursor == "" {
 		t.Fatal("encodeHistoryCursor returned empty cursor")
@@ -2206,7 +742,7 @@ func TestHistoryCursorAcceptsZeroBoundaryFields(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseHistoryCursor: %v", err)
 	}
-	if boundary.TimestampMS != 0 || boundary.AuthorNodeID != 0 || boundary.MessageID != msgID {
+	if boundary.TimestampMS != 0 || boundary.AuthorMemberID != (entmoot.MemberID{}) || boundary.MessageID != msgID {
 		t.Fatalf("boundary = %+v, want zero timestamp/node and message id %s", boundary, msgID)
 	}
 }
@@ -2295,10 +831,7 @@ func TestHandlerMessagePublishSignRequestExecutes(t *testing.T) {
 	created := doJSONRequest[struct {
 		SignRequest SignRequest `json:"sign_request"`
 	}](t, handler, http.MethodPost, "/v1/groups/"+gid.String()+"/messages", map[string]any{
-		"author": entmoot.NodeInfo{
-			PilotNodeID:   45491,
-			EntmootPubKey: pub,
-		},
+		"author":      testOperationalNodeInfo(t, pub),
 		"roster_head": entmoot.RosterEntryID{1},
 		"topics":      []string{"chat"},
 		"content":     []byte("hello from phone"),
@@ -2356,7 +889,7 @@ func TestHandlerMessagePublishSignRequestRejectsDigestMismatch(t *testing.T) {
 	created := doJSONRequest[struct {
 		SignRequest SignRequest `json:"sign_request"`
 	}](t, handler, http.MethodPost, "/v1/groups/"+gid.String()+"/messages", map[string]any{
-		"author":      entmoot.NodeInfo{PilotNodeID: 45491, EntmootPubKey: pub},
+		"author":      testOperationalNodeInfo(t, pub),
 		"roster_head": entmoot.RosterEntryID{1},
 		"topics":      []string{"chat"},
 	}, http.StatusAccepted)
@@ -2381,7 +914,7 @@ func TestHandlerIdempotencyReplaysSignRequestCreation(t *testing.T) {
 	}
 	handler := testMobileHandlerWithPublisher(t, gid, &fakePublisher{}, func() time.Time { return time.UnixMilli(1_234_000) })
 	body := map[string]any{
-		"author":      entmoot.NodeInfo{PilotNodeID: 45491, EntmootPubKey: pub},
+		"author":      testOperationalNodeInfo(t, pub),
 		"roster_head": entmoot.RosterEntryID{1},
 		"topics":      []string{"chat"},
 	}
@@ -2395,7 +928,7 @@ func TestHandlerIdempotencyReplaysSignRequestCreation(t *testing.T) {
 		t.Fatalf("idempotency replay ids = %q/%q", first.SignRequest.ID, second.SignRequest.ID)
 	}
 	errResp := doJSONRequestWithHeaders[errorEnvelope](t, handler, http.MethodPost, "/v1/groups/"+gid.String()+"/messages", map[string]any{
-		"author":      entmoot.NodeInfo{PilotNodeID: 45491, EntmootPubKey: pub},
+		"author":      testOperationalNodeInfo(t, pub),
 		"roster_head": entmoot.RosterEntryID{1},
 		"topics":      []string{"different"},
 	}, map[string]string{idempotencyHeader: "idem-1"}, http.StatusConflict)
@@ -2421,7 +954,7 @@ func TestHandlerIdempotencyDoesNotCacheFailedMutation(t *testing.T) {
 	}](
 		t, handler, http.MethodPost, path,
 		map[string]any{
-			"author":      entmoot.NodeInfo{PilotNodeID: 45491, EntmootPubKey: pub},
+			"author":      testOperationalNodeInfo(t, pub),
 			"roster_head": entmoot.RosterEntryID{1},
 			"topics":      []string{"chat"},
 		},
@@ -2475,7 +1008,7 @@ func TestHandlerIdempotencyScopesReplayToCurrentAuthorizedPrincipal(t *testing.T
 		nil,
 	)
 	body := map[string]any{
-		"author":      entmoot.NodeInfo{PilotNodeID: 45491, EntmootPubKey: pubA},
+		"author":      testOperationalNodeInfo(t, pubA),
 		"roster_head": entmoot.RosterEntryID{1},
 		"topics":      []string{"chat"},
 	}
@@ -3430,11 +1963,11 @@ func (p *fakePublisher) PublishSigned(_ context.Context, msg entmoot.Message) (P
 	}
 	if p.result.Status == "" {
 		return PublishResult{
-			Status:      "accepted",
-			MessageID:   msg.ID,
-			GroupID:     msg.GroupID,
-			Author:      msg.Author.PilotNodeID,
-			TimestampMS: msg.Timestamp,
+			Status:         "accepted",
+			MessageID:      msg.ID,
+			GroupID:        msg.GroupID,
+			AuthorMemberID: messageTestMemberID(msg),
+			TimestampMS:    msg.Timestamp,
 		}, nil
 	}
 	return p.result, nil
@@ -3588,53 +2121,46 @@ func doSignedJSONRequestForWithIdempotency[T any](t *testing.T, handler http.Han
 	return out
 }
 
-func signedMemberRequest(t *testing.T, nodeID entmoot.NodeID, priv ed25519.PrivateKey, method, path string, body any, timestampMillis int64, nonce string) *http.Request {
-	t.Helper()
-	var data []byte
-	if body != nil {
-		var err error
-		data, err = json.Marshal(body)
-		if err != nil {
-			t.Fatalf("Marshal request body: %v", err)
-		}
-	}
-	pub := priv.Public().(ed25519.PublicKey)
-	req := httptest.NewRequest(method, path, bytes.NewReader(data))
-	input := MemberSigningInput(method, req.URL.RequestURI(), nodeID, pub, timestampMillis, nonce, data)
-	sig := ed25519.Sign(priv, []byte(input))
-	req.Header.Set(memberNodeHeader, strconv.FormatUint(uint64(nodeID), 10))
-	req.Header.Set(memberPubKeyHeader, base64.StdEncoding.EncodeToString(pub))
-	req.Header.Set(timestampHeader, strconv.FormatInt(timestampMillis, 10))
-	req.Header.Set(nonceHeader, nonce)
-	req.Header.Set(memberSignatureHeader, base64.StdEncoding.EncodeToString(sig))
-	return req
-}
-
-func doMemberSignedJSONRequest[T any](t *testing.T, handler http.Handler, nodeID entmoot.NodeID, priv ed25519.PrivateKey, method, path string, body any, wantStatus int, timestampMillis int64, nonce string) T {
-	t.Helper()
-	req := signedMemberRequest(t, nodeID, priv, method, path, body, timestampMillis, nonce)
-	resp := httptest.NewRecorder()
-	handler.ServeHTTP(resp, req)
-	if resp.Code != wantStatus {
-		t.Fatalf("%s %s status = %d, want %d\nbody=%s", method, path, resp.Code, wantStatus, resp.Body.String())
-	}
-	var out T
-	if err := json.Unmarshal(resp.Body.Bytes(), &out); err != nil {
-		t.Fatalf("Unmarshal response: %v\n%s", err, resp.Body.String())
-	}
-	return out
+func testMemberID(value uint32) entmoot.MemberID {
+	var memberID entmoot.MemberID
+	memberID[0] = byte(value)
+	memberID[1] = byte(value >> 8)
+	memberID[2] = byte(value >> 16)
+	memberID[3] = byte(value >> 24)
+	return memberID
 }
 
 func testMessage(gid entmoot.GroupID, ts int64, content string) entmoot.Message {
+	publicKey := bytes.Repeat([]byte{0x42}, ed25519.PublicKeySize)
+	memberID, _ := entmoot.MemberIDFromPublicKey(publicKey)
 	msg := entmoot.Message{
+		Version:   2,
 		GroupID:   gid,
-		Author:    entmoot.NodeInfo{PilotNodeID: 45491, EntmootPubKey: []byte("pub")},
+		Author:    entmoot.NodeInfo{MemberID: &memberID, EntmootPubKey: publicKey},
 		Timestamp: ts,
 		Topics:    []string{"test/mailbox"},
 		Content:   []byte(content),
 	}
 	msg.ID = canonical.MessageID(msg)
 	return msg
+}
+
+func testOperationalNodeInfo(t *testing.T, publicKey ed25519.PublicKey) entmoot.NodeInfo {
+	t.Helper()
+	memberID, err := entmoot.MemberIDFromPublicKey(publicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	peerID, err := entmoot.PeerIDFromPublicKey(publicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return entmoot.NodeInfo{MemberID: &memberID, PeerID: peerID, EntmootPubKey: append([]byte(nil), publicKey...)}
+}
+
+func messageTestMemberID(message entmoot.Message) entmoot.MemberID {
+	memberID, _ := entmoot.ResolvedMemberID(message.Author)
+	return memberID
 }
 
 func testTopicMessage(t *testing.T, gid entmoot.GroupID, ts int64, author entmoot.NodeInfo, topics []string, content any) entmoot.Message {

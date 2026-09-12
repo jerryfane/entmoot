@@ -128,14 +128,18 @@ func TestSQLiteAgentCommandClaimReclaimsExhaustedStaleProcessing(t *testing.T) {
 func testAgentInstructionPayload(commandID string) AgentInstructionPayload {
 	var gid entmoot.GroupID
 	gid[0] = 0x42
+	var issuerID, agentID entmoot.MemberID
+	issuerID[0] = 0x11
+	agentID[0] = 0x22
 	cmd := FleetCommandEnvelope{
 		Type:           FleetCommandMessageType,
-		Version:        1,
+		Version:        2,
 		CommandID:      commandID,
 		FleetID:        "fleet-a",
 		ControlGroupID: gid,
-		IssuerNodeID:   45981,
-		Target:         FleetCommandTarget{Kind: FleetCommandTargetNode, PilotNodeID: 133053},
+		IssuerMemberID: issuerID,
+		IssuerPeerID:   "issuer-peer",
+		Target:         FleetCommandTarget{Kind: FleetCommandTargetNode, MemberID: agentID, PeerID: "agent-peer"},
 		Action:         FleetCommandActionAgentInstruction,
 		CreatedAtMS:    1_000,
 		Args: map[string]interface{}{
@@ -143,5 +147,5 @@ func testAgentInstructionPayload(commandID string) AgentInstructionPayload {
 			"timeout_ms":  float64(60_000),
 		},
 	}
-	return NewAgentInstructionPayload(cmd, 133053, "report status", nil, 60_000, 1_500)
+	return NewAgentInstructionPayload(cmd, agentID, "agent-peer", "report status", nil, 60_000, 1_500)
 }

@@ -21,14 +21,15 @@ type DeviceRegistryDocument struct {
 
 // DeviceRecord is one serializable ESP device registry entry.
 type DeviceRecord struct {
-	ID            string   `json:"id"`
-	PublicKey     string   `json:"public_key"`
-	Groups        []string `json:"groups"`
-	AdminGroups   []string `json:"admin_groups"`
-	ClientIDs     []string `json:"client_ids"`
-	PilotNodeID   uint32   `json:"pilot_node_id,omitempty"`
-	EntmootPubKey string   `json:"entmoot_pubkey,omitempty"`
-	Disabled      bool     `json:"disabled"`
+	ID            string           `json:"id"`
+	PublicKey     string           `json:"public_key"`
+	Groups        []string         `json:"groups"`
+	AdminGroups   []string         `json:"admin_groups"`
+	ClientIDs     []string         `json:"client_ids"`
+	MemberID      entmoot.MemberID `json:"member_id,omitempty"`
+	PeerID        string           `json:"peer_id,omitempty"`
+	EntmootPubKey string           `json:"entmoot_pubkey,omitempty"`
+	Disabled      bool             `json:"disabled"`
 }
 
 // LoadDeviceRegistryOrEmpty reads path, returning an empty registry when the
@@ -147,7 +148,8 @@ func DeviceRegistryDocumentFromRegistry(reg *DeviceRegistry) DeviceRegistryDocum
 			Groups:        groups,
 			AdminGroups:   adminGroups,
 			ClientIDs:     append([]string(nil), d.ClientIDs...),
-			PilotNodeID:   uint32(d.PilotNodeID),
+			MemberID:      d.MemberID,
+			PeerID:        d.PeerID,
 			EntmootPubKey: base64.StdEncoding.EncodeToString(d.EntmootPubKey),
 			Disabled:      d.Disabled,
 		})
@@ -178,6 +180,16 @@ func DeviceFromRecord(in DeviceRecord) (Device, error) {
 		if len(entmootPub) != ed25519.PublicKeySize {
 			return Device{}, fmt.Errorf("esphttp: device %q entmoot_pubkey length %d", id, len(entmootPub))
 		}
+		derivedMemberID, err := entmoot.MemberIDFromPublicKey(entmootPub)
+		if err != nil || in.MemberID != derivedMemberID {
+			return Device{}, fmt.Errorf("esphttp: device %q member_id does not match entmoot_pubkey", id)
+		}
+		derivedPeerID := peerIDForPublicKey(entmootPub)
+		if derivedPeerID == "" || in.PeerID != derivedPeerID {
+			return Device{}, fmt.Errorf("esphttp: device %q peer_id does not match entmoot_pubkey", id)
+		}
+	} else if in.MemberID != (entmoot.MemberID{}) || in.PeerID != "" {
+		return Device{}, fmt.Errorf("esphttp: device %q identity requires entmoot_pubkey", id)
 	}
 	groups := make([]entmoot.GroupID, 0, len(in.Groups))
 	for _, rawGroup := range in.Groups {
@@ -209,7 +221,8 @@ func DeviceFromRecord(in DeviceRecord) (Device, error) {
 		Groups:        groups,
 		AdminGroups:   adminGroups,
 		ClientIDs:     clients,
-		PilotNodeID:   entmoot.NodeID(in.PilotNodeID),
+		MemberID:      in.MemberID,
+		PeerID:        in.PeerID,
 		EntmootPubKey: append([]byte(nil), entmootPub...),
 		Disabled:      in.Disabled,
 	}, nil

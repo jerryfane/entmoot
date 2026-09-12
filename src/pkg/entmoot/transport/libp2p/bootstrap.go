@@ -26,22 +26,7 @@ const (
 
 var ErrBootstrapDenied = errors.New("libp2p: bootstrap capability denied")
 
-// BootstrapCapability is a founder-signed, expiring, single-use grant for a
-// specific fresh identity. It grants only the bounded pre-membership protocols.
-type BootstrapCapability struct {
-	GroupID           entmoot.GroupID       `json:"group_id"`
-	TargetPublicKey   []byte                `json:"target_public_key"`
-	TargetMemberID    entmoot.MemberID      `json:"target_member_id"`
-	TargetPeerID      string                `json:"target_peer_id"`
-	Founder           entmoot.NodeInfo      `json:"founder"`
-	RosterHead        entmoot.RosterEntryID `json:"roster_head"`
-	AllowedPeerIDs    []string              `json:"allowed_peer_ids,omitempty"`
-	AllowedMultiaddrs []string              `json:"allowed_multiaddrs,omitempty"`
-	Nonce             [32]byte              `json:"nonce"`
-	IssuedAtMS        int64                 `json:"issued_at_ms"`
-	ExpiresAtMS       int64                 `json:"expires_at_ms"`
-	Signature         []byte                `json:"signature,omitempty"`
-}
+type BootstrapCapability = entmoot.BootstrapCapability
 
 func bootstrapSigningBytes(capability BootstrapCapability) ([]byte, error) {
 	capability.Signature = nil
@@ -60,6 +45,16 @@ func SignBootstrapCapability(founder *keystore.Identity, capability *BootstrapCa
 	if !bytes.Equal(founder.PublicKey, capability.Founder.EntmootPubKey) {
 		return errors.New("libp2p: capability founder does not match signing key")
 	}
+	if err := entmoot.ValidateOperationalMemberInfo(capability.Founder); err != nil {
+		return fmt.Errorf("libp2p: invalid capability founder: %w", err)
+	}
+	targetBinding, err := BindingFromPublicKey(capability.TargetPublicKey)
+	if err != nil {
+		return fmt.Errorf("libp2p: derive target identity: %w", err)
+	}
+	if capability.TargetMemberID != targetBinding.MemberID || capability.TargetPeerID != targetBinding.PeerID.String() {
+		return errors.New("libp2p: capability target identity binding mismatch")
+	}
 	payload, err := bootstrapSigningBytes(*capability)
 	if err != nil {
 		return err
@@ -68,8 +63,8 @@ func SignBootstrapCapability(founder *keystore.Identity, capability *BootstrapCa
 	return nil
 }
 
-// VerifyBootstrapCapability validates every identity and authority binding but
-// does not consume the nonce.
+// VerifyBootstrapCapability validates the signature and target identity without
+// anchoring the signer to a group's roster or checking enrollment state.
 func VerifyBootstrapCapability(capability BootstrapCapability, remotePeer peer.ID, now time.Time) error {
 	if capability.ExpiresAtMS <= capability.IssuedAtMS || now.UnixMilli() < capability.IssuedAtMS || now.UnixMilli() > capability.ExpiresAtMS {
 		return fmt.Errorf("%w: capability is outside its validity window", ErrBootstrapDenied)
@@ -87,16 +82,6 @@ func VerifyBootstrapCapability(capability BootstrapCapability, remotePeer peer.I
 	if target.MemberID != capability.TargetMemberID || target.PeerID.String() != capability.TargetPeerID || target.PeerID != remotePeer {
 		return fmt.Errorf("%w: target identity binding mismatch", ErrBootstrapDenied)
 	}
-	allowed := false
-	for _, value := range capability.AllowedPeerIDs {
-		if value == remotePeer.String() {
-			allowed = true
-			break
-		}
-	}
-	if !allowed {
-		return fmt.Errorf("%w: remote peer is not allowed", ErrBootstrapDenied)
-	}
 	payload, err := bootstrapSigningBytes(capability)
 	if err != nil {
 		return fmt.Errorf("%w: encode capability: %v", ErrBootstrapDenied, err)
@@ -112,46 +97,128 @@ type capabilityKey struct {
 	Nonce   [32]byte
 }
 
-// BootstrapAdmission atomically consumes valid capabilities. The in-memory
-// constructor is intended for tests; OpenPersistentBootstrapAdmission must be
-// used by a restartable remote service.
+// BootstrapAdmission reserves then commits capabilities. Enrollment releases a
+// reservation on failure; direct Authorize callers reserve and commit in one
+// operation.
 type BootstrapAdmission struct {
-	mu      sync.Mutex
-	used    map[capabilityKey]struct{}
-	consume func(capabilityKey) (bool, error)
+	mu          sync.Mutex
+	used        map[capabilityKey]struct{}
+	reserved    map[capabilityKey]struct{}
+	reserve     func(capabilityKey) (bool, error)
+	release     func(capabilityKey) error
+	commit      func(capabilityKey) error
+	unavailable func(capabilityKey) (bool, error)
 }
 
 func NewBootstrapAdmission() *BootstrapAdmission {
-	return &BootstrapAdmission{used: make(map[capabilityKey]struct{})}
+	return &BootstrapAdmission{
+		used:     make(map[capabilityKey]struct{}),
+		reserved: make(map[capabilityKey]struct{}),
+	}
 }
 
-// Authorize permits only enrollment/roster/history and consumes the capability
-// once. Normal gossip and publication remain unavailable before membership.
-func (a *BootstrapAdmission) Authorize(capability BootstrapCapability, remotePeer peer.ID, requested protocol.ID, now time.Time) error {
+func validateBootstrapRequest(capability BootstrapCapability, remotePeer peer.ID, requested protocol.ID, now time.Time) error {
 	switch requested {
 	case EnrollmentProtocol, RosterProtocol, HistoryProtocol:
 	default:
 		return fmt.Errorf("%w: protocol %q is not available before membership", ErrBootstrapDenied, requested)
 	}
-	if err := VerifyBootstrapCapability(capability, remotePeer, now); err != nil {
+	return VerifyBootstrapCapability(capability, remotePeer, now)
+}
+
+// Verify checks an unused bootstrap grant without consuming it. Callers must
+// also bind its founder and checkpoint to the group's authoritative roster.
+func (a *BootstrapAdmission) Verify(capability BootstrapCapability, remotePeer peer.ID, requested protocol.ID, now time.Time) error {
+	if a == nil {
+		return fmt.Errorf("%w: missing admission controller", ErrBootstrapDenied)
+	}
+	if err := validateBootstrapRequest(capability, remotePeer, requested, now); err != nil {
 		return err
 	}
 	key := capabilityKey{GroupID: capability.GroupID, Nonce: capability.Nonce}
-	if a.consume != nil {
-		consumed, err := a.consume(key)
-		if err != nil {
-			return fmt.Errorf("%w: persist nonce: %v", ErrBootstrapDenied, err)
-		}
-		if !consumed {
-			return fmt.Errorf("%w: capability already used", ErrBootstrapDenied)
-		}
-		return nil
-	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if _, exists := a.used[key]; exists {
 		return fmt.Errorf("%w: capability already used", ErrBootstrapDenied)
 	}
+	if _, exists := a.reserved[key]; exists {
+		return fmt.Errorf("%w: capability already reserved", ErrBootstrapDenied)
+	}
+	if a.unavailable != nil {
+		unavailable, err := a.unavailable(key)
+		if err != nil {
+			return fmt.Errorf("%w: read nonce state: %v", ErrBootstrapDenied, err)
+		}
+		if unavailable {
+			return fmt.Errorf("%w: capability already used or reserved", ErrBootstrapDenied)
+		}
+	}
+	return nil
+}
+
+func (a *BootstrapAdmission) Reserve(capability BootstrapCapability, remotePeer peer.ID, requested protocol.ID, now time.Time) error {
+	if err := validateBootstrapRequest(capability, remotePeer, requested, now); err != nil {
+		return err
+	}
+	key := capabilityKey{GroupID: capability.GroupID, Nonce: capability.Nonce}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if _, exists := a.used[key]; exists {
+		return fmt.Errorf("%w: capability already used", ErrBootstrapDenied)
+	}
+	if _, exists := a.reserved[key]; exists {
+		return fmt.Errorf("%w: capability already reserved", ErrBootstrapDenied)
+	}
+	if a.reserve != nil {
+		reserved, err := a.reserve(key)
+		if err != nil {
+			return fmt.Errorf("%w: persist nonce reservation: %v", ErrBootstrapDenied, err)
+		}
+		if !reserved {
+			return fmt.Errorf("%w: capability already used or reserved", ErrBootstrapDenied)
+		}
+	}
+	a.reserved[key] = struct{}{}
+	return nil
+}
+
+func (a *BootstrapAdmission) Release(capability BootstrapCapability) error {
+	key := capabilityKey{GroupID: capability.GroupID, Nonce: capability.Nonce}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	var err error
+	if a.release != nil {
+		err = a.release(key)
+	}
+	delete(a.reserved, key)
+	return err
+}
+
+func (a *BootstrapAdmission) Commit(capability BootstrapCapability) error {
+	key := capabilityKey{GroupID: capability.GroupID, Nonce: capability.Nonce}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if _, exists := a.reserved[key]; !exists {
+		return fmt.Errorf("%w: capability is not reserved", ErrBootstrapDenied)
+	}
+	if a.commit != nil {
+		if err := a.commit(key); err != nil {
+			return err
+		}
+	}
+	delete(a.reserved, key)
 	a.used[key] = struct{}{}
+	return nil
+}
+
+// Authorize preserves one-shot semantics for bootstrap roster/history calls.
+func (a *BootstrapAdmission) Authorize(capability BootstrapCapability, remotePeer peer.ID, requested protocol.ID, now time.Time) error {
+	if err := a.Reserve(capability, remotePeer, requested, now); err != nil {
+		return err
+	}
+	if err := a.Commit(capability); err != nil {
+		_ = a.Release(capability)
+		return err
+	}
 	return nil
 }

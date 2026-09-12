@@ -7,24 +7,17 @@ import (
 	"log/slog"
 	"net/http"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/esphttp"
 	"entmoot/pkg/entmoot/roster"
-	"entmoot/pkg/entmoot/wire"
 )
-
-type memberProfileReader interface {
-	GetMemberProfileAd(context.Context, entmoot.GroupID, entmoot.NodeID, time.Time) (wire.MemberProfileAd, bool, error)
-}
 
 type localGroupCatalog struct {
 	dataDir  string
 	metadata esphttp.GroupMetadataStore
-	profiles memberProfileReader
 	state    esphttp.StateStore
 }
 
@@ -60,11 +53,11 @@ func (p espDiagnosticsProvider) FleetDiagnostics(ctx context.Context, fleet esph
 				return nil, err
 			}
 			if r, err := roster.OpenJSONL(s.dataDir, fleet.ControlGroupID); err == nil {
-				for _, nodeID := range r.Members() {
-					info, ok := r.MemberInfo(nodeID)
+				for _, memberID := range r.MemberIDs() {
+					info, ok := r.MemberInfoByID(memberID)
 					if ok {
 						rosterIdentities = append(rosterIdentities, fleetRosterIdentity{
-							NodeID:        nodeID,
+							MemberID:      memberID,
 							EntmootPubKey: encodeBase64(info.EntmootPubKey),
 						})
 					}
@@ -89,25 +82,20 @@ type espFleetDiagnosticsReport struct {
 }
 
 type espFleetDiagnosticsPeer struct {
-	NodeID        entmoot.NodeID `json:"node_id"`
-	EntmootPubKey string         `json:"entmoot_pubkey,omitempty"`
-	Hostname      string         `json:"hostname,omitempty"`
-	Role          string         `json:"role"`
-	Status        string         `json:"status"`
-	ControlRoster bool           `json:"control_roster"`
-	Profile       string         `json:"profile"`
-	Transport     string         `json:"transport"`
-	Trust         string         `json:"trust"`
-	Route         string         `json:"route"`
-	RTTMS         int64          `json:"rtt_ms,omitempty"`
-	Error         string         `json:"error,omitempty"`
-	Diagnosis     string         `json:"diagnosis"`
-	Suggestion    string         `json:"suggestion,omitempty"`
-	NextCommand   string         `json:"next_command,omitempty"`
+	MemberID      entmoot.MemberID `json:"member_id"`
+	PeerID        string           `json:"peer_id,omitempty"`
+	EntmootPubKey string           `json:"entmoot_pubkey,omitempty"`
+	Hostname      string           `json:"hostname,omitempty"`
+	Role          string           `json:"role"`
+	Status        string           `json:"status"`
+	ControlRoster bool             `json:"control_roster"`
+	Error         string           `json:"error,omitempty"`
+	Diagnosis     string           `json:"diagnosis"`
+	Suggestion    string           `json:"suggestion,omitempty"`
 }
 
 type fleetRosterIdentity struct {
-	NodeID        entmoot.NodeID
+	MemberID      entmoot.MemberID
 	EntmootPubKey string
 }
 
@@ -116,21 +104,21 @@ func buildFleetDiagnosticsReport(fleet esphttp.FleetRecord, members []esphttp.Fl
 		if members[i].Role != members[j].Role {
 			return members[i].Role == esphttp.FleetRoleCoordinator
 		}
-		return members[i].NodeID < members[j].NodeID
+		return bytes.Compare(members[i].MemberID[:], members[j].MemberID[:]) < 0
 	})
-	controlByNode := map[entmoot.NodeID]doctorPeerReport{}
+	controlByMember := map[entmoot.MemberID]doctorPeerReport{}
 	if control != nil {
 		for _, peer := range control.Peers {
-			controlByNode[peer.NodeID] = peer
+			controlByMember[peer.MemberID] = peer
 		}
 	}
 	rosterByIdentity := map[string]fleetRosterIdentity{}
 	controlByIdentity := map[string]doctorPeerReport{}
 	for _, identity := range rosterIdentities {
-		key := fleetDiagnosticsIdentityKey(identity.NodeID, identity.EntmootPubKey)
+		key := fleetDiagnosticsIdentityKey(identity.MemberID, identity.EntmootPubKey)
 		rosterByIdentity[key] = identity
-		if control, ok := controlByNode[identity.NodeID]; ok {
-			controlByIdentity[key] = control
+		if controlPeer, ok := controlByMember[identity.MemberID]; ok {
+			controlByIdentity[key] = controlPeer
 		}
 	}
 	memberIdentities := map[string]struct{}{}
@@ -145,7 +133,7 @@ func buildFleetDiagnosticsReport(fleet esphttp.FleetRecord, members []esphttp.Fl
 		if member.Status == esphttp.FleetMemberActive || member.Role == esphttp.FleetRoleCoordinator {
 			out.ActiveMembers++
 		}
-		identityKey := fleetDiagnosticsIdentityKey(member.NodeID, member.EntmootPubKey)
+		identityKey := fleetDiagnosticsIdentityKey(member.MemberID, member.EntmootPubKey)
 		peer := fleetDiagnosticsPeerFromMember(member, controlByIdentity[identityKey])
 		memberIdentities[identityKey] = struct{}{}
 		_, peer.ControlRoster = rosterByIdentity[identityKey]
@@ -163,10 +151,10 @@ func buildFleetDiagnosticsReport(fleet esphttp.FleetRecord, members []esphttp.Fl
 		out.Peers = append(out.Peers, peer)
 	}
 	for _, identity := range rosterIdentities {
-		if _, ok := memberIdentities[fleetDiagnosticsIdentityKey(identity.NodeID, identity.EntmootPubKey)]; ok {
+		if _, ok := memberIdentities[fleetDiagnosticsIdentityKey(identity.MemberID, identity.EntmootPubKey)]; ok {
 			continue
 		}
-		peer := fleetDiagnosticsPeerFromControlOnly(identity, controlByIdentity[fleetDiagnosticsIdentityKey(identity.NodeID, identity.EntmootPubKey)])
+		peer := fleetDiagnosticsPeerFromControlOnly(identity, controlByIdentity[fleetDiagnosticsIdentityKey(identity.MemberID, identity.EntmootPubKey)])
 		out.Peers = append(out.Peers, peer)
 		out.Consistent = false
 	}
@@ -182,8 +170,8 @@ func buildFleetDiagnosticsReport(fleet esphttp.FleetRecord, members []esphttp.Fl
 		if out.Peers[i].Role != out.Peers[j].Role {
 			return out.Peers[i].Role == esphttp.FleetRoleCoordinator || out.Peers[j].Role == "control_only"
 		}
-		if out.Peers[i].NodeID != out.Peers[j].NodeID {
-			return out.Peers[i].NodeID < out.Peers[j].NodeID
+		if out.Peers[i].MemberID != out.Peers[j].MemberID {
+			return bytes.Compare(out.Peers[i].MemberID[:], out.Peers[j].MemberID[:]) < 0
 		}
 		return out.Peers[i].EntmootPubKey < out.Peers[j].EntmootPubKey
 	})
@@ -192,54 +180,33 @@ func buildFleetDiagnosticsReport(fleet esphttp.FleetRecord, members []esphttp.Fl
 
 func fleetDiagnosticsPeerFromMember(member esphttp.FleetMemberRecord, control doctorPeerReport) espFleetDiagnosticsPeer {
 	peer := espFleetDiagnosticsPeer{
-		NodeID:        member.NodeID,
+		MemberID:      member.MemberID,
+		PeerID:        member.PeerID,
 		EntmootPubKey: member.EntmootPubKey,
 		Hostname:      member.Hostname,
 		Role:          member.Role,
 		Status:        member.Status,
-		Profile:       "not_applicable",
-		Transport:     "not_applicable",
-		Trust:         "not_applicable",
-		Route:         "not_checked",
 	}
-	if control.NodeID != 0 {
-		peer.Hostname = firstNonEmpty(peer.Hostname, control.Hostname)
-		peer.Profile = control.Profile
-		peer.Transport = control.Transport
-		peer.Trust = control.Trust
-		peer.Route = control.Route
-		peer.RTTMS = control.RTTMS
+	if control.MemberID != (entmoot.MemberID{}) {
+		peer.PeerID = firstNonEmpty(peer.PeerID, control.PeerID)
 		peer.Error = control.Error
-		peer.Diagnosis = control.Diagnosis
-		peer.Suggestion = control.Suggestion
-		peer.NextCommand = control.NextCommand
 	}
 	return peer
 }
 
 func fleetDiagnosticsPeerFromControlOnly(identity fleetRosterIdentity, control doctorPeerReport) espFleetDiagnosticsPeer {
 	peer := espFleetDiagnosticsPeer{
-		NodeID:        identity.NodeID,
+		MemberID:      identity.MemberID,
 		EntmootPubKey: identity.EntmootPubKey,
 		Role:          "control_only",
 		Status:        "missing_from_fleet_state",
 		ControlRoster: true,
-		Profile:       "not_applicable",
-		Transport:     "not_applicable",
-		Trust:         "not_applicable",
-		Route:         "not_checked",
 		Diagnosis:     "control_member_missing_from_fleet_state",
 		Suggestion:    fleetMemberSuggestion("control_member_missing_from_fleet_state"),
 	}
-	if control.NodeID != 0 {
-		peer.Hostname = control.Hostname
-		peer.Profile = control.Profile
-		peer.Transport = control.Transport
-		peer.Trust = control.Trust
-		peer.Route = control.Route
-		peer.RTTMS = control.RTTMS
+	if control.MemberID != (entmoot.MemberID{}) {
+		peer.PeerID = control.PeerID
 		peer.Error = control.Error
-		peer.NextCommand = control.NextCommand
 	}
 	return peer
 }
@@ -288,8 +255,8 @@ func fleetMemberSuggestion(diagnosis string) string {
 	}
 }
 
-func fleetDiagnosticsIdentityKey(nodeID entmoot.NodeID, entmootPubKey string) string {
-	return strconv.FormatUint(uint64(nodeID), 10) + ":" + strings.TrimSpace(entmootPubKey)
+func fleetDiagnosticsIdentityKey(memberID entmoot.MemberID, entmootPubKey string) string {
+	return memberID.String() + ":" + strings.TrimSpace(entmootPubKey)
 }
 
 func firstNonEmpty(values ...string) string {
@@ -359,7 +326,7 @@ func (c localGroupCatalog) GetGroup(ctx context.Context, gid entmoot.GroupID) (e
 		return esphttp.GroupSummary{}, false, err
 	}
 	defer r.Close()
-	members := r.Members()
+	members := r.MemberIDs()
 	if len(members) == 0 {
 		return esphttp.GroupSummary{}, false, nil
 	}
@@ -404,43 +371,19 @@ func (c localGroupCatalog) ListMembers(ctx context.Context, gid entmoot.GroupID)
 	}
 	defer r.Close()
 	founder, _ := r.Founder()
-	members := r.Members()
+	founderID, _ := entmoot.MemberIDFromPublicKey(founder.EntmootPubKey)
+	members := r.MemberIDs()
 	out := make([]esphttp.MemberSummary, 0, len(members))
-	for _, nodeID := range members {
-		info, ok := r.MemberInfo(nodeID)
+	for _, memberID := range members {
+		info, ok := r.MemberInfoByID(memberID)
 		if !ok {
 			continue
 		}
-		member := esphttp.MemberSummary{
-			NodeID:        nodeID,
+		out = append(out, esphttp.MemberSummary{
+			MemberID:      memberID,
 			EntmootPubKey: encodeBase64(info.EntmootPubKey),
-			Founder:       founder.PilotNodeID == nodeID,
-		}
-		if c.profiles != nil {
-			now := time.Now()
-			ad, ok, err := c.profiles.GetMemberProfileAd(ctx, gid, nodeID, now)
-			if err != nil {
-				slog.Warn("esp group member profile ignored",
-					slog.String("group_id", gid.String()),
-					slog.Uint64("node_id", uint64(nodeID)),
-					slog.String("err", err.Error()))
-			} else if ok {
-				if memberProfileMatchesRosterInfo(ad, info) {
-					member.Hostname = ad.Hostname
-					if err := esphttp.ObserveMemberProfileNodeProfile(ctx, c.state, gid, nodeID, encodeBase64(info.EntmootPubKey), ad.Hostname, ad.IssuedAt, ad.NotAfter); err != nil {
-						slog.Warn("esp group member profile cache update failed",
-							slog.String("group_id", gid.String()),
-							slog.Uint64("node_id", uint64(nodeID)),
-							slog.String("err", err.Error()))
-					}
-				} else {
-					slog.Debug("esp group member profile ignored: identity mismatch",
-						slog.String("group_id", gid.String()),
-						slog.Uint64("node_id", uint64(nodeID)))
-				}
-			}
-		}
-		out = append(out, member)
+			Founder:       founderID == memberID,
+		})
 	}
 	if c.state != nil {
 		configs, err := c.state.ListLiveAgentConfigs(ctx, gid)
@@ -451,20 +394,15 @@ func (c localGroupCatalog) ListMembers(ctx context.Context, gid entmoot.GroupID)
 		if err != nil {
 			return nil, err
 		}
-		liveByNode := esphttp.LiveAgentStatesByNode(configs, presences, time.Now().UnixMilli())
+		liveByMember := esphttp.LiveAgentStatesByMember(configs, presences, time.Now().UnixMilli())
 		for i := range out {
-			if live, ok := liveByNode[out[i].NodeID]; ok {
+			if live, ok := liveByMember[out[i].MemberID]; ok {
 				state := live
 				out[i].Live = &state
 			}
 		}
 	}
 	return out, nil
-}
-
-func memberProfileMatchesRosterInfo(ad wire.MemberProfileAd, info entmoot.NodeInfo) bool {
-	return ad.Author.PilotNodeID == info.PilotNodeID &&
-		bytes.Equal(ad.Author.EntmootPubKey, info.EntmootPubKey)
 }
 
 func metadataTags(v any) []string {

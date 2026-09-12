@@ -76,11 +76,13 @@ tasks/commands, `ENTMOOT_ENABLE_TASKS=1`.
 
 ## 3. Commands
 
-This is the complete agent-facing surface. Global flags are shared
-across all five: `-socket` (Pilot IPC socket, default `/tmp/pilot.sock`),
-`-identity` (Ed25519 identity file, default `~/.entmoot/identity.json`),
-`-data` (data root, default `~/.entmoot`), `-listen-port` (default
-`1004`), `-log-level` (default `info`).
+This is the complete agent-facing surface. Global flags are shared across all
+commands: `-identity` (Ed25519 identity file, default
+`~/.entmoot/identity.json`), `-data` (data root, default `~/.entmoot`),
+`-listen-port` (default `1004`), `-connectivity` (`direct` or `relay-only`),
+repeatable `-controlled-relay` multiaddrs, and `-log-level` (default `info`).
+Relay-only daemons do not open a direct listener and require at least one
+controlled relay multiaddr ending in `/p2p/<peer-id>`.
 
 `join`, `serve`, and (for live mode) `tail` hold a local control socket;
 `publish` dials it. `info` and `query` read SQLite directly and work

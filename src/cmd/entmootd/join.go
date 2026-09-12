@@ -5,11 +5,12 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	libpeer "github.com/libp2p/go-libp2p/core/peer"
+	multiaddr "github.com/multiformats/go-multiaddr"
 	"io"
 	"log/slog"
 	"net"
@@ -23,11 +24,9 @@ import (
 	"time"
 
 	"entmoot/pkg/entmoot"
-	"entmoot/pkg/entmoot/canonical"
 	"entmoot/pkg/entmoot/defaultmoot"
 	"entmoot/pkg/entmoot/esphttp"
 	"entmoot/pkg/entmoot/events"
-	"entmoot/pkg/entmoot/gossip"
 	"entmoot/pkg/entmoot/ipc"
 	"entmoot/pkg/entmoot/keystore"
 	entpolicy "entmoot/pkg/entmoot/policy"
@@ -35,182 +34,54 @@ import (
 	"entmoot/pkg/entmoot/signing"
 	"entmoot/pkg/entmoot/store"
 	"entmoot/pkg/entmoot/topic"
-	"entmoot/pkg/entmoot/transport/pilot/ipcclient"
+	libp2ptransport "entmoot/pkg/entmoot/transport/libp2p"
 )
 
-// warnIfPilotNotFullyHideIP queries the local pilot-daemon's Info and
-// logs a WARN-level message naming every privacy gap between Entmoot's
-// -hide-ip (gossip-layer IP suppression) and Pilot's three privacy
-// flags (-turn-provider, -outbound-turn-only, -no-registry-endpoint).
-// Best-effort: IPC failures degrade to a Debug log so startup isn't
-// blocked when the daemon is slow to respond.
-//
-// Entmoot's -hide-ip alone suppresses endpoints in transport-ads; it
-// can't prevent registry leaks (pilot-daemon publishes the real IP)
-// or outbound source-IP leaks (pilot-daemon dials peers direct). This
-// cross-layer check surfaces those gaps loudly at startup so the
-// operator knows whether they're actually achieving the privacy
-// posture they asked for.
-//
-// Added in Entmoot v1.4.3, matches pilot-daemon v1.9.0-jf.11a.
-func warnIfPilotNotFullyHideIP(d *ipcclient.Driver) {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	info, err := d.InfoStruct(ctx)
-	if err != nil {
-		slog.Debug("hide-ip check: could not query pilot Info",
-			slog.String("err", err.Error()))
-		return
-	}
-	var issues []string
-	if info.TURNEndpoint == "" {
-		issues = append(issues, "pilot-daemon has no TURN allocation "+
-			"(set pilot-daemon -turn-provider=cloudflare or "+
-			"-turn-provider=static; without it, Entmoot hide-ip "+
-			"publishes empty transport-ads and the peer is unreachable)")
-	}
-	if !info.OutboundTURNOnly {
-		issues = append(issues, "pilot-daemon not in outbound-turn-only "+
-			"mode (outbound tunnel frames may reveal source IP to "+
-			"peers direct; set pilot-daemon -outbound-turn-only)")
-	}
-	if !info.NoRegistryEndpoint {
-		issues = append(issues, "pilot-daemon still publishes endpoint "+
-			"to registry (peers can registry.Lookup your IP; set "+
-			"pilot-daemon -no-registry-endpoint)")
-	}
-	if len(issues) > 0 {
-		slog.Warn("entmootd -hide-ip is only partially supported by the "+
-			"local pilot-daemon; app-layer IP suppression is incomplete",
-			slog.Any("missing", issues),
-			slog.String("remedy", "run pilot-daemon with -hide-ip "+
-				"(preset for -no-registry-endpoint + -outbound-turn-only; "+
-				"requires -turn-provider) or set the sub-flags "+
-				"individually"))
-	} else {
-		slog.Info("entmootd -hide-ip configuration verified: " +
-			"pilot-daemon is in full hide-ip mode " +
-			"(turn-provider + outbound-turn-only + no-registry-endpoint)")
-	}
-}
-
-func localPilotHostname(socketPath, command string) (string, bool) {
-	drv, err := ipcclient.Connect(socketPath)
-	if err != nil {
-		slog.Debug(command+": local pilot hostname lookup failed",
-			slog.String("err", err.Error()))
-		return "", false
-	}
-	defer func() { _ = drv.Close() }()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	info, err := drv.InfoStruct(ctx)
-	if err != nil {
-		slog.Debug(command+": local pilot hostname lookup failed",
-			slog.String("err", err.Error()))
-		return "", false
-	}
-	hostname, ok := normalizeLocalPilotHostname(info.Hostname)
-	if !ok {
-		slog.Debug(command + ": local pilot hostname unavailable")
-	}
-	return hostname, ok
-}
-
-func pilotDriverHasCapability(ctx context.Context, d *ipcclient.Driver, want string) bool {
-	if d == nil {
-		return false
-	}
-	infoCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
-	info, err := d.InfoStruct(infoCtx)
-	if err != nil {
-		slog.Debug("pilot capability lookup failed", slog.String("capability", want), slog.String("err", err.Error()))
-		return false
-	}
-	for _, cap := range info.Capabilities {
-		if cap == want {
-			return true
-		}
-	}
-	return false
-}
-
-// cmdJoin reads or fetches invites and joins them. By default it behaves like
-// a one-shot command: if a daemon is already running, it asks that daemon to
-// join over IPC; otherwise it joins offline, writes local state, and exits.
-// --serve preserves the legacy "join then run a daemon until signalled" mode.
 const defaultJoinTimeout = 90 * time.Second
 
 func cmdJoin(gf *globalFlags, args []string) int {
 	fs := flag.NewFlagSet("join", flag.ContinueOnError)
-	// v1.2.0: repeatable -advertise-endpoint flag feeds the gossiper's
-	// LocalEndpoints callback. Format: "-advertise-endpoint
-	// tcp=37.27.59.89:4443 -advertise-endpoint udp=37.27.59.89:37736".
-	// Zero flags ships a gossiper with LocalEndpoints=nil, which is the
-	// documented "no change from v1.1.x" behavior — we still accept
-	// inbound TransportAds from other peers, we just don't publish one
-	// of our own. Auto-discovery from Pilot (the pilot-daemon's own
-	// configured listen endpoints) is deferred to v1.3 — the jf.7
-	// driver.Info response does not expose listen addresses today.
-	var advertiseEndpoints endpointFlag
-	fs.Var(&advertiseEndpoints, "advertise-endpoint",
-		"advertise this node's endpoint (network=host:port); repeatable (v1.2.0)")
-	serveAfterJoin := fs.Bool("serve", false, "after joining, keep running as the Entmoot daemon (legacy blocking behavior)")
-	ipcTimeout := fs.Duration("timeout", defaultJoinTimeout, "join bootstrap and live-daemon IPC response deadline")
+	serveAfterJoin := fs.Bool("serve", false, "after joining, keep running as the Entmoot daemon")
+	timeout := fs.Duration("timeout", defaultJoinTimeout, "enrollment deadline")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return exitOK
 		}
 		return exitInvalidArgument
 	}
-	rest := fs.Args()
-	if len(rest) == 0 {
-		fmt.Fprintln(os.Stderr, "join: missing invite (file path or http(s) URL)")
+	if fs.NArg() == 0 {
+		fmt.Fprintln(os.Stderr, "join: missing target-bound bootstrap capability")
 		return exitInvalidArgument
 	}
-	inputs, code := loadJoinInputs(rest)
+	inputs, code := loadJoinInputs(fs.Args())
 	if code != exitOK {
 		return code
 	}
 	sockPath := controlSocketPath(gf.data)
-	if !*serveAfterJoin && controlSocketAlive(sockPath, 200*time.Millisecond) {
-		return joinInputsOverIPC(sockPath, inputs, *ipcTimeout)
+	if controlSocketAlive(sockPath, 200*time.Millisecond) {
+		fmt.Fprintln(os.Stderr, "join: stop the running daemon before enrolling a new group")
+		return exitControlUnavail
 	}
-
-	exitAfterLoad := !*serveAfterJoin
 	return runGroupDaemon(gf, groupDaemonOptions{
-		command:            "join",
-		event:              "joined",
-		advertiseEndpoints: advertiseEndpoints,
-		exitAfterLoad:      exitAfterLoad,
+		command:       "join",
+		event:         "joined",
+		exitAfterLoad: !*serveAfterJoin,
 		loadGroups: func(ctx context.Context, runtime *groupRuntime, loadCtx groupDaemonLoadContext) (int, error) {
-			acceptedInvites := make(map[entmoot.GroupID]entmoot.Invite, len(inputs))
 			for _, input := range inputs {
-				invite, code, err := resolveJoinInput(ctx, input, loadCtx)
+				capability, code, err := resolveJoinInput(ctx, input, loadCtx)
 				if err != nil {
 					return code, err
 				}
-				addInvite := runtime.AddInviteWithOptions
-				addOpts := addInviteOptions{scheduleOnboarding: true, bootstrapTimeout: *ipcTimeout}
-				addOpts.groupPolicy = clonePolicyPtr(input.groupPolicy)
-				if exitAfterLoad {
-					addOpts.scheduleOnboarding = false
+				enrollCtx, cancel := context.WithTimeout(ctx, *timeout)
+				_, _, err = runtime.AddCapability(enrollCtx, *capability)
+				cancel()
+				if err != nil {
+					return exitTransport, fmt.Errorf("enroll group %s: %w", capability.GroupID.String(), err)
 				}
-				if _, _, err := addInvite(ctx, *invite, addOpts); err != nil {
-					code := classifyJoinAddInviteError(err)
-					if code == exitInvalidArgument {
-						return code, err
-					}
-					return code, fmt.Errorf("add group %s: %w", invite.GroupID.String(), err)
+				if err := persistJoinGroupMetadata(ctx, loadCtx.metadataStore, capability.GroupID, input.groupMetadata); err != nil {
+					return exitTransport, fmt.Errorf("persist group metadata %s: %w", capability.GroupID.String(), err)
 				}
-				if err := persistJoinGroupMetadata(ctx, loadCtx.metadataStore, invite.GroupID, input.groupMetadata); err != nil {
-					return exitTransport, fmt.Errorf("persist group metadata %s: %w", invite.GroupID.String(), err)
-				}
-				acceptedInvites[invite.GroupID] = *invite
 			}
-			runtime.SetJoinHealthInvites(acceptedInvites)
 			return exitOK, nil
 		},
 	})
@@ -240,22 +111,25 @@ func loadJoinInputs(args []string) ([]joinInput, int) {
 	return inputs, exitOK
 }
 
-func resolveJoinInput(ctx context.Context, input joinInput, loadCtx groupDaemonLoadContext) (*entmoot.Invite, int, error) {
-	invite := input.invite
+func resolveJoinInput(ctx context.Context, input joinInput, loadCtx groupDaemonLoadContext) (*entmoot.BootstrapCapability, int, error) {
+	capability := input.capability
 	if input.openInvite != nil {
 		redeemed, err := redeemJoinOpenInvite(ctx, input.openInvite, loadCtx)
 		if err != nil {
 			return nil, classifyJoinOpenInviteError(err), fmt.Errorf("redeem open invite %s: %w", input.source, err)
 		}
-		if err := validateExpectedJoinInvite(input.source, input.expectedGroup, input.expectedIssuer, redeemed); err != nil {
-			return nil, exitInvalidArgument, err
-		}
-		invite = redeemed
+		capability = redeemed
 	}
-	if invite == nil {
-		return nil, exitInvalidArgument, fmt.Errorf("invite %s: no signed invite produced", input.source)
+	if capability == nil {
+		return nil, exitInvalidArgument, fmt.Errorf("invite %s: legacy signed invites are not accepted; use a bootstrap capability", input.source)
 	}
-	return invite, exitOK, nil
+	if input.expectedGroup != nil && capability.GroupID != *input.expectedGroup {
+		return nil, exitInvalidArgument, fmt.Errorf("invite %s: group does not match signed descriptor", input.source)
+	}
+	if input.expectedIssuer != nil && !nodeInfoEqual(capability.Founder, *input.expectedIssuer) {
+		return nil, exitInvalidArgument, fmt.Errorf("invite %s: founder does not match signed descriptor", input.source)
+	}
+	return capability, exitOK, nil
 }
 
 func joinInputsOverIPC(sockPath string, inputs []joinInput, timeout time.Duration) int {
@@ -284,27 +158,11 @@ func joinInputsOverIPC(sockPath string, inputs []joinInput, timeout time.Duratio
 	return exitOK
 }
 
-func joinInviteOverIPC(ctx context.Context, sockPath string, invite entmoot.Invite, timeout time.Duration) (*ipc.JoinGroupResp, *ipc.ErrorFrame, error) {
-	return joinGroupReqOverIPC(ctx, sockPath, &ipc.JoinGroupReq{Invite: invite}, timeout)
-}
-
 func joinInputOverIPC(ctx context.Context, sockPath string, input joinInput, timeout time.Duration) (*ipc.JoinGroupResp, *ipc.ErrorFrame, error) {
-	req := &ipc.JoinGroupReq{}
-	switch {
-	case input.invite != nil:
-		req.Invite = *input.invite
-	case input.openInvite != nil:
-		req.OpenInvite = &ipc.OpenInviteJoin{
-			IssuerURL:       input.openInvite.IssuerURL,
-			Token:           input.openInvite.Token,
-			ExpectedGroupID: cloneGroupIDPtr(input.expectedGroup),
-			ExpectedIssuer:  cloneNodeInfoPtr(input.expectedIssuer),
-		}
-	default:
-		return nil, nil, fmt.Errorf("invite %s: no signed invite or open invite descriptor", input.source)
+	if input.capability == nil {
+		return nil, nil, fmt.Errorf("invite %s: a bootstrap capability is required", input.source)
 	}
-	req.GroupMetadata = append(json.RawMessage(nil), input.groupMetadata...)
-	req.GroupPolicy = clonePolicyPtr(input.groupPolicy)
+	req := &ipc.JoinGroupReq{Capability: input.capability}
 	resp, frame, err := joinGroupReqOverIPC(ctx, sockPath, req, timeout)
 	if err != nil || frame != nil {
 		return resp, frame, err
@@ -312,12 +170,11 @@ func joinInputOverIPC(ctx context.Context, sockPath string, input joinInput, tim
 	if resp == nil {
 		return nil, nil, fmt.Errorf("invite %s: no join response", input.source)
 	}
-	invite := &entmoot.Invite{GroupID: resp.GroupID}
-	if resp.Issuer != nil {
-		invite.Issuer = *resp.Issuer
+	if input.expectedGroup != nil && resp.GroupID != *input.expectedGroup {
+		return nil, nil, fmt.Errorf("%w: %s redeemed group %s, want signed descriptor group %s", errInviteMalformed, input.source, resp.GroupID.String(), input.expectedGroup.String())
 	}
-	if err := validateExpectedJoinInvite(input.source, input.expectedGroup, input.expectedIssuer, invite); err != nil {
-		return nil, nil, err
+	if input.expectedIssuer != nil && (resp.Issuer == nil || !nodeInfoEqual(*resp.Issuer, *input.expectedIssuer)) {
+		return nil, nil, fmt.Errorf("%w: %s redeemed founder does not match signed descriptor founder", errInviteMalformed, input.source)
 	}
 	return resp, nil, nil
 }
@@ -402,40 +259,44 @@ func classifyJoinOpenInviteError(err error) int {
 	return exitTransport
 }
 
-func classifyJoinAddInviteError(err error) int {
-	switch {
-	case errors.Is(err, entmoot.ErrInviteExpired), errors.Is(err, entmoot.ErrSigInvalid), errors.Is(err, errInviteMalformed):
-		return exitInvalidArgument
-	case errors.Is(err, errLocalGroupNotMember), errors.Is(err, errLocalGroupIdentityMismatch):
-		return exitNotMember
-	default:
-		return exitTransport
-	}
-}
-
 type groupDaemonOptions struct {
-	command            string
-	event              string
-	advertiseEndpoints endpointFlag
-	exitAfterLoad      bool
-	loadGroups         func(context.Context, *groupRuntime, groupDaemonLoadContext) (int, error)
+	command       string
+	event         string
+	exitAfterLoad bool
+	loadGroups    func(context.Context, *groupRuntime, groupDaemonLoadContext) (int, error)
 }
 
 type groupDaemonLoadContext struct {
-	identity        *keystore.Identity
-	pilot           pilotInfoSigner
-	pilotSocketPath string
-	metadataStore   esphttp.GroupMetadataStore
+	identity      *keystore.Identity
+	metadataStore esphttp.GroupMetadataStore
 }
 
-type pilotInfoSigner interface {
-	InfoStruct(context.Context) (ipcclient.Info, error)
-	SignChallenge(context.Context, []byte) (ipcclient.ChallengeSignature, error)
+func daemonHostConfig(gf *globalFlags) (libp2ptransport.HostConfig, error) {
+	config := libp2ptransport.HostConfig{Mode: libp2ptransport.DirectConnectivity}
+	switch gf.connectivity {
+	case "", "direct":
+		config.ListenAddrs = []string{fmt.Sprintf("/ip4/0.0.0.0/tcp/%d", gf.listenPort)}
+	case "relay-only":
+		config.Mode = libp2ptransport.RelayOnlyConnectivity
+		for _, raw := range gf.controlledRelays {
+			address, err := multiaddr.NewMultiaddr(raw)
+			if err != nil {
+				return libp2ptransport.HostConfig{}, fmt.Errorf("controlled relay %q: %w", raw, err)
+			}
+			info, err := libpeer.AddrInfoFromP2pAddr(address)
+			if err != nil {
+				return libp2ptransport.HostConfig{}, fmt.Errorf("controlled relay %q: %w", raw, err)
+			}
+			config.ControlledRelays = append(config.ControlledRelays, *info)
+		}
+		if len(config.ControlledRelays) == 0 {
+			return libp2ptransport.HostConfig{}, errors.New("relay-only connectivity requires at least one -controlled-relay")
+		}
+	default:
+		return libp2ptransport.HostConfig{}, fmt.Errorf("unsupported connectivity profile %q", gf.connectivity)
+	}
+	return config, nil
 }
-
-const pilotCapabilityLookupNode = "lookup_node"
-
-var errPilotLookupUnavailable = errors.New("pilot identity lookup unavailable")
 
 func runGroupDaemon(gf *globalFlags, opts groupDaemonOptions) int {
 	if opts.command == "" {
@@ -450,8 +311,7 @@ func runGroupDaemon(gf *globalFlags, opts groupDaemonOptions) int {
 		return exitTransport
 	}
 
-	// Early-check the control socket: if another daemon is already live,
-	// exit 6 before we touch Pilot.
+	// Refuse a second daemon before mutating local runtime state.
 	sockPath := controlSocketPath(s.dataDir)
 	if controlSocketAlive(sockPath, 200*time.Millisecond) {
 		fmt.Fprintf(os.Stderr, "%s: another entmoot daemon is already running at %s\n", opts.command, sockPath)
@@ -466,25 +326,18 @@ func runGroupDaemon(gf *globalFlags, opts groupDaemonOptions) int {
 		}
 	}
 
-	tr, err := openPilotForJoin(gf)
+	rootCtx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+	hostConfig, err := daemonHostConfig(gf)
 	if err != nil {
-		slog.Error(opts.command+": pilot", slog.String("err", err.Error()))
+		slog.Error(opts.command+": connectivity", slog.String("err", err.Error()))
+		return exitInvalidArgument
+	}
+	libp2pHost, binding, err := libp2ptransport.NewConfiguredHost(rootCtx, s.identity, hostConfig)
+	if err != nil {
+		slog.Error(opts.command+": libp2p host", slog.String("err", err.Error()))
 		return exitTransport
 	}
-	defer tr.Close()
-	nodeID := tr.NodeID()
-
-	// v1.4.3: when -hide-ip is set, verify the local pilot-daemon is
-	// in full hide-ip mode (turn-provider + outbound-turn-only +
-	// no-registry-endpoint). Entmoot's -hide-ip hides IP at the
-	// gossip layer only; without matching pilot-daemon flags, peers
-	// can still learn our IP via registry.Lookup or direct outbound
-	// source-IP leaks. Best-effort: failures to query Info() don't
-	// block startup, just log at Debug.
-	if gf.hideIP {
-		warnIfPilotNotFullyHideIP(tr.Driver())
-	}
-
 	rawStore, err := store.OpenSQLite(s.dataDir)
 	if err != nil {
 		slog.Error(opts.command+": open store", slog.String("err", err.Error()))
@@ -504,76 +357,14 @@ func runGroupDaemon(gf *globalFlags, opts groupDaemonOptions) int {
 	serviceEvents := events.NewBus()
 	notifyStore := newNotifyingStore(rawStore, serviceEvents)
 
-	// Establish the signal-bound root context before anything starts
-	// long-running goroutines (v1.4.4's TURN-endpoint poller is the
-	// first). Previously this was set up just before gossiper.Join;
-	// the poller needs it earlier so its lifetime tracks the daemon's.
-	rootCtx, cancel := signal.NotifyContext(context.Background(),
-		os.Interrupt, syscall.SIGTERM)
-	defer cancel()
-
-	// v1.2.0: snapshot the -advertise-endpoint values once at startup.
-	// v1.4.4: merge a live-polled TURN endpoint from pilot-daemon on
-	// top of the CLI snapshot, so Cloudflare allocation port rotation
-	// (port changes on restart or credential refresh) gets observed
-	// and re-advertised within ~30 s. Without this poller, LocalEndpoints
-	// returns a fixed CLI snapshot; remote peers keep using the stale
-	// TURN relay addr in their cached transport_ad and their outbound
-	// frames get silently dropped by Cloudflare's edge.
-	cliEps := opts.advertiseEndpoints.Snapshot()
-	turnPoller := newTURNEndpointPoller(tr.Driver(), turnEndpointPollInterval)
-	// Prime the poller synchronously so the advertiser's startup
-	// publish sees the current TURN addr on the very first call to
-	// LocalEndpoints. Failure degrades to empty — the ticker will
-	// pick it up on the next 30 s boundary.
-	turnPoller.pollOnce(rootCtx)
-
-	localEndpointsFn := func() []entmoot.NodeEndpoint {
-		out := make([]entmoot.NodeEndpoint, 0, len(cliEps)+1)
-		// Carry non-TURN CLI entries (tcp=, udp=) verbatim.
-		for _, e := range cliEps {
-			if e.Network != "turn" {
-				out = append(out, e)
-			}
-		}
-		// Prefer the live-polled TURN addr. Fall back to any turn=
-		// CLI entries if the poller has no value yet (e.g. the
-		// startup poll failed and the ticker hasn't fired).
-		if live := turnPoller.CurrentTURN(); live != "" {
-			out = append(out, entmoot.NodeEndpoint{Network: "turn", Addr: live})
-		} else {
-			for _, e := range cliEps {
-				if e.Network == "turn" {
-					out = append(out, e)
-				}
-			}
-		}
-		return out
-	}
-	localHostnameFn := func() (string, bool) {
-		return localPilotHostname(gf.socket, opts.command)
-	}
-	// Background polling runs for the lifetime of the daemon.
-	go turnPoller.Run(rootCtx)
-	pilotLookupNodeSupported := pilotDriverHasCapability(rootCtx, tr.Driver(), pilotCapabilityLookupNode)
-	if !pilotLookupNodeSupported {
-		slog.Warn(opts.command + ": pilot-daemon does not advertise lookup_node; ESP invite creation and open-invite redemption are unavailable until Pilot is upgraded")
-	}
-
 	runtime, err := newGroupRuntime(groupRuntimeConfig{
-		NodeID:           nodeID,
-		Identity:         s.identity,
-		DataDir:          s.dataDir,
-		Store:            rawStore,
-		Notify:           notifyStore,
-		Transport:        tr,
-		PilotDriver:      tr.Driver(),
-		LocalEndpoints:   localEndpointsFn,
-		LocalHostname:    localHostnameFn,
-		EndpointsChanged: turnPoller.Changed(),
-		HideIP:           gf.hideIP,
-		TraceReconcile:   gf.traceReconcile,
-		Logger:           slog.Default(),
+		Identity: s.identity,
+		DataDir:  s.dataDir,
+		Store:    rawStore,
+		Notify:   notifyStore,
+		Host:     libp2pHost,
+		Binding:  binding,
+		Logger:   slog.Default(),
 	})
 	if err != nil {
 		slog.Error(opts.command+": new group runtime", slog.String("err", err.Error()))
@@ -586,10 +377,8 @@ func runGroupDaemon(gf *globalFlags, opts groupDaemonOptions) int {
 		return exitInvalidArgument
 	}
 	if code, err := opts.loadGroups(rootCtx, runtime, groupDaemonLoadContext{
-		identity:        s.identity,
-		pilot:           tr.Driver(),
-		pilotSocketPath: gf.socket,
-		metadataStore:   fleetState,
+		identity:      s.identity,
+		metadataStore: fleetState,
 	}); err != nil {
 		if code == exitInvalidArgument || code == exitNotMember || code == exitGroupNotFound {
 			fmt.Fprintf(os.Stderr, "%s: %v\n", opts.command, err)
@@ -607,7 +396,6 @@ func runGroupDaemon(gf *globalFlags, opts groupDaemonOptions) int {
 
 	if opts.exitAfterLoad {
 		groups := runtime.ActiveGroupIDs()
-		runtime.runOneShotOnboardingHandshakes(rootCtx, runtime.JoinHealthInvites())
 		members := groupRuntimeMemberCount(runtime, groups)
 		joinedEvent := groupDaemonEvent(opts.event, gf, groups, members, buildJoinHealthSummary(rootCtx, runtime, rawStore, s.identity.PublicKey), sockPath)
 		if data, err := json.Marshal(joinedEvent); err == nil {
@@ -636,9 +424,7 @@ func runGroupDaemon(gf *globalFlags, opts groupDaemonOptions) int {
 		}
 	}
 
-	// Start the shared transport demux and the IPC accept loop in separate
-	// goroutines. Each group session has already started its own gossiper
-	// workers inside runtime.AddInvite.
+	// Start the shared libp2p transport and local IPC loop independently.
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
@@ -648,21 +434,18 @@ func runGroupDaemon(gf *globalFlags, opts groupDaemonOptions) int {
 		}
 	}()
 
-	// IPC server state: shared across handlers via closure.
 	srv := &ipcServer{
-		nodeID:                   nodeID,
-		identity:                 s.identity,
-		identityPath:             gf.identity,
-		dataDir:                  s.dataDir,
-		pilotSocketPath:          gf.socket,
-		controlSocketPath:        sockPath,
-		listenPort:               uint16(gf.listenPort),
-		runtime:                  runtime,
-		store:                    rawStore,
-		notify:                   notifyStore,
-		pilot:                    tr.Driver(),
-		pilotLookupNodeSupported: pilotLookupNodeSupported,
-		metadataStore:            fleetState,
+		memberID:          binding.MemberID,
+		peerID:            binding.PeerID.String(),
+		identity:          s.identity,
+		identityPath:      gf.identity,
+		dataDir:           s.dataDir,
+		controlSocketPath: sockPath,
+		listenPort:        uint16(gf.listenPort),
+		runtime:           runtime,
+		store:             rawStore,
+		notify:            notifyStore,
+		metadataStore:     fleetState,
 	}
 	commandRunner := newFleetCommandRunner(srv, fleetState, notifyStore, slog.Default())
 
@@ -705,7 +488,7 @@ func groupRuntimeMemberCount(runtime *groupRuntime, groups []entmoot.GroupID) in
 	members := 0
 	for _, gid := range groups {
 		if sess, ok := runtime.Get(gid); ok {
-			members += len(sess.roster.Members())
+			members += len(sess.roster.MemberIDs())
 		}
 	}
 	return members
@@ -727,7 +510,6 @@ func groupDaemonEvent(event string, gf *globalFlags, groups []entmoot.GroupID, m
 func doctorNextCommand(gf *globalFlags, gid entmoot.GroupID) string {
 	args := []string{
 		"entmootd",
-		"-socket", gf.socket,
 		"-identity", gf.identity,
 		"-data", gf.data,
 		"doctor",
@@ -762,7 +544,7 @@ var errFetchFailed = errors.New("invite fetch failed")
 
 type joinInput struct {
 	source         string
-	invite         *entmoot.Invite
+	capability     *entmoot.BootstrapCapability
 	openInvite     *openInviteAcceptPayload
 	expectedGroup  *entmoot.GroupID
 	expectedIssuer *entmoot.NodeInfo
@@ -771,8 +553,8 @@ type joinInput struct {
 }
 
 // loadJoinInput reads a join input from arg (file path, http(s) URL, or
-// entmoot://open-invite link) and classifies it as either a signed invite or an
-// open invite descriptor that must be redeemed after Pilot startup.
+// entmoot://open-invite link) and classifies it as either a bootstrap
+// capability or an open invite descriptor that must be redeemed.
 func loadJoinInput(arg string) (joinInput, error) {
 	if payload, ok, err := parseOpenInviteLinkArg(arg); ok || err != nil {
 		if err != nil {
@@ -804,29 +586,18 @@ func loadJoinInput(arg string) (joinInput, error) {
 		input.source = arg
 		return input, nil
 	}
-	invite, err := parseSignedInvite(raw)
-	if err != nil {
-		return joinInput{}, err
+	var capability entmoot.BootstrapCapability
+	if err := json.Unmarshal(raw, &capability); err != nil {
+		return joinInput{}, fmt.Errorf("%w: parse bootstrap capability: %v", errInviteMalformed, err)
 	}
-	return joinInput{source: arg, invite: invite}, nil
-}
-
-// loadInvite reads a signed invite JSON bundle from arg. Kept as a small
-// compatibility helper for tests and older internal call sites; cmdJoin uses
-// loadJoinInput so app-generated open invites can be redeemed automatically.
-func loadInvite(arg string) (*entmoot.Invite, error) {
-	input, err := loadJoinInput(arg)
-	if err != nil {
-		return nil, err
+	if capability.GroupID == (entmoot.GroupID{}) || len(capability.TargetPublicKey) != ed25519.PublicKeySize {
+		return joinInput{}, fmt.Errorf("%w: unsupported join input; provide a target-bound bootstrap capability", errInviteMalformed)
 	}
-	if input.invite == nil {
-		return nil, fmt.Errorf("%w: open invite descriptor requires redemption", errInviteMalformed)
-	}
-	return input.invite, nil
+	return joinInput{source: arg, capability: &capability}, nil
 }
 
 // readJoinInputBytes reads a join input JSON bundle from arg (file path or
-// http(s) URL). Signed-invite structural checks happen after classification.
+// http(s) URL). Bootstrap capability checks happen after classification.
 func readJoinInputBytes(arg string) ([]byte, error) {
 	if len(arg) > 0 && (hasPrefix(arg, "http://") || hasPrefix(arg, "https://")) {
 		client := &http.Client{Timeout: 5 * time.Second}
@@ -855,33 +626,18 @@ func readJoinInputBytes(arg string) ([]byte, error) {
 	}
 }
 
-func parseSignedInvite(raw []byte) (*entmoot.Invite, error) {
-	var invite entmoot.Invite
-	if err := json.Unmarshal(raw, &invite); err != nil {
-		return nil, fmt.Errorf("%w: parse: %v", errInviteMalformed, err)
-	}
-	if invite.ValidUntil > 0 {
-		now := time.Now().UnixMilli()
-		if now > invite.ValidUntil {
-			return nil, fmt.Errorf("%w: valid_until=%d now=%d",
-				entmoot.ErrInviteExpired, invite.ValidUntil, now)
-		}
-	}
-	return &invite, nil
-}
-
-const fleetInviteDescriptorType = "entmoot.fleet_invite.v1"
+const fleetInviteDescriptorType = "entmoot.fleet_invite.v2"
 
 type fleetInviteDescriptor struct {
-	Type           string          `json:"type,omitempty"`
-	FleetID        string          `json:"fleet_id"`
-	FleetName      string          `json:"fleet_name,omitempty"`
-	ControlGroupID entmoot.GroupID `json:"control_group_id,omitempty"`
-	Invite         entmoot.Invite  `json:"invite"`
-	GroupMetadata  json.RawMessage `json:"group_metadata,omitempty"`
+	Type           string                      `json:"type,omitempty"`
+	FleetID        string                      `json:"fleet_id"`
+	FleetName      string                      `json:"fleet_name,omitempty"`
+	ControlGroupID entmoot.GroupID             `json:"control_group_id,omitempty"`
+	Capability     entmoot.BootstrapCapability `json:"capability"`
+	GroupMetadata  json.RawMessage             `json:"group_metadata,omitempty"`
 }
 
-func newFleetInviteDescriptor(fleet esphttp.FleetRecord, invite entmoot.Invite) (fleetInviteDescriptor, error) {
+func newFleetInviteDescriptor(fleet esphttp.FleetRecord, capability entmoot.BootstrapCapability) (fleetInviteDescriptor, error) {
 	metadata, err := fleetControlGroupMetadata(fleet.FleetID, fleet.Name)
 	if err != nil {
 		return fleetInviteDescriptor{}, err
@@ -891,7 +647,7 @@ func newFleetInviteDescriptor(fleet esphttp.FleetRecord, invite entmoot.Invite) 
 		FleetID:        fleet.FleetID,
 		FleetName:      fleet.Name,
 		ControlGroupID: fleet.ControlGroupID,
-		Invite:         invite,
+		Capability:     capability,
 		GroupMetadata:  metadata,
 	}, nil
 }
@@ -904,7 +660,7 @@ func parseFleetInviteDescriptor(raw []byte) (joinInput, bool, error) {
 	if !hasJSONField(fields, "fleet_id") && !hasJSONField(fields, "group_metadata") {
 		return joinInput{}, false, nil
 	}
-	if !hasJSONField(fields, "invite") {
+	if !hasJSONField(fields, "capability") {
 		return joinInput{}, false, nil
 	}
 	var desc fleetInviteDescriptor
@@ -918,11 +674,11 @@ func parseFleetInviteDescriptor(raw []byte) (joinInput, bool, error) {
 	if desc.FleetID == "" {
 		return joinInput{}, true, fmt.Errorf("%w: fleet invite descriptor requires fleet_id", errInviteMalformed)
 	}
-	if desc.Invite.GroupID == (entmoot.GroupID{}) {
-		return joinInput{}, true, fmt.Errorf("%w: fleet invite descriptor requires a signed invite", errInviteMalformed)
+	if desc.Capability.GroupID == (entmoot.GroupID{}) {
+		return joinInput{}, true, fmt.Errorf("%w: fleet invite descriptor requires a bootstrap capability", errInviteMalformed)
 	}
-	if desc.ControlGroupID != (entmoot.GroupID{}) && desc.ControlGroupID != desc.Invite.GroupID {
-		return joinInput{}, true, fmt.Errorf("%w: fleet invite descriptor control_group_id does not match invite", errInviteMalformed)
+	if desc.ControlGroupID != (entmoot.GroupID{}) && desc.ControlGroupID != desc.Capability.GroupID {
+		return joinInput{}, true, fmt.Errorf("%w: fleet invite descriptor control_group_id does not match capability", errInviteMalformed)
 	}
 	metadata := desc.GroupMetadata
 	if len(bytes.TrimSpace(metadata)) == 0 {
@@ -937,8 +693,8 @@ func parseFleetInviteDescriptor(raw []byte) (joinInput, bool, error) {
 	if !fleetControlMetadataMatches(metadata, desc.FleetID) {
 		return joinInput{}, true, fmt.Errorf("%w: fleet invite descriptor metadata does not match fleet_id", errInviteMalformed)
 	}
-	invite := desc.Invite
-	return joinInput{invite: &invite, groupMetadata: metadata}, true, nil
+	capability := desc.Capability
+	return joinInput{capability: &capability, groupMetadata: metadata}, true, nil
 }
 
 func parseDefaultMootDescriptor(raw []byte) (joinInput, bool, error) {
@@ -1125,7 +881,7 @@ func looksLikeOpenInviteToken(arg string) bool {
 	return true
 }
 
-func redeemJoinOpenInvite(ctx context.Context, payload *openInviteAcceptPayload, loadCtx groupDaemonLoadContext) (*entmoot.Invite, error) {
+func redeemJoinOpenInvite(ctx context.Context, payload *openInviteAcceptPayload, loadCtx groupDaemonLoadContext) (*entmoot.BootstrapCapability, error) {
 	if payload == nil {
 		return nil, fmt.Errorf("%w: open invite payload is missing", errInviteMalformed)
 	}
@@ -1133,115 +889,18 @@ func redeemJoinOpenInvite(ctx context.Context, payload *openInviteAcceptPayload,
 	if err != nil {
 		return nil, err
 	}
-	exec := espOperationExecutor{
-		identity:        loadCtx.identity,
-		pilotSocketPath: loadCtx.pilotSocketPath,
-		timeout:         30 * time.Second,
-	}
-	if loadCtx.pilot != nil {
-		exec.pilotIdentity = func(ctx context.Context) (entmoot.NodeID, string, error) {
-			infoCtx, cancel := context.WithTimeout(ctx, exec.timeout)
-			defer cancel()
-			info, err := loadCtx.pilot.InfoStruct(infoCtx)
-			if err != nil {
-				return 0, "", &esphttp.OperationError{HTTPStatus: http.StatusServiceUnavailable, Code: "pilot_unavailable", Message: "local Pilot identity is unavailable: " + err.Error()}
-			}
-			if info.NodeID == 0 || strings.TrimSpace(info.PublicKey) == "" {
-				return 0, "", &esphttp.OperationError{HTTPStatus: http.StatusServiceUnavailable, Code: "pilot_unavailable", Message: "local Pilot identity is incomplete"}
-			}
-			return entmoot.NodeID(info.NodeID), strings.TrimSpace(info.PublicKey), nil
-		}
-		exec.pilotSignChallenge = func(ctx context.Context, challenge []byte) (string, error) {
-			signCtx, cancel := context.WithTimeout(ctx, exec.timeout)
-			defer cancel()
-			sig, err := loadCtx.pilot.SignChallenge(signCtx, challenge)
-			if err != nil {
-				return "", &esphttp.OperationError{HTTPStatus: http.StatusServiceUnavailable, Code: "pilot_unavailable", Message: "local Pilot challenge signing failed: " + err.Error()}
-			}
-			if strings.TrimSpace(sig.Signature) == "" {
-				return "", &esphttp.OperationError{HTTPStatus: http.StatusServiceUnavailable, Code: "pilot_unavailable", Message: "local Pilot challenge signature is empty"}
-			}
-			return strings.TrimSpace(sig.Signature), nil
-		}
-	}
-	invite, _, err := exec.redeemOpenInviteFromIssuer(ctx, issuer, token)
+	exec := espOperationExecutor{identity: loadCtx.identity, timeout: 30 * time.Second}
+	capability, _, err := exec.redeemOpenInviteFromIssuer(ctx, issuer, token)
 	if err != nil {
 		return nil, err
 	}
-	return &invite, nil
+	return &capability, nil
 }
 
 // hasPrefix is a tiny alias for strings.HasPrefix so the import
 // surface in this file stays minimal.
 func hasPrefix(s, p string) bool {
 	return len(s) >= len(p) && s[:len(p)] == p
-}
-
-// endpointFlag implements flag.Value for a repeatable
-// -advertise-endpoint argument whose value is "network=host:port".
-// Networks are restricted to "tcp", "udp", and "turn" (what Pilot's
-// driver understands today; "turn" added in v1.4.0 / jf.8). The addr
-// half is parsed with net.SplitHostPort so we catch a malformed value
-// at flag-parse time rather than at advertiser-publish time. (v1.2.0)
-type endpointFlag struct {
-	entries []entmoot.NodeEndpoint
-}
-
-// Set parses one -advertise-endpoint value of the form
-// "network=host:port". Repeated invocations append to the slice.
-// Empty values are rejected so `-advertise-endpoint ""` surfaces at
-// parse time rather than as a silent no-op.
-func (e *endpointFlag) Set(s string) error {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return errors.New("empty -advertise-endpoint")
-	}
-	eq := strings.IndexByte(s, '=')
-	if eq <= 0 || eq == len(s)-1 {
-		return fmt.Errorf("-advertise-endpoint %q: want network=host:port", s)
-	}
-	network := strings.TrimSpace(s[:eq])
-	addr := strings.TrimSpace(s[eq+1:])
-	switch network {
-	case "tcp", "udp", "turn":
-	default:
-		return fmt.Errorf("-advertise-endpoint %q: unsupported network %q (want tcp, udp, or turn)", s, network)
-	}
-	if _, _, err := net.SplitHostPort(addr); err != nil {
-		return fmt.Errorf("-advertise-endpoint %q: parse addr: %w", s, err)
-	}
-	e.entries = append(e.entries, entmoot.NodeEndpoint{Network: network, Addr: addr})
-	return nil
-}
-
-// String implements flag.Value. Concatenates the parsed entries in
-// the canonical "network=addr" form joined with commas so help text
-// prints something readable for a partially-parsed state.
-func (e *endpointFlag) String() string {
-	if e == nil || len(e.entries) == 0 {
-		return ""
-	}
-	var sb strings.Builder
-	for i, ep := range e.entries {
-		if i > 0 {
-			sb.WriteByte(',')
-		}
-		sb.WriteString(ep.Network)
-		sb.WriteByte('=')
-		sb.WriteString(ep.Addr)
-	}
-	return sb.String()
-}
-
-// Snapshot returns a defensive copy of the parsed entries. The
-// gossiper's LocalEndpoints callback captures this snapshot in a
-// closure so later flag mutations (shouldn't happen, but we're
-// safe-by-default) don't race the advertiser-loop reads.
-func (e *endpointFlag) Snapshot() []entmoot.NodeEndpoint {
-	if e == nil {
-		return nil
-	}
-	return append([]entmoot.NodeEndpoint(nil), e.entries...)
 }
 
 // notifyingStore wraps a MessageStore and publishes newly-stored
@@ -1311,11 +970,11 @@ func (n *notifyingStore) Put(ctx context.Context, expectedGroup entmoot.GroupID,
 		return inserted, err
 	}
 	n.sink.Emit(events.Event{
-		Type:      events.TypeMessageIngested,
-		GroupID:   m.GroupID,
-		MessageID: m.ID,
-		PeerID:    m.Author.PilotNodeID,
-		At:        time.Now(),
+		Type:           events.TypeMessageIngested,
+		GroupID:        m.GroupID,
+		MessageID:      m.ID,
+		AuthorMemberID: messageAuthorMemberID(m),
+		At:             time.Now(),
 	})
 	n.broadcast(m)
 	return true, nil
@@ -1351,6 +1010,20 @@ func (n *notifyingStore) MerkleRoot(ctx context.Context, gid entmoot.GroupID) ([
 func (n *notifyingStore) IterMessageIDsInIDRange(ctx context.Context, gid entmoot.GroupID, loID, hiID entmoot.MessageID) ([]entmoot.MessageID, error) {
 	return n.inner.IterMessageIDsInIDRange(ctx, gid, loID, hiID)
 }
+func (n *notifyingStore) MessageIDsPage(ctx context.Context, gid entmoot.GroupID, sinceMillis int64, after *store.RangeCursor, expectedGeneration uint64, limit int) (store.MessageIDPage, error) {
+	paged, ok := n.inner.(store.PagedMessageIDStore)
+	if !ok {
+		return store.MessageIDPage{}, errors.New("message store does not support paged history")
+	}
+	return paged.MessageIDsPage(ctx, gid, sinceMillis, after, expectedGeneration, limit)
+}
+func (n *notifyingStore) MessageIDsPageWindow(ctx context.Context, gid entmoot.GroupID, sinceMillis, untilMillis int64, after *store.RangeCursor, expectedGeneration uint64, limit int) (store.MessageIDPage, error) {
+	paged, ok := n.inner.(store.WindowedPagedMessageIDStore)
+	if !ok {
+		return store.MessageIDPage{}, errors.New("message store does not support windowed paged history")
+	}
+	return paged.MessageIDsPageWindow(ctx, gid, sinceMillis, untilMillis, after, expectedGeneration, limit)
+}
 func (n *notifyingStore) PruneBefore(ctx context.Context, gid entmoot.GroupID, beforeMillis int64) (int64, error) {
 	return store.PruneBefore(ctx, n.inner, gid, beforeMillis)
 }
@@ -1363,19 +1036,17 @@ func (n *notifyingStore) Close() error { return n.inner.Close() }
 // read-only after cmdJoin finishes setup so handlers may access them
 // without locking.
 type ipcServer struct {
-	nodeID                   entmoot.NodeID
-	identity                 *keystore.Identity
-	identityPath             string
-	dataDir                  string
-	pilotSocketPath          string
-	controlSocketPath        string
-	listenPort               uint16
-	runtime                  *groupRuntime
-	store                    *store.SQLite
-	notify                   *notifyingStore
-	pilot                    *ipcclient.Driver
-	pilotLookupNodeSupported bool
-	metadataStore            esphttp.GroupMetadataStore
+	memberID          entmoot.MemberID
+	peerID            string
+	identity          *keystore.Identity
+	identityPath      string
+	dataDir           string
+	controlSocketPath string
+	listenPort        uint16
+	runtime           *groupRuntime
+	store             *store.SQLite
+	notify            *notifyingStore
+	metadataStore     esphttp.GroupMetadataStore
 }
 
 // acceptLoop accepts IPC connections until the listener is closed.
@@ -1441,8 +1112,6 @@ func (s *ipcServer) handleConn(ctx context.Context, c net.Conn) {
 		s.handleMemberRemove(ctx, c, v)
 	case *ipc.GroupDeactivateReq:
 		s.handleGroupDeactivate(c, v)
-	case *ipc.DiagProbeReq:
-		s.handleDiagProbe(ctx, c, v)
 	case *ipc.InfoReq:
 		s.handleInfo(ctx, c)
 	case *ipc.TailSubscribe:
@@ -1475,7 +1144,7 @@ func (s *ipcServer) handleSignedPublish(ctx context.Context, c net.Conn, req *ip
 		})
 		return
 	}
-	if err := sess.gossip.Publish(ctx, msg); err != nil {
+	if _, err := sess.live.Publish(ctx, msg); err != nil {
 		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
 			Type:    "error",
 			Code:    publishErrorCode(err),
@@ -1485,11 +1154,11 @@ func (s *ipcServer) handleSignedPublish(ctx context.Context, c net.Conn, req *ip
 		return
 	}
 	_ = ipc.EncodeAndWrite(c, &ipc.SignedPublishResp{
-		Status:      "accepted",
-		MessageID:   msg.ID,
-		GroupID:     gid,
-		Author:      msg.Author.PilotNodeID,
-		TimestampMS: msg.Timestamp,
+		Status:         "accepted",
+		MessageID:      msg.ID,
+		GroupID:        gid,
+		AuthorMemberID: messageAuthorMemberID(msg),
+		TimestampMS:    msg.Timestamp,
 	})
 }
 
@@ -1538,25 +1207,28 @@ func (s *ipcServer) publishLocalMessage(ctx context.Context, gid entmoot.GroupID
 			}
 		}
 	}
-	if !sess.roster.IsMember(s.nodeID) {
+	if !sess.roster.IsMemberID(s.memberID) {
 		return nil, &ipc.ErrorFrame{
 			Type:    "error",
 			Code:    ipc.CodeNotMember,
 			GroupID: &gid,
-			Message: fmt.Sprintf("local node %d is not a member", s.nodeID),
+			Message: fmt.Sprintf("local member %s is not in the roster", s.memberID.String()),
 		}
 	}
 
-	// Build and sign the Message. Author pubkey comes from the
-	// roster's own record of the local node so it matches what every
-	// peer (and our own verifyMessage) expects.
+	// Build and sign the message with the same-key application and transport
+	// identity recorded in the roster.
 	now := time.Now().UnixMilli()
 	author := entmoot.NodeInfo{
-		PilotNodeID:   s.nodeID,
+		MemberID:      &s.memberID,
+		PeerID:        s.peerID,
 		EntmootPubKey: s.identity.PublicKey,
 	}
-	if info, ok := sess.roster.MemberInfo(s.nodeID); ok {
+	if info, ok := sess.roster.MemberInfoByID(s.memberID); ok {
 		author = info
+		if author.PeerID == "" {
+			author.PeerID = s.peerID
+		}
 	}
 
 	msg := entmoot.Message{
@@ -1598,8 +1270,18 @@ func (s *ipcServer) publishLocalMessage(ctx context.Context, gid entmoot.GroupID
 			Message: "sign message: " + err.Error(),
 		}
 	}
+	acceptance, err := s.runtime.AcceptMessage(ctx, gid, msg)
+	if err != nil {
+		return nil, &ipc.ErrorFrame{
+			Type:    "error",
+			Code:    ipc.CodeNotMember,
+			GroupID: &gid,
+			Message: "message acceptance: " + err.Error(),
+		}
+	}
+	msg.Acceptance = &acceptance
 
-	if err := sess.gossip.Publish(ctx, msg); err != nil {
+	if _, err := sess.live.Publish(ctx, msg); err != nil {
 		return nil, &ipc.ErrorFrame{
 			Type:    "error",
 			Code:    publishErrorCode(err),
@@ -1620,78 +1302,9 @@ func publishErrorCode(err error) ipc.ErrorCode {
 		return ipc.CodeNotMember
 	case errors.Is(err, entmoot.ErrSigInvalid):
 		return ipc.CodeInvalidArgument
-	case errors.Is(err, gossip.ErrPolicyUpdateStale):
-		return ipc.CodeConflict
 	default:
 		return ipc.CodeInternal
 	}
-}
-
-func (s *ipcServer) handleDiagProbe(ctx context.Context, c net.Conn, req *ipc.DiagProbeReq) {
-	sess, ok := s.runtime.Get(req.GroupID)
-	if !ok {
-		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
-			Type:    "error",
-			Code:    ipc.CodeGroupNotFound,
-			GroupID: &req.GroupID,
-			Message: "group not joined",
-		})
-		return
-	}
-	if len(req.Peers) > diagProbeMaxPeersPerRequest {
-		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
-			Type:    "error",
-			Code:    ipc.CodeInvalidArgument,
-			GroupID: &req.GroupID,
-			Message: "too many peers for one diagnostic probe",
-		})
-		return
-	}
-	timeout := clampDiagProbeTimeout(time.Duration(req.TimeoutMS) * time.Millisecond)
-	probeRoot, cancelProbeRoot := context.WithTimeout(ctx, diagProbeBudget(timeout, len(req.Peers)))
-	defer cancelProbeRoot()
-
-	peers := append([]entmoot.NodeID(nil), req.Peers...)
-	resp := &ipc.DiagProbeResp{
-		GroupID: req.GroupID,
-		Peers:   make([]ipc.DiagProbePeer, len(peers)),
-	}
-	sem := make(chan struct{}, diagProbeConcurrency)
-	var wg sync.WaitGroup
-	for i, peer := range peers {
-		i, peer := i, peer
-		resp.Peers[i].NodeID = peer
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			select {
-			case sem <- struct{}{}:
-				defer func() { <-sem }()
-			case <-probeRoot.Done():
-				resp.Peers[i].Error = probeRoot.Err().Error()
-				return
-			}
-			nonce := make([]byte, 16)
-			if _, err := rand.Read(nonce); err != nil {
-				resp.Peers[i].Error = "nonce: " + err.Error()
-				return
-			}
-			probeCtx, cancel := context.WithTimeout(probeRoot, timeout)
-			defer cancel()
-			start := time.Now()
-			got, err := sess.gossip.DiagnosticPing(probeCtx, peer, nonce)
-			if err != nil {
-				resp.Peers[i].Error = err.Error()
-				return
-			}
-			resp.Peers[i].OK = true
-			resp.Peers[i].RTTMS = time.Since(start).Milliseconds()
-			resp.Peers[i].Responder = got.Responder
-			resp.Peers[i].ReceivedMS = got.TimestampMS
-		}()
-	}
-	wg.Wait()
-	_ = ipc.EncodeAndWrite(c, resp)
 }
 
 func (s *ipcServer) resolvePublishGroup(c net.Conn, requested *entmoot.GroupID) (entmoot.GroupID, bool) {
@@ -1723,67 +1336,41 @@ func (s *ipcServer) handleJoinGroup(ctx context.Context, c net.Conn, req *ipc.Jo
 	}
 	joinCtx, cancel := context.WithTimeout(ctx, joinTimeout)
 	defer cancel()
-	invite, err := s.resolveJoinGroupInvite(joinCtx, req)
+	var (
+		session *groupSession
+		created bool
+		err     error
+		issuer  *entmoot.NodeInfo
+	)
+	switch {
+	case req.Capability != nil && req.LocalGroupID == nil:
+		session, created, err = s.runtime.AddCapability(joinCtx, *req.Capability)
+		founder := req.Capability.Founder
+		issuer = &founder
+	case req.Capability == nil && req.LocalGroupID != nil:
+		session, created, err = s.runtime.AddLocalGroup(joinCtx, *req.LocalGroupID)
+	default:
+		err = errors.New("exactly one capability or local_group_id is required")
+	}
 	if err != nil {
-		code := ipcCodeForJoinResolveError(err)
-		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
-			Type:    "error",
-			Code:    code,
-			Message: "join group: " + err.Error(),
-		})
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInvalidArgument, Message: "join group: " + err.Error()})
 		return
 	}
-	bootstrapTimeout, err := remainingJoinBootstrapTimeout(joinCtx, joinTimeout, time.Now())
-	if err != nil {
-		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
-			Type:    "error",
-			Code:    ipc.CodeUnavailable,
-			Message: "join group: timeout before bootstrap",
-		})
-		return
-	}
-	sess, created, err := s.runtime.AddInviteWithOptions(joinCtx, invite, addInviteOptions{
-		scheduleOnboarding: true,
-		bootstrapTimeout:   bootstrapTimeout,
-		sessionParent:      ctx,
-		groupPolicy:        req.GroupPolicy,
-	})
-	if err != nil {
-		code := ipc.CodeInternal
-		if errors.Is(err, entmoot.ErrInviteExpired) || errors.Is(err, entmoot.ErrSigInvalid) || errors.Is(err, errInviteMalformed) {
-			code = ipc.CodeInvalidArgument
+	if req.GroupPolicy != nil {
+		if err := s.runtime.policyStore.Put(joinCtx, session.groupID, *req.GroupPolicy); err != nil {
+			_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInternal, GroupID: &session.groupID, Message: "join group: persist policy: " + err.Error()})
+			return
 		}
-		gid := invite.GroupID
-		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
-			Type:    "error",
-			Code:    code,
-			GroupID: &gid,
-			Message: "join group: " + err.Error(),
-		})
-		return
 	}
-	if err := persistJoinGroupMetadata(joinCtx, s.metadataStore, invite.GroupID, req.GroupMetadata); err != nil {
-		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
-			Type:    "error",
-			Code:    ipc.CodeInternal,
-			GroupID: &invite.GroupID,
-			Message: "join group: persist group metadata: " + err.Error(),
-		})
+	if err := persistJoinGroupMetadata(joinCtx, s.metadataStore, session.groupID, req.GroupMetadata); err != nil {
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInternal, GroupID: &session.groupID, Message: "join group: persist group metadata: " + err.Error()})
 		return
 	}
 	status := "already_joined"
 	if created {
 		status = "joined"
 	}
-	s.runtime.RecordJoinHealthInvite(invite)
-	issuer := invite.Issuer
-	_ = ipc.EncodeAndWrite(c, &ipc.JoinGroupResp{
-		Status:    status,
-		GroupID:   sess.groupID,
-		Issuer:    &issuer,
-		Members:   len(sess.roster.Members()),
-		Readiness: s.joinReadinessEvent(ctx),
-	})
+	_ = ipc.EncodeAndWrite(c, &ipc.JoinGroupResp{Status: status, GroupID: session.groupID, Issuer: issuer, Members: len(session.roster.MemberIDs()), Readiness: s.joinReadinessEvent(ctx)})
 }
 
 func persistJoinGroupMetadata(ctx context.Context, metadataStore esphttp.GroupMetadataStore, groupID entmoot.GroupID, metadata json.RawMessage) error {
@@ -1794,58 +1381,6 @@ func persistJoinGroupMetadata(ctx context.Context, metadataStore esphttp.GroupMe
 		return err
 	}
 	return metadataStore.SetGroupMetadata(ctx, groupID, metadata)
-}
-
-func (s *ipcServer) resolveJoinGroupInvite(ctx context.Context, req *ipc.JoinGroupReq) (entmoot.Invite, error) {
-	return resolveJoinGroupInviteWithContext(ctx, req, s.identity, s.pilot, s.pilotSocketPath)
-}
-
-func resolveJoinGroupInviteWithContext(ctx context.Context, req *ipc.JoinGroupReq, identity *keystore.Identity, pilot pilotInfoSigner, pilotSocketPath string) (entmoot.Invite, error) {
-	if req == nil {
-		return entmoot.Invite{}, fmt.Errorf("%w: missing join request", errInviteMalformed)
-	}
-	hasSignedInvite := req.Invite.GroupID != (entmoot.GroupID{})
-	hasOpenInvite := req.OpenInvite != nil
-	if hasSignedInvite == hasOpenInvite {
-		return entmoot.Invite{}, fmt.Errorf("%w: join request requires exactly one signed invite or open invite", errInviteMalformed)
-	}
-	if hasSignedInvite {
-		return req.Invite, nil
-	}
-	invite, err := redeemJoinOpenInvite(ctx, &openInviteAcceptPayload{
-		IssuerURL: req.OpenInvite.IssuerURL,
-		Token:     req.OpenInvite.Token,
-	}, groupDaemonLoadContext{
-		identity:        identity,
-		pilot:           pilot,
-		pilotSocketPath: pilotSocketPath,
-	})
-	if err != nil {
-		return entmoot.Invite{}, err
-	}
-	if invite == nil {
-		return entmoot.Invite{}, fmt.Errorf("%w: open invite redemption returned no signed invite", errInviteMalformed)
-	}
-	if err := validateExpectedJoinInvite("open invite", req.OpenInvite.ExpectedGroupID, req.OpenInvite.ExpectedIssuer, invite); err != nil {
-		return entmoot.Invite{}, err
-	}
-	return *invite, nil
-}
-
-func validateExpectedJoinInvite(source string, expectedGroup *entmoot.GroupID, expectedIssuer *entmoot.NodeInfo, invite *entmoot.Invite) error {
-	if expectedGroup == nil && expectedIssuer == nil {
-		return nil
-	}
-	if invite == nil {
-		return fmt.Errorf("%w: %s produced no signed invite matching signed descriptor", errInviteMalformed, source)
-	}
-	if expectedGroup != nil && invite.GroupID != *expectedGroup {
-		return fmt.Errorf("%w: %s redeemed group %s, want signed descriptor group %s", errInviteMalformed, source, invite.GroupID.String(), expectedGroup.String())
-	}
-	if expectedIssuer != nil && !nodeInfoEqual(invite.Issuer, *expectedIssuer) {
-		return fmt.Errorf("%w: %s redeemed issuer does not match signed descriptor issuer", errInviteMalformed, source)
-	}
-	return nil
 }
 
 func cloneGroupIDPtr(in *entmoot.GroupID) *entmoot.GroupID {
@@ -1878,7 +1413,7 @@ func clonePolicyPtr(in *entpolicy.Policy) *entpolicy.Policy {
 }
 
 func nodeInfoEqual(a, b entmoot.NodeInfo) bool {
-	if a.PilotNodeID != b.PilotNodeID || !bytes.Equal(a.EntmootPubKey, b.EntmootPubKey) {
+	if !bytes.Equal(a.EntmootPubKey, b.EntmootPubKey) || a.PeerID != b.PeerID {
 		return false
 	}
 	if a.MemberID == nil || b.MemberID == nil {
@@ -1906,7 +1441,6 @@ func (s *ipcServer) joinReadinessEvent(ctx context.Context) json.RawMessage {
 		return nil
 	}
 	gf := &globalFlags{
-		socket:     s.pilotSocketPath,
 		identity:   s.identityPath,
 		data:       s.dataDir,
 		listenPort: uint(s.listenPort),
@@ -1926,177 +1460,87 @@ func (s *ipcServer) joinReadinessEvent(ctx context.Context) json.RawMessage {
 	return data
 }
 
-func (s *ipcServer) handleInviteCreate(ctx context.Context, c net.Conn, req *ipc.InviteCreateReq) {
+func (s *ipcServer) handleInviteCreate(_ context.Context, c net.Conn, req *ipc.InviteCreateReq) {
 	gid := req.GroupID
-	if gid == (entmoot.GroupID{}) {
-		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
-			Type:    "error",
-			Code:    ipc.CodeInvalidArgument,
-			Message: "invite_create requires group_id",
-		})
+	if gid == (entmoot.GroupID{}) || len(req.TargetPublicKey) != ed25519.PublicKeySize {
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInvalidArgument, GroupID: &gid, Message: "group_id and target_public_key are required"})
 		return
 	}
-	if req.Target.PilotNodeID == 0 || len(req.Target.EntmootPubKey) != ed25519.PublicKeySize {
-		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
-			Type:    "error",
-			Code:    ipc.CodeInvalidArgument,
-			GroupID: &gid,
-			Message: "invite_create requires target agent identity",
-		})
-		return
-	}
-	if inviteCreateNeedsPilotLookup(req) && !s.pilotLookupNodeSupported {
-		_ = ipc.EncodeAndWrite(c, s.pilotLookupUnavailableError(gid))
-		return
-	}
-	if err := s.verifyTargetPilotIdentity(ctx, req); err != nil {
-		code := ipc.CodeInvalidArgument
-		if errors.Is(err, errPilotLookupUnavailable) {
-			code = ipc.CodeUnavailable
-		}
-		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
-			Type:    "error",
-			Code:    code,
-			GroupID: &gid,
-			Message: err.Error(),
-		})
-		return
-	}
-	sess, ok := s.runtime.Get(gid)
+	session, ok := s.runtime.Get(gid)
 	if !ok {
-		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
-			Type:    "error",
-			Code:    ipc.CodeGroupNotFound,
-			GroupID: &gid,
-			Message: "group not joined",
-		})
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeGroupNotFound, GroupID: &gid, Message: "group not joined"})
 		return
 	}
-	founder, ok := sess.roster.Founder()
-	if !ok {
-		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
-			Type:    "error",
-			Code:    ipc.CodeGroupNotFound,
-			GroupID: &gid,
-			Message: "group has no founder",
-		})
+	founder, ok := session.roster.Founder()
+	if !ok || !bytes.Equal(founder.EntmootPubKey, s.identity.PublicKey) {
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeNotMember, GroupID: &gid, Message: "invite_create requires the local founder identity"})
 		return
 	}
-	if founder.PilotNodeID != s.nodeID || !bytes.Equal(founder.EntmootPubKey, s.identity.PublicKey) {
-		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
-			Type:    "error",
-			Code:    ipc.CodeNotMember,
-			GroupID: &gid,
-			Message: "invite_create requires the local founder identity",
-		})
+	founderBinding, err := libp2ptransport.BindingFromPublicKey(founder.EntmootPubKey)
+	if err != nil || founderBinding.PeerID != s.runtime.host.ID() {
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeNotMember, GroupID: &gid, Message: "founder identity does not match libp2p host"})
 		return
 	}
-	if !sess.roster.HeadIsGroupBound() {
-		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
-			Type:    "error",
-			Code:    ipc.CodeConflict,
-			GroupID: &gid,
-			Message: "legacy roster requires an authenticated upgrade checkpoint",
-		})
-		return
-	}
-	root, err := s.store.MerkleRoot(ctx, gid)
+	founder.MemberID = &founderBinding.MemberID
+	founder.PeerID = founderBinding.PeerID.String()
+	targetBinding, err := libp2ptransport.BindingFromPublicKey(req.TargetPublicKey)
 	if err != nil {
-		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
-			Type:    "error",
-			Code:    ipc.CodeInternal,
-			GroupID: &gid,
-			Message: "merkle root: " + err.Error(),
-		})
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInvalidArgument, GroupID: &gid, Message: err.Error()})
 		return
 	}
-
-	explicitPeers := append([]entmoot.NodeID(nil), req.BootstrapPeers...)
-	var peers []entmoot.NodeID
-	var fanoutPeers []entmoot.NodeID
-	added := false
-	unlock := lockESPInviteRoster(gid)
-	if len(explicitPeers) > 0 {
-		peers = explicitPeers
-	} else {
-		peers = defaultBootstrapPeers(sess.roster, founder.PilotNodeID, 5)
+	if len(req.BootstrapMultiaddrs) == 0 {
+		req.BootstrapMultiaddrs = make([]string, 0, len(s.runtime.host.Addrs()))
+		for _, address := range s.runtime.host.Addrs() {
+			req.BootstrapMultiaddrs = append(req.BootstrapMultiaddrs, address.Encapsulate(multiaddr.StringCast("/p2p/"+founderBinding.PeerID.String())).String())
+		}
 	}
-	if existing, ok := sess.roster.MemberInfo(req.Target.PilotNodeID); ok {
-		if !bytes.Equal(existing.EntmootPubKey, req.Target.EntmootPubKey) {
-			unlock()
-			_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
-				Type:    "error",
-				Code:    ipc.CodeConflict,
-				GroupID: &gid,
-				Message: "target node already exists with a different Entmoot pubkey",
-			})
+	allowedAddresses := make([]string, 0, len(req.BootstrapMultiaddrs))
+	for _, raw := range req.BootstrapMultiaddrs {
+		address, err := multiaddr.NewMultiaddr(raw)
+		if err != nil {
+			_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInvalidArgument, GroupID: &gid, Message: "invalid bootstrap multiaddr"})
 			return
 		}
-	} else if err := applyFounderRosterAdd(s.identity, sess.roster, founder, req.Target); err != nil {
-		unlock()
-		code := ipc.CodeInternal
-		if errors.Is(err, entmoot.ErrRosterReject) {
-			code = ipc.CodeInvalidArgument
+		info, err := libpeer.AddrInfoFromP2pAddr(address)
+		if err != nil || info.ID != founderBinding.PeerID {
+			_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInvalidArgument, GroupID: &gid, Message: "bootstrap address does not name the founder host"})
+			return
 		}
-		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
-			Type:    "error",
-			Code:    code,
-			GroupID: &gid,
-			Message: err.Error(),
-		})
-		return
-	} else {
-		added = true
-		fanoutPeers = sess.roster.Members()
+		allowedAddresses = append(allowedAddresses, address.String())
 	}
-	unlock()
-	if added {
-		sess.gossip.FanoutRoster(ctx, fanoutPeers, req.Target.PilotNodeID)
-	}
-	bootstrap := make([]entmoot.BootstrapPeer, 0, len(peers))
-	for _, p := range peers {
-		if p == req.Target.PilotNodeID {
-			continue
-		}
-		bootstrap = append(bootstrap, entmoot.BootstrapPeer{NodeID: p})
-	}
-	issuedAt := time.Now().UnixMilli()
-	validUntil := issuedAt + (24 * time.Hour).Milliseconds()
+	now := time.Now()
+	expires := now.Add(24 * time.Hour)
 	if req.ValidForMS > 0 {
-		validUntil = issuedAt + req.ValidForMS
+		expires = now.Add(time.Duration(req.ValidForMS) * time.Millisecond)
 	}
 	if req.ValidUntilMS > 0 {
-		validUntil = req.ValidUntilMS
+		expires = time.UnixMilli(req.ValidUntilMS)
 	}
-	invite := entmoot.Invite{
-		GroupID:        gid,
-		Founder:        founder,
-		RosterHead:     sess.roster.Head(),
-		MerkleRoot:     root,
-		BootstrapPeers: bootstrap,
-		IssuedAt:       issuedAt,
-		ValidUntil:     validUntil,
-		Issuer: entmoot.NodeInfo{
-			PilotNodeID:   s.nodeID,
-			EntmootPubKey: append([]byte(nil), s.identity.PublicKey...),
-		},
-	}
-	if err := signInvite(s.identity, &invite); err != nil {
-		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
-			Type:    "error",
-			Code:    ipc.CodeInternal,
-			GroupID: &gid,
-			Message: "sign invite: " + err.Error(),
-		})
+	if !expires.After(now) || expires.After(now.Add(7*24*time.Hour)) {
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInvalidArgument, GroupID: &gid, Message: "capability validity must be within seven days"})
 		return
 	}
-	_ = ipc.EncodeAndWrite(c, &ipc.InviteCreateResp{
-		Status:     "created",
-		GroupID:    gid,
-		Invite:     invite,
-		RosterHead: sess.roster.Head(),
-		Members:    len(sess.roster.Members()),
-	})
+	capability := entmoot.BootstrapCapability{
+		GroupID:           gid,
+		TargetPublicKey:   append([]byte(nil), req.TargetPublicKey...),
+		TargetMemberID:    targetBinding.MemberID,
+		TargetPeerID:      targetBinding.PeerID.String(),
+		Founder:           founder,
+		RosterHead:        session.roster.Head(),
+		AllowedPeerIDs:    []string{founderBinding.PeerID.String()},
+		AllowedMultiaddrs: allowedAddresses,
+		IssuedAtMS:        now.UnixMilli(),
+		ExpiresAtMS:       expires.UnixMilli(),
+	}
+	if _, err := rand.Read(capability.Nonce[:]); err != nil {
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInternal, GroupID: &gid, Message: "nonce generation failed"})
+		return
+	}
+	if err := libp2ptransport.SignBootstrapCapability(s.identity, &capability); err != nil {
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInternal, GroupID: &gid, Message: err.Error()})
+		return
+	}
+	_ = ipc.EncodeAndWrite(c, &ipc.InviteCreateResp{Status: "created", GroupID: gid, Capability: capability, RosterHead: session.roster.Head(), Members: len(session.roster.MemberIDs())})
 }
 
 func (s *ipcServer) handleInviteAuthorityCheck(ctx context.Context, c net.Conn, req *ipc.InviteAuthorityCheckReq) {
@@ -2111,10 +1555,6 @@ func (s *ipcServer) handleInviteAuthorityCheck(ctx context.Context, c net.Conn, 
 	}
 	sess, ok := s.runtime.Get(gid)
 	if !ok {
-		if req.CandidateInvite != nil {
-			s.handleCandidateInviteAuthorityCheck(ctx, c, gid, req.CandidateInvite)
-			return
-		}
 		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
 			Type:    "error",
 			Code:    ipc.CodeGroupNotFound,
@@ -2133,7 +1573,7 @@ func (s *ipcServer) handleInviteAuthorityCheck(ctx context.Context, c net.Conn, 
 		})
 		return
 	}
-	if founder.PilotNodeID != s.nodeID || !bytes.Equal(founder.EntmootPubKey, s.identity.PublicKey) {
+	if founder.MemberID == nil || *founder.MemberID != s.memberID || !bytes.Equal(founder.EntmootPubKey, s.identity.PublicKey) {
 		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
 			Type:    "error",
 			Code:    ipc.CodeNotMember,
@@ -2151,104 +1591,11 @@ func (s *ipcServer) handleInviteAuthorityCheck(ctx context.Context, c net.Conn, 
 		})
 		return
 	}
-	if !s.pilotLookupNodeSupported {
-		_ = ipc.EncodeAndWrite(c, s.pilotLookupUnavailableError(gid))
-		return
-	}
 	_ = ipc.EncodeAndWrite(c, &ipc.InviteAuthorityCheckResp{
 		Status:     "ok",
 		GroupID:    gid,
 		RosterHead: sess.roster.Head(),
-		Members:    len(sess.roster.Members()),
-	})
-}
-
-func (s *ipcServer) handleCandidateInviteAuthorityCheck(ctx context.Context, c net.Conn, gid entmoot.GroupID, invite *entmoot.Invite) {
-	if invite == nil {
-		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
-			Type:    "error",
-			Code:    ipc.CodeInvalidArgument,
-			GroupID: &gid,
-			Message: "candidate invite is required",
-		})
-		return
-	}
-	if invite.GroupID != gid {
-		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
-			Type:    "error",
-			Code:    ipc.CodeInvalidArgument,
-			GroupID: &gid,
-			Message: "candidate invite group_id does not match request",
-		})
-		return
-	}
-	if invite.Founder.PilotNodeID != s.nodeID || !bytes.Equal(invite.Founder.EntmootPubKey, s.identity.PublicKey) {
-		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
-			Type:    "error",
-			Code:    ipc.CodeNotMember,
-			GroupID: &gid,
-			Message: "invite_create requires the local founder identity",
-		})
-		return
-	}
-	if invite.Issuer.PilotNodeID != s.nodeID || !bytes.Equal(invite.Issuer.EntmootPubKey, s.identity.PublicKey) {
-		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
-			Type:    "error",
-			Code:    ipc.CodeNotMember,
-			GroupID: &gid,
-			Message: "candidate invite requires the local issuer identity",
-		})
-		return
-	}
-	signing := *invite
-	signing.Signature = nil
-	sigInput, err := canonical.Encode(signing)
-	if err != nil || !keystore.Verify(invite.Issuer.EntmootPubKey, sigInput, invite.Signature) {
-		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
-			Type:    "error",
-			Code:    ipc.CodeInvalidArgument,
-			GroupID: &gid,
-			Message: "candidate invite signature is invalid",
-		})
-		return
-	}
-	if s.store == nil {
-		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
-			Type:    "error",
-			Code:    ipc.CodeInternal,
-			GroupID: &gid,
-			Message: "store is not configured",
-		})
-		return
-	}
-	root, err := s.store.MerkleRoot(ctx, gid)
-	if err != nil {
-		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
-			Type:    "error",
-			Code:    ipc.CodeInternal,
-			GroupID: &gid,
-			Message: "merkle root: " + err.Error(),
-		})
-		return
-	}
-	if root != invite.MerkleRoot {
-		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
-			Type:    "error",
-			Code:    ipc.CodeInvalidArgument,
-			GroupID: &gid,
-			Message: "candidate invite merkle root does not match local store",
-		})
-		return
-	}
-	if !s.pilotLookupNodeSupported {
-		_ = ipc.EncodeAndWrite(c, s.pilotLookupUnavailableError(gid))
-		return
-	}
-	_ = ipc.EncodeAndWrite(c, &ipc.InviteAuthorityCheckResp{
-		Status:     "ok",
-		GroupID:    gid,
-		RosterHead: invite.RosterHead,
-		Members:    1,
+		Members:    len(sess.roster.MemberIDs()),
 	})
 }
 
@@ -2265,76 +1612,18 @@ func (s *ipcServer) handleGroupDeactivate(c net.Conn, req *ipc.GroupDeactivateRe
 	_ = ipc.EncodeAndWrite(c, &ipc.GroupDeactivateResp{Status: "deactivated", GroupID: gid})
 }
 
-func inviteCreateNeedsPilotLookup(req *ipc.InviteCreateReq) bool {
-	if req == nil {
-		return false
-	}
-	return req.RequirePilotIdentity || req.RequirePilotProof ||
-		len(req.TargetPilotPubKey) > 0 ||
-		len(req.TargetPilotProof) > 0 ||
-		len(req.TargetPilotSignature) > 0
-}
-
-func (s *ipcServer) pilotLookupUnavailableError(gid entmoot.GroupID) *ipc.ErrorFrame {
-	return &ipc.ErrorFrame{
-		Type:    "error",
-		Code:    ipc.CodeUnavailable,
-		GroupID: &gid,
-		Message: "pilot-daemon does not advertise lookup_node; upgrade Pilot to create invites",
-	}
-}
-
-func (s *ipcServer) verifyTargetPilotIdentity(ctx context.Context, req *ipc.InviteCreateReq) error {
-	if len(req.TargetPilotPubKey) == 0 {
-		if req.RequirePilotIdentity {
-			return fmt.Errorf("target pilot_pubkey is required")
-		}
-		return nil
-	}
-	if len(req.TargetPilotPubKey) != ed25519.PublicKeySize {
-		return fmt.Errorf("target pilot_pubkey must be 32 bytes")
-	}
-	if s.pilot == nil {
-		return errPilotLookupUnavailable
-	}
-	lookupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	got, err := s.pilot.LookupNode(lookupCtx, uint32(req.Target.PilotNodeID))
-	if err != nil {
-		return fmt.Errorf("%w: %v", errPilotLookupUnavailable, err)
-	}
-	if got.NodeID != uint32(req.Target.PilotNodeID) {
-		return fmt.Errorf("pilot identity mismatch: lookup returned node_id %d", got.NodeID)
-	}
-	if got.PublicKey == "" {
-		return fmt.Errorf("pilot identity lookup returned no public key")
-	}
-	want := base64.StdEncoding.EncodeToString(req.TargetPilotPubKey)
-	if got.PublicKey != want {
-		return fmt.Errorf("pilot identity mismatch for node %d", req.Target.PilotNodeID)
-	}
-	if req.RequirePilotProof || len(req.TargetPilotProof) > 0 || len(req.TargetPilotSignature) > 0 {
-		if len(req.TargetPilotProof) == 0 {
-			return fmt.Errorf("target pilot proof is required")
-		}
-		if len(req.TargetPilotSignature) != ed25519.SignatureSize {
-			return fmt.Errorf("target pilot signature must be 64 bytes")
-		}
-		if !ed25519.Verify(ed25519.PublicKey(req.TargetPilotPubKey), pilotChallengeSigningBytes(req.TargetPilotProof), req.TargetPilotSignature) {
-			return fmt.Errorf("target pilot proof signature does not verify")
-		}
-	}
-	return nil
-}
-
 func (s *ipcServer) handleMemberRemove(ctx context.Context, c net.Conn, req *ipc.MemberRemoveReq) {
 	gid := req.GroupID
 	if gid == (entmoot.GroupID{}) {
 		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInvalidArgument, Message: "member_remove requires group_id"})
 		return
 	}
-	if req.Target.PilotNodeID == 0 || len(req.Target.EntmootPubKey) != ed25519.PublicKeySize {
-		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInvalidArgument, GroupID: &gid, Message: "member_remove requires target agent identity"})
+	if req.Target.MemberID == nil || req.Target.PeerID == "" || len(req.Target.EntmootPubKey) != ed25519.PublicKeySize {
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInvalidArgument, GroupID: &gid, Message: "member_remove requires target member_id, peer_id, and public key"})
+		return
+	}
+	if err := entmoot.ValidateMemberInfo(req.Target); err != nil {
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInvalidArgument, GroupID: &gid, Message: err.Error()})
 		return
 	}
 	sess, ok := s.runtime.Get(gid)
@@ -2347,16 +1636,16 @@ func (s *ipcServer) handleMemberRemove(ctx context.Context, c net.Conn, req *ipc
 		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeGroupNotFound, GroupID: &gid, Message: "group has no founder"})
 		return
 	}
-	if founder.PilotNodeID != s.nodeID || !bytes.Equal(founder.EntmootPubKey, s.identity.PublicKey) {
+	if founder.MemberID == nil || *founder.MemberID != s.memberID || !bytes.Equal(founder.EntmootPubKey, s.identity.PublicKey) {
 		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeNotMember, GroupID: &gid, Message: "member_remove requires the local founder identity"})
 		return
 	}
-	if req.Target.PilotNodeID == founder.PilotNodeID {
+	if founder.MemberID != nil && *req.Target.MemberID == *founder.MemberID {
 		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInvalidArgument, GroupID: &gid, Message: "cannot remove group founder"})
 		return
 	}
 	unlock := lockESPInviteRoster(gid)
-	existing, ok := sess.roster.MemberInfo(req.Target.PilotNodeID)
+	existing, ok := sess.roster.MemberInfoByID(*req.Target.MemberID)
 	if !ok {
 		unlock()
 		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeNotMember, GroupID: &gid, Message: "target is not a member"})
@@ -2372,11 +1661,9 @@ func (s *ipcServer) handleMemberRemove(ctx context.Context, c net.Conn, req *ipc
 		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInternal, GroupID: &gid, Message: err.Error()})
 		return
 	}
-	fanoutPeers := append(sess.roster.Members(), req.Target.PilotNodeID)
 	head := sess.roster.Head()
-	members := len(sess.roster.Members())
+	members := len(sess.roster.MemberIDs())
 	unlock()
-	sess.gossip.FanoutRoster(ctx, fanoutPeers, 0)
 	_ = ipc.EncodeAndWrite(c, &ipc.MemberRemoveResp{Status: "removed", GroupID: gid, RosterHead: head, Members: members})
 }
 
@@ -2385,7 +1672,7 @@ func (s *ipcServer) handleInfo(ctx context.Context, c net.Conn) {
 	pub := append([]byte(nil), s.identity.PublicKey...)
 	if gid, ok := s.runtime.SingleGroup(); ok {
 		if sess, ok := s.runtime.Get(gid); ok {
-			pub, _ = pubkeyFromRoster(sess.roster, s.nodeID, s.identity.PublicKey)
+			pub, _ = pubkeyFromRoster(sess.roster, s.memberID, s.identity.PublicKey)
 		}
 	}
 
@@ -2407,7 +1694,7 @@ func (s *ipcServer) handleInfo(ctx context.Context, c net.Conn) {
 	for _, gid := range gids {
 		members := 0
 		if sess, ok := s.runtime.Get(gid); ok {
-			members = len(sess.roster.Members())
+			members = len(sess.roster.MemberIDs())
 		} else {
 			// For groups outside the daemon's active roster, peek at
 			// the existing roster file directly. Empty/orphan roster
@@ -2423,11 +1710,11 @@ func (s *ipcServer) handleInfo(ctx context.Context, c net.Conn) {
 			if !ok {
 				continue
 			}
-			if !rosterHasLocalNodeIdentity(r, s.nodeID, s.identity.PublicKey) {
+			if !rosterHasLocalMemberIdentity(r, s.memberID, s.identity.PublicKey) {
 				_ = r.Close()
 				continue
 			}
-			members = len(r.Members())
+			members = len(r.MemberIDs())
 			_ = r.Close()
 		}
 		msgs, err := s.store.Range(ctx, gid, 0, 0)
@@ -2449,7 +1736,8 @@ func (s *ipcServer) handleInfo(ctx context.Context, c net.Conn) {
 	}
 
 	resp := &ipc.InfoResp{
-		PilotNodeID:   s.nodeID,
+		MemberID:      s.memberID,
+		PeerID:        s.peerID,
 		EntmootPubKey: pub,
 		ListenPort:    s.listenPort,
 		DataDir:       s.dataDir,
@@ -2459,13 +1747,13 @@ func (s *ipcServer) handleInfo(ctx context.Context, c net.Conn) {
 	_ = ipc.EncodeAndWrite(c, resp)
 }
 
-// pubkeyFromRoster returns the locally-stored pubkey from the
-// membership projection, falling back to fallback if absent.
-func pubkeyFromRoster(r *roster.RosterLog, id entmoot.NodeID, fallback []byte) ([]byte, bool) {
-	if info, ok := r.MemberInfo(id); ok && len(info.EntmootPubKey) > 0 {
-		return info.EntmootPubKey, true
+// pubkeyFromRoster returns the locally-stored pubkey from the membership
+// projection, falling back to fallback if absent.
+func pubkeyFromRoster(r *roster.RosterLog, id entmoot.MemberID, fallback []byte) ([]byte, bool) {
+	if info, ok := r.MemberInfoByID(id); ok && len(info.EntmootPubKey) > 0 {
+		return append([]byte(nil), info.EntmootPubKey...), true
 	}
-	return fallback, false
+	return append([]byte(nil), fallback...), false
 }
 
 // handleTail registers a subscriber channel with the notifying store
@@ -2533,10 +1821,10 @@ func (s *ipcServer) handleTail(ctx context.Context, c net.Conn, sub *ipc.TailSub
 	}
 }
 
-func normalizeLocalPilotHostname(hostname string) (string, bool) {
-	hostname = strings.TrimSpace(hostname)
-	if hostname == "" {
-		return "", false
+func messageAuthorMemberID(message entmoot.Message) entmoot.MemberID {
+	if message.Author.MemberID != nil {
+		return *message.Author.MemberID
 	}
-	return hostname, true
+	memberID, _ := entmoot.MemberIDFromPublicKey(message.Author.EntmootPubKey)
+	return memberID
 }

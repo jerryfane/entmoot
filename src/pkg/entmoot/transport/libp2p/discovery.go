@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	libp2p "github.com/libp2p/go-libp2p"
@@ -62,7 +61,7 @@ func NewConfiguredHost(ctx context.Context, identity *keystore.Identity, cfg Hos
 			libp2p.EnableAutoRelayWithStaticRelays(cfg.ControlledRelays),
 			libp2p.ConnectionGater(gater),
 			libp2p.AddrsFactory(func(addresses []multiaddr.Multiaddr) []multiaddr.Multiaddr {
-				return filterCircuitAddresses(addresses)
+				return filterControlledCircuitAddresses(addresses, gater.relays)
 			}),
 		)
 	default:
@@ -90,7 +89,7 @@ func InstallVerifiedPeer(h host.Host, r *roster.RosterLog, member entmoot.NodeIn
 		}
 		filtered := addresses[:0]
 		for _, address := range addresses {
-			if isCircuitAddress(address) || peerIDIsControlledRelay(peerID, allowed) {
+			if peerIDIsControlledRelay(peerID, allowed) || circuitUsesControlledRelay(address, allowed) {
 				filtered = append(filtered, address)
 			}
 		}
@@ -119,7 +118,7 @@ func VisiblePeerAddresses(h host.Host, peerID peer.ID, mode ConnectivityMode, co
 	if peerIDIsControlledRelay(peerID, allowed) {
 		return addresses
 	}
-	return filterCircuitAddresses(addresses)
+	return filterControlledCircuitAddresses(addresses, allowed)
 }
 
 // StartMemberMDNS enables LAN discovery only after an explicit direct-profile
@@ -166,19 +165,20 @@ func newRelayOnlyGater(relays []peer.AddrInfo) *relayOnlyGater {
 func (*relayOnlyGater) InterceptPeerDial(peer.ID) bool { return true }
 
 func (g *relayOnlyGater) InterceptAddrDial(peerID peer.ID, address multiaddr.Multiaddr) bool {
-	return peerIDIsControlledRelay(peerID, g.relays) || isCircuitAddress(address)
+	return peerIDIsControlledRelay(peerID, g.relays) || circuitUsesControlledRelay(address, g.relays)
 }
 
 func (g *relayOnlyGater) InterceptAccept(addresses network.ConnMultiaddrs) bool {
-	return isCircuitAddress(addresses.RemoteMultiaddr())
+	return connectionUsesControlledRelay(addresses, g.relays)
 }
 
 func (g *relayOnlyGater) InterceptSecured(_ network.Direction, peerID peer.ID, addresses network.ConnMultiaddrs) bool {
-	return peerIDIsControlledRelay(peerID, g.relays) || isCircuitAddress(addresses.RemoteMultiaddr())
+	return peerIDIsControlledRelay(peerID, g.relays) || connectionUsesControlledRelay(addresses, g.relays)
 }
 
 func (g *relayOnlyGater) InterceptUpgraded(connection network.Conn) (bool, control.DisconnectReason) {
-	allowed := peerIDIsControlledRelay(connection.RemotePeer(), g.relays) || isCircuitAddress(connection.RemoteMultiaddr())
+	allowed := peerIDIsControlledRelay(connection.RemotePeer(), g.relays) ||
+		connectionUsesControlledRelay(connection, g.relays)
 	return allowed, 0
 }
 
@@ -188,13 +188,50 @@ func peerIDIsControlledRelay(peerID peer.ID, relays map[peer.ID]struct{}) bool {
 }
 
 func isCircuitAddress(address multiaddr.Multiaddr) bool {
-	return address != nil && strings.Contains(address.String(), "/p2p-circuit")
+	found := false
+	if address != nil {
+		multiaddr.ForEach(address, func(component multiaddr.Component) bool {
+			found = component.Protocol().Code == multiaddr.P_CIRCUIT
+			return !found
+		})
+	}
+	return found
 }
 
-func filterCircuitAddresses(addresses []multiaddr.Multiaddr) []multiaddr.Multiaddr {
+func circuitUsesControlledRelay(address multiaddr.Multiaddr, relays map[peer.ID]struct{}) bool {
+	var precedingPeer peer.ID
+	allowed := false
+	if address == nil {
+		return false
+	}
+	multiaddr.ForEach(address, func(component multiaddr.Component) bool {
+		switch component.Protocol().Code {
+		case multiaddr.P_P2P:
+			decoded, err := peer.Decode(component.Value())
+			if err != nil {
+				precedingPeer = ""
+			} else {
+				precedingPeer = decoded
+			}
+		case multiaddr.P_CIRCUIT:
+			allowed = peerIDIsControlledRelay(precedingPeer, relays)
+			return false
+		}
+		return true
+	})
+	return allowed
+}
+
+func connectionUsesControlledRelay(addresses network.ConnMultiaddrs, relays map[peer.ID]struct{}) bool {
+	return addresses != nil &&
+		(circuitUsesControlledRelay(addresses.LocalMultiaddr(), relays) ||
+			circuitUsesControlledRelay(addresses.RemoteMultiaddr(), relays))
+}
+
+func filterControlledCircuitAddresses(addresses []multiaddr.Multiaddr, relays map[peer.ID]struct{}) []multiaddr.Multiaddr {
 	filtered := make([]multiaddr.Multiaddr, 0, len(addresses))
 	for _, address := range addresses {
-		if isCircuitAddress(address) {
+		if circuitUsesControlledRelay(address, relays) {
 			filtered = append(filtered, address)
 		}
 	}

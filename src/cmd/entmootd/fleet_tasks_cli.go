@@ -21,6 +21,7 @@ import (
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/esphttp"
 	"entmoot/pkg/entmoot/keystore"
+	libp2ptransport "entmoot/pkg/entmoot/transport/libp2p"
 )
 
 type fleetTasksFlags struct {
@@ -38,7 +39,8 @@ type fleetTasksFlags struct {
 
 type fleetTasksClient struct {
 	baseURL  *url.URL
-	nodeID   entmoot.NodeID
+	memberID entmoot.MemberID
+	peerID   string
 	identity *keystore.Identity
 	client   *http.Client
 }
@@ -234,19 +236,15 @@ func newFleetTasksClient(gf *globalFlags, rawBase string) (*fleetTasksClient, in
 		slog.Error("fleet tasks: setup", slog.String("err", err.Error()))
 		return nil, exitTransport, false
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	info, err := infoOverIPCContext(ctx, controlSocketPath(gf.data))
-	if err != nil || info.PilotNodeID == 0 {
-		if err == nil {
-			err = errors.New("running daemon did not report a Pilot node id")
-		}
-		fmt.Fprintf(os.Stderr, "fleet tasks: running Entmoot daemon with Pilot identity is required: %v\n", err)
+	binding, err := libp2ptransport.BindingFromPublicKey(setupRes.identity.PublicKey)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "fleet tasks: local identity: %v\n", err)
 		return nil, exitTransport, false
 	}
 	return &fleetTasksClient{
 		baseURL:  base,
-		nodeID:   info.PilotNodeID,
+		memberID: binding.MemberID,
+		peerID:   binding.PeerID.String(),
 		identity: setupRes.identity,
 		client:   &http.Client{Timeout: 30 * time.Second},
 	}, exitOK, true
@@ -347,8 +345,9 @@ func (c *fleetTasksClient) newRequest(ctx context.Context, method, path string, 
 	}
 	timestampMS := time.Now().UnixMilli()
 	nonce := randomNonce()
-	input := esphttp.MemberSigningInput(method, req.URL.RequestURI(), c.nodeID, c.identity.PublicKey, timestampMS, nonce, data)
-	req.Header.Set("X-Entmoot-Member-Node-ID", strconv.FormatUint(uint64(c.nodeID), 10))
+	input := esphttp.MemberSigningInput(method, req.URL.RequestURI(), c.memberID, c.peerID, c.identity.PublicKey, timestampMS, nonce, data)
+	req.Header.Set("X-Entmoot-Member-ID", c.memberID.String())
+	req.Header.Set("X-Entmoot-Peer-ID", c.peerID)
 	req.Header.Set("X-Entmoot-Member-Pubkey", base64.StdEncoding.EncodeToString(c.identity.PublicKey))
 	req.Header.Set("X-Entmoot-Timestamp-Ms", strconv.FormatInt(timestampMS, 10))
 	req.Header.Set("X-Entmoot-Nonce", nonce)

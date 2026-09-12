@@ -213,6 +213,15 @@ func testDescriptorKey(t *testing.T) (ed25519.PublicKey, ed25519.PrivateKey) {
 
 func testSignedDescriptor(t *testing.T, priv ed25519.PrivateKey) Descriptor {
 	t.Helper()
+	issuerPub := priv.Public().(ed25519.PublicKey)
+	memberID, err := entmoot.MemberIDFromPublicKey(issuerPub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	peerID, err := entmoot.PeerIDFromPublicKey(issuerPub)
+	if err != nil {
+		t.Fatal(err)
+	}
 	desc := Descriptor{
 		Type:    DescriptorType,
 		Name:    Name,
@@ -222,8 +231,9 @@ func testSignedDescriptor(t *testing.T, priv ed25519.PrivateKey) Descriptor {
 			Token:     "test-token",
 		},
 		Issuer: entmoot.NodeInfo{
-			PilotNodeID:   45491,
-			EntmootPubKey: make([]byte, ed25519.PublicKeySize),
+			MemberID:      &memberID,
+			PeerID:        peerID,
+			EntmootPubKey: issuerPub,
 		},
 		DefaultTopics: []string{"chat/general", "introductions"},
 		RecommendedLiveConfig: RecommendedLiveConfig{

@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -10,35 +12,35 @@ import (
 	"os"
 	"time"
 
+	"github.com/libp2p/go-libp2p/core/peer"
+	multiaddr "github.com/multiformats/go-multiaddr"
+
 	"entmoot/pkg/entmoot"
-	"entmoot/pkg/entmoot/canonical"
 	"entmoot/pkg/entmoot/roster"
-	"entmoot/pkg/entmoot/store"
-	"entmoot/pkg/entmoot/transport/pilot"
+	libp2ptransport "entmoot/pkg/entmoot/transport/libp2p"
 )
 
-// cmdInvite dispatches `invite <op>`; v1 only recognizes `invite create`.
 func cmdInvite(gf *globalFlags, args []string) int {
 	if len(args) == 0 {
 		fmt.Fprintln(os.Stderr, "invite: missing op (want: create)")
 		return exitInvalidArgument
 	}
-	switch args[0] {
-	case "create":
-		return cmdInviteCreate(gf, args[1:])
-	default:
+	if args[0] != "create" {
 		fmt.Fprintf(os.Stderr, "invite: unknown op %q\n", args[0])
 		return exitInvalidArgument
 	}
+	return cmdInviteCreate(gf, args[1:])
 }
 
-// cmdInviteCreate reads the roster for -group, signs a fresh Invite
-// bundle with a ValidUntil window, and prints it to stdout as JSON.
+// cmdInviteCreate emits a target-bound capability. Bootstrap addresses must be
+// full multiaddrs ending in /p2p/<founder-peer-id>.
 func cmdInviteCreate(gf *globalFlags, args []string) int {
 	fs := flag.NewFlagSet("invite create", flag.ContinueOnError)
 	groupStr := fs.String("group", "", "base64 group id (required)")
-	peers := fs.String("peers", "", "comma-separated bootstrap peer node ids (optional)")
-	validFor := fs.String("valid-for", "24h", "invite TTL (time.ParseDuration or <N>d)")
+	targetKey := fs.String("target-pubkey", "", "base64 Ed25519 public key of the joining identity (required)")
+	validFor := fs.String("valid-for", "24h", "capability TTL (time.ParseDuration or <N>d)")
+	var bootstrap stringListFlag
+	fs.Var(&bootstrap, "bootstrap", "founder libp2p multiaddr ending in /p2p/<peer-id>; repeatable")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return exitOK
@@ -51,175 +53,100 @@ func cmdInviteCreate(gf *globalFlags, args []string) int {
 		return exitInvalidArgument
 	}
 	ttl, err := parseDurationDays(*validFor)
+	if err != nil || ttl <= 0 {
+		fmt.Fprintf(os.Stderr, "invite create: -valid-for must be positive: %v\n", err)
+		return exitInvalidArgument
+	}
+	if len(bootstrap) == 0 {
+		fmt.Fprintln(os.Stderr, "invite create: at least one -bootstrap multiaddr is required")
+		return exitInvalidArgument
+	}
+	publicKey, err := base64.StdEncoding.DecodeString(*targetKey)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "invite create: -valid-for: %v\n", err)
+		fmt.Fprintf(os.Stderr, "invite create: -target-pubkey: %v\n", err)
 		return exitInvalidArgument
 	}
-	if ttl <= 0 {
-		fmt.Fprintln(os.Stderr, "invite create: -valid-for must be positive")
+	target, err := libp2ptransport.BindingFromPublicKey(publicKey)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "invite create: -target-pubkey: %v\n", err)
 		return exitInvalidArgument
 	}
-
 	s, err := setup(gf)
 	if err != nil {
 		slog.Error("invite create: setup", slog.String("err", err.Error()))
 		return exitTransport
 	}
-
-	tr, err := openPilot(gf)
-	if err != nil {
-		slog.Error("invite create: pilot", slog.String("err", err.Error()))
-		return exitTransport
-	}
-	defer tr.Close()
-	nodeID := tr.NodeID()
-
-	r, err := roster.OpenJSONL(s.dataDir, gid)
+	rlog, err := roster.OpenJSONL(s.dataDir, gid)
 	if err != nil {
 		slog.Error("invite create: open roster", slog.String("err", err.Error()))
 		return exitTransport
 	}
-	defer func() { _ = r.Close() }()
-
-	founder, ok := r.Founder()
+	defer rlog.Close()
+	founder, ok := rlog.Founder()
 	if !ok {
-		fmt.Fprintln(os.Stderr, "invite create: group has no founder (empty roster)")
+		fmt.Fprintln(os.Stderr, "invite create: group has no founder")
 		return exitGroupNotFound
 	}
-	if founder.PilotNodeID != nodeID || !bytes.Equal(founder.EntmootPubKey, s.identity.PublicKey) {
+	founderBinding, err := libp2ptransport.BindingFromPublicKey(founder.EntmootPubKey)
+	if err != nil || founderBinding.MemberID != mustMemberID(s.identity.PublicKey) || !bytes.Equal(founder.EntmootPubKey, s.identity.PublicKey) {
 		fmt.Fprintln(os.Stderr, "invite create: local identity is not the group founder")
 		return exitNotMember
 	}
-	if !r.HeadIsGroupBound() {
-		fmt.Fprintln(os.Stderr, "invite create: legacy roster requires an authenticated upgrade checkpoint")
-		return exitInvalidArgument
-	}
-
-	st, err := store.OpenSQLite(s.dataDir)
-	if err != nil {
-		slog.Error("invite create: open store", slog.String("err", err.Error()))
-		return exitTransport
-	}
-	defer func() { _ = st.Close() }()
-
-	ctx, cancel := withTimeout(10 * time.Second)
-	defer cancel()
-	merkleRoot, err := st.MerkleRoot(ctx, gid)
-	if err != nil {
-		slog.Error("invite create: merkle root", slog.String("err", err.Error()))
-		return exitTransport
-	}
-
-	peerIDs, err := parsePeerList(*peers)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "invite create: %v\n", err)
-		return exitInvalidArgument
-	}
-	if len(peerIDs) == 0 {
-		peerIDs = defaultBootstrapPeers(r, founder.PilotNodeID, 5)
-	}
-	// Exclude the issuer's own NodeID from BootstrapPeers at mint
-	// time (v1.0.8). A receiver that parses an invite containing
-	// self would otherwise hand its own ID to Pilot's DialConnection
-	// during Join. Pilot jf.6 now rejects self-dials with
-	// ErrDialToSelf, but keeping self out of the invite makes new
-	// invites self-documenting and matches Cassandra's "gossiper
-	// live_endpoints excludes self by construction" invariant.
-	// Legacy invites that still contain self are handled by Gossiper
-	// bootstrap's existing self-skip filter.
-	bootstrap := make([]entmoot.BootstrapPeer, 0, len(peerIDs))
-	for _, p := range peerIDs {
-		if p == nodeID {
-			continue
+	founder.MemberID = &founderBinding.MemberID
+	allowedPeerIDs := make([]string, 0, len(bootstrap))
+	allowedAddresses := make([]string, 0, len(bootstrap))
+	seen := make(map[peer.ID]struct{})
+	for _, raw := range bootstrap {
+		address, err := multiaddr.NewMultiaddr(raw)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "invite create: invalid -bootstrap %q: %v\n", raw, err)
+			return exitInvalidArgument
 		}
-		bp := entmoot.BootstrapPeer{NodeID: p}
-		// v1.2.0: best-effort endpoint hint. For non-self peers we
-		// consult the Pilot daemon's registry view via
-		// ResolveHostname — if the hostname is known the response
-		// includes real_addr (UDP) and, on our fork's
-		// daemon-reachable paths, the TCP endpoint. On the upstream
-		// stock registry the TCP field is silently dropped, so this
-		// usually contributes only UDP — but that still helps
-		// newcomers skip one registry round-trip on the first join.
-		// Empty result is fine; omitempty keeps the invite shape
-		// identical to v1.1.x so legacy receivers accept it
-		// unchanged.
-		if eps := lookupEndpointsFor(tr, p); len(eps) > 0 {
-			bp.Endpoints = eps
+		info, err := peer.AddrInfoFromP2pAddr(address)
+		if err != nil || info.ID != founderBinding.PeerID {
+			fmt.Fprintf(os.Stderr, "invite create: bootstrap must end in founder peer id %s\n", founderBinding.PeerID)
+			return exitInvalidArgument
 		}
-		bootstrap = append(bootstrap, bp)
+		allowedAddresses = append(allowedAddresses, address.String())
+		if _, ok := seen[info.ID]; !ok {
+			seen[info.ID] = struct{}{}
+			allowedPeerIDs = append(allowedPeerIDs, info.ID.String())
+		}
 	}
-
-	issuerInfo := entmoot.NodeInfo{
-		PilotNodeID:   nodeID,
-		EntmootPubKey: s.identity.PublicKey,
+	now := time.Now()
+	capability := entmoot.BootstrapCapability{
+		GroupID:           gid,
+		TargetPublicKey:   append([]byte(nil), publicKey...),
+		TargetMemberID:    target.MemberID,
+		TargetPeerID:      target.PeerID.String(),
+		Founder:           founder,
+		RosterHead:        rlog.Head(),
+		AllowedPeerIDs:    allowedPeerIDs,
+		AllowedMultiaddrs: allowedAddresses,
+		IssuedAtMS:        now.UnixMilli(),
+		ExpiresAtMS:       now.Add(ttl).UnixMilli(),
 	}
-	issuedAt := time.Now().UnixMilli()
-	invite := entmoot.Invite{
-		GroupID:        gid,
-		Founder:        founder,
-		RosterHead:     r.Head(),
-		MerkleRoot:     merkleRoot,
-		BootstrapPeers: bootstrap,
-		IssuedAt:       issuedAt,
-		ValidUntil:     issuedAt + ttl.Milliseconds(),
-		Issuer:         issuerInfo,
-	}
-
-	signing := invite
-	signing.Signature = nil
-	sigInput, err := canonical.Encode(signing)
-	if err != nil {
-		slog.Error("invite create: canonical encode", slog.String("err", err.Error()))
+	if _, err := rand.Read(capability.Nonce[:]); err != nil {
+		slog.Error("invite create: nonce", slog.String("err", err.Error()))
 		return exitTransport
 	}
-	invite.Signature = s.identity.Sign(sigInput)
-
-	data, err := json.MarshalIndent(&invite, "", "  ")
+	if err := libp2ptransport.SignBootstrapCapability(s.identity, &capability); err != nil {
+		slog.Error("invite create: sign", slog.String("err", err.Error()))
+		return exitTransport
+	}
+	encoded, err := json.MarshalIndent(capability, "", "  ")
 	if err != nil {
 		slog.Error("invite create: marshal", slog.String("err", err.Error()))
 		return exitTransport
 	}
-	fmt.Println(string(data))
+	fmt.Println(string(encoded))
 	return exitOK
 }
 
-// lookupEndpointsFor returns the endpoints the local Pilot daemon
-// knows for `p`, if any. v1.2.0 ships with a no-op because today's
-// Pilot Driver has no Lookup(nodeID) RPC — the only shape available
-// is ResolveHostname(hostname), and entmootd does not track
-// hostnames per peer. Returning nil leaves the BootstrapPeer's
-// Endpoints field at its zero value; `omitempty` on the JSON tag
-// then keeps the invite's canonical bytes identical to v1.1.x for
-// receivers that have not yet upgraded.
-//
-// Deferred to v1.3: once pilotprotocol grows a Driver.Lookup or
-// equivalent by-NodeID resolution, this helper becomes a one-liner
-// that calls it and translates driver.Endpoint to entmoot.NodeEndpoint.
-// Until then, endpoints reach the receiver via the Join-time
-// TransportSnapshotReq path, not the invite.
-func lookupEndpointsFor(tr *pilot.Transport, p entmoot.NodeID) []entmoot.NodeEndpoint {
-	_ = tr
-	_ = p
-	return nil
-}
-
-// defaultBootstrapPeers returns founder + up to max-1 other random
-// members. Member ordering from RosterLog.Members is deterministic
-// (sorted ascending by node id).
-func defaultBootstrapPeers(r *roster.RosterLog, founder entmoot.NodeID, max int) []entmoot.NodeID {
-	members := r.Members()
-	out := []entmoot.NodeID{founder}
-	added := 1
-	for _, m := range members {
-		if added >= max {
-			break
-		}
-		if m == founder {
-			continue
-		}
-		out = append(out, m)
-		added++
+func mustMemberID(publicKey []byte) entmoot.MemberID {
+	memberID, err := entmoot.MemberIDFromPublicKey(publicKey)
+	if err != nil {
+		panic(err)
 	}
-	return out
+	return memberID
 }

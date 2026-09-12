@@ -17,6 +17,14 @@ import (
 	"entmoot/pkg/entmoot/roster"
 )
 
+type fixedConnMultiaddrs struct {
+	local  multiaddr.Multiaddr
+	remote multiaddr.Multiaddr
+}
+
+func (a fixedConnMultiaddrs) LocalMultiaddr() multiaddr.Multiaddr  { return a.local }
+func (a fixedConnMultiaddrs) RemoteMultiaddr() multiaddr.Multiaddr { return a.remote }
+
 func TestDirectAndRelayOnlyProfilesAreIndependent(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -135,7 +143,7 @@ func TestVerifiedAddressHintsRespectIdentityAndPrivacyProfile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	member := entmoot.NodeInfo{EntmootPubKey: memberIdentity.PublicKey, MemberID: &memberBinding.MemberID}
+	member := mustNodeInfo(t, memberIdentity.PublicKey)
 	var groupID entmoot.GroupID
 	groupID[0] = 1
 	rosterLog := roster.New(groupID)
@@ -158,13 +166,34 @@ func TestVerifiedAddressHintsRespectIdentityAndPrivacyProfile(t *testing.T) {
 	relayBinding, _ := BindingFromPublicKey(relay.PublicKey)
 	relayInfo := peer.AddrInfo{ID: relayBinding.PeerID}
 	circuit := multiaddr.StringCast("/ip4/198.51.100.2/tcp/4001/p2p/" + relayBinding.PeerID.String() + "/p2p-circuit")
+	unapprovedRelay := mustIdentity(t)
+	unapprovedBinding, _ := BindingFromPublicKey(unapprovedRelay.PublicKey)
+	unapprovedCircuit := multiaddr.StringCast("/ip4/198.51.100.3/tcp/4001/p2p/" + unapprovedBinding.PeerID.String() + "/p2p-circuit")
+	gater := newRelayOnlyGater([]peer.AddrInfo{relayInfo})
+	if !gater.InterceptAddrDial(memberBinding.PeerID, circuit) {
+		t.Fatal("controlled relay circuit was rejected")
+	}
+	if gater.InterceptAddrDial(memberBinding.PeerID, unapprovedCircuit) {
+		t.Fatal("unapproved relay circuit was accepted for dial")
+	}
+	unapprovedConnection := fixedConnMultiaddrs{remote: unapprovedCircuit}
+	if gater.InterceptAccept(unapprovedConnection) {
+		t.Fatal("unapproved relay circuit was accepted inbound")
+	}
+	if gater.InterceptSecured(network.DirInbound, memberBinding.PeerID, unapprovedConnection) {
+		t.Fatal("unapproved relay circuit was accepted after authentication")
+	}
 	localHost.Peerstore().ClearAddrs(memberBinding.PeerID)
-	if err := InstallVerifiedPeer(localHost, rosterLog, member, memberBinding.PeerID, []multiaddr.Multiaddr{direct, circuit}, time.Hour, RelayOnlyConnectivity, []peer.AddrInfo{relayInfo}); err != nil {
+	if err := InstallVerifiedPeer(localHost, rosterLog, member, memberBinding.PeerID, []multiaddr.Multiaddr{direct, unapprovedCircuit, circuit}, time.Hour, RelayOnlyConnectivity, []peer.AddrInfo{relayInfo}); err != nil {
 		t.Fatal(err)
 	}
 	visible := VisiblePeerAddresses(localHost, memberBinding.PeerID, RelayOnlyConnectivity, []peer.AddrInfo{relayInfo})
-	if len(visible) != 1 || !isCircuitAddress(visible[0]) {
-		t.Fatalf("relay-only diagnostics exposed direct addresses: %v", visible)
+	if len(visible) != 1 || !visible[0].Equal(circuit) {
+		t.Fatalf("relay-only diagnostics exposed unapproved or direct addresses: %v", visible)
+	}
+	localHost.Peerstore().ClearAddrs(memberBinding.PeerID)
+	if err := InstallVerifiedPeer(localHost, rosterLog, member, memberBinding.PeerID, []multiaddr.Multiaddr{unapprovedCircuit}, time.Hour, RelayOnlyConnectivity, []peer.AddrInfo{relayInfo}); err == nil {
+		t.Fatal("unapproved relay was the only surviving address")
 	}
 }
 
@@ -172,7 +201,7 @@ func TestMemberMDNSRequiresExplicitStart(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	identity := mustIdentity(t)
-	h, binding, err := NewConfiguredHost(ctx, identity, HostConfig{Mode: DirectConnectivity, ListenAddrs: []string{"/ip4/127.0.0.1/tcp/0"}})
+	h, _, err := NewConfiguredHost(ctx, identity, HostConfig{Mode: DirectConnectivity, ListenAddrs: []string{"/ip4/127.0.0.1/tcp/0"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -180,7 +209,7 @@ func TestMemberMDNSRequiresExplicitStart(t *testing.T) {
 	var groupID entmoot.GroupID
 	groupID[0] = 7
 	r := roster.New(groupID)
-	info := entmoot.NodeInfo{EntmootPubKey: identity.PublicKey, MemberID: &binding.MemberID}
+	info := mustNodeInfo(t, identity.PublicKey)
 	if err := r.Genesis(identity, info, 1_000); err != nil {
 		t.Fatal(err)
 	}

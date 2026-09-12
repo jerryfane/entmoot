@@ -57,9 +57,9 @@ func NewInitiator(cfg Config, storage Storage) (*Session, []Range, error) {
 	}
 	cfg = withDefaults(cfg)
 	s := &Session{
-		cfg:     cfg,
-		storage: storage,
-		role:    RoleInitiator,
+		cfg:      cfg,
+		storage:  storage,
+		role:     RoleInitiator,
 		seen:     make(map[[32]byte]struct{}),
 		resolved: make(map[[64]byte]struct{}),
 	}

@@ -7,6 +7,7 @@ import (
 
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/esphttp"
+	"entmoot/pkg/entmoot/keystore"
 )
 
 func TestFleetListHidesArchivedFleets(t *testing.T) {
@@ -16,11 +17,23 @@ func TestFleetListHidesArchivedFleets(t *testing.T) {
 		t.Fatalf("OpenSQLiteStateStore: %v", err)
 	}
 	ctx := context.Background()
+	identity, err := keystore.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	memberID, err := entmoot.MemberIDFromPublicKey(identity.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	peerID, err := entmoot.PeerIDFromPublicKey(identity.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, rec := range []esphttp.FleetRecord{
 		{
 			FleetID:             "fleet-active",
 			Name:                "Active Fleet",
-			Coordinator:         entmoot.NodeInfo{PilotNodeID: 45491, EntmootPubKey: []byte("coordinator")},
+			Coordinator:         entmoot.NodeInfo{MemberID: &memberID, PeerID: peerID, EntmootPubKey: identity.PublicKey},
 			CoordinatorDeviceID: "ios-1",
 			Status:              esphttp.FleetStatusActive,
 			CreatedAtMS:         2,
@@ -28,7 +41,7 @@ func TestFleetListHidesArchivedFleets(t *testing.T) {
 		{
 			FleetID:             "fleet-archived",
 			Name:                "Archived Fleet",
-			Coordinator:         entmoot.NodeInfo{PilotNodeID: 45491, EntmootPubKey: []byte("coordinator")},
+			Coordinator:         entmoot.NodeInfo{MemberID: &memberID, PeerID: peerID, EntmootPubKey: identity.PublicKey},
 			CoordinatorDeviceID: "ios-1",
 			Status:              esphttp.FleetStatusArchived,
 			CreatedAtMS:         1,

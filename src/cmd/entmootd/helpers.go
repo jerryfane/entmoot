@@ -14,14 +14,12 @@ import (
 	"time"
 
 	"entmoot/pkg/entmoot"
+	"entmoot/pkg/entmoot/conversion"
 	"entmoot/pkg/entmoot/keystore"
 	"entmoot/pkg/entmoot/roster"
-	"entmoot/pkg/entmoot/transport/pilot"
 )
 
-// setupResult carries resources assembled by setup() — every non-info-only
-// subcommand needs identity + data dir; Pilot is opened only by callers
-// that actually need a Transport.
+// setupResult carries resources assembled by setup.
 type setupResult struct {
 	identity *keystore.Identity
 	dataDir  string
@@ -74,6 +72,9 @@ func setup(gf *globalFlags) (*setupResult, error) {
 		if err := id.Save(identityPath); err != nil {
 			return nil, fmt.Errorf("save identity: %w", err)
 		}
+	}
+	if err := conversion.Run(dataDir, id); err != nil {
+		return nil, fmt.Errorf("convert data root: %w", err)
 	}
 	slog.Info("entmootd: using runtime paths",
 		slog.String("data", dataDir),
@@ -323,27 +324,6 @@ func parseDurationDays(s string) (time.Duration, error) {
 // of b.
 func encodeBase64(b []byte) string {
 	return base64.StdEncoding.EncodeToString(b)
-}
-
-// openPilot bounds the initial daemon handshake with the configured wait
-// timeout. Join retries share one outer deadline through openPilotContext.
-func openPilot(gf *globalFlags) (*pilot.Transport, error) {
-	ctx := context.Background()
-	cancel := func() {}
-	if gf.pilotWaitTimeout > 0 {
-		ctx, cancel = context.WithTimeout(ctx, gf.pilotWaitTimeout)
-	}
-	defer cancel()
-	return openPilotContext(ctx, gf)
-}
-
-func openPilotContext(ctx context.Context, gf *globalFlags) (*pilot.Transport, error) {
-	return pilot.Open(ctx, pilot.Config{
-		SocketPath:           gf.socket,
-		ListenPort:           uint16(gf.listenPort),
-		Logger:               slog.Default(),
-		TraceGossipTransport: gf.traceGossipTransport,
-	})
 }
 
 // withTimeout wraps context.WithTimeout and returns both the ctx and

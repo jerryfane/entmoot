@@ -32,34 +32,23 @@ var ErrWriterActive = errors.New("roster: writer already active")
 
 const rosterSchema = `
 CREATE TABLE IF NOT EXISTS roster_meta (
-  group_id          BLOB PRIMARY KEY,
-  version           INTEGER NOT NULL,
-  head_id           BLOB NOT NULL,
-  founder_node_id   INTEGER NOT NULL,
-  founder_pubkey    BLOB NOT NULL,
-  import_complete   INTEGER NOT NULL CHECK (import_complete = 1)
+  group_id        BLOB PRIMARY KEY,
+  version         INTEGER NOT NULL,
+  head_id         BLOB NOT NULL,
+  import_complete INTEGER NOT NULL CHECK (import_complete = 1)
 );
 CREATE TABLE IF NOT EXISTS roster_entries (
-  entry_id          BLOB PRIMARY KEY,
-  group_id          BLOB NOT NULL,
-  sequence          INTEGER NOT NULL,
-  parent_id         BLOB,
-  canonical_bytes   BLOB NOT NULL,
-  op                TEXT NOT NULL,
-  actor_node_id     INTEGER NOT NULL,
-  timestamp_ms      INTEGER NOT NULL,
+  entry_id        BLOB PRIMARY KEY,
+  group_id        BLOB NOT NULL,
+  sequence        INTEGER NOT NULL,
+  parent_id       BLOB,
+  canonical_bytes BLOB NOT NULL,
+  op              TEXT NOT NULL,
+  timestamp_ms    INTEGER NOT NULL,
   UNIQUE (group_id, sequence)
 );
 CREATE INDEX IF NOT EXISTS idx_roster_entries_group_sequence
   ON roster_entries(group_id, sequence);
-CREATE TABLE IF NOT EXISTS roster_members (
-  group_id          BLOB NOT NULL,
-  node_id           INTEGER NOT NULL,
-  pubkey            BLOB NOT NULL,
-  active            INTEGER NOT NULL,
-  last_entry_id     BLOB NOT NULL,
-  PRIMARY KEY (group_id, node_id)
-);
 `
 
 type writerLease struct {
@@ -228,11 +217,70 @@ func openRosterDB(path string) (*sql.DB, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("roster: ping sqlite %q: %w", path, err)
 	}
+	if err := migrateRosterDB(db); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("roster: migrate sqlite: %w", err)
+	}
 	if _, err := db.Exec(rosterSchema); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("roster: apply schema: %w", err)
 	}
 	return db, nil
+}
+
+func migrateRosterDB(db *sql.DB) error {
+	var legacyColumns int
+	if err := db.QueryRow(`
+		SELECT COUNT(*) FROM pragma_table_info('roster_meta')
+		WHERE name = 'founder_node_id';`,
+	).Scan(&legacyColumns); err != nil {
+		return err
+	}
+	if legacyColumns == 0 {
+		return nil
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.Exec(`
+		DROP TABLE IF EXISTS roster_meta_new;
+		DROP TABLE IF EXISTS roster_entries_new;
+		CREATE TABLE roster_meta_new (
+		  group_id BLOB PRIMARY KEY,
+		  version INTEGER NOT NULL,
+		  head_id BLOB NOT NULL,
+		  import_complete INTEGER NOT NULL CHECK (import_complete = 1)
+		);
+		INSERT INTO roster_meta_new (group_id, version, head_id, import_complete)
+		  SELECT group_id, version, head_id, import_complete FROM roster_meta;
+		CREATE TABLE roster_entries_new (
+		  entry_id BLOB PRIMARY KEY,
+		  group_id BLOB NOT NULL,
+		  sequence INTEGER NOT NULL,
+		  parent_id BLOB,
+		  canonical_bytes BLOB NOT NULL,
+		  op TEXT NOT NULL,
+		  timestamp_ms INTEGER NOT NULL,
+		  UNIQUE (group_id, sequence)
+		);
+		INSERT INTO roster_entries_new
+		  (entry_id, group_id, sequence, parent_id, canonical_bytes, op, timestamp_ms)
+		  SELECT entry_id, group_id, sequence, parent_id, canonical_bytes, op, timestamp_ms
+		  FROM roster_entries;
+		DROP INDEX IF EXISTS idx_roster_entries_group_sequence;
+		DROP TABLE IF EXISTS roster_members;
+		DROP TABLE roster_entries;
+		DROP TABLE roster_meta;
+		ALTER TABLE roster_entries_new RENAME TO roster_entries;
+		ALTER TABLE roster_meta_new RENAME TO roster_meta;
+		CREATE INDEX idx_roster_entries_group_sequence
+		  ON roster_entries(group_id, sequence);
+	`); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func importLegacyJSONL(ctx context.Context, db *sql.DB, groupID entmoot.GroupID, path string) error {
@@ -341,6 +389,39 @@ func readAndValidateLegacy(path string, groupID entmoot.GroupID) ([]entmoot.Rost
 	return entries, nil
 }
 
+// ValidateLegacyJSONL validates an immutable legacy roster without importing
+// or modifying it. Conversion uses this during preflight.
+func ValidateLegacyJSONL(path string, groupID entmoot.GroupID) ([]entmoot.RosterEntry, error) {
+	return readAndValidateLegacy(path, groupID)
+}
+
+// ValidateEntries verifies a decoded roster chain in order without persisting
+// it. The caller remains responsible for checking its stored canonical bytes.
+func ValidateEntries(groupID entmoot.GroupID, entries []entmoot.RosterEntry) error {
+	candidate := New(groupID)
+	for i, entry := range entries {
+		candidate.mu.Lock()
+		var err error
+		if len(candidate.entries) == 0 {
+			err = validateGenesis(entry, groupID)
+			if err == nil {
+				candidate.founder = entry.Subject
+				candidate.applyLocked(entry)
+			}
+		} else {
+			err = candidate.validateLocked(entry)
+			if err == nil {
+				candidate.applyLocked(entry)
+			}
+		}
+		candidate.mu.Unlock()
+		if err != nil {
+			return fmt.Errorf("entry %d: %w", i+1, err)
+		}
+	}
+	return nil
+}
+
 func loadSQLite(r *RosterLog, db *sql.DB, groupID entmoot.GroupID) error {
 	ctx := context.Background()
 	tx, err := db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
@@ -350,16 +431,14 @@ func loadSQLite(r *RosterLog, db *sql.DB, groupID entmoot.GroupID) error {
 	defer func() { _ = tx.Rollback() }()
 
 	var (
-		version     int
-		storedHead  []byte
-		founderNode int64
-		founderPub  []byte
-		imported    int
+		version    int
+		storedHead []byte
+		imported   int
 	)
 	err = tx.QueryRowContext(ctx, `
-		SELECT version, head_id, founder_node_id, founder_pubkey, import_complete
+		SELECT version, head_id, import_complete
 		FROM roster_meta WHERE group_id = ?;`, groupID[:],
-	).Scan(&version, &storedHead, &founderNode, &founderPub, &imported)
+	).Scan(&version, &storedHead, &imported)
 	if errors.Is(err, sql.ErrNoRows) {
 		var entryCount int
 		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM roster_entries WHERE group_id = ?;`, groupID[:]).Scan(&entryCount); err != nil {
@@ -426,47 +505,11 @@ func loadSQLite(r *RosterLog, db *sql.DB, groupID entmoot.GroupID) error {
 		r.mu.Unlock()
 		return fmt.Errorf("roster: close sqlite entries: %w", err)
 	}
-	if len(r.entries) != version || !bytes.Equal(storedHead, r.head[:]) ||
-		founderNode != int64(r.founder.PilotNodeID) || !bytes.Equal(founderPub, r.founder.EntmootPubKey) {
+	if len(r.entries) != version || !bytes.Equal(storedHead, r.head[:]) {
 		r.mu.Unlock()
 		return errors.New("roster: sqlite metadata does not match validated entry chain")
 	}
-	projected := make(map[entmoot.NodeID]entmoot.NodeInfo, len(r.members))
-	for id, info := range r.members {
-		projected[id] = info
-	}
 	r.mu.Unlock()
-
-	memberRows, err := tx.QueryContext(ctx, `
-		SELECT node_id, pubkey FROM roster_members
-		WHERE group_id = ? AND active = 1;`, groupID[:])
-	if err != nil {
-		return fmt.Errorf("roster: load member projection: %w", err)
-	}
-	for memberRows.Next() {
-		var node int64
-		var pubkey []byte
-		if err := memberRows.Scan(&node, &pubkey); err != nil {
-			_ = memberRows.Close()
-			return fmt.Errorf("roster: scan member projection: %w", err)
-		}
-		info, ok := projected[entmoot.NodeID(node)]
-		if !ok || !bytes.Equal(info.EntmootPubKey, pubkey) {
-			_ = memberRows.Close()
-			return errors.New("roster: sqlite member projection does not match validated entry chain")
-		}
-		delete(projected, entmoot.NodeID(node))
-	}
-	if err := memberRows.Err(); err != nil {
-		_ = memberRows.Close()
-		return fmt.Errorf("roster: iterate member projection: %w", err)
-	}
-	if err := memberRows.Close(); err != nil {
-		return fmt.Errorf("roster: close member projection: %w", err)
-	}
-	if len(projected) != 0 {
-		return errors.New("roster: sqlite member projection is incomplete")
-	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("roster: finish load snapshot: %w", err)
 	}
@@ -495,19 +538,14 @@ func persistRosterEntryTx(ctx context.Context, tx *sql.Tx, groupID entmoot.Group
 	}
 	var version int64
 	var currentHead []byte
-	var founderNode int64
-	var founderPub []byte
 	err = tx.QueryRowContext(ctx, `
-		SELECT version, head_id, founder_node_id, founder_pubkey
+		SELECT version, head_id
 		FROM roster_meta WHERE group_id = ?;`, groupID[:],
-	).Scan(&version, &currentHead, &founderNode, &founderPub)
+	).Scan(&version, &currentHead)
 	if errors.Is(err, sql.ErrNoRows) {
 		if len(entry.Parents) != 0 {
 			return fmt.Errorf("%w: persistent roster is empty", entmoot.ErrRosterReject)
 		}
-		version = 0
-		founderNode = int64(entry.Subject.PilotNodeID)
-		founderPub = append([]byte(nil), entry.Subject.EntmootPubKey...)
 	} else if err != nil {
 		return fmt.Errorf("read head: %w", err)
 	} else {
@@ -521,38 +559,21 @@ func persistRosterEntryTx(ctx context.Context, tx *sql.Tx, groupID entmoot.Group
 	}
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO roster_entries
-		  (entry_id, group_id, sequence, parent_id, canonical_bytes, op, actor_node_id, timestamp_ms)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?);`,
-		entry.ID[:], groupID[:], version+1, parent, encoded, entry.Op, int64(entry.Actor), entry.Timestamp,
+		  (entry_id, group_id, sequence, parent_id, canonical_bytes, op, timestamp_ms)
+		VALUES (?, ?, ?, ?, ?, ?, ?);`,
+		entry.ID[:], groupID[:], version+1, parent, encoded, entry.Op, entry.Timestamp,
 	); err != nil {
 		return fmt.Errorf("insert entry: %w", err)
 	}
-	active := 1
-	if entry.Op == "remove" {
-		active = 0
-	}
-	if entry.Op == "add" || entry.Op == "remove" {
-		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO roster_members (group_id, node_id, pubkey, active, last_entry_id)
-			VALUES (?, ?, ?, ?, ?)
-			ON CONFLICT(group_id, node_id) DO UPDATE SET
-			  pubkey = excluded.pubkey,
-			  active = excluded.active,
-			  last_entry_id = excluded.last_entry_id;`,
-			groupID[:], int64(entry.Subject.PilotNodeID), entry.Subject.EntmootPubKey, active, entry.ID[:],
-		); err != nil {
-			return fmt.Errorf("update member projection: %w", err)
-		}
-	}
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO roster_meta
-		  (group_id, version, head_id, founder_node_id, founder_pubkey, import_complete)
-		VALUES (?, ?, ?, ?, ?, 1)
+		  (group_id, version, head_id, import_complete)
+		VALUES (?, ?, ?, 1)
 		ON CONFLICT(group_id) DO UPDATE SET
 		  version = excluded.version,
 		  head_id = excluded.head_id,
 		  import_complete = 1;`,
-		groupID[:], version+1, entry.ID[:], founderNode, founderPub,
+		groupID[:], version+1, entry.ID[:],
 	); err != nil {
 		return fmt.Errorf("advance head: %w", err)
 	}

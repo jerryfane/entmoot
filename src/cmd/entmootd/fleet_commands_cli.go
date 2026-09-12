@@ -16,6 +16,7 @@ import (
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/esphttp"
 	"entmoot/pkg/entmoot/ipc"
+	libp2ptransport "entmoot/pkg/entmoot/transport/libp2p"
 )
 
 type fleetCommandsFlags struct {
@@ -271,12 +272,18 @@ func cmdFleetCommandsResult(gf *globalFlags, args []string) int {
 		fmt.Fprintf(os.Stderr, "fleet commands result: running Entmoot daemon is required: %v\n", err)
 		return exitTransport
 	}
+	binding, err := libp2ptransport.BindingFromPublicKey(info.EntmootPubKey)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "fleet commands result: local identity: %v\n", err)
+		return exitTransport
+	}
 	result := esphttp.FleetCommandResultEnvelope{
 		Type:          esphttp.FleetCommandResultType,
-		Version:       1,
+		Version:       2,
 		CommandID:     strings.TrimSpace(cfg.commandID),
 		FleetID:       strings.TrimSpace(cfg.fleet),
-		AgentNodeID:   info.PilotNodeID,
+		AgentMemberID: binding.MemberID,
+		AgentPeerID:   binding.PeerID.String(),
 		Action:        strings.TrimSpace(cfg.action),
 		Status:        status,
 		Summary:       strings.TrimSpace(cfg.summary),

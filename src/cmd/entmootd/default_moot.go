@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -46,10 +47,6 @@ type defaultMootStatusReport struct {
 	PolicySummary         string                             `json:"policy_summary,omitempty"`
 	LiveEnabled           bool                               `json:"live_enabled"`
 	AllowedLiveActions    []string                           `json:"allowed_live_actions,omitempty"`
-	HideIPRequested       bool                               `json:"hide_ip_requested"`
-	TURNAvailable         bool                               `json:"turn_available"`
-	TURNEndpoint          string                             `json:"turn_endpoint,omitempty"`
-	TURNError             string                             `json:"turn_error,omitempty"`
 	LastLocalMessageAtMS  int64                              `json:"last_local_message_at_ms,omitempty"`
 	LocalState            defaultMootLocalState              `json:"local_state"`
 	RecommendedLiveConfig *defaultmoot.RecommendedLiveConfig `json:"recommended_live_config,omitempty"`
@@ -200,7 +197,7 @@ func cmdDefaultMootLeave(gf *globalFlags, args []string) int {
 		fmt.Fprintf(os.Stderr, "default-moot leave: %v\n", err)
 		return exitTransport
 	}
-	disabled, err := disableDefaultMootLiveConfigs(gf.data, gid, 0)
+	disabled, err := disableDefaultMootLiveConfigs(gf.data, gid, entmoot.MemberID{})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "default-moot leave: disable live: %v\n", err)
 		return exitTransport
@@ -249,10 +246,10 @@ func cmdDefaultMootLive(gf *globalFlags, args []string) int {
 }
 
 func cmdDefaultMootLiveOn(gf *globalFlags, args []string) int {
-	var node uint64
+	var node string
 	jsonOut := false
 	fs := flag.NewFlagSet("default-moot live on", flag.ContinueOnError)
-	fs.Uint64Var(&node, "node", 0, "local Pilot node id")
+	fs.StringVar(&node, "member", "", "base64 local member id")
 	fs.BoolVar(&jsonOut, "json", false, "print JSON summary")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -260,7 +257,7 @@ func cmdDefaultMootLiveOn(gf *globalFlags, args []string) int {
 		}
 		return exitInvalidArgument
 	}
-	nodeID, ok := parseAgentLiveNode("default-moot live on", node)
+	nodeID, ok := parseAgentLiveMember("default-moot live on", node)
 	if !ok {
 		return exitInvalidArgument
 	}
@@ -303,11 +300,11 @@ func cmdDefaultMootLiveOn(gf *globalFlags, args []string) int {
 	if jsonOut {
 		return printJSON(rec)
 	}
-	fmt.Fprintf(os.Stdout, "enabled The Ent Moot live replies for node %d\n", nodeID)
+	fmt.Fprintf(os.Stdout, "enabled The Ent Moot live replies for member %s\n", nodeID.String())
 	return exitOK
 }
 
-func validateDefaultMootLiveMembership(gf *globalFlags, gid entmoot.GroupID, nodeID entmoot.NodeID) error {
+func validateDefaultMootLiveMembership(gf *globalFlags, gid entmoot.GroupID, memberID entmoot.MemberID) error {
 	s, err := setup(gf)
 	if err != nil {
 		return err
@@ -320,20 +317,21 @@ func validateDefaultMootLiveMembership(gf *globalFlags, gid entmoot.GroupID, nod
 		return fmt.Errorf("%w: The Ent Moot roster is missing for %s", errLocalGroupNotMember, gid.String())
 	}
 	defer rlog.Close()
-	if !rosterHasLocalNodeIdentity(rlog, nodeID, s.identity.PublicKey) {
-		if _, ok := rlog.MemberInfo(nodeID); ok {
-			return errLocalGroupIdentityMismatch
-		}
+	info, ok := rlog.MemberInfoByID(memberID)
+	if !ok {
 		return errLocalGroupNotMember
+	}
+	if !bytes.Equal(info.EntmootPubKey, s.identity.PublicKey) {
+		return errLocalGroupIdentityMismatch
 	}
 	return nil
 }
 
 func cmdDefaultMootLiveOff(gf *globalFlags, args []string) int {
-	var node uint64
+	var node string
 	jsonOut := false
 	fs := flag.NewFlagSet("default-moot live off", flag.ContinueOnError)
-	fs.Uint64Var(&node, "node", 0, "local Pilot node id; omit to disable all local The Ent Moot live configs")
+	fs.StringVar(&node, "member", "", "base64 local member id; omit to disable all local The Ent Moot live configs")
 	fs.BoolVar(&jsonOut, "json", false, "print JSON summary")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -346,9 +344,9 @@ func cmdDefaultMootLiveOff(gf *globalFlags, args []string) int {
 		fmt.Fprintf(os.Stderr, "default-moot live off: %v\n", err)
 		return exitTransport
 	}
-	var nodeID entmoot.NodeID
-	if node != 0 {
-		parsed, ok := parseAgentLiveNode("default-moot live off", node)
+	var nodeID entmoot.MemberID
+	if strings.TrimSpace(node) != "" {
+		parsed, ok := parseAgentLiveMember("default-moot live off", node)
 		if !ok {
 			return exitInvalidArgument
 		}
@@ -397,9 +395,8 @@ func buildDefaultMootStatus(ctx context.Context, gf *globalFlags) defaultMootSta
 		local.Consent = defaultMootConsentUnconfigured
 	}
 	report := defaultMootStatusReport{
-		Consent:         local.Consent,
-		HideIPRequested: gf.hideIP,
-		LocalState:      local,
+		Consent:    local.Consent,
+		LocalState: local,
 	}
 	cfg, cfgErr := defaultmoot.LoadConfigFromEnv()
 	if cfgErr != nil {
@@ -426,12 +423,6 @@ func buildDefaultMootStatus(ctx context.Context, gf *globalFlags) defaultMootSta
 		report.RecommendedLiveConfig = &desc.RecommendedLiveConfig
 		applyDefaultMootGroupStatus(ctx, gf, desc.GroupID, &report)
 	}
-	if pilot, _, _, err := loadPilotDoctorState(ctx, gf.socket); err == nil {
-		report.TURNEndpoint = pilot.TURNEndpoint
-		report.TURNAvailable = strings.TrimSpace(pilot.TURNEndpoint) != ""
-	} else {
-		report.TURNError = err.Error()
-	}
 	return report
 }
 
@@ -454,11 +445,6 @@ func printDefaultMootStatus(report defaultMootStatusReport) {
 	fmt.Printf("live_enabled: %t\n", report.LiveEnabled)
 	if len(report.AllowedLiveActions) > 0 {
 		fmt.Printf("allowed_live_actions: %s\n", strings.Join(report.AllowedLiveActions, ","))
-	}
-	fmt.Printf("hide_ip_requested: %t\n", report.HideIPRequested)
-	fmt.Printf("turn_available: %t\n", report.TURNAvailable)
-	if report.TURNEndpoint != "" {
-		fmt.Printf("turn_endpoint: %s\n", report.TURNEndpoint)
 	}
 	if report.PolicySummary != "" {
 		fmt.Printf("policy: %s\n", report.PolicySummary)
@@ -647,14 +633,14 @@ func defaultMootLastLocalMessage(ctx context.Context, dataDir string, gid entmoo
 	return latest[0].Timestamp
 }
 
-func disableDefaultMootLiveConfigs(dataDir string, gid entmoot.GroupID, node entmoot.NodeID) (int, error) {
+func disableDefaultMootLiveConfigs(dataDir string, gid entmoot.GroupID, node entmoot.MemberID) (int, error) {
 	state, err := esphttp.OpenSQLiteStateStore(dataDir)
 	if err != nil {
 		return 0, err
 	}
 	defer state.Close()
 	var configs []esphttp.LiveAgentConfig
-	if node != 0 {
+	if node != (entmoot.MemberID{}) {
 		cfg, ok, err := state.GetLiveAgentConfig(context.Background(), gid, node)
 		if err != nil {
 			return 0, err
@@ -671,7 +657,7 @@ func disableDefaultMootLiveConfigs(dataDir string, gid entmoot.GroupID, node ent
 	disabled := 0
 	now := time.Now().UnixMilli()
 	for _, cfg := range configs {
-		if err := state.DeleteLiveAgentConfig(context.Background(), gid, cfg.NodeID, now); err != nil {
+		if err := state.DeleteLiveAgentConfig(context.Background(), gid, cfg.MemberID, now); err != nil {
 			return disabled, err
 		}
 		disabled++

@@ -114,11 +114,19 @@ func (r *RosterLog) SignEntry(
 	op string,
 	subject entmoot.NodeInfo,
 	policy []byte,
-	actor entmoot.NodeID,
 	timestampMillis int64,
 ) (entmoot.RosterEntry, error) {
 	if signer == nil {
 		return entmoot.RosterEntry{}, fmt.Errorf("roster: SignEntry requires a non-nil identity")
+	}
+	actorMemberID, err := entmoot.MemberIDFromPublicKey(signer.PublicKey)
+	if err != nil {
+		return entmoot.RosterEntry{}, fmt.Errorf("roster: derive signer member id: %w", err)
+	}
+	if op == "add" || op == "remove" {
+		if err := entmoot.ValidateOperationalMemberInfo(subject); err != nil {
+			return entmoot.RosterEntry{}, fmt.Errorf("roster: invalid subject identity: %w", err)
+		}
 	}
 	r.mu.RLock()
 	if len(r.entries) == 0 {
@@ -131,15 +139,15 @@ func (r *RosterLog) SignEntry(
 	}
 	groupID := r.groupID
 	entry := entmoot.RosterEntry{
-		Op:        op,
-		Subject:   subject,
-		Policy:    append([]byte(nil), policy...),
-		Actor:     actor,
-		Timestamp: timestampMillis,
-		Parents:   []entmoot.RosterEntryID{r.head},
-		Version:   CurrentEntryVersion,
-		GroupID:   &groupID,
-		Sequence:  uint64(len(r.entries) + 1),
+		Op:            op,
+		Subject:       subject,
+		Policy:        append([]byte(nil), policy...),
+		ActorMemberID: &actorMemberID,
+		Timestamp:     timestampMillis,
+		Parents:       []entmoot.RosterEntryID{r.head},
+		Version:       CurrentEntryVersion,
+		GroupID:       &groupID,
+		Sequence:      uint64(len(r.entries) + 1),
 	}
 	r.mu.RUnlock()
 	sigInput, err := canonical.RosterEntrySigningBytes(entry)
@@ -164,20 +172,22 @@ func (r *RosterLog) Genesis(founder *keystore.Identity, founderInfo entmoot.Node
 	if founder == nil {
 		return fmt.Errorf("roster: Genesis requires a non-nil identity")
 	}
-	if len(founderInfo.EntmootPubKey) == 0 {
-		return fmt.Errorf("roster: Genesis requires founderInfo.EntmootPubKey")
+	if !bytes.Equal(founderInfo.EntmootPubKey, founder.PublicKey) {
+		return fmt.Errorf("roster: founder public key does not match signing identity")
 	}
-
+	if err := entmoot.ValidateOperationalMemberInfo(founderInfo); err != nil {
+		return fmt.Errorf("roster: invalid founder identity: %w", err)
+	}
 	groupID := r.groupID
 	entry := entmoot.RosterEntry{
-		Op:        "add",
-		Subject:   founderInfo,
-		Actor:     founderInfo.PilotNodeID,
-		Timestamp: timestampMillis,
-		Parents:   nil,
-		Version:   CurrentEntryVersion,
-		GroupID:   &groupID,
-		Sequence:  1,
+		Op:            "add",
+		Subject:       founderInfo,
+		ActorMemberID: founderInfo.MemberID,
+		Timestamp:     timestampMillis,
+		Parents:       nil,
+		Version:       CurrentEntryVersion,
+		GroupID:       &groupID,
+		Sequence:      1,
 	}
 	sigInput, err := canonical.RosterEntrySigningBytes(entry)
 	if err != nil {
@@ -297,9 +307,15 @@ func (r *RosterLog) validateLocked(entry entmoot.RosterEntry) error {
 		return fmt.Errorf("%w: invalid op %q", entmoot.ErrRosterReject, entry.Op)
 	}
 
-	if entry.Actor != founder.PilotNodeID {
-		return fmt.Errorf("%w: actor %d is not founder %d",
-			entmoot.ErrRosterReject, entry.Actor, founder.PilotNodeID)
+	if entry.Version == 0 {
+		if entry.Actor != founder.PilotNodeID {
+			return fmt.Errorf("%w: legacy actor %d is not founder %d", entmoot.ErrRosterReject, entry.Actor, founder.PilotNodeID)
+		}
+	} else {
+		founderMemberID, err := entmoot.ResolvedMemberID(founder)
+		if err != nil || entry.ActorMemberID == nil || *entry.ActorMemberID != founderMemberID {
+			return fmt.Errorf("%w: actor member is not founder", entmoot.ErrRosterReject)
+		}
 	}
 
 	// Verify the id the caller supplied matches what we would compute.
@@ -352,9 +368,12 @@ func validateGenesis(entry entmoot.RosterEntry, groupID entmoot.GroupID) error {
 	if len(entry.Parents) != 0 {
 		return fmt.Errorf("%w: genesis must have no parents", entmoot.ErrRosterReject)
 	}
-	if entry.Actor != entry.Subject.PilotNodeID {
-		return fmt.Errorf("%w: genesis must be self-signed (actor %d != subject %d)",
-			entmoot.ErrRosterReject, entry.Actor, entry.Subject.PilotNodeID)
+	if entry.Version == 0 {
+		if entry.Actor != entry.Subject.PilotNodeID {
+			return fmt.Errorf("%w: legacy genesis actor is not subject", entmoot.ErrRosterReject)
+		}
+	} else if entry.ActorMemberID == nil || entry.Subject.MemberID == nil || *entry.ActorMemberID != *entry.Subject.MemberID {
+		return fmt.Errorf("%w: genesis actor member is not subject", entmoot.ErrRosterReject)
 	}
 	if len(entry.Subject.EntmootPubKey) == 0 {
 		return fmt.Errorf("%w: genesis subject has no pubkey", entmoot.ErrRosterReject)
@@ -381,7 +400,7 @@ func validateEntryFormat(entry entmoot.RosterEntry, groupID entmoot.GroupID, seq
 		if !allowLegacy {
 			return fmt.Errorf("%w: legacy entry cannot follow a version-2 entry", entmoot.ErrRosterReject)
 		}
-		if entry.GroupID != nil || entry.Sequence != 0 {
+		if entry.GroupID != nil || entry.Sequence != 0 || entry.ActorMemberID != nil {
 			return fmt.Errorf("%w: legacy entry carries version-2 fields", entmoot.ErrRosterReject)
 		}
 		if entry.Subject.MemberID != nil {
@@ -396,6 +415,14 @@ func validateEntryFormat(entry entmoot.RosterEntry, groupID entmoot.GroupID, seq
 		}
 		if err := entmoot.ValidateMemberInfo(entry.Subject); err != nil {
 			return fmt.Errorf("%w: %v", entmoot.ErrRosterReject, err)
+		}
+		if entry.Op == "add" || entry.Op == "remove" {
+			if entry.Subject.MemberID == nil || entry.Subject.PeerID == "" || entry.Subject.PilotNodeID != 0 {
+				return fmt.Errorf("%w: version-2 roster member requires member_id and same-key peer_id", entmoot.ErrRosterReject)
+			}
+		}
+		if entry.ActorMemberID == nil || entry.Actor != 0 {
+			return fmt.Errorf("%w: version-2 entry has invalid actor identity", entmoot.ErrRosterReject)
 		}
 	default:
 		return fmt.Errorf("%w: unsupported roster entry version %d", entmoot.ErrRosterReject, entry.Version)
@@ -438,15 +465,29 @@ func (r *RosterLog) applyLocked(entry entmoot.RosterEntry) {
 	r.head = stored.ID
 	switch stored.Op {
 	case "add":
-		if stored.Subject.MemberID != nil {
-			r.membersByID[*stored.Subject.MemberID] = stored.Subject
+		projected := stored.Subject
+		memberID := stored.Subject.MemberID
+		if memberID == nil {
+			if derived, err := entmoot.MemberIDFromPublicKey(stored.Subject.EntmootPubKey); err == nil {
+				memberID = &derived
+				projected.MemberID = &derived
+			}
+		}
+		if memberID != nil {
+			r.membersByID[*memberID] = projected
 		}
 		if stored.Subject.PilotNodeID != 0 || stored.Subject.MemberID == nil {
 			r.members[stored.Subject.PilotNodeID] = stored.Subject
 		}
 	case "remove":
-		if stored.Subject.MemberID != nil {
-			delete(r.membersByID, *stored.Subject.MemberID)
+		memberID := stored.Subject.MemberID
+		if memberID == nil {
+			if derived, err := entmoot.MemberIDFromPublicKey(stored.Subject.EntmootPubKey); err == nil {
+				memberID = &derived
+			}
+		}
+		if memberID != nil {
+			delete(r.membersByID, *memberID)
 		}
 		if stored.Subject.PilotNodeID != 0 || stored.Subject.MemberID == nil {
 			delete(r.members, stored.Subject.PilotNodeID)
@@ -456,48 +497,12 @@ func (r *RosterLog) applyLocked(entry entmoot.RosterEntry) {
 	}
 }
 
-// IsMember reports whether nodeID is currently a member of the group.
-func (r *RosterLog) IsMember(nodeID entmoot.NodeID) bool {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	_, ok := r.members[nodeID]
-	return ok
-}
-
 // IsMemberID reports whether the full-width identity is a current member.
 func (r *RosterLog) IsMemberID(memberID entmoot.MemberID) bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	_, ok := r.membersByID[memberID]
 	return ok
-}
-
-// Members returns the current members as a slice of NodeIDs sorted ascending.
-func (r *RosterLog) Members() []entmoot.NodeID {
-	r.mu.RLock()
-	out := make([]entmoot.NodeID, 0, len(r.members))
-	for id := range r.members {
-		out = append(out, id)
-	}
-	r.mu.RUnlock()
-	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
-	return out
-}
-
-// MemberInfo returns the NodeInfo for nodeID, or (zero, false) if not a
-// current member. The NodeInfo carries the EntmootPubKey used to verify
-// message signatures authored by that member.
-func (r *RosterLog) MemberInfo(nodeID entmoot.NodeID) (entmoot.NodeInfo, bool) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	info, ok := r.members[nodeID]
-	if !ok {
-		return entmoot.NodeInfo{}, false
-	}
-	// Copy the pubkey so callers can't mutate internal state.
-	out := info
-	out.EntmootPubKey = append([]byte(nil), info.EntmootPubKey...)
-	return out, true
 }
 
 // MemberInfoByID returns an independent copy of the full-width member record.
@@ -523,32 +528,6 @@ func (r *RosterLog) MemberIDs() []entmoot.MemberID {
 		return bytes.Compare(out[i][:], out[j][:]) < 0
 	})
 	return out
-}
-
-// MemberInfoAt resolves nodeID in the membership projection at head.
-// The third result distinguishes a known head from an unresolved hash.
-func (r *RosterLog) MemberInfoAt(nodeID entmoot.NodeID, head entmoot.RosterEntryID) (entmoot.NodeInfo, bool, bool) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	index, known := r.byID[head]
-	if !known {
-		return entmoot.NodeInfo{}, false, false
-	}
-	for i := index; i >= 0; i-- {
-		entry := r.entries[i]
-		if entry.Subject.PilotNodeID != nodeID {
-			continue
-		}
-		switch entry.Op {
-		case "remove":
-			return entmoot.NodeInfo{}, false, true
-		case "add":
-			info := entry.Subject
-			info.EntmootPubKey = append([]byte(nil), info.EntmootPubKey...)
-			return info, true, true
-		}
-	}
-	return entmoot.NodeInfo{}, false, true
 }
 
 // MemberInfoAtID resolves a full-width identity in the membership projection
@@ -603,15 +582,22 @@ func (r *RosterLog) HeadIsGroupBound() bool {
 	return head.Version == CurrentEntryVersion && head.GroupID != nil && *head.GroupID == r.groupID
 }
 
-// Founder returns the founder's NodeInfo, as recorded by Genesis. Returns
-// (zero, false) if the log is empty.
+// Founder returns the founder identity projected to MemberID. Immutable legacy
+// genesis bytes remain untouched; callers receive the same-key operational
+// identity.
 func (r *RosterLog) Founder() (entmoot.NodeInfo, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	if len(r.entries) == 0 {
 		return entmoot.NodeInfo{}, false
 	}
-	return cloneNodeInfo(r.founder), true
+	founder := cloneNodeInfo(r.founder)
+	if founder.MemberID == nil {
+		if memberID, err := entmoot.MemberIDFromPublicKey(founder.EntmootPubKey); err == nil {
+			founder.MemberID = &memberID
+		}
+	}
+	return founder, true
 }
 
 // Entries returns a deep copy of the entry slice in apply order. Useful for

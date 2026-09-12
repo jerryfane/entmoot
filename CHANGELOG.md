@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Bootstrap sync authorization.** Roster and history reads now require grants
+  anchored to the group's founder and current roster head, naming the serving
+  peer, and neither reserved nor consumed, including after restart. Current
+  members continue to sync without enrollment grants.
+- **Converted legacy history.** Daemons load conversion checkpoints from the
+  canonical URL-safe group directory and serve legacy messages with their
+  verified history proofs to authenticated members.
 - **Group-bound roster and invite trust.** New roster entries use a
   domain-separated version-2 signature over the group id and linear sequence.
   Join now validates fetched chains in temporary state, matches the invite

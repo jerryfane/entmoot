@@ -12,7 +12,6 @@ import (
 	"time"
 
 	entmoot "entmoot/pkg/entmoot"
-	entpolicy "entmoot/pkg/entmoot/policy"
 )
 
 // mustGroupID returns a GroupID filled with the given byte for test
@@ -104,12 +103,17 @@ func TestRoundTripPublishResp(t *testing.T) {
 
 func TestRoundTripSignedPublishReqResp(t *testing.T) {
 	pub, priv := newKey(t)
+	memberID, err := entmoot.MemberIDFromPublicKey(pub)
+	if err != nil {
+		t.Fatal(err)
+	}
 	msg := entmoot.Message{
 		ID:      mustMessageID(0xAC),
+		Version: 2,
 		GroupID: mustGroupID(0x23),
 		Author: entmoot.NodeInfo{
-			PilotNodeID:   45491,
 			EntmootPubKey: pub,
+			MemberID:      &memberID,
 		},
 		Timestamp: 1_700_000_000_700,
 		Topics:    []string{"mobile/service"},
@@ -118,11 +122,11 @@ func TestRoundTripSignedPublishReqResp(t *testing.T) {
 	msg.Signature = ed25519.Sign(priv, []byte("signed-publish-test"))
 	roundTrip(t, &SignedPublishReq{Message: msg})
 	roundTrip(t, &SignedPublishResp{
-		Status:      "accepted",
-		MessageID:   msg.ID,
-		GroupID:     msg.GroupID,
-		Author:      msg.Author.PilotNodeID,
-		TimestampMS: msg.Timestamp,
+		Status:         "accepted",
+		MessageID:      msg.ID,
+		GroupID:        msg.GroupID,
+		AuthorMemberID: memberID,
+		TimestampMS:    msg.Timestamp,
 	})
 }
 
@@ -133,24 +137,18 @@ func TestRoundTripJoinGroupReqResp(t *testing.T) {
 		EntmootPubKey: []byte("founder-key"),
 	}
 	roundTrip(t, &JoinGroupReq{
-		Invite: entmoot.Invite{
-			GroupID:    gid,
-			Founder:    issuer,
-			Issuer:     issuer,
-			IssuedAt:   1_700_000_000_000,
-			ValidUntil: 1_700_086_400_000,
+		Capability: &entmoot.BootstrapCapability{
+			GroupID:         gid,
+			Founder:         issuer,
+			TargetPublicKey: []byte("target-public-key-32-bytes!!"),
+			IssuedAtMS:      1_700_000_000_000,
+			ExpiresAtMS:     1_700_086_400_000,
 		},
 		TimeoutMS: 90_000,
 	})
 	roundTrip(t, &JoinGroupReq{
-		OpenInvite: &OpenInviteJoin{
-			IssuerURL:       "https://esp.example.com",
-			Token:           "open-token",
-			ExpectedGroupID: &gid,
-			ExpectedIssuer:  &issuer,
-		},
-		GroupPolicy: ptr(entpolicy.TheEntMootDefault()),
-		TimeoutMS:   90_000,
+		LocalGroupID: &gid,
+		TimeoutMS:    90_000,
 	})
 	roundTrip(t, &JoinGroupResp{
 		Status:  "joined",
@@ -198,32 +196,23 @@ func TestRoundTripInviteCreateReqResp(t *testing.T) {
 	gid := mustGroupID(0x66)
 	pub, _ := newKey(t)
 	req := &InviteCreateReq{
-		GroupID: gid,
-		Target: entmoot.NodeInfo{
-			PilotNodeID:   45981,
-			EntmootPubKey: pub,
-		},
-		ValidForMS:     int64(time.Hour / time.Millisecond),
-		BootstrapPeers: []entmoot.NodeID{45491, 45460},
+		GroupID:             gid,
+		TargetPublicKey:     pub,
+		ValidForMS:          int64(time.Hour / time.Millisecond),
+		BootstrapMultiaddrs: []string{"/ip4/127.0.0.1/tcp/1004/p2p/12D3KooWExample"},
 	}
 	roundTrip(t, req)
 
 	resp := &InviteCreateResp{
 		Status:     "created",
 		GroupID:    gid,
-		Invite:     entmoot.Invite{GroupID: gid, RosterHead: mustRosterEntryID(0x77)},
+		Capability: entmoot.BootstrapCapability{GroupID: gid, RosterHead: mustRosterEntryID(0x77)},
 		RosterHead: mustRosterEntryID(0x77),
 		Members:    3,
 	}
 	roundTrip(t, resp)
 
-	authorityReq := &InviteAuthorityCheckReq{
-		GroupID: gid,
-		CandidateInvite: &entmoot.Invite{
-			GroupID: gid,
-			Issuer:  entmoot.NodeInfo{PilotNodeID: 7},
-		},
-	}
+	authorityReq := &InviteAuthorityCheckReq{GroupID: gid}
 	roundTrip(t, authorityReq)
 
 	authorityResp := &InviteAuthorityCheckResp{
@@ -247,8 +236,13 @@ func TestRoundTripInfoResp(t *testing.T) {
 	for i := range root {
 		root[i] = byte(i)
 	}
+	memberID, err := entmoot.MemberIDFromPublicKey(pub)
+	if err != nil {
+		t.Fatal(err)
+	}
 	resp := &InfoResp{
-		PilotNodeID:   0xDEADBEEF,
+		MemberID:      memberID,
+		PeerID:        "12D3KooWExample",
 		EntmootPubKey: pub,
 		ListenPort:    1004,
 		DataDir:       "/home/agent/.entmoot",
@@ -351,7 +345,6 @@ func TestDecodeMalformedJSON(t *testing.T) {
 		MsgJoinGroupReq, MsgJoinGroupResp,
 		MsgInviteCreateReq, MsgInviteCreateResp,
 		MsgMemberRemoveReq, MsgMemberRemoveResp,
-		MsgDiagProbeReq, MsgDiagProbeResp,
 		MsgTailSubscribe, MsgTailEvent,
 		MsgInfoResp, MsgError,
 	}

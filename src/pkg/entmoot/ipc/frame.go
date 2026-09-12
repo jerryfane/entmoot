@@ -6,14 +6,10 @@
 //
 //	[4-byte big-endian length][1-byte msg_type][JSON body]
 //
-// length = size of (msg_type + body). The framing shape matches the peer
-// wire protocol for developer familiarity, but the type-number namespace
-// (starting at 0x10), the payload set, and the error taxonomy are all local to
-// this package. Sharing a framing library with pkg/entmoot/wire was
-// rejected in CLI_DESIGN §5.2: peer wire crosses encrypted Pilot tunnels
-// to potentially-untrusted peers; ipc frames move between cooperating
-// processes on the same host. Conflating the two security models would
-// be wrong.
+// length = size of (msg_type + body). The type-number namespace (starting at
+// 0x10), payload set, and error taxonomy are local to this package. IPC frames
+// move only between cooperating processes on the same host and are not reused
+// as the authenticated libp2p protocol.
 //
 // This package deliberately has no replay-protection or rate-limiting
 // path: the socket is 0600 and bound to a single local user, so both

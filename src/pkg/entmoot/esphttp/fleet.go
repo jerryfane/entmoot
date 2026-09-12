@@ -54,29 +54,31 @@ type FleetRecord struct {
 }
 
 type FleetMemberRecord struct {
-	FleetID       string         `json:"fleet_id"`
-	NodeID        entmoot.NodeID `json:"node_id"`
-	EntmootPubKey string         `json:"entmoot_pubkey"`
-	Hostname      string         `json:"hostname,omitempty"`
-	Role          string         `json:"role"`
-	Status        string         `json:"status"`
-	InvitedAtMS   int64          `json:"invited_at_ms,omitempty"`
-	AcceptedAtMS  int64          `json:"accepted_at_ms,omitempty"`
-	RemovedAtMS   int64          `json:"removed_at_ms,omitempty"`
-	UpdatedAtMS   int64          `json:"updated_at_ms"`
+	FleetID       string           `json:"fleet_id"`
+	MemberID      entmoot.MemberID `json:"member_id"`
+	PeerID        string           `json:"peer_id"`
+	EntmootPubKey string           `json:"entmoot_pubkey"`
+	Hostname      string           `json:"hostname,omitempty"`
+	Role          string           `json:"role"`
+	Status        string           `json:"status"`
+	InvitedAtMS   int64            `json:"invited_at_ms,omitempty"`
+	AcceptedAtMS  int64            `json:"accepted_at_ms,omitempty"`
+	RemovedAtMS   int64            `json:"removed_at_ms,omitempty"`
+	UpdatedAtMS   int64            `json:"updated_at_ms"`
 }
 
 type FleetInviteRecord struct {
-	InviteID      string          `json:"invite_id"`
-	FleetID       string          `json:"fleet_id"`
-	NodeID        entmoot.NodeID  `json:"node_id"`
-	EntmootPubKey string          `json:"entmoot_pubkey"`
-	Hostname      string          `json:"hostname,omitempty"`
-	Status        string          `json:"status"`
-	Invite        json.RawMessage `json:"invite,omitempty"`
-	CreatedAtMS   int64           `json:"created_at_ms"`
-	UpdatedAtMS   int64           `json:"updated_at_ms"`
-	ExpiresAtMS   int64           `json:"expires_at_ms,omitempty"`
+	InviteID      string           `json:"invite_id"`
+	FleetID       string           `json:"fleet_id"`
+	MemberID      entmoot.MemberID `json:"member_id"`
+	PeerID        string           `json:"peer_id"`
+	EntmootPubKey string           `json:"entmoot_pubkey"`
+	Hostname      string           `json:"hostname,omitempty"`
+	Status        string           `json:"status"`
+	Capability    json.RawMessage  `json:"capability,omitempty"`
+	CreatedAtMS   int64            `json:"created_at_ms"`
+	UpdatedAtMS   int64            `json:"updated_at_ms"`
+	ExpiresAtMS   int64            `json:"expires_at_ms,omitempty"`
 }
 
 type FleetActivityRecord struct {
@@ -283,7 +285,7 @@ func cloneFleetMemberRecord(in FleetMemberRecord) FleetMemberRecord {
 }
 
 func cloneFleetInviteRecord(in FleetInviteRecord) FleetInviteRecord {
-	in.Invite = append(json.RawMessage(nil), in.Invite...)
+	in.Capability = append(json.RawMessage(nil), in.Capability...)
 	return in
 }
 
