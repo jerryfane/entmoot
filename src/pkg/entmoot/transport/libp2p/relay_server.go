@@ -26,7 +26,7 @@ type RelayServerConfig struct {
 	CircuitDuration       time.Duration
 	CircuitBytes          int64
 	MaxReservations       int
-	MaxCircuitsPerPeer    int
+	MaxCircuitsPerPeer    int // relayv2 enforces this independently for each source and destination peer.
 	MaxReservationsPerIP  int
 	MaxReservationsPerASN int
 }
