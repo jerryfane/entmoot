@@ -2,34 +2,30 @@
 title: Deployment
 ---
 
-Run Pilot first, then Entmoot.
+Join once, then supervise the integrated Entmoot daemon:
 
 ```sh
-scripts/wait-pilot-ready.sh --timeout 45
-entmootd serve
+entmootd join /path/to/invite.json
+entmootd -connectivity direct -listen-port 1004 serve
 ```
 
-Use `entmootd join /path/to/invite.json` only for the first successful join.
-Service managers should run `entmootd serve` so restarts depend on persisted
-local state, not on an invite file that can disappear or expire.
+Use `entmootd join` only for the first successful join. Service managers should
+run `entmootd serve` so restarts depend on persisted local state, not on an
+invite file that can disappear or expire.
 
-Set a readable Pilot hostname before starting Entmoot if member names should
-appear in ESP/mobile clients:
+Direct mode is the default and is appropriate for a publicly reachable host.
+For endpoint shielding from group peers, configure one or more controlled
+Circuit Relay v2 peers:
 
 ```sh
-pilotctl set-hostname laptop
-entmootd serve
+entmootd \
+  -connectivity relay-only \
+  -controlled-relay '/dns4/relay.example/tcp/4001/p2p/<relay-peer-id>' \
+  serve
 ```
 
-Entmoot reads that hostname from Pilot and republishes it as signed member
-profile metadata. Changing the hostname later is safe; the serve process will
-republish the new profile.
+Relay-only mode opens no direct application listener, has no TURN or direct
+fallback, and fails closed when all configured relays are unavailable. The
+relay operator can still observe client addresses.
 
-For strict hide-IP operation, keep flags aligned across layers:
-
-- Pilot handles TURN, rendezvous, and route policy.
-- Entmoot uses `-hide-ip` to suppress direct endpoint ads.
-- Entmoot should publish signed TURN transport ads and subscribe to Pilot TURN
-  endpoint changes.
-
-One host should run one `serve` process per Entmoot identity.
+One host should run one `serve` process per Entmoot identity and data root.

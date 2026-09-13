@@ -2,29 +2,28 @@
 title: Peer Upgrades
 ---
 
-Current release pairing: Entmoot `v1.5.39` with Pilot `v1.9.0-jf.15.25`.
+Entmoot releases contain the complete application and libp2p transport. There
+is no separately versioned transport daemon.
 
 Upgrade order:
 
-1. Update Pilot only when the Entmoot release depends on a newer Pilot.
-2. Restart Pilot and wait for IPC readiness.
-3. Restart the main Entmoot `serve` runtime through its service manager or
+1. Install the intended Entmoot release.
+2. Restart the main `entmootd serve` runtime through its service manager or
    wrapper.
-4. Verify local message count and Merkle root.
-5. Verify the Pilot hostname if the release affects ESP/member display data.
-6. Run `entmootd doctor -group <GROUP_ID> --probe` before declaring the peer
+3. Restart a separately supervised ESP only when the release affects ESP.
+4. Verify local identity, message count, and history coverage.
+5. Run `entmootd doctor -group <GROUP_ID> --probe` before declaring the peer
    healthy.
 
 ```sh
-scripts/wait-pilot-ready.sh --timeout 45
-pilotctl info
+entmootd version
 scripts/verify-mesh-node.sh
 entmootd doctor -group <GROUP_ID> --probe
 ```
 
-Do not use broad process-name cleanup for Entmoot. A public host may run both
-`entmootd serve` and `entmootd esp serve`; killing by executable name can take
-down the ESP HTTP bridge while leaving nginx up.
+Do not use broad process-name cleanup. A public host may run both `entmootd
+serve` and `entmootd esp serve`; killing by executable name can take down the
+ESP HTTP bridge while leaving nginx up.
 
 For service-managed peers, use the update helper so the restart target is
 explicit:
@@ -47,25 +46,8 @@ scripts/update-entmoot-peer.sh --tag vX.Y.Z \
 ```
 
 For unmanaged `serve` processes, pass `--serve-restart-cmd` or set
-`ENTMOOT_SERVE_RESTART_CMD`; the helper will stop only top-level
-`entmootd serve`/`join` processes before running that command.
+`ENTMOOT_SERVE_RESTART_CMD`; the helper stops only the intended top-level
+runtime before running that command.
 
 Peer updates are operational state changes. Do them separately from docs-only
 releases.
-
-For hostname-aware members, set names on every peer before the final Entmoot
-restart:
-
-```sh
-pilotctl set-hostname vps
-pilotctl set-hostname phobos
-pilotctl set-hostname laptop
-```
-
-After restart, `GET /v1/groups/{group_id}/members` should eventually expose
-the signed hostnames for roster members that are online and reachable.
-
-Current Entmoot releases expect the matching Pilot fork to advertise tracked
-stream send acknowledgements, node lookup/challenge signing, and pending
-handshake notifications. If open invites or auto-approval fail after an
-Entmoot-only upgrade, upgrade Pilot and restart in the order above.

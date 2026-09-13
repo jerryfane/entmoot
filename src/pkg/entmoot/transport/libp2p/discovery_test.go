@@ -71,22 +71,51 @@ func TestDirectAndRelayOnlyProfilesAreIndependent(t *testing.T) {
 func TestRelayOnlyPeersConnectThroughControlledRelay(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	relayHost, _, err := NewHost(ctx, mustIdentity(t),
-		libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"),
-		libp2p.ForceReachabilityPublic(),
-		libp2p.EnableRelayService(),
-	)
+	firstIdentity := mustIdentity(t)
+	firstBinding, err := BindingFromPublicKey(firstIdentity.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondIdentity := mustIdentity(t)
+	secondBinding, err := BindingFromPublicKey(secondIdentity.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	relayHost, _, err := NewRelayServer(ctx, mustIdentity(t), RelayServerConfig{
+		ListenAddrs:           []string{"/ip4/127.0.0.1/tcp/0"},
+		AllowedPeers:          []peer.ID{firstBinding.PeerID, secondBinding.PeerID},
+		ReservationTTL:        time.Hour,
+		CircuitDuration:       time.Minute,
+		CircuitBytes:          1 << 20,
+		MaxReservations:       8,
+		MaxCircuitsPerPeer:    2,
+		MaxReservationsPerIP:  8,
+		MaxReservationsPerASN: 8,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer relayHost.Close()
 	relayInfo := peer.AddrInfo{ID: relayHost.ID(), Addrs: relayHost.Addrs()}
-	first, _, err := NewConfiguredHost(ctx, mustIdentity(t), HostConfig{Mode: RelayOnlyConnectivity, ControlledRelays: []peer.AddrInfo{relayInfo}})
+
+	unlisted, _, err := NewConfiguredHost(ctx, mustIdentity(t), HostConfig{Mode: RelayOnlyConnectivity, ControlledRelays: []peer.AddrInfo{relayInfo}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlisted.Close()
+	if err := unlisted.Connect(ctx, relayInfo); err != nil {
+		t.Fatalf("unlisted peer could not reach relay admission endpoint: %v", err)
+	}
+	if _, err := relayclient.Reserve(ctx, unlisted, relayInfo); err == nil {
+		t.Fatal("relay accepted a reservation from an unlisted peer")
+	}
+
+	first, _, err := NewConfiguredHost(ctx, firstIdentity, HostConfig{Mode: RelayOnlyConnectivity, ControlledRelays: []peer.AddrInfo{relayInfo}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer first.Close()
-	second, _, err := NewConfiguredHost(ctx, mustIdentity(t), HostConfig{Mode: RelayOnlyConnectivity, ControlledRelays: []peer.AddrInfo{relayInfo}})
+	second, _, err := NewConfiguredHost(ctx, secondIdentity, HostConfig{Mode: RelayOnlyConnectivity, ControlledRelays: []peer.AddrInfo{relayInfo}})
 	if err != nil {
 		t.Fatal(err)
 	}

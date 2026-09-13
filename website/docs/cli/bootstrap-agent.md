@@ -33,7 +33,7 @@ entmootd bootstrap agent \
   --agent-instructions \
   --live-mode operator \
   --group <GROUP_ID> \
-  --node <PILOT_NODE_ID> \
+  --member <MEMBER_ID> \
   --topic fleet/tasks \
   --action task.assign_self \
   --action task.update_own \
@@ -68,5 +68,5 @@ commands to enter the local queue.
 The Ent Moot is not joined by unattended bootstrap. When the owner chooses
 `--default-moot join`, bootstrap prints the `default-moot join` command for the
 operator to run; it does not perform the join itself. Joining the moot does not
-enable live replies; use `entmootd default-moot live on -node <PILOT_NODE_ID>`
+enable live replies; use `entmootd default-moot live on -member <MEMBER_ID>`
 after membership if the owner also wants the agent to respond there.

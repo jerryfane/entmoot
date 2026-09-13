@@ -183,7 +183,8 @@ Example public directory entry shape:
       "retention_days": 30
     },
     "founder": {
-      "pilot_node_id": 12345,
+      "member_id": "<base64 member id>",
+      "peer_id": "12D3Koo...",
       "entmoot_pubkey": "<base64 public key>"
     },
     "indexing": {
@@ -206,18 +207,14 @@ Example public directory entry shape:
 Operators may set a listed descriptor to `pending`, `delisted`, or `blocked`
 for Entmoot-operated surfaces without changing the group roster.
 
-Member list responses include `display_name` and may include `hostname`,
-`global_hostname`, and `live`. `hostname` is learned from signed member-profile
-gossip scoped to the group and remains the highest-confidence display hint for
-that group. The ESP only exposes a group profile when the profile author's
-Entmoot key still matches the current roster entry for that Pilot node id.
-`global_hostname` is an ESP-local fallback learned from same-group cached member
-profiles, Fleet, invite, or local Pilot context; it is not a global identity
-authority.
-`display_name` is always stable for clients: `<hostname>#<node_id>` when either
-hostname field is available, otherwise `node-<node_id>`. `live` is ESP-local
-state with `enabled`, `status`, `mode`, topic filters, allowed actions, lease,
-and timestamps.
+Member list responses include `display_name` and may include profile and live
+state. A member profile is signed with the same Entmoot key that derives the
+full-width MemberID and libp2p PeerID. ESP exposes it only after the profile
+author still matches the current roster. ESP-local profile observations are
+display hints, not identity authority. `display_name` is stable for clients and
+falls back to a short presentation of the MemberID when no approved name is
+available. `live` is ESP-local state with `enabled`, `status`, `mode`, topic
+filters, allowed actions, lease, and timestamps.
 
 Live-agent config routes:
 
@@ -241,7 +238,7 @@ Admin invite and member-management routes:
   through the running daemon and fans out the new roster head.
 - `POST /v1/groups/{group_id}/invites` creates an `invite_create` sign request
   and returns a targeted signed invite after completion. Entmoot verifies the
-  target Pilot node id/public key binding before adding the roster entry.
+  target MemberID, PeerID, and public-key binding before adding the roster entry.
 - `POST /v1/groups/{group_id}/open-invites` creates an
   `open_invite_create` sign request. Completion stores an issuer-scoped token
   with expiry, max-use count, and optional bootstrap peers, and returns
@@ -251,19 +248,19 @@ Admin invite and member-management routes:
 - `POST /v1/invites/accept` creates an `invite_accept` sign request for a full
   signed invite bundle.
 - `POST /v1/open-invites/accept` creates an `open_invite_accept` sign request.
-  Completion validates the issuer challenge for the requested token/local
-  identity, obtains a local Pilot signature, redeems a normal signed invite,
-  persists the redeemed invite for retry safety, and joins the group. Issuer
+  Completion validates the issuer challenge for the requested token and local
+  Entmoot identity, signs it with the local Entmoot key, redeems a normal signed
+  invite, persists the result for retry safety, and joins the group. Issuer
   redirects are disabled so URL validation cannot be bypassed.
 
 Public open-invite issuer endpoints:
 
-- `POST /v1/open-invites/{token}/challenge` accepts the redeemer Pilot node id,
-  Pilot public key, and Entmoot public key. It returns a bounded,
+- `POST /v1/open-invites/{token}/challenge` accepts the redeemer MemberID,
+  libp2p PeerID, and Entmoot public key. It returns a bounded,
   domain-separated challenge and caps active unused challenges.
-- `POST /v1/open-invites/{token}/redeem` verifies the Pilot signature and
-  returns a signed invite. Replays for the same redeemer return the stored
-  result after re-validating proof.
+- `POST /v1/open-invites/{token}/redeem` verifies the Entmoot identity
+  signature and returns a signed invite. Replays for the same redeemer return
+  the stored result after re-validating proof.
 
 Fleet routes are ESP-local control-plane projections backed by Entmoot group
 events and sign requests:
@@ -309,8 +306,8 @@ Fleet command routes:
   status, results, and `updated_at_ms`.
 
 Auto-accept-safe command actions are `echo`, `entmoot.version`,
-`entmoot.info`, `entmoot.doctor_probe`, `pilot.info`, and
-`fleet.local_state`. `agent.instruction` is manual risk, not read-only, and
+`entmoot.info`, `entmoot.doctor_probe`, and `fleet.local_state`.
+`agent.instruction` is manual risk, not read-only, and
 requires the target node to opt in locally.
 
 Create a message draft sign request:
@@ -319,13 +316,13 @@ Create a message draft sign request:
 POST /v1/groups/<group_id>/messages
 Content-Type: application/json
 
-{"author":{"pilot_node_id":45491,"entmoot_pubkey":"<base64-ed25519-pubkey>"},"topics":["chat"],"content":"aGVsbG8="}
+{"author":{"member_id":"<base64-member-id>","peer_id":"12D3Koo...","entmoot_pubkey":"<base64-ed25519-pubkey>"},"topics":["chat"],"content":"aGVsbG8="}
 ```
 
 Response:
 
 ```json
-{"sign_request":{"id":"<id>","kind":"message_publish","group_id":"<base64>","payload":{"message":{"group_id":"<base64>","author":{"pilot_node_id":45491,"entmoot_pubkey":"<base64-ed25519-pubkey>"},"timestamp":1777392000000,"topics":["chat"],"content":"aGVsbG8="}},"signing_payload":"<base64 canonical message signing bytes>","signing_payload_sha256":"<sha256>","status":"pending"}}
+{"sign_request":{"id":"<id>","kind":"message_publish","group_id":"<base64>","payload":{"message":{"group_id":"<base64>","author":{"member_id":"<base64-member-id>","peer_id":"12D3Koo...","entmoot_pubkey":"<base64-ed25519-pubkey>"},"timestamp":1777392000000,"topics":["chat"],"content":"aGVsbG8="}},"signing_payload":"<base64 canonical message signing bytes>","signing_payload_sha256":"<sha256>","status":"pending"}}
 ```
 
 Complete it:

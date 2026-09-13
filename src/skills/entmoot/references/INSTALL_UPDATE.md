@@ -1,12 +1,12 @@
 # Install, Update, And First Checks
 
 Use this reference for first-run environment checks, missing binaries, release
-updates, and Pilot daemon startup.
+updates, and libp2p connectivity profiles.
 
 ## First Checks
 
 ```sh
-export PATH="$HOME/.pilot/bin:$HOME/.entmoot/bin:$PATH"
+export PATH="$HOME/.entmoot/bin:$PATH"
 
 if [ -x /data/.entmoot/entmoot ]; then
   ENTMOOT=/data/.entmoot/entmoot
@@ -42,14 +42,9 @@ requested operation. Do not reinstall or rejoin.
 
 ## Install Or Update
 
-Install missing binaries:
+Install a missing binary:
 
 ```sh
-if ! command -v pilot-daemon >/dev/null 2>&1; then
-  curl -fsSL https://raw.githubusercontent.com/jerryfane/pilotprotocol/main/install.sh | sh
-  export PATH="$HOME/.pilot/bin:$PATH"
-fi
-
 if [ "$ENTMOOT" != "/data/.entmoot/entmoot" ] && ! command -v entmootd >/dev/null 2>&1; then
   curl -fsSL https://raw.githubusercontent.com/jerryfane/entmoot/main/install.sh | sh
   export PATH="$HOME/.entmoot/bin:$PATH"
@@ -58,8 +53,8 @@ fi
 "$ENTMOOT" version
 ```
 
-Use the release updater when `entmootd version` is older than `v1.5.61`,
-reports `dev`, or when the newest release is needed:
+Use the release updater when `entmootd version` is older than the required
+release, reports `dev`, or when the newest release is needed:
 
 ```sh
 if [ "$ENTMOOT" = "/data/.entmoot/entmoot" ]; then
@@ -75,24 +70,27 @@ fi
 Pin a known release only when that exact version is required:
 
 ```sh
-"$ENTMOOT" update --restart --tag v1.5.61 --install-dir "$ENTMOOT_UPDATE_INSTALL_DIR"
+"$ENTMOOT" update --restart --tag <release-tag> --install-dir "$ENTMOOT_UPDATE_INSTALL_DIR"
 ```
 
-## Start Pilot Only When Needed
+## Connectivity Profiles
+
+Direct mode is the default. It exposes a libp2p listener and is appropriate for
+publicly reachable servers and peers whose network permits direct connections:
 
 ```sh
-if [ ! -S "${PILOT_SOCKET:-/tmp/pilot.sock}" ]; then
-  mkdir -p "$HOME/.pilot"
-  nohup pilot-daemon \
-    -socket "${PILOT_SOCKET:-/tmp/pilot.sock}" \
-    -identity "$HOME/.pilot/identity.json" \
-    -email "${PILOT_EMAIL:-agent@example.com}" \
-    -listen :0 \
-    > "$HOME/.pilot/daemon.log" 2>&1 &
-
-  for _ in 1 2 3 4 5 6 7 8 9 10; do
-    [ -S "${PILOT_SOCKET:-/tmp/pilot.sock}" ] && break
-    sleep 0.5
-  done
-fi
+"$ENTMOOT" -connectivity direct -listen-port 1004 serve
 ```
+
+Relay-only mode prevents direct application-peer connections and requires at
+least one owner-controlled Circuit Relay v2 multiaddr:
+
+```sh
+"$ENTMOOT" \
+  -connectivity relay-only \
+  -controlled-relay '/dns4/relay.example/tcp/4001/p2p/<relay-peer-id>' \
+  serve
+```
+
+Relay-only mode has no direct or TURN fallback. An unavailable controlled relay
+makes the node unavailable by design.
