@@ -1659,6 +1659,8 @@ func migrateESPCommandJSON(tx *sql.Tx, mappings *legacyIdentityResolver) error {
 		{table: "esp_fleet_commands", column: "target"},
 		{table: "esp_fleet_commands", column: "command"},
 		{table: "esp_fleet_command_results", column: "result"},
+		{table: "esp_agent_commands", column: "payload"},
+		{table: "esp_agent_commands", column: "result"},
 		{table: "esp_agent_commands", column: "target"},
 		{table: "esp_agent_commands", column: "command"},
 	} {
@@ -1700,18 +1702,10 @@ func migrateESPCommandJSON(tx *sql.Tx, mappings *legacyIdentityResolver) error {
 				rows.Close()
 				return fmt.Errorf("%s.%s contains invalid JSON: %w", spec.table, spec.column, err)
 			}
-			changed, err := migrateESPJSONIdentity(object, groupID, timestampMS, mappings)
+			changed, err := migrateESPJSONIdentities(object, groupID, timestampMS, mappings)
 			if err != nil {
 				rows.Close()
 				return fmt.Errorf("%s.%s: %w", spec.table, spec.column, err)
-			}
-			if target, ok := object["target"].(map[string]any); ok {
-				targetChanged, err := migrateESPJSONIdentity(target, groupID, timestampMS, mappings)
-				if err != nil {
-					rows.Close()
-					return fmt.Errorf("%s.%s target: %w", spec.table, spec.column, err)
-				}
-				changed = changed || targetChanged
 			}
 			if !changed {
 				continue
@@ -1750,6 +1744,25 @@ func espCommandJSONTimestampExpression(table string, cols map[string]bool) strin
 		}
 	}
 	return espIdentityTimestampExpression(cols)
+}
+
+func migrateESPJSONIdentities(object map[string]any, groupID []byte, timestampMS int64, mappings *legacyIdentityResolver) (bool, error) {
+	changed, err := migrateESPJSONIdentity(object, groupID, timestampMS, mappings)
+	if err != nil {
+		return false, err
+	}
+	for _, field := range []string{"target", "command", "result", "payload"} {
+		child, ok := object[field].(map[string]any)
+		if !ok {
+			continue
+		}
+		childChanged, err := migrateESPJSONIdentities(child, groupID, timestampMS, mappings)
+		if err != nil {
+			return false, fmt.Errorf("%s: %w", field, err)
+		}
+		changed = changed || childChanged
+	}
+	return changed, nil
 }
 
 func migrateESPJSONIdentity(object map[string]any, groupID []byte, timestampMS int64, mappings *legacyIdentityResolver) (bool, error) {

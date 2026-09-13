@@ -2,6 +2,7 @@ package conversion
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
@@ -11,6 +12,7 @@ import (
 
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/canonical"
+	"entmoot/pkg/entmoot/esphttp"
 	"entmoot/pkg/entmoot/keystore"
 	"entmoot/pkg/entmoot/roster"
 
@@ -267,9 +269,16 @@ func TestRunConvertsReassignedLegacyNodeIDBySignedIdentityAndTime(t *testing.T) 
 	if _, err := db.Exec(`
 CREATE TABLE esp_fleets(
   fleet_id TEXT PRIMARY KEY,
-  control_group_id BLOB NOT NULL,
+  name TEXT NOT NULL,
+  control_group_id BLOB,
   coordinator_node_id INTEGER NOT NULL,
-  coordinator_pubkey TEXT NOT NULL
+  coordinator_pubkey TEXT NOT NULL,
+  coordinator_device_id TEXT NOT NULL DEFAULT '',
+  created_at_ms INTEGER NOT NULL,
+  updated_at_ms INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active',
+  archived_at_ms INTEGER NOT NULL DEFAULT 0,
+  deleted_at_ms INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE esp_fleet_activity(
   event_id TEXT PRIMARY KEY,
@@ -289,11 +298,37 @@ CREATE TABLE esp_fleet_command_results(
   completed_at_ms INTEGER NOT NULL,
   updated_at_ms INTEGER NOT NULL,
   result BLOB NOT NULL
+);
+CREATE TABLE esp_agent_commands (
+  command_id TEXT PRIMARY KEY,
+  fleet_id TEXT NOT NULL,
+  control_group_id BLOB NOT NULL,
+  issuer_node_id INTEGER NOT NULL,
+  agent_node_id INTEGER NOT NULL,
+  action TEXT NOT NULL,
+  target BLOB NOT NULL,
+  instruction TEXT NOT NULL,
+  context BLOB,
+  args BLOB,
+  command BLOB NOT NULL,
+  payload BLOB NOT NULL,
+  status TEXT NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  lease_owner TEXT NOT NULL DEFAULT '',
+  lease_until_ms INTEGER NOT NULL DEFAULT 0,
+  created_at_ms INTEGER NOT NULL,
+  expires_at_ms INTEGER NOT NULL DEFAULT 0,
+  received_at_ms INTEGER NOT NULL,
+  started_at_ms INTEGER NOT NULL DEFAULT 0,
+  completed_at_ms INTEGER NOT NULL DEFAULT 0,
+  updated_at_ms INTEGER NOT NULL,
+  result BLOB,
+  last_error TEXT NOT NULL DEFAULT ''
 );`); err != nil {
 		db.Close()
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`INSERT INTO esp_fleets VALUES ('fleet-a',?,45981,?)`, gid[:], founderKey); err != nil {
+	if _, err := db.Exec(`INSERT INTO esp_fleets(fleet_id,name,control_group_id,coordinator_node_id,coordinator_pubkey,created_at_ms,updated_at_ms) VALUES ('fleet-a','Fleet A',?,45981,?,1700000001000,1700000001000)`, gid[:], founderKey); err != nil {
 		db.Close()
 		t.Fatal(err)
 	}
@@ -313,6 +348,35 @@ INSERT INTO esp_fleet_command_results VALUES
 		[]byte(`{"type":"fleet.command.result","version":1,"command_id":"replacement","fleet_id":"fleet-a","agent_node_id":133053,"completed_at_ms":1700000004501}`),
 		[]byte(`{"type":"fleet.command.result","version":1,"command_id":"restored","fleet_id":"fleet-a","agent_node_id":133053,"completed_at_ms":1700000006501}`),
 	); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	agentPayload, err := json.Marshal(map[string]any{
+		"type":             esphttp.AgentInstructionPayloadType,
+		"version":          1,
+		"command_id":       "queued-replacement",
+		"fleet_id":         "fleet-a",
+		"control_group_id": base64.StdEncoding.EncodeToString(gid[:]),
+		"issuer_node_id":   45981,
+		"target":           map[string]any{"kind": "node", "pilot_node_id": 133053},
+		"agent_node_id":    133053,
+		"action":           "agent.instruction",
+		"instruction":      "conversion claim regression",
+		"timeout_ms":       30_000,
+		"created_at_ms":    int64(1_700_000_004_500),
+		"received_at_ms":   int64(1_700_000_004_500),
+	})
+	if err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`
+INSERT INTO esp_agent_commands (
+  command_id,fleet_id,control_group_id,issuer_node_id,agent_node_id,action,target,
+  instruction,command,payload,status,created_at_ms,received_at_ms,updated_at_ms
+) VALUES ('queued-replacement','fleet-a',?,45981,133053,'agent.instruction',?,
+  'conversion claim regression','null',?,'running',1700000004500,1700000004500,1700000004500)
+`, gid[:], []byte(`{"kind":"node","pilot_node_id":133053}`), agentPayload); err != nil {
 		db.Close()
 		t.Fatal(err)
 	}
@@ -346,7 +410,7 @@ INSERT INTO esp_fleet_command_results VALUES
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer converted.Close()
+	t.Cleanup(func() { _ = converted.Close() })
 	firstMember, _ := entmoot.MemberIDFromPublicKey(first.PublicKey)
 	replacementMember, _ := entmoot.MemberIDFromPublicKey(replacement.PublicKey)
 	firstPeer, _ := entmoot.PeerIDFromPublicKey(first.PublicKey)
@@ -383,6 +447,29 @@ INSERT INTO esp_fleet_command_results VALUES
 		if result["agent_member_id"] != want.member.String() || result["agent_peer_id"] != want.peer {
 			t.Fatalf("%s result JSON identity = (%v, %v), want (%s, %s)", want.id, result["agent_member_id"], result["agent_peer_id"], want.member, want.peer)
 		}
+	}
+	if err := converted.Close(); err != nil {
+		t.Fatal(err)
+	}
+	state, err := esphttp.OpenSQLiteStateStore(root)
+	if err != nil {
+		t.Fatalf("OpenSQLiteStateStore: %v", err)
+	}
+	defer state.Close()
+	claimed, ok, err := state.ClaimNextAgentCommand(context.Background(), "conversion-test", 1_700_000_004_600, 1_700_000_005_600, 3)
+	if err != nil || !ok {
+		t.Fatalf("ClaimNextAgentCommand ok/err = %v/%v", ok, err)
+	}
+	founderMember, _ := entmoot.MemberIDFromPublicKey(founder.PublicKey)
+	founderPeer, _ := entmoot.PeerIDFromPublicKey(founder.PublicKey)
+	if claimed.Payload.IssuerMemberID != founderMember || claimed.Payload.IssuerPeerID != founderPeer {
+		t.Fatalf("claimed issuer identity = (%s, %s), want (%s, %s)", claimed.Payload.IssuerMemberID, claimed.Payload.IssuerPeerID, founderMember, founderPeer)
+	}
+	if claimed.Payload.AgentMemberID != replacementMember || claimed.Payload.AgentPeerID != replacementPeer {
+		t.Fatalf("claimed agent identity = (%s, %s), want (%s, %s)", claimed.Payload.AgentMemberID, claimed.Payload.AgentPeerID, replacementMember, replacementPeer)
+	}
+	if claimed.Payload.Target.MemberID != replacementMember || claimed.Payload.Target.PeerID != replacementPeer {
+		t.Fatalf("claimed target identity = (%s, %s), want (%s, %s)", claimed.Payload.Target.MemberID, claimed.Payload.Target.PeerID, replacementMember, replacementPeer)
 	}
 }
 
