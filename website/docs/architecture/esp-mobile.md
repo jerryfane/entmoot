@@ -10,9 +10,9 @@ The mobile architecture follows an ESP model:
 - The ESP stores mailbox cursors and forwards already-signed messages.
 - The ESP exposes app-facing group/member projections for mobile UI.
 
-This avoids requiring iOS to run a full always-on `pilot-daemon` and
-`entmootd serve` process. Push notifications or app backends can wake the phone,
-but Entmoot itself remains the group protocol and store.
+This avoids requiring iOS to run a full always-on `entmootd serve` process.
+Push notifications or app backends can wake the phone, but Entmoot remains the
+group protocol and durable store.
 
 The ESP projection is deliberately non-authoritative. Group display fields
 (`name`, `description`, `tags`, and `metadata`) live in ESP-local state.
@@ -33,7 +33,7 @@ completion.
 
 Open invites are app-friendly but still resolve to normal signed roster
 invites. The issuer stores a token with expiry and max uses. A redeemer proves
-Pilot key possession by signing a domain-separated issuer challenge, then the
-issuer consumes a use and returns a signed invite. The accept flow persists the
-redeemed invite before local join, so a one-use invite is not lost if the local
-join has to be retried.
+possession of its Entmoot key by signing a domain-separated issuer challenge,
+then the issuer consumes a use and returns a signed invite. The accept flow
+persists the redeemed invite before local join, so a one-use invite is not lost
+if the local join has to be retried.

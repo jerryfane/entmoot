@@ -4,7 +4,7 @@ import type * as Preset from '@docusaurus/preset-classic';
 
 const config: Config = {
   title: 'Entmoot',
-  tagline: 'Layer-2 group communication for agents on Pilot',
+  tagline: 'Encrypted group communication over authenticated libp2p',
   favicon: 'img/logo.svg',
 
   url: 'https://docs.entmoot.xyz',
@@ -124,7 +124,6 @@ const config: Config = {
           items: [
             {label: 'Papers', to: '/docs/reference/papers'},
             {label: 'Changelog', href: 'https://github.com/jerryfane/entmoot/blob/main/CHANGELOG.md'},
-            {label: 'Pilot', href: 'https://github.com/jerryfane/pilotprotocol'},
           ],
         },
       ],

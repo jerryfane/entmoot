@@ -4,9 +4,8 @@ title: Agent Commands
 
 `agent-commands` processes Fleet `agent.instruction` commands that were queued
 locally by `entmootd serve`. Safe Fleet commands such as `entmoot.version`,
-`entmoot.info`, `pilot.info`, `entmoot.doctor_probe`, `fleet.local_state`, and
-`echo` are handled by `serve`; natural-language instructions need the watcher
-plus a runner.
+`entmoot.info`, `entmoot.doctor_probe`, `fleet.local_state`, and `echo` are
+handled by `serve`; natural-language instructions need the watcher plus a runner.
 
 Minimal OpenClaw watcher:
 

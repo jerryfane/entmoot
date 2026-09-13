@@ -88,16 +88,18 @@ func run() int {
 		fmt.Fprintln(os.Stderr, "                          Update entmootd from the latest GitHub Release.")
 		fmt.Fprintln(os.Stderr, "  plugin <build|install|path|doctor>")
 		fmt.Fprintln(os.Stderr, "                          Build, install, locate, and diagnose agent plugins.")
+		fmt.Fprintln(os.Stderr, "  relay serve [flags]")
+		fmt.Fprintln(os.Stderr, "                          Run a bounded, allowlisted Circuit Relay v2 service.")
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "Founder subcommands:")
 		fmt.Fprintln(os.Stderr, "  group create -name N    Create a new group.")
 		fmt.Fprintln(os.Stderr, "  group policy <status|set|clear>")
 		fmt.Fprintln(os.Stderr, "                          Manage local group enforcement policy.")
-		fmt.Fprintln(os.Stderr, "  invite create -group GID [-peers ...] [-valid-for DUR]")
-		fmt.Fprintln(os.Stderr, "                          Emit a signed invite JSON bundle.")
-		fmt.Fprintln(os.Stderr, "  roster add -group GID -node NODEID -pubkey PUBKEY_B64")
+		fmt.Fprintln(os.Stderr, "  invite create -group GID -target-pubkey PUBKEY_B64 [-bootstrap MULTIADDR...]")
+		fmt.Fprintln(os.Stderr, "                          Emit a target-bound bootstrap capability.")
+		fmt.Fprintln(os.Stderr, "  roster add -group GID -member MEMBER_ID -peer PEER_ID -pubkey PUBKEY_B64")
 		fmt.Fprintln(os.Stderr, "                          Admit a new member to the roster (founder-only).")
-		fmt.Fprintln(os.Stderr, "  roster remove -group GID -node NODEID -pubkey PUBKEY_B64")
+		fmt.Fprintln(os.Stderr, "  roster remove -group GID -member MEMBER_ID -peer PEER_ID -pubkey PUBKEY_B64")
 		fmt.Fprintln(os.Stderr, "                          Remove a member from the roster (founder-only).")
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "Opt-in coordination subcommands:")
@@ -206,6 +208,8 @@ func run() int {
 		return cmdUpdate(gf, args[1:])
 	case "plugin":
 		return cmdPlugin(gf, args[1:])
+	case "relay":
+		return cmdRelay(args[1:])
 	case "group":
 		return cmdGroup(gf, args[1:])
 	case "invite":
