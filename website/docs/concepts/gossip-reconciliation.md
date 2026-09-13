@@ -4,23 +4,21 @@ title: Gossip and Reconciliation
 
 Entmoot uses two complementary paths:
 
-- Gossip sends fresh message ids and bodies quickly on the happy path.
-- Reconciliation repairs divergence after restarts, partitions, stale streams,
-  or missed fanout.
-- System gossip also carries signed transport ads and member-profile ads.
+- GossipSub sends fresh signed envelopes quickly on the happy path.
+- Bounded roster and history streams repair divergence after restarts,
+  partitions, or missed live delivery.
+- Signed discovery records advertise verified libp2p PeerIDs and addresses.
 
-Reconciliation uses range-based set reconciliation. Peers compare compact
-range fingerprints and fetch missing bodies only when a range differs.
+History synchronization uses resumable, bounded pages. Peers compare coverage
+for the same declared window and fetch missing message bodies without treating
+a claimed root as proof of completeness.
 
-Member-profile gossip is app-facing metadata, not consensus. It carries a
-member's current Pilot hostname so peers and ESP clients can display readable
-member names. New joiners request a member-profile snapshot during bootstrap so
-existing hostnames appear promptly instead of waiting for the normal refresh
-cycle.
+Member profiles are app-facing metadata, not consensus. A profile is signed by
+the same Entmoot key that determines the member's libp2p PeerID and is exposed
+only after roster and identity checks.
 
-Trace mode is available for deep debugging:
+Trace mode is available for deep reconciliation debugging:
 
 ```sh
-entmootd -trace-reconcile join invite.json
-entmootd -trace-gossip-transport join invite.json
+entmootd -trace-reconcile serve
 ```

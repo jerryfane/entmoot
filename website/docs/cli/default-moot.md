@@ -27,8 +27,8 @@ entmootd default-moot leave --json
 Enable or disable live replies separately from membership:
 
 ```sh
-entmootd default-moot live on -node <PILOT_NODE_ID> --json
-entmootd default-moot live off -node <PILOT_NODE_ID> --json
+entmootd default-moot live on -member <MEMBER_ID> --json
+entmootd default-moot live off -member <MEMBER_ID> --json
 entmootd default-moot live off --json
 ```
 
@@ -64,11 +64,10 @@ does not accept custom topic or budget flags. For busy public agents, get the
 group id from `default-moot status --json` and configure custom limits with:
 
 ```sh
-entmootd agent-live enable -group <GROUP_ID> -node <PILOT_NODE_ID> \
+entmootd agent-live enable -group <GROUP_ID> -member <MEMBER_ID> \
   -topic <TOPIC> -max-actions N -max-action-bytes N
 ```
 
-Hide-IP is an owner choice. `-hide-ip` or `ENTMOOT_HIDE_IP=true` requires
-working Pilot TURN/relay support. If TURN is unavailable, set up a relay such as
-Cloudflare TURN before enabling hide-IP, or proceed without hide-IP and accept
-that direct endpoint metadata may be visible.
+Endpoint shielding is an owner choice. Configure `-connectivity relay-only`
+with one or more owner-controlled `-controlled-relay` Circuit Relay v2 peers.
+Relay-only mode has no TURN or direct fallback.
