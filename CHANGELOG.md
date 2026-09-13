@@ -7,6 +7,90 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Controlled-relay recovery and privacy.** Configured hosts now renew relay
+  reservations near half-life and refresh advertised circuit endpoints after
+  relay address changes. Relay-only peerstores reject direct application hints,
+  including identify updates and mixed signed address records. Hard resource
+  admission enforces 64 total connections, eight per peer, and 64 streams per
+  peer. History catch-up retains unfinished pages and cursors across circuit
+  resets and bounded passes without raising frame or transfer budgets.
+- **Multi-group snapshot recovery.** Completed roster/history pages immediately
+  release their active snapshot slots; invalidated history generations release
+  their token, and abandoned pages remain reclaimable at the original expiry.
+  Active sessions retain their pinned state and unchanged resource limits.
+  Full active quotas now report `resource_exhausted`, not `snapshot_expired`.
+- **Concurrent completed-root startup.** Conversion and journal reads now share
+  a cross-process root lock. Completed roots no longer checkpoint or scan live
+  operational databases during routine commands.
+- **Full-width Fleet selectors.** Task assignment and command targeting accept
+  full MemberIDs through `-assignee-member-id` and `-target-member-id`, with
+  matching JSON fields and no numeric aliases.
+- **Surviving Fleet and ESP behavior.** Restored profile refresh/backfill across
+  membership, invitation, archive, restore, and deletion; complete live-action
+  target bindings and invite hostnames; coordinator self-invite protection;
+  successful-invite rollback after a later failure; and PeerIDs in member
+  responses.
+- **Custom installation roots.** Installed wrappers and their symlinks resolve
+  the installation's runtime file and binary even when `ENTMOOT_HOME` contains
+  spaces or apostrophes. Explicit runtime-file overrides remain supported.
+- **Cutover regression coverage.** Added a three-daemon/two-group lifecycle
+  canary with 24 concurrent readiness checks per start, an isolated installed
+  wrapper canary, CLI-to-handler full-ID checks, restored surviving behavior
+  tests, and a pre-cutover test inventory.
+
+- **Bootstrap sync authorization.** Roster and history reads now require grants
+  anchored to the group's founder and current roster head, naming the serving
+  peer, and neither reserved nor consumed, including after restart. Current
+  members continue to sync without enrollment grants.
+- **Converted legacy history.** Daemons load conversion checkpoints from the
+  canonical URL-safe group directory and serve legacy messages with their
+  verified history proofs to authenticated members.
+- **Group-bound roster and invite trust.** New roster entries use a
+  domain-separated version-2 signature over the group id and linear sequence.
+  Join now validates fetched chains in temporary state, matches the invite
+  founder, requires its advertised checkpoint, enforces founder-only issuer
+  authority there, permits valid descendants, and installs nothing on
+  validation failure. Legacy signed bytes and IDs remain unchanged and
+  read-only pending an authenticated upgrade checkpoint.
+- **Historical message authorization.** New messages use a domain-separated
+  version-2 signing form that binds the author to a roster head and carry a
+  founder acceptance certificate.
+  Receivers authorize the historical author key at that certified checkpoint,
+  recover unknown related heads with bounded roster sync, and reject unrelated
+  heads. Founder certificates preserve only the exact accepted message and can
+  migrate legacy message ids without changing their bytes or signatures;
+  uncertified removed-author history has no fallback.
+
+- **Transactional roster persistence.** Roster mutations now serialize
+  validation, SQLite entry/head/version/projection commits, and in-memory
+  updates under one writer boundary. Group-scoped nonblocking writer leases
+  keep daemon and offline maintenance writers exclusive while committed
+  readers remain available. Legacy JSONL imports validate the complete exact
+  signed chain and fail closed without changing the source.
+- **Scalable history synchronization.** SQLite now versions message-set
+  mutations, caches Merkle roots with generation compare-and-swap, enumerates
+  bounded keyset pages, compares roots over an explicit shared retention
+  window, records exact-ID tombstones, and prevents pruned messages from being
+  fetched back. Deterministic topological ordering now uses a heap instead of
+  repeatedly scanning the ready set.
+- **Bounded inbound gossip resources.** Wire frames now use symmetric per-type
+  byte and collection caps before body allocation, bounded chunked reads,
+  per-peer rate admission, global/per-peer handler and retry-queue limits, and
+  deadlines for every inbound handler class.
+- **Message shape validation.** Local publish and network ingest now share
+  limits for parents, concrete topics, references, canonical encoded size, and
+  future clock skew while preserving locally stored legacy records.
+- **Bounded transport startup and shutdown.** Pilot IPC connections no longer
+  close a receive channel while the shared demuxer can send to it, Pilot startup
+  now honors caller deadlines, and gossip transport closure cancels owned
+  workers before waiting for them.
+- **Principal-scoped ESP idempotency.** Mutation replays now use versioned
+  device, member, or bearer scopes, recheck current route authorization, cache
+  only successful responses, ignore legacy unscoped rows, and clean expired
+  SQLite records in bounded cancellable batches.
+
 ## [1.5.81] - 2026-05-27
 
 ### Added

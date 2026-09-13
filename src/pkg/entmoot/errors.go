@@ -27,13 +27,21 @@ var ErrUnknownMessage = errors.New("entmoot: unknown message type")
 // parsing or JSON unmarshaling.
 var ErrMalformedFrame = errors.New("entmoot: malformed frame")
 
-// ErrOversized is returned by the wire codec when a frame's declared length
-// exceeds the 16 MiB hard cap.
-var ErrOversized = errors.New("entmoot: frame exceeds 16 MiB cap")
+// ErrOversized is returned when a frame or decoded collection exceeds its
+// configured global or per-type bound.
+var ErrOversized = errors.New("entmoot: size limit exceeded")
 
 // ErrNotMember is returned by the delivery layer when a message is authored
 // by a node that is not a current roster member.
 var ErrNotMember = errors.New("entmoot: author not a group member")
+
+// ErrRosterHeadUnknown means message verification needs an authenticated
+// roster update before it can decide historical authorization.
+var ErrRosterHeadUnknown = errors.New("entmoot: roster head unknown")
+
+// ErrRosterHeadUnrelated means authenticated roster synchronization completed
+// without finding the message's asserted head.
+var ErrRosterHeadUnrelated = errors.New("entmoot: roster head unrelated")
 
 // ErrInviteExpired is returned by gossip.Join when the invite's ValidUntil
 // timestamp is in the past relative to the local clock.

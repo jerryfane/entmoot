@@ -1,6 +1,7 @@
 package order
 
 import (
+	"encoding/binary"
 	"testing"
 
 	"entmoot/pkg/entmoot"
@@ -154,6 +155,25 @@ func TestUnknownParentEdgesIgnored(t *testing.T) {
 	want := []entmoot.MessageID{orphan.ID}
 	if !equalIDs(got, want) {
 		t.Fatalf("got %v want %v", got, want)
+	}
+}
+
+func BenchmarkTopological50000Parentless(b *testing.B) {
+	msgs := make([]entmoot.Message, 50_000)
+	for i := range msgs {
+		binary.BigEndian.PutUint32(msgs[i].ID[:4], uint32(i+1))
+		msgs[i].Timestamp = int64(len(msgs) - i)
+		msgs[i].Author.PilotNodeID = entmoot.NodeID(i%1024 + 1)
+	}
+	b.ResetTimer()
+	for b.Loop() {
+		got, err := Topological(msgs)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if len(got) != len(msgs) {
+			b.Fatalf("got %d ids, want %d", len(got), len(msgs))
+		}
 	}
 }
 

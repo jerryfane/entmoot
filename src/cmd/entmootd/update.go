@@ -793,8 +793,7 @@ func updateFlagTakesValue(flagName string) bool {
 		flagName = flagName[:idx]
 	}
 	switch flagName {
-	case "socket", "identity", "data", "listen-port", "log-level",
-		"pilot-wait-timeout", "pilot-wait-base-delay", "pilot-wait-max-delay":
+	case "identity", "data", "listen-port", "log-level":
 		return true
 	default:
 		return false

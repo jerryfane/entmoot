@@ -56,8 +56,11 @@ func normalizeFleetTaskRecord(rec FleetTaskRecord, nowMS int64) (FleetTaskRecord
 	if rec.FleetID == "" {
 		return FleetTaskRecord{}, fmt.Errorf("fleet id is required")
 	}
-	if rec.Creator.PilotNodeID == 0 || len(rec.Creator.EntmootPubKey) == 0 {
+	if rec.Creator.MemberID == nil || *rec.Creator.MemberID == (entmoot.MemberID{}) || rec.Creator.PeerID == "" {
 		return FleetTaskRecord{}, fmt.Errorf("task creator identity is required")
+	}
+	if err := entmoot.ValidateMemberInfo(rec.Creator); err != nil {
+		return FleetTaskRecord{}, fmt.Errorf("task creator identity: %w", err)
 	}
 	rec.Title = title
 	rec.Description = description
@@ -86,8 +89,11 @@ func normalizeFleetTaskSubmissionRecord(rec FleetTaskSubmissionRecord, nowMS int
 	if rec.FleetID == "" || rec.TaskID == "" {
 		return FleetTaskSubmissionRecord{}, fmt.Errorf("fleet id and task id are required")
 	}
-	if rec.Author.PilotNodeID == 0 || len(rec.Author.EntmootPubKey) == 0 {
+	if rec.Author.MemberID == nil || *rec.Author.MemberID == (entmoot.MemberID{}) || rec.Author.PeerID == "" {
 		return FleetTaskSubmissionRecord{}, fmt.Errorf("submission author identity is required")
+	}
+	if err := entmoot.ValidateMemberInfo(rec.Author); err != nil {
+		return FleetTaskSubmissionRecord{}, fmt.Errorf("submission author identity: %w", err)
 	}
 	rec.Content = content
 	rec.Status = NormalizeFleetTaskSubmissionStatus(rec.Status)
@@ -100,7 +106,8 @@ func normalizeFleetTaskSubmissionRecord(rec FleetTaskSubmissionRecord, nowMS int
 
 func FleetTaskActorFromMember(member FleetMemberRecord) entmoot.NodeInfo {
 	pub, _ := base64.StdEncoding.DecodeString(strings.TrimSpace(member.EntmootPubKey))
-	return entmoot.NodeInfo{PilotNodeID: member.NodeID, EntmootPubKey: pub}
+	memberID := member.MemberID
+	return entmoot.NodeInfo{MemberID: &memberID, PeerID: member.PeerID, EntmootPubKey: pub}
 }
 
 func FleetTaskCanMutate(member FleetMemberRecord) bool {
@@ -258,10 +265,8 @@ func fleetTaskCanAcceptSubmission(task FleetTaskRecord) bool {
 }
 
 func nodeInfoMatchesPtr(node *entmoot.NodeInfo, member FleetMemberRecord) bool {
-	if node == nil {
-		return false
-	}
-	return node.PilotNodeID == member.NodeID && base64PubKey(*node) == strings.TrimSpace(member.EntmootPubKey)
+	return node != nil && node.MemberID != nil && *node.MemberID == member.MemberID &&
+		base64PubKey(*node) == strings.TrimSpace(member.EntmootPubKey)
 }
 
 func base64PubKey(node entmoot.NodeInfo) string {

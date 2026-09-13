@@ -12,9 +12,8 @@
 // (reads stall) and the 30 s sustained-violation hard disconnect are the
 // connection layer's responsibility (Phase C) and live outside this package.
 //
-// A Limiter tracks one pair of buckets per peer, keyed by NodeID. Buckets
-// are created lazily on first contact: an unknown peer starts with a full
-// burst. Call Reset on disconnect to drop the per-peer state.
+// A Limiter tracks one pair of buckets per peer, keyed by MemberID. Buckets
+// are created lazily on first contact. Call Reset on disconnect to drop state.
 //
 // Clock injection: golang.org/x/time/rate consults time.Now internally only
 // through its Allow / Reserve shorthands. The *At / *N variants accept an
@@ -26,7 +25,6 @@ package ratelimit
 
 import (
 	"sync"
-	"time"
 
 	entmoot "entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/clock"
@@ -68,11 +66,8 @@ type Limits struct {
 	TopicLimits map[string]TopicLimit
 }
 
-// TopicLimit is the per-(peer, topic) quota applied by AllowTopic in
-// addition to the global per-peer limit. Intended for system topics
-// such as "_pilot/transport/v1" that legitimate publishers should emit
-// rarely and abusers would otherwise blast through the generous
-// per-peer Msg/Bytes limits. (v1.2.0)
+// TopicLimit is an optional per-(member, topic) quota applied in addition to
+// the global per-member limit.
 type TopicLimit struct {
 	// MsgRate is the refill rate, in messages/second, for the (peer,
 	// topic) bucket. Zero means "no topic-specific bucket".
@@ -81,10 +76,8 @@ type TopicLimit struct {
 	MsgBurst int
 }
 
-// DefaultLimits returns the v0 ARCHITECTURE.md §10 defaults: 100 msg/s
-// burst 200, 1 MiB/s burst 4 MiB. TopicLimits is populated via
-// DefaultTopicLimits so callers that want both the global quota and the
-// v1.2.0 per-(peer, topic) caps need only take this default.
+// DefaultLimits returns the default global quotas. No retired transport
+// control topics receive special operational treatment.
 func DefaultLimits() Limits {
 	return Limits{
 		MsgRate:     DefaultMsgRate,
@@ -95,21 +88,9 @@ func DefaultLimits() Limits {
 	}
 }
 
-// DefaultTopicLimits returns the per-(peer, topic) defaults for rare
-// signed system topics. Each topic gets a 10-token burst refilled at
-// 1/6-minute (10/hour), leaving generous headroom for legitimate weekly
-// refresh/change traffic while bounding signature-verification abuse.
+// DefaultTopicLimits returns no transport-specific topic limits.
 func DefaultTopicLimits() map[string]TopicLimit {
-	return map[string]TopicLimit{
-		"_pilot/transport/v1": {
-			MsgRate:  rate.Every(6 * time.Minute),
-			MsgBurst: 10,
-		},
-		"_pilot/profile/v1": {
-			MsgRate:  rate.Every(6 * time.Minute),
-			MsgBurst: 10,
-		},
-	}
+	return map[string]TopicLimit{}
 }
 
 // peerLimiter holds the pair of buckets for a single peer. A nil bucket
@@ -122,7 +103,7 @@ type peerLimiter struct {
 
 // topicPeerKey identifies a single per-(peer, topic) bucket. (v1.2.0)
 type topicPeerKey struct {
-	peer  entmoot.NodeID
+	peer  entmoot.MemberID
 	topic string
 }
 
@@ -134,7 +115,7 @@ type Limiter struct {
 	clk    clock.Clock
 
 	mu         sync.Mutex
-	peers      map[entmoot.NodeID]*peerLimiter
+	peers      map[entmoot.MemberID]*peerLimiter
 	topicPeers map[topicPeerKey]*rate.Limiter
 }
 
@@ -149,14 +130,14 @@ func New(limits Limits, clk clock.Clock) *Limiter {
 	return &Limiter{
 		limits:     limits,
 		clk:        clk,
-		peers:      make(map[entmoot.NodeID]*peerLimiter),
+		peers:      make(map[entmoot.MemberID]*peerLimiter),
 		topicPeers: make(map[topicPeerKey]*rate.Limiter),
 	}
 }
 
 // bucketFor returns the peerLimiter for peer, creating it on first sight.
 // Called with l.mu held.
-func (l *Limiter) bucketFor(peer entmoot.NodeID) *peerLimiter {
+func (l *Limiter) bucketFor(peer entmoot.MemberID) *peerLimiter {
 	if pl, ok := l.peers[peer]; ok {
 		return pl
 	}
@@ -183,7 +164,7 @@ func (l *Limiter) bucketFor(peer entmoot.NodeID) *peerLimiter {
 //
 // Callers that disable a bucket by passing rate 0 in Limits still get the
 // other bucket enforced.
-func (l *Limiter) Allow(peer entmoot.NodeID, nbytes int) error {
+func (l *Limiter) Allow(peer entmoot.MemberID, nbytes int) error {
 	now := l.clk.Now()
 
 	l.mu.Lock()
@@ -230,7 +211,7 @@ func (l *Limiter) Allow(peer entmoot.NodeID, nbytes int) error {
 // Per-(peer, topic) buckets created via AllowTopic are also dropped so
 // the next AllowTopic call re-allocates a fresh bucket. Call on
 // disconnect.
-func (l *Limiter) Reset(peer entmoot.NodeID) {
+func (l *Limiter) Reset(peer entmoot.MemberID) {
 	l.mu.Lock()
 	delete(l.peers, peer)
 	for k := range l.topicPeers {
@@ -246,7 +227,7 @@ func (l *Limiter) Reset(peer entmoot.NodeID) {
 // the topic has no configured limit (or its rate is zero), meaning
 // the topic-specific bucket is disabled and only the global per-peer
 // bucket applies. Caller must hold l.mu.
-func (l *Limiter) topicBucketFor(peer entmoot.NodeID, topic string) *rate.Limiter {
+func (l *Limiter) topicBucketFor(peer entmoot.MemberID, topic string) *rate.Limiter {
 	key := topicPeerKey{peer: peer, topic: topic}
 	if b, ok := l.topicPeers[key]; ok {
 		return b
@@ -260,18 +241,9 @@ func (l *Limiter) topicBucketFor(peer entmoot.NodeID, topic string) *rate.Limite
 	return b
 }
 
-// AllowTopic is like Allow but additionally enforces a per-(peer,
-// topic) bucket if one is configured via Limits.TopicLimits. Returns
-// nil only when BOTH the topic bucket (if any) AND the global per-peer
-// bucket allow the message. On rejection from either bucket, returns
-// entmoot.ErrRateLimited and neither bucket has a token consumed
-// (failed reservations are canceled so rejections don't burn tokens).
-//
-// Topics without an explicit TopicLimit entry behave exactly like
-// Allow — the topic dimension is simply skipped. Intended for system
-// topics like "_pilot/transport/v1" that need a tighter cap than the
-// generous per-peer default. (v1.2.0)
-func (l *Limiter) AllowTopic(peer entmoot.NodeID, topic string, nbytes int) error {
+// AllowTopic enforces the global member quota and any configured topic quota.
+// Rejected reservations are canceled so either bucket can recover normally.
+func (l *Limiter) AllowTopic(peer entmoot.MemberID, topic string, nbytes int) error {
 	now := l.clk.Now()
 
 	l.mu.Lock()
@@ -327,6 +299,27 @@ func (l *Limiter) AllowTopic(peer entmoot.NodeID, topic string, nbytes int) erro
 			}
 			return entmoot.ErrRateLimited
 		}
+	}
+	return nil
+}
+
+// AllowTopicOnly charges only the optional per-(peer, topic) message bucket.
+// Use it when the caller already charged the frame to the global peer buckets.
+func (l *Limiter) AllowTopicOnly(peer entmoot.MemberID, topic string) error {
+	now := l.clk.Now()
+	l.mu.Lock()
+	tb := l.topicBucketFor(peer, topic)
+	l.mu.Unlock()
+	if tb == nil {
+		return nil
+	}
+	res := tb.ReserveN(now, 1)
+	if !res.OK() {
+		return entmoot.ErrRateLimited
+	}
+	if res.DelayFrom(now) > 0 {
+		res.CancelAt(now)
+		return entmoot.ErrRateLimited
 	}
 	return nil
 }

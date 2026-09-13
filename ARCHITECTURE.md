@@ -55,10 +55,11 @@ the shape of the design space, not to freeze implementation choices.
    signed roster entries.
 6. **Local control-socket IPC boundary.** v1 introduces a local IPC
    boundary between the long-running `join` process and the short-lived
-   CLI invocations that operate against it. Exactly one `join` or `serve` process
-   per host owns the single Pilot connection and is the only writer to
-   the SQLite message store. Short-lived CLI invocations (`publish`,
-   `doctor`, `peers`, `tail`, `info`, `query`) communicate with the daemon via a
+   CLI invocations that operate against it. Exactly one `join` or `serve`
+   process per host owns the single Pilot connection and the writer leases for
+   the SQLite message and roster stores.
+   Short-lived CLI invocations (`publish`, `doctor`, `peers`, `tail`, `info`,
+   `query`) communicate with the daemon via a
    Unix domain socket at `${data}/control.sock` (mode `0600`, same
    owner). The control-socket codec lives in its own package
    (`src/pkg/entmoot/ipc/`), deliberately separate from the peer wire
@@ -91,15 +92,19 @@ ids. Name collisions are a UI/discovery problem, not a protocol problem.
 ### 3.2 Message
 
 ```
-Message
-├── id:            sha256(author || timestamp || content || parent_hashes)
+Message v2
+├── id:            sha256("entmoot/message/v2\0" + canonical signed fields)
+├── version:       2
 ├── group_id:
-├── author:        Pilot node_id + signature
+├── author:        Pilot node_id + Entmoot public key
 ├── timestamp:     unix millis
 ├── topics:        []string — for subscriber filtering
 ├── parents:       []message_id — for causal ordering and Merkle chaining
 ├── content:       opaque bytes
-└── references:    []message_id — optional soft links (replies, invalidates)
+├── references:    []message_id — optional soft links (replies, invalidates)
+├── roster_head:   roster checkpoint used to authorize the author
+├── signature:     author's Ed25519 signature
+└── acceptance:    founder certificate over group_id, message_id, and roster_head
 ```
 
 Messages form a DAG, not a linear log. `parents` is what the author had seen
@@ -107,23 +112,55 @@ when composing; `references` is application-level semantics (reply, correction,
 obsoletes). The Merkle tree is built over message ids in a deterministic
 topological order.
 
+The author signs the message with `roster_head` present. The founder then
+attaches a domain-separated acceptance certificate. The certificate is not
+part of the message id or author signature, so it can be attached after the
+message is authored without changing its identity.
+
+Verification resolves the author's key and membership at the certified roster
+head, not at the receiver's current head. Normal issuance only certifies the
+current head. Once issued, that certificate keeps the exact message admissible
+after a later removal. A draft left offline or otherwise uncertified before the
+head advances is not accepted history; its timestamp and old head are not a
+substitute for founder acceptance. A removed member cannot certify new traffic.
+If a peer does not know a claimed head, it performs bounded authenticated
+roster sync before deciding; a head outside its accepted linear chain is
+rejected.
+
+Legacy messages without a roster head remain readable from local storage and
+can be admitted while their author is current. Migration may attach a founder
+certificate naming the exact legacy message id and an accepted historical
+roster head; because acceptance is outside the author-signed form, legacy
+bytes, signatures, and ids stay unchanged. An uncertified legacy message from
+a removed author remains inadmissible. There is no epoch-only fallback.
+
 **`parents` rule (v0):** at most 3 entries, chosen as the 3 highest-timestamped
 message ids the author has seen for the group at compose time. Genesis messages
 have `parents = []`. Bound keeps message size predictable while preserving
 causal ordering. Peers receiving a message with `len(parents) > 3` reject it.
+
+All new publish and network-ingest paths also enforce at most 16 concrete
+topics (256 bytes each), at most 64 references, a 256 KiB canonical encoded
+message, and no timestamp more than 2 minutes in the future. Topic names are
+printable ASCII with non-empty `/`-separated segments and no `+` or `#`
+wildcards. Existing local legacy records remain readable, but an over-limit
+legacy record is not re-admitted from the network.
 
 ### 3.3 Membership roster
 
 A roster is itself a signed append-only log:
 
 ```
-RosterEntry
+RosterEntry v2
 ├── op:            "add" | "remove" | "policy_change"
 ├── subject:       Pilot node_id (for add/remove) or policy blob
 ├── actor:         node_id of the signer
 ├── timestamp:
-├── parents:       []roster_entry_id  — prev heads
-└── signature:     Ed25519 over the encoded entry
+├── parents:       []roster_entry_id  — exactly the previous head
+├── version:       2
+├── group_id:      owning group
+├── sequence:      one-based linear position
+└── signature:     Ed25519 over "entmoot/roster-entry/v2\0" + canonical entry
 ```
 
 Membership is whatever the roster's current head says it is. For bootstrap,
@@ -134,6 +171,25 @@ entries remain authoritative. ESP-admin devices can request group metadata,
 invite, open-invite, and member-removal operations, but completion still routes
 through the running daemon and founder/admin authorization checks. Multi-admin
 quorum rosters are a later policy extension.
+
+Roster persistence is transactional SQLite at
+`${data}/groups/<gid>/roster.sqlite`. One process holds a nonblocking
+group-scoped writer lease; other handles can read committed WAL snapshots.
+Validation, entry insertion, head/version advancement, and membership
+projection updates form one serialized mutation. An unsuccessful commit never
+advances the in-memory projection.
+
+Legacy `roster.jsonl` files are immutable import sources. Import requires every
+non-empty line to be exact canonical JSON and validates the complete signed,
+linear chain before one transaction records entries, head, version, and member
+projections. Malformed, noncanonical, forked, or truncated input fails with its
+line diagnostic and remains untouched.
+
+Legacy entries omit `version`, `group_id`, and `sequence`; their canonical
+bytes, signatures, and IDs remain byte-identical. They are import-only.
+Ordinary mutation and invitation require a group-bound v2 head. A legacy
+roster needs a founder-authenticated upgrade checkpoint rather than a
+permissive or implicit rewrite.
 
 ### 3.4 Topics
 
@@ -174,7 +230,9 @@ Connections are plain Pilot streams to a peer's `:1004`. Framing:
 └────────────────┴────────────────┴────────────┘
 ```
 
-4-byte big-endian length is body size in bytes (max 16 MiB per frame for v0).
+The length prefix covers the type byte plus body. The global cap is 512 KiB;
+the shared wire cap table applies tighter limits by type before body allocation
+or transmission. Readers consume accepted bodies in 32 KiB chunks.
 JSON body keeps parity with Pilot's `HandshakeMsg` style — debuggable,
 extensible. We can switch to a binary codec later if it matters.
 
@@ -182,13 +240,15 @@ Message types (v0):
 
 | Type | Direction | Purpose |
 |------|-----------|---------|
-| `hello` | bidirectional | announce node + supported groups |
+| `hello` | bidirectional | legacy compatibility frame; bounded-decode and ignore |
 | `announce_group` | → peer | broadcast availability of group_id |
 | `roster_req` | → peer | request current roster head for a group |
 | `roster_resp` | ← peer | signed roster snapshot |
 | `gossip` | → peer | push one or more message ids (just hashes) |
 | `fetch_req` | → peer | request full message body by id |
 | `fetch_resp` | ← peer | message body |
+| `acceptance_req` | → founder | request founder certification of one live message |
+| `acceptance_resp` | ← founder | message with attached founder certificate |
 | `merkle_req` | → peer | request Merkle proof for a topic filter + range |
 | `merkle_resp` | ← peer | proof + list of in-range ids |
 | `range_req` / `range_resp` | ↔ peer | legacy timestamp-range anti-entropy |
@@ -199,12 +259,46 @@ Message types (v0):
 | `member_profile_ad` | → peer | signed app-facing member profile metadata |
 | `member_profile_snapshot_req` / `member_profile_snapshot_resp` | ↔ peer | join-time member profile snapshot |
 
-All messages that mutate state are signed by their author with Ed25519 keys
-bound to Pilot node ids. We reuse the replay-protection pattern from Pilot's
-`HandshakeMsg`: 5-minute max age, 30-second future clock skew, hash-set dedupe.
-Transport and member-profile system frames are also signed and roster-checked,
-but they do not mutate consensus state: they update local reachability or
-display metadata caches.
+Messages that mutate state are signed by their author with Ed25519 keys bound
+to roster identity. Timestamp-bearing signed frame handlers apply their replay
+rules after authentication; repeatable queries do not populate replay state.
+The legacy `hello` frame is non-authoritative: the active v0 path takes
+`remote` from the authenticated Transport and ignores Hello's claimed identity
+fields and signature. Transport and member-profile system frames are signed
+and roster-checked, but only update local reachability or display metadata
+caches.
+
+### 4.1 Bounded history synchronization
+
+SQLite assigns each group a monotonically increasing generation. Database
+triggers cover direct imports as well as normal inserts and deletes;
+retention-floor-only changes increment it explicitly. Every increment
+invalidates the cached Merkle root in the same transaction. Root computation
+reads one SQLite snapshot and publishes its cache with a generation
+compare-and-swap, so a concurrent writer cannot make a stale root appear
+current.
+
+`range_req` enumerates IDs in `(timestamp, author node id, message id)` order.
+Responses contain at most 1,024 IDs and 128 KiB, plus the generation and an
+exclusive continuation cursor. A generation mismatch tells the requester to
+restart; reconciliation permits three restarts and 128 pages per attempt.
+
+Retention records exact-ID tombstones and a group coverage floor in the prune
+transaction. Tombstones live for at least 90 days, are capped at one million
+per group, and prevent fetched or directly pushed old messages from being
+reinserted. After tombstone collection, normal message ingest still rejects
+timestamps below the durable coverage floor. The floor states the earliest
+history the peer still claims to cover; it is not proof that older history
+never existed.
+
+Peers compare roots from the later of their two coverage floors. A match in
+that window is reported as partial coverage and is not cached as a full-history
+match. A floor change during paging aborts the attempt instead of labeling
+different retention windows converged.
+
+Deterministic DAG ordering uses Kahn's algorithm with a heap for ready
+messages. Parent-before-child order is unchanged while independent-message
+selection is $O(\log n)$ instead of a linear scan.
 
 ## 5. Bootstrap and peer discovery
 
@@ -214,27 +308,29 @@ tried in order from most-reliable to least.
 
 ### 5.1 Invite bundles (primary)
 
-An **invite bundle** is a small out-of-band blob produced by an existing group
-member (typically the founder) when they add a new member. It is delivered
-out-of-band (copy-paste, QR, messaging) — it is *not* an Entmoot wire message.
+An **invite bundle** is a small out-of-band blob produced by the founder when
+they add a new member. It is delivered out-of-band (copy-paste, QR, messaging)
+and is not an Entmoot wire message.
 
 ```
 Invite
 ├── group_id:
 ├── founder:         node_id + Ed25519 pubkey  (anchors roster-sig validation)
-├── roster_head:     roster_entry_id + merkle_path  (auth'd snapshot to diff from)
+├── roster_head:     authenticated roster checkpoint
 ├── merkle_root:     current group Merkle root
 ├── bootstrap_peers: [ {node_id, hostname?} × 3–5 ]   (recently-online members)
 ├── issued_at:       unix millis, signing time
 ├── valid_until:     unix millis, expiration (default 24 h after issued_at)
-├── issuer:          node_id of member who produced the invite
+├── issuer:          founder node_id + Ed25519 pubkey
 └── signature:       Ed25519 over the encoded bundle, signed by issuer
 ```
 
-The new node verifies the signature against the issuer's pubkey (which it
-already trusts pairwise via Pilot — that's *why* the issuer was in a position
-to invite), then attempts `:1004` dials against `bootstrap_peers` in order.
-First successful `hello` → start `roster_req` + gossip.
+The invite signature authenticates the complete bundle, including founder,
+group id, roster head, and bootstrap hints. Bootstrap roster responses are
+first validated in temporary memory. The genesis founder must exactly match
+the invite, the founder must be authorized at the advertised group-bound
+checkpoint, and that checkpoint must occur on the fetched chain. A valid
+descendant head is allowed. Only after all checks pass is the chain installed.
 
 ### 5.2 Pilot-trusted peers ∩ roster (secondary)
 
@@ -364,21 +460,21 @@ IPFS DAG-CBOR chunking. Not novel; just correctly applied.
 - **Authorship**: every message is Ed25519-signed by its author, verified
   against the roster's current pubkey for that node. Unsigned or wrong-sig
   messages are silently dropped.
-- **Replay**: same 5-minute / 30-second window as Pilot's handshake protocol,
-  plus hash dedupe.
+- **Replay**: authenticated Hello frames use the bounded timestamp and
+  per-peer replay set. Content-addressed messages use atomic MessageID
+  insertion deduplication. Repeatable query frames remain legal within their
+  resource budgets.
 - **Membership**: messages from non-members are dropped before they reach
   application logic.
-- **Denial of service**: v0 ships **per-peer token-bucket rate limits** on
-  every `:1004` connection. Two buckets per peer: a message-rate bucket
-  (default 100 msg/s, burst 200) and a byte-rate bucket (default 1 MiB/s,
-  burst 4 MiB). Exceeding the bucket causes backpressure first (reads stall);
-  sustained violation for >30 s drops the connection and records a
-  soft-penalty on the peer (exponential cooldown before reconnects are
-  accepted, starting 10 s, capped at 1 hour). No per-group or per-topic
-  buckets in v0 — one global pair per connection is enough to contain a
-  misbehaving member. Proof-of-work on joins is a v1+ concern; in v0 the
-  roster gate (non-members can't reach `:1004` in the first place, because
-  Pilot rejects untrusted dials) does most of the work.
+- **Denial of service**: every inbound frame is charged before body allocation
+  to per-peer token buckets: 100 frames/s with burst 200 and 1 MiB/s with
+  burst 4 MiB. Per-type byte caps and decoded collection caps bound follow-on
+  work. Bodies are read in 32 KiB chunks under a 5-second first-frame deadline.
+  At most 64 handlers run globally and 8 for one peer; excess streams are
+  closed without launching a goroutine. Ordinary handlers have a 10-second
+  budget, reconcile sessions 30 seconds, and large responses 45 seconds.
+  Retry state is capped at 1,024 entries globally and 64 per peer. Rare system
+  topics add a topic bucket without charging the global frame budget twice.
 - **Eclipse attacks**: the random-peer pool is intended as the defense.
   Details pending.
 - **Privacy**: group membership and topic filters are observable to peers you

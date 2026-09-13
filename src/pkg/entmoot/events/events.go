@@ -22,13 +22,13 @@ const (
 
 // Event is the common local event envelope.
 type Event struct {
-	Type      Type              `json:"type"`
-	GroupID   entmoot.GroupID   `json:"group_id"`
-	MessageID entmoot.MessageID `json:"message_id,omitempty"`
-	ClientID  string            `json:"client_id,omitempty"`
-	PeerID    entmoot.NodeID    `json:"peer_id,omitempty"`
-	Status    string            `json:"status,omitempty"`
-	At        time.Time         `json:"at"`
+	Type           Type              `json:"type"`
+	GroupID        entmoot.GroupID   `json:"group_id"`
+	MessageID      entmoot.MessageID `json:"message_id,omitempty"`
+	ClientID       string            `json:"client_id,omitempty"`
+	AuthorMemberID entmoot.MemberID  `json:"author_member_id,omitempty"`
+	Status         string            `json:"status,omitempty"`
+	At             time.Time         `json:"at"`
 }
 
 // Sink consumes local events. Implementations must not block indefinitely.

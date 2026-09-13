@@ -131,7 +131,7 @@ entmoot_top_level_subcommand() {
     fi
     if [[ "$arg" == -* ]]; then
       case "${arg%%=*}" in
-        -socket|--socket|-identity|--identity|-data|--data|-listen-port|--listen-port|-log-level|--log-level|-pilot-wait-timeout|--pilot-wait-timeout|-pilot-wait-base-delay|--pilot-wait-base-delay|-pilot-wait-max-delay|--pilot-wait-max-delay)
+        -identity|--identity|-data|--data|-listen-port|--listen-port|-log-level|--log-level)
           if [[ "$arg" != *=* ]]; then
             (( i++ ))
           fi

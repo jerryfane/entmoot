@@ -67,25 +67,31 @@ func ValidPattern(pattern string) error {
 	return nil
 }
 
-// validTopic reports whether s is a well-formed concrete topic: non-empty,
-// slash-separated with every segment non-empty, and no MQTT wildcards
-// ('+' or '#') appearing anywhere. Topics are data, not patterns, so a
-// wildcard character inside a topic is not treated as a wildcard but does
-// indicate a malformed input; we reject outright to avoid surprising
-// matches when a mis-encoded topic contains literal '+' or '#'.
-func validTopic(s string) bool {
+// ValidTopic validates a concrete topic name. Unlike ValidPattern it rejects
+// MQTT wildcards. Topic bytes must be printable ASCII so every peer applies
+// identical byte-level length and matching rules.
+func ValidTopic(s string) error {
 	if s == "" {
-		return false
+		return errors.New("topic: empty topic")
+	}
+	for _, b := range []byte(s) {
+		if b < 0x21 || b > 0x7e {
+			return errors.New("topic: topic must be printable ASCII")
+		}
 	}
 	for _, seg := range strings.Split(s, segSep) {
 		if seg == "" {
-			return false
+			return errors.New("topic: empty segment in topic")
 		}
 		if strings.ContainsAny(seg, "+#") {
-			return false
+			return errors.New("topic: concrete topic contains wildcard")
 		}
 	}
-	return true
+	return nil
+}
+
+func validTopic(s string) bool {
+	return ValidTopic(s) == nil
 }
 
 // Match reports whether topic matches pattern per MQTT-style semantics with

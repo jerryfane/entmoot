@@ -118,17 +118,20 @@ func OpenJSONL(root string) (*JSONL, error) {
 
 // Put implements MessageStore.Put. Writes the canonical encoding of m as a
 // new line in messages.jsonl and fsyncs the file before returning.
-func (s *JSONL) Put(_ context.Context, m entmoot.Message) error {
+func (s *JSONL) Put(_ context.Context, expectedGroup entmoot.GroupID, m entmoot.Message) (bool, error) {
+	if expectedGroup != m.GroupID {
+		return false, fmt.Errorf("%w: expected group %s, got %s", ErrInvalidMessage, expectedGroup, m.GroupID)
+	}
 	if isZeroGroupID(m.GroupID) {
-		return fmt.Errorf("%w: zero group id", ErrInvalidMessage)
+		return false, fmt.Errorf("%w: zero group id", ErrInvalidMessage)
 	}
 	if isZeroMessageID(m.ID) {
-		return fmt.Errorf("%w: zero message id", ErrInvalidMessage)
+		return false, fmt.Errorf("%w: zero message id", ErrInvalidMessage)
 	}
 
 	encoded, err := canonical.Encode(m)
 	if err != nil {
-		return fmt.Errorf("store: canonical encode: %w", err)
+		return false, fmt.Errorf("store: canonical encode: %w", err)
 	}
 
 	s.mu.Lock()
@@ -140,32 +143,31 @@ func (s *JSONL) Put(_ context.Context, m entmoot.Message) error {
 		s.groups[m.GroupID] = gs
 	}
 	if _, exists := gs.msgs[m.ID]; exists {
-		// Idempotent: neither cache nor disk touched on duplicate Put.
-		return nil
+		return false, nil
 	}
 
 	if gs.file == nil {
 		dir := filepath.Join(s.groupsDir, encodeGroupDirName(m.GroupID))
 		if err := os.MkdirAll(dir, 0o700); err != nil {
-			return fmt.Errorf("store: mkdir group %q: %w", dir, err)
+			return false, fmt.Errorf("store: mkdir group %q: %w", dir, err)
 		}
 		path := filepath.Join(dir, "messages.jsonl")
 		f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 		if err != nil {
-			return fmt.Errorf("store: open %q: %w", path, err)
+			return false, fmt.Errorf("store: open %q: %w", path, err)
 		}
 		gs.file = f
 	}
 
 	line := append(append(make([]byte, 0, len(encoded)+1), encoded...), '\n')
 	if _, err := gs.file.Write(line); err != nil {
-		return fmt.Errorf("store: write: %w", err)
+		return false, fmt.Errorf("store: write: %w", err)
 	}
 	if err := gs.file.Sync(); err != nil {
-		return fmt.Errorf("store: fsync: %w", err)
+		return false, fmt.Errorf("store: fsync: %w", err)
 	}
 	gs.msgs[m.ID] = m
-	return nil
+	return true, nil
 }
 
 // PruneBefore removes messages in groupID older than beforeMillis and rewrites

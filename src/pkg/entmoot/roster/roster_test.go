@@ -1,10 +1,17 @@
 package roster
 
 import (
+	"bufio"
+	"bytes"
 	"errors"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -19,41 +26,38 @@ import (
 // helper so the validity of an entry tracks the validation code exactly.
 func mkEntry(
 	t *testing.T,
+	rlog *RosterLog,
 	actor *keystore.Identity,
 	actorNodeID entmoot.NodeID,
 	op string,
 	subject entmoot.NodeInfo,
 	ts int64,
-	parents []entmoot.RosterEntryID,
+	_ []entmoot.RosterEntryID,
 ) entmoot.RosterEntry {
 	t.Helper()
-	entry := entmoot.RosterEntry{
-		Op:        op,
-		Subject:   subject,
-		Actor:     actorNodeID,
-		Timestamp: ts,
-		Parents:   parents,
-	}
-	sigInput, err := canonical.Encode(entry)
+	entry, err := rlog.SignEntry(actor, op, subject, nil, ts)
 	if err != nil {
-		t.Fatalf("mkEntry: canonical encode: %v", err)
+		t.Fatalf("mkEntry: %v", err)
 	}
-	entry.Signature = actor.Sign(sigInput)
-	entry.ID = canonical.RosterEntryID(entry)
 	return entry
 }
 
-// newFounder returns a fresh identity and NodeInfo for a founder-like actor.
-func newFounder(t *testing.T, nodeID entmoot.NodeID) (*keystore.Identity, entmoot.NodeInfo) {
+// newFounder returns a fresh same-key operational identity.
+func newFounder(t *testing.T, _ entmoot.NodeID) (*keystore.Identity, entmoot.NodeInfo) {
 	t.Helper()
 	id, err := keystore.Generate()
 	if err != nil {
 		t.Fatalf("keystore.Generate: %v", err)
 	}
-	return id, entmoot.NodeInfo{
-		PilotNodeID:   nodeID,
-		EntmootPubKey: []byte(id.PublicKey),
+	memberID, err := entmoot.MemberIDFromPublicKey(id.PublicKey)
+	if err != nil {
+		t.Fatalf("MemberIDFromPublicKey: %v", err)
 	}
+	peerID, err := entmoot.PeerIDFromPublicKey(id.PublicKey)
+	if err != nil {
+		t.Fatalf("PeerIDFromPublicKey: %v", err)
+	}
+	return id, entmoot.NodeInfo{EntmootPubKey: []byte(id.PublicKey), MemberID: &memberID, PeerID: peerID}
 }
 
 func testGroupID() entmoot.GroupID {
@@ -70,22 +74,153 @@ func TestGenesisHappyPath(t *testing.T) {
 	id, info := newFounder(t, 100)
 
 	r := New(testGroupID())
+
 	if err := r.Genesis(id, info, 1_000); err != nil {
 		t.Fatalf("Genesis: %v", err)
 	}
-	if !r.IsMember(100) {
+	memberID := *info.MemberID
+	if !r.IsMemberID(memberID) {
 		t.Fatalf("expected founder to be a member after Genesis")
 	}
-	got := r.Members()
-	if len(got) != 1 || got[0] != 100 {
-		t.Fatalf("Members() = %v, want [100]", got)
+	got := r.MemberIDs()
+	if len(got) != 1 || got[0] != memberID {
+		t.Fatalf("MemberIDs() = %v, want [%v]", got, memberID)
 	}
 	if r.Head() == (entmoot.RosterEntryID{}) {
 		t.Fatalf("Head() unexpectedly zero after Genesis")
 	}
 	fi, ok := r.Founder()
-	if !ok || fi.PilotNodeID != 100 {
+	if !ok || fi.MemberID == nil || *fi.MemberID != memberID || fi.PeerID != info.PeerID {
 		t.Fatalf("Founder() = %#v, ok=%v", fi, ok)
+	}
+}
+func TestGenesisAndSignEntryUseGroupBoundVersion2(t *testing.T) {
+	t.Parallel()
+	founder, founderInfo := newFounder(t, 100)
+	r := New(testGroupID())
+	if err := r.Genesis(founder, founderInfo, 1_000); err != nil {
+		t.Fatalf("Genesis: %v", err)
+	}
+	genesis := r.Entries()[0]
+	if genesis.Version != CurrentEntryVersion || genesis.GroupID == nil || *genesis.GroupID != testGroupID() || genesis.Sequence != 1 {
+		t.Fatalf("genesis version fields = version %d group %v sequence %d", genesis.Version, genesis.GroupID, genesis.Sequence)
+	}
+	member, memberInfo := newFounder(t, 200)
+	_ = member
+	entry, err := r.SignEntry(founder, "add", memberInfo, nil, 2_000)
+	if err != nil {
+		t.Fatalf("SignEntry: %v", err)
+	}
+	if entry.Version != CurrentEntryVersion || entry.GroupID == nil || *entry.GroupID != testGroupID() || entry.Sequence != 2 {
+		t.Fatalf("entry version fields = version %d group %v sequence %d", entry.Version, entry.GroupID, entry.Sequence)
+	}
+	if err := r.Apply(entry); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+}
+
+func TestFullWidthMembersDoNotCollideAtZeroLegacyNodeID(t *testing.T) {
+	t.Parallel()
+	founder, founderInfo := newFounder(t, 0)
+	founderID, err := entmoot.MemberIDFromPublicKey(founder.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	founderInfo.MemberID = &founderID
+	r := New(testGroupID())
+	if err := r.Genesis(founder, founderInfo, 1_000); err != nil {
+		t.Fatal(err)
+	}
+	member, memberInfo := newFounder(t, 0)
+	memberID, err := entmoot.MemberIDFromPublicKey(member.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	memberInfo.MemberID = &memberID
+	entry := mkEntry(t, r, founder, 0, "add", memberInfo, 2_000, nil)
+	if err := r.Apply(entry); err != nil {
+		t.Fatal(err)
+	}
+	if !r.IsMemberID(founderID) || !r.IsMemberID(memberID) {
+		t.Fatalf("full-width membership missing: %v", r.MemberIDs())
+	}
+	if got := len(r.MemberIDs()); got != 2 {
+		t.Fatalf("full-width member count = %d, want 2", got)
+	}
+	_, forgedInfo := newFounder(t, 0)
+	forgedEntry := mkEntry(t, r, founder, 0, "add", forgedInfo, 3_000, nil)
+	forgedEntry.Subject.MemberID = &memberID
+	signingBytes, err := canonical.RosterEntrySigningBytes(forgedEntry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	forgedEntry.Signature = founder.Sign(signingBytes)
+	forgedEntry.ID = canonical.RosterEntryID(forgedEntry)
+	if err := r.Apply(forgedEntry); err == nil {
+		t.Fatal("colliding MemberID with another public key accepted")
+	}
+}
+
+func TestVersion2RosterEntryRejectedInAnotherGroup(t *testing.T) {
+	t.Parallel()
+	founder, founderInfo := newFounder(t, 100)
+	groupA := testGroupID()
+	groupB := groupA
+	groupB[0] ^= 0xFF
+	a := New(groupA)
+	b := New(groupB)
+	if err := a.Genesis(founder, founderInfo, 1_000); err != nil {
+		t.Fatalf("Genesis A: %v", err)
+	}
+	if err := b.Genesis(founder, founderInfo, 1_000); err != nil {
+		t.Fatalf("Genesis B: %v", err)
+	}
+	_, memberInfo := newFounder(t, 200)
+	entry, err := a.SignEntry(founder, "add", memberInfo, nil, 2_000)
+	if err != nil {
+		t.Fatalf("SignEntry: %v", err)
+	}
+	if err := b.Apply(entry); !errors.Is(err, entmoot.ErrRosterReject) {
+		t.Fatalf("cross-group Apply = %v, want ErrRosterReject", err)
+	}
+}
+
+func TestMemberInfoAtPreservesHistoricalKeyAfterRemoval(t *testing.T) {
+	t.Parallel()
+	founder, founderInfo := newFounder(t, 100)
+	_, memberInfo := newFounder(t, 200)
+	r := New(testGroupID())
+	if err := r.Genesis(founder, founderInfo, 1_000); err != nil {
+		t.Fatalf("Genesis: %v", err)
+	}
+	add, err := r.SignEntry(founder, "add", memberInfo, nil, 2_000)
+	if err != nil {
+		t.Fatalf("SignEntry add: %v", err)
+	}
+	if err := r.Apply(add); err != nil {
+		t.Fatalf("Apply add: %v", err)
+	}
+	historicalHead := r.Head()
+	remove, err := r.SignEntry(founder, "remove", memberInfo, nil, 3_000)
+	if err != nil {
+		t.Fatalf("SignEntry remove: %v", err)
+	}
+	if err := r.Apply(remove); err != nil {
+		t.Fatalf("Apply remove: %v", err)
+	}
+	memberID := *memberInfo.MemberID
+	if _, current := r.MemberInfoByID(memberID); current {
+		t.Fatal("removed member remains current")
+	}
+	got, historical, known := r.MemberInfoAtID(memberID, historicalHead)
+	if !known || !historical || !bytes.Equal(got.EntmootPubKey, memberInfo.EntmootPubKey) {
+		t.Fatalf("historical lookup = (%+v, %v, %v)", got, historical, known)
+	}
+	if _, historical, known := r.MemberInfoAtID(memberID, r.Head()); !known || historical {
+		t.Fatalf("post-removal lookup = member %v known %v", historical, known)
+	}
+	if _, _, known := r.MemberInfoAtID(memberID, entmoot.RosterEntryID{0xFF}); known {
+		t.Fatal("unknown head reported known")
 	}
 }
 
@@ -104,8 +239,8 @@ func TestGenesisTwiceRejected(t *testing.T) {
 	if r.Head() != headBefore {
 		t.Fatalf("head changed after failed second Genesis")
 	}
-	if got := r.Members(); len(got) != 1 || got[0] != 100 {
-		t.Fatalf("Members after failed second Genesis = %v, want [100]", got)
+	if got := r.MemberIDs(); len(got) != 1 || got[0] != *info.MemberID {
+		t.Fatalf("MemberIDs after failed second Genesis = %v, want [%v]", got, *info.MemberID)
 	}
 }
 
@@ -119,25 +254,24 @@ func TestApplyAddBobByFounder(t *testing.T) {
 	if err := r.Genesis(founder, founderInfo, 1_000); err != nil {
 		t.Fatalf("Genesis: %v", err)
 	}
-	entry := mkEntry(t, founder, founderInfo.PilotNodeID, "add", bobInfo, 2_000,
+	entry := mkEntry(t, r, founder, founderInfo.PilotNodeID, "add", bobInfo, 2_000,
 		[]entmoot.RosterEntryID{r.Head()})
 	if err := r.Apply(entry); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
-	if !r.IsMember(200) {
+	if !r.IsMemberID(*bobInfo.MemberID) {
 		t.Fatalf("expected bob to be a member after add")
 	}
-	got := r.Members()
-	want := []entmoot.NodeID{100, 200}
-	if !equalNodeIDs(got, want) {
-		t.Fatalf("Members() = %v, want %v", got, want)
+	got := r.MemberIDs()
+	if len(got) != 2 || !r.IsMemberID(*founderInfo.MemberID) {
+		t.Fatalf("MemberIDs() = %v, want founder and bob", got)
 	}
-	info, ok := r.MemberInfo(200)
+	info, ok := r.MemberInfoByID(*bobInfo.MemberID)
 	if !ok {
-		t.Fatalf("MemberInfo(200) returned ok=false")
+		t.Fatalf("MemberInfoByID(bob) returned ok=false")
 	}
 	if len(info.EntmootPubKey) != len(bobInfo.EntmootPubKey) {
-		t.Fatalf("MemberInfo pubkey length mismatch")
+		t.Fatalf("MemberInfoByID pubkey length mismatch")
 	}
 }
 
@@ -152,7 +286,7 @@ func TestApplyNonFounderRejected(t *testing.T) {
 		t.Fatalf("Genesis: %v", err)
 	}
 	headBefore := r.Head()
-	entry := mkEntry(t, bob, bobInfo.PilotNodeID, "add", bobInfo, 2_000,
+	entry := mkEntry(t, r, bob, bobInfo.PilotNodeID, "add", bobInfo, 2_000,
 		[]entmoot.RosterEntryID{headBefore})
 	err := r.Apply(entry)
 	if err == nil {
@@ -164,7 +298,7 @@ func TestApplyNonFounderRejected(t *testing.T) {
 	if r.Head() != headBefore {
 		t.Fatalf("head changed after rejected Apply")
 	}
-	if r.IsMember(200) {
+	if r.IsMemberID(*bobInfo.MemberID) {
 		t.Fatalf("bob should not be a member after rejected Apply")
 	}
 }
@@ -179,7 +313,7 @@ func TestApplyWrongIDRejected(t *testing.T) {
 	if err := r.Genesis(founder, founderInfo, 1_000); err != nil {
 		t.Fatalf("Genesis: %v", err)
 	}
-	entry := mkEntry(t, founder, founderInfo.PilotNodeID, "add", bobInfo, 2_000,
+	entry := mkEntry(t, r, founder, founderInfo.PilotNodeID, "add", bobInfo, 2_000,
 		[]entmoot.RosterEntryID{r.Head()})
 	entry.ID[0] ^= 0xFF // corrupt the id
 
@@ -187,7 +321,7 @@ func TestApplyWrongIDRejected(t *testing.T) {
 	if !errors.Is(err, entmoot.ErrRosterReject) {
 		t.Fatalf("expected ErrRosterReject, got %v", err)
 	}
-	if r.IsMember(200) {
+	if r.IsMemberID(*bobInfo.MemberID) {
 		t.Fatalf("bob should not be a member after rejected Apply")
 	}
 }
@@ -204,20 +338,20 @@ func TestApplyMonotonicityRejected(t *testing.T) {
 	}
 
 	// equal timestamp: rejected.
-	eq := mkEntry(t, founder, founderInfo.PilotNodeID, "add", bobInfo, 5_000,
+	eq := mkEntry(t, r, founder, founderInfo.PilotNodeID, "add", bobInfo, 5_000,
 		[]entmoot.RosterEntryID{r.Head()})
 	if err := r.Apply(eq); !errors.Is(err, entmoot.ErrRosterReject) {
 		t.Fatalf("equal timestamp: expected ErrRosterReject, got %v", err)
 	}
 
 	// earlier timestamp: rejected.
-	earlier := mkEntry(t, founder, founderInfo.PilotNodeID, "add", bobInfo, 4_999,
+	earlier := mkEntry(t, r, founder, founderInfo.PilotNodeID, "add", bobInfo, 4_999,
 		[]entmoot.RosterEntryID{r.Head()})
 	if err := r.Apply(earlier); !errors.Is(err, entmoot.ErrRosterReject) {
 		t.Fatalf("earlier timestamp: expected ErrRosterReject, got %v", err)
 	}
 
-	if r.IsMember(200) {
+	if r.IsMemberID(*bobInfo.MemberID) {
 		t.Fatalf("bob should not be a member after monotonicity rejections")
 	}
 }
@@ -232,22 +366,22 @@ func TestApplyRemoveMember(t *testing.T) {
 	if err := r.Genesis(founder, founderInfo, 1_000); err != nil {
 		t.Fatalf("Genesis: %v", err)
 	}
-	add := mkEntry(t, founder, founderInfo.PilotNodeID, "add", bobInfo, 2_000,
+	add := mkEntry(t, r, founder, founderInfo.PilotNodeID, "add", bobInfo, 2_000,
 		[]entmoot.RosterEntryID{r.Head()})
 	if err := r.Apply(add); err != nil {
 		t.Fatalf("Apply add: %v", err)
 	}
-	remove := mkEntry(t, founder, founderInfo.PilotNodeID, "remove", bobInfo, 3_000,
+	remove := mkEntry(t, r, founder, founderInfo.PilotNodeID, "remove", bobInfo, 3_000,
 		[]entmoot.RosterEntryID{r.Head()})
 	if err := r.Apply(remove); err != nil {
 		t.Fatalf("Apply remove: %v", err)
 	}
-	if r.IsMember(200) {
+	if r.IsMemberID(*bobInfo.MemberID) {
 		t.Fatalf("bob should not be a member after remove")
 	}
-	got := r.Members()
-	if len(got) != 1 || got[0] != 100 {
-		t.Fatalf("Members after remove = %v, want [100]", got)
+	got := r.MemberIDs()
+	if len(got) != 1 || got[0] != *founderInfo.MemberID {
+		t.Fatalf("MemberIDs after remove = %v, want founder", got)
 	}
 }
 
@@ -262,17 +396,17 @@ func TestHeadMatchesLastApplied(t *testing.T) {
 	if err := r.Genesis(founder, founderInfo, 1_000); err != nil {
 		t.Fatalf("Genesis: %v", err)
 	}
-	a := mkEntry(t, founder, founderInfo.PilotNodeID, "add", bobInfo, 2_000,
+	a := mkEntry(t, r, founder, founderInfo.PilotNodeID, "add", bobInfo, 2_000,
 		[]entmoot.RosterEntryID{r.Head()})
 	if err := r.Apply(a); err != nil {
 		t.Fatalf("Apply a: %v", err)
 	}
-	b := mkEntry(t, founder, founderInfo.PilotNodeID, "add", carolInfo, 3_000,
+	b := mkEntry(t, r, founder, founderInfo.PilotNodeID, "add", carolInfo, 3_000,
 		[]entmoot.RosterEntryID{r.Head()})
 	if err := r.Apply(b); err != nil {
 		t.Fatalf("Apply b: %v", err)
 	}
-	c := mkEntry(t, founder, founderInfo.PilotNodeID, "remove", bobInfo, 4_000,
+	c := mkEntry(t, r, founder, founderInfo.PilotNodeID, "remove", bobInfo, 4_000,
 		[]entmoot.RosterEntryID{r.Head()})
 	if err := r.Apply(c); err != nil {
 		t.Fatalf("Apply c: %v", err)
@@ -301,12 +435,12 @@ func TestJSONLRoundTrip(t *testing.T) {
 	if err := r.Genesis(founder, founderInfo, 1_000); err != nil {
 		t.Fatalf("Genesis: %v", err)
 	}
-	addBob := mkEntry(t, founder, founderInfo.PilotNodeID, "add", bobInfo, 2_000,
+	addBob := mkEntry(t, r, founder, founderInfo.PilotNodeID, "add", bobInfo, 2_000,
 		[]entmoot.RosterEntryID{r.Head()})
 	if err := r.Apply(addBob); err != nil {
 		t.Fatalf("Apply addBob: %v", err)
 	}
-	addCarol := mkEntry(t, founder, founderInfo.PilotNodeID, "add", carolInfo, 3_000,
+	addCarol := mkEntry(t, r, founder, founderInfo.PilotNodeID, "add", carolInfo, 3_000,
 		[]entmoot.RosterEntryID{r.Head()})
 	if err := r.Apply(addCarol); err != nil {
 		t.Fatalf("Apply addCarol: %v", err)
@@ -324,84 +458,87 @@ func TestJSONLRoundTrip(t *testing.T) {
 	if r2.Head() != wantHead {
 		t.Fatalf("reopened Head() = %x, want %x", r2.Head(), wantHead)
 	}
-	got := r2.Members()
-	want := []entmoot.NodeID{100, 200, 300}
-	if !equalNodeIDs(got, want) {
-		t.Fatalf("reopened Members() = %v, want %v", got, want)
+	got := r2.MemberIDs()
+	if len(got) != 3 || !r2.IsMemberID(*founderInfo.MemberID) || !r2.IsMemberID(*bobInfo.MemberID) || !r2.IsMemberID(*carolInfo.MemberID) {
+		t.Fatalf("reopened MemberIDs() = %v, want founder, bob, and carol", got)
 	}
 	fi, ok := r2.Founder()
-	if !ok || fi.PilotNodeID != 100 {
+	if !ok || fi.MemberID == nil || *fi.MemberID != *founderInfo.MemberID || fi.PeerID != founderInfo.PeerID {
 		t.Fatalf("reopened Founder() = %#v, ok=%v", fi, ok)
 	}
 }
 
-//  10. OpenJSONL with a malformed line in the middle skips it, loads valid
-//     entries before and after.
-func TestJSONLSkipsMalformedLine(t *testing.T) {
+// OpenJSONL fails closed when any legacy line is malformed and preserves the
+// source file byte-for-byte for explicit repair.
+func TestJSONLRejectsMalformedLineWithoutChangingSource(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	gid := testGroupID()
 	founder, founderInfo := newFounder(t, 100)
 	_, bobInfo := newFounder(t, 200)
 
-	// Produce two valid entries via a first open, then inject a malformed
-	// line between them and append a third valid line.
-	r, err := OpenJSONL(dir, gid)
-	if err != nil {
-		t.Fatalf("OpenJSONL: %v", err)
-	}
-	if err := r.Genesis(founder, founderInfo, 1_000); err != nil {
+	source := New(gid)
+	if err := source.Genesis(founder, founderInfo, 1_000); err != nil {
 		t.Fatalf("Genesis: %v", err)
 	}
-	addBob := mkEntry(t, founder, founderInfo.PilotNodeID, "add", bobInfo, 2_000,
-		[]entmoot.RosterEntryID{r.Head()})
-	if err := r.Apply(addBob); err != nil {
+	addBob := mkEntry(t, source, founder, founderInfo.PilotNodeID, "add", bobInfo, 2_000,
+		[]entmoot.RosterEntryID{source.Head()})
+	if err := source.Apply(addBob); err != nil {
 		t.Fatalf("Apply addBob: %v", err)
 	}
-	// Build a third valid entry keyed off the current head BEFORE we corrupt
-	// the file, then inject garbage between lines 2 and 3.
-	removeBob := mkEntry(t, founder, founderInfo.PilotNodeID, "remove", bobInfo, 3_000,
-		[]entmoot.RosterEntryID{r.Head()})
-	if err := r.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
+	removeBob := mkEntry(t, source, founder, founderInfo.PilotNodeID, "remove", bobInfo, 3_000,
+		[]entmoot.RosterEntryID{source.Head()})
+	entries := source.Entries()
 
-	path := filepath.Join(dir, "groups", encodeGroupDirName(gid), rosterFileName)
-
-	// Append a malformed line directly, then append the encoded valid entry.
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
-	if err != nil {
-		t.Fatalf("OpenFile: %v", err)
+	groupDir := filepath.Join(dir, "groups", encodeGroupDirName(gid))
+	if err := os.MkdirAll(groupDir, 0o700); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
 	}
-	if _, err := f.Write([]byte("{this is not json\n")); err != nil {
-		t.Fatalf("write garbage: %v", err)
+	path := filepath.Join(groupDir, rosterFileName)
+	var raw []byte
+	for _, entry := range entries {
+		encoded, err := canonical.Encode(entry)
+		if err != nil {
+			t.Fatalf("canonical.Encode: %v", err)
+		}
+		raw = append(raw, encoded...)
+		raw = append(raw, '\n')
 	}
+	validPrefixLen := len(raw)
+	raw = append(raw, []byte("{this is not json\n")...)
 	encoded, err := canonical.Encode(removeBob)
 	if err != nil {
-		t.Fatalf("canonical.Encode: %v", err)
+		t.Fatalf("canonical.Encode remove: %v", err)
 	}
-	if _, err := f.Write(append(encoded, '\n')); err != nil {
-		t.Fatalf("write valid: %v", err)
-	}
-	if err := f.Close(); err != nil {
-		t.Fatalf("Close inject: %v", err)
+	raw = append(raw, encoded...)
+	raw = append(raw, '\n')
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
 	}
 
-	r2, err := OpenJSONL(dir, gid)
+	if _, err := OpenJSONL(dir, gid); err == nil || !strings.Contains(err.Error(), "line 3") {
+		t.Fatalf("OpenJSONL malformed error = %v, want line 3 diagnostic", err)
+	}
+	after, err := os.ReadFile(path)
 	if err != nil {
-		t.Fatalf("OpenJSONL reopen: %v", err)
+		t.Fatalf("ReadFile after failure: %v", err)
 	}
-	defer r2.Close()
-	// All three valid entries should be present despite the garbage line.
-	got := r2.Entries()
-	if len(got) != 3 {
-		t.Fatalf("reopened Entries() len = %d, want 3", len(got))
+	if !bytes.Equal(after, raw) {
+		t.Fatal("failed import changed legacy source")
 	}
-	if r2.Head() != removeBob.ID {
-		t.Fatalf("Head() = %x, want removeBob.ID = %x", r2.Head(), removeBob.ID)
+	repaired := append([]byte(nil), raw[:validPrefixLen]...)
+	repaired = append(repaired, encoded...)
+	repaired = append(repaired, '\n')
+	if err := os.WriteFile(path, repaired, 0o600); err != nil {
+		t.Fatalf("repair WriteFile: %v", err)
 	}
-	if r2.IsMember(200) {
-		t.Fatalf("bob should not be a member after replayed remove")
+	imported, err := OpenJSONL(dir, gid)
+	if err != nil {
+		t.Fatalf("OpenJSONL after repair: %v", err)
+	}
+	defer imported.Close()
+	if got := len(imported.Entries()); got != 3 {
+		t.Fatalf("repaired import entries = %d, want 3", got)
 	}
 }
 
@@ -419,12 +556,12 @@ func TestSubscribeReceivesSuccessfulApplies(t *testing.T) {
 		t.Fatalf("Genesis: %v", err)
 	}
 	// Rejected: non-founder signer.
-	bad := mkEntry(t, bob, bobInfo.PilotNodeID, "add", bobInfo, 2_000,
+	bad := mkEntry(t, r, bob, bobInfo.PilotNodeID, "add", bobInfo, 2_000,
 		[]entmoot.RosterEntryID{r.Head()})
 	if err := r.Apply(bad); !errors.Is(err, entmoot.ErrRosterReject) {
 		t.Fatalf("bad Apply expected ErrRosterReject, got %v", err)
 	}
-	good := mkEntry(t, founder, founderInfo.PilotNodeID, "add", bobInfo, 2_000,
+	good := mkEntry(t, r, founder, founderInfo.PilotNodeID, "add", bobInfo, 2_000,
 		[]entmoot.RosterEntryID{r.Head()})
 	if err := r.Apply(good); err != nil {
 		t.Fatalf("good Apply: %v", err)
@@ -435,10 +572,10 @@ func TestSubscribeReceivesSuccessfulApplies(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("got %d events, want 2", len(got))
 	}
-	if got[0].Entry.Op != "add" || got[0].Entry.Subject.PilotNodeID != 100 {
+	if got[0].Entry.Op != "add" || got[0].Entry.Subject.MemberID == nil || *got[0].Entry.Subject.MemberID != *founderInfo.MemberID {
 		t.Fatalf("first event not Genesis add(founder): %+v", got[0])
 	}
-	if got[1].Entry.Op != "add" || got[1].Entry.Subject.PilotNodeID != 200 {
+	if got[1].Entry.Op != "add" || got[1].Entry.Subject.MemberID == nil || *got[1].Entry.Subject.MemberID != *bobInfo.MemberID {
 		t.Fatalf("second event not add(bob): %+v", got[1])
 	}
 	for _, ev := range got {
@@ -464,6 +601,7 @@ func TestSubscribeCancelIdempotent(t *testing.T) {
 	_, bobInfo := newFounder(t, 200)
 
 	r := New(testGroupID())
+
 	ch, cancel := r.Subscribe()
 
 	if err := r.Genesis(founder, founderInfo, 1_000); err != nil {
@@ -490,10 +628,268 @@ func TestSubscribeCancelIdempotent(t *testing.T) {
 	}
 
 	// Further Applies must not panic even though the subscriber is gone.
-	add := mkEntry(t, founder, founderInfo.PilotNodeID, "add", bobInfo, 2_000,
+	add := mkEntry(t, r, founder, founderInfo.PilotNodeID, "add", bobInfo, 2_000,
 		[]entmoot.RosterEntryID{r.Head()})
 	if err := r.Apply(add); err != nil {
 		t.Fatalf("Apply after cancel: %v", err)
+	}
+}
+func TestConcurrentApplyAcceptsOneChildAndPersistsHead(t *testing.T) {
+	dir := t.TempDir()
+	gid := testGroupID()
+	founder, founderInfo := newFounder(t, 100)
+	r, err := OpenJSONL(dir, gid)
+	if err != nil {
+		t.Fatalf("OpenJSONL: %v", err)
+	}
+	if err := r.Genesis(founder, founderInfo, 1_000); err != nil {
+		t.Fatalf("Genesis: %v", err)
+	}
+	parent := r.Head()
+
+	const contenders = 64
+	entries := make([]entmoot.RosterEntry, contenders)
+	for i := range entries {
+		_, subject := newFounder(t, 0)
+		entries[i] = mkEntry(t, r, founder, 0, "add", subject, int64(2_000+i),
+			[]entmoot.RosterEntryID{parent})
+	}
+	var accepted atomic.Int32
+	var wg sync.WaitGroup
+	for i := range entries {
+		wg.Add(1)
+		go func(entry entmoot.RosterEntry) {
+			defer wg.Done()
+			if err := r.Apply(entry); err == nil {
+				accepted.Add(1)
+			} else if !errors.Is(err, entmoot.ErrRosterReject) {
+				t.Errorf("Apply unexpected error: %v", err)
+			}
+		}(entries[i])
+	}
+	wg.Wait()
+	if got := accepted.Load(); got != 1 {
+		t.Fatalf("accepted = %d, want 1", got)
+	}
+	wantHead := r.Head()
+	if err := r.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	reopened, err := OpenJSONL(dir, gid)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reopened.Close()
+	if reopened.Head() != wantHead || len(reopened.Entries()) != 2 {
+		t.Fatalf("reopened head/entries = (%s, %d), want (%s, 2)", reopened.Head(), len(reopened.Entries()), wantHead)
+	}
+}
+
+func TestPersistentWriterLeaseFailsPromptlyAndAllowsReaders(t *testing.T) {
+	dir := t.TempDir()
+	gid := testGroupID()
+	founder, founderInfo := newFounder(t, 100)
+	writer, err := OpenJSONL(dir, gid)
+	if err != nil {
+		t.Fatalf("OpenJSONL writer: %v", err)
+	}
+	if err := writer.Genesis(founder, founderInfo, 1_000); err != nil {
+		t.Fatalf("Genesis: %v", err)
+	}
+	reader, err := OpenJSONL(dir, gid)
+	if err != nil {
+		t.Fatalf("OpenJSONL reader: %v", err)
+	}
+	defer reader.Close()
+	if got, ok := reader.Founder(); !ok || got.PilotNodeID != founderInfo.PilotNodeID {
+		t.Fatalf("reader Founder = (%+v, %v)", got, ok)
+	}
+	start := time.Now()
+	if err := reader.ClaimWriter(); !errors.Is(err, ErrWriterActive) {
+		t.Fatalf("second ClaimWriter = %v, want ErrWriterActive", err)
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("second ClaimWriter blocked for %s", elapsed)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("writer Close: %v", err)
+	}
+}
+
+func TestLegacyImportRejectsTruncatedEntryAndPreservesSource(t *testing.T) {
+	dir := t.TempDir()
+	gid := testGroupID()
+	founder, founderInfo := newFounder(t, 100)
+	source := New(gid)
+	if err := source.Genesis(founder, founderInfo, 1_000); err != nil {
+		t.Fatalf("Genesis: %v", err)
+	}
+	encoded, err := canonical.Encode(source.Entries()[0])
+	if err != nil {
+		t.Fatalf("canonical.Encode: %v", err)
+	}
+	groupDir := filepath.Join(dir, "groups", encodeGroupDirName(gid))
+	if err := os.MkdirAll(groupDir, 0o700); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	path := filepath.Join(groupDir, rosterFileName)
+	if err := os.WriteFile(path, encoded, 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if _, err := OpenJSONL(dir, gid); err == nil || !strings.Contains(err.Error(), "truncated legacy log") {
+		t.Fatalf("OpenJSONL truncated error = %v", err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if !bytes.Equal(after, encoded) {
+		t.Fatal("truncated import changed source")
+	}
+}
+
+func TestLegacyImportRetainsExactSignedEntries(t *testing.T) {
+	dir := t.TempDir()
+	gid := testGroupID()
+	founder, founderInfo := newFounder(t, 100)
+	_, memberInfo := newFounder(t, 200)
+	source := New(gid)
+	if err := source.Genesis(founder, founderInfo, 1_000); err != nil {
+		t.Fatalf("Genesis: %v", err)
+	}
+	entry := mkEntry(t, source, founder, founderInfo.PilotNodeID, "add", memberInfo, 2_000,
+		[]entmoot.RosterEntryID{source.Head()})
+	if err := source.Apply(entry); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	groupDir := filepath.Join(dir, "groups", encodeGroupDirName(gid))
+	if err := os.MkdirAll(groupDir, 0o700); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	path := filepath.Join(groupDir, rosterFileName)
+	var original []byte
+	for _, item := range source.Entries() {
+		encoded, err := canonical.Encode(item)
+		if err != nil {
+			t.Fatalf("canonical.Encode: %v", err)
+		}
+		original = append(original, encoded...)
+		original = append(original, '\n')
+	}
+	if err := os.WriteFile(path, original, 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	imported, err := OpenJSONL(dir, gid)
+	if err != nil {
+		t.Fatalf("OpenJSONL import: %v", err)
+	}
+	defer imported.Close()
+	got := imported.Entries()
+	want := source.Entries()
+	if len(got) != len(want) {
+		t.Fatalf("imported entries = %d, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i].ID != want[i].ID || !bytes.Equal(got[i].Signature, want[i].Signature) {
+			t.Fatalf("entry %d changed across import", i)
+		}
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if !bytes.Equal(after, original) {
+		t.Fatal("valid import changed legacy source")
+	}
+}
+
+func TestPersistFailureDoesNotAdvanceProjection(t *testing.T) {
+	gid := testGroupID()
+	founder, founderInfo := newFounder(t, 100)
+	_, memberInfo := newFounder(t, 200)
+	r := New(gid)
+	if err := r.Genesis(founder, founderInfo, 1_000); err != nil {
+		t.Fatalf("Genesis: %v", err)
+	}
+	head := r.Head()
+	entry := mkEntry(t, r, founder, founderInfo.PilotNodeID, "add", memberInfo, 2_000,
+		[]entmoot.RosterEntryID{head})
+	r.persist = func(entmoot.RosterEntry) error { return errors.New("injected commit failure") }
+
+	if err := r.Apply(entry); err == nil || !strings.Contains(err.Error(), "injected commit failure") {
+		t.Fatalf("Apply error = %v, want injected failure", err)
+	}
+	if r.Head() != head || r.IsMemberID(*memberInfo.MemberID) || len(r.Entries()) != 1 {
+		t.Fatal("persist failure advanced in-memory roster")
+	}
+}
+
+func TestPersistentWriterLeaseAcrossProcesses(t *testing.T) {
+	if root := os.Getenv("ENTMOOT_ROSTER_LOCK_HELPER"); root != "" {
+		r, err := OpenJSONL(root, testGroupID())
+		if err != nil {
+			t.Fatalf("child OpenJSONL: %v", err)
+		}
+		defer r.Close()
+		if err := r.ClaimWriter(); err != nil {
+			t.Fatalf("child ClaimWriter: %v", err)
+		}
+		fmt.Fprintln(os.Stdout, "ready")
+		_, _ = bufio.NewReader(os.Stdin).ReadByte()
+		return
+	}
+
+	dir := t.TempDir()
+	gid := testGroupID()
+	founder, founderInfo := newFounder(t, 100)
+	seed, err := OpenJSONL(dir, gid)
+	if err != nil {
+		t.Fatalf("seed OpenJSONL: %v", err)
+	}
+	if err := seed.Genesis(founder, founderInfo, 1_000); err != nil {
+		t.Fatalf("seed Genesis: %v", err)
+	}
+	if err := seed.Close(); err != nil {
+		t.Fatalf("seed Close: %v", err)
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run=^TestPersistentWriterLeaseAcrossProcesses$")
+	cmd.Env = append(os.Environ(), "ENTMOOT_ROSTER_LOCK_HELPER="+dir)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatalf("StdoutPipe: %v", err)
+	}
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatalf("StdinPipe: %v", err)
+	}
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("Start child: %v", err)
+	}
+	t.Cleanup(func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+	})
+	line, err := bufio.NewReader(stdout).ReadString('\n')
+	if err != nil || strings.TrimSpace(line) != "ready" {
+		t.Fatalf("child ready = (%q, %v)", line, err)
+	}
+
+	reader, err := OpenJSONL(dir, gid)
+	if err != nil {
+		t.Fatalf("parent reader OpenJSONL: %v", err)
+	}
+	if err := reader.ClaimWriter(); !errors.Is(err, ErrWriterActive) {
+		t.Fatalf("parent ClaimWriter = %v, want ErrWriterActive", err)
+	}
+	_ = reader.Close()
+	if _, err := stdin.Write([]byte{'\n'}); err != nil {
+		t.Fatalf("release child: %v", err)
+	}
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("child Wait: %v", err)
 	}
 }
 
@@ -528,19 +924,24 @@ func mkGenesisEntry(
 // adopted from entry.Subject and membership reflects the founder.
 func TestAcceptGenesis_Valid(t *testing.T) {
 	t.Parallel()
-	id, info := newFounder(t, 100)
+	id, _ := newFounder(t, 100)
+	info := entmoot.NodeInfo{PilotNodeID: 100, EntmootPubKey: append([]byte(nil), id.PublicKey...)}
 	entry := mkGenesisEntry(t, id, info, 1_000)
 
 	r := New(testGroupID())
 	if err := r.AcceptGenesis(entry); err != nil {
 		t.Fatalf("AcceptGenesis: %v", err)
 	}
-	if !r.IsMember(100) {
-		t.Fatalf("expected founder to be a member after AcceptGenesis")
+	legacyMemberID, err := entmoot.MemberIDFromPublicKey(id.PublicKey)
+	if err != nil {
+		t.Fatal(err)
 	}
-	got := r.Members()
-	if len(got) != 1 || got[0] != 100 {
-		t.Fatalf("Members() = %v, want [100]", got)
+	if !r.IsMemberID(legacyMemberID) {
+		t.Fatalf("expected converted legacy founder to be a member after AcceptGenesis")
+	}
+	got := r.MemberIDs()
+	if len(got) != 1 || got[0] != legacyMemberID {
+		t.Fatalf("MemberIDs() = %v, want [%v]", got, legacyMemberID)
 	}
 	if r.Head() != entry.ID {
 		t.Fatalf("Head() = %x, want %x", r.Head(), entry.ID)

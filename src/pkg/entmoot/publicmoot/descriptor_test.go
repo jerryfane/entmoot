@@ -48,16 +48,6 @@ func TestVerifyRejectsTamperedDescriptor(t *testing.T) {
 	}
 }
 
-func TestVerifyRejectsWrongFounderKey(t *testing.T) {
-	id := mustPublicMootIdentity(t)
-	other := mustPublicMootIdentity(t)
-	desc := mustPublicMootSign(t, id, validPublicMootDescriptor())
-	desc.Founder.EntmootPubKey = append([]byte(nil), other.PublicKey...)
-	if err := Verify(desc); !errors.Is(err, ErrDescriptorSignature) {
-		t.Fatalf("Verify wrong founder key err = %v, want ErrDescriptorSignature", err)
-	}
-}
-
 func TestValidateRejectsNonPublicVisibility(t *testing.T) {
 	id := mustPublicMootIdentity(t)
 	for _, visibility := range []string{"private", "unlisted"} {

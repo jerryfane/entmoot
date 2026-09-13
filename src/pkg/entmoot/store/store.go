@@ -21,6 +21,7 @@ import (
 	"errors"
 
 	"entmoot/pkg/entmoot"
+	"entmoot/pkg/entmoot/merkle"
 )
 
 // ErrNotFound is returned by MessageStore.Get when the requested message id is
@@ -32,6 +33,10 @@ import (
 // a storage-layer concern, not a protocol-level one.
 var ErrNotFound = errors.New("store: message not found")
 
+// ErrPruned is returned by persistent stores when an exact message ID was
+// intentionally removed by retention and cannot be resurrected.
+var ErrPruned = errors.New("store: message was pruned")
+
 // TopicSummary is the storage-level aggregate for one message topic in a group.
 type TopicSummary struct {
 	Topic             string
@@ -42,18 +47,18 @@ type TopicSummary struct {
 // PageBoundary identifies the exclusive upper edge for older-history keyset
 // pagination in the same recency order used by Latest.
 type PageBoundary struct {
-	TimestampMS  int64
-	AuthorNodeID entmoot.NodeID
-	MessageID    entmoot.MessageID
+	TimestampMS    int64
+	AuthorMemberID entmoot.MemberID
+	MessageID      entmoot.MessageID
 }
 
 // MessageStore persists messages grouped by GroupID. All methods are safe for
 // concurrent use.
 type MessageStore interface {
-	// Put stores m. If a message with the same ID already exists, Put is a
-	// no-op and returns nil (idempotent). Returns a non-nil error if m is
-	// malformed (e.g., zero GroupID, zero ID).
-	Put(ctx context.Context, m entmoot.Message) error
+	// Put stores m for expectedGroup. It rejects a mismatch before touching
+	// storage. The returned bool reports whether this call inserted the
+	// message; duplicates return false, nil.
+	Put(ctx context.Context, expectedGroup entmoot.GroupID, m entmoot.Message) (inserted bool, err error)
 
 	// Get retrieves a message by id. Returns ErrNotFound if missing.
 	Get(ctx context.Context, groupID entmoot.GroupID, id entmoot.MessageID) (entmoot.Message, error)
@@ -68,7 +73,7 @@ type MessageStore interface {
 	Range(ctx context.Context, groupID entmoot.GroupID, sinceMillis, untilMillis int64) ([]entmoot.Message, error)
 
 	// Latest returns at most limit recent messages in groupID. The recency
-	// window is selected by descending (Timestamp, Author.PilotNodeID, ID), then
+	// window is selected by descending (Timestamp, Author MemberID, ID), then
 	// returned in topological order within that bounded window. A limit <= 0
 	// returns an empty slice.
 	Latest(ctx context.Context, groupID entmoot.GroupID, limit int) ([]entmoot.Message, error)
@@ -110,6 +115,73 @@ type MessageStore interface {
 	// Close releases any resources held by the store. For Memory this is a
 	// no-op; for JSONL it closes any open file handles.
 	Close() error
+}
+
+// RangeCursor is the exclusive keyset boundary for a stable message-id page.
+// All fields participate because timestamp alone is not unique.
+type RangeCursor struct {
+	TimestampMS    int64
+	AuthorMemberID entmoot.MemberID
+	ID             entmoot.MessageID
+}
+
+// MessageIDPage is one generation-bound page used by history synchronization.
+type MessageIDPage struct {
+	IDs             []entmoot.MessageID
+	Generation      uint64
+	Next            *RangeCursor
+	HasMore         bool
+	SnapshotChanged bool
+	CoverageFloorMS int64
+}
+
+// PagedMessageIDStore provides bounded, restartable history enumeration.
+type PagedMessageIDStore interface {
+	MessageIDsPage(ctx context.Context, groupID entmoot.GroupID, sinceMillis int64, after *RangeCursor, expectedGeneration uint64, limit int) (MessageIDPage, error)
+}
+
+// WindowedPagedMessageIDStore constrains enumeration to an explicit
+// [sinceMillis, untilMillis) coverage window.
+type WindowedPagedMessageIDStore interface {
+	MessageIDsPageWindow(ctx context.Context, groupID entmoot.GroupID, sinceMillis, untilMillis int64, after *RangeCursor, expectedGeneration uint64, limit int) (MessageIDPage, error)
+}
+
+// TombstoneStore reports exact IDs intentionally removed by retention.
+type TombstoneStore interface {
+	HasTombstone(ctx context.Context, groupID entmoot.GroupID, id entmoot.MessageID) (bool, error)
+}
+
+// CoverageStore reports the earliest timestamp for which a group claims
+// retained history coverage. Zero means no retention floor is known.
+type CoverageStore interface {
+	CoverageFloor(ctx context.Context, groupID entmoot.GroupID) (int64, error)
+}
+
+// CoverageFloor returns the store's retention floor, or zero for stores that
+// do not persist coverage metadata.
+func CoverageFloor(ctx context.Context, st MessageStore, groupID entmoot.GroupID) (int64, error) {
+	if covered, ok := st.(CoverageStore); ok {
+		return covered.CoverageFloor(ctx, groupID)
+	}
+	return 0, nil
+}
+
+// MerkleRootSince returns the deterministic root for messages at or after the
+// agreed retention floor. The full-history path retains the store's cached
+// MerkleRoot implementation.
+func MerkleRootSince(ctx context.Context, st MessageStore, groupID entmoot.GroupID, sinceMillis int64) ([32]byte, error) {
+	if sinceMillis <= 0 {
+		return st.MerkleRoot(ctx, groupID)
+	}
+	messages, err := st.Range(ctx, groupID, sinceMillis, 0)
+	if err != nil {
+		return [32]byte{}, err
+	}
+	ids := make([]entmoot.MessageID, len(messages))
+	for i := range messages {
+		ids[i] = messages[i].ID
+	}
+	return merkle.New(ids).Root(), nil
 }
 
 // RetentionPruner is implemented by stores that can remove old persisted
@@ -171,3 +243,11 @@ func isZeroMessageID(id entmoot.MessageID) bool {
 // ErrInvalidMessage is returned by Put when the supplied message is missing
 // required identifying fields (zero GroupID or zero ID).
 var ErrInvalidMessage = errors.New("store: invalid message")
+
+func messageMemberID(m entmoot.Message) entmoot.MemberID {
+	if m.Author.MemberID != nil {
+		return *m.Author.MemberID
+	}
+	memberID, _ := entmoot.MemberIDFromPublicKey(m.Author.EntmootPubKey)
+	return memberID
+}

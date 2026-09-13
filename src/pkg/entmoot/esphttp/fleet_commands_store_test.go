@@ -24,17 +24,19 @@ func TestSQLiteListFleetCommandsAgentFilterSortsByFilteredResult(t *testing.T) {
 			t.Fatalf("UpsertFleetCommand %s: %v", cmd.CommandID, err)
 		}
 	}
+	memberA := entmoot.MemberID{0xA1}
+	memberB := entmoot.MemberID{0xB2}
 	for _, result := range []FleetCommandResultEnvelope{
-		testFleetCommandResultEnvelope("cmd-global-newer", 45493, FleetCommandStatusCompleted, 200),
-		testFleetCommandResultEnvelope("cmd-global-newer", 45494, FleetCommandStatusFailed, 500),
-		testFleetCommandResultEnvelope("cmd-agent-newer", 45493, FleetCommandStatusCompleted, 300),
+		testFleetCommandResultEnvelope("cmd-global-newer", memberA, FleetCommandStatusCompleted, 200),
+		testFleetCommandResultEnvelope("cmd-global-newer", memberB, FleetCommandStatusFailed, 500),
+		testFleetCommandResultEnvelope("cmd-agent-newer", memberA, FleetCommandStatusCompleted, 300),
 	} {
 		if err := store.UpsertFleetCommandResult(ctx, result); err != nil {
-			t.Fatalf("UpsertFleetCommandResult %s/%d: %v", result.CommandID, result.AgentNodeID, err)
+			t.Fatalf("UpsertFleetCommandResult %s/%s: %v", result.CommandID, result.AgentMemberID, err)
 		}
 	}
 
-	commands, err := store.ListFleetCommands(ctx, "fleet-a", FleetCommandListFilter{AgentNodeID: 45493, Limit: 1})
+	commands, err := store.ListFleetCommands(ctx, "fleet-a", FleetCommandListFilter{AgentMemberID: memberA, Limit: 1})
 	if err != nil {
 		t.Fatalf("ListFleetCommands: %v", err)
 	}
@@ -44,7 +46,7 @@ func TestSQLiteListFleetCommandsAgentFilterSortsByFilteredResult(t *testing.T) {
 	if commands[0].Command.CommandID != "cmd-agent-newer" {
 		t.Fatalf("command = %s, want cmd-agent-newer", commands[0].Command.CommandID)
 	}
-	if commands[0].LatestResult == nil || commands[0].LatestResult.AgentNodeID != 45493 || commands[0].UpdatedAtMS != 300 {
+	if commands[0].LatestResult == nil || commands[0].LatestResult.AgentMemberID != memberA || commands[0].UpdatedAtMS != 300 {
 		t.Fatalf("filtered summary = %+v", commands[0])
 	}
 }
@@ -87,7 +89,7 @@ func testFleetCommandEnvelope(commandID string, createdAtMS int64) FleetCommandE
 		CommandID:      commandID,
 		FleetID:        "fleet-a",
 		ControlGroupID: entmoot.GroupID{0x94},
-		IssuerNodeID:   45491,
+		IssuerMemberID: entmoot.MemberID{0x91},
 		Target:         FleetCommandTarget{Kind: FleetCommandTargetAll},
 		Action:         FleetCommandActionEntmootInfo,
 		AutoAccept:     true,
@@ -96,13 +98,14 @@ func testFleetCommandEnvelope(commandID string, createdAtMS int64) FleetCommandE
 	}
 }
 
-func testFleetCommandResultEnvelope(commandID string, agentNodeID entmoot.NodeID, status string, completedAtMS int64) FleetCommandResultEnvelope {
+func testFleetCommandResultEnvelope(commandID string, agentMemberID entmoot.MemberID, status string, completedAtMS int64) FleetCommandResultEnvelope {
 	return FleetCommandResultEnvelope{
 		Type:          FleetCommandResultType,
 		Version:       1,
 		CommandID:     commandID,
 		FleetID:       "fleet-a",
-		AgentNodeID:   agentNodeID,
+		AgentMemberID: agentMemberID,
+		AgentPeerID:   "12D3KooWTestAgent",
 		Action:        FleetCommandActionEntmootInfo,
 		Status:        status,
 		Summary:       status,

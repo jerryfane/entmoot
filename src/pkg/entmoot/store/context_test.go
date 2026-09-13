@@ -41,7 +41,7 @@ func TestMessageContext(t *testing.T) {
 		newest := mkContextMsg(t, gid, author, 50, "newest", "ops")
 		otherTopic := mkContextMsg(t, gid, author, 60, "other topic", "chat")
 		for _, msg := range []entmoot.Message{newest, oldest, otherTopic, target, older, newer} {
-			if err := s.Put(ctx, msg); err != nil {
+			if _, err := s.Put(ctx, msg.GroupID, msg); err != nil {
 				t.Fatalf("Put: %v", err)
 			}
 		}
@@ -128,7 +128,7 @@ func TestMessageContextAtEdges(t *testing.T) {
 	middle := mkContextMsg(t, gid, author, 20, "middle")
 	newest := mkContextMsg(t, gid, author, 30, "newest")
 	for _, msg := range []entmoot.Message{middle, newest, oldest} {
-		if err := s.Put(ctx, msg); err != nil {
+		if _, err := s.Put(ctx, msg.GroupID, msg); err != nil {
 			t.Fatalf("Put: %v", err)
 		}
 	}

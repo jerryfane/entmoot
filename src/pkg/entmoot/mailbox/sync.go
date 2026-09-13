@@ -13,12 +13,12 @@ import (
 
 // SyncMessage is the mailbox/mobile JSON view of an Entmoot message.
 type SyncMessage struct {
-	MessageID   entmoot.MessageID `json:"message_id"`
-	GroupID     entmoot.GroupID   `json:"group_id"`
-	Author      uint32            `json:"author"`
-	Topics      []string          `json:"topic"`
-	Content     string            `json:"content"`
-	TimestampMS int64             `json:"timestamp_ms"`
+	MessageID      entmoot.MessageID `json:"message_id"`
+	GroupID        entmoot.GroupID   `json:"group_id"`
+	AuthorMemberID entmoot.MemberID  `json:"author_member_id"`
+	Topics         []string          `json:"topic"`
+	Content        string            `json:"content"`
+	TimestampMS    int64             `json:"timestamp_ms"`
 }
 
 // PullResult is returned by mailbox pull APIs.
@@ -273,10 +273,14 @@ func historyResultFromMessages(groupID entmoot.GroupID, msgs []entmoot.Message, 
 	}
 	if hasMore && len(selected) > 0 {
 		oldest := oldestByRecency(selected)
+		memberID := entmoot.MemberID{}
+		if oldest.Author.MemberID != nil {
+			memberID = *oldest.Author.MemberID
+		} else {
+			memberID, _ = entmoot.MemberIDFromPublicKey(oldest.Author.EntmootPubKey)
+		}
 		result.NextCursorBoundary = &store.PageBoundary{
-			TimestampMS:  oldest.Timestamp,
-			AuthorNodeID: oldest.Author.PilotNodeID,
-			MessageID:    oldest.ID,
+			TimestampMS: oldest.Timestamp, AuthorMemberID: memberID, MessageID: oldest.ID,
 		}
 	}
 	return result, nil
@@ -286,8 +290,9 @@ func messageNewerThan(a, b entmoot.Message) bool {
 	if a.Timestamp != b.Timestamp {
 		return a.Timestamp > b.Timestamp
 	}
-	if a.Author.PilotNodeID != b.Author.PilotNodeID {
-		return a.Author.PilotNodeID > b.Author.PilotNodeID
+	left, right := messageMemberID(a), messageMemberID(b)
+	if left != right {
+		return bytes.Compare(left[:], right[:]) > 0
 	}
 	return bytes.Compare(a.ID[:], b.ID[:]) > 0
 }
@@ -410,13 +415,15 @@ func MessagesView(msgs []entmoot.Message) []SyncMessage {
 
 // MessageView converts one Entmoot message into the mobile mailbox schema.
 func MessageView(m entmoot.Message) SyncMessage {
+	memberID := entmoot.MemberID{}
+	if m.Author.MemberID != nil {
+		memberID = *m.Author.MemberID
+	} else if derived, err := entmoot.MemberIDFromPublicKey(m.Author.EntmootPubKey); err == nil {
+		memberID = derived
+	}
 	return SyncMessage{
-		MessageID:   m.ID,
-		GroupID:     m.GroupID,
-		Author:      uint32(m.Author.PilotNodeID),
-		Topics:      normTopics(m.Topics),
-		Content:     string(m.Content),
-		TimestampMS: m.Timestamp,
+		MessageID: m.ID, GroupID: m.GroupID, AuthorMemberID: memberID,
+		Topics: normTopics(m.Topics), Content: string(m.Content), TimestampMS: m.Timestamp,
 	}
 }
 
@@ -433,4 +440,12 @@ func normTopics(t []string) []string {
 		return []string{}
 	}
 	return t
+}
+
+func messageMemberID(message entmoot.Message) entmoot.MemberID {
+	if message.Author.MemberID != nil {
+		return *message.Author.MemberID
+	}
+	memberID, _ := entmoot.MemberIDFromPublicKey(message.Author.EntmootPubKey)
+	return memberID
 }

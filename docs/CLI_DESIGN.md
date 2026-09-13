@@ -76,11 +76,13 @@ tasks/commands, `ENTMOOT_ENABLE_TASKS=1`.
 
 ## 3. Commands
 
-This is the complete agent-facing surface. Global flags are shared
-across all five: `-socket` (Pilot IPC socket, default `/tmp/pilot.sock`),
-`-identity` (Ed25519 identity file, default `~/.entmoot/identity.json`),
-`-data` (data root, default `~/.entmoot`), `-listen-port` (default
-`1004`), `-log-level` (default `info`).
+This is the complete agent-facing surface. Global flags are shared across all
+commands: `-identity` (Ed25519 identity file, default
+`~/.entmoot/identity.json`), `-data` (data root, default `~/.entmoot`),
+`-listen-port` (default `1004`), `-connectivity` (`direct` or `relay-only`),
+repeatable `-controlled-relay` multiaddrs, and `-log-level` (default `info`).
+Relay-only daemons do not open a direct listener and require at least one
+controlled relay multiaddr ending in `/p2p/<peer-id>`.
 
 `join`, `serve`, and (for live mode) `tail` hold a local control socket;
 `publish` dials it. `info` and `query` read SQLite directly and work
@@ -163,7 +165,9 @@ roster member whose Pilot key matches the roster.
 
 - Creates `~/.entmoot/` (mode 0700) if absent.
 - Creates `~/.entmoot/identity.json` (mode 0600) if absent.
-- Creates `~/.entmoot/groups/<gid>/` with `roster.jsonl`, `messages.jsonl`.
+- Creates `~/.entmoot/groups/<gid>/` with `roster.sqlite` and
+  `messages.sqlite`; an existing `roster.jsonl` remains as an immutable import
+  source.
 - Creates `~/.entmoot/control.sock` (mode 0600) for IPC.
 - Removes the control socket on clean shutdown.
 
@@ -285,8 +289,10 @@ entmootd publish -topic TOPICS (-content STRING|-file PATH| -file -) [-group GID
 
 **Blocking behavior**
 
-Exits immediately after the control-socket round-trip completes.
-Expected duration: well under a second.
+The local founder certifies its message immediately. A non-founder publish
+also makes one bounded round trip to the founder for an acceptance certificate,
+so it can fail when the founder is unreachable. The `-timeout` deadline covers
+both certification and the control-socket round trip.
 
 **Stdout**
 
@@ -312,6 +318,9 @@ One JSON object:
 
 - Appends the message to the running `join` process's MessageStore.
   No direct disk write from the `publish` process.
+- The stored and gossiped message includes the current roster head in the
+  author's signed bytes and a founder acceptance certificate. ESP clients that
+  create message-publish sign requests must supply that current `roster_head`.
 
 ---
 
@@ -864,16 +873,17 @@ require the requested `client_id` to be listed for that device.
   - If the body contains `{"message": ...}` with a fully signed Entmoot
     message, forwards it like `POST /v1/messages`.
   - Otherwise creates a `message_publish` sign request from the draft body.
-    The sign request exposes canonical signing metadata for the exact message
-    the phone must authorize:
+    The draft must include the current `roster_head`. The sign request exposes
+    canonical signing metadata for the exact message the phone must authorize:
 
     ```json
-    {"sign_request":{"id":"<id>","kind":"message_publish","group_id":"<base64>","payload":{"message":{"group_id":"<base64>","author":{"pilot_node_id":45491,"entmoot_pubkey":"<base64-ed25519-pubkey>"},"timestamp":1777392000000,"topics":["chat"],"content":"aGVsbG8="}},"signing_payload":"<base64 canonical message signing bytes>","signing_payload_sha256":"<sha256>","status":"pending"}}
+    {"sign_request":{"id":"<id>","kind":"message_publish","group_id":"<base64>","payload":{"message":{"id":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","version":2,"group_id":"<base64>","author":{"pilot_node_id":45491,"entmoot_pubkey":"<base64-ed25519-pubkey>"},"timestamp":1777392000000,"topics":["chat"],"content":"aGVsbG8=","roster_head":"<base64>"}},"signing_payload":"<base64 domain-separated message-v2 signing bytes>","signing_payload_sha256":"<sha256>","status":"pending"}}
     ```
 
-  - `payload` is draft/debug material for display and retry context. It is not
-    the signing payload. The phone base64-decodes `signing_payload` and signs
-    those bytes with the Entmoot author key.
+  - `payload` is draft/debug material for display and retry context. Its
+    all-zero `id` is the canonical signing placeholder, not the final message
+    id. The phone base64-decodes `signing_payload` and signs those exact bytes
+    with the Entmoot author key.
   - Supports `Idempotency-Key`.
 - `GET /v1/mailbox/pull?client_id=CLIENT&group_id=GID&limit=N`
   - Requires ESP auth.
@@ -898,12 +908,13 @@ require the requested `client_id` to be listed for that device.
   - Body contains a full already-signed Entmoot message:
 
     ```json
-    {"message":{"id":"<base64>","group_id":"<base64>","author":{"pilot_node_id":45491,"entmoot_pubkey":"<base64>"},"timestamp":1713369600000,"topics":["chat"],"content":"<base64>","signature":"<base64>"}}
+    {"message":{"id":"<base64>","version":2,"group_id":"<base64>","author":{"pilot_node_id":45491,"entmoot_pubkey":"<base64>"},"timestamp":1713369600000,"topics":["chat"],"content":"<base64>","roster_head":"<base64>","signature":"<base64>"}}
     ```
 
   - The ESP forwards the message to the running `join` daemon. The daemon
-    verifies current roster membership, signature, canonical message id,
-    then persists and gossips it through the normal publish path.
+    requires the current roster head, verifies current membership, author
+    signature, and canonical message id, obtains a founder acceptance
+    certificate, then persists and gossips the certified message.
   - Success returns `202 Accepted`:
 
     ```json
@@ -1009,12 +1020,17 @@ at any scale.
 
 ### 4.1 Layout
 
-One SQLite database per group, at
-`${data}/groups/<base64url(gid)>/messages.sqlite`. Separate files keep
-permissions, backup, and per-group encryption (a v2 concern) clean.
-The roster stays as `roster.jsonl` alongside; the roster is
-append-only, tiny, and easy to read with `cat`, so it doesn't benefit
-from moving.
+Each group uses `${data}/groups/<base64url(gid)>/messages.sqlite` for
+messages and `roster.sqlite` for the signed membership chain. Separate files
+keep permissions, backup, and transaction ownership clear. A legacy
+`roster.jsonl` alongside them is validated and imported once, then preserved
+unchanged for audit or explicit repair.
+
+New roster records use signed format version 2. The signature covers the
+domain `entmoot/roster-entry/v2`, group id, one-based sequence, operation,
+subject/policy, actor, timestamp, and parent. Legacy records omit the new
+fields and retain their exact historical signing bytes, IDs, and signatures;
+they are read-only until an authenticated upgrade checkpoint exists.
 
 ### 4.2 Schema
 
@@ -1043,15 +1059,54 @@ CREATE TABLE message_topics (
 CREATE INDEX idx_topic_lookup ON message_topics(topic, message_id);
 ```
 
+The roster database stores:
+
+```sql
+CREATE TABLE roster_meta (
+  group_id BLOB PRIMARY KEY,
+  version INTEGER NOT NULL,
+  head_id BLOB NOT NULL,
+  founder_node_id INTEGER NOT NULL,
+  founder_pubkey BLOB NOT NULL,
+  import_complete INTEGER NOT NULL
+);
+CREATE TABLE roster_entries (
+  entry_id BLOB PRIMARY KEY,
+  group_id BLOB NOT NULL,
+  sequence INTEGER NOT NULL,
+  parent_id BLOB,
+  canonical_bytes BLOB NOT NULL,
+  op TEXT NOT NULL,
+  actor_node_id INTEGER NOT NULL,
+  timestamp_ms INTEGER NOT NULL,
+  UNIQUE (group_id, sequence)
+);
+CREATE TABLE roster_members (
+  group_id BLOB NOT NULL,
+  node_id INTEGER NOT NULL,
+  pubkey BLOB NOT NULL,
+  active INTEGER NOT NULL,
+  last_entry_id BLOB NOT NULL,
+  PRIMARY KEY (group_id, node_id)
+);
+```
+
 FTS5 (full-text search) and `prune` (retention) are v2; the schema
 above is v1.
 
 ### 4.3 Concurrency model
 
-WAL mode. The `join` process writes on every `Put`; `query`, `info`,
-and `tail`'s backfill read with a shared lock. Reads never block
-writes and vice-versa under WAL. No cross-process locking beyond what
-SQLite provides.
+Both databases use WAL. The daemon owns each active group's nonblocking roster
+writer lease; separate handles and processes may read committed snapshots.
+Offline roster mutation is admitted only while that lease is free. Roster
+validation, entry/head/version persistence, and membership projection changes
+commit in one transaction before memory advances.
+
+Invite creation is founder-only and requires a group-bound v2 roster head.
+Join validates the complete fetched chain in temporary memory, matches the
+genesis founder key and identity to the signed invite, requires the advertised
+checkpoint on that chain, and checks issuer authorization there. A valid
+descendant head may be installed; validation failure installs nothing.
 
 ### 4.4 Integration with the rest of the system
 

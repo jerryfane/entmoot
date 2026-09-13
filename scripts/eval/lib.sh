@@ -106,9 +106,6 @@ eval_init_entmoot() {
   eval_require_command "$entmootd_bin"
 
   eval_entmoot_base=("$entmootd_bin")
-  if [[ -n "${PILOT_SOCKET:-}" ]]; then
-    eval_entmoot_base+=("-socket" "$PILOT_SOCKET")
-  fi
   if [[ -n "${ENTMOOT_IDENTITY:-}" ]]; then
     eval_entmoot_base+=("-identity" "$ENTMOOT_IDENTITY")
   fi

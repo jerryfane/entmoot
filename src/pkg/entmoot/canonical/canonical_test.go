@@ -2,6 +2,8 @@ package canonical
 
 import (
 	"bytes"
+	"crypto/ed25519"
+	"encoding/hex"
 	"testing"
 
 	"entmoot/pkg/entmoot"
@@ -86,12 +88,19 @@ func TestMessageIDFieldSensitivity(t *testing.T) {
 		t.Fatalf("Signature must not affect MessageID: got %x vs base %x", got, baseID)
 	}
 
+	mAcceptance := base
+	mAcceptance.Acceptance = &entmoot.MessageAcceptance{Version: 1, MessageID: entmoot.MessageID{9}}
+	if got := MessageID(mAcceptance); got != baseID {
+		t.Fatalf("Acceptance must not affect MessageID: got %x vs base %x", got, baseID)
+	}
+
 	// Every other field must affect it.
 	type mutation struct {
 		name  string
 		mutat func(*entmoot.Message)
 	}
 	mutations := []mutation{
+		{"Version", func(m *entmoot.Message) { m.Version = 2 }},
 		{"GroupID", func(m *entmoot.Message) { m.GroupID[0] ^= 0x55 }},
 		{"Author.PilotNodeID", func(m *entmoot.Message) { m.Author.PilotNodeID++ }},
 		{"Author.EntmootPubKey", func(m *entmoot.Message) {
@@ -109,6 +118,10 @@ func TestMessageIDFieldSensitivity(t *testing.T) {
 		}},
 		{"References", func(m *entmoot.Message) {
 			m.References = append(m.References, entmoot.MessageID{8})
+		}},
+		{"RosterHead", func(m *entmoot.Message) {
+			head := entmoot.RosterEntryID{9}
+			m.RosterHead = &head
 		}},
 	}
 	for _, mu := range mutations {
@@ -130,6 +143,60 @@ func TestMessageIDDeterministic(t *testing.T) {
 		if got := MessageID(m); got != first {
 			t.Fatalf("iteration %d: MessageID not stable", i)
 		}
+	}
+}
+
+func TestLegacyMessageSigningFixtureUnchanged(t *testing.T) {
+	seed := make([]byte, ed25519.SeedSize)
+	for i := range seed {
+		seed[i] = byte(i)
+	}
+	privateKey := ed25519.NewKeyFromSeed(seed)
+	publicKey := privateKey.Public().(ed25519.PublicKey)
+	var groupID entmoot.GroupID
+	for i := range groupID {
+		groupID[i] = byte(31 - i)
+	}
+	message := entmoot.Message{
+		GroupID:    groupID,
+		Author:     entmoot.NodeInfo{PilotNodeID: 42, EntmootPubKey: publicKey},
+		Timestamp:  1_700_000_000_123,
+		Topics:     []string{"chat/general"},
+		Parents:    []entmoot.MessageID{{1}},
+		Content:    []byte("legacy history"),
+		References: []entmoot.MessageID{{2}},
+	}
+	message.Acceptance = &entmoot.MessageAcceptance{
+		Version:    1,
+		GroupID:    groupID,
+		MessageID:  entmoot.MessageID{9},
+		RosterHead: entmoot.RosterEntryID{8},
+		Authority:  entmoot.NodeInfo{PilotNodeID: 7, EntmootPubKey: []byte{6}},
+		Signature:  []byte{5},
+	}
+	gotBytes, err := MessageSigningBytes(message)
+	if err != nil {
+		t.Fatalf("MessageSigningBytes: %v", err)
+	}
+	const wantBytes = `{"author":{"entmoot_pubkey":"A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=","pilot_node_id":42},"content":"bGVnYWN5IGhpc3Rvcnk=","group_id":"Hx4dHBsaGRgXFhUUExIREA8ODQwLCgkIBwYFBAMCAQA=","id":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","parents":["AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="],"references":["AgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="],"timestamp":1700000000123,"topics":["chat/general"]}`
+	if string(gotBytes) != wantBytes {
+		t.Fatalf("legacy signing bytes changed\nwant=%s\n got=%s", wantBytes, gotBytes)
+	}
+	wantID, err := hex.DecodeString("677e46b5bce9707712023f29929a4cb526e4a57b00e0873db864a6d91efcfedd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotID := MessageID(message)
+	if !bytes.Equal(gotID[:], wantID) {
+		t.Fatalf("legacy message id changed: %x", gotID[:])
+	}
+	wantSignature, err := hex.DecodeString("3bed74d9016664c473a7ef21009763833195439367f9560f1e4c9af312d01c7deb464fd99bd7a61b286495fd1b5512ee06becf3375c13feaabc1d071d9bbec0b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotSignature := ed25519.Sign(privateKey, gotBytes)
+	if !bytes.Equal(gotSignature, wantSignature) {
+		t.Fatalf("legacy message signature changed: %x", gotSignature)
 	}
 }
 
@@ -195,6 +262,46 @@ func TestRosterEntryIDDeterministic(t *testing.T) {
 	}
 }
 
+func TestLegacyRosterEntrySigningFixtureUnchanged(t *testing.T) {
+	entry := sampleRosterEntry()
+	gotBytes, err := RosterEntrySigningBytes(entry)
+	if err != nil {
+		t.Fatalf("RosterEntrySigningBytes: %v", err)
+	}
+	const wantBytes = `{"actor":42,"id":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","op":"add","parents":["AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","AgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="],"policy":{"admins":1},"subject":{"entmoot_pubkey":"yv66vg==","pilot_node_id":7},"timestamp":1700000000000}`
+	if string(gotBytes) != wantBytes {
+		t.Fatalf("legacy signing bytes changed\nwant=%s\n got=%s", wantBytes, gotBytes)
+	}
+	wantID, err := hex.DecodeString("806523f72f49705f5166908a7197cf69653944c8ce6beda932363dfd7883bdb0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotID := RosterEntryID(entry)
+	if !bytes.Equal(gotID[:], wantID) {
+		t.Fatalf("legacy roster id changed: %x", gotID)
+	}
+}
+
+func TestVersion2RosterEntryIDBindsGroupAndDomain(t *testing.T) {
+	entry := sampleRosterEntry()
+	entry.Version = 2
+	entry.Sequence = 7
+	groupA := entmoot.GroupID{1}
+	entry.GroupID = &groupA
+	idA := RosterEntryID(entry)
+	groupB := entmoot.GroupID{2}
+	entry.GroupID = &groupB
+	if idB := RosterEntryID(entry); idB == idA {
+		t.Fatal("version-2 roster id did not bind group_id")
+	}
+	entry.GroupID = &groupA
+	entry.Version = 0
+	entry.Sequence = 0
+	if legacyID := RosterEntryID(entry); legacyID == idA {
+		t.Fatal("version-2 roster id was not domain separated")
+	}
+}
+
 func sampleRosterEntry() entmoot.RosterEntry {
 	return entmoot.RosterEntry{
 		ID: entmoot.RosterEntryID{0xff, 0xee},
@@ -248,5 +355,15 @@ func cloneMessage(m entmoot.Message) entmoot.Message {
 	out.Content = append([]byte{}, m.Content...)
 	out.References = append([]entmoot.MessageID{}, m.References...)
 	out.Signature = append([]byte{}, m.Signature...)
+	if m.RosterHead != nil {
+		head := *m.RosterHead
+		out.RosterHead = &head
+	}
+	if m.Acceptance != nil {
+		acceptance := *m.Acceptance
+		acceptance.Authority.EntmootPubKey = append([]byte(nil), m.Acceptance.Authority.EntmootPubKey...)
+		acceptance.Signature = append([]byte(nil), m.Acceptance.Signature...)
+		out.Acceptance = &acceptance
+	}
 	return out
 }

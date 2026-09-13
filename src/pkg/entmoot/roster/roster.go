@@ -6,13 +6,13 @@
 // constraint means branches cannot arise — so Head() always refers to the
 // most-recently-applied entry.
 //
-// This package is independent of pkg/entmoot/store. Persistence is provided by
-// a parallel JSONL implementation (see jsonl.go) that deliberately does not
-// share code with the store package even though the two follow the same
-// append-only, base64url-named pattern on disk.
+// Persistence uses a dedicated transactional SQLite schema. Legacy JSONL logs
+// are validated as immutable import sources; they are never replayed
+// permissively or appended after migration.
 package roster
 
 import (
+	"bytes"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -29,6 +29,11 @@ const subscribeBufferCap = 16
 
 // RosterEvent is emitted on state-changing Apply calls — that is, on Genesis
 // and on every subsequent Apply that succeeds.
+
+// CurrentEntryVersion is the group-bound, domain-separated roster format used
+// for every newly signed entry.
+const CurrentEntryVersion uint8 = 2
+
 type RosterEvent struct {
 	// Entry is the roster entry that was just applied.
 	Entry entmoot.RosterEntry
@@ -37,11 +42,9 @@ type RosterEvent struct {
 	Heads []entmoot.RosterEntryID
 }
 
-// RosterLog is the in-memory projection of a single group's signed roster log.
-//
-// Concurrency: Apply is NOT safe for concurrent use (the caller must serialize
-// mutating calls). Read methods (IsMember, Members, MemberInfo, Head, Founder)
-// are safe for concurrent use; they take the read lock.
+// RosterLog is the concurrency-safe in-memory projection of a single group's
+// signed roster log. Mutation validation, durable commit, and projection
+// update are serialized under mu; read methods use the read lock.
 type RosterLog struct {
 	groupID entmoot.GroupID
 
@@ -53,6 +56,8 @@ type RosterLog struct {
 	byID map[entmoot.RosterEntryID]int
 	// members is the current membership projection.
 	members map[entmoot.NodeID]entmoot.NodeInfo
+	// membersByID is the Pilot-independent current membership projection.
+	membersByID map[entmoot.MemberID]entmoot.NodeInfo
 	// founder is set on Genesis; empty until then.
 	founder entmoot.NodeInfo
 	// head is the id of the most-recently-applied entry; zero on empty log.
@@ -62,19 +67,20 @@ type RosterLog struct {
 	subsMu sync.Mutex
 	sinks  map[*subscriber]struct{}
 
-	// persist is called after a successful Apply (including the Genesis
-	// entry). In-memory logs leave this nil. JSONL logs set it to append
-	// the entry to disk.
+	// persist commits one validated entry before the in-memory projection
+	// advances. Persistent logs store entries and projections transactionally.
 	persist func(entmoot.RosterEntry) error
+	// claimWriter acquires the persistent writer lease. In-memory logs leave it
+	// nil. Persistent logs acquire lazily for offline mutation; daemons call
+	// ClaimWriter during startup.
+	claimWriter func() error
 
-	// logger is used for subscribe-drop warnings and malformed-line skips
-	// (the latter only from the JSONL loader path).
+	// logger is used for subscribe-drop warnings.
 	logger *slog.Logger
 
-	// closeOnce guards Close so the file-handle teardown only runs once.
+	// closeOnce guards persistent handle and writer-lease teardown.
 	closeOnce sync.Once
-	// closeFn is set by OpenJSONL; nil for in-memory logs.
-	closeFn func() error
+	closeFn   func() error
 }
 
 // subscriber is one live subscription. cancel is idempotent.
@@ -91,12 +97,66 @@ type subscriber struct {
 // GroupID is accepted; it is the caller's responsibility to pass a real id.
 func New(groupID entmoot.GroupID) *RosterLog {
 	return &RosterLog{
-		groupID: groupID,
-		byID:    make(map[entmoot.RosterEntryID]int),
-		members: make(map[entmoot.NodeID]entmoot.NodeInfo),
-		sinks:   make(map[*subscriber]struct{}),
-		logger:  slog.Default(),
+		groupID:     groupID,
+		byID:        make(map[entmoot.RosterEntryID]int),
+		members:     make(map[entmoot.NodeID]entmoot.NodeInfo),
+		membersByID: make(map[entmoot.MemberID]entmoot.NodeInfo),
+		sinks:       make(map[*subscriber]struct{}),
+		logger:      slog.Default(),
 	}
+}
+
+// SignEntry builds a version-2 entry against the log's current head. Apply
+// still performs authoritative validation, so a concurrent mutation can make
+// the returned entry stale and safely reject it.
+func (r *RosterLog) SignEntry(
+	signer *keystore.Identity,
+	op string,
+	subject entmoot.NodeInfo,
+	policy []byte,
+	timestampMillis int64,
+) (entmoot.RosterEntry, error) {
+	if signer == nil {
+		return entmoot.RosterEntry{}, fmt.Errorf("roster: SignEntry requires a non-nil identity")
+	}
+	actorMemberID, err := entmoot.MemberIDFromPublicKey(signer.PublicKey)
+	if err != nil {
+		return entmoot.RosterEntry{}, fmt.Errorf("roster: derive signer member id: %w", err)
+	}
+	if op == "add" || op == "remove" {
+		if err := entmoot.ValidateOperationalMemberInfo(subject); err != nil {
+			return entmoot.RosterEntry{}, fmt.Errorf("roster: invalid subject identity: %w", err)
+		}
+	}
+	r.mu.RLock()
+	if len(r.entries) == 0 {
+		r.mu.RUnlock()
+		return entmoot.RosterEntry{}, fmt.Errorf("%w: SignEntry on empty log", entmoot.ErrRosterReject)
+	}
+	if r.entries[len(r.entries)-1].Version != CurrentEntryVersion {
+		r.mu.RUnlock()
+		return entmoot.RosterEntry{}, fmt.Errorf("%w: legacy roster requires an authenticated upgrade checkpoint", entmoot.ErrRosterReject)
+	}
+	groupID := r.groupID
+	entry := entmoot.RosterEntry{
+		Op:            op,
+		Subject:       subject,
+		Policy:        append([]byte(nil), policy...),
+		ActorMemberID: &actorMemberID,
+		Timestamp:     timestampMillis,
+		Parents:       []entmoot.RosterEntryID{r.head},
+		Version:       CurrentEntryVersion,
+		GroupID:       &groupID,
+		Sequence:      uint64(len(r.entries) + 1),
+	}
+	r.mu.RUnlock()
+	sigInput, err := canonical.RosterEntrySigningBytes(entry)
+	if err != nil {
+		return entmoot.RosterEntry{}, fmt.Errorf("roster: canonical encode for signing: %w", err)
+	}
+	entry.Signature = signer.Sign(sigInput)
+	entry.ID = canonical.RosterEntryID(entry)
+	return entry, nil
 }
 
 // Genesis writes the founder's self-signed add(founder) entry. It must be
@@ -112,41 +172,39 @@ func (r *RosterLog) Genesis(founder *keystore.Identity, founderInfo entmoot.Node
 	if founder == nil {
 		return fmt.Errorf("roster: Genesis requires a non-nil identity")
 	}
-	if len(founderInfo.EntmootPubKey) == 0 {
-		return fmt.Errorf("roster: Genesis requires founderInfo.EntmootPubKey")
+	if !bytes.Equal(founderInfo.EntmootPubKey, founder.PublicKey) {
+		return fmt.Errorf("roster: founder public key does not match signing identity")
 	}
-
-	r.mu.Lock()
-	if len(r.entries) != 0 {
-		r.mu.Unlock()
-		return fmt.Errorf("roster: Genesis called on non-empty log")
+	if err := entmoot.ValidateOperationalMemberInfo(founderInfo); err != nil {
+		return fmt.Errorf("roster: invalid founder identity: %w", err)
 	}
-	r.mu.Unlock()
-
+	groupID := r.groupID
 	entry := entmoot.RosterEntry{
-		Op:        "add",
-		Subject:   founderInfo,
-		Actor:     founderInfo.PilotNodeID,
-		Timestamp: timestampMillis,
-		Parents:   nil, // genesis has no parents
+		Op:            "add",
+		Subject:       founderInfo,
+		ActorMemberID: founderInfo.MemberID,
+		Timestamp:     timestampMillis,
+		Parents:       nil,
+		Version:       CurrentEntryVersion,
+		GroupID:       &groupID,
+		Sequence:      1,
 	}
-
-	sigInput, err := canonical.Encode(entry)
+	sigInput, err := canonical.RosterEntrySigningBytes(entry)
 	if err != nil {
 		return fmt.Errorf("roster: canonical encode for signing: %w", err)
 	}
 	entry.Signature = founder.Sign(sigInput)
 	entry.ID = canonical.RosterEntryID(entry)
 
-	// Persist before updating in-memory state so a write failure leaves the
-	// log untouched.
-	if r.persist != nil {
-		if err := r.persist(entry); err != nil {
-			return fmt.Errorf("roster: persist genesis: %w", err)
-		}
-	}
-
 	r.mu.Lock()
+	if len(r.entries) != 0 {
+		r.mu.Unlock()
+		return fmt.Errorf("roster: Genesis called on non-empty log")
+	}
+	if err := r.persistLocked(entry, "genesis"); err != nil {
+		r.mu.Unlock()
+		return err
+	}
 	r.founder = founderInfo
 	r.applyLocked(entry)
 	heads := []entmoot.RosterEntryID{r.head}
@@ -172,64 +230,18 @@ func (r *RosterLog) Genesis(founder *keystore.Identity, founderInfo entmoot.Node
 // mirrors the JSONL loader's first-entry path: the founder is adopted from
 // entry.Subject rather than being supplied separately by the caller.
 func (r *RosterLog) AcceptGenesis(entry entmoot.RosterEntry) error {
-	r.mu.RLock()
-	empty := len(r.entries) == 0
-	r.mu.RUnlock()
-	if !empty {
-		return fmt.Errorf("%w: AcceptGenesis on non-empty log", entmoot.ErrRosterReject)
-	}
-
-	// Well-formed genesis: add, no parents, Actor == Subject.PilotNodeID —
-	// that's how we recognize a self-signed genesis vs. a normal add.
-	if entry.Op != "add" {
-		return fmt.Errorf("%w: genesis op must be \"add\", got %q",
-			entmoot.ErrRosterReject, entry.Op)
-	}
-	if len(entry.Parents) != 0 {
-		return fmt.Errorf("%w: genesis must have no parents",
-			entmoot.ErrRosterReject)
-	}
-	if entry.Actor != entry.Subject.PilotNodeID {
-		return fmt.Errorf("%w: genesis must be self-signed (actor %d != subject %d)",
-			entmoot.ErrRosterReject, entry.Actor, entry.Subject.PilotNodeID)
-	}
-	if len(entry.Subject.EntmootPubKey) == 0 {
-		return fmt.Errorf("%w: genesis subject has no pubkey",
-			entmoot.ErrRosterReject)
-	}
-
-	// Verify the supplied id matches the canonical hash of the signing form.
-	if canonical.RosterEntryID(entry) != entry.ID {
-		return fmt.Errorf("%w: genesis entry id does not match canonical hash",
-			entmoot.ErrRosterReject)
-	}
-
-	// Verify the self-signature against the subject's pubkey.
-	signing := entry
-	signing.ID = entmoot.RosterEntryID{}
-	signing.Signature = nil
-	sigInput, err := canonical.Encode(signing)
-	if err != nil {
-		return fmt.Errorf("%w: canonical encode: %v", entmoot.ErrRosterReject, err)
-	}
-	if !keystore.Verify(entry.Subject.EntmootPubKey, sigInput, entry.Signature) {
-		return fmt.Errorf("%w: genesis signature does not verify",
-			entmoot.ErrRosterReject)
-	}
-
-	// Persist before updating in-memory state so a write failure leaves the
-	// log untouched. Matches Genesis semantics.
-	if r.persist != nil {
-		if err := r.persist(entry); err != nil {
-			return fmt.Errorf("roster: persist accepted genesis: %w", err)
-		}
-	}
-
 	r.mu.Lock()
-	// Re-check under the write lock in case a concurrent caller won the race.
 	if len(r.entries) != 0 {
 		r.mu.Unlock()
 		return fmt.Errorf("%w: AcceptGenesis on non-empty log", entmoot.ErrRosterReject)
+	}
+	if err := validateGenesis(entry, r.groupID); err != nil {
+		r.mu.Unlock()
+		return err
+	}
+	if err := r.persistLocked(entry, "accepted genesis"); err != nil {
+		r.mu.Unlock()
+		return err
 	}
 	r.founder = entry.Subject
 	r.applyLocked(entry)
@@ -256,17 +268,15 @@ func (r *RosterLog) AcceptGenesis(entry entmoot.RosterEntry) error {
 //
 // Apply does NOT check wire-layer replay windows — that is the caller's job.
 func (r *RosterLog) Apply(entry entmoot.RosterEntry) error {
-	if err := r.validate(entry); err != nil {
+	r.mu.Lock()
+	if err := r.validateLocked(entry); err != nil {
+		r.mu.Unlock()
 		return err
 	}
-
-	if r.persist != nil {
-		if err := r.persist(entry); err != nil {
-			return fmt.Errorf("roster: persist: %w", err)
-		}
+	if err := r.persistLocked(entry, "entry"); err != nil {
+		r.mu.Unlock()
+		return err
 	}
-
-	r.mu.Lock()
 	r.applyLocked(entry)
 	heads := []entmoot.RosterEntryID{r.head}
 	r.mu.Unlock()
@@ -275,10 +285,10 @@ func (r *RosterLog) Apply(entry entmoot.RosterEntry) error {
 	return nil
 }
 
-// validate performs every check required to accept entry. It returns a wrapped
-// entmoot.ErrRosterReject on any failure so callers can errors.Is against it.
-func (r *RosterLog) validate(entry entmoot.RosterEntry) error {
-	r.mu.RLock()
+// validateLocked performs every non-genesis acceptance check. r.mu must be
+// held for writing so validation and projection update share one critical
+// section.
+func (r *RosterLog) validateLocked(entry entmoot.RosterEntry) error {
 	founder := r.founder
 	head := r.head
 	var headTimestamp int64
@@ -286,7 +296,6 @@ func (r *RosterLog) validate(entry entmoot.RosterEntry) error {
 		headTimestamp = r.entries[len(r.entries)-1].Timestamp
 	}
 	empty := len(r.entries) == 0
-	r.mu.RUnlock()
 
 	if empty {
 		return fmt.Errorf("%w: Apply on empty log; call Genesis first", entmoot.ErrRosterReject)
@@ -298,9 +307,15 @@ func (r *RosterLog) validate(entry entmoot.RosterEntry) error {
 		return fmt.Errorf("%w: invalid op %q", entmoot.ErrRosterReject, entry.Op)
 	}
 
-	if entry.Actor != founder.PilotNodeID {
-		return fmt.Errorf("%w: actor %d is not founder %d",
-			entmoot.ErrRosterReject, entry.Actor, founder.PilotNodeID)
+	if entry.Version == 0 {
+		if entry.Actor != founder.PilotNodeID {
+			return fmt.Errorf("%w: legacy actor %d is not founder %d", entmoot.ErrRosterReject, entry.Actor, founder.PilotNodeID)
+		}
+	} else {
+		founderMemberID, err := entmoot.ResolvedMemberID(founder)
+		if err != nil || entry.ActorMemberID == nil || *entry.ActorMemberID != founderMemberID {
+			return fmt.Errorf("%w: actor member is not founder", entmoot.ErrRosterReject)
+		}
 	}
 
 	// Verify the id the caller supplied matches what we would compute.
@@ -309,12 +324,22 @@ func (r *RosterLog) validate(entry entmoot.RosterEntry) error {
 			entmoot.ErrRosterReject)
 	}
 
-	// Verify the signature against the founder's pubkey using the signing
-	// form (id/sig zeroed).
-	signing := entry
-	signing.ID = entmoot.RosterEntryID{}
-	signing.Signature = nil
-	sigInput, err := canonical.Encode(signing)
+	if err := validateEntryFormat(entry, r.groupID, uint64(len(r.entries)+1), r.entries[len(r.entries)-1].Version == 0); err != nil {
+		return err
+	}
+
+	if entry.Op == "add" && entry.Subject.MemberID != nil {
+		for _, member := range r.members {
+			if member.MemberID != nil && *member.MemberID == *entry.Subject.MemberID &&
+				!bytes.Equal(member.EntmootPubKey, entry.Subject.EntmootPubKey) {
+				return fmt.Errorf("%w: member id is already bound to another public key", entmoot.ErrRosterReject)
+			}
+		}
+	}
+
+	// Verify the signature against the founder's pubkey using the versioned
+	// signing form.
+	sigInput, err := canonical.RosterEntrySigningBytes(entry)
 	if err != nil {
 		return fmt.Errorf("%w: canonical encode: %v", entmoot.ErrRosterReject, err)
 	}
@@ -336,57 +361,205 @@ func (r *RosterLog) validate(entry entmoot.RosterEntry) error {
 	return nil
 }
 
+func validateGenesis(entry entmoot.RosterEntry, groupID entmoot.GroupID) error {
+	if entry.Op != "add" {
+		return fmt.Errorf("%w: genesis op must be \"add\", got %q", entmoot.ErrRosterReject, entry.Op)
+	}
+	if len(entry.Parents) != 0 {
+		return fmt.Errorf("%w: genesis must have no parents", entmoot.ErrRosterReject)
+	}
+	if entry.Version == 0 {
+		if entry.Actor != entry.Subject.PilotNodeID {
+			return fmt.Errorf("%w: legacy genesis actor is not subject", entmoot.ErrRosterReject)
+		}
+	} else if entry.ActorMemberID == nil || entry.Subject.MemberID == nil || *entry.ActorMemberID != *entry.Subject.MemberID {
+		return fmt.Errorf("%w: genesis actor member is not subject", entmoot.ErrRosterReject)
+	}
+	if len(entry.Subject.EntmootPubKey) == 0 {
+		return fmt.Errorf("%w: genesis subject has no pubkey", entmoot.ErrRosterReject)
+	}
+	if err := validateEntryFormat(entry, groupID, 1, true); err != nil {
+		return err
+	}
+	if canonical.RosterEntryID(entry) != entry.ID {
+		return fmt.Errorf("%w: genesis entry id does not match canonical hash", entmoot.ErrRosterReject)
+	}
+	sigInput, err := canonical.RosterEntrySigningBytes(entry)
+	if err != nil {
+		return fmt.Errorf("%w: canonical encode: %v", entmoot.ErrRosterReject, err)
+	}
+	if !keystore.Verify(entry.Subject.EntmootPubKey, sigInput, entry.Signature) {
+		return fmt.Errorf("%w: genesis signature does not verify", entmoot.ErrRosterReject)
+	}
+	return nil
+}
+
+func validateEntryFormat(entry entmoot.RosterEntry, groupID entmoot.GroupID, sequence uint64, allowLegacy bool) error {
+	switch entry.Version {
+	case 0:
+		if !allowLegacy {
+			return fmt.Errorf("%w: legacy entry cannot follow a version-2 entry", entmoot.ErrRosterReject)
+		}
+		if entry.GroupID != nil || entry.Sequence != 0 || entry.ActorMemberID != nil {
+			return fmt.Errorf("%w: legacy entry carries version-2 fields", entmoot.ErrRosterReject)
+		}
+		if entry.Subject.MemberID != nil {
+			return fmt.Errorf("%w: legacy entry carries member_id", entmoot.ErrRosterReject)
+		}
+	case CurrentEntryVersion:
+		if entry.GroupID == nil || *entry.GroupID != groupID {
+			return fmt.Errorf("%w: version-2 entry group_id mismatch", entmoot.ErrRosterReject)
+		}
+		if entry.Sequence != sequence {
+			return fmt.Errorf("%w: version-2 entry sequence %d, want %d", entmoot.ErrRosterReject, entry.Sequence, sequence)
+		}
+		if err := entmoot.ValidateMemberInfo(entry.Subject); err != nil {
+			return fmt.Errorf("%w: %v", entmoot.ErrRosterReject, err)
+		}
+		if entry.Op == "add" || entry.Op == "remove" {
+			if entry.Subject.MemberID == nil || entry.Subject.PeerID == "" || entry.Subject.PilotNodeID != 0 {
+				return fmt.Errorf("%w: version-2 roster member requires member_id and same-key peer_id", entmoot.ErrRosterReject)
+			}
+		}
+		if entry.ActorMemberID == nil || entry.Actor != 0 {
+			return fmt.Errorf("%w: version-2 entry has invalid actor identity", entmoot.ErrRosterReject)
+		}
+	default:
+		return fmt.Errorf("%w: unsupported roster entry version %d", entmoot.ErrRosterReject, entry.Version)
+	}
+	return nil
+}
+
+func (r *RosterLog) persistLocked(entry entmoot.RosterEntry, description string) error {
+	if r.claimWriter != nil {
+		if err := r.claimWriter(); err != nil {
+			return err
+		}
+	}
+	if r.persist != nil {
+		if err := r.persist(entry); err != nil {
+			return fmt.Errorf("roster: persist %s: %w", description, err)
+		}
+	}
+	return nil
+}
+
+// ClaimWriter acquires the persistent writer lease without mutating state.
+// Daemons use it at startup so a second process fails promptly; in-memory logs
+// always succeed.
+func (r *RosterLog) ClaimWriter() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.claimWriter == nil {
+		return nil
+	}
+	return r.claimWriter()
+}
+
 // applyLocked updates in-memory state for entry. Must be called with r.mu
 // held for writing. Does NOT emit events (callers do that after unlocking).
 func (r *RosterLog) applyLocked(entry entmoot.RosterEntry) {
-	r.byID[entry.ID] = len(r.entries)
-	r.entries = append(r.entries, entry)
-	r.head = entry.ID
-
-	switch entry.Op {
+	stored := cloneEntry(entry)
+	r.byID[stored.ID] = len(r.entries)
+	r.entries = append(r.entries, stored)
+	r.head = stored.ID
+	switch stored.Op {
 	case "add":
-		r.members[entry.Subject.PilotNodeID] = entry.Subject
+		projected := stored.Subject
+		memberID := stored.Subject.MemberID
+		if memberID == nil {
+			if derived, err := entmoot.MemberIDFromPublicKey(stored.Subject.EntmootPubKey); err == nil {
+				memberID = &derived
+				projected.MemberID = &derived
+			}
+		}
+		if memberID != nil {
+			r.membersByID[*memberID] = projected
+		}
+		if stored.Subject.PilotNodeID != 0 || stored.Subject.MemberID == nil {
+			r.members[stored.Subject.PilotNodeID] = stored.Subject
+		}
 	case "remove":
-		delete(r.members, entry.Subject.PilotNodeID)
+		memberID := stored.Subject.MemberID
+		if memberID == nil {
+			if derived, err := entmoot.MemberIDFromPublicKey(stored.Subject.EntmootPubKey); err == nil {
+				memberID = &derived
+			}
+		}
+		if memberID != nil {
+			delete(r.membersByID, *memberID)
+		}
+		if stored.Subject.PilotNodeID != 0 || stored.Subject.MemberID == nil {
+			delete(r.members, stored.Subject.PilotNodeID)
+		}
 	case "policy_change":
-		// v0 does not project policy_change into membership state.
+		// Policy changes do not alter the membership projection.
 	}
 }
 
-// IsMember reports whether nodeID is currently a member of the group.
-func (r *RosterLog) IsMember(nodeID entmoot.NodeID) bool {
+// IsMemberID reports whether the full-width identity is a current member.
+func (r *RosterLog) IsMemberID(memberID entmoot.MemberID) bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	_, ok := r.members[nodeID]
+	_, ok := r.membersByID[memberID]
 	return ok
 }
 
-// Members returns the current members as a slice of NodeIDs sorted ascending.
-func (r *RosterLog) Members() []entmoot.NodeID {
-	r.mu.RLock()
-	out := make([]entmoot.NodeID, 0, len(r.members))
-	for id := range r.members {
-		out = append(out, id)
-	}
-	r.mu.RUnlock()
-	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
-	return out
-}
-
-// MemberInfo returns the NodeInfo for nodeID, or (zero, false) if not a
-// current member. The NodeInfo carries the EntmootPubKey used to verify
-// message signatures authored by that member.
-func (r *RosterLog) MemberInfo(nodeID entmoot.NodeID) (entmoot.NodeInfo, bool) {
+// MemberInfoByID returns an independent copy of the full-width member record.
+func (r *RosterLog) MemberInfoByID(memberID entmoot.MemberID) (entmoot.NodeInfo, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	info, ok := r.members[nodeID]
+	info, ok := r.membersByID[memberID]
 	if !ok {
 		return entmoot.NodeInfo{}, false
 	}
-	// Copy the pubkey so callers can't mutate internal state.
-	out := info
-	out.EntmootPubKey = append([]byte(nil), info.EntmootPubKey...)
-	return out, true
+	return cloneNodeInfo(info), true
+}
+
+// MemberIDs returns the current full-width members sorted lexicographically.
+func (r *RosterLog) MemberIDs() []entmoot.MemberID {
+	r.mu.RLock()
+	out := make([]entmoot.MemberID, 0, len(r.membersByID))
+	for id := range r.membersByID {
+		out = append(out, id)
+	}
+	r.mu.RUnlock()
+	sort.Slice(out, func(i, j int) bool {
+		return bytes.Compare(out[i][:], out[j][:]) < 0
+	})
+	return out
+}
+
+// MemberInfoAtID resolves a full-width identity in the membership projection
+// at head. The third result distinguishes a known head from an unresolved hash.
+func (r *RosterLog) MemberInfoAtID(memberID entmoot.MemberID, head entmoot.RosterEntryID) (entmoot.NodeInfo, bool, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	index, known := r.byID[head]
+	if !known {
+		return entmoot.NodeInfo{}, false, false
+	}
+	for i := index; i >= 0; i-- {
+		entry := r.entries[i]
+		if entry.Subject.MemberID == nil || *entry.Subject.MemberID != memberID {
+			continue
+		}
+		switch entry.Op {
+		case "remove":
+			return entmoot.NodeInfo{}, false, true
+		case "add":
+			return cloneNodeInfo(entry.Subject), true, true
+		}
+	}
+	return entmoot.NodeInfo{}, false, true
+}
+
+// HasEntry reports whether id is on this log's accepted linear chain.
+func (r *RosterLog) HasEntry(id entmoot.RosterEntryID) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	_, ok := r.byID[id]
+	return ok
 }
 
 // Head returns the id of the current head entry, or the zero id if the log is
@@ -397,27 +570,68 @@ func (r *RosterLog) Head() entmoot.RosterEntryID {
 	return r.head
 }
 
-// Founder returns the founder's NodeInfo, as recorded by Genesis. Returns
-// (zero, false) if the log is empty.
+// HeadIsGroupBound reports whether the current head is a version-2 entry
+// signed for this log's group.
+func (r *RosterLog) HeadIsGroupBound() bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if len(r.entries) == 0 {
+		return false
+	}
+	head := r.entries[len(r.entries)-1]
+	return head.Version == CurrentEntryVersion && head.GroupID != nil && *head.GroupID == r.groupID
+}
+
+// Founder returns the founder identity projected to MemberID. Immutable legacy
+// genesis bytes remain untouched; callers receive the same-key operational
+// identity.
 func (r *RosterLog) Founder() (entmoot.NodeInfo, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	if len(r.entries) == 0 {
 		return entmoot.NodeInfo{}, false
 	}
-	out := r.founder
-	out.EntmootPubKey = append([]byte(nil), r.founder.EntmootPubKey...)
-	return out, true
+	founder := cloneNodeInfo(r.founder)
+	if founder.MemberID == nil {
+		if memberID, err := entmoot.MemberIDFromPublicKey(founder.EntmootPubKey); err == nil {
+			founder.MemberID = &memberID
+		}
+	}
+	return founder, true
 }
 
-// Entries returns a copy of the entry slice in apply order. Useful for the
-// wire layer's roster_resp payload and for offline diagnostics. The returned
-// slice does not share the underlying storage; callers may mutate it freely.
+// Entries returns a deep copy of the entry slice in apply order. Useful for
+// wire responses and offline diagnostics.
 func (r *RosterLog) Entries() []entmoot.RosterEntry {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	out := make([]entmoot.RosterEntry, len(r.entries))
-	copy(out, r.entries)
+	for i := range r.entries {
+		out[i] = cloneEntry(r.entries[i])
+	}
+	return out
+}
+
+func cloneNodeInfo(info entmoot.NodeInfo) entmoot.NodeInfo {
+	out := info
+	out.EntmootPubKey = append([]byte(nil), info.EntmootPubKey...)
+	if info.MemberID != nil {
+		memberID := *info.MemberID
+		out.MemberID = &memberID
+	}
+	return out
+}
+
+func cloneEntry(entry entmoot.RosterEntry) entmoot.RosterEntry {
+	out := entry
+	out.Subject = cloneNodeInfo(entry.Subject)
+	out.Policy = append([]byte(nil), entry.Policy...)
+	out.Parents = append([]entmoot.RosterEntryID(nil), entry.Parents...)
+	out.Signature = append([]byte(nil), entry.Signature...)
+	if entry.GroupID != nil {
+		groupID := *entry.GroupID
+		out.GroupID = &groupID
+	}
 	return out
 }
 
@@ -478,12 +692,13 @@ func (r *RosterLog) emit(ev RosterEvent) {
 	}
 }
 
-// Close releases resources held by the log. For in-memory logs it is a no-op.
-// For JSONL-backed logs it closes the append file handle. Safe to call
-// multiple times.
+// Close releases persistent resources and any writer lease. It serializes
+// with mutation and is safe to call multiple times.
 func (r *RosterLog) Close() error {
 	var err error
 	r.closeOnce.Do(func() {
+		r.mu.Lock()
+		defer r.mu.Unlock()
 		if r.closeFn != nil {
 			err = r.closeFn()
 		}

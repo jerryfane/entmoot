@@ -15,7 +15,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"time"
 
 	entfeatures "entmoot/pkg/entmoot/features"
 )
@@ -33,25 +32,15 @@ const (
 // globalFlags is the set of flags shared by every subcommand. Populated by
 // the top-level FlagSet before dispatch.
 type globalFlags struct {
-	socket             string
-	identity           string
-	data               string
-	listenPort         uint
-	logLevel           string
-	pilotWaitTimeout   time.Duration
-	pilotWaitBaseDelay time.Duration
-	pilotWaitMaxDelay  time.Duration
-	// hideIP (v1.4.0) toggles the gossiper's transport-ad advertiser
-	// into relay-only mode: UDP/TCP endpoints from Pilot are
-	// suppressed and only the TURN relay endpoint is published.
-	// Defaults to false (normal advertisement). Only join honours it
-	// today — other subcommands are read-only. See the HideIP
-	// comment on gossip.Config for semantics and jf.8+ requirement.
-	hideIP bool
-
-	traceGossipTransport bool
-	traceReconcile       bool
-	features             entfeatures.Flags
+	identity         string
+	data             string
+	allowNewIdentity bool
+	listenPort       uint
+	logLevel         string
+	traceReconcile   bool
+	connectivity     string
+	controlledRelays stringListFlag
+	features         entfeatures.Flags
 }
 
 func main() {
@@ -67,14 +56,14 @@ func run() int {
 		fmt.Fprintln(os.Stderr, "Usage: entmootd [flags] <subcommand> [args]")
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "Agent subcommands:")
-		fmt.Fprintln(os.Stderr, "  join [--serve] <invite> [invite...]")
-		fmt.Fprintln(os.Stderr, "                          Join from signed invite(s) or open-invite link/descriptor(s).")
+		fmt.Fprintln(os.Stderr, "  join [--serve] <bootstrap-capability> [capability...]")
+		fmt.Fprintln(os.Stderr, "                          Enroll using target-bound capabilities or open-invite descriptors.")
 		fmt.Fprintln(os.Stderr, "  serve [-group GID...]")
 		fmt.Fprintln(os.Stderr, "                          Restart joined groups from persistent local state.")
 		fmt.Fprintln(os.Stderr, "  publish -topic T (-content S|-file PATH| -file -) [-group GID]")
 		fmt.Fprintln(os.Stderr, "                          Author and gossip a message via the control socket.")
 		fmt.Fprintln(os.Stderr, "  doctor [-group GID] [--probe] [--json]")
-		fmt.Fprintln(os.Stderr, "                          Diagnose local Pilot, daemon, groups, and peer route state.")
+		fmt.Fprintln(os.Stderr, "                          Diagnose local libp2p identity, groups, and peer bindings.")
 		fmt.Fprintln(os.Stderr, "  peers -group GID [--probe] [--json]")
 		fmt.Fprintln(os.Stderr, "                          Print a compact peer health table for one group.")
 		fmt.Fprintln(os.Stderr, "  env [--json]")
@@ -122,23 +111,16 @@ func run() int {
 	}
 
 	gf := &globalFlags{}
-	fs.StringVar(&gf.socket, "socket", "/tmp/pilot.sock", "Pilot daemon IPC socket path")
 	fs.StringVar(&gf.identity, "identity", "~/.entmoot/identity.json", "Entmoot identity file")
 	fs.StringVar(&gf.data, "data", defaultEntmootDataDir, "Entmoot data root")
+	fs.BoolVar(&gf.allowNewIdentity, "allow-new-identity", false,
+		"allow first-time Entmoot identity creation when the identity file is absent")
 	fs.UintVar(&gf.listenPort, "listen-port", 1004, "Entmoot listen port")
 	fs.StringVar(&gf.logLevel, "log-level", "info", "slog level: debug|info|warn|error")
-	fs.DurationVar(&gf.pilotWaitTimeout, "pilot-wait-timeout", 45*time.Second,
-		"maximum time join waits for pilot-daemon IPC/listen readiness; 0 disables waiting")
-	fs.DurationVar(&gf.pilotWaitBaseDelay, "pilot-wait-base-delay", 250*time.Millisecond,
-		"initial retry delay while waiting for pilot-daemon readiness")
-	fs.DurationVar(&gf.pilotWaitMaxDelay, "pilot-wait-max-delay", 3*time.Second,
-		"maximum retry delay while waiting for pilot-daemon readiness")
-	fs.BoolVar(&gf.hideIP, "hide-ip", false,
-		"suppress UDP/TCP endpoint advertisement; publish only TURN relay (v1.4.0; requires pilot-daemon v1.9.0-jf.8+)")
-	fs.BoolVar(&gf.traceGossipTransport, "trace-gossip-transport", false,
-		"emit verbose Pilot gossip transport lifecycle traces")
 	fs.BoolVar(&gf.traceReconcile, "trace-reconcile", false,
 		"emit verbose reconcile lifecycle traces")
+	fs.StringVar(&gf.connectivity, "connectivity", "direct", "connectivity profile: direct|relay-only")
+	fs.Var(&gf.controlledRelays, "controlled-relay", "controlled Circuit Relay v2 multiaddr ending in /p2p/<peer-id>; repeatable")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		if errors.Is(err, flag.ErrHelp) {

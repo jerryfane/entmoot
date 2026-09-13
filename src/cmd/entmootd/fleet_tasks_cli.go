@@ -21,26 +21,38 @@ import (
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/esphttp"
 	"entmoot/pkg/entmoot/keystore"
+	libp2ptransport "entmoot/pkg/entmoot/transport/libp2p"
 )
 
 type fleetTasksFlags struct {
-	espURL string
-	fleet  string
-	group  string
-	status string
-	task   string
-	title  string
-	desc   string
-	mode   string
-	nodeID uint64
-	text   string
+	espURL           string
+	fleet            string
+	group            string
+	status           string
+	task             string
+	title            string
+	desc             string
+	mode             string
+	assigneeMemberID entmoot.MemberID
+	text             string
 }
 
 type fleetTasksClient struct {
 	baseURL  *url.URL
-	nodeID   entmoot.NodeID
+	memberID entmoot.MemberID
+	peerID   string
 	identity *keystore.Identity
 	client   *http.Client
+}
+
+func decodeMemberIDFlag(raw string, memberID *entmoot.MemberID) error {
+	if err := json.Unmarshal([]byte(strconv.Quote(strings.TrimSpace(raw))), memberID); err != nil {
+		return err
+	}
+	if *memberID == (entmoot.MemberID{}) {
+		return errors.New("member id must not be zero")
+	}
+	return nil
 }
 
 func cmdFleetTasks(gf *globalFlags, args []string) int {
@@ -112,12 +124,18 @@ func cmdFleetTasksCreate(gf *globalFlags, args []string) int {
 	fs.StringVar(&cfg.title, "title", "", "task title")
 	fs.StringVar(&cfg.desc, "description", "", "task description")
 	fs.StringVar(&cfg.mode, "mode", esphttp.FleetTaskModeOpenSubmission, "task mode: open_submission, first_claim, or direct_assignee")
-	fs.Uint64Var(&cfg.nodeID, "assignee-node-id", 0, "active member node id for direct tasks")
+	fs.Func("assignee-member-id", "full-width member id for direct tasks", func(raw string) error {
+		return decodeMemberIDFlag(raw, &cfg.assigneeMemberID)
+	})
 	if code, ok := parseFleetTasksFlags(fs, args); !ok {
 		return code
 	}
 	if strings.TrimSpace(cfg.title) == "" {
 		fmt.Fprintln(os.Stderr, "fleet tasks create: -title is required")
+		return exitInvalidArgument
+	}
+	if cfg.mode == esphttp.FleetTaskModeDirectAssignment && cfg.assigneeMemberID == (entmoot.MemberID{}) {
+		fmt.Fprintln(os.Stderr, "fleet tasks create: -assignee-member-id is required for direct_assignee")
 		return exitInvalidArgument
 	}
 	client, fleetID, code, ok := prepareFleetTasksClient(gf, cfg)
@@ -129,8 +147,8 @@ func cmdFleetTasksCreate(gf *globalFlags, args []string) int {
 		"description": cfg.desc,
 		"mode":        cfg.mode,
 	}
-	if cfg.nodeID != 0 {
-		body["assignee_node_id"] = cfg.nodeID
+	if cfg.assigneeMemberID != (entmoot.MemberID{}) {
+		body["assignee_member_id"] = cfg.assigneeMemberID
 	}
 	path := "/v1/fleets/" + url.PathEscape(fleetID) + "/tasks"
 	return client.doAndPrint(context.Background(), http.MethodPost, path, nil, body, randomIdempotencyKey("fleet-task-create"))
@@ -140,7 +158,9 @@ func cmdFleetTasksMutate(gf *globalFlags, action string, args []string) int {
 	fs, cfg := newFleetTasksFlagSet("fleet tasks " + action)
 	fs.StringVar(&cfg.task, "task", "", "task id")
 	if action == esphttp.FleetTaskActionAssign {
-		fs.Uint64Var(&cfg.nodeID, "assignee-node-id", 0, "active member node id")
+		fs.Func("assignee-member-id", "full-width active member id", func(raw string) error {
+			return decodeMemberIDFlag(raw, &cfg.assigneeMemberID)
+		})
 	}
 	if action == esphttp.FleetTaskActionSubmit {
 		fs.StringVar(&cfg.text, "content", "", "submission content")
@@ -155,11 +175,11 @@ func cmdFleetTasksMutate(gf *globalFlags, action string, args []string) int {
 	body := map[string]any{}
 	switch action {
 	case esphttp.FleetTaskActionAssign:
-		if cfg.nodeID == 0 {
-			fmt.Fprintln(os.Stderr, "fleet tasks assign: -assignee-node-id is required")
+		if cfg.assigneeMemberID == (entmoot.MemberID{}) {
+			fmt.Fprintln(os.Stderr, "fleet tasks assign: -assignee-member-id is required")
 			return exitInvalidArgument
 		}
-		body["assignee_node_id"] = cfg.nodeID
+		body["assignee_member_id"] = cfg.assigneeMemberID
 	case esphttp.FleetTaskActionSubmit:
 		if strings.TrimSpace(cfg.text) == "" {
 			fmt.Fprintln(os.Stderr, "fleet tasks submit: -content is required")
@@ -234,19 +254,15 @@ func newFleetTasksClient(gf *globalFlags, rawBase string) (*fleetTasksClient, in
 		slog.Error("fleet tasks: setup", slog.String("err", err.Error()))
 		return nil, exitTransport, false
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	info, err := infoOverIPCContext(ctx, controlSocketPath(gf.data))
-	if err != nil || info.PilotNodeID == 0 {
-		if err == nil {
-			err = errors.New("running daemon did not report a Pilot node id")
-		}
-		fmt.Fprintf(os.Stderr, "fleet tasks: running Entmoot daemon with Pilot identity is required: %v\n", err)
+	binding, err := libp2ptransport.BindingFromPublicKey(setupRes.identity.PublicKey)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "fleet tasks: local identity: %v\n", err)
 		return nil, exitTransport, false
 	}
 	return &fleetTasksClient{
 		baseURL:  base,
-		nodeID:   info.PilotNodeID,
+		memberID: binding.MemberID,
+		peerID:   binding.PeerID.String(),
 		identity: setupRes.identity,
 		client:   &http.Client{Timeout: 30 * time.Second},
 	}, exitOK, true
@@ -347,8 +363,9 @@ func (c *fleetTasksClient) newRequest(ctx context.Context, method, path string, 
 	}
 	timestampMS := time.Now().UnixMilli()
 	nonce := randomNonce()
-	input := esphttp.MemberSigningInput(method, req.URL.RequestURI(), c.nodeID, c.identity.PublicKey, timestampMS, nonce, data)
-	req.Header.Set("X-Entmoot-Member-Node-ID", strconv.FormatUint(uint64(c.nodeID), 10))
+	input := esphttp.MemberSigningInput(method, req.URL.RequestURI(), c.memberID, c.peerID, c.identity.PublicKey, timestampMS, nonce, data)
+	req.Header.Set("X-Entmoot-Member-ID", c.memberID.String())
+	req.Header.Set("X-Entmoot-Peer-ID", c.peerID)
 	req.Header.Set("X-Entmoot-Member-Pubkey", base64.StdEncoding.EncodeToString(c.identity.PublicKey))
 	req.Header.Set("X-Entmoot-Timestamp-Ms", strconv.FormatInt(timestampMS, 10))
 	req.Header.Set("X-Entmoot-Nonce", nonce)

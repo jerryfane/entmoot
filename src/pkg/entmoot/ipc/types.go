@@ -63,10 +63,6 @@ const (
 	MsgInviteAuthorityCheckReq MsgType = 0x1E
 	// MsgInviteAuthorityCheckResp acknowledges local invite authority.
 	MsgInviteAuthorityCheckResp MsgType = 0x20
-	// MsgDiagProbeReq asks the running daemon to probe peers for one group.
-	MsgDiagProbeReq MsgType = 0x21
-	// MsgDiagProbeResp returns per-peer probe results.
-	MsgDiagProbeResp MsgType = 0x22
 	// MsgGroupDeactivateReq asks the daemon to stop a group session without
 	// changing roster membership.
 	MsgGroupDeactivateReq MsgType = 0x23
@@ -113,10 +109,6 @@ func (t MsgType) String() string {
 		return "invite_authority_check_req"
 	case MsgInviteAuthorityCheckResp:
 		return "invite_authority_check_resp"
-	case MsgDiagProbeReq:
-		return "diag_probe_req"
-	case MsgDiagProbeResp:
-		return "diag_probe_resp"
 	case MsgGroupDeactivateReq:
 		return "group_deactivate_req"
 	case MsgGroupDeactivateResp:
@@ -168,31 +160,21 @@ type SignedPublishReq struct {
 
 // SignedPublishResp acknowledges a successfully accepted signed message.
 type SignedPublishResp struct {
-	Status      string            `json:"status"`
-	MessageID   entmoot.MessageID `json:"message_id"`
-	GroupID     entmoot.GroupID   `json:"group_id"`
-	Author      entmoot.NodeID    `json:"author"`
-	TimestampMS int64             `json:"timestamp_ms"`
+	Status         string            `json:"status"`
+	MessageID      entmoot.MessageID `json:"message_id"`
+	GroupID        entmoot.GroupID   `json:"group_id"`
+	AuthorMemberID entmoot.MemberID  `json:"author_member_id"`
+	TimestampMS    int64             `json:"timestamp_ms"`
 }
 
-// JoinGroupReq carries either a signed invite or an open-invite descriptor to
-// the running daemon. The daemon resolves and joins through the same gossip
-// bootstrap path as startup join.
+// JoinGroupReq carries a target-bound bootstrap capability or requests
+// activation of a group already enrolled in persistent local state.
 type JoinGroupReq struct {
-	Invite        entmoot.Invite    `json:"invite,omitempty"`
-	OpenInvite    *OpenInviteJoin   `json:"open_invite,omitempty"`
-	GroupMetadata json.RawMessage   `json:"group_metadata,omitempty"`
-	GroupPolicy   *entpolicy.Policy `json:"group_policy,omitempty"`
-	TimeoutMS     int64             `json:"timeout_ms,omitempty"`
-}
-
-// OpenInviteJoin describes an open invite that must be redeemed by the daemon
-// using the daemon's Entmoot identity and Pilot socket.
-type OpenInviteJoin struct {
-	IssuerURL       string            `json:"issuer_url"`
-	Token           string            `json:"token"`
-	ExpectedGroupID *entmoot.GroupID  `json:"expected_group_id,omitempty"`
-	ExpectedIssuer  *entmoot.NodeInfo `json:"expected_issuer,omitempty"`
+	Capability    *entmoot.BootstrapCapability `json:"capability,omitempty"`
+	LocalGroupID  *entmoot.GroupID             `json:"local_group_id,omitempty"`
+	GroupMetadata json.RawMessage              `json:"group_metadata,omitempty"`
+	GroupPolicy   *entpolicy.Policy            `json:"group_policy,omitempty"`
+	TimeoutMS     int64                        `json:"timeout_ms,omitempty"`
 }
 
 // JoinGroupResp reports the active session created or found for JoinGroupReq.
@@ -204,34 +186,26 @@ type JoinGroupResp struct {
 	Readiness json.RawMessage   `json:"readiness,omitempty"`
 }
 
-// InviteCreateReq asks the live daemon to mint an invite for an active group.
-// The daemon owns the authoritative in-memory roster, so it must apply target
-// additions before returning an invite that advertises the resulting head.
+// InviteCreateReq asks the live founder daemon to mint a target-bound
+// bootstrap capability from its current roster and advertised addresses.
 type InviteCreateReq struct {
-	GroupID              entmoot.GroupID  `json:"group_id"`
-	Target               entmoot.NodeInfo `json:"target"`
-	TargetPilotPubKey    []byte           `json:"target_pilot_pubkey,omitempty"`
-	RequirePilotIdentity bool             `json:"require_pilot_identity,omitempty"`
-	RequirePilotProof    bool             `json:"require_pilot_proof,omitempty"`
-	TargetPilotProof     []byte           `json:"target_pilot_proof,omitempty"`
-	TargetPilotSignature []byte           `json:"target_pilot_signature,omitempty"`
-	ValidForMS           int64            `json:"valid_for_ms,omitempty"`
-	ValidUntilMS         int64            `json:"valid_until_ms,omitempty"`
-	BootstrapPeers       []entmoot.NodeID `json:"bootstrap_peers,omitempty"`
+	GroupID             entmoot.GroupID `json:"group_id"`
+	TargetPublicKey     []byte          `json:"target_public_key"`
+	BootstrapMultiaddrs []string        `json:"bootstrap_multiaddrs"`
+	ValidForMS          int64           `json:"valid_for_ms,omitempty"`
+	ValidUntilMS        int64           `json:"valid_until_ms,omitempty"`
 }
 
-// InviteCreateResp reports the invite created from live daemon state.
 type InviteCreateResp struct {
-	Status     string                `json:"status"`
-	GroupID    entmoot.GroupID       `json:"group_id"`
-	Invite     entmoot.Invite        `json:"invite"`
-	RosterHead entmoot.RosterEntryID `json:"roster_head"`
-	Members    int                   `json:"members"`
+	Status     string                      `json:"status"`
+	GroupID    entmoot.GroupID             `json:"group_id"`
+	Capability entmoot.BootstrapCapability `json:"capability"`
+	RosterHead entmoot.RosterEntryID       `json:"roster_head"`
+	Members    int                         `json:"members"`
 }
 
 type InviteAuthorityCheckReq struct {
-	GroupID         entmoot.GroupID `json:"group_id"`
-	CandidateInvite *entmoot.Invite `json:"candidate_invite,omitempty"`
+	GroupID entmoot.GroupID `json:"group_id"`
 }
 
 type InviteAuthorityCheckResp struct {
@@ -262,26 +236,6 @@ type GroupDeactivateResp struct {
 	GroupID entmoot.GroupID `json:"group_id"`
 }
 
-type DiagProbeReq struct {
-	GroupID   entmoot.GroupID  `json:"group_id"`
-	Peers     []entmoot.NodeID `json:"peers"`
-	TimeoutMS int64            `json:"timeout_ms,omitempty"`
-}
-
-type DiagProbeResp struct {
-	GroupID entmoot.GroupID `json:"group_id"`
-	Peers   []DiagProbePeer `json:"peers"`
-}
-
-type DiagProbePeer struct {
-	NodeID     entmoot.NodeID `json:"node_id"`
-	OK         bool           `json:"ok"`
-	RTTMS      int64          `json:"rtt_ms,omitempty"`
-	Error      string         `json:"error,omitempty"`
-	Responder  entmoot.NodeID `json:"responder,omitempty"`
-	ReceivedMS int64          `json:"received_ms,omitempty"`
-}
-
 // TailSubscribe opens a live message stream. GroupID is optional (nil
 // means all groups); Topic is an MQTT-style pattern and an empty value is
 // interpreted as "#" (match everything).
@@ -303,23 +257,15 @@ type TailEvent struct {
 type InfoReq struct{}
 
 // InfoResp is the daemon's snapshot response. Groups is a per-group
-// summary; MerkleRoot inside each GroupInfo is nil when Running is false
-// (daemon not running means no authoritative root was available).
+// summary; MerkleRoot inside each GroupInfo is nil when Running is false.
 type InfoResp struct {
-	// PilotNodeID is the Pilot node id the daemon runs as.
-	PilotNodeID entmoot.NodeID `json:"pilot_node_id"`
-	// EntmootPubKey is the Ed25519 public key the daemon signs with
-	// (raw 32 bytes; encoding/json base64s it).
-	EntmootPubKey []byte `json:"entmoot_pubkey"`
-	// ListenPort is the TCP port the daemon accepts peer connections on.
-	ListenPort uint16 `json:"listen_port"`
-	// DataDir is the filesystem root under which the daemon keeps state.
-	DataDir string `json:"data_dir"`
-	// Groups summarises each joined group.
-	Groups []GroupInfo `json:"groups"`
-	// Running is true when the response is served by a live daemon,
-	// false when a client reads SQLite directly (CLI_DESIGN §9, #6).
-	Running bool `json:"running"`
+	MemberID      entmoot.MemberID `json:"member_id"`
+	PeerID        string           `json:"peer_id"`
+	EntmootPubKey []byte           `json:"entmoot_pubkey"`
+	ListenPort    uint16           `json:"listen_port"`
+	DataDir       string           `json:"data_dir"`
+	Groups        []GroupInfo      `json:"groups"`
+	Running       bool             `json:"running"`
 }
 
 // GroupInfo summarises one joined group inside an InfoResp.

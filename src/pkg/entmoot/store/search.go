@@ -19,9 +19,9 @@ var ErrInvalidSearchQuery = errors.New("store: invalid search query")
 // SearchBoundary identifies the exclusive upper edge for older search result
 // pagination in the newest-first order used by SearchMessages.
 type SearchBoundary struct {
-	TimestampMS  int64
-	AuthorNodeID entmoot.NodeID
-	MessageID    entmoot.MessageID
+	TimestampMS    int64
+	AuthorMemberID entmoot.MemberID
+	MessageID      entmoot.MessageID
 }
 
 // SearchOptions controls one lexical search page.
@@ -186,8 +186,9 @@ func sortSearchMessages[T any](items []T, messageAt func(int) entmoot.Message) {
 		if a.Timestamp != b.Timestamp {
 			return a.Timestamp > b.Timestamp
 		}
-		if a.Author.PilotNodeID != b.Author.PilotNodeID {
-			return a.Author.PilotNodeID > b.Author.PilotNodeID
+		authorA, authorB := messageMemberID(a), messageMemberID(b)
+		if authorA != authorB {
+			return bytes.Compare(authorA[:], authorB[:]) > 0
 		}
 		return bytes.Compare(a.ID[:], b.ID[:]) > 0
 	})
@@ -197,16 +198,17 @@ func searchMessageOlderThan(m entmoot.Message, boundary SearchBoundary) bool {
 	if m.Timestamp != boundary.TimestampMS {
 		return m.Timestamp < boundary.TimestampMS
 	}
-	if m.Author.PilotNodeID != boundary.AuthorNodeID {
-		return m.Author.PilotNodeID < boundary.AuthorNodeID
+	author := messageMemberID(m)
+	if author != boundary.AuthorMemberID {
+		return bytes.Compare(author[:], boundary.AuthorMemberID[:]) < 0
 	}
 	return bytes.Compare(m.ID[:], boundary.MessageID[:]) < 0
 }
 
 func searchBoundaryFromMessage(m entmoot.Message) SearchBoundary {
 	return SearchBoundary{
-		TimestampMS:  m.Timestamp,
-		AuthorNodeID: m.Author.PilotNodeID,
-		MessageID:    m.ID,
+		TimestampMS:    m.Timestamp,
+		AuthorMemberID: messageMemberID(m),
+		MessageID:      m.ID,
 	}
 }
