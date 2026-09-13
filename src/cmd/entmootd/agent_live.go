@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -11,7 +12,6 @@ import (
 	"os"
 	"os/signal"
 	"sort"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -32,7 +32,7 @@ const (
 
 type agentLiveConfig struct {
 	group             string
-	node              uint64
+	node              string
 	mode              string
 	topics            repeatedStringFlag
 	actions           repeatedStringFlag
@@ -57,8 +57,8 @@ type agentLiveRunGroupScan struct {
 }
 
 type agentLiveBackoffKey struct {
-	groupID entmoot.GroupID
-	nodeID  entmoot.NodeID
+	groupID  entmoot.GroupID
+	memberID entmoot.MemberID
 }
 
 type agentLiveBackoffEntry struct {
@@ -108,7 +108,7 @@ func cmdAgentLiveEnable(gf *globalFlags, args []string) int {
 	cfg := agentLiveConfig{mode: esphttp.LiveModeReplyOnMention}
 	fs := flag.NewFlagSet("agent-live enable", flag.ContinueOnError)
 	fs.StringVar(&cfg.group, "group", "", "base64 moot group id")
-	fs.Uint64Var(&cfg.node, "node", 0, "local Pilot node id")
+	fs.StringVar(&cfg.node, "member", "", "base64 local member id")
 	fs.StringVar(&cfg.mode, "mode", cfg.mode, "live mode: listen, reply_on_mention, converse, operator")
 	fs.Var(&cfg.topics, "topic", "topic filter; may be repeated")
 	fs.Var(&cfg.actions, "action", "operator action; may be repeated, defaults to all operator actions")
@@ -169,13 +169,13 @@ func cmdAgentLiveEnable(gf *globalFlags, args []string) int {
 	if cfg.json {
 		return printJSON(rec)
 	}
-	fmt.Fprintf(os.Stdout, "enabled live %s for node %d in group %s\n", rec.Mode, rec.NodeID, cfg.group)
+	fmt.Fprintf(os.Stdout, "enabled live %s for member %s in group %s\n", rec.Mode, rec.MemberID.String(), cfg.group)
 	return exitOK
 }
 
 type enableAgentLiveConfigOptions struct {
 	groupID           entmoot.GroupID
-	nodeID            entmoot.NodeID
+	nodeID            entmoot.MemberID
 	mode              string
 	topics            []string
 	actions           []string
@@ -201,7 +201,7 @@ func enableAgentLiveConfig(ctx context.Context, state esphttp.StateStore, opts e
 	}
 	return state.UpsertLiveAgentConfig(ctx, esphttp.LiveAgentConfig{
 		GroupID:           opts.groupID,
-		NodeID:            opts.nodeID,
+		MemberID:          opts.nodeID,
 		Enabled:           true,
 		Mode:              opts.mode,
 		TopicFilters:      append([]string(nil), opts.topics...),
@@ -216,7 +216,7 @@ func cmdAgentLiveDisable(gf *globalFlags, args []string) int {
 	cfg := agentLiveConfig{}
 	fs := flag.NewFlagSet("agent-live disable", flag.ContinueOnError)
 	fs.StringVar(&cfg.group, "group", "", "base64 moot group id")
-	fs.Uint64Var(&cfg.node, "node", 0, "local Pilot node id")
+	fs.StringVar(&cfg.node, "member", "", "base64 local member id")
 	fs.BoolVar(&cfg.json, "json", false, "print JSON summary")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -239,9 +239,9 @@ func cmdAgentLiveDisable(gf *globalFlags, args []string) int {
 		return exitTransport
 	}
 	if cfg.json {
-		return printJSON(map[string]any{"group_id": gid, "node_id": nodeID, "enabled": false})
+		return printJSON(map[string]any{"group_id": gid, "member_id": nodeID, "enabled": false})
 	}
-	fmt.Fprintf(os.Stdout, "disabled live mode for node %d in group %s\n", nodeID, cfg.group)
+	fmt.Fprintf(os.Stdout, "disabled live mode for member %s in group %s\n", nodeID.String(), cfg.group)
 	return exitOK
 }
 
@@ -282,7 +282,7 @@ func cmdAgentLiveStatus(gf *globalFlags, args []string) int {
 		fmt.Fprintf(os.Stderr, "agent-live status: %v\n", err)
 		return exitTransport
 	}
-	states := esphttp.LiveAgentStatesByNode(configs, presence, time.Now().UnixMilli())
+	states := esphttp.LiveAgentStatesByMember(configs, presence, time.Now().UnixMilli())
 	if jsonOut {
 		return printJSON(map[string]any{"group_id": gid, "configs": configs, "presence": presence, "members": states})
 	}
@@ -290,15 +290,15 @@ func cmdAgentLiveStatus(gf *globalFlags, args []string) int {
 		fmt.Fprintln(os.Stdout, "no live agents configured")
 		return exitOK
 	}
-	for nodeID, state := range states {
-		fmt.Fprintf(os.Stdout, "node=%d mode=%s status=%s topics=%s\n", nodeID, state.Mode, state.Status, strings.Join(state.TopicFilters, ","))
+	for memberID, state := range states {
+		fmt.Fprintf(os.Stdout, "member=%s mode=%s status=%s topics=%s\n", memberID.String(), state.Mode, state.Status, strings.Join(state.TopicFilters, ","))
 	}
 	return exitOK
 }
 
 func cmdAgentLiveRun(gf *globalFlags, args []string) int {
 	var rawGroup string
-	var node uint64
+	var node string
 	var interval, lease time.Duration
 	var runner string
 	var timeout time.Duration
@@ -308,7 +308,7 @@ func cmdAgentLiveRun(gf *globalFlags, args []string) int {
 	var once, jsonOut bool
 	fs := flag.NewFlagSet("agent-live run", flag.ContinueOnError)
 	fs.StringVar(&rawGroup, "group", "", "base64 moot group id")
-	fs.Uint64Var(&node, "node", 0, "local Pilot node id")
+	fs.StringVar(&node, "member", "", "base64 local member id")
 	fs.BoolVar(&allGroups, "all-groups", false, "run every enabled live config for this node")
 	fs.Var(&tags, "tag", "moot metadata tag filter for -all-groups; may be repeated")
 	fs.DurationVar(&interval, "interval", 10*time.Second, "heartbeat interval")
@@ -324,7 +324,7 @@ func cmdAgentLiveRun(gf *globalFlags, args []string) int {
 		}
 		return exitInvalidArgument
 	}
-	nodeID, ok := parseAgentLiveNode("agent-live run", node)
+	nodeID, ok := parseAgentLiveMember("agent-live run", node)
 	if !ok {
 		return exitInvalidArgument
 	}
@@ -402,9 +402,9 @@ func cmdAgentLiveRun(gf *globalFlags, args []string) int {
 			return printJSON([]agentLiveRunBinding{})
 		}
 		if allGroups {
-			fmt.Fprintf(os.Stdout, "renewed live presence for node %d in %d group(s)\n", nodeID, len(bindings))
+			fmt.Fprintf(os.Stdout, "renewed live presence for member %s in %d group(s)\n", nodeID.String(), len(bindings))
 		} else if len(bindings) > 0 {
-			fmt.Fprintf(os.Stdout, "renewed live presence for node %d until %d\n", nodeID, bindings[0].Presence.LeaseUntilMS)
+			fmt.Fprintf(os.Stdout, "renewed live presence for member %s until %d\n", nodeID.String(), bindings[0].Presence.LeaseUntilMS)
 		}
 		return exitOK
 	}
@@ -459,7 +459,7 @@ func cmdAgentLiveRun(gf *globalFlags, args []string) int {
 	}
 }
 
-func agentLiveRunGroups(ctx context.Context, state agentLiveRunState, rawGroup string, allGroups bool, nodeID entmoot.NodeID, rawTags []string) ([]agentLiveRunGroup, error) {
+func agentLiveRunGroups(ctx context.Context, state agentLiveRunState, rawGroup string, allGroups bool, nodeID entmoot.MemberID, rawTags []string) ([]agentLiveRunGroup, error) {
 	if strings.TrimSpace(rawGroup) != "" {
 		gid, err := decodeGroupID(rawGroup)
 		if err != nil {
@@ -471,7 +471,7 @@ func agentLiveRunGroups(ctx context.Context, state agentLiveRunState, rawGroup s
 		return nil, errors.New("-group is required unless -all-groups is set")
 	}
 	tags := normalizeGroupTags(rawTags)
-	configs, err := state.ListLiveAgentConfigsForNode(ctx, nodeID)
+	configs, err := state.ListLiveAgentConfigsForMember(ctx, nodeID)
 	if err != nil {
 		return nil, err
 	}
@@ -568,7 +568,7 @@ func agentLiveGroupMatchesTags(ctx context.Context, state esphttp.GroupMetadataS
 	return true, nil
 }
 
-func renewAgentLiveRunBindings(ctx context.Context, state esphttp.StateStore, groups []agentLiveRunGroup, nodeID entmoot.NodeID, lease time.Duration, requireAll bool) ([]agentLiveRunBinding, error) {
+func renewAgentLiveRunBindings(ctx context.Context, state esphttp.StateStore, groups []agentLiveRunGroup, nodeID entmoot.MemberID, lease time.Duration, requireAll bool) ([]agentLiveRunBinding, error) {
 	out := make([]agentLiveRunBinding, 0, len(groups))
 	for _, group := range groups {
 		binding, ok, err := renewAgentLiveRunBinding(ctx, state, group.GroupID, nodeID, lease, requireAll)
@@ -583,11 +583,11 @@ func renewAgentLiveRunBindings(ctx context.Context, state esphttp.StateStore, gr
 	return out, nil
 }
 
-func renewAgentLiveRunBinding(ctx context.Context, state esphttp.StateStore, gid entmoot.GroupID, nodeID entmoot.NodeID, lease time.Duration, requireAll bool) (agentLiveRunBinding, bool, error) {
+func renewAgentLiveRunBinding(ctx context.Context, state esphttp.StateStore, gid entmoot.GroupID, nodeID entmoot.MemberID, lease time.Duration, requireAll bool) (agentLiveRunBinding, bool, error) {
 	return renewAgentLiveRunBindingStatus(ctx, state, gid, nodeID, lease, requireAll, esphttp.LiveStatusOnline)
 }
 
-func renewAgentLiveRunBindingStatus(ctx context.Context, state esphttp.StateStore, gid entmoot.GroupID, nodeID entmoot.NodeID, lease time.Duration, requireAll bool, status string) (agentLiveRunBinding, bool, error) {
+func renewAgentLiveRunBindingStatus(ctx context.Context, state esphttp.StateStore, gid entmoot.GroupID, nodeID entmoot.MemberID, lease time.Duration, requireAll bool, status string) (agentLiveRunBinding, bool, error) {
 	cfg, found, err := state.GetLiveAgentConfig(ctx, gid, nodeID)
 	if err != nil {
 		return agentLiveRunBinding{}, false, err
@@ -601,7 +601,7 @@ func renewAgentLiveRunBindingStatus(ctx context.Context, state esphttp.StateStor
 	now := time.Now().UnixMilli()
 	presence, err := state.UpsertLiveAgentPresence(ctx, esphttp.LiveAgentPresence{
 		GroupID:      gid,
-		NodeID:       nodeID,
+		MemberID:     nodeID,
 		Status:       status,
 		Mode:         cfg.Mode,
 		TopicFilters: cfg.TopicFilters,
@@ -615,7 +615,7 @@ func renewAgentLiveRunBindingStatus(ctx context.Context, state esphttp.StateStor
 	return agentLiveRunBinding{Config: cfg, Presence: presence}, true, nil
 }
 
-func scanAgentLiveRunGroups(ctx context.Context, gf *globalFlags, state esphttp.StateStore, msgStore store.MessageStore, groups []agentLiveRunGroup, nodeID entmoot.NodeID, lease time.Duration, requireAll bool, runCfg agentLiveRuntimeConfig, backoffs *agentLiveBackoffTracker) ([]agentLiveRunBinding, []agentLiveRunGroupScan, error) {
+func scanAgentLiveRunGroups(ctx context.Context, gf *globalFlags, state esphttp.StateStore, msgStore store.MessageStore, groups []agentLiveRunGroup, nodeID entmoot.MemberID, lease time.Duration, requireAll bool, runCfg agentLiveRuntimeConfig, backoffs *agentLiveBackoffTracker) ([]agentLiveRunBinding, []agentLiveRunGroupScan, error) {
 	bindings := make([]agentLiveRunBinding, 0, len(groups))
 	scans := make([]agentLiveRunGroupScan, 0, len(groups))
 	for _, group := range groups {
@@ -628,7 +628,7 @@ func scanAgentLiveRunGroups(ctx context.Context, gf *globalFlags, state esphttp.
 		}
 		groupRunCfg := runCfg
 		groupRunCfg.groupID = binding.Config.GroupID
-		backoffKey := agentLiveBackoffKey{groupID: binding.Config.GroupID, nodeID: nodeID}
+		backoffKey := agentLiveBackoffKey{groupID: binding.Config.GroupID, memberID: nodeID}
 		if scan, ok := backoffScanResult(backoffs, backoffKey, time.Now()); ok {
 			refreshed, ok, err := renewAgentLiveRunBindingStatus(ctx, state, group.GroupID, nodeID, lease, requireAll, esphttp.LiveStatusDegraded)
 			if err != nil {
@@ -654,7 +654,7 @@ func scanAgentLiveRunGroups(ctx context.Context, gf *globalFlags, state esphttp.
 			scan = recoverableLiveScanResult(scan, kind, err, nextAttemptMS)
 			slog.Warn("agent-live run: recoverable scan error",
 				slog.String("group_id", binding.Config.GroupID.String()),
-				slog.Uint64("node_id", uint64(nodeID)),
+				slog.String("member_id", nodeID.String()),
 				slog.String("kind", kind),
 				slog.Int64("next_attempt_at_ms", nextAttemptMS),
 				slog.String("err", err.Error()))
@@ -784,7 +784,10 @@ func agentLiveBackoffJitter(window time.Duration, attempt int, key agentLiveBack
 		h ^= uint64(b)
 		h *= 1099511628211
 	}
-	h ^= uint64(key.nodeID)
+	for _, b := range key.memberID {
+		h ^= uint64(b)
+		h *= 1099511628211
+	}
 	h *= 1099511628211
 	h ^= uint64(attempt)
 	h *= 1099511628211
@@ -838,31 +841,30 @@ func printAgentLiveRunJSON(allGroups bool, bindings []agentLiveRunBinding, scans
 	return printJSON(map[string]any{"presence": presence, "scan": scan})
 }
 
-func parseAgentLiveTarget(command, rawGroup string, rawNode uint64) (entmoot.GroupID, entmoot.NodeID, bool) {
+func parseAgentLiveTarget(command, rawGroup, rawMember string) (entmoot.GroupID, entmoot.MemberID, bool) {
 	if strings.TrimSpace(rawGroup) == "" {
 		fmt.Fprintf(os.Stderr, "%s: -group is required\n", command)
-		return entmoot.GroupID{}, 0, false
+		return entmoot.GroupID{}, entmoot.MemberID{}, false
 	}
 	gid, err := decodeGroupID(rawGroup)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%s: %v\n", command, err)
-		return entmoot.GroupID{}, 0, false
+		return entmoot.GroupID{}, entmoot.MemberID{}, false
 	}
-	nodeID, ok := parseAgentLiveNode(command, rawNode)
+	memberID, ok := parseAgentLiveMember(command, rawMember)
 	if !ok {
-		return entmoot.GroupID{}, 0, false
+		return entmoot.GroupID{}, entmoot.MemberID{}, false
 	}
-	return gid, nodeID, true
+	return gid, memberID, true
 }
 
-func parseAgentLiveNode(command string, rawNode uint64) (entmoot.NodeID, bool) {
-	if rawNode == 0 {
-		fmt.Fprintf(os.Stderr, "%s: -node is required\n", command)
-		return 0, false
+func parseAgentLiveMember(command, rawMember string) (entmoot.MemberID, bool) {
+	var memberID entmoot.MemberID
+	decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(rawMember))
+	if err != nil || len(decoded) != len(memberID) {
+		fmt.Fprintf(os.Stderr, "%s: -member must be a base64 32-byte member id\n", command)
+		return entmoot.MemberID{}, false
 	}
-	if rawNode > uint64(^uint32(0)) {
-		fmt.Fprintf(os.Stderr, "%s: -node is too large: %s\n", command, strconv.FormatUint(rawNode, 10))
-		return 0, false
-	}
-	return entmoot.NodeID(rawNode), true
+	copy(memberID[:], decoded)
+	return memberID, true
 }

@@ -13,11 +13,12 @@ import (
 
 	"entmoot/pkg/entmoot/ipc"
 	"entmoot/pkg/entmoot/store"
+	libp2ptransport "entmoot/pkg/entmoot/transport/libp2p"
 )
 
-// cmdInfo prints a one-shot snapshot of node + group state as a single
-// JSON object on stdout. Reads SQLite directly and probes the control
-// socket to set `running`; does not require a Pilot daemon.
+// cmdInfo prints a one-shot snapshot of member and group state as a single
+// JSON object on stdout. It reads SQLite directly and probes the control
+// socket to set `running`.
 func cmdInfo(gf *globalFlags, args []string) int {
 	fs := flag.NewFlagSet("info", flag.ContinueOnError)
 	if err := fs.Parse(args); err != nil {
@@ -35,12 +36,14 @@ func cmdInfo(gf *globalFlags, args []string) int {
 
 	running := controlSocketAlive(controlSocketPath(s.dataDir), 500*time.Millisecond)
 
+	binding, err := libp2ptransport.BindingFromPublicKey(s.identity.PublicKey)
+	if err != nil {
+		slog.Error("info: derive peer identity", slog.String("err", err.Error()))
+		return exitTransport
+	}
 	resp := ipc.InfoResp{
-		// PilotNodeID is not known without dialing Pilot; leave zero
-		// when info is run standalone. CLI_DESIGN §3.4 says info reads
-		// SQLite directly and works without a running daemon; we therefore
-		// do not open Pilot here.
-		PilotNodeID:   0,
+		MemberID:      binding.MemberID,
+		PeerID:        binding.PeerID.String(),
 		EntmootPubKey: s.identity.PublicKey,
 		ListenPort:    uint16(gf.listenPort),
 		DataDir:       s.dataDir,
@@ -48,8 +51,7 @@ func cmdInfo(gf *globalFlags, args []string) int {
 		Groups:        []ipc.GroupInfo{},
 	}
 
-	// If a join is running, ask it for the snapshot over IPC — that's
-	// the only path with a live pilot_node_id and merkle root.
+	// If a daemon is running, ask it for the live roster and Merkle snapshot.
 	if running {
 		if live, err := infoOverIPC(controlSocketPath(s.dataDir)); err == nil {
 			resp = *live
@@ -97,7 +99,7 @@ func cmdInfo(gf *globalFlags, args []string) int {
 					_ = r.Close()
 					continue
 				}
-				members := len(r.Members())
+				members := len(r.MemberIDs())
 				_ = r.Close()
 
 				msgs, err := st.Range(ctx, gid, 0, 0)

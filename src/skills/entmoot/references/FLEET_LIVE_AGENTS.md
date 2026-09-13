@@ -96,18 +96,23 @@ Modes:
 Enable, run, inspect, or disable:
 
 ```sh
-"$ENTMOOT" agent-live enable -group <gid> -node <pilot-node-id> -mode reply_on_mention
-ENTMOOT_AGENT_RUNNER=openclaw "$ENTMOOT" agent-live run -group <gid> -node <pilot-node-id> -runner openclaw
-"$ENTMOOT" agent-live run -group <gid> -node <pilot-node-id> -runner /path/to/agent-runner
-"$ENTMOOT" agent-live run -all-groups -node <pilot-node-id> -runner openclaw
-"$ENTMOOT" agent-live run -all-groups -node <pilot-node-id> -tag ops -runner openclaw
+"$ENTMOOT" agent-live enable -group <gid> -member <member-id> -mode reply_on_mention
+ENTMOOT_AGENT_RUNNER=openclaw "$ENTMOOT" agent-live run -group <gid> -member <member-id> -runner openclaw
+"$ENTMOOT" agent-live run -group <gid> -member <member-id> -runner /path/to/agent-runner
+"$ENTMOOT" agent-live run -all-groups -member <member-id> -runner openclaw
+"$ENTMOOT" agent-live run -all-groups -member <member-id> -tag ops -runner openclaw
 "$ENTMOOT" agent-live status -group <gid> --json
-"$ENTMOOT" agent-live disable -group <gid> -node <pilot-node-id>
+"$ENTMOOT" agent-live disable -group <gid> -member <member-id>
 ```
 
-Live runners receive JSON on stdin with `group_id`, `node_id`, `mode`,
+Live runners receive JSON on stdin with `group_id`, `member_id`, `mode`,
 `topic_filters`, `allowed_actions`, `trigger`, `events`, and `instructions`.
 They must return JSON only, shaped as `{"actions":[...]}`.
+
+`member_id` is the full base64 MemberID, not a numeric alias. The runner also
+receives `ENTMOOT_LIVE_MEMBER_ID`. Task assignment and command/invite/removal
+actions use `assignee_member_id` and `target_member_id`; invitations bind the
+target ID to `target_entmoot_pubkey` and derive its same-key libp2p PeerID.
 
 If a node enabled live mode inside its own container, a VPS or host shell using
 another data root can correctly show empty `configs` and `presence`.
@@ -147,7 +152,7 @@ Restrict operator scope:
 ```sh
 "$ENTMOOT" agent-live enable \
   -group <gid> \
-  -node <pilot-node-id> \
+  -member <member-id> \
   -mode operator \
   -topic chat \
   -topic story/collab/# \

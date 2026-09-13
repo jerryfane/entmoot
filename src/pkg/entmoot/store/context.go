@@ -147,9 +147,9 @@ func messageContextResult(target entmoot.Message, messages []entmoot.Message, ha
 
 func pageBoundaryFromMessage(m entmoot.Message) PageBoundary {
 	return PageBoundary{
-		TimestampMS:  m.Timestamp,
-		AuthorNodeID: m.Author.PilotNodeID,
-		MessageID:    m.ID,
+		TimestampMS:    m.Timestamp,
+		AuthorMemberID: messageMemberID(m),
+		MessageID:      m.ID,
 	}
 }
 
@@ -160,11 +160,9 @@ func compareMessageRecency(a, b entmoot.Message) int {
 		}
 		return 1
 	}
-	if a.Author.PilotNodeID != b.Author.PilotNodeID {
-		if a.Author.PilotNodeID < b.Author.PilotNodeID {
-			return -1
-		}
-		return 1
+	left, right := messageMemberID(a), messageMemberID(b)
+	if left != right {
+		return bytes.Compare(left[:], right[:])
 	}
 	return bytes.Compare(a.ID[:], b.ID[:])
 }

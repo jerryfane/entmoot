@@ -19,10 +19,7 @@ var (
 
 func cmdServe(gf *globalFlags, args []string) int {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
-	var advertiseEndpoints endpointFlag
 	var groups repeatedStringFlag
-	fs.Var(&advertiseEndpoints, "advertise-endpoint",
-		"advertise this node's endpoint (network=host:port); repeatable")
 	fs.Var(&groups, "group", "base64 group id to serve; may be repeated (default: all joined groups)")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -56,9 +53,8 @@ func cmdServe(gf *globalFlags, args []string) int {
 	}
 
 	return runGroupDaemon(gf, groupDaemonOptions{
-		command:            "serve",
-		event:              "serving",
-		advertiseEndpoints: advertiseEndpoints,
+		command: "serve",
+		event:   "serving",
 		loadGroups: func(ctx context.Context, runtime *groupRuntime, _ groupDaemonLoadContext) (int, error) {
 			strict := len(groups) > 0
 			for _, gid := range selectedGroups {
@@ -146,7 +142,5 @@ func selectServeGroupIDs(dataRoot string, selected []string, logger *slog.Logger
 }
 
 func rosterFileExists(dataRoot string, gid entmoot.GroupID) bool {
-	path := groupRosterPath(dataRoot, gid)
-	info, err := os.Stat(path)
-	return err == nil && !info.IsDir() && info.Size() > 0
+	return groupRosterExists(dataRoot, gid)
 }

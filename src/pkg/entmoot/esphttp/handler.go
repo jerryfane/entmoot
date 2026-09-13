@@ -24,6 +24,9 @@ import (
 	"sync"
 	"time"
 
+	libp2pcrypto "github.com/libp2p/go-libp2p/core/crypto"
+	"github.com/libp2p/go-libp2p/core/peer"
+
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/canonical"
 	"entmoot/pkg/entmoot/espnotify"
@@ -72,7 +75,8 @@ const (
 
 const (
 	deviceIDHeader        = "X-Entmoot-Device-ID"
-	memberNodeHeader      = "X-Entmoot-Member-Node-ID"
+	memberIDHeader        = "X-Entmoot-Member-ID"
+	memberPeerHeader      = "X-Entmoot-Peer-ID"
 	memberPubKeyHeader    = "X-Entmoot-Member-Pubkey"
 	memberSignatureHeader = "X-Entmoot-Member-Signature"
 	idempotencyHeader     = "Idempotency-Key"
@@ -80,7 +84,7 @@ const (
 	nonceHeader           = "X-Entmoot-Nonce"
 	signatureHeader       = "X-Entmoot-Signature"
 	deviceAuthVersion     = "ENTMOOT-ESP-AUTH-V1"
-	memberAuthVersion     = "ENTMOOT-ESP-MEMBER-AUTH-V1"
+	memberAuthVersion     = "ENTMOOT-ESP-MEMBER-AUTH-V2"
 	deviceAuthSkew        = 5 * time.Minute
 	maxAuthBodyBytes      = 16 << 20
 	maxListLimit          = 200
@@ -93,7 +97,8 @@ type Device struct {
 	Groups        []entmoot.GroupID
 	AdminGroups   []entmoot.GroupID
 	ClientIDs     []string
-	PilotNodeID   entmoot.NodeID
+	MemberID      entmoot.MemberID
+	PeerID        string
 	EntmootPubKey []byte
 	Disabled      bool
 }
@@ -126,8 +131,8 @@ func NewDeviceRegistry(devices []Device) (*DeviceRegistry, error) {
 		if len(d.PublicKey) != ed25519.PublicKeySize {
 			return nil, fmt.Errorf("esphttp: device %q public key length %d", d.ID, len(d.PublicKey))
 		}
-		if d.PilotNodeID != 0 && len(d.EntmootPubKey) != ed25519.PublicKeySize {
-			return nil, fmt.Errorf("esphttp: device %q entmoot pubkey length %d", d.ID, len(d.EntmootPubKey))
+		if d.MemberID != (entmoot.MemberID{}) && (d.PeerID == "" || len(d.EntmootPubKey) != ed25519.PublicKeySize) {
+			return nil, fmt.Errorf("esphttp: device %q has incomplete member identity", d.ID)
 		}
 		if _, exists := reg.byID[d.ID]; exists {
 			return nil, fmt.Errorf("esphttp: duplicate device id %q", d.ID)
@@ -207,7 +212,7 @@ func (r *DeviceRegistry) WithAdminGroupRevoked(deviceID string, gid entmoot.Grou
 
 // WithDeviceIdentity returns a validated registry copy with deviceID bound to
 // the Entmoot member identity used by fleet-scoped member operations.
-func (r *DeviceRegistry) WithDeviceIdentity(deviceID string, nodeID entmoot.NodeID, entmootPubKey []byte) (*DeviceRegistry, bool, error) {
+func (r *DeviceRegistry) WithDeviceIdentity(deviceID string, memberID entmoot.MemberID, peerID string, entmootPubKey []byte) (*DeviceRegistry, bool, error) {
 	if r == nil {
 		return nil, false, errors.New("esphttp: device registry is not configured")
 	}
@@ -215,11 +220,16 @@ func (r *DeviceRegistry) WithDeviceIdentity(deviceID string, nodeID entmoot.Node
 	if deviceID == "" {
 		return nil, false, errors.New("esphttp: device id is required")
 	}
-	if nodeID == 0 {
-		return nil, false, errors.New("esphttp: pilot node id is required")
-	}
 	if len(entmootPubKey) != ed25519.PublicKeySize {
 		return nil, false, fmt.Errorf("esphttp: entmoot pubkey length %d", len(entmootPubKey))
+	}
+	derivedMemberID, err := entmoot.MemberIDFromPublicKey(entmootPubKey)
+	if err != nil || memberID != derivedMemberID {
+		return nil, false, errors.New("esphttp: member id does not match entmoot pubkey")
+	}
+	derivedPeerID := peerIDForPublicKey(entmootPubKey)
+	if derivedPeerID == "" || peerID != derivedPeerID {
+		return nil, false, errors.New("esphttp: peer id does not match entmoot pubkey")
 	}
 	devices := r.Snapshot()
 	changed := false
@@ -229,10 +239,11 @@ func (r *DeviceRegistry) WithDeviceIdentity(deviceID string, nodeID entmoot.Node
 			continue
 		}
 		found = true
-		if devices[i].PilotNodeID == nodeID && bytes.Equal(devices[i].EntmootPubKey, entmootPubKey) {
+		if devices[i].MemberID == memberID && devices[i].PeerID == peerID && bytes.Equal(devices[i].EntmootPubKey, entmootPubKey) {
 			break
 		}
-		devices[i].PilotNodeID = nodeID
+		devices[i].MemberID = memberID
+		devices[i].PeerID = peerID
 		devices[i].EntmootPubKey = append([]byte(nil), entmootPubKey...)
 		changed = true
 		break
@@ -375,11 +386,11 @@ type TaskEventPublisherInfo interface {
 
 // PublishResult is the HTTP response for an accepted phone-signed message.
 type PublishResult struct {
-	Status      string            `json:"status"`
-	MessageID   entmoot.MessageID `json:"message_id"`
-	GroupID     entmoot.GroupID   `json:"group_id"`
-	Author      entmoot.NodeID    `json:"author"`
-	TimestampMS int64             `json:"timestamp_ms"`
+	Status         string            `json:"status"`
+	MessageID      entmoot.MessageID `json:"message_id"`
+	GroupID        entmoot.GroupID   `json:"group_id"`
+	AuthorMemberID entmoot.MemberID  `json:"author_member_id"`
+	TimestampMS    int64             `json:"timestamp_ms"`
 }
 
 // PublishError lets publisher implementations request stable HTTP error
@@ -655,7 +666,9 @@ func (h *Handler) handleFleets(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"fleets": visible})
 	case http.MethodPost:
-		h.withIdempotency(w, r, "fleet_create", func(w http.ResponseWriter, r *http.Request) {
+		h.withIdempotency(w, r, "fleet_create", func(w http.ResponseWriter, r *http.Request) bool {
+			return h.authorizeSignRequestCreation(w, r, signRequestKindFleetCreate, entmoot.GroupID{})
+		}, func(w http.ResponseWriter, r *http.Request) {
 			h.createSignRequestFromHTTP(w, r, signRequestKindFleetCreate, entmoot.GroupID{})
 		})
 	default:
@@ -682,7 +695,9 @@ func (h *Handler) handleFleetSubroute(w http.ResponseWriter, r *http.Request) bo
 		case http.MethodGet:
 			h.handleGetFleet(w, r, fleetID)
 		case http.MethodDelete:
-			h.withIdempotency(w, r, "fleet_archive:"+fleetID, func(w http.ResponseWriter, r *http.Request) {
+			h.withIdempotency(w, r, "fleet_archive:"+fleetID, func(w http.ResponseWriter, r *http.Request) bool {
+				return h.checkDeviceActiveFleetAdmin(w, r, fleetID, true)
+			}, func(w http.ResponseWriter, r *http.Request) {
 				h.createFleetSignRequestFromHTTP(w, r, signRequestKindFleetArchive, fleetID)
 			})
 		default:
@@ -694,7 +709,9 @@ func (h *Handler) handleFleetSubroute(w http.ResponseWriter, r *http.Request) bo
 			methodNotAllowed(w, http.MethodPost)
 			return true
 		}
-		h.withIdempotency(w, r, "fleet_restore:"+fleetID, func(w http.ResponseWriter, r *http.Request) {
+		h.withIdempotency(w, r, "fleet_restore:"+fleetID, func(w http.ResponseWriter, r *http.Request) bool {
+			return h.checkDeviceActiveFleetAdmin(w, r, fleetID, true)
+		}, func(w http.ResponseWriter, r *http.Request) {
 			h.createFleetSignRequestFromHTTP(w, r, signRequestKindFleetRestore, fleetID)
 		})
 	case "members":
@@ -708,7 +725,9 @@ func (h *Handler) handleFleetSubroute(w http.ResponseWriter, r *http.Request) bo
 		case http.MethodGet:
 			h.handleListFleetInvites(w, r, fleetID)
 		case http.MethodPost:
-			h.withIdempotency(w, r, "fleet_invite_create:"+fleetID, func(w http.ResponseWriter, r *http.Request) {
+			h.withIdempotency(w, r, "fleet_invite_create:"+fleetID, func(w http.ResponseWriter, r *http.Request) bool {
+				return h.checkDeviceActiveFleetAdmin(w, r, fleetID, false)
+			}, func(w http.ResponseWriter, r *http.Request) {
 				h.createFleetSignRequestFromHTTP(w, r, signRequestKindFleetInviteCreate, fleetID)
 			})
 		default:
@@ -725,7 +744,9 @@ func (h *Handler) handleFleetSubroute(w http.ResponseWriter, r *http.Request) bo
 		case http.MethodGet:
 			h.handleListFleetTasks(w, r, fleetID)
 		case http.MethodPost:
-			h.withIdempotency(w, r, fleetTaskIdempotencyScope(r, "fleet_task_create:"+fleetID), func(w http.ResponseWriter, r *http.Request) {
+			h.withIdempotency(w, r, "fleet_task_create:"+fleetID, func(w http.ResponseWriter, r *http.Request) bool {
+				return h.authorizeFleetTaskActor(w, r, fleetID)
+			}, func(w http.ResponseWriter, r *http.Request) {
 				h.handleCreateFleetTask(w, r, fleetID)
 			})
 		default:
@@ -736,7 +757,9 @@ func (h *Handler) handleFleetSubroute(w http.ResponseWriter, r *http.Request) bo
 		case http.MethodGet:
 			h.handleListFleetCommands(w, r, fleetID)
 		case http.MethodPost:
-			h.withIdempotency(w, r, fleetTaskIdempotencyScope(r, "fleet_command_create:"+fleetID), func(w http.ResponseWriter, r *http.Request) {
+			h.withIdempotency(w, r, "fleet_command_create:"+fleetID, func(w http.ResponseWriter, r *http.Request) bool {
+				return h.authorizeFleetTaskCoordinator(w, r, fleetID)
+			}, func(w http.ResponseWriter, r *http.Request) {
 				h.handleCreateFleetCommand(w, r, fleetID)
 			})
 		default:
@@ -755,7 +778,9 @@ func (h *Handler) handleFleetSubroute(w http.ResponseWriter, r *http.Request) bo
 				return true
 			}
 			trimmed := strings.TrimSuffix(strings.TrimPrefix(suffix, "members/"), "/remove")
-			h.withIdempotency(w, r, "fleet_member_remove:"+fleetID+":"+trimmed, func(w http.ResponseWriter, r *http.Request) {
+			h.withIdempotency(w, r, "fleet_member_remove:"+fleetID+":"+trimmed, func(w http.ResponseWriter, r *http.Request) bool {
+				return h.checkDeviceActiveFleetAdmin(w, r, fleetID, false)
+			}, func(w http.ResponseWriter, r *http.Request) {
 				h.createFleetMemberRemoveSignRequest(w, r, fleetID, trimmed)
 			})
 			return true
@@ -864,28 +889,18 @@ func (h *Handler) handleFleetActivity(w http.ResponseWriter, r *http.Request, fl
 }
 
 type fleetTaskCreateRequest struct {
-	Title          string `json:"title"`
-	Description    string `json:"description,omitempty"`
-	Mode           string `json:"mode,omitempty"`
-	AssigneeNodeID uint64 `json:"assignee_node_id,omitempty"`
+	Title            string           `json:"title"`
+	Description      string           `json:"description,omitempty"`
+	Mode             string           `json:"mode,omitempty"`
+	AssigneeMemberID entmoot.MemberID `json:"assignee_member_id,omitempty"`
 }
 
 type fleetTaskAssignRequest struct {
-	AssigneeNodeID uint64 `json:"assignee_node_id"`
+	AssigneeMemberID entmoot.MemberID `json:"assignee_member_id"`
 }
 
 type fleetTaskSubmitRequest struct {
 	Content string `json:"content"`
-}
-
-func fleetTaskNodeIDFromRequest(raw uint64) (entmoot.NodeID, error) {
-	if raw == 0 {
-		return 0, fmt.Errorf("assignee_node_id is required")
-	}
-	if raw > uint64(^uint32(0)) {
-		return 0, fmt.Errorf("assignee_node_id is out of range")
-	}
-	return entmoot.NodeID(raw), nil
 }
 
 func (h *Handler) handleListFleetTasks(w http.ResponseWriter, r *http.Request, fleetID string) {
@@ -940,17 +955,12 @@ func (h *Handler) handleCreateFleetTask(w http.ResponseWriter, r *http.Request, 
 	mode := NormalizeFleetTaskMode(req.Mode)
 	now := h.clock().UnixMilli()
 	var requestedAssignee *FleetMemberRecord
-	if req.AssigneeNodeID != 0 {
+	if req.AssigneeMemberID != (entmoot.MemberID{}) {
 		if !FleetTaskIsCoordinator(actor) {
 			writeError(w, http.StatusForbidden, "forbidden", "only the fleet coordinator can assign tasks")
 			return
 		}
-		assigneeNodeID, err := fleetTaskNodeIDFromRequest(req.AssigneeNodeID)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, "bad_request", err.Error())
-			return
-		}
-		assignee, found, err := h.fleetMemberByNode(r.Context(), fleet.FleetID, assigneeNodeID)
+		assignee, found, err := h.fleetMemberByID(r.Context(), fleet.FleetID, req.AssigneeMemberID)
 		if err != nil {
 			h.logger.Error("esphttp: fleet task assignee lookup", slog.String("err", err.Error()))
 			writeError(w, http.StatusInternalServerError, "internal_error", "fleet member lookup failed")
@@ -1031,27 +1041,11 @@ func (h *Handler) handleFleetTaskSubroute(w http.ResponseWriter, r *http.Request
 		methodNotAllowed(w, http.MethodPost)
 		return
 	}
-	h.withIdempotency(w, r, fleetTaskIdempotencyScope(r, "fleet_task_"+action+":"+fleetID+":"+taskID), func(w http.ResponseWriter, r *http.Request) {
+	h.withIdempotency(w, r, "fleet_task_"+action+":"+fleetID+":"+taskID, func(w http.ResponseWriter, r *http.Request) bool {
+		return h.authorizeFleetTaskActor(w, r, fleetID)
+	}, func(w http.ResponseWriter, r *http.Request) {
 		h.handleMutateFleetTask(w, r, fleetID, taskID, action)
 	})
-}
-
-func fleetTaskIdempotencyScope(r *http.Request, base string) string {
-	auth := authFromContext(r)
-	if auth.device != nil {
-		if deviceID := strings.TrimSpace(auth.device.ID); deviceID != "" {
-			return base + ":device:" + deviceID
-		}
-	}
-	if auth.member != nil {
-		return base + ":member:" +
-			strconv.FormatUint(uint64(auth.member.NodeID), 10) + ":" +
-			base64.StdEncoding.EncodeToString(auth.member.EntmootPubKey)
-	}
-	if auth.bearer {
-		return base + ":bearer"
-	}
-	return base + ":auth:anonymous"
 }
 
 func (h *Handler) handleGetFleetTask(w http.ResponseWriter, r *http.Request, fleetID, taskID string) {
@@ -1106,12 +1100,11 @@ func (h *Handler) handleMutateFleetTask(w http.ResponseWriter, r *http.Request, 
 		if _, ok := decodeRawBody(w, r, 1<<20, &req); !ok {
 			return
 		}
-		assigneeNodeID, err := fleetTaskNodeIDFromRequest(req.AssigneeNodeID)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		if req.AssigneeMemberID == (entmoot.MemberID{}) {
+			writeError(w, http.StatusBadRequest, "bad_request", "assignee_member_id is required")
 			return
 		}
-		member, found, err := h.fleetMemberByNode(r.Context(), fleetID, assigneeNodeID)
+		member, found, err := h.fleetMemberByID(r.Context(), fleetID, req.AssigneeMemberID)
 		if err != nil {
 			h.logger.Error("esphttp: fleet task assignee lookup", slog.String("err", err.Error()))
 			writeError(w, http.StatusInternalServerError, "internal_error", "fleet member lookup failed")
@@ -1167,28 +1160,65 @@ func (h *Handler) fleetTaskCoordinator(w http.ResponseWriter, r *http.Request, f
 }
 
 func (h *Handler) fleetTaskActor(w http.ResponseWriter, r *http.Request, fleetID string) (FleetRecord, FleetMemberRecord, bool) {
-	auth := authFromContext(r)
+	fleet, ok := h.activeFleetForTask(w, r, fleetID)
+	if !ok {
+		return FleetRecord{}, FleetMemberRecord{}, false
+	}
+	h.reconcileFleetAcceptance(r.Context(), fleet)
+	return h.fleetTaskActorForFleet(w, r, fleet)
+}
+
+func (h *Handler) authorizeFleetTaskActor(w http.ResponseWriter, r *http.Request, fleetID string) bool {
+	fleet, ok := h.activeFleetForTask(w, r, fleetID)
+	if !ok {
+		return false
+	}
+	_, _, ok = h.fleetTaskActorForFleet(w, r, fleet)
+	return ok
+}
+
+func (h *Handler) authorizeFleetTaskCoordinator(w http.ResponseWriter, r *http.Request, fleetID string) bool {
+	fleet, ok := h.activeFleetForTask(w, r, fleetID)
+	if !ok {
+		return false
+	}
+	_, member, ok := h.fleetTaskActorForFleet(w, r, fleet)
+	if !ok {
+		return false
+	}
+	if !FleetTaskIsCoordinator(member) {
+		writeError(w, http.StatusForbidden, "forbidden", "fleet task requires coordinator access")
+		return false
+	}
+	return true
+}
+
+func (h *Handler) activeFleetForTask(w http.ResponseWriter, r *http.Request, fleetID string) (FleetRecord, bool) {
 	if h.state == nil {
 		writeError(w, http.StatusServiceUnavailable, "fleet_unavailable", "fleet store is not configured")
-		return FleetRecord{}, FleetMemberRecord{}, false
+		return FleetRecord{}, false
 	}
 	fleet, found, err := h.state.GetFleet(r.Context(), fleetID)
 	if err != nil {
 		h.logger.Error("esphttp: check fleet task access", slog.String("err", err.Error()))
 		writeError(w, http.StatusInternalServerError, "internal_error", "fleet lookup failed")
-		return FleetRecord{}, FleetMemberRecord{}, false
+		return FleetRecord{}, false
 	}
 	if !found {
 		writeError(w, http.StatusNotFound, "fleet_not_found", "fleet not found")
-		return FleetRecord{}, FleetMemberRecord{}, false
+		return FleetRecord{}, false
 	}
 	if fleet.Status != FleetStatusActive {
 		writeError(w, http.StatusConflict, "fleet_archived", "fleet is archived")
-		return FleetRecord{}, FleetMemberRecord{}, false
+		return FleetRecord{}, false
 	}
-	h.reconcileFleetAcceptance(r.Context(), fleet)
+	return fleet, true
+}
+
+func (h *Handler) fleetTaskActorForFleet(w http.ResponseWriter, r *http.Request, fleet FleetRecord) (FleetRecord, FleetMemberRecord, bool) {
+	auth := authFromContext(r)
 	if auth.member != nil {
-		member, found, err := h.fleetMemberByNode(r.Context(), fleet.FleetID, auth.member.NodeID)
+		member, found, err := h.fleetMemberByID(r.Context(), fleet.FleetID, auth.member.MemberID)
 		if err != nil {
 			h.logger.Error("esphttp: fleet task member lookup", slog.String("err", err.Error()))
 			writeError(w, http.StatusInternalServerError, "internal_error", "fleet member lookup failed")
@@ -1209,11 +1239,11 @@ func (h *Handler) fleetTaskActor(w http.ResponseWriter, r *http.Request, fleetID
 			writeError(w, http.StatusForbidden, "forbidden", "device is not authorized to access fleet")
 			return FleetRecord{}, FleetMemberRecord{}, false
 		}
-		if auth.device.PilotNodeID == 0 || len(auth.device.EntmootPubKey) != ed25519.PublicKeySize {
+		if auth.device.MemberID == (entmoot.MemberID{}) || auth.device.PeerID == "" || len(auth.device.EntmootPubKey) != ed25519.PublicKeySize {
 			writeError(w, http.StatusForbidden, "forbidden", "device is not bound to a fleet member")
 			return FleetRecord{}, FleetMemberRecord{}, false
 		}
-		member, found, err := h.fleetMemberByNode(r.Context(), fleet.FleetID, auth.device.PilotNodeID)
+		member, found, err := h.fleetMemberByID(r.Context(), fleet.FleetID, auth.device.MemberID)
 		if err != nil {
 			h.logger.Error("esphttp: fleet task member lookup", slog.String("err", err.Error()))
 			writeError(w, http.StatusInternalServerError, "internal_error", "fleet member lookup failed")
@@ -1225,7 +1255,7 @@ func (h *Handler) fleetTaskActor(w http.ResponseWriter, r *http.Request, fleetID
 		}
 		return fleet, member, true
 	}
-	member, found, err := h.fleetMemberByNode(r.Context(), fleet.FleetID, fleet.Coordinator.PilotNodeID)
+	member, found, err := h.fleetMemberByID(r.Context(), fleet.FleetID, nodeInfoMemberID(fleet.Coordinator))
 	if err != nil {
 		h.logger.Error("esphttp: fleet task coordinator lookup", slog.String("err", err.Error()))
 		writeError(w, http.StatusInternalServerError, "internal_error", "fleet coordinator lookup failed")
@@ -1240,13 +1270,13 @@ func (h *Handler) fleetTaskActor(w http.ResponseWriter, r *http.Request, fleetID
 	return fleet, member, true
 }
 
-func (h *Handler) fleetMemberByNode(ctx context.Context, fleetID string, nodeID entmoot.NodeID) (FleetMemberRecord, bool, error) {
+func (h *Handler) fleetMemberByID(ctx context.Context, fleetID string, memberID entmoot.MemberID) (FleetMemberRecord, bool, error) {
 	members, err := h.state.ListFleetMembers(ctx, fleetID)
 	if err != nil {
 		return FleetMemberRecord{}, false, err
 	}
 	for _, member := range members {
-		if member.NodeID == nodeID {
+		if member.MemberID == memberID {
 			return member, true, nil
 		}
 	}
@@ -1254,20 +1284,20 @@ func (h *Handler) fleetMemberByNode(ctx context.Context, fleetID string, nodeID 
 }
 
 func (h *Handler) memberCanAccessFleet(ctx context.Context, fleet FleetRecord, member MemberAuth) bool {
-	rec, found, err := h.fleetMemberByNode(ctx, fleet.FleetID, member.NodeID)
+	rec, found, err := h.fleetMemberByID(ctx, fleet.FleetID, member.MemberID)
 	if err != nil {
 		h.logger.Error("esphttp: fleet member access lookup", slog.String("err", err.Error()))
 		return false
 	}
-	return found &&
-		rec.Status == FleetMemberActive &&
+	return found && rec.Status == FleetMemberActive && rec.PeerID == member.PeerID &&
 		rec.EntmootPubKey == base64.StdEncoding.EncodeToString(member.EntmootPubKey)
 }
 
 func fleetCoordinatorMember(fleet FleetRecord, nowMS int64) FleetMemberRecord {
 	return FleetMemberRecord{
 		FleetID:       fleet.FleetID,
-		NodeID:        fleet.Coordinator.PilotNodeID,
+		MemberID:      nodeInfoMemberID(fleet.Coordinator),
+		PeerID:        peerIDForPublicKey(fleet.Coordinator.EntmootPubKey),
 		EntmootPubKey: base64.StdEncoding.EncodeToString(fleet.Coordinator.EntmootPubKey),
 		Role:          FleetRoleCoordinator,
 		Status:        FleetMemberActive,
@@ -1277,25 +1307,25 @@ func fleetCoordinatorMember(fleet FleetRecord, nowMS int64) FleetMemberRecord {
 }
 
 type fleetTaskEventEnvelope struct {
-	Type           string          `json:"type"`
-	FleetID        string          `json:"fleet_id"`
-	ControlGroupID entmoot.GroupID `json:"control_group_id"`
-	TaskID         string          `json:"task_id"`
-	Action         string          `json:"action"`
-	Status         string          `json:"status"`
-	Title          string          `json:"title"`
-	ActorNodeID    entmoot.NodeID  `json:"actor_node_id"`
-	Summary        string          `json:"summary"`
-	CreatedAtMS    int64           `json:"created_at_ms"`
+	Type           string           `json:"type"`
+	FleetID        string           `json:"fleet_id"`
+	ControlGroupID entmoot.GroupID  `json:"control_group_id"`
+	TaskID         string           `json:"task_id"`
+	Action         string           `json:"action"`
+	Status         string           `json:"status"`
+	Title          string           `json:"title"`
+	ActorMemberID  entmoot.MemberID `json:"actor_member_id"`
+	Summary        string           `json:"summary"`
+	CreatedAtMS    int64            `json:"created_at_ms"`
 }
 
 type fleetCommandCreateRequest struct {
-	Target       string          `json:"target"`
-	TargetNodeID uint64          `json:"target_node_id"`
-	Action       string          `json:"action"`
-	Args         json.RawMessage `json:"args"`
-	AutoAccept   *bool           `json:"auto_accept"`
-	ExpiresAtMS  int64           `json:"expires_at_ms"`
+	Target         string           `json:"target"`
+	TargetMemberID entmoot.MemberID `json:"target_member_id"`
+	Action         string           `json:"action"`
+	Args           json.RawMessage  `json:"args"`
+	AutoAccept     *bool            `json:"auto_accept"`
+	ExpiresAtMS    int64            `json:"expires_at_ms"`
 }
 
 func (h *Handler) handleListFleetCommands(w http.ResponseWriter, r *http.Request, fleetID string) {
@@ -1392,13 +1422,13 @@ func fleetCommandListFilterFromRequest(w http.ResponseWriter, r *http.Request) (
 			return FleetCommandListFilter{}, false
 		}
 	}
-	if raw := strings.TrimSpace(q.Get("agent_node_id")); raw != "" {
-		nodeID, err := strconv.ParseUint(raw, 10, 32)
-		if err != nil || nodeID == 0 {
-			writeError(w, http.StatusBadRequest, "bad_request", "agent_node_id must be a positive node id")
+	if raw := strings.TrimSpace(q.Get("agent_member_id")); raw != "" {
+		decoded, err := base64.StdEncoding.DecodeString(raw)
+		if err != nil || len(decoded) != len(entmoot.MemberID{}) {
+			writeError(w, http.StatusBadRequest, "bad_request", "agent_member_id must be a full-width base64 member id")
 			return FleetCommandListFilter{}, false
 		}
-		filter.AgentNodeID = entmoot.NodeID(nodeID)
+		copy(filter.AgentMemberID[:], decoded)
 	}
 	return filter, true
 }
@@ -1420,7 +1450,7 @@ func (h *Handler) reconcileFleetCommandHistory(ctx context.Context, fleet FleetR
 				if err := json.Unmarshal([]byte(msg.Content), &cmd); err == nil &&
 					cmd.Type == FleetCommandMessageType &&
 					cmd.FleetID == fleet.FleetID &&
-					fleetCommandMessageIssuedByCoordinator(msg.Author, cmd, fleet) {
+					fleetCommandMessageIssuedByCoordinator(msg.AuthorMemberID, cmd, fleet) {
 					if _, err := h.state.UpsertFleetCommand(ctx, cmd); err != nil {
 						h.logger.Debug("esphttp: fleet command projection failed", slog.String("command_id", cmd.CommandID), slog.String("err", err.Error()))
 					}
@@ -1430,7 +1460,7 @@ func (h *Handler) reconcileFleetCommandHistory(ctx context.Context, fleet FleetR
 				if err := json.Unmarshal([]byte(msg.Content), &result); err == nil &&
 					result.Type == FleetCommandResultType &&
 					result.FleetID == fleet.FleetID &&
-					h.fleetCommandResultAuthoredByAgent(ctx, fleet, msg.Author, result) {
+					h.fleetCommandResultAuthoredByAgent(ctx, fleet, msg.AuthorMemberID, result) {
 					if err := h.state.UpsertFleetCommandResult(ctx, result); err != nil {
 						h.logger.Debug("esphttp: fleet command result projection failed", slog.String("command_id", result.CommandID), slog.String("err", err.Error()))
 					}
@@ -1440,26 +1470,27 @@ func (h *Handler) reconcileFleetCommandHistory(ctx context.Context, fleet FleetR
 	}
 }
 
-func fleetCommandMessageIssuedByCoordinator(authorNodeID uint32, cmd FleetCommandEnvelope, fleet FleetRecord) bool {
-	if cmd.IssuerNodeID != fleet.Coordinator.PilotNodeID {
+func fleetCommandMessageIssuedByCoordinator(authorMemberID entmoot.MemberID, cmd FleetCommandEnvelope, fleet FleetRecord) bool {
+	coordinatorMemberID := nodeInfoMemberID(fleet.Coordinator)
+	if cmd.IssuerMemberID != coordinatorMemberID {
 		return false
 	}
-	if entmoot.NodeID(authorNodeID) == fleet.Coordinator.PilotNodeID {
+	if authorMemberID == coordinatorMemberID {
 		return true
 	}
 	return VerifyFleetCommandIssuerProof(cmd, fleet.Coordinator.EntmootPubKey)
 }
 
-func (h *Handler) fleetCommandResultAuthoredByAgent(ctx context.Context, fleet FleetRecord, authorNodeID uint32, result FleetCommandResultEnvelope) bool {
-	if result.AgentNodeID == 0 || entmoot.NodeID(authorNodeID) != result.AgentNodeID {
+func (h *Handler) fleetCommandResultAuthoredByAgent(ctx context.Context, fleet FleetRecord, authorMemberID entmoot.MemberID, result FleetCommandResultEnvelope) bool {
+	if result.AgentMemberID == (entmoot.MemberID{}) || authorMemberID != result.AgentMemberID {
 		return false
 	}
-	member, found, err := h.fleetMemberByNode(ctx, fleet.FleetID, result.AgentNodeID)
+	member, found, err := h.fleetMemberByID(ctx, fleet.FleetID, result.AgentMemberID)
 	if err != nil {
 		h.logger.Debug("esphttp: fleet command result author lookup failed", slog.String("fleet_id", fleet.FleetID), slog.String("command_id", result.CommandID), slog.String("err", err.Error()))
 		return false
 	}
-	if !found || !FleetTaskCanMutate(member) {
+	if !found || !FleetTaskCanMutate(member) || member.PeerID != result.AgentPeerID {
 		return false
 	}
 	detail, found, err := h.state.GetFleetCommandDetail(ctx, fleet.FleetID, result.CommandID)
@@ -1478,7 +1509,7 @@ func fleetCommandTargetIncludesResultAgent(cmd FleetCommandEnvelope, member Flee
 	case FleetCommandTargetAll:
 		return !FleetTaskIsCoordinator(member)
 	case FleetCommandTargetNode:
-		return cmd.Target.PilotNodeID == member.NodeID
+		return cmd.Target.MemberID == member.MemberID && cmd.Target.PeerID == member.PeerID
 	default:
 		return false
 	}
@@ -1525,12 +1556,11 @@ func (h *Handler) handleCreateFleetCommand(w http.ResponseWriter, r *http.Reques
 	target := FleetCommandTarget{Kind: targetKind}
 	var subject *entmoot.NodeInfo
 	if targetKind == FleetCommandTargetNode {
-		nodeID, err := fleetTaskNodeIDFromRequest(req.TargetNodeID)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		if req.TargetMemberID == (entmoot.MemberID{}) {
+			writeError(w, http.StatusBadRequest, "bad_request", "target_member_id is required for target=node")
 			return
 		}
-		member, found, err := h.fleetMemberByNode(r.Context(), fleet.FleetID, nodeID)
+		member, found, err := h.fleetMemberByID(r.Context(), fleet.FleetID, req.TargetMemberID)
 		if err != nil {
 			h.logger.Error("esphttp: fleet command target lookup", slog.String("err", err.Error()))
 			writeError(w, http.StatusInternalServerError, "internal_error", "fleet member lookup failed")
@@ -1540,14 +1570,15 @@ func (h *Handler) handleCreateFleetCommand(w http.ResponseWriter, r *http.Reques
 			writeError(w, http.StatusBadRequest, "bad_request", "target must be an active fleet member")
 			return
 		}
-		target.PilotNodeID = nodeID
+		target.MemberID = member.MemberID
+		target.PeerID = member.PeerID
 		info := FleetTaskActorFromMember(member)
 		subject = &info
 	} else if targetKind != FleetCommandTargetAll {
 		writeError(w, http.StatusBadRequest, "bad_request", "invalid command target")
 		return
-	} else if req.TargetNodeID != 0 {
-		writeError(w, http.StatusBadRequest, "bad_request", "target_node_id requires target=node")
+	} else if req.TargetMemberID != (entmoot.MemberID{}) {
+		writeError(w, http.StatusBadRequest, "bad_request", "target_member_id requires target=node")
 		return
 	}
 	now := h.clock().UnixMilli()
@@ -1580,11 +1611,12 @@ func (h *Handler) handleCreateFleetCommand(w http.ResponseWriter, r *http.Reques
 	}
 	command := FleetCommandEnvelope{
 		Type:           FleetCommandMessageType,
-		Version:        1,
+		Version:        2,
 		CommandID:      commandID,
 		FleetID:        fleet.FleetID,
 		ControlGroupID: fleet.ControlGroupID,
-		IssuerNodeID:   actor.NodeID,
+		IssuerMemberID: actor.MemberID,
+		IssuerPeerID:   actor.PeerID,
 		Target:         target,
 		Action:         action,
 		Args:           args,
@@ -1645,8 +1677,9 @@ func (h *Handler) handleCreateFleetCommand(w http.ResponseWriter, r *http.Reques
 
 func fleetCommandIssuerProofFromMember(auth MemberAuth, body []byte) *FleetCommandIssuerProof {
 	return &FleetCommandIssuerProof{
-		Scheme:        FleetCommandIssuerProofMemberV1,
-		NodeID:        auth.NodeID,
+		Scheme:        FleetCommandIssuerProofMemberV2,
+		MemberID:      auth.MemberID,
+		PeerID:        auth.PeerID,
 		EntmootPubKey: base64.StdEncoding.EncodeToString(auth.EntmootPubKey),
 		Method:        strings.ToUpper(strings.TrimSpace(auth.Method)),
 		Path:          auth.Path,
@@ -1666,7 +1699,8 @@ func (h *Handler) taskEventPublisherMatchesCoordinator(ctx context.Context, coor
 	if err != nil {
 		return false, err
 	}
-	return info.PilotNodeID == coordinator.PilotNodeID && bytes.Equal(info.EntmootPubKey, coordinator.EntmootPubKey), nil
+	return nodeInfoMemberID(info) == nodeInfoMemberID(coordinator) &&
+		bytes.Equal(info.EntmootPubKey, coordinator.EntmootPubKey), nil
 }
 
 func (h *Handler) persistFleetTaskMutation(ctx context.Context, mutation FleetTaskMutation, actor FleetMemberRecord) (FleetTaskRecord, FleetActivityRecord, FleetTaskSubmissionRecord, error) {
@@ -1747,7 +1781,7 @@ func (h *Handler) publishFleetTaskEvent(ctx context.Context, mutation FleetTaskM
 		Action:         mutation.Action,
 		Status:         task.Status,
 		Title:          task.Title,
-		ActorNodeID:    actor.NodeID,
+		ActorMemberID:  actor.MemberID,
 		Summary:        mutation.Summary,
 		CreatedAtMS:    createdAtMS,
 	}
@@ -1828,10 +1862,10 @@ func (h *Handler) reconcileFleetAcceptance(ctx context.Context, fleet FleetRecor
 	}
 	rosterByIdentity := make(map[string]MemberSummary, len(rosterMembers))
 	for _, member := range rosterMembers {
-		if member.NodeID == 0 || strings.TrimSpace(member.EntmootPubKey) == "" {
+		if member.MemberID == (entmoot.MemberID{}) || strings.TrimSpace(member.EntmootPubKey) == "" {
 			continue
 		}
-		rosterByIdentity[fleetIdentityKey(member.NodeID, member.EntmootPubKey)] = member
+		rosterByIdentity[fleetIdentityKey(member.MemberID, member.EntmootPubKey)] = member
 	}
 	if len(rosterByIdentity) == 0 {
 		return
@@ -1852,14 +1886,14 @@ func (h *Handler) reconcileFleetAcceptance(ctx context.Context, fleet FleetRecor
 		if invite.Status != FleetMemberInvited {
 			continue
 		}
-		key := fleetIdentityKey(invite.NodeID, invite.EntmootPubKey)
+		key := fleetIdentityKey(invite.MemberID, invite.EntmootPubKey)
 		invitesByIdentity[key] = append(invitesByIdentity[key], invite)
 	}
 	for _, member := range members {
 		if member.Status != FleetMemberInvited || member.Role == FleetRoleCoordinator {
 			continue
 		}
-		key := fleetIdentityKey(member.NodeID, member.EntmootPubKey)
+		key := fleetIdentityKey(member.MemberID, member.EntmootPubKey)
 		rosterMember, joined := rosterByIdentity[key]
 		if !joined {
 			continue
@@ -1868,28 +1902,29 @@ func (h *Handler) reconcileFleetAcceptance(ctx context.Context, fleet FleetRecor
 		if len(matchingInvites) == 0 {
 			continue
 		}
-		accepted, activity, applied, err := h.state.ReconcileFleetInviteAcceptance(ctx, fleet.FleetID, member.NodeID, member.EntmootPubKey, now, rosterMember.Hostname)
+		accepted, activity, applied, err := h.state.ReconcileFleetInviteAcceptance(ctx, fleet.FleetID, member.MemberID, member.EntmootPubKey, now, rosterMember.Hostname)
 		if err != nil {
-			h.logger.Warn("esphttp: reconcile fleet acceptance member update failed", slog.String("fleet_id", fleet.FleetID), slog.Uint64("node_id", uint64(member.NodeID)), slog.String("err", err.Error()))
+			h.logger.Warn("esphttp: reconcile fleet acceptance member update failed", slog.String("fleet_id", fleet.FleetID), slog.String("member_id", member.MemberID.String()), slog.String("err", err.Error()))
 			continue
 		}
 		if !applied {
 			continue
 		}
-		h.logger.Debug("esphttp: reconciled fleet invite acceptance", slog.String("fleet_id", fleet.FleetID), slog.Uint64("node_id", uint64(accepted.NodeID)), slog.String("event_id", activity.EventID))
+		h.logger.Debug("esphttp: reconciled fleet invite acceptance", slog.String("fleet_id", fleet.FleetID), slog.String("member_id", accepted.MemberID.String()), slog.String("event_id", activity.EventID))
 	}
 }
 
-func fleetIdentityKey(nodeID entmoot.NodeID, pubkey string) string {
-	return strconv.FormatUint(uint64(nodeID), 10) + ":" + strings.TrimSpace(pubkey)
+func fleetIdentityKey(memberID entmoot.MemberID, pubkey string) string {
+	return memberID.String() + ":" + strings.TrimSpace(pubkey)
 }
 
 func fleetNodeInfoFromMember(member FleetMemberRecord) (entmoot.NodeInfo, bool) {
 	pubkey, err := base64.StdEncoding.DecodeString(member.EntmootPubKey)
-	if err != nil {
+	if err != nil || member.MemberID == (entmoot.MemberID{}) {
 		return entmoot.NodeInfo{}, false
 	}
-	return entmoot.NodeInfo{PilotNodeID: member.NodeID, EntmootPubKey: pubkey}, true
+	memberID := member.MemberID
+	return entmoot.NodeInfo{MemberID: &memberID, PeerID: member.PeerID, EntmootPubKey: pubkey}, true
 }
 
 func fleetAcceptanceActivityFromMember(member FleetMemberRecord, createdAtMS int64) (FleetActivityRecord, error) {
@@ -1971,7 +2006,9 @@ func (h *Handler) handleGroups(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		h.handleListGroups(w, r)
 	case http.MethodPost:
-		h.withIdempotency(w, r, "group_create", func(w http.ResponseWriter, r *http.Request) {
+		h.withIdempotency(w, r, "group_create", func(w http.ResponseWriter, r *http.Request) bool {
+			return h.authorizeSignRequestCreation(w, r, "group_create", entmoot.GroupID{})
+		}, func(w http.ResponseWriter, r *http.Request) {
 			h.createSignRequestFromHTTP(w, r, "group_create", entmoot.GroupID{})
 		})
 	default:
@@ -2039,7 +2076,9 @@ func (h *Handler) handleGroupSubroute(w http.ResponseWriter, r *http.Request) bo
 			return true
 		}
 		escapedMember := strings.TrimPrefix(suffix, "members/")
-		h.withIdempotency(w, r, "member_remove:"+groupID.String()+":"+escapedMember, func(w http.ResponseWriter, r *http.Request) {
+		h.withIdempotency(w, r, "member_remove:"+groupID.String()+":"+escapedMember, func(w http.ResponseWriter, r *http.Request) bool {
+			return h.authorizeSignRequestCreation(w, r, "member_remove", groupID)
+		}, func(w http.ResponseWriter, r *http.Request) {
 			h.createMemberRemoveSignRequest(w, r, groupID, escapedMember)
 		})
 		return true
@@ -2052,11 +2091,15 @@ func (h *Handler) handleGroupSubroute(w http.ResponseWriter, r *http.Request) bo
 		}
 		switch r.Method {
 		case http.MethodPut:
-			h.withIdempotency(w, r, "live_agent_config:"+groupID.String()+":"+strconv.FormatUint(uint64(nodeID), 10), func(w http.ResponseWriter, r *http.Request) {
+			h.withIdempotency(w, r, "live_agent_config:"+groupID.String()+":"+nodeID.String(), func(w http.ResponseWriter, r *http.Request) bool {
+				return h.checkLiveAgentConfigWrite(w, r, groupID, nodeID)
+			}, func(w http.ResponseWriter, r *http.Request) {
 				h.handleUpsertLiveAgentConfig(w, r, groupID, nodeID)
 			})
 		case http.MethodDelete:
-			h.withIdempotency(w, r, "live_agent_config_delete:"+groupID.String()+":"+strconv.FormatUint(uint64(nodeID), 10), func(w http.ResponseWriter, r *http.Request) {
+			h.withIdempotency(w, r, "live_agent_config_delete:"+groupID.String()+":"+nodeID.String(), func(w http.ResponseWriter, r *http.Request) bool {
+				return h.checkLiveAgentConfigWrite(w, r, groupID, nodeID)
+			}, func(w http.ResponseWriter, r *http.Request) {
 				h.handleDeleteLiveAgentConfig(w, r, groupID, nodeID)
 			})
 		default:
@@ -2075,7 +2118,9 @@ func (h *Handler) handleGroupSubroute(w http.ResponseWriter, r *http.Request) bo
 			methodNotAllowed(w, http.MethodPost)
 			return true
 		}
-		h.withIdempotency(w, r, "open_invite_revoke:"+groupID.String()+":"+escapedInvite, func(w http.ResponseWriter, r *http.Request) {
+		h.withIdempotency(w, r, "open_invite_revoke:"+groupID.String()+":"+escapedInvite, func(w http.ResponseWriter, r *http.Request) bool {
+			return h.checkDeviceGroupAdmin(w, r, groupID)
+		}, func(w http.ResponseWriter, r *http.Request) {
 			h.handleRevokeOpenInvite(w, r, groupID, escapedInvite)
 		})
 		return true
@@ -2086,7 +2131,9 @@ func (h *Handler) handleGroupSubroute(w http.ResponseWriter, r *http.Request) bo
 		case http.MethodGet:
 			h.handleGetGroup(w, r, groupID)
 		case http.MethodPatch:
-			h.withIdempotency(w, r, "group_update:"+groupID.String(), func(w http.ResponseWriter, r *http.Request) {
+			h.withIdempotency(w, r, "group_update:"+groupID.String(), func(w http.ResponseWriter, r *http.Request) bool {
+				return h.authorizeSignRequestCreation(w, r, "group_update", groupID)
+			}, func(w http.ResponseWriter, r *http.Request) {
 				h.createSignRequestFromHTTP(w, r, "group_update", groupID)
 			})
 		default:
@@ -2097,11 +2144,15 @@ func (h *Handler) handleGroupSubroute(w http.ResponseWriter, r *http.Request) bo
 		case http.MethodGet:
 			h.handleGetGroupPolicy(w, r, groupID)
 		case http.MethodPut:
-			h.withIdempotency(w, r, "group_policy_update:"+groupID.String(), func(w http.ResponseWriter, r *http.Request) {
+			h.withIdempotency(w, r, "group_policy_update:"+groupID.String(), func(w http.ResponseWriter, r *http.Request) bool {
+				return h.authorizeSignRequestCreation(w, r, signRequestKindGroupPolicyUpdate, groupID)
+			}, func(w http.ResponseWriter, r *http.Request) {
 				h.createSignRequestFromHTTP(w, r, signRequestKindGroupPolicyUpdate, groupID)
 			})
 		case http.MethodDelete:
-			h.withIdempotency(w, r, "group_policy_clear:"+groupID.String(), func(w http.ResponseWriter, r *http.Request) {
+			h.withIdempotency(w, r, "group_policy_clear:"+groupID.String(), func(w http.ResponseWriter, r *http.Request) bool {
+				return h.authorizeSignRequestCreation(w, r, signRequestKindGroupPolicyClear, groupID)
+			}, func(w http.ResponseWriter, r *http.Request) {
 				h.createSignRequestFromHTTP(w, r, signRequestKindGroupPolicyClear, groupID)
 			})
 		default:
@@ -2112,7 +2163,9 @@ func (h *Handler) handleGroupSubroute(w http.ResponseWriter, r *http.Request) bo
 			methodNotAllowed(w, http.MethodPost)
 			return true
 		}
-		h.withIdempotency(w, r, "group_public_publish:"+groupID.String(), func(w http.ResponseWriter, r *http.Request) {
+		h.withIdempotency(w, r, "group_public_publish:"+groupID.String(), func(w http.ResponseWriter, r *http.Request) bool {
+			return h.authorizeSignRequestCreation(w, r, signRequestKindGroupPublicPublish, groupID)
+		}, func(w http.ResponseWriter, r *http.Request) {
 			h.createSignRequestFromHTTP(w, r, signRequestKindGroupPublicPublish, groupID)
 		})
 	case "members":
@@ -2132,7 +2185,9 @@ func (h *Handler) handleGroupSubroute(w http.ResponseWriter, r *http.Request) bo
 			methodNotAllowed(w, http.MethodPost)
 			return true
 		}
-		h.withIdempotency(w, r, "invite_create:"+groupID.String(), func(w http.ResponseWriter, r *http.Request) {
+		h.withIdempotency(w, r, "invite_create:"+groupID.String(), func(w http.ResponseWriter, r *http.Request) bool {
+			return h.authorizeSignRequestCreation(w, r, "invite_create", groupID)
+		}, func(w http.ResponseWriter, r *http.Request) {
 			h.createSignRequestFromHTTP(w, r, "invite_create", groupID)
 		})
 	case "open-invites":
@@ -2140,7 +2195,9 @@ func (h *Handler) handleGroupSubroute(w http.ResponseWriter, r *http.Request) bo
 		case http.MethodGet:
 			h.handleListOpenInvites(w, r, groupID)
 		case http.MethodPost:
-			h.withIdempotency(w, r, "open_invite_create:"+groupID.String(), func(w http.ResponseWriter, r *http.Request) {
+			h.withIdempotency(w, r, "open_invite_create:"+groupID.String(), func(w http.ResponseWriter, r *http.Request) bool {
+				return h.authorizeSignRequestCreation(w, r, "open_invite_create", groupID)
+			}, func(w http.ResponseWriter, r *http.Request) {
 				h.createSignRequestFromHTTP(w, r, "open_invite_create", groupID)
 			})
 		default:
@@ -2157,7 +2214,9 @@ func (h *Handler) handleGroupSubroute(w http.ResponseWriter, r *http.Request) bo
 		case http.MethodGet:
 			h.handleGroupMessages(w, r, groupID)
 		case http.MethodPost:
-			h.withIdempotency(w, r, "message_publish:"+groupID.String(), func(w http.ResponseWriter, r *http.Request) {
+			h.withIdempotency(w, r, "message_publish:"+groupID.String(), func(w http.ResponseWriter, r *http.Request) bool {
+				return h.checkDeviceGroup(w, r, groupID)
+			}, func(w http.ResponseWriter, r *http.Request) {
 				h.handleGroupMessagePublish(w, r, groupID)
 			})
 		default:
@@ -2274,7 +2333,7 @@ func (h *Handler) observeFleetMemberProfiles(ctx context.Context, members []Flee
 		}
 		if _, _, err := h.state.UpsertNodeProfile(ctx, profile); err != nil {
 			h.logger.Warn("esphttp: fleet member profile cache update failed",
-				slog.Uint64("node_id", uint64(member.NodeID)),
+				slog.String("member_id", member.MemberID.String()),
 				slog.String("err", err.Error()))
 		}
 	}
@@ -2291,7 +2350,7 @@ func (h *Handler) observeFleetInviteProfiles(ctx context.Context, invites []Flee
 		}
 		if _, _, err := h.state.UpsertNodeProfile(ctx, profile); err != nil {
 			h.logger.Warn("esphttp: fleet invite profile cache update failed",
-				slog.Uint64("node_id", uint64(invite.NodeID)),
+				slog.String("member_id", invite.MemberID.String()),
 				slog.String("err", err.Error()))
 		}
 	}
@@ -2322,11 +2381,11 @@ func (h *Handler) handleListLiveAgentConfigs(w http.ResponseWriter, r *http.Requ
 		writeError(w, http.StatusInternalServerError, "internal_error", "live agent presence listing failed")
 		return
 	}
-	states := LiveAgentStatesByNode(configs, presence, h.clock().UnixMilli())
+	states := LiveAgentStatesByMember(configs, presence, h.clock().UnixMilli())
 	writeJSON(w, http.StatusOK, map[string]any{"configs": configs, "presence": presence, "members": states})
 }
 
-func (h *Handler) handleUpsertLiveAgentConfig(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID, nodeID entmoot.NodeID) {
+func (h *Handler) handleUpsertLiveAgentConfig(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID, nodeID entmoot.MemberID) {
 	if !h.checkLiveAgentConfigWrite(w, r, groupID, nodeID) {
 		return
 	}
@@ -2365,7 +2424,7 @@ func (h *Handler) handleUpsertLiveAgentConfig(w http.ResponseWriter, r *http.Req
 	}
 	cfg, err := h.state.UpsertLiveAgentConfig(r.Context(), LiveAgentConfig{
 		GroupID:           groupID,
-		NodeID:            nodeID,
+		MemberID:          nodeID,
 		Enabled:           enabled,
 		Mode:              mode,
 		TopicFilters:      topicFilters,
@@ -2436,7 +2495,7 @@ func filterLiveActionsDisabledByFeatures(actions []string, flags entfeatures.Fla
 	return out
 }
 
-func (h *Handler) handleDeleteLiveAgentConfig(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID, nodeID entmoot.NodeID) {
+func (h *Handler) handleDeleteLiveAgentConfig(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID, nodeID entmoot.MemberID) {
 	if !h.checkLiveAgentConfigWrite(w, r, groupID, nodeID) {
 		return
 	}
@@ -2729,12 +2788,12 @@ func (h *Handler) writeMessageContextResult(w http.ResponseWriter, result mailbo
 }
 
 type historyCursorPayload struct {
-	Version      int               `json:"v"`
-	GroupID      entmoot.GroupID   `json:"group_id"`
-	Topic        string            `json:"topic,omitempty"`
-	TimestampMS  int64             `json:"timestamp_ms"`
-	AuthorNodeID entmoot.NodeID    `json:"author_node_id"`
-	MessageID    entmoot.MessageID `json:"message_id"`
+	Version        int               `json:"v"`
+	GroupID        entmoot.GroupID   `json:"group_id"`
+	Topic          string            `json:"topic,omitempty"`
+	TimestampMS    int64             `json:"timestamp_ms"`
+	AuthorMemberID entmoot.MemberID  `json:"author_member_id"`
+	MessageID      entmoot.MessageID `json:"message_id"`
 }
 
 func parseHistoryCursor(raw string, groupID entmoot.GroupID, topic string) (*store.PageBoundary, error) {
@@ -2749,7 +2808,7 @@ func parseHistoryCursor(raw string, groupID entmoot.GroupID, topic string) (*sto
 	if err := json.Unmarshal(data, &payload); err != nil {
 		return nil, fmt.Errorf("invalid history cursor")
 	}
-	if payload.Version != 1 {
+	if payload.Version != 2 {
 		return nil, fmt.Errorf("unsupported history cursor")
 	}
 	if payload.GroupID != groupID || payload.Topic != topic {
@@ -2759,9 +2818,9 @@ func parseHistoryCursor(raw string, groupID entmoot.GroupID, topic string) (*sto
 		return nil, fmt.Errorf("invalid history cursor")
 	}
 	return &store.PageBoundary{
-		TimestampMS:  payload.TimestampMS,
-		AuthorNodeID: payload.AuthorNodeID,
-		MessageID:    payload.MessageID,
+		TimestampMS:    payload.TimestampMS,
+		AuthorMemberID: payload.AuthorMemberID,
+		MessageID:      payload.MessageID,
 	}, nil
 }
 
@@ -2770,12 +2829,12 @@ func encodeHistoryCursor(groupID entmoot.GroupID, topic string, boundary *store.
 		return ""
 	}
 	data, err := json.Marshal(historyCursorPayload{
-		Version:      1,
-		GroupID:      groupID,
-		Topic:        topic,
-		TimestampMS:  boundary.TimestampMS,
-		AuthorNodeID: boundary.AuthorNodeID,
-		MessageID:    boundary.MessageID,
+		Version:        2,
+		GroupID:        groupID,
+		Topic:          topic,
+		TimestampMS:    boundary.TimestampMS,
+		AuthorMemberID: boundary.AuthorMemberID,
+		MessageID:      boundary.MessageID,
 	})
 	if err != nil {
 		return ""
@@ -2784,13 +2843,13 @@ func encodeHistoryCursor(groupID entmoot.GroupID, topic string, boundary *store.
 }
 
 type searchCursorPayload struct {
-	Version      int               `json:"v"`
-	GroupID      entmoot.GroupID   `json:"group_id"`
-	Topic        string            `json:"topic,omitempty"`
-	QueryHash    string            `json:"query_hash"`
-	TimestampMS  int64             `json:"timestamp_ms"`
-	AuthorNodeID entmoot.NodeID    `json:"author_node_id"`
-	MessageID    entmoot.MessageID `json:"message_id"`
+	Version        int               `json:"v"`
+	GroupID        entmoot.GroupID   `json:"group_id"`
+	Topic          string            `json:"topic,omitempty"`
+	QueryHash      string            `json:"query_hash"`
+	TimestampMS    int64             `json:"timestamp_ms"`
+	AuthorMemberID entmoot.MemberID  `json:"author_member_id"`
+	MessageID      entmoot.MessageID `json:"message_id"`
 }
 
 func parseSearchCursor(raw string, groupID entmoot.GroupID, topic, queryHash string) (*store.SearchBoundary, error) {
@@ -2805,7 +2864,7 @@ func parseSearchCursor(raw string, groupID entmoot.GroupID, topic, queryHash str
 	if err := json.Unmarshal(data, &payload); err != nil {
 		return nil, fmt.Errorf("invalid search cursor")
 	}
-	if payload.Version != 1 {
+	if payload.Version != 2 {
 		return nil, fmt.Errorf("unsupported search cursor")
 	}
 	if payload.GroupID != groupID || payload.Topic != topic || payload.QueryHash != queryHash {
@@ -2815,9 +2874,9 @@ func parseSearchCursor(raw string, groupID entmoot.GroupID, topic, queryHash str
 		return nil, fmt.Errorf("invalid search cursor")
 	}
 	return &store.SearchBoundary{
-		TimestampMS:  payload.TimestampMS,
-		AuthorNodeID: payload.AuthorNodeID,
-		MessageID:    payload.MessageID,
+		TimestampMS:    payload.TimestampMS,
+		AuthorMemberID: payload.AuthorMemberID,
+		MessageID:      payload.MessageID,
 	}, nil
 }
 
@@ -2826,13 +2885,13 @@ func encodeSearchCursor(groupID entmoot.GroupID, topic, queryHash string, bounda
 		return ""
 	}
 	data, err := json.Marshal(searchCursorPayload{
-		Version:      1,
-		GroupID:      groupID,
-		Topic:        topic,
-		QueryHash:    queryHash,
-		TimestampMS:  boundary.TimestampMS,
-		AuthorNodeID: boundary.AuthorNodeID,
-		MessageID:    boundary.MessageID,
+		Version:        2,
+		GroupID:        groupID,
+		Topic:          topic,
+		QueryHash:      queryHash,
+		TimestampMS:    boundary.TimestampMS,
+		AuthorMemberID: boundary.AuthorMemberID,
+		MessageID:      boundary.MessageID,
 	})
 	if err != nil {
 		return ""
@@ -2912,7 +2971,9 @@ func (h *Handler) handleInviteAccept(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w, http.MethodPost)
 		return
 	}
-	h.withIdempotency(w, r, "invite_accept", func(w http.ResponseWriter, r *http.Request) {
+	h.withIdempotency(w, r, "invite_accept", func(w http.ResponseWriter, r *http.Request) bool {
+		return h.authorizeSignRequestCreation(w, r, "invite_accept", entmoot.GroupID{})
+	}, func(w http.ResponseWriter, r *http.Request) {
 		h.createSignRequestFromHTTP(w, r, "invite_accept", entmoot.GroupID{})
 	})
 }
@@ -2922,7 +2983,9 @@ func (h *Handler) handleOpenInviteAccept(w http.ResponseWriter, r *http.Request)
 		methodNotAllowed(w, http.MethodPost)
 		return
 	}
-	h.withIdempotency(w, r, "open_invite_accept", func(w http.ResponseWriter, r *http.Request) {
+	h.withIdempotency(w, r, "open_invite_accept", func(w http.ResponseWriter, r *http.Request) bool {
+		return h.authorizeSignRequestCreation(w, r, "open_invite_accept", entmoot.GroupID{})
+	}, func(w http.ResponseWriter, r *http.Request) {
 		h.createSignRequestFromHTTP(w, r, "open_invite_accept", entmoot.GroupID{})
 	})
 }
@@ -2937,7 +3000,7 @@ func (h *Handler) handleOpenInviteRedeem(w http.ResponseWriter, r *http.Request)
 	}
 	rest := strings.TrimPrefix(r.URL.EscapedPath(), prefix)
 	escapedToken, suffix, ok := strings.Cut(rest, "/")
-	if !ok || (suffix != "redeem" && suffix != "challenge") {
+	if !ok || suffix != "redeem" {
 		writeError(w, http.StatusNotFound, "not_found", "not found")
 		return true
 	}
@@ -2958,22 +3021,12 @@ func (h *Handler) handleOpenInviteRedeem(w http.ResponseWriter, r *http.Request)
 	if len(payload) == 0 || string(payload) == "null" {
 		body = []byte("{}")
 	}
-	var result json.RawMessage
-	if suffix == "challenge" {
-		challenger, ok := h.operations.(OpenInviteChallenger)
-		if !ok {
-			writeError(w, http.StatusServiceUnavailable, "open_invite_unavailable", "open invite challenge is not configured")
-			return true
-		}
-		result, err = challenger.CreateOpenInviteChallenge(r.Context(), token, body)
-	} else {
-		redeemer, ok := h.operations.(OpenInviteRedeemer)
-		if !ok {
-			writeError(w, http.StatusServiceUnavailable, "open_invite_unavailable", "open invite redemption is not configured")
-			return true
-		}
-		result, err = redeemer.RedeemOpenInvite(r.Context(), token, body)
+	redeemer, ok := h.operations.(OpenInviteRedeemer)
+	if !ok {
+		writeError(w, http.StatusServiceUnavailable, "open_invite_unavailable", "open invite redemption is not configured")
+		return true
 	}
+	result, err := redeemer.RedeemOpenInvite(r.Context(), token, body)
 	if err != nil {
 		var opErr *OperationError
 		if errors.As(err, &opErr) {
@@ -3034,7 +3087,9 @@ func (h *Handler) handleSignRequestSubroute(w http.ResponseWriter, r *http.Reque
 			methodNotAllowed(w, http.MethodPost)
 			return true
 		}
-		h.withIdempotency(w, r, "sign_request_complete:"+id, func(w http.ResponseWriter, r *http.Request) {
+		h.withIdempotency(w, r, "sign_request_complete:"+id, func(w http.ResponseWriter, r *http.Request) bool {
+			return h.authorizeSignRequestCompletion(w, r, id)
+		}, func(w http.ResponseWriter, r *http.Request) {
 			h.handleCompleteSignRequest(w, r, id)
 		})
 	case "reject":
@@ -3045,6 +3100,26 @@ func (h *Handler) handleSignRequestSubroute(w http.ResponseWriter, r *http.Reque
 		h.handleRejectSignRequest(w, r, id)
 	default:
 		writeError(w, http.StatusNotFound, "not_found", "not found")
+	}
+	return true
+}
+
+func (h *Handler) authorizeSignRequestCompletion(w http.ResponseWriter, r *http.Request, id string) bool {
+	req, found, err := h.state.GetSignRequest(r.Context(), id)
+	if err != nil {
+		h.writeSignRequestMutation(w, SignRequest{}, err)
+		return false
+	}
+	if !found {
+		h.writeSignRequestMutation(w, SignRequest{}, sql.ErrNoRows)
+		return false
+	}
+	if !h.signRequestVisible(w, r, req) {
+		return false
+	}
+	if feature, disabled := h.disabledSignRequestFeature(req); disabled {
+		h.writeFeatureDisabled(w, feature)
+		return false
 	}
 	return true
 }
@@ -3171,13 +3246,20 @@ func (h *Handler) handlePushToken(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w, http.MethodPut)
 		return
 	}
-	h.withIdempotency(w, r, "push_token:"+deviceIDForRequest(authFromContext(r)), h.handlePushTokenMutation)
+	h.withIdempotency(w, r, "push_token", h.authorizePushTokenMutation, h.handlePushTokenMutation)
+}
+
+func (h *Handler) authorizePushTokenMutation(w http.ResponseWriter, r *http.Request) bool {
+	if authFromContext(r).device == nil {
+		writeError(w, http.StatusForbidden, "forbidden", "device auth is required")
+		return false
+	}
+	return true
 }
 
 func (h *Handler) handlePushTokenMutation(w http.ResponseWriter, r *http.Request) {
-	auth, _ := r.Context().Value(authContextKey{}).(authContext)
-	if auth.device == nil {
-		writeError(w, http.StatusForbidden, "forbidden", "device auth is required")
+	auth := authFromContext(r)
+	if !h.authorizePushTokenMutation(w, r) {
 		return
 	}
 	var body struct {
@@ -3394,7 +3476,8 @@ func (h *Handler) handleMessagePublish(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Message.ID == (entmoot.MessageID{}) &&
 		req.Message.GroupID == (entmoot.GroupID{}) &&
-		req.Message.Author.PilotNodeID == 0 &&
+		req.Message.Author.MemberID == nil &&
+		req.Message.Author.PeerID == "" &&
 		len(req.Message.Author.EntmootPubKey) == 0 &&
 		req.Message.Timestamp == 0 &&
 		len(req.Message.Topics) == 0 &&
@@ -3499,13 +3582,14 @@ type authContext struct {
 }
 
 type MemberAuth struct {
-	NodeID        entmoot.NodeID `json:"node_id"`
-	EntmootPubKey []byte         `json:"entmoot_pubkey"`
-	Method        string         `json:"-"`
-	Path          string         `json:"-"`
-	TimestampMS   int64          `json:"-"`
-	Nonce         string         `json:"-"`
-	Signature     string         `json:"-"`
+	MemberID      entmoot.MemberID `json:"member_id"`
+	PeerID        string           `json:"peer_id"`
+	EntmootPubKey []byte           `json:"entmoot_pubkey"`
+	Method        string           `json:"-"`
+	Path          string           `json:"-"`
+	TimestampMS   int64            `json:"-"`
+	Nonce         string           `json:"-"`
+	Signature     string           `json:"-"`
 }
 
 func (h *Handler) authorize(w http.ResponseWriter, r *http.Request) (authContext, bool) {
@@ -3569,7 +3653,8 @@ func (h *Handler) authorize(w http.ResponseWriter, r *http.Request) (authContext
 }
 
 func requestHasMemberAuth(r *http.Request) bool {
-	return r.Header.Get(memberNodeHeader) != "" ||
+	return r.Header.Get(memberIDHeader) != "" ||
+		r.Header.Get(memberPeerHeader) != "" ||
 		r.Header.Get(memberPubKeyHeader) != "" ||
 		r.Header.Get(memberSignatureHeader) != ""
 }
@@ -3695,14 +3780,30 @@ func (h *Handler) authorizedMember(w http.ResponseWriter, r *http.Request, body 
 }
 
 func (h *Handler) memberAuthFromRequest(r *http.Request, body []byte) (authContext, string, bool) {
-	nodeRaw := strings.TrimSpace(r.Header.Get(memberNodeHeader))
-	node64, err := strconv.ParseUint(nodeRaw, 10, 32)
-	if err != nil || node64 == 0 {
-		return authContext{}, "invalid member node id", false
+	var memberID entmoot.MemberID
+	if err := memberID.UnmarshalJSON([]byte(strconv.Quote(strings.TrimSpace(r.Header.Get(memberIDHeader))))); err != nil || memberID == (entmoot.MemberID{}) {
+		return authContext{}, "invalid member id", false
+	}
+	peerIDRaw := strings.TrimSpace(r.Header.Get(memberPeerHeader))
+	peerID, err := peer.Decode(peerIDRaw)
+	if err != nil {
+		return authContext{}, "invalid peer id", false
 	}
 	pub, err := base64.StdEncoding.DecodeString(strings.TrimSpace(r.Header.Get(memberPubKeyHeader)))
 	if err != nil || len(pub) != ed25519.PublicKeySize {
 		return authContext{}, "invalid member public key", false
+	}
+	derivedMemberID, err := entmoot.MemberIDFromPublicKey(pub)
+	if err != nil || derivedMemberID != memberID {
+		return authContext{}, "member id does not match public key", false
+	}
+	publicKey, err := libp2pcrypto.UnmarshalEd25519PublicKey(pub)
+	if err != nil {
+		return authContext{}, "invalid member public key", false
+	}
+	derivedPeerID, err := peer.IDFromPublicKey(publicKey)
+	if err != nil || derivedPeerID != peerID {
+		return authContext{}, "peer id does not match public key", false
 	}
 	tsRaw := strings.TrimSpace(r.Header.Get(timestampHeader))
 	tsMillis, err := strconv.ParseInt(tsRaw, 10, 64)
@@ -3722,23 +3823,15 @@ func (h *Handler) memberAuthFromRequest(r *http.Request, body []byte) (authConte
 	if err != nil || len(sig) != ed25519.SignatureSize {
 		return authContext{}, "invalid signature", false
 	}
-	input := MemberSigningInput(r.Method, r.URL.RequestURI(), entmoot.NodeID(node64), pub, tsMillis, nonce, body)
+	input := MemberSigningInput(r.Method, r.URL.RequestURI(), memberID, peerIDRaw, pub, tsMillis, nonce, body)
 	if !ed25519.Verify(pub, []byte(input), sig) {
 		return authContext{}, "invalid signature", false
 	}
-	nonceKey := fmt.Sprintf("member:%d:%s", node64, base64.StdEncoding.EncodeToString(pub))
+	nonceKey := "member:" + memberID.String() + ":" + peerIDRaw
 	if !h.nonceCache.use(nonceKey, nonce, now.Add(deviceAuthSkew)) {
 		return authContext{}, "replayed nonce", false
 	}
-	return authContext{member: &MemberAuth{
-		NodeID:        entmoot.NodeID(node64),
-		EntmootPubKey: append([]byte(nil), pub...),
-		Method:        r.Method,
-		Path:          r.URL.RequestURI(),
-		TimestampMS:   tsMillis,
-		Nonce:         nonce,
-		Signature:     strings.TrimSpace(r.Header.Get(memberSignatureHeader)),
-	}}, "", true
+	return authContext{member: &MemberAuth{MemberID: memberID, PeerID: peerIDRaw, EntmootPubKey: append([]byte(nil), pub...), Method: r.Method, Path: r.URL.RequestURI(), TimestampMS: tsMillis, Nonce: nonce, Signature: strings.TrimSpace(r.Header.Get(memberSignatureHeader))}}, "", true
 }
 
 // DeviceSigningInput returns the canonical bytes a device signs for one ESP
@@ -3755,13 +3848,14 @@ func DeviceSigningInput(method, pathWithRawQuery string, timestampMillis int64, 
 	}, "\n")
 }
 
-func MemberSigningInput(method, pathWithRawQuery string, nodeID entmoot.NodeID, entmootPubKey []byte, timestampMillis int64, nonce string, body []byte) string {
+func MemberSigningInput(method, pathWithRawQuery string, memberID entmoot.MemberID, peerID string, entmootPubKey []byte, timestampMillis int64, nonce string, body []byte) string {
 	sum := sha256.Sum256(body)
 	return strings.Join([]string{
 		memberAuthVersion,
 		strings.ToUpper(method),
 		pathWithRawQuery,
-		strconv.FormatUint(uint64(nodeID), 10),
+		memberID.String(),
+		peerID,
 		base64.StdEncoding.EncodeToString(entmootPubKey),
 		strconv.FormatInt(timestampMillis, 10),
 		nonce,
@@ -3829,7 +3923,7 @@ func (h *Handler) checkLiveAgentConfigRead(w http.ResponseWriter, r *http.Reques
 		return true
 	}
 	if auth.member != nil {
-		if h.memberAuthMatchesGroupMember(r.Context(), groupID, auth.member.NodeID, auth.member.EntmootPubKey) {
+		if h.memberAuthMatchesGroupMember(r.Context(), groupID, auth.member.MemberID, auth.member.EntmootPubKey) {
 			return true
 		}
 		writeError(w, http.StatusForbidden, "forbidden", "member is not authorized for group")
@@ -3838,7 +3932,7 @@ func (h *Handler) checkLiveAgentConfigRead(w http.ResponseWriter, r *http.Reques
 	return h.checkDeviceGroupRead(w, r, groupID)
 }
 
-func (h *Handler) checkLiveAgentConfigWrite(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID, nodeID entmoot.NodeID) bool {
+func (h *Handler) checkLiveAgentConfigWrite(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID, nodeID entmoot.MemberID) bool {
 	auth := authFromContext(r)
 	if auth.bearer {
 		return true
@@ -3851,11 +3945,11 @@ func (h *Handler) checkLiveAgentConfigWrite(w http.ResponseWriter, r *http.Reque
 		return false
 	}
 	if auth.member != nil {
-		if auth.member.NodeID != nodeID {
+		if auth.member.MemberID == (entmoot.MemberID{}) {
 			writeError(w, http.StatusForbidden, "forbidden", "member can only manage its own live agent config")
 			return false
 		}
-		if h.memberAuthMatchesGroupMember(r.Context(), groupID, nodeID, auth.member.EntmootPubKey) {
+		if h.memberAuthMatchesGroupMember(r.Context(), groupID, auth.member.MemberID, auth.member.EntmootPubKey) {
 			return true
 		}
 		writeError(w, http.StatusForbidden, "forbidden", "member is not authorized for group")
@@ -3865,7 +3959,7 @@ func (h *Handler) checkLiveAgentConfigWrite(w http.ResponseWriter, r *http.Reque
 	return false
 }
 
-func (h *Handler) memberAuthMatchesGroupMember(ctx context.Context, groupID entmoot.GroupID, nodeID entmoot.NodeID, pub []byte) bool {
+func (h *Handler) memberAuthMatchesGroupMember(ctx context.Context, groupID entmoot.GroupID, memberID entmoot.MemberID, pub []byte) bool {
 	if h.groups == nil {
 		return false
 	}
@@ -3876,25 +3970,25 @@ func (h *Handler) memberAuthMatchesGroupMember(ctx context.Context, groupID entm
 	}
 	encodedPub := base64.StdEncoding.EncodeToString(pub)
 	for _, member := range members {
-		if member.NodeID == nodeID && member.EntmootPubKey == encodedPub {
+		if member.MemberID == memberID && member.EntmootPubKey == encodedPub {
 			return true
 		}
 	}
 	return false
 }
 
-func parseLiveAgentNodePath(w http.ResponseWriter, escapedNode string) (entmoot.NodeID, bool) {
-	rawNode, err := url.PathUnescape(escapedNode)
+func parseLiveAgentNodePath(w http.ResponseWriter, escapedNode string) (entmoot.MemberID, bool) {
+	rawMember, err := url.PathUnescape(escapedNode)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", "node id is invalid")
-		return 0, false
+		writeError(w, http.StatusBadRequest, "bad_request", "member id is invalid")
+		return entmoot.MemberID{}, false
 	}
-	node64, err := strconv.ParseUint(strings.TrimSpace(rawNode), 10, 32)
-	if err != nil || node64 == 0 {
-		writeError(w, http.StatusBadRequest, "bad_request", "node id is required")
-		return 0, false
+	var memberID entmoot.MemberID
+	if err := memberID.UnmarshalJSON([]byte(strconv.Quote(strings.TrimSpace(rawMember)))); err != nil || memberID == (entmoot.MemberID{}) {
+		writeError(w, http.StatusBadRequest, "bad_request", "member id is required")
+		return entmoot.MemberID{}, false
 	}
-	return entmoot.NodeID(node64), true
+	return memberID, true
 }
 
 func (h *Handler) requireFleetDevice(w http.ResponseWriter, r *http.Request) (*Device, bool) {
@@ -4018,17 +4112,12 @@ func (h *Handler) createFleetMemberRemoveSignRequest(w http.ResponseWriter, r *h
 	if !h.checkDeviceActiveFleetAdmin(w, r, fleetID, false) {
 		return
 	}
-	rawMember, err := url.PathUnescape(escapedMember)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
-		return
-	}
-	nodeID64, err := strconv.ParseUint(strings.TrimSpace(rawMember), 10, 32)
-	if err != nil || nodeID64 == 0 {
-		writeError(w, http.StatusBadRequest, "bad_request", "member node_id must be a positive integer")
+	memberID, ok := parseLiveAgentNodePath(w, escapedMember)
+	if !ok {
 		return
 	}
 	var body struct {
+		PeerID        string `json:"peer_id"`
 		EntmootPubKey string `json:"entmoot_pubkey"`
 	}
 	if _, ok := decodeRawBody(w, r, 1<<20, &body); !ok {
@@ -4037,7 +4126,8 @@ func (h *Handler) createFleetMemberRemoveSignRequest(w http.ResponseWriter, r *h
 	payload, err := json.Marshal(map[string]any{
 		"fleet_id": fleetID,
 		"target": map[string]any{
-			"pilot_node_id":  entmoot.NodeID(nodeID64),
+			"member_id":      memberID,
+			"peer_id":        strings.TrimSpace(body.PeerID),
 			"entmoot_pubkey": strings.TrimSpace(body.EntmootPubKey),
 		},
 	})
@@ -4049,17 +4139,12 @@ func (h *Handler) createFleetMemberRemoveSignRequest(w http.ResponseWriter, r *h
 }
 
 func (h *Handler) createMemberRemoveSignRequest(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID, escapedMember string) {
-	rawMember, err := url.PathUnescape(escapedMember)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
-		return
-	}
-	nodeID64, err := strconv.ParseUint(strings.TrimSpace(rawMember), 10, 32)
-	if err != nil || nodeID64 == 0 {
-		writeError(w, http.StatusBadRequest, "bad_request", "member node_id must be a positive integer")
+	memberID, ok := parseLiveAgentNodePath(w, escapedMember)
+	if !ok {
 		return
 	}
 	var body struct {
+		PeerID        string `json:"peer_id"`
 		EntmootPubKey string `json:"entmoot_pubkey"`
 	}
 	if _, ok := decodeRawBody(w, r, 1<<20, &body); !ok {
@@ -4067,7 +4152,8 @@ func (h *Handler) createMemberRemoveSignRequest(w http.ResponseWriter, r *http.R
 	}
 	payload, err := json.Marshal(map[string]any{
 		"target": map[string]any{
-			"pilot_node_id":  entmoot.NodeID(nodeID64),
+			"member_id":      memberID,
+			"peer_id":        strings.TrimSpace(body.PeerID),
 			"entmoot_pubkey": strings.TrimSpace(body.EntmootPubKey),
 		},
 	})
@@ -4078,19 +4164,28 @@ func (h *Handler) createMemberRemoveSignRequest(w http.ResponseWriter, r *http.R
 	h.createSignRequest(w, r, "member_remove", groupID, payload)
 }
 
-func (h *Handler) createSignRequest(w http.ResponseWriter, r *http.Request, kind string, groupID entmoot.GroupID, payload []byte) {
-	auth, _ := r.Context().Value(authContextKey{}).(authContext)
+func (h *Handler) authorizeSignRequestCreation(w http.ResponseWriter, r *http.Request, kind string, groupID entmoot.GroupID) bool {
+	auth := authFromContext(r)
 	if executableOperationKind(kind) && auth.device == nil {
 		writeError(w, http.StatusForbidden, "device_signature_required", "operation requires a registered device signature")
-		return
+		return false
 	}
-	if groupID != (entmoot.GroupID{}) {
-		if !h.checkDeviceGroup(w, r, groupID) {
-			return
-		}
-		if requiresGroupAdmin(kind) && !h.checkDeviceGroupAdmin(w, r, groupID) {
-			return
-		}
+	if groupID == (entmoot.GroupID{}) {
+		return true
+	}
+	if !h.checkDeviceGroup(w, r, groupID) {
+		return false
+	}
+	if requiresGroupAdmin(kind) && !h.checkDeviceGroupAdmin(w, r, groupID) {
+		return false
+	}
+	return true
+}
+
+func (h *Handler) createSignRequest(w http.ResponseWriter, r *http.Request, kind string, groupID entmoot.GroupID, payload []byte) {
+	auth := authFromContext(r)
+	if !h.authorizeSignRequestCreation(w, r, kind, groupID) {
+		return
 	}
 	if len(payload) == 0 {
 		payload = []byte("{}")
@@ -4400,14 +4495,29 @@ func signRequestKindFeature(kind string) (string, bool) {
 	}
 }
 
-func (h *Handler) withIdempotency(w http.ResponseWriter, r *http.Request, scope string, next func(http.ResponseWriter, *http.Request)) {
+type idempotencyAuthorizer func(http.ResponseWriter, *http.Request) bool
+
+func (h *Handler) withIdempotency(w http.ResponseWriter, r *http.Request, routeScope string, authorize idempotencyAuthorizer, next func(http.ResponseWriter, *http.Request)) {
 	key := strings.TrimSpace(r.Header.Get(idempotencyHeader))
 	if key == "" {
 		next(w, r)
 		return
 	}
+	if authorize == nil {
+		h.logger.Error("esphttp: idempotency route missing authorizer", slog.String("path", r.URL.Path))
+		writeError(w, http.StatusInternalServerError, "internal_error", "idempotency authorization is not configured")
+		return
+	}
+	if !authorize(w, r) {
+		return
+	}
 	if len(key) > 256 {
 		writeError(w, http.StatusBadRequest, "bad_request", "Idempotency-Key is too long")
+		return
+	}
+	scope, ok := h.principalIdempotencyScope(r, routeScope)
+	if !ok {
+		writeError(w, http.StatusForbidden, "forbidden", "authenticated principal is required")
 		return
 	}
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxAuthBodyBytes))
@@ -4417,17 +4527,16 @@ func (h *Handler) withIdempotency(w http.ResponseWriter, r *http.Request, scope 
 	}
 	_ = r.Body.Close()
 	r.Body = io.NopCloser(bytes.NewReader(body))
-	sum := sha256.Sum256(body)
-	bodyHash := base64.StdEncoding.EncodeToString(sum[:])
-	rec, ok, err := h.state.GetIdempotencyRecord(r.Context(), scope, key)
+	requestHash := idempotencyRequestHash(r, body)
+	rec, found, err := h.state.GetIdempotencyRecord(r.Context(), scope, key)
 	if err != nil {
 		h.logger.Error("esphttp: idempotency lookup", slog.String("err", err.Error()))
 		writeError(w, http.StatusInternalServerError, "internal_error", "idempotency lookup failed")
 		return
 	}
-	if ok {
-		if rec.RequestHash != bodyHash {
-			writeError(w, http.StatusConflict, "idempotency_conflict", "Idempotency-Key was already used with a different request body")
+	if found {
+		if rec.RequestHash != requestHash {
+			writeError(w, http.StatusConflict, "idempotency_conflict", "Idempotency-Key was already used with a different request")
 			return
 		}
 		writeStoredJSON(w, rec.StatusCode, rec.Response)
@@ -4435,20 +4544,59 @@ func (h *Handler) withIdempotency(w http.ResponseWriter, r *http.Request, scope 
 	}
 	recorder := newCaptureResponseWriter()
 	next(recorder, r)
+	status := recorder.statusCode()
 	response := recorder.body.Bytes()
 	if len(response) == 0 {
 		response = []byte("{}")
 	}
-	if err := h.state.SaveIdempotencyRecord(r.Context(), IdempotencyRecord{
-		Scope:       scope,
-		Key:         key,
-		RequestHash: bodyHash,
-		StatusCode:  recorder.statusCode(),
-		Response:    append(json.RawMessage(nil), response...),
-	}); err != nil {
-		h.logger.Warn("esphttp: idempotency save failed", slog.String("err", err.Error()))
+	if status >= http.StatusOK && status < http.StatusMultipleChoices {
+		if err := h.state.SaveIdempotencyRecord(r.Context(), IdempotencyRecord{
+			Scope:       scope,
+			Key:         key,
+			RequestHash: requestHash,
+			StatusCode:  status,
+			Response:    append(json.RawMessage(nil), response...),
+		}); err != nil {
+			h.logger.Warn("esphttp: idempotency save failed", slog.String("err", err.Error()))
+		}
 	}
 	copyCapturedResponse(w, recorder)
+}
+
+func (h *Handler) principalIdempotencyScope(r *http.Request, routeScope string) (string, bool) {
+	auth := authFromContext(r)
+	var principal string
+	switch {
+	case auth.member != nil:
+		principal = "member\x00" +
+			auth.member.MemberID.String() + "\x00" +
+			auth.member.PeerID + "\x00" + base64.StdEncoding.EncodeToString(auth.member.EntmootPubKey)
+	case auth.device != nil:
+		principal = "device\x00" + strings.TrimSpace(auth.device.ID)
+	case auth.bearer:
+		principal = "bearer\x00" + h.token
+	default:
+		return "", false
+	}
+	principalHash := sha256.Sum256([]byte(principal))
+	resourceHash := sha256.Sum256([]byte(strings.Join([]string{
+		strings.ToUpper(r.Method),
+		r.URL.EscapedPath(),
+		routeScope,
+	}, "\n")))
+	return "v2:" +
+		base64.RawURLEncoding.EncodeToString(principalHash[:]) + ":" +
+		base64.RawURLEncoding.EncodeToString(resourceHash[:]), true
+}
+
+func idempotencyRequestHash(r *http.Request, body []byte) string {
+	sum := sha256.New()
+	_, _ = io.WriteString(sum, strings.ToUpper(r.Method))
+	_, _ = io.WriteString(sum, "\n")
+	_, _ = io.WriteString(sum, r.URL.RequestURI())
+	_, _ = io.WriteString(sum, "\n")
+	_, _ = sum.Write(body)
+	return base64.StdEncoding.EncodeToString(sum.Sum(nil))
 }
 
 func decodeRawBody(w http.ResponseWriter, r *http.Request, maxBytes int64, dst any) ([]byte, bool) {
@@ -4510,12 +4658,13 @@ func deviceView(device Device) map[string]any {
 	adminGroups = append(adminGroups, device.AdminGroups...)
 	clients := append([]string(nil), device.ClientIDs...)
 	out := map[string]any{
-		"id":            device.ID,
-		"groups":        groups,
-		"admin_groups":  adminGroups,
-		"client_ids":    clients,
-		"pilot_node_id": device.PilotNodeID,
-		"disabled":      device.Disabled,
+		"id":           device.ID,
+		"groups":       groups,
+		"admin_groups": adminGroups,
+		"client_ids":   clients,
+		"member_id":    device.MemberID,
+		"peer_id":      device.PeerID,
+		"disabled":     device.Disabled,
 	}
 	if len(device.EntmootPubKey) > 0 {
 		out["entmoot_pubkey"] = base64.StdEncoding.EncodeToString(device.EntmootPubKey)
@@ -4525,7 +4674,8 @@ func deviceView(device Device) map[string]any {
 
 func memberAuthView(member MemberAuth) map[string]any {
 	return map[string]any{
-		"node_id":        member.NodeID,
+		"member_id":      member.MemberID,
+		"peer_id":        member.PeerID,
 		"entmoot_pubkey": base64.StdEncoding.EncodeToString(member.EntmootPubKey),
 	}
 }
@@ -4660,4 +4810,20 @@ func decodeBase64Array32(name, s string) ([]byte, error) {
 		return nil, fmt.Errorf("%s: expected 32 bytes, got %d", name, len(raw))
 	}
 	return raw, nil
+}
+
+func nodeInfoMemberID(info entmoot.NodeInfo) entmoot.MemberID {
+	if info.MemberID != nil {
+		return *info.MemberID
+	}
+	memberID, _ := entmoot.MemberIDFromPublicKey(info.EntmootPubKey)
+	return memberID
+}
+
+func peerIDForPublicKey(publicKey []byte) string {
+	peerID, err := entmoot.PeerIDFromPublicKey(publicKey)
+	if err != nil {
+		return ""
+	}
+	return peerID
 }

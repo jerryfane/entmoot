@@ -29,16 +29,17 @@ func TestLiveTopicMatches(t *testing.T) {
 
 func TestLiveAgentStateExpiresLease(t *testing.T) {
 	gid := testLiveGroupID(1)
-	states := LiveAgentStatesByNode([]LiveAgentConfig{{
+	memberID := testLiveMemberID(7)
+	states := LiveAgentStatesByMember([]LiveAgentConfig{{
 		GroupID:      gid,
-		NodeID:       7,
+		MemberID:     memberID,
 		Enabled:      true,
 		Mode:         LiveModeConverse,
 		TopicFilters: []string{"story/#"},
 		UpdatedAtMS:  10,
 	}}, []LiveAgentPresence{{
 		GroupID:      gid,
-		NodeID:       7,
+		MemberID:     memberID,
 		Status:       LiveStatusOnline,
 		Mode:         LiveModeConverse,
 		TopicFilters: []string{"story/#"},
@@ -46,36 +47,37 @@ func TestLiveAgentStateExpiresLease(t *testing.T) {
 		LeaseUntilMS: 30,
 		UpdatedAtMS:  20,
 	}}, 31)
-	if states[7].Status != LiveStatusOffline {
-		t.Fatalf("expired live status = %q, want offline", states[7].Status)
+	if states[memberID].Status != LiveStatusOffline {
+		t.Fatalf("expired live status = %q, want offline", states[memberID].Status)
 	}
 }
 
 func TestLiveAgentStatePreservesDegradedUntilLeaseExpires(t *testing.T) {
 	gid := testLiveGroupID(2)
+	memberID := testLiveMemberID(7)
 	configs := []LiveAgentConfig{{
 		GroupID:     gid,
-		NodeID:      7,
+		MemberID:    memberID,
 		Enabled:     true,
 		Mode:        LiveModeConverse,
 		UpdatedAtMS: 10,
 	}}
 	presences := []LiveAgentPresence{{
 		GroupID:      gid,
-		NodeID:       7,
+		MemberID:     memberID,
 		Status:       LiveStatusDegraded,
 		Mode:         LiveModeConverse,
 		LastSeenAtMS: 20,
 		LeaseUntilMS: 40,
 		UpdatedAtMS:  20,
 	}}
-	states := LiveAgentStatesByNode(configs, presences, 30)
-	if states[7].Status != LiveStatusDegraded {
-		t.Fatalf("active degraded live status = %q, want degraded", states[7].Status)
+	states := LiveAgentStatesByMember(configs, presences, 30)
+	if states[memberID].Status != LiveStatusDegraded {
+		t.Fatalf("active degraded live status = %q, want degraded", states[memberID].Status)
 	}
-	states = LiveAgentStatesByNode(configs, presences, 41)
-	if states[7].Status != LiveStatusOffline {
-		t.Fatalf("expired degraded live status = %q, want offline", states[7].Status)
+	states = LiveAgentStatesByMember(configs, presences, 41)
+	if states[memberID].Status != LiveStatusOffline {
+		t.Fatalf("expired degraded live status = %q, want offline", states[memberID].Status)
 	}
 }
 
@@ -92,7 +94,7 @@ func TestLiveAgentConfigPersists(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg, err := tc.store.UpsertLiveAgentConfig(ctx, LiveAgentConfig{
 				GroupID:           gid,
-				NodeID:            9,
+				MemberID:          testLiveMemberID(9),
 				Enabled:           true,
 				Mode:              LiveModeOperator,
 				TopicFilters:      []string{"story/#", "story/#", "chat"},
@@ -113,7 +115,7 @@ func TestLiveAgentConfigPersists(t *testing.T) {
 			}
 			presence, err := tc.store.UpsertLiveAgentPresence(ctx, LiveAgentPresence{
 				GroupID:      gid,
-				NodeID:       9,
+				MemberID:     testLiveMemberID(9),
 				Status:       LiveStatusOnline,
 				Mode:         LiveModeOperator,
 				TopicFilters: []string{"story/#"},
@@ -131,29 +133,30 @@ func TestLiveAgentConfigPersists(t *testing.T) {
 			if err != nil {
 				t.Fatalf("ListLiveAgentConfigs: %v", err)
 			}
-			nodeConfigs, err := tc.store.ListLiveAgentConfigsForNode(ctx, 9)
+			memberID := testLiveMemberID(9)
+			memberConfigs, err := tc.store.ListLiveAgentConfigsForMember(ctx, memberID)
 			if err != nil {
-				t.Fatalf("ListLiveAgentConfigsForNode: %v", err)
+				t.Fatalf("ListLiveAgentConfigsForMember: %v", err)
 			}
-			if len(nodeConfigs) != 1 || nodeConfigs[0].GroupID != gid || nodeConfigs[0].NodeID != 9 {
-				t.Fatalf("node configs = %+v, want config for node 9 in group %s", nodeConfigs, gid)
+			if len(memberConfigs) != 1 || memberConfigs[0].GroupID != gid || memberConfigs[0].MemberID != memberID {
+				t.Fatalf("member configs = %+v, want config for member %s in group %s", memberConfigs, memberID, gid)
 			}
 			presences, err := tc.store.ListLiveAgentPresence(ctx, gid)
 			if err != nil {
 				t.Fatalf("ListLiveAgentPresence: %v", err)
 			}
-			states := LiveAgentStatesByNode(configs, presences, 150)
-			if states[9].Status != LiveStatusOnline || states[9].Mode != LiveModeOperator {
-				t.Fatalf("live state = %+v", states[9])
+			states := LiveAgentStatesByMember(configs, presences, 150)
+			if states[memberID].Status != LiveStatusOnline || states[memberID].Mode != LiveModeOperator {
+				t.Fatalf("live state = %+v", states[memberID])
 			}
-			if states[9].MaxActionsPerScan != 3 || states[9].MaxActionBytes != 128 {
-				t.Fatalf("live state spam controls = %+v, want 3/128", states[9])
+			if states[memberID].MaxActionsPerScan != 3 || states[memberID].MaxActionBytes != 128 {
+				t.Fatalf("live state spam controls = %+v, want 3/128", states[memberID])
 			}
 		})
 	}
 }
 
-func TestListLiveAgentConfigsForNodeOrdersByGroup(t *testing.T) {
+func TestListLiveAgentConfigsForMemberOrdersByGroup(t *testing.T) {
 	ctx := context.Background()
 	for _, tc := range []struct {
 		name  string
@@ -166,7 +169,7 @@ func TestListLiveAgentConfigsForNodeOrdersByGroup(t *testing.T) {
 			for _, gid := range []entmoot.GroupID{testLiveGroupID(9), testLiveGroupID(3), testLiveGroupID(6)} {
 				if _, err := tc.store.UpsertLiveAgentConfig(ctx, LiveAgentConfig{
 					GroupID:      gid,
-					NodeID:       9,
+					MemberID:     testLiveMemberID(9),
 					Enabled:      true,
 					Mode:         LiveModeListen,
 					TopicFilters: []string{"#"},
@@ -174,9 +177,9 @@ func TestListLiveAgentConfigsForNodeOrdersByGroup(t *testing.T) {
 					t.Fatalf("UpsertLiveAgentConfig(%s): %v", gid, err)
 				}
 			}
-			configs, err := tc.store.ListLiveAgentConfigsForNode(ctx, 9)
+			configs, err := tc.store.ListLiveAgentConfigsForMember(ctx, testLiveMemberID(9))
 			if err != nil {
-				t.Fatalf("ListLiveAgentConfigsForNode: %v", err)
+				t.Fatalf("ListLiveAgentConfigsForMember: %v", err)
 			}
 			want := []entmoot.GroupID{testLiveGroupID(3), testLiveGroupID(6), testLiveGroupID(9)}
 			if len(configs) != len(want) {
@@ -204,7 +207,7 @@ func TestLiveAgentConfigRejectsNegativeSpamControls(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := tc.cfg
 			cfg.GroupID = gid
-			cfg.NodeID = 16
+			cfg.MemberID = testLiveMemberID(16)
 			cfg.Enabled = true
 			cfg.Mode = LiveModeConverse
 			cfg.TopicFilters = []string{"chat"}
@@ -227,14 +230,14 @@ func TestLiveAgentCursorPersists(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cursor, err := tc.store.UpsertLiveAgentCursor(ctx, LiveAgentCursor{
-				GroupID:              gid,
-				NodeID:               15,
-				ScanFloorAtMS:        120,
-				LastSeenAtMS:         123,
-				LastSeenAuthorNodeID: 16,
-				LastSeenMessageID:    testLiveMessageID(17),
-				SeenMessageIDs:       []entmoot.MessageID{testLiveMessageID(17), testLiveMessageID(18)},
-				UpdatedAtMS:          124,
+				GroupID:                gid,
+				MemberID:               testLiveMemberID(15),
+				ScanFloorAtMS:          120,
+				LastSeenAtMS:           123,
+				LastSeenAuthorMemberID: testLiveMemberID(16),
+				LastSeenMessageID:      testLiveMessageID(17),
+				SeenMessageIDs:         []entmoot.MessageID{testLiveMessageID(17), testLiveMessageID(18)},
+				UpdatedAtMS:            124,
 			})
 			if err != nil {
 				t.Fatalf("UpsertLiveAgentCursor: %v", err)
@@ -242,11 +245,11 @@ func TestLiveAgentCursorPersists(t *testing.T) {
 			if cursor.LastSeenAtMS != 123 {
 				t.Fatalf("cursor.LastSeenAtMS = %d, want 123", cursor.LastSeenAtMS)
 			}
-			got, ok, err := tc.store.GetLiveAgentCursor(ctx, gid, 15)
+			got, ok, err := tc.store.GetLiveAgentCursor(ctx, gid, testLiveMemberID(15))
 			if err != nil || !ok {
 				t.Fatalf("GetLiveAgentCursor ok/err = %v/%v", ok, err)
 			}
-			if got.ScanFloorAtMS != 120 || got.LastSeenAtMS != 123 || got.LastSeenAuthorNodeID != 16 || got.LastSeenMessageID != testLiveMessageID(17) || len(got.SeenMessageIDs) != 2 || got.SeenMessageIDs[1] != testLiveMessageID(18) || got.UpdatedAtMS != 124 {
+			if got.ScanFloorAtMS != 120 || got.LastSeenAtMS != 123 || got.LastSeenAuthorMemberID != testLiveMemberID(16) || got.LastSeenMessageID != testLiveMessageID(17) || len(got.SeenMessageIDs) != 2 || got.SeenMessageIDs[1] != testLiveMessageID(18) || got.UpdatedAtMS != 124 {
 				t.Fatalf("cursor = %+v", got)
 			}
 		})
@@ -266,7 +269,7 @@ func TestLiveAgentConfigRejectsUnknownActions(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := tc.store.UpsertLiveAgentConfig(ctx, LiveAgentConfig{
 				GroupID:        gid,
-				NodeID:         11,
+				MemberID:       testLiveMemberID(11),
 				Enabled:        true,
 				Mode:           LiveModeOperator,
 				AllowedActions: []string{"shell.rnu"},
@@ -303,21 +306,21 @@ func TestMemoryDeleteLiveAgentConfigDoesNotInsertMissingPresence(t *testing.T) {
 	gid := testLiveGroupID(4)
 	if _, err := store.UpsertLiveAgentPresence(ctx, LiveAgentPresence{
 		GroupID:      gid,
-		NodeID:       12,
+		MemberID:     testLiveMemberID(12),
 		Status:       LiveStatusOnline,
 		Mode:         LiveModeListen,
 		TopicFilters: []string{"chat"},
 	}); err != nil {
 		t.Fatalf("UpsertLiveAgentPresence: %v", err)
 	}
-	if err := store.DeleteLiveAgentConfig(ctx, gid, 13, 100); err != nil {
+	if err := store.DeleteLiveAgentConfig(ctx, gid, testLiveMemberID(13), 100); err != nil {
 		t.Fatalf("DeleteLiveAgentConfig: %v", err)
 	}
 	presence, err := store.ListLiveAgentPresence(ctx, gid)
 	if err != nil {
 		t.Fatalf("ListLiveAgentPresence: %v", err)
 	}
-	if len(presence) != 1 || presence[0].NodeID != 12 {
+	if len(presence) != 1 || presence[0].MemberID != testLiveMemberID(12) {
 		t.Fatalf("presence after deleting missing node = %+v, want only node 12", presence)
 	}
 }
@@ -330,6 +333,12 @@ func mustOpenLiveStateStore(t *testing.T) StateStore {
 	}
 	t.Cleanup(func() { _ = store.Close() })
 	return store
+}
+
+func testLiveMemberID(seed byte) entmoot.MemberID {
+	var id entmoot.MemberID
+	id[0] = seed
+	return id
 }
 
 func testLiveGroupID(seed byte) entmoot.GroupID {

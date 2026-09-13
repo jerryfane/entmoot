@@ -15,7 +15,7 @@ func TestMessagesSinceAndAckCursor(t *testing.T) {
 	st := store.NewMemory()
 	gid := groupID(1)
 	for i := 1; i <= 3; i++ {
-		if err := st.Put(ctx, message(gid, int64(i))); err != nil {
+		if _, err := st.Put(ctx, message(gid, int64(i)).GroupID, message(gid, int64(i))); err != nil {
 			t.Fatalf("Put %d: %v", i, err)
 		}
 	}
@@ -66,7 +66,7 @@ func TestHistoryLimitZeroReturnsEmptyPage(t *testing.T) {
 	st := store.NewMemory()
 	gid := groupID(1)
 	for i := 1; i <= 3; i++ {
-		if err := st.Put(ctx, message(gid, int64(i))); err != nil {
+		if _, err := st.Put(ctx, message(gid, int64(i)).GroupID, message(gid, int64(i))); err != nil {
 			t.Fatalf("Put %d: %v", i, err)
 		}
 	}
@@ -96,7 +96,7 @@ func TestHistoryReturnsLatestTopologicalPage(t *testing.T) {
 	child.Parents = []entmoot.MessageID{parent.ID}
 	child.ID = canonical.MessageID(child)
 	for _, msg := range []entmoot.Message{child, parent} {
-		if err := st.Put(ctx, msg); err != nil {
+		if _, err := st.Put(ctx, msg.GroupID, msg); err != nil {
 			t.Fatalf("Put: %v", err)
 		}
 	}
@@ -131,7 +131,7 @@ func TestSearchReturnsNewestFirstWithoutAdvancingCursor(t *testing.T) {
 	newest := messageWithContent(gid, 3, "mars policy limits newest", "ops")
 	missing := messageWithContent(gid, 4, "mars policy only", "ops")
 	for _, msg := range []entmoot.Message{old, mid, newest, missing} {
-		if err := st.Put(ctx, msg); err != nil {
+		if _, err := st.Put(ctx, msg.GroupID, msg); err != nil {
 			t.Fatalf("Put: %v", err)
 		}
 	}
@@ -192,7 +192,7 @@ func TestMessageContextReturnsConversationWindowWithoutAdvancingCursor(t *testin
 	newest := messageWithContent(gid, 40, "newest", "ops")
 	otherTopic := messageWithContent(gid, 50, "other topic", "chat")
 	for _, msg := range []entmoot.Message{newest, target, otherTopic, old, newer} {
-		if err := st.Put(ctx, msg); err != nil {
+		if _, err := st.Put(ctx, msg.GroupID, msg); err != nil {
 			t.Fatalf("Put: %v", err)
 		}
 	}
@@ -272,7 +272,7 @@ func TestMessagesSinceFallsBackToTimestampWhenCursorIDMissing(t *testing.T) {
 	st := store.NewMemory()
 	gid := groupID(1)
 	for i := 1; i <= 3; i++ {
-		if err := st.Put(ctx, message(gid, int64(i))); err != nil {
+		if _, err := st.Put(ctx, message(gid, int64(i)).GroupID, message(gid, int64(i))); err != nil {
 			t.Fatalf("Put %d: %v", i, err)
 		}
 	}

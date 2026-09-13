@@ -90,7 +90,7 @@ func TestSearchMessagesFallback(t *testing.T) {
 		otherTopic := mkSearchMsg(t, gid, author, 50, "mars hub policy limits other topic", "other")
 		embeddedTerm := mkSearchMsg(t, gid, author, 60, "mars hub xpolicyx limits", "ops")
 		for _, msg := range []entmoot.Message{old, middle, newest, missingTerm, otherTopic, embeddedTerm} {
-			if err := s.Put(ctx, msg); err != nil {
+			if _, err := s.Put(ctx, msg.GroupID, msg); err != nil {
 				t.Fatalf("Put: %v", err)
 			}
 		}
@@ -173,7 +173,7 @@ func TestSQLiteSearchIndexMaintenance(t *testing.T) {
 	kept := mkSearchMsg(t, gid, author, 20, "mars hub policy limits keep", "keep")
 	missingTerm := mkSearchMsg(t, gid, author, 30, "mars hub policy only", "keep")
 	for _, msg := range []entmoot.Message{pruned, kept, missingTerm, kept} {
-		if err := s.Put(ctx, msg); err != nil {
+		if _, err := s.Put(ctx, msg.GroupID, msg); err != nil {
 			t.Fatalf("Put: %v", err)
 		}
 	}
@@ -231,7 +231,7 @@ func TestSQLiteSearchBackfillsMissingDocsOnReopen(t *testing.T) {
 
 	gid := randGroupID(t)
 	msg := mkSearchMsg(t, gid, testAuthor(1, 0xAA), 10, "mars hub policy limits backfill", "ops")
-	if err := s.Put(ctx, msg); err != nil {
+	if _, err := s.Put(ctx, msg.GroupID, msg); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
 	db, err := s.dbFor(gid)

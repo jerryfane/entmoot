@@ -35,11 +35,12 @@ const (
 )
 
 type messagePublishDraft struct {
-	Author     entmoot.NodeInfo    `json:"author"`
-	Topics     []string            `json:"topics,omitempty"`
-	Content    []byte              `json:"content,omitempty"`
-	Parents    []entmoot.MessageID `json:"parents,omitempty"`
-	References []entmoot.MessageID `json:"references,omitempty"`
+	Author     entmoot.NodeInfo       `json:"author"`
+	RosterHead *entmoot.RosterEntryID `json:"roster_head"`
+	Topics     []string               `json:"topics,omitempty"`
+	Content    []byte                 `json:"content,omitempty"`
+	Parents    []entmoot.MessageID    `json:"parents,omitempty"`
+	References []entmoot.MessageID    `json:"references,omitempty"`
 }
 
 type messagePublishPayload struct {
@@ -57,13 +58,20 @@ type genericSignRequestEnvelope struct {
 }
 
 func buildMessagePublishSignRequest(deviceID string, groupID entmoot.GroupID, draft messagePublishDraft, timestampMS int64) (SignRequest, error) {
-	if draft.Author.PilotNodeID == 0 {
-		return SignRequest{}, fmt.Errorf("author.pilot_node_id is required")
+	if draft.Author.MemberID == nil {
+		return SignRequest{}, fmt.Errorf("author.member_id is required")
 	}
-	if len(draft.Author.EntmootPubKey) != 32 {
-		return SignRequest{}, fmt.Errorf("author.entmoot_pubkey must be 32 bytes")
+	if draft.Author.PeerID == "" {
+		return SignRequest{}, fmt.Errorf("author.peer_id is required")
+	}
+	if err := entmoot.ValidateMemberInfo(draft.Author); err != nil {
+		return SignRequest{}, fmt.Errorf("author identity: %w", err)
+	}
+	if draft.RosterHead == nil {
+		return SignRequest{}, fmt.Errorf("roster_head is required")
 	}
 	msg := entmoot.Message{
+		Version:    2,
 		GroupID:    groupID,
 		Author:     cloneNodeInfo(draft.Author),
 		Timestamp:  timestampMS,
@@ -71,6 +79,7 @@ func buildMessagePublishSignRequest(deviceID string, groupID entmoot.GroupID, dr
 		Parents:    append([]entmoot.MessageID(nil), draft.Parents...),
 		Content:    append([]byte(nil), draft.Content...),
 		References: append([]entmoot.MessageID(nil), draft.References...),
+		RosterHead: draft.RosterHead,
 	}
 	payload, err := json.Marshal(messagePublishPayload{Message: msg})
 	if err != nil {
@@ -134,5 +143,9 @@ func setSignRequestSigningPayload(req *SignRequest, canonicalType string, signin
 func cloneNodeInfo(in entmoot.NodeInfo) entmoot.NodeInfo {
 	out := in
 	out.EntmootPubKey = append([]byte(nil), in.EntmootPubKey...)
+	if in.MemberID != nil {
+		memberID := *in.MemberID
+		out.MemberID = &memberID
+	}
 	return out
 }

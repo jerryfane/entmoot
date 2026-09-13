@@ -14,7 +14,7 @@ func TestCmdEnvDoesNotCreateIdentityOrData(t *testing.T) {
 	dir := t.TempDir()
 	dataDir := filepath.Join(dir, "missing-data")
 	identity := filepath.Join(dir, "missing-identity.json")
-	gf := &globalFlags{socket: filepath.Join(dir, "pilot.sock"), data: dataDir, identity: identity}
+	gf := &globalFlags{data: dataDir, identity: identity}
 
 	code, stdout, stderr := captureCommandOutput(t, func() int {
 		return cmdEnv(gf, []string{"--json"})
@@ -59,7 +59,7 @@ func TestRuntimeNoDaemonHelpReportsNamespaceMismatch(t *testing.T) {
 	}
 	cmdline := strings.Join([]string{
 		"/data/.entmoot/bin/entmootd",
-		"-socket", "/tmp/pilot.sock",
+		"-connectivity", "direct",
 		"-identity", "/data/.entmoot/identity.json",
 		"-data", "/data/.entmoot",
 		"serve",
@@ -84,7 +84,6 @@ func TestRuntimeNoDaemonHelpReportsNamespaceMismatch(t *testing.T) {
 	}()
 
 	gf := &globalFlags{
-		socket:   "/tmp/pilot.sock",
 		data:     "/data/.entmoot",
 		identity: "/data/.entmoot/identity.json",
 	}
@@ -116,7 +115,7 @@ func TestRuntimeReportClassifiesHalfAliveDaemon(t *testing.T) {
 	}
 	cmdline := strings.Join([]string{
 		"/usr/local/bin/entmootd",
-		"-socket", filepath.Join(dir, "pilot.sock"),
+		"-connectivity", "direct",
 		"-identity", filepath.Join(dataDir, "identity.json"),
 		"-data", dataDir,
 		"serve",
@@ -126,7 +125,6 @@ func TestRuntimeReportClassifiesHalfAliveDaemon(t *testing.T) {
 	}
 
 	report := collectRuntimeReport(&globalFlags{
-		socket:   filepath.Join(dir, "pilot.sock"),
 		data:     dataDir,
 		identity: filepath.Join(dataDir, "identity.json"),
 	}, dataDir)
@@ -151,7 +149,6 @@ func TestRuntimeReportClassifiesHealthyPublishPath(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 	dataDir := filepath.Join(dir, "data")
-	pilotSock := filepath.Join(dir, "missing-pilot.sock")
 	controlSock := controlSocketPath(dataDir)
 	if err := os.MkdirAll(dataDir, 0o755); err != nil {
 		t.Fatal(err)
@@ -169,7 +166,6 @@ func TestRuntimeReportClassifiesHealthyPublishPath(t *testing.T) {
 	}()
 
 	report := collectRuntimeReport(&globalFlags{
-		socket:   pilotSock,
 		data:     dataDir,
 		identity: filepath.Join(dataDir, "identity.json"),
 	}, dataDir)
@@ -178,9 +174,6 @@ func TestRuntimeReportClassifiesHealthyPublishPath(t *testing.T) {
 	}
 	if !report.PublishPathHealthy {
 		t.Fatalf("publish path not healthy: %+v", report)
-	}
-	if report.PilotSocketReachable {
-		t.Fatalf("pilot socket unexpectedly reachable: %+v", report)
 	}
 	if !report.ControlSocketReachable {
 		t.Fatalf("control socket not reachable: %+v", report)
@@ -300,7 +293,6 @@ func TestRuntimeDiscoveryExpandsDefaultDaemonDataDir(t *testing.T) {
 	}()
 
 	gf := &globalFlags{
-		socket:   "/tmp/pilot.sock",
 		data:     homeDataDir,
 		identity: filepath.Join(homeDataDir, "identity.json"),
 	}
@@ -353,7 +345,6 @@ func TestRuntimeDiscoveryIgnoresUnrelatedDaemon(t *testing.T) {
 	defer ln.Close()
 
 	gf := &globalFlags{
-		socket:   "/tmp/pilot.sock",
 		data:     "/data/.entmoot-a",
 		identity: "/data/.entmoot-a/identity.json",
 	}
@@ -393,7 +384,6 @@ func TestRuntimeDiscoveryIgnoresNestedESPServe(t *testing.T) {
 	}
 
 	gf := &globalFlags{
-		socket:   "/tmp/pilot.sock",
 		data:     "/data/.entmoot",
 		identity: "/data/.entmoot/identity.json",
 	}
@@ -419,7 +409,7 @@ func TestRuntimeDiscoveryParsesDoubleDashGlobalFlags(t *testing.T) {
 	}
 	cmdline := strings.Join([]string{
 		"/data/.entmoot/bin/entmootd",
-		"--socket", "/data/.pilot/pilot.sock",
+		"--connectivity", "direct",
 		"--identity", "/data/.entmoot/identity.json",
 		"--data", dataDir,
 		"serve",
@@ -439,9 +429,6 @@ func TestRuntimeDiscoveryParsesDoubleDashGlobalFlags(t *testing.T) {
 	if daemon.IdentityPath != "/data/.entmoot/identity.json" {
 		t.Fatalf("identity = %q", daemon.IdentityPath)
 	}
-	if daemon.PilotSocket != "/data/.pilot/pilot.sock" {
-		t.Fatalf("pilot socket = %q", daemon.PilotSocket)
-	}
 }
 
 func TestRuntimeReportDoesNotExposeDaemonCommandLine(t *testing.T) {
@@ -460,7 +447,7 @@ func TestRuntimeReportDoesNotExposeDaemonCommandLine(t *testing.T) {
 	secretInvite := "entmoot://open-invite?issuer=https://esp.example&token=secret-token"
 	cmdline := strings.Join([]string{
 		"/data/.entmoot/bin/entmootd",
-		"-socket", "/data/.pilot/pilot.sock",
+		"-connectivity", "direct",
 		"-identity", "/data/.entmoot/identity.json",
 		"-data", "/data/.entmoot",
 		"join",
@@ -471,7 +458,6 @@ func TestRuntimeReportDoesNotExposeDaemonCommandLine(t *testing.T) {
 	}
 
 	gf := &globalFlags{
-		socket:   "/data/.pilot/pilot.sock",
 		data:     "/data/.entmoot",
 		identity: "/data/.entmoot/identity.json",
 	}
@@ -500,7 +486,6 @@ func TestRedactDoctorReportOmitsRuntime(t *testing.T) {
 			Binary:        "/data/.entmoot/bin/entmootd",
 			DataDir:       "/data/.entmoot",
 			IdentityPath:  "/data/.entmoot/identity.json",
-			PilotSocket:   "/data/.pilot/pilot.sock",
 			ControlSocket: "/data/.entmoot/control.sock",
 			RunningDaemon: &runtimeDaemonReport{
 				PID:                 12345,

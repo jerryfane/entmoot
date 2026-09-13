@@ -123,19 +123,6 @@ func cmdTail(gf *globalFlags, args []string) int {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	// Watch stdin for EOF so pipe-based consumers can drop the tail
-	// cleanly by closing their end.
-	go func() {
-		buf := make([]byte, 256)
-		for {
-			_, err := os.Stdin.Read(buf)
-			if err != nil {
-				cancel()
-				return
-			}
-		}
-	}()
-
 	// Close the connection when context is cancelled, which unblocks
 	// ReadAndDecode.
 	go func() {

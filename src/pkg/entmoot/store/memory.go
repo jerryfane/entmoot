@@ -31,12 +31,15 @@ func NewMemory() *Memory {
 }
 
 // Put implements MessageStore.Put.
-func (s *Memory) Put(_ context.Context, m entmoot.Message) error {
+func (s *Memory) Put(_ context.Context, expectedGroup entmoot.GroupID, m entmoot.Message) (bool, error) {
+	if expectedGroup != m.GroupID {
+		return false, fmt.Errorf("%w: expected group %s, got %s", ErrInvalidMessage, expectedGroup, m.GroupID)
+	}
 	if isZeroGroupID(m.GroupID) {
-		return fmt.Errorf("%w: zero group id", ErrInvalidMessage)
+		return false, fmt.Errorf("%w: zero group id", ErrInvalidMessage)
 	}
 	if isZeroMessageID(m.ID) {
-		return fmt.Errorf("%w: zero message id", ErrInvalidMessage)
+		return false, fmt.Errorf("%w: zero message id", ErrInvalidMessage)
 	}
 
 	s.mu.Lock()
@@ -48,11 +51,10 @@ func (s *Memory) Put(_ context.Context, m entmoot.Message) error {
 		s.groups[m.GroupID] = bucket
 	}
 	if _, exists := bucket[m.ID]; exists {
-		// Idempotent: same id already present, no-op.
-		return nil
+		return false, nil
 	}
 	bucket[m.ID] = m
-	return nil
+	return true, nil
 }
 
 // PruneBefore removes messages in groupID older than beforeMillis.
@@ -352,8 +354,9 @@ func messageOlderThan(m entmoot.Message, boundary PageBoundary) bool {
 	if m.Timestamp != boundary.TimestampMS {
 		return m.Timestamp < boundary.TimestampMS
 	}
-	if m.Author.PilotNodeID != boundary.AuthorNodeID {
-		return m.Author.PilotNodeID < boundary.AuthorNodeID
+	author := messageMemberID(m)
+	if author != boundary.AuthorMemberID {
+		return bytes.Compare(author[:], boundary.AuthorMemberID[:]) < 0
 	}
 	return bytes.Compare(m.ID[:], boundary.MessageID[:]) < 0
 }
@@ -366,8 +369,9 @@ func latestMessages(msgs []entmoot.Message, limit int) ([]entmoot.Message, error
 		if msgs[i].Timestamp != msgs[j].Timestamp {
 			return msgs[i].Timestamp > msgs[j].Timestamp
 		}
-		if msgs[i].Author.PilotNodeID != msgs[j].Author.PilotNodeID {
-			return msgs[i].Author.PilotNodeID > msgs[j].Author.PilotNodeID
+		left, right := messageMemberID(msgs[i]), messageMemberID(msgs[j])
+		if left != right {
+			return bytes.Compare(left[:], right[:]) > 0
 		}
 		return bytes.Compare(msgs[i].ID[:], msgs[j].ID[:]) > 0
 	})

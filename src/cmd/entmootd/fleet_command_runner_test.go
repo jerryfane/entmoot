@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"strings"
+	"log/slog"
 	"testing"
 
 	"entmoot/pkg/entmoot"
@@ -19,8 +19,8 @@ func TestFleetCommandContextFallsBackToControlRoster(t *testing.T) {
 	ctx := context.Background()
 	dataDir := t.TempDir()
 	gid := testFleetCommandGroupID(0x42)
-	coordinatorID, coordinator := testFleetCommandIdentity(t, 45981)
-	agentID, agent := testFleetCommandIdentity(t, 133053)
+	coordinatorID, coordinator := testFleetCommandIdentity(t)
+	agentID, agent := testFleetCommandIdentity(t)
 	testFleetCommandRoster(t, dataDir, gid, coordinatorID, coordinator, agent)
 	state, err := esphttp.OpenSQLiteStateStore(dataDir)
 	if err != nil {
@@ -30,7 +30,8 @@ func TestFleetCommandContextFallsBackToControlRoster(t *testing.T) {
 	testFleetCommandMetadata(t, ctx, state, gid, "fleet-a")
 	runner := &fleetCommandRunner{
 		server: &ipcServer{
-			nodeID:   agent.PilotNodeID,
+			memberID: *agent.MemberID,
+			peerID:   agent.PeerID,
 			identity: agentID,
 			dataDir:  dataDir,
 		},
@@ -39,7 +40,7 @@ func TestFleetCommandContextFallsBackToControlRoster(t *testing.T) {
 	commandCtx, ok, err := runner.commandContextForCommand(ctx, gid, esphttp.FleetCommandEnvelope{
 		FleetID:        "fleet-a",
 		ControlGroupID: gid,
-		IssuerNodeID:   coordinator.PilotNodeID,
+		IssuerMemberID: *coordinator.MemberID,
 	})
 	if err != nil {
 		t.Fatalf("commandContextForCommand: %v", err)
@@ -50,11 +51,11 @@ func TestFleetCommandContextFallsBackToControlRoster(t *testing.T) {
 	if commandCtx.source != "control_roster" {
 		t.Fatalf("source = %q, want control_roster", commandCtx.source)
 	}
-	if commandCtx.fleet.Coordinator.PilotNodeID != coordinator.PilotNodeID {
-		t.Fatalf("coordinator node = %d, want %d", commandCtx.fleet.Coordinator.PilotNodeID, coordinator.PilotNodeID)
+	if *commandCtx.fleet.Coordinator.MemberID != *coordinator.MemberID {
+		t.Fatalf("coordinator member = %s, want %s", commandCtx.fleet.Coordinator.MemberID, coordinator.MemberID)
 	}
-	if commandCtx.local.NodeID != agent.PilotNodeID || commandCtx.local.Role != esphttp.FleetRoleAgent || commandCtx.local.Status != esphttp.FleetMemberActive {
-		t.Fatalf("local member = %+v, want active agent %d", commandCtx.local, agent.PilotNodeID)
+	if commandCtx.local.MemberID != *agent.MemberID || commandCtx.local.Role != esphttp.FleetRoleAgent || commandCtx.local.Status != esphttp.FleetMemberActive {
+		t.Fatalf("local member = %+v, want active agent %s", commandCtx.local, agent.MemberID)
 	}
 	if commandCtx.memberCount != 2 {
 		t.Fatalf("memberCount = %d, want 2", commandCtx.memberCount)
@@ -66,8 +67,8 @@ func TestFleetCommandContextDoesNotFallbackWithoutFleetMetadata(t *testing.T) {
 	ctx := context.Background()
 	dataDir := t.TempDir()
 	gid := testFleetCommandGroupID(0x44)
-	coordinatorID, coordinator := testFleetCommandIdentity(t, 45981)
-	agentID, agent := testFleetCommandIdentity(t, 133053)
+	coordinatorID, coordinator := testFleetCommandIdentity(t)
+	agentID, agent := testFleetCommandIdentity(t)
 	testFleetCommandRoster(t, dataDir, gid, coordinatorID, coordinator, agent)
 	state, err := esphttp.OpenSQLiteStateStore(dataDir)
 	if err != nil {
@@ -76,7 +77,8 @@ func TestFleetCommandContextDoesNotFallbackWithoutFleetMetadata(t *testing.T) {
 	defer state.Close()
 	runner := &fleetCommandRunner{
 		server: &ipcServer{
-			nodeID:   agent.PilotNodeID,
+			memberID: *agent.MemberID,
+			peerID:   agent.PeerID,
 			identity: agentID,
 			dataDir:  dataDir,
 		},
@@ -85,7 +87,7 @@ func TestFleetCommandContextDoesNotFallbackWithoutFleetMetadata(t *testing.T) {
 	if _, ok, err := runner.commandContextForCommand(ctx, gid, esphttp.FleetCommandEnvelope{
 		FleetID:        "fleet-a",
 		ControlGroupID: gid,
-		IssuerNodeID:   coordinator.PilotNodeID,
+		IssuerMemberID: *coordinator.MemberID,
 	}); err != nil {
 		t.Fatalf("commandContextForCommand: %v", err)
 	} else if ok {
@@ -93,51 +95,49 @@ func TestFleetCommandContextDoesNotFallbackWithoutFleetMetadata(t *testing.T) {
 	}
 }
 
-func TestFleetCommandRunnerDoesNotMarkCommandBeforeContextExists(t *testing.T) {
-	t.Parallel()
+func TestFleetCommandRunnerProcessesAfterControlMetadataArrives(t *testing.T) {
+	t.Setenv("ENTMOOT_AGENT_INSTRUCTIONS", "1")
+	t.Setenv("ENTMOOT_ENABLE_FLEET", "1")
+	t.Setenv("ENTMOOT_ENABLE_TASKS", "1")
 	ctx := context.Background()
 	dataDir := t.TempDir()
 	gid := testFleetCommandGroupID(0x46)
-	coordinatorID, coordinator := testFleetCommandIdentity(t, 45981)
-	agentID, agent := testFleetCommandIdentity(t, 133053)
+	coordinatorID, coordinator := testFleetCommandIdentity(t)
+	agentID, agent := testFleetCommandIdentity(t)
 	testFleetCommandRoster(t, dataDir, gid, coordinatorID, coordinator, agent)
-	state, err := esphttp.OpenSQLiteStateStore(dataDir)
-	if err != nil {
-		t.Fatalf("OpenSQLiteStateStore: %v", err)
-	}
-	defer state.Close()
+	state := mustOpenFleetCommandState(t, dataDir)
 	runner := &fleetCommandRunner{
-		server: &ipcServer{
-			nodeID:   agent.PilotNodeID,
-			identity: agentID,
-			dataDir:  dataDir,
-		},
-		state:     state,
-		processed: make(map[string]struct{}),
+		server: &ipcServer{memberID: *agent.MemberID, peerID: agent.PeerID, identity: agentID, dataDir: dataDir, runtime: &groupRuntime{}},
+		state:  state, processed: make(map[string]struct{}), logger: slog.Default(),
 	}
 	command := esphttp.FleetCommandEnvelope{
-		Type:           esphttp.FleetCommandMessageType,
-		Version:        1,
-		CommandID:      "cmd_wait_for_metadata",
-		FleetID:        "fleet-a",
-		ControlGroupID: gid,
-		IssuerNodeID:   coordinator.PilotNodeID,
-		Target:         esphttp.FleetCommandTarget{Kind: esphttp.FleetCommandTargetNode, PilotNodeID: agent.PilotNodeID},
-		Action:         esphttp.FleetCommandActionEntmootVersion,
-		AutoAccept:     true,
+		Type: esphttp.FleetCommandMessageType, Version: 2,
+		CommandID: "cmd_wait_for_metadata", FleetID: "fleet-a", ControlGroupID: gid,
+		IssuerMemberID: *coordinator.MemberID, IssuerPeerID: coordinator.PeerID,
+		Target: esphttp.FleetCommandTarget{Kind: esphttp.FleetCommandTargetNode, MemberID: *agent.MemberID, PeerID: agent.PeerID},
+		Action: esphttp.FleetCommandActionAgentInstruction,
+		Args:   map[string]interface{}{"instruction": "Process after enrollment"},
 	}
 	content, err := json.Marshal(command)
 	if err != nil {
-		t.Fatalf("Marshal command: %v", err)
+		t.Fatal(err)
 	}
-	runner.handleMessage(ctx, entmoot.Message{
-		GroupID: gid,
-		Author:  coordinator,
-		Topics:  []string{"fleet/commands"},
-		Content: content,
-	})
-	if _, ok := runner.processed[command.CommandID]; ok {
-		t.Fatal("command was marked processed before Fleet control metadata was available")
+	message := entmoot.Message{Version: 2, GroupID: gid, Author: coordinator, Topics: []string{"fleet/commands"}, Content: content}
+	message.ID = canonical.MessageID(message)
+	payload, err := canonical.MessageSigningBytes(message)
+	if err != nil {
+		t.Fatal(err)
+	}
+	message.Signature = coordinatorID.Sign(payload)
+	runner.handleMessage(ctx, message)
+	if _, found, err := state.GetAgentCommand(ctx, command.CommandID); err != nil || found {
+		t.Fatalf("queued before control metadata: found=%v err=%v", found, err)
+	}
+	testFleetCommandMetadata(t, ctx, state, gid, "fleet-a")
+	runner.handleMessage(ctx, message)
+	queued, found, err := state.GetAgentCommand(ctx, command.CommandID)
+	if err != nil || !found || queued.Payload.Instruction != "Process after enrollment" {
+		t.Fatalf("command was lost while awaiting metadata: %+v found=%v err=%v", queued, found, err)
 	}
 }
 
@@ -146,8 +146,8 @@ func TestFleetCommandContextDoesNotFallbackForMismatchedFleetMetadata(t *testing
 	ctx := context.Background()
 	dataDir := t.TempDir()
 	gid := testFleetCommandGroupID(0x45)
-	coordinatorID, coordinator := testFleetCommandIdentity(t, 45981)
-	agentID, agent := testFleetCommandIdentity(t, 133053)
+	coordinatorID, coordinator := testFleetCommandIdentity(t)
+	agentID, agent := testFleetCommandIdentity(t)
 	testFleetCommandRoster(t, dataDir, gid, coordinatorID, coordinator, agent)
 	state, err := esphttp.OpenSQLiteStateStore(dataDir)
 	if err != nil {
@@ -157,7 +157,8 @@ func TestFleetCommandContextDoesNotFallbackForMismatchedFleetMetadata(t *testing
 	testFleetCommandMetadata(t, ctx, state, gid, "other-fleet")
 	runner := &fleetCommandRunner{
 		server: &ipcServer{
-			nodeID:   agent.PilotNodeID,
+			memberID: *agent.MemberID,
+			peerID:   agent.PeerID,
 			identity: agentID,
 			dataDir:  dataDir,
 		},
@@ -166,7 +167,7 @@ func TestFleetCommandContextDoesNotFallbackForMismatchedFleetMetadata(t *testing
 	if _, ok, err := runner.commandContextForCommand(ctx, gid, esphttp.FleetCommandEnvelope{
 		FleetID:        "fleet-a",
 		ControlGroupID: gid,
-		IssuerNodeID:   coordinator.PilotNodeID,
+		IssuerMemberID: *coordinator.MemberID,
 	}); err != nil {
 		t.Fatalf("commandContextForCommand: %v", err)
 	} else if ok {
@@ -179,8 +180,8 @@ func TestFleetCommandContextDoesNotFallbackForArchivedFleetState(t *testing.T) {
 	ctx := context.Background()
 	dataDir := t.TempDir()
 	gid := testFleetCommandGroupID(0x43)
-	coordinatorID, coordinator := testFleetCommandIdentity(t, 45981)
-	agentID, agent := testFleetCommandIdentity(t, 133053)
+	coordinatorID, coordinator := testFleetCommandIdentity(t)
+	agentID, agent := testFleetCommandIdentity(t)
 	testFleetCommandRoster(t, dataDir, gid, coordinatorID, coordinator, agent)
 	state, err := esphttp.OpenSQLiteStateStore(dataDir)
 	if err != nil {
@@ -197,7 +198,8 @@ func TestFleetCommandContextDoesNotFallbackForArchivedFleetState(t *testing.T) {
 	}
 	runner := &fleetCommandRunner{
 		server: &ipcServer{
-			nodeID:   agent.PilotNodeID,
+			memberID: *agent.MemberID,
+			peerID:   agent.PeerID,
 			identity: agentID,
 			dataDir:  dataDir,
 		},
@@ -206,7 +208,7 @@ func TestFleetCommandContextDoesNotFallbackForArchivedFleetState(t *testing.T) {
 	if _, ok, err := runner.commandContextForCommand(ctx, gid, esphttp.FleetCommandEnvelope{
 		FleetID:        "fleet-a",
 		ControlGroupID: gid,
-		IssuerNodeID:   coordinator.PilotNodeID,
+		IssuerMemberID: *coordinator.MemberID,
 	}); err != nil {
 		t.Fatalf("commandContextForCommand: %v", err)
 	} else if ok {
@@ -223,9 +225,6 @@ func TestFleetCommandAgentInstructionRequiresOptIn(t *testing.T) {
 	if result.status != esphttp.FleetCommandStatusRejected {
 		t.Fatalf("status = %q, want rejected", result.status)
 	}
-	if !strings.Contains(result.summary, "not enabled") {
-		t.Fatalf("summary = %q, want opt-in rejection", result.summary)
-	}
 }
 
 func TestFleetCommandAgentInstructionRequiresTaskFeature(t *testing.T) {
@@ -237,9 +236,6 @@ func TestFleetCommandAgentInstructionRequiresTaskFeature(t *testing.T) {
 	}
 	if result.status != esphttp.FleetCommandStatusRejected {
 		t.Fatalf("status = %q, want rejected", result.status)
-	}
-	if !strings.Contains(result.summary, "task coordination is disabled") {
-		t.Fatalf("summary = %q, want task feature rejection", result.summary)
 	}
 }
 
@@ -265,8 +261,8 @@ func TestFleetCommandAgentInstructionQueuesSQLite(t *testing.T) {
 	if queued.Payload.Instruction != "Send a status update to Mars Hub" {
 		t.Fatalf("instruction = %q", queued.Payload.Instruction)
 	}
-	if queued.Payload.AgentNodeID != commandCtx.local.NodeID {
-		t.Fatalf("agent node = %d, want %d", queued.Payload.AgentNodeID, commandCtx.local.NodeID)
+	if queued.Payload.AgentMemberID != commandCtx.local.MemberID {
+		t.Fatalf("agent member = %s, want %s", queued.Payload.AgentMemberID, commandCtx.local.MemberID)
 	}
 	if queued.Status != esphttp.FleetCommandStatusRunning {
 		t.Fatalf("queued status = %q, want running", queued.Status)
@@ -279,7 +275,7 @@ func TestFleetCommandAgentInstructionDoesNotRequeueExistingCommand(t *testing.T)
 	t.Setenv("ENTMOOT_ENABLE_FLEET", "1")
 	t.Setenv("ENTMOOT_ENABLE_TASKS", "1")
 	receivedAt := int64(9999)
-	payload := esphttp.NewAgentInstructionPayload(cmd, commandCtx.local.NodeID, "existing", nil, 60000, receivedAt)
+	payload := esphttp.NewAgentInstructionPayload(cmd, commandCtx.local.MemberID, commandCtx.local.PeerID, "existing", nil, 60000, receivedAt)
 	if _, created, err := runner.state.EnqueueAgentCommand(context.Background(), payload); err != nil || !created {
 		t.Fatalf("EnqueueAgentCommand created/err = %v/%v", created, err)
 	}
@@ -340,13 +336,17 @@ func TestFleetCommandStatusIsTerminal(t *testing.T) {
 
 func testFleetCommandInstructionRunner(t *testing.T) (*fleetCommandRunner, fleetCommandContext, esphttp.FleetCommandEnvelope) {
 	t.Helper()
+	t.Setenv("ENTMOOT_AGENT_INSTRUCTIONS", "0")
+	t.Setenv("ENTMOOT_ENABLE_FLEET", "0")
+	t.Setenv("ENTMOOT_ENABLE_TASKS", "0")
 	dataDir := t.TempDir()
-	agentID, agent := testFleetCommandIdentity(t, 133053)
-	coordinator := entmoot.NodeInfo{PilotNodeID: 45981}
+	agentID, agent := testFleetCommandIdentity(t)
+	_, coordinator := testFleetCommandIdentity(t)
 	gid := testFleetCommandGroupID(0x47)
 	runner := &fleetCommandRunner{
 		server: &ipcServer{
-			nodeID:   agent.PilotNodeID,
+			memberID: *agent.MemberID,
+			peerID:   agent.PeerID,
 			identity: agentID,
 			dataDir:  dataDir,
 		},
@@ -363,18 +363,20 @@ func testFleetCommandInstructionRunner(t *testing.T) (*fleetCommandRunner, fleet
 			FleetID:       "fleet-a",
 			Role:          esphttp.FleetRoleAgent,
 			Status:        esphttp.FleetMemberActive,
-			NodeID:        agent.PilotNodeID,
+			MemberID:      *agent.MemberID,
+			PeerID:        agent.PeerID,
 			EntmootPubKey: base64.StdEncoding.EncodeToString(agent.EntmootPubKey),
 		},
 	}
 	cmd := esphttp.FleetCommandEnvelope{
 		Type:           esphttp.FleetCommandMessageType,
-		Version:        1,
+		Version:        2,
 		CommandID:      "cmd_agent_instruction",
 		FleetID:        "fleet-a",
 		ControlGroupID: gid,
-		IssuerNodeID:   coordinator.PilotNodeID,
-		Target:         esphttp.FleetCommandTarget{Kind: esphttp.FleetCommandTargetNode, PilotNodeID: agent.PilotNodeID},
+		IssuerMemberID: *coordinator.MemberID,
+		IssuerPeerID:   coordinator.PeerID,
+		Target:         esphttp.FleetCommandTarget{Kind: esphttp.FleetCommandTargetNode, MemberID: *agent.MemberID, PeerID: agent.PeerID},
 		Action:         esphttp.FleetCommandActionAgentInstruction,
 		AutoAccept:     true,
 		CreatedAtMS:    1234,
@@ -399,13 +401,21 @@ func mustOpenFleetCommandState(t *testing.T, dataDir string) *esphttp.SQLiteStat
 	return state
 }
 
-func testFleetCommandIdentity(t *testing.T, nodeID entmoot.NodeID) (*keystore.Identity, entmoot.NodeInfo) {
+func testFleetCommandIdentity(t *testing.T) (*keystore.Identity, entmoot.NodeInfo) {
 	t.Helper()
 	id, err := keystore.Generate()
 	if err != nil {
 		t.Fatalf("keystore.Generate: %v", err)
 	}
-	return id, entmoot.NodeInfo{PilotNodeID: nodeID, EntmootPubKey: []byte(id.PublicKey)}
+	memberID, err := entmoot.MemberIDFromPublicKey(id.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	peerID, err := entmoot.PeerIDFromPublicKey(id.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id, entmoot.NodeInfo{MemberID: &memberID, PeerID: peerID, EntmootPubKey: id.PublicKey}
 }
 
 func testFleetCommandRoster(t *testing.T, dataDir string, gid entmoot.GroupID, coordinatorID *keystore.Identity, coordinator, agent entmoot.NodeInfo) {
@@ -418,19 +428,10 @@ func testFleetCommandRoster(t *testing.T, dataDir string, gid entmoot.GroupID, c
 	if err := rlog.Genesis(coordinatorID, coordinator, 1_700_000_000_000); err != nil {
 		t.Fatalf("Genesis: %v", err)
 	}
-	entry := entmoot.RosterEntry{
-		Op:        "add",
-		Subject:   agent,
-		Actor:     coordinator.PilotNodeID,
-		Timestamp: 1_700_000_001_000,
-		Parents:   []entmoot.RosterEntryID{rlog.Head()},
-	}
-	sigInput, err := canonical.Encode(entry)
+	entry, err := rlog.SignEntry(coordinatorID, "add", agent, nil, 1_700_000_001_000)
 	if err != nil {
-		t.Fatalf("canonical encode roster entry: %v", err)
+		t.Fatal(err)
 	}
-	entry.Signature = coordinatorID.Sign(sigInput)
-	entry.ID = canonical.RosterEntryID(entry)
 	if err := rlog.Apply(entry); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}

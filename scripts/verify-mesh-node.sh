@@ -8,13 +8,12 @@ usage() {
   cat <<'USAGE'
 Usage: verify-mesh-node.sh [--limit n] [--log-minutes n]
 
-Prints a local mesh health snapshot after Pilot/Entmoot restart.
+Prints a local Entmoot libp2p health snapshot.
 
 Environment:
-  PILOTCTL      pilotctl binary path (default: pilotctl)
   ENTMOOTD      entmootd binary path (default: entmootd)
+  ENTMOOT_DATA  Entmoot data directory (default: ~/.entmoot)
   GROUP         optional Entmoot group id for query
-  PILOT_SOCKET  optional Pilot IPC socket path passed as -socket
   ENTMOOT_LOG   optional Entmoot log file (default: ~/.entmoot/log/entmootd.log)
 USAGE
 }
@@ -41,42 +40,30 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-pilotctl_bin="${PILOTCTL:-pilotctl}"
 entmootd_bin="${ENTMOOTD:-entmootd}"
-entmoot_log="${ENTMOOT_LOG:-$HOME/.entmoot/log/entmootd.log}"
+entmoot_data="${ENTMOOT_DATA:-$HOME/.entmoot}"
+entmoot_log="${ENTMOOT_LOG:-$entmoot_data/log/entmootd.log}"
+base=("$entmootd_bin" -data "$entmoot_data")
 
-pilot_base=("$pilotctl_bin")
-if [[ -n "${PILOT_SOCKET:-}" ]]; then
-  pilot_base+=("-socket" "$PILOT_SOCKET")
-fi
-
-echo "== pilot version =="
-"${pilot_base[@]}" version 2>/dev/null || "$pilotctl_bin" version 2>/dev/null || true
-
-echo
-echo "== pilot peers =="
-"${pilot_base[@]}" peers 2>&1 || true
-
-echo
-echo "== pilot info summary =="
-"${pilot_base[@]}" info 2>&1 | sed -n '1,80p' || true
-
-echo
 echo "== entmoot version =="
-"$entmootd_bin" version 2>/dev/null || true
+"$entmootd_bin" version
+
+echo
+echo "== entmoot identity and libp2p endpoint =="
+"${base[@]}" info --json
 
 echo
 echo "== entmoot message count =="
-query_cmd=("$entmootd_bin" query --limit "$limit")
+query_cmd=("${base[@]}" query --limit "$limit")
 if [[ -n "${GROUP:-}" ]]; then
   query_cmd+=("-group" "$GROUP")
 fi
-"${query_cmd[@]}" 2>/dev/null | wc -l | tr -d ' '
+"${query_cmd[@]}" --json | wc -l | tr -d ' '
 
 echo
-echo "== entmoot recent transport/reconcile lines =="
+echo "== recent libp2p and reconciliation lines =="
 if [[ -f "$entmoot_log" ]]; then
-  tail -300 "$entmoot_log" | grep -E 'turn-endpoint|transport_ad|reconcile|range response|message ingested|pilot:|yamux|session' | tail -80 || true
+  tail -300 "$entmoot_log" | grep -E 'libp2p|reconcile|history|enroll|roster|message ingested' | tail -80 || true
 else
   echo "log file not found: $entmoot_log"
 fi

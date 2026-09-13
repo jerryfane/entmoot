@@ -44,9 +44,11 @@ type openClawAgentInstructionContext struct {
 	CommandID      string                               `json:"command_id"`
 	FleetID        string                               `json:"fleet_id"`
 	ControlGroupID entmoot.GroupID                      `json:"control_group_id"`
-	IssuerNodeID   entmoot.NodeID                       `json:"issuer_node_id"`
+	IssuerMemberID entmoot.MemberID                     `json:"issuer_member_id"`
+	IssuerPeerID   string                               `json:"issuer_peer_id"`
 	Target         esphttp.FleetCommandTarget           `json:"target"`
-	AgentNodeID    entmoot.NodeID                       `json:"agent_node_id"`
+	AgentMemberID  entmoot.MemberID                     `json:"agent_member_id"`
+	AgentPeerID    string                               `json:"agent_peer_id"`
 	Action         string                               `json:"action"`
 	Context        map[string]interface{}               `json:"context"`
 	Actions        []esphttp.FleetCommandExternalAction `json:"actions,omitempty"`
@@ -352,7 +354,8 @@ func agentCommandRunnerEnv(dataDir string, payload esphttp.AgentInstructionPaylo
 		"ENTMOOT_AGENT_COMMAND_ID="+payload.CommandID,
 		"ENTMOOT_AGENT_FLEET_ID="+payload.FleetID,
 		"ENTMOOT_AGENT_CONTROL_GROUP_ID="+payload.ControlGroupID.String(),
-		"ENTMOOT_AGENT_NODE_ID="+fmt.Sprintf("%d", payload.AgentNodeID),
+		"ENTMOOT_AGENT_MEMBER_ID="+payload.AgentMemberID.String(),
+		"ENTMOOT_AGENT_PEER_ID="+payload.AgentPeerID,
 		"ENTMOOT_AGENT_DATA_DIR="+dataDir,
 	)
 }
@@ -414,9 +417,11 @@ func openClawAgentMessage(payload esphttp.AgentInstructionPayload) (string, erro
 		CommandID:      payload.CommandID,
 		FleetID:        payload.FleetID,
 		ControlGroupID: payload.ControlGroupID,
-		IssuerNodeID:   payload.IssuerNodeID,
+		IssuerMemberID: payload.IssuerMemberID,
+		IssuerPeerID:   payload.IssuerPeerID,
 		Target:         payload.Target,
-		AgentNodeID:    payload.AgentNodeID,
+		AgentMemberID:  payload.AgentMemberID,
+		AgentPeerID:    payload.AgentPeerID,
 		Action:         payload.Action,
 		Context:        payload.Context,
 		Actions:        payload.Actions,
@@ -798,16 +803,17 @@ func agentCommandResult(payload esphttp.AgentInstructionPayload, status, summary
 		summary = "Agent instruction handled"
 	}
 	result := esphttp.FleetCommandResultEnvelope{
-		Type:        esphttp.FleetCommandResultType,
-		Version:     1,
-		CommandID:   payload.CommandID,
-		FleetID:     payload.FleetID,
-		AgentNodeID: payload.AgentNodeID,
-		Action:      esphttp.FleetCommandActionAgentInstruction,
-		Status:      status,
-		Summary:     summary,
-		Output:      output,
-		StartedAtMS: startedAtMS,
+		Type:          esphttp.FleetCommandResultType,
+		Version:       2,
+		CommandID:     payload.CommandID,
+		FleetID:       payload.FleetID,
+		AgentMemberID: payload.AgentMemberID,
+		AgentPeerID:   payload.AgentPeerID,
+		Action:        esphttp.FleetCommandActionAgentInstruction,
+		Status:        status,
+		Summary:       summary,
+		Output:        output,
+		StartedAtMS:   startedAtMS,
 	}
 	if fleetCommandStatusIsTerminal(status) {
 		result.CompletedAtMS = time.Now().UnixMilli()

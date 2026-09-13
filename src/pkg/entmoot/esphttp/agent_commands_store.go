@@ -24,9 +24,11 @@ type AgentInstructionPayload struct {
 	CommandID      string                       `json:"command_id"`
 	FleetID        string                       `json:"fleet_id"`
 	ControlGroupID entmoot.GroupID              `json:"control_group_id"`
-	IssuerNodeID   entmoot.NodeID               `json:"issuer_node_id"`
+	IssuerMemberID entmoot.MemberID             `json:"issuer_member_id"`
+	IssuerPeerID   string                       `json:"issuer_peer_id"`
 	Target         FleetCommandTarget           `json:"target"`
-	AgentNodeID    entmoot.NodeID               `json:"agent_node_id"`
+	AgentMemberID  entmoot.MemberID             `json:"agent_member_id"`
+	AgentPeerID    string                       `json:"agent_peer_id"`
 	Action         string                       `json:"action"`
 	Instruction    string                       `json:"instruction"`
 	Context        map[string]interface{}       `json:"context,omitempty"`
@@ -66,20 +68,22 @@ type AgentCommandQueueStats struct {
 	LastCompletedID string `json:"last_completed_command_id,omitempty"`
 }
 
-func NewAgentInstructionPayload(cmd FleetCommandEnvelope, agentNodeID entmoot.NodeID, instruction string, instructionContext map[string]interface{}, timeoutMS, receivedAtMS int64) AgentInstructionPayload {
+func NewAgentInstructionPayload(cmd FleetCommandEnvelope, agentMemberID entmoot.MemberID, agentPeerID, instruction string, instructionContext map[string]interface{}, timeoutMS, receivedAtMS int64) AgentInstructionPayload {
 	action := NormalizeFleetCommandAction(cmd.Action)
 	if action == "" {
 		action = FleetCommandActionAgentInstruction
 	}
 	return AgentInstructionPayload{
 		Type:           AgentInstructionPayloadType,
-		Version:        1,
+		Version:        2,
 		CommandID:      strings.TrimSpace(cmd.CommandID),
 		FleetID:        strings.TrimSpace(cmd.FleetID),
 		ControlGroupID: cmd.ControlGroupID,
-		IssuerNodeID:   cmd.IssuerNodeID,
+		IssuerMemberID: cmd.IssuerMemberID,
+		IssuerPeerID:   cmd.IssuerPeerID,
 		Target:         cmd.Target,
-		AgentNodeID:    agentNodeID,
+		AgentMemberID:  agentMemberID,
+		AgentPeerID:    agentPeerID,
 		Action:         action,
 		Instruction:    instruction,
 		Context:        instructionContext,
@@ -107,12 +111,13 @@ func (s *SQLiteStateStore) EnqueueAgentCommand(ctx context.Context, payload Agen
 	payloadJSON, _ := json.Marshal(payload)
 	res, err := s.db.ExecContext(ctx, `
 INSERT OR IGNORE INTO esp_agent_commands (
-  command_id, fleet_id, control_group_id, issuer_node_id, agent_node_id, action,
-  target, instruction, context, args, command, payload, status, created_at_ms,
-  expires_at_ms, received_at_ms, updated_at_ms
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		payload.CommandID, payload.FleetID, payload.ControlGroupID[:], payload.IssuerNodeID,
-		payload.AgentNodeID, payload.Action, target, payload.Instruction, nullableJSON(contextJSON),
+  command_id, fleet_id, control_group_id, issuer_member_id, issuer_peer_id,
+  agent_member_id, agent_peer_id, action, target, instruction, context, args,
+  command, payload, status, created_at_ms, expires_at_ms, received_at_ms, updated_at_ms
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		payload.CommandID, payload.FleetID, payload.ControlGroupID[:],
+		payload.IssuerMemberID[:], payload.IssuerPeerID, payload.AgentMemberID[:],
+		payload.AgentPeerID, payload.Action, target, payload.Instruction, nullableJSON(contextJSON),
 		nullableJSON(args), commandJSON, payloadJSON, rec.Status, payload.CreatedAtMS,
 		payload.ExpiresAtMS, payload.ReceivedAtMS, rec.UpdatedAtMS)
 	if err != nil {

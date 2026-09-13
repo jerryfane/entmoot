@@ -26,7 +26,7 @@ type bootstrapAgentOptions struct {
 	agentInstructions bool
 	liveMode          string
 	group             string
-	node              uint64
+	node              string
 	topics            repeatedStringFlag
 	actions           repeatedStringFlag
 	maxActionsPerScan int
@@ -52,7 +52,7 @@ type bootstrapAgentLiveReport struct {
 	Enabled           bool     `json:"enabled"`
 	Group             string   `json:"group,omitempty"`
 	GroupID           string   `json:"group_id,omitempty"`
-	NodeID            uint64   `json:"node_id,omitempty"`
+	MemberID          string   `json:"member_id,omitempty"`
 	Mode              string   `json:"mode,omitempty"`
 	TopicFilters      []string `json:"topic_filters,omitempty"`
 	AllowedActions    []string `json:"allowed_actions,omitempty"`
@@ -99,7 +99,7 @@ func cmdBootstrapAgent(gf *globalFlags, args []string) int {
 	fs.BoolVar(&cfg.agentInstructions, "agent-instructions", false, "enable instruction-command runtime guidance for entmootd serve")
 	fs.StringVar(&cfg.liveMode, "live-mode", cfg.liveMode, "live mode: off, listen, reply_on_mention, converse, operator")
 	fs.StringVar(&cfg.group, "group", "", "base64 moot group id for live mode")
-	fs.Uint64Var(&cfg.node, "node", 0, "local Pilot node id for live mode")
+	fs.StringVar(&cfg.node, "member", "", "base64 local member id for live mode")
 	fs.Var(&cfg.topics, "topic", "live topic filter; may be repeated")
 	fs.Var(&cfg.actions, "action", "operator action; may be repeated")
 	fs.IntVar(&cfg.maxActionsPerScan, "max-actions", 0, "optional maximum live actions per scan; 0 means unlimited")
@@ -178,9 +178,9 @@ func cmdBootstrapAgent(gf *globalFlags, args []string) int {
 	return exitOK
 }
 
-func buildBootstrapAgentReport(gf *globalFlags, cfg bootstrapAgentOptions) (bootstrapAgentReport, entmoot.GroupID, entmoot.NodeID, error) {
+func buildBootstrapAgentReport(gf *globalFlags, cfg bootstrapAgentOptions) (bootstrapAgentReport, entmoot.GroupID, entmoot.MemberID, error) {
 	var gid entmoot.GroupID
-	var nodeID entmoot.NodeID
+	var nodeID entmoot.MemberID
 	runner := normalizeAgentRunnerKind(cfg.runner)
 	if runner == "" {
 		return bootstrapAgentReport{}, gid, nodeID, fmt.Errorf("invalid --runner; use none, custom, or openclaw")
@@ -256,7 +256,7 @@ func buildBootstrapAgentReport(gf *globalFlags, cfg bootstrapAgentOptions) (boot
 			Enabled:           true,
 			Group:             cfg.group,
 			GroupID:           gid.String(),
-			NodeID:            uint64(nodeID),
+			MemberID:          nodeID.String(),
 			Mode:              liveMode,
 			TopicFilters:      topics,
 			AllowedActions:    actions,
@@ -281,12 +281,12 @@ func bootstrapAgentCommands(gf *globalFlags, report bootstrapAgentReport) []stri
 		out = append(out, envPrefixedCommand(coordinationEnv, entmootCommand(gf, report.Runtime, "agent-commands", "watch", "-runner", report.RunnerCommand)))
 	}
 	if report.Live.Enabled {
-		parts := []string{"agent-live", "run", "-group", report.Live.Group, "-node", strconv.FormatUint(report.Live.NodeID, 10)}
+		parts := []string{"agent-live", "run", "-group", report.Live.Group, "-member", report.Live.MemberID}
 		if report.Runner != agentRunnerNone {
 			parts = append(parts, "-runner", report.RunnerCommand)
 		}
 		command := envPrefixedCommand(coordinationEnv, entmootCommand(gf, report.Runtime, parts...))
-		out = append(out, stackGatedCommand(bootstrapStackHelper(gf, report), bootstrapStackHelperEnv(gf, report), command))
+		out = append(out, command)
 	}
 	return out
 }
@@ -324,46 +324,6 @@ func normalizeBootstrapDefaultMootChoice(choice string) string {
 	return choice
 }
 
-func bootstrapStackHelper(gf *globalFlags, report bootstrapAgentReport) string {
-	stackHelper := strings.TrimSpace(report.Runtime.StackHelper)
-	if stackHelper == "" || gf == nil {
-		return ""
-	}
-	if strings.TrimSpace(gf.data) != agentEntmootDataPath || strings.TrimSpace(gf.socket) != agentPilotSocketPath {
-		return ""
-	}
-	if gf.listenPort != 0 && gf.listenPort != 1004 {
-		return ""
-	}
-	if logLevel := strings.TrimSpace(gf.logLevel); logLevel != "" && logLevel != "info" {
-		return ""
-	}
-	if gf.traceGossipTransport || gf.traceReconcile {
-		return ""
-	}
-	return stackHelper
-}
-
-func bootstrapStackHelperEnv(gf *globalFlags, report bootstrapAgentReport) []string {
-	var env []string
-	if gf != nil {
-		env = append(env,
-			shellEnvAssignment("ENTMOOT_DATA", gf.data),
-			shellEnvAssignment("ENTMOOT_IDENTITY", gf.identity),
-			shellEnvAssignment("PILOT_SOCKET", gf.socket),
-			shellEnvAssignment("ENTMOOT_HIDE_IP", strconv.FormatBool(gf.hideIP)),
-		)
-	}
-	if report.AgentInstructions {
-		env = append(env, "ENTMOOT_AGENT_INSTRUCTIONS=1")
-	}
-	env = append(env, featureFlagEnv(gf)...)
-	if report.Runner != agentRunnerNone && report.RunnerCommand != "" {
-		env = append(env, shellEnvAssignment("ENTMOOT_AGENT_RUNNER", report.RunnerCommand))
-	}
-	return env
-}
-
 func bootstrapCoordinationEnv(gf *globalFlags, report bootstrapAgentReport) []string {
 	var env []string
 	if report.AgentInstructions {
@@ -391,33 +351,10 @@ func envPrefixedCommand(env []string, command string) string {
 	return strings.Join(append(append([]string{}, env...), command), " ")
 }
 
-func shellEnvAssignment(name, value string) string {
-	return name + "=" + shellQuoteArg(value)
-}
-
-func stackGatedCommand(stackHelper string, env []string, command string) string {
-	stackHelper = strings.TrimSpace(stackHelper)
-	if stackHelper == "" {
-		return command
-	}
-	return strings.Join([]string{
-		stackHelperCommand(stackHelper, "ensure", env),
-		stackHelperCommand(stackHelper, "check", env),
-		command,
-	}, " && ")
-}
-
-func stackHelperCommand(stackHelper, mode string, env []string) string {
-	parts := append([]string{}, env...)
-	parts = append(parts, shellCommand(stackHelper, mode))
-	return strings.Join(parts, " ")
-}
-
 func entmootCommand(gf *globalFlags, report runtimeReport, args ...string) string {
 	binary := firstNonEmpty(report.AgentWrapper, report.Binary, "entmootd")
 	parts := []string{
 		binary,
-		"-socket", gf.socket,
 		"-identity", gf.identity,
 		"-data", gf.data,
 	}
@@ -427,12 +364,6 @@ func entmootCommand(gf *globalFlags, report runtimeReport, args ...string) strin
 	if strings.TrimSpace(gf.logLevel) != "" {
 		parts = append(parts, "-log-level", gf.logLevel)
 	}
-	if gf.hideIP {
-		parts = append(parts, "-hide-ip")
-	}
-	if gf.traceGossipTransport {
-		parts = append(parts, "-trace-gossip-transport")
-	}
 	if gf.traceReconcile {
 		parts = append(parts, "-trace-reconcile")
 	}
@@ -440,21 +371,19 @@ func entmootCommand(gf *globalFlags, report runtimeReport, args ...string) strin
 	return shellCommand(parts...)
 }
 
-func parseBootstrapLiveTarget(rawGroup string, rawNode uint64) (entmoot.GroupID, entmoot.NodeID, error) {
+func parseBootstrapLiveTarget(rawGroup, rawMember string) (entmoot.GroupID, entmoot.MemberID, error) {
 	if strings.TrimSpace(rawGroup) == "" {
-		return entmoot.GroupID{}, 0, fmt.Errorf("--group is required when --live-mode is not off")
+		return entmoot.GroupID{}, entmoot.MemberID{}, fmt.Errorf("--group is required when --live-mode is not off")
 	}
 	gid, err := decodeGroupID(rawGroup)
 	if err != nil {
-		return entmoot.GroupID{}, 0, err
+		return entmoot.GroupID{}, entmoot.MemberID{}, err
 	}
-	if rawNode == 0 {
-		return entmoot.GroupID{}, 0, fmt.Errorf("--node is required when --live-mode is not off")
+	memberID, ok := parseAgentLiveMember("bootstrap agent", rawMember)
+	if !ok {
+		return entmoot.GroupID{}, entmoot.MemberID{}, fmt.Errorf("--member must be a base64 32-byte member id")
 	}
-	if rawNode > uint64(^uint32(0)) {
-		return entmoot.GroupID{}, 0, fmt.Errorf("--node is too large: %s", strconv.FormatUint(rawNode, 10))
-	}
-	return gid, entmoot.NodeID(rawNode), nil
+	return gid, memberID, nil
 }
 
 func printBootstrapAgentReport(report bootstrapAgentReport) {
@@ -471,7 +400,7 @@ func printBootstrapAgentReport(report bootstrapAgentReport) {
 	}
 	fmt.Printf("agent_instructions: %t\n", report.AgentInstructions)
 	if report.Live.Enabled {
-		fmt.Printf("live: enabled mode=%s group=%s node=%d\n", report.Live.Mode, report.Live.Group, report.Live.NodeID)
+		fmt.Printf("live: enabled mode=%s group=%s member=%s\n", report.Live.Mode, report.Live.Group, report.Live.MemberID)
 		fmt.Printf("live_topics: %s\n", strings.Join(report.Live.TopicFilters, ","))
 		if len(report.Live.AllowedActions) > 0 {
 			fmt.Printf("live_actions: %s\n", strings.Join(report.Live.AllowedActions, ","))
@@ -535,13 +464,9 @@ func promptBootstrapAgentOptions(cfg bootstrapAgentOptions) (bootstrapAgentOptio
 		if err != nil {
 			return cfg, err
 		}
-		rawNode, err := promptString(reader, "live node id", nodeDefault(cfg.node))
+		cfg.node, err = promptString(reader, "live member id", cfg.node)
 		if err != nil {
 			return cfg, err
-		}
-		cfg.node, err = strconv.ParseUint(strings.TrimSpace(rawNode), 10, 64)
-		if err != nil {
-			return cfg, fmt.Errorf("live node id: %w", err)
 		}
 		rawTopics, err := promptString(reader, "live topics comma-separated", strings.Join(cfg.topics, ","))
 		if err != nil {
@@ -612,9 +537,6 @@ func promptBool(reader *bufio.Reader, label string, current bool) (bool, error) 
 	}
 }
 
-func nodeDefault(node uint64) string {
-	if node == 0 {
-		return ""
-	}
-	return strconv.FormatUint(node, 10)
+func nodeDefault(member string) string {
+	return strings.TrimSpace(member)
 }

@@ -15,7 +15,7 @@ func TestLocalSignerSignsVerifiableMessage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Generate: %v", err)
 	}
-	author := entmoot.NodeInfo{PilotNodeID: 10, EntmootPubKey: id.PublicKey}
+	author := operationalInfo(t, id)
 	signer, err := NewLocalSigner(author, id)
 	if err != nil {
 		t.Fatalf("NewLocalSigner: %v", err)
@@ -46,7 +46,7 @@ func TestExternalSignerAllowsPhoneHeldIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Generate: %v", err)
 	}
-	author := entmoot.NodeInfo{PilotNodeID: 45491, EntmootPubKey: id.PublicKey}
+	author := operationalInfo(t, id)
 	signer, err := NewExternalSigner(author, func(_ context.Context, payload []byte) ([]byte, error) {
 		return id.Sign(payload), nil
 	})
@@ -78,7 +78,7 @@ func TestVerifyMessageCanonicalIDMismatchWrapsSigInvalid(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Generate: %v", err)
 	}
-	author := entmoot.NodeInfo{PilotNodeID: 45491, EntmootPubKey: id.PublicKey}
+	author := operationalInfo(t, id)
 	signer, err := NewExternalSigner(author, func(_ context.Context, payload []byte) ([]byte, error) {
 		return id.Sign(payload), nil
 	})
@@ -110,10 +110,23 @@ func TestLocalSignerRejectsMismatchedAuthorKey(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Generate other: %v", err)
 	}
-	_, err = NewLocalSigner(entmoot.NodeInfo{PilotNodeID: 10, EntmootPubKey: other.PublicKey}, id)
+	_, err = NewLocalSigner(operationalInfo(t, other), id)
 	if err == nil {
 		t.Fatalf("NewLocalSigner accepted mismatched author key")
 	}
+}
+
+func operationalInfo(t *testing.T, id *keystore.Identity) entmoot.NodeInfo {
+	t.Helper()
+	memberID, err := entmoot.MemberIDFromPublicKey(id.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	peerID, err := entmoot.PeerIDFromPublicKey(id.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return entmoot.NodeInfo{EntmootPubKey: id.PublicKey, MemberID: &memberID, PeerID: peerID}
 }
 
 func groupID(seed byte) entmoot.GroupID {

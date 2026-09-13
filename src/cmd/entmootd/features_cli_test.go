@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/esphttp"
 	entfeatures "entmoot/pkg/entmoot/features"
 )
@@ -101,8 +102,8 @@ func TestFleetCommandMutationsRequireTaskFeature(t *testing.T) {
 
 func TestEnableAgentLiveConfigRejectsEmptyExplicitActions(t *testing.T) {
 	_, err := enableAgentLiveConfig(context.Background(), esphttp.NewMemoryStateStore(), enableAgentLiveConfigOptions{
-		groupID: testAgentLiveGroupID(0x41),
-		nodeID:  45491,
+		groupID: testFeatureGroupID(0x41),
+		nodeID:  entmoot.MemberID{0x41},
 		mode:    esphttp.LiveModeOperator,
 		actions: []string{""},
 	})
@@ -137,7 +138,6 @@ func TestCoordinationCommandsRunWhenEnabled(t *testing.T) {
 
 func TestRuntimeReportIncludesFeatureCapabilities(t *testing.T) {
 	report := collectRuntimeReport(enableCoordinationFeatures(&globalFlags{
-		socket:   filepath.Join(t.TempDir(), "pilot.sock"),
 		identity: filepath.Join(t.TempDir(), "identity.json"),
 		data:     t.TempDir(),
 	}), t.TempDir())
@@ -170,4 +170,10 @@ func TestLiveAllowedActionsForConfigDefaultsReplyActions(t *testing.T) {
 	if strings.Contains(strings.Join(operator, ","), liveActionTaskCreate) {
 		t.Fatalf("operator actions = %v, want task actions filtered while disabled", operator)
 	}
+}
+
+func testFeatureGroupID(seed byte) entmoot.GroupID {
+	var id entmoot.GroupID
+	id[0] = seed
+	return id
 }

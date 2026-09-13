@@ -84,10 +84,19 @@ func Sign(desc Descriptor, identity *keystore.Identity) (Descriptor, error) {
 	if len(identity.PublicKey) != ed25519.PublicKeySize {
 		return Descriptor{}, fmt.Errorf("%w: signer public key length %d", ErrDescriptorSignature, len(identity.PublicKey))
 	}
-	if desc.Founder.PilotNodeID == 0 {
-		return Descriptor{}, fmt.Errorf("%w: founder pilot_node_id is required", ErrInvalidDescriptor)
+	memberID, err := entmoot.MemberIDFromPublicKey(identity.PublicKey)
+	if err != nil {
+		return Descriptor{}, fmt.Errorf("%w: %v", ErrInvalidDescriptor, err)
 	}
-	desc.Founder.EntmootPubKey = append([]byte(nil), identity.PublicKey...)
+	peerID, err := entmoot.PeerIDFromPublicKey(identity.PublicKey)
+	if err != nil {
+		return Descriptor{}, fmt.Errorf("%w: %v", ErrInvalidDescriptor, err)
+	}
+	desc.Founder = entmoot.NodeInfo{
+		MemberID:      &memberID,
+		PeerID:        peerID,
+		EntmootPubKey: append([]byte(nil), identity.PublicKey...),
+	}
 	signingBytes, err := SigningBytes(desc)
 	if err != nil {
 		return Descriptor{}, err
@@ -148,11 +157,17 @@ func Validate(desc Descriptor) error {
 	if err := desc.Policy.Validate(); err != nil {
 		return fmt.Errorf("%w: policy: %v", ErrInvalidDescriptor, err)
 	}
-	if desc.Founder.PilotNodeID == 0 {
-		return fmt.Errorf("%w: founder pilot_node_id is required", ErrInvalidDescriptor)
+	if desc.Founder.MemberID == nil {
+		return fmt.Errorf("%w: founder member_id is required", ErrInvalidDescriptor)
+	}
+	if strings.TrimSpace(desc.Founder.PeerID) == "" {
+		return fmt.Errorf("%w: founder peer_id is required", ErrInvalidDescriptor)
 	}
 	if len(desc.Founder.EntmootPubKey) != ed25519.PublicKeySize {
 		return fmt.Errorf("%w: founder entmoot_pubkey length %d", ErrInvalidDescriptor, len(desc.Founder.EntmootPubKey))
+	}
+	if err := entmoot.ValidateMemberInfo(desc.Founder); err != nil {
+		return fmt.Errorf("%w: founder identity: %v", ErrInvalidDescriptor, err)
 	}
 	if !desc.Indexing.Directory {
 		return fmt.Errorf("%w: indexing.directory must be true", ErrInvalidDescriptor)

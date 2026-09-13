@@ -12,8 +12,24 @@ import (
 	"fmt"
 )
 
-// NodeID is a typed alias for Pilot's 32-bit node identifier.
+// NodeID is retained only for immutable Pilot-era signed records and upgrade mappings.
 type NodeID uint32
+
+// MemberID is the full-width application identity derived from an Entmoot
+// Ed25519 public key.
+type MemberID [32]byte
+
+func (m MemberID) String() string {
+	return base64.StdEncoding.EncodeToString(m[:])
+}
+
+func (m MemberID) MarshalJSON() ([]byte, error) {
+	return json.Marshal(m.String())
+}
+
+func (m *MemberID) UnmarshalJSON(data []byte) error {
+	return decodeBase64Array32("MemberID", data, m[:])
+}
 
 // GroupID is the 32-byte random identifier of an Entmoot group.
 //
@@ -77,14 +93,18 @@ func (r *RosterEntryID) UnmarshalJSON(data []byte) error {
 // type.
 type merkleRoot [32]byte
 
-// NodeInfo binds a Pilot node id to the Ed25519 public key used for Entmoot
-// signatures produced by that node.
+// NodeInfo binds an Entmoot signing key to its application and transport
+// identities. PilotNodeID is serialized only for immutable legacy records.
 type NodeInfo struct {
-	// PilotNodeID is the 32-bit Pilot node id.
-	PilotNodeID NodeID `json:"pilot_node_id"`
+	// PilotNodeID is retained solely for exact legacy signed encodings.
+	PilotNodeID NodeID `json:"pilot_node_id,omitempty"`
 	// EntmootPubKey is the raw Ed25519 public key (32 bytes). encoding/json
 	// marshals []byte as base64 automatically.
 	EntmootPubKey []byte `json:"entmoot_pubkey"`
+	// MemberID is present on Pilot-independent versioned records.
+	MemberID *MemberID `json:"member_id,omitempty"`
+	// PeerID is the same-key libp2p identity for operational records.
+	PeerID string `json:"peer_id,omitempty"`
 }
 
 // Group is the top-level record for an Entmoot group: identity, founder,
@@ -134,8 +154,12 @@ func (g *Group) UnmarshalJSON(data []byte) error {
 
 // Message is a single group message. Messages form a DAG via Parents.
 type Message struct {
-	// ID is sha256(canonical(message with ID and Signature zeroed)).
+	// ID is sha256(canonical author-signed form with ID, Signature, and
+	// Acceptance zeroed).
 	ID MessageID `json:"id"`
+	// Version is zero for legacy messages and 2 for the group-bound signing
+	// form.
+	Version uint8 `json:"version,omitempty"`
 	// GroupID is the owning group.
 	GroupID GroupID `json:"group_id"`
 	// Author carries the author's Pilot node id and Ed25519 pubkey.
@@ -152,9 +176,27 @@ type Message struct {
 	Content []byte `json:"content,omitempty"`
 	// References are soft application-level links (reply, correction, etc).
 	References []MessageID `json:"references,omitempty"`
-	// Signature is the Ed25519 signature over the canonical encoding of the
-	// message with ID and Signature zeroed.
+	// RosterHead is the group-bound roster checkpoint under which the author
+	// was admitted. It is absent only on legacy v1 messages.
+	RosterHead *RosterEntryID `json:"roster_head,omitempty"`
+	// Signature authenticates the message signing form, including RosterHead
+	// but excluding Acceptance.
 	Signature []byte `json:"signature,omitempty"`
+	// Acceptance proves that the roster authority accepted this exact message
+	// under a named roster checkpoint. It is attached after author signing and
+	// does not change the message ID.
+	Acceptance *MessageAcceptance `json:"acceptance,omitempty"`
+}
+
+// MessageAcceptance is a founder-signed admission certificate for one exact
+// message under one group-bound roster head.
+type MessageAcceptance struct {
+	Version    uint8         `json:"version"`
+	GroupID    GroupID       `json:"group_id"`
+	MessageID  MessageID     `json:"message_id"`
+	RosterHead RosterEntryID `json:"roster_head"`
+	Authority  NodeInfo      `json:"authority"`
+	Signature  []byte        `json:"signature,omitempty"`
 }
 
 // RosterEntry is one signed record in a group's append-only roster log.
@@ -168,15 +210,24 @@ type RosterEntry struct {
 	Subject NodeInfo `json:"subject"`
 	// Policy is the new policy blob for "policy_change" entries.
 	Policy json.RawMessage `json:"policy,omitempty"`
-	// Actor is the Pilot node id of the signer. v0 requires this to be the
-	// founder; all other actors are rejected by the roster layer.
-	Actor NodeID `json:"actor"`
+	// Actor is retained only for immutable version-0 records.
+	Actor NodeID `json:"actor,omitempty"`
+	// ActorMemberID identifies the signer of version-2 records.
+	ActorMemberID *MemberID `json:"actor_member_id,omitempty"`
 	// Timestamp is unix milliseconds when the entry was produced.
 	Timestamp int64 `json:"timestamp"`
 	// Parents are previous heads being superseded.
 	Parents []RosterEntryID `json:"parents,omitempty"`
-	// Signature is the Ed25519 signature over the canonical encoding of the
-	// entry with Signature zeroed.
+	// Version selects the signed roster-entry format. Zero is the byte-exact
+	// legacy format; new entries use version 2.
+	Version uint8 `json:"version,omitempty"`
+	// GroupID binds version-2 entries to one group. It is a pointer so the
+	// field is absent from legacy JSON and legacy signatures remain stable.
+	GroupID *GroupID `json:"group_id,omitempty"`
+	// Sequence is the one-based position of a version-2 entry in its linear
+	// roster chain.
+	Sequence uint64 `json:"sequence,omitempty"`
+	// Signature is the Ed25519 signature over canonical.RosterEntrySigningBytes.
 	Signature []byte `json:"signature,omitempty"`
 }
 
@@ -240,6 +291,23 @@ type Invite struct {
 	// Signature is the Ed25519 signature over the canonical encoding of the
 	// invite with Signature zeroed, signed by the issuer.
 	Signature []byte `json:"signature,omitempty"`
+}
+
+// BootstrapCapability is a founder-signed, expiring, single-use grant for one
+// fresh identity and a bounded set of bootstrap endpoints.
+type BootstrapCapability struct {
+	GroupID           GroupID       `json:"group_id"`
+	TargetPublicKey   []byte        `json:"target_public_key"`
+	TargetMemberID    MemberID      `json:"target_member_id"`
+	TargetPeerID      string        `json:"target_peer_id"`
+	Founder           NodeInfo      `json:"founder"`
+	RosterHead        RosterEntryID `json:"roster_head"`
+	AllowedPeerIDs    []string      `json:"allowed_peer_ids,omitempty"`
+	AllowedMultiaddrs []string      `json:"allowed_multiaddrs,omitempty"`
+	Nonce             [32]byte      `json:"nonce"`
+	IssuedAtMS        int64         `json:"issued_at_ms"`
+	ExpiresAtMS       int64         `json:"expires_at_ms"`
+	Signature         []byte        `json:"signature,omitempty"`
 }
 
 // MarshalJSON encodes Invite with MerkleRoot as base64 rather than a numeric

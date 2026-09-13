@@ -43,7 +43,6 @@ const (
 	FleetCommandActionEntmootInfo      = "entmoot.info"
 	FleetCommandActionEntmootVersion   = "entmoot.version"
 	FleetCommandActionEntmootDoctor    = "entmoot.doctor_probe"
-	FleetCommandActionPilotInfo        = "pilot.info"
 	FleetCommandActionFleetLocalState  = "fleet.local_state"
 	FleetCommandActionAgentInstruction = "agent.instruction"
 
@@ -60,8 +59,9 @@ const (
 )
 
 type FleetCommandTarget struct {
-	Kind        string         `json:"kind"`
-	PilotNodeID entmoot.NodeID `json:"pilot_node_id,omitempty"`
+	Kind     string           `json:"kind"`
+	MemberID entmoot.MemberID `json:"member_id,omitempty"`
+	PeerID   string           `json:"peer_id,omitempty"`
 }
 
 type FleetCommandEnvelope struct {
@@ -70,7 +70,8 @@ type FleetCommandEnvelope struct {
 	CommandID      string                   `json:"command_id"`
 	FleetID        string                   `json:"fleet_id"`
 	ControlGroupID entmoot.GroupID          `json:"control_group_id"`
-	IssuerNodeID   entmoot.NodeID           `json:"issuer_node_id"`
+	IssuerMemberID entmoot.MemberID         `json:"issuer_member_id"`
+	IssuerPeerID   string                   `json:"issuer_peer_id"`
 	Target         FleetCommandTarget       `json:"target"`
 	Action         string                   `json:"action"`
 	Args           map[string]interface{}   `json:"args,omitempty"`
@@ -81,31 +82,33 @@ type FleetCommandEnvelope struct {
 }
 
 type FleetCommandIssuerProof struct {
-	Scheme        string          `json:"scheme"`
-	NodeID        entmoot.NodeID  `json:"node_id"`
-	EntmootPubKey string          `json:"entmoot_pubkey"`
-	Method        string          `json:"method"`
-	Path          string          `json:"path"`
-	TimestampMS   int64           `json:"timestamp_ms"`
-	Nonce         string          `json:"nonce"`
-	Body          json.RawMessage `json:"body"`
-	Signature     string          `json:"signature"`
+	Scheme        string           `json:"scheme"`
+	MemberID      entmoot.MemberID `json:"member_id"`
+	PeerID        string           `json:"peer_id"`
+	EntmootPubKey string           `json:"entmoot_pubkey"`
+	Method        string           `json:"method"`
+	Path          string           `json:"path"`
+	TimestampMS   int64            `json:"timestamp_ms"`
+	Nonce         string           `json:"nonce"`
+	Body          json.RawMessage  `json:"body"`
+	Signature     string           `json:"signature"`
 }
 
-const FleetCommandIssuerProofMemberV1 = "member_v1"
+const FleetCommandIssuerProofMemberV2 = "member_v2"
 
 type FleetCommandResultEnvelope struct {
-	Type          string         `json:"type"`
-	Version       int            `json:"version"`
-	CommandID     string         `json:"command_id"`
-	FleetID       string         `json:"fleet_id"`
-	AgentNodeID   entmoot.NodeID `json:"agent_node_id"`
-	Action        string         `json:"action,omitempty"`
-	Status        string         `json:"status"`
-	Summary       string         `json:"summary,omitempty"`
-	Output        string         `json:"output,omitempty"`
-	StartedAtMS   int64          `json:"started_at_ms,omitempty"`
-	CompletedAtMS int64          `json:"completed_at_ms,omitempty"`
+	Type          string           `json:"type"`
+	Version       int              `json:"version"`
+	CommandID     string           `json:"command_id"`
+	FleetID       string           `json:"fleet_id"`
+	AgentMemberID entmoot.MemberID `json:"agent_member_id"`
+	AgentPeerID   string           `json:"agent_peer_id"`
+	Action        string           `json:"action,omitempty"`
+	Status        string           `json:"status"`
+	Summary       string           `json:"summary,omitempty"`
+	Output        string           `json:"output,omitempty"`
+	StartedAtMS   int64            `json:"started_at_ms,omitempty"`
+	CompletedAtMS int64            `json:"completed_at_ms,omitempty"`
 }
 
 type FleetCommandSummaryRecord struct {
@@ -156,7 +159,6 @@ var fleetCommandCatalog = []FleetCommandCatalogEntry{
 	{Name: FleetCommandActionEntmootVersion, Risk: FleetCommandRiskSafe, ReadOnly: true, Idempotent: true, AutoAcceptSafe: true, TimeoutMS: 2_000, MaxOutputBytes: 2_048, Description: "Report the local Entmoot build version."},
 	{Name: FleetCommandActionEntmootInfo, Risk: FleetCommandRiskSafe, ReadOnly: true, Idempotent: true, AutoAcceptSafe: true, TimeoutMS: 5_000, MaxOutputBytes: 8_192, Description: "Report local Entmoot runtime group state."},
 	{Name: FleetCommandActionEntmootDoctor, Risk: FleetCommandRiskSafe, ReadOnly: true, Idempotent: true, AutoAcceptSafe: true, TimeoutMS: 15_000, MaxOutputBytes: 16_384, Description: "Run a bounded local Fleet diagnostic snapshot."},
-	{Name: FleetCommandActionPilotInfo, Risk: FleetCommandRiskSafe, ReadOnly: true, Idempotent: true, AutoAcceptSafe: true, TimeoutMS: 5_000, MaxOutputBytes: 8_192, Description: "Report local Pilot daemon info."},
 	{Name: FleetCommandActionFleetLocalState, Risk: FleetCommandRiskSafe, ReadOnly: true, Idempotent: true, AutoAcceptSafe: true, TimeoutMS: 5_000, MaxOutputBytes: 8_192, Description: "Report local Fleet membership state from ESP storage."},
 	{Name: FleetCommandActionAgentInstruction, Risk: FleetCommandRiskManual, ReadOnly: false, Idempotent: false, AutoAcceptSafe: false, TimeoutMS: MaxFleetInstructionTimeoutMS, MaxOutputBytes: 32_768, Description: "Queue a natural-language instruction for the local agent runtime."},
 }
@@ -218,7 +220,8 @@ func NewFleetCommandID() (string, error) {
 func FleetCommandIDFromIssuerProofMaterial(proof FleetCommandIssuerProof) string {
 	sum := sha256.Sum256([]byte(strings.Join([]string{
 		proof.Scheme,
-		strconv.FormatUint(uint64(proof.NodeID), 10),
+		proof.MemberID.String(),
+		proof.PeerID,
 		proof.EntmootPubKey,
 		strings.ToUpper(strings.TrimSpace(proof.Method)),
 		proof.Path,
@@ -377,10 +380,10 @@ func fleetCommandExternalActionsArg(raw interface{}) ([]FleetCommandExternalActi
 
 func VerifyFleetCommandIssuerProof(cmd FleetCommandEnvelope, coordinatorPubKey []byte) bool {
 	proof := cmd.IssuerProof
-	if proof == nil || proof.Scheme != FleetCommandIssuerProofMemberV1 {
+	if proof == nil || proof.Scheme != FleetCommandIssuerProofMemberV2 {
 		return false
 	}
-	if proof.NodeID == 0 || proof.NodeID != cmd.IssuerNodeID {
+	if proof.MemberID == (entmoot.MemberID{}) || proof.MemberID != cmd.IssuerMemberID || proof.PeerID == "" || proof.PeerID != cmd.IssuerPeerID {
 		return false
 	}
 	pub, err := base64.StdEncoding.DecodeString(strings.TrimSpace(proof.EntmootPubKey))
@@ -411,7 +414,7 @@ func VerifyFleetCommandIssuerProof(cmd FleetCommandEnvelope, coordinatorPubKey [
 	if cmd.CommandID != FleetCommandIDFromIssuerProofMaterial(*proof) {
 		return false
 	}
-	input := MemberSigningInput(method, proof.Path, proof.NodeID, pub, proof.TimestampMS, proof.Nonce, body)
+	input := MemberSigningInput(method, proof.Path, proof.MemberID, proof.PeerID, pub, proof.TimestampMS, proof.Nonce, body)
 	return ed25519.Verify(pub, []byte(input), sig)
 }
 
@@ -430,12 +433,13 @@ func fleetCommandProofPathMatches(rawPath, fleetID string) bool {
 
 func fleetCommandProofBodyMatches(body []byte, cmd FleetCommandEnvelope) bool {
 	var req struct {
-		Target       string          `json:"target"`
-		TargetNodeID uint64          `json:"target_node_id"`
-		Action       string          `json:"action"`
-		Args         json.RawMessage `json:"args"`
-		AutoAccept   *bool           `json:"auto_accept"`
-		ExpiresAtMS  int64           `json:"expires_at_ms"`
+		Target         string           `json:"target"`
+		TargetMemberID entmoot.MemberID `json:"target_member_id"`
+		TargetPeerID   string           `json:"target_peer_id"`
+		Action         string           `json:"action"`
+		Args           json.RawMessage  `json:"args"`
+		AutoAccept     *bool            `json:"auto_accept"`
+		ExpiresAtMS    int64            `json:"expires_at_ms"`
 	}
 	if err := json.Unmarshal(body, &req); err != nil {
 		return false
@@ -443,7 +447,7 @@ func fleetCommandProofBodyMatches(body []byte, cmd FleetCommandEnvelope) bool {
 	if NormalizeFleetCommandTarget(req.Target) != NormalizeFleetCommandTarget(cmd.Target.Kind) {
 		return false
 	}
-	if cmd.Target.Kind == FleetCommandTargetNode && entmoot.NodeID(req.TargetNodeID) != cmd.Target.PilotNodeID {
+	if cmd.Target.Kind == FleetCommandTargetNode && (req.TargetMemberID != cmd.Target.MemberID || req.TargetPeerID != cmd.Target.PeerID) {
 		return false
 	}
 	if NormalizeFleetCommandAction(req.Action) != NormalizeFleetCommandAction(cmd.Action) {

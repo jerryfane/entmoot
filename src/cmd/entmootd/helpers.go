@@ -14,29 +14,72 @@ import (
 	"time"
 
 	"entmoot/pkg/entmoot"
+	"entmoot/pkg/entmoot/conversion"
 	"entmoot/pkg/entmoot/keystore"
-	"entmoot/pkg/entmoot/transport/pilot"
+	"entmoot/pkg/entmoot/roster"
 )
 
-// setupResult carries resources assembled by setup() — every non-info-only
-// subcommand needs identity + data dir; Pilot is opened only by callers
-// that actually need a Transport.
+// setupResult carries resources assembled by setup.
 type setupResult struct {
 	identity *keystore.Identity
 	dataDir  string
 }
 
-// setup performs the common boilerplate: mkdir the data root, load or
-// generate the identity. Subcommands that need Pilot dial it separately.
+// setup validates the data root and loads the identity. Identity creation is
+// explicit so a bad runtime path cannot silently create a different node.
 func setup(gf *globalFlags) (*setupResult, error) {
-	if err := os.MkdirAll(gf.data, 0o700); err != nil {
-		return nil, fmt.Errorf("mkdir data %q: %w", gf.data, err)
+	if strings.TrimSpace(gf.data) == "" {
+		return nil, errors.New("entmootd: data root is empty")
 	}
-	id, err := keystore.LoadOrGenerate(gf.identity)
+	if strings.TrimSpace(gf.identity) == "" {
+		return nil, errors.New("entmootd: identity path is empty")
+	}
+	dataDir, err := filepath.Abs(gf.data)
 	if err != nil {
-		return nil, fmt.Errorf("load identity: %w", err)
+		return nil, fmt.Errorf("entmootd: resolve data root %q: %w", gf.data, err)
 	}
-	return &setupResult{identity: id, dataDir: gf.data}, nil
+	identityPath, err := filepath.Abs(gf.identity)
+	if err != nil {
+		return nil, fmt.Errorf("entmootd: resolve identity %q: %w", gf.identity, err)
+	}
+	info, err := os.Stat(dataDir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("entmootd: data root %q does not exist", dataDir)
+		}
+		return nil, fmt.Errorf("entmootd: stat data root %q: %w", dataDir, err)
+	}
+	if !info.IsDir() {
+		return nil, fmt.Errorf("entmootd: data root %q is not a directory", dataDir)
+	}
+
+	id, err := keystore.Load(identityPath)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("load identity: %w", err)
+		}
+		if !gf.allowNewIdentity {
+			return nil, fmt.Errorf(
+				"entmootd: identity %q does not exist; pass -allow-new-identity to create it",
+				identityPath,
+			)
+		}
+		id, err = keystore.Generate()
+		if err != nil {
+			return nil, fmt.Errorf("generate identity: %w", err)
+		}
+		slog.Info("entmootd: creating new identity", slog.String("path", identityPath))
+		if err := id.Save(identityPath); err != nil {
+			return nil, fmt.Errorf("save identity: %w", err)
+		}
+	}
+	if err := conversion.Run(dataDir, id); err != nil {
+		return nil, fmt.Errorf("convert data root: %w", err)
+	}
+	slog.Info("entmootd: using runtime paths",
+		slog.String("data", dataDir),
+		slog.String("identity", identityPath))
+	return &setupResult{identity: id, dataDir: dataDir}, nil
 }
 
 // expandHome returns path with a leading "~" or "~/" expanded to the
@@ -172,6 +215,14 @@ func groupRosterPath(dataRoot string, gid entmoot.GroupID) string {
 	return filepath.Join(groupDirPath(dataRoot, gid), "roster.jsonl")
 }
 
+func groupRosterSQLitePath(dataRoot string, gid entmoot.GroupID) string {
+	return filepath.Join(groupDirPath(dataRoot, gid), "roster.sqlite")
+}
+
+func groupRosterExists(dataRoot string, gid entmoot.GroupID) bool {
+	return roster.Exists(dataRoot, gid)
+}
+
 // controlSocketPath returns the canonical control-socket path under the
 // given data root.
 func controlSocketPath(dataRoot string) string {
@@ -273,18 +324,6 @@ func parseDurationDays(s string) (time.Duration, error) {
 // of b.
 func encodeBase64(b []byte) string {
 	return base64.StdEncoding.EncodeToString(b)
-}
-
-// openPilot dials the Pilot daemon and binds the listen port. Every
-// subcommand that needs a Pilot transport goes through this single
-// helper so the Config is consistent.
-func openPilot(gf *globalFlags) (*pilot.Transport, error) {
-	return pilot.Open(pilot.Config{
-		SocketPath:           gf.socket,
-		ListenPort:           uint16(gf.listenPort),
-		Logger:               slog.Default(),
-		TraceGossipTransport: gf.traceGossipTransport,
-	})
 }
 
 // withTimeout wraps context.WithTimeout and returns both the ctx and

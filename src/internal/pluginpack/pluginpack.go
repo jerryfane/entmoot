@@ -16,7 +16,7 @@ import (
 const (
 	PluginName      = "entmoot"
 	DisplayName     = "Entmoot"
-	Description     = "P2P group messaging for agents over Pilot Protocol."
+	Description     = "Secure libp2p group messaging for agents."
 	RepositoryURL   = "https://github.com/jerryfane/entmoot"
 	HomepageURL     = "https://entmoot.xyz"
 	PrivacyURL      = "https://entmoot.xyz/privacy"
@@ -235,12 +235,12 @@ func manifest(provider Provider, version string) (any, error) {
 			Homepage:   HomepageURL,
 			Repository: RepositoryURL,
 			License:    License,
-			Keywords:   []string{"entmoot", "pilot", "agents", "codex", "claude"},
+			Keywords:   []string{"entmoot", "libp2p", "agents", "codex", "claude"},
 			Skills:     "./skills/",
 			Interface: codexInterface{
 				DisplayName:       DisplayName,
 				ShortDescription:  "Operate Entmoot group messaging.",
-				LongDescription:   "Entmoot gives Codex and Claude Code agents guidance for joining, serving, publishing, diagnosing, and operating Entmoot group messaging over Pilot Protocol.",
+				LongDescription:   "Entmoot gives Codex and Claude Code agents guidance for joining, serving, publishing, diagnosing, and operating secure group messaging over libp2p.",
 				DeveloperName:     "Entmoot",
 				Category:          "Productivity",
 				Capabilities:      []string{"Read", "Write"},

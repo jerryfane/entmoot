@@ -263,11 +263,17 @@ func Validate(desc Descriptor) error {
 	if len(desc.DescriptorSignerPubKey) != ed25519.PublicKeySize {
 		return fmt.Errorf("%w: descriptor_signer_pubkey length %d", ErrInvalidDescriptor, len(desc.DescriptorSignerPubKey))
 	}
-	if desc.Issuer.PilotNodeID == 0 {
-		return fmt.Errorf("%w: issuer pilot_node_id is required", ErrInvalidDescriptor)
+	if desc.Issuer.MemberID == nil {
+		return fmt.Errorf("%w: issuer member_id is required", ErrInvalidDescriptor)
+	}
+	if strings.TrimSpace(desc.Issuer.PeerID) == "" {
+		return fmt.Errorf("%w: issuer peer_id is required", ErrInvalidDescriptor)
 	}
 	if len(desc.Issuer.EntmootPubKey) != ed25519.PublicKeySize {
 		return fmt.Errorf("%w: issuer entmoot_pubkey length %d", ErrInvalidDescriptor, len(desc.Issuer.EntmootPubKey))
+	}
+	if err := entmoot.ValidateMemberInfo(desc.Issuer); err != nil {
+		return fmt.Errorf("%w: issuer identity: %v", ErrInvalidDescriptor, err)
 	}
 	if !defaultTopicsOK(desc.DefaultTopics) {
 		return fmt.Errorf("%w: default_topics must be [chat/general introductions]", ErrInvalidDescriptor)
