@@ -7,6 +7,7 @@ import (
 	"time"
 
 	libp2p "github.com/libp2p/go-libp2p"
+	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/protocol"
@@ -14,6 +15,7 @@ import (
 	multiaddr "github.com/multiformats/go-multiaddr"
 
 	"entmoot/pkg/entmoot"
+	"entmoot/pkg/entmoot/keystore"
 	"entmoot/pkg/entmoot/roster"
 )
 
@@ -155,6 +157,73 @@ func TestRelayOnlyPeersConnectThroughControlledRelay(t *testing.T) {
 		if !isCircuitAddress(address) {
 			t.Fatalf("relay-only peerstore exposed direct address %s", address)
 		}
+	}
+}
+
+func TestRelayCircuitLimitAppliesPerPeer(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	identities := make([]*keystore.Identity, 4)
+	allowed := make([]peer.ID, 4)
+	for i := range identities {
+		identities[i] = mustIdentity(t)
+		binding, err := BindingFromPublicKey(identities[i].PublicKey)
+		if err != nil {
+			t.Fatal(err)
+		}
+		allowed[i] = binding.PeerID
+	}
+	relayHost, _, err := NewRelayServer(ctx, mustIdentity(t), RelayServerConfig{
+		ListenAddrs:           []string{"/ip4/127.0.0.1/tcp/0"},
+		AllowedPeers:          allowed,
+		ReservationTTL:        time.Hour,
+		CircuitDuration:       time.Minute,
+		CircuitBytes:          1 << 20,
+		MaxReservations:       8,
+		MaxCircuitsPerPeer:    1,
+		MaxReservationsPerIP:  8,
+		MaxReservationsPerASN: 8,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer relayHost.Close()
+	relayInfo := peer.AddrInfo{ID: relayHost.ID(), Addrs: relayHost.Addrs()}
+
+	clients := make([]host.Host, len(identities))
+	for i, identity := range identities {
+		clients[i], _, err = NewConfiguredHost(ctx, identity, HostConfig{
+			Mode:             RelayOnlyConnectivity,
+			ControlledRelays: []peer.AddrInfo{relayInfo},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer clients[i].Close()
+		if _, err := relayclient.Reserve(ctx, clients[i], relayInfo); err != nil {
+			t.Fatal(err)
+		}
+	}
+	relayAddrs, err := peer.AddrInfoToP2pAddrs(&relayInfo)
+	if err != nil || len(relayAddrs) == 0 {
+		t.Fatalf("relay address: %v", err)
+	}
+	circuitAddress := multiaddr.Join(relayAddrs[0], multiaddr.StringCast("/p2p-circuit"))
+	connect := func(source, destination int) error {
+		return clients[source].Connect(ctx, peer.AddrInfo{
+			ID:    clients[destination].ID(),
+			Addrs: []multiaddr.Multiaddr{circuitAddress},
+		})
+	}
+	if err := connect(0, 1); err != nil {
+		t.Fatalf("first peer pair: %v", err)
+	}
+	if err := connect(2, 3); err != nil {
+		t.Fatalf("independent peer pair was rejected by a relay-wide circuit limit: %v", err)
+	}
+	if err := connect(0, 2); err == nil {
+		t.Fatal("peer opened a second circuit despite its per-peer limit")
 	}
 }
 
