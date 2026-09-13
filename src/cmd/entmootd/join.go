@@ -273,22 +273,16 @@ type groupDaemonLoadContext struct {
 
 func daemonHostConfig(gf *globalFlags) (libp2ptransport.HostConfig, error) {
 	config := libp2ptransport.HostConfig{Mode: libp2ptransport.DirectConnectivity}
+	relays, err := parseControlledRelays(gf.controlledRelays)
+	if err != nil {
+		return libp2ptransport.HostConfig{}, err
+	}
+	config.ControlledRelays = relays
 	switch gf.connectivity {
 	case "", "direct":
 		config.ListenAddrs = []string{fmt.Sprintf("/ip4/0.0.0.0/tcp/%d", gf.listenPort)}
 	case "relay-only":
 		config.Mode = libp2ptransport.RelayOnlyConnectivity
-		for _, raw := range gf.controlledRelays {
-			address, err := multiaddr.NewMultiaddr(raw)
-			if err != nil {
-				return libp2ptransport.HostConfig{}, fmt.Errorf("controlled relay %q: %w", raw, err)
-			}
-			info, err := libpeer.AddrInfoFromP2pAddr(address)
-			if err != nil {
-				return libp2ptransport.HostConfig{}, fmt.Errorf("controlled relay %q: %w", raw, err)
-			}
-			config.ControlledRelays = append(config.ControlledRelays, *info)
-		}
 		if len(config.ControlledRelays) == 0 {
 			return libp2ptransport.HostConfig{}, errors.New("relay-only connectivity requires at least one -controlled-relay")
 		}
@@ -296,6 +290,25 @@ func daemonHostConfig(gf *globalFlags) (libp2ptransport.HostConfig, error) {
 		return libp2ptransport.HostConfig{}, fmt.Errorf("unsupported connectivity profile %q", gf.connectivity)
 	}
 	return config, nil
+}
+
+// parseControlledRelays resolves repeatable -controlled-relay multiaddrs. In the
+// direct profile they are hole-punch rendezvous points, so a NATed peer stays
+// reachable while DCUtR upgrades the connection; relay-only requires them.
+func parseControlledRelays(values []string) ([]libpeer.AddrInfo, error) {
+	var relays []libpeer.AddrInfo
+	for _, raw := range values {
+		address, err := multiaddr.NewMultiaddr(raw)
+		if err != nil {
+			return nil, fmt.Errorf("controlled relay %q: %w", raw, err)
+		}
+		info, err := libpeer.AddrInfoFromP2pAddr(address)
+		if err != nil {
+			return nil, fmt.Errorf("controlled relay %q: %w", raw, err)
+		}
+		relays = append(relays, *info)
+	}
+	return relays, nil
 }
 
 func runGroupDaemon(gf *globalFlags, opts groupDaemonOptions) int {

@@ -29,4 +29,6 @@ Useful global flags:
 
 Without `-group`, all locally joined groups with a persisted roster are served.
 With `-group`, missing or invalid group state is an error. Relay-only mode
-requires at least one `-controlled-relay` flag.
+requires at least one `-controlled-relay` flag. Direct mode accepts the same
+flag as a DCUtR hole-punch rendezvous, which is what makes a peer behind NAT
+reachable before the connection is upgraded to a direct one.

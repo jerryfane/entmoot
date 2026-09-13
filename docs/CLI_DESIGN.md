@@ -114,7 +114,11 @@ keep machine-readable output on stdout.
 ## 7. Connectivity
 
 Direct mode listens on the configured TCP port. It is the default and may expose
-addresses to authorized peers.
+addresses to authorized peers. It enables DCUtR on every peer, so a relayed
+connection is upgraded to a direct one when both sides can be punched.
+`-controlled-relay` is accepted in direct mode as a hole-punch rendezvous: the
+peer reserves there and remains reachable over the circuit while unreachable
+directly. Symmetric and carrier-grade NAT are not punchable and stay relayed.
 
 Relay-only mode requires at least one `-controlled-relay` address ending in
 `/p2p/<relay-peer-id>`. It opens no direct application listener and rejects
