@@ -80,6 +80,11 @@ func NewConfiguredHost(ctx context.Context, identity *keystore.Identity, cfg Hos
 		if len(cfg.ListenAddrs) > 0 {
 			options = append(options, libp2p.ListenAddrStrings(cfg.ListenAddrs...))
 		}
+		// DCUtR upgrades a relayed connection to a direct one. Both ends must
+		// speak it: a publicly reachable peer is the punch target for a NATed
+		// peer, so the protocol is enabled even without local relays. Relay
+		// rendezvous itself stays opt-in through ControlledRelays.
+		options = append(options, libp2p.EnableRelay(), libp2p.EnableHolePunching())
 	case RelayOnlyConnectivity:
 		gater := newRelayOnlyGater(cfg.ControlledRelays)
 		privateAddresses, err = newRelayOnlyPeerstore(gater.relays)
@@ -121,6 +126,8 @@ func NewConfiguredHost(ctx context.Context, identity *keystore.Identity, cfg Hos
 	if privateHost != nil {
 		privateHost.Host = h
 		h = privateHost
+	}
+	if len(cfg.ControlledRelays) > 0 {
 		reservations := &RelayReservationManager{Host: h, Relays: cfg.ControlledRelays}
 		if err := reservations.Run(hostCtx); err != nil {
 			_ = h.Close()

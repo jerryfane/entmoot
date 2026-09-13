@@ -7,6 +7,7 @@ import (
 	"time"
 
 	libp2p "github.com/libp2p/go-libp2p"
+	"github.com/libp2p/go-libp2p/core/event"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -156,6 +157,106 @@ func TestRelayOnlyPeersConnectThroughControlledRelay(t *testing.T) {
 	for _, address := range VisiblePeerAddresses(first, second.ID(), RelayOnlyConnectivity, []peer.AddrInfo{relayInfo}) {
 		if !isCircuitAddress(address) {
 			t.Fatalf("relay-only peerstore exposed direct address %s", address)
+		}
+	}
+}
+
+// A direct-profile peer behind NAT is unreachable until it reserves with a
+// rendezvous relay. The reservation is also what DCUtR needs before it can
+// upgrade the relayed connection to a direct one. libp2p only advertises the
+// circuit address once AutoNAT confirms private reachability, which loopback
+// cannot produce, so the relay address is read from the event the address
+// manager consumes.
+func TestDirectProfileReservesRendezvousRelayAndStaysDialable(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	natedIdentity := mustIdentity(t)
+	natedBinding, err := BindingFromPublicKey(natedIdentity.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dialerIdentity := mustIdentity(t)
+	dialerBinding, err := BindingFromPublicKey(dialerIdentity.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	relayHost, _, err := NewRelayServer(ctx, mustIdentity(t), RelayServerConfig{
+		ListenAddrs:           []string{"/ip4/127.0.0.1/tcp/0"},
+		AllowedPeers:          []peer.ID{natedBinding.PeerID, dialerBinding.PeerID},
+		ReservationTTL:        time.Hour,
+		CircuitDuration:       time.Minute,
+		CircuitBytes:          1 << 20,
+		MaxReservations:       8,
+		MaxCircuitsPerPeer:    2,
+		MaxReservationsPerIP:  8,
+		MaxReservationsPerASN: 8,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer relayHost.Close()
+	relayInfo := peer.AddrInfo{ID: relayHost.ID(), Addrs: relayHost.Addrs()}
+
+	nated, _, err := NewConfiguredHost(ctx, natedIdentity, HostConfig{
+		Mode:             DirectConnectivity,
+		ListenAddrs:      []string{"/ip4/127.0.0.1/tcp/0"},
+		ControlledRelays: []peer.AddrInfo{relayInfo},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nated.Close()
+	dialer, _, err := NewConfiguredHost(ctx, dialerIdentity, HostConfig{
+		Mode:        DirectConnectivity,
+		ListenAddrs: []string{"/ip4/127.0.0.1/tcp/0"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dialer.Close()
+
+	circuit := waitForPublishedRelayAddress(ctx, t, nated, relayInfo.ID)
+	const probeProtocol = protocol.ID("/entmoot/direct-relay-check/1")
+	nated.SetStreamHandler(probeProtocol, func(stream network.Stream) {
+		defer stream.Close()
+		_, _ = stream.Write([]byte("reachable"))
+	})
+	if err := dialer.Connect(ctx, peer.AddrInfo{ID: nated.ID(), Addrs: []multiaddr.Multiaddr{circuit}}); err != nil {
+		t.Fatalf("connect to relay-reserved direct peer: %v", err)
+	}
+	stream, err := dialer.NewStream(network.WithAllowLimitedConn(ctx, "direct profile relay check"), nated.ID(), probeProtocol)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := io.ReadAll(stream)
+	_ = stream.Close()
+	if err != nil || string(payload) != "reachable" {
+		t.Fatalf("relayed payload=%q err=%v", payload, err)
+	}
+}
+
+func waitForPublishedRelayAddress(ctx context.Context, t *testing.T, h host.Host, relay peer.ID) multiaddr.Multiaddr {
+	t.Helper()
+	allowed := map[peer.ID]struct{}{relay: {}}
+	subscription, err := h.EventBus().Subscribe(new(event.EvtAutoRelayAddrsUpdated))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer subscription.Close()
+	for {
+		select {
+		case raw := <-subscription.Out():
+			update, ok := raw.(event.EvtAutoRelayAddrsUpdated)
+			if !ok {
+				continue
+			}
+			for _, address := range update.RelayAddrs {
+				if circuitUsesControlledRelay(address, allowed) {
+					return address
+				}
+			}
+		case <-ctx.Done():
+			t.Fatal("direct profile never published a circuit address for its rendezvous relay")
 		}
 	}
 }
