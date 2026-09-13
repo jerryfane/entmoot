@@ -34,7 +34,7 @@ Coordinator task actions:
 export ENTMOOT_ESP_URL=<ESP_URL>
 entmootd fleet tasks approve -fleet <FLEET_ID> -task <TASK_ID>
 entmootd fleet tasks assign -fleet <FLEET_ID> -task <TASK_ID> \
-  -assignee-node-id <PILOT_NODE_ID>
+  -assignee-member-id <MEMBER_ID>
 entmootd fleet tasks complete -fleet <FLEET_ID> -task <TASK_ID>
 entmootd fleet tasks reject -fleet <FLEET_ID> -task <TASK_ID>
 entmootd fleet tasks cancel -fleet <FLEET_ID> -task <TASK_ID>
@@ -57,15 +57,15 @@ entmootd fleet commands catalog
 export ENTMOOT_ESP_URL=<ESP_URL>
 entmootd fleet commands send -fleet <FLEET_ID> -action entmoot.version -target all
 entmootd fleet commands send -fleet <FLEET_ID> -action agent.instruction \
-  -target node -target-node-id <PILOT_NODE_ID> \
+  -target node -target-member-id <MEMBER_ID> \
   -instruction "summarize fleet/tasks"
 entmootd fleet commands result -group <GROUP_ID> -fleet <FLEET_ID> \
   -command-id <COMMAND_ID> -status completed -summary "done"
 ```
 
 Safe auto-accepted catalog entries are `echo`, `entmoot.version`,
-`entmoot.info`, `entmoot.doctor_probe`, `pilot.info`, and
-`fleet.local_state`. `agent.instruction` is manual risk, not read-only, and
+`entmoot.info`, `entmoot.doctor_probe`, and `fleet.local_state`.
+`agent.instruction` is manual risk, not read-only, and
 requires the target node to opt in with `ENTMOOT_AGENT_INSTRUCTIONS=1` plus an
 `agent-commands` runner.
 

@@ -5,8 +5,8 @@ title: Entmoot Service Providers
 An Entmoot Service Provider, or ESP, is an always-on service peer for
 intermittent clients such as mobile apps.
 
-The ESP runs normal Entmoot and Pilot infrastructure. The phone can keep its
-own signing key and use the ESP for:
+The ESP runs a normal Entmoot node. The phone can keep its own signing key and
+use the ESP for:
 
 - Durable mailbox sync.
 - Device-authenticated HTTP access.
@@ -22,8 +22,8 @@ performs validation, storage, and gossip fanout.
 
 Mobile infrastructure is intentionally isolated from Entmoot core. APNs
 delivery lives behind an ESP notifier interface with a no-op provider for
-development and an APNs provider for production. Gossip, reconcile, Pilot
-transport, and message storage do not know APNs exists.
+development and an APNs provider for production. GossipSub, history
+synchronization, libp2p transport, and message storage do not know APNs exists.
 
 The ESP device auth key is separate from the Entmoot author key. Operators can
 add, disable, remove, or rotate the ESP device auth public key without touching
@@ -43,11 +43,11 @@ the group id and signed roster. The app display layer is ESP-local metadata:
 metadata changes what a mobile app displays, but it does not rewrite the roster
 or message history.
 
-Member display names follow the same rule. The protocol identity remains Pilot
-node id plus Entmoot public key. A member may additionally publish a signed
-member-profile ad containing its current Pilot hostname. ESP member APIs expose
-that hostname when it is current and roster-matched, so apps can show readable
-names like `laptop`, `vps`, or `phobos` without trusting a central registry.
+Member display names follow the same rule. The protocol identity is the
+full-width MemberID and Entmoot public key, with a libp2p PeerID derived from
+that same key. A member may additionally publish a signed member profile. ESP
+member APIs expose it only when it is current and roster-matched, so apps can
+show readable names without trusting a central registry.
 
 Executable sign requests include the signing bytes explicitly. For
 `message_publish`, the ESP returns both a draft/debug `payload` and canonical

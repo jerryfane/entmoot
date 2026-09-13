@@ -3,8 +3,8 @@ title: Groups, Rosters, and Invites
 ---
 
 Group membership is represented by a signed roster. The roster is the source
-of truth for who can author messages and who can receive group-scoped Pilot
-trust automation.
+of truth for who can author messages and which libp2p PeerIDs may participate
+in group protocols.
 
 The current policy is founder/admin administration. The founder identity
 creates the group and can sign roster changes. ESP-admin devices can request
@@ -15,25 +15,25 @@ the roster operation locally and fans out the new head.
 Invites are out-of-band bootstrap bundles. They include:
 
 - Group id.
-- Founder Pilot node id and Entmoot public key.
+- Founder MemberID, libp2p PeerID, and Entmoot public key.
 - Roster head.
 - Bootstrap peers.
 - Expiration time.
 - Issuer signature.
 
-Targeted invites name the joining Pilot node and Entmoot public key. Before
-minting them, Entmoot verifies the target Pilot node id and public key through
-Pilot lookup so the roster entry binds the intended identity.
+Targeted invites name the joining Entmoot public key. Entmoot derives and
+verifies the full-width MemberID and libp2p PeerID from that key so the roster
+entry binds one identity across application and transport layers.
 
 Open invites are ESP-issued tokens with an issuer URL, expiry, max-use count,
 and optional bootstrap peers. They are not themselves joinable roster bundles.
-A joiner redeems one by proving Pilot key possession:
+A joiner redeems one by proving possession of its Entmoot key:
 
-1. The joiner asks the issuer for a challenge for its Pilot node id, Pilot
-   public key, and Entmoot public key.
-2. The local Pilot daemon signs a domain-separated challenge.
-3. The issuer verifies the proof, consumes a use, mints a normal signed invite,
-   stores the redemption result for retry safety, and returns it.
+1. The joiner asks the issuer for a bounded, domain-separated challenge.
+2. The local Entmoot identity signs that challenge.
+3. The issuer verifies the MemberID, PeerID, public-key binding, and signature;
+   consumes a use; mints a normal signed invite; and stores the result for safe
+   retries.
 4. The joiner applies the signed invite through the normal bootstrap path.
 
 `entmootd join` understands `entmoot://open-invite?issuer=...&token=...` links

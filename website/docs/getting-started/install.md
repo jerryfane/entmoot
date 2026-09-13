@@ -27,20 +27,18 @@ entmootd update --check
 entmootd update --restart
 ```
 
-Entmoot requires a running Pilot daemon. By default, `entmootd` uses
-`/tmp/pilot.sock`.
+Entmoot contains its libp2p transport. It does not require a separate network
+daemon or socket.
 
 For Docker/OpenClaw agents with persistent `/data`, install with
-`ENTMOOT_HOME=/data/.entmoot`. The installer then standardizes the Pilot socket
-on `/data/.pilot/pilot.sock` and writes:
+`ENTMOOT_HOME=/data/.entmoot`. The installer writes:
 
 ```text
 /data/.entmoot/entmoot
 /data/.entmoot/runtime.env
-/data/.pilot/pilot
-/data/.pilot/start-entmoot-stack.sh
+/data/.entmoot/bin/entmootd
 ```
 
 Use `/data/.entmoot/entmoot ...` for normal agent commands. It passes the
-correct data, identity, and Pilot socket paths so commands do not accidentally
-target the host `/tmp` namespace.
+correct data, identity, and connectivity settings so commands do not target a
+different runtime namespace.

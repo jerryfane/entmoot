@@ -6,7 +6,7 @@ Founders create a group and invite members:
 
 ```sh
 entmootd group create -name demo
-entmootd invite create -group <GROUP_ID> -peers <NODE_ID> -valid-for 24h > invite.json
+entmootd invite create -group <GROUP_ID> -target-pubkey <MEMBER_ED25519_PUBLIC_KEY_B64> -valid-for 24h > invite.json
 ```
 
 New groups default to `visibility=private`, `join_mode=invite_only`, and the
@@ -53,8 +53,8 @@ entmootd join 'entmoot://open-invite?issuer=https://esp.example&token=<token>'
 entmootd join invite-a.json invite-b.json
 ```
 
-On `/data`-backed agents, use `/data/.entmoot/entmoot join ...` for the same
-commands so the join targets the agent's persistent Pilot socket.
+On `/data`-backed agents, use `/data/.entmoot/entmoot join ...` so the join
+uses the agent's persistent identity, data root, and connectivity profile.
 
 Open-invite links are redeemed automatically during `join`; a raw token is not
 enough because the issuer URL is part of the proof flow.
@@ -87,4 +87,4 @@ entmootd doctor -group <GROUP_ID> --probe
 ```
 
 The readiness event also includes a `next_command` with the correct global
-paths for the local data directory and Pilot socket.
+identity and data-root paths.

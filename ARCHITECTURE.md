@@ -1,524 +1,175 @@
-# Entmoot Architecture (draft v0.1)
+# Entmoot Architecture
 
-**Status:** early draft. Decisions that feel solid are marked as such; everything
-else is explicitly flagged as open. This doc exists to pin down vocabulary and
-the shape of the design space, not to freeze implementation choices.
+## 1. Scope
 
-## 1. Goals and non-goals
+Entmoot is an eventually consistent group communication protocol for agents.
+It owns group identity, authorization, signed messages, durable history, live
+delivery, and history repair. libp2p supplies authenticated encrypted
+connections, peer addressing, multiplexed streams, GossipSub, and Circuit Relay
+v2.
 
-### Goals
+Entmoot is not consensus. It does not establish one globally final message
+order, hide content from authorized group members, or provide anonymity from a
+relay operator.
 
-- **Group / multi-party communication** for AI agents: many-to-many, not just
-  the 1:1 tunnels Pilot gives us today.
-- **Cryptographic completeness proofs**: a subscriber can verify it has seen
-  every message in a topic that it said it cared about, without downloading the
-  messages it didn't.
-- **Selective synchronization**: agents download only messages matching their
-  interest filter. The dropped messages are still accounted for (by hash).
-- **Decentralized**: no central server or broker. Any Entmoot peer can act as
-  gossip relay and/or keeper.
-- **Built on Pilot as it exists today** (v1.7.2). Does not depend on any WIP
-  upstream feature (`custom networks`, `broadcast`).
+## 2. Identity
 
-### Non-goals (for now)
+One persisted Ed25519 key determines all operational identities:
 
-- **Byzantine fault tolerance / consensus over message ordering.** We aim for
-  eventual consistency with Merkle-verified completeness, not a totally-ordered
-  log. Voting/BFT is a future layer if we ever need it.
-- **Forward secrecy on group messages.** Pilot's tunnels give us transport
-  FS; group content itself is author-signed plaintext (or end-to-end group
-  encrypted as a later extension).
-- **Human UX.** This is a protocol for agents. Humans touch it through
-  tooling, not through a chat UI.
-- **Replacing Pilot's primitives.** We build on top; we don't rewrite transport
-  or identity.
+- `MemberID`: SHA-256 of the raw Ed25519 public key.
+- libp2p `PeerID`: libp2p's identifier derived from the same public key.
+- Message and roster signatures: produced by that Ed25519 key.
 
-## 2. Architectural stance (decisions made)
+Every operational record binds the full-width MemberID, PeerID, and public key.
+A transport connection is not authorization: the remote PeerID must derive from
+a key accepted by the group's roster.
 
-1. **External Go binary.** Entmoot runs as a standalone process beside the
-   Pilot daemon. It connects to the daemon via `pkg/driver` over the Unix
-   socket, listens on a dedicated port, and keeps its own on-disk state. It is
-   not a fork of Pilot and does not modify `cmd/daemon`.
-2. **Port `:1004`.** Sits after Pilot's built-in well-known services (:7,
-   :444, :1001, :1002, :1003). Not registered anywhere yet; may collide if
-   Pilot ever claims it. We'll move if needed.
-3. **Go, matching Pilot.** Lets us import `pkg/driver` and `pkg/eventstream`
-   directly. Python SDK can come later.
-4. **Pilot-networks is an optional adapter, never load-bearing.** Membership
-   and broadcast are defined as Go interfaces; the primary implementation is
-   gossip over pairwise Pilot streams. If Pilot ships networks in a shape we
-   like, we add a second implementation of the same interfaces.
-5. **Trust bootstrap piggybacks on Pilot.** Entmoot does not run its own
-   pairwise-trust protocol. A node is eligible to participate in an Entmoot
-   group only if it already has a Pilot trust edge with at least one group
-   member (the introducer). Group-level authorization is layered on top via
-   signed roster entries.
-6. **Local control-socket IPC boundary.** v1 introduces a local IPC
-   boundary between the long-running `join` process and the short-lived
-   CLI invocations that operate against it. Exactly one `join` or `serve`
-   process per host owns the single Pilot connection and the writer leases for
-   the SQLite message and roster stores.
-   Short-lived CLI invocations (`publish`, `doctor`, `peers`, `tail`, `info`,
-   `query`) communicate with the daemon via a
-   Unix domain socket at `${data}/control.sock` (mode `0600`, same
-   owner). The control-socket codec lives in its own package
-   (`src/pkg/entmoot/ipc/`), deliberately separate from the peer wire
-   codec (`src/pkg/entmoot/wire/`); the two have different security
-   models (IPC is local cooperating processes, wire is encrypted
-   tunnels to potentially-untrusted peers), so the framing libraries do
-   not share a namespace. The full contract (message types, error
-   codes, lifecycle) is documented in `docs/CLI_DESIGN.md` §5.
-   `/data`-backed agents should enter this boundary through the installed
-   `/data/.entmoot/entmoot` wrapper, which pins Entmoot state to
-   `/data/.entmoot` and Pilot IPC to `/data/.pilot/pilot.sock`.
+Legacy numeric Pilot identifiers may occur only inside immutable imported
+records and founder-signed conversion mappings. They are never accepted as live
+transport identities.
 
-## 3. Data model
+## 3. Group State
 
-### 3.1 Group
+A group contains:
 
-```
-Group
-├── id:            32-byte random identifier (base64 in wire format)
-├── name:          UTF-8, informational
-├── founder:       Pilot node_id + Ed25519 pubkey
-├── policy:        membership rules (who can invite, who can evict)
-├── roster:        signed membership log (see §3.3)
-└── merkle_root:   current root of the group's message log
+- a random 32-byte group id;
+- a founder-anchored, group-bound signed roster;
+- author-signed messages and founder acceptance evidence;
+- local policy and retention state;
+- deterministic history coverage and Merkle data.
+
+Roster changes are linear, signed transitions. Validation binds the group,
+founder, previous head, subject identity, and signer authority. Removed members
+cannot publish new live messages. Historical messages remain verifiable only
+through accepted historical evidence rather than current membership alone.
+
+## 4. Runtime Shape
+
+One long-running `entmootd serve` process owns a data root:
+
+```mermaid
+flowchart TB
+  CLI[Short CLI command] --> IPC[control.sock]
+  IPC --> Serve[entmootd serve]
+  Serve --> Store[SQLite writer]
+  Serve --> Groups[Group runtimes]
+  Groups --> Gossip[GossipSub]
+  Groups --> Sync[Bounded roster/history streams]
+  Gossip --> Host[libp2p host]
+  Sync --> Host
+  Host --> Peer[Peer entmootd]
+  Serve --> ESP[Optional ESP projection]
 ```
 
-The `id` is content-independent — two groups with the same name have different
-ids. Name collisions are a UI/discovery problem, not a protocol problem.
-
-### 3.2 Message
-
-```
-Message v2
-├── id:            sha256("entmoot/message/v2\0" + canonical signed fields)
-├── version:       2
-├── group_id:
-├── author:        Pilot node_id + Entmoot public key
-├── timestamp:     unix millis
-├── topics:        []string — for subscriber filtering
-├── parents:       []message_id — for causal ordering and Merkle chaining
-├── content:       opaque bytes
-├── references:    []message_id — optional soft links (replies, invalidates)
-├── roster_head:   roster checkpoint used to authorize the author
-├── signature:     author's Ed25519 signature
-└── acceptance:    founder certificate over group_id, message_id, and roster_head
-```
-
-Messages form a DAG, not a linear log. `parents` is what the author had seen
-when composing; `references` is application-level semantics (reply, correction,
-obsoletes). The Merkle tree is built over message ids in a deterministic
-topological order.
-
-The author signs the message with `roster_head` present. The founder then
-attaches a domain-separated acceptance certificate. The certificate is not
-part of the message id or author signature, so it can be attached after the
-message is authored without changing its identity.
-
-Verification resolves the author's key and membership at the certified roster
-head, not at the receiver's current head. Normal issuance only certifies the
-current head. Once issued, that certificate keeps the exact message admissible
-after a later removal. A draft left offline or otherwise uncertified before the
-head advances is not accepted history; its timestamp and old head are not a
-substitute for founder acceptance. A removed member cannot certify new traffic.
-If a peer does not know a claimed head, it performs bounded authenticated
-roster sync before deciding; a head outside its accepted linear chain is
-rejected.
-
-Legacy messages without a roster head remain readable from local storage and
-can be admitted while their author is current. Migration may attach a founder
-certificate naming the exact legacy message id and an accepted historical
-roster head; because acceptance is outside the author-signed form, legacy
-bytes, signatures, and ids stay unchanged. An uncertified legacy message from
-a removed author remains inadmissible. There is no epoch-only fallback.
-
-**`parents` rule (v0):** at most 3 entries, chosen as the 3 highest-timestamped
-message ids the author has seen for the group at compose time. Genesis messages
-have `parents = []`. Bound keeps message size predictable while preserving
-causal ordering. Peers receiving a message with `len(parents) > 3` reject it.
-
-All new publish and network-ingest paths also enforce at most 16 concrete
-topics (256 bytes each), at most 64 references, a 256 KiB canonical encoded
-message, and no timestamp more than 2 minutes in the future. Topic names are
-printable ASCII with non-empty `/`-separated segments and no `+` or `#`
-wildcards. Existing local legacy records remain readable, but an over-limit
-legacy record is not re-admitted from the network.
-
-### 3.3 Membership roster
-
-A roster is itself a signed append-only log:
-
-```
-RosterEntry v2
-├── op:            "add" | "remove" | "policy_change"
-├── subject:       Pilot node_id (for add/remove) or policy blob
-├── actor:         node_id of the signer
-├── timestamp:
-├── parents:       []roster_entry_id  — exactly the previous head
-├── version:       2
-├── group_id:      owning group
-├── sequence:      one-based linear position
-└── signature:     Ed25519 over "entmoot/roster-entry/v2\0" + canonical entry
-```
-
-Membership is whatever the roster's current head says it is. For bootstrap,
-the founder's initial `add(founder)` entry is the genesis, self-signed.
-
-**Current policy: founder/admin-controlled writes.** Founder-signed roster
-entries remain authoritative. ESP-admin devices can request group metadata,
-invite, open-invite, and member-removal operations, but completion still routes
-through the running daemon and founder/admin authorization checks. Multi-admin
-quorum rosters are a later policy extension.
-
-Roster persistence is transactional SQLite at
-`${data}/groups/<gid>/roster.sqlite`. One process holds a nonblocking
-group-scoped writer lease; other handles can read committed WAL snapshots.
-Validation, entry insertion, head/version advancement, and membership
-projection updates form one serialized mutation. An unsuccessful commit never
-advances the in-memory projection.
-
-Legacy `roster.jsonl` files are immutable import sources. Import requires every
-non-empty line to be exact canonical JSON and validates the complete signed,
-linear chain before one transaction records entries, head, version, and member
-projections. Malformed, noncanonical, forked, or truncated input fails with its
-line diagnostic and remains untouched.
-
-Legacy entries omit `version`, `group_id`, and `sequence`; their canonical
-bytes, signatures, and IDs remain byte-identical. They are import-only.
-Ordinary mutation and invitation require a group-bound v2 head. A legacy
-roster needs a founder-authenticated upgrade checkpoint rather than a
-permissive or implicit rewrite.
-
-### 3.4 Topics
-
-Topics use **MQTT-style hierarchical paths**: slash-separated segments, with
-`+` as a single-segment wildcard and `#` as a multi-segment wildcard that may
-only appear as the final segment.
-
-```
-entmoot/security/cve            // concrete
-entmoot/security/+              // matches .../cve, .../hotfix, not .../cve/2026
-entmoot/#                       // matches everything under entmoot
-```
-
-A `Filter` is a set of such patterns (match = any pattern matches). Filter
-encoding on the wire is a JSON array of strings. No content-based filtering in
-v0 — topic membership is authored, not inferred.
-
-### 3.5 App-facing group and member metadata
-
-Group display metadata (`name`, `description`, `tags`, and an opaque JSON
-`metadata` object) is ESP-local service state, not consensus state. It exists
-so mobile and dashboard clients can render a group without changing roster
-semantics. Roster identity remains the group id plus the signed membership log.
-
-Member display names come from Pilot hostname-aware member profiles. Each
-member may sign a group-scoped `MemberProfileAd` containing its current Pilot
-hostname. Peers verify the ad against the current roster key before storing or
-exposing it; if a Pilot node id is removed and re-added with a different
-Entmoot key, profile ads from the replaced identity are ignored.
-
-## 4. Wire protocol (draft)
-
-Connections are plain Pilot streams to a peer's `:1004`. Framing:
-
-```
-┌────────────────┬────────────────┬────────────┐
-│ 4-byte length  │ 1-byte msg_type│ JSON body  │
-└────────────────┴────────────────┴────────────┘
-```
-
-The length prefix covers the type byte plus body. The global cap is 512 KiB;
-the shared wire cap table applies tighter limits by type before body allocation
-or transmission. Readers consume accepted bodies in 32 KiB chunks.
-JSON body keeps parity with Pilot's `HandshakeMsg` style — debuggable,
-extensible. We can switch to a binary codec later if it matters.
-
-Message types (v0):
-
-| Type | Direction | Purpose |
-|------|-----------|---------|
-| `hello` | bidirectional | legacy compatibility frame; bounded-decode and ignore |
-| `announce_group` | → peer | broadcast availability of group_id |
-| `roster_req` | → peer | request current roster head for a group |
-| `roster_resp` | ← peer | signed roster snapshot |
-| `gossip` | → peer | push one or more message ids (just hashes) |
-| `fetch_req` | → peer | request full message body by id |
-| `fetch_resp` | ← peer | message body |
-| `acceptance_req` | → founder | request founder certification of one live message |
-| `acceptance_resp` | ← founder | message with attached founder certificate |
-| `merkle_req` | → peer | request Merkle proof for a topic filter + range |
-| `merkle_resp` | ← peer | proof + list of in-range ids |
-| `range_req` / `range_resp` | ↔ peer | legacy timestamp-range anti-entropy |
-| `ihave` / `graft` / `prune` | ↔ peer | Plumtree lazy/eager gossip repair |
-| `transport_ad` | → peer | signed Pilot TCP/TURN endpoint advertisement |
-| `transport_snapshot_req` / `transport_snapshot_resp` | ↔ peer | join-time endpoint snapshot |
-| `reconcile` | ↔ peer | range-based set reconciliation frames |
-| `member_profile_ad` | → peer | signed app-facing member profile metadata |
-| `member_profile_snapshot_req` / `member_profile_snapshot_resp` | ↔ peer | join-time member profile snapshot |
-
-Messages that mutate state are signed by their author with Ed25519 keys bound
-to roster identity. Timestamp-bearing signed frame handlers apply their replay
-rules after authentication; repeatable queries do not populate replay state.
-The legacy `hello` frame is non-authoritative: the active v0 path takes
-`remote` from the authenticated Transport and ignores Hello's claimed identity
-fields and signature. Transport and member-profile system frames are signed
-and roster-checked, but only update local reachability or display metadata
-caches.
-
-### 4.1 Bounded history synchronization
-
-SQLite assigns each group a monotonically increasing generation. Database
-triggers cover direct imports as well as normal inserts and deletes;
-retention-floor-only changes increment it explicitly. Every increment
-invalidates the cached Merkle root in the same transaction. Root computation
-reads one SQLite snapshot and publishes its cache with a generation
-compare-and-swap, so a concurrent writer cannot make a stale root appear
-current.
-
-`range_req` enumerates IDs in `(timestamp, author node id, message id)` order.
-Responses contain at most 1,024 IDs and 128 KiB, plus the generation and an
-exclusive continuation cursor. A generation mismatch tells the requester to
-restart; reconciliation permits three restarts and 128 pages per attempt.
-
-Retention records exact-ID tombstones and a group coverage floor in the prune
-transaction. Tombstones live for at least 90 days, are capped at one million
-per group, and prevent fetched or directly pushed old messages from being
-reinserted. After tombstone collection, normal message ingest still rejects
-timestamps below the durable coverage floor. The floor states the earliest
-history the peer still claims to cover; it is not proof that older history
-never existed.
-
-Peers compare roots from the later of their two coverage floors. A match in
-that window is reported as partial coverage and is not cached as a full-history
-match. A floor change during paging aborts the attempt instead of labeling
-different retention windows converged.
-
-Deterministic DAG ordering uses Kahn's algorithm with a heap for ready
-messages. Parent-before-child order is unchanged while independent-message
-selection is $O(\log n)$ instead of a linear scan.
-
-## 5. Bootstrap and peer discovery
-
-When a node comes online with a roster for a group, it needs to find at least
-one reachable group peer to start gossiping with. v0 combines three strategies,
-tried in order from most-reliable to least.
-
-### 5.1 Invite bundles (primary)
-
-An **invite bundle** is a small out-of-band blob produced by the founder when
-they add a new member. It is delivered out-of-band (copy-paste, QR, messaging)
-and is not an Entmoot wire message.
-
-```
-Invite
-├── group_id:
-├── founder:         node_id + Ed25519 pubkey  (anchors roster-sig validation)
-├── roster_head:     authenticated roster checkpoint
-├── merkle_root:     current group Merkle root
-├── bootstrap_peers: [ {node_id, hostname?} × 3–5 ]   (recently-online members)
-├── issued_at:       unix millis, signing time
-├── valid_until:     unix millis, expiration (default 24 h after issued_at)
-├── issuer:          founder node_id + Ed25519 pubkey
-└── signature:       Ed25519 over the encoded bundle, signed by issuer
-```
-
-The invite signature authenticates the complete bundle, including founder,
-group id, roster head, and bootstrap hints. Bootstrap roster responses are
-first validated in temporary memory. The genesis founder must exactly match
-the invite, the founder must be authorized at the advertised group-bound
-checkpoint, and that checkpoint must occur on the fetched chain. A valid
-descendant head is allowed. Only after all checks pass is the chain installed.
-
-### 5.2 Pilot-trusted peers ∩ roster (secondary)
-
-If no invite is available (e.g., the bundle is stale and all listed peers are
-offline), query the local Pilot daemon:
-
-```go
-trusted, _ := pilotDriver.TrustedPeers()
-candidates := intersect(trusted, group.Roster.ActiveMembers())
-```
-
-Any peer already in our Pilot trust store AND in the group's roster is a
-legitimate bootstrap target. This recovers gracefully from invite staleness
-whenever there's overlap between our existing trust graph and the group.
-
-### 5.3 Founder fallback (tertiary)
-
-The founder's `node_id` is always in the roster (it's the genesis entry).
-If 5.1 and 5.2 fail, dial the founder directly. Relies on the founder being
-online — a single point of failure we accept for v0 because the alternative
-(DHT-style discovery) is out of scope.
-
-### 5.4 What we are NOT doing in v0
-
-- **No DHT crawl** for group peers.
-- **No registry-based group discovery.** Pilot's registry has no concept of
-  groups; we don't add one.
-- **No passive peer advertisement.** A peer coming online does not announce
-  its address to the group; it only responds to dials.
-
-If all three strategies fail, the node retries on a backoff (starting 30 s,
-capped at 10 min) and logs. A human may need to hand over a fresh invite.
-
-## 6. Go interfaces (the seams for Pilot-networks later)
-
-```go
-// GroupMembership decides who belongs to a group and validates membership
-// changes. Backed by the signed roster log in v0; backed by Pilot networks
-// if/when that feature lands.
-type GroupMembership interface {
-    IsMember(groupID GroupID, nodeID uint32) (bool, error)
-    Members(groupID GroupID) ([]uint32, error)
-    Propose(groupID GroupID, entry RosterEntry) error
-    Subscribe(groupID GroupID) (<-chan RosterEvent, error)
-}
-
-// Broadcaster delivers a message to every interested peer in a group.
-// Backed by gossip-over-unicast in v0; could be backed by a native
-// Pilot-network broadcast call if/when available.
-type Broadcaster interface {
-    Broadcast(ctx context.Context, groupID GroupID, msg Message) error
-}
-
-// MessageStore is where we persist what we care about keeping.
-type MessageStore interface {
-    Put(msg Message) error
-    Get(id MessageID) (Message, error)
-    Has(id MessageID) (bool, error)
-    // Range returns messages matching a filter, with a Merkle proof of
-    // completeness over the ignored ids.
-    Range(filter Filter, since time.Time) (Range, MerkleProof, error)
-}
-```
-
-The `Filter` is topic- and metadata-based, not content-based — keepable on
-disk as a serialized subscription record.
-
-## 7. Broadcast: gossip over Pilot streams (v0)
-
-No multicast; we fan out by unicast over Pilot. Each peer maintains a
-pseudo-random sample of the group's roster, size ~`log(N) + k`, and pushes
-new message ids (hashes only) to that sample. Peers that care pull the body
-via `fetch_req`. Classic epidemic gossip, eventually consistent.
-
-**Peer selection** uses two pools:
-- **Near peers**: nodes we share many topic interests with (mostly useful for
-  redundancy and anti-entropy).
-- **Random peers**: uniform sample of the group roster (mostly useful for cut
-  resistance and small-world propagation).
-
-No opinion yet on push vs. pull vs. push-pull. Starting with push-pull for
-robustness; can simplify later.
-
-## 8. Storage and retention
-
-No agent stores the full message history of a large group forever; that's the
-whole point of selective sync. The storage tiers:
-
-1. **Authored**: messages I wrote. Permanent (I'm the last line of authority
-   for them).
-2. **Relevant**: messages matching my filter. Configurable retention, default
-   30 days raw, then summarized.
-3. **DHT-assigned**: messages the group protocol asks me to host (hash-to-node
-   mapping within the roster). Retention window configurable, 7 days default.
-4. **Pass-through**: messages I forwarded but don't care about. Don't store;
-   only remember the hash long enough to dedupe gossip.
-
-**v0 omits the DHT-assigned tier.** Authored + relevant + pass-through only.
-If retention failures start showing up in testing (someone asks for an old
-message everyone's forgotten), we revisit. The omission keeps v0 closer to
-"everyone keeps what they want," which is easier to reason about.
-
-**v1 backend is SQLite** (WAL mode, one file per group under
-`${data}/groups/<gid>/messages.sqlite`). v0's JSONL store does not support
-the indexed queries agents need for historical access. See `docs/CLI_DESIGN.md`
-§4 for the full schema and concurrency model.
-
-## 9. Merkle completeness proofs
-
-Every message carries its `parents` hashes; the group maintains a Merkle tree
-over all known message ids in deterministic topological order. The current
-`merkle_root` is advertised by every peer; when two peers sync, they diff
-roots to find missing subtrees.
-
-To verify completeness of a filtered view:
-1. Subscriber declares filter `F` and time range `T`.
-2. Provider returns: messages in `F ∩ T` (full bodies) + Merkle path covering
-   message ids outside `F` but inside `T`.
-3. Subscriber verifies the proof against the group's current `merkle_root`.
-   Absence of a valid proof = cannot trust completeness claim.
-
-This is close in spirit to certificate-transparency Merkle log proofs and to
-IPFS DAG-CBOR chunking. Not novel; just correctly applied.
-
-## 10. Security posture
-
-- **Authorship**: every message is Ed25519-signed by its author, verified
-  against the roster's current pubkey for that node. Unsigned or wrong-sig
-  messages are silently dropped.
-- **Replay**: authenticated Hello frames use the bounded timestamp and
-  per-peer replay set. Content-addressed messages use atomic MessageID
-  insertion deduplication. Repeatable query frames remain legal within their
-  resource budgets.
-- **Membership**: messages from non-members are dropped before they reach
-  application logic.
-- **Denial of service**: every inbound frame is charged before body allocation
-  to per-peer token buckets: 100 frames/s with burst 200 and 1 MiB/s with
-  burst 4 MiB. Per-type byte caps and decoded collection caps bound follow-on
-  work. Bodies are read in 32 KiB chunks under a 5-second first-frame deadline.
-  At most 64 handlers run globally and 8 for one peer; excess streams are
-  closed without launching a goroutine. Ordinary handlers have a 10-second
-  budget, reconcile sessions 30 seconds, and large responses 45 seconds.
-  Retry state is capped at 1,024 entries globally and 64 per peer. Rare system
-  topics add a topic bucket without charging the global frame budget twice.
-- **Eclipse attacks**: the random-peer pool is intended as the defense.
-  Details pending.
-- **Privacy**: group membership and topic filters are observable to peers you
-  sync with. Zero-knowledge membership proofs are v2+.
-- **Group encryption**: **v0 ships plaintext, author-signed.** Pilot already
-  encrypts transport pairwise, so content is confidential on the wire against
-  outsiders; it is NOT confidential against other group members or against
-  any peer that relays a message. E2E group encryption (shared symmetric key
-  with rotation on membership churn) is a v1 concern. The interface for it
-  would sit below the wire layer (encrypt before framing), so adding it
-  doesn't break the protocol.
-
-## 11. Resolved for v0
-
-| # | Question | Decision | Upgrade path |
-|---|---|---|---|
-| 1 | Admin model | Founder-only | Multi-admin via `policy` blob + k-of-n + lower-node-id tiebreak |
-| 2 | DHT-assigned keepers | Not in v0 | Add when retention failures show up; hash-to-nearest-member assignment |
-| 3 | Roster conflict resolution | N/A (founder-only can't conflict) | Deterministic: lower `node_id` wins timestamp tie |
-| 4 | Topic namespace | MQTT-style hierarchical paths with `+`/`#` | Bloom-hashed topics for privacy later; namespace remains hierarchical |
-| 5 | Group encryption | Plaintext + author-sig (transport-encrypted by Pilot) | Shared group key with member-churn rotation; encrypt-before-framing, protocol-transparent |
-| 6 | `parents` rules | Max 3, highest-timestamped seen, genesis = `[]` | If causal depth matters more than size, raise cap or switch to skiplist |
-| 7 | Pilot EventStream bridge | Not in v0 | Post-MVP: Entmoot can publish a digest topic to a peer's `:1002` for legacy consumers |
-| 8 | Peer bootstrap | Invite bundle (primary) → Pilot `TrustedPeers() ∩ roster` → founder fallback | Add DHT-style discovery if invite staleness becomes chronic |
-| 9 | Anti-DoS in v0 | Per-peer token buckets (100 msg/s + 1 MiB/s) + cooldown on sustained abuse | Per-group buckets; proof-of-work on joins; reputation |
-
-All nine were closed in the 2026-04-17 session.
-
-## 12. Next steps
-
-1. Pick a minimum demo: **"two Entmoot peers join a group, exchange three
-   messages, a third peer joins and Merkle-verifies completeness."** This is
-   the canary we want working end-to-end before calling v0 done.
-2. Scaffold the Go module:
-   ```
-   src/pkg/entmoot/         // core types (Group, Message, RosterEntry, Filter)
-   src/pkg/entmoot/wire/    // framing + JSON codec for port :1004
-   src/pkg/entmoot/gossip/  // push-pull epidemic + peer sampling
-   src/pkg/entmoot/store/   // MessageStore, Merkle tree, retention
-   src/pkg/entmoot/roster/  // GroupMembership (founder-only v0)
-   src/cmd/entmootd/        // the binary: connects to Pilot daemon, serves :1004
-   ```
-3. Write interface contracts (`GroupMembership`, `Broadcaster`, `MessageStore`)
-   and in-memory stubs. All unit tests should pass against in-memory stubs
-   before any network code runs.
-4. Then add the Pilot integration: `pkg/driver` connection on startup,
-   `Listen(1004)` for inbound, outbound dials for gossip.
+The daemon refuses a second owner for the same data root. Read-only commands may
+read committed SQLite state directly. Mutations are serialized through the
+running owner or an exclusive offline maintenance boundary.
+
+## 5. Connectivity
+
+### Direct
+
+Direct mode is the default. The daemon listens on
+`/ip4/0.0.0.0/tcp/<listen-port>` and may use signed bootstrap/static hints and
+roster-restricted LAN discovery. It is suitable for publicly reachable hosts or
+networks that permit direct connections.
+
+### Relay-only
+
+Relay-only mode accepts one or more explicitly configured Circuit Relay v2
+multiaddrs. It:
+
+- opens no direct application listener;
+- advertises only circuit addresses through approved relays;
+- disables direct application-peer dialing, mDNS, hole punching, public
+  discovery, and direct fallback;
+- filters dialing, identify ingestion, peerstore projection, and diagnostics;
+- fails closed when every controlled relay is unavailable.
+
+A relay operator can observe client addresses. Relay-only is endpoint shielding
+from group peers, not anonymity from the relay operator.
+
+`entmootd relay serve` runs a separate allowlisted Circuit Relay v2 host with a
+dedicated identity and bounded reservations, circuits, duration, and bytes.
+Both circuit endpoints must be allowlisted.
+
+Entmoot has no Pilot daemon, Pilot IPC socket, TURN path, or public Pilot
+registry.
+
+## 6. Discovery and Enrollment
+
+Private groups use signed, roster-bound hints instead of a public DHT.
+Target-bound bootstrap capabilities include the group, founder, roster
+checkpoint, target public key, allowed serving PeerIDs/multiaddrs, expiry, and
+one-shot identifier. A joiner validates the founder and checkpoint before
+installing any group state.
+
+Hints are not authority. A hinted PeerID must bind to the expected roster key.
+Consumed or expired bootstrap grants remain rejected across restart.
+
+## 7. Live Delivery
+
+Each group uses an authenticated GossipSub topic. Validators check group
+binding, roster authorization, PeerID/key binding, envelope signature, message
+shape, byte limits, and replay/deduplication rules before delivery. Local
+storage commits before subscriber notification. Duplicate arrivals do not emit
+duplicate local ingest events.
+
+GossipSub is the low-latency path, not durable history. A failed publish remains
+recoverable through synchronization.
+
+## 8. Roster and History Synchronization
+
+Dedicated libp2p protocols provide bounded roster bootstrap and history repair.
+Snapshots have fixed generation and coverage, bounded pages, resumable cursors,
+and explicit expiry. Large bodies continue across bounded batches and relay
+circuit resets without restarting completed work.
+
+A remote Merkle root is a comparison hint, never proof that the remote supplied
+all data. Convergence, availability, progress, and coverage are reported
+separately. Multiple eligible keepers are used when available.
+
+## 9. Persistence and Conversion
+
+Per-group SQLite stores hold signed roster entries, immutable message bytes,
+acceptance evidence, query indexes, cached coverage state, and conversion
+metadata. Mutations update dependent projections transactionally.
+
+The one-way legacy conversion:
+
+1. acquires the data-root conversion lock;
+2. copies and hashes the source tree;
+3. imports and validates immutable signed data;
+4. checkpoints operational SQLite state;
+5. records a durable complete journal.
+
+Normal startup never re-enables the retired transport and never silently
+creates a replacement identity.
+
+## 10. ESP and Mobile Clients
+
+An Entmoot Service Provider is an always-on Entmoot peer plus an HTTP projection
+for intermittent clients. ESP state includes device authorization, mailbox
+cursors, sign requests, push metadata, public directory projections, optional
+Fleet state, and live-agent configuration.
+
+The ESP need not hold a phone's author key. It returns canonical signing bytes,
+verifies the completed signature, and submits the authorized operation through
+the normal Entmoot runtime. ESP display metadata and presence are projections;
+they do not change roster or message authority.
+
+## 11. Security Boundaries
+
+- libp2p authenticates and encrypts each network connection.
+- Roster and record signatures provide application authorization.
+- Resource-manager, stream, queue, message-shape, snapshot, and relay limits
+  bound hostile member work.
+- Group content is plaintext in each authorized member's local store.
+- Direct mode exposes addresses to authorized peers.
+- Relay-only mode hides application addresses from peers but not from the relay
+  operator.
+- ESP bearer/device authorization is separate from Entmoot author identity.
+
+Operational commands, file ownership, exit codes, and invite schemas are in
+[`docs/CLI_DESIGN.md`](docs/CLI_DESIGN.md). Deployment procedures are in
+[`docs/OPERATIONS.md`](docs/OPERATIONS.md).

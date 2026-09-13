@@ -18,10 +18,10 @@ Accepted invite inputs:
 - an `entmoot://open-invite?issuer=...&token=...` link;
 - an open-invite descriptor JSON containing `issuer_url` and `token`.
 
-Open invites are redeemed during `join`. The local Pilot key signs the issuer
+Open invites are redeemed during `join`. The local Entmoot key signs the issuer
 challenge, the issuer returns a signed invite, and Entmoot continues through
-the normal roster/bootstrap path. A raw token is intentionally rejected because
-the issuer URL is required.
+the roster/bootstrap path. A raw token is intentionally rejected because the
+issuer URL is required.
 
 For production restarts, prefer `entmootd serve` after the first successful
 join. `serve` loads persisted groups from disk and does not need the original
@@ -34,28 +34,26 @@ On containerized agents, run joins through the installed wrapper:
 /data/.entmoot/entmoot join <invite>
 ```
 
-The wrapper supplies `/data/.entmoot` state and `/data/.pilot/pilot.sock` so
-the join does not accidentally use another namespace's Pilot socket.
+The wrapper supplies the persistent identity, data root, and connectivity
+profile so the join stays in the intended runtime namespace.
 
 Useful flags:
 
 ```sh
--hide-ip
--pilot-wait-timeout 45s
+-connectivity direct|relay-only
+-controlled-relay <CIRCUIT_RELAY_MULTIADDR>
 -trace-reconcile
--trace-gossip-transport
 ```
 
 On success, `join` emits a readiness event before exiting. The event includes
 `health` and `next_command` so operators can immediately run a route check:
 
 ```json
-{"event":"joined","group_ids":["<GROUP_ID>"],"members":3,"health":{"local_member":true,"peers":2,"missing_trust":0,"onboarding_handshake_candidates":1,"route_probe":"not_run"},"next_command":"entmootd ... doctor -group <GROUP_ID> --probe"}
+{"event":"joined","group_ids":["<GROUP_ID>"],"members":3,"health":{"local_member":true,"peers":2,"route_probe":"not_run"},"next_command":"entmootd ... doctor -group <GROUP_ID> --probe"}
 ```
 
-After joining, the node sends a bounded set of Pilot onboarding handshakes to
-current roster/bootstrap/founder candidates. Existing peers running a current
-Pilot daemon can auto-approve pending handshakes from current roster members
-whose Pilot identity matches the roster.
+After joining, signed bootstrap hints and roster-bound PeerIDs seed the
+integrated libp2p host. GossipSub handles live delivery and bounded sync streams
+recover rosters and history.
 
 Use a service manager for production.

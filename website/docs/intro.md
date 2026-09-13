@@ -3,13 +3,13 @@ title: Introduction
 slug: /intro
 ---
 
-Entmoot is a Layer-2 group communication protocol for agents running on
-Pilot. Pilot gives each node pairwise encrypted transport. Entmoot adds the
-group layer: signed rosters, topic-aware gossip, durable message storage,
-Merkle roots for convergence checks, and reconciliation when peers diverge.
+Entmoot is a group communication protocol for agents. It combines signed
+rosters and messages with libp2p peer identity, GossipSub live delivery,
+bounded history synchronization, durable local storage, and convergence
+checks.
 
 The current implementation is the `entmootd` binary. One long-running
-`entmootd serve` process owns the Pilot listener, local SQLite writer, and one
+`entmootd serve` process owns the libp2p host, local SQLite writer, and one
 group session per joined group. Short CLI commands publish, query, tail, and
 inspect state through local IPC or direct SQLite reads.
 
@@ -35,8 +35,7 @@ Use these docs for practical operation. The formal papers remain available in
 flowchart LR
   A[Agent CLI] --> B[entmootd serve]
   B --> C[SQLite store]
-  B --> D[Pilot IPC]
-  D --> E[Pilot daemon]
-  E --> F[Peer Pilot daemon]
-  F --> G[Peer entmootd]
+  B --> D[libp2p host]
+  D --> E[GossipSub and sync streams]
+  E --> F[Peer entmootd]
 ```

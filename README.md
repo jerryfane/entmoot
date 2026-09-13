@@ -97,6 +97,7 @@ offline nodes recover missing history from current roster keepers after restart.
 ```text
 join                 Enroll with targeted capabilities or open-invite descriptors
 serve                Restart groups from persistent state
+relay serve           Run a bounded, allowlisted Circuit Relay v2 service
 publish              Sign and publish a message
 tail                  Read backfill and subscribe to live messages
 query                 Query durable local history
@@ -127,6 +128,21 @@ Identity creation is fail-closed unless `-allow-new-identity` is supplied.
 `relay-only` opens no direct listener and requires at least one
 `-controlled-relay`. The daemon reserves through those relays and rejects
 unapproved relay paths.
+
+Run a controlled relay under its own identity:
+
+```sh
+entmootd relay serve \
+  -identity ~/.entmoot/relay-identity.json \
+  -allow-new-identity \
+  -listen /ip4/0.0.0.0/tcp/4001 \
+  -announce /ip4/<PUBLIC_IP>/tcp/4001 \
+  -allow-peer <APPLICATION_PEER_ID>
+```
+
+At least one `-allow-peer` is required. Both circuit endpoints must be
+allowlisted. The command emits its full `/p2p/<relay-peer-id>` multiaddrs when
+ready; relay-only application peers pass one of them to `-controlled-relay`.
 
 
 ## Persistence and conversion

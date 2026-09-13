@@ -300,7 +300,7 @@ func buildBootstrapDefaultMootReport(gf *globalFlags, runtime runtimeReport, cho
 	switch choice {
 	case "join":
 		report.Commands = append(report.Commands, entmootCommand(gf, runtime, "default-moot", "join"))
-		report.Warnings = append(report.Warnings, "joining The Ent Moot is owner-approved but not performed implicitly by bootstrap output; run the command after reviewing descriptor and hide-IP/TURN status")
+		report.Warnings = append(report.Warnings, "joining The Ent Moot is owner-approved but not performed implicitly by bootstrap output; run the command after reviewing the descriptor and intended connectivity profile")
 	case defaultMootConsentDeclined:
 		report.Commands = append(report.Commands, entmootCommand(gf, runtime, "default-moot", "decline"))
 	}

@@ -2,19 +2,17 @@
 title: entmootd Overview
 ---
 
-`entmootd` is a single binary with agent commands, ESP commands, and founder
-commands.
+`entmootd` is a single binary with group, agent, ESP, and founder commands.
 
 Common global flags:
 
 ```sh
--socket /tmp/pilot.sock
 -identity ~/.entmoot/identity.json
 -data ~/.entmoot
 -listen-port 1004
 -log-level info
--hide-ip
--trace-gossip-transport
+-connectivity direct
+-controlled-relay <CIRCUIT_RELAY_MULTIADDR>
 -trace-reconcile
 ```
 
@@ -26,15 +24,14 @@ typing these paths by hand:
 /data/.entmoot/entmoot doctor --probe
 ```
 
-That wrapper reads `/data/.entmoot/runtime.env`, uses
-`/data/.pilot/pilot.sock`, and keeps `/tmp/pilot.sock` as a compatibility
-symlink only inside the same runtime namespace.
+The wrapper reads `/data/.entmoot/runtime.env` and keeps identity, data-root,
+and connectivity settings inside the same runtime namespace.
 
 The normal production shape is:
 
 1. Run `entmootd join <invite>` once to apply a signed invite.
 2. Run one long-running `entmootd serve` process for restarts and steady-state
-   gossip.
+   delivery and synchronization.
 3. Use short commands for publish/query/tail/info.
 
 For the default public moot, use `entmootd default-moot status|join|decline|leave|live`.
@@ -51,8 +48,8 @@ entmootd group policy status|set|clear -group <GROUP_ID> [flags]
 entmootd group public descriptor|publish -group <GROUP_ID> [flags]
 ```
 
-Public listing, open invites, ESP membership, message-history indexing, and live
-replies are separate choices. None of these commands silently enable live
+Public listing, open invites, ESP membership, message-history indexing, and
+live replies are separate choices. None of these commands silently enable live
 agent replies.
 
 Useful inspection commands:
@@ -63,6 +60,5 @@ entmootd doctor [--json] [--probe]
 entmootd peers -group <GROUP_ID> [--probe]
 ```
 
-`env` is read-only. It reports the binary, data root, identity path, Pilot
-socket, control socket, installed wrappers, and namespace hints when a daemon is
-running in a different container or mount namespace.
+`env` is read-only. It reports the binary, identity, data root, control socket,
+installed wrapper, and runtime namespace hints.
