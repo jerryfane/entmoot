@@ -794,30 +794,36 @@ func writeUpgradeCheckpoints(groups []groupState, founder *keystore.Identity) er
 			if !bytes.Equal(founder.PublicKey, founderInfo.EntmootPubKey) {
 				return fmt.Errorf("group %s conversion must run with founder identity or an existing founder-signed checkpoint", group.ID)
 			}
-			infos := map[entmoot.NodeID]entmoot.NodeInfo{}
+			type mappingKey struct {
+				nodeID   entmoot.NodeID
+				memberID entmoot.MemberID
+			}
+			infos := map[mappingKey]entmoot.NodeInfo{}
 			for _, entry := range legacy {
 				if entry.Subject.PilotNodeID == 0 {
 					continue
 				}
-				if old, ok := infos[entry.Subject.PilotNodeID]; ok && !bytes.Equal(old.EntmootPubKey, entry.Subject.EntmootPubKey) {
-					return fmt.Errorf("group %s reuses legacy node id %d", group.ID, entry.Subject.PilotNodeID)
-				}
-				infos[entry.Subject.PilotNodeID] = entry.Subject
-			}
-			ids := make([]int, 0, len(infos))
-			for id := range infos {
-				ids = append(ids, int(id))
-			}
-			sort.Ints(ids)
-			head := legacy[len(legacy)-1].ID
-			cp := checkpoint{Version: 1, GroupID: group.ID, RosterHead: head, LegacyMessageIDs: append([]entmoot.MessageID(nil), group.LegacyMessageIDs...)}
-			for _, rawID := range ids {
-				info := infos[entmoot.NodeID(rawID)]
-				memberID, err := entmoot.MemberIDFromPublicKey(info.EntmootPubKey)
+				memberID, err := entmoot.MemberIDFromPublicKey(entry.Subject.EntmootPubKey)
 				if err != nil {
 					return err
 				}
-				mapping := entmoot.LegacyIdentityMapping{GroupID: group.ID, LegacyNodeID: entmoot.NodeID(rawID), MemberID: memberID, MemberPubKey: append([]byte(nil), info.EntmootPubKey...), RosterHead: head, Founder: founderInfo}
+				infos[mappingKey{nodeID: entry.Subject.PilotNodeID, memberID: memberID}] = entry.Subject
+			}
+			keys := make([]mappingKey, 0, len(infos))
+			for key := range infos {
+				keys = append(keys, key)
+			}
+			sort.Slice(keys, func(i, j int) bool {
+				if keys[i].nodeID != keys[j].nodeID {
+					return keys[i].nodeID < keys[j].nodeID
+				}
+				return bytes.Compare(keys[i].memberID[:], keys[j].memberID[:]) < 0
+			})
+			head := legacy[len(legacy)-1].ID
+			cp := checkpoint{Version: 1, GroupID: group.ID, RosterHead: head, LegacyMessageIDs: append([]entmoot.MessageID(nil), group.LegacyMessageIDs...)}
+			for _, key := range keys {
+				info := infos[key]
+				mapping := entmoot.LegacyIdentityMapping{GroupID: group.ID, LegacyNodeID: key.nodeID, MemberID: key.memberID, MemberPubKey: append([]byte(nil), info.EntmootPubKey...), RosterHead: head, Founder: founderInfo}
 				if err := entmoot.SignLegacyIdentityMapping(founder, &mapping); err != nil {
 					return err
 				}
@@ -1021,8 +1027,28 @@ func commitUpgradeEntry(path string, groupID entmoot.GroupID, cp checkpoint) err
 	return tx.Commit()
 }
 
-func loadMappings(groups []groupState) (map[entmoot.NodeID]entmoot.MemberID, error) {
-	out := map[entmoot.NodeID]entmoot.MemberID{}
+type legacyIdentityInterval struct {
+	memberID entmoot.MemberID
+	startMS  int64
+	endMS    int64
+}
+
+type legacyIdentityResolver struct {
+	byNode         map[entmoot.NodeID]map[entmoot.MemberID]struct{}
+	publicKeys     map[entmoot.MemberID][]byte
+	intervals      map[entmoot.NodeID][]legacyIdentityInterval
+	byGroup        map[string]map[entmoot.NodeID]map[entmoot.MemberID]struct{}
+	groupIntervals map[string]map[entmoot.NodeID][]legacyIdentityInterval
+}
+
+func loadMappings(groups []groupState) (*legacyIdentityResolver, error) {
+	out := &legacyIdentityResolver{
+		byNode:         map[entmoot.NodeID]map[entmoot.MemberID]struct{}{},
+		publicKeys:     map[entmoot.MemberID][]byte{},
+		intervals:      map[entmoot.NodeID][]legacyIdentityInterval{},
+		byGroup:        map[string]map[entmoot.NodeID]map[entmoot.MemberID]struct{}{},
+		groupIntervals: map[string]map[entmoot.NodeID][]legacyIdentityInterval{},
+	}
 	for _, group := range groups {
 		if !hasLegacyRoster(group.Entries) {
 			continue
@@ -1036,17 +1062,130 @@ func loadMappings(groups []groupState) (map[entmoot.NodeID]entmoot.MemberID, err
 		}
 		var cp checkpoint
 		_ = json.Unmarshal(data, &cp)
-		for _, m := range cp.Mappings {
-			if old, ok := out[m.LegacyNodeID]; ok && old != m.MemberID {
-				return nil, fmt.Errorf("legacy node id %d maps to multiple members", m.LegacyNodeID)
+		groupKey := string(group.ID[:])
+		groupMembers := map[entmoot.NodeID]map[entmoot.MemberID]struct{}{}
+		groupIntervals := map[entmoot.NodeID][]legacyIdentityInterval{}
+		for _, mapping := range cp.Mappings {
+			members := out.byNode[mapping.LegacyNodeID]
+			if members == nil {
+				members = map[entmoot.MemberID]struct{}{}
+				out.byNode[mapping.LegacyNodeID] = members
 			}
-			out[m.LegacyNodeID] = m.MemberID
+			members[mapping.MemberID] = struct{}{}
+			members = groupMembers[mapping.LegacyNodeID]
+			if members == nil {
+				members = map[entmoot.MemberID]struct{}{}
+				groupMembers[mapping.LegacyNodeID] = members
+			}
+			members[mapping.MemberID] = struct{}{}
+			out.publicKeys[mapping.MemberID] = append([]byte(nil), mapping.MemberPubKey...)
 		}
+
+		type activeKey struct {
+			nodeID   entmoot.NodeID
+			memberID entmoot.MemberID
+		}
+		type activeIndexes struct {
+			global int
+			group  int
+		}
+		active := map[activeKey]activeIndexes{}
+		for _, entry := range legacyRosterEntries(group.Entries) {
+			if entry.Subject.PilotNodeID == 0 {
+				continue
+			}
+			memberID, err := entmoot.MemberIDFromPublicKey(entry.Subject.EntmootPubKey)
+			if err != nil {
+				return nil, err
+			}
+			key := activeKey{nodeID: entry.Subject.PilotNodeID, memberID: memberID}
+			switch entry.Op {
+			case "add":
+				global := out.intervals[key.nodeID]
+				local := groupIntervals[key.nodeID]
+				active[key] = activeIndexes{global: len(global), group: len(local)}
+				out.intervals[key.nodeID] = append(global, legacyIdentityInterval{memberID: memberID, startMS: entry.Timestamp})
+				groupIntervals[key.nodeID] = append(local, legacyIdentityInterval{memberID: memberID, startMS: entry.Timestamp})
+			case "remove":
+				indexes, ok := active[key]
+				if !ok {
+					continue
+				}
+				global := out.intervals[key.nodeID]
+				global[indexes.global].endMS = entry.Timestamp
+				out.intervals[key.nodeID] = global
+				local := groupIntervals[key.nodeID]
+				local[indexes.group].endMS = entry.Timestamp
+				groupIntervals[key.nodeID] = local
+				delete(active, key)
+			}
+		}
+		out.byGroup[groupKey] = groupMembers
+		out.groupIntervals[groupKey] = groupIntervals
 	}
 	return out, nil
 }
 
-func migrateOperationalSchemas(root string, mappings map[entmoot.NodeID]entmoot.MemberID) error {
+func (r *legacyIdentityResolver) resolve(nodeID entmoot.NodeID, encodedPublicKey string, timestampMS int64) (entmoot.MemberID, error) {
+	return r.resolveMapped(nodeID, encodedPublicKey, timestampMS, r.byNode[nodeID], r.intervals[nodeID])
+}
+
+func (r *legacyIdentityResolver) resolveForGroup(groupID []byte, nodeID entmoot.NodeID, encodedPublicKey string, timestampMS int64) (entmoot.MemberID, error) {
+	if len(groupID) == 0 {
+		return r.resolve(nodeID, encodedPublicKey, timestampMS)
+	}
+	groupKey := string(groupID)
+	return r.resolveMapped(nodeID, encodedPublicKey, timestampMS, r.byGroup[groupKey][nodeID], r.groupIntervals[groupKey][nodeID])
+}
+
+func (r *legacyIdentityResolver) resolveMapped(nodeID entmoot.NodeID, encodedPublicKey string, timestampMS int64, members map[entmoot.MemberID]struct{}, intervals []legacyIdentityInterval) (entmoot.MemberID, error) {
+	if len(members) == 0 {
+		return entmoot.MemberID{}, fmt.Errorf("legacy node %d has no founder mapping", nodeID)
+	}
+	if strings.TrimSpace(encodedPublicKey) != "" {
+		publicKey, err := base64.StdEncoding.DecodeString(encodedPublicKey)
+		if err != nil {
+			return entmoot.MemberID{}, fmt.Errorf("legacy node %d has invalid public key: %w", nodeID, err)
+		}
+		memberID, err := entmoot.MemberIDFromPublicKey(publicKey)
+		if err != nil {
+			return entmoot.MemberID{}, err
+		}
+		if _, ok := members[memberID]; !ok {
+			return entmoot.MemberID{}, fmt.Errorf("legacy node %d public key has no founder mapping", nodeID)
+		}
+		return memberID, nil
+	}
+	if len(members) == 1 {
+		for memberID := range members {
+			return memberID, nil
+		}
+	}
+	active := map[entmoot.MemberID]struct{}{}
+	if timestampMS > 0 {
+		for _, interval := range intervals {
+			if interval.startMS <= timestampMS && (interval.endMS == 0 || timestampMS < interval.endMS) {
+				active[interval.memberID] = struct{}{}
+			}
+		}
+	}
+	if len(active) == 1 {
+		for memberID := range active {
+			return memberID, nil
+		}
+	}
+	return entmoot.MemberID{}, fmt.Errorf("legacy node %d is ambiguous at timestamp %d without a signing key", nodeID, timestampMS)
+}
+
+func (r *legacyIdentityResolver) peerID(memberID entmoot.MemberID) (string, error) {
+	publicKey := r.publicKeys[memberID]
+	if len(publicKey) == 0 {
+		return "", fmt.Errorf("member %s has no founder-mapped public key", memberID)
+	}
+	return entmoot.PeerIDFromPublicKey(publicKey)
+}
+
+func migrateOperationalSchemas(root string, mappings *legacyIdentityResolver) error {
 	groupsDir := filepath.Join(root, "groups")
 	dirs, err := os.ReadDir(groupsDir)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -1171,7 +1310,7 @@ func migrateMessages(path string) error {
 	return tx.Commit()
 }
 
-func migrateESP(path string, mappings map[entmoot.NodeID]entmoot.MemberID) error {
+func migrateESP(path string, mappings *legacyIdentityResolver) error {
 	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
 		return nil
 	} else if err != nil {
@@ -1195,6 +1334,11 @@ func migrateESP(path string, mappings map[entmoot.NodeID]entmoot.MemberID) error
 	if err != nil {
 		return err
 	}
+	fleetCols, err := columnsTx(tx, "esp_fleets")
+	if err != nil {
+		return err
+	}
+	hasFleetLookup := fleetCols["fleet_id"] && fleetCols["control_group_id"]
 	for _, table := range tables {
 		cols, err := columnsTx(tx, table)
 		if err != nil {
@@ -1213,58 +1357,140 @@ func migrateESP(path string, mappings map[entmoot.NodeID]entmoot.MemberID) error
 			if !cols[name] {
 				continue
 			}
-			rows, err := tx.Query(fmt.Sprintf(`SELECT rowid,%s FROM %s`, quoteIdent(name), quoteIdent(table)))
+			publicKeyExpr := `''`
+			if publicKeyColumn := espIdentityPublicKeyColumn(table, name); publicKeyColumn != "" && cols[publicKeyColumn] {
+				publicKeyExpr = fmt.Sprintf(`COALESCE(CAST(%s AS TEXT),'')`, quoteIdent(publicKeyColumn))
+			}
+			query := fmt.Sprintf(
+				`SELECT rowid,%s,%s,%s,%s FROM %s`,
+				quoteIdent(name),
+				publicKeyExpr,
+				espIdentityTimestampExpression(cols),
+				espIdentityGroupExpression(table, cols, hasFleetLookup),
+				quoteIdent(table),
+			)
+			rows, err := tx.Query(query)
 			if err != nil {
 				return err
 			}
 			type update struct {
-				rowid int64
+				rowID int64
 				value []byte
 			}
 			var updates []update
 			for rows.Next() {
-				var rowid int64
+				var rowID, timestampMS int64
 				var value any
-				if err = rows.Scan(&rowid, &value); err != nil {
+				var groupID []byte
+				var encodedPublicKey string
+				if err = rows.Scan(&rowID, &value, &encodedPublicKey, &timestampMS, &groupID); err != nil {
 					rows.Close()
 					return err
 				}
+				var legacyNodeID entmoot.NodeID
 				switch v := value.(type) {
 				case int64:
-					member, ok := mappings[entmoot.NodeID(v)]
-					if !ok && v != 0 {
-						rows.Close()
-						return fmt.Errorf("%s.%s legacy node %d has no founder mapping", table, name, v)
+					if v == 0 {
+						updates = append(updates, update{rowID: rowID, value: []byte{}})
+						continue
 					}
-					if ok {
-						updates = append(updates, update{rowid, append([]byte(nil), member[:]...)})
-					}
+					legacyNodeID = entmoot.NodeID(v)
 				case []byte:
-					if len(v) == 4 {
-						legacy := entmoot.NodeID(uint32(v[0]) | uint32(v[1])<<8 | uint32(v[2])<<16 | uint32(v[3])<<24)
-						if member, ok := mappings[legacy]; ok {
-							updates = append(updates, update{rowid, append([]byte(nil), member[:]...)})
+					switch len(v) {
+					case 0, len(entmoot.MemberID{}):
+						continue
+					case 4:
+						legacyNodeID = entmoot.NodeID(uint32(v[0]) | uint32(v[1])<<8 | uint32(v[2])<<16 | uint32(v[3])<<24)
+						if legacyNodeID == 0 {
+							updates = append(updates, update{rowID: rowID, value: []byte{}})
+							continue
 						}
+					default:
+						rows.Close()
+						return fmt.Errorf("%s.%s has invalid identity width %d", table, name, len(v))
 					}
+				default:
+					rows.Close()
+					return fmt.Errorf("%s.%s has unsupported legacy identity type %T", table, name, value)
 				}
+				memberID, err := mappings.resolveForGroup(groupID, legacyNodeID, encodedPublicKey, timestampMS)
+				if err != nil {
+					rows.Close()
+					return fmt.Errorf("%s.%s: %w", table, name, err)
+				}
+				updates = append(updates, update{rowID: rowID, value: append([]byte(nil), memberID[:]...)})
 			}
 			if err = rows.Close(); err != nil {
 				return err
 			}
-			for _, u := range updates {
-				if _, err = tx.Exec(fmt.Sprintf(`UPDATE %s SET %s=? WHERE rowid=?`, quoteIdent(table), quoteIdent(name)), u.value, u.rowid); err != nil {
+			for _, update := range updates {
+				if _, err = tx.Exec(fmt.Sprintf(`UPDATE %s SET %s=? WHERE rowid=?`, quoteIdent(table), quoteIdent(name)), update.value, update.rowID); err != nil {
 					return err
 				}
 			}
 		}
 	}
-	if err := migrateESPPeerBindings(tx); err != nil {
+	if err := migrateESPPeerBindings(tx, mappings); err != nil {
+		return err
+	}
+	if err := migrateESPCommandJSON(tx, mappings); err != nil {
 		return err
 	}
 	return tx.Commit()
 }
 
-func migrateESPPeerBindings(tx *sql.Tx) error {
+func espIdentityPublicKeyColumn(table, memberColumn string) string {
+	switch table + "." + memberColumn {
+	case "esp_fleets.coordinator_member_id":
+		return "coordinator_pubkey"
+	case "esp_fleet_members.member_id", "esp_fleet_invites.member_id", "esp_node_profile_sources.member_id", "esp_node_profiles.member_id":
+		return "entmoot_pubkey"
+	case "esp_fleet_activity.actor_member_id":
+		return "actor_pubkey"
+	case "esp_fleet_activity.subject_member_id":
+		return "subject_pubkey"
+	case "esp_fleet_tasks.creator_member_id":
+		return "creator_pubkey"
+	case "esp_fleet_tasks.assignee_member_id":
+		return "assignee_pubkey"
+	case "esp_fleet_task_submissions.author_member_id":
+		return "author_pubkey"
+	default:
+		return ""
+	}
+}
+
+func espIdentityTimestampExpression(cols map[string]bool) string {
+	var candidates []string
+	for _, name := range []string{"created_at_ms", "observed_at_ms", "started_at_ms", "completed_at_ms", "updated_at_ms", "invited_at_ms", "accepted_at_ms"} {
+		if cols[name] {
+			candidates = append(candidates, fmt.Sprintf("NULLIF(%s,0)", quoteIdent(name)))
+		}
+	}
+	if len(candidates) == 0 {
+		return "0"
+	}
+	return "COALESCE(" + strings.Join(candidates, ",") + ",0)"
+}
+
+func espIdentityGroupExpression(table string, cols map[string]bool, hasFleetLookup bool) string {
+	if cols["control_group_id"] {
+		return fmt.Sprintf(`COALESCE(CAST(%s AS BLOB),X'')`, quoteIdent("control_group_id"))
+	}
+	if cols["group_id"] {
+		return fmt.Sprintf(`COALESCE(CAST(%s AS BLOB),X'')`, quoteIdent("group_id"))
+	}
+	if cols["fleet_id"] && hasFleetLookup {
+		return fmt.Sprintf(
+			`COALESCE((SELECT CAST(f.control_group_id AS BLOB) FROM esp_fleets AS f WHERE f.fleet_id=%s.%s),X'')`,
+			quoteIdent(table),
+			quoteIdent("fleet_id"),
+		)
+	}
+	return `X''`
+}
+
+func migrateESPPeerBindings(tx *sql.Tx, mappings *legacyIdentityResolver) error {
 	for _, spec := range []struct {
 		table, memberColumn, peerColumn, pubkeyColumn string
 	}{
@@ -1363,29 +1589,210 @@ func migrateESPPeerBindings(tx *sql.Tx) error {
 			continue
 		}
 		if !cols[spec.peerColumn] {
-			var count int
-			if err := tx.QueryRow(fmt.Sprintf(`SELECT COUNT(*) FROM %s`, quoteIdent(spec.table))).Scan(&count); err != nil {
-				return err
-			}
-			if count != 0 {
-				return fmt.Errorf("%s contains legacy identity rows without same-key PeerID; external client migration is required", spec.table)
-			}
 			if _, err := tx.Exec(fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s TEXT NOT NULL DEFAULT ''`, quoteIdent(spec.table), quoteIdent(spec.peerColumn))); err != nil {
 				return err
 			}
-			continue
 		}
-		var count int
-		query := fmt.Sprintf(`SELECT COUNT(*) FROM %s WHERE %s=''`, quoteIdent(spec.table), quoteIdent(spec.peerColumn))
-		if err := tx.QueryRow(query).Scan(&count); err != nil {
+		query := fmt.Sprintf(`SELECT rowid,%s,%s FROM %s`, quoteIdent(spec.memberColumn), quoteIdent(spec.peerColumn), quoteIdent(spec.table))
+		rows, err := tx.Query(query)
+		if err != nil {
 			return err
 		}
-		if count != 0 {
-			return fmt.Errorf("%s contains identity rows without same-key PeerID; external client migration is required", spec.table)
+		type peerUpdate struct {
+			rowID  int64
+			peerID string
+		}
+		var updates []peerUpdate
+		for rows.Next() {
+			var rowID int64
+			var memberBytes []byte
+			var peerID string
+			if err := rows.Scan(&rowID, &memberBytes, &peerID); err != nil {
+				rows.Close()
+				return err
+			}
+			if len(memberBytes) == 0 {
+				continue
+			}
+			if len(memberBytes) != len(entmoot.MemberID{}) {
+				rows.Close()
+				return fmt.Errorf("%s.%s is not a full MemberID", spec.table, spec.memberColumn)
+			}
+			var memberID entmoot.MemberID
+			copy(memberID[:], memberBytes)
+			wantPeerID, err := mappings.peerID(memberID)
+			if err != nil {
+				rows.Close()
+				return fmt.Errorf("%s.%s: %w", spec.table, spec.memberColumn, err)
+			}
+			if peerID != "" && peerID != wantPeerID {
+				rows.Close()
+				return fmt.Errorf("%s.%s does not match the founder-mapped signing key", spec.table, spec.peerColumn)
+			}
+			if peerID == "" {
+				updates = append(updates, peerUpdate{rowID: rowID, peerID: wantPeerID})
+			}
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		for _, update := range updates {
+			stmt := fmt.Sprintf(`UPDATE %s SET %s=? WHERE rowid=?`, quoteIdent(spec.table), quoteIdent(spec.peerColumn))
+			if _, err := tx.Exec(stmt, update.peerID, update.rowID); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
 }
+
+func migrateESPCommandJSON(tx *sql.Tx, mappings *legacyIdentityResolver) error {
+	fleetCols, err := columnsTx(tx, "esp_fleets")
+	if err != nil {
+		return err
+	}
+	hasFleetLookup := fleetCols["fleet_id"] && fleetCols["control_group_id"]
+	for _, spec := range []struct {
+		table  string
+		column string
+	}{
+		{table: "esp_fleet_commands", column: "target"},
+		{table: "esp_fleet_commands", column: "command"},
+		{table: "esp_fleet_command_results", column: "result"},
+		{table: "esp_agent_commands", column: "target"},
+		{table: "esp_agent_commands", column: "command"},
+	} {
+		cols, err := columnsTx(tx, spec.table)
+		if err != nil {
+			return err
+		}
+		if len(cols) == 0 || !cols[spec.column] {
+			continue
+		}
+		query := fmt.Sprintf(
+			`SELECT rowid,%s,%s,%s FROM %s`,
+			quoteIdent(spec.column),
+			espCommandJSONTimestampExpression(spec.table, cols),
+			espIdentityGroupExpression(spec.table, cols, hasFleetLookup),
+			quoteIdent(spec.table),
+		)
+		rows, err := tx.Query(query)
+		if err != nil {
+			return err
+		}
+		type jsonUpdate struct {
+			rowID int64
+			value []byte
+		}
+		var updates []jsonUpdate
+		for rows.Next() {
+			var rowID, timestampMS int64
+			var raw, groupID []byte
+			if err := rows.Scan(&rowID, &raw, &timestampMS, &groupID); err != nil {
+				rows.Close()
+				return err
+			}
+			if len(raw) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+				continue
+			}
+			var object map[string]any
+			if err := json.Unmarshal(raw, &object); err != nil {
+				rows.Close()
+				return fmt.Errorf("%s.%s contains invalid JSON: %w", spec.table, spec.column, err)
+			}
+			changed, err := migrateESPJSONIdentity(object, groupID, timestampMS, mappings)
+			if err != nil {
+				rows.Close()
+				return fmt.Errorf("%s.%s: %w", spec.table, spec.column, err)
+			}
+			if target, ok := object["target"].(map[string]any); ok {
+				targetChanged, err := migrateESPJSONIdentity(target, groupID, timestampMS, mappings)
+				if err != nil {
+					rows.Close()
+					return fmt.Errorf("%s.%s target: %w", spec.table, spec.column, err)
+				}
+				changed = changed || targetChanged
+			}
+			if !changed {
+				continue
+			}
+			encoded, err := json.Marshal(object)
+			if err != nil {
+				rows.Close()
+				return err
+			}
+			updates = append(updates, jsonUpdate{rowID: rowID, value: encoded})
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		for _, update := range updates {
+			stmt := fmt.Sprintf(`UPDATE %s SET %s=? WHERE rowid=?`, quoteIdent(spec.table), quoteIdent(spec.column))
+			if _, err := tx.Exec(stmt, update.value, update.rowID); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func espCommandJSONTimestampExpression(table string, cols map[string]bool) string {
+	var preferred []string
+	switch table {
+	case "esp_fleet_commands", "esp_agent_commands":
+		preferred = []string{"created_at_ms", "updated_at_ms"}
+	case "esp_fleet_command_results":
+		preferred = []string{"completed_at_ms", "started_at_ms", "updated_at_ms"}
+	}
+	for _, name := range preferred {
+		if cols[name] {
+			return fmt.Sprintf("COALESCE(%s,0)", quoteIdent(name))
+		}
+	}
+	return espIdentityTimestampExpression(cols)
+}
+
+func migrateESPJSONIdentity(object map[string]any, groupID []byte, timestampMS int64, mappings *legacyIdentityResolver) (bool, error) {
+	changed := false
+	for _, spec := range []struct {
+		legacyFields []string
+		memberField  string
+		peerField    string
+	}{
+		{legacyFields: []string{"pilot_node_id", "node_id"}, memberField: "member_id", peerField: "peer_id"},
+		{legacyFields: []string{"issuer_node_id"}, memberField: "issuer_member_id", peerField: "issuer_peer_id"},
+		{legacyFields: []string{"agent_node_id"}, memberField: "agent_member_id", peerField: "agent_peer_id"},
+	} {
+		for _, legacyField := range spec.legacyFields {
+			raw, ok := object[legacyField]
+			if !ok {
+				continue
+			}
+			numeric, ok := raw.(float64)
+			if !ok || numeric < 0 || numeric != float64(entmoot.NodeID(numeric)) {
+				return false, fmt.Errorf("%s is not a valid legacy node id", legacyField)
+			}
+			nodeID := entmoot.NodeID(numeric)
+			delete(object, legacyField)
+			changed = true
+			if nodeID == 0 {
+				continue
+			}
+			memberID, err := mappings.resolveForGroup(groupID, nodeID, "", timestampMS)
+			if err != nil {
+				return false, err
+			}
+			peerID, err := mappings.peerID(memberID)
+			if err != nil {
+				return false, err
+			}
+			object[spec.memberField] = memberID.String()
+			object[spec.peerField] = peerID
+		}
+	}
+	return changed, nil
+}
+
 func tableNames(tx *sql.Tx) ([]string, error) {
 	rows, err := tx.Query(`SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'`)
 	if err != nil {
