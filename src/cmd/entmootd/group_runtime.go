@@ -212,6 +212,10 @@ func (r *groupRuntime) enroll(_ context.Context, capability entmoot.BootstrapCap
 		return libp2ptransport.EnrollmentResponse{}, libp2ptransport.RejectEnrollment(
 			libp2ptransport.EnrollRejectUnknownCheckpoint, "invite checkpoint %s is not on this group's roster chain", capability.RosterHead.String())
 	}
+	if removed, _ := session.roster.RemovedSince(*applicant.MemberID, capability.RosterHead); removed {
+		return libp2ptransport.EnrollmentResponse{}, libp2ptransport.RejectEnrollment(
+			libp2ptransport.EnrollRejectIdentityConflict, "applicant was removed from the roster after the invite checkpoint; a new invite is required")
+	}
 	target := entmoot.NodeInfo{EntmootPubKey: append([]byte(nil), applicant.EntmootPubKey...), MemberID: applicant.MemberID, PeerID: applicant.PeerID}
 
 	// Roster timestamps must grow strictly. Two people redeeming a multi-use
