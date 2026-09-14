@@ -100,10 +100,13 @@ sequence, and the remedy is one `roster checkpoint` on the founder.
 
 A removed node can read nothing: every door is shut to it. So a peer that
 refuses it answers with the record its own projection acted on when it dropped
-that member, plus the policy records that gave the record's author authority —
-nothing else. Policy records say who may act, not who is in the group, so the
-node learns why it was refused without being handed the membership it no longer
-belongs to.
+that member, plus the `policy` records that came before that removal and are
+still held — and nothing else. The subject needs those: a member removed by a
+delegated admin may never have seen the grant that made that admin able to act.
+
+Policy records say who may act, not who is in the group, so the disclosure is
+bounded to how the admin set moved in that window. The node learns why it was
+refused without being handed the membership it no longer belongs to.
 
 The node acts only on that signed record, never on the refusal itself: a peer's
 word is not evidence, and a node that evicted itself on an unproven claim could

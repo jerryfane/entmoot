@@ -464,6 +464,11 @@ func (g *Group) IsMemberID(id entmoot.MemberID) bool {
 func (g *Group) RemovalProof(member entmoot.MemberID) ([]Record, bool) {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
+	// A member still in the group has no removal to be shown. Its only caller
+	// today asks after a refusal, and a refused caller is not a member, so
+	// this cannot fire through that path; it is here because the method is
+	// exported and its answer would otherwise depend on the caller having
+	// checked first.
 	if _, still := g.state.Members[member]; still {
 		return nil, false
 	}
@@ -483,10 +488,17 @@ func (g *Group) RemovalProof(member entmoot.MemberID) ([]Record, bool) {
 		}
 		// The removal alone may not convince its subject: if a delegated
 		// admin signed it, the subject needs the grant that gave that admin
-		// authority, which it may never have seen. Policy records travel with
-		// the proof for that reason, and only those — they say who may act,
-		// not who is in the group, so a node learns why it was removed
-		// without being handed the membership it no longer belongs to.
+		// authority, which it may never have seen. Every effective policy
+		// record ordered before the removal travels with it — not only the
+		// one that authorised this remover, because working out which grants
+		// a projection leaned on means re-deriving the projection, and the
+		// whole set is small, bounded by the checkpoint cadence, and made of
+		// the same kind of statement.
+		//
+		// Policy records say who may act, not who is in the group, so the
+		// disclosure is bounded to the admin set's history in this window: a
+		// node learns why it was removed without being handed the membership
+		// it no longer belongs to.
 		proof := make([]Record, 0, 4)
 		for _, candidate := range effective[:i] {
 			if candidate.Kind == KindPolicy {
