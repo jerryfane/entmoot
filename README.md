@@ -129,6 +129,13 @@ Identity creation is fail-closed unless `-allow-new-identity` is supplied.
 `-controlled-relay`. The daemon reserves through those relays and rejects
 unapproved relay paths.
 
+Direct mode speaks DCUtR, so two peers behind NAT can hole-punch into a direct
+connection. A peer that is not publicly reachable needs a rendezvous point:
+pass `-controlled-relay` in direct mode too, and the daemon reserves there,
+stays reachable over the circuit, and upgrades to direct when the punch
+succeeds. Symmetric and carrier-grade NAT cannot be punched and keep using the
+relay.
+
 Run a controlled relay under its own identity:
 
 ```sh
