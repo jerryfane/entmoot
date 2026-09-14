@@ -371,13 +371,15 @@ func runGroupDaemon(gf *globalFlags, opts groupDaemonOptions) int {
 	notifyStore := newNotifyingStore(rawStore, serviceEvents)
 
 	runtime, err := newGroupRuntime(groupRuntimeConfig{
-		Identity: s.identity,
-		DataDir:  s.dataDir,
-		Store:    rawStore,
-		Notify:   notifyStore,
-		Host:     libp2pHost,
-		Binding:  binding,
-		Logger:   slog.Default(),
+		Identity:         s.identity,
+		DataDir:          s.dataDir,
+		Store:            rawStore,
+		Notify:           notifyStore,
+		Host:             libp2pHost,
+		Binding:          binding,
+		Logger:           slog.Default(),
+		Mode:             hostConfig.Mode,
+		ControlledRelays: hostConfig.ControlledRelays,
 	})
 	if err != nil {
 		slog.Error(opts.command+": new group runtime", slog.String("err", err.Error()))
