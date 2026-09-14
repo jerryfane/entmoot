@@ -203,12 +203,25 @@ func (s *SyncServer) removalRecordFor(stream network.Stream, groupID entmoot.Gro
 	if err != nil || binding.PeerID != remote {
 		return membership.Record{}, false
 	}
+	if group.IsMemberID(binding.MemberID) {
+		// Whatever this caller was refused for, it was not removal.
+		return membership.Record{}, false
+	}
 	for _, record := range group.Pending() {
 		if record.Kind != membership.KindRemove {
 			continue
 		}
 		subject, err := record.SubjectMemberID()
 		if err != nil || subject != binding.MemberID {
+			continue
+		}
+		// A record naming the caller is not necessarily the record that
+		// removed it: anybody can sign one, and the projection ignores the
+		// ones whose author had no authority. Serving such a record would
+		// tell a node "you were removed" with a proof that proves nothing,
+		// and it would then keep asking for ever.
+		actor, err := record.ActorMemberID()
+		if err != nil || !group.CanAdminister(actor) {
 			continue
 		}
 		return record, true

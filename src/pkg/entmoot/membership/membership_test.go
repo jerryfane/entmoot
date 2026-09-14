@@ -1270,3 +1270,149 @@ func TestCheckpointMustNameTheRosterChainItReplaces(t *testing.T) {
 		t.Fatalf("refusal was %v, want a roster rejection", err)
 	}
 }
+
+// A checkpoint that arrives for a sequence the group has already passed — what
+// a node coming back from a partition produces — must not pull the canonical
+// checkpoint backwards. It used to: the walk picked the best child at each
+// step, so the late sibling beat the one its successors were built on, the
+// walk stopped there because nothing chained onto it, and the membership the
+// later checkpoints carried was retired and gone.
+func TestLateCheckpointForAPassedSequenceDoesNotRewindMembership(t *testing.T) {
+	f := newFixture(t, DefaultPolicy())
+	admin := mustIdentity(t)
+	f.join(admin)
+	f.grantAdmin(f.memberID(admin))
+	f.tick(10)
+	if _, signed, err := f.group.SignCheckpoint(f.founder, true); err != nil || !signed {
+		t.Fatalf("grant checkpoint: signed=%t err=%v", signed, err)
+	}
+	base := f.group.Canonical()
+
+	// The admin checkpoints the next two sequences, folding in two members.
+	firstMember, secondMember := mustIdentity(t), mustIdentity(t)
+	f.tick(10)
+	f.join(firstMember)
+	f.tick(10)
+	if _, signed, err := f.group.SignCheckpoint(admin, true); err != nil || !signed {
+		t.Fatalf("admin checkpoint: signed=%t err=%v", signed, err)
+	}
+	f.tick(10)
+	f.join(secondMember)
+	f.tick(10)
+	if _, signed, err := f.group.SignCheckpoint(admin, true); err != nil || !signed {
+		t.Fatalf("second admin checkpoint: signed=%t err=%v", signed, err)
+	}
+	head := f.group.Canonical()
+	if head.Sequence != base.Sequence+2 {
+		t.Fatalf("canonical sequence = %d, want %d", head.Sequence, base.Sequence+2)
+	}
+
+	// Now the founder's own checkpoint for the sequence the admin already
+	// passed arrives. It is perfectly valid, and preferred at its own
+	// sequence, but it is not where the group is.
+	stale, _ := Project(base, nil)
+	staleBody := stale.Checkpoint(f.groupID, base.Sequence+1, base.ID, 0, base.Timestamp+1)
+	staleSigned, err := SignCheckpoint(f.founder, f.info(f.founder), staleBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.group.ApplyCheckpoint(staleSigned); err != nil {
+		t.Fatalf("a valid checkpoint for a passed sequence was refused: %v", err)
+	}
+	if got := f.group.Canonical().Sequence; got != head.Sequence {
+		t.Fatalf("canonical rewound to sequence %d, want %d", got, head.Sequence)
+	}
+	for _, member := range []*keystore.Identity{admin, firstMember, secondMember} {
+		if !f.group.IsMemberID(f.memberID(member)) {
+			t.Fatalf("member %s was lost", f.memberID(member).String())
+		}
+	}
+}
+
+// A node that joined after the group retired its early checkpoints holds no
+// sequence zero at all. Its chain must still advance, which is why the anchor
+// is the oldest checkpoint held rather than the sequence-zero one.
+func TestANodeWithoutSequenceZeroKeepsCheckpointing(t *testing.T) {
+	f := newFixture(t, DefaultPolicy())
+	f.join(mustIdentity(t))
+	f.tick(10)
+	if _, signed, err := f.group.SignCheckpoint(f.founder, true); err != nil || !signed {
+		t.Fatalf("first checkpoint: signed=%t err=%v", signed, err)
+	}
+	// A joiner adopts the group as it stands: sequence 1, no zero behind it.
+	joined, err := Adopt(t.TempDir(), f.group.Canonical())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer joined.Close()
+	if joined.Canonical().Sequence == 0 {
+		t.Fatal("the fixture adopted a sequence-zero checkpoint, so the test proves nothing")
+	}
+
+	// It then follows the group forward. Each step has to become canonical, or
+	// this node is frozen at the checkpoint it adopted.
+	for round := 0; round < 3; round++ {
+		f.tick(10)
+		newcomer := mustIdentity(t)
+		f.join(newcomer)
+		f.tick(10)
+		checkpoint, signed, err := f.group.SignCheckpoint(f.founder, true)
+		if err != nil || !signed {
+			t.Fatalf("round %d: signed=%t err=%v", round, signed, err)
+		}
+		for _, rec := range f.group.Pending() {
+			if _, err := joined.Apply(rec); err != nil && !errors.Is(err, ErrStale) {
+				t.Fatalf("round %d: apply record: %v", round, err)
+			}
+		}
+		if _, err := joined.ApplyCheckpoint(checkpoint); err != nil {
+			t.Fatalf("round %d: apply checkpoint: %v", round, err)
+		}
+		if got := joined.Canonical().ID; got != checkpoint.ID {
+			t.Fatalf("round %d: canonical is %s, want %s", round, got, checkpoint.ID)
+		}
+		if !joined.IsMemberID(f.memberID(newcomer)) {
+			t.Fatalf("round %d: the newcomer never arrived", round)
+		}
+	}
+}
+
+// Adoption is the one moment a node has nothing of its own to check against,
+// so it accepts only the founder's signature: an admin-signed checkpoint would
+// have to be taken on the strength of its own claim about who the admins are.
+func TestAdoptRefusesACheckpointTheFounderDidNotSign(t *testing.T) {
+	f := newFixture(t, DefaultPolicy())
+	admin := mustIdentity(t)
+	f.join(admin)
+	f.grantAdmin(f.memberID(admin))
+	f.tick(10)
+	if _, signed, err := f.group.SignCheckpoint(f.founder, true); err != nil || !signed {
+		t.Fatalf("base checkpoint: signed=%t err=%v", signed, err)
+	}
+	f.tick(10)
+	f.join(mustIdentity(t))
+	f.tick(10)
+	adminSigned, signed, err := f.group.SignCheckpoint(admin, true)
+	if err != nil || !signed {
+		t.Fatalf("admin checkpoint: signed=%t err=%v", signed, err)
+	}
+	group, err := Adopt(t.TempDir(), adminSigned)
+	if err == nil {
+		_ = group.Close()
+		t.Fatal("an admin-signed checkpoint was adopted as a starting point")
+	}
+	if !errors.Is(err, ErrNotAuthorised) {
+		t.Fatalf("refusal was %v, want ErrNotAuthorised", err)
+	}
+	// The founder's own checkpoint at that sequence is adoptable, so the rule
+	// refuses the signature rather than the sequence.
+	founderSigned, signed, err := f.group.SignCheckpoint(f.founder, true)
+	if err != nil || !signed {
+		t.Fatalf("founder checkpoint: signed=%t err=%v", signed, err)
+	}
+	adopted, err := Adopt(t.TempDir(), founderSigned)
+	if err != nil {
+		t.Fatalf("the founder's checkpoint was not adoptable: %v", err)
+	}
+	defer adopted.Close()
+}

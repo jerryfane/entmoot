@@ -1,11 +1,16 @@
 package libp2ptransport
 
 import (
+	"errors"
 	"testing"
+
+	libp2p "github.com/libp2p/go-libp2p"
 
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/keystore"
 	"entmoot/pkg/entmoot/membership"
+	"github.com/libp2p/go-libp2p/core/network"
+	"github.com/libp2p/go-libp2p/core/peer"
 )
 
 // A node with a real backlog must still converge. The client used to name the
@@ -87,5 +92,139 @@ func TestRefusalWithAnIneffectiveRecordIsNotAnEviction(t *testing.T) {
 	}
 	if !client.IsMemberID(p.clientMemberID) {
 		t.Fatal("a stranger's removal took effect")
+	}
+}
+
+// A peer that refuses us may serve the record it says removed us. Only the
+// projection decides whether it did: a record that stores but changes nothing
+// is not an eviction, and this must hold through the real pull path, not just
+// at Group.Apply.
+func TestRefusedPullOnlyReportsRemovalWhenMembershipActuallyDrops(t *testing.T) {
+	p := newMembershipSyncPair(t)
+	client := p.adoptClient(t)
+	if _, _, _, err := FetchMembership(p.ctx, p.clientHost, p.remote, client, p.clientMemberID); err != nil {
+		t.Fatal(err)
+	}
+	if !client.IsMemberID(p.clientMemberID) {
+		t.Fatal("the pulling member is not a member of its own group")
+	}
+
+	// The server holds a removal naming the client, signed by a stranger, so
+	// it stores and is ignored. The server itself still counts the client as a
+	// member, so it will refuse the pull on the strength of... nothing: the
+	// refusal has to come from somewhere, so remove the client for real on the
+	// server and hand it a SECOND, ineffective record for the same subject.
+	stranger := mustIdentity(t)
+	subject := mustNode(t, p.member)
+	ineffective, err := membership.SignRecord(stranger, membership.Record{
+		Version:   membership.Version,
+		GroupID:   p.groupID,
+		Kind:      membership.KindRemove,
+		Actor:     mustNode(t, stranger),
+		Subject:   entmoot.NodeInfo{MemberID: subject.MemberID},
+		Timestamp: p.group.Canonical().Timestamp + 5_000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if applied, err := p.group.Apply(ineffective); err != nil || !applied {
+		t.Fatalf("the server would not hold the ineffective record: applied=%t err=%v", applied, err)
+	}
+	if !p.group.IsMemberID(p.clientMemberID) {
+		t.Fatal("a stranger's removal took effect on the server")
+	}
+
+	// The client is still a member here, so the pull is authorised and must
+	// come back clean: the ineffective record may travel, but it must not be
+	// read as an eviction.
+	_, _, _, err = FetchMembership(p.ctx, p.clientHost, p.remote, client, p.clientMemberID)
+	if errors.Is(err, ErrRemoved) {
+		t.Fatal("an ineffective removal was reported as an eviction")
+	}
+	if err != nil {
+		t.Fatalf("pull: %v", err)
+	}
+	if !client.IsMemberID(p.clientMemberID) {
+		t.Fatal("the client evicted itself on a record that changes nothing")
+	}
+
+	// Now a real removal, signed by the founder: the same path must report it.
+	if _, err := p.group.SignRecord(p.founder, membership.Record{
+		Kind:    membership.KindRemove,
+		Subject: subject,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if p.group.IsMemberID(p.clientMemberID) {
+		t.Fatal("the founder's removal did not take effect on the server")
+	}
+	_, _, _, err = FetchMembership(p.ctx, p.clientHost, p.remote, client, p.clientMemberID)
+	if !errors.Is(err, ErrRemoved) {
+		t.Fatalf("a real removal was not reported: %v", err)
+	}
+	if client.IsMemberID(p.clientMemberID) {
+		t.Fatal("the client still counts itself a member after learning of its removal")
+	}
+}
+
+// A hostile peer can say anything, including "you were removed", and attach a
+// record that names this node but changes nothing. The client must not act on
+// it: the only thing that evicts a node is its own projection dropping it.
+func TestHostilePeerCannotTalkANodeOutOfItsMembership(t *testing.T) {
+	p := newMembershipSyncPair(t)
+	client := p.adoptClient(t)
+	if _, _, _, err := FetchMembership(p.ctx, p.clientHost, p.remote, client, p.clientMemberID); err != nil {
+		t.Fatal(err)
+	}
+	if !client.IsMemberID(p.clientMemberID) {
+		t.Fatal("the pulling member is not a member of its own group")
+	}
+
+	// A peer that answers every membership request with a refusal plus a
+	// removal signed by a stranger.
+	hostileIdentity := mustIdentity(t)
+	hostileHost, _, err := NewHost(p.ctx, hostileIdentity, libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hostileHost.Close()
+	stranger := mustIdentity(t)
+	subject := mustNode(t, p.member)
+	bogus, err := membership.SignRecord(stranger, membership.Record{
+		Version:   membership.Version,
+		GroupID:   p.groupID,
+		Kind:      membership.KindRemove,
+		Actor:     mustNode(t, stranger),
+		Subject:   entmoot.NodeInfo{MemberID: subject.MemberID},
+		Timestamp: client.Canonical().Timestamp + 9_000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	hostileHost.SetStreamHandler(MembershipProtocol, func(stream network.Stream) {
+		defer stream.Close()
+		var request MembershipSyncRequest
+		if err := decodeJSONLimit(stream, maxSyncRequestBytes, &request); err != nil {
+			return
+		}
+		_ = encodeJSONLimit(stream, MembershipSyncResponse{
+			Version:   1,
+			RequestID: request.RequestID,
+			GroupID:   request.GroupID,
+			Error:     SyncNotMember,
+			Records:   []membership.Record{bogus},
+		}, maxMembershipResponse)
+	})
+
+	hostile := peer.AddrInfo{ID: hostileHost.ID(), Addrs: hostileHost.Addrs()}
+	_, _, _, err = FetchMembership(p.ctx, p.clientHost, hostile, client, p.clientMemberID)
+	if errors.Is(err, ErrRemoved) {
+		t.Fatal("a hostile peer evicted this node with a record that changes nothing")
+	}
+	if err == nil {
+		t.Fatal("a refusal was reported as a successful pull")
+	}
+	if !client.IsMemberID(p.clientMemberID) {
+		t.Fatal("the node dropped its own membership on a stranger's word")
 	}
 }

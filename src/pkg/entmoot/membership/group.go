@@ -601,9 +601,6 @@ func (g *Group) ApplyCheckpoint(cp Checkpoint) (bool, error) {
 	if err := g.verifyCheckpointClockLocked(cp); err != nil {
 		return false, err
 	}
-	if err := g.verifyLegacyAnchorLocked(cp); err != nil {
-		return false, err
-	}
 	if _, exists := g.checkpoints[cp.ID]; exists {
 		return false, nil
 	}
@@ -658,6 +655,11 @@ func (g *Group) verifyCheckpointClockLocked(cp Checkpoint) error {
 // roster chain to the chain this node actually holds. Without this the
 // LegacyHead field is decoration: a checkpoint could claim any upgrade, or
 // none, and be believed either way.
+//
+// Only Adopt calls it, and that is the whole reachable surface: a checkpoint
+// may name a legacy head only at sequence zero (VerifyCheckpoint), and a
+// sequence-zero checkpoint cannot arrive through ApplyCheckpoint, which
+// requires a predecessor this node already holds.
 func (g *Group) verifyLegacyAnchorLocked(cp Checkpoint) error {
 	if g.legacy == nil {
 		if cp.LegacyHead != nil {
@@ -809,22 +811,7 @@ func (g *Group) settleCanonicalLocked() error {
 	if !ok {
 		return nil
 	}
-	for {
-		var candidate *Checkpoint
-		for id, cp := range g.checkpoints {
-			if cp.Previous != best.ID || id == best.ID {
-				continue
-			}
-			if candidate == nil || checkpointBeats(cp, *candidate) {
-				next := cp
-				candidate = &next
-			}
-		}
-		if candidate == nil {
-			break
-		}
-		best = *candidate
-	}
+	best = g.furthestFromLocked(best)
 	if best.ID == g.canonicalID {
 		return nil
 	}
@@ -907,6 +894,39 @@ func (g *Group) settleCanonicalLocked() error {
 	}
 	g.reproject()
 	return nil
+}
+
+// furthestFromLocked follows the chains that descend from root and returns the
+// one that reaches furthest, ties broken by checkpointBeats so every node
+// choosing between the same set of chains chooses the same one.
+//
+// It compares whole chains rather than picking the best child at each step.
+// Stepping greedily meant a checkpoint arriving late for a sequence the group
+// had already passed — which is exactly what a node coming back from a
+// partition produces — could beat the sibling its successors were built on,
+// and the walk then stopped there because nothing chained onto it. The
+// canonical checkpoint moved BACKWARDS, and membership the later checkpoints
+// carried was retired and gone.
+func (g *Group) furthestFromLocked(root Checkpoint) Checkpoint {
+	best := root
+	for id, cp := range g.checkpoints {
+		if cp.Previous != root.ID || id == root.ID {
+			continue
+		}
+		reach := g.furthestFromLocked(cp)
+		if best.ID == root.ID && root.Sequence < reach.Sequence {
+			best = reach
+			continue
+		}
+		if reach.Sequence > best.Sequence {
+			best = reach
+			continue
+		}
+		if reach.Sequence == best.Sequence && checkpointBeats(reach, best) {
+			best = reach
+		}
+	}
+	return best
 }
 
 // anchorCheckpointLocked returns the checkpoint this node's chain starts from:
