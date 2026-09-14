@@ -25,12 +25,15 @@ import (
 )
 
 const (
-	maxSyncRequestBytes       = 8 << 10
-	maxRosterResponse         = 512 << 10
-	maxHistoryListBytes       = 128 << 10
-	maxHistoryBodyBytes       = 384 << 10
-	maxSyncPageItems          = 1024
-	maxHistoryBodyItems       = 64
+	maxSyncRequestBytes = 8 << 10
+	maxRosterResponse   = 512 << 10
+	maxHistoryListBytes = 128 << 10
+	maxHistoryBodyBytes = 384 << 10
+	maxSyncPageItems    = 1024
+	maxHistoryBodyItems = 64
+	// historyBodyPageReserve leaves room for the response envelope fields that
+	// grow as bodies are added, so a fitted page never trips the encoder cap.
+	historyBodyPageReserve    = 8 << 10
 	maxPeerRecordResponse     = 256 << 10
 	maxPeerRecordsPerResponse = 128
 	syncSnapshotLifetime      = 30 * time.Second
@@ -414,13 +417,18 @@ func (s *SyncServer) handleHistoryList(stream network.Stream, request HistorySyn
 	s.writeHistory(stream, response, maxHistoryListBytes)
 }
 
+// handleHistoryBodies serves as many requested bodies as fit the response cap
+// and reports truncation through HasMore. Refusing the whole page instead would
+// stall a keeper forever: the client cannot know a smaller batch is needed, and
+// large messages early in a page would block every later message.
 func (s *SyncServer) handleHistoryBodies(stream network.Stream, request HistorySyncRequest, response HistorySyncResponse) {
 	if len(request.IDs) == 0 || len(request.IDs) > maxHistoryBodyItems {
 		response.Error = SyncResourceExhausted
 		s.writeHistory(stream, response, maxHistoryBodyBytes)
 		return
 	}
-	for _, id := range request.IDs {
+	budget := maxHistoryBodyBytes - encodedJSONSize(response) - historyBodyPageReserve
+	for index, id := range request.IDs {
 		message, err := s.Store.Get(context.Background(), request.GroupID, id)
 		if errors.Is(err, store.ErrNotFound) {
 			response.Missing = append(response.Missing, id)
@@ -431,6 +439,7 @@ func (s *SyncServer) handleHistoryBodies(stream network.Stream, request HistoryS
 			s.writeHistory(stream, response, maxHistoryBodyBytes)
 			return
 		}
+		var legacyProof *LegacyHistoryProof
 		if message.Version == 0 {
 			if s.LegacyHistory == nil {
 				response.Error = SyncInternal
@@ -449,7 +458,26 @@ func (s *SyncServer) handleHistoryBodies(stream network.Stream, request HistoryS
 				s.writeHistory(stream, response, maxHistoryBodyBytes)
 				return
 			}
-			response.LegacyProofs = append(response.LegacyProofs, LegacyHistoryProof{MessageID: message.ID, Proof: proof})
+			legacyProof = &LegacyHistoryProof{MessageID: message.ID, Proof: proof}
+		}
+		cost := encodedJSONSize(message)
+		if legacyProof != nil {
+			cost += encodedJSONSize(*legacyProof)
+		}
+		if cost > budget {
+			if index == 0 && len(response.Messages) == 0 {
+				// A single body cannot fit the page cap. Truncating would make
+				// no progress, so say so instead of serving an empty page.
+				response.Error = SyncResourceExhausted
+				s.writeHistory(stream, response, maxHistoryBodyBytes)
+				return
+			}
+			response.HasMore = true
+			break
+		}
+		budget -= cost
+		if legacyProof != nil {
+			response.LegacyProofs = append(response.LegacyProofs, *legacyProof)
 		}
 		response.Messages = append(response.Messages, message)
 	}
