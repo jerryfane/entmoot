@@ -96,6 +96,25 @@ founder that never checkpoints therefore leaves a longer chain behind;
 `roster status` shows it as the gap between the anchor and the canonical
 sequence, and the remedy is one `roster checkpoint` on the founder.
 
+### Being told you were removed
+
+A removed node can read nothing: every door is shut to it. So a peer that
+refuses it answers with the record its own projection acted on when it dropped
+that member, plus the policy records that gave the record's author authority —
+nothing else. Policy records say who may act, not who is in the group, so the
+node learns why it was refused without being handed the membership it no longer
+belongs to.
+
+The node acts only on that signed record, never on the refusal itself: a peer's
+word is not evidence, and a node that evicted itself on an unproven claim could
+be talked out of a group by anybody. Once the record applies, the node drops
+itself, says so in the log, and stops publishing.
+
+A removal already folded into a checkpoint cannot be proven this way: showing
+that one identity is absent from a checkpoint means showing the whole member
+set. Such a node is told only that it is unauthorised. Closing that needs a
+commitment over the member set, and is not implemented.
+
 ### What a checkpoint may not claim
 
 - A timestamp more than five minutes ahead of the reading node's clock is

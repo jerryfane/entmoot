@@ -451,6 +451,53 @@ func (g *Group) IsMemberID(id entmoot.MemberID) bool {
 	return ok
 }
 
+// RemovalProof returns the record this node's own projection acted on when it
+// dropped a member, while that record is still held. It is what a node can
+// hand to the member itself: a signed statement the member can check, chosen
+// by the same rule that decided the outcome here.
+//
+// The question is deliberately "did this record take effect?", not "may its
+// author administer the group now". Authority is judged when a record applies,
+// and the order in an eviction is often admin-removes-member then
+// founder-removes-admin: asking about present authority would withhold the one
+// record that explains the removal, in exactly the case where it matters.
+func (g *Group) RemovalProof(member entmoot.MemberID) ([]Record, bool) {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	if _, still := g.state.Members[member]; still {
+		return nil, false
+	}
+	records := make([]Record, 0, len(g.records))
+	for _, rec := range g.records {
+		records = append(records, rec)
+	}
+	_, effective := Project(g.checkpoints[g.canonicalID], records)
+	for i := len(effective) - 1; i >= 0; i-- {
+		rec := effective[i]
+		if rec.Kind != KindRemove {
+			continue
+		}
+		subject, err := rec.SubjectMemberID()
+		if err != nil || subject != member {
+			continue
+		}
+		// The removal alone may not convince its subject: if a delegated
+		// admin signed it, the subject needs the grant that gave that admin
+		// authority, which it may never have seen. Policy records travel with
+		// the proof for that reason, and only those — they say who may act,
+		// not who is in the group, so a node learns why it was removed
+		// without being handed the membership it no longer belongs to.
+		proof := make([]Record, 0, 4)
+		for _, candidate := range effective[:i] {
+			if candidate.Kind == KindPolicy {
+				proof = append(proof, cloneRecord(candidate))
+			}
+		}
+		return append(proof, cloneRecord(rec)), true
+	}
+	return nil, false
+}
+
 // BannedIDs returns the identities currently barred from rejoining, sorted.
 // It comes from the projection, not from the canonical checkpoint: a ban that
 // arrived as a record and has not been folded in yet still bars its subject,

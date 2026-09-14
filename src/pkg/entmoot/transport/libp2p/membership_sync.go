@@ -116,9 +116,9 @@ func (s *SyncServer) handleMembership(stream network.Stream) {
 		// so it can act on it; the error code alone is not, and no node may
 		// evict itself on a peer's unproven word.
 		response.Error = SyncUnauthorized
-		if record, found := s.removalRecordFor(stream, request.GroupID); found {
+		if proof, found := s.removalRecordFor(stream, request.GroupID); found {
 			response.Error = SyncNotMember
-			response.Records = []membership.Record{record}
+			response.Records = proof
 		}
 		s.writeMembership(stream, response)
 		return
@@ -182,10 +182,10 @@ func afterCursor(record membership.Record, afterTimestamp int64, afterID entmoot
 // caller is told, and it is told nothing when no such record is held: a
 // checkpoint that has already folded the removal in cannot prove one identity
 // is absent without disclosing every identity that is present.
-func (s *SyncServer) removalRecordFor(stream network.Stream, groupID entmoot.GroupID) (membership.Record, bool) {
+func (s *SyncServer) removalRecordFor(stream network.Stream, groupID entmoot.GroupID) ([]membership.Record, bool) {
 	group, ok := s.Group(groupID)
 	if !ok {
-		return membership.Record{}, false
+		return nil, false
 	}
 	remote := stream.Conn().RemotePeer()
 	publicKey, err := remote.ExtractPublicKey()
@@ -193,40 +193,23 @@ func (s *SyncServer) removalRecordFor(stream network.Stream, groupID entmoot.Gro
 		publicKey = s.Host.Peerstore().PubKey(remote)
 	}
 	if publicKey == nil {
-		return membership.Record{}, false
+		return nil, false
 	}
 	raw, err := publicKey.Raw()
 	if err != nil {
-		return membership.Record{}, false
+		return nil, false
 	}
 	binding, err := BindingFromPublicKey(raw)
 	if err != nil || binding.PeerID != remote {
-		return membership.Record{}, false
+		return nil, false
 	}
-	if group.IsMemberID(binding.MemberID) {
-		// Whatever this caller was refused for, it was not removal.
-		return membership.Record{}, false
-	}
-	for _, record := range group.Pending() {
-		if record.Kind != membership.KindRemove {
-			continue
-		}
-		subject, err := record.SubjectMemberID()
-		if err != nil || subject != binding.MemberID {
-			continue
-		}
-		// A record naming the caller is not necessarily the record that
-		// removed it: anybody can sign one, and the projection ignores the
-		// ones whose author had no authority. Serving such a record would
-		// tell a node "you were removed" with a proof that proves nothing,
-		// and it would then keep asking for ever.
-		actor, err := record.ActorMemberID()
-		if err != nil || !group.CanAdminister(actor) {
-			continue
-		}
-		return record, true
-	}
-	return membership.Record{}, false
+	// Ask the group which record it acted on. Anybody can sign a record
+	// naming this caller, and the projection ignores the ones whose author had
+	// no authority when they applied; serving one of those would tell a node
+	// "you were removed" with a proof that proves nothing, and it would keep
+	// asking for ever. A caller that is still a member gets nothing, because
+	// then whatever it was refused for, it was not removal.
+	return group.RemovalProof(binding.MemberID)
 }
 
 func (s *SyncServer) writeMembership(stream network.Stream, response MembershipSyncResponse) {

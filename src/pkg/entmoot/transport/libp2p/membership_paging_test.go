@@ -228,3 +228,56 @@ func TestHostilePeerCannotTalkANodeOutOfItsMembership(t *testing.T) {
 		t.Fatal("the node dropped its own membership on a stranger's word")
 	}
 }
+
+// The order an eviction actually happens in: a delegated admin removes a
+// member, and the founder then removes the admin. The removed member must
+// still be told why it is refused — the record that removed it is the record
+// that removed it, whatever became of its author afterwards.
+func TestRemovedMemberIsToldEvenAfterItsRemoverLosesAdmin(t *testing.T) {
+	adminIdentity := mustIdentity(t)
+	p := newMembershipSyncPair(t, adminIdentity)
+	client := p.adoptClient(t)
+	if _, _, _, err := FetchMembership(p.ctx, p.clientHost, p.remote, client, p.clientMemberID); err != nil {
+		t.Fatal(err)
+	}
+
+	admin := mustNode(t, adminIdentity)
+	policy := p.group.Policy()
+	policy.Admins = membership.SortAdmins([]entmoot.MemberID{*admin.MemberID})
+	if _, err := p.group.SignRecord(p.founder, membership.Record{
+		Kind:   membership.KindPolicy,
+		Policy: &policy,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !p.group.CanAdminister(*admin.MemberID) {
+		t.Fatal("the grant did not take effect")
+	}
+	if _, err := p.group.SignRecord(adminIdentity, membership.Record{
+		Kind:    membership.KindRemove,
+		Subject: mustNode(t, p.member),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if p.group.IsMemberID(p.clientMemberID) {
+		t.Fatal("the admin's removal did not take effect")
+	}
+	// And now the admin itself goes.
+	if _, err := p.group.SignRecord(p.founder, membership.Record{
+		Kind:    membership.KindRemove,
+		Subject: admin,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if p.group.CanAdminister(*admin.MemberID) {
+		t.Fatal("the removed admin still holds authority")
+	}
+
+	_, _, _, err := FetchMembership(p.ctx, p.clientHost, p.remote, client, p.clientMemberID)
+	if !errors.Is(err, ErrRemoved) {
+		t.Fatalf("the removed member was not told why it is refused: %v", err)
+	}
+	if client.IsMemberID(p.clientMemberID) {
+		t.Fatal("the member still counts itself in after learning of its removal")
+	}
+}
