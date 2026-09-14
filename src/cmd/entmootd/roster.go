@@ -29,7 +29,7 @@ type espOpenInviteLister interface {
 // cmdRoster dispatches `roster <op>`.
 func cmdRoster(gf *globalFlags, args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "roster: missing op (want: add, remove, or admin)")
+		fmt.Fprintln(os.Stderr, "roster: missing op (want: add, remove, admin, or repair)")
 		return exitInvalidArgument
 	}
 	switch args[0] {
@@ -39,6 +39,8 @@ func cmdRoster(gf *globalFlags, args []string) int {
 		return cmdRosterRemove(gf, args[1:])
 	case "admin":
 		return cmdRosterAdmin(gf, args[1:])
+	case "repair":
+		return cmdRosterRepair(gf, args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "roster: unknown op %q\n", args[0])
 		return exitInvalidArgument
