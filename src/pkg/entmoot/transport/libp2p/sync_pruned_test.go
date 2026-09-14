@@ -13,16 +13,50 @@ import (
 	"entmoot/pkg/entmoot/store"
 )
 
-// floorlessStore hides its retention floor, as a peer running a server that
-// predates coverage windows does. The client then receives identifiers it has
-// already pruned and must recognise them from its own tombstones.
-type floorlessStore struct {
-	*store.SQLite
+// wrappedStore is shaped like the daemon's own destination: a wrapper that
+// implements MessageStore and forwards the retention interfaces explicitly.
+// The fix has to work through that shape, not only against a bare *SQLite.
+type wrappedStore struct {
+	inner *store.SQLite
 }
 
-func (floorlessStore) CoverageFloor(context.Context, entmoot.GroupID) (int64, error) {
-	return 0, nil
+func (w wrappedStore) Put(ctx context.Context, group entmoot.GroupID, message entmoot.Message) (bool, error) {
+	return w.inner.Put(ctx, group, message)
 }
+func (w wrappedStore) Get(ctx context.Context, group entmoot.GroupID, id entmoot.MessageID) (entmoot.Message, error) {
+	return w.inner.Get(ctx, group, id)
+}
+func (w wrappedStore) Has(ctx context.Context, group entmoot.GroupID, id entmoot.MessageID) (bool, error) {
+	return w.inner.Has(ctx, group, id)
+}
+func (w wrappedStore) Range(ctx context.Context, group entmoot.GroupID, since, until int64) ([]entmoot.Message, error) {
+	return w.inner.Range(ctx, group, since, until)
+}
+func (w wrappedStore) Latest(ctx context.Context, group entmoot.GroupID, limit int) ([]entmoot.Message, error) {
+	return w.inner.Latest(ctx, group, limit)
+}
+func (w wrappedStore) LatestBefore(ctx context.Context, group entmoot.GroupID, limit int, boundary *store.PageBoundary) ([]entmoot.Message, error) {
+	return w.inner.LatestBefore(ctx, group, limit, boundary)
+}
+func (w wrappedStore) Topics(ctx context.Context, group entmoot.GroupID, limit int) ([]store.TopicSummary, error) {
+	return w.inner.Topics(ctx, group, limit)
+}
+func (w wrappedStore) LatestByTopic(ctx context.Context, group entmoot.GroupID, topic string, limit int) ([]entmoot.Message, error) {
+	return w.inner.LatestByTopic(ctx, group, topic, limit)
+}
+func (w wrappedStore) LatestByTopicBefore(ctx context.Context, group entmoot.GroupID, topic string, limit int, boundary *store.PageBoundary) ([]entmoot.Message, error) {
+	return w.inner.LatestByTopicBefore(ctx, group, topic, limit, boundary)
+}
+func (w wrappedStore) MerkleRoot(ctx context.Context, group entmoot.GroupID) ([32]byte, error) {
+	return w.inner.MerkleRoot(ctx, group)
+}
+func (w wrappedStore) IterMessageIDsInIDRange(ctx context.Context, group entmoot.GroupID, loID, hiID entmoot.MessageID) ([]entmoot.MessageID, error) {
+	return w.inner.IterMessageIDsInIDRange(ctx, group, loID, hiID)
+}
+func (w wrappedStore) HasTombstone(ctx context.Context, group entmoot.GroupID, id entmoot.MessageID) (bool, error) {
+	return store.HasTombstone(ctx, w.inner, group, id)
+}
+func (w wrappedStore) Close() error { return nil }
 
 // A node with a shorter retention window keeps being offered messages it has
 // already dropped. Before this fix it asked for them every round and its own
@@ -47,10 +81,9 @@ func TestPrunedHistoryDoesNotStallSyncOrCountAsMissing(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer local.Close()
-	// Syncing through a destination that reports no coverage floor keeps the
-	// keeper listing the pruned identifiers, which is what makes the tombstone
-	// check load-bearing rather than incidental.
-	destination := floorlessStore{SQLite: local}
+	// The destination is the wrapper shape the daemon builds, so the tombstone
+	// path has to reach through it rather than only working against *SQLite.
+	destination := wrappedStore{inner: local}
 	validate := func(message entmoot.Message, _ *merkle.Proof) error {
 		return signing.VerifyMessage(message, message.Author)
 	}
@@ -86,8 +119,19 @@ func TestPrunedHistoryDoesNotStallSyncOrCountAsMissing(t *testing.T) {
 		if item.MissingBodies != 0 {
 			t.Fatalf("pass %d counted %d pruned ids as missing bodies", pass, item.MissingBodies)
 		}
+		if item.PrunedLocally != int(pruned) {
+			t.Fatalf("pass %d reported %d pruned identifiers, want %d", pass, item.PrunedLocally, pruned)
+		}
 		if !item.Available {
 			t.Fatalf("pass %d reported the keeper unavailable", pass)
+		}
+		// Recognising the tombstone means the body is never requested again.
+		// A pass that re-downloads the dropped history costs bodies; a pass
+		// that recognises it costs only the listing, well under a quarter of
+		// the initial transfer.
+		if item.TransferredBytes*4 >= first.TransferredBytes {
+			t.Fatalf("pass %d transferred %d bytes against an initial %d: pruned bodies were re-requested",
+				pass, item.TransferredBytes, first.TransferredBytes)
 		}
 	}
 
@@ -99,9 +143,76 @@ func TestPrunedHistoryDoesNotStallSyncOrCountAsMissing(t *testing.T) {
 	}
 }
 
-// A node that knows its own retention floor should stop being offered history
-// below it at all, instead of filtering it on every pass.
-func TestSyncRequestsOnlyTheWindowThisNodeRetains(t *testing.T) {
+// hidesTombstones answers the tombstone check as if the identifier were still
+// fetchable, while the store underneath already holds the tombstone. That is
+// the shape of a retention pass landing between the check and the insert: the
+// client asks for the body and Put refuses it.
+type hidesTombstones struct {
+	wrappedStore
+}
+
+func (hidesTombstones) HasTombstone(context.Context, entmoot.GroupID, entmoot.MessageID) (bool, error) {
+	return false, nil
+}
+
+// Retention can tombstone an identifier between listing and insertion. The
+// refusal is correct; failing the keeper over it is not.
+func TestPruneDuringInsertionIsAnIntentionalGap(t *testing.T) {
+	f := newSnapshotLifecycleFixture(t)
+	group := f.groups[0]
+	for sequence := 3; sequence <= 12; sequence++ {
+		f.addMessage(t, group, sequence)
+	}
+	server := &SyncServer{
+		Host: f.serverHost, Admission: NewBootstrapAdmission(), Store: f.store,
+		Roster: func(id entmoot.GroupID) (*roster.RosterLog, bool) { log, ok := f.logs[id]; return log, ok },
+	}
+	if err := server.Install(); err != nil {
+		t.Fatal(err)
+	}
+	local, err := store.OpenSQLite(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer local.Close()
+	base := wrappedStore{inner: local}
+	validate := func(message entmoot.Message, _ *merkle.Proof) error {
+		return signing.VerifyMessage(message, message.Author)
+	}
+	keepers := []peer.AddrInfo{f.remote}
+
+	// Take the history, then prune it: the store now holds tombstones.
+	if first := SyncFromKeepers(f.ctx, f.client, group, keepers, base, validate, new(HistorySyncState))[0]; first.Err != nil {
+		t.Fatalf("initial sync failed: %v", first.Err)
+	}
+	pruned, err := store.PruneBeforeExceptTopics(context.Background(), local, group, int64(10_000+12), nil)
+	if err != nil || pruned == 0 {
+		t.Fatalf("prune removed %d messages: %v", pruned, err)
+	}
+
+	// Hiding the tombstone check reproduces retention landing after the check
+	// and before the insert: the bodies are requested and Put refuses them.
+	destination := hidesTombstones{wrappedStore: base}
+	item := SyncFromKeepers(f.ctx, f.client, group, keepers, destination, validate, new(HistorySyncState))[0]
+	if item.Err != nil {
+		t.Fatalf("a prune between listing and insertion failed the keeper: %v", item.Err)
+	}
+	if !item.Available {
+		t.Fatal("keeper reported unavailable after an insert-time refusal")
+	}
+	if item.PrunedLocally != int(pruned) {
+		t.Fatalf("insert-time refusals reported %d pruned, want %d", item.PrunedLocally, pruned)
+	}
+	if item.Inserted != 0 {
+		t.Fatalf("a pruned message was re-inserted %d times", item.Inserted)
+	}
+}
+
+// The coverage floor advances whenever retention runs, even when it deletes
+// nothing and for messages retention deliberately exempts. Using it to narrow
+// what a node asks for would hide history it still wants, so a message kept
+// below the floor must still arrive.
+func TestRetainedHistoryBelowTheCoverageFloorStillSyncs(t *testing.T) {
 	f := newSnapshotLifecycleFixture(t)
 	group := f.groups[0]
 	for sequence := 3; sequence <= 12; sequence++ {
@@ -124,28 +235,33 @@ func TestSyncRequestsOnlyTheWindowThisNodeRetains(t *testing.T) {
 	}
 	keepers := []peer.AddrInfo{f.remote}
 
-	full := SyncFromKeepers(f.ctx, f.client, group, keepers, destination, validate, new(HistorySyncState))[0]
-	if full.Err != nil || full.Listed == 0 {
-		t.Fatalf("initial sync listed=%d err=%v", full.Listed, full.Err)
-	}
-
+	// Retention runs on an empty store, exactly as it does at session start on
+	// a joining node: nothing is deleted, but the floor moves.
 	cutoff := int64(10_000 + 9)
-	if pruned, err := store.PruneBeforeExceptTopics(context.Background(), destination, group, cutoff, nil); err != nil || pruned == 0 {
-		t.Fatalf("prune removed %d messages: %v", pruned, err)
+	if pruned, err := store.PruneBeforeExceptTopics(context.Background(), destination, group, cutoff, nil); err != nil || pruned != 0 {
+		t.Fatalf("prune on an empty store removed %d: %v", pruned, err)
 	}
 	floor, err := destination.CoverageFloor(context.Background(), group)
 	if err != nil || floor == 0 {
-		t.Fatalf("coverage floor after prune = %d/%v, want a retention floor", floor, err)
+		t.Fatalf("coverage floor after prune = %d/%v, want a floor", floor, err)
 	}
 
-	narrowed := SyncFromKeepers(f.ctx, f.client, group, keepers, destination, validate, new(HistorySyncState))[0]
-	if narrowed.Err != nil {
-		t.Fatalf("sync after prune failed: %v", narrowed.Err)
+	item := SyncFromKeepers(f.ctx, f.client, group, keepers, destination, validate, new(HistorySyncState))[0]
+	if item.Err != nil {
+		t.Fatalf("sync failed: %v", item.Err)
 	}
-	if narrowed.Listed >= full.Listed {
-		t.Fatalf("keeper still listed %d of %d identifiers below the retention floor", narrowed.Listed, full.Listed)
+	if item.PrunedLocally != 0 {
+		t.Fatalf("a floor with no tombstones reported %d pruned identifiers", item.PrunedLocally)
 	}
-	if narrowed.Inserted != 0 {
-		t.Fatalf("sync after prune re-inserted %d messages", narrowed.Inserted)
+	// Every message the keeper holds must land, including those older than the
+	// floor this node advanced without dropping anything.
+	for _, id := range f.ids[group] {
+		present, err := destination.Has(context.Background(), group, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !present {
+			t.Fatalf("history below the coverage floor was never fetched: %s", id)
+		}
 	}
 }

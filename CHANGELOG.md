@@ -26,12 +26,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retention window kept being offered messages it had already dropped: it
   asked for them every pass and its own store refused them with
   `store: message was pruned`, which aborted the whole keeper pass, so one
-  expired message stopped history sync for good. The sync client now sends its
-  own retention floor, so keepers stop listing history below it; recognises
-  its own tombstones and skips those identifiers instead of re-fetching them;
-  and treats a pruned insert as an intentional gap rather than a failure.
-  Deliberately dropped identifiers are reported as `pruned_locally`, separate
-  from `missing_bodies`, so differing retention windows read as a coverage
+  expired message stopped history sync for good. The sync client now
+  recognises its own tombstones and skips those identifiers instead of
+  re-fetching their bodies, and treats a pruned insert as an intentional gap
+  rather than a failure. Only a tombstone means "dropped on purpose": the
+  coverage floor is deliberately *not* used to narrow what a node asks for,
+  because retention advances it even when it deletes nothing and for messages
+  it exempts, which would hide history the node still wants. Dropped
+  identifiers are reported as `pruned_locally`, separate from
+  `missing_bodies`, so differing retention windows read as a coverage
   difference and not as incomplete sync. Part of #101.
 
 - **Outstanding invites survive the first join.** Enrollment required the
