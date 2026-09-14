@@ -79,13 +79,25 @@ func (r *groupRuntime) repairRoster(ctx context.Context, session *groupSession, 
 	for _, entry := range chain {
 		keep[entry.ID] = struct{}{}
 	}
+	var discarded []entmoot.RosterEntry
 	for _, entry := range local {
 		if _, ok := keep[entry.ID]; !ok {
-			plan.discarded = append(plan.discarded, describeRepairEntry(entry, ""))
+			discarded = append(discarded, entry)
 		}
 	}
-	if len(plan.discarded) == 0 && plan.localHead == plan.remoteHead {
-		return plan, nil
+	// A repair is for a fork: two chains, neither extending the other. If the
+	// peer's whole chain is a prefix of ours it is simply behind, and adopting
+	// it would delete committed history to fix nothing. The ordinary sync path
+	// already ignores such a peer; so does this.
+	if plan.shared == len(chain) {
+		if plan.localHead == plan.remoteHead {
+			return plan, nil
+		}
+		return nil, fmt.Errorf("peer %s is behind this node, not forked from it: its whole chain is already on ours, so there is nothing to repair",
+			remote.ID)
+	}
+	for _, entry := range discarded {
+		plan.discarded = append(plan.discarded, describeRepairEntry(entry, ""))
 	}
 	if dryRun {
 		for i := range plan.discarded {
@@ -97,6 +109,15 @@ func (r *groupRuntime) repairRoster(ctx context.Context, session *groupSession, 
 	dropped, err := session.roster.ReplaceChain(chain)
 	if err != nil {
 		return nil, fmt.Errorf("adopt chain from %s: %w", remote.ID, err)
+	}
+	// Report what was actually dropped, not the snapshot taken before the
+	// fetch: another writer can commit while the chain is in flight, and a
+	// change this repair discarded must appear in the report even then.
+	// LocalHead stays the head the repair started from, which is what the
+	// operator asked about.
+	plan.discarded = plan.discarded[:0]
+	for _, entry := range dropped {
+		plan.discarded = append(plan.discarded, describeRepairEntry(entry, ""))
 	}
 	r.logger.Warn("roster repaired from peer",
 		slog.String("group_id", session.groupID.String()),

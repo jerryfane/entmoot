@@ -273,8 +273,8 @@ func TestRepairRefusesWithoutATarget(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Now()
-	f.session.noteRosterSyncFailure(f.remote.ID, now, before, entmoot.RosterEntryID{0x01}, "pull failed: test")
-	f.session.noteRosterSyncFailure(otherBinding.PeerID, now, before, entmoot.RosterEntryID{0x02}, "pull failed: test")
+	f.session.noteRosterSyncFailure(f.remote.ID, now, before, entmoot.RosterEntryID{0x01}, "pull failed: test", true)
+	f.session.noteRosterSyncFailure(otherBinding.PeerID, now, before, entmoot.RosterEntryID{0x02}, "pull failed: test", true)
 	_, err = f.runtime.repairRoster(f.ctx, f.session, "", false)
 	if err == nil || !strings.Contains(err.Error(), "different heads") {
 		t.Fatalf("ambiguous divergence produced %v, want a refusal naming the disagreement", err)
@@ -312,5 +312,30 @@ func TestRepairSkipsChangesTheAdoptedChainAlreadySatisfies(t *testing.T) {
 	}
 	if len(f.session.roster.Entries()) != len(f.winning) {
 		t.Fatalf("entries = %d, want the adopted %d with no duplicate re-issue", len(f.session.roster.Entries()), len(f.winning))
+	}
+}
+
+// A peer that is merely behind is not a fork. Adopting its chain would delete
+// committed history to fix nothing, so the repair refuses and says why.
+func TestRepairRefusesAPeerThatIsMerelyBehind(t *testing.T) {
+	f := newRepairFixture(t, repairOptions{localIsAdmin: true})
+	// Take the peer's chain, so this node is strictly ahead of it: the peer's
+	// head is now on our chain and it has nothing we lack.
+	if _, err := f.runtime.repairRoster(f.ctx, f.session, f.remote.ID.String(), false); err != nil {
+		t.Fatal(err)
+	}
+	head := f.session.roster.Head()
+	entries := len(f.session.roster.Entries())
+
+	_, err := f.runtime.repairRoster(f.ctx, f.session, f.remote.ID.String(), false)
+	if err == nil {
+		t.Fatal("a repair against a peer that is behind was accepted")
+	}
+	if !strings.Contains(err.Error(), "is behind this node") {
+		t.Fatalf("error = %v, want it to name the peer as behind rather than forked", err)
+	}
+	if f.session.roster.Head() != head || len(f.session.roster.Entries()) != entries {
+		t.Fatalf("a refused repair rewrote the chain: head %s -> %s, %d -> %d entries",
+			head, f.session.roster.Head(), entries, len(f.session.roster.Entries()))
 	}
 }

@@ -2,6 +2,7 @@ package roster
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"entmoot/pkg/entmoot"
@@ -202,4 +203,68 @@ func tamperedChain(chain []entmoot.RosterEntry) []entmoot.RosterEntry {
 	broken.Signature[0] ^= 0xff
 	out[len(out)-1] = broken
 	return out
+}
+
+// A write that reports failure is not proof the store is unchanged: an I/O
+// error can arrive after the bytes landed. If the projection kept the old
+// chain while the store held the new one, the daemon would serve a head that
+// no longer exists and every later write would fail at persist time. The store
+// is asked what it holds, and that answer wins.
+func TestFailedReplaceResyncsTheProjectionWithTheStore(t *testing.T) {
+	f := newForkFixture(t)
+	adopted := f.winning[len(f.winning)-1].ID
+
+	// The replacement lands durably and then reports an error.
+	var stored []entmoot.RosterEntry
+	f.local.replace = func(chain []entmoot.RosterEntry) error {
+		stored = append([]entmoot.RosterEntry(nil), chain...)
+		return errors.New("commit reported an I/O error after the write")
+	}
+	f.local.storedChain = func() ([]entmoot.RosterEntry, error) { return stored, nil }
+
+	if _, err := f.local.ReplaceChain(f.winning); err == nil {
+		t.Fatal("a failed replace reported success")
+	}
+	if f.local.Head() != adopted {
+		t.Fatalf("head = %s, want the durable %s: the projection did not follow the store", f.local.Head(), adopted)
+	}
+	if !f.local.IsMemberID(*f.winner.MemberID) || f.local.IsMemberID(*f.losing.MemberID) {
+		t.Fatal("the projection does not match the durable chain")
+	}
+
+}
+
+// A write that truly did not land must leave the projection alone.
+func TestFailedReplaceThatDidNotLandLeavesTheProjection(t *testing.T) {
+	f := newForkFixture(t)
+	before := f.local.Head()
+	unchanged := f.local.Entries()
+	f.local.replace = func([]entmoot.RosterEntry) error { return errors.New("disk full") }
+	f.local.storedChain = func() ([]entmoot.RosterEntry, error) { return unchanged, nil }
+
+	if _, err := f.local.ReplaceChain(f.winning); err == nil {
+		t.Fatal("a failed replace reported success")
+	}
+	if f.local.Head() != before {
+		t.Fatalf("head moved to %s after a write that did not land", f.local.Head())
+	}
+	if !f.local.IsMemberID(*f.losing.MemberID) {
+		t.Fatal("a write that did not land changed the projection")
+	}
+}
+
+// An unreadable store must report that the state is unknown rather than guess.
+func TestFailedReplaceWithAnUnreadableStoreReportsUnknownState(t *testing.T) {
+	f := newForkFixture(t)
+	before := f.local.Head()
+	f.local.replace = func([]entmoot.RosterEntry) error { return errors.New("disk full") }
+	f.local.storedChain = func() ([]entmoot.RosterEntry, error) { return nil, errors.New("database is locked") }
+
+	_, err := f.local.ReplaceChain(f.winning)
+	if err == nil || !strings.Contains(err.Error(), "unknown") {
+		t.Fatalf("error = %v, want it to say the durable state is unknown", err)
+	}
+	if f.local.Head() != before {
+		t.Fatal("an unresolvable failure changed the projection")
+	}
 }

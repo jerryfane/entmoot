@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 
 	"entmoot/pkg/entmoot"
 )
@@ -14,6 +15,12 @@ import (
 // the legacy identity upgrade checkpoint) travel through the same entry op and
 // leave the admin set alone.
 const AdminPolicyType = "admins/v1"
+
+// adminPolicyFamily prefixes every admin-set policy version. A payload in this
+// family that this build cannot read is refused rather than ignored: treating
+// it as an unrelated policy would leave the current admins standing while the
+// founder believed the set had changed.
+const adminPolicyFamily = "admins/"
 
 // MaxAdmins bounds the delegated-admin set. Roster changes stay strictly
 // linear, so every admin is a concurrent writer competing for the same head;
@@ -44,6 +51,18 @@ func IsAdminPolicy(payload []byte) bool {
 		return false
 	}
 	return probe.Type == AdminPolicyType
+}
+
+// IsUnknownAdminPolicy reports whether a payload claims to change the admin
+// set in a version this build does not implement. Such an entry must not be
+// accepted: peers would disagree about who can sign next, and the node that
+// cannot read it would keep honouring admins the payload may have removed.
+func IsUnknownAdminPolicy(payload []byte) bool {
+	var probe policyDiscriminator
+	if err := json.Unmarshal(payload, &probe); err != nil {
+		return false
+	}
+	return strings.HasPrefix(probe.Type, adminPolicyFamily) && probe.Type != AdminPolicyType
 }
 
 // MarshalAdminPolicy encodes a complete admin set for a policy_change entry.

@@ -137,6 +137,9 @@ func OpenJSONL(root string, groupID entmoot.GroupID) (*RosterLog, error) {
 	r.replace = func(chain []entmoot.RosterEntry) error {
 		return replaceRosterChain(context.Background(), db, groupID, chain)
 	}
+	r.storedChain = func() ([]entmoot.RosterEntry, error) {
+		return readRosterChain(context.Background(), db, groupID)
+	}
 	r.closeFn = func() error {
 		leaseErr := lease.close()
 		dbErr := db.Close()
@@ -611,4 +614,37 @@ func replaceRosterChain(ctx context.Context, db *sql.DB, groupID entmoot.GroupID
 		return fmt.Errorf("commit replace: %w", err)
 	}
 	return nil
+}
+
+// readRosterChain returns the committed chain in sequence order, decoded from
+// its stored canonical bytes. Repair uses it to find out what the store
+// actually holds after a write whose outcome is unknown.
+func readRosterChain(ctx context.Context, db *sql.DB, groupID entmoot.GroupID) ([]entmoot.RosterEntry, error) {
+	rows, err := db.QueryContext(ctx, `
+		SELECT canonical_bytes FROM roster_entries
+		WHERE group_id = ? ORDER BY sequence;`, groupID[:])
+	if err != nil {
+		return nil, fmt.Errorf("read chain: %w", err)
+	}
+	defer rows.Close()
+	var out []entmoot.RosterEntry
+	for rows.Next() {
+		var raw []byte
+		if err := rows.Scan(&raw); err != nil {
+			return nil, fmt.Errorf("scan entry: %w", err)
+		}
+		var entry entmoot.RosterEntry
+		if err := json.Unmarshal(raw, &entry); err != nil {
+			return nil, fmt.Errorf("decode entry: %w", err)
+		}
+		encoded, err := canonical.Encode(entry)
+		if err != nil || !bytes.Equal(encoded, raw) {
+			return nil, errors.New("stored entry canonical bytes are corrupt")
+		}
+		out = append(out, entry)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate entries: %w", err)
+	}
+	return out, nil
 }

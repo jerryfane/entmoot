@@ -72,7 +72,11 @@ func (r *RosterLog) replaceChainLocked(chain []entmoot.RosterEntry) ([]entmoot.R
 
 	if r.replace != nil {
 		if err := r.replace(chain); err != nil {
-			return nil, nil, fmt.Errorf("roster: persist replacement chain: %w", err)
+			// A failed commit is not proof the store is unchanged: an I/O error
+			// can be reported after the write has landed. Read the store back
+			// and project whatever it now holds, so memory and disk cannot
+			// disagree silently until the next restart.
+			return nil, nil, r.resyncAfterFailedReplaceLocked(err)
 		}
 	}
 	r.resetLocked()
@@ -111,4 +115,37 @@ func (r *RosterLog) CommonPrefix(chain []entmoot.RosterEntry) int {
 		shared++
 	}
 	return shared
+}
+
+// resyncAfterFailedReplaceLocked reconciles the projection with the store
+// after a replacement whose outcome is unknown. database/sql cannot tell "did
+// not commit" from "committed, then failed to report it", so the store is
+// asked what it holds and that answer wins. r.mu must be held for writing.
+func (r *RosterLog) resyncAfterFailedReplaceLocked(cause error) error {
+	if r.storedChain == nil {
+		return fmt.Errorf("roster: persist replacement chain: %w", cause)
+	}
+	stored, readErr := r.storedChain()
+	if readErr != nil {
+		return fmt.Errorf("roster: persist replacement chain: %w; and the durable chain could not be read back, so this group's state is unknown until the daemon restarts: %v", cause, readErr)
+	}
+	if len(stored) == 0 {
+		return fmt.Errorf("roster: persist replacement chain: %w; the durable chain is now empty, so this group's state is unknown and must be restored from a peer or a backup", cause)
+	}
+	if len(stored) == len(r.entries) && stored[len(stored)-1].ID == r.head {
+		// The store still holds what we already project: the commit did not
+		// land and nothing else changed.
+		return fmt.Errorf("roster: persist replacement chain: %w", cause)
+	}
+	if err := ValidateEntries(r.groupID, stored); err != nil {
+		return fmt.Errorf("roster: persist replacement chain: %w; the durable chain no longer validates (%v), so this group's state is unknown and must be restored from a peer or a backup", cause, err)
+	}
+	r.resetLocked()
+	for i, entry := range stored {
+		if i == 0 {
+			r.founder = entry.Subject
+		}
+		r.applyLocked(entry)
+	}
+	return fmt.Errorf("roster: replacement chain reported %w, but the durable chain had changed; the projection now matches the store at head %s", cause, r.head)
 }

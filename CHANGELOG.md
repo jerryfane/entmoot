@@ -22,19 +22,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `issuer` names the admin that signed. Enrollment and pre-membership
   roster/history reads both require that signer to be a member who may
   currently administer the group, so naming yourself as issuer buys nothing.
-  Policy payloads of other types (the legacy identity-upgrade checkpoint) pass
-  through untouched.
+  Policy payloads of other families (the legacy identity-upgrade checkpoint)
+  pass through untouched, but one that claims to change the admin set in a
+  version this build cannot apply is refused rather than ignored: accepting it
+  would leave this node honouring admins the founder may have just removed
+  while a newer peer applied the change, and the two would then disagree about
+  who may sign.
 - **Roster state travels between members, not just from the founder.** Every
   node now pulls roster entries from up to eight reachable members, founder
   first, and the founder pulls too. Without this, an admin-authored add or
   removal stayed on one node and the group ran on two heads. One full chain
   pull per round, a per-peer exponential backoff (30s to 15m) after a pull
-  that cannot be taken, and a 4096-entry ceiling per pull bound what one
-  member can cost. A peer advertising a head this node cannot extend is
-  reported as `roster_divergence` in status output, with both heads, the
-  reason and when it started, not just logged. Enrollment retries its own
-  entry against a moved head instead of failing, so a concurrent write by
-  another admin costs a retry.
+  that cannot be taken, and a ceiling of 4096 *newly downloaded* entries per
+  pull bound what one member can cost; the ceiling deliberately does not count
+  the local prefix, because a group that has made more than that many
+  membership changes must still be able to catch up. The head probe that
+  decides whether a pull is worth it reserves no paging snapshot on the peer,
+  so probing every tick cannot starve the pull it is probing for. A peer whose
+  chain does not extend ours is reported as `roster_divergence` in status
+  output, with both heads, the reason and when it started; a timeout, an
+  exhausted server slot or a rotated snapshot earns the same backoff but is
+  not reported as divergence, and a report is dropped as soon as the head it
+  names turns out to be on our chain. Enrollment retries its own entry against
+  a moved head instead of failing, and one group admits one applicant at a
+  time, so two invites redeemed for the same person in the same instant cost a
+  retry rather than two roster entries for one member.
 - **`roster repair` ends a fork.** The roster is strictly linear (one parent,
   which must be the current head), so two authorised signers who commit
   against the same head while partitioned produce two chains that no retry can
@@ -49,10 +61,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   silence. The command needs the running daemon, which holds the roster writer
   lease and the peer connections. A repair never changes group or founder: a
   chain with a different genesis, a bad signature or a gap is refused with the
-  log untouched. A message published in the fork window naming a discarded
-  head cannot be verified against the adopted chain; that is the cost of
-  converging. `roster admin` remains offline maintenance only, like
-  `roster add|remove`.
+  log untouched, and so is a peer that is merely behind, whose whole chain is
+  already on ours — adopting that would delete committed history to fix
+  nothing. If the durable swap reports an error, the store is read back and the
+  in-memory view follows whatever it actually holds, because a failed commit is
+  not proof the write did not land; when the store cannot be read the error
+  says the group's state is unknown instead of guessing. A message published in
+  the fork window naming a discarded head cannot be verified against the
+  adopted chain; that is the cost of converging. `roster admin` remains offline
+  maintenance only, like `roster add|remove`.
 - **Removal reporting is complete and survives cleanup failure.** `roster
   remove`, the IPC member-remove path and the ESP member_remove operation now
   report the removal result even when invite revocation fails, carrying
