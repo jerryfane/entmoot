@@ -49,6 +49,11 @@ type Group struct {
 	db          *sql.DB
 	lease       *writerLease
 	checkpoints map[entmoot.RosterEntryID]Checkpoint
+	// membersAt indexes each retained checkpoint's membership, so asking
+	// whether someone was a member at a cited checkpoint is a lookup rather
+	// than a scan of the member list. Verifying old messages does this for
+	// every message, so it has to be cheap at any group size.
+	membersAt   map[entmoot.RosterEntryID]map[entmoot.MemberID]entmoot.NodeInfo
 	canonicalID entmoot.RosterEntryID
 	records     map[entmoot.RosterEntryID]Record
 	state       State
@@ -188,6 +193,7 @@ func newGroup(dir string, groupID entmoot.GroupID, db *sql.DB) (*Group, error) {
 		db:          db,
 		lease:       &writerLease{path: filepath.Join(dir, lockFileName)},
 		checkpoints: make(map[entmoot.RosterEntryID]Checkpoint, len(stored.checkpoints)),
+		membersAt:   make(map[entmoot.RosterEntryID]map[entmoot.MemberID]entmoot.NodeInfo, len(stored.checkpoints)),
 		canonicalID: stored.canonicalID,
 		records:     make(map[entmoot.RosterEntryID]Record, len(stored.records)),
 		now:         time.Now,
@@ -197,7 +203,7 @@ func newGroup(dir string, groupID entmoot.GroupID, db *sql.DB) (*Group, error) {
 		if err := VerifyCheckpoint(cp); err != nil {
 			return nil, fmt.Errorf("membership: stored checkpoint %s: %w", cp.ID, err)
 		}
-		g.checkpoints[cp.ID] = cp
+		g.retainLocked(cp)
 	}
 	if _, ok := g.checkpoints[g.canonicalID]; !ok {
 		return nil, errors.New("membership: stored canonical checkpoint is missing")
@@ -435,24 +441,20 @@ func (g *Group) MemberIDs() []entmoot.MemberID {
 func (g *Group) MemberAt(id entmoot.MemberID, checkpoint entmoot.RosterEntryID) (info entmoot.NodeInfo, active bool, known bool) {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
-	cp, ok := g.checkpoints[checkpoint]
+	index, ok := g.membersAt[checkpoint]
 	if !ok {
 		if g.legacy != nil {
 			return g.legacy.MemberAt(id, checkpoint)
 		}
 		return entmoot.NodeInfo{}, false, false
 	}
-	for _, member := range cp.Members {
-		memberID, err := entmoot.ResolvedMemberID(member)
-		if err != nil || memberID != id {
-			continue
-		}
+	if member, present := index[id]; present {
 		return cloneNodeInfo(member), true, true
 	}
 	// A member admitted after the cited checkpoint but before the next one is
 	// still a legitimate author of a message citing it: the join record was
 	// pending when the message was written.
-	if info, ok := g.state.Members[id]; ok && cp.ID == g.canonicalID {
+	if info, ok := g.state.Members[id]; ok && checkpoint == g.canonicalID {
 		return cloneNodeInfo(info), true, true
 	}
 	return entmoot.NodeInfo{}, false, true
@@ -567,7 +569,7 @@ func (g *Group) ApplyCheckpoint(cp Checkpoint) (bool, error) {
 	if err := tx.Commit(); err != nil {
 		return false, fmt.Errorf("membership: commit checkpoint: %w", err)
 	}
-	g.checkpoints[cp.ID] = cloneCheckpoint(cp)
+	g.retainLocked(cp)
 	if err := g.settleCanonicalLocked(); err != nil {
 		return true, err
 	}
@@ -751,6 +753,7 @@ func (g *Group) settleCanonicalLocked() error {
 	g.canonicalID = best.ID
 	for _, id := range dropped {
 		delete(g.checkpoints, id)
+		delete(g.membersAt, id)
 	}
 	if retireBefore > 0 {
 		for id, rec := range g.records {
@@ -897,6 +900,19 @@ func identityInfo(identity *keystore.Identity) (entmoot.NodeInfo, error) {
 		PeerID:        peerID,
 		EntmootPubKey: bytes.Clone(identity.PublicKey),
 	}, nil
+}
+
+// retainLocked stores a checkpoint and indexes its membership.
+func (g *Group) retainLocked(cp Checkpoint) {
+	stored := cloneCheckpoint(cp)
+	g.checkpoints[stored.ID] = stored
+	index := make(map[entmoot.MemberID]entmoot.NodeInfo, len(stored.Members))
+	for _, member := range stored.Members {
+		if id, err := entmoot.ResolvedMemberID(member); err == nil {
+			index[id] = member
+		}
+	}
+	g.membersAt[stored.ID] = index
 }
 
 // recordCoveredLocked reports whether a record whose timestamp equals the
