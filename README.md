@@ -129,11 +129,23 @@ group create          Create a founder-owned group
 invite create         Create an enrollment capability (targeted or open)
 invite list           Show issued invites, uses spent, and state
 invite revoke         Withdraw an outstanding invite before it expires
-roster add/remove     Apply founder-signed membership changes
+roster add/remove     Apply membership changes as founder or delegated admin
+roster admin          Grant, revoke, or list delegated admins (founder only)
 esp serve             Run the local ESP mailbox HTTP API
 esp device            Manage ESP device authorization
 mailbox               Manage the local ESP sync cursor
 ```
+
+A founder can delegate admission without handing over the group:
+
+```sh
+entmootd roster admin grant -group <GROUP_ID> -member <MEMBER_ID>
+```
+
+A delegated admin may add and remove ordinary members and issue invites from
+its own node (`-bootstrap` must name that node). It cannot remove the founder,
+remove another admin, or change who is an admin. Revoking delegation, or
+removing the member, ends the authority immediately.
 
 Global runtime flags:
 

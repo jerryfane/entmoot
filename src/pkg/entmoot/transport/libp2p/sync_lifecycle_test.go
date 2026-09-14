@@ -283,3 +283,261 @@ func (f *snapshotLifecycleFixture) historyPage(groupID entmoot.GroupID, previous
 	}
 	return RequestHistoryPage(f.ctx, f.client, f.remote, request)
 }
+
+// The head probe runs on every maintenance tick, so it must cost the server
+// nothing that lingers. Reserving a paging snapshot it never finishes would
+// pin one of the few per-peer slots for the snapshot lifetime and starve the
+// roster pull the probe exists to decide on.
+func TestRosterHeadProbeReservesNoSnapshotSlot(t *testing.T) {
+	f := newSnapshotLifecycleFixture(t)
+	group := f.groups[0]
+	head := f.logs[group].Head()
+
+	// Occupy every per-peer slot with genuine paged sessions, the state a busy
+	// peer is in. A probe that reserves a snapshot cannot be served now.
+	held := make([]RosterSyncResponse, 0, maxPeerSnapshots)
+	for i := 0; i < maxPeerSnapshots; i++ {
+		page, err := f.rosterPage(f.groups[i%len(f.groups)], nil, 1)
+		if err != nil || page.Complete {
+			t.Fatalf("holding reservation %d: page=%+v err=%v", i, page, err)
+		}
+		held = append(held, page)
+	}
+	exhausted, err := f.rosterPage(group, nil, 1)
+	if err == nil || exhausted.Error != SyncResourceExhausted {
+		t.Fatalf("slots are not full: page=%+v err=%v", exhausted, err)
+	}
+
+	// Probes must still answer, repeatedly, with every slot taken.
+	for i := 0; i < maxPeerSnapshots*3; i++ {
+		got, err := FetchRosterHead(f.ctx, f.client, f.remote, group)
+		if err != nil {
+			t.Fatalf("probe %d with all slots held: %v", i, err)
+		}
+		if got != head {
+			t.Fatalf("probe %d returned head %s, want %s", i, got, head)
+		}
+	}
+
+	// And the probes must not have consumed anything themselves: a pull works
+	// as soon as the paged sessions finish.
+	for i, page := range held {
+		done, err := f.rosterPage(f.groups[i%len(f.groups)], &page, 100)
+		if err != nil || !done.Complete {
+			t.Fatalf("completing reservation %d: page=%+v err=%v", i, done, err)
+		}
+	}
+	local := f.logs[group].Entries()[:1]
+	updates, complete, err := FetchRosterUpdates(f.ctx, f.client, f.remote, group, local)
+	if !complete {
+		t.Fatal("a small chain was not served completely in one pull")
+	}
+	if err != nil {
+		t.Fatalf("roster pull after the probes: %v", err)
+	}
+	if len(updates) != len(f.logs[group].Entries())-1 {
+		t.Fatalf("pull returned %d entries, want %d", len(updates), len(f.logs[group].Entries())-1)
+	}
+}
+
+// The pull ceiling is a per-round cost limit, not a limit on how many
+// membership changes a group may ever make. Counting the local prefix would
+// turn it into a lifetime cap: a group whose chain passed the ceiling could
+// never be synced again by any node, and roster entries are never compacted.
+func TestRosterPullCeilingBoundsTheDeltaNotTheChainLength(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	founder := mustIdentity(t)
+	serverHost, _, err := NewHost(ctx, founder, libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverHost.Close()
+	clientIdentity := mustIdentity(t)
+	clientHost, _, err := NewHost(ctx, clientIdentity, libp2p.NoListenAddrs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientHost.Close()
+
+	groupID := entmoot.GroupID{0x6c}
+	log := roster.New(groupID)
+	founderInfo := mustNodeInfo(t, founder.PublicKey)
+	if err := log.Genesis(founder, founderInfo, 1_000); err != nil {
+		t.Fatal(err)
+	}
+	// The client must be a member to read the roster at all.
+	client := mustNodeInfo(t, clientIdentity.PublicKey)
+	entry, err := log.SignEntry(founder, "add", client, nil, 2_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := log.Apply(entry); err != nil {
+		t.Fatal(err)
+	}
+	// Grow the chain past the per-round ceiling with founder-signed policy
+	// entries of a type this build does not interpret: cheap to produce and
+	// accepted exactly like any other entry.
+	foreign := []byte(`{"type":"legacy-identity-upgrade/v1"}`)
+	for timestamp := int64(3_000); len(log.Entries()) <= maxRosterSyncEntries+2; timestamp++ {
+		policyEntry, err := log.SignEntry(founder, "policy_change", entmoot.NodeInfo{}, foreign, timestamp)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := log.Apply(policyEntry); err != nil {
+			t.Fatal(err)
+		}
+	}
+	chain := log.Entries()
+	if len(chain) <= maxRosterSyncEntries {
+		t.Fatalf("chain is %d entries, want more than the ceiling %d", len(chain), maxRosterSyncEntries)
+	}
+
+	server := &SyncServer{
+		Host: serverHost, Admission: NewBootstrapAdmission(), Store: store.NewMemory(),
+		Roster: func(id entmoot.GroupID) (*roster.RosterLog, bool) {
+			if id != groupID {
+				return nil, false
+			}
+			return log, true
+		},
+	}
+	if err := server.Install(); err != nil {
+		t.Fatal(err)
+	}
+	remote := peer.AddrInfo{ID: serverHost.ID(), Addrs: serverHost.Addrs()}
+
+	// A node that is one entry behind on an over-ceiling chain must still be
+	// able to catch up: the delta is one entry.
+	local := chain[:len(chain)-1]
+	updates, complete, err := FetchRosterUpdates(ctx, clientHost, remote, groupID, local)
+	if !complete {
+		t.Fatal("a small chain was not served completely in one pull")
+	}
+	if err != nil {
+		t.Fatalf("catching up one entry on a %d-entry chain: %v", len(chain), err)
+	}
+	if len(updates) != 1 || updates[0].ID != chain[len(chain)-1].ID {
+		t.Fatalf("pull returned %d entries, want the single missing one", len(updates))
+	}
+
+	// The ceiling still bounds one round, and a node far behind converges by
+	// keeping each round's validated progress instead of restarting.
+	held := chain[:1]
+	rounds := 0
+	for {
+		rounds++
+		if rounds > 8 {
+			t.Fatalf("catching up from the genesis did not converge in %d rounds", rounds)
+		}
+		part, complete, err := FetchRosterUpdates(ctx, clientHost, remote, groupID, held)
+		if err != nil {
+			t.Fatalf("round %d: %v", rounds, err)
+		}
+		if len(part) == 0 {
+			t.Fatalf("round %d served nothing", rounds)
+		}
+		if len(part) > maxRosterSyncEntries {
+			t.Fatalf("round %d downloaded %d entries, past the ceiling %d", rounds, len(part), maxRosterSyncEntries)
+		}
+		held = append(held, part...)
+		if complete {
+			break
+		}
+	}
+	if rounds < 2 {
+		t.Fatalf("an over-ceiling chain was taken in %d round; the ceiling did not bound the round", rounds)
+	}
+	if len(held) != len(chain) || held[len(held)-1].ID != chain[len(chain)-1].ID {
+		t.Fatalf("catch-up produced %d entries ending %s, want %d ending %s",
+			len(held), held[len(held)-1].ID, len(chain), chain[len(chain)-1].ID)
+	}
+
+	// The unfinished round must have handed its snapshot back, or chaining
+	// rounds would exhaust the peer's per-peer quota: four rounds would pin
+	// all four slots for the snapshot lifetime and a node further behind would
+	// stall instead of converging.
+	for i := 0; i < maxPeerSnapshots; i++ {
+		page, err := RequestRosterPage(ctx, clientHost, remote, RosterSyncRequest{
+			Version: 2, RequestID: fmt.Sprintf("slot-%d", i), GroupID: groupID, Limit: 1,
+		})
+		if err != nil || page.Complete {
+			t.Fatalf("slot %d was not free after the chained pull: page=%+v err=%v", i, page, err)
+		}
+	}
+}
+
+// A peer asking for entries past the end of our chain is not making a
+// malformed request: it holds a longer prefix than we do. Saying which of the
+// two it is lets the caller tell a fork from a transport problem.
+func TestRosterPageReportsAChainShorterThanTheRequest(t *testing.T) {
+	f := newSnapshotLifecycleFixture(t)
+	group := f.groups[0]
+	held := len(f.logs[group].Entries())
+
+	beyond, err := RequestRosterPage(f.ctx, f.client, f.remote, RosterSyncRequest{
+		Version: 2, RequestID: "past-the-end", GroupID: group,
+		AfterSequence: uint64(held + 3), Limit: 16,
+	})
+	if err == nil {
+		t.Fatal("a request past the end of the chain succeeded")
+	}
+	if beyond.Error != SyncShortChain {
+		t.Fatalf("error = %q, want %q", beyond.Error, SyncShortChain)
+	}
+	// A request inside the chain is unaffected.
+	inside, err := RequestRosterPage(f.ctx, f.client, f.remote, RosterSyncRequest{
+		Version: 2, RequestID: "inside", GroupID: group, AfterSequence: 1, Limit: 16,
+	})
+	if err != nil || !inside.Complete || len(inside.Entries) != held-1 {
+		t.Fatalf("page inside the chain: page=%+v err=%v", inside, err)
+	}
+}
+
+// A snapshot token is a handle, not an authorisation. The paged path checks
+// owner, group and kind before honouring one, and releasing must not be the
+// weaker door: a caller holding someone else's token must not be able to
+// cancel that peer's in-flight pull.
+func TestReleasingASnapshotRequiresOwningIt(t *testing.T) {
+	f := newSnapshotLifecycleFixture(t)
+	group := f.groups[0]
+
+	// The fixture client starts a paged pull and holds its snapshot.
+	page, err := f.rosterPage(group, nil, 1)
+	if err != nil || page.Complete || page.SnapshotToken == "" {
+		t.Fatalf("starting the pull: page=%+v err=%v", page, err)
+	}
+
+	// A second member of the same group — authorized, so the request reaches
+	// the handler — tries to free the first member's token.
+	otherIdentity := mustIdentity(t)
+	admit, err := f.logs[group].SignEntry(f.founder, "add", mustNodeInfo(t, otherIdentity.PublicKey), nil, 9_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.logs[group].Apply(admit); err != nil {
+		t.Fatal(err)
+	}
+	other, _, err := NewHost(f.ctx, otherIdentity, libp2p.NoListenAddrs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	if _, err := RequestRosterPage(f.ctx, other, f.remote, RosterSyncRequest{
+		Version: 2, RequestID: "member-can-read", GroupID: group, Limit: 1,
+	}); err != nil {
+		t.Fatalf("the second member cannot read the roster, so the test proves nothing: %v", err)
+	}
+	if _, err := RequestRosterPage(f.ctx, other, f.remote, RosterSyncRequest{
+		Version: 2, RequestID: "steal-release", GroupID: group,
+		SnapshotToken: page.SnapshotToken, ReleaseSnapshot: true,
+	}); err != nil {
+		t.Fatalf("release request failed outright: %v", err)
+	}
+
+	// The owner's pull must still continue on its own snapshot.
+	next, err := f.rosterPage(group, &page, 100)
+	if err != nil || !next.Complete {
+		t.Fatalf("the owner's pull was cancelled by another caller: page=%+v err=%v", next, err)
+	}
+}

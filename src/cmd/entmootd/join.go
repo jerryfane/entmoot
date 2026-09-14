@@ -63,6 +63,26 @@ func cmdJoin(gf *globalFlags, args []string) int {
 		fmt.Fprintln(os.Stderr, "join: stop the running daemon before enrolling a new group")
 		return exitControlUnavail
 	}
+	// A brand-new node has no way to find a relay, so adopt the ones the
+	// inviter uses when the operator named none. Explicit -controlled-relay
+	// flags always win.
+	adoptedRelays := []string(nil)
+	if len(gf.controlledRelays) == 0 {
+		for _, input := range inputs {
+			if input.capability == nil {
+				continue
+			}
+			adoptedRelays = append(adoptedRelays, input.capability.Relays...)
+		}
+		adoptedRelays, _ = validateRelayHints(adoptedRelays)
+		if len(adoptedRelays) > 0 {
+			gf.controlledRelays = append(gf.controlledRelays, adoptedRelays...)
+			fmt.Fprintf(os.Stderr, "join: adopting %d relay(s) named by the invite:\n", len(adoptedRelays))
+			for _, relay := range adoptedRelays {
+				fmt.Fprintf(os.Stderr, "  %s\n", relay)
+			}
+		}
+	}
 	return runGroupDaemon(gf, groupDaemonOptions{
 		command:       "join",
 		event:         "joined",
@@ -81,6 +101,13 @@ func cmdJoin(gf *globalFlags, args []string) int {
 				}
 				if err := persistJoinGroupMetadata(ctx, loadCtx.metadataStore, capability.GroupID, input.groupMetadata); err != nil {
 					return exitTransport, fmt.Errorf("persist group metadata %s: %w", capability.GroupID.String(), err)
+				}
+				// Remember the adopted relays, or a restart of `serve` would
+				// come back with no way to be reached.
+				if len(adoptedRelays) > 0 {
+					if err := saveRelayHints(gf.data, adoptedRelays); err != nil {
+						slog.Warn("join: persist adopted relays", slog.String("err", err.Error()))
+					}
 				}
 			}
 			return exitOK, nil
@@ -274,7 +301,19 @@ type groupDaemonLoadContext struct {
 
 func daemonHostConfig(gf *globalFlags) (libp2ptransport.HostConfig, error) {
 	config := libp2ptransport.HostConfig{Mode: libp2ptransport.DirectConnectivity}
-	relays, err := parseControlledRelays(gf.controlledRelays)
+	configured := gf.controlledRelays
+	if len(configured) == 0 {
+		// Relays adopted from an invite have to survive a restart, otherwise a
+		// NATed node comes back unreachable and nobody can tell it a relay.
+		stored, err := loadRelayHints(gf.data)
+		if err != nil {
+			slog.Warn("daemon: read adopted relays", slog.String("err", err.Error()))
+		} else if len(stored) > 0 {
+			configured = stored
+			slog.Info("daemon: using relays adopted from an invite", slog.Int("relays", len(stored)))
+		}
+	}
+	relays, err := parseControlledRelays(configured)
 	if err != nil {
 		return libp2ptransport.HostConfig{}, err
 	}
@@ -1139,6 +1178,8 @@ func (s *ipcServer) handleConn(ctx context.Context, c net.Conn) {
 		s.handleMemberRemove(ctx, c, v)
 	case *ipc.GroupDeactivateReq:
 		s.handleGroupDeactivate(c, v)
+	case *ipc.RosterRepairReq:
+		s.handleRosterRepair(ctx, c, v)
 	case *ipc.InfoReq:
 		s.handleInfo(ctx, c)
 	case *ipc.TailSubscribe:
@@ -1500,17 +1541,40 @@ func (s *ipcServer) handleInviteCreate(_ context.Context, c net.Conn, req *ipc.I
 		return
 	}
 	founder, ok := session.roster.Founder()
-	if !ok || !bytes.Equal(founder.EntmootPubKey, s.identity.PublicKey) {
-		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeNotMember, GroupID: &gid, Message: "invite_create requires the local founder identity"})
+	if !ok {
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeGroupNotFound, GroupID: &gid, Message: "group has no founder"})
+		return
+	}
+	if !session.roster.CanAdminister(s.memberID) {
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeNotMember, GroupID: &gid, Message: "invite_create requires the founder or a delegated admin identity"})
 		return
 	}
 	founderBinding, err := libp2ptransport.BindingFromPublicKey(founder.EntmootPubKey)
-	if err != nil || founderBinding.PeerID != s.runtime.host.ID() {
-		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeNotMember, GroupID: &gid, Message: "founder identity does not match libp2p host"})
+	if err != nil {
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInternal, GroupID: &gid, Message: "founder identity: " + err.Error()})
 		return
 	}
 	founder.MemberID = &founderBinding.MemberID
 	founder.PeerID = founderBinding.PeerID.String()
+	// This node serves the enrollment, so the invite must name this node's
+	// addresses and, when it is not the founder, this node as the issuer.
+	localBinding, err := libp2ptransport.BindingFromPublicKey(s.identity.PublicKey)
+	if err != nil || localBinding.PeerID != s.runtime.host.ID() {
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeNotMember, GroupID: &gid, Message: "local identity does not match libp2p host"})
+		return
+	}
+	var issuer *entmoot.NodeInfo
+	if s.memberID != founderBinding.MemberID {
+		info, found := session.roster.MemberInfoByID(s.memberID)
+		if !found {
+			_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeNotMember, GroupID: &gid, Message: "local identity is not a member of this group"})
+			return
+		}
+		memberID := s.memberID
+		info.MemberID = &memberID
+		info.PeerID = localBinding.PeerID.String()
+		issuer = &info
+	}
 	var targetMemberID entmoot.MemberID
 	targetPeerID := ""
 	if len(req.TargetPublicKey) != 0 {
@@ -1525,7 +1589,7 @@ func (s *ipcServer) handleInviteCreate(_ context.Context, c net.Conn, req *ipc.I
 	if len(req.BootstrapMultiaddrs) == 0 {
 		req.BootstrapMultiaddrs = make([]string, 0, len(s.runtime.host.Addrs()))
 		for _, address := range s.runtime.host.Addrs() {
-			req.BootstrapMultiaddrs = append(req.BootstrapMultiaddrs, address.Encapsulate(multiaddr.StringCast("/p2p/"+founderBinding.PeerID.String())).String())
+			req.BootstrapMultiaddrs = append(req.BootstrapMultiaddrs, address.Encapsulate(multiaddr.StringCast("/p2p/"+localBinding.PeerID.String())).String())
 		}
 	}
 	allowedAddresses := make([]string, 0, len(req.BootstrapMultiaddrs))
@@ -1536,8 +1600,8 @@ func (s *ipcServer) handleInviteCreate(_ context.Context, c net.Conn, req *ipc.I
 			return
 		}
 		info, err := libpeer.AddrInfoFromP2pAddr(address)
-		if err != nil || info.ID != founderBinding.PeerID {
-			_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInvalidArgument, GroupID: &gid, Message: "bootstrap address does not name the founder host"})
+		if err != nil || info.ID != localBinding.PeerID {
+			_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInvalidArgument, GroupID: &gid, Message: "bootstrap address does not name the issuing host"})
 			return
 		}
 		allowedAddresses = append(allowedAddresses, address.String())
@@ -1560,9 +1624,11 @@ func (s *ipcServer) handleInviteCreate(_ context.Context, c net.Conn, req *ipc.I
 		TargetMemberID:    targetMemberID,
 		TargetPeerID:      targetPeerID,
 		Founder:           founder,
+		Issuer:            issuer,
 		RosterHead:        session.roster.Head(),
-		AllowedPeerIDs:    []string{founderBinding.PeerID.String()},
+		AllowedPeerIDs:    []string{localBinding.PeerID.String()},
 		AllowedMultiaddrs: allowedAddresses,
+		Relays:            s.runtime.relayHints(),
 		MaxUses:           req.MaxUses,
 		IssuedAtMS:        now.UnixMilli(),
 		ExpiresAtMS:       expires.UnixMilli(),
@@ -1602,8 +1668,7 @@ func (s *ipcServer) handleInviteAuthorityCheck(ctx context.Context, c net.Conn, 
 		})
 		return
 	}
-	founder, ok := sess.roster.Founder()
-	if !ok {
+	if _, ok := sess.roster.Founder(); !ok {
 		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
 			Type:    "error",
 			Code:    ipc.CodeGroupNotFound,
@@ -1612,12 +1677,12 @@ func (s *ipcServer) handleInviteAuthorityCheck(ctx context.Context, c net.Conn, 
 		})
 		return
 	}
-	if founder.MemberID == nil || *founder.MemberID != s.memberID || !bytes.Equal(founder.EntmootPubKey, s.identity.PublicKey) {
+	if !sess.roster.CanAdminister(s.memberID) {
 		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
 			Type:    "error",
 			Code:    ipc.CodeNotMember,
 			GroupID: &gid,
-			Message: "invite_create requires the local founder identity",
+			Message: "invite creation requires the founder or a delegated admin identity",
 		})
 		return
 	}
@@ -1675,8 +1740,8 @@ func (s *ipcServer) handleMemberRemove(ctx context.Context, c net.Conn, req *ipc
 		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeGroupNotFound, GroupID: &gid, Message: "group has no founder"})
 		return
 	}
-	if founder.MemberID == nil || *founder.MemberID != s.memberID || !bytes.Equal(founder.EntmootPubKey, s.identity.PublicKey) {
-		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeNotMember, GroupID: &gid, Message: "member_remove requires the local founder identity"})
+	if !sess.roster.CanAdminister(s.memberID) {
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeNotMember, GroupID: &gid, Message: "member_remove requires the founder or a delegated admin identity"})
 		return
 	}
 	if founder.MemberID != nil && *req.Target.MemberID == *founder.MemberID {
@@ -1695,7 +1760,7 @@ func (s *ipcServer) handleMemberRemove(ctx context.Context, c net.Conn, req *ipc
 		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeConflict, GroupID: &gid, Message: "target identity does not match current roster"})
 		return
 	}
-	if err := applyFounderRosterRemove(s.identity, sess.roster, founder, existing); err != nil {
+	if err := applyRosterRemove(s.identity, sess.roster, founder, existing); err != nil {
 		unlock()
 		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInternal, GroupID: &gid, Message: err.Error()})
 		return
@@ -1703,25 +1768,63 @@ func (s *ipcServer) handleMemberRemove(ctx context.Context, c net.Conn, req *ipc
 	head := sess.roster.Head()
 	members := len(sess.roster.MemberIDs())
 	unlock()
-	// Removal voids the invites that would readmit this identity; open bearer
-	// invites cannot be attributed, so they are reported instead.
+	// The removal is committed, so a revocation failure is reported alongside
+	// the result rather than replacing it: answering with an error alone would
+	// make a caller think nothing happened.
+	var revocationError string
 	revoked, err := s.runtime.admission.RevokeInvitesForMember(gid, *existing.MemberID)
 	if err != nil {
-		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInternal, GroupID: &gid, Message: "revoke invites for removed member: " + err.Error()})
-		return
+		revocationError = "revoke invites for removed member: " + err.Error()
+		slog.Error("member_remove: revoke invites", slog.String("err", err.Error()))
 	}
+	var nonces []string
 	live, err := s.runtime.admission.LiveOpenInvites(gid)
 	if err != nil {
-		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInternal, GroupID: &gid, Message: "read open invites: " + err.Error()})
-		return
+		if revocationError == "" {
+			revocationError = "read open invites: " + err.Error()
+		}
+		slog.Error("member_remove: read open invites", slog.String("err", err.Error()))
+	} else {
+		nonces = make([]string, 0, len(live))
+		for _, record := range live {
+			nonces = append(nonces, base64.StdEncoding.EncodeToString(record.Nonce[:]))
+		}
 	}
-	nonces := make([]string, 0, len(live))
-	for _, record := range live {
-		nonces = append(nonces, base64.StdEncoding.EncodeToString(record.Nonce[:]))
+	// metadataStore is the narrow interface the join path needs; the concrete
+	// ESP state store also lists open-invite tokens. A count of zero must mean
+	// "none outstanding", never "could not look", so an unreadable or absent
+	// store leaves the count nil and names the reason.
+	var espOpen *int
+	espError := ""
+	lister, ok := s.metadataStore.(espOpenInviteLister)
+	switch {
+	case !ok || lister == nil:
+		espError = "esp open-invite store is unavailable on this daemon"
+	default:
+		records, err := lister.ListOpenInvitesByGroup(ctx, gid)
+		if err != nil {
+			espError = "read esp open invites: " + err.Error()
+			slog.Error("member_remove: read esp open invites", slog.String("err", err.Error()))
+			break
+		}
+		nowMS := time.Now().UnixMilli()
+		espLive := 0
+		for _, record := range records {
+			if record.Revoked ||
+				(record.ExpiresAtMS > 0 && record.ExpiresAtMS <= nowMS) ||
+				(record.MaxUses > 0 && record.UseCount >= record.MaxUses) {
+				continue
+			}
+			espLive++
+		}
+		espOpen = &espLive
 	}
 	_ = ipc.EncodeAndWrite(c, &ipc.MemberRemoveResp{
 		Status: "removed", GroupID: gid, RosterHead: head, Members: members,
 		RevokedInvites: revoked, OutstandingOpenInvites: nonces,
+		OutstandingESPOpenInvites: espOpen,
+		ESPOpenInvitesError:       espError,
+		InviteRevocationError:     revocationError,
 	})
 }
 

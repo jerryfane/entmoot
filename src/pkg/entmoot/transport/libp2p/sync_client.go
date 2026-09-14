@@ -101,11 +101,26 @@ func ValidateRosterChain(groupID entmoot.GroupID, expectedFounder entmoot.NodeIn
 	return temporary, nil
 }
 
-// FetchRosterUpdates downloads one committed roster snapshot and validates the
-// complete chain before returning entries missing from the local prefix.
-func FetchRosterUpdates(ctx context.Context, h host.Host, remote peer.AddrInfo, groupID entmoot.GroupID, local []entmoot.RosterEntry) ([]entmoot.RosterEntry, error) {
+// maxRosterSyncEntries bounds how many entries one pull may DOWNLOAD. It is a
+// cost limit on a single round, not a limit on how long a group's chain may
+// grow: the local prefix is not counted, because a group that has made more
+// than this many membership changes must still be able to catch up. A peer
+// serving more than this in one round is either broken or making every sync
+// expensive, so the pull is abandoned rather than paged forever.
+const maxRosterSyncEntries = 4096
+
+// FetchRosterUpdates downloads committed roster entries that extend the local
+// prefix and validates them before returning them.
+//
+// It returns complete=false when it stopped at the per-round ceiling with more
+// to take. The entries returned are still a validated extension of the local
+// prefix, so the caller applies them and continues from the new head on a
+// later round: a node far behind converges in several rounds instead of
+// re-downloading the same first pages forever. Only a complete pull is checked
+// against the peer's advertised head, because only then should the two agree.
+func FetchRosterUpdates(ctx context.Context, h host.Host, remote peer.AddrInfo, groupID entmoot.GroupID, local []entmoot.RosterEntry) ([]entmoot.RosterEntry, bool, error) {
 	if len(local) == 0 {
-		return nil, errors.New("libp2p: local roster is empty")
+		return nil, false, errors.New("libp2p: local roster is empty")
 	}
 	all := append([]entmoot.RosterEntry(nil), local...)
 	after := uint64(len(local))
@@ -122,30 +137,82 @@ func FetchRosterUpdates(ctx context.Context, h host.Host, remote peer.AddrInfo, 
 		}
 		response, err := RequestRosterPage(ctx, h, remote, request)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		if page == 0 {
 			token = response.SnapshotToken
 			committedHead = response.CommittedHead
 		} else if response.SnapshotToken != token || response.CommittedHead != committedHead {
-			return nil, errors.New("libp2p: roster snapshot changed")
+			return nil, false, errors.New("libp2p: roster snapshot changed")
 		}
 		if response.NextSequence != after+uint64(len(response.Entries)) {
-			return nil, errors.New("libp2p: invalid roster continuation")
+			return nil, false, errors.New("libp2p: invalid roster continuation")
 		}
 		all = append(all, response.Entries...)
 		after = response.NextSequence
 		if response.Complete {
 			if _, err := ValidateRosterChain(groupID, local[0].Subject, committedHead, all); err != nil {
-				return nil, err
+				return nil, false, err
 			}
-			return append([]entmoot.RosterEntry(nil), all[len(local):]...), nil
+			return append([]entmoot.RosterEntry(nil), all[len(local):]...), true, nil
 		}
 		if len(response.Entries) == 0 {
-			return nil, errors.New("libp2p: empty roster continuation")
+			return nil, false, errors.New("libp2p: empty roster continuation")
+		}
+		if len(all)-len(local) >= maxRosterSyncEntries {
+			// Stop this round at the ceiling, but keep what we validated: the
+			// prefix is a real chain extension even though it is not the
+			// peer's head yet.
+			if _, err := ValidateRosterChain(groupID, local[0].Subject, all[len(all)-1].ID, all); err != nil {
+				return nil, false, err
+			}
+			// Hand the unfinished snapshot back, so chaining rounds does not
+			// exhaust the peer's per-peer quota. A peer that does not know the
+			// field keeps it until it expires, exactly as before.
+			releaseRosterSnapshot(ctx, h, remote, groupID, token)
+			return append([]entmoot.RosterEntry(nil), all[len(local):]...), false, nil
 		}
 	}
-	return nil, errors.New("libp2p: roster page budget exhausted")
+	return nil, false, errors.New("libp2p: roster page budget exhausted")
+}
+
+// FetchRosterHead asks a peer for the head it has committed, without pulling
+// the chain. Callers use it to tell "this peer is behind" from "this peer has
+// entries we do not", which decides whether a sync is worth the pages.
+//
+// The head-only request is newer than the paged one and the decoder rejects
+// unknown fields, so a peer built before it answers malformed. That is not a
+// reason to stop probing it: the probe falls back to the paged form, which
+// every version understands. The fallback costs the peer a snapshot slot it
+// releases on expiry, which is exactly the old behaviour, so an old peer is no
+// worse off than before and a current one pays nothing.
+func FetchRosterHead(ctx context.Context, h host.Host, remote peer.AddrInfo, groupID entmoot.GroupID) (entmoot.RosterEntryID, error) {
+	request := RosterSyncRequest{
+		Version:   2,
+		RequestID: fmt.Sprintf("roster-head-%d", time.Now().UnixNano()),
+		GroupID:   groupID,
+		HeadOnly:  true,
+	}
+	response, err := RequestRosterPage(ctx, h, remote, request)
+	if err == nil {
+		return response.CommittedHead, nil
+	}
+	if ctx.Err() != nil {
+		return entmoot.RosterEntryID{}, err
+	}
+	legacy := RosterSyncRequest{
+		Version:   2,
+		RequestID: fmt.Sprintf("roster-head-legacy-%d", time.Now().UnixNano()),
+		GroupID:   groupID,
+		Limit:     1,
+	}
+	fallback, legacyErr := RequestRosterPage(ctx, h, remote, legacy)
+	if legacyErr != nil {
+		// Report the head-only failure: against a current peer that is the
+		// real error, and against an old one the paged attempt failed too.
+		return entmoot.RosterEntryID{}, err
+	}
+	return fallback.CommittedHead, nil
 }
 
 func equalMemberID(left, right *entmoot.MemberID) bool {
@@ -511,4 +578,25 @@ func encodedJSONSize(value any) int {
 		return 0
 	}
 	return len(payload)
+}
+
+// MaxRosterSyncEntries reports the per-round pull ceiling. Callers that have to
+// chain several pulls, such as fork repair, use it to size their own bounds.
+func MaxRosterSyncEntries() int { return maxRosterSyncEntries }
+
+// releaseRosterSnapshot tells a peer we will not finish a paged pull, so it can
+// free the slot now rather than at expiry. Best effort: an older peer does not
+// know the field and keeps the snapshot until it expires, which is the
+// behaviour before this existed.
+func releaseRosterSnapshot(ctx context.Context, h host.Host, remote peer.AddrInfo, groupID entmoot.GroupID, token string) {
+	if token == "" {
+		return
+	}
+	_, _ = RequestRosterPage(ctx, h, remote, RosterSyncRequest{
+		Version:         2,
+		RequestID:       fmt.Sprintf("roster-release-%d", time.Now().UnixNano()),
+		GroupID:         groupID,
+		SnapshotToken:   token,
+		ReleaseSnapshot: true,
+	})
 }

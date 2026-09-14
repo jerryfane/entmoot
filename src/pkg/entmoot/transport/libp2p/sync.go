@@ -51,6 +51,12 @@ const (
 	SyncCoverageUnavailable SyncErrorCode = "coverage_unavailable"
 	SyncResourceExhausted   SyncErrorCode = "resource_exhausted"
 	SyncInternal            SyncErrorCode = "internal"
+	// SyncShortChain says the caller asked for entries past the end of this
+	// peer's chain: it holds fewer entries than the caller's prefix. That is
+	// not a malformed request, and the difference matters — a caller whose
+	// head is not on this peer's chain and whose prefix is longer is looking
+	// at a fork, which no retry repairs.
+	SyncShortChain SyncErrorCode = "short_chain"
 )
 
 type RosterSyncRequest struct {
@@ -61,6 +67,17 @@ type RosterSyncRequest struct {
 	SnapshotToken string               `json:"snapshot_token,omitempty"`
 	AfterSequence uint64               `json:"after_sequence,omitempty"`
 	Limit         int                  `json:"limit,omitempty"`
+	// ReleaseSnapshot frees the named snapshot without asking for a page. A
+	// pull that stops at its per-round ceiling uses it so the peer's slot is
+	// free immediately: without it, four chained rounds exhaust the per-peer
+	// quota and a node catching up over several rounds stalls.
+	ReleaseSnapshot bool `json:"release_snapshot,omitempty"`
+	// HeadOnly asks for the committed head and nothing else. A head probe must
+	// not reserve a paging snapshot: it is repeated on every maintenance tick,
+	// and a reservation it never finishes would pin one of the server's few
+	// per-peer slots until it expired, starving the pull the probe exists to
+	// decide on.
+	HeadOnly bool `json:"head_only,omitempty"`
 }
 
 type RosterSyncResponse struct {
@@ -244,6 +261,9 @@ func (s *SyncServer) authorize(stream network.Stream, groupID entmoot.GroupID, c
 	if capability == nil {
 		return ErrBootstrapDenied
 	}
+	// Pre-membership reads stay pinned to the current head: unlike enrollment,
+	// nothing here needs an older checkpoint, so a superseded grant gets no
+	// roster or history access.
 	if capability.GroupID != groupID || capability.RosterHead != r.Head() {
 		return ErrBootstrapDenied
 	}
@@ -251,6 +271,14 @@ func (s *SyncServer) authorize(stream network.Stream, groupID entmoot.GroupID, c
 	if !ok || !equalMemberID(founder.MemberID, capability.Founder.MemberID) ||
 		!bytes.Equal(founder.EntmootPubKey, capability.Founder.EntmootPubKey) {
 		return ErrBootstrapDenied
+	}
+	// The signature verifies against the authority the capability names, which
+	// its holder chooses, so that authority must be a member who may currently
+	// administer the group. Without this, anyone could name the real founder as
+	// the anchor, name itself as issuer, self-sign, and read roster and history
+	// before membership.
+	if err := AuthorizedIssuer(r, capability.SigningAuthority()); err != nil {
+		return err
 	}
 	allowedServer := false
 	for _, allowed := range capability.AllowedPeerIDs {
@@ -291,6 +319,34 @@ func (s *SyncServer) handleRoster(stream network.Stream) {
 		return
 	}
 	entries := r.Entries()
+	if request.HeadOnly {
+		// No snapshot, no paging: the answer is one id from live state.
+		if len(entries) == 0 {
+			response.Error = SyncUnauthorized
+			s.writeRoster(stream, response)
+			return
+		}
+		response.Complete = true
+		response.CommittedHead = entries[len(entries)-1].ID
+		response.NextSequence = uint64(len(entries))
+		s.writeRoster(stream, response)
+		return
+	}
+	if request.ReleaseSnapshot {
+		// The caller is done with a snapshot it did not finish, which happens
+		// when a pull stops at its per-round ceiling. Releasing it frees the
+		// slot now instead of holding it for the full snapshot lifetime, so a
+		// node catching up over several rounds does not exhaust this peer's
+		// per-peer quota and stall.
+		s.releaseSnapshotOwnedBy(request.SnapshotToken, stream.Conn().RemotePeer(), request.GroupID)
+		response.Complete = true
+		if len(entries) > 0 {
+			response.CommittedHead = entries[len(entries)-1].ID
+			response.NextSequence = uint64(len(entries))
+		}
+		s.writeRoster(stream, response)
+		return
+	}
 	snapshot, token, snapshotErr := s.rosterSnapshot(stream.Conn().RemotePeer(), request, len(entries))
 	if snapshotErr != "" {
 		response.Error = snapshotErr
@@ -303,7 +359,9 @@ func (s *SyncServer) handleRoster(stream network.Stream) {
 	limit := boundedLimit(request.Limit, 256, maxSyncPageItems)
 	start := int(request.AfterSequence)
 	if start > len(entries) {
-		response.Error = SyncMalformed
+		// The caller's prefix is longer than our whole chain. Say so plainly:
+		// combined with a head the caller does not hold, it is a fork.
+		response.Error = SyncShortChain
 		if request.SnapshotToken == "" {
 			s.releaseSnapshot(token)
 		}
@@ -546,6 +604,24 @@ func (s *SyncServer) snapshot(peerID peer.ID, groupID entmoot.GroupID, kind prot
 func (s *SyncServer) releaseSnapshot(token string) {
 	s.snapshotMu.Lock()
 	defer s.snapshotMu.Unlock()
+	delete(s.snapshots, token)
+}
+
+// releaseSnapshotOwnedBy frees a snapshot only for the peer that reserved it
+// in this group. A client-supplied token is otherwise an unauthenticated
+// handle: the paged path already checks owner, group and kind before honouring
+// one, and a release must not be the weaker door that lets a caller cancel
+// another peer's in-flight pull.
+func (s *SyncServer) releaseSnapshotOwnedBy(token string, peerID peer.ID, groupID entmoot.GroupID) {
+	if token == "" {
+		return
+	}
+	s.snapshotMu.Lock()
+	defer s.snapshotMu.Unlock()
+	value, ok := s.snapshots[token]
+	if !ok || value.peerID != peerID || value.groupID != groupID {
+		return
+	}
 	delete(s.snapshots, token)
 }
 
