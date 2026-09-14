@@ -423,11 +423,60 @@ func TestSyncRosterRecordsARealForkAndClearsItAfterRepair(t *testing.T) {
 	if reports := f.session.rosterDivergenceReports(f.groupID); len(reports) != 0 {
 		t.Fatalf("the repair left a divergence report: %+v", reports)
 	}
+	// The report list is filtered, so it cannot tell a cleared record from one
+	// hidden by the filter. Readiness can: a peer left backed off is not
+	// pulled from for up to fifteen minutes.
+	if !f.session.rosterSyncReady(f.remote.ID, time.Now()) {
+		t.Fatal("the repair left the repaired peer backed off")
+	}
 	// And a further round against the same peer stays clean: our chain now
 	// contains its whole chain, so it is behind, not forked.
 	f.runtime.syncRoster(f.ctx, f.session)
 	if reports := f.session.rosterDivergenceReports(f.groupID); len(reports) != 0 {
 		t.Fatalf("a peer that is merely behind was reported as divergent: %+v", reports)
+	}
+	if !f.session.rosterSyncReady(f.remote.ID, time.Now()) {
+		t.Fatal("a peer that is merely behind was backed off")
+	}
+}
+
+// A peer that is behind us holds a head we already have and a shorter chain.
+// The round must recognise that from the head probe alone: no pull, no
+// divergence, no backoff. Classifying by the error text without the
+// head conjunct, or dropping the equal-or-behind check, both land here.
+func TestSyncRosterIgnoresAPeerThatIsSimplyBehind(t *testing.T) {
+	f := newRepairFixture(t, repairOptions{localIsAdmin: true})
+	// Adopt the peer's chain, then grow ours past it, so the peer's head is on
+	// our chain and its chain is shorter than our prefix.
+	if _, err := f.runtime.repairRoster(f.ctx, f.session, f.remote.ID.String(), false); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		extra := mustNodeInfoFor(t, mustTestIdentityValue(t))
+		entry, err := f.session.roster.SignEntry(f.runtime.identity, "add", extra, nil, f.session.roster.HeadTimestamp()+10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := f.session.roster.Apply(entry); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !f.session.roster.HasEntry(f.winning[len(f.winning)-1].ID) {
+		t.Fatal("fixture: the peer's head is not on our chain")
+	}
+
+	head := f.session.roster.Head()
+	entries := len(f.session.roster.Entries())
+	f.runtime.syncRoster(f.ctx, f.session)
+
+	if reports := f.session.rosterDivergenceReports(f.groupID); len(reports) != 0 {
+		t.Fatalf("a peer behind us was reported as divergent: %+v", reports)
+	}
+	if !f.session.rosterSyncReady(f.remote.ID, time.Now()) {
+		t.Fatal("a peer behind us was backed off, so later rounds will skip it")
+	}
+	if f.session.roster.Head() != head || len(f.session.roster.Entries()) != entries {
+		t.Fatalf("a round against a peer behind us changed our chain: head %s -> %s", head, f.session.roster.Head())
 	}
 }
 

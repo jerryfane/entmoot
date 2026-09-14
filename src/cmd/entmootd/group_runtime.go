@@ -787,6 +787,11 @@ func rosterChainDiverged(err error, headOffChain bool) bool {
 	// together with a head we do not hold: the server cannot know our head, so
 	// the caller supplies that half. Without it, a peer that simply pruned or
 	// restarted would be reported as forked.
+	//
+	// Today this is redundant with syncRoster's equal-or-behind check, which
+	// never pulls from a peer whose head is on our chain, so no test can
+	// distinguish the two. It is kept so the classifier states its own
+	// precondition instead of depending on one caller's ordering.
 	return headOffChain && strings.Contains(text, string(libp2ptransport.SyncShortChain))
 }
 
@@ -861,7 +866,7 @@ func (r *groupRuntime) syncRoster(ctx context.Context, session *groupSession) {
 			}
 			applied++
 		}
-		session.noteRosterSyncOutcome(remote.ID, applied, rejected, complete)
+		session.noteRosterSyncOutcome(remote.ID, applied, rejected)
 		if applied > 0 {
 			r.logger.Info("libp2p roster synchronized",
 				slog.String("group_id", session.groupID.String()),
@@ -1156,15 +1161,14 @@ func rosterHasLocalIdentityPubKey(rlog *roster.RosterLog, publicKey []byte) bool
 //     chain may have applied, but the peer still holds a chain this node could
 //     not take, and clearing that would erase the fork evidence in the same
 //     round it was found.
-//   - applied and complete: the peers agree, so the record is cleared.
-//   - applied but stopped at the per-round ceiling: progress, not convergence.
-//     The record is dropped so the next round is not delayed, because a node
-//     catching up over several rounds must not be backed off for progressing.
-func (s *groupSession) noteRosterSyncOutcome(id peer.ID, applied int, rejected, complete bool) {
+//   - anything applied with nothing rejected: the peer served a validated
+//     extension of our chain, so it is not forked from us and must not be
+//     delayed — whether it finished or stopped at the per-round ceiling. A
+//     node catching up over several rounds is never backed off for
+//     progressing.
+func (s *groupSession) noteRosterSyncOutcome(id peer.ID, applied int, rejected bool) {
 	if applied == 0 || rejected {
 		return
 	}
-	// Complete and "more to take" both clear the record: the peer served a
-	// validated extension, so it is neither forked from us nor worth delaying.
 	s.clearRosterSyncFailure(id)
 }
