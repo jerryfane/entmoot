@@ -1178,6 +1178,8 @@ func (s *ipcServer) handleConn(ctx context.Context, c net.Conn) {
 		s.handleMemberRemove(ctx, c, v)
 	case *ipc.GroupDeactivateReq:
 		s.handleGroupDeactivate(c, v)
+	case *ipc.RosterRepairReq:
+		s.handleRosterRepair(ctx, c, v)
 	case *ipc.InfoReq:
 		s.handleInfo(ctx, c)
 	case *ipc.TailSubscribe:

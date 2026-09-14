@@ -60,6 +60,7 @@ group public descriptor|publish
 invite create|list|revoke
 roster add|remove
 roster admin list|grant|revoke
+roster repair
 ```
 
 Fleet and agent-command surfaces are disabled unless their explicit environment
@@ -179,6 +180,19 @@ recorded also blocks it, so a leaked invite file is recoverable. `roster
 remove` revokes the invites bound to the removed member, reports the count, and
 lists the group's remaining open nonces, which name nobody and therefore cannot
 be revoked automatically.
+
+Two authorised signers who write against the same roster head produce two
+chains, and the log is strictly linear, so nothing merges them: the group
+splits and `status` reports `roster_divergence`. `roster repair -group <id>`
+ends that split from the losing side. It asks the named peer (`-peer`, or the
+only divergent peer) for its chain, validates it from the shared genesis,
+adopts it, and re-signs the local changes the adopted chain does not carry.
+`-dry-run` reports what would be discarded first. The command needs a running
+daemon, because the daemon holds the roster writer lease and the peer
+connections. A change this node may no longer author is reported as
+unrecoverable, with a non-zero exit, instead of being dropped in silence; a
+message published in the fork window and naming a discarded head cannot be
+verified against the adopted chain.
 
 Join validates the complete capability before network use, fetches roster state
 only from an allowed serving peer, binds the fetched founder and its own

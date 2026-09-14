@@ -35,14 +35,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reason and when it started, not just logged. Enrollment retries its own
   entry against a moved head instead of failing, so a concurrent write by
   another admin costs a retry.
-- **Known limitation: concurrent roster authors can still fork the log.** The
-  roster is strictly linear (one parent, must be the current head), so if two
-  authorised signers commit against the same head while partitioned, both
-  sides keep their own entry and neither can accept the other's. Retries and
-  the pre-apply retry above shrink the window to the write itself, and
-  `roster_divergence` makes a split visible, but there is no automatic repair
-  yet: an operator has to re-issue the losing change. `roster admin` is also
-  offline maintenance only, like `roster add|remove`.
+- **`roster repair` ends a fork.** The roster is strictly linear (one parent,
+  which must be the current head), so two authorised signers who commit
+  against the same head while partitioned produce two chains that no retry can
+  merge. Enrollment retrying against a moved head shrinks the window to the
+  write itself and `roster_divergence` makes a split visible; this closes it.
+  `roster repair -group <id> [-peer <peer>] [-dry-run]` asks a peer for its
+  chain, validates it from the shared genesis under the ordinary acceptance
+  rules, adopts it in one transaction, and re-signs the local changes the
+  adopted chain does not carry. It reports what it discarded, what it
+  re-issued, what the adopted chain already satisfied, and — with a non-zero
+  exit — any change this node may no longer author, so nothing goes missing in
+  silence. The command needs the running daemon, which holds the roster writer
+  lease and the peer connections. A repair never changes group or founder: a
+  chain with a different genesis, a bad signature or a gap is refused with the
+  log untouched. A message published in the fork window naming a discarded
+  head cannot be verified against the adopted chain; that is the cost of
+  converging. `roster admin` remains offline maintenance only, like
+  `roster add|remove`.
 - **Removal reporting is complete and survives cleanup failure.** `roster
   remove`, the IPC member-remove path and the ESP member_remove operation now
   report the removal result even when invite revocation fails, carrying

@@ -83,6 +83,9 @@ type RosterLog struct {
 	// persist commits one validated entry before the in-memory projection
 	// advances. Persistent logs store entries and projections transactionally.
 	persist func(entmoot.RosterEntry) error
+	// replace atomically swaps the whole persisted chain. Only fork repair
+	// uses it; in-memory logs leave it nil.
+	replace func([]entmoot.RosterEntry) error
 	// claimWriter acquires the persistent writer lease. In-memory logs leave it
 	// nil. Persistent logs acquire lazily for offline mutation; daemons call
 	// ClaimWriter during startup.
@@ -797,6 +800,10 @@ func cloneEntry(entry entmoot.RosterEntry) entmoot.RosterEntry {
 	out.Policy = append([]byte(nil), entry.Policy...)
 	out.Parents = append([]entmoot.RosterEntryID(nil), entry.Parents...)
 	out.Signature = append([]byte(nil), entry.Signature...)
+	if entry.ActorMemberID != nil {
+		actor := *entry.ActorMemberID
+		out.ActorMemberID = &actor
+	}
 	if entry.GroupID != nil {
 		groupID := *entry.GroupID
 		out.GroupID = &groupID
