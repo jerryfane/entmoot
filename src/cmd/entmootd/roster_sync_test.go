@@ -310,7 +310,7 @@ func TestRosterSyncOutcomeKeepsForkEvidenceAndFreesProgress(t *testing.T) {
 
 	// Applied some, then rejected: the fork stays reported and backed off.
 	partial := forked()
-	partial.noteRosterSyncOutcome(id, 3, true, false)
+	partial.noteRosterSyncOutcome(id, 3, true)
 	if reports := partial.rosterDivergenceReports(groupID); len(reports) != 1 {
 		t.Fatalf("a partially applied pull erased its fork record: %+v", reports)
 	}
@@ -320,14 +320,14 @@ func TestRosterSyncOutcomeKeepsForkEvidenceAndFreesProgress(t *testing.T) {
 
 	// Applied nothing at all: likewise untouched.
 	empty := forked()
-	empty.noteRosterSyncOutcome(id, 0, false, true)
+	empty.noteRosterSyncOutcome(id, 0, false)
 	if reports := empty.rosterDivergenceReports(groupID); len(reports) != 1 {
 		t.Fatalf("a pull that applied nothing erased its fork record: %+v", reports)
 	}
 
 	// Applied and complete: the peers agree, so nothing is left standing.
 	agreed := forked()
-	agreed.noteRosterSyncOutcome(id, 3, false, true)
+	agreed.noteRosterSyncOutcome(id, 3, false)
 	if reports := agreed.rosterDivergenceReports(groupID); len(reports) != 0 {
 		t.Fatalf("a completed pull left a fork record: %+v", reports)
 	}
@@ -337,7 +337,7 @@ func TestRosterSyncOutcomeKeepsForkEvidenceAndFreesProgress(t *testing.T) {
 
 	// Applied, more to take: progress must not be delayed.
 	progressing := forked()
-	progressing.noteRosterSyncOutcome(id, 3, false, false)
+	progressing.noteRosterSyncOutcome(id, 3, false)
 	if !progressing.rosterSyncReady(id, now) {
 		t.Fatal("a peer serving progress was backed off")
 	}
