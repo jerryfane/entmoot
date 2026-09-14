@@ -281,7 +281,8 @@ func (r *RosterLog) AcceptGenesis(entry entmoot.RosterEntry) error {
 //   - Op must be one of "add", "remove", or "policy_change";
 //   - the signer must be authorised for that op: the founder always, a
 //     delegated admin for adds and removals of ordinary members. Only the
-//     founder changes the admin set, removes an admin, or removes itself;
+//     founder changes the admin set or removes another admin; an admin may
+//     remove itself, which gives up its own delegation;
 //   - the signature must verify against the signer's current member record,
 //     so losing membership or delegation ends the authority at once;
 //   - Entry.ID must equal canonical.RosterEntryID of the entry with id and

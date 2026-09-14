@@ -27,6 +27,10 @@ type repairFixture struct {
 	remote  peer.AddrInfo
 	groupID entmoot.GroupID
 	winning []entmoot.RosterEntry
+	// remoteLog is the founder's chain, served over the roster protocol.
+	remoteLog *roster.RosterLog
+	// founderIdentity signs entries on the founder's chain.
+	founderIdentity *keystore.Identity
 	// losing is the member this node added on the branch that loses.
 	losing entmoot.NodeInfo
 	// winner is the member the founder's chain carries instead.
@@ -155,7 +159,8 @@ func newRepairFixture(t *testing.T, opts repairOptions) *repairFixture {
 	}
 	return &repairFixture{
 		ctx: ctx, runtime: runtime, session: session, remote: remote,
-		groupID: groupID, winning: remoteLog.Entries(), losing: losing, winner: winner,
+		groupID: groupID, winning: remoteLog.Entries(), remoteLog: remoteLog,
+		founderIdentity: founderIdentity, losing: losing, winner: winner,
 	}
 }
 
@@ -337,5 +342,48 @@ func TestRepairRefusesAPeerThatIsMerelyBehind(t *testing.T) {
 	if f.session.roster.Head() != head || len(f.session.roster.Entries()) != entries {
 		t.Fatalf("a refused repair rewrote the chain: head %s -> %s, %d -> %d entries",
 			head, f.session.roster.Head(), entries, len(f.session.roster.Entries()))
+	}
+}
+
+// A pull stops at a per-round ceiling, so a repair whose adopted chain is
+// longer than that must chain several pulls. Failing here would make the
+// documented escape hatch for a long-lived group unusable, which is the case
+// most likely to need it.
+func TestRepairAdoptsAChainLongerThanOnePull(t *testing.T) {
+	f := newRepairFixture(t, repairOptions{localIsAdmin: true})
+	// Grow the peer's chain past one pull's ceiling with founder-signed policy
+	// entries of a family this build does not interpret: cheap to produce and
+	// accepted exactly like any other entry.
+	foreign := []byte(`{"type":"legacy-identity-upgrade/v1"}`)
+	timestamp := f.remoteLog.HeadTimestamp()
+	// Comfortably past one round, so a single pull cannot coincidentally
+	// cover the whole chain.
+	for len(f.remoteLog.Entries()) < libp2ptransport.MaxRosterSyncEntries()+600 {
+		timestamp++
+		entry, err := f.remoteLog.SignEntry(f.founderIdentity, "policy_change", entmoot.NodeInfo{}, foreign, timestamp)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := f.remoteLog.Apply(entry); err != nil {
+			t.Fatal(err)
+		}
+	}
+	want := f.remoteLog.Entries()
+	if len(want) <= libp2ptransport.MaxRosterSyncEntries()+1 {
+		t.Fatalf("peer chain is %d entries, want more than one pull's ceiling", len(want))
+	}
+
+	plan, err := f.runtime.repairRoster(f.ctx, f.session, f.remote.ID.String(), false)
+	if err != nil {
+		t.Fatalf("repairing against a chain longer than one pull: %v", err)
+	}
+	if plan.remoteHead != want[len(want)-1].ID {
+		t.Fatalf("adopted head %s, want %s", plan.remoteHead, want[len(want)-1].ID)
+	}
+	if got := len(f.session.roster.Entries()); got != len(want)+len(plan.reissued) {
+		t.Fatalf("adopted %d entries, want %d plus %d re-issued", got, len(want), len(plan.reissued))
+	}
+	if !f.session.roster.IsMemberID(*f.winner.MemberID) {
+		t.Fatal("the adopted chain's member is missing")
 	}
 }

@@ -232,6 +232,12 @@ func TestOnlyANonExtendingChainCountsAsDivergence(t *testing.T) {
 	if reports := session.rosterDivergenceReports(groupID); len(reports) != 1 {
 		t.Fatalf("a fork produced %+v, want one report", reports)
 	}
+	// A timeout after a fork does not mean the fork healed, so the standing
+	// report must survive it.
+	session.noteRosterSyncFailure(id, now, groupRoster.Head(), entmoot.RosterEntryID{9}, "pull unavailable: context deadline exceeded", false)
+	if reports := session.rosterDivergenceReports(groupID); len(reports) != 1 {
+		t.Fatalf("a transient failure erased a standing fork report: %+v", reports)
+	}
 
 	// A report must stop being asserted once the head it names is on our
 	// chain, even before the peer is retried.
@@ -253,4 +259,20 @@ func mustTestIdentityInfo(t *testing.T) entmoot.NodeInfo {
 	t.Helper()
 	_, info, _ := mustTestIdentity(t)
 	return info
+}
+
+// A forked peer can be SHORTER than we are: it holds fewer entries and a head
+// we do not have. The server reports that its chain ends before our prefix,
+// and that must read as a fork, or the split is invisible and `roster repair`
+// has nothing to name.
+func TestAShorterForkedChainIsReportedAsDivergence(t *testing.T) {
+	shortChain := fmt.Errorf("libp2p: roster sync: %s", libp2ptransport.SyncShortChain)
+	if !rosterChainDiverged(shortChain) {
+		t.Fatalf("%v was not classified as a fork", shortChain)
+	}
+	// And it must still be distinguishable from an ordinary malformed reply,
+	// which says nothing about chains.
+	if rosterChainDiverged(fmt.Errorf("libp2p: roster sync: %s", libp2ptransport.SyncMalformed)) {
+		t.Fatal("a malformed reply was classified as a fork")
+	}
 }

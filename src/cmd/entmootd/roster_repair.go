@@ -18,6 +18,11 @@ import (
 	libp2ptransport "entmoot/pkg/entmoot/transport/libp2p"
 )
 
+// maxRepairFetchRounds bounds how many ceiling-limited pulls one repair will
+// chain together. A repair must be able to take a chain longer than a single
+// round allows, but it must not page from a peer forever.
+const maxRepairFetchRounds = 16
+
 // repairPlan is what a repair would do, or did: the chain to adopt, the local
 // entries that chain does not carry, and what became of each of them.
 type repairPlan struct {
@@ -52,22 +57,33 @@ func (r *groupRuntime) repairRoster(ctx context.Context, session *groupSession, 
 	if len(local) == 0 {
 		return nil, errors.New("local roster is empty; join or import the group first")
 	}
-	fetchCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	fetchCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
 	// Ask from the genesis entry: the peer's chain diverges from ours, so only
-	// the genesis is guaranteed common ground, and FetchRosterUpdates validates
-	// the complete chain it returns against that anchor.
-	updates, err := libp2ptransport.FetchRosterUpdates(fetchCtx, r.host, remote, session.groupID, local[:1])
-	if err != nil {
-		return nil, fmt.Errorf("fetch chain from %s: %w", remote.ID, err)
+	// the genesis is guaranteed common ground. A pull stops at a per-round
+	// ceiling, so keep asking with what we already hold until the peer says
+	// the chain is complete — a repair needs the whole chain, not a prefix.
+	chain := []entmoot.RosterEntry{local[0]}
+	for round := 0; ; round++ {
+		if round == maxRepairFetchRounds {
+			return nil, fmt.Errorf("peer %s served more than %d rounds of roster entries without completing its chain",
+				remote.ID, maxRepairFetchRounds)
+		}
+		updates, complete, err := libp2ptransport.FetchRosterUpdates(fetchCtx, r.host, remote, session.groupID, chain)
+		if err != nil {
+			return nil, fmt.Errorf("fetch chain from %s: %w", remote.ID, err)
+		}
+		if len(updates) == 0 {
+			if round == 0 {
+				return nil, fmt.Errorf("peer %s served nothing beyond the genesis entry", remote.ID)
+			}
+			return nil, fmt.Errorf("peer %s stopped serving its chain before completing it", remote.ID)
+		}
+		chain = append(chain, updates...)
+		if complete {
+			break
+		}
 	}
-	if len(updates) == 0 {
-		return nil, fmt.Errorf("peer %s served nothing beyond the genesis entry", remote.ID)
-	}
-	// FetchRosterUpdates returns only what the prefix was missing, and it has
-	// already validated the whole chain against this genesis, so the complete
-	// chain is the genesis plus those entries.
-	chain := append([]entmoot.RosterEntry{local[0]}, updates...)
 	plan := &repairPlan{
 		peer:       remote,
 		chain:      chain,

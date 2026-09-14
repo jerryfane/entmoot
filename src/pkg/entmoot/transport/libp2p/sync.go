@@ -51,6 +51,12 @@ const (
 	SyncCoverageUnavailable SyncErrorCode = "coverage_unavailable"
 	SyncResourceExhausted   SyncErrorCode = "resource_exhausted"
 	SyncInternal            SyncErrorCode = "internal"
+	// SyncShortChain says the caller asked for entries past the end of this
+	// peer's chain: it holds fewer entries than the caller's prefix. That is
+	// not a malformed request, and the difference matters — a caller whose
+	// head is not on this peer's chain and whose prefix is longer is looking
+	// at a fork, which no retry repairs.
+	SyncShortChain SyncErrorCode = "short_chain"
 )
 
 type RosterSyncRequest struct {
@@ -333,7 +339,9 @@ func (s *SyncServer) handleRoster(stream network.Stream) {
 	limit := boundedLimit(request.Limit, 256, maxSyncPageItems)
 	start := int(request.AfterSequence)
 	if start > len(entries) {
-		response.Error = SyncMalformed
+		// The caller's prefix is longer than our whole chain. Say so plainly:
+		// combined with a head the caller does not hold, it is a fork.
+		response.Error = SyncShortChain
 		if request.SnapshotToken == "" {
 			s.releaseSnapshot(token)
 		}

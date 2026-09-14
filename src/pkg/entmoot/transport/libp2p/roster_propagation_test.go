@@ -79,7 +79,10 @@ func TestFounderPullsAdminAuthoredRosterEntries(t *testing.T) {
 	if founderLog.HasEntry(head) {
 		t.Fatal("advertised head is already known locally")
 	}
-	updates, err := FetchRosterUpdates(ctx, founderHost, remote, groupID, founderLog.Entries())
+	updates, complete, err := FetchRosterUpdates(ctx, founderHost, remote, groupID, founderLog.Entries())
+	if !complete {
+		t.Fatal("a small chain was not served completely in one pull")
+	}
 	if err != nil {
 		t.Fatalf("founder could not pull admin-authored entries: %v", err)
 	}

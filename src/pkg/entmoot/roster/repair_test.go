@@ -222,8 +222,14 @@ func TestFailedReplaceResyncsTheProjectionWithTheStore(t *testing.T) {
 	}
 	f.local.storedChain = func() ([]entmoot.RosterEntry, error) { return stored, nil }
 
-	if _, err := f.local.ReplaceChain(f.winning); err == nil {
+	_, err := f.local.ReplaceChain(f.winning)
+	if err == nil {
 		t.Fatal("a failed replace reported success")
+	}
+	// The repair is over, so the change the reconciled chain does not carry is
+	// the operator's to redo: the error has to name it.
+	if !strings.Contains(err.Error(), "did not re-issue") {
+		t.Fatalf("error = %q, want it to name the changes the repair did not re-issue", err)
 	}
 	if f.local.Head() != adopted {
 		t.Fatalf("head = %s, want the durable %s: the projection did not follow the store", f.local.Head(), adopted)

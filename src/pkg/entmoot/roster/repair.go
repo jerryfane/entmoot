@@ -2,6 +2,7 @@ package roster
 
 import (
 	"fmt"
+	"strings"
 
 	"entmoot/pkg/entmoot"
 )
@@ -121,6 +122,11 @@ func (r *RosterLog) CommonPrefix(chain []entmoot.RosterEntry) int {
 // after a replacement whose outcome is unknown. database/sql cannot tell "did
 // not commit" from "committed, then failed to report it", so the store is
 // asked what it holds and that answer wins. r.mu must be held for writing.
+//
+// The repair is over either way: this returns an error, so the caller never
+// re-issues anything. When the store did move, the error names the entries the
+// reconciled chain no longer carries, because those are exactly the changes an
+// operator still has to make by hand.
 func (r *RosterLog) resyncAfterFailedReplaceLocked(cause error) error {
 	if r.storedChain == nil {
 		return fmt.Errorf("roster: persist replacement chain: %w", cause)
@@ -140,6 +146,16 @@ func (r *RosterLog) resyncAfterFailedReplaceLocked(cause error) error {
 	if err := ValidateEntries(r.groupID, stored); err != nil {
 		return fmt.Errorf("roster: persist replacement chain: %w; the durable chain no longer validates (%v), so this group's state is unknown and must be restored from a peer or a backup", cause, err)
 	}
+	keep := make(map[entmoot.RosterEntryID]struct{}, len(stored))
+	for _, entry := range stored {
+		keep[entry.ID] = struct{}{}
+	}
+	var lost []string
+	for _, entry := range r.entries {
+		if _, ok := keep[entry.ID]; !ok {
+			lost = append(lost, entry.Op+" "+entry.ID.String())
+		}
+	}
 	r.resetLocked()
 	for i, entry := range stored {
 		if i == 0 {
@@ -147,5 +163,9 @@ func (r *RosterLog) resyncAfterFailedReplaceLocked(cause error) error {
 		}
 		r.applyLocked(entry)
 	}
-	return fmt.Errorf("roster: replacement chain reported %w, but the durable chain had changed; the projection now matches the store at head %s", cause, r.head)
+	if len(lost) == 0 {
+		return fmt.Errorf("roster: replacement chain reported %w, but the durable chain had changed; the projection now matches the store at head %s", cause, r.head)
+	}
+	return fmt.Errorf("roster: replacement chain reported %w, but the durable chain had changed; the projection now matches the store at head %s, and the repair did not re-issue these changes, which are no longer on the chain: %s",
+		cause, r.head, strings.Join(lost, ", "))
 }
