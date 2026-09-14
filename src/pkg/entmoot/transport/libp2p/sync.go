@@ -15,6 +15,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/peerstore"
 	"github.com/libp2p/go-libp2p/core/protocol"
 
 	"entmoot/pkg/entmoot"
@@ -24,15 +25,17 @@ import (
 )
 
 const (
-	maxSyncRequestBytes  = 8 << 10
-	maxRosterResponse    = 512 << 10
-	maxHistoryListBytes  = 128 << 10
-	maxHistoryBodyBytes  = 384 << 10
-	maxSyncPageItems     = 1024
-	maxHistoryBodyItems  = 64
-	syncSnapshotLifetime = 30 * time.Second
-	maxPeerSnapshots     = 4
-	maxGlobalSnapshots   = 32
+	maxSyncRequestBytes       = 8 << 10
+	maxRosterResponse         = 512 << 10
+	maxHistoryListBytes       = 128 << 10
+	maxHistoryBodyBytes       = 384 << 10
+	maxSyncPageItems          = 1024
+	maxHistoryBodyItems       = 64
+	maxPeerRecordResponse     = 256 << 10
+	maxPeerRecordsPerResponse = 128
+	syncSnapshotLifetime      = 30 * time.Second
+	maxPeerSnapshots          = 4
+	maxGlobalSnapshots        = 32
 )
 
 type SyncErrorCode string
@@ -110,6 +113,20 @@ type HistorySyncResponse struct {
 	Error              SyncErrorCode        `json:"error,omitempty"`
 }
 
+type PeerRecordRequest struct {
+	Version uint8           `json:"version"`
+	GroupID entmoot.GroupID `json:"group_id"`
+}
+
+// PeerRecordResponse carries marshalled libp2p record.Envelope bytes, each
+// signed by the member it describes, so a third member can forward them
+// without any additional signing authority.
+type PeerRecordResponse struct {
+	Version uint8         `json:"version"`
+	Records [][]byte      `json:"records,omitempty"`
+	Error   SyncErrorCode `json:"error,omitempty"`
+}
+
 type syncSnapshot struct {
 	peerID     peer.ID
 	groupID    entmoot.GroupID
@@ -133,7 +150,10 @@ type SyncServer struct {
 	Roster        func(entmoot.GroupID) (*roster.RosterLog, bool)
 	Store         store.MessageStore
 	LegacyHistory func(entmoot.GroupID) (*merkle.Tree, bool)
-	Now           func() time.Time
+	// PeerRecords supplies the group's verified record cache. Without it the
+	// server can still serve its own address, but it forwards nothing.
+	PeerRecords func(entmoot.GroupID) (*PeerRecordCache, bool)
+	Now         func() time.Time
 
 	snapshotMu sync.Mutex
 	snapshots  map[string]syncSnapshot
@@ -146,7 +166,50 @@ func (s *SyncServer) Install() error {
 	s.snapshots = make(map[string]syncSnapshot)
 	s.Host.SetStreamHandler(RosterProtocol, s.handleRoster)
 	s.Host.SetStreamHandler(HistoryProtocol, s.handleHistory)
+	s.Host.SetStreamHandler(PeerRecordProtocol, s.handlePeerRecords)
 	return nil
+}
+
+// handlePeerRecords serves this node's own signed peer record plus the verified
+// records it holds for other members. Membership is the only credential: a
+// bootstrap capability cannot open this protocol, so an enrolling peer learns
+// no member addresses here.
+func (s *SyncServer) handlePeerRecords(stream network.Stream) {
+	defer stream.Close()
+	_ = stream.SetDeadline(time.Now().Add(10 * time.Second))
+	var request PeerRecordRequest
+	if err := decodeJSONLimit(stream, maxSyncRequestBytes, &request); err != nil || request.Version != 1 {
+		s.writePeerRecords(stream, PeerRecordResponse{Version: 1, Error: SyncMalformed})
+		return
+	}
+	if err := s.authorize(stream, request.GroupID, nil, PeerRecordProtocol); err != nil {
+		s.writePeerRecords(stream, PeerRecordResponse{Version: 1, Error: SyncUnauthorized})
+		return
+	}
+	if _, ok := s.Roster(request.GroupID); !ok {
+		s.writePeerRecords(stream, PeerRecordResponse{Version: 1, Error: SyncUnauthorized})
+		return
+	}
+	remote := stream.Conn().RemotePeer()
+	response := PeerRecordResponse{Version: 1}
+	if certified, ok := peerstore.GetCertifiedAddrBook(s.Host.Peerstore()); ok {
+		if envelope := certified.GetPeerRecord(s.Host.ID()); envelope != nil {
+			if payload, err := envelope.Marshal(); err == nil {
+				response.Records = append(response.Records, payload)
+			}
+		}
+	}
+	if s.PeerRecords != nil {
+		if cache, ok := s.PeerRecords(request.GroupID); ok {
+			for _, payload := range cache.Snapshot(remote) {
+				if len(response.Records) >= maxPeerRecordsPerResponse {
+					break
+				}
+				response.Records = append(response.Records, payload)
+			}
+		}
+	}
+	s.writePeerRecords(stream, response)
 }
 
 func (s *SyncServer) now() time.Time {
@@ -461,6 +524,15 @@ func (s *SyncServer) releaseSnapshot(token string) {
 func (s *SyncServer) writeRoster(stream network.Stream, response RosterSyncResponse) {
 	if err := encodeJSONLimit(stream, response, maxRosterResponse); err != nil {
 		_ = stream.Reset()
+	}
+}
+
+func (s *SyncServer) writePeerRecords(stream network.Stream, response PeerRecordResponse) {
+	if err := encodeJSONLimit(stream, response, maxPeerRecordResponse); err != nil {
+		fallback := PeerRecordResponse{Version: 1, Error: SyncResourceExhausted}
+		if fallbackErr := encodeJSONLimit(stream, fallback, maxPeerRecordResponse); fallbackErr != nil {
+			_ = stream.Reset()
+		}
 	}
 }
 

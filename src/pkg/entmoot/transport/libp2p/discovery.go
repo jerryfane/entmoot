@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"sync"
 	"time"
 
 	libp2p "github.com/libp2p/go-libp2p"
@@ -75,6 +76,7 @@ func NewConfiguredHost(ctx context.Context, identity *keystore.Identity, cfg Hos
 	}
 	options := []libp2p.Option{libp2p.ConnectionManager(manager), libp2p.ResourceManager(resources)}
 	var privateAddresses *relayOnlyPeerstore
+	var relayAddrs *advertisedRelayAddrs
 	switch cfg.Mode {
 	case "", DirectConnectivity:
 		if len(cfg.ListenAddrs) > 0 {
@@ -85,6 +87,16 @@ func NewConfiguredHost(ctx context.Context, identity *keystore.Identity, cfg Hos
 		// peer, so the protocol is enabled even without local relays. Relay
 		// rendezvous itself stays opt-in through ControlledRelays.
 		options = append(options, libp2p.EnableRelay(), libp2p.EnableHolePunching())
+		if len(cfg.ControlledRelays) > 0 {
+			// libp2p only folds relay addresses into Addrs() once AutoNAT
+			// reports no reachable address. Members must be able to publish a
+			// circuit address as soon as the reservation exists, so mirror the
+			// reservation manager's addresses unconditionally.
+			relayAddrs = &advertisedRelayAddrs{}
+			options = append(options, libp2p.AddrsFactory(func(addresses []multiaddr.Multiaddr) []multiaddr.Multiaddr {
+				return multiaddr.Unique(append(slices.Clone(addresses), relayAddrs.snapshot()...))
+			}))
+		}
 	case RelayOnlyConnectivity:
 		gater := newRelayOnlyGater(cfg.ControlledRelays)
 		privateAddresses, err = newRelayOnlyPeerstore(gater.relays)
@@ -126,6 +138,12 @@ func NewConfiguredHost(ctx context.Context, identity *keystore.Identity, cfg Hos
 	if privateHost != nil {
 		privateHost.Host = h
 		h = privateHost
+	}
+	if relayAddrs != nil {
+		if err := relayAddrs.watch(hostCtx, h.EventBus()); err != nil {
+			_ = h.Close()
+			return nil, Binding{}, err
+		}
 	}
 	if len(cfg.ControlledRelays) > 0 {
 		reservations := &RelayReservationManager{Host: h, Relays: cfg.ControlledRelays}
@@ -215,6 +233,48 @@ func (n *memberMDNSNotifee) HandlePeerFound(info peer.AddrInfo) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_ = n.host.Connect(ctx, info)
+}
+
+// advertisedRelayAddrs mirrors the reservation manager's circuit addresses so a
+// direct-profile host advertises them without waiting for AutoNAT to report
+// private reachability.
+type advertisedRelayAddrs struct {
+	mu    sync.RWMutex
+	addrs []multiaddr.Multiaddr
+}
+
+func (a *advertisedRelayAddrs) snapshot() []multiaddr.Multiaddr {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return slices.Clone(a.addrs)
+}
+
+func (a *advertisedRelayAddrs) watch(ctx context.Context, bus event.Bus) error {
+	subscription, err := bus.Subscribe(new(event.EvtAutoRelayAddrsUpdated))
+	if err != nil {
+		return err
+	}
+	go func() {
+		defer subscription.Close()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case raw, ok := <-subscription.Out():
+				if !ok {
+					return
+				}
+				update, isUpdate := raw.(event.EvtAutoRelayAddrsUpdated)
+				if !isUpdate {
+					continue
+				}
+				a.mu.Lock()
+				a.addrs = slices.Clone(update.RelayAddrs)
+				a.mu.Unlock()
+			}
+		}
+	}()
+	return nil
 }
 
 type relayOnlyGater struct {
