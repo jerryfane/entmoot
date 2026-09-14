@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
@@ -55,7 +54,9 @@ func cmdInviteCreate(gf *globalFlags, args []string) int {
 	maxUses := fs.Int("max-uses", 1, "how many distinct identities may join with this invite")
 	validFor := fs.String("valid-for", "24h", "capability TTL (time.ParseDuration or <N>d)")
 	var bootstrap stringListFlag
-	fs.Var(&bootstrap, "bootstrap", "founder libp2p multiaddr ending in /p2p/<peer-id>; repeatable")
+	fs.Var(&bootstrap, "bootstrap", "issuing node's libp2p multiaddr ending in /p2p/<peer-id>; repeatable")
+	var relays stringListFlag
+	fs.Var(&relays, "relay", "controlled-relay multiaddr the joiner should adopt, ending in /p2p/<relay-peer-id>; repeatable; defaults to this data root's own relays")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return exitOK
@@ -123,11 +124,35 @@ func cmdInviteCreate(gf *globalFlags, args []string) int {
 		return exitGroupNotFound
 	}
 	founderBinding, err := libp2ptransport.BindingFromPublicKey(founder.EntmootPubKey)
-	if err != nil || founderBinding.MemberID != mustMemberID(s.identity.PublicKey) || !bytes.Equal(founder.EntmootPubKey, s.identity.PublicKey) {
-		fmt.Fprintln(os.Stderr, "invite create: local identity is not the group founder")
-		return exitNotMember
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "invite create: founder identity: %v\n", err)
+		return exitTransport
 	}
 	founder.MemberID = &founderBinding.MemberID
+	// The founder or any delegated admin may invite. The issuer's own host is
+	// what serves enrollment, so the bootstrap addresses must name it.
+	localMemberID := mustMemberID(s.identity.PublicKey)
+	if !rlog.CanAdminister(localMemberID) {
+		fmt.Fprintln(os.Stderr, "invite create: local identity is neither the group founder nor a delegated admin")
+		return exitNotMember
+	}
+	localBinding, err := libp2ptransport.BindingFromPublicKey(s.identity.PublicKey)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "invite create: local identity: %v\n", err)
+		return exitTransport
+	}
+	var issuer *entmoot.NodeInfo
+	if localMemberID != founderBinding.MemberID {
+		info, found := rlog.MemberInfoByID(localMemberID)
+		if !found {
+			fmt.Fprintln(os.Stderr, "invite create: local identity is not a member of this group")
+			return exitNotMember
+		}
+		memberID := localMemberID
+		info.MemberID = &memberID
+		info.PeerID = localBinding.PeerID.String()
+		issuer = &info
+	}
 	allowedPeerIDs := make([]string, 0, len(bootstrap))
 	allowedAddresses := make([]string, 0, len(bootstrap))
 	seen := make(map[peer.ID]struct{})
@@ -138,8 +163,8 @@ func cmdInviteCreate(gf *globalFlags, args []string) int {
 			return exitInvalidArgument
 		}
 		info, err := peer.AddrInfoFromP2pAddr(address)
-		if err != nil || info.ID != founderBinding.PeerID {
-			fmt.Fprintf(os.Stderr, "invite create: bootstrap must end in founder peer id %s\n", founderBinding.PeerID)
+		if err != nil || info.ID != localBinding.PeerID {
+			fmt.Fprintf(os.Stderr, "invite create: bootstrap must end in the issuing node's peer id %s\n", localBinding.PeerID)
 			return exitInvalidArgument
 		}
 		allowedAddresses = append(allowedAddresses, address.String())
@@ -148,6 +173,26 @@ func cmdInviteCreate(gf *globalFlags, args []string) int {
 			allowedPeerIDs = append(allowedPeerIDs, info.ID.String())
 		}
 	}
+	// Relay hints default to whatever this node itself relays through, since
+	// that is the set already known to accept it.
+	relayHints := []string(relays)
+	if len(relayHints) == 0 {
+		relayHints = gf.controlledRelays
+	}
+	if len(relayHints) == 0 {
+		if stored, err := loadRelayHints(s.dataDir); err == nil {
+			relayHints = stored
+		}
+	}
+	relayHints, err = validateRelayHints(relayHints)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "invite create: -relay: %v\n", err)
+		return exitInvalidArgument
+	}
+	if len(relays) > 0 && len(relayHints) != len(relays) {
+		fmt.Fprintln(os.Stderr, "invite create: every -relay must be a multiaddr ending in /p2p/<relay-peer-id>")
+		return exitInvalidArgument
+	}
 	now := time.Now()
 	capability := entmoot.BootstrapCapability{
 		GroupID:           gid,
@@ -155,9 +200,11 @@ func cmdInviteCreate(gf *globalFlags, args []string) int {
 		TargetMemberID:    targetMemberID,
 		TargetPeerID:      targetPeerID,
 		Founder:           founder,
+		Issuer:            issuer,
 		RosterHead:        rlog.Head(),
 		AllowedPeerIDs:    allowedPeerIDs,
 		AllowedMultiaddrs: allowedAddresses,
+		Relays:            relayHints,
 		MaxUses:           *maxUses,
 		IssuedAtMS:        now.UnixMilli(),
 		ExpiresAtMS:       now.Add(ttl).UnixMilli(),

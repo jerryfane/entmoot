@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -80,6 +81,31 @@ type groupSession struct {
 	// want of a roster checkpoint, kept so status output can show the gap.
 	unknownHeads atomic.Int64
 	peerRecords  *libp2ptransport.PeerRecordCache
+
+	// rosterBackoffMu guards rosterBackoff, which holds the earliest time this
+	// node will attempt another full roster pull from a peer. A peer whose
+	// advertised head does not extend ours is either forked or hostile; either
+	// way, re-downloading its chain every tick is wasted work.
+	rosterBackoffMu sync.Mutex
+	rosterBackoff   map[peer.ID]rosterBackoffState
+
+	// enrollMu serializes enrollment writes for this group, so the membership
+	// check and the roster append behave as one step.
+	enrollMu sync.Mutex
+}
+
+type rosterBackoffState struct {
+	until      time.Time
+	failures   int
+	localHead  entmoot.RosterEntryID
+	remoteHead entmoot.RosterEntryID
+	reason     string
+	sinceMS    int64
+	// fork records that the peer's chain does not extend ours, which is the
+	// only evidence of a real fork. A timeout, an exhausted server slot or a
+	// rotated snapshot earns the same backoff but is not a divergence, and
+	// reporting it as one would send an operator to repair a healthy group.
+	fork bool
 }
 type groupPolicyEnforcer struct {
 	mu          sync.Mutex
@@ -179,6 +205,22 @@ func (r *groupRuntime) peerRecordsForGroup(groupID entmoot.GroupID) (*libp2ptran
 	return session.peerRecords, true
 }
 
+// relayHints renders this node's controlled relays as full multiaddrs, so an
+// invite can hand them to a joiner that has no other way to find a relay.
+func (r *groupRuntime) relayHints() []string {
+	out := make([]string, 0, len(r.controlledRelays))
+	for _, relay := range r.controlledRelays {
+		suffix := multiaddr.StringCast("/p2p/" + relay.ID.String())
+		for _, address := range relay.Addrs {
+			out = append(out, address.Encapsulate(suffix).String())
+			if len(out) == libp2ptransport.MaxCapabilityRelays {
+				return out
+			}
+		}
+	}
+	return out
+}
+
 // enroll applies the roster add for an applicant that presented a valid
 // invite. The invite's checkpoint only has to be somewhere on this group's
 // chain: the first joiner advances the head, and every other outstanding
@@ -191,14 +233,19 @@ func (r *groupRuntime) enroll(_ context.Context, capability entmoot.BootstrapCap
 		return libp2ptransport.EnrollmentResponse{}, libp2ptransport.RejectEnrollment(
 			libp2ptransport.EnrollRejectUnknownGroup, "group %s is not served here", capability.GroupID.String())
 	}
-	founder, ok := session.roster.Founder()
-	if !ok || !bytes.Equal(founder.EntmootPubKey, r.identity.PublicKey) || founder.MemberID == nil || *founder.MemberID != r.binding.MemberID {
+	if !session.roster.CanAdminister(r.binding.MemberID) {
 		return libp2ptransport.EnrollmentResponse{}, libp2ptransport.RejectEnrollment(
 			libp2ptransport.EnrollRejectNotIssuer, "local identity cannot sign roster changes for this group")
 	}
-	if capability.Founder.MemberID == nil || *capability.Founder.MemberID != *founder.MemberID || !bytes.Equal(capability.Founder.EntmootPubKey, founder.EntmootPubKey) {
-		return libp2ptransport.EnrollmentResponse{}, libp2ptransport.RejectEnrollment(
-			libp2ptransport.EnrollRejectIssuerMismatch, "invite issuer is not this group's founder")
+	// The joiner pins Founder as the group's anchor, so it must be this
+	// group's real founder. The signature was already verified against the
+	// signing authority; binding that key to a member who may currently
+	// administer the group is what turns it into authority.
+	if err := verifyInviteAnchor(session.roster, capability.Founder); err != nil {
+		return libp2ptransport.EnrollmentResponse{}, err
+	}
+	if err := verifyInviteIssuer(session.roster, capability.SigningAuthority()); err != nil {
+		return libp2ptransport.EnrollmentResponse{}, err
 	}
 	if applicant.MemberID == nil {
 		return libp2ptransport.EnrollmentResponse{}, libp2ptransport.RejectEnrollment(
@@ -222,24 +269,77 @@ func (r *groupRuntime) enroll(_ context.Context, capability entmoot.BootstrapCap
 	}
 	target := entmoot.NodeInfo{EntmootPubKey: append([]byte(nil), applicant.EntmootPubKey...), MemberID: applicant.MemberID, PeerID: applicant.PeerID}
 
-	// Roster timestamps must grow strictly. Two people redeeming a multi-use
-	// invite in the same millisecond would otherwise make the second add
-	// unappliable.
-	timestamp := time.Now().UnixMilli()
-	if head := session.roster.HeadTimestamp(); timestamp <= head {
-		timestamp = head + 1
+	// One enrollment at a time per group. The checks above and the write below
+	// are not one atomic step, so two capabilities redeemed for the same
+	// applicant at the same moment could both pass the membership check and
+	// append two adds for one member: the duplicate-binding guard only rejects
+	// a re-add under a different key.
+	session.enrollMu.Lock()
+	defer session.enrollMu.Unlock()
+	if session.roster.IsMemberID(*applicant.MemberID) {
+		// Admitted while we waited for the lock. The invite is satisfied.
+		return libp2ptransport.EnrollmentResponse{RosterHead: session.roster.Head(), Entries: session.roster.Entries()}, nil
 	}
-	entry, err := session.roster.SignEntry(r.identity, "add", target, nil, timestamp)
-	if err != nil {
-		return libp2ptransport.EnrollmentResponse{}, err
+
+	// Several nodes may author roster entries, and the log is strictly linear:
+	// an entry signed against a head that moved is rejected. Retry against the
+	// new head instead of failing, so a concurrent write by another admin costs
+	// a retry rather than a split.
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		// Roster timestamps must grow strictly. Two people redeeming a
+		// multi-use invite in the same millisecond would otherwise make the
+		// second add unappliable.
+		timestamp := time.Now().UnixMilli()
+		if head := session.roster.HeadTimestamp(); timestamp <= head {
+			timestamp = head + 1
+		}
+		entry, err := session.roster.SignEntry(r.identity, "add", target, nil, timestamp)
+		if err != nil {
+			return libp2ptransport.EnrollmentResponse{}, err
+		}
+		if err := session.roster.Apply(entry); err != nil {
+			lastErr = err
+			if errors.Is(err, entmoot.ErrRosterReject) {
+				continue
+			}
+			return libp2ptransport.EnrollmentResponse{}, err
+		}
+		// This node just advanced the head, which may be the head a held
+		// message named.
+		r.drainRosterAhead(context.Background(), session)
+		return libp2ptransport.EnrollmentResponse{RosterHead: session.roster.Head(), Entries: session.roster.Entries()}, nil
 	}
-	if err := session.roster.Apply(entry); err != nil {
-		return libp2ptransport.EnrollmentResponse{}, err
+	return libp2ptransport.EnrollmentResponse{}, lastErr
+}
+
+// verifyInviteIssuer requires the identity that signed an invite to be a
+// member who may currently administer the group: the founder or a delegated
+// admin. Demoting or removing an admin therefore voids its outstanding
+// invites.
+func verifyInviteIssuer(groupRoster *roster.RosterLog, issuer entmoot.NodeInfo) error {
+	if err := libp2ptransport.AuthorizedIssuer(groupRoster, issuer); err != nil {
+		return libp2ptransport.RejectEnrollment(libp2ptransport.EnrollRejectIssuerMismatch, "%v", err)
 	}
-	// This node just advanced the head, which may be the head a held message
-	// named.
-	r.drainRosterAhead(context.Background(), session)
-	return libp2ptransport.EnrollmentResponse{RosterHead: session.roster.Head(), Entries: session.roster.Entries()}, nil
+	return nil
+}
+
+// verifyInviteAnchor requires the invite's Founder field to be this group's
+// actual founder. It is the anchor the joiner pins before trusting a served
+// roster, so an invite naming anyone else must not enroll here even when a
+// delegated admin signed it.
+func verifyInviteAnchor(groupRoster *roster.RosterLog, claimed entmoot.NodeInfo) error {
+	founder, ok := groupRoster.Founder()
+	if !ok || founder.MemberID == nil {
+		return libp2ptransport.RejectEnrollment(
+			libp2ptransport.EnrollRejectIssuerMismatch, "group has no resolvable founder")
+	}
+	claimedMemberID, err := entmoot.ResolvedMemberID(claimed)
+	if err != nil || claimedMemberID != *founder.MemberID || !bytes.Equal(claimed.EntmootPubKey, founder.EntmootPubKey) {
+		return libp2ptransport.RejectEnrollment(
+			libp2ptransport.EnrollRejectIssuerMismatch, "invite does not name this group's founder as its anchor")
+	}
+	return nil
 }
 
 func (r *groupRuntime) AddLocalGroup(ctx context.Context, groupID entmoot.GroupID) (*groupSession, bool, error) {
@@ -574,45 +674,261 @@ func (r *groupRuntime) pruneGroup(ctx context.Context, session *groupSession) {
 	}
 }
 
+const (
+	// maxRosterSyncPeers bounds how many members one roster sync round probes.
+	// Roster changes are rare and the chain is linear, so a handful of peers is
+	// enough to converge without turning every tick into a fan-out.
+	maxRosterSyncPeers = 8
+	// rosterSyncPullsPerRound bounds the full chain downloads one round may
+	// perform. Probing a head is one small request; pulling a chain is not, and
+	// a peer advertising an unknown head can otherwise make every tick expensive.
+	rosterSyncPullsPerRound = 1
+	// rosterSyncBackoffBase and rosterSyncBackoffMax bound how often a peer
+	// whose chain failed to extend ours is retried.
+	rosterSyncBackoffBase = 30 * time.Second
+	rosterSyncBackoffMax  = 15 * time.Minute
+)
+
+// rosterSyncReady reports whether this peer may be pulled from now.
+func (s *groupSession) rosterSyncReady(id peer.ID, now time.Time) bool {
+	s.rosterBackoffMu.Lock()
+	defer s.rosterBackoffMu.Unlock()
+	state, known := s.rosterBackoff[id]
+	return !known || now.After(state.until)
+}
+
+// noteRosterSyncFailure backs a peer off with exponential delay and records
+// why, so a forked or hostile member costs one pull per backoff window instead
+// of one per tick and an operator can see the cause.
+func (s *groupSession) noteRosterSyncFailure(id peer.ID, now time.Time, localHead, remoteHead entmoot.RosterEntryID, reason string, fork bool) time.Duration {
+	s.rosterBackoffMu.Lock()
+	defer s.rosterBackoffMu.Unlock()
+	if s.rosterBackoff == nil {
+		s.rosterBackoff = make(map[peer.ID]rosterBackoffState)
+	}
+	state := s.rosterBackoff[id]
+	state.failures++
+	delay := rosterSyncBackoffBase << min(state.failures-1, 8)
+	if delay > rosterSyncBackoffMax {
+		delay = rosterSyncBackoffMax
+	}
+	state.until = now.Add(delay)
+	state.localHead = localHead
+	state.remoteHead = remoteHead
+	state.reason = reason
+	if state.sinceMS == 0 {
+		state.sinceMS = now.UnixMilli()
+	}
+	// Fork evidence is sticky. A timeout after a fork does not mean the fork
+	// healed; only a successful exchange, or the head turning up on our chain,
+	// clears the record (clearRosterSyncFailure and the report filter).
+	state.fork = state.fork || fork
+	s.rosterBackoff[id] = state
+	return delay
+}
+
+func (s *groupSession) clearRosterSyncFailure(id peer.ID) {
+	s.rosterBackoffMu.Lock()
+	defer s.rosterBackoffMu.Unlock()
+	delete(s.rosterBackoff, id)
+}
+
+// rosterDivergenceReports describes peers whose chain does not extend ours:
+// the visible symptom of a forked log, which retrying never repairs. Peers
+// backed off for a transient reason are deliberately absent, and a report is
+// dropped as soon as the peer's head turns out to be on our chain, so status
+// cannot assert a divergence that no longer exists.
+func (s *groupSession) rosterDivergenceReports(groupID entmoot.GroupID) []rosterDivergenceReport {
+	s.rosterBackoffMu.Lock()
+	defer s.rosterBackoffMu.Unlock()
+	if len(s.rosterBackoff) == 0 {
+		return nil
+	}
+	out := make([]rosterDivergenceReport, 0, len(s.rosterBackoff))
+	for id, state := range s.rosterBackoff {
+		if !state.fork {
+			continue
+		}
+		if s.roster.HasEntry(state.remoteHead) {
+			// The head we could not take is now on our chain: whatever this
+			// was, it is not a fork any more.
+			continue
+		}
+		out = append(out, rosterDivergenceReport{
+			GroupID:    groupID.String(),
+			PeerID:     id.String(),
+			LocalHead:  state.localHead.String(),
+			RemoteHead: state.remoteHead.String(),
+			Reason:     state.reason,
+			SinceMS:    state.sinceMS,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].PeerID < out[j].PeerID })
+	return out
+}
+
+// rosterChainDiverged reports whether a failed pull proves the peer's chain
+// does not extend ours. Only a chain that fails validation against our own
+// prefix, or a head that cannot be reached from the served chain, is evidence
+// of a fork; transport failures, deadlines, exhausted server snapshots, a
+// rotated snapshot and the size caps are all transient costs.
+func rosterChainDiverged(err error, headOffChain bool) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, entmoot.ErrRosterReject) {
+		return true
+	}
+	text := err.Error()
+	if strings.Contains(text, "roster head mismatch") {
+		return true
+	}
+	// "Your prefix is longer than my whole chain" is only fork evidence
+	// together with a head we do not hold: the server cannot know our head, so
+	// the caller supplies that half. Without it, a peer that simply pruned or
+	// restarted would be reported as forked.
+	//
+	// The conjunct itself is pinned: removing it here makes a short chain from
+	// a peer whose head we hold read as a fork. What no test can separate is
+	// this check from syncRoster's equal-or-behind guard, which already never
+	// pulls from such a peer — forcing the argument true at that one call site
+	// changes nothing observable. Both are kept: the classifier states its own
+	// precondition rather than depending on one caller's ordering.
+	return headOffChain && strings.Contains(text, string(libp2ptransport.SyncShortChain))
+}
+
+// syncRoster pulls roster entries from the group's members. Any admin can
+// author membership changes, so pulling only from the founder would leave
+// admin-authored adds and removals stranded on one node and the group split
+// across two heads. The founder pulls too, for the same reason.
 func (r *groupRuntime) syncRoster(ctx context.Context, session *groupSession) {
-	founder, ok := session.roster.Founder()
-	if !ok {
+	local := session.roster.Entries()
+	if len(local) == 0 {
 		return
 	}
-	binding, err := libp2ptransport.BindingFromPublicKey(founder.EntmootPubKey)
-	if err != nil || binding.PeerID == r.host.ID() {
-		return
-	}
-	remote := peer.AddrInfo{ID: binding.PeerID, Addrs: r.host.Peerstore().Addrs(binding.PeerID)}
-	if len(remote.Addrs) == 0 {
-		peers, loadErr := loadGroupPeers(r.dataDir, session.groupID)
-		if loadErr != nil {
+	pulls := 0
+	for _, remote := range r.rosterSyncPeers(session) {
+		if pulls >= rosterSyncPullsPerRound {
 			return
 		}
-		for _, candidate := range peers {
-			if candidate.ID == remote.ID {
-				remote.Addrs = candidate.Addrs
+		now := time.Now()
+		if !session.rosterSyncReady(remote.ID, now) {
+			continue
+		}
+		syncCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		head, err := libp2ptransport.FetchRosterHead(syncCtx, r.host, remote, session.groupID)
+		if err != nil {
+			cancel()
+			r.logger.Debug("libp2p roster head",
+				slog.String("group_id", session.groupID.String()),
+				slog.String("peer_id", remote.ID.String()),
+				slog.String("err", err.Error()))
+			continue
+		}
+		if session.roster.HasEntry(head) {
+			// Equal or behind: nothing to take from this peer.
+			cancel()
+			session.clearRosterSyncFailure(remote.ID)
+			continue
+		}
+		pulls++
+		updates, complete, err := libp2ptransport.FetchRosterUpdates(syncCtx, r.host, remote, session.groupID, local)
+		cancel()
+		if err != nil {
+			fork := rosterChainDiverged(err, !session.roster.HasEntry(head))
+			reason := "pull failed: " + err.Error()
+			if !fork {
+				reason = "pull unavailable: " + err.Error()
+			}
+			delay := session.noteRosterSyncFailure(remote.ID, now, session.roster.Head(), head, reason, fork)
+			// The peer advertises a head we do not hold and we could not take
+			// its chain. That is either a fork, which retrying never repairs,
+			// or a peer feeding us junk; both earn a backoff.
+			r.logger.Warn("libp2p roster pull failed",
+				slog.String("group_id", session.groupID.String()),
+				slog.String("peer_id", remote.ID.String()),
+				slog.String("local_head", session.roster.Head().String()),
+				slog.String("remote_head", head.String()),
+				slog.Duration("retry_after", delay),
+				slog.String("err", err.Error()))
+			continue
+		}
+		applied := 0
+		rejected := false
+		for _, entry := range updates {
+			if err := session.roster.Apply(entry); err != nil {
+				rejected = true
+				delay := session.noteRosterSyncFailure(remote.ID, now, session.roster.Head(), head, "apply rejected: "+err.Error(), errors.Is(err, entmoot.ErrRosterReject))
+				r.logger.Warn("libp2p roster apply",
+					slog.String("group_id", session.groupID.String()),
+					slog.String("peer_id", remote.ID.String()),
+					slog.Duration("retry_after", delay),
+					slog.String("err", err.Error()))
 				break
 			}
+			applied++
+		}
+		session.noteRosterSyncOutcome(remote.ID, applied, rejected)
+		if applied > 0 {
+			r.logger.Info("libp2p roster synchronized",
+				slog.String("group_id", session.groupID.String()),
+				slog.String("peer_id", remote.ID.String()),
+				slog.Int("entries", applied),
+				slog.Bool("complete", complete && !rejected))
+			local = session.roster.Entries()
+			// Messages held for one of the heads we just learned can be
+			// accepted now.
+			r.drainRosterAhead(ctx, session)
 		}
 	}
-	syncCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	updates, err := libp2ptransport.FetchRosterUpdates(syncCtx, r.host, remote, session.groupID, session.roster.Entries())
-	if err != nil {
-		r.logger.Debug("libp2p roster sync", slog.String("group_id", session.groupID.String()), slog.String("err", err.Error()))
-		return
+}
+
+// rosterSyncPeers lists dialable candidates to pull roster state from: every
+// current member except this node, founder first because it is the most likely
+// to be reachable and authoritative.
+func (r *groupRuntime) rosterSyncPeers(session *groupSession) []peer.AddrInfo {
+	cached, _ := loadGroupPeers(r.dataDir, session.groupID)
+	addrsFor := func(id peer.ID) []multiaddr.Multiaddr {
+		if addrs := r.host.Peerstore().Addrs(id); len(addrs) > 0 {
+			return addrs
+		}
+		for _, candidate := range cached {
+			if candidate.ID == id {
+				return candidate.Addrs
+			}
+		}
+		return nil
 	}
-	for _, entry := range updates {
-		if err := session.roster.Apply(entry); err != nil {
-			r.logger.Warn("libp2p roster apply", slog.String("group_id", session.groupID.String()), slog.String("err", err.Error()))
-			return
+	ordered := make([]entmoot.MemberID, 0, len(session.roster.MemberIDs())+1)
+	if founder, ok := session.roster.Founder(); ok && founder.MemberID != nil {
+		ordered = append(ordered, *founder.MemberID)
+	}
+	for _, memberID := range session.roster.MemberIDs() {
+		if len(ordered) > 0 && memberID == ordered[0] {
+			continue
+		}
+		ordered = append(ordered, memberID)
+	}
+	out := make([]peer.AddrInfo, 0, len(ordered))
+	for _, memberID := range ordered {
+		info, found := session.roster.MemberInfoByID(memberID)
+		if !found {
+			continue
+		}
+		binding, err := libp2ptransport.BindingFromPublicKey(info.EntmootPubKey)
+		if err != nil || binding.PeerID == r.host.ID() {
+			continue
+		}
+		addrs := addrsFor(binding.PeerID)
+		if len(addrs) == 0 {
+			continue
+		}
+		out = append(out, peer.AddrInfo{ID: binding.PeerID, Addrs: addrs})
+		if len(out) == maxRosterSyncPeers {
+			break
 		}
 	}
-	if len(updates) > 0 {
-		r.logger.Info("libp2p roster synchronized", slog.String("group_id", session.groupID.String()), slog.Int("entries", len(updates)))
-		r.drainRosterAhead(ctx, session)
-	}
+	return out
 }
 
 // drainRosterAhead releases messages that were held for a roster head this
@@ -839,4 +1155,22 @@ func rosterHasLocalIdentityPubKey(rlog *roster.RosterLog, publicKey []byte) bool
 	}
 	member, ok := rlog.MemberInfoByID(memberID)
 	return ok && bytes.Equal(member.EntmootPubKey, publicKey)
+}
+
+// noteRosterSyncOutcome settles what a finished pull leaves behind.
+//
+//   - nothing applied, or some entry rejected: the record stands. Part of the
+//     chain may have applied, but the peer still holds a chain this node could
+//     not take, and clearing that would erase the fork evidence in the same
+//     round it was found.
+//   - anything applied with nothing rejected: the peer served a validated
+//     extension of our chain, so it is not forked from us and must not be
+//     delayed — whether it finished or stopped at the per-round ceiling. A
+//     node catching up over several rounds is never backed off for
+//     progressing.
+func (s *groupSession) noteRosterSyncOutcome(id peer.ID, applied int, rejected bool) {
+	if applied == 0 || rejected {
+		return
+	}
+	s.clearRosterSyncFailure(id)
 }

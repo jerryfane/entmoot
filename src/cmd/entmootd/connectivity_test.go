@@ -134,3 +134,77 @@ func TestEnrollmentRetryReturnsExistingMatchingMembership(t *testing.T) {
 		t.Fatalf("idempotent enrollment response = %+v", response)
 	}
 }
+
+// One person redeeming two invites at the same instant must end up as one
+// member. The membership check and the roster write are separate steps, so
+// without serialization both attempts pass the check and append an add for the
+// same member: the duplicate-binding guard only rejects a re-add under a
+// different key.
+func TestConcurrentEnrollmentOfOneApplicantAddsOneEntry(t *testing.T) {
+	founderIdentity, err := keystore.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	founderBinding, err := libp2ptransport.BindingFromPublicKey(founderIdentity.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetIdentity, err := keystore.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetBinding, err := libp2ptransport.BindingFromPublicKey(targetIdentity.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	groupID := entmoot.GroupID{0x1d}
+	groupRoster := roster.New(groupID)
+	founder := entmoot.NodeInfo{
+		MemberID: &founderBinding.MemberID, PeerID: founderBinding.PeerID.String(),
+		EntmootPubKey: founderIdentity.PublicKey,
+	}
+	if err := groupRoster.Genesis(founderIdentity, founder, 1_000); err != nil {
+		t.Fatal(err)
+	}
+	inviteHead := groupRoster.Head()
+	target := entmoot.NodeInfo{
+		MemberID: &targetBinding.MemberID, PeerID: targetBinding.PeerID.String(),
+		EntmootPubKey: targetIdentity.PublicKey,
+	}
+	runtime := &groupRuntime{
+		identity: founderIdentity, binding: founderBinding,
+		sessions: map[entmoot.GroupID]*groupSession{groupID: {groupID: groupID, roster: groupRoster}},
+	}
+	capability := entmoot.BootstrapCapability{
+		GroupID: groupID, Founder: founder, RosterHead: inviteHead,
+		TargetPublicKey: targetIdentity.PublicKey, TargetMemberID: targetBinding.MemberID,
+		TargetPeerID: targetBinding.PeerID.String(),
+	}
+
+	const racers = 8
+	start := make(chan struct{})
+	results := make(chan error, racers)
+	for i := 0; i < racers; i++ {
+		go func() {
+			<-start
+			_, err := runtime.enroll(nil, capability, target)
+			results <- err
+		}()
+	}
+	close(start)
+	for i := 0; i < racers; i++ {
+		if err := <-results; err != nil {
+			t.Fatalf("concurrent enrollment %d failed: %v", i, err)
+		}
+	}
+
+	adds := 0
+	for _, entry := range groupRoster.Entries() {
+		if entry.Op == "add" && entry.Subject.MemberID != nil && *entry.Subject.MemberID == targetBinding.MemberID {
+			adds++
+		}
+	}
+	if adds != 1 {
+		t.Fatalf("%d concurrent enrollments produced %d add entries for one member", racers, adds)
+	}
+}

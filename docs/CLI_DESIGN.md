@@ -59,6 +59,8 @@ group policy status|set|clear
 group public descriptor|publish
 invite create|list|revoke
 roster add|remove
+roster admin list|grant|revoke
+roster repair
 ```
 
 Fleet and agent-command surfaces are disabled unless their explicit environment
@@ -151,15 +153,25 @@ full-width MemberID. Enabling config does not start a runner.
 
 ## 9. Invite and Bootstrap Contract
 
-`invite create` accepts one or more founder libp2p bootstrap multiaddrs and
-either a target Ed25519 public key or `-open`. With a target, the MemberID and
-PeerID are derived from that key and only that identity may redeem the invite.
-With `-open` the invite is a bearer credential: any holder may redeem it while
-uses remain, which is how a small team joins from one link. Omitting both is an
-error, so a missing target never silently produces a bearer invite.
-`-max-uses` caps the number of distinct identities (default 1, ceiling 64). The
-founder signs the group id, founder identity, roster checkpoint, target if any,
-permitted bootstrap peers/addresses, use limit, expiry, and capability nonce.
+`invite create` accepts one or more libp2p bootstrap multiaddrs naming the
+issuing node, and either a target Ed25519 public key or `-open`. With a target,
+the MemberID and PeerID are derived from that key and only that identity may
+redeem the invite. With `-open` the invite is a bearer credential: any holder
+may redeem it while uses remain, which is how a small team joins from one link.
+Omitting both is an error, so a missing target never silently produces a bearer
+invite. `-max-uses` caps the number of distinct identities (default 1, ceiling
+64). The issuer signs the group id, founder anchor, its own issuer identity
+when it is not the founder, roster checkpoint, target if any, permitted
+bootstrap peers/addresses, use limit, expiry, and capability nonce.
+
+The founder or any delegated admin may issue invites and apply membership
+changes. `roster admin grant|revoke` rewrites the delegated-admin set in one
+founder-signed `policy_change` entry (`type: admins/v1`, ceiling 16) and
+`roster admin list` reports it. An admin may add and remove ordinary members;
+it cannot remove the founder, remove another admin, or change the admin set.
+Losing membership or delegation ends the authority at once, including for
+invites that admin already issued. Enrollment requires the invite's `founder`
+field to be the group's real founder, since that is the anchor the joiner pins.
 
 `invite list` shows issued invites with uses spent and state
 (open/spent/expired/revoked). `invite revoke` withdraws an invite before it
@@ -168,6 +180,19 @@ recorded also blocks it, so a leaked invite file is recoverable. `roster
 remove` revokes the invites bound to the removed member, reports the count, and
 lists the group's remaining open nonces, which name nobody and therefore cannot
 be revoked automatically.
+
+Two authorised signers who write against the same roster head produce two
+chains, and the log is strictly linear, so nothing merges them: the group
+splits and `status` reports `roster_divergence`. `roster repair -group <id>`
+ends that split from the losing side. It asks the named peer (`-peer`, or the
+only divergent peer) for its chain, validates it from the shared genesis,
+adopts it, and re-signs the local changes the adopted chain does not carry.
+`-dry-run` reports what would be discarded first. The command needs a running
+daemon, because the daemon holds the roster writer lease and the peer
+connections. A change this node may no longer author is reported as
+unrecoverable, with a non-zero exit, instead of being dropped in silence; a
+message published in the fork window and naming a discarded head cannot be
+verified against the adopted chain.
 
 Join validates the complete capability before network use, fetches roster state
 only from an allowed serving peer, binds the fetched founder and its own

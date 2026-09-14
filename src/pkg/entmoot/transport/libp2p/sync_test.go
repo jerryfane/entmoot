@@ -256,7 +256,10 @@ func TestFetchRosterUpdatesAdvancesExistingMember(t *testing.T) {
 	if err := server.Install(); err != nil {
 		t.Fatal(err)
 	}
-	updates, err := FetchRosterUpdates(ctx, memberHost, peer.AddrInfo{ID: founderHost.ID(), Addrs: founderHost.Addrs()}, groupID, stale.Entries())
+	updates, complete, err := FetchRosterUpdates(ctx, memberHost, peer.AddrInfo{ID: founderHost.ID(), Addrs: founderHost.Addrs()}, groupID, stale.Entries())
+	if !complete {
+		t.Fatal("a small chain was not served completely in one pull")
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -410,6 +413,15 @@ func TestSyncBootstrapAuthorityAndMembership(t *testing.T) {
 	wrongServer.AllowedPeerIDs = []string{clientHost.ID().String()}
 	sign(&wrongServer, founder)
 	check("unlisted_server", &wrongServer, false)
+	// The capability's signature verifies against whatever issuer it names, so
+	// naming the real founder as the anchor and yourself as the issuer must not
+	// buy pre-membership roster or history access.
+	selfIssued := grant
+	selfIssued.Nonce = [32]byte{9}
+	selfIssuer := mustNodeInfo(t, target.PublicKey)
+	selfIssued.Issuer = &selfIssuer
+	sign(&selfIssued, target)
+	check("unauthorized_issuer", &selfIssued, false)
 	check("fresh_grant", &grant, true)
 	if err := admission.Reserve(grant, clientHost.ID(), EnrollmentProtocol, now); err != nil {
 		t.Fatal(err)

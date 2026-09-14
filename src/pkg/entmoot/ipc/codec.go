@@ -52,6 +52,10 @@ func Encode(v any) (MsgType, []byte, error) {
 		t = MsgGroupDeactivateReq
 	case *GroupDeactivateResp:
 		t = MsgGroupDeactivateResp
+	case *RosterRepairReq:
+		t = MsgRosterRepairReq
+	case *RosterRepairResp:
+		t = MsgRosterRepairResp
 	case *TailSubscribe:
 		t = MsgTailSubscribe
 	case *TailEvent:
@@ -116,6 +120,10 @@ func Decode(t MsgType, body []byte) (any, error) {
 		return decodeAs[GroupDeactivateReq](t, body)
 	case MsgGroupDeactivateResp:
 		return decodeAs[GroupDeactivateResp](t, body)
+	case MsgRosterRepairReq:
+		return decodeAs[RosterRepairReq](t, body)
+	case MsgRosterRepairResp:
+		return decodeAs[RosterRepairResp](t, body)
 	case MsgTailSubscribe:
 		return decodeAs[TailSubscribe](t, body)
 	case MsgTailEvent:
