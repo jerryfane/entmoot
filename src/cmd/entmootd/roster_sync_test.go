@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -114,7 +116,7 @@ func TestRosterSyncBacksOffAFailingPeer(t *testing.T) {
 	if !session.rosterSyncReady(id, now) {
 		t.Fatal("an unseen peer should be ready")
 	}
-	first := session.noteRosterSyncFailure(id, now, entmoot.RosterEntryID{1}, entmoot.RosterEntryID{2}, "pull failed: test")
+	first := session.noteRosterSyncFailure(id, now, entmoot.RosterEntryID{1}, entmoot.RosterEntryID{2}, "pull failed: test", true)
 	if first != rosterSyncBackoffBase {
 		t.Fatalf("first backoff = %s, want %s", first, rosterSyncBackoffBase)
 	}
@@ -124,12 +126,12 @@ func TestRosterSyncBacksOffAFailingPeer(t *testing.T) {
 	if !session.rosterSyncReady(id, now.Add(first+time.Second)) {
 		t.Fatal("a backed-off peer was never retried")
 	}
-	second := session.noteRosterSyncFailure(id, now, entmoot.RosterEntryID{1}, entmoot.RosterEntryID{2}, "pull failed: test")
+	second := session.noteRosterSyncFailure(id, now, entmoot.RosterEntryID{1}, entmoot.RosterEntryID{2}, "pull failed: test", true)
 	if second <= first {
 		t.Fatalf("backoff did not grow: %s then %s", first, second)
 	}
 	for i := 0; i < 20; i++ {
-		if capped := session.noteRosterSyncFailure(id, now, entmoot.RosterEntryID{1}, entmoot.RosterEntryID{2}, "pull failed: test"); capped > rosterSyncBackoffMax {
+		if capped := session.noteRosterSyncFailure(id, now, entmoot.RosterEntryID{1}, entmoot.RosterEntryID{2}, "pull failed: test", true); capped > rosterSyncBackoffMax {
 			t.Fatalf("backoff %s exceeds the cap %s", capped, rosterSyncBackoffMax)
 		}
 	}
@@ -144,8 +146,13 @@ func TestRosterSyncBacksOffAFailingPeer(t *testing.T) {
 // A fork is not repaired by retrying, so it has to be visible as state and
 // not only as a log line that scrolls away.
 func TestRosterDivergenceIsReportedAsGroupState(t *testing.T) {
+	founderIdentity, founder, _ := mustTestIdentity(t)
 	groupID := entmoot.GroupID{0x41}
-	session := &groupSession{groupID: groupID}
+	groupRoster := roster.New(groupID)
+	if err := groupRoster.Genesis(founderIdentity, founder, 1_000); err != nil {
+		t.Fatal(err)
+	}
+	session := &groupSession{groupID: groupID, roster: groupRoster}
 	var id peer.ID = "12D3KooWBdvL92Hd76R1LN5qswuXSgQf7ZWZNwHhKeS4tDoHGzuA"
 	if reports := session.rosterDivergenceReports(groupID); len(reports) != 0 {
 		t.Fatalf("healthy session reported %+v", reports)
@@ -153,7 +160,7 @@ func TestRosterDivergenceIsReportedAsGroupState(t *testing.T) {
 	now := time.Now()
 	local := entmoot.RosterEntryID{7}
 	remote := entmoot.RosterEntryID{9}
-	session.noteRosterSyncFailure(id, now, local, remote, "apply rejected: parents must reference current head")
+	session.noteRosterSyncFailure(id, now, local, remote, "apply rejected: parents must reference current head", true)
 	reports := session.rosterDivergenceReports(groupID)
 	if len(reports) != 1 {
 		t.Fatalf("reports = %+v, want one", reports)
@@ -167,7 +174,7 @@ func TestRosterDivergenceIsReportedAsGroupState(t *testing.T) {
 	}
 	// The first-seen time must not reset on every retry, or a persistent fork
 	// would always look new.
-	session.noteRosterSyncFailure(id, now.Add(time.Minute), local, remote, "apply rejected: parents must reference current head")
+	session.noteRosterSyncFailure(id, now.Add(time.Minute), local, remote, "apply rejected: parents must reference current head", true)
 	if again := session.rosterDivergenceReports(groupID); again[0].SinceMS != report.SinceMS {
 		t.Fatalf("since_ms moved from %d to %d", report.SinceMS, again[0].SinceMS)
 	}
@@ -175,4 +182,75 @@ func TestRosterDivergenceIsReportedAsGroupState(t *testing.T) {
 	if reports := session.rosterDivergenceReports(groupID); len(reports) != 0 {
 		t.Fatalf("converged session still reports %+v", reports)
 	}
+}
+
+// Divergence means "this peer's chain does not extend ours", which no retry
+// repairs. A timeout, an exhausted server snapshot or a rotated snapshot earns
+// the same backoff but is not a fork: reporting those as divergence would send
+// an operator to repair a healthy group.
+func TestOnlyANonExtendingChainCountsAsDivergence(t *testing.T) {
+	founderIdentity, founder, _ := mustTestIdentity(t)
+	groupID := entmoot.GroupID{0x42}
+	groupRoster := roster.New(groupID)
+	if err := groupRoster.Genesis(founderIdentity, founder, 1_000); err != nil {
+		t.Fatal(err)
+	}
+	session := &groupSession{groupID: groupID, roster: groupRoster}
+	var id peer.ID = "12D3KooWBdvL92Hd76R1LN5qswuXSgQf7ZWZNwHhKeS4tDoHGzuA"
+	now := time.Now()
+
+	transient := []error{
+		context.DeadlineExceeded,
+		errors.New("libp2p: roster page request failed: resource_exhausted"),
+		errors.New("libp2p: roster snapshot changed"),
+		errors.New("libp2p: roster pull exceeds 4096 new entries"),
+		errors.New("failed to open stream: context canceled"),
+	}
+	for _, err := range transient {
+		if rosterChainDiverged(err) {
+			t.Fatalf("%v was classified as a fork", err)
+		}
+		session.noteRosterSyncFailure(id, now, groupRoster.Head(), entmoot.RosterEntryID{9}, "pull unavailable: "+err.Error(), false)
+		if reports := session.rosterDivergenceReports(groupID); len(reports) != 0 {
+			t.Fatalf("%v produced a divergence report: %+v", err, reports)
+		}
+		if session.rosterSyncReady(id, now) {
+			t.Fatalf("%v did not back the peer off", err)
+		}
+	}
+
+	forks := []error{
+		fmt.Errorf("%w: parents must reference current head", entmoot.ErrRosterReject),
+		errors.New("libp2p: roster head mismatch"),
+	}
+	for _, err := range forks {
+		if !rosterChainDiverged(err) {
+			t.Fatalf("%v was not classified as a fork", err)
+		}
+	}
+	session.noteRosterSyncFailure(id, now, groupRoster.Head(), entmoot.RosterEntryID{9}, "pull failed: forked", true)
+	if reports := session.rosterDivergenceReports(groupID); len(reports) != 1 {
+		t.Fatalf("a fork produced %+v, want one report", reports)
+	}
+
+	// A report must stop being asserted once the head it names is on our
+	// chain, even before the peer is retried.
+	member := mustTestIdentityInfo(t)
+	entry, err := groupRoster.SignEntry(founderIdentity, "add", member, nil, 2_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := groupRoster.Apply(entry); err != nil {
+		t.Fatal(err)
+	}
+	session.noteRosterSyncFailure(id, now, groupRoster.Head(), entry.ID, "pull failed: forked", true)
+	if reports := session.rosterDivergenceReports(groupID); len(reports) != 0 {
+		t.Fatalf("a head now on our chain is still reported as divergence: %+v", reports)
+	}
+}
+
+func mustTestIdentityInfo(t *testing.T) entmoot.NodeInfo {
+	t.Helper()
+	_, info, _ := mustTestIdentity(t)
+	return info
 }

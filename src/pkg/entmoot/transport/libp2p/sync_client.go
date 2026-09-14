@@ -101,10 +101,12 @@ func ValidateRosterChain(groupID entmoot.GroupID, expectedFounder entmoot.NodeIn
 	return temporary, nil
 }
 
-// maxRosterSyncEntries bounds one roster pull. A roster is a membership list,
-// not history: a peer that claims a chain this long is either broken or trying
-// to make every sync round expensive, so the pull is abandoned rather than
-// downloaded and then rejected.
+// maxRosterSyncEntries bounds how many entries one pull may DOWNLOAD. It is a
+// cost limit on a single round, not a limit on how long a group's chain may
+// grow: the local prefix is not counted, because a group that has made more
+// than this many membership changes must still be able to catch up. A peer
+// serving more than this in one round is either broken or making every sync
+// expensive, so the pull is abandoned rather than paged forever.
 const maxRosterSyncEntries = 4096
 
 // FetchRosterUpdates downloads one committed roster snapshot and validates the
@@ -141,8 +143,8 @@ func FetchRosterUpdates(ctx context.Context, h host.Host, remote peer.AddrInfo, 
 		}
 		all = append(all, response.Entries...)
 		after = response.NextSequence
-		if len(all) > maxRosterSyncEntries {
-			return nil, fmt.Errorf("libp2p: roster chain exceeds %d entries", maxRosterSyncEntries)
+		if len(all)-len(local) > maxRosterSyncEntries {
+			return nil, fmt.Errorf("libp2p: roster pull exceeds %d new entries", maxRosterSyncEntries)
 		}
 		if response.Complete {
 			if _, err := ValidateRosterChain(groupID, local[0].Subject, committedHead, all); err != nil {
@@ -165,7 +167,7 @@ func FetchRosterHead(ctx context.Context, h host.Host, remote peer.AddrInfo, gro
 		Version:   2,
 		RequestID: fmt.Sprintf("roster-head-%d", time.Now().UnixNano()),
 		GroupID:   groupID,
-		Limit:     1,
+		HeadOnly:  true,
 	}
 	response, err := RequestRosterPage(ctx, h, remote, request)
 	if err != nil {

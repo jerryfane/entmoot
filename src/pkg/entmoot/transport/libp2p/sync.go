@@ -61,6 +61,12 @@ type RosterSyncRequest struct {
 	SnapshotToken string               `json:"snapshot_token,omitempty"`
 	AfterSequence uint64               `json:"after_sequence,omitempty"`
 	Limit         int                  `json:"limit,omitempty"`
+	// HeadOnly asks for the committed head and nothing else. A head probe must
+	// not reserve a paging snapshot: it is repeated on every maintenance tick,
+	// and a reservation it never finishes would pin one of the server's few
+	// per-peer slots until it expired, starving the pull the probe exists to
+	// decide on.
+	HeadOnly bool `json:"head_only,omitempty"`
 }
 
 type RosterSyncResponse struct {
@@ -302,6 +308,19 @@ func (s *SyncServer) handleRoster(stream network.Stream) {
 		return
 	}
 	entries := r.Entries()
+	if request.HeadOnly {
+		// No snapshot, no paging: the answer is one id from live state.
+		if len(entries) == 0 {
+			response.Error = SyncUnauthorized
+			s.writeRoster(stream, response)
+			return
+		}
+		response.Complete = true
+		response.CommittedHead = entries[len(entries)-1].ID
+		response.NextSequence = uint64(len(entries))
+		s.writeRoster(stream, response)
+		return
+	}
 	snapshot, token, snapshotErr := s.rosterSnapshot(stream.Conn().RemotePeer(), request, len(entries))
 	if snapshotErr != "" {
 		response.Error = snapshotErr

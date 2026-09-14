@@ -230,3 +230,48 @@ func TestUndecodablePolicyIsRefusedAndAuthorityReducing(t *testing.T) {
 		t.Fatal("an unreadable policy left delegated authority standing")
 	}
 }
+
+// A policy that claims to change the admin set in a version this build cannot
+// read must be refused. Accepting it would leave this node honouring admins
+// the founder may have just removed, while a newer peer applied the change:
+// the two would then disagree about who may sign the next entry.
+func TestUnknownAdminPolicyVersionIsRefusedAndAuthorityReducing(t *testing.T) {
+	f := newAdminFixture(t)
+	adminIdentity, admin := f.member(t)
+	f.grant(t, *admin.MemberID)
+	if !f.log.CanAdminister(*admin.MemberID) {
+		t.Fatal("the delegated admin was not granted")
+	}
+
+	future := []byte(`{"type":"admins/v2","admins":[],"quorum":2}`)
+	if !IsUnknownAdminPolicy(future) {
+		t.Fatal("a future admin version was not recognised as unreadable")
+	}
+	if IsUnknownAdminPolicy([]byte(`{"type":"legacy-identity-upgrade/v1"}`)) {
+		t.Fatal("an unrelated policy was treated as an admin policy")
+	}
+	if err := f.sign(t, f.founder, "policy_change", entmoot.NodeInfo{}, future); err == nil {
+		t.Fatal("an admin policy version this build cannot apply was accepted")
+	}
+	if !f.log.CanAdminister(*admin.MemberID) {
+		t.Fatal("a refused entry changed the admin set")
+	}
+
+	// Reaching the projection without validation (an older or broken writer)
+	// must reduce authority rather than keep admins the payload does not state.
+	entry, err := f.log.SignEntry(f.founder, "policy_change", entmoot.NodeInfo{}, future, f.nextTime+50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.log.mu.Lock()
+	f.log.applyLocked(entry)
+	f.log.mu.Unlock()
+	if f.log.CanAdminister(*admin.MemberID) {
+		t.Fatal("an unreadable admin policy left delegated authority standing")
+	}
+	// The admin's ordinary membership is untouched; only delegation is lost.
+	if !f.log.IsMemberID(*admin.MemberID) {
+		t.Fatal("clearing delegation removed the member")
+	}
+	_ = adminIdentity
+}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -282,4 +283,143 @@ func (f *snapshotLifecycleFixture) historyPage(groupID entmoot.GroupID, previous
 		request.AfterAuthorMemberID = previous.NextAuthorMemberID
 	}
 	return RequestHistoryPage(f.ctx, f.client, f.remote, request)
+}
+
+// The head probe runs on every maintenance tick, so it must cost the server
+// nothing that lingers. Reserving a paging snapshot it never finishes would
+// pin one of the few per-peer slots for the snapshot lifetime and starve the
+// roster pull the probe exists to decide on.
+func TestRosterHeadProbeReservesNoSnapshotSlot(t *testing.T) {
+	f := newSnapshotLifecycleFixture(t)
+	group := f.groups[0]
+	head := f.logs[group].Head()
+
+	// Occupy every per-peer slot with genuine paged sessions, the state a busy
+	// peer is in. A probe that reserves a snapshot cannot be served now.
+	held := make([]RosterSyncResponse, 0, maxPeerSnapshots)
+	for i := 0; i < maxPeerSnapshots; i++ {
+		page, err := f.rosterPage(f.groups[i%len(f.groups)], nil, 1)
+		if err != nil || page.Complete {
+			t.Fatalf("holding reservation %d: page=%+v err=%v", i, page, err)
+		}
+		held = append(held, page)
+	}
+	exhausted, err := f.rosterPage(group, nil, 1)
+	if err == nil || exhausted.Error != SyncResourceExhausted {
+		t.Fatalf("slots are not full: page=%+v err=%v", exhausted, err)
+	}
+
+	// Probes must still answer, repeatedly, with every slot taken.
+	for i := 0; i < maxPeerSnapshots*3; i++ {
+		got, err := FetchRosterHead(f.ctx, f.client, f.remote, group)
+		if err != nil {
+			t.Fatalf("probe %d with all slots held: %v", i, err)
+		}
+		if got != head {
+			t.Fatalf("probe %d returned head %s, want %s", i, got, head)
+		}
+	}
+
+	// And the probes must not have consumed anything themselves: a pull works
+	// as soon as the paged sessions finish.
+	for i, page := range held {
+		done, err := f.rosterPage(f.groups[i%len(f.groups)], &page, 100)
+		if err != nil || !done.Complete {
+			t.Fatalf("completing reservation %d: page=%+v err=%v", i, done, err)
+		}
+	}
+	local := f.logs[group].Entries()[:1]
+	updates, err := FetchRosterUpdates(f.ctx, f.client, f.remote, group, local)
+	if err != nil {
+		t.Fatalf("roster pull after the probes: %v", err)
+	}
+	if len(updates) != len(f.logs[group].Entries())-1 {
+		t.Fatalf("pull returned %d entries, want %d", len(updates), len(f.logs[group].Entries())-1)
+	}
+}
+
+// The pull ceiling is a per-round cost limit, not a limit on how many
+// membership changes a group may ever make. Counting the local prefix would
+// turn it into a lifetime cap: a group whose chain passed the ceiling could
+// never be synced again by any node, and roster entries are never compacted.
+func TestRosterPullCeilingBoundsTheDeltaNotTheChainLength(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	founder := mustIdentity(t)
+	serverHost, _, err := NewHost(ctx, founder, libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverHost.Close()
+	clientIdentity := mustIdentity(t)
+	clientHost, _, err := NewHost(ctx, clientIdentity, libp2p.NoListenAddrs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientHost.Close()
+
+	groupID := entmoot.GroupID{0x6c}
+	log := roster.New(groupID)
+	founderInfo := mustNodeInfo(t, founder.PublicKey)
+	if err := log.Genesis(founder, founderInfo, 1_000); err != nil {
+		t.Fatal(err)
+	}
+	// The client must be a member to read the roster at all.
+	client := mustNodeInfo(t, clientIdentity.PublicKey)
+	entry, err := log.SignEntry(founder, "add", client, nil, 2_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := log.Apply(entry); err != nil {
+		t.Fatal(err)
+	}
+	// Grow the chain past the per-round ceiling with founder-signed policy
+	// entries of a type this build does not interpret: cheap to produce and
+	// accepted exactly like any other entry.
+	foreign := []byte(`{"type":"legacy-identity-upgrade/v1"}`)
+	for timestamp := int64(3_000); len(log.Entries()) <= maxRosterSyncEntries+2; timestamp++ {
+		policyEntry, err := log.SignEntry(founder, "policy_change", entmoot.NodeInfo{}, foreign, timestamp)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := log.Apply(policyEntry); err != nil {
+			t.Fatal(err)
+		}
+	}
+	chain := log.Entries()
+	if len(chain) <= maxRosterSyncEntries {
+		t.Fatalf("chain is %d entries, want more than the ceiling %d", len(chain), maxRosterSyncEntries)
+	}
+
+	server := &SyncServer{
+		Host: serverHost, Admission: NewBootstrapAdmission(), Store: store.NewMemory(),
+		Roster: func(id entmoot.GroupID) (*roster.RosterLog, bool) {
+			if id != groupID {
+				return nil, false
+			}
+			return log, true
+		},
+	}
+	if err := server.Install(); err != nil {
+		t.Fatal(err)
+	}
+	remote := peer.AddrInfo{ID: serverHost.ID(), Addrs: serverHost.Addrs()}
+
+	// A node that is one entry behind on an over-ceiling chain must still be
+	// able to catch up: the delta is one entry.
+	local := chain[:len(chain)-1]
+	updates, err := FetchRosterUpdates(ctx, clientHost, remote, groupID, local)
+	if err != nil {
+		t.Fatalf("catching up one entry on a %d-entry chain: %v", len(chain), err)
+	}
+	if len(updates) != 1 || updates[0].ID != chain[len(chain)-1].ID {
+		t.Fatalf("pull returned %d entries, want the single missing one", len(updates))
+	}
+
+	// The ceiling still bounds one round: a node holding only the genesis
+	// cannot pull an over-ceiling chain in a single pull.
+	if _, err := FetchRosterUpdates(ctx, clientHost, remote, groupID, chain[:1]); err == nil ||
+		!strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("an over-ceiling download was not refused: %v", err)
+	}
 }

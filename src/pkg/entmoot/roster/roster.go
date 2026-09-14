@@ -86,6 +86,10 @@ type RosterLog struct {
 	// replace atomically swaps the whole persisted chain. Only fork repair
 	// uses it; in-memory logs leave it nil.
 	replace func([]entmoot.RosterEntry) error
+	// storedChain reads the committed chain back from the store. Repair uses
+	// it to resolve an ambiguous write failure, where the store may or may not
+	// have landed the new chain. In-memory logs leave it nil.
+	storedChain func() ([]entmoot.RosterEntry, error)
 	// claimWriter acquires the persistent writer lease. In-memory logs leave it
 	// nil. Persistent logs acquire lazily for offline mutation; daemons call
 	// ClaimWriter during startup.
@@ -272,16 +276,22 @@ func (r *RosterLog) AcceptGenesis(entry entmoot.RosterEntry) error {
 // Apply validates and appends a single entry. On any validation failure the
 // returned error wraps entmoot.ErrRosterReject and the log is unchanged.
 //
-// Validation (v0):
-//   - log must already have a genesis entry (founder recorded),
-//   - Op must be one of "add", "remove", or "policy_change",
-//   - Actor must equal the founder's PilotNodeID,
-//   - Signature must verify against the founder's EntmootPubKey,
-//   - Entry.ID must equal canonical.RosterEntryID of the entry with id/sig
-//     zeroed,
-//   - Entry.Timestamp must be strictly greater than the current head's
-//     timestamp (monotonicity),
-//   - Parents must reference the current head (v0 linear log).
+// Validation:
+//   - the log must already have a genesis entry, so the founder is known;
+//   - Op must be one of "add", "remove", or "policy_change";
+//   - the signer must be authorised for that op: the founder always, a
+//     delegated admin for adds and removals of ordinary members. Only the
+//     founder changes the admin set, removes an admin, or removes itself;
+//   - the signature must verify against the signer's current member record,
+//     so losing membership or delegation ends the authority at once;
+//   - Entry.ID must equal canonical.RosterEntryID of the entry with id and
+//     signature zeroed, and version-2 entries must carry this group's id and
+//     the next sequence number;
+//   - Entry.Timestamp must be strictly greater than the current head's;
+//   - Parents must reference the current head: the log stays linear, so two
+//     writers racing means one of them retries;
+//   - a version-2 policy_change payload must be readable JSON, and one that
+//     claims to change the admin set must be a version this build can apply.
 //
 // Apply does NOT check wire-layer replay windows — that is the caller's job.
 func (r *RosterLog) Apply(entry entmoot.RosterEntry) error {
@@ -365,6 +375,13 @@ func (r *RosterLog) validateLocked(entry entmoot.RosterEntry) error {
 	if entry.Op == "policy_change" && entry.Version != 0 {
 		if len(entry.Policy) == 0 || !json.Valid(entry.Policy) {
 			return fmt.Errorf("%w: policy_change payload is not valid JSON", entmoot.ErrRosterReject)
+		}
+		if IsUnknownAdminPolicy(entry.Policy) {
+			// It says it changes the admin set, in a version this build cannot
+			// read. Accepting it would leave the current admins standing here
+			// while a newer peer applied the change: the two nodes would then
+			// disagree about who may sign. Refuse and let the operator see it.
+			return fmt.Errorf("%w: policy_change names an admin policy version this build cannot apply", entmoot.ErrRosterReject)
 		}
 		if IsAdminPolicy(entry.Policy) {
 			if _, err := ParseAdminPolicy(entry.Policy); err != nil {
@@ -542,13 +559,15 @@ func (r *RosterLog) applyLocked(entry entmoot.RosterEntry) {
 			delete(r.members, stored.Subject.PilotNodeID)
 		}
 	case "policy_change":
-		// Membership is unchanged. A readable policy of another type leaves the
-		// admin set alone; an admin policy replaces it wholesale. Anything this
-		// build cannot read is authority-reducing: validation rejects such
-		// entries, so reaching one here means the log was loaded without
-		// validation, and keeping delegated authority the bytes do not state
-		// would be the unsafe reading.
-		if len(stored.Policy) > 0 && !IsAdminPolicy(stored.Policy) && json.Valid(stored.Policy) {
+		// Membership is unchanged. A readable policy of another family leaves
+		// the admin set alone; an admin policy replaces it wholesale. A policy
+		// that claims to change the admin set but that this build cannot read
+		// is authority-reducing: validation rejects such entries, so reaching
+		// one here means the log was loaded without validation, and keeping
+		// delegated authority the bytes do not state would be the unsafe
+		// reading.
+		if len(stored.Policy) > 0 && json.Valid(stored.Policy) &&
+			!IsAdminPolicy(stored.Policy) && !IsUnknownAdminPolicy(stored.Policy) {
 			break
 		}
 		policy, err := ParseAdminPolicy(stored.Policy)
