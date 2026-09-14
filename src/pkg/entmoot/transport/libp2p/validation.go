@@ -10,7 +10,6 @@ import (
 
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/canonical"
-	"entmoot/pkg/entmoot/keystore"
 	"entmoot/pkg/entmoot/merkle"
 	"entmoot/pkg/entmoot/roster"
 	"entmoot/pkg/entmoot/signing"
@@ -97,11 +96,12 @@ func VerifyLiveAuthor(groupRoster *roster.RosterLog, message entmoot.Message, no
 	return signing.VerifyMessage(message, author)
 }
 
+// VerifyLiveMessage authenticates a live message against the roster. Current
+// membership at the named checkpoint is the whole authority: there is no
+// per-message admission certificate, so a group keeps working when any
+// particular member, founder included, is offline.
 func VerifyLiveMessage(groupRoster *roster.RosterLog, message entmoot.Message, now time.Time) error {
-	if err := VerifyLiveAuthor(groupRoster, message, now); err != nil {
-		return err
-	}
-	return verifyMessageAcceptance(groupRoster, message)
+	return VerifyLiveAuthor(groupRoster, message, now)
 }
 
 // VerifyHistoricalMessage accepts version-2 messages at a known roster
@@ -161,7 +161,7 @@ func VerifyHistoricalMessageWithProof(groupRoster *roster.RosterLog, message ent
 		if err := signing.VerifyMessage(message, author); err != nil {
 			return err
 		}
-		return verifyMessageAcceptance(groupRoster, message)
+		return nil
 	default:
 		return fmt.Errorf("libp2p: unsupported historical message version %d", message.Version)
 	}
@@ -210,37 +210,6 @@ func verifyOperationalAuthor(claimed, rosterAuthor entmoot.NodeInfo) error {
 	}
 	if claimed.PeerID != rosterPeerID {
 		return fmt.Errorf("%w: message author peer_id does not match roster key", entmoot.ErrNotMember)
-	}
-	return nil
-}
-func verifyMessageAcceptance(groupRoster *roster.RosterLog, message entmoot.Message) error {
-	if message.Acceptance == nil {
-		return fmt.Errorf("%w: message has no roster acceptance certificate", entmoot.ErrSigInvalid)
-	}
-	acceptance := message.Acceptance
-	if acceptance.Version != 1 || acceptance.GroupID != message.GroupID || acceptance.MessageID != message.ID ||
-		(message.RosterHead != nil && acceptance.RosterHead != *message.RosterHead) {
-		return fmt.Errorf("%w: acceptance certificate does not match message", entmoot.ErrSigInvalid)
-	}
-	founder, ok := groupRoster.Founder()
-	if !ok || acceptance.Authority.MemberID == nil || founder.MemberID == nil ||
-		*acceptance.Authority.MemberID != *founder.MemberID ||
-		!bytes.Equal(acceptance.Authority.EntmootPubKey, founder.EntmootPubKey) {
-		return fmt.Errorf("%w: acceptance authority is not the founder", entmoot.ErrSigInvalid)
-	}
-	_, active, known := groupRoster.MemberInfoAtID(*founder.MemberID, acceptance.RosterHead)
-	if !known {
-		return fmt.Errorf("%w: acceptance head %s", entmoot.ErrRosterHeadUnknown, acceptance.RosterHead)
-	}
-	if !active {
-		return fmt.Errorf("%w: founder inactive at acceptance head", entmoot.ErrSigInvalid)
-	}
-	signingBytes, err := canonical.MessageAcceptanceSigningBytes(*acceptance)
-	if err != nil {
-		return fmt.Errorf("%w: canonical acceptance: %v", entmoot.ErrSigInvalid, err)
-	}
-	if !keystore.Verify(founder.EntmootPubKey, signingBytes, acceptance.Signature) {
-		return fmt.Errorf("%w: acceptance signature does not verify", entmoot.ErrSigInvalid)
 	}
 	return nil
 }

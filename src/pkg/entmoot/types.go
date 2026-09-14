@@ -179,24 +179,10 @@ type Message struct {
 	// RosterHead is the group-bound roster checkpoint under which the author
 	// was admitted. It is absent only on legacy v1 messages.
 	RosterHead *RosterEntryID `json:"roster_head,omitempty"`
-	// Signature authenticates the message signing form, including RosterHead
-	// but excluding Acceptance.
+	// Signature authenticates the message signing form, including RosterHead.
+	// Membership at RosterHead is the only authority a message needs: a member
+	// publishes on its own signature, and moderation is roster removal.
 	Signature []byte `json:"signature,omitempty"`
-	// Acceptance proves that the roster authority accepted this exact message
-	// under a named roster checkpoint. It is attached after author signing and
-	// does not change the message ID.
-	Acceptance *MessageAcceptance `json:"acceptance,omitempty"`
-}
-
-// MessageAcceptance is a founder-signed admission certificate for one exact
-// message under one group-bound roster head.
-type MessageAcceptance struct {
-	Version    uint8         `json:"version"`
-	GroupID    GroupID       `json:"group_id"`
-	MessageID  MessageID     `json:"message_id"`
-	RosterHead RosterEntryID `json:"roster_head"`
-	Authority  NodeInfo      `json:"authority"`
-	Signature  []byte        `json:"signature,omitempty"`
 }
 
 // RosterEntry is one signed record in a group's append-only roster log.

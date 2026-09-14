@@ -1285,17 +1285,6 @@ func (s *ipcServer) publishLocalMessage(ctx context.Context, gid entmoot.GroupID
 			Message: "sign message: " + err.Error(),
 		}
 	}
-	acceptance, err := s.runtime.AcceptMessage(ctx, gid, msg)
-	if err != nil {
-		return nil, &ipc.ErrorFrame{
-			Type:    "error",
-			Code:    ipc.CodeNotMember,
-			GroupID: &gid,
-			Message: "message acceptance: " + err.Error(),
-		}
-	}
-	msg.Acceptance = &acceptance
-
 	if _, err := sess.live.Publish(ctx, msg); err != nil {
 		return nil, &ipc.ErrorFrame{
 			Type:    "error",

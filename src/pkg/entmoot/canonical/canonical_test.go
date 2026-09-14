@@ -88,12 +88,6 @@ func TestMessageIDFieldSensitivity(t *testing.T) {
 		t.Fatalf("Signature must not affect MessageID: got %x vs base %x", got, baseID)
 	}
 
-	mAcceptance := base
-	mAcceptance.Acceptance = &entmoot.MessageAcceptance{Version: 1, MessageID: entmoot.MessageID{9}}
-	if got := MessageID(mAcceptance); got != baseID {
-		t.Fatalf("Acceptance must not affect MessageID: got %x vs base %x", got, baseID)
-	}
-
 	// Every other field must affect it.
 	type mutation struct {
 		name  string
@@ -165,14 +159,6 @@ func TestLegacyMessageSigningFixtureUnchanged(t *testing.T) {
 		Parents:    []entmoot.MessageID{{1}},
 		Content:    []byte("legacy history"),
 		References: []entmoot.MessageID{{2}},
-	}
-	message.Acceptance = &entmoot.MessageAcceptance{
-		Version:    1,
-		GroupID:    groupID,
-		MessageID:  entmoot.MessageID{9},
-		RosterHead: entmoot.RosterEntryID{8},
-		Authority:  entmoot.NodeInfo{PilotNodeID: 7, EntmootPubKey: []byte{6}},
-		Signature:  []byte{5},
 	}
 	gotBytes, err := MessageSigningBytes(message)
 	if err != nil {
@@ -358,12 +344,6 @@ func cloneMessage(m entmoot.Message) entmoot.Message {
 	if m.RosterHead != nil {
 		head := *m.RosterHead
 		out.RosterHead = &head
-	}
-	if m.Acceptance != nil {
-		acceptance := *m.Acceptance
-		acceptance.Authority.EntmootPubKey = append([]byte(nil), m.Acceptance.Authority.EntmootPubKey...)
-		acceptance.Signature = append([]byte(nil), m.Acceptance.Signature...)
-		out.Acceptance = &acceptance
 	}
 	return out
 }

@@ -34,14 +34,14 @@ A group contains:
 
 - a random 32-byte group id;
 - a founder-anchored, group-bound signed roster;
-- author-signed messages and founder acceptance evidence;
+- author-signed messages bound to a roster checkpoint;
 - local policy and retention state;
 - deterministic history coverage and Merkle data.
 
 Roster changes are linear, signed transitions. Validation binds the group,
 founder, previous head, subject identity, and signer authority. Removed members
-cannot publish new live messages. Historical messages remain verifiable only
-through accepted historical evidence rather than current membership alone.
+cannot publish new live messages. Historical messages remain verifiable against
+the roster checkpoint they name, so removal does not erase past history.
 
 ## 4. Runtime Shape
 
@@ -132,8 +132,8 @@ separately. Multiple eligible keepers are used when available.
 ## 9. Persistence and Conversion
 
 Per-group SQLite stores hold signed roster entries, immutable message bytes,
-acceptance evidence, query indexes, cached coverage state, and conversion
-metadata. Mutations update dependent projections transactionally.
+query indexes, cached coverage state, and conversion metadata. Mutations update
+dependent projections transactionally.
 
 The one-way legacy conversion:
 
