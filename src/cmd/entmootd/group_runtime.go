@@ -483,7 +483,7 @@ func (r *groupRuntime) maintainGroup(ctx context.Context, session *groupSession)
 			// A node that never pulls, such as the founder, still learns heads
 			// by writing them, so drain on the tick as well. It is a no-op
 			// when nothing is held.
-			r.drainRosterAhead(ctx, session)
+			r.drainHeldMessages(ctx, session)
 		case <-historyTicker.C:
 			go r.catchUp(ctx, session)
 		case <-retentionTicker.C:
@@ -547,7 +547,7 @@ func (r *groupRuntime) syncMembership(ctx context.Context, session *groupSession
 				r.logger.Warn("libp2p membership: this node was removed from the group",
 					slog.String("group_id", session.groupID.String()),
 					slog.String("peer_id", remote.ID.String()))
-				r.drainRosterAhead(ctx, session)
+				r.drainHeldMessages(ctx, session)
 				return
 			}
 			// Any other refusal is information about that peer, not about the
@@ -583,7 +583,7 @@ func (r *groupRuntime) syncMembership(ctx context.Context, session *groupSession
 	}
 	if progressed {
 		// Messages held for a checkpoint we have now learned can be accepted.
-		r.drainRosterAhead(ctx, session)
+		r.drainHeldMessages(ctx, session)
 		r.signCheckpointIfDue(session)
 	}
 }
@@ -660,12 +660,12 @@ func (r *groupRuntime) membershipPeers(session *groupSession) []peer.AddrInfo {
 	return out
 }
 
-// drainRosterAhead releases messages that were held for a checkpoint this node
+// drainHeldMessages releases messages that were held for a checkpoint this node
 // has now learned. Every path that advances a session's membership calls it: a
 // checkpoint learned through a join or an ESP change releases held messages
 // exactly as a pull does. A message the updated membership still refuses is
 // dropped and counted: silence there would hide a message that never arrives.
-func (r *groupRuntime) drainRosterAhead(ctx context.Context, session *groupSession) {
+func (r *groupRuntime) drainHeldMessages(ctx context.Context, session *groupSession) {
 	if session == nil || session.live == nil {
 		return
 	}
