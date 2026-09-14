@@ -182,11 +182,17 @@ func requestResponse(ctx context.Context, h host.Host, remote peer.AddrInfo, pro
 }
 
 type KeeperProgress struct {
-	PeerID           peer.ID
-	Available        bool
-	Listed           int
-	Inserted         int
-	MissingBodies    int
+	PeerID        peer.ID
+	Available     bool
+	Listed        int
+	Inserted      int
+	MissingBodies int
+	// PrunedLocally counts pruned identifiers this pass encountered from this
+	// keeper: identifiers retention deliberately dropped here, offered again by
+	// a peer with a longer window. It is a coverage difference, not a gap to
+	// chase, so it is reported apart from MissingBodies. The same identifier
+	// offered by several keepers is counted once per keeper.
+	PrunedLocally    int
 	ConvergedHint    bool
 	CoverageFloorMS  int64
 	TransferredBytes int
@@ -227,6 +233,7 @@ type SyncSummary struct {
 	Available      int
 	Inserted       int
 	MissingBodies  int
+	PrunedLocally  int
 	ConvergedHints int
 }
 
@@ -238,6 +245,7 @@ func SummarizeKeeperProgress(progress []KeeperProgress) SyncSummary {
 		}
 		summary.Inserted += item.Inserted
 		summary.MissingBodies += item.MissingBodies
+		summary.PrunedLocally += item.PrunedLocally
 		if item.ConvergedHint {
 			summary.ConvergedHints++
 		}
@@ -288,6 +296,12 @@ func SyncFromKeepers(
 			delete(state.keepers, id)
 		}
 	}
+	// No request floor is sent. A node's coverage floor advances whenever
+	// retention runs, including when it deletes nothing and for messages that
+	// retention deliberately exempts, so using it as a request lower bound
+	// would permanently hide history this node still wants. Only a tombstone
+	// means "we dropped this on purpose", and that is checked per identifier
+	// below.
 	for keeperIndex, keeper := range keepers {
 		item := KeeperProgress{PeerID: keeper.ID}
 		cursor := state.keepers[keeper.ID]
@@ -361,9 +375,22 @@ func syncFromKeeper(ctx context.Context, h host.Host, groupID entmoot.GroupID, k
 				if err != nil {
 					return err
 				}
-				if !has {
-					missing = append(missing, id)
+				if has {
+					continue
 				}
+				// A message this node pruned on purpose is absent, not
+				// missing. Without this check the keeper is asked for it every
+				// round and the local store refuses it with ErrPruned, so one
+				// expired message stalls the whole sync forever.
+				tombstoned, err := store.HasTombstone(ctx, destination, groupID, id)
+				if err != nil {
+					return err
+				}
+				if tombstoned {
+					progress.PrunedLocally++
+					continue
+				}
+				missing = append(missing, id)
 			}
 			if len(missing) == 0 {
 				cursor.offset = end
@@ -408,6 +435,13 @@ func syncFromKeeper(ctx context.Context, h host.Host, groupID entmoot.GroupID, k
 				}
 				inserted, err := destination.Put(ctx, groupID, message)
 				if err != nil {
+					// Retention may have tombstoned this id between listing and
+					// insertion. Refusing it is correct; aborting the sync over
+					// it is not.
+					if errors.Is(err, store.ErrPruned) {
+						progress.PrunedLocally++
+						continue
+					}
 					return err
 				}
 				if inserted {

@@ -166,6 +166,16 @@ func CoverageFloor(ctx context.Context, st MessageStore, groupID entmoot.GroupID
 	return 0, nil
 }
 
+// HasTombstone reports whether retention intentionally removed this exact id,
+// so a caller can tell "we never had it" from "we deliberately dropped it".
+// Stores without tombstones answer false.
+func HasTombstone(ctx context.Context, st MessageStore, groupID entmoot.GroupID, id entmoot.MessageID) (bool, error) {
+	if tombstoned, ok := st.(TombstoneStore); ok {
+		return tombstoned.HasTombstone(ctx, groupID, id)
+	}
+	return false, nil
+}
+
 // MerkleRootSince returns the deterministic root for messages at or after the
 // agreed retention floor. The full-history path retains the store's cached
 // MerkleRoot implementation.
