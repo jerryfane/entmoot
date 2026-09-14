@@ -294,7 +294,7 @@ func insertRecordTx(ctx context.Context, tx *sql.Tx, rec Record) error {
 		return fmt.Errorf("membership: encode record: %w", err)
 	}
 	var subject []byte
-	if id, err := entmoot.ResolvedMemberID(rec.Subject); err == nil {
+	if id, err := rec.SubjectMemberID(); err == nil {
 		subject = id[:]
 	}
 	if _, err := tx.ExecContext(ctx, `

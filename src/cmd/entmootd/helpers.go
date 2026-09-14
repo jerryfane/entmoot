@@ -16,7 +16,7 @@ import (
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/conversion"
 	"entmoot/pkg/entmoot/keystore"
-	"entmoot/pkg/entmoot/roster"
+	"entmoot/pkg/entmoot/membership"
 )
 
 // setupResult carries resources assembled by setup.
@@ -206,21 +206,17 @@ func parseTopicList(s string) []string {
 
 // groupsDir returns the parent directory under which per-group subdirs
 // live, matching the on-disk layout used by store/sqlite.go and
-// roster/jsonl.go (both use <dataRoot>/groups/<base64url(gid)>/).
+// membership/store.go (both use <dataRoot>/groups/<base64url(gid)>/).
 func groupsDir(dataRoot string) string {
 	return filepath.Join(dataRoot, "groups")
 }
 
-func groupRosterPath(dataRoot string, gid entmoot.GroupID) string {
-	return filepath.Join(groupDirPath(dataRoot, gid), "roster.jsonl")
-}
-
-func groupRosterSQLitePath(dataRoot string, gid entmoot.GroupID) string {
-	return filepath.Join(groupDirPath(dataRoot, gid), "roster.sqlite")
-}
-
-func groupRosterExists(dataRoot string, gid entmoot.GroupID) bool {
-	return roster.Exists(dataRoot, gid)
+// groupMembershipExists reports whether a group can be served: it needs a
+// checkpoint. A directory holding only the pre-checkpoint chain is not
+// serveable until `membership upgrade` mints checkpoint 0, and saying so is
+// better than starting a session that cannot answer anything.
+func groupMembershipExists(dataRoot string, gid entmoot.GroupID) bool {
+	return membership.Exists(dataRoot, gid)
 }
 
 // controlSocketPath returns the canonical control-socket path under the

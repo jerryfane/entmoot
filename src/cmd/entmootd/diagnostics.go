@@ -12,7 +12,7 @@ import (
 
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/ipc"
-	"entmoot/pkg/entmoot/roster"
+	"entmoot/pkg/entmoot/membership"
 	"entmoot/pkg/entmoot/store"
 	libp2ptransport "entmoot/pkg/entmoot/transport/libp2p"
 )
@@ -199,7 +199,7 @@ func buildDoctorReport(ctx context.Context, gf *globalFlags, groupFilter *entmoo
 
 func buildDoctorGroup(ctx context.Context, messageStore *store.SQLite, dataDir string, gid entmoot.GroupID, localMemberID entmoot.MemberID, live ipc.GroupInfo) doctorGroupReport {
 	group := doctorGroupReport{GroupID: gid, Running: live.GroupID == gid, Peers: []doctorPeerReport{}}
-	rlog, err := roster.OpenJSONL(dataDir, gid)
+	rlog, err := membership.Open(dataDir, gid)
 	if err != nil {
 		group.Error = err.Error()
 		return group

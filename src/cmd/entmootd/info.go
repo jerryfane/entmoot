@@ -85,7 +85,7 @@ func cmdInfo(gf *globalFlags, args []string) int {
 
 			groups := make([]ipc.GroupInfo, 0, len(gids))
 			for _, gid := range gids {
-				r, ok, err := openExistingRosterLog(s.dataDir, gid)
+				r, ok, err := openExistingGroup(s.dataDir, gid)
 				if err != nil {
 					slog.Warn("info: open roster",
 						slog.String("group", gid.String()),
@@ -95,7 +95,7 @@ func cmdInfo(gf *globalFlags, args []string) int {
 				if !ok {
 					continue
 				}
-				if !rosterHasLocalIdentityPubKey(r, s.identity.PublicKey) {
+				if !groupHasLocalIdentityPubKey(r, s.identity.PublicKey) {
 					_ = r.Close()
 					continue
 				}

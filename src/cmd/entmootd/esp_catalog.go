@@ -12,7 +12,7 @@ import (
 
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/esphttp"
-	"entmoot/pkg/entmoot/roster"
+	"entmoot/pkg/entmoot/membership"
 )
 
 type localGroupCatalog struct {
@@ -52,7 +52,7 @@ func (p espDiagnosticsProvider) FleetDiagnostics(ctx context.Context, fleet esph
 			if err != nil {
 				return nil, err
 			}
-			if r, err := roster.OpenJSONL(s.dataDir, fleet.ControlGroupID); err == nil {
+			if r, err := membership.Open(s.dataDir, fleet.ControlGroupID); err == nil {
 				for _, memberID := range r.MemberIDs() {
 					info, ok := r.MemberInfoByID(memberID)
 					if ok {
@@ -321,7 +321,7 @@ func groupFleetControl(meta map[string]interface{}) bool {
 }
 
 func (c localGroupCatalog) GetGroup(ctx context.Context, gid entmoot.GroupID) (esphttp.GroupSummary, bool, error) {
-	r, err := roster.OpenJSONL(c.dataDir, gid)
+	r, err := membership.Open(c.dataDir, gid)
 	if err != nil {
 		return esphttp.GroupSummary{}, false, err
 	}
@@ -333,7 +333,7 @@ func (c localGroupCatalog) GetGroup(ctx context.Context, gid entmoot.GroupID) (e
 	group := esphttp.GroupSummary{
 		GroupID:    gid,
 		Members:    len(members),
-		RosterHead: r.Head(),
+		RosterHead: r.Canonical().ID,
 	}
 	if c.metadata != nil {
 		if raw, ok, err := c.metadata.GetGroupMetadata(ctx, gid); err != nil {
@@ -365,12 +365,12 @@ func (c localGroupCatalog) GetGroup(ctx context.Context, gid entmoot.GroupID) (e
 }
 
 func (c localGroupCatalog) ListMembers(ctx context.Context, gid entmoot.GroupID) ([]esphttp.MemberSummary, error) {
-	r, err := roster.OpenJSONL(c.dataDir, gid)
+	r, err := membership.Open(c.dataDir, gid)
 	if err != nil {
 		return nil, err
 	}
 	defer r.Close()
-	founder, _ := r.Founder()
+	founder := r.Founder()
 	founderID, _ := entmoot.MemberIDFromPublicKey(founder.EntmootPubKey)
 	members := r.MemberIDs()
 	out := make([]esphttp.MemberSummary, 0, len(members))

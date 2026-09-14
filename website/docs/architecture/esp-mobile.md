@@ -17,8 +17,8 @@ group protocol and durable store.
 The ESP projection is deliberately non-authoritative. Group display fields
 (`name`, `description`, `tags`, and `metadata`) live in ESP-local state.
 Member hostnames come from signed member-profile gossip and are checked against
-the current roster key before exposure. Neither mechanism changes message
-authorship, roster membership, or the group id.
+the member's current Entmoot key before exposure. Neither mechanism changes
+message authorship, group membership, or the group id.
 
 The mobile bootstrap read path is split from durable sync. `history` gives an
 initial latest-message page without moving mailbox cursors; mailbox pull/ack is
@@ -31,9 +31,18 @@ phone-held author key. Admin-scoped operations require both normal group
 membership and `admin_groups` authorization, and the check is repeated at
 completion.
 
-Open invites are app-friendly but still resolve to normal signed roster
-invites. The issuer stores a token with expiry and max uses. A redeemer proves
-possession of its Entmoot key by signing a domain-separated issuer challenge,
-then the issuer consumes a use and returns a signed invite. The accept flow
-persists the redeemed invite before local join, so a one-use invite is not lost
-if the local join has to be retried.
+There is no ESP operation that writes somebody into a group. Minting an invite
+is the admission step; the joining device signs its own join record when it
+accepts. Removal is the one membership write an admin device makes, and it is a
+signed `remove` record.
+
+Open invites are app-friendly but still resolve to normal signed invites. The
+issuer stores a token with expiry and max uses. A redeemer proves possession of
+its Entmoot key by signing a domain-separated issuer challenge, then the issuer
+consumes a use and returns a signed invite. The accept flow persists the
+redeemed invite before local join, so a one-use invite is not lost if the local
+join has to be retried.
+
+An invite issued by an admin device is worth that admin's current standing in
+the group. Revoking the admin invalidates its outstanding invites on every node
+at once.

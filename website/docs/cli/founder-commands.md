@@ -19,15 +19,19 @@ entmootd group create \
   -join-mode open_invite \
   -policy preset:standard \
   --json
-entmootd invite create -group <GROUP_ID> -peers <NODE_ID> -valid-for 24h
-entmootd roster add -group <GROUP_ID> -node <NODE_ID> -pubkey <BASE64_PUBKEY>
+entmootd invite create -group <GROUP_ID> -target-pubkey <BASE64_PUBKEY> -bootstrap <MULTIADDR> -valid-for 24h
+entmootd roster status -group <GROUP_ID>
 ```
 
+There is no `roster add`. A member signs its own join record and redeems an
+invite, so admitting somebody is issuing an invite, not writing an entry. The
+issuer does not have to be online when the joiner uses it.
+
 These commands are intentionally separate from the common agent surface. The
-app/ESP path now exposes higher-level founder/admin operations through
-executable sign requests: group metadata updates, targeted invites, open
-invites, and member removal. Those operations still execute through the
-running daemon so live roster state and fanout stay coherent.
+app/ESP path exposes higher-level founder/admin operations through executable
+sign requests: group metadata updates, targeted invites, open invites, and
+member removal. Those operations execute through the running daemon so live
+membership and fanout stay coherent.
 
 ## Group creation
 
@@ -62,6 +66,112 @@ entmootd group policy clear -group <GROUP_ID> --json
 possible. Use `-local-only` only when the operator intentionally wants to avoid
 propagation. Policy updates coordinate cooperating nodes; every receiving node
 still enforces its accepted local policy.
+
+Two policy fields are group membership policy rather than local enforcement
+policy, and both are founder-only:
+
+```sh
+entmootd group policy join-rule -group <GROUP_ID> -rule invite
+entmootd group policy join-rule -group <GROUP_ID> -rule open
+entmootd group policy checkpoint-every -group <GROUP_ID> -records 64
+```
+
+`join-rule invite` (the default) means a join record must redeem a valid
+invite. `join-rule open` means the group's own signed policy admits anyone who
+signs a join. `checkpoint-every` sets how many effective membership records
+accumulate before an admin signs a checkpoint; the default is 64 and the
+minimum is 1.
+
+Each of these writes a signed `policy` record, so they take the group's writer
+lease: stop the local daemon first.
+
+## Membership administration
+
+```sh
+entmootd roster status -group <GROUP_ID>
+entmootd roster checkpoint -group <GROUP_ID>
+entmootd roster remove -group <GROUP_ID> -member <MEMBER_ID> -peer <PEER_ID> -pubkey <BASE64_PUBKEY>
+entmootd roster ban -group <GROUP_ID> -member <MEMBER_ID>
+entmootd roster unban -group <GROUP_ID> -member <MEMBER_ID>
+entmootd roster leave -group <GROUP_ID>
+entmootd roster admin list -group <GROUP_ID>
+entmootd roster admin grant -group <GROUP_ID> -member <MEMBER_ID>
+entmootd roster admin revoke -group <GROUP_ID> -member <MEMBER_ID>
+```
+
+Authority:
+
+- `remove` and `ban`: the founder or a delegated admin. Only the founder may
+  remove or ban an admin. A plain `remove` is recoverable — a later join
+  re-admits the member — while `ban` bars rejoining.
+- `unban`: founder only.
+- `leave`: any member, about itself. No admin is involved.
+- `checkpoint`: the founder or any delegated admin. It signs a checkpoint now
+  instead of waiting for the cadence, and retires the records it folds in. It
+  prints `nothing to fold in` when there is nothing pending.
+- `admin grant` / `admin revoke`: founder only. Each writes a `policy` record
+  carrying the complete admin set.
+
+Every command in that list except `status` writes a signed record and takes the
+group's writer lease, so stop the local daemon before running it. Member
+removal while the daemon is running goes through the ESP `member_remove`
+operation or the control socket instead.
+
+`roster status` reads local state and prints the canonical checkpoint, the
+membership, the admin set, bans, the count of records not yet folded into a
+checkpoint, and the membership policy:
+
+```json
+{"group_id":"<base64>","founder":"<base64>","checkpoint":"<base64>","sequence":3,"pending":7,"members":["<base64>"],"admins":[],"banned":[],"policy":{"join_rule":"invite","checkpoint_every":64}}
+```
+
+There is no `roster repair`: membership is a set, so nodes holding the same
+records project the same membership and there is no fork to repair.
+
+## Invites
+
+```sh
+entmootd invite create -group <GROUP_ID> -target-pubkey <BASE64_PUBKEY> -bootstrap <MULTIADDR> -valid-for 24h
+entmootd invite create -group <GROUP_ID> -open -max-uses 5 -valid-for 24h
+entmootd invite list -group <GROUP_ID>
+entmootd invite revoke -group <GROUP_ID> -nonce <BASE64_NONCE>
+```
+
+An invite is worth its issuer's current standing in the group. Removing or
+demoting the issuer invalidates its outstanding invites on every node at once,
+with no revocation step. `invite revoke` writes a signed `revoke_invite`
+record, which is what makes other nodes refuse it, and also marks the local
+issuance ledger; it therefore takes the writer lease and needs the daemon
+stopped. `-open` mints a bearer invite: whoever holds it can join until it
+expires, is revoked, or runs out of uses.
+
+`invite list` reads `bootstrap-admission.db`, which is only a local record of
+the invites this node issued. Invite use limits themselves are counted from the
+group's signed state, so every node reaches the same answer offline.
+
+## Migrating a pre-checkpoint group
+
+Groups created before signed checkpoints hold a linear roster chain in
+`roster.sqlite`. Such a group cannot be served: the daemon reports it as absent
+and says what to run.
+
+```sh
+entmootd membership upgrade -group <GROUP_ID>
+```
+
+This is founder-only and needs the daemon stopped. It mints checkpoint 0 from
+the existing chain, preserving the members and the delegated-admin set, and
+records the chain's head in the checkpoint so a fabricated upgrade is
+detectable. The chain stays on disk read-only: version-0 messages that cite it
+are still verified against it and against the founder-signed conversion
+commitment. Other nodes adopt the checkpoint when they see it, and refuse one
+whose membership disagrees with the chain they already hold.
+
+Running it twice is safe and reports the existing checkpoint:
+
+```json
+{"status":"already_upgraded","group_id":"<base64>","checkpoint":"<base64>","sequence":0}
+```
 
 ## Public descriptors
 

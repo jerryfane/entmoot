@@ -14,22 +14,17 @@ import (
 
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/keystore"
-	"entmoot/pkg/entmoot/roster"
+	"entmoot/pkg/entmoot/membership"
 	"entmoot/pkg/entmoot/signing"
 	"entmoot/pkg/entmoot/store"
 )
 
+// A completed pull must cost the server nothing afterwards: its token is
+// retired and its slot freed, so a member polling two groups in turn keeps
+// being served instead of locking itself out after maxPeerSnapshots polls.
 func TestTerminalSnapshotsDoNotStarveMultiGroupHistory(t *testing.T) {
 	f := newSnapshotLifecycleFixture(t)
-	// Repeated terminal roster polls across two groups previously occupied
-	// every slot before the same member could begin history recovery.
-	for i := 0; i < maxPeerSnapshots; i++ {
-		page, err := f.rosterPage(f.groups[i%len(f.groups)], nil, 100)
-		if err != nil || !page.Complete || len(page.Entries) != 2 {
-			t.Fatalf("roster poll %d: page=%+v err=%v", i, page, err)
-		}
-	}
-	for i := 0; i <= maxPeerSnapshots; i++ {
+	for i := range maxPeerSnapshots*2 + 1 {
 		groupID := f.groups[i%len(f.groups)]
 		page, err := f.historyPage(groupID, nil, 100)
 		if err != nil || page.HasMore || !slices.Equal(page.IDs, f.ids[groupID]) {
@@ -44,100 +39,67 @@ func TestTerminalSnapshotsDoNotStarveMultiGroupHistory(t *testing.T) {
 
 func TestActiveSnapshotsRemainPinnedBoundedAndExpire(t *testing.T) {
 	f := newSnapshotLifecycleFixture(t)
-	var rosters [2]RosterSyncResponse
-	var histories [2]HistorySyncResponse
-	for i, groupID := range f.groups {
-		var err error
-		rosters[i], err = f.rosterPage(groupID, nil, 1)
-		if err != nil || rosters[i].Complete || len(rosters[i].Entries) != 1 {
-			t.Fatalf("start roster %d: page=%+v err=%v", i, rosters[i], err)
+	var sessions [maxPeerSnapshots]HistorySyncResponse
+	for i := range sessions {
+		groupID := f.groups[i%len(f.groups)]
+		page, err := f.historyPage(groupID, nil, 1)
+		if err != nil || !page.HasMore || !slices.Equal(page.IDs, f.ids[groupID][:1]) {
+			t.Fatalf("start history %d: page=%+v err=%v", i, page, err)
 		}
-		histories[i], err = f.historyPage(groupID, nil, 1)
-		if err != nil || !histories[i].HasMore || !slices.Equal(histories[i].IDs, f.ids[groupID][:1]) {
-			t.Fatalf("start history %d: page=%+v err=%v", i, histories[i], err)
-		}
+		sessions[i] = page
 	}
-	fullRoster, err := f.rosterPage(f.groups[0], nil, 1)
-	if err == nil || fullRoster.Error != SyncResourceExhausted {
-		t.Fatalf("active roster quota: page=%+v err=%v", fullRoster, err)
-	}
-	fullHistory, err := f.historyPage(f.groups[1], nil, 1)
-	if err == nil || fullHistory.Error != SyncResourceExhausted {
-		t.Fatalf("active history quota: page=%+v err=%v", fullHistory, err)
+	overQuota, err := f.historyPage(f.groups[0], nil, 1)
+	if err == nil || overQuota.Error != SyncResourceExhausted {
+		t.Fatalf("active history quota: page=%+v err=%v", overQuota, err)
 	}
 
-	// An unrelated roster update must not change the in-flight pinned head.
-	extra := mustIdentity(t)
-	entry, err := f.logs[f.groups[0]].SignEntry(f.founder, "add", mustNodeInfo(t, extra.PublicKey), nil, 3_000)
-	if err != nil {
-		t.Fatal(err)
+	// Completion frees exactly one slot and retires exactly one token.
+	last, err := f.historyPage(f.groups[0], &sessions[0], 100)
+	if err != nil || last.HasMore || last.Generation != sessions[0].Generation ||
+		last.SnapshotToken != sessions[0].SnapshotToken || !slices.Equal(last.IDs, f.ids[f.groups[0]][1:]) {
+		t.Fatalf("pinned history completion: page=%+v err=%v", last, err)
 	}
-	if err := f.logs[f.groups[0]].Apply(entry); err != nil {
-		t.Fatal(err)
-	}
-	lastRoster, err := f.rosterPage(f.groups[0], &rosters[0], 100)
-	if err != nil || !lastRoster.Complete || len(lastRoster.Entries) != 1 ||
-		lastRoster.SnapshotToken != rosters[0].SnapshotToken || lastRoster.CommittedHead != rosters[0].CommittedHead {
-		t.Fatalf("pinned roster completion: page=%+v err=%v", lastRoster, err)
-	}
-	chain := append(append([]entmoot.RosterEntry(nil), rosters[0].Entries...), lastRoster.Entries...)
-	if _, err := ValidateRosterChain(f.groups[0], mustNodeInfo(t, f.founder.PublicKey), rosters[0].CommittedHead, chain); err != nil {
-		t.Fatalf("completed pinned roster: %v", err)
-	}
-	retired, err := f.rosterPage(f.groups[0], &rosters[0], 100)
+	retired, err := f.historyPage(f.groups[0], &sessions[0], 100)
 	if err == nil || retired.Error != SyncSnapshotExpired {
-		t.Fatalf("completed roster token remained usable: page=%+v err=%v", retired, err)
+		t.Fatalf("completed history token remained usable: page=%+v err=%v", retired, err)
 	}
-
-	// Completion frees exactly one slot without evicting the other sessions.
 	replacement, err := f.historyPage(f.groups[1], nil, 1)
 	if err != nil || !replacement.HasMore {
-		t.Fatalf("reusing completed roster slot: page=%+v err=%v", replacement, err)
+		t.Fatalf("reusing the completed slot: page=%+v err=%v", replacement, err)
 	}
-	fullHistory, err = f.historyPage(f.groups[0], nil, 1)
-	if err == nil || fullHistory.Error != SyncResourceExhausted {
-		t.Fatalf("replacement exceeded active quota: page=%+v err=%v", fullHistory, err)
-	}
-	for i, groupID := range f.groups {
-		last, err := f.historyPage(groupID, &histories[i], 100)
-		if err != nil || last.HasMore || last.Generation != histories[i].Generation ||
-			last.SnapshotToken != histories[i].SnapshotToken || !slices.Equal(last.IDs, f.ids[groupID][1:]) {
-			t.Fatalf("pinned history completion %d: page=%+v err=%v", i, last, err)
-		}
-		paused, err := f.rosterPage(f.groups[0], nil, 1)
-		if err != nil || paused.Complete {
-			t.Fatalf("reusing completed history slot %d: page=%+v err=%v", i, paused, err)
-		}
+	full, err := f.historyPage(f.groups[0], nil, 1)
+	if err == nil || full.Error != SyncResourceExhausted {
+		t.Fatalf("replacement exceeded the active quota: page=%+v err=%v", full, err)
 	}
 
-	// Rejected cross-group tokens do not evict the legitimate active session.
-	wrongGroup, err := f.rosterPage(f.groups[0], &rosters[1], 1)
+	// A token is a handle for one group's pull, and rejecting a misdirected
+	// one must not evict the session it names.
+	wrongGroup, err := f.historyPage(f.groups[0], &sessions[1], 1)
 	if err == nil || wrongGroup.Error != SyncSnapshotExpired {
 		t.Fatalf("cross-group token: page=%+v err=%v", wrongGroup, err)
 	}
-	f.elapsed.Store(int64(syncSnapshotLifetime - time.Nanosecond))
-	fullHistory, err = f.historyPage(f.groups[0], nil, 1)
-	if err == nil || fullHistory.Error != SyncResourceExhausted {
-		t.Fatalf("abandoned slots reclaimed before expiry: page=%+v err=%v", fullHistory, err)
-	}
-	retry := rosters[1]
-	retry.NextSequence = 0
-	beforeExpiry, err := f.rosterPage(f.groups[1], &retry, 1)
-	if err != nil || beforeExpiry.Complete || beforeExpiry.CommittedHead != rosters[1].CommittedHead ||
-		len(beforeExpiry.Entries) != 1 || beforeExpiry.Entries[0].ID != rosters[1].Entries[0].ID {
-		t.Fatalf("live page before expiry: page=%+v err=%v", beforeExpiry, err)
+	second, err := f.historyPage(f.groups[1], &sessions[1], 1)
+	if err != nil || !second.HasMore || second.SnapshotToken != sessions[1].SnapshotToken ||
+		!slices.Equal(second.IDs, f.ids[f.groups[1]][1:2]) {
+		t.Fatalf("live continuation after a rejected token: page=%+v err=%v", second, err)
 	}
 
-	// A continuation does not extend the original lifetime. No sleeps or
-	// inspection of the server's private snapshot map are needed.
-	f.elapsed.Store(int64(syncSnapshotLifetime))
-	expiredRoster, err := f.rosterPage(f.groups[1], &rosters[1], 100)
-	if err == nil || expiredRoster.Error != SyncSnapshotExpired {
-		t.Fatalf("expired roster token: page=%+v err=%v", expiredRoster, err)
+	// Abandoned slots are held until they expire, and a continuation does not
+	// extend the original lifetime. No sleeps or peeking at the server's
+	// private snapshot map are needed.
+	f.elapsed.Store(int64(syncSnapshotLifetime - time.Nanosecond))
+	stillFull, err := f.historyPage(f.groups[0], nil, 1)
+	if err == nil || stillFull.Error != SyncResourceExhausted {
+		t.Fatalf("abandoned slots reclaimed before expiry: page=%+v err=%v", stillFull, err)
 	}
-	expiredHistory, err := f.historyPage(f.groups[1], &replacement, 100)
-	if err == nil || expiredHistory.Error != SyncSnapshotExpired {
-		t.Fatalf("expired history token: page=%+v err=%v", expiredHistory, err)
+	third, err := f.historyPage(f.groups[1], &second, 1)
+	if err != nil || !third.HasMore || !slices.Equal(third.IDs, f.ids[f.groups[1]][2:3]) {
+		t.Fatalf("continuation before expiry: page=%+v err=%v", third, err)
+	}
+	f.elapsed.Store(int64(syncSnapshotLifetime))
+	expired, err := f.historyPage(f.groups[1], &third, 1)
+	if err == nil || expired.Error != SyncSnapshotExpired {
+		t.Fatalf("expired history token: page=%+v err=%v", expired, err)
 	}
 	recovered, err := f.historyPage(f.groups[1], nil, 100)
 	if err != nil || recovered.HasMore || !slices.Equal(recovered.IDs, f.ids[f.groups[1]]) {
@@ -148,7 +110,7 @@ func TestActiveSnapshotsRemainPinnedBoundedAndExpire(t *testing.T) {
 func TestInvalidatedHistorySnapshotReleasesItsSlot(t *testing.T) {
 	f := newSnapshotLifecycleFixture(t)
 	var first HistorySyncResponse
-	for i := 0; i < maxPeerSnapshots; i++ {
+	for i := range maxPeerSnapshots {
 		page, err := f.historyPage(f.groups[0], nil, 1)
 		if err != nil || !page.HasMore {
 			t.Fatalf("start history %d: page=%+v err=%v", i, page, err)
@@ -157,7 +119,7 @@ func TestInvalidatedHistorySnapshotReleasesItsSlot(t *testing.T) {
 			first = page
 		}
 	}
-	f.addMessage(t, f.groups[0], 3)
+	f.addMessage(t, f.groups[0], 9)
 	changed, err := f.historyPage(f.groups[0], &first, 1)
 	if err == nil || changed.Error != SyncSnapshotExpired {
 		t.Fatalf("changed generation: page=%+v err=%v", changed, err)
@@ -166,9 +128,52 @@ func TestInvalidatedHistorySnapshotReleasesItsSlot(t *testing.T) {
 	if err != nil || !next.HasMore || !slices.Equal(next.IDs, f.ids[f.groups[1]][:1]) {
 		t.Fatalf("invalidated slot starved the other group: page=%+v err=%v", next, err)
 	}
-	full, err := f.rosterPage(f.groups[1], nil, 1)
+	full, err := f.historyPage(f.groups[1], nil, 1)
 	if err == nil || full.Error != SyncResourceExhausted {
 		t.Fatalf("invalidation removed other active slots: page=%+v err=%v", full, err)
+	}
+}
+
+// A snapshot token is a handle, not an authorisation: the paged path checks
+// owner, group and generation before honouring one. Another member of the same
+// group is authorized, so its request reaches the handler — and must still not
+// be able to drive, or disturb, someone else's in-flight pull.
+func TestHistorySnapshotTokenBelongsToItsOwner(t *testing.T) {
+	f := newSnapshotLifecycleFixture(t)
+	group := f.groups[0]
+	page, err := f.historyPage(group, nil, 1)
+	if err != nil || !page.HasMore || page.SnapshotToken == "" {
+		t.Fatalf("starting the pull: page=%+v err=%v", page, err)
+	}
+
+	otherIdentity := mustIdentity(t)
+	if _, err := f.membership[group].SignRecord(otherIdentity, membership.Record{Kind: membership.KindJoin}); err != nil {
+		t.Fatal(err)
+	}
+	other, _, err := NewHost(f.ctx, otherIdentity, libp2p.NoListenAddrs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	ownPage, err := RequestHistoryPage(f.ctx, other, f.remote, HistorySyncRequest{
+		Version: 2, RequestID: "member-can-read", GroupID: group, Mode: "list", Limit: 1,
+	})
+	if err != nil || !ownPage.HasMore {
+		t.Fatalf("the second member cannot read history, so the test proves nothing: page=%+v err=%v", ownPage, err)
+	}
+	stolen, err := RequestHistoryPage(f.ctx, other, f.remote, HistorySyncRequest{
+		Version: 2, RequestID: "steal-token", GroupID: group, Mode: "list", Limit: 1,
+		SnapshotToken: page.SnapshotToken, Generation: page.Generation,
+		AfterID: page.NextID, AfterTimestampMS: page.NextTimestampMS, AfterAuthorMemberID: page.NextAuthorMemberID,
+	})
+	if err == nil || stolen.Error != SyncSnapshotExpired {
+		t.Fatalf("another member drove someone else's snapshot: page=%+v err=%v", stolen, err)
+	}
+
+	// The owner's pull must still continue on its own snapshot.
+	next, err := f.historyPage(group, &page, 100)
+	if err != nil || next.HasMore || next.SnapshotToken != page.SnapshotToken {
+		t.Fatalf("the owner's pull was disturbed by another caller: page=%+v err=%v", next, err)
 	}
 }
 
@@ -179,7 +184,7 @@ type snapshotLifecycleFixture struct {
 	serverHost host.Host
 	remote     peer.AddrInfo
 	groups     [2]entmoot.GroupID
-	logs       map[entmoot.GroupID]*roster.RosterLog
+	membership map[entmoot.GroupID]*membership.Group
 	store      *store.SQLite
 	ids        map[entmoot.GroupID][]entmoot.MessageID
 	elapsed    atomic.Int64
@@ -209,31 +214,25 @@ func newSnapshotLifecycleFixture(t *testing.T) *snapshotLifecycleFixture {
 		ctx: ctx, founder: founder, client: clientHost,
 		serverHost: serverHost,
 		remote:     peer.AddrInfo{ID: serverHost.ID(), Addrs: serverHost.Addrs()},
-		groups:     [2]entmoot.GroupID{{1}, {2}},
-		logs:       make(map[entmoot.GroupID]*roster.RosterLog), store: source,
-		ids: make(map[entmoot.GroupID][]entmoot.MessageID),
+		membership: make(map[entmoot.GroupID]*membership.Group),
+		store:      source,
+		ids:        make(map[entmoot.GroupID][]entmoot.MessageID),
 	}
-	for _, groupID := range f.groups {
-		log := roster.New(groupID)
-		if err := log.Genesis(founder, mustNodeInfo(t, founder.PublicKey), 1_000); err != nil {
-			t.Fatal(err)
+	for i := range f.groups {
+		groupID, group := mustOpenGroup(t, founder, member)
+		f.groups[i] = groupID
+		f.membership[groupID] = group
+		// Four messages per group: enough for a paged pull to stay in flight
+		// across several continuations.
+		for sequence := 1; sequence <= 4; sequence++ {
+			f.addMessage(t, groupID, sequence)
 		}
-		entry, err := log.SignEntry(founder, "add", mustNodeInfo(t, member.PublicKey), nil, 2_000)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := log.Apply(entry); err != nil {
-			t.Fatal(err)
-		}
-		f.logs[groupID] = log
-		f.addMessage(t, groupID, 1)
-		f.addMessage(t, groupID, 2)
 	}
 	server := &SyncServer{
-		Host: serverHost, Admission: NewBootstrapAdmission(), Store: source,
-		Roster: func(id entmoot.GroupID) (*roster.RosterLog, bool) {
-			log, ok := f.logs[id]
-			return log, ok
+		Host: serverHost, Store: source,
+		Group: func(id entmoot.GroupID) (*membership.Group, bool) {
+			group, ok := f.membership[id]
+			return group, ok
 		},
 		Now: func() time.Time { return time.Unix(200, 0).Add(time.Duration(f.elapsed.Load())) },
 	}
@@ -243,13 +242,18 @@ func newSnapshotLifecycleFixture(t *testing.T) *snapshotLifecycleFixture {
 	return f
 }
 
+// head is the checkpoint a message published now must cite.
+func (f *snapshotLifecycleFixture) head(groupID entmoot.GroupID) entmoot.RosterEntryID {
+	return f.membership[groupID].Canonical().ID
+}
+
 func (f *snapshotLifecycleFixture) addMessage(t *testing.T, groupID entmoot.GroupID, sequence int) {
 	t.Helper()
 	signer, err := signing.NewLocalSigner(mustNodeInfo(t, f.founder.PublicKey), f.founder)
 	if err != nil {
 		t.Fatal(err)
 	}
-	head := f.logs[groupID].Head()
+	head := f.head(groupID)
 	message, err := signer.SignMessage(f.ctx, entmoot.Message{
 		Version: 2, GroupID: groupID, Timestamp: int64(10_000 + sequence),
 		Topics: []string{"sync"}, Content: []byte(fmt.Sprintf("message-%d", sequence)), RosterHead: &head,
@@ -263,15 +267,6 @@ func (f *snapshotLifecycleFixture) addMessage(t *testing.T, groupID entmoot.Grou
 	f.ids[groupID] = append(f.ids[groupID], message.ID)
 }
 
-func (f *snapshotLifecycleFixture) rosterPage(groupID entmoot.GroupID, previous *RosterSyncResponse, limit int) (RosterSyncResponse, error) {
-	request := RosterSyncRequest{Version: 2, RequestID: "roster", GroupID: groupID, Limit: limit}
-	if previous != nil {
-		request.SnapshotToken = previous.SnapshotToken
-		request.AfterSequence = previous.NextSequence
-	}
-	return RequestRosterPage(f.ctx, f.client, f.remote, request)
-}
-
 func (f *snapshotLifecycleFixture) historyPage(groupID entmoot.GroupID, previous *HistorySyncResponse, limit int) (HistorySyncResponse, error) {
 	request := HistorySyncRequest{Version: 2, RequestID: "history", GroupID: groupID, Mode: "list", Limit: limit}
 	if previous != nil {
@@ -282,262 +277,4 @@ func (f *snapshotLifecycleFixture) historyPage(groupID entmoot.GroupID, previous
 		request.AfterAuthorMemberID = previous.NextAuthorMemberID
 	}
 	return RequestHistoryPage(f.ctx, f.client, f.remote, request)
-}
-
-// The head probe runs on every maintenance tick, so it must cost the server
-// nothing that lingers. Reserving a paging snapshot it never finishes would
-// pin one of the few per-peer slots for the snapshot lifetime and starve the
-// roster pull the probe exists to decide on.
-func TestRosterHeadProbeReservesNoSnapshotSlot(t *testing.T) {
-	f := newSnapshotLifecycleFixture(t)
-	group := f.groups[0]
-	head := f.logs[group].Head()
-
-	// Occupy every per-peer slot with genuine paged sessions, the state a busy
-	// peer is in. A probe that reserves a snapshot cannot be served now.
-	held := make([]RosterSyncResponse, 0, maxPeerSnapshots)
-	for i := 0; i < maxPeerSnapshots; i++ {
-		page, err := f.rosterPage(f.groups[i%len(f.groups)], nil, 1)
-		if err != nil || page.Complete {
-			t.Fatalf("holding reservation %d: page=%+v err=%v", i, page, err)
-		}
-		held = append(held, page)
-	}
-	exhausted, err := f.rosterPage(group, nil, 1)
-	if err == nil || exhausted.Error != SyncResourceExhausted {
-		t.Fatalf("slots are not full: page=%+v err=%v", exhausted, err)
-	}
-
-	// Probes must still answer, repeatedly, with every slot taken.
-	for i := 0; i < maxPeerSnapshots*3; i++ {
-		got, err := FetchRosterHead(f.ctx, f.client, f.remote, group)
-		if err != nil {
-			t.Fatalf("probe %d with all slots held: %v", i, err)
-		}
-		if got != head {
-			t.Fatalf("probe %d returned head %s, want %s", i, got, head)
-		}
-	}
-
-	// And the probes must not have consumed anything themselves: a pull works
-	// as soon as the paged sessions finish.
-	for i, page := range held {
-		done, err := f.rosterPage(f.groups[i%len(f.groups)], &page, 100)
-		if err != nil || !done.Complete {
-			t.Fatalf("completing reservation %d: page=%+v err=%v", i, done, err)
-		}
-	}
-	local := f.logs[group].Entries()[:1]
-	updates, complete, err := FetchRosterUpdates(f.ctx, f.client, f.remote, group, local)
-	if !complete {
-		t.Fatal("a small chain was not served completely in one pull")
-	}
-	if err != nil {
-		t.Fatalf("roster pull after the probes: %v", err)
-	}
-	if len(updates) != len(f.logs[group].Entries())-1 {
-		t.Fatalf("pull returned %d entries, want %d", len(updates), len(f.logs[group].Entries())-1)
-	}
-}
-
-// The pull ceiling is a per-round cost limit, not a limit on how many
-// membership changes a group may ever make. Counting the local prefix would
-// turn it into a lifetime cap: a group whose chain passed the ceiling could
-// never be synced again by any node, and roster entries are never compacted.
-func TestRosterPullCeilingBoundsTheDeltaNotTheChainLength(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
-	defer cancel()
-	founder := mustIdentity(t)
-	serverHost, _, err := NewHost(ctx, founder, libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer serverHost.Close()
-	clientIdentity := mustIdentity(t)
-	clientHost, _, err := NewHost(ctx, clientIdentity, libp2p.NoListenAddrs)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer clientHost.Close()
-
-	groupID := entmoot.GroupID{0x6c}
-	log := roster.New(groupID)
-	founderInfo := mustNodeInfo(t, founder.PublicKey)
-	if err := log.Genesis(founder, founderInfo, 1_000); err != nil {
-		t.Fatal(err)
-	}
-	// The client must be a member to read the roster at all.
-	client := mustNodeInfo(t, clientIdentity.PublicKey)
-	entry, err := log.SignEntry(founder, "add", client, nil, 2_000)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := log.Apply(entry); err != nil {
-		t.Fatal(err)
-	}
-	// Grow the chain past the per-round ceiling with founder-signed policy
-	// entries of a type this build does not interpret: cheap to produce and
-	// accepted exactly like any other entry.
-	foreign := []byte(`{"type":"legacy-identity-upgrade/v1"}`)
-	for timestamp := int64(3_000); len(log.Entries()) <= maxRosterSyncEntries+2; timestamp++ {
-		policyEntry, err := log.SignEntry(founder, "policy_change", entmoot.NodeInfo{}, foreign, timestamp)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := log.Apply(policyEntry); err != nil {
-			t.Fatal(err)
-		}
-	}
-	chain := log.Entries()
-	if len(chain) <= maxRosterSyncEntries {
-		t.Fatalf("chain is %d entries, want more than the ceiling %d", len(chain), maxRosterSyncEntries)
-	}
-
-	server := &SyncServer{
-		Host: serverHost, Admission: NewBootstrapAdmission(), Store: store.NewMemory(),
-		Roster: func(id entmoot.GroupID) (*roster.RosterLog, bool) {
-			if id != groupID {
-				return nil, false
-			}
-			return log, true
-		},
-	}
-	if err := server.Install(); err != nil {
-		t.Fatal(err)
-	}
-	remote := peer.AddrInfo{ID: serverHost.ID(), Addrs: serverHost.Addrs()}
-
-	// A node that is one entry behind on an over-ceiling chain must still be
-	// able to catch up: the delta is one entry.
-	local := chain[:len(chain)-1]
-	updates, complete, err := FetchRosterUpdates(ctx, clientHost, remote, groupID, local)
-	if !complete {
-		t.Fatal("a small chain was not served completely in one pull")
-	}
-	if err != nil {
-		t.Fatalf("catching up one entry on a %d-entry chain: %v", len(chain), err)
-	}
-	if len(updates) != 1 || updates[0].ID != chain[len(chain)-1].ID {
-		t.Fatalf("pull returned %d entries, want the single missing one", len(updates))
-	}
-
-	// The ceiling still bounds one round, and a node far behind converges by
-	// keeping each round's validated progress instead of restarting.
-	held := chain[:1]
-	rounds := 0
-	for {
-		rounds++
-		if rounds > 8 {
-			t.Fatalf("catching up from the genesis did not converge in %d rounds", rounds)
-		}
-		part, complete, err := FetchRosterUpdates(ctx, clientHost, remote, groupID, held)
-		if err != nil {
-			t.Fatalf("round %d: %v", rounds, err)
-		}
-		if len(part) == 0 {
-			t.Fatalf("round %d served nothing", rounds)
-		}
-		if len(part) > maxRosterSyncEntries {
-			t.Fatalf("round %d downloaded %d entries, past the ceiling %d", rounds, len(part), maxRosterSyncEntries)
-		}
-		held = append(held, part...)
-		if complete {
-			break
-		}
-	}
-	if rounds < 2 {
-		t.Fatalf("an over-ceiling chain was taken in %d round; the ceiling did not bound the round", rounds)
-	}
-	if len(held) != len(chain) || held[len(held)-1].ID != chain[len(chain)-1].ID {
-		t.Fatalf("catch-up produced %d entries ending %s, want %d ending %s",
-			len(held), held[len(held)-1].ID, len(chain), chain[len(chain)-1].ID)
-	}
-
-	// The unfinished round must have handed its snapshot back, or chaining
-	// rounds would exhaust the peer's per-peer quota: four rounds would pin
-	// all four slots for the snapshot lifetime and a node further behind would
-	// stall instead of converging.
-	for i := 0; i < maxPeerSnapshots; i++ {
-		page, err := RequestRosterPage(ctx, clientHost, remote, RosterSyncRequest{
-			Version: 2, RequestID: fmt.Sprintf("slot-%d", i), GroupID: groupID, Limit: 1,
-		})
-		if err != nil || page.Complete {
-			t.Fatalf("slot %d was not free after the chained pull: page=%+v err=%v", i, page, err)
-		}
-	}
-}
-
-// A peer asking for entries past the end of our chain is not making a
-// malformed request: it holds a longer prefix than we do. Saying which of the
-// two it is lets the caller tell a fork from a transport problem.
-func TestRosterPageReportsAChainShorterThanTheRequest(t *testing.T) {
-	f := newSnapshotLifecycleFixture(t)
-	group := f.groups[0]
-	held := len(f.logs[group].Entries())
-
-	beyond, err := RequestRosterPage(f.ctx, f.client, f.remote, RosterSyncRequest{
-		Version: 2, RequestID: "past-the-end", GroupID: group,
-		AfterSequence: uint64(held + 3), Limit: 16,
-	})
-	if err == nil {
-		t.Fatal("a request past the end of the chain succeeded")
-	}
-	if beyond.Error != SyncShortChain {
-		t.Fatalf("error = %q, want %q", beyond.Error, SyncShortChain)
-	}
-	// A request inside the chain is unaffected.
-	inside, err := RequestRosterPage(f.ctx, f.client, f.remote, RosterSyncRequest{
-		Version: 2, RequestID: "inside", GroupID: group, AfterSequence: 1, Limit: 16,
-	})
-	if err != nil || !inside.Complete || len(inside.Entries) != held-1 {
-		t.Fatalf("page inside the chain: page=%+v err=%v", inside, err)
-	}
-}
-
-// A snapshot token is a handle, not an authorisation. The paged path checks
-// owner, group and kind before honouring one, and releasing must not be the
-// weaker door: a caller holding someone else's token must not be able to
-// cancel that peer's in-flight pull.
-func TestReleasingASnapshotRequiresOwningIt(t *testing.T) {
-	f := newSnapshotLifecycleFixture(t)
-	group := f.groups[0]
-
-	// The fixture client starts a paged pull and holds its snapshot.
-	page, err := f.rosterPage(group, nil, 1)
-	if err != nil || page.Complete || page.SnapshotToken == "" {
-		t.Fatalf("starting the pull: page=%+v err=%v", page, err)
-	}
-
-	// A second member of the same group — authorized, so the request reaches
-	// the handler — tries to free the first member's token.
-	otherIdentity := mustIdentity(t)
-	admit, err := f.logs[group].SignEntry(f.founder, "add", mustNodeInfo(t, otherIdentity.PublicKey), nil, 9_000)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := f.logs[group].Apply(admit); err != nil {
-		t.Fatal(err)
-	}
-	other, _, err := NewHost(f.ctx, otherIdentity, libp2p.NoListenAddrs)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer other.Close()
-	if _, err := RequestRosterPage(f.ctx, other, f.remote, RosterSyncRequest{
-		Version: 2, RequestID: "member-can-read", GroupID: group, Limit: 1,
-	}); err != nil {
-		t.Fatalf("the second member cannot read the roster, so the test proves nothing: %v", err)
-	}
-	if _, err := RequestRosterPage(f.ctx, other, f.remote, RosterSyncRequest{
-		Version: 2, RequestID: "steal-release", GroupID: group,
-		SnapshotToken: page.SnapshotToken, ReleaseSnapshot: true,
-	}); err != nil {
-		t.Fatalf("release request failed outright: %v", err)
-	}
-
-	// The owner's pull must still continue on its own snapshot.
-	next, err := f.rosterPage(group, &page, 100)
-	if err != nil || !next.Complete {
-		t.Fatalf("the owner's pull was cancelled by another caller: page=%+v err=%v", next, err)
-	}
 }

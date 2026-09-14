@@ -14,7 +14,7 @@ import (
 
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/esphttp"
-	"entmoot/pkg/entmoot/roster"
+	"entmoot/pkg/entmoot/membership"
 	libp2ptransport "entmoot/pkg/entmoot/transport/libp2p"
 	"github.com/libp2p/go-libp2p/core/peer"
 )
@@ -29,18 +29,24 @@ type espOpenInviteLister interface {
 // cmdRoster dispatches `roster <op>`.
 func cmdRoster(gf *globalFlags, args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "roster: missing op (want: add, remove, admin, or repair)")
+		fmt.Fprintln(os.Stderr, "roster: missing op (want: remove, ban, unban, leave, checkpoint, status, or admin)")
 		return exitInvalidArgument
 	}
 	switch args[0] {
-	case "add":
-		return cmdRosterAdd(gf, args[1:])
 	case "remove":
 		return cmdRosterRemove(gf, args[1:])
+	case "ban":
+		return cmdRosterBan(gf, args[1:])
+	case "unban":
+		return cmdRosterUnban(gf, args[1:])
+	case "leave":
+		return cmdRosterLeave(gf, args[1:])
+	case "checkpoint":
+		return cmdRosterCheckpoint(gf, args[1:])
+	case "status":
+		return cmdRosterStatus(gf, args[1:])
 	case "admin":
 		return cmdRosterAdmin(gf, args[1:])
-	case "repair":
-		return cmdRosterRepair(gf, args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "roster: unknown op %q\n", args[0])
 		return exitInvalidArgument
@@ -87,18 +93,18 @@ func cmdRosterAdminList(gf *globalFlags, args []string) int {
 		slog.Error("roster admin list: setup", slog.String("err", err.Error()))
 		return exitTransport
 	}
-	rlog, err := roster.OpenJSONL(s.dataDir, gid)
+	group, err := membership.Open(s.dataDir, gid)
 	if err != nil {
-		slog.Error("roster admin list: open roster", slog.String("err", err.Error()))
+		if errors.Is(err, membership.ErrLegacyOnly) {
+			fmt.Fprintf(os.Stderr, "roster admin list: group %s has no checkpoint yet\n", gid.String())
+			return exitGroupNotFound
+		}
+		slog.Error("roster admin list: open membership", slog.String("err", err.Error()))
 		return exitTransport
 	}
-	defer rlog.Close()
-	founder, ok := rlog.Founder()
-	if !ok {
-		fmt.Fprintln(os.Stderr, "roster admin list: group has no founder")
-		return exitGroupNotFound
-	}
-	admins := rlog.Admins()
+	defer group.Close()
+	founder := group.Founder()
+	admins := group.Admins()
 	encoded := make([]string, 0, len(admins))
 	for _, admin := range admins {
 		encoded = append(encoded, admin.String())
@@ -153,13 +159,13 @@ func cmdRosterAdminChange(gf *globalFlags, args []string, grant bool) int {
 		fmt.Fprintf(os.Stderr, "%s: the founder always administers the group\n", command)
 		return exitInvalidArgument
 	}
-	if grant && !ctx.roster.IsMemberID(memberID) {
+	if grant && !ctx.group.IsMemberID(memberID) {
 		fmt.Fprintf(os.Stderr, "%s: %s is not a member of this group\n", command, memberID.String())
 		return exitNotMember
 	}
-	next := make([]entmoot.MemberID, 0, len(ctx.roster.Admins())+1)
+	next := make([]entmoot.MemberID, 0, len(ctx.group.Admins())+1)
 	changed := false
-	for _, admin := range ctx.roster.Admins() {
+	for _, admin := range ctx.group.Admins() {
 		if admin == memberID {
 			if grant {
 				return reportAdminSet(ctx, gid, false)
@@ -176,21 +182,11 @@ func cmdRosterAdminChange(gf *globalFlags, args []string, grant bool) int {
 	if !changed {
 		return reportAdminSet(ctx, gid, false)
 	}
-	payload, err := roster.MarshalAdminPolicy(next)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s: %v\n", command, err)
-		return exitInvalidArgument
-	}
-	timestamp := time.Now().UnixMilli()
-	if head := ctx.roster.HeadTimestamp(); timestamp <= head {
-		timestamp = head + 1
-	}
-	entry, err := ctx.roster.SignEntry(ctx.setup.identity, "policy_change", entmoot.NodeInfo{}, payload, timestamp)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s: sign policy: %v\n", command, err)
-		return exitInvalidArgument
-	}
-	if err := ctx.roster.Apply(entry); err != nil {
+	// The policy record states the complete set, so reading one record is
+	// enough to know who may sign after it.
+	policy := ctx.group.Policy()
+	policy.Admins = membership.SortAdmins(next)
+	if _, err := ctx.group.SignRecord(ctx.setup.identity, membership.Record{Kind: membership.KindPolicy, Policy: &policy}); err != nil {
 		if errors.Is(err, entmoot.ErrRosterReject) {
 			fmt.Fprintf(os.Stderr, "%s: %v\n", command, err)
 			return exitInvalidArgument
@@ -202,7 +198,7 @@ func cmdRosterAdminChange(gf *globalFlags, args []string, grant bool) int {
 }
 
 func reportAdminSet(ctx founderRosterContext, gid entmoot.GroupID, changed bool) int {
-	admins := ctx.roster.Admins()
+	admins := ctx.group.Admins()
 	encoded := make([]string, 0, len(admins))
 	for _, admin := range admins {
 		encoded = append(encoded, admin.String())
@@ -212,10 +208,10 @@ func reportAdminSet(ctx founderRosterContext, gid entmoot.GroupID, changed bool)
 		status = "updated"
 	}
 	data, err := json.Marshal(map[string]any{
-		"status":      status,
-		"group_id":    gid,
-		"roster_head": ctx.roster.Head(),
-		"admins":      encoded,
+		"status":     status,
+		"group_id":   gid,
+		"checkpoint": ctx.group.Canonical().ID,
+		"admins":     encoded,
 	})
 	if err != nil {
 		slog.Error("roster admin: marshal", slog.String("err", err.Error()))
@@ -288,12 +284,12 @@ func parseRosterMemberFlags(command string, flags rosterMemberFlags) (entmoot.Gr
 	return gid, entmoot.NodeInfo{MemberID: &memberID, PeerID: binding.PeerID.String(), EntmootPubKey: pubkey}, exitOK, true
 }
 
-// founderRosterContext is an open, write-leased roster plus the identity that
-// will sign. localMemberID is the signer; it is the founder or, for membership
-// changes, a delegated admin.
+// founderRosterContext is an open, write-leased membership store plus the
+// identity that will sign. localMemberID is the signer; it is the founder or,
+// for membership changes, a delegated admin.
 type founderRosterContext struct {
 	setup         *setupResult
-	roster        *roster.RosterLog
+	group         *membership.Group
 	founder       entmoot.NodeInfo
 	localMemberID entmoot.MemberID
 	close         func()
@@ -321,99 +317,206 @@ func setupRosterWriter(gf *globalFlags, command string, gid entmoot.GroupID, fou
 		slog.Error(command+": local identity", slog.String("err", err.Error()))
 		return founderRosterContext{}, exitTransport, false
 	}
-	r, err := roster.OpenJSONL(s.dataDir, gid)
+	g, err := membership.Open(s.dataDir, gid)
 	if err != nil {
-		slog.Error(command+": open roster", slog.String("err", err.Error()))
+		if errors.Is(err, membership.ErrLegacyOnly) {
+			fmt.Fprintf(os.Stderr, "%s: group %s has no checkpoint yet; run `entmootd membership upgrade -group %s` on the founder\n",
+				command, gid.String(), gid.String())
+			return founderRosterContext{}, exitGroupNotFound, false
+		}
+		slog.Error(command+": open membership", slog.String("err", err.Error()))
 		return founderRosterContext{}, exitTransport, false
 	}
-	if err := r.ClaimWriter(); err != nil {
-		_ = r.Close()
-		slog.Error(command+": roster writer", slog.String("err", err.Error()))
+	if err := g.ClaimWriter(); err != nil {
+		_ = g.Close()
+		slog.Error(command+": membership writer", slog.String("err", err.Error()))
 		return founderRosterContext{}, exitTransport, false
 	}
-	founder, ok := r.Founder()
-	if !ok {
-		_ = r.Close()
-		fmt.Fprintf(os.Stderr, "%s: group has no founder (empty roster)\n", command)
-		return founderRosterContext{}, exitGroupNotFound, false
-	}
+	founder := g.Founder()
 	isFounder := founder.MemberID != nil && *founder.MemberID == memberID && bytes.Equal(founder.EntmootPubKey, s.identity.PublicKey)
 	if founderOnly && !isFounder {
-		_ = r.Close()
+		_ = g.Close()
 		fmt.Fprintf(os.Stderr, "%s: local member is not founder of group %s\n", command, gid.String())
 		return founderRosterContext{}, exitNotMember, false
 	}
-	if !isFounder && !r.CanAdminister(memberID) {
-		_ = r.Close()
+	if !isFounder && !g.CanAdminister(memberID) {
+		_ = g.Close()
 		fmt.Fprintf(os.Stderr, "%s: local member is neither founder nor a delegated admin of group %s\n", command, gid.String())
 		return founderRosterContext{}, exitNotMember, false
 	}
 	return founderRosterContext{
 		setup:         s,
-		roster:        r,
+		group:         g,
 		founder:       founder,
 		localMemberID: memberID,
-		close:         func() { _ = r.Close() },
+		close:         func() { _ = g.Close() },
 	}, exitOK, true
 }
 
-// cmdRosterAdd admits a new member to a group's roster. The founder or a
-// delegated admin may sign it. This offline maintenance command acquires the
-// roster writer lease and fails promptly while the daemon owns it.
-func cmdRosterAdd(gf *globalFlags, args []string) int {
-	fs := flag.NewFlagSet("roster add", flag.ContinueOnError)
-	memberFlags := addRosterMemberFlags(fs)
+// cmdRosterLeave records that the local member is leaving. It needs no admin:
+// a member's own departure is a statement about itself, which is the point of
+// self-signed records.
+func cmdRosterLeave(gf *globalFlags, args []string) int {
+	fs := flag.NewFlagSet("roster leave", flag.ContinueOnError)
+	groupStr := fs.String("group", "", "base64 group id (required)")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return exitOK
 		}
 		return exitInvalidArgument
 	}
-
-	gid, subject, code, ok := parseRosterMemberFlags("roster add", memberFlags)
-	if !ok {
-		return code
+	gid, err := decodeGroupID(*groupStr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "roster leave: %v\n", err)
+		return exitInvalidArgument
 	}
-	ctx, code, ok := setupAdminRoster(gf, "roster add", gid)
+	s, err := setup(gf)
+	if err != nil {
+		slog.Error("roster leave: setup", slog.String("err", err.Error()))
+		return exitTransport
+	}
+	memberID, err := entmoot.MemberIDFromPublicKey(s.identity.PublicKey)
+	if err != nil {
+		slog.Error("roster leave: local identity", slog.String("err", err.Error()))
+		return exitTransport
+	}
+	group, err := membership.Open(s.dataDir, gid)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "roster leave: %v\n", err)
+		return exitGroupNotFound
+	}
+	defer group.Close()
+	if err := group.ClaimWriter(); err != nil {
+		slog.Error("roster leave: membership writer", slog.String("err", err.Error()))
+		return exitTransport
+	}
+	if !group.IsMemberID(memberID) {
+		fmt.Fprintln(os.Stderr, "roster leave: this identity is not a member of that group")
+		return exitNotMember
+	}
+	record, err := group.SignRecord(s.identity, membership.Record{Kind: membership.KindLeave})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "roster leave: %v\n", err)
+		return exitInvalidArgument
+	}
+	data, err := json.Marshal(map[string]any{
+		"status":    "left",
+		"group_id":  gid,
+		"record_id": record.ID,
+		"member_id": memberID,
+		"members":   len(group.MemberIDs()),
+	})
+	if err != nil {
+		slog.Error("roster leave: marshal", slog.String("err", err.Error()))
+		return exitTransport
+	}
+	fmt.Println(string(data))
+	return exitOK
+}
+
+// cmdRosterCheckpoint signs a checkpoint now, rather than waiting for the
+// cadence. It is how an operator retires history on demand.
+func cmdRosterCheckpoint(gf *globalFlags, args []string) int {
+	fs := flag.NewFlagSet("roster checkpoint", flag.ContinueOnError)
+	groupStr := fs.String("group", "", "base64 group id (required)")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return exitOK
+		}
+		return exitInvalidArgument
+	}
+	gid, err := decodeGroupID(*groupStr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "roster checkpoint: %v\n", err)
+		return exitInvalidArgument
+	}
+	ctx, code, ok := setupAdminRoster(gf, "roster checkpoint", gid)
 	if !ok {
 		return code
 	}
 	defer ctx.close()
-
-	entry, err := ctx.roster.SignEntry(ctx.setup.identity, "add", subject, nil, time.Now().UnixMilli())
+	checkpoint, signed, err := ctx.group.SignCheckpoint(ctx.setup.identity, true)
 	if err != nil {
-		slog.Error("roster add: sign entry", slog.String("err", err.Error()))
+		fmt.Fprintf(os.Stderr, "roster checkpoint: %v\n", err)
+		return exitInvalidArgument
+	}
+	if !signed {
+		fmt.Fprintln(os.Stderr, "roster checkpoint: nothing to fold in")
+		return exitOK
+	}
+	data, err := json.Marshal(map[string]any{
+		"status":     "signed",
+		"group_id":   gid,
+		"checkpoint": checkpoint.ID,
+		"sequence":   checkpoint.Sequence,
+		"covered":    checkpoint.Covered,
+		"members":    len(checkpoint.Members),
+	})
+	if err != nil {
+		slog.Error("roster checkpoint: marshal", slog.String("err", err.Error()))
 		return exitTransport
 	}
+	fmt.Println(string(data))
+	return exitOK
+}
 
-	if err := ctx.roster.Apply(entry); err != nil {
-		if errors.Is(err, entmoot.ErrRosterReject) {
-			fmt.Fprintf(os.Stderr, "roster add: %v\n", err)
-			return exitInvalidArgument
+// cmdRosterStatus prints what this node holds: the checkpoint it projects
+// from, the membership, and how many records are still outside a checkpoint.
+func cmdRosterStatus(gf *globalFlags, args []string) int {
+	fs := flag.NewFlagSet("roster status", flag.ContinueOnError)
+	groupStr := fs.String("group", "", "base64 group id (required)")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return exitOK
 		}
-		slog.Error("roster add: apply", slog.String("err", err.Error()))
+		return exitInvalidArgument
+	}
+	gid, err := decodeGroupID(*groupStr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "roster status: %v\n", err)
+		return exitInvalidArgument
+	}
+	s, err := setup(gf)
+	if err != nil {
+		slog.Error("roster status: setup", slog.String("err", err.Error()))
 		return exitTransport
 	}
-
-	slog.Info("roster add: member admitted",
-		slog.String("group_id", gid.String()),
-		slog.String("member_id", subject.MemberID.String()),
-		slog.String("entry_id", entry.ID.String()))
-
-	binding, _ := libp2ptransport.BindingFromPublicKey(subject.EntmootPubKey)
-	out := map[string]any{
-		"entry_id": entry.ID,
-		"group_id": gid,
-		"members":  len(ctx.roster.MemberIDs()),
-		"added": map[string]any{
-			"member_id":      subject.MemberID,
-			"peer_id":        binding.PeerID.String(),
-			"entmoot_pubkey": encodeBase64(subject.EntmootPubKey),
-		},
-	}
-	data, err := json.Marshal(out)
+	group, err := membership.Open(s.dataDir, gid)
 	if err != nil {
-		slog.Error("roster add: marshal", slog.String("err", err.Error()))
+		fmt.Fprintf(os.Stderr, "roster status: %v\n", err)
+		return exitGroupNotFound
+	}
+	defer group.Close()
+	canonical := group.Canonical()
+	policy := group.Policy()
+	members := make([]string, 0, len(canonical.Members))
+	for _, id := range group.MemberIDs() {
+		members = append(members, id.String())
+	}
+	admins := make([]string, 0, len(policy.Admins))
+	for _, admin := range policy.Admins {
+		admins = append(admins, admin.String())
+	}
+	banned := make([]string, 0, len(canonical.Banned))
+	for _, id := range canonical.Banned {
+		banned = append(banned, id.String())
+	}
+	data, err := json.Marshal(map[string]any{
+		"group_id":   gid,
+		"founder":    group.Founder().MemberID,
+		"checkpoint": canonical.ID,
+		"sequence":   canonical.Sequence,
+		"pending":    group.EffectivePendingCount(),
+		"members":    members,
+		"admins":     admins,
+		"banned":     banned,
+		"policy": map[string]any{
+			"join_rule":        policy.JoinRule,
+			"checkpoint_every": policy.CheckpointEvery,
+		},
+	})
+	if err != nil {
+		slog.Error("roster status: marshal", slog.String("err", err.Error()))
 		return exitTransport
 	}
 	fmt.Println(string(data))
@@ -443,7 +546,7 @@ func cmdRosterRemove(gf *globalFlags, args []string) int {
 	}
 	defer ctx.close()
 
-	existing, ok := ctx.roster.MemberInfoByID(*target.MemberID)
+	existing, ok := ctx.group.MemberInfoByID(*target.MemberID)
 	if !ok {
 		fmt.Fprintln(os.Stderr, "roster remove: target is not a member")
 		return exitNotMember
@@ -456,7 +559,7 @@ func cmdRosterRemove(gf *globalFlags, args []string) int {
 		fmt.Fprintln(os.Stderr, "roster remove: cannot remove group founder")
 		return exitInvalidArgument
 	}
-	if err := applyRosterRemove(ctx.setup.identity, ctx.roster, ctx.founder, existing); err != nil {
+	if err := applyRosterRemove(ctx.setup.identity, ctx.group, existing); err != nil {
 		if errors.Is(err, entmoot.ErrRosterReject) {
 			fmt.Fprintf(os.Stderr, "roster remove: %v\n", err)
 			return exitInvalidArgument
@@ -469,15 +572,14 @@ func cmdRosterRemove(gf *globalFlags, args []string) int {
 		slog.String("group_id", gid.String()),
 		slog.String("member_id", target.MemberID.String()))
 
-	// The removal is already committed, so a revocation failure must not
-	// swallow the result: report what happened and what the operator still has
-	// to do by hand.
-	revoked, openInvites, revokeErr := revokeInvitesAfterRemoval(ctx.setup.dataDir, gid, *target.MemberID)
-	if revokeErr != nil {
-		slog.Error("roster remove: revoke invites", slog.String("err", revokeErr.Error()))
-		fmt.Fprintf(os.Stderr, "roster remove: warning: the member was removed but its invites could not be revoked: %v\n"+
-			"Run: entmootd invite list -group %s, then entmootd invite revoke -group %s -nonce <NONCE>\n",
-			revokeErr, gid.String(), gid.String())
+	// Invites the removed member issued are void already: an invite carries
+	// its issuer's current authority, and that authority is gone. Invites from
+	// other admins are not affected, so list what is still live.
+	openInvites, listErr := outstandingOpenInvites(ctx.setup.dataDir, gid)
+	if listErr != nil {
+		slog.Error("roster remove: read invite ledger", slog.String("err", listErr.Error()))
+		fmt.Fprintf(os.Stderr, "roster remove: warning: the member was removed but this node's invite ledger could not be read: %v\n"+
+			"Run: entmootd invite list -group %s\n", listErr, gid.String())
 	}
 	if len(openInvites) > 0 {
 		fmt.Fprintf(os.Stderr, "roster remove: warning: %d open bearer invite(s) remain for this group; anyone holding one can still join. Revoke with: entmootd invite revoke -group %s -nonce <NONCE>\n",
@@ -500,8 +602,7 @@ func cmdRosterRemove(gf *globalFlags, args []string) int {
 	binding, _ := libp2ptransport.BindingFromPublicKey(target.EntmootPubKey)
 	out := map[string]any{
 		"group_id":                     gid,
-		"members":                      len(ctx.roster.MemberIDs()),
-		"revoked_invites":              revoked,
+		"members":                      len(ctx.group.MemberIDs()),
 		"outstanding_open_invites":     openInvites,
 		"outstanding_esp_open_invites": espOpen,
 		"removed": map[string]any{
@@ -514,8 +615,8 @@ func cmdRosterRemove(gf *globalFlags, args []string) int {
 		out["outstanding_esp_open_invites"] = nil
 		out["esp_open_invites_error"] = espErr.Error()
 	}
-	if revokeErr != nil {
-		out["invite_revocation_error"] = revokeErr.Error()
+	if listErr != nil {
+		out["invite_ledger_error"] = listErr.Error()
 	}
 	data, err := json.Marshal(out)
 	if err != nil {
@@ -523,34 +624,32 @@ func cmdRosterRemove(gf *globalFlags, args []string) int {
 		return exitTransport
 	}
 	fmt.Println(string(data))
-	if revokeErr != nil {
+	if listErr != nil {
 		return exitTransport
 	}
 	return exitOK
 }
 
-// revokeInvitesAfterRemoval voids every invite bound to the removed member and
-// returns the nonces of the group's remaining open bearer invites, which no
-// removal can attribute to anyone.
-func revokeInvitesAfterRemoval(dataDir string, groupID entmoot.GroupID, memberID entmoot.MemberID) (int, []string, error) {
-	admission, err := libp2ptransport.OpenPersistentBootstrapAdmission(dataDir)
+// outstandingOpenInvites lists this node's live bearer invites after a
+// removal. The removed member's own invites need no cleanup: an invite is
+// worth its issuer's current authority, so losing membership voids them
+// everywhere at once. Invites from other admins are unaffected, and an
+// operator may want to see them.
+func outstandingOpenInvites(dataDir string, groupID entmoot.GroupID) ([]string, error) {
+	ledger, err := libp2ptransport.OpenInviteLedger(dataDir)
 	if err != nil {
-		return 0, nil, err
+		return nil, err
 	}
-	defer admission.Close()
-	revoked, err := admission.RevokeInvitesForMember(groupID, memberID)
+	defer ledger.Close()
+	live, err := ledger.LiveOpenInvites(groupID)
 	if err != nil {
-		return 0, nil, err
-	}
-	live, err := admission.LiveOpenInvites(groupID)
-	if err != nil {
-		return revoked, nil, err
+		return nil, err
 	}
 	nonces := make([]string, 0, len(live))
 	for _, record := range live {
 		nonces = append(nonces, base64.StdEncoding.EncodeToString(record.Nonce[:]))
 	}
-	return revoked, nonces, nil
+	return nonces, nil
 }
 
 // liveESPOpenInvites counts the ESP-hosted open-invite tokens still redeemable
@@ -598,4 +697,92 @@ func decodePubkey(s string) ([]byte, error) {
 		return nil, fmt.Errorf("expected 32 bytes, got %d", len(raw))
 	}
 	return raw, nil
+}
+
+// cmdRosterBan removes a member and bars it from rejoining. A plain removal
+// lets the member back in with a fresh invite, which is right for "left the
+// team" and wrong for "must not come back".
+func cmdRosterBan(gf *globalFlags, args []string) int {
+	return rosterBanChange(gf, args, true)
+}
+
+// cmdRosterUnban lifts a ban. Founder-only: an admin that could unban could
+// undo the founder's decision.
+func cmdRosterUnban(gf *globalFlags, args []string) int {
+	return rosterBanChange(gf, args, false)
+}
+
+func rosterBanChange(gf *globalFlags, args []string, ban bool) int {
+	command := "roster unban"
+	if ban {
+		command = "roster ban"
+	}
+	fs := flag.NewFlagSet(command, flag.ContinueOnError)
+	groupStr := fs.String("group", "", "base64 group id (required)")
+	memberStr := fs.String("member", "", "base64 MemberID (required)")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return exitOK
+		}
+		return exitInvalidArgument
+	}
+	gid, err := decodeGroupID(*groupStr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s: %v\n", command, err)
+		return exitInvalidArgument
+	}
+	memberID, err := decodeMemberID(*memberStr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s: -member: %v\n", command, err)
+		return exitInvalidArgument
+	}
+
+	var ctx founderRosterContext
+	var code int
+	var ok bool
+	if ban {
+		ctx, code, ok = setupAdminRoster(gf, command, gid)
+	} else {
+		ctx, code, ok = setupFounderRoster(gf, command, gid)
+	}
+	if !ok {
+		return code
+	}
+	defer ctx.close()
+
+	subject := entmoot.NodeInfo{MemberID: &memberID}
+	if info, present := ctx.group.MemberInfoByID(memberID); present {
+		subject = info
+	} else if !ban && !ctx.group.IsBanned(memberID) {
+		fmt.Fprintf(os.Stderr, "%s: %s is neither a member nor banned\n", command, memberID.String())
+		return exitNotMember
+	}
+	kind := membership.KindUnban
+	record := membership.Record{Kind: kind, Subject: subject}
+	if ban {
+		record = membership.Record{Kind: membership.KindRemove, Subject: subject, Banned: true}
+	}
+	signed, err := ctx.group.SignRecord(ctx.setup.identity, record)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s: %v\n", command, err)
+		return exitInvalidArgument
+	}
+	status := "unbanned"
+	if ban {
+		status = "banned"
+	}
+	data, err := json.Marshal(map[string]any{
+		"status":    status,
+		"group_id":  gid,
+		"record_id": signed.ID,
+		"member_id": memberID,
+		"members":   len(ctx.group.MemberIDs()),
+		"banned":    ctx.group.IsBanned(memberID),
+	})
+	if err != nil {
+		slog.Error(command+": marshal", slog.String("err", err.Error()))
+		return exitTransport
+	}
+	fmt.Println(string(data))
+	return exitOK
 }

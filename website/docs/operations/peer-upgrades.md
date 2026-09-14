@@ -51,3 +51,22 @@ runtime before running that command.
 
 Peer updates are operational state changes. Do them separately from docs-only
 releases.
+
+## One-time membership migration
+
+A group created before signed membership checkpoints holds a linear roster
+chain. After upgrading the binaries, that group is reported as absent and is
+not served until checkpoint 0 exists.
+
+On the founder's host only, with its daemon stopped:
+
+```sh
+entmootd membership upgrade -group <GROUP_ID>
+entmootd serve
+```
+
+The other peers adopt the checkpoint on their next membership sync; they refuse
+one whose membership disagrees with the chain they already hold, so a
+fabricated upgrade cannot take. Verify on each peer that `roster status` shows
+the same checkpoint id and the pre-upgrade member count. Running the command a
+second time is safe and reports `already_upgraded`.

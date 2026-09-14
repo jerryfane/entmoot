@@ -14,9 +14,7 @@ import (
 	relayclient "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/client"
 	multiaddr "github.com/multiformats/go-multiaddr"
 
-	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/keystore"
-	"entmoot/pkg/entmoot/roster"
 )
 
 type fixedConnMultiaddrs struct {
@@ -332,14 +330,9 @@ func TestVerifiedAddressHintsRespectIdentityAndPrivacyProfile(t *testing.T) {
 		t.Fatal(err)
 	}
 	member := mustNodeInfo(t, memberIdentity.PublicKey)
-	var groupID entmoot.GroupID
-	groupID[0] = 1
-	rosterLog := roster.New(groupID)
-	if err := rosterLog.Genesis(memberIdentity, member, 1_000); err != nil {
-		t.Fatal(err)
-	}
+	_, group := mustOpenGroup(t, memberIdentity)
 	direct := multiaddr.StringCast("/ip4/203.0.113.10/tcp/4001")
-	if err := InstallVerifiedPeer(localHost, rosterLog, member, memberBinding.PeerID, []multiaddr.Multiaddr{direct}, time.Hour, DirectConnectivity, nil); err != nil {
+	if err := InstallVerifiedPeer(localHost, group, member, memberBinding.PeerID, []multiaddr.Multiaddr{direct}, time.Hour, DirectConnectivity, nil); err != nil {
 		t.Fatal(err)
 	}
 	if got := VisiblePeerAddresses(localHost, memberBinding.PeerID, DirectConnectivity, nil); len(got) != 1 {
@@ -347,7 +340,7 @@ func TestVerifiedAddressHintsRespectIdentityAndPrivacyProfile(t *testing.T) {
 	}
 	attacker := mustIdentity(t)
 	attackerBinding, _ := BindingFromPublicKey(attacker.PublicKey)
-	if err := InstallVerifiedPeer(localHost, rosterLog, member, attackerBinding.PeerID, []multiaddr.Multiaddr{direct}, time.Hour, DirectConnectivity, nil); err == nil {
+	if err := InstallVerifiedPeer(localHost, group, member, attackerBinding.PeerID, []multiaddr.Multiaddr{direct}, time.Hour, DirectConnectivity, nil); err == nil {
 		t.Fatal("address hint with invalid PeerID/key binding accepted")
 	}
 	relay := mustIdentity(t)
@@ -372,7 +365,7 @@ func TestVerifiedAddressHintsRespectIdentityAndPrivacyProfile(t *testing.T) {
 		t.Fatal("unapproved relay circuit was accepted after authentication")
 	}
 	localHost.Peerstore().ClearAddrs(memberBinding.PeerID)
-	if err := InstallVerifiedPeer(localHost, rosterLog, member, memberBinding.PeerID, []multiaddr.Multiaddr{direct, unapprovedCircuit, circuit}, time.Hour, RelayOnlyConnectivity, []peer.AddrInfo{relayInfo}); err != nil {
+	if err := InstallVerifiedPeer(localHost, group, member, memberBinding.PeerID, []multiaddr.Multiaddr{direct, unapprovedCircuit, circuit}, time.Hour, RelayOnlyConnectivity, []peer.AddrInfo{relayInfo}); err != nil {
 		t.Fatal(err)
 	}
 	visible := VisiblePeerAddresses(localHost, memberBinding.PeerID, RelayOnlyConnectivity, []peer.AddrInfo{relayInfo})
@@ -380,7 +373,7 @@ func TestVerifiedAddressHintsRespectIdentityAndPrivacyProfile(t *testing.T) {
 		t.Fatalf("relay-only diagnostics exposed unapproved or direct addresses: %v", visible)
 	}
 	localHost.Peerstore().ClearAddrs(memberBinding.PeerID)
-	if err := InstallVerifiedPeer(localHost, rosterLog, member, memberBinding.PeerID, []multiaddr.Multiaddr{unapprovedCircuit}, time.Hour, RelayOnlyConnectivity, []peer.AddrInfo{relayInfo}); err == nil {
+	if err := InstallVerifiedPeer(localHost, group, member, memberBinding.PeerID, []multiaddr.Multiaddr{unapprovedCircuit}, time.Hour, RelayOnlyConnectivity, []peer.AddrInfo{relayInfo}); err == nil {
 		t.Fatal("unapproved relay was the only surviving address")
 	}
 }

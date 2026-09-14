@@ -309,7 +309,7 @@ func validateDefaultMootLiveMembership(gf *globalFlags, gid entmoot.GroupID, mem
 	if err != nil {
 		return err
 	}
-	rlog, ok, err := openExistingRosterLog(s.dataDir, gid)
+	rlog, ok, err := openExistingGroup(s.dataDir, gid)
 	if err != nil {
 		return err
 	}
@@ -535,12 +535,12 @@ func defaultMootJoined(gf *globalFlags, gid entmoot.GroupID) bool {
 	if err != nil {
 		return false
 	}
-	rlog, ok, err := openExistingRosterLog(gf.data, gid)
+	rlog, ok, err := openExistingGroup(gf.data, gid)
 	if err != nil || !ok {
 		return false
 	}
 	defer rlog.Close()
-	return rosterHasLocalIdentityPubKey(rlog, id.PublicKey)
+	return groupHasLocalIdentityPubKey(rlog, id.PublicKey)
 }
 
 func defaultMootDeclinedLocalState(ctx context.Context, dataDir string) (defaultMootLocalState, error) {

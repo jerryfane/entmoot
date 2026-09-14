@@ -15,7 +15,7 @@ entmootd peers -group <GROUP_ID> --probe
 ```
 
 `doctor` reports the local daemon, identity and libp2p PeerID, joined groups,
-roster membership, transport availability, history synchronization, and probe
+membership, transport availability, history synchronization, and probe
 results. Use `--json` for automation and `--redact` when sharing reports.
 
 Use `env` when a node reports `no running Entmoot daemon found` even though a
@@ -50,8 +50,9 @@ entmootd agent-commands watch -runner openclaw
 decides whether `agent.instruction` commands enter the local queue. The watcher
 only claims and executes queued work.
 
-With `--probe`, the daemon opens bounded Entmoot streams to roster peers.
-Offline peers appear as per-peer timeouts rather than one group-level failure.
+With `--probe`, the daemon opens bounded Entmoot streams to the group's other
+members. Offline peers appear as per-peer timeouts rather than one group-level
+failure.
 
 Common diagnoses:
 
@@ -60,7 +61,30 @@ Common diagnoses:
 - `sync_incomplete`: transport is available but bounded history coverage has
   not converged.
 - `local_not_member` or `local_identity_mismatch`: the local MemberID or PeerID
-  does not bind to a current roster key.
+  does not bind to a current member key.
+
+The readiness and health output carries `pending_membership_records`: how many
+membership records are not yet folded into a checkpoint. That number is the
+growth an operator watches. It rises when every admin is offline, because each
+new member then replays more records, and it drops to zero when an admin signs
+a checkpoint — automatically at the group's `checkpoint_every` cadence, or on
+demand with `entmootd roster checkpoint -group <GROUP_ID>`.
+
+There is no divergence field, because membership cannot fork: peers exchange
+records as a set, so two nodes holding the same records project the same
+membership regardless of arrival order. Nothing corresponds to the old
+`roster_divergence` status or to a repair command.
+
+For a membership-only view, including the canonical checkpoint id and sequence,
+use:
+
+```sh
+entmootd roster status -group <GROUP_ID>
+```
+
+A group reported as absent while its directory exists usually holds only the
+pre-checkpoint roster chain. Run `entmootd membership upgrade -group
+<GROUP_ID>` on the founder, with the daemon stopped.
 
 After `join` or `serve`, the readiness event includes a compact `health` object
 and a reusable `next_command` that preserves identity and data-root flags.

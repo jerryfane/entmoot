@@ -112,7 +112,7 @@ func applyRecord(state *State, rec Record) bool {
 		delete(state.Members, actor)
 		return true
 	case KindRekey:
-		subject, err := entmoot.ResolvedMemberID(rec.Subject)
+		subject, err := rec.SubjectMemberID()
 		if err != nil {
 			return false
 		}
@@ -158,7 +158,7 @@ func applyAuthority(state *State, rec Record, actor entmoot.MemberID) bool {
 		state.Policy = policy
 		return true
 	case KindRemove:
-		subject, err := entmoot.ResolvedMemberID(rec.Subject)
+		subject, err := rec.SubjectMemberID()
 		if err != nil {
 			return false
 		}
@@ -190,7 +190,7 @@ func applyAuthority(state *State, rec Record, actor entmoot.MemberID) bool {
 		if !isFounder {
 			return false
 		}
-		subject, err := entmoot.ResolvedMemberID(rec.Subject)
+		subject, err := rec.SubjectMemberID()
 		if err != nil {
 			return false
 		}
@@ -297,7 +297,7 @@ func inviteAdmits(state *State, invite entmoot.BootstrapCapability, atMS int64, 
 // ExplainJoin says why a join would not take effect, so a joiner is told the
 // reason instead of just failing.
 func ExplainJoin(state State, rec Record) string {
-	subject, err := entmoot.ResolvedMemberID(rec.Subject)
+	subject, err := rec.SubjectMemberID()
 	if err != nil {
 		return "the join record names an invalid identity"
 	}

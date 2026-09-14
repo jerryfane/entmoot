@@ -138,7 +138,15 @@ type Record struct {
 }
 
 // SubjectMemberID resolves who the record is about.
+//
+// A named member id is authoritative: a removal or unban may carry nothing
+// else, because the identity it names is not a member and so no member record
+// holds its key. VerifyRecord has already checked that a subject carrying both
+// an id and a key agrees with itself.
 func (r Record) SubjectMemberID() (entmoot.MemberID, error) {
+	if r.Subject.MemberID != nil {
+		return *r.Subject.MemberID, nil
+	}
 	return entmoot.ResolvedMemberID(r.Subject)
 }
 

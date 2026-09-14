@@ -7,6 +7,75 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Group membership is now a set of self-signed records with signed
+  checkpoints, replacing the linear founder/admin-signed roster chain.** A
+  joiner signs its own admission, redeeming an invite that authorises it, so
+  admitting a member no longer requires the founder or a delegated admin to be
+  online and writing. Records (`join`, `leave`, `rekey`, `remove`, `unban`,
+  `policy`, `revoke_invite`) merge by one deterministic total order —
+  timestamp, then kind, then id — with joins applied before rekeys, authority
+  records, and leaves. The kind order is a decision, not an accident: a
+  removal beats a simultaneous join, and a leave always sticks, because
+  admitting someone by mistake is recoverable and failing to remove them is
+  not.
+
+  Because membership is a set, two nodes holding the same records project the
+  same membership whatever order those records arrived in. That removes the
+  fork as a concept, and with it `roster repair`, per-peer roster backoff,
+  fork classification, divergence reports and the `roster_divergence` status
+  field. Join health now reports `pending_membership_records` instead, which
+  is the growth an operator can actually act on.
+
+  Any admin — not only the founder — periodically signs a checkpoint: the
+  complete member set, policy, bans and invite-use counts, chained to the
+  previous checkpoint. A checkpoint replaces the records it covers, so records
+  older than it are refused as stale and a discarded change cannot return. A
+  new member downloads one checkpoint instead of replaying a group's whole
+  past, and looking up membership at a cited checkpoint is constant time: 330ns
+  at 1,000 members and 172ns at 100,000, against 3.5ms and 316ms for the chain
+  walk it replaces. Cadence is group policy (`checkpoint_every`, default 64);
+  `roster checkpoint` signs one on demand.
+
+  An invite is now worth exactly its issuer's current authority. Remove or
+  demote the issuer and its outstanding invites stop working on every node at
+  once, with no revocation step and nothing to fail. Use limits and
+  `revoke_invite` records are projected from the group's own signed state, so
+  every node reaches the same answer offline; the per-node reservation ledger
+  that used to count redemptions is gone, and `bootstrap-admission.db` is now
+  only a local record of what this node issued, for `invite list`.
+- **Transport.** `/entmoot/membership/1` serves checkpoints plus the records a
+  caller does not hold, and `/entmoot/membership-push/1` accepts one signed
+  record, which is how a joiner delivers its own join and how a member
+  propagates a change without waiting for the next round. A node that accepts
+  a pushed record forwards it once to the group's other reachable members, so
+  a join reaches members the joiner never contacted. Membership answers carry
+  no paging snapshot: they are computed from live state, partial progress is
+  always safe, and a truncated answer means "ask again". `/entmoot/roster/2`
+  and `/entmoot/enrollment/3` are removed. History sync and peer records are
+  unchanged.
+
+  One response is capped at 4 MiB, which bounds a group at roughly 20,000
+  members: a larger group cannot carry its checkpoint in one answer and says
+  so, rather than syncing half a membership. Records are capped at 512 per
+  answer.
+- **Commands.** `roster remove` (founder or admin; only the founder may remove
+  an admin), `roster ban`/`roster unban` (unban is founder-only), `roster
+  leave` (any member, about itself), `roster checkpoint`, `roster status`,
+  `group policy join-rule`, `group policy checkpoint-every`. `roster add` is
+  gone: a member signs itself in with an invite. `roster repair` is gone: there
+  is no fork to repair.
+- **Migration.** `membership upgrade -group GID` mints checkpoint 0 from an
+  existing linear chain, preserving members and delegated admins and recording
+  the chain head inside the checkpoint so a fabricated upgrade is detectable.
+  It is founder-only, because only the founder's signature anchors a group,
+  and idempotent. The chain stays on disk read-only: version-0 messages that
+  cite it are still verified against it and against the founder-signed
+  conversion commitment. A group with no checkpoint is not served — the daemon
+  skips it and names it — rather than being served from a chain the protocol
+  no longer speaks.
+
 ### Added
 
 - **Delegated admins.** A founder can now name delegated admins with

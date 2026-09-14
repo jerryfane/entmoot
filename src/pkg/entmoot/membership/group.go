@@ -307,13 +307,22 @@ func (g *Group) CheckpointsSince(sequence uint64) []Checkpoint {
 	return out
 }
 
-// Pending returns the records this node holds that are not folded into the
-// canonical checkpoint.
+// Pending returns the records a peer still needs: the ones this node holds
+// that the canonical checkpoint has not folded in.
+//
+// Records covered by the canonical checkpoint are deliberately excluded even
+// though they are still on disk. They are kept for one checkpoint of lag, so a
+// peer arriving at the previous checkpoint can re-verify the newest one; a
+// peer arriving at the newest checkpoint would reject them as stale, and
+// serving records a receiver must refuse is worse than serving none.
 func (g *Group) Pending() []Record {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 	out := make([]Record, 0, len(g.records))
 	for _, rec := range g.records {
+		if g.recordCoveredLocked(rec) {
+			continue
+		}
 		out = append(out, cloneRecord(rec))
 	}
 	sort.Slice(out, func(i, j int) bool {
@@ -929,4 +938,68 @@ func mustMemberID(info entmoot.NodeInfo) entmoot.MemberID {
 		return entmoot.MemberID{}
 	}
 	return id
+}
+
+// CheckInvite reports whether an invite still authorises its holder to read
+// this group's membership. It is the pre-membership gate: a joiner has no
+// member record yet, so the invite is the only credential it can present.
+//
+// The answer comes from the group's own signed state, not from a local
+// ledger. That is what makes it the same answer on every node: an invite
+// revoked by a record, exhausted by other joins, or signed by a demoted
+// admin stops working everywhere, without any node having to be told.
+func (g *Group) CheckInvite(invite entmoot.BootstrapCapability, atMS int64) error {
+	if err := VerifyInviteSignature(invite); err != nil {
+		return err
+	}
+	if invite.GroupID != g.groupID {
+		return fmt.Errorf("%w: invite names another group", ErrInviteDenied)
+	}
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	if _, revoked := g.state.RevokedInvites[invite.Nonce]; revoked {
+		return fmt.Errorf("%w: invite was revoked", ErrInviteDenied)
+	}
+	if err := InviteValidAt(invite, atMS); err != nil {
+		return err
+	}
+	if g.state.InviteUses[invite.Nonce] >= invite.Uses() {
+		return fmt.Errorf("%w: invite has no uses left", ErrInviteDenied)
+	}
+	authority := invite.SigningAuthority()
+	authorityID, err := entmoot.ResolvedMemberID(authority)
+	if err != nil {
+		return fmt.Errorf("%w: invite issuer is incomplete", ErrInviteDenied)
+	}
+	if !g.state.CanAdminister(authorityID) {
+		return fmt.Errorf("%w: invite issuer cannot administer this group", ErrInviteDenied)
+	}
+	if g.state.IsFounder(authorityID) {
+		if !bytes.Equal(g.state.Founder.EntmootPubKey, authority.EntmootPubKey) {
+			return fmt.Errorf("%w: invite issuer key does not match the founder", ErrInviteDenied)
+		}
+		return nil
+	}
+	member, ok := g.state.Members[authorityID]
+	if !ok || !bytes.Equal(member.EntmootPubKey, authority.EntmootPubKey) {
+		return fmt.Errorf("%w: invite issuer key does not match its member record", ErrInviteDenied)
+	}
+	return nil
+}
+
+// InviteUses reports how many identities the group's state records as having
+// redeemed one invite. This is the count that decides admission, so an
+// operator reading it sees what every other node sees.
+func (g *Group) InviteUses(nonce [32]byte) int {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.state.InviteUses[nonce]
+}
+
+// IsInviteRevoked reports whether a signed record has withdrawn an invite.
+func (g *Group) IsInviteRevoked(nonce [32]byte) bool {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	_, revoked := g.state.RevokedInvites[nonce]
+	return revoked
 }

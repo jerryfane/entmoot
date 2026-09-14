@@ -567,17 +567,38 @@ func TestConcurrentCheckpointsSettleOnOneCanonical(t *testing.T) {
 }
 
 // Retention is the point of checkpoints, but a node keeps the records behind
-// the newest one so it can still check a checkpoint that arrives late.
+// the newest one so it can still judge a checkpoint that arrives late. The
+// observable is that a second admin's checkpoint at the held sequence is
+// checked against those records instead of being taken on trust, and that
+// retiring the older records loses no member.
 func TestRetentionKeepsOneCheckpointLag(t *testing.T) {
 	f := newFixture(t, DefaultPolicy())
+	admin := mustIdentity(t)
+	f.join(admin)
+	f.grantAdmin(f.memberID(admin))
 	first := mustIdentity(t)
 	f.join(first)
 	f.tick(10)
 	if _, signed, err := f.group.SignCheckpoint(f.founder, true); err != nil || !signed {
 		t.Fatalf("first checkpoint: signed=%t err=%v", signed, err)
 	}
-	if len(f.group.Pending()) == 0 {
-		t.Fatal("the records behind the newest checkpoint were dropped immediately")
+
+	// The same body, signed by the other admin: checking it requires the
+	// records behind the head, which a node that dropped them could not do.
+	held := f.group.Canonical()
+	competing := held
+	competing.ID = entmoot.RosterEntryID{}
+	competing.Signer = entmoot.NodeInfo{}
+	competing.Signature = nil
+	signedCompeting, err := SignCheckpoint(admin, f.info(admin), competing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.group.ApplyCheckpoint(signedCompeting); err != nil {
+		t.Fatalf("a checkpoint at the held sequence was refused: %v", err)
+	}
+	if !f.group.IsMemberID(f.memberID(first)) {
+		t.Fatal("settling two checkpoints at one sequence lost a member")
 	}
 
 	second := mustIdentity(t)
@@ -586,18 +607,21 @@ func TestRetentionKeepsOneCheckpointLag(t *testing.T) {
 	if _, signed, err := f.group.SignCheckpoint(f.founder, true); err != nil || !signed {
 		t.Fatalf("second checkpoint: signed=%t err=%v", signed, err)
 	}
-	for _, rec := range f.group.Pending() {
-		if rec.Timestamp < f.group.Canonical().Timestamp && rec.Kind == KindJoin {
-			if subject, err := rec.SubjectMemberID(); err == nil && subject == f.memberID(first) {
-				t.Fatal("a record two checkpoints old was retained")
-			}
-		}
-	}
 	if !f.group.IsMemberID(f.memberID(first)) || !f.group.IsMemberID(f.memberID(second)) {
 		t.Fatal("retiring records lost a member")
 	}
 	if got := f.group.Canonical().Sequence; got != 2 {
 		t.Fatalf("canonical sequence = %d, want 2", got)
+	}
+	// A record the canonical checkpoint has folded in is never offered to a
+	// peer: a fresh joiner refuses it as stale, and serving records a receiver
+	// must reject is worse than serving none.
+	canonical := f.group.Canonical()
+	for _, rec := range f.group.Pending() {
+		if rec.Timestamp <= canonical.Timestamp {
+			t.Fatalf("checkpoint %d already covers %s at %d, but it is still offered",
+				canonical.Sequence, rec.Kind, rec.Timestamp)
+		}
 	}
 }
 

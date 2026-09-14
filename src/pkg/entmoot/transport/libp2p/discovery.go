@@ -24,7 +24,7 @@ import (
 
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/keystore"
-	"entmoot/pkg/entmoot/roster"
+	"entmoot/pkg/entmoot/membership"
 )
 
 type ConnectivityMode string
@@ -157,7 +157,7 @@ func NewConfiguredHost(ctx context.Context, identity *keystore.Identity, cfg Hos
 
 // InstallVerifiedPeer accepts invite/static/identify hints only after the
 // roster key binds both full-width identifiers. Stale hints expire in 30 min.
-func InstallVerifiedPeer(h host.Host, r *roster.RosterLog, member entmoot.NodeInfo, peerID peer.ID, addresses []multiaddr.Multiaddr, ttl time.Duration, mode ConnectivityMode, controlledRelays []peer.AddrInfo) error {
+func InstallVerifiedPeer(h host.Host, r *membership.Group, member entmoot.NodeInfo, peerID peer.ID, addresses []multiaddr.Multiaddr, ttl time.Duration, mode ConnectivityMode, controlledRelays []peer.AddrInfo) error {
 	if h == nil || r == nil || member.MemberID == nil || !r.IsMemberID(*member.MemberID) {
 		return errors.New("libp2p: address hint is not for a current member")
 	}
@@ -216,7 +216,7 @@ func VisiblePeerAddresses(h host.Host, peerID peer.ID, mode ConnectivityMode, co
 
 // StartMemberMDNS enables LAN discovery only after an explicit direct-profile
 // call. Discovered addresses are still accepted only for current roster peers.
-func StartMemberMDNS(h host.Host, r *roster.RosterLog, groupID entmoot.GroupID) (mdns.Service, error) {
+func StartMemberMDNS(h host.Host, r *membership.Group, groupID entmoot.GroupID) (mdns.Service, error) {
 	if h == nil || r == nil {
 		return nil, errors.New("libp2p: host and roster are required for mDNS")
 	}
@@ -230,7 +230,7 @@ func StartMemberMDNS(h host.Host, r *roster.RosterLog, groupID entmoot.GroupID) 
 
 type memberMDNSNotifee struct {
 	host   host.Host
-	roster *roster.RosterLog
+	roster *membership.Group
 }
 
 func (n *memberMDNSNotifee) HandlePeerFound(info peer.AddrInfo) {

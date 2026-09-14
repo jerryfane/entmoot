@@ -153,7 +153,7 @@ func verifyRecordFields(rec Record) error {
 		if err != nil {
 			return fmt.Errorf("%w: %v", entmoot.ErrRosterReject, err)
 		}
-		subject, err := entmoot.ResolvedMemberID(rec.Subject)
+		subject, err := rec.SubjectMemberID()
 		if err != nil {
 			return fmt.Errorf("%w: invalid subject: %v", entmoot.ErrRosterReject, err)
 		}
@@ -250,8 +250,15 @@ func verifyRecordFields(rec Record) error {
 		if rec.Subject.MemberID == nil {
 			return fmt.Errorf("%w: %s must name a member id", entmoot.ErrRosterReject, rec.Kind)
 		}
-		if err := entmoot.ValidateMemberInfo(rec.Subject); err != nil {
-			return fmt.Errorf("%w: invalid subject: %v", entmoot.ErrRosterReject, err)
+		// A member id is enough to name who a record is about, and sometimes it
+		// is all there is: an unban names an identity that is by definition not
+		// a member, so no member record carries its key. When a key IS
+		// supplied it must be the one that id was derived from, or the record
+		// would name one identity and carry another's key.
+		if len(rec.Subject.EntmootPubKey) != 0 {
+			if err := entmoot.ValidateMemberInfo(rec.Subject); err != nil {
+				return fmt.Errorf("%w: invalid subject: %v", entmoot.ErrRosterReject, err)
+			}
 		}
 		if rec.Invite != nil {
 			return fmt.Errorf("%w: %s must not carry an invite", entmoot.ErrRosterReject, rec.Kind)

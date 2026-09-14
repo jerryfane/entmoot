@@ -18,7 +18,7 @@ import (
 	"entmoot/pkg/entmoot/canonical"
 	"entmoot/pkg/entmoot/conversion"
 	"entmoot/pkg/entmoot/keystore"
-	"entmoot/pkg/entmoot/roster"
+	"entmoot/pkg/entmoot/membership"
 	"entmoot/pkg/entmoot/store"
 	libp2ptransport "entmoot/pkg/entmoot/transport/libp2p"
 )
@@ -84,20 +84,18 @@ func TestGroupRuntimeServesConvertedLegacyHistory(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer clientHost.Close()
-	rlog, err := roster.OpenJSONL(root, groupID)
+	// The converted chain has no checkpoint, so the founder mints one before
+	// the daemon can serve the group. The genesis entry of a Pilot-era chain
+	// names its founder by node id alone, so the checkpoint restates that
+	// founder under the member identity derived from the same key.
+	mustAdoptCheckpointZero(t, root, groupID, founder)
+	group, err := membership.Open(root, groupID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer rlog.Close()
 	memberInfo := entmoot.NodeInfo{MemberID: &clientBinding.MemberID, PeerID: clientHost.ID().String(), EntmootPubKey: member.PublicKey}
-	add, err := rlog.SignEntry(founder, "add", memberInfo, nil, time.Now().UnixMilli())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := rlog.Apply(add); err != nil {
-		t.Fatal(err)
-	}
-	if err := rlog.Close(); err != nil {
+	mustJoinWithInvite(t, group, member, mustDaemonInvite(t, group, founder, memberInfo, 1))
+	if err := group.Close(); err != nil {
 		t.Fatal(err)
 	}
 	messages, err := store.OpenSQLite(root)
@@ -134,7 +132,7 @@ func TestGroupRuntimeServesConvertedLegacyHistory(t *testing.T) {
 	if !bytes.Equal(got, encoded) {
 		t.Fatal("served legacy signed bytes changed")
 	}
-	if err := libp2ptransport.VerifyHistoricalMessageWithProof(session.roster, response.Messages[0], time.Now(), &response.LegacyProofs[0].Proof); err != nil {
+	if err := libp2ptransport.VerifyHistoricalMessageWithProof(session.group, response.Messages[0], time.Now(), &response.LegacyProofs[0].Proof); err != nil {
 		t.Fatalf("served conversion proof failed validation: %v", err)
 	}
 	t.Log("authenticated daemon member received 1 unchanged legacy message and 1 verified conversion proof")

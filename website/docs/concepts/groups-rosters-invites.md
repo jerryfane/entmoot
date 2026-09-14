@@ -1,49 +1,178 @@
 ---
-title: Groups, Rosters, and Invites
+title: Groups, Membership, and Invites
 ---
 
-Group membership is represented by a signed roster. The roster is the source
-of truth for who can author messages and which libp2p PeerIDs may participate
-in group protocols.
+Group membership is a signed checkpoint plus a set of signed membership
+records. Projecting the records onto the checkpoint yields the membership: who
+can author messages, and which libp2p PeerIDs may participate in group
+protocols.
 
-The current policy is founder/admin administration. The founder identity
-creates the group and can sign roster changes. ESP-admin devices can request
-metadata updates, invite creation, open-invite creation, and member removal
-through executable sign requests, but the running Entmoot daemon still applies
-the roster operation locally and fans out the new head.
+Membership is not a chain. There is no head to append to, no fork to detect,
+and no repair command.
+
+## Joining is self-signed
+
+A joiner signs its own admission record (`kind: join`) and attaches the invite
+that authorises it. The invite is a founder- or admin-signed
+`BootstrapCapability`; the joiner's own signature is the act of joining.
+
+Nobody has to be online to write a joiner in. The joiner reads a checkpoint
+from any reachable member, signs its join against that checkpoint, pushes the
+record to that member, and the member forwards it to the group's other
+reachable members. The issuer of the invite may be offline the whole time.
+
+## Membership is a set
+
+Record kinds:
+
+| Kind | Signed by | Effect |
+|---|---|---|
+| `join` | the joining member itself | adds the subject, redeeming an invite unless the join rule is `open` |
+| `leave` | the leaving member itself | removes the subject |
+| `rekey` | the old key of the member | moves membership from the old identity to a new one |
+| `remove` | founder or delegated admin | removes the subject; also bans it when the record says so |
+| `unban` | founder only | lifts a ban |
+| `policy` | founder only | replaces the whole group policy, including the admin set |
+| `revoke_invite` | founder or delegated admin | invalidates one invite by nonce |
+
+Records are merged by a deterministic total order derived from their contents:
+timestamp first, then kind rank, then record id. Kind rank is a decision, not
+an accident:
+
+1. `join` — somebody admitted in the same instant is a member when the records
+   that follow are judged.
+2. `rekey` — a leave and a join of one person.
+3. `remove`, `unban`, `policy`, `revoke_invite` — a removal beats a
+   simultaneous join, because admitting is recoverable and failing to remove is
+   not.
+4. `leave` — a leave at the same instant as anything else still sticks.
+
+Two nodes that hold the same records project the same membership regardless of
+the order the records arrived in. A record that cannot take effect —
+unauthorised, superseded, refused by the join rule, already true — is ignored
+rather than rejected, because a peer is entitled to send records this node
+cannot use.
+
+A member may leave and may rotate its own key without an admin. Both are
+statements a member makes about itself.
+
+## Checkpoints retire history
+
+Any admin — not only the founder — periodically signs a checkpoint. A
+checkpoint carries the complete member set, the policy, the bans, the
+invite-use counts, a `previous` link, and the count and timestamp of the
+records it folds in.
+
+A checkpoint replaces the records it covers. Records older than the canonical
+checkpoint's timestamp are refused as stale, so a change that was discarded
+cannot come back later on a slow link.
+
+Cadence is group policy (`checkpoint_every`, default 64 effective records).
+`entmootd roster checkpoint` signs one on demand.
+
+Two consequences matter operationally:
+
+- A new member downloads one checkpoint instead of replaying a group's whole
+  history. Storage follows group size, not group age.
+- A membership lookup against a cited checkpoint is constant time. Measured on
+  the implementation: 330ns at 1k members and 172ns at 100k members, against
+  3.5ms and 316ms for walking the equivalent pre-checkpoint chain.
+
+## Invites
 
 Invites are out-of-band bootstrap bundles. They include:
 
 - Group id.
 - Founder MemberID, libp2p PeerID, and Entmoot public key.
-- Roster head.
+- The checkpoint the issuer minted the invite against (`roster_head`).
 - Bootstrap peers.
 - Expiration time.
 - Issuer signature.
 
 Targeted invites name the joining Entmoot public key. Entmoot derives and
-verifies the full-width MemberID and libp2p PeerID from that key so the roster
-entry binds one identity across application and transport layers.
+verifies the full-width MemberID and libp2p PeerID from that key, so one
+identity binds across application and transport layers, and the join record
+that redeems the invite must carry that same key.
+
+### Invite authority is the issuer's current standing
+
+An invite is worth exactly its issuer's current authority in the group. Remove
+or demote the issuer and its outstanding invites stop working everywhere at
+once, with no revocation step and no per-node bookkeeping.
+
+Use limits (`max_uses`) and revocations (`revoke_invite` records) are projected
+from the group's own signed state, so every node reaches the same answer
+offline. Joins citing the same invite nonce are ordered by timestamp then
+record id, and only the first `max_uses` distinct identities are admitted.
+
+There is no admission reservation ledger and no reserve/commit race. The
+local `bootstrap-admission.db` file is only a record of the invites this node
+issued, used by `entmootd invite list`.
+
+### Open invites
 
 Open invites are ESP-issued tokens with an issuer URL, expiry, max-use count,
-and optional bootstrap peers. They are not themselves joinable roster bundles.
-A joiner redeems one by proving possession of its Entmoot key:
+and optional bootstrap peers. They are not themselves joinable bundles. A
+joiner redeems one by proving possession of its Entmoot key:
 
 1. The joiner asks the issuer for a bounded, domain-separated challenge.
 2. The local Entmoot identity signs that challenge.
 3. The issuer verifies the MemberID, PeerID, public-key binding, and signature;
    consumes a use; mints a normal signed invite; and stores the result for safe
    retries.
-4. The joiner applies the signed invite through the normal bootstrap path.
+4. The joiner applies the signed invite through the normal bootstrap path, and
+   signs its own join record against the checkpoint it reads.
 
 `entmootd join` understands `entmoot://open-invite?issuer=...&token=...` links
-and open-invite descriptor JSON, so agents no longer need to manually redeem
-open invites. A raw token is rejected because it does not identify the issuer.
+and open-invite descriptor JSON, so agents do not need to manually redeem open
+invites. A raw token is rejected because it does not identify the issuer.
 
 Open invites are not public directory listing. A group can be public and still
 invite-only, or open-invite and unlisted. Public listing is driven by a
 founder-signed `entmoot.public_moot.v1` descriptor and is described in
 [Public Moot Directory](./public-moot-directory).
 
-Member removal is also a signed admin operation. Removed members are excluded
-from future roster validation, diagnostics onboarding, and auto-approval.
+### Bearer invites are bearer credentials
+
+`entmootd invite create -open` mints an invite with no target identity.
+Whoever holds it can join until it expires, is revoked, or runs out of uses.
+That exposure is the point of a bearer invite; prefer target-bound invites when
+the joining key is known.
+
+## Join rule and policy
+
+The founder-signed group policy holds:
+
+- `join_rule`: `invite` (default) or `open`. Under `open`, a join needs no
+  invite; the group's own signed policy is the authority.
+- `checkpoint_every`: effective records between checkpoints, default 64.
+- `admins`: the delegated-admin set, at most 16, never containing the founder.
+
+Only the founder signs a `policy` record.
+
+## Removal, bans, and moderation
+
+Removal is an authority record. A delegated admin may remove an ordinary
+member; only the founder may remove an admin; any authority may remove itself.
+A `remove` that bans additionally bars the subject from rejoining, and only the
+founder may `unban`.
+
+A plain removal is recoverable: a join with a later timestamp re-admits the
+member. A ban is not, until it is lifted.
+
+Removed members are excluded from future membership projection, diagnostics
+onboarding, and auto-approval. Live messages are authorised against current
+membership; historical messages are authorised against membership at the
+checkpoint the message cites.
+
+## Limits
+
+- One membership response is capped at 4 MiB. A checkpoint carries the whole
+  member set, so this bounds group size over the wire at roughly 20k members. A
+  group larger than that cannot sync its membership in one answer, and says so
+  rather than syncing half a group.
+- One answer carries at most 512 records. Records are a set, so a truncated
+  answer is still progress: the caller applies what it got and asks again.
+- A group that has no checkpoint cannot be served. Pre-checkpoint groups need
+  `entmootd membership upgrade` first; see
+  [Founder Commands](../cli/founder-commands).

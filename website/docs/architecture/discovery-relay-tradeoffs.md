@@ -2,9 +2,9 @@
 title: Discovery and Relay Tradeoffs
 ---
 
-Entmoot uses signed, roster-bound peer hints rather than a public DHT or
+Entmoot uses signed, membership-bound peer hints rather than a public DHT or
 rendezvous registry. LAN discovery is available only in direct mode and accepts
-addresses only for current roster peers.
+addresses only for current members.
 
 Direct mode gives the simplest path and lowest relay cost, but authorized peers
 can observe direct addresses and NAT or firewall policy may prevent a
@@ -15,5 +15,5 @@ shields application-peer addresses and fails closed without a relay, but the
 relay operator observes client addresses and controls relay availability and
 resource budgets.
 
-Discovery hints are not authority. Every accepted PeerID must derive from the
-member's roster key, and stale hints expire.
+Discovery hints are not authority. Every accepted PeerID must derive from a
+current member's Entmoot key, and stale hints expire.

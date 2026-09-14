@@ -11,7 +11,7 @@ import (
 	"entmoot/pkg/entmoot/canonical"
 	"entmoot/pkg/entmoot/esphttp"
 	"entmoot/pkg/entmoot/keystore"
-	"entmoot/pkg/entmoot/roster"
+	"entmoot/pkg/entmoot/membership"
 )
 
 func TestFleetCommandContextFallsBackToControlRoster(t *testing.T) {
@@ -21,7 +21,7 @@ func TestFleetCommandContextFallsBackToControlRoster(t *testing.T) {
 	gid := testFleetCommandGroupID(0x42)
 	coordinatorID, coordinator := testFleetCommandIdentity(t)
 	agentID, agent := testFleetCommandIdentity(t)
-	testFleetCommandRoster(t, dataDir, gid, coordinatorID, coordinator, agent)
+	testFleetCommandRoster(t, dataDir, gid, coordinatorID, coordinator, agent, agentID)
 	state, err := esphttp.OpenSQLiteStateStore(dataDir)
 	if err != nil {
 		t.Fatalf("OpenSQLiteStateStore: %v", err)
@@ -69,7 +69,7 @@ func TestFleetCommandContextDoesNotFallbackWithoutFleetMetadata(t *testing.T) {
 	gid := testFleetCommandGroupID(0x44)
 	coordinatorID, coordinator := testFleetCommandIdentity(t)
 	agentID, agent := testFleetCommandIdentity(t)
-	testFleetCommandRoster(t, dataDir, gid, coordinatorID, coordinator, agent)
+	testFleetCommandRoster(t, dataDir, gid, coordinatorID, coordinator, agent, agentID)
 	state, err := esphttp.OpenSQLiteStateStore(dataDir)
 	if err != nil {
 		t.Fatalf("OpenSQLiteStateStore: %v", err)
@@ -104,7 +104,7 @@ func TestFleetCommandRunnerProcessesAfterControlMetadataArrives(t *testing.T) {
 	gid := testFleetCommandGroupID(0x46)
 	coordinatorID, coordinator := testFleetCommandIdentity(t)
 	agentID, agent := testFleetCommandIdentity(t)
-	testFleetCommandRoster(t, dataDir, gid, coordinatorID, coordinator, agent)
+	testFleetCommandRoster(t, dataDir, gid, coordinatorID, coordinator, agent, agentID)
 	state := mustOpenFleetCommandState(t, dataDir)
 	runner := &fleetCommandRunner{
 		server: &ipcServer{memberID: *agent.MemberID, peerID: agent.PeerID, identity: agentID, dataDir: dataDir, runtime: &groupRuntime{}},
@@ -148,7 +148,7 @@ func TestFleetCommandContextDoesNotFallbackForMismatchedFleetMetadata(t *testing
 	gid := testFleetCommandGroupID(0x45)
 	coordinatorID, coordinator := testFleetCommandIdentity(t)
 	agentID, agent := testFleetCommandIdentity(t)
-	testFleetCommandRoster(t, dataDir, gid, coordinatorID, coordinator, agent)
+	testFleetCommandRoster(t, dataDir, gid, coordinatorID, coordinator, agent, agentID)
 	state, err := esphttp.OpenSQLiteStateStore(dataDir)
 	if err != nil {
 		t.Fatalf("OpenSQLiteStateStore: %v", err)
@@ -182,7 +182,7 @@ func TestFleetCommandContextDoesNotFallbackForArchivedFleetState(t *testing.T) {
 	gid := testFleetCommandGroupID(0x43)
 	coordinatorID, coordinator := testFleetCommandIdentity(t)
 	agentID, agent := testFleetCommandIdentity(t)
-	testFleetCommandRoster(t, dataDir, gid, coordinatorID, coordinator, agent)
+	testFleetCommandRoster(t, dataDir, gid, coordinatorID, coordinator, agent, agentID)
 	state, err := esphttp.OpenSQLiteStateStore(dataDir)
 	if err != nil {
 		t.Fatalf("OpenSQLiteStateStore: %v", err)
@@ -418,22 +418,26 @@ func testFleetCommandIdentity(t *testing.T) (*keystore.Identity, entmoot.NodeInf
 	return id, entmoot.NodeInfo{MemberID: &memberID, PeerID: peerID, EntmootPubKey: id.PublicKey}
 }
 
-func testFleetCommandRoster(t *testing.T, dataDir string, gid entmoot.GroupID, coordinatorID *keystore.Identity, coordinator, agent entmoot.NodeInfo) {
+func testFleetCommandRoster(t *testing.T, dataDir string, gid entmoot.GroupID, coordinatorID *keystore.Identity, coordinator, agent entmoot.NodeInfo, agentID *keystore.Identity) {
 	t.Helper()
-	rlog, err := roster.OpenJSONL(dataDir, gid)
+	policy := membership.DefaultPolicy()
+	policy.JoinRule = membership.JoinRuleOpen
+	group, err := membership.Create(dataDir, coordinatorID, coordinator, gid, policy, 1_700_000_000_000)
 	if err != nil {
-		t.Fatalf("OpenJSONL: %v", err)
+		t.Fatalf("membership.Create: %v", err)
 	}
-	defer rlog.Close()
-	if err := rlog.Genesis(coordinatorID, coordinator, 1_700_000_000_000); err != nil {
-		t.Fatalf("Genesis: %v", err)
+	defer func() {
+		if err := group.Close(); err != nil {
+			t.Fatalf("membership close: %v", err)
+		}
+	}()
+	// The agent admits itself: under the open join rule a member's own signed
+	// join is all it takes, which is what the daemon does at join time.
+	if _, err := group.SignRecord(agentID, membership.Record{Kind: membership.KindJoin}); err != nil {
+		t.Fatalf("agent join: %v", err)
 	}
-	entry, err := rlog.SignEntry(coordinatorID, "add", agent, nil, 1_700_000_001_000)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := rlog.Apply(entry); err != nil {
-		t.Fatalf("Apply: %v", err)
+	if !group.IsMemberID(*agent.MemberID) {
+		t.Fatal("agent is not a member after its join record")
 	}
 }
 
