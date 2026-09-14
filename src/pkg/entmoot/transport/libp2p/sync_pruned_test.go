@@ -2,6 +2,8 @@ package libp2ptransport
 
 import (
 	"context"
+	"fmt"
+	"sync/atomic"
 	"testing"
 
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -263,5 +265,65 @@ func TestRetainedHistoryBelowTheCoverageFloorStillSyncs(t *testing.T) {
 		if !present {
 			t.Fatalf("history below the coverage floor was never fetched: %s", id)
 		}
+	}
+}
+
+// A historical message whose roster checkpoint is not on this node's chain yet
+// cannot be authorized, but it is not junk and it is not the keeper's fault:
+// the pass skips it, keeps the keeper, and must not claim convergence, because
+// claiming it would stop the retry that eventually picks the message up.
+func TestUnknownRosterHeadIsAGapNotConvergence(t *testing.T) {
+	f := newSnapshotLifecycleFixture(t)
+	group := f.groups[0]
+	for sequence := 3; sequence <= 6; sequence++ {
+		f.addMessage(t, group, sequence)
+	}
+	local, err := store.OpenSQLite(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer local.Close()
+
+	// The last identifier names a checkpoint this node has not synchronized,
+	// which is what the daemon's historical validation reports mid-catch-up.
+	unsynchronized := f.ids[group][len(f.ids[group])-1]
+	var lagging atomic.Bool
+	lagging.Store(true)
+	validate := func(message entmoot.Message, _ *merkle.Proof) error {
+		if lagging.Load() && message.ID == unsynchronized {
+			return fmt.Errorf("%w: historical head", entmoot.ErrRosterHeadUnknown)
+		}
+		return signing.VerifyMessage(message, message.Author)
+	}
+	keepers := []peer.AddrInfo{f.remote}
+
+	item := SyncFromKeepers(f.ctx, f.client, group, keepers, local, validate, new(HistorySyncState))[0]
+	if item.Err != nil {
+		t.Fatalf("an unknown checkpoint failed the keeper: %v", item.Err)
+	}
+	if !item.Available {
+		t.Fatal("keeper reported unavailable for an unknown checkpoint")
+	}
+	if item.UnknownHeads != 1 {
+		t.Fatalf("unknown heads = %d, want 1", item.UnknownHeads)
+	}
+	if item.Inserted != len(f.ids[group])-1 {
+		t.Fatalf("inserted %d of %d authorizable messages", item.Inserted, len(f.ids[group])-1)
+	}
+	if item.ConvergedHint {
+		t.Fatal("a pass that skipped a message claimed convergence")
+	}
+	if present, err := local.Has(context.Background(), group, unsynchronized); err != nil || present {
+		t.Fatalf("an unauthorized message was stored: present=%t err=%v", present, err)
+	}
+
+	// After roster synchronization the retry completes and converges.
+	lagging.Store(false)
+	retry := SyncFromKeepers(f.ctx, f.client, group, keepers, local, validate, new(HistorySyncState))[0]
+	if retry.Err != nil || retry.Inserted != 1 || retry.UnknownHeads != 0 {
+		t.Fatalf("retry after roster sync: inserted=%d unknown=%d err=%v", retry.Inserted, retry.UnknownHeads, retry.Err)
+	}
+	if !retry.ConvergedHint {
+		t.Fatal("a complete pass did not report convergence")
 	}
 }

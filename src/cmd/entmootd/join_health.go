@@ -18,6 +18,10 @@ type joinHealthSummary struct {
 	// synchronization gap that resolves itself; a value that stays non-zero is
 	// a roster that is not converging.
 	QuarantinedMessages int `json:"quarantined_messages"`
+	// UnknownHeadMessages counts historical messages the last catch-up skipped
+	// for the same reason. Unlike the live buffer these are not held, so the
+	// count is what the most recent pass saw.
+	UnknownHeadMessages int `json:"unknown_head_messages"`
 }
 
 func buildJoinHealthSummary(_ context.Context, runtime *groupRuntime, _ *store.SQLite, _ []byte) joinHealthSummary {
@@ -37,6 +41,7 @@ func buildJoinHealthSummary(_ context.Context, runtime *groupRuntime, _ *store.S
 				health.LocalMemberStatus = "missing"
 			}
 			health.QuarantinedMessages += session.live.QuarantinedMessages()
+			health.UnknownHeadMessages += int(session.unknownHeads.Load())
 		}
 	}
 	return health

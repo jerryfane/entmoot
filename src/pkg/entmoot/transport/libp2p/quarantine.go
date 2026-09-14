@@ -2,6 +2,7 @@ package libp2ptransport
 
 import (
 	"context"
+	"sort"
 	"sync"
 	"time"
 
@@ -103,57 +104,72 @@ func (q *rosterAheadQuarantine) expireLocked() {
 	}
 }
 
-// take removes and returns every held message whose head the roster now holds.
+// take removes and returns every held message whose head the roster now holds,
+// oldest arrival first so a drain does not reorder what a publisher sent.
 // Messages for heads that are still unknown stay until they expire.
 func (q *rosterAheadQuarantine) take(known func(entmoot.RosterEntryID) bool) []entmoot.Message {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.expireLocked()
-	var ready []entmoot.Message
+	var ready []quarantinedMessage
 	for head, held := range q.heads {
 		if !known(head) {
 			continue
 		}
 		for _, item := range held {
-			ready = append(ready, item.message)
+			ready = append(ready, item)
 			delete(q.byID, item.message.ID)
 			q.count--
 		}
 		delete(q.heads, head)
 	}
-	return ready
+	sort.SliceStable(ready, func(i, j int) bool {
+		return ready[i].received.Before(ready[j].received)
+	})
+	out := make([]entmoot.Message, 0, len(ready))
+	for _, item := range ready {
+		out = append(out, item.message)
+	}
+	return out
 }
 
+// len reports how many messages are waiting, expiring stale entries first so a
+// status reader never sees a gap that has already timed out.
 func (q *rosterAheadQuarantine) len() int {
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	q.expireLocked()
 	return q.count
 }
 
 // DrainQuarantine re-validates messages held for a roster head this node did
-// not have, stores the ones the synchronized roster now authorizes, and emits
-// them locally. It returns how many were ingested. Callers run it after a
-// roster synchronization; messages whose head is still unknown keep waiting
-// until they expire.
-func (g *LiveGroup) DrainQuarantine(ctx context.Context) int {
+// not have and stores the ones the synchronized roster authorizes. It returns
+// how many were ingested and how many were dropped as unauthorized. Callers
+// run it after a roster synchronization; messages whose head is still unknown
+// keep waiting until they expire.
+//
+// A roster sync can apply several entries at once, so by drain time a held
+// message may name a head that is already superseded. It is still authentic
+// history, authorized at the head it names, so it is verified as historical
+// rather than discarded for being late.
+func (g *LiveGroup) DrainQuarantine(ctx context.Context) (ingested int, dropped int) {
 	if g == nil || g.quarantine == nil {
-		return 0
+		return 0, 0
 	}
 	ready := g.quarantine.take(g.cfg.Roster.HasEntry)
-	ingested := 0
 	for _, message := range ready {
 		// The roster moved on since the message arrived, so re-run the full
-		// live check rather than trusting the earlier partial result.
-		if err := VerifyLiveMessage(g.cfg.Roster, message, g.now()); err != nil {
+		// check rather than trusting the earlier partial result.
+		if err := g.authorizeDrained(message); err != nil {
+			dropped++
 			continue
 		}
-		if g.cfg.Authorize != nil {
-			if err := g.cfg.Authorize(message); err != nil {
-				continue
-			}
-		}
 		inserted, err := g.cfg.Store.Put(ctx, g.cfg.GroupID, message)
-		if err != nil || !inserted {
+		if err != nil {
+			dropped++
+			continue
+		}
+		if !inserted {
 			continue
 		}
 		ingested++
@@ -161,7 +177,26 @@ func (g *LiveGroup) DrainQuarantine(ctx context.Context) int {
 			g.cfg.OnIngest(message)
 		}
 	}
-	return ingested
+	return ingested, dropped
+}
+
+// authorizeDrained applies the live rule when the held message still names the
+// current head, and the historical rule when the roster has moved past it. A
+// message is never accepted on weaker grounds than it would have been at
+// arrival: both paths verify author authority at the named head and the author
+// signature.
+func (g *LiveGroup) authorizeDrained(message entmoot.Message) error {
+	if message.RosterHead != nil && *message.RosterHead != g.cfg.Roster.Head() {
+		if err := VerifyHistoricalMessage(g.cfg.Roster, message, g.now()); err != nil {
+			return err
+		}
+	} else if err := VerifyLiveMessage(g.cfg.Roster, message, g.now()); err != nil {
+		return err
+	}
+	if g.cfg.Authorize != nil {
+		return g.cfg.Authorize(message)
+	}
+	return nil
 }
 
 // QuarantinedMessages reports how many roster-ahead messages are waiting. It
