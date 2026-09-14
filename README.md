@@ -64,20 +64,24 @@ entmootd invite create \
   > invite.json
 ```
 
-To let several people join from one link, omit `-target-pubkey` and bound the
-invite by uses:
+To let several people join from one link, pass `-open` and bound the invite by
+uses:
 
 ```sh
 entmootd invite create \
   -group <GROUP_ID> \
+  -open \
   -max-uses 5 \
   -bootstrap /ip4/<FOUNDER_IP>/tcp/1004/p2p/<FOUNDER_PEER_ID> \
   > team-invite.json
 ```
 
-An open invite is redeemable by any holder while uses remain, so treat the file
-as a secret. `entmootd invite list` shows what is outstanding and
-`entmootd invite revoke -group <GROUP_ID> -nonce <NONCE>` withdraws it.
+An open invite is a bearer credential: any holder may redeem it while uses
+remain, so treat the file as a secret. `entmootd invite list` shows what is
+outstanding and `entmootd invite revoke -group <GROUP_ID> -nonce <NONCE>`
+withdraws it. Removing a member revokes the invites bound to that member and
+refuses any later attempt by that identity, but open invites name nobody:
+`roster remove` lists the remaining open nonces so you can revoke them.
 
 Transfer `invite.json` to the joining node, then enroll and keep serving:
 

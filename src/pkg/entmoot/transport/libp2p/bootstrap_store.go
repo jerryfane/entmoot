@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"net/url"
 	"path/filepath"
 	"time"
 
@@ -46,7 +47,14 @@ func OpenPersistentBootstrapAdmission(dataDir string) (*PersistentBootstrapAdmis
 	if dataDir == "" {
 		return nil, errors.New("libp2p: bootstrap admission data directory is required")
 	}
-	db, err := sql.Open("sqlite", filepath.Join(dataDir, "bootstrap-admission.db"))
+	// The invite CLI opens this database alongside the running daemon, so a
+	// contending writer must wait rather than surface a driver error to a
+	// joiner mid-enrollment.
+	q := url.Values{}
+	q.Add("_pragma", "journal_mode(WAL)")
+	q.Add("_pragma", "synchronous(NORMAL)")
+	q.Add("_pragma", "busy_timeout(5000)")
+	db, err := sql.Open("sqlite", "file:"+filepath.Join(dataDir, "bootstrap-admission.db")+"?"+q.Encode())
 	if err != nil {
 		return nil, fmt.Errorf("libp2p: open bootstrap admission: %w", err)
 	}
@@ -246,6 +254,51 @@ func (a *PersistentBootstrapAdmission) RevokeInvite(groupID entmoot.GroupID, non
 		}
 	}
 	return true, tx.Commit()
+}
+
+// RevokeInvitesForMember revokes every live invite bound to memberID in this
+// group and returns how many it revoked. A removal has to void the invites
+// that would readmit that identity, or eviction would only last until the
+// evicted member replayed an invite it still holds.
+func (a *PersistentBootstrapAdmission) RevokeInvitesForMember(groupID entmoot.GroupID, memberID entmoot.MemberID) (int, error) {
+	if a == nil || a.db == nil {
+		return 0, errors.New("libp2p: bootstrap admission is not open")
+	}
+	now := time.Now().UnixMilli()
+	result, err := a.db.Exec(`UPDATE bootstrap_invites SET revoked_at_ms=?
+		WHERE group_id=? AND target_member_id=? AND revoked_at_ms=0`,
+		now, groupID[:], memberID[:])
+	if err != nil {
+		return 0, err
+	}
+	affected, err := result.RowsAffected()
+	return int(affected), err
+}
+
+// LiveOpenInvites returns the group's open invites that are neither revoked
+// nor expired and still have uses left. They are bearer credentials with no
+// recorded target, so a removal cannot void them automatically and the
+// operator has to be told they exist.
+func (a *PersistentBootstrapAdmission) LiveOpenInvites(groupID entmoot.GroupID) ([]InviteRecord, error) {
+	records, err := a.ListInvites(&groupID)
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now().UnixMilli()
+	live := make([]InviteRecord, 0, len(records))
+	for _, record := range records {
+		if !record.Open() || record.RevokedAtMS > 0 {
+			continue
+		}
+		if record.ExpiresAtMS > 0 && record.ExpiresAtMS <= now {
+			continue
+		}
+		if record.MaxUses > 0 && record.UsesCommitted >= record.MaxUses {
+			continue
+		}
+		live = append(live, record)
+	}
+	return live, nil
 }
 
 // ListInvites returns recorded invites with their spent uses, newest first.

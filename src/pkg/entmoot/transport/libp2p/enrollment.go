@@ -128,6 +128,12 @@ func (s *EnrollmentServer) handle(stream network.Stream) {
 	}
 	remote := stream.Conn().RemotePeer()
 	if err := s.Admission.Reserve(capability, remote, EnrollmentProtocol, now); err != nil {
+		if errors.Is(err, ErrBootstrapUnavailable) {
+			// A store failure says nothing about the invite, and its driver
+			// text is not the joiner's business.
+			reject(EnrollRejectInternal, "admission state is unavailable; retry")
+			return
+		}
 		reject(EnrollRejectCapability, "%v", err)
 		return
 	}

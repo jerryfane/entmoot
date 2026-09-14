@@ -27,7 +27,15 @@ const (
 	bootstrapCapabilityDomain = "entmoot/bootstrap-capability/v1\x00"
 )
 
-var ErrBootstrapDenied = errors.New("libp2p: bootstrap capability denied")
+var (
+	// ErrBootstrapDenied means the grant itself was refused: expired, revoked,
+	// exhausted, replayed, or bound to another identity. It is safe to report.
+	ErrBootstrapDenied = errors.New("libp2p: bootstrap capability denied")
+	// ErrBootstrapUnavailable means admission state could not be read or
+	// written, so the request was refused without judging the grant. Callers
+	// report it as an internal condition and keep the detail local.
+	ErrBootstrapUnavailable = errors.New("libp2p: bootstrap admission unavailable")
+)
 
 type BootstrapCapability = entmoot.BootstrapCapability
 
@@ -194,7 +202,7 @@ func (a *BootstrapAdmission) checkRevoked(invite capabilityKey) error {
 	}
 	revoked, err := a.revoked(invite)
 	if err != nil {
-		return fmt.Errorf("%w: read revocation state: %v", ErrBootstrapDenied, err)
+		return fmt.Errorf("%w: read revocation state: %v", ErrBootstrapUnavailable, err)
 	}
 	if revoked {
 		return fmt.Errorf("%w: capability is revoked", ErrBootstrapDenied)
@@ -230,7 +238,7 @@ func (a *BootstrapAdmission) Verify(capability BootstrapCapability, remotePeer p
 	if a.unavailable != nil {
 		unavailable, err := a.unavailable(key, capability.Uses())
 		if err != nil {
-			return fmt.Errorf("%w: read nonce state: %v", ErrBootstrapDenied, err)
+			return fmt.Errorf("%w: read nonce state: %v", ErrBootstrapUnavailable, err)
 		}
 		if unavailable {
 			return fmt.Errorf("%w: capability already used or reserved", ErrBootstrapDenied)
@@ -261,7 +269,7 @@ func (a *BootstrapAdmission) Reserve(capability BootstrapCapability, remotePeer 
 	if a.reserve != nil {
 		reserved, err := a.reserve(key, capability.Uses())
 		if err != nil {
-			return fmt.Errorf("%w: persist nonce reservation: %v", ErrBootstrapDenied, err)
+			return fmt.Errorf("%w: persist nonce reservation: %v", ErrBootstrapUnavailable, err)
 		}
 		if !reserved {
 			return fmt.Errorf("%w: capability already used or reserved", ErrBootstrapDenied)

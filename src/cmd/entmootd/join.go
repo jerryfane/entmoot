@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -1472,7 +1473,11 @@ func (s *ipcServer) handleInviteCreate(_ context.Context, c net.Conn, req *ipc.I
 		return
 	}
 	if len(req.TargetPublicKey) != 0 && len(req.TargetPublicKey) != ed25519.PublicKeySize {
-		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInvalidArgument, GroupID: &gid, Message: "target_public_key must be an Ed25519 key or empty for an open invite"})
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInvalidArgument, GroupID: &gid, Message: "target_public_key must be an Ed25519 key"})
+		return
+	}
+	if req.Open == (len(req.TargetPublicKey) != 0) {
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInvalidArgument, GroupID: &gid, Message: "provide target_public_key, or set open for a bearer invite; not both"})
 		return
 	}
 	if req.MaxUses < 0 || req.MaxUses > maxInviteUses {
@@ -1688,7 +1693,26 @@ func (s *ipcServer) handleMemberRemove(ctx context.Context, c net.Conn, req *ipc
 	head := sess.roster.Head()
 	members := len(sess.roster.MemberIDs())
 	unlock()
-	_ = ipc.EncodeAndWrite(c, &ipc.MemberRemoveResp{Status: "removed", GroupID: gid, RosterHead: head, Members: members})
+	// Removal voids the invites that would readmit this identity; open bearer
+	// invites cannot be attributed, so they are reported instead.
+	revoked, err := s.runtime.admission.RevokeInvitesForMember(gid, *existing.MemberID)
+	if err != nil {
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInternal, GroupID: &gid, Message: "revoke invites for removed member: " + err.Error()})
+		return
+	}
+	live, err := s.runtime.admission.LiveOpenInvites(gid)
+	if err != nil {
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInternal, GroupID: &gid, Message: "read open invites: " + err.Error()})
+		return
+	}
+	nonces := make([]string, 0, len(live))
+	for _, record := range live {
+		nonces = append(nonces, base64.StdEncoding.EncodeToString(record.Nonce[:]))
+	}
+	_ = ipc.EncodeAndWrite(c, &ipc.MemberRemoveResp{
+		Status: "removed", GroupID: gid, RosterHead: head, Members: members,
+		RevokedInvites: revoked, OutstandingOpenInvites: nonces,
+	})
 }
 
 // handleInfo assembles a full InfoResp snapshot from live state.

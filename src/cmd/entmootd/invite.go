@@ -43,14 +43,15 @@ func cmdInvite(gf *globalFlags, args []string) int {
 	}
 }
 
-// cmdInviteCreate emits a bootstrap capability. Without -target-pubkey it
-// emits an open invite that any holder may redeem, bounded by -max-uses and
-// the TTL. Bootstrap addresses must be full multiaddrs ending in
-// /p2p/<founder-peer-id>.
+// cmdInviteCreate emits a bootstrap capability. It is bound to one target
+// identity unless -open is given, which mints a bearer invite any holder may
+// redeem while uses remain. Bootstrap addresses must be full multiaddrs
+// ending in /p2p/<founder-peer-id>.
 func cmdInviteCreate(gf *globalFlags, args []string) int {
 	fs := flag.NewFlagSet("invite create", flag.ContinueOnError)
 	groupStr := fs.String("group", "", "base64 group id (required)")
-	targetKey := fs.String("target-pubkey", "", "base64 Ed25519 public key of the joining identity; empty mints an open invite")
+	targetKey := fs.String("target-pubkey", "", "base64 Ed25519 public key of the joining identity (required unless -open)")
+	open := fs.Bool("open", false, "mint a bearer invite with no target identity; any holder may redeem it")
 	maxUses := fs.Int("max-uses", 1, "how many distinct identities may join with this invite")
 	validFor := fs.String("valid-for", "24h", "capability TTL (time.ParseDuration or <N>d)")
 	var bootstrap stringListFlag
@@ -77,6 +78,14 @@ func cmdInviteCreate(gf *globalFlags, args []string) int {
 	}
 	if *maxUses < 1 || *maxUses > maxInviteUses {
 		fmt.Fprintf(os.Stderr, "invite create: -max-uses must be between 1 and %d\n", maxInviteUses)
+		return exitInvalidArgument
+	}
+	switch {
+	case *open && *targetKey != "":
+		fmt.Fprintln(os.Stderr, "invite create: -open and -target-pubkey are mutually exclusive")
+		return exitInvalidArgument
+	case !*open && *targetKey == "":
+		fmt.Fprintln(os.Stderr, "invite create: -target-pubkey is required; pass -open to mint a bearer invite any holder can redeem")
 		return exitInvalidArgument
 	}
 	var publicKey []byte
@@ -176,6 +185,13 @@ func cmdInviteCreate(gf *globalFlags, args []string) int {
 		slog.Error("invite create: marshal", slog.String("err", err.Error()))
 		return exitTransport
 	}
+	binding := "bound to target " + capability.TargetMemberID.String()
+	if capability.IsOpenInvite() {
+		binding = "OPEN bearer invite: any holder can redeem it"
+	}
+	fmt.Fprintf(os.Stderr, "invite create: %s; max uses %d; expires %s; nonce %s\n",
+		binding, capability.Uses(), time.UnixMilli(capability.ExpiresAtMS).Format(time.RFC3339),
+		base64.StdEncoding.EncodeToString(capability.Nonce[:]))
 	fmt.Println(string(encoded))
 	return exitOK
 }

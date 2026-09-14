@@ -242,10 +242,27 @@ func cmdRosterRemove(gf *globalFlags, args []string) int {
 		slog.String("group_id", gid.String()),
 		slog.String("member_id", target.MemberID.String()))
 
+	// Removal has to void what would readmit this identity, and warn about the
+	// bearer invites it cannot attribute.
+	revoked, openInvites, err := revokeInvitesAfterRemoval(ctx.setup.dataDir, gid, *target.MemberID)
+	if err != nil {
+		slog.Error("roster remove: revoke invites", slog.String("err", err.Error()))
+		return exitTransport
+	}
+	if len(openInvites) > 0 {
+		fmt.Fprintf(os.Stderr, "roster remove: warning: %d open bearer invite(s) remain for this group; anyone holding one can still join. Revoke with: entmootd invite revoke -group %s -nonce <NONCE>\n",
+			len(openInvites), gid.String())
+		for _, nonce := range openInvites {
+			fmt.Fprintf(os.Stderr, "  nonce %s\n", nonce)
+		}
+	}
+
 	binding, _ := libp2ptransport.BindingFromPublicKey(target.EntmootPubKey)
 	out := map[string]any{
-		"group_id": gid,
-		"members":  len(ctx.roster.MemberIDs()),
+		"group_id":                 gid,
+		"members":                  len(ctx.roster.MemberIDs()),
+		"revoked_invites":          revoked,
+		"outstanding_open_invites": openInvites,
 		"removed": map[string]any{
 			"member_id":      target.MemberID,
 			"peer_id":        binding.PeerID.String(),
@@ -259,6 +276,30 @@ func cmdRosterRemove(gf *globalFlags, args []string) int {
 	}
 	fmt.Println(string(data))
 	return exitOK
+}
+
+// revokeInvitesAfterRemoval voids every invite bound to the removed member and
+// returns the nonces of the group's remaining open bearer invites, which no
+// removal can attribute to anyone.
+func revokeInvitesAfterRemoval(dataDir string, groupID entmoot.GroupID, memberID entmoot.MemberID) (int, []string, error) {
+	admission, err := libp2ptransport.OpenPersistentBootstrapAdmission(dataDir)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer admission.Close()
+	revoked, err := admission.RevokeInvitesForMember(groupID, memberID)
+	if err != nil {
+		return 0, nil, err
+	}
+	live, err := admission.LiveOpenInvites(groupID)
+	if err != nil {
+		return revoked, nil, err
+	}
+	nonces := make([]string, 0, len(live))
+	for _, record := range live {
+		nonces = append(nonces, base64.StdEncoding.EncodeToString(record.Nonce[:]))
+	}
+	return revoked, nonces, nil
 }
 
 // decodePubkey parses a base64 Ed25519 public key. Accepts both std and
