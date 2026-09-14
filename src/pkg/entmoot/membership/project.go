@@ -52,7 +52,7 @@ func Project(base Checkpoint, records []Record) (State, []Record) {
 	seen := make(map[entmoot.RosterEntryID]struct{}, len(records))
 	ordered := make([]Record, 0, len(records))
 	for _, rec := range records {
-		if rec.GroupID != base.GroupID || rec.Timestamp < base.Timestamp {
+		if rec.GroupID != base.GroupID || coveredBy(base, rec) {
 			continue
 		}
 		if _, duplicate := seen[rec.ID]; duplicate {
@@ -89,6 +89,19 @@ func Project(base Checkpoint, records []Record) (State, []Record) {
 		}
 	}
 	return state, effective
+}
+
+// coveredBy reports whether a base already accounts for a record. The bound is
+// inclusive, and must stay identical to the one Group.Apply uses: a record the
+// projection replays but the store refuses (or the reverse) would make two
+// nodes holding the same data disagree. Invite-use counting is the one
+// non-idempotent effect, so a replay there is not merely wasteful.
+//
+// A base that folded nothing in covers nothing, whatever its timestamp: that
+// is the genesis case, where the checkpoint's timestamp is its own signing
+// time rather than a record's.
+func coveredBy(base Checkpoint, rec Record) bool {
+	return base.Covered > 0 && rec.Timestamp <= base.Timestamp
 }
 
 func actorIs(rec Record, id entmoot.MemberID) bool {

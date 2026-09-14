@@ -292,10 +292,10 @@ func TestLegacyHistoryRequiresFounderCommittedMessageID(t *testing.T) {
 	chain = append(chain, legacyEntry(t, founderIdentity, chain, "policy_change", entmoot.NodeInfo{}, policy, 3_001))
 	writeLegacyChain(t, root, groupID, chain)
 
-	group, err := membership.Create(root, founderIdentity, founder, groupID, membership.DefaultPolicy(), time.Now().UnixMilli())
-	if err != nil {
-		t.Fatal(err)
-	}
+	// The upgrade path, not Create: a group that holds a chain must mint a
+	// checkpoint 0 that names that chain's head, or the checkpoint would
+	// silently discard the membership the chain records.
+	group := mustUpgradeLegacyGroup(t, root, groupID, founderIdentity)
 	defer group.Close()
 	if group.Legacy() == nil {
 		t.Fatal("group did not load the legacy chain beside its membership store")
@@ -444,4 +444,43 @@ func waitForStoredMessage(t *testing.T, ctx context.Context, messageStore store.
 		case <-ticker.C:
 		}
 	}
+}
+
+// mustUpgradeLegacyGroup mints checkpoint 0 from a linear roster chain the way
+// `entmootd membership upgrade` does, binding it to the chain it replaces.
+func mustUpgradeLegacyGroup(t *testing.T, root string, groupID entmoot.GroupID, founderIdentity *keystore.Identity) *membership.Group {
+	t.Helper()
+	legacy, err := membership.LoadLegacyChain(root, groupID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	founder := legacy.Founder()
+	state := membership.State{
+		Founder:        founder,
+		Members:        make(map[entmoot.MemberID]entmoot.NodeInfo),
+		Policy:         membership.DefaultPolicy(),
+		Banned:         make(map[entmoot.MemberID]struct{}),
+		RevokedInvites: make(map[[32]byte]struct{}),
+		InviteUses:     make(map[[32]byte]int),
+	}
+	state.Policy.Admins = membership.SortAdmins(legacy.Admins())
+	for _, member := range legacy.Members() {
+		id, err := entmoot.ResolvedMemberID(member)
+		if err != nil {
+			t.Fatal(err)
+		}
+		state.Members[id] = member
+	}
+	head := legacy.Head()
+	body := state.Checkpoint(groupID, 0, entmoot.RosterEntryID{}, 0, time.Now().UnixMilli())
+	body.LegacyHead = &head
+	signed, err := membership.SignCheckpoint(founderIdentity, founder, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	group, err := membership.Adopt(root, signed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return group
 }

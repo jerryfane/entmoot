@@ -70,6 +70,41 @@ cannot come back later on a slow link.
 Cadence is group policy (`checkpoint_every`, default 64 effective records).
 `entmootd roster checkpoint` signs one on demand.
 
+### Who may sign one
+
+The checkpoint **before** it decides. A checkpoint's own admin set is written
+by its signer, so it is never consulted when judging that signature: a peer
+could otherwise name itself an admin and be believed by any node that holds no
+record from the covered window — which is every joiner, and every node that
+was quiet through that window.
+
+Two consequences follow:
+
+- An admin granted authority inside the window a checkpoint covers signs the
+  checkpoint **after next**, not the one carrying its own grant. A checkpoint
+  only that admin's grantor could verify would leave every later checkpoint
+  unreachable as well, for naming an unknown predecessor.
+- A node starting from nothing adopts a **founder-signed** checkpoint. An
+  invite pins the founder's key and nothing else, so that is the only
+  signature such a node can check. Admins still sign checkpoints — that is
+  what retires history while the founder is away — and where two exist at one
+  sequence, the founder-signed one wins, so the chain a joiner walks stays
+  anchored.
+
+Each node keeps the chain from its newest founder-signed checkpoint forward. A
+founder that never checkpoints therefore leaves a longer chain behind;
+`roster status` shows it as the gap between the anchor and the canonical
+sequence, and the remedy is one `roster checkpoint` on the founder.
+
+### What a checkpoint may not claim
+
+- A timestamp more than five minutes ahead of the reading node's clock is
+  refused. The timestamp decides which records the checkpoint covers, so one
+  dated next year would make every legitimate record stale and freeze the node.
+- A checkpoint that says it replaces a linear roster chain must name the head
+  of the chain that node holds. One claiming an upgrade where there is no chain
+  is refused rather than installed.
+
 Two consequences matter operationally:
 
 - A new member downloads one checkpoint instead of replaying a group's whole

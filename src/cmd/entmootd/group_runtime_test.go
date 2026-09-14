@@ -129,8 +129,15 @@ func TestGroupRuntimeServesConvertedLegacyHistory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Byte identity is the contract here, not an incidental layout: the
+	// founder's Ed25519 signature and the conversion proof's leaf are both
+	// taken over exactly these canonical bytes, and this node did not sign
+	// them and cannot re-derive them. A server that re-encodes a legacy
+	// message even equivalently hands a receiver something unverifiable, so
+	// the comparison is against the bytes the founder signed, computed by this
+	// test rather than pasted in.
 	if !bytes.Equal(got, encoded) {
-		t.Fatal("served legacy signed bytes changed")
+		t.Fatalf("served legacy bytes differ from the signed bytes: served %d bytes, stored %d", len(got), len(encoded))
 	}
 	if err := libp2ptransport.VerifyHistoricalMessageWithProof(session.group, response.Messages[0], time.Now(), &response.LegacyProofs[0].Proof); err != nil {
 		t.Fatalf("served conversion proof failed validation: %v", err)

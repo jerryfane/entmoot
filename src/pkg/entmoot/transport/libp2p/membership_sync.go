@@ -1,6 +1,7 @@
 package libp2ptransport
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -26,13 +27,15 @@ const (
 	// set, so a truncated answer is still progress: the caller applies what it
 	// got and asks again.
 	maxMembershipRecords = 512
-	// maxMembershipHave bounds the ids a caller may list as already held. A
-	// caller holding more sends its newest ones and re-downloads the rest.
-	maxMembershipHave = 512
-	// maxMembershipCheckpoints bounds checkpoints per answer: a caller far
-	// behind needs the newest one, and at most a few older ones to chain it
-	// to what it holds.
+	// maxMembershipCheckpoints bounds checkpoints per answer. A caller far
+	// behind receives them oldest-first and pages forward, because it must
+	// chain each one onto the previous to check who was allowed to sign it.
 	maxMembershipCheckpoints = 4
+	// maxMembershipRounds bounds one pull's pages. It is a cost limit on a
+	// single exchange, not on how far a node may catch up: the cursor is
+	// durable in the sense that every applied record is, so the next round
+	// resumes from what landed.
+	maxMembershipRounds = 32
 )
 
 // MembershipSyncRequest asks a peer for the membership state this node is
@@ -49,10 +52,17 @@ type MembershipSyncRequest struct {
 	// can share a sequence, and a caller on the losing one must be told.
 	HaveSequence   uint64                `json:"have_sequence,omitempty"`
 	HaveCheckpoint entmoot.RosterEntryID `json:"have_checkpoint,omitempty"`
-	// HaveRecords are record ids the caller already holds, so the answer
-	// carries only what is new.
-	HaveRecords []entmoot.RosterEntryID `json:"have_records,omitempty"`
-	Limit       int                     `json:"limit,omitempty"`
+	// AfterTimestamp and AfterID are a cursor into the group's record order
+	// (timestamp, then id), which is the same order on every node. The answer
+	// carries records strictly after it.
+	//
+	// A cursor rather than a list of held ids: a list long enough to describe
+	// a real backlog did not fit in the request frame, and naming only part of
+	// it made the server re-serve records the caller already had, round after
+	// round, without ever reaching the ones it lacked.
+	AfterTimestamp int64                 `json:"after_timestamp,omitempty"`
+	AfterID        entmoot.RosterEntryID `json:"after_id,omitempty"`
+	Limit          int                   `json:"limit,omitempty"`
 }
 
 // MembershipSyncResponse answers with verifiable objects only: every
@@ -69,9 +79,12 @@ type MembershipSyncResponse struct {
 	// CanonicalSequence lets a caller see how far behind it is without
 	// decoding the checkpoint body.
 	CanonicalSequence uint64 `json:"canonical_sequence"`
-	// Complete is false when records were cut by the page limit. The caller
-	// applies what arrived and asks again; there is nothing to resume from,
-	// because a set has no order to lose.
+	// NextTimestamp and NextID are the cursor to continue from when a page was
+	// cut short, so the next request starts where this one stopped instead of
+	// walking the same prefix again.
+	NextTimestamp int64                 `json:"next_timestamp,omitempty"`
+	NextID        entmoot.RosterEntryID `json:"next_id,omitempty"`
+	// Complete is false when checkpoints or records were cut by a page limit.
 	Complete bool          `json:"complete"`
 	Error    SyncErrorCode `json:"error,omitempty"`
 }
@@ -88,7 +101,7 @@ func (s *SyncServer) handleMembership(stream network.Stream) {
 		return
 	}
 	response := MembershipSyncResponse{Version: 1, RequestID: request.RequestID, GroupID: request.GroupID}
-	if request.Version != 1 || request.RequestID == "" || len(request.HaveRecords) > maxMembershipHave {
+	if request.Version != 1 || request.RequestID == "" {
 		response.Error = SyncMalformed
 		s.writeMembership(stream, response)
 		return
@@ -120,26 +133,24 @@ func (s *SyncServer) handleMembership(stream network.Stream) {
 	response.Canonical = canonical.ID
 	response.CanonicalSequence = canonical.Sequence
 
+	response.Complete = true
+
 	// A caller already on our canonical checkpoint needs no checkpoint at all.
-	// Otherwise send the ones from its sequence forward: they chain, so it can
-	// verify each against the previous instead of trusting this peer.
+	// Otherwise send the ones from its sequence forward, OLDEST FIRST: each
+	// one is checked against its predecessor, so a caller far behind has to
+	// walk them in order rather than being handed the newest few.
 	if request.HaveCheckpoint != canonical.ID {
-		from := request.HaveSequence
-		checkpoints := group.CheckpointsSince(from)
+		checkpoints := group.CheckpointsSince(request.HaveSequence)
 		if len(checkpoints) > maxMembershipCheckpoints {
-			checkpoints = checkpoints[len(checkpoints)-maxMembershipCheckpoints:]
+			checkpoints = checkpoints[:maxMembershipCheckpoints]
+			response.Complete = false
 		}
 		response.Checkpoints = checkpoints
 	}
 
-	held := make(map[entmoot.RosterEntryID]struct{}, len(request.HaveRecords))
-	for _, id := range request.HaveRecords {
-		held[id] = struct{}{}
-	}
 	limit := boundedLimit(request.Limit, maxMembershipRecords, maxMembershipRecords)
-	response.Complete = true
 	for _, record := range group.Pending() {
-		if _, seen := held[record.ID]; seen {
+		if !afterCursor(record, request.AfterTimestamp, request.AfterID) {
 			continue
 		}
 		if len(response.Records) >= limit {
@@ -147,8 +158,23 @@ func (s *SyncServer) handleMembership(stream network.Stream) {
 			break
 		}
 		response.Records = append(response.Records, record)
+		response.NextTimestamp = record.Timestamp
+		response.NextID = record.ID
 	}
 	s.writeMembership(stream, response)
+}
+
+// afterCursor reports whether a record sorts strictly after a cursor in the
+// group's record order. Group.Pending() is already sorted that way, so a page
+// plus its closing cursor walks the whole set without repeating or skipping.
+func afterCursor(record membership.Record, afterTimestamp int64, afterID entmoot.RosterEntryID) bool {
+	if afterTimestamp == 0 && afterID == (entmoot.RosterEntryID{}) {
+		return true
+	}
+	if record.Timestamp != afterTimestamp {
+		return record.Timestamp > afterTimestamp
+	}
+	return bytes.Compare(record.ID[:], afterID[:]) > 0
 }
 
 // removalRecordFor finds the signed record by which this group removed the
@@ -225,80 +251,108 @@ func RequestMembership(ctx context.Context, h host.Host, remote peer.AddrInfo, r
 // failure: retrying cannot change it.
 var ErrRemoved = errors.New("libp2p: this node was removed from the group")
 
-// FetchMembership pulls once from a peer and applies what verifies into the
-// local group. It returns how many checkpoints and records were adopted, and
-// whether the peer had more records to give.
+// FetchMembership pulls membership from a peer and applies what verifies into
+// the local group. It pages until the peer has nothing more to give, or until
+// maxMembershipRounds, and reports how many checkpoints and records were
+// adopted and whether the peer still had more.
+//
+// self is this node's member id, needed only to tell a refusal apart from an
+// eviction: a peer may serve the signed record that removed us, and only the
+// resulting state — not the peer's word, and not the mere fact that a record
+// was stored — decides whether this node has really been removed.
 //
 // Nothing here trusts the peer: the group verifies each checkpoint's signature
 // and authority, and each record's signature, before it changes any state. A
 // peer serving junk therefore costs bandwidth, not correctness.
-func FetchMembership(ctx context.Context, h host.Host, remote peer.AddrInfo, group *membership.Group) (checkpoints int, records int, complete bool, err error) {
+func FetchMembership(ctx context.Context, h host.Host, remote peer.AddrInfo, group *membership.Group, self entmoot.MemberID) (checkpoints int, records int, complete bool, err error) {
 	if group == nil {
 		return 0, 0, false, errors.New("libp2p: membership pull requires a local group")
 	}
-	canonical := group.Canonical()
-	pending := group.Pending()
-	have := make([]entmoot.RosterEntryID, 0, len(pending))
-	// Newest first: if the caller holds more records than one request can
-	// name, re-downloading the oldest is the cheapest thing to lose.
-	for i := len(pending) - 1; i >= 0 && len(have) < maxMembershipHave; i-- {
-		have = append(have, pending[i].ID)
-	}
-	request := MembershipSyncRequest{
-		Version:        1,
-		RequestID:      fmt.Sprintf("membership-%d", time.Now().UnixNano()),
-		GroupID:        group.GroupID(),
-		HaveSequence:   canonical.Sequence,
-		HaveCheckpoint: canonical.ID,
-		HaveRecords:    have,
-		Limit:          maxMembershipRecords,
-	}
-	response, err := RequestMembership(ctx, h, remote, request)
-	if err != nil {
-		if response.Error == SyncNotMember {
-			// The peer refused us and said why, with a record we can check.
-			// Applying it makes this node's own view of itself correct, which
-			// is the whole point: a node that has been removed should know.
-			for _, record := range response.Records {
-				if applied, applyErr := group.Apply(record); applyErr == nil && applied {
-					records++
+	var firstErr error
+	var cursorTimestamp int64
+	var cursorID entmoot.RosterEntryID
+	for round := 0; round < maxMembershipRounds; round++ {
+		canonical := group.Canonical()
+		request := MembershipSyncRequest{
+			Version:        1,
+			RequestID:      fmt.Sprintf("membership-%d-%d", time.Now().UnixNano(), round),
+			GroupID:        group.GroupID(),
+			HaveSequence:   canonical.Sequence,
+			HaveCheckpoint: canonical.ID,
+			AfterTimestamp: cursorTimestamp,
+			AfterID:        cursorID,
+			Limit:          maxMembershipRecords,
+		}
+		response, requestErr := RequestMembership(ctx, h, remote, request)
+		if requestErr != nil {
+			if response.Error == SyncNotMember && group.IsMemberID(self) {
+				// The peer refused us and said why, with a record we can
+				// check. Applying it makes this node's own view of itself
+				// correct, which is the point: a node that has been removed
+				// should know. The record only counts as an eviction if the
+				// projection actually drops us — a stored record that changed
+				// nothing proves nothing.
+				for _, record := range response.Records {
+					if applied, applyErr := group.Apply(record); applyErr == nil && applied {
+						records++
+					}
+				}
+				if !group.IsMemberID(self) {
+					return checkpoints, records, true, ErrRemoved
 				}
 			}
-			if records > 0 {
-				return 0, records, true, ErrRemoved
-			}
-		}
-		return 0, 0, false, err
-	}
-	var firstErr error
-	for _, checkpoint := range response.Checkpoints {
-		applied, applyErr := group.ApplyCheckpoint(checkpoint)
-		if applyErr != nil {
 			if firstErr == nil {
-				firstErr = applyErr
+				firstErr = requestErr
 			}
-			continue
+			return checkpoints, records, false, firstErr
 		}
-		if applied {
-			checkpoints++
+		progressed := false
+		for _, checkpoint := range response.Checkpoints {
+			applied, applyErr := group.ApplyCheckpoint(checkpoint)
+			if applyErr != nil {
+				if firstErr == nil {
+					firstErr = applyErr
+				}
+				continue
+			}
+			if applied {
+				checkpoints++
+				progressed = true
+			}
+		}
+		for _, record := range response.Records {
+			applied, applyErr := group.Apply(record)
+			if applyErr != nil {
+				// A peer one checkpoint behind still holds records our
+				// checkpoint has already folded in, and may serve them. That
+				// is not a fault in the peer or in us: the record is
+				// accounted for either way.
+				if firstErr == nil && !errors.Is(applyErr, membership.ErrStale) {
+					firstErr = applyErr
+				}
+				continue
+			}
+			if applied {
+				records++
+				progressed = true
+			}
+		}
+		if response.Complete {
+			return checkpoints, records, true, firstErr
+		}
+		// The page was cut short, so continue from where it stopped. A page
+		// that neither advanced the cursor nor applied anything would repeat
+		// for ever, so stop and let the next round try another peer.
+		advanced := response.NextTimestamp != 0 || response.NextID != (entmoot.RosterEntryID{})
+		if !advanced && !progressed {
+			return checkpoints, records, false, firstErr
+		}
+		if advanced {
+			cursorTimestamp = response.NextTimestamp
+			cursorID = response.NextID
 		}
 	}
-	for _, record := range response.Records {
-		applied, applyErr := group.Apply(record)
-		if applyErr != nil {
-			// A peer one checkpoint behind still holds records our checkpoint
-			// has already folded in, and may serve them. That is not a fault
-			// in the peer or in us: the record is accounted for either way.
-			if firstErr == nil && !errors.Is(applyErr, membership.ErrStale) {
-				firstErr = applyErr
-			}
-			continue
-		}
-		if applied {
-			records++
-		}
-	}
-	return checkpoints, records, response.Complete, firstErr
+	return checkpoints, records, false, firstErr
 }
 
 // JoinGroup is how a non-member gets in. It reads the group's checkpoint with
@@ -320,7 +374,21 @@ func JoinGroup(ctx context.Context, h host.Host, remote peer.AddrInfo, root stri
 	if len(response.Checkpoints) == 0 {
 		return nil, errors.New("libp2p: peer served no membership checkpoint")
 	}
-	group, err := membership.Adopt(root, response.Checkpoints[0])
+	// The invite pins the founder's key, and that is the joiner's only anchor:
+	// everything else in the answer is checked against it. A peer that served
+	// a group founded by somebody else — its own, say — would otherwise be
+	// installed as if it were the group the invite names.
+	anchor := response.Checkpoints[0]
+	invitedFounder, err := entmoot.ResolvedMemberID(capability.Founder)
+	if err != nil {
+		return nil, fmt.Errorf("libp2p: invite names an unusable founder: %w", err)
+	}
+	servedFounder, err := entmoot.ResolvedMemberID(anchor.Founder)
+	if err != nil || servedFounder != invitedFounder ||
+		!bytes.Equal(anchor.Founder.EntmootPubKey, capability.Founder.EntmootPubKey) {
+		return nil, errors.New("libp2p: served checkpoint names a different founder than the invite")
+	}
+	group, err := membership.Adopt(root, anchor)
 	if err != nil {
 		return nil, err
 	}
@@ -337,6 +405,16 @@ func JoinGroup(ctx context.Context, h host.Host, remote peer.AddrInfo, root stri
 			if errors.Is(err, membership.ErrStale) {
 				continue
 			}
+			_ = group.Close()
+			return nil, err
+		}
+	}
+	// The first answer may have been cut short by a page limit, and the join
+	// has to be signed against the newest membership this node can reach, or a
+	// record it has not seen yet could make the join ineffective.
+	if !response.Complete && applicant.MemberID != nil {
+		if _, _, _, err := FetchMembership(ctx, h, remote, group, *applicant.MemberID); err != nil &&
+			!errors.Is(err, ErrRemoved) {
 			_ = group.Close()
 			return nil, err
 		}

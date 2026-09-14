@@ -38,6 +38,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   walk it replaces. Cadence is group policy (`checkpoint_every`, default 64);
   `roster checkpoint` signs one on demand.
 
+  Who may sign one is decided by the checkpoint BEFORE it, and never by the
+  checkpoint's own claim about the admin set — its signer writes that claim,
+  so reading authority from it let any peer name itself an admin and be
+  believed by a node that held no record from the covered window. The same
+  rule is why a freshly granted admin signs the checkpoint after next rather
+  than the one carrying its own grant: a checkpoint nobody else could verify
+  would make every later one unreachable too.
+
+  A node starting from nothing adopts a FOUNDER-signed checkpoint, because the
+  founder's key is the only thing an invite pins and therefore the only
+  signature such a node can check. Admins may still sign checkpoints — that is
+  what lets a group retire history while the founder is away — and at one
+  sequence a founder-signed checkpoint wins over an admin-signed one, so the
+  chain a joiner walks stays anchored. Each node keeps the chain from its
+  newest founder-signed checkpoint forward, so a founder that never
+  checkpoints leaves a longer chain behind; `roster status` shows it as the
+  gap between the anchor and the canonical sequence.
+
+  A checkpoint dated more than five minutes ahead of the local clock is
+  refused: its timestamp decides which records it covers, so one dated next
+  year would make every legitimate record stale and freeze the node. A
+  checkpoint that claims to replace a linear roster chain must name the head
+  of the chain the node actually holds, and one that claims an upgrade where
+  there is no chain is refused rather than installed.
+
   An invite is now worth exactly its issuer's current authority. Remove or
   demote the issuer and its outstanding invites stop working on every node at
   once, with no revocation step and nothing to fail. Use limits and
@@ -56,10 +81,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `/entmoot/enrollment/3` are removed. History sync and peer records are
   unchanged.
 
+  A pull names the checkpoint it projects from and a cursor into the group's
+  record order; the answer carries what follows and the cursor to continue
+  from, and one pull pages up to 32 times. The cursor replaced a list of held
+  record ids, which did not fit in the request frame once a node held a few
+  hundred records and, when truncated, made the server re-serve records the
+  caller already had round after round without ever reaching the ones it
+  lacked — a silent livelock rather than a visible failure.
+
   One response is capped at 4 MiB, which bounds a group at roughly 20,000
   members: a larger group cannot carry its checkpoint in one answer and says
   so, rather than syncing half a membership. Records are capped at 512 per
-  answer.
+  answer and checkpoints at four, served oldest first so a caller far behind
+  can walk them in the order it must verify them.
 - **Commands.** `roster remove` (founder or admin; only the founder may remove
   an admin), `roster ban`/`roster unban` (unban is founder-only), `roster
   leave` (any member, about itself), `roster checkpoint`, `roster status`,

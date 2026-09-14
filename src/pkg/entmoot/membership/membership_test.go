@@ -1,9 +1,12 @@
 package membership
 
 import (
+	"bytes"
 	"crypto/rand"
 	"errors"
 	"math/big"
+	"slices"
+	"sort"
 	"testing"
 	"time"
 
@@ -126,6 +129,17 @@ func (f *fixture) sign(identity *keystore.Identity, rec Record) Record {
 func (f *fixture) join(identity *keystore.Identity) Record {
 	f.t.Helper()
 	capability := f.invite(f.founder, identity, 1)
+	rec := f.sign(identity, Record{Kind: KindJoin, Invite: &capability})
+	if _, err := f.group.Apply(rec); err != nil {
+		f.t.Fatal(err)
+	}
+	return rec
+}
+
+// joinWith admits an identity by redeeming a caller-supplied invite, so a test
+// can drive one invite's use limit.
+func (f *fixture) joinWith(identity *keystore.Identity, capability entmoot.BootstrapCapability) Record {
+	f.t.Helper()
 	rec := f.sign(identity, Record{Kind: KindJoin, Invite: &capability})
 	if _, err := f.group.Apply(rec); err != nil {
 		f.t.Fatal(err)
@@ -535,20 +549,31 @@ func TestCheckpointRequiresAuthorisedSignerAndMatchingState(t *testing.T) {
 // one without asking anybody.
 func TestConcurrentCheckpointsSettleOnOneCanonical(t *testing.T) {
 	f := newFixture(t, DefaultPolicy())
-	admin := mustIdentity(t)
-	f.join(admin)
-	f.grantAdmin(f.memberID(admin))
+	first, second := mustIdentity(t), mustIdentity(t)
+	f.join(first)
+	f.join(second)
+	f.grantAdmin(f.memberID(first), f.memberID(second))
+	f.tick(10)
+	// A checkpoint that names both admins: a signer is judged by the
+	// checkpoint before it, so the grant has to be in the base before either
+	// admin can sign.
+	if _, signed, err := f.group.SignCheckpoint(f.founder, true); err != nil || !signed {
+		t.Fatalf("base checkpoint: signed=%t err=%v", signed, err)
+	}
 	base := f.group.Canonical()
 	state := f.group.State()
 
 	f.tick(10)
-	early := state.Checkpoint(f.groupID, base.Sequence+1, base.ID, 2, f.clockMS)
-	earlySigned, err := SignCheckpoint(f.founder, f.info(f.founder), early)
+	third := mustIdentity(t)
+	f.join(third)
+	state, _ = Project(base, f.group.Pending())
+	early := state.Checkpoint(f.groupID, base.Sequence+1, base.ID, 1, f.clockMS)
+	earlySigned, err := SignCheckpoint(first, f.info(first), early)
 	if err != nil {
 		t.Fatal(err)
 	}
-	late := state.Checkpoint(f.groupID, base.Sequence+1, base.ID, 2, f.clockMS+5)
-	lateSigned, err := SignCheckpoint(admin, f.info(admin), late)
+	late := state.Checkpoint(f.groupID, base.Sequence+1, base.ID, 1, f.clockMS+5)
+	lateSigned, err := SignCheckpoint(second, f.info(second), late)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -564,20 +589,95 @@ func TestConcurrentCheckpointsSettleOnOneCanonical(t *testing.T) {
 	if got := f.group.Canonical().ID; got != earlySigned.ID {
 		t.Fatalf("canonical checkpoint is %s, want the earlier %s", got, earlySigned.ID)
 	}
+	if !f.group.IsMemberID(f.memberID(third)) {
+		t.Fatal("settling lost the member the checkpoints folded in")
+	}
 }
 
-// Retention is the point of checkpoints, but a node keeps the records behind
-// the newest one so it can still judge a checkpoint that arrives late. The
-// observable is that a second admin's checkpoint at the held sequence is
-// checked against those records instead of being taken on trust, and that
-// retiring the older records loses no member.
+// A founder-signed checkpoint wins its sequence even when an admin signed one
+// earlier: it is the only kind a node holding no group state can adopt, so
+// preferring it is what keeps a group joinable while admins keep checkpointing.
+func TestFounderSignedCheckpointWinsItsSequence(t *testing.T) {
+	f := newFixture(t, DefaultPolicy())
+	admin := mustIdentity(t)
+	f.join(admin)
+	f.grantAdmin(f.memberID(admin))
+	f.tick(10)
+	if _, signed, err := f.group.SignCheckpoint(f.founder, true); err != nil || !signed {
+		t.Fatalf("base checkpoint: signed=%t err=%v", signed, err)
+	}
+	base := f.group.Canonical()
+
+	f.tick(10)
+	f.join(mustIdentity(t))
+	state, _ := Project(base, f.group.Pending())
+	adminBody := state.Checkpoint(f.groupID, base.Sequence+1, base.ID, 1, f.clockMS)
+	adminSigned, err := SignCheckpoint(admin, f.info(admin), adminBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	founderBody := state.Checkpoint(f.groupID, base.Sequence+1, base.ID, 1, f.clockMS+50)
+	founderSignedCP, err := SignCheckpoint(f.founder, f.info(f.founder), founderBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.group.ApplyCheckpoint(adminSigned); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.group.ApplyCheckpoint(founderSignedCP); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.group.Canonical().ID; got != founderSignedCP.ID {
+		t.Fatalf("canonical is %s, want the founder-signed %s", got, founderSignedCP.ID)
+	}
+	// And a node starting from nothing can adopt what this group now offers,
+	// which is the whole reason for the preference.
+	adopted, err := Adopt(t.TempDir(), f.group.Canonical())
+	if err != nil {
+		t.Fatalf("a joiner could not adopt the canonical checkpoint: %v", err)
+	}
+	defer adopted.Close()
+}
+
+// A member granted admin authority inside the window a checkpoint covers may
+// not sign that checkpoint: a peer judges a checkpoint by its predecessor
+// alone, so one signed on the strength of a grant the predecessor does not
+// carry would be unverifiable — and would then make every later checkpoint
+// unreachable for naming an unknown previous.
+func TestFreshlyGrantedAdminWaitsOneCheckpoint(t *testing.T) {
+	f := newFixture(t, DefaultPolicy())
+	admin := mustIdentity(t)
+	f.join(admin)
+	f.grantAdmin(f.memberID(admin))
+	f.tick(10)
+	if _, _, err := f.group.SignCheckpoint(admin, true); !errors.Is(err, ErrNotAuthorised) {
+		t.Fatalf("a freshly granted admin signed the checkpoint carrying its own grant: %v", err)
+	}
+	if _, signed, err := f.group.SignCheckpoint(f.founder, true); err != nil || !signed {
+		t.Fatalf("founder checkpoint: signed=%t err=%v", signed, err)
+	}
+	// Now the base names it, so the next one is its to sign.
+	f.tick(10)
+	f.join(mustIdentity(t))
+	f.tick(10)
+	if _, signed, err := f.group.SignCheckpoint(admin, true); err != nil || !signed {
+		t.Fatalf("the admin could not sign the following checkpoint: signed=%t err=%v", signed, err)
+	}
+}
+
 func TestRetentionKeepsOneCheckpointLag(t *testing.T) {
 	f := newFixture(t, DefaultPolicy())
 	admin := mustIdentity(t)
 	f.join(admin)
 	f.grantAdmin(f.memberID(admin))
+	f.tick(10)
+	// A checkpoint that carries the grant: a signer is judged by the
+	// checkpoint before it, so the admin can only sign once one names it.
+	if _, signed, err := f.group.SignCheckpoint(f.founder, true); err != nil || !signed {
+		t.Fatalf("grant checkpoint: signed=%t err=%v", signed, err)
+	}
 	first := mustIdentity(t)
-	f.join(first)
+	firstJoin := f.join(first)
 	f.tick(10)
 	if _, signed, err := f.group.SignCheckpoint(f.founder, true); err != nil || !signed {
 		t.Fatalf("first checkpoint: signed=%t err=%v", signed, err)
@@ -610,19 +710,99 @@ func TestRetentionKeepsOneCheckpointLag(t *testing.T) {
 	if !f.group.IsMemberID(f.memberID(first)) || !f.group.IsMemberID(f.memberID(second)) {
 		t.Fatal("retiring records lost a member")
 	}
-	if got := f.group.Canonical().Sequence; got != 2 {
-		t.Fatalf("canonical sequence = %d, want 2", got)
+	if got := f.group.Canonical().Sequence; got != 3 {
+		t.Fatalf("canonical sequence = %d, want 3", got)
 	}
-	// A record the canonical checkpoint has folded in is never offered to a
-	// peer: a fresh joiner refuses it as stale, and serving records a receiver
-	// must reject is worse than serving none.
-	canonical := f.group.Canonical()
-	for _, rec := range f.group.Pending() {
-		if rec.Timestamp <= canonical.Timestamp {
-			t.Fatalf("checkpoint %d already covers %s at %d, but it is still offered",
-				canonical.Sequence, rec.Kind, rec.Timestamp)
+	// A member admitted after the newest checkpoint: its record is still live,
+	// so the served set is not empty and the assertions below are about what a
+	// receiver is actually handed.
+	third := mustIdentity(t)
+	thirdJoin := f.join(third)
+
+	// What a consumer sees of retirement: a record the canonical checkpoint has
+	// folded in is inside it, so re-offering one is never taken as new and
+	// changes no membership; and a fresh peer handed exactly what this node
+	// serves reaches the same members — including the one admitted since the
+	// checkpoint — and can still admit the next one.
+	before := f.group.MemberIDs()
+	reapplied, err := f.group.Apply(firstJoin)
+	if err != nil && !errors.Is(err, ErrStale) {
+		t.Fatalf("re-applying a record the checkpoint covers: %v", err)
+	}
+	if reapplied {
+		t.Fatal("a record the canonical checkpoint already covers was accepted as new")
+	}
+	if got := f.group.MemberIDs(); !slices.Equal(got, before) {
+		t.Fatalf("replaying a covered record changed the members to %v from %v", got, before)
+	}
+
+	// The folded record is also not handed to anyone else, while the record the
+	// checkpoint does not cover still is: the served set is what a peer
+	// receives, and a record already inside the canonical checkpoint is one the
+	// receiver would have to refuse.
+	offered := f.group.Pending()
+	if !slices.ContainsFunc(offered, func(rec Record) bool { return rec.ID == thirdJoin.ID }) {
+		t.Fatalf("the join that no checkpoint covers is not offered to peers: served %d records", len(offered))
+	}
+	for _, rec := range offered {
+		if rec.ID == firstJoin.ID {
+			t.Fatalf("the canonical checkpoint at sequence %d covers the %s record at %d, but it is still offered to peers",
+				f.group.Canonical().Sequence, firstJoin.Kind, firstJoin.Timestamp)
 		}
 	}
+
+	fresh := adoptServedSet(t, f.group)
+	if got := fresh.MemberIDs(); !slices.Equal(got, f.group.MemberIDs()) {
+		t.Fatalf("a peer given the served set holds %v, this node holds %v", got, f.group.MemberIDs())
+	}
+	newcomer := mustIdentity(t)
+	welcome := f.invite(f.founder, newcomer, 1)
+	if _, err := fresh.Apply(f.sign(newcomer, Record{Kind: KindJoin, Invite: &welcome})); err != nil {
+		t.Fatalf("the fresh peer refused a join against its adopted checkpoint: %v", err)
+	}
+	if !fresh.IsMemberID(f.memberID(newcomer)) {
+		t.Fatal("the fresh peer did not admit a newcomer joining under the checkpoint it adopted")
+	}
+}
+
+// adoptServedSet builds the group a fresh peer ends up with when it is handed
+// what a member serves: the retained checkpoints and the pending records. The
+// peer starts from the canonical head, which is the only thing a node with no
+// group state can check, and then takes what it can of the rest — an
+// admin-signed checkpoint is believable only to a node that holds the records
+// granting that admin, so a receiver skips those instead of trusting them.
+// What must hold is that this is enough to reach the same members, and that
+// every record the source serves is one the receiver can apply: a record the
+// canonical checkpoint has already folded in would be refused here.
+func adoptServedSet(t *testing.T, source *Group) *Group {
+	t.Helper()
+	served := source.CheckpointsSince(0)
+	if len(served) == 0 {
+		t.Fatal("the source group served no checkpoints, so a fresh peer could not start")
+	}
+	head := source.Canonical()
+	fresh, err := Adopt(t.TempDir(), head)
+	if err != nil {
+		t.Fatalf("adopting the served head at sequence %d: %v", head.Sequence, err)
+	}
+	t.Cleanup(func() { _ = fresh.Close() })
+	for _, checkpoint := range served {
+		if checkpoint.ID == head.ID {
+			continue
+		}
+		if _, err := fresh.ApplyCheckpoint(checkpoint); err != nil && !errors.Is(err, ErrNotAuthorised) && !errors.Is(err, ErrUnknownPrevious) {
+			t.Fatalf("a peer given served checkpoint %d failed for an unexpected reason: %v", checkpoint.Sequence, err)
+		}
+	}
+	if got := fresh.Canonical().ID; got != head.ID {
+		t.Fatalf("a peer given the served set settled on checkpoint %s, the source holds %s", got, head.ID)
+	}
+	for _, record := range source.Pending() {
+		if _, err := fresh.Apply(record); err != nil {
+			t.Fatalf("a peer given the served set refused the %s record at %d: %v", record.Kind, record.Timestamp, err)
+		}
+	}
+	return fresh
 }
 
 func TestOpenReloadsExactState(t *testing.T) {
@@ -669,15 +849,41 @@ func TestOpenReloadsExactState(t *testing.T) {
 }
 
 // A join that cannot take effect must say why, so a joiner is told rather than
-// left guessing.
+// left guessing. The sentences are user-facing prose and may be reworded; what
+// has to hold is that the join really is refused, that the group state carries
+// the cause, that each cause earns its own non-empty explanation, and that a
+// join which does take effect is explained as nothing at all.
 func TestExplainJoinNamesTheReason(t *testing.T) {
 	f := newFixture(t, DefaultPolicy())
-	stranger := mustIdentity(t)
+	reasons := make(map[string]string, 4)
 
-	bare := f.sign(stranger, Record{Kind: KindJoin})
-	if got := ExplainJoin(f.group.State(), bare); got != "the group requires an invite and the join carried none" {
-		t.Fatalf("reason = %q", got)
+	// refused records the reason the group gives for a join, having proved the
+	// join does not take effect.
+	refused := func(cause string, rec Record) {
+		t.Helper()
+		subject, err := rec.SubjectMemberID()
+		if err != nil {
+			t.Fatalf("%s: join record names no usable subject: %v", cause, err)
+		}
+		reason := ExplainJoin(f.group.State(), rec)
+		if reason == "" {
+			t.Fatalf("%s: the group gave no reason for a join it refuses", cause)
+		}
+		if _, err := f.group.Apply(rec); err != nil {
+			t.Fatalf("%s: apply: %v", cause, err)
+		}
+		if f.group.IsMemberID(subject) {
+			t.Fatalf("%s: the join took effect anyway (reason %q)", cause, reason)
+		}
+		reasons[cause] = reason
 	}
+
+	stranger := mustIdentity(t)
+	bare := f.sign(stranger, Record{Kind: KindJoin})
+	if rule := f.group.Policy().JoinRule; rule != JoinRuleInvite || bare.Invite != nil {
+		t.Fatalf("fixture: want an invite-only group and an inviteless join, got rule %q invite=%t", rule, bare.Invite != nil)
+	}
+	refused("no invite", bare)
 
 	capability := f.invite(f.founder, stranger, 1)
 	if _, err := f.group.SignRecord(f.founder, Record{Kind: KindRevokeInvite, InviteNonce: capability.Nonce}); err != nil {
@@ -685,9 +891,25 @@ func TestExplainJoinNamesTheReason(t *testing.T) {
 	}
 	f.tick(10)
 	revoked := f.sign(stranger, Record{Kind: KindJoin, Invite: &capability, Timestamp: f.clockMS})
-	if got := ExplainJoin(f.group.State(), revoked); got != "the invite was revoked" {
-		t.Fatalf("reason = %q", got)
+	if _, gone := f.group.State().RevokedInvites[capability.Nonce]; !gone {
+		t.Fatal("fixture: the invite is not revoked in the group state")
 	}
+	refused("revoked invite", revoked)
+
+	shared := f.invite(f.founder, nil, 1)
+	firstUser := mustIdentity(t)
+	if _, err := f.group.Apply(f.sign(firstUser, Record{Kind: KindJoin, Invite: &shared})); err != nil {
+		t.Fatal(err)
+	}
+	if !f.group.IsMemberID(f.memberID(firstUser)) {
+		t.Fatal("fixture: the single-use invite admitted nobody")
+	}
+	latecomer := mustIdentity(t)
+	late := f.sign(latecomer, Record{Kind: KindJoin, Invite: &shared})
+	if used := f.group.State().InviteUses[shared.Nonce]; used < shared.Uses() {
+		t.Fatalf("fixture: the invite has %d of %d uses spent", used, shared.Uses())
+	}
+	refused("invite exhausted", late)
 
 	banned := mustIdentity(t)
 	f.join(banned)
@@ -697,8 +919,26 @@ func TestExplainJoinNamesTheReason(t *testing.T) {
 	f.tick(10)
 	again := f.invite(f.founder, banned, 1)
 	attempt := f.sign(banned, Record{Kind: KindJoin, Invite: &again, Timestamp: f.clockMS})
-	if got := ExplainJoin(f.group.State(), attempt); got != "this identity is banned from the group" {
-		t.Fatalf("reason = %q", got)
+	if !f.group.IsBanned(f.memberID(banned)) {
+		t.Fatal("fixture: the identity is not banned in the group state")
+	}
+	refused("banned", attempt)
+
+	// A join that does take effect leaves nothing to explain, so a caller can
+	// read the empty reason as "no problem".
+	admitted := f.join(mustIdentity(t))
+	if reason := ExplainJoin(f.group.State(), admitted); reason != "" {
+		t.Fatalf("an effective join was explained as %q", reason)
+	}
+
+	// Each cause earns its own sentence: one reason serving two different
+	// problems tells a caller nothing it can act on.
+	byReason := make(map[string]string, len(reasons))
+	for cause, reason := range reasons {
+		if other, clash := byReason[reason]; clash {
+			t.Fatalf("%q and %q are both explained as %q", cause, other, reason)
+		}
+		byReason[reason] = cause
 	}
 }
 
@@ -814,5 +1054,219 @@ func TestRecordsInTheSameInstantResolveSafely(t *testing.T) {
 	state, _ = Project(base, []Record{plainJoin})
 	if _, member := state.Members[f.memberID(plain)]; !member {
 		t.Fatal("an uncontested join in the same instant was refused")
+	}
+}
+
+// A group that keeps checkpointing must keep converging. The node used to
+// anchor its forward walk on the sequence-zero checkpoint, which retention
+// then deleted: from that moment the canonical checkpoint could never advance
+// and no record was ever retired again.
+func TestCheckpointingPastTheRetentionWindowKeepsConverging(t *testing.T) {
+	f := newFixture(t, DefaultPolicy())
+	for round := 0; round < 6; round++ {
+		f.join(mustIdentity(t))
+		f.tick(10)
+		checkpoint, signed, err := f.group.SignCheckpoint(f.founder, true)
+		if err != nil || !signed {
+			t.Fatalf("round %d: signed=%t err=%v", round, signed, err)
+		}
+		if got := f.group.Canonical().ID; got != checkpoint.ID {
+			t.Fatalf("round %d: canonical is %s, want the checkpoint just signed %s", round, got, checkpoint.ID)
+		}
+		if got, want := f.group.Canonical().Sequence, uint64(round+1); got != want {
+			t.Fatalf("round %d: canonical sequence = %d, want %d", round, got, want)
+		}
+	}
+	// Seven members: the founder plus one per round. Retiring records must not
+	// lose any of them.
+	if got := len(f.group.MemberIDs()); got != 7 {
+		t.Fatalf("membership = %d members, want 7", got)
+	}
+	// And the records behind the second-newest checkpoint are gone, which is
+	// the storage claim the whole design rests on.
+	canonical := f.group.Canonical()
+	for _, rec := range f.group.Pending() {
+		if rec.Timestamp <= canonical.Timestamp {
+			t.Fatalf("checkpoint %d covers %s at %d, but it was never retired",
+				canonical.Sequence, rec.Kind, rec.Timestamp)
+		}
+	}
+}
+
+// A checkpoint's own claim about who may sign it is worth nothing: its signer
+// writes that claim. A node with no record in the covered window used to
+// believe it, which let any peer install itself as an admin.
+func TestCheckpointSignerCannotAuthoriseItself(t *testing.T) {
+	f := newFixture(t, DefaultPolicy())
+	member := mustIdentity(t)
+	f.join(member)
+	f.tick(10)
+	if _, signed, err := f.group.SignCheckpoint(f.founder, true); err != nil || !signed {
+		t.Fatalf("base checkpoint: signed=%t err=%v", signed, err)
+	}
+	base := f.group.Canonical()
+
+	// A quiet node: it holds the checkpoint but none of the records behind the
+	// next one, so its only defence is refusing to read authority from the
+	// claim itself.
+	quietRoot := t.TempDir()
+	quiet, err := Adopt(quietRoot, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer quiet.Close()
+
+	stranger := mustIdentity(t)
+	strangerID := f.memberID(stranger)
+	forged := base
+	forged.ID = entmoot.RosterEntryID{}
+	forged.Sequence = base.Sequence + 1
+	forged.Previous = base.ID
+	forged.Timestamp = base.Timestamp + 1
+	forged.Covered = 1
+	forged.Members = append(append([]entmoot.NodeInfo(nil), base.Members...), f.info(stranger))
+	sortCheckpointMembers(&forged)
+	forged.Policy = base.Policy.Clone()
+	forged.Policy.Admins = SortAdmins(append(append([]entmoot.MemberID(nil), base.Policy.Admins...), strangerID))
+	forged.Signature = nil
+	signedForgery, err := SignCheckpoint(stranger, f.info(stranger), forged)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := quiet.ApplyCheckpoint(signedForgery); !errors.Is(err, ErrNotAuthorised) {
+		t.Fatalf("a stranger's self-authorised checkpoint was accepted: err=%v, admins now %v",
+			err, quiet.Admins())
+	}
+	if quiet.CanAdminister(strangerID) {
+		t.Fatal("the stranger became an admin")
+	}
+	if quiet.IsMemberID(strangerID) {
+		t.Fatal("the stranger became a member")
+	}
+}
+
+// sortCheckpointMembers puts a hand-built member list in the order a real
+// checkpoint carries, so the signature covers a well-formed body.
+func sortCheckpointMembers(cp *Checkpoint) {
+	sort.Slice(cp.Members, func(i, j int) bool {
+		left, _ := entmoot.ResolvedMemberID(cp.Members[i])
+		right, _ := entmoot.ResolvedMemberID(cp.Members[j])
+		return bytes.Compare(left[:], right[:]) < 0
+	})
+}
+
+// A record dated exactly at the checkpoint's timestamp is inside it. The
+// projection used a strict comparison while the store used an inclusive one,
+// so such a record survived retention and was replayed on top of a checkpoint
+// that had already folded it in. Invite-use counting is the one effect that is
+// not idempotent, so the replay inflated it and split membership.
+func TestRecordsAtTheCheckpointTimestampAreNotReplayed(t *testing.T) {
+	f := newFixture(t, DefaultPolicy())
+	first, second := mustIdentity(t), mustIdentity(t)
+	invite := f.invite(f.founder, nil, 2)
+	f.joinWith(first, invite)
+	checkpoint, signed, err := f.group.SignCheckpoint(f.founder, true)
+	if err != nil || !signed {
+		t.Fatalf("checkpoint: signed=%t err=%v", signed, err)
+	}
+	joinRecord := f.group.Pending()
+	if len(joinRecord) != 0 {
+		t.Fatalf("checkpoint left %d records uncovered, want the join folded in", len(joinRecord))
+	}
+	if got := f.group.InviteUses(invite.Nonce); got != 1 {
+		t.Fatalf("invite uses = %d, want 1", got)
+	}
+
+	// Retire it for real: a second checkpoint drops the records behind the
+	// first, which is the state a peer one checkpoint behind re-delivers into.
+	f.tick(10)
+	f.join(mustIdentity(t))
+	f.tick(10)
+	if _, signed, err := f.group.SignCheckpoint(f.founder, true); err != nil || !signed {
+		t.Fatalf("second checkpoint: signed=%t err=%v", signed, err)
+	}
+	replay, err := SignRecord(first, Record{
+		Version: Version, GroupID: f.groupID, Kind: KindJoin,
+		Actor: f.info(first), Subject: f.info(first), Invite: &invite,
+		Timestamp: checkpoint.Timestamp,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.group.Apply(replay); !errors.Is(err, ErrStale) {
+		t.Fatalf("a record at the checkpoint timestamp was accepted: %v", err)
+	}
+	if got := f.group.InviteUses(invite.Nonce); got != 1 {
+		t.Fatalf("the replay inflated invite uses to %d", got)
+	}
+	// The invite's second use is still available to somebody who has not used
+	// it, which is what an inflated count would have denied.
+	f.joinWith(second, invite)
+	if !f.group.IsMemberID(f.memberID(second)) {
+		t.Fatal("the invite's remaining use was denied")
+	}
+}
+
+// A checkpoint dated far in the future would make every legitimate record
+// stale and freeze the node until that date arrived, so it is refused.
+func TestCheckpointFarAheadOfTheLocalClockIsRefused(t *testing.T) {
+	f := newFixture(t, DefaultPolicy())
+	f.join(mustIdentity(t))
+	f.tick(10)
+	if _, signed, err := f.group.SignCheckpoint(f.founder, true); err != nil || !signed {
+		t.Fatalf("base checkpoint: signed=%t err=%v", signed, err)
+	}
+	base := f.group.Canonical()
+	future := base
+	future.ID = entmoot.RosterEntryID{}
+	future.Sequence = base.Sequence + 1
+	future.Previous = base.ID
+	future.Timestamp = f.clockMS + (24 * time.Hour).Milliseconds()
+	future.Covered = 0
+	future.Signature = nil
+	signedFuture, err := SignCheckpoint(f.founder, f.info(f.founder), future)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.group.ApplyCheckpoint(signedFuture); err == nil {
+		t.Fatal("a checkpoint dated a day ahead was accepted")
+	}
+	if got := f.group.Canonical().ID; got != base.ID {
+		t.Fatalf("canonical moved to %s", got)
+	}
+	// And the group still accepts ordinary records, which a future-dated
+	// checkpoint would have made stale.
+	late := mustIdentity(t)
+	f.tick(10)
+	f.join(late)
+	if !f.group.IsMemberID(f.memberID(late)) {
+		t.Fatal("a legitimate join was refused after the future-dated checkpoint")
+	}
+}
+
+// LegacyHead is signed into checkpoint 0 to bind an upgrade to the chain it
+// replaces. A checkpoint naming a chain this node does not hold, or naming a
+// different head, is refused rather than believed.
+func TestCheckpointMustNameTheRosterChainItReplaces(t *testing.T) {
+	f := newFixture(t, DefaultPolicy())
+	base := f.group.Canonical()
+	other := entmoot.RosterEntryID{0x7f}
+	claiming := base
+	claiming.ID = entmoot.RosterEntryID{}
+	claiming.LegacyHead = &other
+	claiming.Signature = nil
+	signedClaim, err := SignCheckpoint(f.founder, f.info(f.founder), claiming)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A fresh node adopting it: there is no chain here, so the claim is a
+	// fabrication and must be refused rather than installed.
+	group, err := Adopt(t.TempDir(), signedClaim)
+	if err == nil {
+		_ = group.Close()
+		t.Fatal("a root checkpoint claiming an upgrade with no chain behind it was adopted")
+	}
+	if !errors.Is(err, entmoot.ErrRosterReject) {
+		t.Fatalf("refusal was %v, want a roster rejection", err)
 	}
 }

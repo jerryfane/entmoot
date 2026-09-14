@@ -498,7 +498,7 @@ func cmdRosterStatus(gf *globalFlags, args []string) int {
 		admins = append(admins, admin.String())
 	}
 	banned := make([]string, 0, len(canonical.Banned))
-	for _, id := range canonical.Banned {
+	for _, id := range group.BannedIDs() {
 		banned = append(banned, id.String())
 	}
 	data, err := json.Marshal(map[string]any{

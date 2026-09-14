@@ -32,6 +32,9 @@ type membershipSyncPair struct {
 	remote     peer.AddrInfo
 	groupID    entmoot.GroupID
 	group      *membership.Group
+	// clientMemberID is the pulling member's own id, which a pull needs so it
+	// can tell a refusal apart from its own removal.
+	clientMemberID entmoot.MemberID
 	// root is the group's first checkpoint, which is what a peer starting from
 	// nothing adopts.
 	root membership.Checkpoint
@@ -39,7 +42,10 @@ type membershipSyncPair struct {
 
 func newMembershipSyncPair(t *testing.T, joiners ...*keystore.Identity) *membershipSyncPair {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	// Generous: one of these tests builds a backlog of several hundred signed
+	// records before it dials, and a deadline spent on setup would look like
+	// an unreachable peer.
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	t.Cleanup(cancel)
 	founder, member := mustIdentity(t), mustIdentity(t)
 	serverHost, _, err := NewHost(ctx, founder, libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"))
@@ -66,8 +72,11 @@ func newMembershipSyncPair(t *testing.T, joiners ...*keystore.Identity) *members
 	return &membershipSyncPair{
 		ctx: ctx, founder: founder, member: member,
 		serverHost: serverHost, clientHost: clientHost,
-		remote:  peer.AddrInfo{ID: serverHost.ID(), Addrs: serverHost.Addrs()},
-		groupID: groupID, group: group, root: group.Canonical(),
+		remote:         peer.AddrInfo{ID: serverHost.ID(), Addrs: serverHost.Addrs()},
+		groupID:        groupID,
+		group:          group,
+		root:           group.Canonical(),
+		clientMemberID: *mustNode(t, member).MemberID,
 	}
 }
 
@@ -91,7 +100,7 @@ func TestMembershipPullCarriesRecordsThenCheckpoints(t *testing.T) {
 		t.Fatal("the client already agrees with the server, so the pull proves nothing")
 	}
 
-	checkpoints, records, complete, err := FetchMembership(p.ctx, p.clientHost, p.remote, client)
+	checkpoints, records, complete, err := FetchMembership(p.ctx, p.clientHost, p.remote, client, p.clientMemberID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,7 +120,7 @@ func TestMembershipPullCarriesRecordsThenCheckpoints(t *testing.T) {
 	if p.group.Canonical().Sequence != 1 {
 		t.Fatalf("server canonical sequence = %d, want 1", p.group.Canonical().Sequence)
 	}
-	checkpoints, records, complete, err = FetchMembership(p.ctx, p.clientHost, p.remote, client)
+	checkpoints, records, complete, err = FetchMembership(p.ctx, p.clientHost, p.remote, client, p.clientMemberID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -131,10 +140,10 @@ func TestMembershipPullCarriesRecordsThenCheckpoints(t *testing.T) {
 func TestMembershipPullAppliesNothingWhenAlreadySynchronised(t *testing.T) {
 	p := newMembershipSyncPair(t, mustIdentity(t))
 	client := p.adoptClient(t)
-	if _, _, _, err := FetchMembership(p.ctx, p.clientHost, p.remote, client); err != nil {
+	if _, _, _, err := FetchMembership(p.ctx, p.clientHost, p.remote, client, p.clientMemberID); err != nil {
 		t.Fatal(err)
 	}
-	checkpoints, records, complete, err := FetchMembership(p.ctx, p.clientHost, p.remote, client)
+	checkpoints, records, complete, err := FetchMembership(p.ctx, p.clientHost, p.remote, client, p.clientMemberID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -149,7 +158,7 @@ func TestMembershipPullAppliesNothingWhenAlreadySynchronised(t *testing.T) {
 func TestMembershipPullTellsARemovedNodeItWasRemoved(t *testing.T) {
 	p := newMembershipSyncPair(t)
 	client := p.adoptClient(t)
-	if _, _, _, err := FetchMembership(p.ctx, p.clientHost, p.remote, client); err != nil {
+	if _, _, _, err := FetchMembership(p.ctx, p.clientHost, p.remote, client, p.clientMemberID); err != nil {
 		t.Fatal(err)
 	}
 	binding, err := BindingFromPublicKey(p.member.PublicKey)
@@ -164,7 +173,7 @@ func TestMembershipPullTellsARemovedNodeItWasRemoved(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	_, records, _, err := FetchMembership(p.ctx, p.clientHost, p.remote, client)
+	_, records, _, err := FetchMembership(p.ctx, p.clientHost, p.remote, client, p.clientMemberID)
 	if !errors.Is(err, ErrRemoved) {
 		t.Fatalf("pull after removal: records=%d err=%v", records, err)
 	}
@@ -201,7 +210,7 @@ func TestTruncatedMembershipPageConverges(t *testing.T) {
 	if slices.Equal(client.MemberIDs(), p.group.MemberIDs()) {
 		t.Fatal("one record was the whole set, so truncation proves nothing")
 	}
-	_, records, complete, err := FetchMembership(p.ctx, p.clientHost, p.remote, client)
+	_, records, complete, err := FetchMembership(p.ctx, p.clientHost, p.remote, client, p.clientMemberID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -327,17 +336,58 @@ func TestJoinGroupAdmitsTheJoinerOnBothSides(t *testing.T) {
 	}
 }
 
-func TestKeeperAvailabilitySummaryIsExplicit(t *testing.T) {
-	if got := SummarizeKeeperProgress(nil); got.Availability != NoKeeperAvailable || got.Eligible != 0 {
-		t.Fatalf("zero-keeper summary = %+v", got)
+// The daemon's catch-up loop keeps retrying while no keeper was available and
+// reports the last error, so a keeper it could not reach must never summarise
+// as coverage: an unreachable peer counted as available ends catch-up having
+// fetched nothing and says everything is fine.
+func TestUnreachableKeeperIsNotCountedAsCoverage(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	clientIdentity := mustIdentity(t)
+	clientHost, _, err := NewHost(ctx, clientIdentity, libp2p.NoListenAddrs)
+	if err != nil {
+		t.Fatal(err)
 	}
-	one := SummarizeKeeperProgress([]KeeperProgress{{Available: true, Inserted: 2, ConvergedHint: true}})
-	if one.Availability != OneKeeperAvailable || one.Available != 1 || one.Inserted != 2 {
-		t.Fatalf("one-keeper summary = %+v", one)
+	defer clientHost.Close()
+	groupID, _ := mustOpenGroup(t, clientIdentity)
+	destination, err := store.OpenSQLite(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
 	}
-	multiple := SummarizeKeeperProgress([]KeeperProgress{{Available: true}, {Available: true, MissingBodies: 1}})
-	if multiple.Availability != MultipleKeepersAvailable || multiple.Available != 2 || multiple.MissingBodies != 1 {
-		t.Fatalf("multi-keeper summary = %+v", multiple)
+	defer destination.Close()
+	// A member whose address we do not have: the peer id is derivable from its
+	// key, so the keeper is eligible, but there is nothing to dial.
+	absent, err := BindingFromPublicKey(mustIdentity(t).PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	progress := SyncFromKeepers(ctx, clientHost, groupID, []peer.AddrInfo{{ID: absent.PeerID}}, destination,
+		func(entmoot.Message, *merkle.Proof) error { return nil }, &HistorySyncState{})
+	if len(progress) != 1 {
+		t.Fatalf("keeper progress = %+v, want one entry", progress)
+	}
+	if progress[0].Available {
+		t.Fatalf("an unreachable keeper was reported available: %+v", progress[0])
+	}
+	if progress[0].Err == nil {
+		t.Fatal("an unreachable keeper reported no error, so the daemon has nothing to log")
+	}
+	summary := SummarizeKeeperProgress(progress)
+	if summary.Eligible != 1 {
+		t.Fatalf("summary counted %d eligible keepers, want the one that was tried", summary.Eligible)
+	}
+	if summary.Available != 0 || summary.Availability != NoKeeperAvailable {
+		t.Fatalf("summary = %+v, want no keeper available so the caller retries", summary)
+	}
+	if summary.Inserted != 0 || summary.ConvergedHints != 0 {
+		t.Fatalf("summary claimed progress from an unreachable keeper: %+v", summary)
+	}
+	messages, err := destination.Range(ctx, groupID, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(messages) != 0 {
+		t.Fatalf("a failed pass wrote %d messages", len(messages))
 	}
 }
 
@@ -422,6 +472,20 @@ func TestHistorySyncContinuesAfterWithholdingKeeperAndResumesPages(t *testing.T)
 	}
 	if progress[1].Inserted != 300 || progress[1].Listed != 300 || !progress[1].ConvergedHint {
 		t.Fatalf("honest keeper progress = %+v", progress[1])
+	}
+	// What the daemon does with these two keepers: it reports the gap rather
+	// than the appearance of success. The withholding keeper answered, so a
+	// pass happened, but its 300 unfetched bodies are surfaced and its silence
+	// about convergence is not turned into a converged group.
+	summary := SummarizeKeeperProgress(progress)
+	if summary.Eligible != 2 || summary.Available != 2 || summary.Availability != MultipleKeepersAvailable {
+		t.Fatalf("summary = %+v, want both keepers counted as answering", summary)
+	}
+	if summary.MissingBodies != 300 {
+		t.Fatalf("summary hid the withheld bodies: %+v", summary)
+	}
+	if summary.Inserted != 300 || summary.ConvergedHints != 1 {
+		t.Fatalf("summary = %+v, want the honest keeper's 300 inserts and its hint alone", summary)
 	}
 	messages, err := destination.Range(ctx, groupID, 0, 0)
 	if err != nil {

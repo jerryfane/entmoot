@@ -535,8 +535,8 @@ func (r *groupRuntime) syncMembership(ctx context.Context, session *groupSession
 	}
 	progressed := false
 	for _, remote := range peers {
-		syncCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		checkpoints, records, complete, err := libp2ptransport.FetchMembership(syncCtx, r.host, remote, session.group)
+		syncCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		checkpoints, records, complete, err := libp2ptransport.FetchMembership(syncCtx, r.host, remote, session.group, r.binding.MemberID)
 		cancel()
 		if err != nil {
 			if errors.Is(err, libp2ptransport.ErrRemoved) {
@@ -567,18 +567,12 @@ func (r *groupRuntime) syncMembership(ctx context.Context, session *groupSession
 				slog.Bool("complete", complete))
 		}
 		if !complete {
-			// The peer had more than one answer could carry. Ask it again now
-			// rather than waiting a whole round: what we just applied is
-			// already durable, so this resumes instead of restarting.
-			syncCtx, cancel = context.WithTimeout(ctx, 10*time.Second)
-			_, _, _, err = libp2ptransport.FetchMembership(syncCtx, r.host, remote, session.group)
-			cancel()
-			if err != nil {
-				r.logger.Debug("libp2p membership pull continuation",
-					slog.String("group_id", session.groupID.String()),
-					slog.String("peer_id", remote.ID.String()),
-					slog.String("err", err.Error()))
-			}
+			// The pull paged as far as one exchange is allowed to and the
+			// peer still had more. Nothing is lost: every record it did apply
+			// is durable, so the next round resumes rather than restarting.
+			r.logger.Info("libp2p membership pull incomplete",
+				slog.String("group_id", session.groupID.String()),
+				slog.String("peer_id", remote.ID.String()))
 		}
 	}
 	if progressed {

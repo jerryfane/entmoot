@@ -134,11 +134,19 @@ func Adopt(root string, cp Checkpoint) (*Group, error) {
 	if err := VerifyCheckpoint(cp); err != nil {
 		return nil, err
 	}
-	if cp.Sequence != 0 {
-		return nil, fmt.Errorf("membership: cannot adopt checkpoint %d as a starting point", cp.Sequence)
-	}
-	if Exists(root, cp.GroupID) {
-		return nil, fmt.Errorf("%w: group %s", ErrExists, cp.GroupID.String())
+	// A node with no group state can check exactly one thing: the founder's
+	// signature, whose key the invite pins. Adopting an admin-signed
+	// checkpoint would mean trusting that checkpoint's own claim about who the
+	// admins are, which its signer wrote.
+	//
+	// The sequence is deliberately unconstrained: a group that has retired its
+	// early checkpoints has no sequence zero to offer, and requiring one made
+	// such a group unjoinable.
+	signer, signerErr := entmoot.ResolvedMemberID(cp.Signer)
+	founder, founderErr := entmoot.ResolvedMemberID(cp.Founder)
+	if signerErr != nil || founderErr != nil || signer != founder ||
+		!bytes.Equal(cp.Signer.EntmootPubKey, cp.Founder.EntmootPubKey) {
+		return nil, fmt.Errorf("%w: a starting checkpoint must be signed by the group's founder", ErrNotAuthorised)
 	}
 	dir, err := groupDir(root, cp.GroupID)
 	if err != nil {
@@ -146,6 +154,20 @@ func Adopt(root string, cp Checkpoint) (*Group, error) {
 	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("membership: mkdir %q: %w", dir, err)
+	}
+	// Creating a store is a write, so it takes the group's writer lease like
+	// every other write. Without it the Exists check below and the insert that
+	// follows are two steps a second creator can slip between, leaving two
+	// roots in one store and a canonical choice that depends on map order.
+	lease := &writerLease{path: filepath.Join(dir, lockFileName)}
+	if err := lease.claim(); err != nil {
+		return nil, err
+	}
+	defer func() {
+		_ = lease.close()
+	}()
+	if Exists(root, cp.GroupID) {
+		return nil, fmt.Errorf("%w: group %s", ErrExists, cp.GroupID.String())
 	}
 	db, err := openStoreDB(filepath.Join(dir, storeFileName))
 	if err != nil {
@@ -175,6 +197,18 @@ func Adopt(root string, cp Checkpoint) (*Group, error) {
 	if err != nil {
 		_ = db.Close()
 		return nil, err
+	}
+	// The same binding every later checkpoint gets: a root that claims to
+	// replace a roster chain must name the chain this node holds, and one that
+	// claims an upgrade where there is no chain is refused. Checking it only
+	// on later checkpoints would leave the adopted root — the one a joiner
+	// trusts most — unchecked.
+	group.mu.RLock()
+	legacyErr := group.verifyLegacyAnchorLocked(cp)
+	group.mu.RUnlock()
+	if legacyErr != nil {
+		_ = group.Close()
+		return nil, legacyErr
 	}
 	return group, nil
 }
@@ -417,6 +451,21 @@ func (g *Group) IsMemberID(id entmoot.MemberID) bool {
 	return ok
 }
 
+// BannedIDs returns the identities currently barred from rejoining, sorted.
+// It comes from the projection, not from the canonical checkpoint: a ban that
+// arrived as a record and has not been folded in yet still bars its subject,
+// and an operator reading a ban list needs to see it.
+func (g *Group) BannedIDs() []entmoot.MemberID {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	out := make([]entmoot.MemberID, 0, len(g.state.Banned))
+	for id := range g.state.Banned {
+		out = append(out, id)
+	}
+	sortMemberIDs(out)
+	return out
+}
+
 // IsBanned reports whether id is barred from rejoining.
 func (g *Group) IsBanned(id entmoot.MemberID) bool {
 	g.mu.RLock()
@@ -549,6 +598,12 @@ func (g *Group) ApplyCheckpoint(cp Checkpoint) (bool, error) {
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	if err := g.verifyCheckpointClockLocked(cp); err != nil {
+		return false, err
+	}
+	if err := g.verifyLegacyAnchorLocked(cp); err != nil {
+		return false, err
+	}
 	if _, exists := g.checkpoints[cp.ID]; exists {
 		return false, nil
 	}
@@ -585,6 +640,48 @@ func (g *Group) ApplyCheckpoint(cp Checkpoint) (bool, error) {
 	return true, nil
 }
 
+// maxCheckpointSkew bounds how far ahead of this node's clock a checkpoint may
+// be dated. A checkpoint's timestamp decides which records it covers, so one
+// dated next year would make every legitimate record stale and freeze the node
+// until that date arrived.
+const maxCheckpointSkew = 5 * time.Minute
+
+func (g *Group) verifyCheckpointClockLocked(cp Checkpoint) error {
+	if limit := g.now().Add(maxCheckpointSkew).UnixMilli(); cp.Timestamp > limit {
+		return fmt.Errorf("%w: checkpoint is dated %d, more than %s ahead of this node's clock",
+			entmoot.ErrRosterReject, cp.Timestamp, maxCheckpointSkew)
+	}
+	return nil
+}
+
+// verifyLegacyAnchorLocked binds a checkpoint that claims to replace a linear
+// roster chain to the chain this node actually holds. Without this the
+// LegacyHead field is decoration: a checkpoint could claim any upgrade, or
+// none, and be believed either way.
+func (g *Group) verifyLegacyAnchorLocked(cp Checkpoint) error {
+	if g.legacy == nil {
+		if cp.LegacyHead != nil {
+			return fmt.Errorf("%w: checkpoint claims to replace a roster chain this node does not hold",
+				entmoot.ErrRosterReject)
+		}
+		return nil
+	}
+	if cp.LegacyHead == nil {
+		// Only a root may be silent about the chain: later checkpoints
+		// inherit the claim their ancestor made.
+		if _, held := g.checkpoints[cp.Previous]; held {
+			return nil
+		}
+		return fmt.Errorf("%w: checkpoint does not name the roster chain it replaces",
+			entmoot.ErrRosterReject)
+	}
+	if *cp.LegacyHead != g.legacy.Head() {
+		return fmt.Errorf("%w: checkpoint names roster chain head %s, this node holds %s",
+			entmoot.ErrRosterReject, cp.LegacyHead.String(), g.legacy.Head().String())
+	}
+	return nil
+}
+
 // verifyCheckpointAuthorityLocked requires the signer to have been able to
 // author a checkpoint at the previous one: the founder, or an admin that was
 // then an unbanned member.
@@ -593,20 +690,26 @@ func (g *Group) verifyCheckpointAuthorityLocked(cp, previous Checkpoint) error {
 	if err != nil {
 		return fmt.Errorf("%w: %v", entmoot.ErrRosterReject, err)
 	}
-	// The signer may have been granted authority by a record this checkpoint
-	// folds in, so its own claimed state is the right place to judge it. That
-	// claim is not taken on trust: verifyCheckpointContentsLocked requires it
-	// to agree with the records this node holds.
-	claimed := stateFrom(cp)
-	previousState := stateFrom(previous)
-	if !claimed.CanAdminister(signer) && !previousState.CanAdminister(signer) {
+	// Authority comes from the PREVIOUS checkpoint and nothing else.
+	//
+	// Not from the checkpoint's own claim: its signer writes that claim, so a
+	// peer could name itself an admin and be believed by any node holding no
+	// record in the covered window — a joiner's position, and a quiet node's.
+	//
+	// And not from the records in the window either, tempting as that is for
+	// an admin granted mid-window. If a checkpoint could only be judged by a
+	// node that holds those records, then a node without them cannot follow
+	// the chain at all: it would refuse that checkpoint and then refuse every
+	// later one for naming an unknown previous. The cost of this rule is one
+	// cadence of patience — a freshly granted admin signs the checkpoint after
+	// next — and the benefit is that every checkpoint is verifiable by every
+	// node from its predecessor alone.
+	authority := stateFrom(previous)
+	if !authority.CanAdminister(signer) {
 		return fmt.Errorf("%w: %s may not sign a checkpoint for this group", ErrNotAuthorised, signer.String())
 	}
-	if !claimed.IsFounder(signer) {
-		member, ok := claimed.Members[signer]
-		if !ok {
-			member, ok = previousState.Members[signer]
-		}
+	if !authority.IsFounder(signer) {
+		member, ok := authority.Members[signer]
 		if !ok || !bytes.Equal(member.EntmootPubKey, cp.Signer.EntmootPubKey) {
 			return fmt.Errorf("%w: checkpoint signer key does not match the group's record for it", ErrNotAuthorised)
 		}
@@ -623,6 +726,20 @@ func (g *Group) verifyCheckpointAuthorityLocked(cp, previous Checkpoint) error {
 // records accepts it on the signer's authority; a node that does hold them
 // requires agreement.
 func (g *Group) verifyCheckpointContentsLocked(cp, previous Checkpoint) error {
+	projected, ok := g.projectWindowLocked(cp, previous)
+	if !ok {
+		return nil
+	}
+	if !sameMembership(projected, stateFrom(cp)) {
+		return ErrCheckpointMismatch
+	}
+	return nil
+}
+
+// projectWindowLocked projects the records this node holds inside the window a
+// checkpoint claims to cover. ok is false when this node holds none of them, in
+// which case the node has nothing of its own to check the claim against.
+func (g *Group) projectWindowLocked(cp, previous Checkpoint) (State, bool) {
 	relevant := make([]Record, 0, len(g.records))
 	for _, rec := range g.records {
 		if rec.Timestamp >= previous.Timestamp && rec.Timestamp <= cp.Timestamp {
@@ -630,14 +747,10 @@ func (g *Group) verifyCheckpointContentsLocked(cp, previous Checkpoint) error {
 		}
 	}
 	if len(relevant) == 0 {
-		return nil
+		return State{}, false
 	}
 	projected, _ := Project(previous, relevant)
-	claimed := stateFrom(cp)
-	if !sameMembership(projected, claimed) {
-		return ErrCheckpointMismatch
-	}
-	return nil
+	return projected, true
 }
 
 func sameMembership(left, right State) bool {
@@ -688,11 +801,11 @@ func sameMembership(left, right State) bool {
 // one wins, ties broken by id, so every node picks the same one without
 // negotiating.
 func (g *Group) settleCanonicalLocked() error {
-	// Walk forward from the group's first checkpoint, not from the current
-	// canonical one: a better sibling can arrive after a worse one was already
+	// Walk forward from this node's anchor, not from the current canonical
+	// checkpoint: a better sibling can arrive after a worse one was already
 	// chosen, and every node must end up with the same answer regardless of
 	// the order the two showed up in.
-	best, ok := g.rootCheckpointLocked()
+	best, ok := g.anchorCheckpointLocked()
 	if !ok {
 		return nil
 	}
@@ -740,11 +853,32 @@ func (g *Group) settleCanonicalLocked() error {
 			return err
 		}
 	}
-	// Drop stale forks: a checkpoint two or more sequences behind the
-	// canonical one can no longer be chosen.
+	// What this node keeps is the chain from its newest founder-signed
+	// checkpoint up to the canonical one, plus one sequence of lag for
+	// siblings. Two reasons, and both are load-bearing:
+	//
+	//   - The chain must stay CONTIGUOUS. The forward walk steps by Previous,
+	//     so a hole in the middle freezes the canonical checkpoint for ever
+	//     and stops records being retired at all.
+	//   - A joiner can only anchor on a founder-signed checkpoint: the invite
+	//     pins the founder's key and nothing else, so that signature is the
+	//     one thing a node with no group state can check. Keeping the newest
+	//     one, and everything after it, is what lets a group admit members
+	//     while its founder is away. The cost is that a founder who never
+	//     checkpoints leaves a longer chain behind, which `roster status`
+	//     shows as the gap between the anchor and the canonical sequence.
+	keepFrom := best.Sequence
+	if best.Sequence > 0 {
+		keepFrom = best.Sequence - 1
+	}
+	for _, cp := range g.checkpoints {
+		if cp.Sequence < keepFrom && g.isFounderSignedLocked(cp) && g.onChainLocked(cp, best) {
+			keepFrom = cp.Sequence
+		}
+	}
 	var dropped []entmoot.RosterEntryID
 	for id, cp := range g.checkpoints {
-		if id == best.ID {
+		if id == best.ID || cp.Sequence >= keepFrom {
 			continue
 		}
 		if cp.Sequence+1 < best.Sequence {
@@ -775,22 +909,75 @@ func (g *Group) settleCanonicalLocked() error {
 	return nil
 }
 
-// rootCheckpointLocked returns the sequence-zero checkpoint, which every
-// chain of checkpoints descends from.
-func (g *Group) rootCheckpointLocked() (Checkpoint, bool) {
+// anchorCheckpointLocked returns the checkpoint this node's chain starts from:
+// the oldest one it still holds, ties broken the same way siblings are, so two
+// nodes holding the same checkpoints choose the same anchor.
+//
+// It is deliberately NOT "the sequence-zero checkpoint". A node that has
+// retired old checkpoints holds no sequence zero, and anchoring on one that is
+// gone froze the canonical checkpoint permanently: nothing newer could be
+// chosen and no records were ever retired again.
+func (g *Group) anchorCheckpointLocked() (Checkpoint, bool) {
+	var anchor Checkpoint
+	found := false
 	for _, cp := range g.checkpoints {
-		if cp.Sequence == 0 {
-			return cp, true
+		if !found || cp.Sequence < anchor.Sequence ||
+			(cp.Sequence == anchor.Sequence && checkpointBeats(cp, anchor)) {
+			anchor = cp
+			found = true
 		}
 	}
-	return Checkpoint{}, false
+	return anchor, found
 }
 
+// isFounderSignedLocked reports whether the group's founder signed cp, which
+// is the only signature a node holding no other group state can check.
+func (g *Group) isFounderSignedLocked(cp Checkpoint) bool {
+	return founderSigned(cp)
+}
+
+// onChainLocked reports whether cp is an ancestor of head along the Previous
+// links this node still holds.
+func (g *Group) onChainLocked(cp, head Checkpoint) bool {
+	for {
+		if head.ID == cp.ID {
+			return true
+		}
+		previous, ok := g.checkpoints[head.Previous]
+		if !ok {
+			return false
+		}
+		head = previous
+	}
+}
+
+// checkpointBeats decides between two checkpoints at the same sequence. Every
+// node applies the same rule, so no negotiation is needed.
+//
+// A founder-signed checkpoint wins first, before any timestamp comparison: it
+// is the only kind a node holding no group state can adopt, so preferring it
+// keeps a group joinable. Then the earlier timestamp, then the lower id.
 func checkpointBeats(candidate, current Checkpoint) bool {
+	if left, right := founderSigned(candidate), founderSigned(current); left != right {
+		return left
+	}
 	if candidate.Timestamp != current.Timestamp {
 		return candidate.Timestamp < current.Timestamp
 	}
 	return bytes.Compare(candidate.ID[:], current.ID[:]) < 0
+}
+
+// founderSigned reports whether a checkpoint's signer is the founder it names.
+func founderSigned(cp Checkpoint) bool {
+	signer, err := entmoot.ResolvedMemberID(cp.Signer)
+	if err != nil {
+		return false
+	}
+	founder, err := entmoot.ResolvedMemberID(cp.Founder)
+	if err != nil || signer != founder {
+		return false
+	}
+	return bytes.Equal(cp.Signer.EntmootPubKey, cp.Founder.EntmootPubKey)
 }
 
 // SignRecord fills in the actor, group and timestamp, signs, and applies.
@@ -853,9 +1040,14 @@ func (g *Group) SignCheckpoint(identity *keystore.Identity, force bool) (Checkpo
 
 	g.mu.Lock()
 	base := g.checkpoints[g.canonicalID]
-	if !g.state.CanAdminister(signerID) {
+	// Signed against the base's OWN admin set, not the current projection: a
+	// peer judges this checkpoint by its predecessor alone, so an admin the
+	// base does not yet name would produce a checkpoint nobody else could
+	// accept. Waiting one cadence is the price of a chain every node can
+	// follow.
+	if !stateFrom(base).CanAdminister(signerID) {
 		g.mu.Unlock()
-		return Checkpoint{}, false, fmt.Errorf("%w: %s may not sign a checkpoint", ErrNotAuthorised, signerID.String())
+		return Checkpoint{}, false, fmt.Errorf("%w: %s may not sign a checkpoint for this group yet", ErrNotAuthorised, signerID.String())
 	}
 	records := make([]Record, 0, len(g.records))
 	for _, rec := range g.records {
@@ -924,12 +1116,11 @@ func (g *Group) retainLocked(cp Checkpoint) {
 	g.membersAt[stored.ID] = index
 }
 
-// recordCoveredLocked reports whether a record whose timestamp equals the
-// canonical checkpoint's is already accounted for by it, which is true unless
-// the checkpoint predates any record at all.
+// recordCoveredLocked reports whether the canonical checkpoint already accounts
+// for a record. It defers to the projection's rule so the store and the
+// projection can never disagree about which records are inside a checkpoint.
 func (g *Group) recordCoveredLocked(rec Record) bool {
-	canonical := g.checkpoints[g.canonicalID]
-	return canonical.Covered > 0 && rec.Timestamp <= canonical.Timestamp
+	return coveredBy(g.checkpoints[g.canonicalID], rec)
 }
 
 func mustMemberID(info entmoot.NodeInfo) entmoot.MemberID {

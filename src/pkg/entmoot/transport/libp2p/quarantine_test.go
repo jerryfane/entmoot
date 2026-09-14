@@ -2,9 +2,14 @@ package libp2ptransport
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
+
+	libp2p "github.com/libp2p/go-libp2p"
+	pubsub "github.com/libp2p/go-libp2p-pubsub"
+	pb "github.com/libp2p/go-libp2p-pubsub/pb"
 
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/keystore"
@@ -51,10 +56,16 @@ func newQuarantineFixture(t *testing.T) *quarantineFixture {
 		clock:   time.Now(),
 	}
 	t.Cleanup(func() { f.store.Close() })
+	localHost, _, err := NewHost(context.Background(), founder, libp2p.NoListenAddrs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = localHost.Close() })
 	cfg := LiveConfig{
 		GroupID: groupID,
 		Group:   local,
 		Store:   f.store,
+		Host:    localHost,
 		Now:     func() time.Time { return f.clock },
 		OnIngest: func(message entmoot.Message) {
 			f.ingested = append(f.ingested, message)
@@ -62,6 +73,26 @@ func newQuarantineFixture(t *testing.T) *quarantineFixture {
 	}
 	f.group = &LiveGroup{cfg: cfg, quarantine: newRosterAheadQuarantine(cfg.Now)}
 	return f
+}
+
+// ingest is what the router does with an arriving message: the live group's
+// validator decides whether to accept it, hold it for a later retry or refuse
+// it outright. Going through it rather than calling the quarantine directly
+// keeps the test on the path a real publisher reaches.
+func (f *quarantineFixture) ingest(t *testing.T, author *keystore.Identity, message entmoot.Message) pubsub.ValidationResult {
+	t.Helper()
+	data, err := json.Marshal(message)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding, err := BindingFromPublicKey(author.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	from := []byte(binding.PeerID)
+	return f.group.validate(context.Background(), binding.PeerID, &pubsub.Message{
+		Message: &pb.Message{From: from, Data: data},
+	})
 }
 
 // admitAhead admits an identity on the publisher's copy only. The group's join
@@ -147,8 +178,10 @@ func TestMembershipAheadMessageIsHeldAndIngestedAfterSync(t *testing.T) {
 	if !isUnknownRosterHead(err) {
 		t.Fatalf("unknown checkpoint reported as %v, want ErrRosterHeadUnknown", err)
 	}
-	if !f.group.quarantine.hold(message) {
-		t.Fatal("message was not held for retry")
+	// The router is told to ignore it rather than reject it, so the publisher
+	// is not penalised for being ahead of us, and the message waits.
+	if got := f.ingest(t, newcomer, message); got != pubsub.ValidationIgnore {
+		t.Fatalf("validation of a message naming an unknown checkpoint = %v, want ignore", got)
 	}
 	if f.group.QuarantinedMessages() != 1 {
 		t.Fatalf("quarantined = %d, want 1", f.group.QuarantinedMessages())
@@ -188,7 +221,7 @@ func TestQuarantineIsBoundedByMessagesHeadsAndTime(t *testing.T) {
 		var head entmoot.RosterEntryID
 		head[0] = byte(i + 1)
 		message := f.signedAt(t, f.member, head, "invented head")
-		if f.group.quarantine.hold(message) {
+		if f.ingest(t, f.member, message) == pubsub.ValidationIgnore {
 			held++
 		}
 	}
@@ -201,14 +234,14 @@ func TestQuarantineIsBoundedByMessagesHeadsAndTime(t *testing.T) {
 	single[0] = 1
 	for range maxQuarantinedMessages + 16 {
 		f.clock = f.clock.Add(time.Millisecond)
-		f.group.quarantine.hold(f.signedAt(t, f.member, single, "flood"))
+		f.ingest(t, f.member, f.signedAt(t, f.member, single, "flood"))
 	}
 	if count := f.group.QuarantinedMessages(); count != maxQuarantinedMessages {
 		t.Fatalf("quarantined %d messages, want the cap of %d", count, maxQuarantinedMessages)
 	}
 
-	// A duplicate of a held message must not consume another slot. The buffer
-	// is at its message cap, so make room first: without the dedup check the
+	// A message offered twice must not consume another slot. The buffer is at
+	// its message cap, so make room first: without the dedup check the
 	// re-offered message would take the freed slot and the count would climb
 	// back to the cap.
 	f.clock = f.clock.Add(quarantineTTL + time.Second)
@@ -217,11 +250,11 @@ func TestQuarantineIsBoundedByMessagesHeadsAndTime(t *testing.T) {
 	}
 	f.clock = f.clock.Add(time.Millisecond)
 	first := f.signedAt(t, f.member, single, "only message")
-	if !f.group.quarantine.hold(first) {
-		t.Fatal("a message was refused by an empty quarantine")
+	if got := f.ingest(t, f.member, first); got != pubsub.ValidationIgnore {
+		t.Fatalf("an empty quarantine validated a message naming an unknown head as %v, want ignore", got)
 	}
-	if f.group.quarantine.hold(first) {
-		t.Fatal("the same message was held twice")
+	if got := f.ingest(t, f.member, first); got == pubsub.ValidationIgnore {
+		t.Fatal("the same message was held a second time")
 	}
 	if count := f.group.QuarantinedMessages(); count != 1 {
 		t.Fatalf("a duplicate consumed a slot: quarantined %d, want 1", count)
@@ -318,8 +351,8 @@ func TestHeldMessageSurvivesABatchedMembershipAdvance(t *testing.T) {
 	f.admitAhead(t, newcomer)
 	middle := f.checkpointAhead(t)
 	message := f.signedAt(t, newcomer, middle.ID, "published at the middle checkpoint")
-	if !f.group.quarantine.hold(message) {
-		t.Fatal("message was not held")
+	if got := f.ingest(t, newcomer, message); got != pubsub.ValidationIgnore {
+		t.Fatalf("validation of the ahead message = %v, want ignore so it waits", got)
 	}
 
 	// It moves on again, and further records are still pending there.
@@ -363,8 +396,8 @@ func TestDrainDeliversHeldMessagesInArrivalOrder(t *testing.T) {
 		// buckets: exactly the case map iteration would shuffle.
 		f.clock = f.clock.Add(time.Millisecond)
 		content := "step " + string(rune('a'+step))
-		if !f.group.quarantine.hold(f.signedAt(t, newcomer, checkpoint.ID, content)) {
-			t.Fatalf("message %q was not held", content)
+		if got := f.ingest(t, newcomer, f.signedAt(t, newcomer, checkpoint.ID, content)); got != pubsub.ValidationIgnore {
+			t.Fatalf("message %q validated as %v, want ignore so it waits", content, got)
 		}
 		contents = append(contents, content)
 		f.admitAhead(t, mustIdentity(t))
