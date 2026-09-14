@@ -493,3 +493,51 @@ func TestRosterPageReportsAChainShorterThanTheRequest(t *testing.T) {
 		t.Fatalf("page inside the chain: page=%+v err=%v", inside, err)
 	}
 }
+
+// A snapshot token is a handle, not an authorisation. The paged path checks
+// owner, group and kind before honouring one, and releasing must not be the
+// weaker door: a caller holding someone else's token must not be able to
+// cancel that peer's in-flight pull.
+func TestReleasingASnapshotRequiresOwningIt(t *testing.T) {
+	f := newSnapshotLifecycleFixture(t)
+	group := f.groups[0]
+
+	// The fixture client starts a paged pull and holds its snapshot.
+	page, err := f.rosterPage(group, nil, 1)
+	if err != nil || page.Complete || page.SnapshotToken == "" {
+		t.Fatalf("starting the pull: page=%+v err=%v", page, err)
+	}
+
+	// A second member of the same group — authorized, so the request reaches
+	// the handler — tries to free the first member's token.
+	otherIdentity := mustIdentity(t)
+	admit, err := f.logs[group].SignEntry(f.founder, "add", mustNodeInfo(t, otherIdentity.PublicKey), nil, 9_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.logs[group].Apply(admit); err != nil {
+		t.Fatal(err)
+	}
+	other, _, err := NewHost(f.ctx, otherIdentity, libp2p.NoListenAddrs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	if _, err := RequestRosterPage(f.ctx, other, f.remote, RosterSyncRequest{
+		Version: 2, RequestID: "member-can-read", GroupID: group, Limit: 1,
+	}); err != nil {
+		t.Fatalf("the second member cannot read the roster, so the test proves nothing: %v", err)
+	}
+	if _, err := RequestRosterPage(f.ctx, other, f.remote, RosterSyncRequest{
+		Version: 2, RequestID: "steal-release", GroupID: group,
+		SnapshotToken: page.SnapshotToken, ReleaseSnapshot: true,
+	}); err != nil {
+		t.Fatalf("release request failed outright: %v", err)
+	}
+
+	// The owner's pull must still continue on its own snapshot.
+	next, err := f.rosterPage(group, &page, 100)
+	if err != nil || !next.Complete {
+		t.Fatalf("the owner's pull was cancelled by another caller: page=%+v err=%v", next, err)
+	}
+}
