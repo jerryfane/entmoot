@@ -244,6 +244,9 @@ func (s *SyncServer) authorize(stream network.Stream, groupID entmoot.GroupID, c
 	if capability == nil {
 		return ErrBootstrapDenied
 	}
+	// Pre-membership reads stay pinned to the current head: unlike enrollment,
+	// nothing here needs an older checkpoint, so a superseded grant gets no
+	// roster or history access.
 	if capability.GroupID != groupID || capability.RosterHead != r.Head() {
 		return ErrBootstrapDenied
 	}
@@ -251,6 +254,14 @@ func (s *SyncServer) authorize(stream network.Stream, groupID entmoot.GroupID, c
 	if !ok || !equalMemberID(founder.MemberID, capability.Founder.MemberID) ||
 		!bytes.Equal(founder.EntmootPubKey, capability.Founder.EntmootPubKey) {
 		return ErrBootstrapDenied
+	}
+	// The signature verifies against the authority the capability names, which
+	// its holder chooses, so that authority must be a member who may currently
+	// administer the group. Without this, anyone could name the real founder as
+	// the anchor, name itself as issuer, self-sign, and read roster and history
+	// before membership.
+	if err := AuthorizedIssuer(r, capability.SigningAuthority()); err != nil {
+		return err
 	}
 	allowedServer := false
 	for _, allowed := range capability.AllowedPeerIDs {

@@ -148,6 +148,23 @@ func FetchRosterUpdates(ctx context.Context, h host.Host, remote peer.AddrInfo, 
 	return nil, errors.New("libp2p: roster page budget exhausted")
 }
 
+// FetchRosterHead asks a peer for the head it has committed, without pulling
+// the chain. Callers use it to tell "this peer is behind" from "this peer has
+// entries we do not", which decides whether a sync is worth the pages.
+func FetchRosterHead(ctx context.Context, h host.Host, remote peer.AddrInfo, groupID entmoot.GroupID) (entmoot.RosterEntryID, error) {
+	request := RosterSyncRequest{
+		Version:   2,
+		RequestID: fmt.Sprintf("roster-head-%d", time.Now().UnixNano()),
+		GroupID:   groupID,
+		Limit:     1,
+	}
+	response, err := RequestRosterPage(ctx, h, remote, request)
+	if err != nil {
+		return entmoot.RosterEntryID{}, err
+	}
+	return response.CommittedHead, nil
+}
+
 func equalMemberID(left, right *entmoot.MemberID) bool {
 	if left == nil || right == nil {
 		return left == nil && right == nil

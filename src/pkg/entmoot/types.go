@@ -297,11 +297,16 @@ type BootstrapCapability struct {
 	RosterHead        RosterEntryID `json:"roster_head"`
 	AllowedPeerIDs    []string      `json:"allowed_peer_ids,omitempty"`
 	AllowedMultiaddrs []string      `json:"allowed_multiaddrs,omitempty"`
-	MaxUses           int           `json:"max_uses,omitempty"`
-	Nonce             [32]byte      `json:"nonce"`
-	IssuedAtMS        int64         `json:"issued_at_ms"`
-	ExpiresAtMS       int64         `json:"expires_at_ms"`
-	Signature         []byte        `json:"signature,omitempty"`
+	// Relays are the issuer's controlled-relay multiaddrs, each ending in
+	// /p2p/<relay-peer-id>. A new node cannot discover a relay by itself, so
+	// the inviter hands over the ones it uses; adopting them is what keeps a
+	// NATed joiner reachable.
+	Relays      []string `json:"relays,omitempty"`
+	MaxUses     int      `json:"max_uses,omitempty"`
+	Nonce       [32]byte `json:"nonce"`
+	IssuedAtMS  int64    `json:"issued_at_ms"`
+	ExpiresAtMS int64    `json:"expires_at_ms"`
+	Signature   []byte   `json:"signature,omitempty"`
 }
 
 // SigningAuthority returns the identity whose key signs and is answerable for

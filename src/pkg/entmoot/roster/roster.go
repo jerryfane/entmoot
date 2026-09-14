@@ -1,10 +1,17 @@
 // Package roster maintains the signed append-only membership log for a group.
 //
 // Each group has a single RosterLog; the log's head is the group's current
-// membership. v0 is founder-only admin: only entries signed by the founder are
-// accepted by Apply. The log is strictly linear in v0 — the single-admin
-// constraint means branches cannot arise — so Head() always refers to the
-// most-recently-applied entry.
+// membership. Entries are accepted from the founder or from a delegated admin
+// named by a founder-signed policy_change (see admin.go). Admins exist so a
+// group can admit and evict members while the founder is away; only the
+// founder changes the admin set, removes an admin, or is removed.
+//
+// The log is strictly linear: every entry must name the current head as its
+// only parent, so concurrent authors do not branch — the loser's entry is
+// rejected and has to be re-signed against the new head. Head() therefore
+// always refers to the most-recently-applied entry. Because several nodes may
+// author entries, peers must pull roster state from members generally, not
+// only from the founder.
 //
 // Persistence uses a dedicated transactional SQLite schema. Legacy JSONL logs
 // are validated as immutable import sources; they are never replayed
@@ -37,8 +44,9 @@ const CurrentEntryVersion uint8 = 2
 type RosterEvent struct {
 	// Entry is the roster entry that was just applied.
 	Entry entmoot.RosterEntry
-	// Heads is the new set of log heads after the apply. In v0 this is
-	// always a single-element slice because founder-only admin is linear.
+	// Heads is the new set of log heads after the apply. It is always a
+	// single-element slice: the log is strictly linear, so branches cannot
+	// arise even with several authorised signers.
 	Heads []entmoot.RosterEntryID
 }
 
@@ -354,12 +362,14 @@ func (r *RosterLog) validateLocked(entry entmoot.RosterEntry) error {
 		}
 	}
 
+	// A member id is derived from its key, so re-adding one under a different
+	// key is an identity substitution. r.members is keyed by legacy Pilot node
+	// id and is empty for version-2 groups, so this has to consult the
+	// full-width projection.
 	if entry.Op == "add" && entry.Subject.MemberID != nil {
-		for _, member := range r.members {
-			if member.MemberID != nil && *member.MemberID == *entry.Subject.MemberID &&
-				!bytes.Equal(member.EntmootPubKey, entry.Subject.EntmootPubKey) {
-				return fmt.Errorf("%w: member id is already bound to another public key", entmoot.ErrRosterReject)
-			}
+		if existing, ok := r.membersByID[*entry.Subject.MemberID]; ok &&
+			!bytes.Equal(existing.EntmootPubKey, entry.Subject.EntmootPubKey) {
+			return fmt.Errorf("%w: member id is already bound to another public key", entmoot.ErrRosterReject)
 		}
 	}
 
@@ -521,11 +531,20 @@ func (r *RosterLog) applyLocked(entry entmoot.RosterEntry) {
 			delete(r.members, stored.Subject.PilotNodeID)
 		}
 	case "policy_change":
-		// Membership is unchanged; the admin set is replaced wholesale. A
-		// payload that does not parse was already rejected by validation, and
-		// a legacy entry carrying some other policy leaves the set alone.
+		// Membership is unchanged. A policy of another type leaves the admin
+		// set alone; an admin policy replaces it wholesale. Apply-time
+		// validation rejects an unreadable admin policy, so reaching one here
+		// means the log was loaded without validation: fail closed to no
+		// admins rather than keeping an authority the bytes do not state.
+		if !IsAdminPolicy(stored.Policy) {
+			break
+		}
 		policy, err := ParseAdminPolicy(stored.Policy)
 		if err != nil {
+			r.logger.Warn("roster: unreadable admin policy; clearing delegated admins",
+				slog.String("entry_id", stored.ID.String()),
+				slog.String("err", err.Error()))
+			r.admins = make(map[entmoot.MemberID]struct{})
 			break
 		}
 		r.admins = make(map[entmoot.MemberID]struct{}, len(policy.Admins))

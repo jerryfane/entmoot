@@ -286,14 +286,29 @@ func parseRosterMemberFlags(command string, flags rosterMemberFlags) (entmoot.Gr
 	return gid, entmoot.NodeInfo{MemberID: &memberID, PeerID: binding.PeerID.String(), EntmootPubKey: pubkey}, exitOK, true
 }
 
+// founderRosterContext is an open, write-leased roster plus the identity that
+// will sign. localMemberID is the signer; it is the founder or, for membership
+// changes, a delegated admin.
 type founderRosterContext struct {
-	setup   *setupResult
-	roster  *roster.RosterLog
-	founder entmoot.NodeInfo
-	close   func()
+	setup         *setupResult
+	roster        *roster.RosterLog
+	founder       entmoot.NodeInfo
+	localMemberID entmoot.MemberID
+	close         func()
 }
 
+// setupFounderRoster opens the roster for a founder-only operation.
 func setupFounderRoster(gf *globalFlags, command string, gid entmoot.GroupID) (founderRosterContext, int, bool) {
+	return setupRosterWriter(gf, command, gid, true)
+}
+
+// setupAdminRoster opens the roster for an operation any current admin may
+// sign: adding and removing ordinary members.
+func setupAdminRoster(gf *globalFlags, command string, gid entmoot.GroupID) (founderRosterContext, int, bool) {
+	return setupRosterWriter(gf, command, gid, false)
+}
+
+func setupRosterWriter(gf *globalFlags, command string, gid entmoot.GroupID, founderOnly bool) (founderRosterContext, int, bool) {
 	s, err := setup(gf)
 	if err != nil {
 		slog.Error(command+": setup", slog.String("err", err.Error()))
@@ -320,16 +335,23 @@ func setupFounderRoster(gf *globalFlags, command string, gid entmoot.GroupID) (f
 		fmt.Fprintf(os.Stderr, "%s: group has no founder (empty roster)\n", command)
 		return founderRosterContext{}, exitGroupNotFound, false
 	}
-	if founder.MemberID == nil || *founder.MemberID != memberID || !bytes.Equal(founder.EntmootPubKey, s.identity.PublicKey) {
+	isFounder := founder.MemberID != nil && *founder.MemberID == memberID && bytes.Equal(founder.EntmootPubKey, s.identity.PublicKey)
+	if founderOnly && !isFounder {
 		_ = r.Close()
 		fmt.Fprintf(os.Stderr, "%s: local member is not founder of group %s\n", command, gid.String())
 		return founderRosterContext{}, exitNotMember, false
 	}
+	if !isFounder && !r.CanAdminister(memberID) {
+		_ = r.Close()
+		fmt.Fprintf(os.Stderr, "%s: local member is neither founder nor a delegated admin of group %s\n", command, gid.String())
+		return founderRosterContext{}, exitNotMember, false
+	}
 	return founderRosterContext{
-		setup:   s,
-		roster:  r,
-		founder: founder,
-		close:   func() { _ = r.Close() },
+		setup:         s,
+		roster:        r,
+		founder:       founder,
+		localMemberID: memberID,
+		close:         func() { _ = r.Close() },
 	}, exitOK, true
 }
 
@@ -351,7 +373,7 @@ func cmdRosterAdd(gf *globalFlags, args []string) int {
 	if !ok {
 		return code
 	}
-	ctx, code, ok := setupFounderRoster(gf, "roster add", gid)
+	ctx, code, ok := setupAdminRoster(gf, "roster add", gid)
 	if !ok {
 		return code
 	}
@@ -413,7 +435,7 @@ func cmdRosterRemove(gf *globalFlags, args []string) int {
 	if !ok {
 		return code
 	}
-	ctx, code, ok := setupFounderRoster(gf, "roster remove", gid)
+	ctx, code, ok := setupAdminRoster(gf, "roster remove", gid)
 	if !ok {
 		return code
 	}
@@ -464,7 +486,10 @@ func cmdRosterRemove(gf *globalFlags, args []string) int {
 	}
 	espOpen, espErr := liveESPOpenInvites(ctx.setup.dataDir, gid)
 	if espErr != nil {
-		slog.Warn("roster remove: read esp open invites", slog.String("err", espErr.Error()))
+		// Reporting zero when the store could not be read would understate
+		// what is outstanding, so report that it is unknown instead.
+		slog.Error("roster remove: read esp open invites", slog.String("err", espErr.Error()))
+		fmt.Fprintf(os.Stderr, "roster remove: warning: could not read ESP open-invite tokens for this group: %v\n", espErr)
 	}
 	if espOpen > 0 {
 		fmt.Fprintf(os.Stderr, "roster remove: warning: %d ESP open-invite token(s) remain for this group; revoke them through the ESP API\n", espOpen)
@@ -482,6 +507,10 @@ func cmdRosterRemove(gf *globalFlags, args []string) int {
 			"peer_id":        binding.PeerID.String(),
 			"entmoot_pubkey": encodeBase64(target.EntmootPubKey),
 		},
+	}
+	if espErr != nil {
+		out["outstanding_esp_open_invites"] = nil
+		out["esp_open_invites_error"] = espErr.Error()
 	}
 	if revokeErr != nil {
 		out["invite_revocation_error"] = revokeErr.Error()

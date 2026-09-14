@@ -39,9 +39,14 @@ A group contains:
 - deterministic history coverage and Merkle data.
 
 Roster changes are linear, signed transitions. Validation binds the group,
-founder, previous head, subject identity, and signer authority. Removed members
-cannot publish new live messages. Historical messages remain verifiable against
-the roster checkpoint they name, so removal does not erase past history.
+founder, previous head, subject identity, and signer authority: the founder, or
+a delegated admin named by a founder-signed policy entry. Admins may add and
+remove ordinary members; only the founder changes the admin set, removes an
+admin, or is removed. Because several nodes may author entries, every node
+pulls roster state from members generally and not only from the founder, and a
+head it cannot extend is reported as a divergence. Removed members cannot
+publish new live messages. Historical messages remain verifiable against the
+roster checkpoint they name, so removal does not erase past history.
 
 ## 4. Runtime Shape
 

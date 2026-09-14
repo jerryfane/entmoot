@@ -12,22 +12,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Delegated admins.** A founder can now name delegated admins with
   `roster admin grant|revoke|list`, carried as a founder-signed
   `policy_change` entry holding the complete set (`type: admins/v1`, ceiling
-  16). An admin may add and remove ordinary members and issue invites from its
-  own host, so a group keeps admitting and evicting members while the founder
-  is away. An admin cannot remove the founder, remove another admin, or change
-  the admin set; losing membership or delegation removes the authority at once.
-  Invites gained an optional `issuer` field: `founder` stays the anchor a
-  joiner pins, while `issuer` names the admin that signed, and enrollment
-  requires that signer to be a member who may currently administer the group.
+  16). An admin may add and remove ordinary members (`roster add|remove`, the
+  IPC member-remove path, the ESP member_remove operation) and issue invites
+  from its own host (`invite create`, IPC `invite_create`), so a group keeps
+  admitting and evicting members while the founder is away. An admin cannot
+  remove the founder, remove another admin, or change the admin set; losing
+  membership or delegation removes the authority at once. Invites gained an
+  optional `issuer` field: `founder` stays the anchor a joiner pins, while
+  `issuer` names the admin that signed. Enrollment and pre-membership
+  roster/history reads both require that signer to be a member who may
+  currently administer the group, so naming yourself as issuer buys nothing.
   Policy payloads of other types (the legacy identity-upgrade checkpoint) pass
   through untouched.
+- **Roster state travels between members, not just from the founder.** Every
+  node now pulls roster entries from up to eight reachable members, founder
+  first, and the founder pulls too. Without this, an admin-authored add or
+  removal stayed on one node and the group ran on two heads. A peer that
+  advertises a head this node cannot extend is reported as a roster divergence
+  rather than looking merely unreachable.
 - **Removal reporting is complete and survives cleanup failure.** `roster
-  remove` and the IPC member-remove path now print the removal result even when
-  invite revocation fails, carrying `invite_revocation_error` and the manual
-  revoke command, instead of exiting with an error that made it look as though
-  nothing had happened. Both also report how many ESP-hosted open-invite
-  tokens remain for the group, which are a second bearer path revoked through
-  the ESP API rather than by a roster change.
+  remove`, the IPC member-remove path and the ESP member_remove operation now
+  report the removal result even when invite revocation fails, carrying
+  `invite_revocation_error` and the manual revoke command, instead of failing
+  in a way that looked as though nothing had happened. All three report the
+  group's remaining open bearer invites and how many ESP-hosted open-invite
+  tokens remain — a second bearer path revoked through the ESP API, not by a
+  roster change — and say so explicitly when that store cannot be read
+  instead of reporting zero.
 
 - **Multi-use and open invites, with revocation.** `invite create` accepts
   `-max-uses` (default 1, ceiling 64) and `-open`, which mints a bearer invite
