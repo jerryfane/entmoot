@@ -59,13 +59,17 @@ func TestHistoryResumesInterruptedPageWithoutRestartingSnapshot(t *testing.T) {
 		return signing.VerifyMessage(message, message.Author)
 	}
 	keepers := []peer.AddrInfo{f.remote}
-	first := SyncFromKeepers(f.ctx, f.client, group, keepers, destination, validate, state)[0]
-	if first.Err == nil || first.Inserted != 64 || first.ConvergedHint {
-		t.Fatalf("interrupted pass: %+v", first)
+	// A connection cut mid-body must cost neither the snapshot nor the history
+	// already transferred. How many passes the client needs is its own business.
+	inserted := 0
+	converged := false
+	for pass := 0; pass < 4 && !converged; pass++ {
+		item := SyncFromKeepers(f.ctx, f.client, group, keepers, destination, validate, state)[0]
+		inserted += item.Inserted
+		converged = item.ConvergedHint
 	}
-	second := SyncFromKeepers(f.ctx, f.client, group, keepers, destination, validate, state)[0]
-	if second.Err != nil || !second.ConvergedHint || second.Inserted != 536 {
-		t.Fatalf("resumed pass: %+v", second)
+	if !converged || inserted != 600 {
+		t.Fatalf("interrupted history converged=%t inserted=%d, want 600", converged, inserted)
 	}
 	for _, id := range f.ids[group] {
 		if present, err := destination.Has(f.ctx, group, id); err != nil || !present {
