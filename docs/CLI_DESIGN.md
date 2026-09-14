@@ -78,8 +78,8 @@ runtime.env            Installed wrapper defaults
 conversion-*           One-way legacy conversion journal and backup
 ```
 
-Per-group SQLite schemas store immutable signed bytes, roster state, acceptance
-evidence, query indexes, and generation-bound coverage data. Store writes are
+Per-group SQLite schemas store immutable signed bytes, roster state, query
+indexes, and generation-bound coverage data. Store writes are
 transactional and return whether a message was newly inserted so local delivery
 and network propagation happen once per process.
 

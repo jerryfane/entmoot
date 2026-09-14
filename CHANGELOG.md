@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Membership is the only publishing authority.** Messages no longer carry a
+  founder-signed acceptance certificate, and the `/entmoot/acceptance/2`
+  protocol is removed. A member publishes on its own signature at a named
+  roster head; receivers authorize the author against the roster, and removal
+  from the roster is the moderation lever. This means a group keeps accepting
+  new messages while the founder is offline, which was previously impossible.
+  It is a wire break with no compatibility path: version-2 messages carrying an
+  `acceptance` field are rejected by the strict live and sync decoders, so all
+  nodes in a group must run this build. Stored history is unaffected because
+  acceptance never contributed to message signing bytes or message ids.
+
 ### Fixed
 
 - **Controlled-relay recovery and privacy.** Configured hosts now renew relay
@@ -55,13 +68,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   validation failure. Legacy signed bytes and IDs remain unchanged and
   read-only pending an authenticated upgrade checkpoint.
 - **Historical message authorization.** New messages use a domain-separated
-  version-2 signing form that binds the author to a roster head and carry a
-  founder acceptance certificate.
-  Receivers authorize the historical author key at that certified checkpoint,
-  recover unknown related heads with bounded roster sync, and reject unrelated
-  heads. Founder certificates preserve only the exact accepted message and can
-  migrate legacy message ids without changing their bytes or signatures;
-  uncertified removed-author history has no fallback.
+  version-2 signing form that binds the author to a roster head. Receivers
+  authorize the historical author key at that checkpoint, recover unknown
+  related heads with bounded roster sync, and reject unrelated heads. Legacy
+  message ids can be migrated without changing their bytes or signatures.
 
 - **Transactional roster persistence.** Roster mutations now serialize
   validation, SQLite entry/head/version/projection commits, and in-memory

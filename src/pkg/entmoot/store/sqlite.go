@@ -1681,8 +1681,12 @@ func notNilBytes(b []byte) []byte {
 
 // decodeMessage reconstructs a Message from its canonical_bytes. The canonical
 // encoding is the ground truth on disk; re-decoding it via encoding/json and
-// re-encoding through canonical.Encode produces byte-identical output, which
-// the shared test suite asserts.
+// re-encoding through canonical.Encode produces byte-identical output for rows
+// this build wrote, which the shared test suite asserts. Rows written before
+// the founder acceptance certificate was removed carry an extra `acceptance`
+// object; decoding drops it, so those rows do not round-trip byte-identically.
+// Nothing depends on that: ids and signatures derive from the signing form,
+// which never covered acceptance.
 func decodeMessage(canonBytes []byte) (entmoot.Message, error) {
 	var msg entmoot.Message
 	if err := json.Unmarshal(canonBytes, &msg); err != nil {

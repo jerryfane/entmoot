@@ -55,7 +55,7 @@ func TestThreePeerGossipSubPersistsAndEmitsOnce(t *testing.T) {
 		defer groups[i].Close()
 	}
 	time.Sleep(1500 * time.Millisecond)
-	message := signedAcceptedLiveMessage(t, identities[0], bindings[0].MemberID, rosterLog, groupID, 10_000, "valid")
+	message := signedLiveMessage(t, identities[0], bindings[0].MemberID, rosterLog, groupID, 10_000, "valid")
 	tampered := message
 	tampered.Content = []byte("malformed variant")
 	rawTampered, err := json.Marshal(tampered)
@@ -87,7 +87,7 @@ func TestThreePeerGossipSubPersistsAndEmitsOnce(t *testing.T) {
 	if err := rosterLog.Apply(removeEntry); err != nil {
 		t.Fatal(err)
 	}
-	afterRemoval := signedAcceptedLiveMessage(t, identities[0], bindings[0].MemberID, rosterLog, groupID, 11_000, "after removal")
+	afterRemoval := signedLiveMessage(t, identities[0], bindings[0].MemberID, rosterLog, groupID, 11_000, "after removal")
 	if _, err := groups[0].Publish(ctx, afterRemoval); err != nil {
 		t.Fatal(err)
 	}
@@ -155,7 +155,7 @@ func TestUnauthorizedPeerCannotJoinAuthorizedTopic(t *testing.T) {
 	}
 	defer outsiderSubscription.Cancel()
 	time.Sleep(1500 * time.Millisecond)
-	message := signedAcceptedLiveMessage(t, founder, founderBinding.MemberID, rosterLog, groupID, 20_000, "members only")
+	message := signedLiveMessage(t, founder, founderBinding.MemberID, rosterLog, groupID, 20_000, "members only")
 	if _, err := founderLive.Publish(ctx, message); err != nil {
 		t.Fatal(err)
 	}
@@ -224,7 +224,7 @@ func TestSharedRouterCarriesMultipleGroups(t *testing.T) {
 	time.Sleep(time.Second)
 	founderID := bindings[0].MemberID
 	for index, spec := range specs {
-		message := signedAcceptedLiveMessage(t, identities[0], founderID, spec.roster, spec.id, time.Now().UnixMilli(), spec.label)
+		message := signedLiveMessage(t, identities[0], founderID, spec.roster, spec.id, time.Now().UnixMilli(), spec.label)
 		if _, err := groups[0][index].Publish(ctx, message); err != nil {
 			t.Fatal(err)
 		}
@@ -256,7 +256,7 @@ func TestLocalPublishChargesAuthorizationOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer group.Close()
-	message := signedAcceptedLiveMessage(t, identity, binding.MemberID, rosterLog, groupID, time.Now().UnixMilli(), "one charge")
+	message := signedLiveMessage(t, identity, binding.MemberID, rosterLog, groupID, time.Now().UnixMilli(), "one charge")
 	if _, err := group.Publish(ctx, message); err != nil {
 		t.Fatal(err)
 	}
@@ -352,7 +352,7 @@ func liveRoster(t *testing.T, identities []*keystore.Identity, bindings []Bindin
 	return groupID, result
 }
 
-func signedAcceptedLiveMessage(t *testing.T, identity *keystore.Identity, memberID entmoot.MemberID, rosterLog *roster.RosterLog, groupID entmoot.GroupID, timestamp int64, content string) entmoot.Message {
+func signedLiveMessage(t *testing.T, identity *keystore.Identity, memberID entmoot.MemberID, rosterLog *roster.RosterLog, groupID entmoot.GroupID, timestamp int64, content string) entmoot.Message {
 	t.Helper()
 	author := mustNodeInfo(t, identity.PublicKey)
 	signer, err := signing.NewLocalSigner(author, identity)
@@ -364,68 +364,53 @@ func signedAcceptedLiveMessage(t *testing.T, identity *keystore.Identity, member
 	if err != nil {
 		t.Fatal(err)
 	}
-	founder, ok := rosterLog.Founder()
-	if !ok || string(founder.EntmootPubKey) != string(identity.PublicKey) {
-		t.Fatal("test publisher must be founder")
-	}
-	message.Acceptance = &entmoot.MessageAcceptance{Version: 1, GroupID: groupID, MessageID: message.ID, RosterHead: head, Authority: founder}
-	payload, err := canonical.MessageAcceptanceSigningBytes(*message.Acceptance)
-	if err != nil {
-		t.Fatal(err)
-	}
-	message.Acceptance.Signature = identity.Sign(payload)
 	if err := VerifyLiveMessage(rosterLog, message, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	return message
 }
 
-func TestCurrentMemberObtainsFounderAcceptance(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+// Any current member publishes on its own signature. No other member has to be
+// reachable, which is what keeps a group usable when the founder is offline.
+func TestNonFounderMemberPublishesWithoutAnyOtherAuthority(t *testing.T) {
 	founderIdentity := mustIdentity(t)
 	memberIdentity := mustIdentity(t)
-	founderHost, founderBinding, err := NewHost(ctx, founderIdentity, libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"))
+	founderBinding, err := BindingFromPublicKey(founderIdentity.PublicKey)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer founderHost.Close()
-	memberHost, memberBinding, err := NewHost(ctx, memberIdentity, libp2p.NoListenAddrs)
+	memberBinding, err := BindingFromPublicKey(memberIdentity.PublicKey)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer memberHost.Close()
 	groupID, rosterLog := liveRoster(t, []*keystore.Identity{founderIdentity, memberIdentity}, []Binding{founderBinding, memberBinding})
-	server := AcceptanceServer{
-		Host:     founderHost,
-		Identity: founderIdentity,
-		Roster: func(candidate entmoot.GroupID) (*roster.RosterLog, bool) {
-			return rosterLog, candidate == groupID
-		},
-	}
-	if err := server.Install(); err != nil {
-		t.Fatal(err)
-	}
 	author := mustNodeInfo(t, memberIdentity.PublicKey)
 	signer, err := signing.NewLocalSigner(author, memberIdentity)
 	if err != nil {
 		t.Fatal(err)
 	}
 	head := rosterLog.Head()
-	message, err := signer.SignMessage(ctx, entmoot.Message{
+	message, err := signer.SignMessage(context.Background(), entmoot.Message{
 		Version: 2, GroupID: groupID, Timestamp: time.Now().UnixMilli(),
 		Topics: []string{"live"}, Content: []byte("member authored"), RosterHead: &head,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	acceptance, err := RequestMessageAcceptance(ctx, memberHost, peer.AddrInfo{ID: founderHost.ID(), Addrs: founderHost.Addrs()}, message)
+	if err := VerifyLiveMessage(rosterLog, message, time.Now()); err != nil {
+		t.Fatalf("member message did not verify: %v", err)
+	}
+	// Removal is the moderation lever: once off the roster the same message
+	// stops verifying.
+	removal, err := rosterLog.SignEntry(founderIdentity, "remove", author, nil, 9_000)
 	if err != nil {
 		t.Fatal(err)
 	}
-	message.Acceptance = &acceptance
-	if err := VerifyLiveMessage(rosterLog, message, time.Now()); err != nil {
-		t.Fatalf("accepted member message did not verify: %v", err)
+	if err := rosterLog.Apply(removal); err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifyLiveMessage(rosterLog, message, time.Now()); err == nil {
+		t.Fatal("removed member still authorised to publish")
 	}
 }
 

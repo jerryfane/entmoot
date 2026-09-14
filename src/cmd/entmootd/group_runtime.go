@@ -138,16 +138,6 @@ func newGroupRuntime(cfg groupRuntimeConfig) (*groupRuntime, error) {
 		_ = liveRouter.Close()
 		return nil, err
 	}
-	acceptance := &libp2ptransport.AcceptanceServer{
-		Host:     cfg.Host,
-		Identity: cfg.Identity,
-		Roster:   r.rosterForGroup,
-	}
-	if err := acceptance.Install(); err != nil {
-		_ = liveRouter.Close()
-		_ = admission.Close()
-		return nil, err
-	}
 	enrollment := &libp2ptransport.EnrollmentServer{
 		Admission: admission.BootstrapAdmission,
 		Enroll:    r.enroll,
@@ -219,36 +209,6 @@ func (r *groupRuntime) enroll(_ context.Context, capability entmoot.BootstrapCap
 		return libp2ptransport.EnrollmentResponse{}, err
 	}
 	return libp2ptransport.EnrollmentResponse{RosterHead: session.roster.Head(), Entries: session.roster.Entries()}, nil
-}
-func (r *groupRuntime) AcceptMessage(ctx context.Context, groupID entmoot.GroupID, message entmoot.Message) (entmoot.MessageAcceptance, error) {
-	r.mu.RLock()
-	session, ok := r.sessions[groupID]
-	r.mu.RUnlock()
-	if !ok {
-		return entmoot.MessageAcceptance{}, errors.New("group runtime: unknown group")
-	}
-	founder, ok := session.roster.Founder()
-	if !ok || founder.MemberID == nil {
-		return entmoot.MessageAcceptance{}, errors.New("group runtime: founder unavailable")
-	}
-	if *founder.MemberID == r.binding.MemberID {
-		return libp2ptransport.SignMessageAcceptance(r.identity, founder, message)
-	}
-	founderPeerID, err := peer.Decode(founder.PeerID)
-	if err != nil {
-		return entmoot.MessageAcceptance{}, fmt.Errorf("group runtime: decode founder peer id: %w", err)
-	}
-	remote := peer.AddrInfo{ID: founderPeerID, Addrs: r.host.Peerstore().Addrs(founderPeerID)}
-	acceptance, err := libp2ptransport.RequestMessageAcceptance(ctx, r.host, remote, message)
-	if err != nil {
-		return entmoot.MessageAcceptance{}, err
-	}
-	candidate := message
-	candidate.Acceptance = &acceptance
-	if err := libp2ptransport.VerifyLiveMessage(session.roster, candidate, time.Now()); err != nil {
-		return entmoot.MessageAcceptance{}, fmt.Errorf("group runtime: verify founder acceptance: %w", err)
-	}
-	return acceptance, nil
 }
 
 func (r *groupRuntime) AddLocalGroup(ctx context.Context, groupID entmoot.GroupID) (*groupSession, bool, error) {
