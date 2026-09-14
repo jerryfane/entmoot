@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/libp2p/go-libp2p/core/host"
@@ -207,6 +208,9 @@ type keeperSyncState struct {
 	page          *HistorySyncResponse
 	offset        int
 	missingBodies int
+	// batch shrinks when a keeper refuses a body page, so a peer running an
+	// older server that cannot truncate still makes progress.
+	batch int
 }
 
 type KeeperAvailability string
@@ -347,7 +351,10 @@ func syncFromKeeper(ctx context.Context, h host.Host, groupID entmoot.GroupID, k
 				progress.BudgetExhausted = true
 				return nil
 			}
-			end := min(cursor.offset+maxHistoryBodyItems, len(listed.IDs))
+			if cursor.batch <= 0 || cursor.batch > maxHistoryBodyItems {
+				cursor.batch = maxHistoryBodyItems
+			}
+			end := min(cursor.offset+cursor.batch, len(listed.IDs))
 			missing := make([]entmoot.MessageID, 0, end-cursor.offset)
 			for _, id := range listed.IDs[cursor.offset:end] {
 				has, err := destination.Has(ctx, groupID, id)
@@ -368,6 +375,14 @@ func syncFromKeeper(ctx context.Context, h host.Host, groupID entmoot.GroupID, k
 				GroupID:   groupID, Mode: "bodies", IDs: missing,
 			})
 			if err != nil {
+				// Shrink on a refused page and on a transport failure alike: a
+				// relay circuit budget smaller than the page cap cuts the stream
+				// mid-response, and retrying the same size would never finish.
+				// Typed server denials keep their error.
+				if (bodies.Error == SyncResourceExhausted || bodies.Error == "") && cursor.batch > 1 {
+					cursor.batch /= 2
+					continue
+				}
 				return err
 			}
 			progress.TransferredBytes += encodedJSONSize(bodies) + 1
@@ -399,7 +414,25 @@ func syncFromKeeper(ctx context.Context, h host.Host, groupID entmoot.GroupID, k
 					progress.Inserted++
 				}
 			}
-			cursor.offset = end
+			// Advance only past the identifiers the keeper accounted for. A
+			// truncated page leaves the rest for the next request.
+			served := len(bodies.Messages) + len(bodies.Missing)
+			if served >= len(missing) {
+				cursor.offset = end
+				continue
+			}
+			if served == 0 {
+				return errors.New("libp2p: keeper served no body for a requested message")
+			}
+			remaining := served
+			position := cursor.offset
+			for position < end && remaining > 0 {
+				if slices.ContainsFunc(missing, func(id entmoot.MessageID) bool { return id == listed.IDs[position] }) {
+					remaining--
+				}
+				position++
+			}
+			cursor.offset = position
 		}
 		cursor.page = nil
 		if !listed.HasMore {
