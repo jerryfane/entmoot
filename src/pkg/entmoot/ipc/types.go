@@ -237,6 +237,13 @@ type MemberRemoveResp struct {
 	// bearer invites. They name no target, so a removal cannot void them and
 	// whoever holds one can still join until it is revoked or expires.
 	OutstandingOpenInvites []string `json:"outstanding_open_invites,omitempty"`
+	// OutstandingESPOpenInvites counts ESP-hosted open-invite tokens still
+	// redeemable for this group. They are a second bearer path and are revoked
+	// through the ESP API, not by a roster change.
+	OutstandingESPOpenInvites int `json:"outstanding_esp_open_invites"`
+	// InviteRevocationError reports that the removal was applied but its
+	// invite cleanup failed, so the caller knows to revoke by hand.
+	InviteRevocationError string `json:"invite_revocation_error,omitempty"`
 }
 
 type GroupDeactivateReq struct {

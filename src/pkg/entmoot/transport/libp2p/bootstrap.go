@@ -48,18 +48,24 @@ func bootstrapSigningBytes(capability BootstrapCapability) ([]byte, error) {
 	return append([]byte(bootstrapCapabilityDomain), payload...), nil
 }
 
-// SignBootstrapCapability binds the grant to the issuing identity. An open
-// invite carries no target identity and is redeemable by any holder while uses
-// remain.
-func SignBootstrapCapability(founder *keystore.Identity, capability *BootstrapCapability) error {
-	if founder == nil || capability == nil {
-		return errors.New("libp2p: founder and capability are required")
+// SignBootstrapCapability binds the grant to the issuing identity: the founder,
+// or the delegated admin named in Issuer. An open invite carries no target
+// identity and is redeemable by any holder while uses remain.
+func SignBootstrapCapability(issuer *keystore.Identity, capability *BootstrapCapability) error {
+	if issuer == nil || capability == nil {
+		return errors.New("libp2p: issuer and capability are required")
 	}
-	if !bytes.Equal(founder.PublicKey, capability.Founder.EntmootPubKey) {
-		return errors.New("libp2p: capability founder does not match signing key")
+	authority := capability.SigningAuthority()
+	if !bytes.Equal(issuer.PublicKey, authority.EntmootPubKey) {
+		return errors.New("libp2p: capability signing authority does not match signing key")
 	}
 	if err := entmoot.ValidateOperationalMemberInfo(capability.Founder); err != nil {
 		return fmt.Errorf("libp2p: invalid capability founder: %w", err)
+	}
+	if capability.Issuer != nil {
+		if err := entmoot.ValidateOperationalMemberInfo(*capability.Issuer); err != nil {
+			return fmt.Errorf("libp2p: invalid capability issuer: %w", err)
+		}
 	}
 	if capability.MaxUses < 0 {
 		return errors.New("libp2p: capability max uses cannot be negative")
@@ -81,7 +87,7 @@ func SignBootstrapCapability(founder *keystore.Identity, capability *BootstrapCa
 	if err != nil {
 		return err
 	}
-	capability.Signature = founder.Sign(payload)
+	capability.Signature = issuer.Sign(payload)
 	return nil
 }
 
@@ -101,6 +107,11 @@ func VerifyBootstrapCapability(capability BootstrapCapability, remotePeer peer.I
 	if err := entmoot.ValidateMemberInfo(capability.Founder); err != nil {
 		return fmt.Errorf("%w: invalid founder: %v", ErrBootstrapDenied, err)
 	}
+	if capability.Issuer != nil {
+		if err := entmoot.ValidateMemberInfo(*capability.Issuer); err != nil {
+			return fmt.Errorf("%w: invalid issuer: %v", ErrBootstrapDenied, err)
+		}
+	}
 	if capability.IsOpenInvite() {
 		if capability.TargetMemberID != (entmoot.MemberID{}) || capability.TargetPeerID != "" {
 			return fmt.Errorf("%w: open invite carries a partial target identity", ErrBootstrapDenied)
@@ -118,8 +129,9 @@ func VerifyBootstrapCapability(capability BootstrapCapability, remotePeer peer.I
 	if err != nil {
 		return fmt.Errorf("%w: encode capability: %v", ErrBootstrapDenied, err)
 	}
-	if len(capability.Founder.EntmootPubKey) != ed25519.PublicKeySize || !keystore.Verify(capability.Founder.EntmootPubKey, payload, capability.Signature) {
-		return fmt.Errorf("%w: invalid founder signature", ErrBootstrapDenied)
+	authority := capability.SigningAuthority()
+	if len(authority.EntmootPubKey) != ed25519.PublicKeySize || !keystore.Verify(authority.EntmootPubKey, payload, capability.Signature) {
+		return fmt.Errorf("%w: invalid issuer signature", ErrBootstrapDenied)
 	}
 	return nil
 }

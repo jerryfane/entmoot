@@ -191,14 +191,19 @@ func (r *groupRuntime) enroll(_ context.Context, capability entmoot.BootstrapCap
 		return libp2ptransport.EnrollmentResponse{}, libp2ptransport.RejectEnrollment(
 			libp2ptransport.EnrollRejectUnknownGroup, "group %s is not served here", capability.GroupID.String())
 	}
-	founder, ok := session.roster.Founder()
-	if !ok || !bytes.Equal(founder.EntmootPubKey, r.identity.PublicKey) || founder.MemberID == nil || *founder.MemberID != r.binding.MemberID {
+	if !session.roster.CanAdminister(r.binding.MemberID) {
 		return libp2ptransport.EnrollmentResponse{}, libp2ptransport.RejectEnrollment(
 			libp2ptransport.EnrollRejectNotIssuer, "local identity cannot sign roster changes for this group")
 	}
-	if capability.Founder.MemberID == nil || *capability.Founder.MemberID != *founder.MemberID || !bytes.Equal(capability.Founder.EntmootPubKey, founder.EntmootPubKey) {
-		return libp2ptransport.EnrollmentResponse{}, libp2ptransport.RejectEnrollment(
-			libp2ptransport.EnrollRejectIssuerMismatch, "invite issuer is not this group's founder")
+	// The joiner pins Founder as the group's anchor, so it must be this
+	// group's real founder. The signature was already verified against the
+	// signing authority; binding that key to a member who may currently
+	// administer the group is what turns it into authority.
+	if err := verifyInviteAnchor(session.roster, capability.Founder); err != nil {
+		return libp2ptransport.EnrollmentResponse{}, err
+	}
+	if err := verifyInviteIssuer(session.roster, capability.SigningAuthority()); err != nil {
+		return libp2ptransport.EnrollmentResponse{}, err
 	}
 	if applicant.MemberID == nil {
 		return libp2ptransport.EnrollmentResponse{}, libp2ptransport.RejectEnrollment(
@@ -240,6 +245,54 @@ func (r *groupRuntime) enroll(_ context.Context, capability entmoot.BootstrapCap
 	// named.
 	r.drainRosterAhead(context.Background(), session)
 	return libp2ptransport.EnrollmentResponse{RosterHead: session.roster.Head(), Entries: session.roster.Entries()}, nil
+}
+
+// verifyInviteIssuer requires the identity that signed an invite to be a
+// member who may currently administer the group: the founder or a delegated
+// admin. Demoting or removing an admin therefore voids its outstanding
+// invites.
+func verifyInviteIssuer(groupRoster *roster.RosterLog, issuer entmoot.NodeInfo) error {
+	issuerMemberID, err := entmoot.ResolvedMemberID(issuer)
+	if err != nil {
+		return libp2ptransport.RejectEnrollment(
+			libp2ptransport.EnrollRejectIssuerMismatch, "invite issuer identity is incomplete")
+	}
+	if !groupRoster.CanAdminister(issuerMemberID) {
+		return libp2ptransport.RejectEnrollment(
+			libp2ptransport.EnrollRejectIssuerMismatch, "invite issuer %s cannot administer this group", issuerMemberID.String())
+	}
+	known, found := groupRoster.MemberInfoByID(issuerMemberID)
+	if found {
+		if !bytes.Equal(known.EntmootPubKey, issuer.EntmootPubKey) {
+			return libp2ptransport.RejectEnrollment(
+				libp2ptransport.EnrollRejectIssuerMismatch, "invite issuer key does not match the roster record")
+		}
+		return nil
+	}
+	founder, ok := groupRoster.Founder()
+	if !ok || !bytes.Equal(founder.EntmootPubKey, issuer.EntmootPubKey) {
+		return libp2ptransport.RejectEnrollment(
+			libp2ptransport.EnrollRejectIssuerMismatch, "invite issuer is not a member of this group")
+	}
+	return nil
+}
+
+// verifyInviteAnchor requires the invite's Founder field to be this group's
+// actual founder. It is the anchor the joiner pins before trusting a served
+// roster, so an invite naming anyone else must not enroll here even when a
+// delegated admin signed it.
+func verifyInviteAnchor(groupRoster *roster.RosterLog, claimed entmoot.NodeInfo) error {
+	founder, ok := groupRoster.Founder()
+	if !ok || founder.MemberID == nil {
+		return libp2ptransport.RejectEnrollment(
+			libp2ptransport.EnrollRejectIssuerMismatch, "group has no resolvable founder")
+	}
+	claimedMemberID, err := entmoot.ResolvedMemberID(claimed)
+	if err != nil || claimedMemberID != *founder.MemberID || !bytes.Equal(claimed.EntmootPubKey, founder.EntmootPubKey) {
+		return libp2ptransport.RejectEnrollment(
+			libp2ptransport.EnrollRejectIssuerMismatch, "invite does not name this group's founder as its anchor")
+	}
+	return nil
 }
 
 func (r *groupRuntime) AddLocalGroup(ctx context.Context, groupID entmoot.GroupID) (*groupSession, bool, error) {

@@ -60,6 +60,10 @@ type RosterLog struct {
 	membersByID map[entmoot.MemberID]entmoot.NodeInfo
 	// founder is set on Genesis; empty until then.
 	founder entmoot.NodeInfo
+	// admins is the current delegated-admin set, maintained by founder-signed
+	// policy_change entries. The founder is always an admin and is never
+	// listed here.
+	admins map[entmoot.MemberID]struct{}
 	// head is the id of the most-recently-applied entry; zero on empty log.
 	head entmoot.RosterEntryID
 
@@ -103,6 +107,7 @@ func New(groupID entmoot.GroupID) *RosterLog {
 		membersByID: make(map[entmoot.MemberID]entmoot.NodeInfo),
 		sinks:       make(map[*subscriber]struct{}),
 		logger:      slog.Default(),
+		admins:      make(map[entmoot.MemberID]struct{}),
 	}
 }
 
@@ -307,15 +312,27 @@ func (r *RosterLog) validateLocked(entry entmoot.RosterEntry) error {
 		return fmt.Errorf("%w: invalid op %q", entmoot.ErrRosterReject, entry.Op)
 	}
 
+	founderMemberID, founderErr := entmoot.ResolvedMemberID(founder)
 	if entry.Version == 0 {
 		if entry.Actor != founder.PilotNodeID {
 			return fmt.Errorf("%w: legacy actor %d is not founder %d", entmoot.ErrRosterReject, entry.Actor, founder.PilotNodeID)
 		}
-	} else {
-		founderMemberID, err := entmoot.ResolvedMemberID(founder)
-		if err != nil || entry.ActorMemberID == nil || *entry.ActorMemberID != founderMemberID {
-			return fmt.Errorf("%w: actor member is not founder", entmoot.ErrRosterReject)
+	} else if founderErr != nil || entry.ActorMemberID == nil {
+		return fmt.Errorf("%w: actor member is not resolvable", entmoot.ErrRosterReject)
+	}
+	// signerKey is the key the entry must verify against: the founder for
+	// legacy entries and founder-only operations, or a delegated admin.
+	signerKey := founder.EntmootPubKey
+	if entry.Version != 0 && *entry.ActorMemberID != founderMemberID {
+		actor, isAdmin := r.adminInfoLocked(*entry.ActorMemberID)
+		if !isAdmin {
+			return fmt.Errorf("%w: actor %s is not the founder or a delegated admin",
+				entmoot.ErrRosterReject, entry.ActorMemberID.String())
 		}
+		if err := r.validateAdminOpLocked(entry); err != nil {
+			return err
+		}
+		signerKey = actor.EntmootPubKey
 	}
 
 	// Verify the id the caller supplied matches what we would compute.
@@ -328,6 +345,15 @@ func (r *RosterLog) validateLocked(entry entmoot.RosterEntry) error {
 		return err
 	}
 
+	// An admin-set policy change must be readable, or peers would disagree
+	// about who can sign the next entry. Other policy types travel through the
+	// same op and are not interpreted here.
+	if entry.Op == "policy_change" && IsAdminPolicy(entry.Policy) {
+		if _, err := ParseAdminPolicy(entry.Policy); err != nil {
+			return fmt.Errorf("%w: %v", entmoot.ErrRosterReject, err)
+		}
+	}
+
 	if entry.Op == "add" && entry.Subject.MemberID != nil {
 		for _, member := range r.members {
 			if member.MemberID != nil && *member.MemberID == *entry.Subject.MemberID &&
@@ -337,13 +363,13 @@ func (r *RosterLog) validateLocked(entry entmoot.RosterEntry) error {
 		}
 	}
 
-	// Verify the signature against the founder's pubkey using the versioned
-	// signing form.
+	// Verify the signature against the acting authority's pubkey using the
+	// versioned signing form.
 	sigInput, err := canonical.RosterEntrySigningBytes(entry)
 	if err != nil {
 		return fmt.Errorf("%w: canonical encode: %v", entmoot.ErrRosterReject, err)
 	}
-	if !keystore.Verify(founder.EntmootPubKey, sigInput, entry.Signature) {
+	if !keystore.Verify(signerKey, sigInput, entry.Signature) {
 		return fmt.Errorf("%w: signature does not verify", entmoot.ErrRosterReject)
 	}
 
@@ -488,13 +514,92 @@ func (r *RosterLog) applyLocked(entry entmoot.RosterEntry) {
 		}
 		if memberID != nil {
 			delete(r.membersByID, *memberID)
+			// Losing membership loses delegated authority with it.
+			delete(r.admins, *memberID)
 		}
 		if stored.Subject.PilotNodeID != 0 || stored.Subject.MemberID == nil {
 			delete(r.members, stored.Subject.PilotNodeID)
 		}
 	case "policy_change":
-		// Policy changes do not alter the membership projection.
+		// Membership is unchanged; the admin set is replaced wholesale. A
+		// payload that does not parse was already rejected by validation, and
+		// a legacy entry carrying some other policy leaves the set alone.
+		policy, err := ParseAdminPolicy(stored.Policy)
+		if err != nil {
+			break
+		}
+		r.admins = make(map[entmoot.MemberID]struct{}, len(policy.Admins))
+		for _, admin := range policy.Admins {
+			r.admins[admin] = struct{}{}
+		}
 	}
+}
+
+// adminInfoLocked resolves a delegated admin's current member record. An admin
+// that is no longer a member has no authority. r.mu must be held.
+func (r *RosterLog) adminInfoLocked(memberID entmoot.MemberID) (entmoot.NodeInfo, bool) {
+	if _, delegated := r.admins[memberID]; !delegated {
+		return entmoot.NodeInfo{}, false
+	}
+	info, member := r.membersByID[memberID]
+	if !member {
+		return entmoot.NodeInfo{}, false
+	}
+	return info, true
+}
+
+// validateAdminOpLocked enforces what a delegated admin may do. Admins exist
+// so members can be invited and evicted without the founder present; changing
+// who holds that authority stays with the founder, and an admin cannot remove
+// another admin or the founder. r.mu must be held.
+func (r *RosterLog) validateAdminOpLocked(entry entmoot.RosterEntry) error {
+	switch entry.Op {
+	case "add":
+		return nil
+	case "remove":
+		subject, err := entmoot.ResolvedMemberID(entry.Subject)
+		if err != nil {
+			return fmt.Errorf("%w: remove subject is not resolvable", entmoot.ErrRosterReject)
+		}
+		if founderMemberID, err := entmoot.ResolvedMemberID(r.founder); err == nil && subject == founderMemberID {
+			return fmt.Errorf("%w: an admin cannot remove the founder", entmoot.ErrRosterReject)
+		}
+		if _, delegated := r.admins[subject]; delegated && subject != *entry.ActorMemberID {
+			return fmt.Errorf("%w: an admin cannot remove another admin", entmoot.ErrRosterReject)
+		}
+		return nil
+	case "policy_change":
+		return fmt.Errorf("%w: only the founder can change the admin set", entmoot.ErrRosterReject)
+	default:
+		return fmt.Errorf("%w: invalid op %q", entmoot.ErrRosterReject, entry.Op)
+	}
+}
+
+// Admins returns the current delegated-admin set sorted lexicographically. The
+// founder is always authoritative and is not listed.
+func (r *RosterLog) Admins() []entmoot.MemberID {
+	r.mu.RLock()
+	out := make([]entmoot.MemberID, 0, len(r.admins))
+	for id := range r.admins {
+		out = append(out, id)
+	}
+	r.mu.RUnlock()
+	sort.Slice(out, func(i, j int) bool {
+		return bytes.Compare(out[i][:], out[j][:]) < 0
+	})
+	return out
+}
+
+// CanAdminister reports whether memberID may currently sign membership
+// changes: the founder, or a delegated admin that is still a member.
+func (r *RosterLog) CanAdminister(memberID entmoot.MemberID) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if founderMemberID, err := entmoot.ResolvedMemberID(r.founder); err == nil && memberID == founderMemberID {
+		return true
+	}
+	_, ok := r.adminInfoLocked(memberID)
+	return ok
 }
 
 // IsMemberID reports whether the full-width identity is a current member.
