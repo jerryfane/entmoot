@@ -67,6 +67,11 @@ type RosterSyncRequest struct {
 	SnapshotToken string               `json:"snapshot_token,omitempty"`
 	AfterSequence uint64               `json:"after_sequence,omitempty"`
 	Limit         int                  `json:"limit,omitempty"`
+	// ReleaseSnapshot frees the named snapshot without asking for a page. A
+	// pull that stops at its per-round ceiling uses it so the peer's slot is
+	// free immediately: without it, four chained rounds exhaust the per-peer
+	// quota and a node catching up over several rounds stalls.
+	ReleaseSnapshot bool `json:"release_snapshot,omitempty"`
 	// HeadOnly asks for the committed head and nothing else. A head probe must
 	// not reserve a paging snapshot: it is repeated on every maintenance tick,
 	// and a reservation it never finishes would pin one of the server's few
@@ -324,6 +329,23 @@ func (s *SyncServer) handleRoster(stream network.Stream) {
 		response.Complete = true
 		response.CommittedHead = entries[len(entries)-1].ID
 		response.NextSequence = uint64(len(entries))
+		s.writeRoster(stream, response)
+		return
+	}
+	if request.ReleaseSnapshot {
+		// The caller is done with a snapshot it did not finish, which happens
+		// when a pull stops at its per-round ceiling. Releasing it frees the
+		// slot now instead of holding it for the full snapshot lifetime, so a
+		// node catching up over several rounds does not exhaust this peer's
+		// per-peer quota and stall.
+		if request.SnapshotToken != "" {
+			s.releaseSnapshot(request.SnapshotToken)
+		}
+		response.Complete = true
+		if len(entries) > 0 {
+			response.CommittedHead = entries[len(entries)-1].ID
+			response.NextSequence = uint64(len(entries))
+		}
 		s.writeRoster(stream, response)
 		return
 	}

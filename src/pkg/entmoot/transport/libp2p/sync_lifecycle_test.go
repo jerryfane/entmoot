@@ -452,6 +452,19 @@ func TestRosterPullCeilingBoundsTheDeltaNotTheChainLength(t *testing.T) {
 		t.Fatalf("catch-up produced %d entries ending %s, want %d ending %s",
 			len(held), held[len(held)-1].ID, len(chain), chain[len(chain)-1].ID)
 	}
+
+	// The unfinished round must have handed its snapshot back, or chaining
+	// rounds would exhaust the peer's per-peer quota: four rounds would pin
+	// all four slots for the snapshot lifetime and a node further behind would
+	// stall instead of converging.
+	for i := 0; i < maxPeerSnapshots; i++ {
+		page, err := RequestRosterPage(ctx, clientHost, remote, RosterSyncRequest{
+			Version: 2, RequestID: fmt.Sprintf("slot-%d", i), GroupID: groupID, Limit: 1,
+		})
+		if err != nil || page.Complete {
+			t.Fatalf("slot %d was not free after the chained pull: page=%+v err=%v", i, page, err)
+		}
+	}
 }
 
 // A peer asking for entries past the end of our chain is not making a

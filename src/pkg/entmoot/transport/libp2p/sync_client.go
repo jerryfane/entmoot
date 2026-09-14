@@ -166,6 +166,10 @@ func FetchRosterUpdates(ctx context.Context, h host.Host, remote peer.AddrInfo, 
 			if _, err := ValidateRosterChain(groupID, local[0].Subject, all[len(all)-1].ID, all); err != nil {
 				return nil, false, err
 			}
+			// Hand the unfinished snapshot back, so chaining rounds does not
+			// exhaust the peer's per-peer quota. A peer that does not know the
+			// field keeps it until it expires, exactly as before.
+			releaseRosterSnapshot(ctx, h, remote, groupID, token)
 			return append([]entmoot.RosterEntry(nil), all[len(local):]...), false, nil
 		}
 	}
@@ -579,3 +583,20 @@ func encodedJSONSize(value any) int {
 // MaxRosterSyncEntries reports the per-round pull ceiling. Callers that have to
 // chain several pulls, such as fork repair, use it to size their own bounds.
 func MaxRosterSyncEntries() int { return maxRosterSyncEntries }
+
+// releaseRosterSnapshot tells a peer we will not finish a paged pull, so it can
+// free the slot now rather than at expiry. Best effort: an older peer does not
+// know the field and keeps the snapshot until it expires, which is the
+// behaviour before this existed.
+func releaseRosterSnapshot(ctx context.Context, h host.Host, remote peer.AddrInfo, groupID entmoot.GroupID, token string) {
+	if token == "" {
+		return
+	}
+	_, _ = RequestRosterPage(ctx, h, remote, RosterSyncRequest{
+		Version:         2,
+		RequestID:       fmt.Sprintf("roster-release-%d", time.Now().UnixNano()),
+		GroupID:         groupID,
+		SnapshotToken:   token,
+		ReleaseSnapshot: true,
+	})
+}
