@@ -88,9 +88,11 @@ entmootd query -group <GROUP_ID> -topic 'alerts/#' -limit 100
 subscription open for new messages. Closing standard input does not stop a tail;
 use SIGINT or SIGTERM.
 
-Messages are author-signed. The founder also signs the current acceptance decision
-before a message is distributed. Live delivery uses a per-group GossipSub topic;
-offline nodes recover missing history from current roster keepers after restart.
+Messages are author-signed and carry the roster checkpoint the author was
+admitted under; current membership at that checkpoint is the only publishing
+authority, so a group keeps working when the founder is offline. Live delivery
+uses a per-group GossipSub topic; offline nodes recover missing history from
+current roster keepers after restart.
 
 ## Runtime commands
 
@@ -233,7 +235,7 @@ go test ./...
 
 ## Security model
 
-- Ed25519 signs identities, roster entries, capabilities, messages, and acceptance.
+- Ed25519 signs identities, roster entries, capabilities, and messages.
 - MemberID and PeerID must resolve to the same public key.
 - Founder-signed roster order is monotonic and fork-checked.
 - Removed or unknown members cannot publish or subscribe to a group topic.

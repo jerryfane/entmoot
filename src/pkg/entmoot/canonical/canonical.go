@@ -16,8 +16,8 @@
 //
 // MessageID computes sha256 over MessageSigningBytes. Legacy messages keep
 // their exact canonical bytes; version-2 messages use a domain-separated form
-// that binds version, group, roster head, author, and content fields. ID,
-// Signature, and Acceptance never contribute.
+// that binds version, group, roster head, author, and content fields. ID and
+// Signature never contribute.
 package canonical
 
 import (
@@ -31,9 +31,8 @@ import (
 )
 
 const (
-	messageV2Domain           = "entmoot/message/v2\x00"
-	rosterEntryV2Domain       = "entmoot/roster-entry/v2\x00"
-	messageAcceptanceV1Domain = "entmoot/message-acceptance/v1\x00"
+	messageV2Domain     = "entmoot/message/v2\x00"
+	rosterEntryV2Domain = "entmoot/roster-entry/v2\x00"
 )
 
 // Encode returns the deterministic canonical JSON encoding of v.
@@ -162,14 +161,12 @@ func (s sortedObject) MarshalJSON() ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// MessageSigningBytes returns the exact author-signed form. Acceptance is
-// attached later by the roster authority and therefore excluded from both the
-// author signature and content-addressed message ID.
+// MessageSigningBytes returns the exact author-signed form. The identifier and
+// the signature itself are excluded so the form is stable.
 func MessageSigningBytes(m entmoot.Message) ([]byte, error) {
 	signing := m
 	signing.ID = entmoot.MessageID{}
 	signing.Signature = nil
-	signing.Acceptance = nil
 	encoded, err := Encode(signing)
 	if err != nil {
 		return nil, err
@@ -194,21 +191,6 @@ func MessageID(m entmoot.Message) entmoot.MessageID {
 		panic(fmt.Sprintf("canonical.MessageID: encoding message failed: %v", err))
 	}
 	return entmoot.MessageID(sha256.Sum256(encoded))
-}
-
-// MessageAcceptanceSigningBytes returns the domain-separated bytes signed by
-// the roster authority for an acceptance certificate.
-func MessageAcceptanceSigningBytes(a entmoot.MessageAcceptance) ([]byte, error) {
-	signing := a
-	signing.Signature = nil
-	encoded, err := Encode(signing)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]byte, 0, len(messageAcceptanceV1Domain)+len(encoded))
-	out = append(out, messageAcceptanceV1Domain...)
-	out = append(out, encoded...)
-	return out, nil
 }
 
 // RosterEntrySigningBytes returns the exact bytes covered by a roster

@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Membership is the only publishing authority.** Messages no longer carry a
+  founder-signed acceptance certificate, and the `/entmoot/acceptance/2`
+  protocol is removed. A member publishes on its own signature at a named
+  roster head; receivers authorize the author against the roster, and removal
+  from the roster is the moderation lever. This means a group keeps accepting
+  new messages while the founder is offline, which was previously impossible.
+  It is a wire break with no compatibility path: version-2 messages carrying an
+  `acceptance` field are rejected by the strict live and sync decoders, so all
+  nodes in a group must run this build. Stored history is unaffected because
+  acceptance never contributed to message signing bytes or message ids.
+
 ### Fixed
 
 - **Controlled-relay recovery and privacy.** Configured hosts now renew relay

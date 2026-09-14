@@ -112,7 +112,7 @@ func TestFreshMemberEnrollsAcrossLibp2pWithoutPilot(t *testing.T) {
 		t.Fatal(err)
 	}
 	time.Sleep(2 * time.Second)
-	message := signedAcceptedLiveMessage(t, founderIdentity, *founderInfo.MemberID, rosterLog, groupID, 10_001, "enrolled-live")
+	message := signedLiveMessage(t, founderIdentity, *founderInfo.MemberID, rosterLog, groupID, 10_001, "enrolled-live")
 	if _, err := founderLive.Publish(ctx, message); err != nil {
 		t.Fatal(err)
 	}
