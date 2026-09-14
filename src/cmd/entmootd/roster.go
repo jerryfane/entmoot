@@ -355,10 +355,9 @@ func setupRosterWriter(gf *globalFlags, command string, gid entmoot.GroupID, fou
 	}, exitOK, true
 }
 
-// cmdRosterAdd admits a new member to a group's roster. Founder-only: the
-// local identity must match the declared founder. This offline maintenance
-// command acquires the roster writer lease and fails promptly while the daemon
-// owns it.
+// cmdRosterAdd admits a new member to a group's roster. The founder or a
+// delegated admin may sign it. This offline maintenance command acquires the
+// roster writer lease and fails promptly while the daemon owns it.
 func cmdRosterAdd(gf *globalFlags, args []string) int {
 	fs := flag.NewFlagSet("roster add", flag.ContinueOnError)
 	memberFlags := addRosterMemberFlags(fs)
@@ -419,8 +418,9 @@ func cmdRosterAdd(gf *globalFlags, args []string) int {
 	return exitOK
 }
 
-// cmdRosterRemove removes an existing member from a group's roster. Founder
-// only, matching roster add and the ESP member_remove operation.
+// cmdRosterRemove removes an existing member from a group's roster. The
+// founder or a delegated admin may sign it, matching roster add and the ESP
+// member_remove operation; only the founder may remove an admin.
 func cmdRosterRemove(gf *globalFlags, args []string) int {
 	fs := flag.NewFlagSet("roster remove", flag.ContinueOnError)
 	memberFlags := addRosterMemberFlags(fs)
@@ -454,7 +454,7 @@ func cmdRosterRemove(gf *globalFlags, args []string) int {
 		fmt.Fprintln(os.Stderr, "roster remove: cannot remove group founder")
 		return exitInvalidArgument
 	}
-	if err := applyFounderRosterRemove(ctx.setup.identity, ctx.roster, ctx.founder, existing); err != nil {
+	if err := applyRosterRemove(ctx.setup.identity, ctx.roster, ctx.founder, existing); err != nil {
 		if errors.Is(err, entmoot.ErrRosterReject) {
 			fmt.Fprintf(os.Stderr, "roster remove: %v\n", err)
 			return exitInvalidArgument

@@ -1666,8 +1666,7 @@ func (s *ipcServer) handleInviteAuthorityCheck(ctx context.Context, c net.Conn, 
 		})
 		return
 	}
-	founder, ok := sess.roster.Founder()
-	if !ok {
+	if _, ok := sess.roster.Founder(); !ok {
 		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
 			Type:    "error",
 			Code:    ipc.CodeGroupNotFound,
@@ -1676,12 +1675,12 @@ func (s *ipcServer) handleInviteAuthorityCheck(ctx context.Context, c net.Conn, 
 		})
 		return
 	}
-	if founder.MemberID == nil || *founder.MemberID != s.memberID || !bytes.Equal(founder.EntmootPubKey, s.identity.PublicKey) {
+	if !sess.roster.CanAdminister(s.memberID) {
 		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
 			Type:    "error",
 			Code:    ipc.CodeNotMember,
 			GroupID: &gid,
-			Message: "invite_create requires the local founder identity",
+			Message: "invite creation requires the founder or a delegated admin identity",
 		})
 		return
 	}
@@ -1759,7 +1758,7 @@ func (s *ipcServer) handleMemberRemove(ctx context.Context, c net.Conn, req *ipc
 		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeConflict, GroupID: &gid, Message: "target identity does not match current roster"})
 		return
 	}
-	if err := applyFounderRosterRemove(s.identity, sess.roster, founder, existing); err != nil {
+	if err := applyRosterRemove(s.identity, sess.roster, founder, existing); err != nil {
 		unlock()
 		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInternal, GroupID: &gid, Message: err.Error()})
 		return
@@ -1789,29 +1788,40 @@ func (s *ipcServer) handleMemberRemove(ctx context.Context, c net.Conn, req *ipc
 			nonces = append(nonces, base64.StdEncoding.EncodeToString(record.Nonce[:]))
 		}
 	}
-	espOpen := 0
 	// metadataStore is the narrow interface the join path needs; the concrete
-	// ESP state store also lists open-invite tokens.
-	if lister, ok := s.metadataStore.(espOpenInviteLister); ok && lister != nil {
+	// ESP state store also lists open-invite tokens. A count of zero must mean
+	// "none outstanding", never "could not look", so an unreadable or absent
+	// store leaves the count nil and names the reason.
+	var espOpen *int
+	espError := ""
+	lister, ok := s.metadataStore.(espOpenInviteLister)
+	switch {
+	case !ok || lister == nil:
+		espError = "esp open-invite store is unavailable on this daemon"
+	default:
 		records, err := lister.ListOpenInvitesByGroup(ctx, gid)
 		if err != nil {
+			espError = "read esp open invites: " + err.Error()
 			slog.Error("member_remove: read esp open invites", slog.String("err", err.Error()))
-		} else {
-			nowMS := time.Now().UnixMilli()
-			for _, record := range records {
-				if record.Revoked ||
-					(record.ExpiresAtMS > 0 && record.ExpiresAtMS <= nowMS) ||
-					(record.MaxUses > 0 && record.UseCount >= record.MaxUses) {
-					continue
-				}
-				espOpen++
-			}
+			break
 		}
+		nowMS := time.Now().UnixMilli()
+		espLive := 0
+		for _, record := range records {
+			if record.Revoked ||
+				(record.ExpiresAtMS > 0 && record.ExpiresAtMS <= nowMS) ||
+				(record.MaxUses > 0 && record.UseCount >= record.MaxUses) {
+				continue
+			}
+			espLive++
+		}
+		espOpen = &espLive
 	}
 	_ = ipc.EncodeAndWrite(c, &ipc.MemberRemoveResp{
 		Status: "removed", GroupID: gid, RosterHead: head, Members: members,
 		RevokedInvites: revoked, OutstandingOpenInvites: nonces,
 		OutstandingESPOpenInvites: espOpen,
+		ESPOpenInvitesError:       espError,
 		InviteRevocationError:     revocationError,
 	})
 }

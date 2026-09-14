@@ -1981,7 +1981,8 @@ func (e espOperationExecutor) removeMember(ctx context.Context, req esphttp.Sign
 	}
 	// A removal only sticks if the invites that would readmit the member are
 	// gone, and bearer invites cannot be attributed, so the caller is told
-	// what remains rather than left to assume it is clean.
+	// what remains — including when a store could not be read, since a zero
+	// there would read as "nothing outstanding".
 	out := map[string]any{
 		"status":                       resp.Status,
 		"group_id":                     resp.GroupID,
@@ -1993,6 +1994,9 @@ func (e espOperationExecutor) removeMember(ctx context.Context, req esphttp.Sign
 	}
 	if resp.InviteRevocationError != "" {
 		out["invite_revocation_error"] = resp.InviteRevocationError
+	}
+	if resp.ESPOpenInvitesError != "" {
+		out["esp_open_invites_error"] = resp.ESPOpenInvitesError
 	}
 	return json.Marshal(out)
 }
@@ -2073,7 +2077,7 @@ func sha256Base64(data []byte) string {
 	return base64.StdEncoding.EncodeToString(sum[:])
 }
 
-func applyFounderRosterAdd(identity *keystore.Identity, rlog *roster.RosterLog, founder entmoot.NodeInfo, target entmoot.NodeInfo) error {
+func applyRosterAdd(identity *keystore.Identity, rlog *roster.RosterLog, founder entmoot.NodeInfo, target entmoot.NodeInfo) error {
 	now := time.Now().UnixMilli()
 	entries := rlog.Entries()
 	if len(entries) > 0 && now <= entries[len(entries)-1].Timestamp {
@@ -2092,7 +2096,7 @@ func applyFounderRosterAdd(identity *keystore.Identity, rlog *roster.RosterLog, 
 	return nil
 }
 
-func applyFounderRosterRemove(identity *keystore.Identity, rlog *roster.RosterLog, founder entmoot.NodeInfo, target entmoot.NodeInfo) error {
+func applyRosterRemove(identity *keystore.Identity, rlog *roster.RosterLog, founder entmoot.NodeInfo, target entmoot.NodeInfo) error {
 	now := time.Now().UnixMilli()
 	entries := rlog.Entries()
 	if len(entries) > 0 && now <= entries[len(entries)-1].Timestamp {

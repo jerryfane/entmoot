@@ -193,3 +193,40 @@ func TestUnrelatedPolicyChangeLeavesAdminSetAlone(t *testing.T) {
 		t.Fatal("an unreadable admin policy was accepted")
 	}
 }
+
+// A policy payload this build cannot read must never leave delegated
+// authority standing: validation refuses it, and a log loaded without
+// validation reduces the admin set rather than keeping it.
+func TestUndecodablePolicyIsRefusedAndAuthorityReducing(t *testing.T) {
+	f := newAdminFixture(t)
+	_, admin := f.member(t)
+	f.grant(t, *admin.MemberID)
+
+	truncated := []byte(`{"type":"admins/v1","admins":[`)
+	if err := f.sign(t, f.founder, "policy_change", entmoot.NodeInfo{}, truncated); err == nil {
+		t.Fatal("a policy payload that is not valid JSON was accepted")
+	}
+	if !f.log.CanAdminister(*admin.MemberID) {
+		t.Fatal("a rejected entry changed the admin set")
+	}
+
+	// The same bytes reaching the projection without validation, as a log
+	// written by a broken writer would. This build cannot even sign such a
+	// payload (canonical encoding refuses it), so the entry is assembled by
+	// hand from a valid one.
+	valid, err := MarshalAdminPolicy([]entmoot.MemberID{*admin.MemberID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry, err := f.log.SignEntry(f.founder, "policy_change", entmoot.NodeInfo{}, valid, f.nextTime+50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry.Policy = truncated
+	f.log.mu.Lock()
+	f.log.applyLocked(entry)
+	f.log.mu.Unlock()
+	if f.log.CanAdminister(*admin.MemberID) {
+		t.Fatal("an unreadable policy left delegated authority standing")
+	}
+}

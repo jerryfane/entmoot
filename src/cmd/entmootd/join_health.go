@@ -22,6 +22,20 @@ type joinHealthSummary struct {
 	// for the same reason. Unlike the live buffer these are not held, so the
 	// count is what the most recent pass saw.
 	UnknownHeadMessages int `json:"unknown_head_messages"`
+	// RosterDivergence lists peers advertising a roster head this node holds
+	// no chain for and could not take. It is the visible symptom of a forked
+	// log, which retrying never repairs, so it belongs in status output and
+	// not only in the daemon log.
+	RosterDivergence []rosterDivergenceReport `json:"roster_divergence,omitempty"`
+}
+
+type rosterDivergenceReport struct {
+	GroupID    string `json:"group_id"`
+	PeerID     string `json:"peer_id"`
+	LocalHead  string `json:"local_head"`
+	RemoteHead string `json:"remote_head"`
+	Reason     string `json:"reason"`
+	SinceMS    int64  `json:"since_ms"`
 }
 
 func buildJoinHealthSummary(_ context.Context, runtime *groupRuntime, _ *store.SQLite, _ []byte) joinHealthSummary {
@@ -42,6 +56,7 @@ func buildJoinHealthSummary(_ context.Context, runtime *groupRuntime, _ *store.S
 			}
 			health.QuarantinedMessages += session.live.QuarantinedMessages()
 			health.UnknownHeadMessages += int(session.unknownHeads.Load())
+			health.RosterDivergence = append(health.RosterDivergence, session.rosterDivergenceReports(groupID)...)
 		}
 	}
 	return health

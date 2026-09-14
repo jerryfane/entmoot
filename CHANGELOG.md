@@ -27,9 +27,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Roster state travels between members, not just from the founder.** Every
   node now pulls roster entries from up to eight reachable members, founder
   first, and the founder pulls too. Without this, an admin-authored add or
-  removal stayed on one node and the group ran on two heads. A peer that
-  advertises a head this node cannot extend is reported as a roster divergence
-  rather than looking merely unreachable.
+  removal stayed on one node and the group ran on two heads. One full chain
+  pull per round, a per-peer exponential backoff (30s to 15m) after a pull
+  that cannot be taken, and a 4096-entry ceiling per pull bound what one
+  member can cost. A peer advertising a head this node cannot extend is
+  reported as `roster_divergence` in status output, with both heads, the
+  reason and when it started, not just logged. Enrollment retries its own
+  entry against a moved head instead of failing, so a concurrent write by
+  another admin costs a retry.
+- **Known limitation: concurrent roster authors can still fork the log.** The
+  roster is strictly linear (one parent, must be the current head), so if two
+  authorised signers commit against the same head while partitioned, both
+  sides keep their own entry and neither can accept the other's. Retries and
+  the pre-apply retry above shrink the window to the write itself, and
+  `roster_divergence` makes a split visible, but there is no automatic repair
+  yet: an operator has to re-issue the losing change. `roster admin` is also
+  offline maintenance only, like `roster add|remove`.
 - **Removal reporting is complete and survives cleanup failure.** `roster
   remove`, the IPC member-remove path and the ESP member_remove operation now
   report the removal result even when invite revocation fails, carrying

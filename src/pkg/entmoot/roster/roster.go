@@ -20,6 +20,7 @@ package roster
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -353,12 +354,19 @@ func (r *RosterLog) validateLocked(entry entmoot.RosterEntry) error {
 		return err
 	}
 
-	// An admin-set policy change must be readable, or peers would disagree
-	// about who can sign the next entry. Other policy types travel through the
-	// same op and are not interpreted here.
-	if entry.Op == "policy_change" && IsAdminPolicy(entry.Policy) {
-		if _, err := ParseAdminPolicy(entry.Policy); err != nil {
-			return fmt.Errorf("%w: %v", entmoot.ErrRosterReject, err)
+	// A version-2 policy payload must be readable JSON, and an admin-set
+	// policy must parse: otherwise peers would disagree about who can sign the
+	// next entry, and an undecodable payload would silently count as "some
+	// other policy". Other policy types travel through the same op and are not
+	// interpreted here.
+	if entry.Op == "policy_change" && entry.Version != 0 {
+		if len(entry.Policy) == 0 || !json.Valid(entry.Policy) {
+			return fmt.Errorf("%w: policy_change payload is not valid JSON", entmoot.ErrRosterReject)
+		}
+		if IsAdminPolicy(entry.Policy) {
+			if _, err := ParseAdminPolicy(entry.Policy); err != nil {
+				return fmt.Errorf("%w: %v", entmoot.ErrRosterReject, err)
+			}
 		}
 	}
 
@@ -531,17 +539,18 @@ func (r *RosterLog) applyLocked(entry entmoot.RosterEntry) {
 			delete(r.members, stored.Subject.PilotNodeID)
 		}
 	case "policy_change":
-		// Membership is unchanged. A policy of another type leaves the admin
-		// set alone; an admin policy replaces it wholesale. Apply-time
-		// validation rejects an unreadable admin policy, so reaching one here
-		// means the log was loaded without validation: fail closed to no
-		// admins rather than keeping an authority the bytes do not state.
-		if !IsAdminPolicy(stored.Policy) {
+		// Membership is unchanged. A readable policy of another type leaves the
+		// admin set alone; an admin policy replaces it wholesale. Anything this
+		// build cannot read is authority-reducing: validation rejects such
+		// entries, so reaching one here means the log was loaded without
+		// validation, and keeping delegated authority the bytes do not state
+		// would be the unsafe reading.
+		if len(stored.Policy) > 0 && !IsAdminPolicy(stored.Policy) && json.Valid(stored.Policy) {
 			break
 		}
 		policy, err := ParseAdminPolicy(stored.Policy)
 		if err != nil {
-			r.logger.Warn("roster: unreadable admin policy; clearing delegated admins",
+			r.logger.Warn("roster: unreadable policy_change; clearing delegated admins",
 				slog.String("entry_id", stored.ID.String()),
 				slog.String("err", err.Error()))
 			r.admins = make(map[entmoot.MemberID]struct{})

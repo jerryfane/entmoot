@@ -80,6 +80,22 @@ type groupSession struct {
 	// want of a roster checkpoint, kept so status output can show the gap.
 	unknownHeads atomic.Int64
 	peerRecords  *libp2ptransport.PeerRecordCache
+
+	// rosterBackoffMu guards rosterBackoff, which holds the earliest time this
+	// node will attempt another full roster pull from a peer. A peer whose
+	// advertised head does not extend ours is either forked or hostile; either
+	// way, re-downloading its chain every tick is wasted work.
+	rosterBackoffMu sync.Mutex
+	rosterBackoff   map[peer.ID]rosterBackoffState
+}
+
+type rosterBackoffState struct {
+	until      time.Time
+	failures   int
+	localHead  entmoot.RosterEntryID
+	remoteHead entmoot.RosterEntryID
+	reason     string
+	sinceMS    int64
 }
 type groupPolicyEnforcer struct {
 	mu          sync.Mutex
@@ -243,24 +259,36 @@ func (r *groupRuntime) enroll(_ context.Context, capability entmoot.BootstrapCap
 	}
 	target := entmoot.NodeInfo{EntmootPubKey: append([]byte(nil), applicant.EntmootPubKey...), MemberID: applicant.MemberID, PeerID: applicant.PeerID}
 
-	// Roster timestamps must grow strictly. Two people redeeming a multi-use
-	// invite in the same millisecond would otherwise make the second add
-	// unappliable.
-	timestamp := time.Now().UnixMilli()
-	if head := session.roster.HeadTimestamp(); timestamp <= head {
-		timestamp = head + 1
+	// Several nodes may author roster entries, and the log is strictly linear:
+	// an entry signed against a head that moved is rejected. Retry against the
+	// new head instead of failing, so a concurrent write by another admin costs
+	// a retry rather than a split.
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		// Roster timestamps must grow strictly. Two people redeeming a
+		// multi-use invite in the same millisecond would otherwise make the
+		// second add unappliable.
+		timestamp := time.Now().UnixMilli()
+		if head := session.roster.HeadTimestamp(); timestamp <= head {
+			timestamp = head + 1
+		}
+		entry, err := session.roster.SignEntry(r.identity, "add", target, nil, timestamp)
+		if err != nil {
+			return libp2ptransport.EnrollmentResponse{}, err
+		}
+		if err := session.roster.Apply(entry); err != nil {
+			lastErr = err
+			if errors.Is(err, entmoot.ErrRosterReject) {
+				continue
+			}
+			return libp2ptransport.EnrollmentResponse{}, err
+		}
+		// This node just advanced the head, which may be the head a held
+		// message named.
+		r.drainRosterAhead(context.Background(), session)
+		return libp2ptransport.EnrollmentResponse{RosterHead: session.roster.Head(), Entries: session.roster.Entries()}, nil
 	}
-	entry, err := session.roster.SignEntry(r.identity, "add", target, nil, timestamp)
-	if err != nil {
-		return libp2ptransport.EnrollmentResponse{}, err
-	}
-	if err := session.roster.Apply(entry); err != nil {
-		return libp2ptransport.EnrollmentResponse{}, err
-	}
-	// This node just advanced the head, which may be the head a held message
-	// named.
-	r.drainRosterAhead(context.Background(), session)
-	return libp2ptransport.EnrollmentResponse{RosterHead: session.roster.Head(), Entries: session.roster.Entries()}, nil
+	return libp2ptransport.EnrollmentResponse{}, lastErr
 }
 
 // verifyInviteIssuer requires the identity that signed an invite to be a
@@ -624,10 +652,85 @@ func (r *groupRuntime) pruneGroup(ctx context.Context, session *groupSession) {
 	}
 }
 
-// maxRosterSyncPeers bounds how many members one roster sync round dials.
-// Roster changes are rare and the chain is linear, so a handful of peers is
-// enough to converge without turning every tick into a fan-out.
-const maxRosterSyncPeers = 8
+const (
+	// maxRosterSyncPeers bounds how many members one roster sync round probes.
+	// Roster changes are rare and the chain is linear, so a handful of peers is
+	// enough to converge without turning every tick into a fan-out.
+	maxRosterSyncPeers = 8
+	// rosterSyncPullsPerRound bounds the full chain downloads one round may
+	// perform. Probing a head is one small request; pulling a chain is not, and
+	// a peer advertising an unknown head can otherwise make every tick expensive.
+	rosterSyncPullsPerRound = 1
+	// rosterSyncBackoffBase and rosterSyncBackoffMax bound how often a peer
+	// whose chain failed to extend ours is retried.
+	rosterSyncBackoffBase = 30 * time.Second
+	rosterSyncBackoffMax  = 15 * time.Minute
+)
+
+// rosterSyncReady reports whether this peer may be pulled from now.
+func (s *groupSession) rosterSyncReady(id peer.ID, now time.Time) bool {
+	s.rosterBackoffMu.Lock()
+	defer s.rosterBackoffMu.Unlock()
+	state, known := s.rosterBackoff[id]
+	return !known || now.After(state.until)
+}
+
+// noteRosterSyncFailure backs a peer off with exponential delay and records
+// why, so a forked or hostile member costs one pull per backoff window instead
+// of one per tick and an operator can see the cause.
+func (s *groupSession) noteRosterSyncFailure(id peer.ID, now time.Time, localHead, remoteHead entmoot.RosterEntryID, reason string) time.Duration {
+	s.rosterBackoffMu.Lock()
+	defer s.rosterBackoffMu.Unlock()
+	if s.rosterBackoff == nil {
+		s.rosterBackoff = make(map[peer.ID]rosterBackoffState)
+	}
+	state := s.rosterBackoff[id]
+	state.failures++
+	delay := rosterSyncBackoffBase << min(state.failures-1, 8)
+	if delay > rosterSyncBackoffMax {
+		delay = rosterSyncBackoffMax
+	}
+	state.until = now.Add(delay)
+	state.localHead = localHead
+	state.remoteHead = remoteHead
+	state.reason = reason
+	if state.sinceMS == 0 {
+		state.sinceMS = now.UnixMilli()
+	}
+	s.rosterBackoff[id] = state
+	return delay
+}
+
+func (s *groupSession) clearRosterSyncFailure(id peer.ID) {
+	s.rosterBackoffMu.Lock()
+	defer s.rosterBackoffMu.Unlock()
+	delete(s.rosterBackoff, id)
+}
+
+// rosterDivergenceReports describes peers this node could not take a chain
+// from. A single failure may be transient; one that persists across backoff
+// windows is a fork, and either way it is state an operator should see rather
+// than a log line that scrolls away.
+func (s *groupSession) rosterDivergenceReports(groupID entmoot.GroupID) []rosterDivergenceReport {
+	s.rosterBackoffMu.Lock()
+	defer s.rosterBackoffMu.Unlock()
+	if len(s.rosterBackoff) == 0 {
+		return nil
+	}
+	out := make([]rosterDivergenceReport, 0, len(s.rosterBackoff))
+	for id, state := range s.rosterBackoff {
+		out = append(out, rosterDivergenceReport{
+			GroupID:    groupID.String(),
+			PeerID:     id.String(),
+			LocalHead:  state.localHead.String(),
+			RemoteHead: state.remoteHead.String(),
+			Reason:     state.reason,
+			SinceMS:    state.sinceMS,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].PeerID < out[j].PeerID })
+	return out
+}
 
 // syncRoster pulls roster entries from the group's members. Any admin can
 // author membership changes, so pulling only from the founder would leave
@@ -638,7 +741,15 @@ func (r *groupRuntime) syncRoster(ctx context.Context, session *groupSession) {
 	if len(local) == 0 {
 		return
 	}
+	pulls := 0
 	for _, remote := range r.rosterSyncPeers(session) {
+		if pulls >= rosterSyncPullsPerRound {
+			return
+		}
+		now := time.Now()
+		if !session.rosterSyncReady(remote.ID, now) {
+			continue
+		}
 		syncCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		head, err := libp2ptransport.FetchRosterHead(syncCtx, r.host, remote, session.groupID)
 		if err != nil {
@@ -652,34 +763,41 @@ func (r *groupRuntime) syncRoster(ctx context.Context, session *groupSession) {
 		if session.roster.HasEntry(head) {
 			// Equal or behind: nothing to take from this peer.
 			cancel()
+			session.clearRosterSyncFailure(remote.ID)
 			continue
 		}
+		pulls++
 		updates, err := libp2ptransport.FetchRosterUpdates(syncCtx, r.host, remote, session.groupID, local)
 		cancel()
 		if err != nil {
-			// The peer advertises a head we do not hold and its chain does not
-			// extend ours: the log has forked, which no amount of retrying
-			// repairs. Say so loudly rather than looking merely offline.
-			r.logger.Warn("libp2p roster divergence",
+			delay := session.noteRosterSyncFailure(remote.ID, now, session.roster.Head(), head, "pull failed: "+err.Error())
+			// The peer advertises a head we do not hold and we could not take
+			// its chain. That is either a fork, which retrying never repairs,
+			// or a peer feeding us junk; both earn a backoff.
+			r.logger.Warn("libp2p roster pull failed",
 				slog.String("group_id", session.groupID.String()),
 				slog.String("peer_id", remote.ID.String()),
 				slog.String("local_head", session.roster.Head().String()),
 				slog.String("remote_head", head.String()),
+				slog.Duration("retry_after", delay),
 				slog.String("err", err.Error()))
 			continue
 		}
 		applied := 0
 		for _, entry := range updates {
 			if err := session.roster.Apply(entry); err != nil {
+				delay := session.noteRosterSyncFailure(remote.ID, now, session.roster.Head(), head, "apply rejected: "+err.Error())
 				r.logger.Warn("libp2p roster apply",
 					slog.String("group_id", session.groupID.String()),
 					slog.String("peer_id", remote.ID.String()),
+					slog.Duration("retry_after", delay),
 					slog.String("err", err.Error()))
 				break
 			}
 			applied++
 		}
 		if applied > 0 {
+			session.clearRosterSyncFailure(remote.ID)
 			r.logger.Info("libp2p roster synchronized",
 				slog.String("group_id", session.groupID.String()),
 				slog.String("peer_id", remote.ID.String()),

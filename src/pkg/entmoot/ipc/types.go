@@ -239,8 +239,13 @@ type MemberRemoveResp struct {
 	OutstandingOpenInvites []string `json:"outstanding_open_invites,omitempty"`
 	// OutstandingESPOpenInvites counts ESP-hosted open-invite tokens still
 	// redeemable for this group. They are a second bearer path and are revoked
-	// through the ESP API, not by a roster change.
-	OutstandingESPOpenInvites int `json:"outstanding_esp_open_invites"`
+	// through the ESP API, not by a roster change. It is nil when that store
+	// could not be read, because reporting zero would understate what is
+	// outstanding.
+	OutstandingESPOpenInvites *int `json:"outstanding_esp_open_invites"`
+	// ESPOpenInvitesError reports why the ESP open-invite store could not be
+	// read, when it could not.
+	ESPOpenInvitesError string `json:"esp_open_invites_error,omitempty"`
 	// InviteRevocationError reports that the removal was applied but its
 	// invite cleanup failed, so the caller knows to revoke by hand.
 	InviteRevocationError string `json:"invite_revocation_error,omitempty"`
