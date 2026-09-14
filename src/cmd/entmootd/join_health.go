@@ -13,6 +13,11 @@ type joinHealthSummary struct {
 	LocalMember       bool   `json:"local_member"`
 	LocalMemberStatus string `json:"local_member_status"`
 	RouteProbe        string `json:"route_probe"`
+	// QuarantinedMessages counts live messages held because they name a roster
+	// head this node has not synchronized yet. A non-zero value is a
+	// synchronization gap that resolves itself; a value that stays non-zero is
+	// a roster that is not converging.
+	QuarantinedMessages int `json:"quarantined_messages"`
 }
 
 func buildJoinHealthSummary(_ context.Context, runtime *groupRuntime, _ *store.SQLite, _ []byte) joinHealthSummary {
@@ -31,6 +36,7 @@ func buildJoinHealthSummary(_ context.Context, runtime *groupRuntime, _ *store.S
 				health.LocalMember = false
 				health.LocalMemberStatus = "missing"
 			}
+			health.QuarantinedMessages += session.live.QuarantinedMessages()
 		}
 	}
 	return health

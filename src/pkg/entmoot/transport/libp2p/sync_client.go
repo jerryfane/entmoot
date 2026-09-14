@@ -192,7 +192,11 @@ type KeeperProgress struct {
 	// a peer with a longer window. It is a coverage difference, not a gap to
 	// chase, so it is reported apart from MissingBodies. The same identifier
 	// offered by several keepers is counted once per keeper.
-	PrunedLocally    int
+	PrunedLocally int
+	// UnknownHeads counts historical messages skipped because their roster
+	// checkpoint is not on this node's chain yet. They are retried on a later
+	// pass, after roster synchronization, rather than failing the keeper.
+	UnknownHeads     int
 	ConvergedHint    bool
 	CoverageFloorMS  int64
 	TransferredBytes int
@@ -234,6 +238,7 @@ type SyncSummary struct {
 	Inserted       int
 	MissingBodies  int
 	PrunedLocally  int
+	UnknownHeads   int
 	ConvergedHints int
 }
 
@@ -246,6 +251,7 @@ func SummarizeKeeperProgress(progress []KeeperProgress) SyncSummary {
 		summary.Inserted += item.Inserted
 		summary.MissingBodies += item.MissingBodies
 		summary.PrunedLocally += item.PrunedLocally
+		summary.UnknownHeads += item.UnknownHeads
 		if item.ConvergedHint {
 			summary.ConvergedHints++
 		}
@@ -430,6 +436,16 @@ func syncFromKeeper(ctx context.Context, h host.Host, groupID entmoot.GroupID, k
 						proof = &itemCopy
 					}
 					if err := validate(message, proof); err != nil {
+						// A head this node has not synchronized yet is a
+						// synchronization gap, not a bad message: skip it,
+						// report it, and let the next pass retry once roster
+						// sync has caught up. Anything else is still fatal for
+						// this keeper, because a keeper serving invalid
+						// history is not a keeper.
+						if errors.Is(err, entmoot.ErrRosterHeadUnknown) {
+							progress.UnknownHeads++
+							continue
+						}
 						return fmt.Errorf("libp2p: invalid historical message: %w", err)
 					}
 				}

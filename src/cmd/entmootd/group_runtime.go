@@ -600,6 +600,15 @@ func (r *groupRuntime) syncRoster(ctx context.Context, session *groupSession) {
 	}
 	if len(updates) > 0 {
 		r.logger.Info("libp2p roster synchronized", slog.String("group_id", session.groupID.String()), slog.Int("entries", len(updates)))
+		// Messages that named one of the heads we just learned were held
+		// rather than dropped; they can be accepted now.
+		if session.live != nil {
+			if ingested := session.live.DrainQuarantine(ctx); ingested > 0 {
+				r.logger.Info("libp2p roster-ahead messages ingested",
+					slog.String("group_id", session.groupID.String()),
+					slog.Int("messages", ingested))
+			}
+		}
 	}
 }
 
@@ -664,6 +673,7 @@ retry:
 		slog.Int("inserted", summary.Inserted),
 		slog.Int("missing_bodies", summary.MissingBodies),
 		slog.Int("pruned_locally", summary.PrunedLocally),
+		slog.Int("unknown_heads", summary.UnknownHeads),
 		slog.Int("converged_hints", summary.ConvergedHints),
 		slog.String("last_error", lastErr))
 }
@@ -746,7 +756,6 @@ func (r *groupRuntime) persistKnownPeers(session *groupSession) {
 		})
 	}
 }
-
 func (r *groupRuntime) Close() {
 	r.mu.Lock()
 	if r.closed {

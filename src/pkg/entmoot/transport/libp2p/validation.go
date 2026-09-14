@@ -81,8 +81,18 @@ func VerifyLiveAuthor(groupRoster *roster.RosterLog, message entmoot.Message, no
 	if err := ValidateMessageShape(message, now); err != nil {
 		return err
 	}
-	if message.Version != 2 || message.Author.MemberID == nil || message.RosterHead == nil || *message.RosterHead != groupRoster.Head() {
+	if message.Version != 2 || message.Author.MemberID == nil || message.RosterHead == nil {
 		return fmt.Errorf("%w: live message must name the current full-width member and roster head", entmoot.ErrNotMember)
+	}
+	if *message.RosterHead != groupRoster.Head() {
+		// A publisher whose roster is ahead of ours names a head we have not
+		// seen yet. That is a synchronization gap, not a bad message: the
+		// caller may hold it briefly and retry after a roster sync. A head we
+		// do know but that is no longer current is a stale publisher.
+		if !groupRoster.HasEntry(*message.RosterHead) {
+			return fmt.Errorf("%w: live head %s", entmoot.ErrRosterHeadUnknown, message.RosterHead)
+		}
+		return fmt.Errorf("%w: live message names superseded roster head %s", entmoot.ErrNotMember, message.RosterHead)
 	}
 	author, ok := groupRoster.MemberInfoByID(*message.Author.MemberID)
 	if !ok {

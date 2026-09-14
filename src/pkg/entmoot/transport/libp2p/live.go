@@ -71,6 +71,7 @@ type LiveGroup struct {
 	subscription *pubsub.Subscription
 	cancel       context.CancelFunc
 	done         chan struct{}
+	quarantine   *rosterAheadQuarantine
 	closeOnce    sync.Once
 }
 
@@ -123,7 +124,7 @@ func (r *LiveRouter) AddGroup(ctx context.Context, cfg LiveConfig) (*LiveGroup, 
 		return nil, fmt.Errorf("libp2p: group topic is already active")
 	}
 	liveCtx, cancel := context.WithCancel(ctx)
-	group := &LiveGroup{cfg: cfg, router: r, topicName: topicName, cancel: cancel, done: make(chan struct{})}
+	group := &LiveGroup{cfg: cfg, router: r, topicName: topicName, cancel: cancel, done: make(chan struct{}), quarantine: newRosterAheadQuarantine(cfg.Now)}
 	if err := r.pubsub.RegisterTopicValidator(topicName, group.validate,
 		pubsub.WithValidatorConcurrency(8)); err != nil {
 		r.filter.remove(topicName)
@@ -211,6 +212,13 @@ func (g *LiveGroup) validate(_ context.Context, _ peer.ID, envelope *pubsub.Mess
 		return pubsub.ValidationReject
 	}
 	if err := VerifyLiveMessage(g.cfg.Roster, message, g.now()); err != nil {
+		// A message naming a roster head we have not synchronized yet is a
+		// race with a membership change, not a bad message. Hold it, ignore
+		// the envelope so it is neither propagated nor counted against the
+		// sender, and retry after the next roster sync.
+		if errors.Is(err, entmoot.ErrRosterHeadUnknown) && g.quarantine != nil && g.quarantine.hold(message) {
+			return pubsub.ValidationIgnore
+		}
 		return pubsub.ValidationReject
 	}
 	if g.cfg.Authorize != nil && envelope.GetFrom() != g.cfg.Host.ID() {
