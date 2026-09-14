@@ -6,6 +6,7 @@ import (
 	"time"
 
 	libp2p "github.com/libp2p/go-libp2p"
+	"github.com/libp2p/go-libp2p/core/peer"
 	multiaddr "github.com/multiformats/go-multiaddr"
 
 	"entmoot/pkg/entmoot"
@@ -100,5 +101,78 @@ func TestRosterSyncPeersSkipUnreachableAndPreferFounder(t *testing.T) {
 	candidates := runtime.rosterSyncPeers(runtime.sessions[groupID])
 	if len(candidates) != 1 || candidates[0].ID != founderBinding.PeerID {
 		t.Fatalf("candidates = %+v, want only the reachable founder", candidates)
+	}
+}
+
+// A peer whose chain cannot be taken must not be re-downloaded every tick:
+// without a backoff, one forked or hostile member makes every maintenance
+// round expensive.
+func TestRosterSyncBacksOffAFailingPeer(t *testing.T) {
+	session := &groupSession{}
+	var id peer.ID = "12D3KooWBdvL92Hd76R1LN5qswuXSgQf7ZWZNwHhKeS4tDoHGzuA"
+	now := time.Now()
+	if !session.rosterSyncReady(id, now) {
+		t.Fatal("an unseen peer should be ready")
+	}
+	first := session.noteRosterSyncFailure(id, now, entmoot.RosterEntryID{1}, entmoot.RosterEntryID{2}, "pull failed: test")
+	if first != rosterSyncBackoffBase {
+		t.Fatalf("first backoff = %s, want %s", first, rosterSyncBackoffBase)
+	}
+	if session.rosterSyncReady(id, now.Add(first/2)) {
+		t.Fatal("a backed-off peer was retried inside its window")
+	}
+	if !session.rosterSyncReady(id, now.Add(first+time.Second)) {
+		t.Fatal("a backed-off peer was never retried")
+	}
+	second := session.noteRosterSyncFailure(id, now, entmoot.RosterEntryID{1}, entmoot.RosterEntryID{2}, "pull failed: test")
+	if second <= first {
+		t.Fatalf("backoff did not grow: %s then %s", first, second)
+	}
+	for i := 0; i < 20; i++ {
+		if capped := session.noteRosterSyncFailure(id, now, entmoot.RosterEntryID{1}, entmoot.RosterEntryID{2}, "pull failed: test"); capped > rosterSyncBackoffMax {
+			t.Fatalf("backoff %s exceeds the cap %s", capped, rosterSyncBackoffMax)
+		}
+	}
+	// Converging with a peer clears its record, so a transient failure does
+	// not keep penalising a healthy member.
+	session.clearRosterSyncFailure(id)
+	if !session.rosterSyncReady(id, now) {
+		t.Fatal("clearing the failure did not make the peer ready")
+	}
+}
+
+// A fork is not repaired by retrying, so it has to be visible as state and
+// not only as a log line that scrolls away.
+func TestRosterDivergenceIsReportedAsGroupState(t *testing.T) {
+	groupID := entmoot.GroupID{0x41}
+	session := &groupSession{groupID: groupID}
+	var id peer.ID = "12D3KooWBdvL92Hd76R1LN5qswuXSgQf7ZWZNwHhKeS4tDoHGzuA"
+	if reports := session.rosterDivergenceReports(groupID); len(reports) != 0 {
+		t.Fatalf("healthy session reported %+v", reports)
+	}
+	now := time.Now()
+	local := entmoot.RosterEntryID{7}
+	remote := entmoot.RosterEntryID{9}
+	session.noteRosterSyncFailure(id, now, local, remote, "apply rejected: parents must reference current head")
+	reports := session.rosterDivergenceReports(groupID)
+	if len(reports) != 1 {
+		t.Fatalf("reports = %+v, want one", reports)
+	}
+	report := reports[0]
+	if report.PeerID != id.String() || report.LocalHead != local.String() || report.RemoteHead != remote.String() {
+		t.Fatalf("report = %+v", report)
+	}
+	if report.Reason == "" || report.SinceMS == 0 {
+		t.Fatalf("report lacks a reason or first-seen time: %+v", report)
+	}
+	// The first-seen time must not reset on every retry, or a persistent fork
+	// would always look new.
+	session.noteRosterSyncFailure(id, now.Add(time.Minute), local, remote, "apply rejected: parents must reference current head")
+	if again := session.rosterDivergenceReports(groupID); again[0].SinceMS != report.SinceMS {
+		t.Fatalf("since_ms moved from %d to %d", report.SinceMS, again[0].SinceMS)
+	}
+	session.clearRosterSyncFailure(id)
+	if reports := session.rosterDivergenceReports(groupID); len(reports) != 0 {
+		t.Fatalf("converged session still reports %+v", reports)
 	}
 }

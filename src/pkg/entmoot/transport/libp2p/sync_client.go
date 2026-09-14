@@ -101,6 +101,12 @@ func ValidateRosterChain(groupID entmoot.GroupID, expectedFounder entmoot.NodeIn
 	return temporary, nil
 }
 
+// maxRosterSyncEntries bounds one roster pull. A roster is a membership list,
+// not history: a peer that claims a chain this long is either broken or trying
+// to make every sync round expensive, so the pull is abandoned rather than
+// downloaded and then rejected.
+const maxRosterSyncEntries = 4096
+
 // FetchRosterUpdates downloads one committed roster snapshot and validates the
 // complete chain before returning entries missing from the local prefix.
 func FetchRosterUpdates(ctx context.Context, h host.Host, remote peer.AddrInfo, groupID entmoot.GroupID, local []entmoot.RosterEntry) ([]entmoot.RosterEntry, error) {
@@ -135,6 +141,9 @@ func FetchRosterUpdates(ctx context.Context, h host.Host, remote peer.AddrInfo, 
 		}
 		all = append(all, response.Entries...)
 		after = response.NextSequence
+		if len(all) > maxRosterSyncEntries {
+			return nil, fmt.Errorf("libp2p: roster chain exceeds %d entries", maxRosterSyncEntries)
+		}
 		if response.Complete {
 			if _, err := ValidateRosterChain(groupID, local[0].Subject, committedHead, all); err != nil {
 				return nil, err
