@@ -71,8 +71,9 @@ func ValidateMessageShape(message entmoot.Message, now time.Time) error {
 	return nil
 }
 
-// VerifyLiveAuthor validates a current member's author-signed message before
-// the founder issues the acceptance certificate.
+// VerifyLiveAuthor validates an author-signed live message against the group's
+// current roster: shape, author membership at the current head, identity
+// binding, and the author signature.
 func VerifyLiveAuthor(groupRoster *roster.RosterLog, message entmoot.Message, now time.Time) error {
 	if groupRoster == nil {
 		return fmt.Errorf("%w: missing roster", entmoot.ErrNotMember)

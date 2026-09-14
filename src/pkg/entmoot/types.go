@@ -154,8 +154,7 @@ func (g *Group) UnmarshalJSON(data []byte) error {
 
 // Message is a single group message. Messages form a DAG via Parents.
 type Message struct {
-	// ID is sha256(canonical author-signed form with ID, Signature, and
-	// Acceptance zeroed).
+	// ID is sha256(canonical author-signed form with ID and Signature zeroed).
 	ID MessageID `json:"id"`
 	// Version is zero for legacy messages and 2 for the group-bound signing
 	// form.
