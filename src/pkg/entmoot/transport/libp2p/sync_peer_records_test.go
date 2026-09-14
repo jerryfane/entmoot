@@ -177,8 +177,8 @@ func TestPeerRecordInstallDropsStaleAddresses(t *testing.T) {
 	if len(addresses) != 1 || !addresses[0].Equal(current) {
 		t.Fatalf("peerstore kept stale addresses: %v", addresses)
 	}
-	if sequence, tracked := cache.sequence(memberBinding.PeerID); !tracked || sequence != 5 {
-		t.Fatalf("cached sequence = %d tracked=%t, want 5", sequence, tracked)
+	if existing, tracked := cache.current(memberBinding.PeerID); !tracked || existing.seq != 5 {
+		t.Fatalf("cached sequence = %d tracked=%t, want 5", existing.seq, tracked)
 	}
 	if len(cache.Snapshot(memberBinding.PeerID)) != 0 {
 		t.Fatal("snapshot returned the requester's own record")
@@ -225,6 +225,101 @@ func TestPeerRecordInstallKeepsRelayOnlyProfilePrivate(t *testing.T) {
 	if installed := InstallPeerRecords(localHost, rosterLog, [][]byte{circuit},
 		RelayOnlyConnectivity, relays, NewPeerRecordCache()); installed != 1 {
 		t.Fatal("relay-only member rejected an approved circuit address")
+	}
+}
+
+// An update this node cannot use must not cost it a working address: losing the
+// only dialable address would make a reachable member unreachable until the
+// subject happens to publish again.
+func TestPeerRecordInstallKeepsWorkingAddressWhenUpdateIsUnusable(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	founderIdentity := mustIdentity(t)
+	memberIdentity := mustIdentity(t)
+	founderBinding, err := BindingFromPublicKey(founderIdentity.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	memberBinding, err := BindingFromPublicKey(memberIdentity.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, rosterLog := syncRoster(t, founderIdentity, founderBinding.MemberID, memberIdentity, memberBinding.MemberID)
+	relayIdentity := mustIdentity(t)
+	relayBinding, err := BindingFromPublicKey(relayIdentity.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	relays := []peer.AddrInfo{{ID: relayBinding.PeerID, Addrs: []multiaddr.Multiaddr{multiaddr.StringCast("/ip4/203.0.113.9/tcp/4001")}}}
+	localHost, _, err := NewHost(ctx, founderIdentity, libp2p.NoListenAddrs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer localHost.Close()
+
+	circuit := multiaddr.StringCast("/ip4/203.0.113.9/tcp/4001/p2p/" + relayBinding.PeerID.String() + "/p2p-circuit")
+	cache := NewPeerRecordCache()
+	if installed := InstallPeerRecords(localHost, rosterLog, [][]byte{sealPeerRecord(t, memberIdentity, circuit, 5)},
+		RelayOnlyConnectivity, relays, cache); installed != 1 {
+		t.Fatal("approved circuit address was not installed")
+	}
+	// Newer, authentic, and useless to a relay-only member.
+	direct := sealPeerRecord(t, memberIdentity, multiaddr.StringCast("/ip4/198.51.100.30/tcp/4001"), 6)
+	if installed := InstallPeerRecords(localHost, rosterLog, [][]byte{direct},
+		RelayOnlyConnectivity, relays, cache); installed != 0 {
+		t.Fatal("relay-only member installed a direct address")
+	}
+	addresses := localHost.Peerstore().Addrs(memberBinding.PeerID)
+	if len(addresses) != 1 || !addresses[0].Equal(circuit) {
+		t.Fatalf("working circuit address lost to an unusable update: %v", addresses)
+	}
+	existing, tracked := cache.current(memberBinding.PeerID)
+	if !tracked || existing.seq != 6 {
+		t.Fatalf("freshness floor = %d tracked=%t, want 6", existing.seq, tracked)
+	}
+	// The floor must now reject the superseded record instead of reinstalling it.
+	if installed := InstallPeerRecords(localHost, rosterLog, [][]byte{sealPeerRecord(t, memberIdentity, circuit, 5)},
+		RelayOnlyConnectivity, relays, cache); installed != 0 {
+		t.Fatal("superseded record was installed again")
+	}
+}
+
+// A member removed from the roster must stop being forwarded.
+func TestPeerRecordCacheDropsFormerMembers(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	founderIdentity := mustIdentity(t)
+	memberIdentity := mustIdentity(t)
+	founderBinding, err := BindingFromPublicKey(founderIdentity.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	memberBinding, err := BindingFromPublicKey(memberIdentity.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, rosterLog := syncRoster(t, founderIdentity, founderBinding.MemberID, memberIdentity, memberBinding.MemberID)
+	localHost, _, err := NewHost(ctx, founderIdentity, libp2p.NoListenAddrs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer localHost.Close()
+	cache := NewPeerRecordCache()
+	if installed := InstallPeerRecords(localHost, rosterLog,
+		[][]byte{sealPeerRecord(t, memberIdentity, multiaddr.StringCast("/ip4/198.51.100.40/tcp/4001"), 2)},
+		DirectConnectivity, nil, cache); installed != 1 {
+		t.Fatal("member record was not installed")
+	}
+	removal, err := rosterLog.SignEntry(founderIdentity, "remove", mustNodeInfo(t, memberIdentity.PublicKey), nil, 4_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rosterLog.Apply(removal); err != nil {
+		t.Fatal(err)
+	}
+	InstallPeerRecords(localHost, rosterLog, nil, DirectConnectivity, nil, cache)
+	if cache.Len() != 0 {
+		t.Fatalf("cache still forwards %d removed member records", cache.Len())
 	}
 }
 
