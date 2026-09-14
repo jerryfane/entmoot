@@ -87,3 +87,57 @@ func TestEnrollmentAcceptsSupersededInviteCheckpoint(t *testing.T) {
 		t.Fatal("rejected applicant was added to the roster")
 	}
 }
+
+// Accepting older checkpoints must not reopen the door for someone who was
+// evicted: removal is a later decision than the invite, and it wins.
+func TestRemovalBeatsAnInviteIssuedBeforeIt(t *testing.T) {
+	founderIdentity, founder, founderBinding := mustTestIdentity(t)
+	_, member, _ := mustTestIdentity(t)
+
+	groupID := entmoot.GroupID{12}
+	groupRoster := roster.New(groupID)
+	if err := groupRoster.Genesis(founderIdentity, founder, 1_000); err != nil {
+		t.Fatal(err)
+	}
+	oldInviteHead := groupRoster.Head()
+	runtime := &groupRuntime{
+		identity: founderIdentity, binding: founderBinding,
+		sessions: map[entmoot.GroupID]*groupSession{groupID: {groupID: groupID, roster: groupRoster}},
+	}
+	invite := func(head entmoot.RosterEntryID) entmoot.BootstrapCapability {
+		return entmoot.BootstrapCapability{GroupID: groupID, Founder: founder, RosterHead: head}
+	}
+	if _, err := runtime.enroll(nil, invite(oldInviteHead), member); err != nil {
+		t.Fatal(err)
+	}
+	removal, err := groupRoster.SignEntry(founderIdentity, "remove", member, nil, groupRoster.HeadTimestamp()+1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := groupRoster.Apply(removal); err != nil {
+		t.Fatal(err)
+	}
+	if groupRoster.IsMemberID(*member.MemberID) {
+		t.Fatal("removal did not take effect")
+	}
+
+	_, err = runtime.enroll(nil, invite(oldInviteHead), member)
+	if err == nil {
+		t.Fatal("evicted member rejoined with the invite it held before removal")
+	}
+	var rejection *libp2ptransport.EnrollmentRejection
+	if !errors.As(err, &rejection) || rejection.Code != libp2ptransport.EnrollRejectIdentityConflict {
+		t.Fatalf("rejection = %v, want identity conflict", err)
+	}
+	if groupRoster.IsMemberID(*member.MemberID) {
+		t.Fatal("rejected applicant was re-added")
+	}
+
+	// A fresh invite, issued after the removal, readmits them.
+	if _, err := runtime.enroll(nil, invite(groupRoster.Head()), member); err != nil {
+		t.Fatalf("invite issued after the removal was refused: %v", err)
+	}
+	if !groupRoster.IsMemberID(*member.MemberID) {
+		t.Fatal("readmission did not take effect")
+	}
+}

@@ -562,6 +562,29 @@ func (r *RosterLog) HasEntry(id entmoot.RosterEntryID) bool {
 	return ok
 }
 
+// RemovedSince reports whether memberID was removed at any entry after since,
+// and whether since is a known entry. An invite vouches for admission as of
+// its checkpoint, so a later removal has to override it: otherwise an evicted
+// member could rejoin with an invite it already holds.
+func (r *RosterLog) RemovedSince(memberID entmoot.MemberID, since entmoot.RosterEntryID) (bool, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	index, known := r.byID[since]
+	if !known {
+		return false, false
+	}
+	for i := index + 1; i < len(r.entries); i++ {
+		entry := r.entries[i]
+		if entry.Op != "remove" || entry.Subject.MemberID == nil {
+			continue
+		}
+		if *entry.Subject.MemberID == memberID {
+			return true, true
+		}
+	}
+	return false, true
+}
+
 // Head returns the id of the current head entry, or the zero id if the log is
 // empty.
 func (r *RosterLog) Head() entmoot.RosterEntryID {
