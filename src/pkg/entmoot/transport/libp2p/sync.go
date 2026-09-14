@@ -338,9 +338,7 @@ func (s *SyncServer) handleRoster(stream network.Stream) {
 		// slot now instead of holding it for the full snapshot lifetime, so a
 		// node catching up over several rounds does not exhaust this peer's
 		// per-peer quota and stall.
-		if request.SnapshotToken != "" {
-			s.releaseSnapshot(request.SnapshotToken)
-		}
+		s.releaseSnapshotOwnedBy(request.SnapshotToken, stream.Conn().RemotePeer(), request.GroupID)
 		response.Complete = true
 		if len(entries) > 0 {
 			response.CommittedHead = entries[len(entries)-1].ID
@@ -606,6 +604,24 @@ func (s *SyncServer) snapshot(peerID peer.ID, groupID entmoot.GroupID, kind prot
 func (s *SyncServer) releaseSnapshot(token string) {
 	s.snapshotMu.Lock()
 	defer s.snapshotMu.Unlock()
+	delete(s.snapshots, token)
+}
+
+// releaseSnapshotOwnedBy frees a snapshot only for the peer that reserved it
+// in this group. A client-supplied token is otherwise an unauthenticated
+// handle: the paged path already checks owner, group and kind before honouring
+// one, and a release must not be the weaker door that lets a caller cancel
+// another peer's in-flight pull.
+func (s *SyncServer) releaseSnapshotOwnedBy(token string, peerID peer.ID, groupID entmoot.GroupID) {
+	if token == "" {
+		return
+	}
+	s.snapshotMu.Lock()
+	defer s.snapshotMu.Unlock()
+	value, ok := s.snapshots[token]
+	if !ok || value.peerID != peerID || value.groupID != groupID {
+		return
+	}
 	delete(s.snapshots, token)
 }
 

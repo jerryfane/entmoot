@@ -50,7 +50,10 @@ type repairOptions struct {
 // newRepairFixture builds the fork described by opts.
 func newRepairFixture(t *testing.T, opts repairOptions) *repairFixture {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	// Generous: one of these tests repairs a chain longer than a single pull,
+	// which signs and validates several thousand entries, and that is slow
+	// under the race detector.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	t.Cleanup(cancel)
 	founderIdentity, founder, _ := mustTestIdentity(t)
 	localIdentity, local, localBinding := mustTestIdentity(t)
@@ -386,4 +389,82 @@ func TestRepairAdoptsAChainLongerThanOnePull(t *testing.T) {
 	if !f.session.roster.IsMemberID(*f.winner.MemberID) {
 		t.Fatal("the adopted chain's member is missing")
 	}
+}
+
+// syncRoster is where the classification is composed: it decides the
+// head-off-chain conjunct and the rejected/complete flags. The helpers are
+// unit-tested, but only a real round proves the composition, and swapping
+// either value re-opens a fixed defect.
+func TestSyncRosterRecordsARealForkAndClearsItAfterRepair(t *testing.T) {
+	f := newRepairFixture(t, repairOptions{localIsAdmin: true})
+
+	// A real round against a genuinely forked peer must record divergence.
+	f.runtime.syncRoster(f.ctx, f.session)
+	reports := f.session.rosterDivergenceReports(f.groupID)
+	if len(reports) != 1 {
+		t.Fatalf("a real round against a forked peer reported %+v, want one divergence", reports)
+	}
+	if reports[0].PeerID != f.remote.ID.String() {
+		t.Fatalf("report names %s, want the forked peer %s", reports[0].PeerID, f.remote.ID)
+	}
+	if reports[0].LocalHead == reports[0].RemoteHead {
+		t.Fatalf("report has one head twice: %+v", reports[0])
+	}
+	// The peer is backed off, so the next tick does not re-download its chain.
+	if f.session.rosterSyncReady(f.remote.ID, time.Now()) {
+		t.Fatal("a forked peer was not backed off")
+	}
+
+	// Repairing adopts the peer's chain and re-issues what was lost, so the
+	// next round agrees with the peer and the report is gone.
+	if _, err := f.runtime.repairRoster(f.ctx, f.session, f.remote.ID.String(), false); err != nil {
+		t.Fatal(err)
+	}
+	if reports := f.session.rosterDivergenceReports(f.groupID); len(reports) != 0 {
+		t.Fatalf("the repair left a divergence report: %+v", reports)
+	}
+	// And a further round against the same peer stays clean: our chain now
+	// contains its whole chain, so it is behind, not forked.
+	f.runtime.syncRoster(f.ctx, f.session)
+	if reports := f.session.rosterDivergenceReports(f.groupID); len(reports) != 0 {
+		t.Fatalf("a peer that is merely behind was reported as divergent: %+v", reports)
+	}
+}
+
+// The short-chain path: the forked peer holds FEWER entries than our prefix,
+// so the server answers short_chain rather than serving a page. Only the
+// caller knows whether the peer's head is on our chain, and the report depends
+// on that conjunct being supplied here.
+func TestSyncRosterRecordsAForkAgainstAShorterPeer(t *testing.T) {
+	f := newRepairFixture(t, repairOptions{localIsAdmin: true})
+	// Grow this node's branch past the peer's, so a pull asks for entries the
+	// peer does not have.
+	for i := 0; i < 2; i++ {
+		extra := mustNodeInfoFor(t, mustTestIdentityValue(t))
+		entry, err := f.session.roster.SignEntry(f.runtime.identity, "add", extra, nil, f.session.roster.HeadTimestamp()+10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := f.session.roster.Apply(entry); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(f.session.roster.Entries()) <= len(f.winning) {
+		t.Fatalf("local chain is %d entries, want more than the peer's %d", len(f.session.roster.Entries()), len(f.winning))
+	}
+
+	f.runtime.syncRoster(f.ctx, f.session)
+	reports := f.session.rosterDivergenceReports(f.groupID)
+	if len(reports) != 1 {
+		t.Fatalf("a shorter forked peer reported %+v, want one divergence", reports)
+	}
+	if reports[0].PeerID != f.remote.ID.String() {
+		t.Fatalf("report names %s, want %s", reports[0].PeerID, f.remote.ID)
+	}
+}
+
+func mustTestIdentityValue(t *testing.T) *keystore.Identity {
+	t.Helper()
+	identity, _, _ := mustTestIdentity(t)
+	return identity
 }
