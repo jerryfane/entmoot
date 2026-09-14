@@ -107,7 +107,7 @@ func TestGroupRuntimeServesConvertedLegacyHistory(t *testing.T) {
 	defer messages.Close()
 	runtime, err := newGroupRuntime(groupRuntimeConfig{
 		Identity: founder, DataDir: root, Store: messages, Notify: newNotifyingStore(messages, nil),
-		Host: serverHost, Binding: serverBinding,
+		Host: serverHost, Binding: serverBinding, Mode: libp2ptransport.DirectConnectivity,
 	})
 	if err != nil {
 		t.Fatal(err)

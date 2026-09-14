@@ -40,20 +40,26 @@ type groupRuntimeConfig struct {
 	Host     host.Host
 	Binding  libp2ptransport.Binding
 	Logger   *slog.Logger
+	// Mode and ControlledRelays mirror the host's connectivity profile so
+	// forwarded member addresses are filtered exactly as dial hints are.
+	Mode             libp2ptransport.ConnectivityMode
+	ControlledRelays []peer.AddrInfo
 }
 
 type groupRuntime struct {
-	identity        *keystore.Identity
-	dataDir         string
-	store           *store.SQLite
-	notify          *notifyingStore
-	host            host.Host
-	binding         libp2ptransport.Binding
-	logger          *slog.Logger
-	policyStore     *entpolicy.FileStore
-	admission       *libp2ptransport.PersistentBootstrapAdmission
-	liveRouter      *libp2ptransport.LiveRouter
-	policyEnforcers map[entmoot.GroupID]*groupPolicyEnforcer
+	identity         *keystore.Identity
+	dataDir          string
+	store            *store.SQLite
+	notify           *notifyingStore
+	host             host.Host
+	binding          libp2ptransport.Binding
+	logger           *slog.Logger
+	mode             libp2ptransport.ConnectivityMode
+	controlledRelays []peer.AddrInfo
+	policyStore      *entpolicy.FileStore
+	admission        *libp2ptransport.PersistentBootstrapAdmission
+	liveRouter       *libp2ptransport.LiveRouter
+	policyEnforcers  map[entmoot.GroupID]*groupPolicyEnforcer
 
 	mu       sync.RWMutex
 	sessions map[entmoot.GroupID]*groupSession
@@ -69,6 +75,7 @@ type groupSession struct {
 	cancel        context.CancelFunc
 	catchup       sync.Mutex
 	history       libp2ptransport.HistorySyncState
+	peerRecords   *libp2ptransport.PeerRecordCache
 }
 type groupPolicyEnforcer struct {
 	mu          sync.Mutex
@@ -102,19 +109,21 @@ func newGroupRuntime(cfg groupRuntimeConfig) (*groupRuntime, error) {
 		return nil, err
 	}
 	r := &groupRuntime{
-		identity:        cfg.Identity,
-		dataDir:         cfg.DataDir,
-		store:           cfg.Store,
-		notify:          cfg.Notify,
-		host:            cfg.Host,
-		binding:         cfg.Binding,
-		logger:          cfg.Logger,
-		policyStore:     policyStore,
-		admission:       admission,
-		liveRouter:      liveRouter,
-		sessions:        make(map[entmoot.GroupID]*groupSession),
-		joining:         make(map[entmoot.GroupID]chan struct{}),
-		policyEnforcers: make(map[entmoot.GroupID]*groupPolicyEnforcer),
+		identity:         cfg.Identity,
+		dataDir:          cfg.DataDir,
+		store:            cfg.Store,
+		notify:           cfg.Notify,
+		host:             cfg.Host,
+		binding:          cfg.Binding,
+		logger:           cfg.Logger,
+		mode:             cfg.Mode,
+		controlledRelays: cfg.ControlledRelays,
+		policyStore:      policyStore,
+		admission:        admission,
+		liveRouter:       liveRouter,
+		sessions:         make(map[entmoot.GroupID]*groupSession),
+		joining:          make(map[entmoot.GroupID]chan struct{}),
+		policyEnforcers:  make(map[entmoot.GroupID]*groupPolicyEnforcer),
 	}
 	syncServer := &libp2ptransport.SyncServer{
 		Host:          cfg.Host,
@@ -122,6 +131,7 @@ func newGroupRuntime(cfg groupRuntimeConfig) (*groupRuntime, error) {
 		Roster:        r.rosterForGroup,
 		Store:         cfg.Notify,
 		LegacyHistory: r.legacyHistoryForGroup,
+		PeerRecords:   r.peerRecordsForGroup,
 	}
 	if err := syncServer.Install(); err != nil {
 		_ = admission.Close()
@@ -163,6 +173,16 @@ func (r *groupRuntime) rosterForGroup(groupID entmoot.GroupID) (*roster.RosterLo
 		return nil, false
 	}
 	return session.roster, true
+}
+
+func (r *groupRuntime) peerRecordsForGroup(groupID entmoot.GroupID) (*libp2ptransport.PeerRecordCache, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	session, ok := r.sessions[groupID]
+	if !ok {
+		return nil, false
+	}
+	return session.peerRecords, true
 }
 
 func (r *groupRuntime) enroll(_ context.Context, capability entmoot.BootstrapCapability) (libp2ptransport.EnrollmentResponse, error) {
@@ -285,7 +305,10 @@ func (r *groupRuntime) AddLocalGroup(ctx context.Context, groupID entmoot.GroupI
 		_ = rlog.Close()
 		return nil, false, err
 	}
-	session := &groupSession{groupID: groupID, roster: rlog, live: live, legacyHistory: legacyHistory, cancel: cancel}
+	session := &groupSession{
+		groupID: groupID, roster: rlog, live: live, legacyHistory: legacyHistory, cancel: cancel,
+		peerRecords: libp2ptransport.NewPeerRecordCache(),
+	}
 	r.mu.Lock()
 	if r.closed {
 		r.mu.Unlock()
@@ -604,36 +627,21 @@ func (r *groupRuntime) catchUp(ctx context.Context, session *groupSession) {
 		return
 	}
 	defer session.catchup.Unlock()
-	keepers, err := loadGroupPeers(r.dataDir, session.groupID)
+	keepers, err := r.keepersFor(session)
 	if err != nil {
 		r.logger.Warn("libp2p history catch-up: load peers", slog.String("group_id", session.groupID.String()), slog.String("err", err.Error()))
 		return
 	}
-	byID := make(map[peer.ID]peer.AddrInfo, len(keepers))
-	for _, keeper := range keepers {
-		byID[keeper.ID] = keeper
+	// Members behind NAT are only dialable at a circuit address they cannot
+	// publish themselves, so collect signed records from every keeper first and
+	// rebuild the set: a member whose address just arrived is synced in this
+	// same pass.
+	r.exchangePeerRecords(ctx, session, keepers)
+	keepers, err = r.keepersFor(session)
+	if err != nil {
+		r.logger.Warn("libp2p history catch-up: load peers", slog.String("group_id", session.groupID.String()), slog.String("err", err.Error()))
+		return
 	}
-	for _, memberID := range session.roster.MemberIDs() {
-		info, ok := session.roster.MemberInfoByID(memberID)
-		if !ok {
-			continue
-		}
-		binding, err := libp2ptransport.BindingFromPublicKey(info.EntmootPubKey)
-		if err != nil || binding.PeerID == r.host.ID() {
-			continue
-		}
-		known := byID[binding.PeerID]
-		known.ID = binding.PeerID
-		known.Addrs = append(known.Addrs, r.host.Peerstore().Addrs(binding.PeerID)...)
-		byID[binding.PeerID] = known
-	}
-	keepers = keepers[:0]
-	for _, keeper := range byID {
-		if len(keeper.Addrs) > 0 {
-			keepers = append(keepers, keeper)
-		}
-	}
-	sort.Slice(keepers, func(i, j int) bool { return keepers[i].ID.String() < keepers[j].ID.String() })
 	if len(keepers) == 0 {
 		return
 	}
@@ -669,6 +677,69 @@ retry:
 		slog.Int("inserted", summary.Inserted),
 		slog.Int("converged_hints", summary.ConvergedHints),
 		slog.String("last_error", lastErr))
+}
+
+// keepersFor lists roster members with at least one known address, combining
+// the persisted cache with whatever the peerstore currently holds.
+func (r *groupRuntime) keepersFor(session *groupSession) ([]peer.AddrInfo, error) {
+	cached, err := loadGroupPeers(r.dataDir, session.groupID)
+	if err != nil {
+		return nil, err
+	}
+	byID := make(map[peer.ID]peer.AddrInfo, len(cached))
+	for _, keeper := range cached {
+		byID[keeper.ID] = keeper
+	}
+	for _, memberID := range session.roster.MemberIDs() {
+		info, ok := session.roster.MemberInfoByID(memberID)
+		if !ok {
+			continue
+		}
+		binding, err := libp2ptransport.BindingFromPublicKey(info.EntmootPubKey)
+		if err != nil || binding.PeerID == r.host.ID() {
+			continue
+		}
+		known := byID[binding.PeerID]
+		known.ID = binding.PeerID
+		known.Addrs = append(known.Addrs, r.host.Peerstore().Addrs(binding.PeerID)...)
+		byID[binding.PeerID] = known
+	}
+	keepers := make([]peer.AddrInfo, 0, len(byID))
+	for _, keeper := range byID {
+		if len(keeper.Addrs) > 0 {
+			keepers = append(keepers, keeper)
+		}
+	}
+	sort.Slice(keepers, func(i, j int) bool { return keepers[i].ID.String() < keepers[j].ID.String() })
+	return keepers, nil
+}
+
+// exchangePeerRecords pulls the signed peer records each reachable member holds
+// and installs the verified addresses, which is how a member learns the circuit
+// address of a peer it has never been able to dial.
+func (r *groupRuntime) exchangePeerRecords(ctx context.Context, session *groupSession, keepers []peer.AddrInfo) {
+	installed := 0
+	for _, keeper := range keepers {
+		if ctx.Err() != nil {
+			return
+		}
+		attempt, cancel := context.WithTimeout(ctx, 10*time.Second)
+		records, err := libp2ptransport.RequestPeerRecords(attempt, r.host, keeper, session.groupID)
+		cancel()
+		if err != nil {
+			// An unreachable or older keeper is expected; history sync reports
+			// reachability for the same peer set.
+			continue
+		}
+		installed += libp2ptransport.InstallPeerRecords(r.host, session.roster, records,
+			r.mode, r.controlledRelays, session.peerRecords)
+	}
+	if installed > 0 {
+		r.logger.Info("libp2p peer records",
+			slog.String("group_id", session.groupID.String()),
+			slog.Int("installed", installed),
+			slog.Int("forwardable", session.peerRecords.Len()))
+	}
 }
 
 func (r *groupRuntime) persistKnownPeers(session *groupSession) {
