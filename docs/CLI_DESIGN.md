@@ -59,6 +59,7 @@ group policy status|set|clear
 group public descriptor|publish
 invite create|list|revoke
 roster add|remove
+roster admin list|grant|revoke
 ```
 
 Fleet and agent-command surfaces are disabled unless their explicit environment
@@ -151,15 +152,25 @@ full-width MemberID. Enabling config does not start a runner.
 
 ## 9. Invite and Bootstrap Contract
 
-`invite create` accepts one or more founder libp2p bootstrap multiaddrs and
-either a target Ed25519 public key or `-open`. With a target, the MemberID and
-PeerID are derived from that key and only that identity may redeem the invite.
-With `-open` the invite is a bearer credential: any holder may redeem it while
-uses remain, which is how a small team joins from one link. Omitting both is an
-error, so a missing target never silently produces a bearer invite.
-`-max-uses` caps the number of distinct identities (default 1, ceiling 64). The
-founder signs the group id, founder identity, roster checkpoint, target if any,
-permitted bootstrap peers/addresses, use limit, expiry, and capability nonce.
+`invite create` accepts one or more libp2p bootstrap multiaddrs naming the
+issuing node, and either a target Ed25519 public key or `-open`. With a target,
+the MemberID and PeerID are derived from that key and only that identity may
+redeem the invite. With `-open` the invite is a bearer credential: any holder
+may redeem it while uses remain, which is how a small team joins from one link.
+Omitting both is an error, so a missing target never silently produces a bearer
+invite. `-max-uses` caps the number of distinct identities (default 1, ceiling
+64). The issuer signs the group id, founder anchor, its own issuer identity
+when it is not the founder, roster checkpoint, target if any, permitted
+bootstrap peers/addresses, use limit, expiry, and capability nonce.
+
+The founder or any delegated admin may issue invites and apply membership
+changes. `roster admin grant|revoke` rewrites the delegated-admin set in one
+founder-signed `policy_change` entry (`type: admins/v1`, ceiling 16) and
+`roster admin list` reports it. An admin may add and remove ordinary members;
+it cannot remove the founder, remove another admin, or change the admin set.
+Losing membership or delegation ends the authority at once, including for
+invites that admin already issued. Enrollment requires the invite's `founder`
+field to be the group's real founder, since that is the anchor the joiner pins.
 
 `invite list` shows issued invites with uses spent and state
 (open/spent/expired/revoked). `invite revoke` withdraws an invite before it

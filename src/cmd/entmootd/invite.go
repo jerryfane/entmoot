@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
@@ -123,11 +122,35 @@ func cmdInviteCreate(gf *globalFlags, args []string) int {
 		return exitGroupNotFound
 	}
 	founderBinding, err := libp2ptransport.BindingFromPublicKey(founder.EntmootPubKey)
-	if err != nil || founderBinding.MemberID != mustMemberID(s.identity.PublicKey) || !bytes.Equal(founder.EntmootPubKey, s.identity.PublicKey) {
-		fmt.Fprintln(os.Stderr, "invite create: local identity is not the group founder")
-		return exitNotMember
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "invite create: founder identity: %v\n", err)
+		return exitTransport
 	}
 	founder.MemberID = &founderBinding.MemberID
+	// The founder or any delegated admin may invite. The issuer's own host is
+	// what serves enrollment, so the bootstrap addresses must name it.
+	localMemberID := mustMemberID(s.identity.PublicKey)
+	if !rlog.CanAdminister(localMemberID) {
+		fmt.Fprintln(os.Stderr, "invite create: local identity is neither the group founder nor a delegated admin")
+		return exitNotMember
+	}
+	localBinding, err := libp2ptransport.BindingFromPublicKey(s.identity.PublicKey)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "invite create: local identity: %v\n", err)
+		return exitTransport
+	}
+	var issuer *entmoot.NodeInfo
+	if localMemberID != founderBinding.MemberID {
+		info, found := rlog.MemberInfoByID(localMemberID)
+		if !found {
+			fmt.Fprintln(os.Stderr, "invite create: local identity is not a member of this group")
+			return exitNotMember
+		}
+		memberID := localMemberID
+		info.MemberID = &memberID
+		info.PeerID = localBinding.PeerID.String()
+		issuer = &info
+	}
 	allowedPeerIDs := make([]string, 0, len(bootstrap))
 	allowedAddresses := make([]string, 0, len(bootstrap))
 	seen := make(map[peer.ID]struct{})
@@ -138,8 +161,8 @@ func cmdInviteCreate(gf *globalFlags, args []string) int {
 			return exitInvalidArgument
 		}
 		info, err := peer.AddrInfoFromP2pAddr(address)
-		if err != nil || info.ID != founderBinding.PeerID {
-			fmt.Fprintf(os.Stderr, "invite create: bootstrap must end in founder peer id %s\n", founderBinding.PeerID)
+		if err != nil || info.ID != localBinding.PeerID {
+			fmt.Fprintf(os.Stderr, "invite create: bootstrap must end in the issuing node's peer id %s\n", localBinding.PeerID)
 			return exitInvalidArgument
 		}
 		allowedAddresses = append(allowedAddresses, address.String())
@@ -155,6 +178,7 @@ func cmdInviteCreate(gf *globalFlags, args []string) int {
 		TargetMemberID:    targetMemberID,
 		TargetPeerID:      targetPeerID,
 		Founder:           founder,
+		Issuer:            issuer,
 		RosterHead:        rlog.Head(),
 		AllowedPeerIDs:    allowedPeerIDs,
 		AllowedMultiaddrs: allowedAddresses,

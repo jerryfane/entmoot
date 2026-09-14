@@ -1703,25 +1703,52 @@ func (s *ipcServer) handleMemberRemove(ctx context.Context, c net.Conn, req *ipc
 	head := sess.roster.Head()
 	members := len(sess.roster.MemberIDs())
 	unlock()
-	// Removal voids the invites that would readmit this identity; open bearer
-	// invites cannot be attributed, so they are reported instead.
+	// The removal is committed, so a revocation failure is reported alongside
+	// the result rather than replacing it: answering with an error alone would
+	// make a caller think nothing happened.
+	var revocationError string
 	revoked, err := s.runtime.admission.RevokeInvitesForMember(gid, *existing.MemberID)
 	if err != nil {
-		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInternal, GroupID: &gid, Message: "revoke invites for removed member: " + err.Error()})
-		return
+		revocationError = "revoke invites for removed member: " + err.Error()
+		slog.Error("member_remove: revoke invites", slog.String("err", err.Error()))
 	}
+	var nonces []string
 	live, err := s.runtime.admission.LiveOpenInvites(gid)
 	if err != nil {
-		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInternal, GroupID: &gid, Message: "read open invites: " + err.Error()})
-		return
+		if revocationError == "" {
+			revocationError = "read open invites: " + err.Error()
+		}
+		slog.Error("member_remove: read open invites", slog.String("err", err.Error()))
+	} else {
+		nonces = make([]string, 0, len(live))
+		for _, record := range live {
+			nonces = append(nonces, base64.StdEncoding.EncodeToString(record.Nonce[:]))
+		}
 	}
-	nonces := make([]string, 0, len(live))
-	for _, record := range live {
-		nonces = append(nonces, base64.StdEncoding.EncodeToString(record.Nonce[:]))
+	espOpen := 0
+	// metadataStore is the narrow interface the join path needs; the concrete
+	// ESP state store also lists open-invite tokens.
+	if lister, ok := s.metadataStore.(espOpenInviteLister); ok && lister != nil {
+		records, err := lister.ListOpenInvitesByGroup(ctx, gid)
+		if err != nil {
+			slog.Error("member_remove: read esp open invites", slog.String("err", err.Error()))
+		} else {
+			nowMS := time.Now().UnixMilli()
+			for _, record := range records {
+				if record.Revoked ||
+					(record.ExpiresAtMS > 0 && record.ExpiresAtMS <= nowMS) ||
+					(record.MaxUses > 0 && record.UseCount >= record.MaxUses) {
+					continue
+				}
+				espOpen++
+			}
+		}
 	}
 	_ = ipc.EncodeAndWrite(c, &ipc.MemberRemoveResp{
 		Status: "removed", GroupID: gid, RosterHead: head, Members: members,
 		RevokedInvites: revoked, OutstandingOpenInvites: nonces,
+		OutstandingESPOpenInvites: espOpen,
+		InviteRevocationError:     revocationError,
 	})
 }
 
