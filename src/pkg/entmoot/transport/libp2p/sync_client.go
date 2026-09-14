@@ -218,6 +218,10 @@ type keeperSyncState struct {
 	page          *HistorySyncResponse
 	offset        int
 	missingBodies int
+	// unknownHeads counts messages this pass could not authorize yet because
+	// their roster checkpoint is not on our chain. They are a real gap, so a
+	// pass that skipped any of them has not converged.
+	unknownHeads int
 	// batch shrinks when a keeper refuses a body page, so a peer running an
 	// older server that cannot truncate still makes progress.
 	batch int
@@ -355,6 +359,7 @@ func syncFromKeeper(ctx context.Context, h host.Host, groupID entmoot.GroupID, k
 						cursor.request.AfterAuthorMemberID = entmoot.MemberID{}
 						cursor.request.AfterID = nil
 						cursor.missingBodies = 0
+						cursor.unknownHeads = 0
 					}
 				}
 				return err
@@ -444,6 +449,7 @@ func syncFromKeeper(ctx context.Context, h host.Host, groupID entmoot.GroupID, k
 						// history is not a keeper.
 						if errors.Is(err, entmoot.ErrRosterHeadUnknown) {
 							progress.UnknownHeads++
+							cursor.unknownHeads++
 							continue
 						}
 						return fmt.Errorf("libp2p: invalid historical message: %w", err)
@@ -486,7 +492,7 @@ func syncFromKeeper(ctx context.Context, h host.Host, groupID entmoot.GroupID, k
 		}
 		cursor.page = nil
 		if !listed.HasMore {
-			progress.ConvergedHint = cursor.missingBodies == 0
+			progress.ConvergedHint = cursor.missingBodies == 0 && cursor.unknownHeads == 0
 			return nil
 		}
 		cursor.request.SnapshotToken = listed.SnapshotToken

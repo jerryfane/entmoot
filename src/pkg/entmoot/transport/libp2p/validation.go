@@ -90,6 +90,14 @@ func VerifyLiveAuthor(groupRoster *roster.RosterLog, message entmoot.Message, no
 		// caller may hold it briefly and retry after a roster sync. A head we
 		// do know but that is no longer current is a stale publisher.
 		if !groupRoster.HasEntry(*message.RosterHead) {
+			// Only report a gap for a message that is at least internally
+			// authentic. Without this, unsigned junk naming a fabricated head
+			// would be indistinguishable from a real race and would occupy a
+			// caller's retry buffer. Membership cannot be checked here: the
+			// author may be a member only at the head we are missing.
+			if err := signing.VerifyMessage(message, message.Author); err != nil {
+				return fmt.Errorf("%w: unknown head with an invalid author signature: %v", entmoot.ErrSigInvalid, err)
+			}
 			return fmt.Errorf("%w: live head %s", entmoot.ErrRosterHeadUnknown, message.RosterHead)
 		}
 		return fmt.Errorf("%w: live message names superseded roster head %s", entmoot.ErrNotMember, message.RosterHead)
