@@ -442,8 +442,9 @@ func TestSyncRosterRecordsARealForkAndClearsItAfterRepair(t *testing.T) {
 
 // A peer that is behind us holds a head we already have and a shorter chain.
 // The round must recognise that from the head probe alone: no pull, no
-// divergence, no backoff. Classifying by the error text without the
-// head conjunct, or dropping the equal-or-behind check, both land here.
+// divergence, no backoff, and no change to our chain. Dropping the
+// equal-or-behind guard lands here; the classifier's own conjunct is pinned
+// separately, by TestAShorterForkedChainIsReportedAsDivergence.
 func TestSyncRosterIgnoresAPeerThatIsSimplyBehind(t *testing.T) {
 	f := newRepairFixture(t, repairOptions{localIsAdmin: true})
 	// Adopt the peer's chain, then grow ours past it, so the peer's head is on
@@ -516,4 +517,40 @@ func mustTestIdentityValue(t *testing.T) *keystore.Identity {
 	t.Helper()
 	identity, _, _ := mustTestIdentity(t)
 	return identity
+}
+
+// A peer that recovers must not keep its escalating backoff. The probe's
+// equal-or-behind path clears the record, and the observable is the next
+// failure's delay: without the clear, the old failure count survives and the
+// peer is penalised for a fault it no longer has.
+func TestSyncRosterResetsBackoffWhenAPeerCatchesUp(t *testing.T) {
+	f := newRepairFixture(t, repairOptions{localIsAdmin: true})
+	if _, err := f.runtime.repairRoster(f.ctx, f.session, f.remote.ID.String(), false); err != nil {
+		t.Fatal(err)
+	}
+
+	// Three past failures, all elapsed, so the peer is probed again.
+	stale := time.Now().Add(-2 * rosterSyncBackoffMax)
+	var escalated time.Duration
+	for i := 0; i < 3; i++ {
+		escalated = f.session.noteRosterSyncFailure(f.remote.ID, stale, f.session.roster.Head(),
+			entmoot.RosterEntryID{0x77}, "pull unavailable: context deadline exceeded", false)
+	}
+	if escalated <= rosterSyncBackoffBase {
+		t.Fatalf("fixture did not escalate the backoff: %v", escalated)
+	}
+	if !f.session.rosterSyncReady(f.remote.ID, time.Now()) {
+		t.Fatal("an elapsed backoff did not make the peer ready")
+	}
+
+	// The round finds the peer's head on our chain: nothing to take, and the
+	// record must go.
+	f.runtime.syncRoster(f.ctx, f.session)
+
+	next := f.session.noteRosterSyncFailure(f.remote.ID, time.Now(), f.session.roster.Head(),
+		entmoot.RosterEntryID{0x78}, "pull unavailable: context deadline exceeded", false)
+	if next != rosterSyncBackoffBase {
+		t.Fatalf("a recovered peer starts its next backoff at %v, want the base %v: the failure count was not reset",
+			next, rosterSyncBackoffBase)
+	}
 }
