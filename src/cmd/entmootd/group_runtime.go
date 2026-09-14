@@ -662,6 +662,8 @@ retry:
 		slog.Int("keepers", summary.Eligible),
 		slog.Int("available", summary.Available),
 		slog.Int("inserted", summary.Inserted),
+		slog.Int("missing_bodies", summary.MissingBodies),
+		slog.Int("pruned_locally", summary.PrunedLocally),
 		slog.Int("converged_hints", summary.ConvergedHints),
 		slog.String("last_error", lastErr))
 }
