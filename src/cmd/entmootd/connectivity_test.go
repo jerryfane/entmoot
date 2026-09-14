@@ -123,7 +123,7 @@ func TestEnrollmentRetryReturnsExistingMatchingMembership(t *testing.T) {
 		GroupID: groupID, Founder: founder, RosterHead: inviteHead,
 		TargetPublicKey: targetIdentity.PublicKey, TargetMemberID: targetBinding.MemberID,
 		TargetPeerID: targetBinding.PeerID.String(),
-	})
+	}, target)
 	if err != nil {
 		t.Fatalf("idempotent enrollment retry failed: %v", err)
 	}

@@ -278,21 +278,39 @@ type Invite struct {
 	Signature []byte `json:"signature,omitempty"`
 }
 
-// BootstrapCapability is a founder-signed, expiring, single-use grant for one
-// fresh identity and a bounded set of bootstrap endpoints.
+// BootstrapCapability is an issuer-signed, expiring grant for a bounded set of
+// bootstrap endpoints. Target fields bind it to one fresh identity; leaving
+// them empty makes it an open invite that any holder may redeem. MaxUses caps
+// how many distinct identities may enroll with it (absent or zero means one).
 type BootstrapCapability struct {
 	GroupID           GroupID       `json:"group_id"`
-	TargetPublicKey   []byte        `json:"target_public_key"`
-	TargetMemberID    MemberID      `json:"target_member_id"`
-	TargetPeerID      string        `json:"target_peer_id"`
+	TargetPublicKey   []byte        `json:"target_public_key,omitempty"`
+	TargetMemberID    MemberID      `json:"target_member_id,omitempty"`
+	TargetPeerID      string        `json:"target_peer_id,omitempty"`
 	Founder           NodeInfo      `json:"founder"`
 	RosterHead        RosterEntryID `json:"roster_head"`
 	AllowedPeerIDs    []string      `json:"allowed_peer_ids,omitempty"`
 	AllowedMultiaddrs []string      `json:"allowed_multiaddrs,omitempty"`
+	MaxUses           int           `json:"max_uses,omitempty"`
 	Nonce             [32]byte      `json:"nonce"`
 	IssuedAtMS        int64         `json:"issued_at_ms"`
 	ExpiresAtMS       int64         `json:"expires_at_ms"`
 	Signature         []byte        `json:"signature,omitempty"`
+}
+
+// IsOpenInvite reports whether the capability is unbound to a single target
+// identity, so any holder may redeem it while uses remain.
+func (c BootstrapCapability) IsOpenInvite() bool {
+	return len(c.TargetPublicKey) == 0
+}
+
+// Uses returns the number of distinct identities permitted to enroll with this
+// capability. Zero or negative MaxUses means one.
+func (c BootstrapCapability) Uses() int {
+	if c.MaxUses <= 0 {
+		return 1
+	}
+	return c.MaxUses
 }
 
 // MarshalJSON encodes Invite with MerkleRoot as base64 rather than a numeric

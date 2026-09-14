@@ -415,7 +415,7 @@ func TestSyncBootstrapAuthorityAndMembership(t *testing.T) {
 		t.Fatal(err)
 	}
 	check("reserved_grant", &grant, false)
-	if err := admission.Release(grant); err != nil {
+	if err := admission.Release(grant, clientHost.ID()); err != nil {
 		t.Fatal(err)
 	}
 	check("released_grant", &grant, true)
@@ -445,7 +445,7 @@ func TestSyncBootstrapAuthorityAndMembership(t *testing.T) {
 	sign(&fresh, founder)
 	enrollment := EnrollmentServer{
 		Admission: admission.BootstrapAdmission,
-		Enroll: func(context.Context, BootstrapCapability) (EnrollmentResponse, error) {
+		Enroll: func(context.Context, BootstrapCapability, entmoot.NodeInfo) (EnrollmentResponse, error) {
 			entry, err := log.SignEntry(founder, "add", mustNodeInfo(t, target.PublicKey), nil, 3_000)
 			if err != nil {
 				return EnrollmentResponse{}, err
@@ -459,7 +459,7 @@ func TestSyncBootstrapAuthorityAndMembership(t *testing.T) {
 	if err := enrollment.Install(serverHost); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Enroll(ctx, clientHost, remote, fresh); err != nil {
+	if _, err := Enroll(ctx, clientHost, remote, fresh, target.PublicKey); err != nil {
 		t.Fatal(err)
 	}
 	check("admitted_member", nil, true)
