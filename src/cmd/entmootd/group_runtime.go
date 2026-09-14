@@ -788,10 +788,12 @@ func rosterChainDiverged(err error, headOffChain bool) bool {
 	// the caller supplies that half. Without it, a peer that simply pruned or
 	// restarted would be reported as forked.
 	//
-	// Today this is redundant with syncRoster's equal-or-behind check, which
-	// never pulls from a peer whose head is on our chain, so no test can
-	// distinguish the two. It is kept so the classifier states its own
-	// precondition instead of depending on one caller's ordering.
+	// The conjunct itself is pinned: removing it here makes a short chain from
+	// a peer whose head we hold read as a fork. What no test can separate is
+	// this check from syncRoster's equal-or-behind guard, which already never
+	// pulls from such a peer — forcing the argument true at that one call site
+	// changes nothing observable. Both are kept: the classifier states its own
+	// precondition rather than depending on one caller's ordering.
 	return headOffChain && strings.Contains(text, string(libp2ptransport.SyncShortChain))
 }
 
