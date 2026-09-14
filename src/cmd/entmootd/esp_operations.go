@@ -1979,12 +1979,22 @@ func (e espOperationExecutor) removeMember(ctx context.Context, req esphttp.Sign
 	if err != nil {
 		return nil, err
 	}
-	return json.Marshal(map[string]any{
-		"status":      resp.Status,
-		"group_id":    resp.GroupID,
-		"roster_head": resp.RosterHead,
-		"members":     resp.Members,
-	})
+	// A removal only sticks if the invites that would readmit the member are
+	// gone, and bearer invites cannot be attributed, so the caller is told
+	// what remains rather than left to assume it is clean.
+	out := map[string]any{
+		"status":                       resp.Status,
+		"group_id":                     resp.GroupID,
+		"roster_head":                  resp.RosterHead,
+		"members":                      resp.Members,
+		"revoked_invites":              resp.RevokedInvites,
+		"outstanding_open_invites":     resp.OutstandingOpenInvites,
+		"outstanding_esp_open_invites": resp.OutstandingESPOpenInvites,
+	}
+	if resp.InviteRevocationError != "" {
+		out["invite_revocation_error"] = resp.InviteRevocationError
+	}
+	return json.Marshal(out)
 }
 
 func buildInviteCreateIPCRequest(gid entmoot.GroupID, payload inviteCreatePayload) (*ipc.InviteCreateReq, error) {

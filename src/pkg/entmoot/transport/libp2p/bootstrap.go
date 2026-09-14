@@ -14,6 +14,7 @@ import (
 
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/keystore"
+	"entmoot/pkg/entmoot/roster"
 )
 
 const (
@@ -25,6 +26,10 @@ const (
 	PeerRecordProtocol protocol.ID = "/entmoot/peer-records/1"
 
 	bootstrapCapabilityDomain = "entmoot/bootstrap-capability/v1\x00"
+
+	// MaxCapabilityRelays bounds the relay hints one invite may carry, so an
+	// invite cannot fan a joiner out across an unbounded relay set.
+	MaxCapabilityRelays = 8
 )
 
 var (
@@ -104,6 +109,10 @@ func VerifyBootstrapCapability(capability BootstrapCapability, remotePeer peer.I
 	if capability.MaxUses < 0 {
 		return fmt.Errorf("%w: negative max uses", ErrBootstrapDenied)
 	}
+	if len(capability.Relays) > MaxCapabilityRelays {
+		return fmt.Errorf("%w: capability advertises %d relays, cap is %d",
+			ErrBootstrapDenied, len(capability.Relays), MaxCapabilityRelays)
+	}
 	if err := entmoot.ValidateMemberInfo(capability.Founder); err != nil {
 		return fmt.Errorf("%w: invalid founder: %v", ErrBootstrapDenied, err)
 	}
@@ -132,6 +141,34 @@ func VerifyBootstrapCapability(capability BootstrapCapability, remotePeer peer.I
 	authority := capability.SigningAuthority()
 	if len(authority.EntmootPubKey) != ed25519.PublicKeySize || !keystore.Verify(authority.EntmootPubKey, payload, capability.Signature) {
 		return fmt.Errorf("%w: invalid issuer signature", ErrBootstrapDenied)
+	}
+	return nil
+}
+
+// authorizedIssuer requires the identity that signed a capability to be a
+// member who may currently administer the group, with the key the roster
+// records for it. The signing authority travels in the capability, so binding
+// it to roster state is what makes the signature mean anything.
+func AuthorizedIssuer(groupRoster *roster.RosterLog, issuer entmoot.NodeInfo) error {
+	if groupRoster == nil {
+		return fmt.Errorf("%w: missing roster", ErrBootstrapDenied)
+	}
+	issuerMemberID, err := entmoot.ResolvedMemberID(issuer)
+	if err != nil {
+		return fmt.Errorf("%w: issuer identity is incomplete", ErrBootstrapDenied)
+	}
+	if !groupRoster.CanAdminister(issuerMemberID) {
+		return fmt.Errorf("%w: issuer cannot administer this group", ErrBootstrapDenied)
+	}
+	if known, found := groupRoster.MemberInfoByID(issuerMemberID); found {
+		if !bytes.Equal(known.EntmootPubKey, issuer.EntmootPubKey) {
+			return fmt.Errorf("%w: issuer key does not match the roster record", ErrBootstrapDenied)
+		}
+		return nil
+	}
+	founder, ok := groupRoster.Founder()
+	if !ok || !bytes.Equal(founder.EntmootPubKey, issuer.EntmootPubKey) {
+		return fmt.Errorf("%w: issuer is not a member of this group", ErrBootstrapDenied)
 	}
 	return nil
 }

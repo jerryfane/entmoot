@@ -179,6 +179,22 @@ func (r *groupRuntime) peerRecordsForGroup(groupID entmoot.GroupID) (*libp2ptran
 	return session.peerRecords, true
 }
 
+// relayHints renders this node's controlled relays as full multiaddrs, so an
+// invite can hand them to a joiner that has no other way to find a relay.
+func (r *groupRuntime) relayHints() []string {
+	out := make([]string, 0, len(r.controlledRelays))
+	for _, relay := range r.controlledRelays {
+		suffix := multiaddr.StringCast("/p2p/" + relay.ID.String())
+		for _, address := range relay.Addrs {
+			out = append(out, address.Encapsulate(suffix).String())
+			if len(out) == libp2ptransport.MaxCapabilityRelays {
+				return out
+			}
+		}
+	}
+	return out
+}
+
 // enroll applies the roster add for an applicant that presented a valid
 // invite. The invite's checkpoint only has to be somewhere on this group's
 // chain: the first joiner advances the head, and every other outstanding
@@ -252,27 +268,8 @@ func (r *groupRuntime) enroll(_ context.Context, capability entmoot.BootstrapCap
 // admin. Demoting or removing an admin therefore voids its outstanding
 // invites.
 func verifyInviteIssuer(groupRoster *roster.RosterLog, issuer entmoot.NodeInfo) error {
-	issuerMemberID, err := entmoot.ResolvedMemberID(issuer)
-	if err != nil {
-		return libp2ptransport.RejectEnrollment(
-			libp2ptransport.EnrollRejectIssuerMismatch, "invite issuer identity is incomplete")
-	}
-	if !groupRoster.CanAdminister(issuerMemberID) {
-		return libp2ptransport.RejectEnrollment(
-			libp2ptransport.EnrollRejectIssuerMismatch, "invite issuer %s cannot administer this group", issuerMemberID.String())
-	}
-	known, found := groupRoster.MemberInfoByID(issuerMemberID)
-	if found {
-		if !bytes.Equal(known.EntmootPubKey, issuer.EntmootPubKey) {
-			return libp2ptransport.RejectEnrollment(
-				libp2ptransport.EnrollRejectIssuerMismatch, "invite issuer key does not match the roster record")
-		}
-		return nil
-	}
-	founder, ok := groupRoster.Founder()
-	if !ok || !bytes.Equal(founder.EntmootPubKey, issuer.EntmootPubKey) {
-		return libp2ptransport.RejectEnrollment(
-			libp2ptransport.EnrollRejectIssuerMismatch, "invite issuer is not a member of this group")
+	if err := libp2ptransport.AuthorizedIssuer(groupRoster, issuer); err != nil {
+		return libp2ptransport.RejectEnrollment(libp2ptransport.EnrollRejectIssuerMismatch, "%v", err)
 	}
 	return nil
 }
@@ -627,45 +624,120 @@ func (r *groupRuntime) pruneGroup(ctx context.Context, session *groupSession) {
 	}
 }
 
+// maxRosterSyncPeers bounds how many members one roster sync round dials.
+// Roster changes are rare and the chain is linear, so a handful of peers is
+// enough to converge without turning every tick into a fan-out.
+const maxRosterSyncPeers = 8
+
+// syncRoster pulls roster entries from the group's members. Any admin can
+// author membership changes, so pulling only from the founder would leave
+// admin-authored adds and removals stranded on one node and the group split
+// across two heads. The founder pulls too, for the same reason.
 func (r *groupRuntime) syncRoster(ctx context.Context, session *groupSession) {
-	founder, ok := session.roster.Founder()
-	if !ok {
+	local := session.roster.Entries()
+	if len(local) == 0 {
 		return
 	}
-	binding, err := libp2ptransport.BindingFromPublicKey(founder.EntmootPubKey)
-	if err != nil || binding.PeerID == r.host.ID() {
-		return
-	}
-	remote := peer.AddrInfo{ID: binding.PeerID, Addrs: r.host.Peerstore().Addrs(binding.PeerID)}
-	if len(remote.Addrs) == 0 {
-		peers, loadErr := loadGroupPeers(r.dataDir, session.groupID)
-		if loadErr != nil {
-			return
+	for _, remote := range r.rosterSyncPeers(session) {
+		syncCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		head, err := libp2ptransport.FetchRosterHead(syncCtx, r.host, remote, session.groupID)
+		if err != nil {
+			cancel()
+			r.logger.Debug("libp2p roster head",
+				slog.String("group_id", session.groupID.String()),
+				slog.String("peer_id", remote.ID.String()),
+				slog.String("err", err.Error()))
+			continue
 		}
-		for _, candidate := range peers {
-			if candidate.ID == remote.ID {
-				remote.Addrs = candidate.Addrs
+		if session.roster.HasEntry(head) {
+			// Equal or behind: nothing to take from this peer.
+			cancel()
+			continue
+		}
+		updates, err := libp2ptransport.FetchRosterUpdates(syncCtx, r.host, remote, session.groupID, local)
+		cancel()
+		if err != nil {
+			// The peer advertises a head we do not hold and its chain does not
+			// extend ours: the log has forked, which no amount of retrying
+			// repairs. Say so loudly rather than looking merely offline.
+			r.logger.Warn("libp2p roster divergence",
+				slog.String("group_id", session.groupID.String()),
+				slog.String("peer_id", remote.ID.String()),
+				slog.String("local_head", session.roster.Head().String()),
+				slog.String("remote_head", head.String()),
+				slog.String("err", err.Error()))
+			continue
+		}
+		applied := 0
+		for _, entry := range updates {
+			if err := session.roster.Apply(entry); err != nil {
+				r.logger.Warn("libp2p roster apply",
+					slog.String("group_id", session.groupID.String()),
+					slog.String("peer_id", remote.ID.String()),
+					slog.String("err", err.Error()))
 				break
 			}
+			applied++
+		}
+		if applied > 0 {
+			r.logger.Info("libp2p roster synchronized",
+				slog.String("group_id", session.groupID.String()),
+				slog.String("peer_id", remote.ID.String()),
+				slog.Int("entries", applied))
+			local = session.roster.Entries()
+			// Messages held for one of the heads we just learned can be
+			// accepted now.
+			r.drainRosterAhead(ctx, session)
 		}
 	}
-	syncCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	updates, err := libp2ptransport.FetchRosterUpdates(syncCtx, r.host, remote, session.groupID, session.roster.Entries())
-	if err != nil {
-		r.logger.Debug("libp2p roster sync", slog.String("group_id", session.groupID.String()), slog.String("err", err.Error()))
-		return
+}
+
+// rosterSyncPeers lists dialable candidates to pull roster state from: every
+// current member except this node, founder first because it is the most likely
+// to be reachable and authoritative.
+func (r *groupRuntime) rosterSyncPeers(session *groupSession) []peer.AddrInfo {
+	cached, _ := loadGroupPeers(r.dataDir, session.groupID)
+	addrsFor := func(id peer.ID) []multiaddr.Multiaddr {
+		if addrs := r.host.Peerstore().Addrs(id); len(addrs) > 0 {
+			return addrs
+		}
+		for _, candidate := range cached {
+			if candidate.ID == id {
+				return candidate.Addrs
+			}
+		}
+		return nil
 	}
-	for _, entry := range updates {
-		if err := session.roster.Apply(entry); err != nil {
-			r.logger.Warn("libp2p roster apply", slog.String("group_id", session.groupID.String()), slog.String("err", err.Error()))
-			return
+	ordered := make([]entmoot.MemberID, 0, len(session.roster.MemberIDs())+1)
+	if founder, ok := session.roster.Founder(); ok && founder.MemberID != nil {
+		ordered = append(ordered, *founder.MemberID)
+	}
+	for _, memberID := range session.roster.MemberIDs() {
+		if len(ordered) > 0 && memberID == ordered[0] {
+			continue
+		}
+		ordered = append(ordered, memberID)
+	}
+	out := make([]peer.AddrInfo, 0, len(ordered))
+	for _, memberID := range ordered {
+		info, found := session.roster.MemberInfoByID(memberID)
+		if !found {
+			continue
+		}
+		binding, err := libp2ptransport.BindingFromPublicKey(info.EntmootPubKey)
+		if err != nil || binding.PeerID == r.host.ID() {
+			continue
+		}
+		addrs := addrsFor(binding.PeerID)
+		if len(addrs) == 0 {
+			continue
+		}
+		out = append(out, peer.AddrInfo{ID: binding.PeerID, Addrs: addrs})
+		if len(out) == maxRosterSyncPeers {
+			break
 		}
 	}
-	if len(updates) > 0 {
-		r.logger.Info("libp2p roster synchronized", slog.String("group_id", session.groupID.String()), slog.Int("entries", len(updates)))
-		r.drainRosterAhead(ctx, session)
-	}
+	return out
 }
 
 // drainRosterAhead releases messages that were held for a roster head this

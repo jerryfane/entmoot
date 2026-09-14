@@ -54,7 +54,9 @@ func cmdInviteCreate(gf *globalFlags, args []string) int {
 	maxUses := fs.Int("max-uses", 1, "how many distinct identities may join with this invite")
 	validFor := fs.String("valid-for", "24h", "capability TTL (time.ParseDuration or <N>d)")
 	var bootstrap stringListFlag
-	fs.Var(&bootstrap, "bootstrap", "founder libp2p multiaddr ending in /p2p/<peer-id>; repeatable")
+	fs.Var(&bootstrap, "bootstrap", "issuing node's libp2p multiaddr ending in /p2p/<peer-id>; repeatable")
+	var relays stringListFlag
+	fs.Var(&relays, "relay", "controlled-relay multiaddr the joiner should adopt, ending in /p2p/<relay-peer-id>; repeatable; defaults to this data root's own relays")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return exitOK
@@ -171,6 +173,26 @@ func cmdInviteCreate(gf *globalFlags, args []string) int {
 			allowedPeerIDs = append(allowedPeerIDs, info.ID.String())
 		}
 	}
+	// Relay hints default to whatever this node itself relays through, since
+	// that is the set already known to accept it.
+	relayHints := []string(relays)
+	if len(relayHints) == 0 {
+		relayHints = gf.controlledRelays
+	}
+	if len(relayHints) == 0 {
+		if stored, err := loadRelayHints(s.dataDir); err == nil {
+			relayHints = stored
+		}
+	}
+	relayHints, err = validateRelayHints(relayHints)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "invite create: -relay: %v\n", err)
+		return exitInvalidArgument
+	}
+	if len(relays) > 0 && len(relayHints) != len(relays) {
+		fmt.Fprintln(os.Stderr, "invite create: every -relay must be a multiaddr ending in /p2p/<relay-peer-id>")
+		return exitInvalidArgument
+	}
 	now := time.Now()
 	capability := entmoot.BootstrapCapability{
 		GroupID:           gid,
@@ -182,6 +204,7 @@ func cmdInviteCreate(gf *globalFlags, args []string) int {
 		RosterHead:        rlog.Head(),
 		AllowedPeerIDs:    allowedPeerIDs,
 		AllowedMultiaddrs: allowedAddresses,
+		Relays:            relayHints,
 		MaxUses:           *maxUses,
 		IssuedAtMS:        now.UnixMilli(),
 		ExpiresAtMS:       now.Add(ttl).UnixMilli(),
