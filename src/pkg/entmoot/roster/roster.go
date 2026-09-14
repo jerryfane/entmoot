@@ -562,12 +562,48 @@ func (r *RosterLog) HasEntry(id entmoot.RosterEntryID) bool {
 	return ok
 }
 
+// RemovedSince reports whether memberID was removed at any entry after since,
+// and whether since is a known entry. An invite vouches for admission as of
+// its checkpoint, so a later removal has to override it: otherwise an evicted
+// member could rejoin with an invite it already holds.
+func (r *RosterLog) RemovedSince(memberID entmoot.MemberID, since entmoot.RosterEntryID) (bool, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	index, known := r.byID[since]
+	if !known {
+		return false, false
+	}
+	for i := index + 1; i < len(r.entries); i++ {
+		entry := r.entries[i]
+		if entry.Op != "remove" || entry.Subject.MemberID == nil {
+			continue
+		}
+		if *entry.Subject.MemberID == memberID {
+			return true, true
+		}
+	}
+	return false, true
+}
+
 // Head returns the id of the current head entry, or the zero id if the log is
 // empty.
 func (r *RosterLog) Head() entmoot.RosterEntryID {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.head
+}
+
+// HeadTimestamp returns the unix-millisecond timestamp of the current head, or
+// zero if the log is empty. Entry timestamps must grow strictly, so a caller
+// producing back-to-back entries needs this to pick a valid timestamp when the
+// wall clock has not ticked.
+func (r *RosterLog) HeadTimestamp() int64 {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if len(r.entries) == 0 {
+		return 0
+	}
+	return r.entries[len(r.entries)-1].Timestamp
 }
 
 // HeadIsGroupBound reports whether the current head is a version-2 entry

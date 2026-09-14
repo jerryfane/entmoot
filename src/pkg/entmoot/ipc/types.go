@@ -186,12 +186,17 @@ type JoinGroupResp struct {
 	Readiness json.RawMessage   `json:"readiness,omitempty"`
 }
 
-// InviteCreateReq asks the live founder daemon to mint a target-bound
-// bootstrap capability from its current roster and advertised addresses.
+// InviteCreateReq asks the live founder daemon to mint a bootstrap capability
+// from its current roster and advertised addresses. TargetPublicKey is
+// required unless Open is set, which mints a bearer invite any holder may
+// redeem; MaxUses caps how many distinct identities may enroll with it (zero
+// means one).
 type InviteCreateReq struct {
 	GroupID             entmoot.GroupID `json:"group_id"`
-	TargetPublicKey     []byte          `json:"target_public_key"`
+	TargetPublicKey     []byte          `json:"target_public_key,omitempty"`
+	Open                bool            `json:"open,omitempty"`
 	BootstrapMultiaddrs []string        `json:"bootstrap_multiaddrs"`
+	MaxUses             int             `json:"max_uses,omitempty"`
 	ValidForMS          int64           `json:"valid_for_ms,omitempty"`
 	ValidUntilMS        int64           `json:"valid_until_ms,omitempty"`
 }
@@ -225,6 +230,13 @@ type MemberRemoveResp struct {
 	GroupID    entmoot.GroupID       `json:"group_id"`
 	RosterHead entmoot.RosterEntryID `json:"roster_head"`
 	Members    int                   `json:"members"`
+	// RevokedInvites counts invites bound to the removed member that this
+	// removal voided.
+	RevokedInvites int `json:"revoked_invites"`
+	// OutstandingOpenInvites lists base64 nonces of the group's remaining
+	// bearer invites. They name no target, so a removal cannot void them and
+	// whoever holds one can still join until it is revoked or expires.
+	OutstandingOpenInvites []string `json:"outstanding_open_invites,omitempty"`
 }
 
 type GroupDeactivateReq struct {

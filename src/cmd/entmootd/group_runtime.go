@@ -175,33 +175,57 @@ func (r *groupRuntime) peerRecordsForGroup(groupID entmoot.GroupID) (*libp2ptran
 	return session.peerRecords, true
 }
 
-func (r *groupRuntime) enroll(_ context.Context, capability entmoot.BootstrapCapability) (libp2ptransport.EnrollmentResponse, error) {
+// enroll applies the roster add for an applicant that presented a valid
+// invite. The invite's checkpoint only has to be somewhere on this group's
+// chain: the first joiner advances the head, and every other outstanding
+// invite must still work.
+func (r *groupRuntime) enroll(_ context.Context, capability entmoot.BootstrapCapability, applicant entmoot.NodeInfo) (libp2ptransport.EnrollmentResponse, error) {
 	r.mu.RLock()
 	session, ok := r.sessions[capability.GroupID]
 	r.mu.RUnlock()
 	if !ok {
-		return libp2ptransport.EnrollmentResponse{}, errors.New("unknown group")
+		return libp2ptransport.EnrollmentResponse{}, libp2ptransport.RejectEnrollment(
+			libp2ptransport.EnrollRejectUnknownGroup, "group %s is not served here", capability.GroupID.String())
 	}
 	founder, ok := session.roster.Founder()
 	if !ok || !bytes.Equal(founder.EntmootPubKey, r.identity.PublicKey) || founder.MemberID == nil || *founder.MemberID != r.binding.MemberID {
-		return libp2ptransport.EnrollmentResponse{}, errors.New("local identity is not the founder")
+		return libp2ptransport.EnrollmentResponse{}, libp2ptransport.RejectEnrollment(
+			libp2ptransport.EnrollRejectNotIssuer, "local identity cannot sign roster changes for this group")
 	}
 	if capability.Founder.MemberID == nil || *capability.Founder.MemberID != *founder.MemberID || !bytes.Equal(capability.Founder.EntmootPubKey, founder.EntmootPubKey) {
-		return libp2ptransport.EnrollmentResponse{}, errors.New("founder binding mismatch")
+		return libp2ptransport.EnrollmentResponse{}, libp2ptransport.RejectEnrollment(
+			libp2ptransport.EnrollRejectIssuerMismatch, "invite issuer is not this group's founder")
 	}
-	if session.roster.IsMemberID(capability.TargetMemberID) {
-		existing, found := session.roster.MemberInfoByID(capability.TargetMemberID)
-		if !found || existing.PeerID != capability.TargetPeerID || !bytes.Equal(existing.EntmootPubKey, capability.TargetPublicKey) {
-			return libp2ptransport.EnrollmentResponse{}, errors.New("target member identity is already bound differently")
+	if applicant.MemberID == nil {
+		return libp2ptransport.EnrollmentResponse{}, libp2ptransport.RejectEnrollment(
+			libp2ptransport.EnrollRejectApplicant, "applicant identity is incomplete")
+	}
+	if session.roster.IsMemberID(*applicant.MemberID) {
+		existing, found := session.roster.MemberInfoByID(*applicant.MemberID)
+		if !found || existing.PeerID != applicant.PeerID || !bytes.Equal(existing.EntmootPubKey, applicant.EntmootPubKey) {
+			return libp2ptransport.EnrollmentResponse{}, libp2ptransport.RejectEnrollment(
+				libp2ptransport.EnrollRejectIdentityConflict, "member id is already bound to another key")
 		}
 		return libp2ptransport.EnrollmentResponse{RosterHead: session.roster.Head(), Entries: session.roster.Entries()}, nil
 	}
-	if capability.RosterHead != session.roster.Head() {
-		return libp2ptransport.EnrollmentResponse{}, errors.New("stale roster checkpoint")
+	if !session.roster.HasEntry(capability.RosterHead) {
+		return libp2ptransport.EnrollmentResponse{}, libp2ptransport.RejectEnrollment(
+			libp2ptransport.EnrollRejectUnknownCheckpoint, "invite checkpoint %s is not on this group's roster chain", capability.RosterHead.String())
 	}
-	target := entmoot.NodeInfo{EntmootPubKey: append([]byte(nil), capability.TargetPublicKey...), MemberID: &capability.TargetMemberID, PeerID: capability.TargetPeerID}
+	if removed, _ := session.roster.RemovedSince(*applicant.MemberID, capability.RosterHead); removed {
+		return libp2ptransport.EnrollmentResponse{}, libp2ptransport.RejectEnrollment(
+			libp2ptransport.EnrollRejectIdentityConflict, "applicant was removed from the roster after the invite checkpoint; a new invite is required")
+	}
+	target := entmoot.NodeInfo{EntmootPubKey: append([]byte(nil), applicant.EntmootPubKey...), MemberID: applicant.MemberID, PeerID: applicant.PeerID}
 
-	entry, err := session.roster.SignEntry(r.identity, "add", target, nil, time.Now().UnixMilli())
+	// Roster timestamps must grow strictly. Two people redeeming a multi-use
+	// invite in the same millisecond would otherwise make the second add
+	// unappliable.
+	timestamp := time.Now().UnixMilli()
+	if head := session.roster.HeadTimestamp(); timestamp <= head {
+		timestamp = head + 1
+	}
+	entry, err := session.roster.SignEntry(r.identity, "add", target, nil, timestamp)
 	if err != nil {
 		return libp2ptransport.EnrollmentResponse{}, err
 	}
@@ -287,7 +311,8 @@ func (r *groupRuntime) AddCapability(ctx context.Context, capability entmoot.Boo
 	if err := libp2ptransport.VerifyBootstrapCapability(capability, r.host.ID(), time.Now()); err != nil {
 		return nil, false, err
 	}
-	if capability.TargetMemberID != r.binding.MemberID || capability.TargetPeerID != r.binding.PeerID.String() || !bytes.Equal(capability.TargetPublicKey, r.identity.PublicKey) {
+	if !capability.IsOpenInvite() &&
+		(capability.TargetMemberID != r.binding.MemberID || capability.TargetPeerID != r.binding.PeerID.String() || !bytes.Equal(capability.TargetPublicKey, r.identity.PublicKey)) {
 		return nil, false, errors.New("bootstrap capability is for a different local identity")
 	}
 	var lastErr error
@@ -306,12 +331,12 @@ func (r *groupRuntime) AddCapability(ctx context.Context, capability entmoot.Boo
 			lastErr = errors.New("bootstrap address peer is not authorized by capability")
 			continue
 		}
-		response, err := libp2ptransport.Enroll(ctx, r.host, *info, capability)
+		response, err := libp2ptransport.Enroll(ctx, r.host, *info, capability, r.identity.PublicKey)
 		if err != nil {
 			lastErr = err
 			continue
 		}
-		if err := validateEnrollmentResponse(capability, response); err != nil {
+		if err := validateEnrollmentResponse(capability, r.binding.MemberID, response); err != nil {
 			return nil, false, err
 		}
 		if err := persistEnrollment(r.dataDir, capability.GroupID, response.Entries); err != nil {
@@ -339,7 +364,9 @@ func (r *groupRuntime) AddCapability(ctx context.Context, capability entmoot.Boo
 	return nil, false, lastErr
 }
 
-func validateEnrollmentResponse(capability entmoot.BootstrapCapability, response libp2ptransport.EnrollmentResponse) error {
+// validateEnrollmentResponse replays the served roster locally and requires
+// that it admits this node under the invite's issuer.
+func validateEnrollmentResponse(capability entmoot.BootstrapCapability, localMemberID entmoot.MemberID, response libp2ptransport.EnrollmentResponse) error {
 	if len(response.Entries) == 0 {
 		return errors.New("enrollment response has no roster")
 	}
@@ -352,7 +379,7 @@ func validateEnrollmentResponse(capability entmoot.BootstrapCapability, response
 			return fmt.Errorf("validate enrollment roster: %w", err)
 		}
 	}
-	if candidate.Head() != response.RosterHead || !candidate.IsMemberID(capability.TargetMemberID) {
+	if candidate.Head() != response.RosterHead || !candidate.IsMemberID(localMemberID) {
 		return errors.New("enrollment response checkpoint or membership mismatch")
 	}
 	founder, ok := candidate.Founder()
