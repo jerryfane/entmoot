@@ -63,11 +63,11 @@ func TestFreshMemberEnrollsAcrossLibp2pWithoutPilot(t *testing.T) {
 	server := EnrollmentServer{
 		Admission: NewBootstrapAdmission(),
 		Now:       func() time.Time { return now },
-		Enroll: func(_ context.Context, cap BootstrapCapability) (EnrollmentResponse, error) {
+		Enroll: func(_ context.Context, cap BootstrapCapability, applicant entmoot.NodeInfo) (EnrollmentResponse, error) {
 			if cap.GroupID != groupID || cap.RosterHead != rosterLog.Head() {
 				return EnrollmentResponse{}, errors.New("stale bootstrap checkpoint")
 			}
-			subject := mustNodeInfo(t, cap.TargetPublicKey)
+			subject := applicant
 			entry, err := rosterLog.SignEntry(founderIdentity, "add", subject, nil, 2_000)
 			if err != nil {
 				return EnrollmentResponse{}, err
@@ -81,7 +81,7 @@ func TestFreshMemberEnrollsAcrossLibp2pWithoutPilot(t *testing.T) {
 	if err := server.Install(founderHost); err != nil {
 		t.Fatal(err)
 	}
-	response, err := Enroll(ctx, targetHost, peer.AddrInfo{ID: founderHost.ID(), Addrs: founderHost.Addrs()}, capability)
+	response, err := Enroll(ctx, targetHost, peer.AddrInfo{ID: founderHost.ID(), Addrs: founderHost.Addrs()}, capability, targetIdentity.PublicKey)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -117,7 +117,7 @@ func TestFreshMemberEnrollsAcrossLibp2pWithoutPilot(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitForStoredMessage(t, ctx, targetStore, groupID, message.ID)
-	if _, err := Enroll(ctx, targetHost, peer.AddrInfo{ID: founderHost.ID(), Addrs: founderHost.Addrs()}, capability); err == nil {
+	if _, err := Enroll(ctx, targetHost, peer.AddrInfo{ID: founderHost.ID(), Addrs: founderHost.Addrs()}, capability, targetIdentity.PublicKey); err == nil {
 		t.Fatal("replayed enrollment capability succeeded")
 	}
 }
@@ -158,7 +158,7 @@ func TestEnrollmentCapabilityRetriesAfterCallbackFailure(t *testing.T) {
 	server := EnrollmentServer{
 		Admission: NewBootstrapAdmission(),
 		Now:       func() time.Time { return now },
-		Enroll: func(context.Context, BootstrapCapability) (EnrollmentResponse, error) {
+		Enroll: func(context.Context, BootstrapCapability, entmoot.NodeInfo) (EnrollmentResponse, error) {
 			calls++
 			if calls == 1 {
 				return EnrollmentResponse{}, errors.New("temporary persistence failure")
@@ -170,13 +170,13 @@ func TestEnrollmentCapabilityRetriesAfterCallbackFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	remote := peer.AddrInfo{ID: founderHost.ID(), Addrs: founderHost.Addrs()}
-	if _, err := Enroll(ctx, targetHost, remote, capability); err == nil {
+	if _, err := Enroll(ctx, targetHost, remote, capability, targetIdentity.PublicKey); err == nil {
 		t.Fatal("first enrollment unexpectedly succeeded")
 	}
-	if _, err := Enroll(ctx, targetHost, remote, capability); err != nil {
+	if _, err := Enroll(ctx, targetHost, remote, capability, targetIdentity.PublicKey); err != nil {
 		t.Fatalf("retry after callback failure: %v", err)
 	}
-	if _, err := Enroll(ctx, targetHost, remote, capability); err == nil {
+	if _, err := Enroll(ctx, targetHost, remote, capability, targetIdentity.PublicKey); err == nil {
 		t.Fatal("committed capability replay succeeded")
 	}
 	if calls != 2 {
@@ -219,19 +219,19 @@ func TestEnrollmentCommitFailureReleasesReservationForIdempotentRetry(t *testing
 	used := false
 	commitCalls := 0
 	releaseCalls := 0
-	admission.reserve = func(capabilityKey) (bool, error) {
+	admission.reserve = func(redemptionKey, int) (bool, error) {
 		if reserved || used {
 			return false, nil
 		}
 		reserved = true
 		return true, nil
 	}
-	admission.release = func(capabilityKey) error {
+	admission.release = func(redemptionKey) error {
 		releaseCalls++
 		reserved = false
 		return nil
 	}
-	admission.commit = func(capabilityKey) error {
+	admission.commit = func(redemptionKey) error {
 		commitCalls++
 		if commitCalls == 1 {
 			return errors.New("temporary admission store failure")
@@ -244,7 +244,7 @@ func TestEnrollmentCommitFailureReleasesReservationForIdempotentRetry(t *testing
 	server := EnrollmentServer{
 		Admission: admission,
 		Now:       func() time.Time { return now },
-		Enroll: func(context.Context, BootstrapCapability) (EnrollmentResponse, error) {
+		Enroll: func(context.Context, BootstrapCapability, entmoot.NodeInfo) (EnrollmentResponse, error) {
 			enrollCalls++
 			return EnrollmentResponse{}, nil
 		},
@@ -253,13 +253,13 @@ func TestEnrollmentCommitFailureReleasesReservationForIdempotentRetry(t *testing
 		t.Fatal(err)
 	}
 	remote := peer.AddrInfo{ID: founderHost.ID(), Addrs: founderHost.Addrs()}
-	if _, err := Enroll(ctx, targetHost, remote, capability); err == nil {
+	if _, err := Enroll(ctx, targetHost, remote, capability, targetIdentity.PublicKey); err == nil {
 		t.Fatal("enrollment unexpectedly succeeded when admission commit failed")
 	}
-	if _, err := Enroll(ctx, targetHost, remote, capability); err != nil {
+	if _, err := Enroll(ctx, targetHost, remote, capability, targetIdentity.PublicKey); err != nil {
 		t.Fatalf("retry after admission commit failure: %v", err)
 	}
-	if _, err := Enroll(ctx, targetHost, remote, capability); err == nil {
+	if _, err := Enroll(ctx, targetHost, remote, capability, targetIdentity.PublicKey); err == nil {
 		t.Fatal("committed capability replay succeeded")
 	}
 	if releaseCalls != 1 || enrollCalls != 2 {

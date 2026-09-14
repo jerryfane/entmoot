@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Multi-use and open invites, with revocation.** `invite create` now accepts
+  `-max-uses` (default 1, ceiling 64) and makes `-target-pubkey` optional: an
+  invite with no target is redeemable by any holder while uses remain, so one
+  link admits a small team. Uses are counted per applicant peer and persisted,
+  so the limit survives restarts. `invite list` reports issued invites with
+  uses spent and state, and `invite revoke` withdraws an invite before it
+  expires, including one whose file was lost. The daemon IPC `invite_create`
+  request carries the same `max_uses` and optional target.
+
+### Fixed
+
+- **Outstanding invites survive the first join.** Enrollment required the
+  invite to name the *current* roster head, so the first joiner invalidated
+  every other invite the founder had handed out; those joiners saw only
+  `enrollment_failed`. An invite is now accepted at any checkpoint on the
+  group's roster chain. Enrollment rejections carry a typed code and a reason
+  (unknown group, not issuer, unknown checkpoint, identity conflict, applicant
+  mismatch, capability denied), and a rejection the applicant can fix leaves
+  the invite's uses intact. Roster adds also advance their timestamp past the
+  head, so two joiners redeeming one invite in the same millisecond both apply.
+
 ### Changed
 
 - **Membership is the only publishing authority.** Messages no longer carry a

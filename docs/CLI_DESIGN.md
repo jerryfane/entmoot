@@ -57,7 +57,7 @@ Founder/admin commands:
 group create
 group policy status|set|clear
 group public descriptor|publish
-invite create
+invite create|list|revoke
 roster add|remove
 ```
 
@@ -151,15 +151,28 @@ full-width MemberID. Enabling config does not start a runner.
 
 ## 9. Invite and Bootstrap Contract
 
-`invite create` accepts a target Ed25519 public key and one or more founder
-libp2p bootstrap multiaddrs. The target MemberID and PeerID are derived from that
-key. The founder signs the group id, founder identity, roster checkpoint,
-target, permitted bootstrap peers/addresses, expiry, and one-shot capability id.
+`invite create` accepts one or more founder libp2p bootstrap multiaddrs and,
+optionally, a target Ed25519 public key. With a target, the MemberID and PeerID
+are derived from that key and only that identity may redeem the invite. Without
+one, the invite is open: any holder may redeem it while uses remain, which is
+how a small team joins from one link. `-max-uses` caps the number of distinct
+identities (default 1, ceiling 64). The founder signs the group id, founder
+identity, roster checkpoint, target if any, permitted bootstrap
+peers/addresses, use limit, expiry, and capability nonce.
+
+`invite list` shows issued invites with uses spent and state
+(open/spent/expired/revoked). `invite revoke` withdraws an invite before it
+expires, blocking every remaining use; revoking a nonce this data root never
+recorded also blocks it, so a leaked invite file is recoverable.
 
 Join validates the complete capability before network use, fetches roster state
-only from an allowed serving peer, binds the fetched founder and checkpoint, and
-persists consumption. Invalid, expired, replayed, wrong-target, wrong-founder,
-or unrelated-checkpoint capabilities install no partial group state.
+only from an allowed serving peer, binds the fetched founder and its own
+resulting membership, and persists consumption per applicant. Invalid, expired,
+replayed, revoked, exhausted, wrong-target or wrong-founder capabilities
+install no partial group state. An invite's checkpoint only has to be on the
+group's roster chain: earlier joins advance the head without invalidating
+outstanding invites. Enrollment rejections carry a typed code and a reason, and
+a rejection that the applicant could fix does not spend a use.
 
 Open-invite redemption uses the same Entmoot identity. The joiner signs a
 bounded issuer challenge with its Ed25519 key; the issuer verifies the MemberID,

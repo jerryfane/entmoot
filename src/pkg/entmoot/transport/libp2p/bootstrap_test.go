@@ -166,7 +166,7 @@ func TestPersistentReservationExpiresAfterRestart(t *testing.T) {
 	if err := second.Reserve(capability, targetBinding.PeerID, EnrollmentProtocol, now); err == nil {
 		t.Fatal("fresh reservation was stolen after restart")
 	}
-	if _, err := second.db.Exec(`UPDATE used_bootstrap_capabilities SET reserved_at_ms=0 WHERE group_id=? AND nonce=?`, capability.GroupID[:], capability.Nonce[:]); err != nil {
+	if _, err := second.db.Exec(`UPDATE bootstrap_redemptions SET reserved_at_ms=0 WHERE group_id=? AND nonce=?`, capability.GroupID[:], capability.Nonce[:]); err != nil {
 		t.Fatal(err)
 	}
 	if err := second.Reserve(capability, targetBinding.PeerID, EnrollmentProtocol, now); err != nil {
