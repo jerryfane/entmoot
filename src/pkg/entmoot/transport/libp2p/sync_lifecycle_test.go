@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"slices"
-	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -329,7 +328,10 @@ func TestRosterHeadProbeReservesNoSnapshotSlot(t *testing.T) {
 		}
 	}
 	local := f.logs[group].Entries()[:1]
-	updates, err := FetchRosterUpdates(f.ctx, f.client, f.remote, group, local)
+	updates, complete, err := FetchRosterUpdates(f.ctx, f.client, f.remote, group, local)
+	if !complete {
+		t.Fatal("a small chain was not served completely in one pull")
+	}
 	if err != nil {
 		t.Fatalf("roster pull after the probes: %v", err)
 	}
@@ -408,7 +410,10 @@ func TestRosterPullCeilingBoundsTheDeltaNotTheChainLength(t *testing.T) {
 	// A node that is one entry behind on an over-ceiling chain must still be
 	// able to catch up: the delta is one entry.
 	local := chain[:len(chain)-1]
-	updates, err := FetchRosterUpdates(ctx, clientHost, remote, groupID, local)
+	updates, complete, err := FetchRosterUpdates(ctx, clientHost, remote, groupID, local)
+	if !complete {
+		t.Fatal("a small chain was not served completely in one pull")
+	}
 	if err != nil {
 		t.Fatalf("catching up one entry on a %d-entry chain: %v", len(chain), err)
 	}
@@ -416,10 +421,62 @@ func TestRosterPullCeilingBoundsTheDeltaNotTheChainLength(t *testing.T) {
 		t.Fatalf("pull returned %d entries, want the single missing one", len(updates))
 	}
 
-	// The ceiling still bounds one round: a node holding only the genesis
-	// cannot pull an over-ceiling chain in a single pull.
-	if _, err := FetchRosterUpdates(ctx, clientHost, remote, groupID, chain[:1]); err == nil ||
-		!strings.Contains(err.Error(), "exceeds") {
-		t.Fatalf("an over-ceiling download was not refused: %v", err)
+	// The ceiling still bounds one round, and a node far behind converges by
+	// keeping each round's validated progress instead of restarting.
+	held := chain[:1]
+	rounds := 0
+	for {
+		rounds++
+		if rounds > 8 {
+			t.Fatalf("catching up from the genesis did not converge in %d rounds", rounds)
+		}
+		part, complete, err := FetchRosterUpdates(ctx, clientHost, remote, groupID, held)
+		if err != nil {
+			t.Fatalf("round %d: %v", rounds, err)
+		}
+		if len(part) == 0 {
+			t.Fatalf("round %d served nothing", rounds)
+		}
+		if len(part) > maxRosterSyncEntries {
+			t.Fatalf("round %d downloaded %d entries, past the ceiling %d", rounds, len(part), maxRosterSyncEntries)
+		}
+		held = append(held, part...)
+		if complete {
+			break
+		}
+	}
+	if rounds < 2 {
+		t.Fatalf("an over-ceiling chain was taken in %d round; the ceiling did not bound the round", rounds)
+	}
+	if len(held) != len(chain) || held[len(held)-1].ID != chain[len(chain)-1].ID {
+		t.Fatalf("catch-up produced %d entries ending %s, want %d ending %s",
+			len(held), held[len(held)-1].ID, len(chain), chain[len(chain)-1].ID)
+	}
+}
+
+// A peer asking for entries past the end of our chain is not making a
+// malformed request: it holds a longer prefix than we do. Saying which of the
+// two it is lets the caller tell a fork from a transport problem.
+func TestRosterPageReportsAChainShorterThanTheRequest(t *testing.T) {
+	f := newSnapshotLifecycleFixture(t)
+	group := f.groups[0]
+	held := len(f.logs[group].Entries())
+
+	beyond, err := RequestRosterPage(f.ctx, f.client, f.remote, RosterSyncRequest{
+		Version: 2, RequestID: "past-the-end", GroupID: group,
+		AfterSequence: uint64(held + 3), Limit: 16,
+	})
+	if err == nil {
+		t.Fatal("a request past the end of the chain succeeded")
+	}
+	if beyond.Error != SyncShortChain {
+		t.Fatalf("error = %q, want %q", beyond.Error, SyncShortChain)
+	}
+	// A request inside the chain is unaffected.
+	inside, err := RequestRosterPage(f.ctx, f.client, f.remote, RosterSyncRequest{
+		Version: 2, RequestID: "inside", GroupID: group, AfterSequence: 1, Limit: 16,
+	})
+	if err != nil || !inside.Complete || len(inside.Entries) != held-1 {
+		t.Fatalf("page inside the chain: page=%+v err=%v", inside, err)
 	}
 }

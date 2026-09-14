@@ -256,7 +256,10 @@ func TestFetchRosterUpdatesAdvancesExistingMember(t *testing.T) {
 	if err := server.Install(); err != nil {
 		t.Fatal(err)
 	}
-	updates, err := FetchRosterUpdates(ctx, memberHost, peer.AddrInfo{ID: founderHost.ID(), Addrs: founderHost.Addrs()}, groupID, stale.Entries())
+	updates, complete, err := FetchRosterUpdates(ctx, memberHost, peer.AddrInfo{ID: founderHost.ID(), Addrs: founderHost.Addrs()}, groupID, stale.Entries())
+	if !complete {
+		t.Fatal("a small chain was not served completely in one pull")
+	}
 	if err != nil {
 		t.Fatal(err)
 	}

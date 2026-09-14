@@ -719,7 +719,10 @@ func (s *groupSession) noteRosterSyncFailure(id peer.ID, now time.Time, localHea
 	if state.sinceMS == 0 {
 		state.sinceMS = now.UnixMilli()
 	}
-	state.fork = fork
+	// Fork evidence is sticky. A timeout after a fork does not mean the fork
+	// healed; only a successful exchange, or the head turning up on our chain,
+	// clears the record (clearRosterSyncFailure and the report filter).
+	state.fork = state.fork || fork
 	s.rosterBackoff[id] = state
 	return delay
 }
@@ -776,7 +779,13 @@ func rosterChainDiverged(err error) bool {
 	if errors.Is(err, entmoot.ErrRosterReject) {
 		return true
 	}
-	return strings.Contains(err.Error(), "roster head mismatch")
+	text := err.Error()
+	if strings.Contains(text, "roster head mismatch") {
+		return true
+	}
+	// The peer holds fewer entries than our prefix while advertising a head we
+	// do not have: its chain cannot contain ours, so the two have forked.
+	return strings.Contains(text, string(libp2ptransport.SyncShortChain))
 }
 
 // syncRoster pulls roster entries from the group's members. Any admin can
@@ -814,7 +823,7 @@ func (r *groupRuntime) syncRoster(ctx context.Context, session *groupSession) {
 			continue
 		}
 		pulls++
-		updates, err := libp2ptransport.FetchRosterUpdates(syncCtx, r.host, remote, session.groupID, local)
+		updates, complete, err := libp2ptransport.FetchRosterUpdates(syncCtx, r.host, remote, session.groupID, local)
 		cancel()
 		if err != nil {
 			fork := rosterChainDiverged(err)
@@ -849,7 +858,13 @@ func (r *groupRuntime) syncRoster(ctx context.Context, session *groupSession) {
 			applied++
 		}
 		if applied > 0 {
-			session.clearRosterSyncFailure(remote.ID)
+			if complete {
+				session.clearRosterSyncFailure(remote.ID)
+			} else {
+				// More to take from this peer: it is not converged, but it is
+				// making progress, so the next round must not be backed off.
+				session.noteRosterSyncProgress(remote.ID)
+			}
 			r.logger.Info("libp2p roster synchronized",
 				slog.String("group_id", session.groupID.String()),
 				slog.String("peer_id", remote.ID.String()),
@@ -1134,4 +1149,14 @@ func rosterHasLocalIdentityPubKey(rlog *roster.RosterLog, publicKey []byte) bool
 	}
 	member, ok := rlog.MemberInfoByID(memberID)
 	return ok && bytes.Equal(member.EntmootPubKey, publicKey)
+}
+
+// noteRosterSyncProgress records that a peer served a validated extension but
+// has more to give. The failure counter is reset so a node catching up over
+// several rounds is never backed off for making progress, and any fork record
+// is dropped: a chain that extends ours is not a fork.
+func (s *groupSession) noteRosterSyncProgress(id peer.ID) {
+	s.rosterBackoffMu.Lock()
+	defer s.rosterBackoffMu.Unlock()
+	delete(s.rosterBackoff, id)
 }
