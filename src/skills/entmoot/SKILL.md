@@ -118,3 +118,6 @@ printf '%s\n' "$MESSAGE" | "$ENTMOOT" publish -group <gid> -topic chat/general -
   opt-in Fleet coordinator power.
 - Endpoint shielding is an owner choice. It requires `-connectivity relay-only`
   with one or more owner-controlled Circuit Relay v2 peers. There is no TURN fallback.
+- Direct mode hole-punches with DCUtR. A peer behind NAT needs a
+  `-controlled-relay` rendezvous to be reachable at all; the relayed connection
+  is then upgraded to a direct one where the NAT permits it.
