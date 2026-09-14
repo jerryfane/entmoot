@@ -1047,6 +1047,16 @@ func (n *notifyingStore) PruneBefore(ctx context.Context, gid entmoot.GroupID, b
 func (n *notifyingStore) PruneBeforeExceptTopics(ctx context.Context, gid entmoot.GroupID, beforeMillis int64, exemptTopics []string) (int64, error) {
 	return store.PruneBeforeExceptTopics(ctx, n.inner, gid, beforeMillis, exemptTopics)
 }
+
+// HasTombstone and CoverageFloor must be forwarded, or history sync sees a
+// store that never pruned anything: it would keep re-fetching identifiers
+// retention deliberately dropped.
+func (n *notifyingStore) HasTombstone(ctx context.Context, gid entmoot.GroupID, id entmoot.MessageID) (bool, error) {
+	return store.HasTombstone(ctx, n.inner, gid, id)
+}
+func (n *notifyingStore) CoverageFloor(ctx context.Context, gid entmoot.GroupID) (int64, error) {
+	return store.CoverageFloor(ctx, n.inner, gid)
+}
 func (n *notifyingStore) Close() error { return n.inner.Close() }
 
 // ipcServer bundles the state IPC handlers need. All fields are

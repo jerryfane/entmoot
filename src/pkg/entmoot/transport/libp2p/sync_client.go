@@ -187,10 +187,11 @@ type KeeperProgress struct {
 	Listed        int
 	Inserted      int
 	MissingBodies int
-	// PrunedLocally counts identifiers this node deliberately dropped under its
-	// own retention policy. They are a coverage difference between peers, not a
-	// gap to chase, and are reported separately so a shorter retention window
-	// never reads as incomplete sync.
+	// PrunedLocally counts pruned identifiers this pass encountered from this
+	// keeper: identifiers retention deliberately dropped here, offered again by
+	// a peer with a longer window. It is a coverage difference, not a gap to
+	// chase, so it is reported apart from MissingBodies. The same identifier
+	// offered by several keepers is counted once per keeper.
 	PrunedLocally    int
 	ConvergedHint    bool
 	CoverageFloorMS  int64
@@ -295,22 +296,18 @@ func SyncFromKeepers(
 			delete(state.keepers, id)
 		}
 	}
-	// Ask keepers only for the window this node is willing to retain. A peer
-	// with a longer window otherwise lists messages that retention here has
-	// already dropped, every round, forever.
-	localFloor, floorErr := store.CoverageFloor(ctx, destination, groupID)
-	if floorErr != nil {
-		localFloor = 0
-	}
+	// No request floor is sent. A node's coverage floor advances whenever
+	// retention runs, including when it deletes nothing and for messages that
+	// retention deliberately exempts, so using it as a request lower bound
+	// would permanently hide history this node still wants. Only a tombstone
+	// means "we dropped this on purpose", and that is checked per identifier
+	// below.
 	for keeperIndex, keeper := range keepers {
 		item := KeeperProgress{PeerID: keeper.ID}
 		cursor := state.keepers[keeper.ID]
 		if cursor == nil {
 			cursor = &keeperSyncState{request: HistorySyncRequest{Version: 2, GroupID: groupID, Mode: "list", Limit: 256}}
 			state.keepers[keeper.ID] = cursor
-		}
-		if localFloor > 0 && cursor.request.CoverageFloorMS < localFloor {
-			cursor.request.CoverageFloorMS = localFloor
 		}
 		keeperCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		err := syncFromKeeper(keeperCtx, h, groupID, keeper, destination, validate, keeperIndex, &item, cursor)
