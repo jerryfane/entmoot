@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/libp2p/go-libp2p/core/host"
@@ -75,7 +76,10 @@ type groupSession struct {
 	cancel        context.CancelFunc
 	catchup       sync.Mutex
 	history       libp2ptransport.HistorySyncState
-	peerRecords   *libp2ptransport.PeerRecordCache
+	// unknownHeads is the count the most recent history catch-up skipped for
+	// want of a roster checkpoint, kept so status output can show the gap.
+	unknownHeads atomic.Int64
+	peerRecords  *libp2ptransport.PeerRecordCache
 }
 type groupPolicyEnforcer struct {
 	mu          sync.Mutex
@@ -232,6 +236,9 @@ func (r *groupRuntime) enroll(_ context.Context, capability entmoot.BootstrapCap
 	if err := session.roster.Apply(entry); err != nil {
 		return libp2ptransport.EnrollmentResponse{}, err
 	}
+	// This node just advanced the head, which may be the head a held message
+	// named.
+	r.drainRosterAhead(context.Background(), session)
 	return libp2ptransport.EnrollmentResponse{RosterHead: session.roster.Head(), Entries: session.roster.Entries()}, nil
 }
 
@@ -539,6 +546,10 @@ func (r *groupRuntime) maintainGroup(ctx context.Context, session *groupSession)
 			return
 		case <-rosterTicker.C:
 			r.syncRoster(ctx, session)
+			// A node that never pulls, such as the founder, still learns heads
+			// by writing them, so drain on the tick as well. It is a no-op
+			// when nothing is held.
+			r.drainRosterAhead(ctx, session)
 		case <-historyTicker.C:
 			go r.catchUp(ctx, session)
 		case <-retentionTicker.C:
@@ -600,6 +611,30 @@ func (r *groupRuntime) syncRoster(ctx context.Context, session *groupSession) {
 	}
 	if len(updates) > 0 {
 		r.logger.Info("libp2p roster synchronized", slog.String("group_id", session.groupID.String()), slog.Int("entries", len(updates)))
+		r.drainRosterAhead(ctx, session)
+	}
+}
+
+// drainRosterAhead releases messages that were held for a roster head this
+// node has now learned. Every path that advances a session's roster calls it,
+// because a head learned through enrollment or an ESP roster change releases
+// held messages exactly as a sync does. A message the synchronized roster
+// still refuses is dropped and counted: silence there would hide a message
+// that never arrives.
+func (r *groupRuntime) drainRosterAhead(ctx context.Context, session *groupSession) {
+	if session == nil || session.live == nil {
+		return
+	}
+	ingested, dropped := session.live.DrainQuarantine(ctx)
+	if ingested > 0 {
+		r.logger.Info("libp2p roster-ahead messages ingested",
+			slog.String("group_id", session.groupID.String()),
+			slog.Int("messages", ingested))
+	}
+	if dropped > 0 {
+		r.logger.Warn("libp2p roster-ahead messages dropped",
+			slog.String("group_id", session.groupID.String()),
+			slog.Int("messages", dropped))
 	}
 }
 
@@ -643,6 +678,7 @@ retry:
 			return r.enforceGroupPolicy(ctx, session.groupID, message)
 		}, &session.history)
 		summary = libp2ptransport.SummarizeKeeperProgress(progress)
+		session.unknownHeads.Store(int64(summary.UnknownHeads))
 		if len(progress) > 0 && progress[0].Err != nil {
 			lastErr = progress[0].Err.Error()
 		}
@@ -664,6 +700,7 @@ retry:
 		slog.Int("inserted", summary.Inserted),
 		slog.Int("missing_bodies", summary.MissingBodies),
 		slog.Int("pruned_locally", summary.PrunedLocally),
+		slog.Int("unknown_heads", summary.UnknownHeads),
 		slog.Int("converged_hints", summary.ConvergedHints),
 		slog.String("last_error", lastErr))
 }
@@ -746,7 +783,6 @@ func (r *groupRuntime) persistKnownPeers(session *groupSession) {
 		})
 	}
 }
-
 func (r *groupRuntime) Close() {
 	r.mu.Lock()
 	if r.closed {

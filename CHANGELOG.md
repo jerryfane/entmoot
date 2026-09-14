@@ -22,6 +22,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Roster-ahead messages are held, not lost.** A publisher whose roster moved
+  first names a head the receiver has not synchronized, and live validation
+  required an exact match: the message was rejected outright, so a membership
+  change racing a publish lost the message and cost the sender GossipSub
+  score. Such a message is now held in a bounded buffer (64 messages, 8
+  distinct heads, 2 minutes) and drained, in arrival order, whenever this node
+  learns a roster entry. Holding requires a valid author self-signature, so
+  forged traffic naming an invented head cannot occupy the buffer; membership
+  is checked at drain time, because the author may be a member only at the
+  head we are missing. A drain that the synchronized roster refuses is counted
+  and logged rather than dropped silently, and a message held across a batched
+  roster advance is accepted as history at the head it names instead of being
+  discarded for being late. History sync likewise skips and reports a message
+  whose checkpoint is not on this chain yet, instead of failing the whole
+  keeper pass; such a pass never reports convergence. The counts appear as
+  `unknown_head_messages` and `quarantined_messages` in status output. A head
+  that is known but superseded, and a non-member author at a known head, are
+  still refused outright. Closes the bounded roster-ahead quarantine bullet
+  shared by #92, #94 and #104.
+
 - **Pruned history no longer stalls synchronization.** A node with a shorter
   retention window kept being offered messages it had already dropped: it
   asked for them every pass and its own store refused them with
