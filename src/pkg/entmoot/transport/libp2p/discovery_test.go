@@ -7,7 +7,6 @@ import (
 	"time"
 
 	libp2p "github.com/libp2p/go-libp2p"
-	"github.com/libp2p/go-libp2p/core/event"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -162,11 +161,10 @@ func TestRelayOnlyPeersConnectThroughControlledRelay(t *testing.T) {
 }
 
 // A direct-profile peer behind NAT is unreachable until it reserves with a
-// rendezvous relay. The reservation is also what DCUtR needs before it can
-// upgrade the relayed connection to a direct one. libp2p only advertises the
-// circuit address once AutoNAT confirms private reachability, which loopback
-// cannot produce, so the relay address is read from the event the address
-// manager consumes.
+// rendezvous relay, which is also what DCUtR needs before it can upgrade the
+// relayed connection to a direct one. The profile advertises the circuit
+// address itself, so other members can learn it without waiting for AutoNAT to
+// confirm private reachability.
 func TestDirectProfileReservesRendezvousRelayAndStaysDialable(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -215,7 +213,7 @@ func TestDirectProfileReservesRendezvousRelayAndStaysDialable(t *testing.T) {
 	}
 	defer dialer.Close()
 
-	circuit := waitForPublishedRelayAddress(ctx, t, nated, relayInfo.ID)
+	circuit := waitForAdvertisedRelayAddress(ctx, t, nated, relayInfo.ID)
 	const probeProtocol = protocol.ID("/entmoot/direct-relay-check/1")
 	nated.SetStreamHandler(probeProtocol, func(stream network.Stream) {
 		defer stream.Close()
@@ -235,28 +233,19 @@ func TestDirectProfileReservesRendezvousRelayAndStaysDialable(t *testing.T) {
 	}
 }
 
-func waitForPublishedRelayAddress(ctx context.Context, t *testing.T, h host.Host, relay peer.ID) multiaddr.Multiaddr {
+func waitForAdvertisedRelayAddress(ctx context.Context, t *testing.T, h host.Host, relay peer.ID) multiaddr.Multiaddr {
 	t.Helper()
 	allowed := map[peer.ID]struct{}{relay: {}}
-	subscription, err := h.EventBus().Subscribe(new(event.EvtAutoRelayAddrsUpdated))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer subscription.Close()
 	for {
+		for _, address := range h.Addrs() {
+			if circuitUsesControlledRelay(address, allowed) {
+				return address
+			}
+		}
 		select {
-		case raw := <-subscription.Out():
-			update, ok := raw.(event.EvtAutoRelayAddrsUpdated)
-			if !ok {
-				continue
-			}
-			for _, address := range update.RelayAddrs {
-				if circuitUsesControlledRelay(address, allowed) {
-					return address
-				}
-			}
 		case <-ctx.Done():
-			t.Fatal("direct profile never published a circuit address for its rendezvous relay")
+			t.Fatalf("direct profile never advertised a circuit address through its rendezvous relay: %v", h.Addrs())
+		case <-time.After(100 * time.Millisecond):
 		}
 	}
 }

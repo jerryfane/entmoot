@@ -52,6 +52,24 @@ func RequestHistoryPage(ctx context.Context, h host.Host, remote peer.AddrInfo, 
 	return response, nil
 }
 
+// RequestPeerRecords returns the signed peer records a member holds for other
+// roster members. The bytes are unverified here; InstallPeerRecords validates
+// every envelope before any address reaches the peerstore.
+func RequestPeerRecords(ctx context.Context, h host.Host, remote peer.AddrInfo, groupID entmoot.GroupID) ([][]byte, error) {
+	var response PeerRecordResponse
+	request := PeerRecordRequest{Version: 1, GroupID: groupID}
+	if err := requestResponse(ctx, h, remote, PeerRecordProtocol, request, maxSyncRequestBytes, &response, maxPeerRecordResponse); err != nil {
+		return nil, err
+	}
+	if response.Version != 1 {
+		return nil, errors.New("libp2p: peer record response version mismatch")
+	}
+	if response.Error != "" {
+		return nil, fmt.Errorf("libp2p: peer records: %s", response.Error)
+	}
+	return response.Records, nil
+}
+
 // ValidateRosterChain replays a fetched roster in temporary state. Nothing is
 // installed unless the founder anchor, every signature and the advertised head
 // all validate.

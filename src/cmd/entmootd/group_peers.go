@@ -67,6 +67,9 @@ func loadGroupPeers(dataDir string, groupID entmoot.GroupID) ([]peer.AddrInfo, e
 	return out, nil
 }
 
+// persistGroupPeer records the peer's current address set, replacing whatever
+// was cached before. Unioning would keep a member reachable at an address it
+// abandoned after a NAT change, and the cache has no expiry of its own.
 func persistGroupPeer(dataDir string, groupID entmoot.GroupID, info peer.AddrInfo) error {
 	if info.ID == "" || len(info.Addrs) == 0 {
 		return nil
@@ -79,12 +82,8 @@ func persistGroupPeer(dataDir string, groupID entmoot.GroupID, info peer.AddrInf
 	for _, current := range peers {
 		byID[current.ID] = current
 	}
-	current := byID[info.ID]
-	current.ID = info.ID
-	seen := make(map[string]bool, len(current.Addrs)+len(info.Addrs))
-	for _, address := range current.Addrs {
-		seen[address.String()] = true
-	}
+	current := peer.AddrInfo{ID: info.ID}
+	seen := make(map[string]bool, len(info.Addrs))
 	for _, address := range info.Addrs {
 		if !seen[address.String()] {
 			current.Addrs = append(current.Addrs, address)

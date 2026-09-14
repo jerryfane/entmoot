@@ -20,6 +20,9 @@ const (
 	EnrollmentProtocol protocol.ID = "/entmoot/enrollment/2"
 	RosterProtocol     protocol.ID = "/entmoot/roster/2"
 	HistoryProtocol    protocol.ID = "/entmoot/history/2"
+	// PeerRecordProtocol serves members the signed peer records this node holds
+	// for other members. It is members-only and never a bootstrap target.
+	PeerRecordProtocol protocol.ID = "/entmoot/peer-records/1"
 
 	bootstrapCapabilityDomain = "entmoot/bootstrap-capability/v1\x00"
 )
