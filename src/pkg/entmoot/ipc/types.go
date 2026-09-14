@@ -186,12 +186,15 @@ type JoinGroupResp struct {
 	Readiness json.RawMessage   `json:"readiness,omitempty"`
 }
 
-// InviteCreateReq asks the live founder daemon to mint a target-bound
-// bootstrap capability from its current roster and advertised addresses.
+// InviteCreateReq asks the live founder daemon to mint a bootstrap capability
+// from its current roster and advertised addresses. An empty TargetPublicKey
+// mints an open invite any holder may redeem; MaxUses caps how many distinct
+// identities may enroll with it (zero means one).
 type InviteCreateReq struct {
 	GroupID             entmoot.GroupID `json:"group_id"`
-	TargetPublicKey     []byte          `json:"target_public_key"`
+	TargetPublicKey     []byte          `json:"target_public_key,omitempty"`
 	BootstrapMultiaddrs []string        `json:"bootstrap_multiaddrs"`
+	MaxUses             int             `json:"max_uses,omitempty"`
 	ValidForMS          int64           `json:"valid_for_ms,omitempty"`
 	ValidUntilMS        int64           `json:"valid_until_ms,omitempty"`
 }

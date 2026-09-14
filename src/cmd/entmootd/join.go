@@ -605,8 +605,9 @@ func loadJoinInput(arg string) (joinInput, error) {
 	if err := json.Unmarshal(raw, &capability); err != nil {
 		return joinInput{}, fmt.Errorf("%w: parse bootstrap capability: %v", errInviteMalformed, err)
 	}
-	if capability.GroupID == (entmoot.GroupID{}) || len(capability.TargetPublicKey) != ed25519.PublicKeySize {
-		return joinInput{}, fmt.Errorf("%w: unsupported join input; provide a target-bound bootstrap capability", errInviteMalformed)
+	if capability.GroupID == (entmoot.GroupID{}) || capability.Signature == nil ||
+		(!capability.IsOpenInvite() && len(capability.TargetPublicKey) != ed25519.PublicKeySize) {
+		return joinInput{}, fmt.Errorf("%w: unsupported join input; provide a signed bootstrap capability", errInviteMalformed)
 	}
 	return joinInput{source: arg, capability: &capability}, nil
 }
@@ -1466,8 +1467,16 @@ func (s *ipcServer) joinReadinessEvent(ctx context.Context) json.RawMessage {
 
 func (s *ipcServer) handleInviteCreate(_ context.Context, c net.Conn, req *ipc.InviteCreateReq) {
 	gid := req.GroupID
-	if gid == (entmoot.GroupID{}) || len(req.TargetPublicKey) != ed25519.PublicKeySize {
-		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInvalidArgument, GroupID: &gid, Message: "group_id and target_public_key are required"})
+	if gid == (entmoot.GroupID{}) {
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInvalidArgument, GroupID: &gid, Message: "group_id is required"})
+		return
+	}
+	if len(req.TargetPublicKey) != 0 && len(req.TargetPublicKey) != ed25519.PublicKeySize {
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInvalidArgument, GroupID: &gid, Message: "target_public_key must be an Ed25519 key or empty for an open invite"})
+		return
+	}
+	if req.MaxUses < 0 || req.MaxUses > maxInviteUses {
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInvalidArgument, GroupID: &gid, Message: fmt.Sprintf("max_uses must be between 0 and %d", maxInviteUses)})
 		return
 	}
 	session, ok := s.runtime.Get(gid)
@@ -1487,10 +1496,16 @@ func (s *ipcServer) handleInviteCreate(_ context.Context, c net.Conn, req *ipc.I
 	}
 	founder.MemberID = &founderBinding.MemberID
 	founder.PeerID = founderBinding.PeerID.String()
-	targetBinding, err := libp2ptransport.BindingFromPublicKey(req.TargetPublicKey)
-	if err != nil {
-		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInvalidArgument, GroupID: &gid, Message: err.Error()})
-		return
+	var targetMemberID entmoot.MemberID
+	targetPeerID := ""
+	if len(req.TargetPublicKey) != 0 {
+		targetBinding, err := libp2ptransport.BindingFromPublicKey(req.TargetPublicKey)
+		if err != nil {
+			_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInvalidArgument, GroupID: &gid, Message: err.Error()})
+			return
+		}
+		targetMemberID = targetBinding.MemberID
+		targetPeerID = targetBinding.PeerID.String()
 	}
 	if len(req.BootstrapMultiaddrs) == 0 {
 		req.BootstrapMultiaddrs = make([]string, 0, len(s.runtime.host.Addrs()))
@@ -1527,12 +1542,13 @@ func (s *ipcServer) handleInviteCreate(_ context.Context, c net.Conn, req *ipc.I
 	capability := entmoot.BootstrapCapability{
 		GroupID:           gid,
 		TargetPublicKey:   append([]byte(nil), req.TargetPublicKey...),
-		TargetMemberID:    targetBinding.MemberID,
-		TargetPeerID:      targetBinding.PeerID.String(),
+		TargetMemberID:    targetMemberID,
+		TargetPeerID:      targetPeerID,
 		Founder:           founder,
 		RosterHead:        session.roster.Head(),
 		AllowedPeerIDs:    []string{founderBinding.PeerID.String()},
 		AllowedMultiaddrs: allowedAddresses,
+		MaxUses:           req.MaxUses,
 		IssuedAtMS:        now.UnixMilli(),
 		ExpiresAtMS:       expires.UnixMilli(),
 	}
@@ -1542,6 +1558,10 @@ func (s *ipcServer) handleInviteCreate(_ context.Context, c net.Conn, req *ipc.I
 	}
 	if err := libp2ptransport.SignBootstrapCapability(s.identity, &capability); err != nil {
 		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInternal, GroupID: &gid, Message: err.Error()})
+		return
+	}
+	if err := s.runtime.admission.RecordIssuedInvite(capability); err != nil {
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInternal, GroupID: &gid, Message: "record issued invite: " + err.Error()})
 		return
 	}
 	_ = ipc.EncodeAndWrite(c, &ipc.InviteCreateResp{Status: "created", GroupID: gid, Capability: capability, RosterHead: session.roster.Head(), Members: len(session.roster.MemberIDs())})

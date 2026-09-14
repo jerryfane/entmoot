@@ -570,6 +570,19 @@ func (r *RosterLog) Head() entmoot.RosterEntryID {
 	return r.head
 }
 
+// HeadTimestamp returns the unix-millisecond timestamp of the current head, or
+// zero if the log is empty. Entry timestamps must grow strictly, so a caller
+// producing back-to-back entries needs this to pick a valid timestamp when the
+// wall clock has not ticked.
+func (r *RosterLog) HeadTimestamp() int64 {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if len(r.entries) == 0 {
+		return 0
+	}
+	return r.entries[len(r.entries)-1].Timestamp
+}
+
 // HeadIsGroupBound reports whether the current head is a version-2 entry
 // signed for this log's group.
 func (r *RosterLog) HeadIsGroupBound() bool {
