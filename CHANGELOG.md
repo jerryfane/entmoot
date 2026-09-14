@@ -9,14 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Multi-use and open invites, with revocation.** `invite create` now accepts
-  `-max-uses` (default 1, ceiling 64) and makes `-target-pubkey` optional: an
-  invite with no target is redeemable by any holder while uses remain, so one
-  link admits a small team. Uses are counted per applicant peer and persisted,
-  so the limit survives restarts. `invite list` reports issued invites with
-  uses spent and state, and `invite revoke` withdraws an invite before it
-  expires, including one whose file was lost. The daemon IPC `invite_create`
-  request carries the same `max_uses` and optional target.
+- **Multi-use and open invites, with revocation.** `invite create` accepts
+  `-max-uses` (default 1, ceiling 64) and `-open`, which mints a bearer invite
+  with no target identity that any holder may redeem while uses remain, so one
+  link admits a small team. `-target-pubkey` is still required unless `-open`
+  is given, and the command prints the binding, use limit, expiry and nonce to
+  stderr at mint time. Uses are counted per applicant peer and persisted, so
+  the limit survives restarts. `invite list` reports issued invites with uses
+  spent and state, and `invite revoke` withdraws an invite before it expires,
+  including one whose file was lost. The daemon IPC `invite_create` request
+  carries the same `max_uses` and an explicit `open` flag.
 
 ### Fixed
 
@@ -29,6 +31,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mismatch, capability denied), and a rejection the applicant can fix leaves
   the invite's uses intact. Roster adds also advance their timestamp past the
   head, so two joiners redeeming one invite in the same millisecond both apply.
+- **Removal stays a removal.** Because an invite is no longer tied to one exact
+  head, `roster remove` and the IPC member-remove path now revoke every invite
+  bound to the removed member and report how many; enrollment separately
+  refuses any applicant removed after the invite's checkpoint. Open bearer
+  invites name no target, so they cannot be attributed: both paths list the
+  remaining open nonces so an operator can revoke them.
 
 ### Changed
 
