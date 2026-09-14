@@ -772,7 +772,7 @@ func (s *groupSession) rosterDivergenceReports(groupID entmoot.GroupID) []roster
 // prefix, or a head that cannot be reached from the served chain, is evidence
 // of a fork; transport failures, deadlines, exhausted server snapshots, a
 // rotated snapshot and the size caps are all transient costs.
-func rosterChainDiverged(err error) bool {
+func rosterChainDiverged(err error, headOffChain bool) bool {
 	if err == nil {
 		return false
 	}
@@ -783,9 +783,11 @@ func rosterChainDiverged(err error) bool {
 	if strings.Contains(text, "roster head mismatch") {
 		return true
 	}
-	// The peer holds fewer entries than our prefix while advertising a head we
-	// do not have: its chain cannot contain ours, so the two have forked.
-	return strings.Contains(text, string(libp2ptransport.SyncShortChain))
+	// "Your prefix is longer than my whole chain" is only fork evidence
+	// together with a head we do not hold: the server cannot know our head, so
+	// the caller supplies that half. Without it, a peer that simply pruned or
+	// restarted would be reported as forked.
+	return headOffChain && strings.Contains(text, string(libp2ptransport.SyncShortChain))
 }
 
 // syncRoster pulls roster entries from the group's members. Any admin can
@@ -826,7 +828,7 @@ func (r *groupRuntime) syncRoster(ctx context.Context, session *groupSession) {
 		updates, complete, err := libp2ptransport.FetchRosterUpdates(syncCtx, r.host, remote, session.groupID, local)
 		cancel()
 		if err != nil {
-			fork := rosterChainDiverged(err)
+			fork := rosterChainDiverged(err, !session.roster.HasEntry(head))
 			reason := "pull failed: " + err.Error()
 			if !fork {
 				reason = "pull unavailable: " + err.Error()
@@ -845,8 +847,10 @@ func (r *groupRuntime) syncRoster(ctx context.Context, session *groupSession) {
 			continue
 		}
 		applied := 0
+		rejected := false
 		for _, entry := range updates {
 			if err := session.roster.Apply(entry); err != nil {
+				rejected = true
 				delay := session.noteRosterSyncFailure(remote.ID, now, session.roster.Head(), head, "apply rejected: "+err.Error(), errors.Is(err, entmoot.ErrRosterReject))
 				r.logger.Warn("libp2p roster apply",
 					slog.String("group_id", session.groupID.String()),
@@ -857,18 +861,13 @@ func (r *groupRuntime) syncRoster(ctx context.Context, session *groupSession) {
 			}
 			applied++
 		}
+		session.noteRosterSyncOutcome(remote.ID, applied, rejected, complete)
 		if applied > 0 {
-			if complete {
-				session.clearRosterSyncFailure(remote.ID)
-			} else {
-				// More to take from this peer: it is not converged, but it is
-				// making progress, so the next round must not be backed off.
-				session.noteRosterSyncProgress(remote.ID)
-			}
 			r.logger.Info("libp2p roster synchronized",
 				slog.String("group_id", session.groupID.String()),
 				slog.String("peer_id", remote.ID.String()),
-				slog.Int("entries", applied))
+				slog.Int("entries", applied),
+				slog.Bool("complete", complete && !rejected))
 			local = session.roster.Entries()
 			// Messages held for one of the heads we just learned can be
 			// accepted now.
@@ -1151,12 +1150,21 @@ func rosterHasLocalIdentityPubKey(rlog *roster.RosterLog, publicKey []byte) bool
 	return ok && bytes.Equal(member.EntmootPubKey, publicKey)
 }
 
-// noteRosterSyncProgress records that a peer served a validated extension but
-// has more to give. The failure counter is reset so a node catching up over
-// several rounds is never backed off for making progress, and any fork record
-// is dropped: a chain that extends ours is not a fork.
-func (s *groupSession) noteRosterSyncProgress(id peer.ID) {
-	s.rosterBackoffMu.Lock()
-	defer s.rosterBackoffMu.Unlock()
-	delete(s.rosterBackoff, id)
+// noteRosterSyncOutcome settles what a finished pull leaves behind.
+//
+//   - nothing applied, or some entry rejected: the record stands. Part of the
+//     chain may have applied, but the peer still holds a chain this node could
+//     not take, and clearing that would erase the fork evidence in the same
+//     round it was found.
+//   - applied and complete: the peers agree, so the record is cleared.
+//   - applied but stopped at the per-round ceiling: progress, not convergence.
+//     The record is dropped so the next round is not delayed, because a node
+//     catching up over several rounds must not be backed off for progressing.
+func (s *groupSession) noteRosterSyncOutcome(id peer.ID, applied int, rejected, complete bool) {
+	if applied == 0 || rejected {
+		return
+	}
+	// Complete and "more to take" both clear the record: the peer served a
+	// validated extension, so it is neither forked from us nor worth delaying.
+	s.clearRosterSyncFailure(id)
 }

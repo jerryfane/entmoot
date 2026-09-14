@@ -207,7 +207,7 @@ func TestOnlyANonExtendingChainCountsAsDivergence(t *testing.T) {
 		errors.New("failed to open stream: context canceled"),
 	}
 	for _, err := range transient {
-		if rosterChainDiverged(err) {
+		if rosterChainDiverged(err, true) {
 			t.Fatalf("%v was classified as a fork", err)
 		}
 		session.noteRosterSyncFailure(id, now, groupRoster.Head(), entmoot.RosterEntryID{9}, "pull unavailable: "+err.Error(), false)
@@ -224,7 +224,7 @@ func TestOnlyANonExtendingChainCountsAsDivergence(t *testing.T) {
 		errors.New("libp2p: roster head mismatch"),
 	}
 	for _, err := range forks {
-		if !rosterChainDiverged(err) {
+		if !rosterChainDiverged(err, true) {
 			t.Fatalf("%v was not classified as a fork", err)
 		}
 	}
@@ -267,12 +267,78 @@ func mustTestIdentityInfo(t *testing.T) entmoot.NodeInfo {
 // has nothing to name.
 func TestAShorterForkedChainIsReportedAsDivergence(t *testing.T) {
 	shortChain := fmt.Errorf("libp2p: roster sync: %s", libp2ptransport.SyncShortChain)
-	if !rosterChainDiverged(shortChain) {
+	if !rosterChainDiverged(shortChain, true) {
 		t.Fatalf("%v was not classified as a fork", shortChain)
+	}
+	// The server cannot know our head, so the conjunct is the caller's: a
+	// short chain from a peer whose head we DO hold is just a peer that pruned
+	// or restarted, not a fork.
+	if rosterChainDiverged(shortChain, false) {
+		t.Fatal("a short chain from a peer whose head is on our chain was called a fork")
 	}
 	// And it must still be distinguishable from an ordinary malformed reply,
 	// which says nothing about chains.
-	if rosterChainDiverged(fmt.Errorf("libp2p: roster sync: %s", libp2ptransport.SyncMalformed)) {
+	if rosterChainDiverged(fmt.Errorf("libp2p: roster sync: %s", libp2ptransport.SyncMalformed), true) {
 		t.Fatal("a malformed reply was classified as a fork")
+	}
+}
+
+// What a finished pull leaves behind decides whether a fork stays visible and
+// whether a node catching up gets delayed. A pull that applied some entries
+// and then hit a rejection has still met a chain it cannot take: clearing its
+// record because something applied would erase the evidence in the round it
+// was found.
+func TestRosterSyncOutcomeKeepsForkEvidenceAndFreesProgress(t *testing.T) {
+	founderIdentity, founder, _ := mustTestIdentity(t)
+	groupID := entmoot.GroupID{0x43}
+	groupRoster := roster.New(groupID)
+	if err := groupRoster.Genesis(founderIdentity, founder, 1_000); err != nil {
+		t.Fatal(err)
+	}
+	var id peer.ID = "12D3KooWBdvL92Hd76R1LN5qswuXSgQf7ZWZNwHhKeS4tDoHGzuA"
+	now := time.Now()
+	remoteHead := entmoot.RosterEntryID{0x5c}
+	forked := func() *groupSession {
+		session := &groupSession{groupID: groupID, roster: groupRoster}
+		session.noteRosterSyncFailure(id, now, groupRoster.Head(), remoteHead,
+			"apply rejected: parents must reference current head", true)
+		if reports := session.rosterDivergenceReports(groupID); len(reports) != 1 {
+			t.Fatalf("fixture did not record the fork: %+v", reports)
+		}
+		return session
+	}
+
+	// Applied some, then rejected: the fork stays reported and backed off.
+	partial := forked()
+	partial.noteRosterSyncOutcome(id, 3, true, false)
+	if reports := partial.rosterDivergenceReports(groupID); len(reports) != 1 {
+		t.Fatalf("a partially applied pull erased its fork record: %+v", reports)
+	}
+	if partial.rosterSyncReady(id, now) {
+		t.Fatal("a partially applied pull cleared the backoff")
+	}
+
+	// Applied nothing at all: likewise untouched.
+	empty := forked()
+	empty.noteRosterSyncOutcome(id, 0, false, true)
+	if reports := empty.rosterDivergenceReports(groupID); len(reports) != 1 {
+		t.Fatalf("a pull that applied nothing erased its fork record: %+v", reports)
+	}
+
+	// Applied and complete: the peers agree, so nothing is left standing.
+	agreed := forked()
+	agreed.noteRosterSyncOutcome(id, 3, false, true)
+	if reports := agreed.rosterDivergenceReports(groupID); len(reports) != 0 {
+		t.Fatalf("a completed pull left a fork record: %+v", reports)
+	}
+	if !agreed.rosterSyncReady(id, now) {
+		t.Fatal("a completed pull left the peer backed off")
+	}
+
+	// Applied, more to take: progress must not be delayed.
+	progressing := forked()
+	progressing.noteRosterSyncOutcome(id, 3, false, false)
+	if !progressing.rosterSyncReady(id, now) {
+		t.Fatal("a peer serving progress was backed off")
 	}
 }

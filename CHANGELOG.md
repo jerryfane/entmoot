@@ -38,7 +38,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   prefix and does not discard progress: a pull that stops at the ceiling
   returns the validated entries it did take, so a node further behind than one
   round converges over several rounds instead of re-downloading the same pages
-  forever, and a peer serving progress is not backed off. The head probe that
+  forever, and a peer serving progress is not backed off. An unfinished round
+  hands its paging snapshot back (`release_snapshot`), so chaining rounds does
+  not exhaust the peer's four per-peer slots and stall the catch-up it is
+  meant to make; a peer that does not know the field keeps the snapshot until
+  it expires, as before. A pull that applied some entries and then hit a
+  rejection keeps its divergence record: part landing does not mean the chains
+  agree. The head probe that
   decides whether a pull is worth it reserves no paging snapshot on the peer,
   so probing every tick cannot starve the pull it is probing for. A peer whose
   chain does not extend ours is reported as `roster_divergence` in status
@@ -47,7 +53,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not reported as divergence, and a report is dropped as soon as the head it
   names turns out to be on our chain. A peer holding fewer entries than our
   prefix now answers `short_chain` rather than `malformed`, so a fork with a
-  shorter chain is reported as one instead of looking like a transport error.
+  shorter chain is reported as one instead of looking like a transport error;
+  that reading requires the head to be off our chain as well, which the caller
+  supplies, because the server cannot know our head.
   Fork evidence is sticky: a later timeout does not erase a standing report,
   only a successful exchange does. The head probe falls back to the paged
   request against a peer built before the `head_only` field, so probing keeps
