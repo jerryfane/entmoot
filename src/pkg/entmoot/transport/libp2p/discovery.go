@@ -167,24 +167,32 @@ func InstallVerifiedPeer(h host.Host, r *roster.RosterLog, member entmoot.NodeIn
 	if ttl <= 0 || ttl > maxPeerAddressAge {
 		ttl = maxPeerAddressAge
 	}
-	if mode == RelayOnlyConnectivity {
-		allowed := make(map[peer.ID]struct{}, len(controlledRelays))
-		for _, relay := range controlledRelays {
-			allowed[relay.ID] = struct{}{}
-		}
-		filtered := addresses[:0]
-		for _, address := range addresses {
-			if peerIDIsControlledRelay(peerID, allowed) || circuitUsesControlledRelay(address, allowed) {
-				filtered = append(filtered, address)
-			}
-		}
-		addresses = filtered
-	}
+	addresses = profileAddresses(peerID, addresses, mode, controlledRelays)
 	if len(addresses) == 0 {
 		return errors.New("libp2p: no address survives the connectivity profile")
 	}
 	h.Peerstore().AddAddrs(peerID, addresses, ttl)
 	return nil
+}
+
+// profileAddresses returns the addresses a connectivity profile permits for a
+// peer. It never mutates its input: callers hold address sets that must stay
+// intact when nothing survives.
+func profileAddresses(peerID peer.ID, addresses []multiaddr.Multiaddr, mode ConnectivityMode, controlledRelays []peer.AddrInfo) []multiaddr.Multiaddr {
+	if mode != RelayOnlyConnectivity {
+		return slices.Clone(addresses)
+	}
+	allowed := make(map[peer.ID]struct{}, len(controlledRelays))
+	for _, relay := range controlledRelays {
+		allowed[relay.ID] = struct{}{}
+	}
+	filtered := make([]multiaddr.Multiaddr, 0, len(addresses))
+	for _, address := range addresses {
+		if peerIDIsControlledRelay(peerID, allowed) || circuitUsesControlledRelay(address, allowed) {
+			filtered = append(filtered, address)
+		}
+	}
+	return filtered
 }
 
 // VisiblePeerAddresses is the only diagnostics-facing peerstore projection.

@@ -7,6 +7,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/record"
+	multiaddr "github.com/multiformats/go-multiaddr"
 
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/roster"
@@ -25,26 +26,29 @@ type PeerRecordCache struct {
 type cachedPeerRecord struct {
 	payload []byte
 	seq     uint64
+	// installed records which addresses this cache put in the peerstore, so a
+	// replacement retires exactly those and leaves hints from invites, mDNS or
+	// identify alone.
+	installed []multiaddr.Multiaddr
 }
 
 func NewPeerRecordCache() *PeerRecordCache {
 	return &PeerRecordCache{records: make(map[peer.ID]cachedPeerRecord)}
 }
 
-// sequence reports the newest accepted sequence for a peer.
-func (c *PeerRecordCache) sequence(id peer.ID) (uint64, bool) {
+func (c *PeerRecordCache) current(id peer.ID) (cachedPeerRecord, bool) {
 	if c == nil {
-		return 0, false
+		return cachedPeerRecord{}, false
 	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	current, ok := c.records[id]
-	return current.seq, ok
+	existing, ok := c.records[id]
+	return existing, ok
 }
 
-// put keeps the highest sequence seen for a peer. An older record never
-// replaces a newer one, so a stale forward cannot undo a NAT change.
-func (c *PeerRecordCache) put(id peer.ID, payload []byte, seq uint64) {
+// accept stores a verified record. An older record never replaces a newer one,
+// so a stale forward cannot undo a NAT change.
+func (c *PeerRecordCache) accept(id peer.ID, payload []byte, seq uint64, installed []multiaddr.Multiaddr) {
 	if c == nil {
 		return
 	}
@@ -53,10 +57,29 @@ func (c *PeerRecordCache) put(id peer.ID, payload []byte, seq uint64) {
 	if c.records == nil {
 		c.records = make(map[peer.ID]cachedPeerRecord)
 	}
-	if current, ok := c.records[id]; ok && current.seq > seq {
+	if existing, ok := c.records[id]; ok && existing.seq > seq {
 		return
 	}
-	c.records[id] = cachedPeerRecord{payload: slices.Clone(payload), seq: seq}
+	c.records[id] = cachedPeerRecord{
+		payload:   slices.Clone(payload),
+		seq:       seq,
+		installed: slices.Clone(installed),
+	}
+}
+
+// retain drops records for peers that are no longer members, so a removed
+// member is neither forwarded nor counted against the response budget.
+func (c *PeerRecordCache) retain(members map[peer.ID]entmoot.NodeInfo) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for id := range c.records {
+		if _, ok := members[id]; !ok {
+			delete(c.records, id)
+		}
+	}
 }
 
 // Snapshot returns the cached records except the excluded peer's own record,
@@ -68,11 +91,11 @@ func (c *PeerRecordCache) Snapshot(exclude peer.ID) [][]byte {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	out := make([][]byte, 0, len(c.records))
-	for id, current := range c.records {
+	for id, existing := range c.records {
 		if id == exclude {
 			continue
 		}
-		out = append(out, slices.Clone(current.payload))
+		out = append(out, slices.Clone(existing.payload))
 	}
 	return out
 }
@@ -87,23 +110,16 @@ func (c *PeerRecordCache) Len() int {
 	return len(c.records)
 }
 
-// Forget drops a peer's cached record, used when membership ends.
-func (c *PeerRecordCache) Forget(id peer.ID) {
-	if c == nil {
-		return
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	delete(c.records, id)
-}
-
 // InstallPeerRecords verifies forwarded libp2p signed peer records and installs
-// the surviving addresses for current roster members. A newer record replaces
-// every previously known address for that peer so a NAT change cannot
-// resurrect stale hints; an older one is ignored. Accepted records are cached
-// for forwarding. Returns the number of records that installed an address.
+// the surviving addresses for current roster members. A newer record retires
+// the addresses its predecessor installed so a NAT change cannot leave stale
+// hints behind, and an older record is ignored. A newer record whose addresses
+// the local profile rejects still advances the freshness floor but changes no
+// address, because losing a working address to an unusable update would make a
+// reachable member unreachable. Accepted records are cached for forwarding.
+// Returns the number of records that installed an address.
 func InstallPeerRecords(h host.Host, r *roster.RosterLog, records [][]byte, mode ConnectivityMode, controlledRelays []peer.AddrInfo, cache *PeerRecordCache) int {
-	if h == nil || r == nil || len(records) == 0 {
+	if h == nil || r == nil {
 		return 0
 	}
 	members := make(map[peer.ID]entmoot.NodeInfo)
@@ -118,6 +134,7 @@ func InstallPeerRecords(h host.Host, r *roster.RosterLog, records [][]byte, mode
 		}
 		members[binding.PeerID] = info
 	}
+	cache.retain(members)
 	installed := 0
 	for _, payload := range records {
 		envelope, value, err := record.ConsumeEnvelope(payload, peer.PeerRecordEnvelopeDomain)
@@ -136,19 +153,47 @@ func InstallPeerRecords(h host.Host, r *roster.RosterLog, records [][]byte, mode
 		if !isMember {
 			continue
 		}
-		last, seen := cache.sequence(peerRecord.PeerID)
-		if seen && peerRecord.Seq < last {
+		existing, seen := cache.current(peerRecord.PeerID)
+		if seen && peerRecord.Seq < existing.seq {
 			continue
 		}
-		if !seen || peerRecord.Seq > last {
-			h.Peerstore().ClearAddrs(peerRecord.PeerID)
+		surviving := profileAddresses(peerRecord.PeerID, peerRecord.Addrs, mode, controlledRelays)
+		if len(surviving) == 0 {
+			// Authentic and current, but nothing here is dialable under this
+			// profile. Record the sequence so an older forward cannot win.
+			cache.accept(peerRecord.PeerID, payload, peerRecord.Seq, nil)
+			continue
 		}
-		if err := InstallVerifiedPeer(h, r, member, peerRecord.PeerID, slices.Clone(peerRecord.Addrs),
+		retireReplacedAddresses(h, peerRecord.PeerID, existing.installed, surviving)
+		if err := InstallVerifiedPeer(h, r, member, peerRecord.PeerID, surviving,
 			maxPeerAddressAge, mode, controlledRelays); err != nil {
 			continue
 		}
-		cache.put(peerRecord.PeerID, payload, peerRecord.Seq)
+		cache.accept(peerRecord.PeerID, payload, peerRecord.Seq, surviving)
 		installed++
 	}
 	return installed
+}
+
+// retireReplacedAddresses expires the addresses a previous record installed and
+// the new one dropped. Expiring by TTL keeps every address this node learned
+// from another source.
+func retireReplacedAddresses(h host.Host, peerID peer.ID, previous, current []multiaddr.Multiaddr) {
+	if len(previous) == 0 {
+		return
+	}
+	keep := make(map[string]struct{}, len(current))
+	for _, address := range current {
+		keep[address.String()] = struct{}{}
+	}
+	stale := make([]multiaddr.Multiaddr, 0, len(previous))
+	for _, address := range previous {
+		if _, ok := keep[address.String()]; !ok {
+			stale = append(stale, address)
+		}
+	}
+	if len(stale) == 0 {
+		return
+	}
+	h.Peerstore().SetAddrs(peerID, stale, 0)
 }
