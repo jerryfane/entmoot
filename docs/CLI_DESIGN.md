@@ -65,6 +65,8 @@ membership upgrade|adopt
 
 ## 4. Storage and Ownership
 
+### 4.1 Data root
+
 The data root contains:
 
 ```text
@@ -74,8 +76,12 @@ groups/<gid>/...       Membership records, checkpoints, messages, indexes
 mailbox.sqlite         ESP mailbox cursors
 esp.sqlite             ESP and live-agent projections
 runtime.env            Installed wrapper defaults
-conversion-*           One-way legacy conversion journal and backup
+conversion.sqlite      One-way legacy conversion journal
+conversion-backup/     Pre-conversion copy of the files it rewrites
+conversion.lock        Exclusive lock held for the duration of a conversion
 ```
+
+### 4.2 Per-group schemas
 
 Per-group SQLite schemas store immutable signed bytes, membership records and
 checkpoints, query indexes, and generation-bound coverage data. Store writes are
@@ -87,6 +93,8 @@ maintenance requires the owner to be stopped and uses the same exclusive lock.
 
 ## 5. IPC and Lifecycle
 
+### 5.1 Socket lifecycle
+
 The daemon creates `<data>/control.sock`. A stale socket is removed only after a
 bounded liveness check proves no daemon owns it. Control requests have bounded
 payloads and deadlines. Shutdown cancels owned workers before waiting and closes
@@ -95,6 +103,29 @@ the libp2p host, group runtimes, stores, and socket in ownership order.
 `publish`, live `tail`, online joins, and administrative mutations use this
 boundary. Read-only `query`, `info`, and `version` do not require a running
 daemon.
+
+### 5.2 Framing
+
+Each request and response is one length-prefixed frame: a four-byte big-endian
+length followed by that many bytes of JSON. A zero length is malformed, and a
+length above `ipc.MaxFrameSize` is refused as oversized before the body is
+read, so an oversized prefix costs no allocation.
+
+### 5.3 Message types
+
+Every frame carries a numeric message type. Types are registered in
+`pkg/entmoot/ipc/types.go`. A request and its response are adjacent
+(`0x10`/`0x11`, `0x1C`/`0x1D`), and the numbering is deliberately stretched to
+leave room for future pairs without renumbering existing ones. The sequence is
+not contiguous: `MsgError` sits at `0x1F`, inside the range, and gaps exist
+where types were retired.
+
+### 5.4 Error envelope
+
+An error response has `type` set to the literal string `error` and carries a
+short uppercase code plus a human-readable reason. Codes are registered in
+`pkg/entmoot/ipc/error.go` and map to the process exit codes in section 6; an
+unrecognised code maps to exit 1.
 
 ## 6. Exit Codes
 
