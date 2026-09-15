@@ -335,12 +335,12 @@ func runGroupDaemon(gf *globalFlags, opts groupDaemonOptions) int {
 		return exitTransport
 	}
 	defer func() { _ = rawStore.Close() }()
-	fleetState, err := esphttp.OpenSQLiteStateStore(s.dataDir)
+	espState, err := esphttp.OpenSQLiteStateStore(s.dataDir)
 	if err != nil {
-		slog.Error(opts.command+": open fleet state", slog.String("err", err.Error()))
+		slog.Error(opts.command+": open esp state", slog.String("err", err.Error()))
 		return exitTransport
 	}
-	defer fleetState.Close()
+	defer espState.Close()
 
 	// Wrap the store so IPC tail subscribers and service integrations see
 	// new messages as they land. The gossip/publish path writes through this
@@ -371,7 +371,7 @@ func runGroupDaemon(gf *globalFlags, opts groupDaemonOptions) int {
 	}
 	if code, err := opts.loadGroups(rootCtx, runtime, groupDaemonLoadContext{
 		identity:      s.identity,
-		metadataStore: fleetState,
+		metadataStore: espState,
 	}); err != nil {
 		if code == exitInvalidArgument || code == exitNotMember || code == exitGroupNotFound {
 			fmt.Fprintf(os.Stderr, "%s: %v\n", opts.command, err)
@@ -438,10 +438,8 @@ func runGroupDaemon(gf *globalFlags, opts groupDaemonOptions) int {
 		runtime:           runtime,
 		store:             rawStore,
 		notify:            notifyStore,
-		metadataStore:     fleetState,
+		metadataStore:     espState,
 	}
-	commandRunner := newFleetCommandRunner(srv, fleetState, notifyStore, slog.Default())
-
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -450,11 +448,6 @@ func runGroupDaemon(gf *globalFlags, opts groupDaemonOptions) int {
 			_ = listener.Close()
 		}()
 		srv.acceptLoop(rootCtx, listener)
-	}()
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		commandRunner.run(rootCtx)
 	}()
 
 	// Emit the one-line "joined" event on stdout.
@@ -572,13 +565,6 @@ func loadJoinInput(arg string) (joinInput, error) {
 		}
 		return joinInput{source: arg, openInvite: payload}, nil
 	}
-	if input, ok, err := parseFleetInviteDescriptor(raw); ok || err != nil {
-		if err != nil {
-			return joinInput{}, err
-		}
-		input.source = arg
-		return input, nil
-	}
 	var capability entmoot.BootstrapCapability
 	if err := json.Unmarshal(raw, &capability); err != nil {
 		return joinInput{}, fmt.Errorf("%w: parse bootstrap capability: %v", errInviteMalformed, err)
@@ -618,77 +604,6 @@ func readJoinInputBytes(arg string) ([]byte, error) {
 		}
 		return b, nil
 	}
-}
-
-const fleetInviteDescriptorType = "entmoot.fleet_invite.v2"
-
-type fleetInviteDescriptor struct {
-	Type           string                      `json:"type,omitempty"`
-	FleetID        string                      `json:"fleet_id"`
-	FleetName      string                      `json:"fleet_name,omitempty"`
-	ControlGroupID entmoot.GroupID             `json:"control_group_id,omitempty"`
-	Capability     entmoot.BootstrapCapability `json:"capability"`
-	GroupMetadata  json.RawMessage             `json:"group_metadata,omitempty"`
-}
-
-func newFleetInviteDescriptor(fleet esphttp.FleetRecord, capability entmoot.BootstrapCapability) (fleetInviteDescriptor, error) {
-	metadata, err := fleetControlGroupMetadata(fleet.FleetID, fleet.Name)
-	if err != nil {
-		return fleetInviteDescriptor{}, err
-	}
-	return fleetInviteDescriptor{
-		Type:           fleetInviteDescriptorType,
-		FleetID:        fleet.FleetID,
-		FleetName:      fleet.Name,
-		ControlGroupID: fleet.ControlGroupID,
-		Capability:     capability,
-		GroupMetadata:  metadata,
-	}, nil
-}
-
-func parseFleetInviteDescriptor(raw []byte) (joinInput, bool, error) {
-	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &fields); err != nil {
-		return joinInput{}, false, nil
-	}
-	if !hasJSONField(fields, "fleet_id") && !hasJSONField(fields, "group_metadata") {
-		return joinInput{}, false, nil
-	}
-	if !hasJSONField(fields, "capability") {
-		return joinInput{}, false, nil
-	}
-	var desc fleetInviteDescriptor
-	if err := json.Unmarshal(raw, &desc); err != nil {
-		return joinInput{}, true, fmt.Errorf("%w: fleet invite descriptor: %v", errInviteMalformed, err)
-	}
-	if desc.Type != "" && desc.Type != fleetInviteDescriptorType {
-		return joinInput{}, true, fmt.Errorf("%w: unsupported fleet invite descriptor type %q", errInviteMalformed, desc.Type)
-	}
-	desc.FleetID = strings.TrimSpace(desc.FleetID)
-	if desc.FleetID == "" {
-		return joinInput{}, true, fmt.Errorf("%w: fleet invite descriptor requires fleet_id", errInviteMalformed)
-	}
-	if desc.Capability.GroupID == (entmoot.GroupID{}) {
-		return joinInput{}, true, fmt.Errorf("%w: fleet invite descriptor requires a bootstrap capability", errInviteMalformed)
-	}
-	if desc.ControlGroupID != (entmoot.GroupID{}) && desc.ControlGroupID != desc.Capability.GroupID {
-		return joinInput{}, true, fmt.Errorf("%w: fleet invite descriptor control_group_id does not match capability", errInviteMalformed)
-	}
-	metadata := desc.GroupMetadata
-	if len(bytes.TrimSpace(metadata)) == 0 {
-		var err error
-		metadata, err = fleetControlGroupMetadata(desc.FleetID, desc.FleetName)
-		if err != nil {
-			return joinInput{}, true, fmt.Errorf("%w: fleet invite descriptor metadata: %v", errInviteMalformed, err)
-		}
-	} else if _, err := esphttp.NormalizeGroupMetadata(metadata); err != nil {
-		return joinInput{}, true, fmt.Errorf("%w: fleet invite descriptor metadata: %v", errInviteMalformed, err)
-	}
-	if !fleetControlMetadataMatches(metadata, desc.FleetID) {
-		return joinInput{}, true, fmt.Errorf("%w: fleet invite descriptor metadata does not match fleet_id", errInviteMalformed)
-	}
-	capability := desc.Capability
-	return joinInput{capability: &capability, groupMetadata: metadata}, true, nil
 }
 
 func parseDefaultMootDescriptor(raw []byte) (joinInput, bool, error) {

@@ -329,7 +329,7 @@ func TestRunAgentLiveScanPublishFailureKeepsCursor(t *testing.T) {
 	if err := os.WriteFile(runner, []byte("#!/bin/sh\nprintf '{\"actions\":[{\"kind\":\"reply\",\"message\":\"ok\"}]}'\n"), 0o700); err != nil {
 		t.Fatalf("WriteFile runner: %v", err)
 	}
-	_, err = runAgentLiveScan(ctx, enableCoordinationFeatures(&globalFlags{data: t.TempDir()}), state, msgStore, cfg, agentLiveRuntimeConfig{
+	_, err = runAgentLiveScan(ctx, &globalFlags{data: t.TempDir()}, state, msgStore, cfg, agentLiveRuntimeConfig{
 		groupID: gid,
 		nodeID:  nodeID,
 		runner:  runner,
@@ -376,7 +376,7 @@ func TestRunAgentLiveScanPartialPublishFailurePersistsCursor(t *testing.T) {
 	t.Cleanup(func() { _ = os.RemoveAll(dataDir) })
 	stop := serveLivePublishOnceThenFail(t, controlSocketPath(dataDir))
 	defer stop()
-	result, err := runAgentLiveScan(ctx, enableCoordinationFeatures(&globalFlags{data: dataDir}), state, msgStore, cfg, agentLiveRuntimeConfig{
+	result, err := runAgentLiveScan(ctx, &globalFlags{data: dataDir}, state, msgStore, cfg, agentLiveRuntimeConfig{
 		groupID: gid,
 		nodeID:  nodeID,
 		runner:  runner,
@@ -432,7 +432,7 @@ func TestRunAgentLiveScanHonorsMaxActionsPerScan(t *testing.T) {
 	topicsCh := make(chan []string, 1)
 	stop := serveLivePublishCapture(t, controlSocketPath(dataDir), topicsCh)
 	defer stop()
-	result, err := runAgentLiveScan(ctx, enableCoordinationFeatures(&globalFlags{data: dataDir}), state, msgStore, cfg, agentLiveRuntimeConfig{
+	result, err := runAgentLiveScan(ctx, &globalFlags{data: dataDir}, state, msgStore, cfg, agentLiveRuntimeConfig{
 		groupID: gid,
 		nodeID:  nodeID,
 		runner:  runner,
@@ -485,7 +485,7 @@ JSON
 	topicsCh := make(chan []string, 1)
 	stop := serveLivePublishCapture(t, controlSocketPath(dataDir), topicsCh)
 	defer stop()
-	result, err := runAgentLiveScan(ctx, enableCoordinationFeatures(&globalFlags{data: dataDir}), state, msgStore, cfg, agentLiveRuntimeConfig{
+	result, err := runAgentLiveScan(ctx, &globalFlags{data: dataDir}, state, msgStore, cfg, agentLiveRuntimeConfig{
 		groupID: gid,
 		nodeID:  nodeID,
 		runner:  runner,
@@ -574,7 +574,7 @@ func TestApplyLiveAgentActionAllowsOwnerAlertOutsideFilters(t *testing.T) {
 		TopicFilters:   []string{"tasks/#"},
 		AllowedActions: []string{liveActionAlertOwner},
 	}
-	_, err := applyLiveAgentAction(ctx, enableCoordinationFeatures(&globalFlags{data: t.TempDir()}), esphttp.NewMemoryStateStore(), cfg, nil, liveAgentAction{
+	_, err := applyLiveAgentAction(ctx, &globalFlags{data: t.TempDir()}, esphttp.NewMemoryStateStore(), cfg, nil, liveAgentAction{
 		Kind:    liveActionAlertOwner,
 		Message: "owner check",
 	})
@@ -602,7 +602,7 @@ func TestApplyLiveAgentActionDefaultsWhitespaceOwnerAlertTopic(t *testing.T) {
 	topicsCh := make(chan []string, 1)
 	stop := serveLivePublishCapture(t, controlSocketPath(dataDir), topicsCh)
 	defer stop()
-	applied, err := applyLiveAgentAction(ctx, enableCoordinationFeatures(&globalFlags{data: dataDir}), esphttp.NewMemoryStateStore(), cfg, []liveAgentRunnerMessage{{
+	applied, err := applyLiveAgentAction(ctx, &globalFlags{data: dataDir}, esphttp.NewMemoryStateStore(), cfg, []liveAgentRunnerMessage{{
 		Topics: []string{"tasks/incident"},
 	}}, liveAgentAction{
 		Kind:    liveActionAlertOwner,
@@ -639,7 +639,7 @@ func TestApplyLiveAgentActionDefaultsToMatchedReplyTopic(t *testing.T) {
 	topicsCh := make(chan []string, 1)
 	stop := serveLivePublishCapture(t, controlSocketPath(dataDir), topicsCh)
 	defer stop()
-	applied, err := applyLiveAgentAction(ctx, enableCoordinationFeatures(&globalFlags{data: dataDir}), esphttp.NewMemoryStateStore(), cfg, []liveAgentRunnerMessage{{
+	applied, err := applyLiveAgentAction(ctx, &globalFlags{data: dataDir}, esphttp.NewMemoryStateStore(), cfg, []liveAgentRunnerMessage{{
 		Topics: []string{"noise", "ops"},
 	}}, liveAgentAction{
 		Kind:    liveActionReply,
@@ -668,7 +668,7 @@ func TestApplyLiveAgentActionRejectsOversizedMessage(t *testing.T) {
 		TopicFilters:   []string{"chat"},
 		MaxActionBytes: 3,
 	}
-	applied, err := applyLiveAgentAction(ctx, enableCoordinationFeatures(&globalFlags{data: t.TempDir()}), esphttp.NewMemoryStateStore(), cfg, []liveAgentRunnerMessage{{
+	applied, err := applyLiveAgentAction(ctx, &globalFlags{data: t.TempDir()}, esphttp.NewMemoryStateStore(), cfg, []liveAgentRunnerMessage{{
 		Topics: []string{"chat"},
 	}}, liveAgentAction{
 		Kind:    liveActionReply,
@@ -948,7 +948,7 @@ func TestScanAgentLiveRunGroupsActionTransportDegrades(t *testing.T) {
 	if err := os.WriteFile(runner, []byte("#!/bin/sh\nprintf '{\"actions\":[{\"kind\":\"reply\",\"message\":\"ok\"}]}'\n"), 0o700); err != nil {
 		t.Fatalf("WriteFile runner: %v", err)
 	}
-	bindings, scans, err := scanAgentLiveRunGroups(ctx, enableCoordinationFeatures(&globalFlags{data: t.TempDir()}), state, msgStore, []agentLiveRunGroup{{GroupID: gid, Mode: esphttp.LiveModeConverse}}, nodeID, time.Second, true, agentLiveRuntimeConfig{
+	bindings, scans, err := scanAgentLiveRunGroups(ctx, &globalFlags{data: t.TempDir()}, state, msgStore, []agentLiveRunGroup{{GroupID: gid, Mode: esphttp.LiveModeConverse}}, nodeID, time.Second, true, agentLiveRuntimeConfig{
 		nodeID:  nodeID,
 		runner:  runner,
 		timeout: time.Second,
@@ -1348,7 +1348,7 @@ func TestLiveMessageMentionsAgentRequiresExactToken(t *testing.T) {
 
 func TestCmdAgentLiveRunMalformedGroupIsInvalidArgument(t *testing.T) {
 	code, _, stderr := captureCommandOutput(t, func() int {
-		return cmdAgentLiveRun(enableCoordinationFeatures(&globalFlags{data: t.TempDir()}), []string{"-group", "not-a-group", "-member", testAgentLiveMemberID(7).String(), "-once"})
+		return cmdAgentLiveRun(&globalFlags{data: t.TempDir()}, []string{"-group", "not-a-group", "-member", testAgentLiveMemberID(7).String(), "-once"})
 	})
 	if code != exitInvalidArgument {
 		t.Fatalf("malformed group exit=%d; stderr=%s", code, stderr)

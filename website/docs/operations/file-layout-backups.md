@@ -29,7 +29,7 @@ State ownership:
 | other group SQLite files | Messages, Merkle state, profiles, and gossip state. |
 | `bootstrap-admission.db` | Local record of the invites this node issued, used by `invite list`. Not an authority: invite use limits and revocations are projected from the group's signed state. |
 | `mailbox.sqlite` | Durable ESP mailbox cursors. |
-| `esp.sqlite` | Sign requests, push tokens, notification preferences, Fleets, Fleet members, tasks, commands, local agent-command queue, live-agent configs, presence, and cursors. |
+| `esp.sqlite` | Sign requests, push tokens, notification preferences, public moot directory records, live-agent configs, presence, and cursors. |
 | `esp-devices.json` | Local ESP device registry. |
 | `runtime.env` | Installed wrapper defaults for data path, identity, and connectivity. |
 

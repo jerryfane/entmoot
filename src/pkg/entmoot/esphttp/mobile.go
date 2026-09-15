@@ -1,7 +1,6 @@
 package esphttp
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -10,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -197,36 +197,6 @@ type StateStore interface {
 	RedeemOpenInvite(context.Context, string, OpenInviteRedemption, int64) (OpenInviteRecord, OpenInviteRedemption, bool, error)
 	CompleteOpenInviteRedemption(context.Context, string, string, json.RawMessage, int64) error
 	ReleaseOpenInviteRedemption(context.Context, string, string, int64) error
-	CreateFleet(context.Context, FleetRecord) (FleetRecord, error)
-	ListFleets(context.Context) ([]FleetRecord, error)
-	GetFleet(context.Context, string) (FleetRecord, bool, error)
-	GetFleetByControlGroup(context.Context, entmoot.GroupID) (FleetRecord, bool, error)
-	ArchiveFleet(context.Context, string, int64) (FleetRecord, bool, error)
-	RestoreFleet(context.Context, string, int64) (FleetRecord, bool, error)
-	DeleteFleet(context.Context, string) error
-	UpsertFleetMember(context.Context, FleetMemberRecord) (FleetMemberRecord, error)
-	UpsertFleetMemberForActiveFleet(context.Context, FleetMemberRecord) (FleetMemberRecord, error)
-	ReconcileFleetInviteAcceptance(context.Context, string, entmoot.MemberID, string, int64, string) (FleetMemberRecord, FleetActivityRecord, bool, error)
-	ListFleetMembers(context.Context, string) ([]FleetMemberRecord, error)
-	DeleteFleetMember(context.Context, string, entmoot.MemberID) error
-	CreateFleetInvite(context.Context, FleetInviteRecord) (FleetInviteRecord, error)
-	CreateFleetInviteForActiveFleet(context.Context, FleetInviteRecord) (FleetInviteRecord, error)
-	ListFleetInvites(context.Context, string) ([]FleetInviteRecord, error)
-	DeleteFleetInvite(context.Context, string) error
-	AppendFleetActivity(context.Context, FleetActivityRecord) (FleetActivityRecord, error)
-	ListFleetActivity(context.Context, string, int, int64) ([]FleetActivityRecord, error)
-	DeleteFleetActivity(context.Context, string, string) error
-	UpsertFleetTask(context.Context, FleetTaskRecord) (FleetTaskRecord, error)
-	UpdateFleetTaskIfCurrent(context.Context, FleetTaskRecord, int64) (FleetTaskRecord, bool, error)
-	ClaimFleetTask(context.Context, FleetTaskRecord) (FleetTaskRecord, bool, error)
-	SubmitFleetTask(context.Context, FleetTaskRecord, int64, FleetTaskSubmissionRecord) (FleetTaskRecord, FleetTaskSubmissionRecord, bool, error)
-	GetFleetTask(context.Context, string, string) (FleetTaskRecord, bool, error)
-	ListFleetTasks(context.Context, string, string) ([]FleetTaskRecord, error)
-	DeleteFleetTask(context.Context, string, string) error
-	UpsertFleetCommand(context.Context, FleetCommandEnvelope) (FleetCommandSummaryRecord, error)
-	UpsertFleetCommandResult(context.Context, FleetCommandResultEnvelope) error
-	GetFleetCommandDetail(context.Context, string, string) (FleetCommandDetailRecord, bool, error)
-	ListFleetCommands(context.Context, string, FleetCommandListFilter) ([]FleetCommandSummaryRecord, error)
 	UpsertLiveAgentConfig(context.Context, LiveAgentConfig) (LiveAgentConfig, error)
 	GetLiveAgentConfig(context.Context, entmoot.GroupID, entmoot.MemberID) (LiveAgentConfig, bool, error)
 	ListLiveAgentConfigs(context.Context, entmoot.GroupID) ([]LiveAgentConfig, error)
@@ -243,9 +213,6 @@ type StateStore interface {
 	UpsertNodeProfile(context.Context, NodeProfileRecord) (NodeProfileRecord, bool, error)
 	GetNodeProfile(context.Context, entmoot.MemberID) (NodeProfileRecord, bool, error)
 	ListNodeProfiles(context.Context, []entmoot.MemberID) (map[entmoot.MemberID]NodeProfileRecord, error)
-	UpsertFleetTaskSubmission(context.Context, FleetTaskSubmissionRecord) (FleetTaskSubmissionRecord, error)
-	GetFleetTaskSubmission(context.Context, string, string, string) (FleetTaskSubmissionRecord, bool, error)
-	ListFleetTaskSubmissions(context.Context, string, string) ([]FleetTaskSubmissionRecord, error)
 	Close() error
 }
 
@@ -267,7 +234,6 @@ var (
 	ErrOpenInviteExpired   = errors.New("esphttp: open invite expired")
 	ErrOpenInviteRevoked   = errors.New("esphttp: open invite revoked")
 	ErrOpenInviteExhausted = errors.New("esphttp: open invite exhausted")
-	ErrFleetNotActive      = errors.New("esphttp: fleet is not active")
 )
 
 // ValidateOpenInviteMaxUses accepts zero as unlimited and rejects negatives.
@@ -285,51 +251,35 @@ func OpenInviteUseLimitReached(rec OpenInviteRecord) bool {
 
 // MemoryStateStore is useful for tests and dev-mode ESP handlers.
 type MemoryStateStore struct {
-	mu                  sync.Mutex
-	requests            map[string]SignRequest
-	devices             map[string]DeviceState
-	idem                map[string]IdempotencyRecord
-	groups              map[entmoot.GroupID]json.RawMessage
-	invites             map[string]OpenInviteRecord
-	redeems             map[string]map[string]OpenInviteRedemption
-	fleets              map[string]FleetRecord
-	fleetMembers        map[string]map[entmoot.MemberID]FleetMemberRecord
-	fleetInvites        map[string][]FleetInviteRecord
-	fleetActivity       map[string][]FleetActivityRecord
-	fleetTasks          map[string]map[string]FleetTaskRecord
-	fleetTaskSubs       map[string]map[string][]FleetTaskSubmissionRecord
-	fleetCommands       map[string]map[string]FleetCommandEnvelope
-	fleetCommandResults map[string]map[string]map[entmoot.MemberID]FleetCommandResultEnvelope
-	liveAgentConfigs    map[entmoot.GroupID]map[entmoot.MemberID]LiveAgentConfig
-	liveAgentPresence   map[entmoot.GroupID]map[entmoot.MemberID]LiveAgentPresence
-	liveAgentCursors    map[entmoot.GroupID]map[entmoot.MemberID]LiveAgentCursor
-	publicMoots         map[entmoot.GroupID]PublicMootRecord
-	nodeProfiles        map[entmoot.MemberID]map[string]NodeProfileRecord
-	clock               func() time.Time
+	mu                sync.Mutex
+	requests          map[string]SignRequest
+	devices           map[string]DeviceState
+	idem              map[string]IdempotencyRecord
+	groups            map[entmoot.GroupID]json.RawMessage
+	invites           map[string]OpenInviteRecord
+	redeems           map[string]map[string]OpenInviteRedemption
+	liveAgentConfigs  map[entmoot.GroupID]map[entmoot.MemberID]LiveAgentConfig
+	liveAgentPresence map[entmoot.GroupID]map[entmoot.MemberID]LiveAgentPresence
+	liveAgentCursors  map[entmoot.GroupID]map[entmoot.MemberID]LiveAgentCursor
+	publicMoots       map[entmoot.GroupID]PublicMootRecord
+	nodeProfiles      map[entmoot.MemberID]map[string]NodeProfileRecord
+	clock             func() time.Time
 }
 
 func NewMemoryStateStore() *MemoryStateStore {
 	return &MemoryStateStore{
-		requests:            make(map[string]SignRequest),
-		devices:             make(map[string]DeviceState),
-		idem:                make(map[string]IdempotencyRecord),
-		groups:              make(map[entmoot.GroupID]json.RawMessage),
-		invites:             make(map[string]OpenInviteRecord),
-		redeems:             make(map[string]map[string]OpenInviteRedemption),
-		fleets:              make(map[string]FleetRecord),
-		fleetMembers:        make(map[string]map[entmoot.MemberID]FleetMemberRecord),
-		fleetInvites:        make(map[string][]FleetInviteRecord),
-		fleetActivity:       make(map[string][]FleetActivityRecord),
-		fleetTasks:          make(map[string]map[string]FleetTaskRecord),
-		fleetTaskSubs:       make(map[string]map[string][]FleetTaskSubmissionRecord),
-		fleetCommands:       make(map[string]map[string]FleetCommandEnvelope),
-		fleetCommandResults: make(map[string]map[string]map[entmoot.MemberID]FleetCommandResultEnvelope),
-		liveAgentConfigs:    make(map[entmoot.GroupID]map[entmoot.MemberID]LiveAgentConfig),
-		liveAgentPresence:   make(map[entmoot.GroupID]map[entmoot.MemberID]LiveAgentPresence),
-		liveAgentCursors:    make(map[entmoot.GroupID]map[entmoot.MemberID]LiveAgentCursor),
-		publicMoots:         make(map[entmoot.GroupID]PublicMootRecord),
-		nodeProfiles:        make(map[entmoot.MemberID]map[string]NodeProfileRecord),
-		clock:               time.Now,
+		requests:          make(map[string]SignRequest),
+		devices:           make(map[string]DeviceState),
+		idem:              make(map[string]IdempotencyRecord),
+		groups:            make(map[entmoot.GroupID]json.RawMessage),
+		invites:           make(map[string]OpenInviteRecord),
+		redeems:           make(map[string]map[string]OpenInviteRedemption),
+		liveAgentConfigs:  make(map[entmoot.GroupID]map[entmoot.MemberID]LiveAgentConfig),
+		liveAgentPresence: make(map[entmoot.GroupID]map[entmoot.MemberID]LiveAgentPresence),
+		liveAgentCursors:  make(map[entmoot.GroupID]map[entmoot.MemberID]LiveAgentCursor),
+		publicMoots:       make(map[entmoot.GroupID]PublicMootRecord),
+		nodeProfiles:      make(map[entmoot.MemberID]map[string]NodeProfileRecord),
+		clock:             time.Now,
 	}
 }
 
@@ -659,564 +609,6 @@ func (s *MemoryStateStore) DeleteGroupMetadata(_ context.Context, groupID entmoo
 	return nil
 }
 
-func (s *MemoryStateStore) CreateFleet(_ context.Context, rec FleetRecord) (FleetRecord, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	now := s.nowMS()
-	if rec.FleetID == "" {
-		var err error
-		rec.FleetID, err = NewFleetID()
-		if err != nil {
-			return FleetRecord{}, err
-		}
-	}
-	if rec.CreatedAtMS == 0 {
-		rec.CreatedAtMS = now
-	}
-	rec.Status = NormalizeFleetStatus(rec.Status)
-	rec.UpdatedAtMS = now
-	s.fleets[rec.FleetID] = cloneFleetRecord(rec)
-	return cloneFleetRecord(rec), nil
-}
-
-func (s *MemoryStateStore) ListFleets(_ context.Context) ([]FleetRecord, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	out := make([]FleetRecord, 0, len(s.fleets))
-	for _, rec := range s.fleets {
-		out = append(out, cloneFleetRecord(rec))
-	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].CreatedAtMS == out[j].CreatedAtMS {
-			return out[i].FleetID < out[j].FleetID
-		}
-		return out[i].CreatedAtMS > out[j].CreatedAtMS
-	})
-	return out, nil
-}
-
-func (s *MemoryStateStore) GetFleet(_ context.Context, fleetID string) (FleetRecord, bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	rec, ok := s.fleets[fleetID]
-	return cloneFleetRecord(rec), ok, nil
-}
-
-func (s *MemoryStateStore) GetFleetByControlGroup(_ context.Context, groupID entmoot.GroupID) (FleetRecord, bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for _, rec := range s.fleets {
-		if rec.ControlGroupID == groupID {
-			return cloneFleetRecord(rec), true, nil
-		}
-	}
-	return FleetRecord{}, false, nil
-}
-
-func (s *MemoryStateStore) ArchiveFleet(_ context.Context, fleetID string, archivedAtMS int64) (FleetRecord, bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	rec, ok := s.fleets[fleetID]
-	if !ok {
-		return FleetRecord{}, false, nil
-	}
-	if archivedAtMS == 0 {
-		archivedAtMS = s.nowMS()
-	}
-	if rec.Status != FleetStatusArchived {
-		rec.Status = FleetStatusArchived
-		rec.ArchivedAtMS = archivedAtMS
-		rec.UpdatedAtMS = archivedAtMS
-		s.fleets[fleetID] = cloneFleetRecord(rec)
-	}
-	s.refreshFleetNodeProfilesLocked(fleetID)
-	delete(s.fleetInvites, fleetID)
-	return cloneFleetRecord(rec), true, nil
-}
-
-func (s *MemoryStateStore) RestoreFleet(_ context.Context, fleetID string, restoredAtMS int64) (FleetRecord, bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	rec, ok := s.fleets[fleetID]
-	if !ok {
-		return FleetRecord{}, false, nil
-	}
-	if restoredAtMS == 0 {
-		restoredAtMS = s.nowMS()
-	}
-	if rec.Status != FleetStatusActive {
-		rec.Status = FleetStatusActive
-		rec.ArchivedAtMS = 0
-		rec.DeletedAtMS = 0
-		rec.UpdatedAtMS = restoredAtMS
-		s.fleets[fleetID] = cloneFleetRecord(rec)
-	}
-
-	s.refreshFleetNodeProfilesLocked(fleetID)
-	return cloneFleetRecord(rec), true, nil
-}
-
-func (s *MemoryStateStore) DeleteFleet(_ context.Context, fleetID string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	delete(s.fleets, fleetID)
-	s.refreshFleetNodeProfilesLocked(fleetID)
-	delete(s.fleetMembers, fleetID)
-	delete(s.fleetInvites, fleetID)
-	delete(s.fleetActivity, fleetID)
-	delete(s.fleetTasks, fleetID)
-	delete(s.fleetTaskSubs, fleetID)
-	delete(s.fleetCommands, fleetID)
-	delete(s.fleetCommandResults, fleetID)
-
-	return nil
-}
-
-func (s *MemoryStateStore) UpsertFleetMember(_ context.Context, rec FleetMemberRecord) (FleetMemberRecord, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.upsertFleetMemberLocked(rec)
-}
-
-func (s *MemoryStateStore) UpsertFleetMemberForActiveFleet(_ context.Context, rec FleetMemberRecord) (FleetMemberRecord, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if !s.fleetActiveLocked(rec.FleetID) {
-		return FleetMemberRecord{}, ErrFleetNotActive
-	}
-	return s.upsertFleetMemberLocked(rec)
-}
-
-func (s *MemoryStateStore) ReconcileFleetInviteAcceptance(_ context.Context, fleetID string, memberID entmoot.MemberID, entmootPubKey string, acceptedAtMS int64, hostname string) (FleetMemberRecord, FleetActivityRecord, bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	entmootPubKey = strings.TrimSpace(entmootPubKey)
-	if !s.fleetActiveLocked(fleetID) {
-		return FleetMemberRecord{}, FleetActivityRecord{}, false, nil
-	}
-	members := s.fleetMembers[fleetID]
-	member, ok := members[memberID]
-	if !ok || member.Status != FleetMemberInvited || member.Role == FleetRoleCoordinator || member.EntmootPubKey != entmootPubKey {
-		return FleetMemberRecord{}, FleetActivityRecord{}, false, nil
-	}
-	if acceptedAtMS == 0 {
-		acceptedAtMS = s.nowMS()
-	}
-	hasInvite := false
-	invites := s.fleetInvites[fleetID]
-	remainingInvites := invites[:0]
-	for _, invite := range invites {
-		if invite.MemberID == memberID && invite.EntmootPubKey == entmootPubKey && invite.Status == FleetMemberInvited {
-			hasInvite = true
-			continue
-		}
-		remainingInvites = append(remainingInvites, invite)
-	}
-	if !hasInvite {
-		return FleetMemberRecord{}, FleetActivityRecord{}, false, nil
-	}
-	if strings.TrimSpace(member.Hostname) == "" {
-		member.Hostname = strings.TrimSpace(hostname)
-	}
-	member.Status = FleetMemberActive
-	member.AcceptedAtMS = acceptedAtMS
-	member.RemovedAtMS = 0
-	member.UpdatedAtMS = s.nowMS()
-	activity, err := fleetAcceptanceActivityFromMember(member, acceptedAtMS)
-	if err != nil {
-		return FleetMemberRecord{}, FleetActivityRecord{}, false, err
-	}
-	members[memberID] = cloneFleetMemberRecord(member)
-	if len(remainingInvites) == 0 {
-		delete(s.fleetInvites, fleetID)
-	} else {
-		s.fleetInvites[fleetID] = append([]FleetInviteRecord(nil), remainingInvites...)
-	}
-	s.fleetActivity[fleetID] = append(s.fleetActivity[fleetID], cloneFleetActivityRecord(activity))
-	_ = s.observeFleetMemberNodeProfileLocked(member)
-	_ = s.refreshFleetInviteNodeProfileLocked(memberID)
-	return cloneFleetMemberRecord(member), cloneFleetActivityRecord(activity), true, nil
-}
-
-func (s *MemoryStateStore) fleetActiveLocked(fleetID string) bool {
-	fleet, ok := s.fleets[fleetID]
-	return ok && NormalizeFleetStatus(fleet.Status) == FleetStatusActive
-}
-
-func (s *MemoryStateStore) upsertFleetMemberLocked(rec FleetMemberRecord) (FleetMemberRecord, error) {
-	if s.fleetMembers[rec.FleetID] == nil {
-		s.fleetMembers[rec.FleetID] = make(map[entmoot.MemberID]FleetMemberRecord)
-	}
-	rec.Role = NormalizeFleetMemberRole(rec.Role)
-	rec.Status = NormalizeFleetMemberStatus(rec.Status)
-	rec.UpdatedAtMS = s.nowMS()
-	s.fleetMembers[rec.FleetID][rec.MemberID] = cloneFleetMemberRecord(rec)
-	_ = s.observeFleetMemberNodeProfileLocked(rec)
-	return cloneFleetMemberRecord(rec), nil
-}
-
-func (s *MemoryStateStore) ListFleetMembers(_ context.Context, fleetID string) ([]FleetMemberRecord, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	members := s.fleetMembers[fleetID]
-	out := make([]FleetMemberRecord, 0, len(members))
-	for _, rec := range members {
-		out = append(out, cloneFleetMemberRecord(rec))
-	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].Role != out[j].Role {
-			return out[i].Role == FleetRoleCoordinator
-		}
-		return out[i].MemberID.String() < out[j].MemberID.String()
-	})
-	return out, nil
-}
-
-func (s *MemoryStateStore) DeleteFleetMember(_ context.Context, fleetID string, memberID entmoot.MemberID) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if members := s.fleetMembers[fleetID]; members != nil {
-		delete(members, memberID)
-		if len(members) == 0 {
-			delete(s.fleetMembers, fleetID)
-		}
-	}
-	_ = s.refreshFleetMemberNodeProfileLocked(memberID)
-	return nil
-}
-
-func (s *MemoryStateStore) CreateFleetInvite(_ context.Context, rec FleetInviteRecord) (FleetInviteRecord, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.createFleetInviteLocked(rec)
-}
-
-func (s *MemoryStateStore) CreateFleetInviteForActiveFleet(_ context.Context, rec FleetInviteRecord) (FleetInviteRecord, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if !s.fleetActiveLocked(rec.FleetID) {
-		return FleetInviteRecord{}, ErrFleetNotActive
-	}
-	return s.createFleetInviteLocked(rec)
-}
-
-func (s *MemoryStateStore) createFleetInviteLocked(rec FleetInviteRecord) (FleetInviteRecord, error) {
-	now := s.nowMS()
-	if rec.InviteID == "" {
-		var err error
-		rec.InviteID, err = NewFleetInviteID()
-		if err != nil {
-			return FleetInviteRecord{}, err
-		}
-	}
-	if rec.CreatedAtMS == 0 {
-		rec.CreatedAtMS = now
-	}
-	rec.UpdatedAtMS = now
-	rec.Status = strings.TrimSpace(rec.Status)
-	if rec.Status == "" {
-		rec.Status = FleetMemberInvited
-	}
-	s.fleetInvites[rec.FleetID] = append(s.fleetInvites[rec.FleetID], cloneFleetInviteRecord(rec))
-	_ = s.observeFleetInviteNodeProfileLocked(rec)
-	return cloneFleetInviteRecord(rec), nil
-}
-
-func (s *MemoryStateStore) ListFleetInvites(_ context.Context, fleetID string) ([]FleetInviteRecord, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	out := append([]FleetInviteRecord(nil), s.fleetInvites[fleetID]...)
-	for i := range out {
-		out[i] = cloneFleetInviteRecord(out[i])
-	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].CreatedAtMS == out[j].CreatedAtMS {
-			return out[i].InviteID < out[j].InviteID
-		}
-		return out[i].CreatedAtMS > out[j].CreatedAtMS
-	})
-	return out, nil
-}
-
-func (s *MemoryStateStore) DeleteFleetInvite(_ context.Context, inviteID string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	removed := make(map[entmoot.MemberID]struct{})
-	for fleetID, invites := range s.fleetInvites {
-		dst := invites[:0]
-		for _, invite := range invites {
-			if invite.InviteID != inviteID {
-				dst = append(dst, invite)
-			} else {
-				removed[invite.MemberID] = struct{}{}
-			}
-		}
-		if len(dst) == 0 {
-			delete(s.fleetInvites, fleetID)
-		} else {
-			s.fleetInvites[fleetID] = append([]FleetInviteRecord(nil), dst...)
-		}
-	}
-	for id := range removed {
-		_ = s.refreshFleetInviteNodeProfileLocked(id)
-	}
-	return nil
-}
-
-func (s *MemoryStateStore) AppendFleetActivity(_ context.Context, rec FleetActivityRecord) (FleetActivityRecord, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if rec.EventID == "" {
-		var err error
-		rec.EventID, err = NewFleetActivityID()
-		if err != nil {
-			return FleetActivityRecord{}, err
-		}
-	}
-	if rec.CreatedAtMS == 0 {
-		rec.CreatedAtMS = s.nowMS()
-	}
-	s.fleetActivity[rec.FleetID] = append(s.fleetActivity[rec.FleetID], cloneFleetActivityRecord(rec))
-	return cloneFleetActivityRecord(rec), nil
-}
-
-func (s *MemoryStateStore) ListFleetActivity(_ context.Context, fleetID string, limit int, beforeMS int64) ([]FleetActivityRecord, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if limit <= 0 || limit > 200 {
-		limit = 50
-	}
-	var out []FleetActivityRecord
-	events := s.fleetActivity[fleetID]
-	for i := len(events) - 1; i >= 0 && len(out) < limit; i-- {
-		ev := events[i]
-		if beforeMS > 0 && ev.CreatedAtMS >= beforeMS {
-			continue
-		}
-		out = append(out, cloneFleetActivityRecord(ev))
-	}
-	return out, nil
-}
-
-func (s *MemoryStateStore) DeleteFleetActivity(_ context.Context, fleetID string, eventID string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if events := s.fleetActivity[fleetID]; events != nil {
-		dst := events[:0]
-		for _, event := range events {
-			if event.EventID == eventID {
-				continue
-			}
-			dst = append(dst, event)
-		}
-		if len(dst) == 0 {
-			delete(s.fleetActivity, fleetID)
-			return nil
-		}
-		s.fleetActivity[fleetID] = append([]FleetActivityRecord(nil), dst...)
-	}
-	return nil
-}
-
-func (s *MemoryStateStore) UpsertFleetTask(_ context.Context, rec FleetTaskRecord) (FleetTaskRecord, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	now := s.nowMS()
-	var err error
-	rec, err = normalizeFleetTaskRecord(rec, now)
-	if err != nil {
-		return FleetTaskRecord{}, err
-	}
-	if s.fleetTasks[rec.FleetID] == nil {
-		s.fleetTasks[rec.FleetID] = make(map[string]FleetTaskRecord)
-	}
-	s.fleetTasks[rec.FleetID][rec.TaskID] = cloneFleetTaskRecord(rec)
-	return cloneFleetTaskRecord(rec), nil
-}
-
-func (s *MemoryStateStore) ClaimFleetTask(_ context.Context, rec FleetTaskRecord) (FleetTaskRecord, bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	now := s.nowMS()
-	var err error
-	rec, err = normalizeFleetTaskRecord(rec, now)
-	if err != nil {
-		return FleetTaskRecord{}, false, err
-	}
-	current, ok := s.fleetTasks[rec.FleetID][rec.TaskID]
-	if !ok || !fleetTaskCanBeClaimed(current) {
-		return FleetTaskRecord{}, false, nil
-	}
-	if s.fleetTasks[rec.FleetID] == nil {
-		s.fleetTasks[rec.FleetID] = make(map[string]FleetTaskRecord)
-	}
-	s.fleetTasks[rec.FleetID][rec.TaskID] = cloneFleetTaskRecord(rec)
-	return cloneFleetTaskRecord(rec), true, nil
-}
-
-func (s *MemoryStateStore) UpdateFleetTaskIfCurrent(_ context.Context, rec FleetTaskRecord, expectedUpdatedAtMS int64) (FleetTaskRecord, bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	now := s.nowMS()
-	var err error
-	rec, err = normalizeFleetTaskRecord(rec, now)
-	if err != nil {
-		return FleetTaskRecord{}, false, err
-	}
-	current, ok := s.fleetTasks[rec.FleetID][rec.TaskID]
-	if !ok || current.UpdatedAtMS != expectedUpdatedAtMS {
-		return FleetTaskRecord{}, false, nil
-	}
-	if s.fleetTasks[rec.FleetID] == nil {
-		s.fleetTasks[rec.FleetID] = make(map[string]FleetTaskRecord)
-	}
-	s.fleetTasks[rec.FleetID][rec.TaskID] = cloneFleetTaskRecord(rec)
-	return cloneFleetTaskRecord(rec), true, nil
-}
-
-func (s *MemoryStateStore) SubmitFleetTask(_ context.Context, rec FleetTaskRecord, expectedUpdatedAtMS int64, submission FleetTaskSubmissionRecord) (FleetTaskRecord, FleetTaskSubmissionRecord, bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	now := s.nowMS()
-	var err error
-	rec, err = normalizeFleetTaskRecord(rec, now)
-	if err != nil {
-		return FleetTaskRecord{}, FleetTaskSubmissionRecord{}, false, err
-	}
-	submission, err = normalizeFleetTaskSubmissionRecord(submission, now)
-	if err != nil {
-		return FleetTaskRecord{}, FleetTaskSubmissionRecord{}, false, err
-	}
-	current, ok := s.fleetTasks[rec.FleetID][rec.TaskID]
-	if rec.Mode == FleetTaskModeOpenSubmission {
-		if !ok || current.Mode != FleetTaskModeOpenSubmission || !fleetTaskCanAcceptSubmission(current) {
-			return FleetTaskRecord{}, FleetTaskSubmissionRecord{}, false, nil
-		}
-		stored, err := s.upsertFleetTaskSubmissionLocked(submission)
-		if err != nil {
-			return FleetTaskRecord{}, FleetTaskSubmissionRecord{}, false, err
-		}
-		return cloneFleetTaskRecord(current), stored, true, nil
-	}
-	if !ok || current.UpdatedAtMS != expectedUpdatedAtMS {
-		return FleetTaskRecord{}, FleetTaskSubmissionRecord{}, false, nil
-	}
-	if s.fleetTasks[rec.FleetID] == nil {
-		s.fleetTasks[rec.FleetID] = make(map[string]FleetTaskRecord)
-	}
-	s.fleetTasks[rec.FleetID][rec.TaskID] = cloneFleetTaskRecord(rec)
-	stored, err := s.upsertFleetTaskSubmissionLocked(submission)
-	if err != nil {
-		return FleetTaskRecord{}, FleetTaskSubmissionRecord{}, false, err
-	}
-	return cloneFleetTaskRecord(rec), stored, true, nil
-}
-
-func (s *MemoryStateStore) GetFleetTask(_ context.Context, fleetID, taskID string) (FleetTaskRecord, bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	rec, ok := s.fleetTasks[fleetID][taskID]
-	return cloneFleetTaskRecord(rec), ok, nil
-}
-
-func (s *MemoryStateStore) ListFleetTasks(_ context.Context, fleetID, status string) ([]FleetTaskRecord, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	out := make([]FleetTaskRecord, 0, len(s.fleetTasks[fleetID]))
-	status = strings.TrimSpace(status)
-	for _, rec := range s.fleetTasks[fleetID] {
-		if status != "" && rec.Status != status {
-			continue
-		}
-		out = append(out, cloneFleetTaskRecord(rec))
-	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].UpdatedAtMS == out[j].UpdatedAtMS {
-			return out[i].TaskID < out[j].TaskID
-		}
-		return out[i].UpdatedAtMS > out[j].UpdatedAtMS
-	})
-	return out, nil
-}
-
-func (s *MemoryStateStore) DeleteFleetTask(_ context.Context, fleetID, taskID string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if tasks := s.fleetTasks[fleetID]; tasks != nil {
-		delete(tasks, taskID)
-		if len(tasks) == 0 {
-			delete(s.fleetTasks, fleetID)
-		}
-	}
-	if subs := s.fleetTaskSubs[fleetID]; subs != nil {
-		delete(subs, taskID)
-		if len(subs) == 0 {
-			delete(s.fleetTaskSubs, fleetID)
-		}
-	}
-	return nil
-}
-
-func (s *MemoryStateStore) UpsertFleetTaskSubmission(_ context.Context, rec FleetTaskSubmissionRecord) (FleetTaskSubmissionRecord, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	now := s.nowMS()
-	var err error
-	rec, err = normalizeFleetTaskSubmissionRecord(rec, now)
-	if err != nil {
-		return FleetTaskSubmissionRecord{}, err
-	}
-	return s.upsertFleetTaskSubmissionLocked(rec)
-}
-
-func (s *MemoryStateStore) upsertFleetTaskSubmissionLocked(rec FleetTaskSubmissionRecord) (FleetTaskSubmissionRecord, error) {
-	if s.fleetTaskSubs[rec.FleetID] == nil {
-		s.fleetTaskSubs[rec.FleetID] = make(map[string][]FleetTaskSubmissionRecord)
-	}
-	submissions := s.fleetTaskSubs[rec.FleetID][rec.TaskID]
-	replaced := false
-	for i := range submissions {
-		if submissions[i].SubmissionID == rec.SubmissionID {
-			submissions[i] = cloneFleetTaskSubmissionRecord(rec)
-			replaced = true
-			break
-		}
-	}
-	if !replaced {
-		submissions = append(submissions, cloneFleetTaskSubmissionRecord(rec))
-	}
-	s.fleetTaskSubs[rec.FleetID][rec.TaskID] = submissions
-	return cloneFleetTaskSubmissionRecord(rec), nil
-}
-
-func (s *MemoryStateStore) GetFleetTaskSubmission(_ context.Context, fleetID, taskID, submissionID string) (FleetTaskSubmissionRecord, bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for _, rec := range s.fleetTaskSubs[fleetID][taskID] {
-		if rec.SubmissionID == submissionID {
-			return cloneFleetTaskSubmissionRecord(rec), true, nil
-		}
-	}
-	return FleetTaskSubmissionRecord{}, false, nil
-}
-
-func (s *MemoryStateStore) ListFleetTaskSubmissions(_ context.Context, fleetID, taskID string) ([]FleetTaskSubmissionRecord, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	out := append([]FleetTaskSubmissionRecord(nil), s.fleetTaskSubs[fleetID][taskID]...)
-	for i := range out {
-		out[i] = cloneFleetTaskSubmissionRecord(out[i])
-	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].CreatedAtMS == out[j].CreatedAtMS {
-			return out[i].SubmissionID < out[j].SubmissionID
-		}
-		return out[i].CreatedAtMS > out[j].CreatedAtMS
-	})
-	return out, nil
-}
-
 func (s *MemoryStateStore) Close() error {
 	return nil
 }
@@ -1368,186 +760,6 @@ CREATE INDEX IF NOT EXISTS idx_node_profile_sources_node
 CREATE INDEX IF NOT EXISTS idx_node_profile_sources_expires
   ON esp_node_profile_sources(expires_at_ms);
 
-CREATE TABLE IF NOT EXISTS esp_fleets (
-  fleet_id TEXT PRIMARY KEY,
-  name TEXT NOT NULL,
-  control_group_id BLOB,
-  coordinator_member_id BLOB NOT NULL,
-  coordinator_peer_id TEXT NOT NULL,
-  coordinator_pubkey TEXT NOT NULL,
-  coordinator_device_id TEXT NOT NULL DEFAULT '',
-  status TEXT NOT NULL DEFAULT 'active',
-  created_at_ms INTEGER NOT NULL,
-  updated_at_ms INTEGER NOT NULL,
-  archived_at_ms INTEGER NOT NULL DEFAULT 0,
-  deleted_at_ms INTEGER NOT NULL DEFAULT 0
-);
-
-CREATE TABLE IF NOT EXISTS esp_fleet_members (
-  fleet_id TEXT NOT NULL,
-  member_id BLOB NOT NULL,
-  peer_id TEXT NOT NULL,
-  entmoot_pubkey TEXT NOT NULL,
-  hostname TEXT NOT NULL DEFAULT '',
-  role TEXT NOT NULL,
-  status TEXT NOT NULL,
-  invited_at_ms INTEGER NOT NULL DEFAULT 0,
-  accepted_at_ms INTEGER NOT NULL DEFAULT 0,
-  removed_at_ms INTEGER NOT NULL DEFAULT 0,
-  updated_at_ms INTEGER NOT NULL,
-  PRIMARY KEY(fleet_id, member_id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_fleet_members_status
-  ON esp_fleet_members(fleet_id, status, role, member_id);
-
-CREATE TABLE IF NOT EXISTS esp_fleet_invites (
-  invite_id TEXT PRIMARY KEY,
-  fleet_id TEXT NOT NULL,
-  member_id BLOB NOT NULL,
-  peer_id TEXT NOT NULL,
-  entmoot_pubkey TEXT NOT NULL,
-  hostname TEXT NOT NULL DEFAULT '',
-  status TEXT NOT NULL,
-  capability BLOB,
-  created_at_ms INTEGER NOT NULL,
-  updated_at_ms INTEGER NOT NULL,
-  expires_at_ms INTEGER NOT NULL DEFAULT 0
-);
-CREATE INDEX IF NOT EXISTS idx_fleet_invites_fleet
-  ON esp_fleet_invites(fleet_id, created_at_ms DESC);
-
-CREATE TABLE IF NOT EXISTS esp_fleet_activity (
-  event_id TEXT PRIMARY KEY,
-  fleet_id TEXT NOT NULL,
-  type TEXT NOT NULL,
-  actor_member_id BLOB NOT NULL,
-  actor_peer_id TEXT NOT NULL,
-  actor_pubkey TEXT NOT NULL,
-  subject_member_id BLOB,
-  subject_peer_id TEXT NOT NULL DEFAULT '',
-  subject_pubkey TEXT NOT NULL DEFAULT '',
-  summary TEXT NOT NULL DEFAULT '',
-  metadata BLOB,
-  created_at_ms INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_fleet_activity_fleet_time
-  ON esp_fleet_activity(fleet_id, created_at_ms DESC, event_id);
-
-CREATE TABLE IF NOT EXISTS esp_fleet_tasks (
-  task_id TEXT PRIMARY KEY,
-  fleet_id TEXT NOT NULL,
-  title TEXT NOT NULL,
-  description TEXT NOT NULL DEFAULT '',
-  mode TEXT NOT NULL,
-  status TEXT NOT NULL,
-  creator_member_id BLOB NOT NULL,
-  creator_peer_id TEXT NOT NULL,
-  creator_pubkey TEXT NOT NULL,
-  assignee_member_id BLOB,
-  assignee_peer_id TEXT NOT NULL DEFAULT '',
-  assignee_pubkey TEXT NOT NULL DEFAULT '',
-  created_at_ms INTEGER NOT NULL,
-  updated_at_ms INTEGER NOT NULL,
-  completed_at_ms INTEGER NOT NULL DEFAULT 0,
-  rejected_at_ms INTEGER NOT NULL DEFAULT 0,
-  canceled_at_ms INTEGER NOT NULL DEFAULT 0
-);
-
-CREATE INDEX IF NOT EXISTS idx_fleet_tasks_fleet_status
-  ON esp_fleet_tasks(fleet_id, status, updated_at_ms DESC);
-
-CREATE TABLE IF NOT EXISTS esp_fleet_task_submissions (
-  submission_id TEXT PRIMARY KEY,
-  fleet_id TEXT NOT NULL,
-  task_id TEXT NOT NULL,
-  author_member_id BLOB NOT NULL,
-  author_peer_id TEXT NOT NULL,
-  author_pubkey TEXT NOT NULL,
-  content TEXT NOT NULL,
-  status TEXT NOT NULL,
-  created_at_ms INTEGER NOT NULL,
-  updated_at_ms INTEGER NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_fleet_task_submissions_task
-  ON esp_fleet_task_submissions(fleet_id, task_id, created_at_ms DESC);
-
-CREATE TABLE IF NOT EXISTS esp_fleet_commands (
-  command_id TEXT PRIMARY KEY,
-  fleet_id TEXT NOT NULL,
-  issuer_member_id BLOB NOT NULL,
-  issuer_peer_id TEXT NOT NULL,
-  target BLOB NOT NULL,
-  action TEXT NOT NULL,
-  args BLOB,
-  auto_accept INTEGER NOT NULL,
-  created_at_ms INTEGER NOT NULL,
-  expires_at_ms INTEGER NOT NULL DEFAULT 0,
-  command BLOB NOT NULL,
-  updated_at_ms INTEGER NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_fleet_commands_fleet_time
-  ON esp_fleet_commands(fleet_id, updated_at_ms DESC, command_id);
-
-CREATE INDEX IF NOT EXISTS idx_fleet_commands_fleet_action
-  ON esp_fleet_commands(fleet_id, action, updated_at_ms DESC);
-
-CREATE TABLE IF NOT EXISTS esp_fleet_command_results (
-  command_id TEXT NOT NULL,
-  fleet_id TEXT NOT NULL,
-  agent_member_id BLOB NOT NULL,
-  agent_peer_id TEXT NOT NULL,
-  action TEXT NOT NULL,
-  status TEXT NOT NULL,
-  summary TEXT NOT NULL DEFAULT '',
-  output TEXT NOT NULL DEFAULT '',
-  started_at_ms INTEGER NOT NULL DEFAULT 0,
-  completed_at_ms INTEGER NOT NULL DEFAULT 0,
-  result BLOB NOT NULL,
-  updated_at_ms INTEGER NOT NULL,
-  PRIMARY KEY(command_id, agent_member_id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_fleet_command_results_fleet_command
-  ON esp_fleet_command_results(fleet_id, command_id, updated_at_ms DESC);
-
-CREATE TABLE IF NOT EXISTS esp_agent_commands (
-  command_id TEXT PRIMARY KEY,
-  fleet_id TEXT NOT NULL,
-  control_group_id BLOB NOT NULL,
-  issuer_member_id BLOB NOT NULL,
-  issuer_peer_id TEXT NOT NULL,
-  agent_member_id BLOB NOT NULL,
-  agent_peer_id TEXT NOT NULL,
-  action TEXT NOT NULL,
-  target BLOB NOT NULL,
-  instruction TEXT NOT NULL,
-  context BLOB,
-  args BLOB,
-  command BLOB NOT NULL,
-  payload BLOB NOT NULL,
-  status TEXT NOT NULL,
-  attempts INTEGER NOT NULL DEFAULT 0,
-  lease_owner TEXT NOT NULL DEFAULT '',
-  lease_until_ms INTEGER NOT NULL DEFAULT 0,
-  created_at_ms INTEGER NOT NULL,
-  expires_at_ms INTEGER NOT NULL DEFAULT 0,
-  received_at_ms INTEGER NOT NULL,
-  started_at_ms INTEGER NOT NULL DEFAULT 0,
-  completed_at_ms INTEGER NOT NULL DEFAULT 0,
-  updated_at_ms INTEGER NOT NULL,
-  result BLOB,
-  last_error TEXT NOT NULL DEFAULT ''
-);
-
-CREATE INDEX IF NOT EXISTS idx_agent_commands_status
-  ON esp_agent_commands(status, received_at_ms);
-
-CREATE INDEX IF NOT EXISTS idx_agent_commands_lease
-  ON esp_agent_commands(status, lease_until_ms);
-
 CREATE TABLE IF NOT EXISTS esp_live_agent_configs (
   group_id BLOB NOT NULL,
   member_id BLOB NOT NULL,
@@ -1625,11 +837,8 @@ func OpenSQLiteStateStore(dataDir string) (*SQLiteStateStore, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	retireFleetTables(db, dbPath)
 	store := &SQLiteStateStore{db: db}
-	if err := store.backfillFleetNodeProfiles(context.Background()); err != nil {
-		_ = db.Close()
-		return nil, err
-	}
 	cleanupCtx, cleanupCancel := context.WithCancel(context.Background())
 	store.cleanupCancel = cleanupCancel
 	_, _ = store.deleteExpiredIdempotency(cleanupCtx, idempotencyCleanupBatchSize)
@@ -2115,549 +1324,6 @@ func (s *SQLiteStateStore) DeleteGroupMetadata(ctx context.Context, groupID entm
 	return nil
 }
 
-func (s *SQLiteStateStore) CreateFleet(ctx context.Context, rec FleetRecord) (FleetRecord, error) {
-	now := time.Now().UnixMilli()
-	if rec.FleetID == "" {
-		var err error
-		rec.FleetID, err = NewFleetID()
-		if err != nil {
-			return FleetRecord{}, err
-		}
-	}
-	if rec.Coordinator.MemberID == nil || rec.Coordinator.PeerID == "" {
-		return FleetRecord{}, errors.New("esphttp: fleet coordinator member_id and peer_id are required")
-	}
-	if err := entmoot.ValidateMemberInfo(rec.Coordinator); err != nil {
-		return FleetRecord{}, fmt.Errorf("esphttp: fleet coordinator identity: %w", err)
-	}
-	if rec.CreatedAtMS == 0 {
-		rec.CreatedAtMS = now
-	}
-	rec.UpdatedAtMS = now
-	var controlGroup []byte
-	if rec.ControlGroupID != (entmoot.GroupID{}) {
-		controlGroup = rec.ControlGroupID[:]
-	}
-	if _, err := s.db.ExecContext(ctx, `
-INSERT INTO esp_fleets
-  (fleet_id, name, control_group_id, coordinator_member_id, coordinator_peer_id, coordinator_pubkey, coordinator_device_id, status, created_at_ms, updated_at_ms, archived_at_ms, deleted_at_ms)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		rec.FleetID, rec.Name, controlGroup, (*rec.Coordinator.MemberID)[:], rec.Coordinator.PeerID, base64.StdEncoding.EncodeToString(rec.Coordinator.EntmootPubKey),
-		rec.CoordinatorDeviceID, NormalizeFleetStatus(rec.Status), rec.CreatedAtMS, rec.UpdatedAtMS, rec.ArchivedAtMS, rec.DeletedAtMS); err != nil {
-		return FleetRecord{}, fmt.Errorf("esphttp: create fleet: %w", err)
-	}
-	rec.Status = NormalizeFleetStatus(rec.Status)
-	return cloneFleetRecord(rec), nil
-}
-
-func (s *SQLiteStateStore) ListFleets(ctx context.Context) ([]FleetRecord, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT fleet_id, name, control_group_id, coordinator_member_id, coordinator_peer_id, coordinator_pubkey, coordinator_device_id, status, created_at_ms, updated_at_ms, archived_at_ms, deleted_at_ms FROM esp_fleets ORDER BY created_at_ms DESC`)
-	if err != nil {
-		return nil, fmt.Errorf("esphttp: list fleets: %w", err)
-	}
-	defer rows.Close()
-	var out []FleetRecord
-	for rows.Next() {
-		rec, err := scanFleetRecord(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, rec)
-	}
-	return out, rows.Err()
-}
-
-func (s *SQLiteStateStore) GetFleet(ctx context.Context, fleetID string) (FleetRecord, bool, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT fleet_id, name, control_group_id, coordinator_member_id, coordinator_peer_id, coordinator_pubkey, coordinator_device_id, status, created_at_ms, updated_at_ms, archived_at_ms, deleted_at_ms FROM esp_fleets WHERE fleet_id = ?`, fleetID)
-	rec, err := scanFleetRecord(row)
-	if errors.Is(err, sql.ErrNoRows) {
-		return FleetRecord{}, false, nil
-	}
-	if err != nil {
-		return FleetRecord{}, false, fmt.Errorf("esphttp: get fleet: %w", err)
-	}
-	return rec, true, nil
-}
-
-func (s *SQLiteStateStore) GetFleetByControlGroup(ctx context.Context, groupID entmoot.GroupID) (FleetRecord, bool, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT fleet_id, name, control_group_id, coordinator_member_id, coordinator_peer_id, coordinator_pubkey, coordinator_device_id, status, created_at_ms, updated_at_ms, archived_at_ms, deleted_at_ms FROM esp_fleets WHERE control_group_id = ?`, groupID[:])
-	rec, err := scanFleetRecord(row)
-	if errors.Is(err, sql.ErrNoRows) {
-		return FleetRecord{}, false, nil
-	}
-	if err != nil {
-		return FleetRecord{}, false, fmt.Errorf("esphttp: get fleet by control group: %w", err)
-	}
-	return rec, true, nil
-}
-
-func (s *SQLiteStateStore) ArchiveFleet(ctx context.Context, fleetID string, archivedAtMS int64) (FleetRecord, bool, error) {
-	if archivedAtMS == 0 {
-		archivedAtMS = time.Now().UnixMilli()
-	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return FleetRecord{}, false, fmt.Errorf("esphttp: archive fleet begin: %w", err)
-	}
-	defer tx.Rollback()
-	res, err := tx.ExecContext(ctx, `UPDATE esp_fleets SET status = ?, archived_at_ms = CASE WHEN archived_at_ms = 0 THEN ? ELSE archived_at_ms END, updated_at_ms = ? WHERE fleet_id = ? AND status != ?`,
-		FleetStatusArchived, archivedAtMS, archivedAtMS, fleetID, FleetStatusArchived)
-	if err != nil {
-		return FleetRecord{}, false, fmt.Errorf("esphttp: archive fleet: %w", err)
-	}
-	affected, err := res.RowsAffected()
-	if err != nil {
-		return FleetRecord{}, false, fmt.Errorf("esphttp: archive fleet affected rows: %w", err)
-	}
-	profileMembers, err := fleetProfileMemberIDs(ctx, tx, fleetID)
-	if err != nil {
-		return FleetRecord{}, false, fmt.Errorf("esphttp: archive fleet profiles: %w", err)
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM esp_fleet_invites WHERE fleet_id = ?`, fleetID); err != nil {
-		return FleetRecord{}, false, fmt.Errorf("esphttp: archive fleet invites: %w", err)
-	}
-	row := tx.QueryRowContext(ctx, `SELECT fleet_id, name, control_group_id, coordinator_member_id, coordinator_peer_id, coordinator_pubkey, coordinator_device_id, status, created_at_ms, updated_at_ms, archived_at_ms, deleted_at_ms FROM esp_fleets WHERE fleet_id = ?`, fleetID)
-	rec, err := scanFleetRecord(row)
-	if errors.Is(err, sql.ErrNoRows) {
-		return FleetRecord{}, false, nil
-	}
-	if err != nil {
-		return FleetRecord{}, false, fmt.Errorf("esphttp: get archived fleet: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return FleetRecord{}, false, fmt.Errorf("esphttp: archive fleet commit: %w", err)
-	}
-	_ = s.refreshFleetNodeProfiles(ctx, profileMembers)
-	if affected == 0 && rec.Status != FleetStatusArchived {
-		return FleetRecord{}, false, nil
-	}
-	return rec, true, nil
-}
-
-func (s *SQLiteStateStore) RestoreFleet(ctx context.Context, fleetID string, restoredAtMS int64) (FleetRecord, bool, error) {
-	if restoredAtMS == 0 {
-		restoredAtMS = time.Now().UnixMilli()
-	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return FleetRecord{}, false, fmt.Errorf("esphttp: restore fleet begin: %w", err)
-	}
-	defer tx.Rollback()
-	res, err := tx.ExecContext(ctx, `UPDATE esp_fleets SET status = ?, archived_at_ms = 0, deleted_at_ms = 0, updated_at_ms = ? WHERE fleet_id = ? AND status != ?`,
-		FleetStatusActive, restoredAtMS, fleetID, FleetStatusActive)
-	if err != nil {
-		return FleetRecord{}, false, fmt.Errorf("esphttp: restore fleet: %w", err)
-	}
-	affected, err := res.RowsAffected()
-	if err != nil {
-		return FleetRecord{}, false, fmt.Errorf("esphttp: restore fleet affected rows: %w", err)
-	}
-	profileMembers, err := fleetProfileMemberIDs(ctx, tx, fleetID)
-	if err != nil {
-		return FleetRecord{}, false, fmt.Errorf("esphttp: restore fleet profiles: %w", err)
-	}
-	row := tx.QueryRowContext(ctx, `SELECT fleet_id, name, control_group_id, coordinator_member_id, coordinator_peer_id, coordinator_pubkey, coordinator_device_id, status, created_at_ms, updated_at_ms, archived_at_ms, deleted_at_ms FROM esp_fleets WHERE fleet_id = ?`, fleetID)
-	rec, err := scanFleetRecord(row)
-	if errors.Is(err, sql.ErrNoRows) {
-		return FleetRecord{}, false, nil
-	}
-	if err != nil {
-		return FleetRecord{}, false, fmt.Errorf("esphttp: get restored fleet: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return FleetRecord{}, false, fmt.Errorf("esphttp: restore fleet commit: %w", err)
-	}
-	_ = s.refreshFleetNodeProfiles(ctx, profileMembers)
-	if affected == 0 && rec.Status != FleetStatusActive {
-		return FleetRecord{}, false, nil
-	}
-	return rec, true, nil
-}
-
-func (s *SQLiteStateStore) DeleteFleet(ctx context.Context, fleetID string) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("esphttp: delete fleet begin: %w", err)
-	}
-	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, `DELETE FROM esp_fleet_command_results WHERE fleet_id = ?`, fleetID); err != nil {
-		return fmt.Errorf("esphttp: delete fleet command results: %w", err)
-	}
-	profileMembers, err := fleetProfileMemberIDs(ctx, tx, fleetID)
-	if err != nil {
-		return fmt.Errorf("esphttp: delete fleet profiles: %w", err)
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM esp_fleet_commands WHERE fleet_id = ?`, fleetID); err != nil {
-		return fmt.Errorf("esphttp: delete fleet commands: %w", err)
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM esp_fleet_task_submissions WHERE fleet_id = ?`, fleetID); err != nil {
-		return fmt.Errorf("esphttp: delete fleet task submissions: %w", err)
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM esp_fleet_tasks WHERE fleet_id = ?`, fleetID); err != nil {
-		return fmt.Errorf("esphttp: delete fleet tasks: %w", err)
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM esp_fleet_activity WHERE fleet_id = ?`, fleetID); err != nil {
-		return fmt.Errorf("esphttp: delete fleet activity: %w", err)
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM esp_fleet_invites WHERE fleet_id = ?`, fleetID); err != nil {
-		return fmt.Errorf("esphttp: delete fleet invites: %w", err)
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM esp_fleet_members WHERE fleet_id = ?`, fleetID); err != nil {
-		return fmt.Errorf("esphttp: delete fleet members: %w", err)
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM esp_fleets WHERE fleet_id = ?`, fleetID); err != nil {
-		return fmt.Errorf("esphttp: delete fleet: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("esphttp: delete fleet commit: %w", err)
-	}
-	_ = s.refreshFleetNodeProfiles(ctx, profileMembers)
-	return nil
-}
-
-func (s *SQLiteStateStore) UpsertFleetMember(ctx context.Context, rec FleetMemberRecord) (FleetMemberRecord, error) {
-	return s.upsertFleetMember(ctx, rec, false)
-}
-
-func (s *SQLiteStateStore) UpsertFleetMemberForActiveFleet(ctx context.Context, rec FleetMemberRecord) (FleetMemberRecord, error) {
-	return s.upsertFleetMember(ctx, rec, true)
-}
-
-func (s *SQLiteStateStore) ReconcileFleetInviteAcceptance(ctx context.Context, fleetID string, nodeID entmoot.MemberID, entmootPubKey string, acceptedAtMS int64, hostname string) (FleetMemberRecord, FleetActivityRecord, bool, error) {
-	entmootPubKey = strings.TrimSpace(entmootPubKey)
-	if acceptedAtMS == 0 {
-		acceptedAtMS = time.Now().UnixMilli()
-	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return FleetMemberRecord{}, FleetActivityRecord{}, false, fmt.Errorf("esphttp: reconcile fleet invite acceptance begin: %w", err)
-	}
-	defer tx.Rollback()
-	row := tx.QueryRowContext(ctx, `
-SELECT m.fleet_id, m.member_id, m.peer_id, m.entmoot_pubkey, m.hostname, m.role, m.status, m.invited_at_ms, m.accepted_at_ms, m.removed_at_ms, m.updated_at_ms
-FROM esp_fleet_members m
-JOIN esp_fleets f ON f.fleet_id = m.fleet_id
-WHERE m.fleet_id = ? AND m.member_id = ? AND f.status = ?`, fleetID, nodeID[:], FleetStatusActive)
-	member, err := scanFleetMemberRecord(row)
-	if errors.Is(err, sql.ErrNoRows) {
-		return FleetMemberRecord{}, FleetActivityRecord{}, false, nil
-	}
-	if err != nil {
-		return FleetMemberRecord{}, FleetActivityRecord{}, false, fmt.Errorf("esphttp: reconcile fleet invite acceptance member: %w", err)
-	}
-	if member.Status != FleetMemberInvited || member.Role == FleetRoleCoordinator || member.EntmootPubKey != entmootPubKey {
-		return FleetMemberRecord{}, FleetActivityRecord{}, false, nil
-	}
-	var inviteCount int
-	if err := tx.QueryRowContext(ctx, `
-	SELECT COUNT(1)
-	FROM esp_fleet_invites
-	WHERE fleet_id = ? AND member_id = ? AND entmoot_pubkey = ? AND status = ?`,
-		fleetID, nodeID[:], entmootPubKey, FleetMemberInvited).Scan(&inviteCount); err != nil {
-		return FleetMemberRecord{}, FleetActivityRecord{}, false, fmt.Errorf("esphttp: reconcile fleet invite acceptance invites: %w", err)
-	}
-	if inviteCount == 0 {
-		return FleetMemberRecord{}, FleetActivityRecord{}, false, nil
-	}
-	if strings.TrimSpace(member.Hostname) == "" {
-		member.Hostname = strings.TrimSpace(hostname)
-	}
-	member.Status = FleetMemberActive
-	member.AcceptedAtMS = acceptedAtMS
-	member.RemovedAtMS = 0
-	member.UpdatedAtMS = time.Now().UnixMilli()
-	activity, err := fleetAcceptanceActivityFromMember(member, acceptedAtMS)
-	if err != nil {
-		return FleetMemberRecord{}, FleetActivityRecord{}, false, err
-	}
-	res, err := tx.ExecContext(ctx, `
-UPDATE esp_fleet_members
-SET hostname = ?, status = ?, accepted_at_ms = ?, removed_at_ms = 0, updated_at_ms = ?
-WHERE fleet_id = ? AND member_id = ? AND entmoot_pubkey = ? AND status = ? AND role != ?
-  AND EXISTS (SELECT 1 FROM esp_fleets WHERE fleet_id = ? AND status = ?)
-	  AND EXISTS (
-	    SELECT 1 FROM esp_fleet_invites
-	    WHERE fleet_id = ? AND member_id = ? AND entmoot_pubkey = ? AND status = ?
-	  )`,
-		member.Hostname, member.Status, member.AcceptedAtMS, member.UpdatedAtMS,
-		fleetID, nodeID[:], entmootPubKey, FleetMemberInvited, FleetRoleCoordinator,
-		fleetID, FleetStatusActive,
-		fleetID, nodeID[:], entmootPubKey, FleetMemberInvited)
-	if err != nil {
-		return FleetMemberRecord{}, FleetActivityRecord{}, false, fmt.Errorf("esphttp: reconcile fleet invite acceptance update member: %w", err)
-	}
-	affected, err := res.RowsAffected()
-	if err != nil {
-		return FleetMemberRecord{}, FleetActivityRecord{}, false, fmt.Errorf("esphttp: reconcile fleet invite acceptance affected rows: %w", err)
-	}
-	if affected == 0 {
-		return FleetMemberRecord{}, FleetActivityRecord{}, false, nil
-	}
-	if _, err := tx.ExecContext(ctx, `
-	DELETE FROM esp_fleet_invites
-	WHERE fleet_id = ? AND member_id = ? AND entmoot_pubkey = ? AND status = ?`,
-		fleetID, nodeID[:], entmootPubKey, FleetMemberInvited); err != nil {
-		return FleetMemberRecord{}, FleetActivityRecord{}, false, fmt.Errorf("esphttp: reconcile fleet invite acceptance delete invites: %w", err)
-	}
-	if err := insertFleetActivity(ctx, tx, activity); err != nil {
-		return FleetMemberRecord{}, FleetActivityRecord{}, false, err
-	}
-	if err := tx.Commit(); err != nil {
-		return FleetMemberRecord{}, FleetActivityRecord{}, false, fmt.Errorf("esphttp: reconcile fleet invite acceptance commit: %w", err)
-	}
-	// Display profile cache writes are derived state; do not make a committed
-	// fleet reconciliation appear to fail if the cache write is unavailable.
-	_ = s.observeFleetMemberNodeProfile(ctx, member)
-	_ = s.refreshFleetInviteNodeProfile(ctx, nodeID)
-	return cloneFleetMemberRecord(member), cloneFleetActivityRecord(activity), true, nil
-}
-
-func (s *SQLiteStateStore) upsertFleetMember(ctx context.Context, rec FleetMemberRecord, requireActive bool) (FleetMemberRecord, error) {
-	rec.Role = NormalizeFleetMemberRole(rec.Role)
-	rec.Status = NormalizeFleetMemberStatus(rec.Status)
-	rec.UpdatedAtMS = time.Now().UnixMilli()
-	query := `
-INSERT INTO esp_fleet_members
-  (fleet_id, member_id, peer_id, entmoot_pubkey, hostname, role, status, invited_at_ms, accepted_at_ms, removed_at_ms, updated_at_ms)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-ON CONFLICT(fleet_id, member_id) DO UPDATE SET
-  peer_id = excluded.peer_id,
-  entmoot_pubkey = excluded.entmoot_pubkey,
-  hostname = excluded.hostname,
-  role = excluded.role,
-  status = excluded.status,
-  invited_at_ms = excluded.invited_at_ms,
-  accepted_at_ms = excluded.accepted_at_ms,
-  removed_at_ms = excluded.removed_at_ms,
-  updated_at_ms = excluded.updated_at_ms`
-	args := []any{rec.FleetID, rec.MemberID[:], rec.PeerID, rec.EntmootPubKey, rec.Hostname, rec.Role, rec.Status, rec.InvitedAtMS, rec.AcceptedAtMS, rec.RemovedAtMS, rec.UpdatedAtMS}
-	if requireActive {
-		query = `
-INSERT INTO esp_fleet_members
-  (fleet_id, member_id, peer_id, entmoot_pubkey, hostname, role, status, invited_at_ms, accepted_at_ms, removed_at_ms, updated_at_ms)
-SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-WHERE EXISTS (SELECT 1 FROM esp_fleets WHERE fleet_id = ? AND status = ?)
-ON CONFLICT(fleet_id, member_id) DO UPDATE SET
-  peer_id = excluded.peer_id,
-  entmoot_pubkey = excluded.entmoot_pubkey,
-  hostname = excluded.hostname,
-  role = excluded.role,
-  status = excluded.status,
-  invited_at_ms = excluded.invited_at_ms,
-  accepted_at_ms = excluded.accepted_at_ms,
-  removed_at_ms = excluded.removed_at_ms,
-  updated_at_ms = excluded.updated_at_ms`
-		args = append(args, rec.FleetID, FleetStatusActive)
-	}
-	res, err := s.db.ExecContext(ctx, query, args...)
-	if err != nil {
-		return FleetMemberRecord{}, fmt.Errorf("esphttp: upsert fleet member: %w", err)
-	}
-	if requireActive {
-		affected, err := res.RowsAffected()
-		if err != nil {
-			return FleetMemberRecord{}, fmt.Errorf("esphttp: upsert fleet member affected rows: %w", err)
-		}
-		if affected == 0 {
-			return FleetMemberRecord{}, ErrFleetNotActive
-		}
-	}
-	// Display profile cache writes are derived state; the fleet member row is
-	// authoritative and handler read paths can backfill this cache later.
-	_ = s.observeFleetMemberNodeProfile(ctx, rec)
-	return cloneFleetMemberRecord(rec), nil
-}
-
-func (s *SQLiteStateStore) ListFleetMembers(ctx context.Context, fleetID string) ([]FleetMemberRecord, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT fleet_id, member_id, peer_id, entmoot_pubkey, hostname, role, status, invited_at_ms, accepted_at_ms, removed_at_ms, updated_at_ms FROM esp_fleet_members WHERE fleet_id = ? ORDER BY role = 'coordinator' DESC, member_id ASC`, fleetID)
-	if err != nil {
-		return nil, fmt.Errorf("esphttp: list fleet members: %w", err)
-	}
-	defer rows.Close()
-	var out []FleetMemberRecord
-	for rows.Next() {
-		rec, err := scanFleetMemberRecord(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, rec)
-	}
-	return out, rows.Err()
-}
-
-func (s *SQLiteStateStore) DeleteFleetMember(ctx context.Context, fleetID string, memberID entmoot.MemberID) error {
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM esp_fleet_members WHERE fleet_id = ? AND member_id = ?`, fleetID, memberID[:]); err != nil {
-		return fmt.Errorf("esphttp: delete fleet member: %w", err)
-	}
-	_ = s.refreshFleetMemberNodeProfile(ctx, memberID)
-	return nil
-}
-
-func (s *SQLiteStateStore) CreateFleetInvite(ctx context.Context, rec FleetInviteRecord) (FleetInviteRecord, error) {
-	return s.createFleetInvite(ctx, rec, false)
-}
-
-func (s *SQLiteStateStore) CreateFleetInviteForActiveFleet(ctx context.Context, rec FleetInviteRecord) (FleetInviteRecord, error) {
-	return s.createFleetInvite(ctx, rec, true)
-}
-
-func (s *SQLiteStateStore) createFleetInvite(ctx context.Context, rec FleetInviteRecord, requireActive bool) (FleetInviteRecord, error) {
-	now := time.Now().UnixMilli()
-	if rec.InviteID == "" {
-		var err error
-		rec.InviteID, err = NewFleetInviteID()
-		if err != nil {
-			return FleetInviteRecord{}, err
-		}
-	}
-	if rec.CreatedAtMS == 0 {
-		rec.CreatedAtMS = now
-	}
-	rec.UpdatedAtMS = now
-	if strings.TrimSpace(rec.Status) == "" {
-		rec.Status = FleetMemberInvited
-	}
-	query := `
-INSERT INTO esp_fleet_invites
-  (invite_id, fleet_id, member_id, peer_id, entmoot_pubkey, hostname, status, capability, created_at_ms, updated_at_ms, expires_at_ms)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-	args := []any{rec.InviteID, rec.FleetID, rec.MemberID[:], rec.PeerID, rec.EntmootPubKey, rec.Hostname, rec.Status, []byte(rec.Capability), rec.CreatedAtMS, rec.UpdatedAtMS, rec.ExpiresAtMS}
-	if requireActive {
-		query = `
-INSERT INTO esp_fleet_invites
-  (invite_id, fleet_id, member_id, peer_id, entmoot_pubkey, hostname, status, capability, created_at_ms, updated_at_ms, expires_at_ms)
-SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-WHERE EXISTS (SELECT 1 FROM esp_fleets WHERE fleet_id = ? AND status = ?)`
-		args = append(args, rec.FleetID, FleetStatusActive)
-	}
-	res, err := s.db.ExecContext(ctx, query, args...)
-	if err != nil {
-		return FleetInviteRecord{}, fmt.Errorf("esphttp: create fleet invite: %w", err)
-	}
-	if requireActive {
-		affected, err := res.RowsAffected()
-		if err != nil {
-			return FleetInviteRecord{}, fmt.Errorf("esphttp: create fleet invite affected rows: %w", err)
-		}
-		if affected == 0 {
-			return FleetInviteRecord{}, ErrFleetNotActive
-		}
-	}
-	_ = s.observeFleetInviteNodeProfile(ctx, rec)
-	return cloneFleetInviteRecord(rec), nil
-}
-func (s *SQLiteStateStore) ListFleetInvites(ctx context.Context, fleetID string) ([]FleetInviteRecord, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT invite_id, fleet_id, member_id, peer_id, entmoot_pubkey, hostname, status, capability, created_at_ms, updated_at_ms, expires_at_ms FROM esp_fleet_invites WHERE fleet_id = ? ORDER BY created_at_ms DESC`, fleetID)
-	if err != nil {
-		return nil, fmt.Errorf("esphttp: list fleet invites: %w", err)
-	}
-	defer rows.Close()
-	var out []FleetInviteRecord
-	for rows.Next() {
-		rec, err := scanFleetInviteRecord(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, rec)
-	}
-	return out, rows.Err()
-}
-
-func (s *SQLiteStateStore) DeleteFleetInvite(ctx context.Context, inviteID string) error {
-	ids, err := nodeProfileMemberIDs(ctx, s.db, `DELETE FROM esp_fleet_invites WHERE invite_id = ? RETURNING member_id`, inviteID)
-	if err != nil {
-		return fmt.Errorf("esphttp: delete fleet invite: %w", err)
-	}
-	for _, id := range ids {
-		_ = s.refreshFleetInviteNodeProfile(ctx, id)
-	}
-	return nil
-}
-
-func (s *SQLiteStateStore) AppendFleetActivity(ctx context.Context, rec FleetActivityRecord) (FleetActivityRecord, error) {
-	if rec.EventID == "" {
-		var err error
-		rec.EventID, err = NewFleetActivityID()
-		if err != nil {
-			return FleetActivityRecord{}, err
-		}
-	}
-	if rec.CreatedAtMS == 0 {
-		rec.CreatedAtMS = time.Now().UnixMilli()
-	}
-	if err := insertFleetActivity(ctx, s.db, rec); err != nil {
-		return FleetActivityRecord{}, err
-	}
-	return cloneFleetActivityRecord(rec), nil
-}
-
-type fleetActivityExecer interface {
-	ExecContext(context.Context, string, ...any) (sql.Result, error)
-}
-
-func insertFleetActivity(ctx context.Context, execer fleetActivityExecer, rec FleetActivityRecord) error {
-	if rec.Actor.PeerID == "" {
-		return errors.New("esphttp: fleet activity actor peer_id is required")
-	}
-	var subjectMember []byte
-	var subjectPeer, subjectPub string
-	if rec.Subject != nil {
-		if rec.Subject.PeerID == "" {
-			return errors.New("esphttp: fleet activity subject peer_id is required")
-		}
-		memberID := nodeInfoMemberID(*rec.Subject)
-		subjectMember = memberID[:]
-		subjectPeer = rec.Subject.PeerID
-		subjectPub = base64.StdEncoding.EncodeToString(rec.Subject.EntmootPubKey)
-	}
-	actorMember := nodeInfoMemberID(rec.Actor)
-	_, err := execer.ExecContext(ctx, `
-INSERT OR IGNORE INTO esp_fleet_activity
-  (event_id, fleet_id, type, actor_member_id, actor_peer_id, actor_pubkey, subject_member_id, subject_peer_id, subject_pubkey, summary, metadata, created_at_ms)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		rec.EventID, rec.FleetID, rec.Type, actorMember[:], rec.Actor.PeerID, base64.StdEncoding.EncodeToString(rec.Actor.EntmootPubKey),
-		subjectMember, subjectPeer, subjectPub, rec.Summary, []byte(rec.Metadata), rec.CreatedAtMS)
-	if err != nil {
-		return fmt.Errorf("esphttp: append fleet activity: %w", err)
-	}
-	return nil
-}
-
-func (s *SQLiteStateStore) ListFleetActivity(ctx context.Context, fleetID string, limit int, beforeMS int64) ([]FleetActivityRecord, error) {
-	if limit <= 0 || limit > 200 {
-		limit = 50
-	}
-	query := `SELECT event_id, fleet_id, type, actor_member_id, actor_peer_id, actor_pubkey, subject_member_id, subject_peer_id, subject_pubkey, summary, metadata, created_at_ms FROM esp_fleet_activity WHERE fleet_id = ?`
-	args := []any{fleetID}
-	if beforeMS > 0 {
-		query += ` AND created_at_ms < ?`
-		args = append(args, beforeMS)
-	}
-	query += ` ORDER BY created_at_ms DESC, event_id DESC LIMIT ?`
-	args = append(args, limit)
-	rows, err := s.db.QueryContext(ctx, query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("esphttp: list fleet activity: %w", err)
-	}
-	defer rows.Close()
-	var out []FleetActivityRecord
-	for rows.Next() {
-		rec, err := scanFleetActivityRecord(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, rec)
-	}
-	return out, rows.Err()
-}
-
-func (s *SQLiteStateStore) DeleteFleetActivity(ctx context.Context, fleetID string, eventID string) error {
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM esp_fleet_activity WHERE fleet_id = ? AND event_id = ?`, fleetID, eventID); err != nil {
-		return fmt.Errorf("esphttp: delete fleet activity: %w", err)
-	}
-	return nil
-}
-
 func (s *SQLiteStateStore) Close() error {
 	if s.cleanupCancel != nil {
 		s.cleanupCancel()
@@ -2769,22 +1435,6 @@ func migrateSQLiteState(db *sql.DB) error {
 			return fmt.Errorf("esphttp: migrate state schema add live cursor %s: %w", stmt.name, err)
 		}
 	}
-	for _, spec := range []struct {
-		table, memberColumn, peerColumn, pubkeyColumn string
-	}{
-		{"esp_fleets", "coordinator_member_id", "coordinator_peer_id", "coordinator_pubkey"},
-		{"esp_fleet_members", "member_id", "peer_id", "entmoot_pubkey"},
-		{"esp_fleet_invites", "member_id", "peer_id", "entmoot_pubkey"},
-		{"esp_fleet_activity", "actor_member_id", "actor_peer_id", "actor_pubkey"},
-		{"esp_fleet_activity", "subject_member_id", "subject_peer_id", "subject_pubkey"},
-		{"esp_fleet_tasks", "creator_member_id", "creator_peer_id", "creator_pubkey"},
-		{"esp_fleet_tasks", "assignee_member_id", "assignee_peer_id", "assignee_pubkey"},
-		{"esp_fleet_task_submissions", "author_member_id", "author_peer_id", "author_pubkey"},
-	} {
-		if err := migrateIdentityPeerColumn(db, spec.table, spec.memberColumn, spec.peerColumn, spec.pubkeyColumn); err != nil {
-			return err
-		}
-	}
 	return nil
 }
 
@@ -2812,89 +1462,11 @@ func tableColumns(db *sql.DB, table string) (map[string]bool, error) {
 	return cols, nil
 }
 
-func migrateIdentityPeerColumn(db *sql.DB, table, memberColumn, peerColumn, pubkeyColumn string) error {
-	cols, err := tableColumns(db, table)
-	if err != nil {
-		return err
-	}
-	if !cols[memberColumn] || !cols[pubkeyColumn] {
-		return nil
-	}
-	if !cols[peerColumn] {
-		stmt := fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s TEXT NOT NULL DEFAULT ''`, table, peerColumn)
-		if _, err := db.Exec(stmt); err != nil {
-			return fmt.Errorf("esphttp: add %s.%s: %w", table, peerColumn, err)
-		}
-	}
-	query := fmt.Sprintf(`SELECT rowid, %s, %s, %s FROM %s`, memberColumn, peerColumn, pubkeyColumn, table)
-	rows, err := db.Query(query)
-	if err != nil {
-		return fmt.Errorf("esphttp: read %s identity binding: %w", table, err)
-	}
-	type update struct {
-		rowID  int64
-		peerID string
-	}
-	var updates []update
-	for rows.Next() {
-		var rowID int64
-		var memberBytes []byte
-		var peerID, encodedPubkey string
-		if err := rows.Scan(&rowID, &memberBytes, &peerID, &encodedPubkey); err != nil {
-			rows.Close()
-			return fmt.Errorf("esphttp: scan %s identity binding: %w", table, err)
-		}
-		if len(memberBytes) == 0 && strings.TrimSpace(encodedPubkey) == "" {
-			continue
-		}
-		if len(memberBytes) != len(entmoot.MemberID{}) {
-			rows.Close()
-			return fmt.Errorf("esphttp: %s has invalid %s", table, memberColumn)
-		}
-		pubkey, err := base64.StdEncoding.DecodeString(encodedPubkey)
-		if err != nil {
-			rows.Close()
-			return fmt.Errorf("esphttp: %s has invalid %s: %w", table, pubkeyColumn, err)
-		}
-		memberID, err := entmoot.MemberIDFromPublicKey(pubkey)
-		if err != nil || !bytes.Equal(memberID[:], memberBytes) {
-			rows.Close()
-			return fmt.Errorf("esphttp: %s identity does not match %s", table, memberColumn)
-		}
-		wantPeerID, err := entmoot.PeerIDFromPublicKey(pubkey)
-		if err != nil {
-			rows.Close()
-			return fmt.Errorf("esphttp: %s peer binding: %w", table, err)
-		}
-		if peerID != "" && peerID != wantPeerID {
-			rows.Close()
-			return fmt.Errorf("esphttp: %s %s does not match signing key", table, peerColumn)
-		}
-		if peerID == "" {
-			updates = append(updates, update{rowID: rowID, peerID: wantPeerID})
-		}
-	}
-	if err := rows.Close(); err != nil {
-		return err
-	}
-	for _, item := range updates {
-		stmt := fmt.Sprintf(`UPDATE %s SET %s = ? WHERE rowid = ?`, table, peerColumn)
-		if _, err := db.Exec(stmt, item.peerID, item.rowID); err != nil {
-			return fmt.Errorf("esphttp: backfill %s.%s: %w", table, peerColumn, err)
-		}
-	}
-	return nil
-}
-
 type signRequestScanner interface {
 	Scan(...interface{}) error
 }
 
 type openInviteScanner interface {
-	Scan(...interface{}) error
-}
-
-type fleetScanner interface {
 	Scan(...interface{}) error
 }
 
@@ -2922,101 +1494,6 @@ func scanSignRequest(row signRequestScanner) (SignRequest, error) {
 	}
 	req.OperationResult = append(json.RawMessage(nil), operationResult...)
 	return req, nil
-}
-
-func scanFleetRecord(row fleetScanner) (FleetRecord, error) {
-	var rec FleetRecord
-	var controlGroup, coordinatorBytes []byte
-	var pub string
-	if err := row.Scan(&rec.FleetID, &rec.Name, &controlGroup, &coordinatorBytes, &rec.Coordinator.PeerID, &pub, &rec.CoordinatorDeviceID, &rec.Status, &rec.CreatedAtMS, &rec.UpdatedAtMS, &rec.ArchivedAtMS, &rec.DeletedAtMS); err != nil {
-		return FleetRecord{}, err
-	}
-	rec.Status = NormalizeFleetStatus(rec.Status)
-	if len(controlGroup) == len(rec.ControlGroupID) {
-		copy(rec.ControlGroupID[:], controlGroup)
-	}
-	if len(coordinatorBytes) != len(entmoot.MemberID{}) {
-		return FleetRecord{}, errors.New("esphttp: invalid fleet coordinator member id")
-	}
-	memberID := entmoot.MemberID{}
-	copy(memberID[:], coordinatorBytes)
-	rec.Coordinator.MemberID = &memberID
-	if pub != "" {
-		raw, err := base64.StdEncoding.DecodeString(pub)
-		if err != nil {
-			return FleetRecord{}, fmt.Errorf("esphttp: decode fleet coordinator pubkey: %w", err)
-		}
-		rec.Coordinator.EntmootPubKey = raw
-	}
-	return rec, nil
-}
-
-func scanFleetMemberRecord(row fleetScanner) (FleetMemberRecord, error) {
-	var rec FleetMemberRecord
-	var memberBytes []byte
-	if err := row.Scan(&rec.FleetID, &memberBytes, &rec.PeerID, &rec.EntmootPubKey, &rec.Hostname, &rec.Role, &rec.Status, &rec.InvitedAtMS, &rec.AcceptedAtMS, &rec.RemovedAtMS, &rec.UpdatedAtMS); err != nil {
-		return FleetMemberRecord{}, err
-	}
-	if len(memberBytes) != len(rec.MemberID) {
-		return FleetMemberRecord{}, errors.New("esphttp: invalid fleet member id")
-	}
-	copy(rec.MemberID[:], memberBytes)
-	return rec, nil
-}
-
-func scanFleetInviteRecord(row fleetScanner) (FleetInviteRecord, error) {
-	var rec FleetInviteRecord
-	var memberBytes, capability []byte
-	if err := row.Scan(&rec.InviteID, &rec.FleetID, &memberBytes, &rec.PeerID, &rec.EntmootPubKey, &rec.Hostname, &rec.Status, &capability, &rec.CreatedAtMS, &rec.UpdatedAtMS, &rec.ExpiresAtMS); err != nil {
-		return FleetInviteRecord{}, err
-	}
-	if len(memberBytes) != len(rec.MemberID) {
-		return FleetInviteRecord{}, errors.New("esphttp: invalid fleet invite member id")
-	}
-	copy(rec.MemberID[:], memberBytes)
-	rec.Capability = append(json.RawMessage(nil), capability...)
-	return rec, nil
-}
-
-func scanFleetActivityRecord(row fleetScanner) (FleetActivityRecord, error) {
-	var rec FleetActivityRecord
-	var actorBytes, subjectBytes []byte
-	var actorPub, subjectPeer, subjectPub string
-	var metadata []byte
-	if err := row.Scan(&rec.EventID, &rec.FleetID, &rec.Type, &actorBytes, &rec.Actor.PeerID, &actorPub, &subjectBytes, &subjectPeer, &subjectPub, &rec.Summary, &metadata, &rec.CreatedAtMS); err != nil {
-		return FleetActivityRecord{}, err
-	}
-	if len(actorBytes) != len(entmoot.MemberID{}) {
-		return FleetActivityRecord{}, errors.New("esphttp: invalid fleet activity actor member id")
-	}
-	actorID := entmoot.MemberID{}
-	copy(actorID[:], actorBytes)
-	rec.Actor.MemberID = &actorID
-	if actorPub != "" {
-		raw, err := base64.StdEncoding.DecodeString(actorPub)
-		if err != nil {
-			return FleetActivityRecord{}, fmt.Errorf("esphttp: decode fleet actor pubkey: %w", err)
-		}
-		rec.Actor.EntmootPubKey = raw
-	}
-	if len(subjectBytes) != 0 || subjectPub != "" {
-		if len(subjectBytes) != len(entmoot.MemberID{}) {
-			return FleetActivityRecord{}, errors.New("esphttp: invalid fleet activity subject member id")
-		}
-		subjectID := entmoot.MemberID{}
-		copy(subjectID[:], subjectBytes)
-		subj := entmoot.NodeInfo{MemberID: &subjectID, PeerID: subjectPeer}
-		if subjectPub != "" {
-			raw, err := base64.StdEncoding.DecodeString(subjectPub)
-			if err != nil {
-				return FleetActivityRecord{}, fmt.Errorf("esphttp: decode fleet subject pubkey: %w", err)
-			}
-			subj.EntmootPubKey = raw
-		}
-		rec.Subject = &subj
-	}
-	rec.Metadata = append(json.RawMessage(nil), metadata...)
-	return rec, nil
 }
 
 func scanOpenInviteRecord(row openInviteScanner) (OpenInviteRecord, error) {
@@ -3106,13 +1583,6 @@ func sortOpenInviteRecords(records []OpenInviteRecord) {
 	})
 }
 
-func encodeBootstrapPeers(peers []entmoot.MemberID) ([]byte, error) {
-	if len(peers) == 0 {
-		return nil, nil
-	}
-	return json.Marshal(peers)
-}
-
 func boolInt(v bool) int {
 	if v {
 		return 1
@@ -3158,4 +1628,49 @@ func deviceIDForRequest(auth authContext) string {
 		return ""
 	}
 	return strings.TrimSpace(auth.device.ID)
+}
+
+// retiredFleetTables are the tables of the removed Fleet/tasks/agent-commands
+// feature. They are dropped rather than left in place so an upgraded node stops
+// carrying rows nothing can read, and so a later reader cannot mistake stale
+// fleet state for something live.
+var retiredFleetTables = []string{
+	"esp_fleet_command_results",
+	"esp_fleet_commands",
+	"esp_fleet_task_submissions",
+	"esp_fleet_tasks",
+	"esp_fleet_activity",
+	"esp_fleet_invites",
+	"esp_fleet_members",
+	"esp_fleets",
+	"esp_agent_commands",
+}
+
+// retireFleetTables drops the removed feature's tables, best-effort.
+//
+// DROP TABLE needs a write transaction while the schema block above needs
+// none, so this runs outside it and never fails the open: this fleet runs
+// `serve` and `esp serve` against one data root, and an unrelated writer
+// holding the lock must not stop the ESP starting. busy_timeout is lowered for
+// the attempt and restored afterwards so a contended open is not stalled for
+// the path's full 5s; whatever is left is retired on a later open.
+func retireFleetTables(db *sql.DB, dbPath string) {
+	if _, err := db.Exec(`PRAGMA busy_timeout = 200`); err != nil {
+		slog.Debug("esphttp: retire fleet tables deferred: set busy_timeout",
+			slog.String("path", dbPath), slog.String("err", err.Error()))
+		return
+	}
+	defer func() {
+		if _, err := db.Exec(`PRAGMA busy_timeout = 5000`); err != nil {
+			slog.Warn("esphttp: restore busy_timeout after fleet retirement",
+				slog.String("path", dbPath), slog.String("err", err.Error()))
+		}
+	}()
+	for _, table := range retiredFleetTables {
+		if _, err := db.Exec(`DROP TABLE IF EXISTS ` + table); err != nil {
+			slog.Debug("esphttp: retire fleet table deferred to a later open",
+				slog.String("path", dbPath), slog.String("table", table), slog.String("err", err.Error()))
+			return
+		}
+	}
 }

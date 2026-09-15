@@ -18,7 +18,6 @@ import (
 
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/esphttp"
-	entfeatures "entmoot/pkg/entmoot/features"
 	entpolicy "entmoot/pkg/entmoot/policy"
 	"entmoot/pkg/entmoot/store"
 )
@@ -142,10 +141,6 @@ func cmdAgentLiveEnable(gf *globalFlags, args []string) int {
 		fmt.Fprintf(os.Stderr, "agent-live enable: unknown -action value(s): %s\n", strings.Join(unknown, ", "))
 		return exitInvalidArgument
 	}
-	if disabled := coordinationLiveActions([]string(cfg.actions), featureFlags(gf)); len(disabled) > 0 {
-		fmt.Fprintf(os.Stderr, "agent-live enable: live action(s) require ENTMOOT_ENABLE_FLEET=1 and ENTMOOT_ENABLE_TASKS=1: %s\n", strings.Join(disabled, ", "))
-		return exitInvalidArgument
-	}
 	state, err := esphttp.OpenSQLiteStateStore(gf.data)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "agent-live enable: %v\n", err)
@@ -158,7 +153,6 @@ func cmdAgentLiveEnable(gf *globalFlags, args []string) int {
 		mode:              mode,
 		topics:            topics,
 		actions:           []string(cfg.actions),
-		features:          featureFlags(gf),
 		maxActionsPerScan: cfg.maxActionsPerScan,
 		maxActionBytes:    cfg.maxActionBytes,
 	})
@@ -179,7 +173,6 @@ type enableAgentLiveConfigOptions struct {
 	mode              string
 	topics            []string
 	actions           []string
-	features          entfeatures.Flags
 	maxActionsPerScan int
 	maxActionBytes    int
 }
@@ -193,12 +186,6 @@ func enableAgentLiveConfig(ctx context.Context, state esphttp.StateStore, opts e
 	if opts.mode == esphttp.LiveModeOperator && len(actions) == 0 && !actionsExplicit {
 		actions = esphttp.DefaultLiveActions()
 	}
-	if disabled := coordinationLiveActions(actions, opts.features); len(disabled) > 0 {
-		if actionsExplicit {
-			return esphttp.LiveAgentConfig{}, fmt.Errorf("live action(s) require ENTMOOT_ENABLE_FLEET=1 and ENTMOOT_ENABLE_TASKS=1: %s", strings.Join(disabled, ", "))
-		}
-		actions = filterDisabledLiveActions(actions, opts.features)
-	}
 	return state.UpsertLiveAgentConfig(ctx, esphttp.LiveAgentConfig{
 		GroupID:           opts.groupID,
 		MemberID:          opts.nodeID,
@@ -210,6 +197,42 @@ func enableAgentLiveConfig(ctx context.Context, state esphttp.StateStore, opts e
 		MaxActionBytes:    opts.maxActionBytes,
 		UpdatedAtMS:       time.Now().UnixMilli(),
 	})
+}
+
+// liveAllowedActionsForConfig resolves the effective action allow-list for a
+// live-agent config, applying the per-mode defaults when the config carries
+// no explicit list.
+func liveAllowedActionsForConfig(cfg esphttp.LiveAgentConfig) []string {
+	if len(cfg.AllowedActions) > 0 {
+		return cfg.AllowedActions
+	}
+	switch cfg.Mode {
+	case esphttp.LiveModeOperator:
+		return esphttp.DefaultLiveActions()
+	case esphttp.LiveModeReplyOnMention, esphttp.LiveModeConverse:
+		return []string{liveActionReply, liveActionMessageSummarize}
+	}
+	return nil
+}
+
+// openClawSelectorError is the OpenClaw CLI error that means no session
+// selector was supplied.
+const openClawSelectorError = "Pass --to <E.164>, --session-id, or --agent to choose a session"
+
+// addAgentRuntimeFailureAdvice appends the fix for a missing OpenClaw session
+// selector to a failed runner's output.
+func addAgentRuntimeFailureAdvice(output string) string {
+	if !strings.Contains(output, openClawSelectorError) {
+		return output
+	}
+	const advice = "Entmoot fix: use the built-in OpenClaw adapter with ENTMOOT_AGENT_RUNNER=openclaw and set ENTMOOT_OPENCLAW_AGENT, ENTMOOT_OPENCLAW_SESSION_ID, or ENTMOOT_OPENCLAW_TO as needed. Without an explicit selector, the built-in adapter defaults to ENTMOOT_OPENCLAW_AGENT=main."
+	if strings.Contains(output, advice) {
+		return output
+	}
+	if strings.TrimSpace(output) == "" {
+		return advice
+	}
+	return strings.TrimSpace(output) + "\n\n" + advice
 }
 
 func cmdAgentLiveDisable(gf *globalFlags, args []string) int {

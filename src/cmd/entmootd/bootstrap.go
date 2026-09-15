@@ -23,7 +23,6 @@ type bootstrapAgentOptions struct {
 	json              bool
 	runner            string
 	runnerCommand     string
-	agentInstructions bool
 	liveMode          string
 	group             string
 	node              string
@@ -39,7 +38,6 @@ type bootstrapAgentReport struct {
 	Applied           bool                       `json:"applied"`
 	Runner            string                     `json:"runner"`
 	RunnerCommand     string                     `json:"runner_command,omitempty"`
-	AgentInstructions bool                       `json:"agent_instructions"`
 	Live              bootstrapAgentLiveReport   `json:"live"`
 	DefaultMoot       bootstrapDefaultMootReport `json:"default_moot"`
 	Commands          []string                   `json:"commands,omitempty"`
@@ -96,7 +94,6 @@ func cmdBootstrapAgent(gf *globalFlags, args []string) int {
 	fs.BoolVar(&cfg.json, "json", false, "print JSON summary")
 	fs.StringVar(&cfg.runner, "runner", cfg.runner, "agent runtime: none, custom, or openclaw")
 	fs.StringVar(&cfg.runnerCommand, "runner-command", "", "custom agent runner command")
-	fs.BoolVar(&cfg.agentInstructions, "agent-instructions", false, "enable instruction-command runtime guidance for entmootd serve")
 	fs.StringVar(&cfg.liveMode, "live-mode", cfg.liveMode, "live mode: off, listen, reply_on_mention, converse, operator")
 	fs.StringVar(&cfg.group, "group", "", "base64 moot group id for live mode")
 	fs.StringVar(&cfg.node, "member", "", "base64 local member id for live mode")
@@ -146,7 +143,6 @@ func cmdBootstrapAgent(gf *globalFlags, args []string) int {
 			mode:              report.Live.Mode,
 			topics:            report.Live.TopicFilters,
 			actions:           report.Live.AllowedActions,
-			features:          featureFlags(gf),
 			maxActionsPerScan: report.Live.MaxActionsPerScan,
 			maxActionBytes:    report.Live.MaxActionBytes,
 		})
@@ -209,29 +205,14 @@ func buildBootstrapAgentReport(gf *globalFlags, cfg bootstrapAgentOptions) (boot
 	if unknown := esphttp.UnknownLiveActions([]string(cfg.actions)); len(unknown) > 0 {
 		return bootstrapAgentReport{}, gid, nodeID, fmt.Errorf("unknown --action value(s): %s", strings.Join(unknown, ", "))
 	}
-	if cfg.agentInstructions {
-		if err := featureFlags(gf).RequireTasks(); err != nil {
-			return bootstrapAgentReport{}, gid, nodeID, fmt.Errorf("agent instruction commands require ENTMOOT_ENABLE_FLEET=1 and ENTMOOT_ENABLE_TASKS=1")
-		}
-	}
 	runnerCommand := agentRunnerCommand(runner, cfg.runnerCommand)
 	runtime := collectRuntimeReport(gf, gf.data)
 	report := bootstrapAgentReport{
-		DryRun:            cfg.dryRun,
-		Runner:            runner,
-		RunnerCommand:     runnerCommand,
-		AgentInstructions: cfg.agentInstructions,
-		Runtime:           runtime,
-		DefaultMoot:       buildBootstrapDefaultMootReport(gf, runtime, cfg.defaultMoot),
-	}
-	if cfg.agentInstructions {
-		report.Warnings = append(report.Warnings, "run entmootd serve with ENTMOOT_AGENT_INSTRUCTIONS=1; bootstrap cannot change the environment of an already-running daemon")
-		if runner == agentRunnerNone {
-			report.Warnings = append(report.Warnings, "instruction commands can be queued, but no agent-commands runner is configured")
-		}
-		if report.Runtime.RunningDaemon != nil {
-			report.Warnings = append(report.Warnings, "a running entmootd daemon was detected; restart or update its supervisor if instruction commands should be enabled")
-		}
+		DryRun:        cfg.dryRun,
+		Runner:        runner,
+		RunnerCommand: runnerCommand,
+		Runtime:       runtime,
+		DefaultMoot:   buildBootstrapDefaultMootReport(gf, runtime, cfg.defaultMoot),
 	}
 	if liveMode != bootstrapLiveModeOff {
 		topics := esphttp.NormalizeLiveTopicFilters([]string(cfg.topics))
@@ -245,12 +226,6 @@ func buildBootstrapAgentReport(gf *globalFlags, cfg bootstrapAgentOptions) (boot
 		}
 		if liveMode == esphttp.LiveModeOperator && len(actions) == 0 && len(rawActions) == 0 {
 			actions = esphttp.DefaultLiveActions()
-		}
-		if disabled := coordinationLiveActions(actions, featureFlags(gf)); len(disabled) > 0 {
-			if len(rawActions) > 0 {
-				return bootstrapAgentReport{}, gid, nodeID, fmt.Errorf("live action(s) require ENTMOOT_ENABLE_FLEET=1 and ENTMOOT_ENABLE_TASKS=1: %s", strings.Join(disabled, ", "))
-			}
-			actions = filterDisabledLiveActions(actions, featureFlags(gf))
 		}
 		report.Live = bootstrapAgentLiveReport{
 			Enabled:           true,
@@ -274,19 +249,13 @@ func buildBootstrapAgentReport(gf *globalFlags, cfg bootstrapAgentOptions) (boot
 func bootstrapAgentCommands(gf *globalFlags, report bootstrapAgentReport) []string {
 	var out []string
 	out = append(out, report.DefaultMoot.Commands...)
-	coordinationEnv := bootstrapCoordinationEnv(gf, report)
-	serve := envPrefixedCommand(coordinationEnv, entmootCommand(gf, report.Runtime, "serve"))
-	out = append(out, serve)
-	if report.AgentInstructions && report.Runner != agentRunnerNone && featureFlags(gf).RequireTasks() == nil {
-		out = append(out, envPrefixedCommand(coordinationEnv, entmootCommand(gf, report.Runtime, "agent-commands", "watch", "-runner", report.RunnerCommand)))
-	}
+	out = append(out, entmootCommand(gf, report.Runtime, "serve"))
 	if report.Live.Enabled {
 		parts := []string{"agent-live", "run", "-group", report.Live.Group, "-member", report.Live.MemberID}
 		if report.Runner != agentRunnerNone {
 			parts = append(parts, "-runner", report.RunnerCommand)
 		}
-		command := envPrefixedCommand(coordinationEnv, entmootCommand(gf, report.Runtime, parts...))
-		out = append(out, command)
+		out = append(out, entmootCommand(gf, report.Runtime, parts...))
 	}
 	return out
 }
@@ -322,33 +291,6 @@ func normalizeBootstrapDefaultMootChoice(choice string) string {
 		return defaultMootConsentDeclined
 	}
 	return choice
-}
-
-func bootstrapCoordinationEnv(gf *globalFlags, report bootstrapAgentReport) []string {
-	var env []string
-	if report.AgentInstructions {
-		env = append(env, "ENTMOOT_AGENT_INSTRUCTIONS=1")
-	}
-	env = append(env, featureFlagEnv(gf)...)
-	return env
-}
-
-func featureFlagEnv(gf *globalFlags) []string {
-	var env []string
-	if featureFlags(gf).FleetEnabled {
-		env = append(env, "ENTMOOT_ENABLE_FLEET=1")
-	}
-	if featureFlags(gf).TasksEnabled {
-		env = append(env, "ENTMOOT_ENABLE_TASKS=1")
-	}
-	return env
-}
-
-func envPrefixedCommand(env []string, command string) string {
-	if len(env) == 0 {
-		return command
-	}
-	return strings.Join(append(append([]string{}, env...), command), " ")
 }
 
 func entmootCommand(gf *globalFlags, report runtimeReport, args ...string) string {
@@ -395,7 +337,6 @@ func printBootstrapAgentReport(report bootstrapAgentReport) {
 	if report.RunnerCommand != "" {
 		fmt.Printf("runner_command: %s\n", report.RunnerCommand)
 	}
-	fmt.Printf("agent_instructions: %t\n", report.AgentInstructions)
 	if report.Live.Enabled {
 		fmt.Printf("live: enabled mode=%s group=%s member=%s\n", report.Live.Mode, report.Live.Group, report.Live.MemberID)
 		fmt.Printf("live_topics: %s\n", strings.Join(report.Live.TopicFilters, ","))
@@ -432,10 +373,6 @@ func promptBootstrapAgentOptions(cfg bootstrapAgentOptions) (bootstrapAgentOptio
 		if err != nil {
 			return cfg, err
 		}
-	}
-	cfg.agentInstructions, err = promptBool(reader, "enable instruction commands", cfg.agentInstructions)
-	if err != nil {
-		return cfg, err
 	}
 	cfg.defaultMoot, err = promptChoice(reader, "The Ent Moot [skip/join/decline]", cfg.defaultMoot, map[string]bool{
 		"skip":                     true,
@@ -513,23 +450,4 @@ func promptString(reader *bufio.Reader, label, current string) (string, error) {
 		value = current
 	}
 	return value, nil
-}
-
-func promptBool(reader *bufio.Reader, label string, current bool) (bool, error) {
-	def := "n"
-	if current {
-		def = "y"
-	}
-	raw, err := promptString(reader, label+" [y/n]", def)
-	if err != nil {
-		return false, err
-	}
-	switch strings.TrimSpace(strings.ToLower(raw)) {
-	case "y", "yes", "true", "1":
-		return true, nil
-	case "n", "no", "false", "0":
-		return false, nil
-	default:
-		return false, fmt.Errorf("invalid boolean for %s", label)
-	}
 }

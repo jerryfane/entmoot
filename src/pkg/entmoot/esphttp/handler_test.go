@@ -19,7 +19,6 @@ import (
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/canonical"
 	"entmoot/pkg/entmoot/espnotify"
-	entfeatures "entmoot/pkg/entmoot/features"
 	"entmoot/pkg/entmoot/mailbox"
 	"entmoot/pkg/entmoot/mailbox/mailboxtest"
 	"entmoot/pkg/entmoot/signing"
@@ -110,7 +109,7 @@ func TestHandlerHealthzDoesNotRequireAuth(t *testing.T) {
 	}
 }
 
-func TestHandlerCapabilitiesExposeDefaultDisabledFeatures(t *testing.T) {
+func TestHandlerCapabilitiesAreUnauthenticatedAndOmitFeatures(t *testing.T) {
 	gid := testGroupID(1)
 	handler, err := NewHandler(Config{
 		Token:   "secret",
@@ -126,18 +125,14 @@ func TestHandlerCapabilitiesExposeDefaultDisabledFeatures(t *testing.T) {
 		t.Fatalf("unauth capabilities status = %d, want %d body=%s", unauth.Code, http.StatusOK, unauth.Body.String())
 	}
 
-	caps := doJSONRequest[struct {
-		Features entfeatures.Capabilities `json:"features"`
-	}](t, handler, http.MethodGet, "/v1/capabilities", nil, http.StatusOK)
-	if caps.Features.FleetEnabled || caps.Features.TasksEnabled {
-		t.Fatalf("capabilities = %+v, want default disabled", caps.Features)
+	caps := doJSONRequest[map[string]any](t, handler, http.MethodGet, "/v1/capabilities", nil, http.StatusOK)
+	if _, ok := caps["features"]; ok {
+		t.Fatalf("capabilities = %+v, want no features key", caps)
 	}
 
-	status := doJSONRequest[struct {
-		Features entfeatures.Capabilities `json:"features"`
-	}](t, handler, http.MethodGet, "/v1/status", nil, http.StatusOK)
-	if status.Features.FleetEnabled || status.Features.TasksEnabled {
-		t.Fatalf("status features = %+v, want default disabled", status.Features)
+	status := doJSONRequest[map[string]any](t, handler, http.MethodGet, "/v1/status", nil, http.StatusOK)
+	if _, ok := status["features"]; ok {
+		t.Fatalf("status = %+v, want no features key", status)
 	}
 }
 
@@ -1800,7 +1795,6 @@ func testMobileHandlerFull(t *testing.T, gid entmoot.GroupID, reg *DeviceRegistr
 		Publisher: publisher,
 		Notifier:  notifier,
 		State:     state,
-		Features:  testCoordinationFeatures(),
 		Groups:    catalog,
 		Clock:     clock,
 		GroupExists: func(_ context.Context, got entmoot.GroupID) (bool, error) {
@@ -1811,10 +1805,6 @@ func testMobileHandlerFull(t *testing.T, gid entmoot.GroupID, reg *DeviceRegistr
 		t.Fatalf("NewHandler: %v", err)
 	}
 	return handler
-}
-
-func testCoordinationFeatures() entfeatures.Flags {
-	return entfeatures.Flags{FleetEnabled: true, TasksEnabled: true}
 }
 
 func testDeviceHandler(t *testing.T, gid entmoot.GroupID, reg *DeviceRegistry, now time.Time) http.Handler {
@@ -1845,19 +1835,6 @@ type fakePublisher struct {
 	result PublishResult
 	err    error
 	got    entmoot.Message
-}
-
-type fakeTaskEventPublisher struct {
-	events    []fakeTaskEvent
-	err       error
-	localInfo entmoot.NodeInfo
-	infoErr   error
-}
-
-type fakeTaskEvent struct {
-	groupID entmoot.GroupID
-	topics  []string
-	content []byte
 }
 
 type fakeOperationExecutor struct {
@@ -1893,9 +1870,7 @@ type fakeNotifier struct {
 
 type fakeDiagnostics struct {
 	result  any
-	fleet   any
 	gid     entmoot.GroupID
-	fleetID string
 	probe   bool
 	timeout time.Duration
 }
@@ -1904,16 +1879,6 @@ func (d *fakeDiagnostics) GroupDiagnostics(_ context.Context, gid entmoot.GroupI
 	d.gid = gid
 	d.probe = probe
 	d.timeout = timeout
-	return d.result, nil
-}
-
-func (d *fakeDiagnostics) FleetDiagnostics(_ context.Context, fleet FleetRecord, _ []FleetMemberRecord, probe bool, timeout time.Duration) (any, error) {
-	d.fleetID = fleet.FleetID
-	d.probe = probe
-	d.timeout = timeout
-	if d.fleet != nil {
-		return d.fleet, nil
-	}
 	return d.result, nil
 }
 
@@ -1943,28 +1908,6 @@ func (p *fakePublisher) PublishSigned(_ context.Context, msg entmoot.Message) (P
 		}, nil
 	}
 	return p.result, nil
-}
-
-func (p *fakeTaskEventPublisher) PublishTaskEvent(_ context.Context, groupID entmoot.GroupID, topics []string, content []byte) (PublishResult, error) {
-	p.events = append(p.events, fakeTaskEvent{
-		groupID: groupID,
-		topics:  append([]string(nil), topics...),
-		content: append([]byte(nil), content...),
-	})
-	if p.err != nil {
-		return PublishResult{}, p.err
-	}
-	return PublishResult{Status: "accepted", GroupID: groupID}, nil
-}
-
-func (p *fakeTaskEventPublisher) LocalNodeInfo(_ context.Context) (entmoot.NodeInfo, error) {
-	if p.infoErr != nil {
-		return entmoot.NodeInfo{}, p.infoErr
-	}
-	return entmoot.NodeInfo{
-		PilotNodeID:   p.localInfo.PilotNodeID,
-		EntmootPubKey: append([]byte(nil), p.localInfo.EntmootPubKey...),
-	}, nil
 }
 
 func mustMailboxService(t *testing.T, gid entmoot.GroupID) *mailbox.Service {
@@ -2173,9 +2116,6 @@ func (c *fakeCatalog) ListGroups(ctx context.Context) ([]GroupSummary, error) {
 func (c *fakeCatalog) ListGroupsWithOptions(_ context.Context, opts GroupListOptions) ([]GroupSummary, error) {
 	out := make([]GroupSummary, 0, len(c.groups))
 	for _, group := range c.groups {
-		if group.Metadata["fleet_control"] == true {
-			continue
-		}
 		if opts.IncludeHidden || group.Metadata["hidden"] != true {
 			out = append(out, group)
 		}

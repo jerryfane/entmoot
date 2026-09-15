@@ -15,8 +15,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-
-	entfeatures "entmoot/pkg/entmoot/features"
 )
 
 // Exit codes per CLI_DESIGN §6.
@@ -39,7 +37,6 @@ type globalFlags struct {
 	logLevel         string
 	connectivity     string
 	controlledRelays stringListFlag
-	features         entfeatures.Flags
 }
 
 func main() {
@@ -110,12 +107,6 @@ func run() int {
 		fmt.Fprintln(os.Stderr, "  membership upgrade -group GID")
 		fmt.Fprintln(os.Stderr, "                          Mint checkpoint 0 from a pre-checkpoint group (founder-only).")
 		fmt.Fprintln(os.Stderr, "")
-		fmt.Fprintln(os.Stderr, "Opt-in coordination subcommands:")
-		fmt.Fprintln(os.Stderr, "  fleet <list|info|activity|tasks|commands>")
-		fmt.Fprintln(os.Stderr, "                          Inspect Fleet state. Requires ENTMOOT_ENABLE_FLEET=1.")
-		fmt.Fprintln(os.Stderr, "  agent-commands <watch|run-once|status>")
-		fmt.Fprintln(os.Stderr, "                          Process queued instructions. Requires ENTMOOT_ENABLE_FLEET=1 and ENTMOOT_ENABLE_TASKS=1.")
-		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "Global flags:")
 		fs.PrintDefaults()
 	}
@@ -162,12 +153,6 @@ func run() int {
 		fmt.Fprintf(os.Stderr, "entmootd: %v\n", err)
 		return exitInvalidArgument
 	}
-	featureFlags, err := entfeatures.FromEnv()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "entmootd: %v\n", err)
-		return exitInvalidArgument
-	}
-	gf.features = featureFlags
 
 	args := fs.Args()
 	if len(args) == 0 {
@@ -198,10 +183,6 @@ func run() int {
 		return cmdInfo(gf, args[1:])
 	case "query":
 		return cmdQuery(gf, args[1:])
-	case "fleet":
-		return cmdFleet(gf, args[1:])
-	case "agent-commands":
-		return cmdAgentCommands(gf, args[1:])
 	case "agent-live":
 		return cmdAgentLive(gf, args[1:])
 	case "mailbox":

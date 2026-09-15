@@ -195,10 +195,6 @@ func runESPServe(gf *globalFlags, cfg espServeConfig) int {
 		Devices:   devices,
 		Service:   resources.service,
 		Publisher: controlSocketSignedPublisher{socketPath: controlSocketPath(gf.data), timeout: 30 * time.Second},
-		TaskEvents: controlSocketTaskEventPublisher{
-			socketPath: controlSocketPath(gf.data),
-			timeout:    30 * time.Second,
-		},
 		Operations: espOperationExecutor{
 			dataDir:       gf.data,
 			identity:      setupRes.identity,
@@ -210,7 +206,6 @@ func runESPServe(gf *globalFlags, cfg espServeConfig) int {
 		},
 		Notifier:    notifier,
 		State:       resources.espState,
-		Features:    featureFlags(gf),
 		Groups:      localGroupCatalog{dataDir: gf.data, metadata: metadataStore, state: resources.espState},
 		Diagnostics: espDiagnosticsProvider{flags: *gf},
 		GroupExists: espGroupExists(gf.data),
@@ -232,11 +227,7 @@ func runESPServe(gf *globalFlags, cfg espServeConfig) int {
 	} else if closer != nil {
 		defer closer.Shutdown()
 	}
-	features := featureFlags(gf).Capabilities()
-	slog.Info("esp serve: listening",
-		slog.String("addr", cfg.addr),
-		slog.Bool("fleet_enabled", features.FleetEnabled),
-		slog.Bool("tasks_enabled", features.TasksEnabled))
+	slog.Info("esp serve: listening", slog.String("addr", cfg.addr))
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		slog.Error("esp serve: http server", slog.String("err", err.Error()))
 		return exitTransport
@@ -308,11 +299,6 @@ type controlSocketSignedPublisher struct {
 	timeout    time.Duration
 }
 
-type controlSocketTaskEventPublisher struct {
-	socketPath string
-	timeout    time.Duration
-}
-
 func (p controlSocketSignedPublisher) PublishSigned(ctx context.Context, msg entmoot.Message) (esphttp.PublishResult, error) {
 	timeout := p.timeout
 	if timeout <= 0 {
@@ -354,65 +340,6 @@ func (p controlSocketSignedPublisher) PublishSigned(ctx context.Context, msg ent
 	default:
 		return esphttp.PublishResult{}, fmt.Errorf("unexpected signed publish response %T", payload)
 	}
-}
-
-func (p controlSocketTaskEventPublisher) PublishTaskEvent(ctx context.Context, groupID entmoot.GroupID, topics []string, content []byte) (esphttp.PublishResult, error) {
-	timeout := p.timeout
-	if timeout <= 0 {
-		timeout = 30 * time.Second
-	}
-	dialCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
-	defer cancel()
-	var dialer net.Dialer
-	conn, err := dialer.DialContext(dialCtx, "unix", p.socketPath)
-	if err != nil {
-		return esphttp.PublishResult{}, &esphttp.PublishError{
-			HTTPStatus: http.StatusServiceUnavailable,
-			Code:       "join_unavailable",
-			Message:    noJoinHelp,
-		}
-	}
-	defer conn.Close()
-	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
-		return esphttp.PublishResult{}, err
-	}
-	if err := ipc.EncodeAndWrite(conn, &ipc.PublishReq{
-		GroupID: &groupID,
-		Topics:  topics,
-		Content: append([]byte(nil), content...),
-	}); err != nil {
-		return esphttp.PublishResult{}, err
-	}
-	_, payload, err := ipc.ReadAndDecode(conn)
-	if err != nil {
-		return esphttp.PublishResult{}, err
-	}
-	switch v := payload.(type) {
-	case *ipc.PublishResp:
-		return esphttp.PublishResult{
-			Status:      "accepted",
-			MessageID:   v.MessageID,
-			GroupID:     v.GroupID,
-			TimestampMS: v.TimestampMS,
-		}, nil
-	case *ipc.ErrorFrame:
-		return esphttp.PublishResult{}, publishHTTPError(v)
-	default:
-		return esphttp.PublishResult{}, fmt.Errorf("unexpected task event publish response %T", payload)
-	}
-}
-
-func (p controlSocketTaskEventPublisher) LocalNodeInfo(ctx context.Context) (entmoot.NodeInfo, error) {
-	info, err := infoOverIPCContext(ctx, p.socketPath)
-	if err != nil {
-		return entmoot.NodeInfo{}, err
-	}
-	memberID := info.MemberID
-	return entmoot.NodeInfo{
-		MemberID:      &memberID,
-		PeerID:        info.PeerID,
-		EntmootPubKey: append([]byte(nil), info.EntmootPubKey...),
-	}, nil
 }
 
 func publishHTTPError(frame *ipc.ErrorFrame) error {

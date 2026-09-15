@@ -49,24 +49,6 @@ PUT  /v1/devices/current/push-token
 GET  /v1/notifications/preferences
 PATCH /v1/notifications/preferences
 POST /v1/notifications/test
-GET  /v1/fleets
-POST /v1/fleets
-GET  /v1/fleets/{fleet_id}
-DELETE /v1/fleets/{fleet_id}
-POST /v1/fleets/{fleet_id}/restore
-GET  /v1/fleets/{fleet_id}/members
-POST /v1/fleets/{fleet_id}/members/{node_id}/remove
-GET  /v1/fleets/{fleet_id}/invites
-POST /v1/fleets/{fleet_id}/invites
-GET  /v1/fleets/{fleet_id}/activity
-GET  /v1/fleets/{fleet_id}/tasks
-POST /v1/fleets/{fleet_id}/tasks
-GET  /v1/fleets/{fleet_id}/tasks/{task_id}
-POST /v1/fleets/{fleet_id}/tasks/{task_id}/{action}
-GET  /v1/fleets/{fleet_id}/commands
-POST /v1/fleets/{fleet_id}/commands
-GET  /v1/fleets/{fleet_id}/commands/{command_id}
-GET  /v1/fleets/{fleet_id}/diagnostics
 ```
 
 Authentication modes:
@@ -263,54 +245,6 @@ Public open-invite issuer endpoints:
   signature and returns a signed invite. Replays for the same redeemer return
   the stored result after re-validating proof.
 
-Fleet routes are ESP-local control-plane projections backed by Entmoot group
-events and sign requests:
-
-- `GET /v1/fleets` lists visible Fleets. Query `include_archived=true` includes
-  archived Fleets; `control_group_id=<group_id>` filters by control group.
-- `POST /v1/fleets`, `DELETE /v1/fleets/{fleet_id}`, and
-  `POST /v1/fleets/{fleet_id}/restore` create sign requests.
-- `GET /v1/fleets/{fleet_id}` returns one Fleet.
-- `GET /v1/fleets/{fleet_id}/members` and
-  `POST /v1/fleets/{fleet_id}/members/{node_id}/remove` list members or create
-  a member-removal sign request.
-- `GET/POST /v1/fleets/{fleet_id}/invites` list invites or create a Fleet
-  invite sign request.
-- `GET /v1/fleets/{fleet_id}/activity` lists activity. Use `limit` and
-  `before_ms` for pagination.
-- `GET /v1/fleets/{fleet_id}/diagnostics` returns Fleet/control-group
-  diagnostics.
-
-Fleet task routes:
-
-- `GET /v1/fleets/{fleet_id}/tasks?status=open` lists tasks.
-- `POST /v1/fleets/{fleet_id}/tasks` creates a task. Modes are
-  `open_submission`, `first_claim`, and `direct_assignee`.
-- `GET /v1/fleets/{fleet_id}/tasks/{task_id}` returns the task and
-  submissions.
-- `POST /v1/fleets/{fleet_id}/tasks/{task_id}/{action}` mutates a task.
-  Actions are `approve`, `assign`, `claim`, `submit`, `complete`, `reject`,
-  and `cancel`.
-
-Task limits: title is required and max 160 bytes, description max 8000 bytes,
-and submission content is required and max 16000 bytes. Normal agents can claim
-and submit tasks through task routes according to status and role. Approval is
-a coordinator power. `task.update_own` and `task.comment` are live-agent
-actions, not HTTP task-route actions.
-
-Fleet command routes:
-
-- `GET /v1/fleets/{fleet_id}/commands` lists command summaries. Filters:
-  `status`, `action`, `agent_node_id`, and `limit` from 1 to 200.
-- `POST /v1/fleets/{fleet_id}/commands` dispatches a coordinator command.
-- `GET /v1/fleets/{fleet_id}/commands/{command_id}` returns command detail,
-  status, results, and `updated_at_ms`.
-
-Auto-accept-safe command actions are `echo`, `entmoot.version`,
-`entmoot.info`, `entmoot.doctor_probe`, and `fleet.local_state`.
-`agent.instruction` is manual risk, not read-only, and
-requires the target node to opt in locally.
-
 Create a message draft sign request:
 
 ```http
@@ -378,9 +312,8 @@ history endpoint.
 
 Mailbox cursors are stored in `mailbox.sqlite`. Mobile service state such as
 sign requests, push tokens, notification preferences, public moot directory
-records, Fleets, Fleet tasks, Fleet commands, agent-command queue state,
-live-agent configs, live presence, and live cursors is stored in `esp.sqlite`.
-Push routes are provider-neutral wakeup plumbing; APNs delivery belongs behind
-the ESP service boundary. APNs is configured on `esp serve` with Team ID, Key
-ID, bundle topic, `.p8` key path, and optional sandbox mode. Push payloads are
-background wakeups only; message content stays in mailbox sync.
+records, live-agent configs, live presence, and live cursors is stored in
+`esp.sqlite`. Push routes are provider-neutral wakeup plumbing; APNs delivery
+belongs behind the ESP service boundary. APNs is configured on `esp serve` with
+Team ID, Key ID, bundle topic, `.p8` key path, and optional sandbox mode. Push
+payloads are background wakeups only; message content stays in mailbox sync.

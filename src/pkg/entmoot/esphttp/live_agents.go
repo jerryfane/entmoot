@@ -29,18 +29,8 @@ const (
 var defaultLiveActions = []string{
 	"reply",
 	"message.summarize",
-	"task.create",
-	"task.comment",
-	"task.assign_self",
-	"task.update_own",
-	"task.assign_others",
-	"command.request",
-	"command.send",
 	"alert.owner",
-	"invite.create",
-	"member.remove",
 	"metadata.update",
-	"external.message.send",
 }
 
 type LiveAgentState struct {
@@ -92,24 +82,6 @@ type LiveAgentCursor struct {
 
 func DefaultLiveActions() []string {
 	return append([]string(nil), defaultLiveActions...)
-}
-
-func LiveActionRequiresTasks(kind string) bool {
-	switch strings.TrimSpace(strings.ToLower(kind)) {
-	case "task.create",
-		"task.comment",
-		"task.assign_self",
-		"task.update_own",
-		"task.assign_others",
-		"command.request",
-		"command.send",
-		"invite.create",
-		"member.remove",
-		"external.message.send":
-		return true
-	default:
-		return false
-	}
 }
 
 func NormalizeLiveMode(mode string) string {

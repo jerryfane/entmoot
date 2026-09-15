@@ -1334,11 +1334,6 @@ func migrateESP(path string, mappings *legacyIdentityResolver) error {
 	if err != nil {
 		return err
 	}
-	fleetCols, err := columnsTx(tx, "esp_fleets")
-	if err != nil {
-		return err
-	}
-	hasFleetLookup := fleetCols["fleet_id"] && fleetCols["control_group_id"]
 	for _, table := range tables {
 		cols, err := columnsTx(tx, table)
 		if err != nil {
@@ -1366,7 +1361,7 @@ func migrateESP(path string, mappings *legacyIdentityResolver) error {
 				quoteIdent(name),
 				publicKeyExpr,
 				espIdentityTimestampExpression(cols),
-				espIdentityGroupExpression(table, cols, hasFleetLookup),
+				espIdentityGroupExpression(cols),
 				quoteIdent(table),
 			)
 			rows, err := tx.Query(query)
@@ -1430,31 +1425,26 @@ func migrateESP(path string, mappings *legacyIdentityResolver) error {
 			}
 		}
 	}
-	if err := migrateESPPeerBindings(tx, mappings); err != nil {
-		return err
-	}
-	if err := migrateESPCommandJSON(tx, mappings); err != nil {
-		return err
-	}
 	return tx.Commit()
+}
+
+// espIdentityGroupExpression names the column a row's group is read from, so
+// a rewritten identity can be scoped to the group it belonged to. Rows that
+// carry no group at all yield an empty blob and are matched on identity alone.
+func espIdentityGroupExpression(cols map[string]bool) string {
+	if cols["control_group_id"] {
+		return fmt.Sprintf(`COALESCE(CAST(%s AS BLOB),X'')`, quoteIdent("control_group_id"))
+	}
+	if cols["group_id"] {
+		return fmt.Sprintf(`COALESCE(CAST(%s AS BLOB),X'')`, quoteIdent("group_id"))
+	}
+	return `X''`
 }
 
 func espIdentityPublicKeyColumn(table, memberColumn string) string {
 	switch table + "." + memberColumn {
-	case "esp_fleets.coordinator_member_id":
-		return "coordinator_pubkey"
-	case "esp_fleet_members.member_id", "esp_fleet_invites.member_id", "esp_node_profile_sources.member_id", "esp_node_profiles.member_id":
+	case "esp_node_profile_sources.member_id", "esp_node_profiles.member_id":
 		return "entmoot_pubkey"
-	case "esp_fleet_activity.actor_member_id":
-		return "actor_pubkey"
-	case "esp_fleet_activity.subject_member_id":
-		return "subject_pubkey"
-	case "esp_fleet_tasks.creator_member_id":
-		return "creator_pubkey"
-	case "esp_fleet_tasks.assignee_member_id":
-		return "assignee_pubkey"
-	case "esp_fleet_task_submissions.author_member_id":
-		return "author_pubkey"
 	default:
 		return ""
 	}
@@ -1472,264 +1462,6 @@ func espIdentityTimestampExpression(cols map[string]bool) string {
 	}
 	return "COALESCE(" + strings.Join(candidates, ",") + ",0)"
 }
-
-func espIdentityGroupExpression(table string, cols map[string]bool, hasFleetLookup bool) string {
-	if cols["control_group_id"] {
-		return fmt.Sprintf(`COALESCE(CAST(%s AS BLOB),X'')`, quoteIdent("control_group_id"))
-	}
-	if cols["group_id"] {
-		return fmt.Sprintf(`COALESCE(CAST(%s AS BLOB),X'')`, quoteIdent("group_id"))
-	}
-	if cols["fleet_id"] && hasFleetLookup {
-		return fmt.Sprintf(
-			`COALESCE((SELECT CAST(f.control_group_id AS BLOB) FROM esp_fleets AS f WHERE f.fleet_id=%s.%s),X'')`,
-			quoteIdent(table),
-			quoteIdent("fleet_id"),
-		)
-	}
-	return `X''`
-}
-
-func migrateESPPeerBindings(tx *sql.Tx, mappings *legacyIdentityResolver) error {
-	for _, spec := range []struct {
-		table, memberColumn, peerColumn, pubkeyColumn string
-	}{
-		{"esp_fleets", "coordinator_member_id", "coordinator_peer_id", "coordinator_pubkey"},
-		{"esp_fleet_members", "member_id", "peer_id", "entmoot_pubkey"},
-		{"esp_fleet_invites", "member_id", "peer_id", "entmoot_pubkey"},
-		{"esp_fleet_activity", "actor_member_id", "actor_peer_id", "actor_pubkey"},
-		{"esp_fleet_activity", "subject_member_id", "subject_peer_id", "subject_pubkey"},
-		{"esp_fleet_tasks", "creator_member_id", "creator_peer_id", "creator_pubkey"},
-		{"esp_fleet_tasks", "assignee_member_id", "assignee_peer_id", "assignee_pubkey"},
-		{"esp_fleet_task_submissions", "author_member_id", "author_peer_id", "author_pubkey"},
-	} {
-		cols, err := columnsTx(tx, spec.table)
-		if err != nil {
-			return err
-		}
-		if len(cols) == 0 || !cols[spec.memberColumn] || !cols[spec.pubkeyColumn] {
-			continue
-		}
-		if !cols[spec.peerColumn] {
-			if _, err := tx.Exec(fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s TEXT NOT NULL DEFAULT ''`, quoteIdent(spec.table), quoteIdent(spec.peerColumn))); err != nil {
-				return err
-			}
-		}
-		query := fmt.Sprintf(`SELECT rowid,%s,%s,%s FROM %s`, quoteIdent(spec.memberColumn), quoteIdent(spec.peerColumn), quoteIdent(spec.pubkeyColumn), quoteIdent(spec.table))
-		rows, err := tx.Query(query)
-		if err != nil {
-			return err
-		}
-		type peerUpdate struct {
-			rowID  int64
-			peerID string
-		}
-		var updates []peerUpdate
-		for rows.Next() {
-			var rowID int64
-			var memberBytes []byte
-			var peerID, encodedPubkey string
-			if err := rows.Scan(&rowID, &memberBytes, &peerID, &encodedPubkey); err != nil {
-				rows.Close()
-				return err
-			}
-			if len(memberBytes) == 0 && strings.TrimSpace(encodedPubkey) == "" {
-				continue
-			}
-			if len(memberBytes) != len(entmoot.MemberID{}) {
-				rows.Close()
-				return fmt.Errorf("%s.%s is not a full MemberID", spec.table, spec.memberColumn)
-			}
-			pubkey, err := base64.StdEncoding.DecodeString(encodedPubkey)
-			if err != nil {
-				rows.Close()
-				return fmt.Errorf("%s.%s is invalid: %w", spec.table, spec.pubkeyColumn, err)
-			}
-			memberID, err := entmoot.MemberIDFromPublicKey(pubkey)
-			if err != nil || !bytes.Equal(memberID[:], memberBytes) {
-				rows.Close()
-				return fmt.Errorf("%s identity does not match %s", spec.table, spec.memberColumn)
-			}
-			wantPeerID, err := entmoot.PeerIDFromPublicKey(pubkey)
-			if err != nil {
-				rows.Close()
-				return err
-			}
-			if peerID != "" && peerID != wantPeerID {
-				rows.Close()
-				return fmt.Errorf("%s.%s does not match the signing key", spec.table, spec.peerColumn)
-			}
-			if peerID == "" {
-				updates = append(updates, peerUpdate{rowID: rowID, peerID: wantPeerID})
-			}
-		}
-		if err := rows.Close(); err != nil {
-			return err
-		}
-		for _, update := range updates {
-			stmt := fmt.Sprintf(`UPDATE %s SET %s=? WHERE rowid=?`, quoteIdent(spec.table), quoteIdent(spec.peerColumn))
-			if _, err := tx.Exec(stmt, update.peerID, update.rowID); err != nil {
-				return err
-			}
-		}
-	}
-	for _, spec := range []struct {
-		table, memberColumn, peerColumn string
-	}{
-		{"esp_fleet_commands", "issuer_member_id", "issuer_peer_id"},
-		{"esp_fleet_command_results", "agent_member_id", "agent_peer_id"},
-		{"esp_agent_commands", "issuer_member_id", "issuer_peer_id"},
-		{"esp_agent_commands", "agent_member_id", "agent_peer_id"},
-	} {
-		cols, err := columnsTx(tx, spec.table)
-		if err != nil {
-			return err
-		}
-		if len(cols) == 0 || !cols[spec.memberColumn] {
-			continue
-		}
-		if !cols[spec.peerColumn] {
-			if _, err := tx.Exec(fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s TEXT NOT NULL DEFAULT ''`, quoteIdent(spec.table), quoteIdent(spec.peerColumn))); err != nil {
-				return err
-			}
-		}
-		query := fmt.Sprintf(`SELECT rowid,%s,%s FROM %s`, quoteIdent(spec.memberColumn), quoteIdent(spec.peerColumn), quoteIdent(spec.table))
-		rows, err := tx.Query(query)
-		if err != nil {
-			return err
-		}
-		type peerUpdate struct {
-			rowID  int64
-			peerID string
-		}
-		var updates []peerUpdate
-		for rows.Next() {
-			var rowID int64
-			var memberBytes []byte
-			var peerID string
-			if err := rows.Scan(&rowID, &memberBytes, &peerID); err != nil {
-				rows.Close()
-				return err
-			}
-			if len(memberBytes) == 0 {
-				continue
-			}
-			if len(memberBytes) != len(entmoot.MemberID{}) {
-				rows.Close()
-				return fmt.Errorf("%s.%s is not a full MemberID", spec.table, spec.memberColumn)
-			}
-			var memberID entmoot.MemberID
-			copy(memberID[:], memberBytes)
-			wantPeerID, err := mappings.peerID(memberID)
-			if err != nil {
-				rows.Close()
-				return fmt.Errorf("%s.%s: %w", spec.table, spec.memberColumn, err)
-			}
-			if peerID != "" && peerID != wantPeerID {
-				rows.Close()
-				return fmt.Errorf("%s.%s does not match the founder-mapped signing key", spec.table, spec.peerColumn)
-			}
-			if peerID == "" {
-				updates = append(updates, peerUpdate{rowID: rowID, peerID: wantPeerID})
-			}
-		}
-		if err := rows.Close(); err != nil {
-			return err
-		}
-		for _, update := range updates {
-			stmt := fmt.Sprintf(`UPDATE %s SET %s=? WHERE rowid=?`, quoteIdent(spec.table), quoteIdent(spec.peerColumn))
-			if _, err := tx.Exec(stmt, update.peerID, update.rowID); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
-func migrateESPCommandJSON(tx *sql.Tx, mappings *legacyIdentityResolver) error {
-	fleetCols, err := columnsTx(tx, "esp_fleets")
-	if err != nil {
-		return err
-	}
-	hasFleetLookup := fleetCols["fleet_id"] && fleetCols["control_group_id"]
-	for _, spec := range []struct {
-		table  string
-		column string
-	}{
-		{table: "esp_fleet_commands", column: "target"},
-		{table: "esp_fleet_commands", column: "command"},
-		{table: "esp_fleet_command_results", column: "result"},
-		{table: "esp_agent_commands", column: "payload"},
-		{table: "esp_agent_commands", column: "result"},
-		{table: "esp_agent_commands", column: "target"},
-		{table: "esp_agent_commands", column: "command"},
-	} {
-		cols, err := columnsTx(tx, spec.table)
-		if err != nil {
-			return err
-		}
-		if len(cols) == 0 || !cols[spec.column] {
-			continue
-		}
-		query := fmt.Sprintf(
-			`SELECT rowid,%s,%s,%s FROM %s`,
-			quoteIdent(spec.column),
-			espCommandJSONTimestampExpression(spec.table, cols),
-			espIdentityGroupExpression(spec.table, cols, hasFleetLookup),
-			quoteIdent(spec.table),
-		)
-		rows, err := tx.Query(query)
-		if err != nil {
-			return err
-		}
-		type jsonUpdate struct {
-			rowID int64
-			value []byte
-		}
-		var updates []jsonUpdate
-		for rows.Next() {
-			var rowID, timestampMS int64
-			var raw, groupID []byte
-			if err := rows.Scan(&rowID, &raw, &timestampMS, &groupID); err != nil {
-				rows.Close()
-				return err
-			}
-			if len(raw) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
-				continue
-			}
-			var object map[string]any
-			if err := json.Unmarshal(raw, &object); err != nil {
-				rows.Close()
-				return fmt.Errorf("%s.%s contains invalid JSON: %w", spec.table, spec.column, err)
-			}
-			changed, err := migrateESPJSONIdentities(object, groupID, timestampMS, mappings)
-			if err != nil {
-				rows.Close()
-				return fmt.Errorf("%s.%s: %w", spec.table, spec.column, err)
-			}
-			if !changed {
-				continue
-			}
-			encoded, err := json.Marshal(object)
-			if err != nil {
-				rows.Close()
-				return err
-			}
-			updates = append(updates, jsonUpdate{rowID: rowID, value: encoded})
-		}
-		if err := rows.Close(); err != nil {
-			return err
-		}
-		for _, update := range updates {
-			stmt := fmt.Sprintf(`UPDATE %s SET %s=? WHERE rowid=?`, quoteIdent(spec.table), quoteIdent(spec.column))
-			if _, err := tx.Exec(stmt, update.value, update.rowID); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
 func espCommandJSONTimestampExpression(table string, cols map[string]bool) string {
 	var preferred []string
 	switch table {

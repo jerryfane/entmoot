@@ -67,19 +67,11 @@ Non-interactive custom runner setup:
 
 Important defaults:
 
-- `--yes` never prompts and keeps instruction commands and live mode off.
+- `--yes` never prompts and keeps live mode off.
 - `--interactive` requires a TTY. If no TTY exists, ask the owner in chat and
   pass explicit flags instead.
 - `--default-moot skip` is the unattended default.
 - `bootstrap agent` does not install OpenClaw and does not supervise daemons.
-- Fleet/task coordination is disabled by default. Only use
-  `--agent-instructions`, Fleet operator actions, or `agent-commands` when the
-  owner explicitly enabled `ENTMOOT_ENABLE_FLEET=1` and
-  `ENTMOOT_ENABLE_TASKS=1`.
-- `--agent-instructions` means `serve` must run with
-  `ENTMOOT_AGENT_INSTRUCTIONS=1` in the same opt-in supervisor environment.
-- Normal agents cannot approve proposed Fleet tasks; that remains an opt-in
-  Fleet coordinator power.
 
 ## The Ent Moot
 

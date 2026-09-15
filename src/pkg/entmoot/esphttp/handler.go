@@ -18,7 +18,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,7 +29,6 @@ import (
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/canonical"
 	"entmoot/pkg/entmoot/espnotify"
-	entfeatures "entmoot/pkg/entmoot/features"
 	"entmoot/pkg/entmoot/mailbox"
 	"entmoot/pkg/entmoot/signing"
 	"entmoot/pkg/entmoot/store"
@@ -42,7 +40,6 @@ type GroupExistsFunc func(context.Context, entmoot.GroupID) (bool, error)
 // DiagnosticsProvider produces a group-scoped health report for ESP clients.
 type DiagnosticsProvider interface {
 	GroupDiagnostics(context.Context, entmoot.GroupID, bool, time.Duration) (any, error)
-	FleetDiagnostics(context.Context, FleetRecord, []FleetMemberRecord, bool, time.Duration) (any, error)
 }
 
 // Config wires the HTTP handler to an existing mailbox service.
@@ -53,11 +50,9 @@ type Config struct {
 	Clock       func() time.Time
 	Service     *mailbox.Service
 	Publisher   Publisher
-	TaskEvents  TaskEventPublisher
 	Operations  OperationExecutor
 	Notifier    espnotify.Notifier
 	State       StateStore
-	Features    entfeatures.Flags
 	Groups      GroupCatalog
 	Diagnostics DiagnosticsProvider
 	GroupExists GroupExistsFunc
@@ -211,7 +206,7 @@ func (r *DeviceRegistry) WithAdminGroupRevoked(deviceID string, gid entmoot.Grou
 }
 
 // WithDeviceIdentity returns a validated registry copy with deviceID bound to
-// the Entmoot member identity used by fleet-scoped member operations.
+// the Entmoot member identity used by member-scoped operations.
 func (r *DeviceRegistry) WithDeviceIdentity(deviceID string, memberID entmoot.MemberID, peerID string, entmootPubKey []byte) (*DeviceRegistry, bool, error) {
 	if r == nil {
 		return nil, false, errors.New("esphttp: device registry is not configured")
@@ -376,14 +371,6 @@ type Publisher interface {
 	PublishSigned(context.Context, entmoot.Message) (PublishResult, error)
 }
 
-type TaskEventPublisher interface {
-	PublishTaskEvent(context.Context, entmoot.GroupID, []string, []byte) (PublishResult, error)
-}
-
-type TaskEventPublisherInfo interface {
-	LocalNodeInfo(context.Context) (entmoot.NodeInfo, error)
-}
-
 // PublishResult is the HTTP response for an accepted phone-signed message.
 type PublishResult struct {
 	Status         string            `json:"status"`
@@ -417,11 +404,9 @@ type Handler struct {
 	clock                 func() time.Time
 	service               *mailbox.Service
 	publisher             Publisher
-	taskEvents            TaskEventPublisher
 	operations            OperationExecutor
 	notifier              espnotify.Notifier
 	state                 StateStore
-	features              entfeatures.Flags
 	groups                GroupCatalog
 	diagnostics           DiagnosticsProvider
 	groupExists           GroupExistsFunc
@@ -474,11 +459,9 @@ func NewHandler(cfg Config) (*Handler, error) {
 		clock:                 clock,
 		service:               cfg.Service,
 		publisher:             cfg.Publisher,
-		taskEvents:            cfg.TaskEvents,
 		operations:            cfg.Operations,
 		notifier:              cfg.Notifier,
 		state:                 state,
-		features:              cfg.Features.Normalize(),
 		groups:                cfg.Groups,
 		diagnostics:           cfg.Diagnostics,
 		groupExists:           groupExists,
@@ -509,9 +492,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if h.handleCapabilities(w, r) {
 		return
 	}
-	if h.handleDisabledCoordinationRoute(w, r) {
-		return
-	}
 	auth, ok := h.authorize(w, r)
 	if !ok {
 		return
@@ -532,8 +512,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleStatus(w, r)
 	case "/v1/groups":
 		h.handleGroups(w, r)
-	case "/v1/fleets":
-		h.handleFleets(w, r)
 	case "/v1/invites/accept":
 		h.handleInviteAccept(w, r)
 	case "/v1/open-invites/accept":
@@ -552,9 +530,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if h.handleGroupSubroute(w, r) {
 			return
 		}
-		if h.handleFleetSubroute(w, r) {
-			return
-		}
 		if h.handleSignRequestSubroute(w, r) {
 			return
 		}
@@ -570,1394 +545,8 @@ func (h *Handler) handleCapabilities(w http.ResponseWriter, r *http.Request) boo
 		methodNotAllowed(w, http.MethodGet)
 		return true
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"features": h.features.Capabilities()})
+	writeJSON(w, http.StatusOK, map[string]any{})
 	return true
-}
-
-func (h *Handler) handleDisabledCoordinationRoute(w http.ResponseWriter, r *http.Request) bool {
-	feature, disabled := h.disabledCoordinationFeature(r.URL.Path)
-	if !disabled {
-		return false
-	}
-	h.writeFeatureDisabled(w, feature)
-	return true
-}
-
-func (h *Handler) disabledCoordinationFeature(path string) (string, bool) {
-	if path == "/v1/fleets" || strings.HasPrefix(path, "/v1/fleets/") {
-		if err := h.features.RequireFleet(); err != nil {
-			return entfeatures.FeatureFleet, true
-		}
-		if fleetPathRequiresTasks(path) {
-			if err := h.features.RequireTasks(); err != nil {
-				return entfeatures.FeatureTasks, true
-			}
-		}
-	}
-	return "", false
-}
-
-func fleetPathRequiresTasks(path string) bool {
-	const prefix = "/v1/fleets/"
-	if !strings.HasPrefix(path, prefix) {
-		return false
-	}
-	rest := strings.TrimPrefix(path, prefix)
-	_, suffix, ok := strings.Cut(rest, "/")
-	if !ok {
-		return false
-	}
-	return suffix == "tasks" ||
-		strings.HasPrefix(suffix, "tasks/") ||
-		suffix == "commands" ||
-		strings.HasPrefix(suffix, "commands/")
-}
-
-func (h *Handler) writeFeatureDisabled(w http.ResponseWriter, feature string) {
-	writeJSON(w, http.StatusNotFound, errorEnvelope{Error: errorBody{
-		Code:    "feature_disabled",
-		Message: feature + " feature is disabled",
-		Feature: feature,
-	}})
-}
-
-func (h *Handler) handleFleets(w http.ResponseWriter, r *http.Request) {
-	switch r.Method {
-	case http.MethodGet:
-		auth := authFromContext(r)
-		if auth.device == nil && auth.member == nil {
-			writeError(w, http.StatusForbidden, "device_signature_required", "fleet access requires a registered device or active fleet member signature")
-			return
-		}
-		if h.state == nil {
-			writeJSON(w, http.StatusOK, map[string]any{"fleets": []FleetRecord{}})
-			return
-		}
-		includeArchived := parseBoolQuery(r.URL.Query().Get("include_archived"))
-		var controlGroupID entmoot.GroupID
-		if rawControl := strings.TrimSpace(r.URL.Query().Get("control_group_id")); rawControl != "" {
-			gid, err := decodeGroupID(rawControl)
-			if err != nil {
-				writeError(w, http.StatusBadRequest, "bad_request", err.Error())
-				return
-			}
-			controlGroupID = gid
-		}
-		fleets, err := h.state.ListFleets(r.Context())
-		if err != nil {
-			h.logger.Error("esphttp: list fleets", slog.String("err", err.Error()))
-			writeError(w, http.StatusInternalServerError, "internal_error", "fleet listing failed")
-			return
-		}
-		visible := make([]FleetRecord, 0, len(fleets))
-		for _, fleet := range VisibleFleetRecords(fleets, includeArchived) {
-			if controlGroupID != (entmoot.GroupID{}) && fleet.ControlGroupID != controlGroupID {
-				continue
-			}
-			if auth.member != nil {
-				h.reconcileFleetAcceptance(r.Context(), fleet)
-			}
-			switch {
-			case auth.device != nil && fleet.CoordinatorDeviceID == auth.device.ID:
-				visible = append(visible, fleet)
-			case auth.member != nil && h.memberCanAccessFleet(r.Context(), fleet, *auth.member):
-				visible = append(visible, fleet)
-			}
-		}
-		writeJSON(w, http.StatusOK, map[string]any{"fleets": visible})
-	case http.MethodPost:
-		h.withIdempotency(w, r, "fleet_create", func(w http.ResponseWriter, r *http.Request) bool {
-			return h.authorizeSignRequestCreation(w, r, signRequestKindFleetCreate, entmoot.GroupID{})
-		}, func(w http.ResponseWriter, r *http.Request) {
-			h.createSignRequestFromHTTP(w, r, signRequestKindFleetCreate, entmoot.GroupID{})
-		})
-	default:
-		methodNotAllowed(w, http.MethodGet+", "+http.MethodPost)
-	}
-}
-
-func (h *Handler) handleFleetSubroute(w http.ResponseWriter, r *http.Request) bool {
-	const prefix = "/v1/fleets/"
-	escapedPath := r.URL.EscapedPath()
-	if !strings.HasPrefix(escapedPath, prefix) {
-		return false
-	}
-	rest := strings.TrimPrefix(escapedPath, prefix)
-	escapedFleet, suffix, _ := strings.Cut(rest, "/")
-	fleetID, err := url.PathUnescape(escapedFleet)
-	if err != nil || strings.TrimSpace(fleetID) == "" {
-		writeError(w, http.StatusBadRequest, "bad_request", "fleet id is required")
-		return true
-	}
-	switch suffix {
-	case "":
-		switch r.Method {
-		case http.MethodGet:
-			h.handleGetFleet(w, r, fleetID)
-		case http.MethodDelete:
-			h.withIdempotency(w, r, "fleet_archive:"+fleetID, func(w http.ResponseWriter, r *http.Request) bool {
-				return h.checkDeviceActiveFleetAdmin(w, r, fleetID, true)
-			}, func(w http.ResponseWriter, r *http.Request) {
-				h.createFleetSignRequestFromHTTP(w, r, signRequestKindFleetArchive, fleetID)
-			})
-		default:
-			methodNotAllowed(w, http.MethodGet+", "+http.MethodDelete)
-			return true
-		}
-	case "restore":
-		if r.Method != http.MethodPost {
-			methodNotAllowed(w, http.MethodPost)
-			return true
-		}
-		h.withIdempotency(w, r, "fleet_restore:"+fleetID, func(w http.ResponseWriter, r *http.Request) bool {
-			return h.checkDeviceActiveFleetAdmin(w, r, fleetID, true)
-		}, func(w http.ResponseWriter, r *http.Request) {
-			h.createFleetSignRequestFromHTTP(w, r, signRequestKindFleetRestore, fleetID)
-		})
-	case "members":
-		if r.Method != http.MethodGet {
-			methodNotAllowed(w, http.MethodGet)
-			return true
-		}
-		h.handleListFleetMembers(w, r, fleetID)
-	case "invites":
-		switch r.Method {
-		case http.MethodGet:
-			h.handleListFleetInvites(w, r, fleetID)
-		case http.MethodPost:
-			h.withIdempotency(w, r, "fleet_invite_create:"+fleetID, func(w http.ResponseWriter, r *http.Request) bool {
-				return h.checkDeviceActiveFleetAdmin(w, r, fleetID, false)
-			}, func(w http.ResponseWriter, r *http.Request) {
-				h.createFleetSignRequestFromHTTP(w, r, signRequestKindFleetInviteCreate, fleetID)
-			})
-		default:
-			methodNotAllowed(w, http.MethodGet+", "+http.MethodPost)
-		}
-	case "activity":
-		if r.Method != http.MethodGet {
-			methodNotAllowed(w, http.MethodGet)
-			return true
-		}
-		h.handleFleetActivity(w, r, fleetID)
-	case "tasks":
-		switch r.Method {
-		case http.MethodGet:
-			h.handleListFleetTasks(w, r, fleetID)
-		case http.MethodPost:
-			h.withIdempotency(w, r, "fleet_task_create:"+fleetID, func(w http.ResponseWriter, r *http.Request) bool {
-				return h.authorizeFleetTaskActor(w, r, fleetID)
-			}, func(w http.ResponseWriter, r *http.Request) {
-				h.handleCreateFleetTask(w, r, fleetID)
-			})
-		default:
-			methodNotAllowed(w, http.MethodGet+", "+http.MethodPost)
-		}
-	case "commands":
-		switch r.Method {
-		case http.MethodGet:
-			h.handleListFleetCommands(w, r, fleetID)
-		case http.MethodPost:
-			h.withIdempotency(w, r, "fleet_command_create:"+fleetID, func(w http.ResponseWriter, r *http.Request) bool {
-				return h.authorizeFleetTaskCoordinator(w, r, fleetID)
-			}, func(w http.ResponseWriter, r *http.Request) {
-				h.handleCreateFleetCommand(w, r, fleetID)
-			})
-		default:
-			methodNotAllowed(w, http.MethodGet+", "+http.MethodPost)
-		}
-	case "diagnostics":
-		if r.Method != http.MethodGet {
-			methodNotAllowed(w, http.MethodGet)
-			return true
-		}
-		h.handleFleetDiagnostics(w, r, fleetID)
-	default:
-		if strings.HasPrefix(suffix, "members/") && strings.HasSuffix(suffix, "/remove") {
-			if r.Method != http.MethodPost {
-				methodNotAllowed(w, http.MethodPost)
-				return true
-			}
-			trimmed := strings.TrimSuffix(strings.TrimPrefix(suffix, "members/"), "/remove")
-			h.withIdempotency(w, r, "fleet_member_remove:"+fleetID+":"+trimmed, func(w http.ResponseWriter, r *http.Request) bool {
-				return h.checkDeviceActiveFleetAdmin(w, r, fleetID, false)
-			}, func(w http.ResponseWriter, r *http.Request) {
-				h.createFleetMemberRemoveSignRequest(w, r, fleetID, trimmed)
-			})
-			return true
-		}
-		if strings.HasPrefix(suffix, "tasks/") {
-			h.handleFleetTaskSubroute(w, r, fleetID, strings.TrimPrefix(suffix, "tasks/"))
-			return true
-		}
-		if strings.HasPrefix(suffix, "commands/") {
-			h.handleFleetCommandSubroute(w, r, fleetID, strings.TrimPrefix(suffix, "commands/"))
-			return true
-		}
-		writeError(w, http.StatusNotFound, "not_found", "not found")
-	}
-	return true
-}
-
-func (h *Handler) handleGetFleet(w http.ResponseWriter, r *http.Request, fleetID string) {
-	fleet, ok := h.authorizedFleet(w, r, fleetID)
-	if !ok {
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"fleet": fleet})
-}
-
-func (h *Handler) handleListFleetMembers(w http.ResponseWriter, r *http.Request, fleetID string) {
-	fleet, ok := h.authorizedFleet(w, r, fleetID)
-	if !ok {
-		return
-	}
-	if h.state == nil {
-		writeJSON(w, http.StatusOK, map[string]any{"members": []FleetMemberRecord{}})
-		return
-	}
-	h.reconcileFleetAcceptance(r.Context(), fleet)
-	members, err := h.state.ListFleetMembers(r.Context(), fleetID)
-	if err != nil {
-		h.logger.Error("esphttp: list fleet members", slog.String("err", err.Error()))
-		writeError(w, http.StatusInternalServerError, "internal_error", "fleet member listing failed")
-		return
-	}
-	if members == nil {
-		members = []FleetMemberRecord{}
-	}
-	if NormalizeFleetStatus(fleet.Status) == FleetStatusActive {
-		h.observeFleetMemberProfiles(r.Context(), members)
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"members": members})
-}
-
-func (h *Handler) handleListFleetInvites(w http.ResponseWriter, r *http.Request, fleetID string) {
-	fleet, ok := h.authorizedFleet(w, r, fleetID)
-	if !ok {
-		return
-	}
-	if h.state == nil {
-		writeJSON(w, http.StatusOK, map[string]any{"invites": []FleetInviteRecord{}})
-		return
-	}
-	h.reconcileFleetAcceptance(r.Context(), fleet)
-	invites, err := h.state.ListFleetInvites(r.Context(), fleetID)
-	if err != nil {
-		h.logger.Error("esphttp: list fleet invites", slog.String("err", err.Error()))
-		writeError(w, http.StatusInternalServerError, "internal_error", "fleet invite listing failed")
-		return
-	}
-	if invites == nil {
-		invites = []FleetInviteRecord{}
-	}
-	if NormalizeFleetStatus(fleet.Status) == FleetStatusActive {
-		h.observeFleetInviteProfiles(r.Context(), invites)
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"invites": invites})
-}
-
-func (h *Handler) handleFleetActivity(w http.ResponseWriter, r *http.Request, fleetID string) {
-	fleet, ok := h.authorizedFleet(w, r, fleetID)
-	if !ok {
-		return
-	}
-	if h.state == nil {
-		writeJSON(w, http.StatusOK, map[string]any{"activity": []FleetActivityRecord{}})
-		return
-	}
-	h.reconcileFleetAcceptance(r.Context(), fleet)
-	limit := 50
-	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
-		if parsed, err := strconv.Atoi(raw); err == nil {
-			limit = parsed
-		}
-	}
-	var before int64
-	if raw := strings.TrimSpace(r.URL.Query().Get("before_ms")); raw != "" {
-		before, _ = strconv.ParseInt(raw, 10, 64)
-	}
-	activity, err := h.state.ListFleetActivity(r.Context(), fleetID, limit, before)
-	if err != nil {
-		h.logger.Error("esphttp: list fleet activity", slog.String("err", err.Error()))
-		writeError(w, http.StatusInternalServerError, "internal_error", "fleet activity listing failed")
-		return
-	}
-	if activity == nil {
-		activity = []FleetActivityRecord{}
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"activity": activity})
-}
-
-type fleetTaskCreateRequest struct {
-	Title            string           `json:"title"`
-	Description      string           `json:"description,omitempty"`
-	Mode             string           `json:"mode,omitempty"`
-	AssigneeMemberID entmoot.MemberID `json:"assignee_member_id,omitempty"`
-}
-
-type fleetTaskAssignRequest struct {
-	AssigneeMemberID entmoot.MemberID `json:"assignee_member_id"`
-}
-
-type fleetTaskSubmitRequest struct {
-	Content string `json:"content"`
-}
-
-func (h *Handler) handleListFleetTasks(w http.ResponseWriter, r *http.Request, fleetID string) {
-	_, _, ok := h.fleetTaskActor(w, r, fleetID)
-	if !ok {
-		return
-	}
-	if h.state == nil {
-		writeJSON(w, http.StatusOK, map[string]any{"tasks": []FleetTaskRecord{}})
-		return
-	}
-	status := strings.TrimSpace(r.URL.Query().Get("status"))
-	if status != "" && NormalizeFleetTaskStatus(status) != status {
-		writeError(w, http.StatusBadRequest, "bad_request", "invalid task status")
-		return
-	}
-	tasks, err := h.state.ListFleetTasks(r.Context(), fleetID, status)
-	if err != nil {
-		h.logger.Error("esphttp: list fleet tasks", slog.String("err", err.Error()))
-		writeError(w, http.StatusInternalServerError, "internal_error", "fleet task listing failed")
-		return
-	}
-	if tasks == nil {
-		tasks = []FleetTaskRecord{}
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"tasks": tasks})
-}
-
-func (h *Handler) handleCreateFleetTask(w http.ResponseWriter, r *http.Request, fleetID string) {
-	fleet, actor, ok := h.fleetTaskActor(w, r, fleetID)
-	if !ok {
-		return
-	}
-	var req fleetTaskCreateRequest
-	if _, ok := decodeRawBody(w, r, 1<<20, &req); !ok {
-		return
-	}
-	title, err := NormalizeFleetTaskTitle(req.Title)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
-		return
-	}
-	description, err := NormalizeFleetTaskDescription(req.Description)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
-		return
-	}
-	if strings.TrimSpace(req.Mode) != "" && !IsValidFleetTaskMode(req.Mode) {
-		writeError(w, http.StatusBadRequest, "bad_request", "invalid task mode")
-		return
-	}
-	mode := NormalizeFleetTaskMode(req.Mode)
-	now := h.clock().UnixMilli()
-	var requestedAssignee *FleetMemberRecord
-	if req.AssigneeMemberID != (entmoot.MemberID{}) {
-		if !FleetTaskIsCoordinator(actor) {
-			writeError(w, http.StatusForbidden, "forbidden", "only the fleet coordinator can assign tasks")
-			return
-		}
-		assignee, found, err := h.fleetMemberByID(r.Context(), fleet.FleetID, req.AssigneeMemberID)
-		if err != nil {
-			h.logger.Error("esphttp: fleet task assignee lookup", slog.String("err", err.Error()))
-			writeError(w, http.StatusInternalServerError, "internal_error", "fleet member lookup failed")
-			return
-		}
-		if !found || !FleetTaskCanMutate(assignee) {
-			writeError(w, http.StatusBadRequest, "bad_request", "assignee must be an active fleet member")
-			return
-		}
-		requestedAssignee = &assignee
-	}
-	if mode == FleetTaskModeDirectAssignment && requestedAssignee == nil {
-		writeError(w, http.StatusBadRequest, "bad_request", "direct tasks require an active assignee")
-		return
-	}
-	if mode != FleetTaskModeDirectAssignment && requestedAssignee != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", "assignee is only valid for direct tasks")
-		return
-	}
-	task := FleetTaskRecord{
-		FleetID:     fleet.FleetID,
-		Title:       title,
-		Description: description,
-		Mode:        mode,
-		Status:      FleetTaskStatusOpen,
-		Creator:     FleetTaskActorFromMember(actor),
-		CreatedAtMS: now,
-		UpdatedAtMS: now,
-	}
-	mutation, err := ApplyFleetTaskMutation(task, FleetTaskActionCreate, actor, now, nil, nil)
-	if err != nil {
-		h.writeFleetTaskError(w, err)
-		return
-	}
-	task, activity, _, err := h.persistFleetTaskMutation(r.Context(), mutation, actor)
-	if err != nil {
-		h.writeFleetTaskError(w, err)
-		return
-	}
-	var activities []FleetActivityRecord
-	if activity.EventID != "" {
-		activities = append(activities, activity)
-	}
-	if requestedAssignee != nil {
-		mutation, err = ApplyFleetTaskMutation(task, FleetTaskActionAssign, actor, now, requestedAssignee, nil)
-		if err != nil {
-			h.writeFleetTaskError(w, err)
-			return
-		}
-		task, activity, _, err = h.persistFleetTaskMutation(r.Context(), mutation, actor)
-		if err != nil {
-			h.writeFleetTaskError(w, err)
-			return
-		}
-		if activity.EventID != "" {
-			activities = append(activities, activity)
-		}
-	}
-	writeJSON(w, http.StatusCreated, map[string]any{"task": task, "activity": activities})
-}
-
-func (h *Handler) handleFleetTaskSubroute(w http.ResponseWriter, r *http.Request, fleetID, rest string) {
-	escapedTask, action, _ := strings.Cut(rest, "/")
-	taskID, err := url.PathUnescape(escapedTask)
-	if err != nil || strings.TrimSpace(taskID) == "" {
-		writeError(w, http.StatusBadRequest, "bad_request", "task id is required")
-		return
-	}
-	if action == "" {
-		if r.Method != http.MethodGet {
-			methodNotAllowed(w, http.MethodGet)
-			return
-		}
-		h.handleGetFleetTask(w, r, fleetID, taskID)
-		return
-	}
-	if r.Method != http.MethodPost {
-		methodNotAllowed(w, http.MethodPost)
-		return
-	}
-	h.withIdempotency(w, r, "fleet_task_"+action+":"+fleetID+":"+taskID, func(w http.ResponseWriter, r *http.Request) bool {
-		return h.authorizeFleetTaskActor(w, r, fleetID)
-	}, func(w http.ResponseWriter, r *http.Request) {
-		h.handleMutateFleetTask(w, r, fleetID, taskID, action)
-	})
-}
-
-func (h *Handler) handleGetFleetTask(w http.ResponseWriter, r *http.Request, fleetID, taskID string) {
-	_, _, ok := h.fleetTaskActor(w, r, fleetID)
-	if !ok {
-		return
-	}
-	task, found, err := h.state.GetFleetTask(r.Context(), fleetID, taskID)
-	if err != nil {
-		h.logger.Error("esphttp: get fleet task", slog.String("err", err.Error()))
-		writeError(w, http.StatusInternalServerError, "internal_error", "fleet task lookup failed")
-		return
-	}
-	if !found {
-		writeError(w, http.StatusNotFound, "task_not_found", "task not found")
-		return
-	}
-	submissions, err := h.state.ListFleetTaskSubmissions(r.Context(), fleetID, taskID)
-	if err != nil {
-		h.logger.Error("esphttp: list fleet task submissions", slog.String("err", err.Error()))
-		writeError(w, http.StatusInternalServerError, "internal_error", "fleet task submission listing failed")
-		return
-	}
-	if submissions == nil {
-		submissions = []FleetTaskSubmissionRecord{}
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"task": task, "submissions": submissions})
-}
-
-func (h *Handler) handleMutateFleetTask(w http.ResponseWriter, r *http.Request, fleetID, taskID, action string) {
-	_, actor, ok := h.fleetTaskActor(w, r, fleetID)
-	if !ok {
-		return
-	}
-	task, found, err := h.state.GetFleetTask(r.Context(), fleetID, taskID)
-	if err != nil {
-		h.logger.Error("esphttp: get fleet task", slog.String("err", err.Error()))
-		writeError(w, http.StatusInternalServerError, "internal_error", "fleet task lookup failed")
-		return
-	}
-	if !found {
-		writeError(w, http.StatusNotFound, "task_not_found", "task not found")
-		return
-	}
-	now := h.clock().UnixMilli()
-	var assignee *FleetMemberRecord
-	var submission *FleetTaskSubmissionRecord
-	mutationAction := strings.TrimSpace(action)
-	switch mutationAction {
-	case FleetTaskActionAssign:
-		var req fleetTaskAssignRequest
-		if _, ok := decodeRawBody(w, r, 1<<20, &req); !ok {
-			return
-		}
-		if req.AssigneeMemberID == (entmoot.MemberID{}) {
-			writeError(w, http.StatusBadRequest, "bad_request", "assignee_member_id is required")
-			return
-		}
-		member, found, err := h.fleetMemberByID(r.Context(), fleetID, req.AssigneeMemberID)
-		if err != nil {
-			h.logger.Error("esphttp: fleet task assignee lookup", slog.String("err", err.Error()))
-			writeError(w, http.StatusInternalServerError, "internal_error", "fleet member lookup failed")
-			return
-		}
-		if !found {
-			writeError(w, http.StatusBadRequest, "bad_request", "assignee must be an active fleet member")
-			return
-		}
-		assignee = &member
-	case FleetTaskActionSubmit:
-		var req fleetTaskSubmitRequest
-		if _, ok := decodeRawBody(w, r, 1<<20, &req); !ok {
-			return
-		}
-		content, err := NormalizeFleetTaskSubmissionContent(req.Content)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, "bad_request", err.Error())
-			return
-		}
-		submission = &FleetTaskSubmissionRecord{FleetID: fleetID, TaskID: taskID, Content: content, CreatedAtMS: now, UpdatedAtMS: now}
-	}
-	mutation, err := ApplyFleetTaskMutation(task, mutationAction, actor, now, assignee, submission)
-	if err != nil {
-		h.writeFleetTaskError(w, err)
-		return
-	}
-	task, activity, persistedSubmission, err := h.persistFleetTaskMutation(r.Context(), mutation, actor)
-	if err != nil {
-		h.writeFleetTaskError(w, err)
-		return
-	}
-	response := map[string]any{"task": task}
-	if persistedSubmission.SubmissionID != "" {
-		response["submission"] = persistedSubmission
-	}
-	if activity.EventID != "" {
-		response["activity"] = activity
-	}
-	writeJSON(w, http.StatusOK, response)
-}
-
-func (h *Handler) fleetTaskCoordinator(w http.ResponseWriter, r *http.Request, fleetID string) (FleetRecord, FleetMemberRecord, bool) {
-	fleet, member, ok := h.fleetTaskActor(w, r, fleetID)
-	if !ok {
-		return FleetRecord{}, FleetMemberRecord{}, false
-	}
-	if !FleetTaskIsCoordinator(member) {
-		writeError(w, http.StatusForbidden, "forbidden", "fleet task requires coordinator access")
-		return FleetRecord{}, FleetMemberRecord{}, false
-	}
-	return fleet, member, true
-}
-
-func (h *Handler) fleetTaskActor(w http.ResponseWriter, r *http.Request, fleetID string) (FleetRecord, FleetMemberRecord, bool) {
-	fleet, ok := h.activeFleetForTask(w, r, fleetID)
-	if !ok {
-		return FleetRecord{}, FleetMemberRecord{}, false
-	}
-	h.reconcileFleetAcceptance(r.Context(), fleet)
-	return h.fleetTaskActorForFleet(w, r, fleet)
-}
-
-func (h *Handler) authorizeFleetTaskActor(w http.ResponseWriter, r *http.Request, fleetID string) bool {
-	fleet, ok := h.activeFleetForTask(w, r, fleetID)
-	if !ok {
-		return false
-	}
-	_, _, ok = h.fleetTaskActorForFleet(w, r, fleet)
-	return ok
-}
-
-func (h *Handler) authorizeFleetTaskCoordinator(w http.ResponseWriter, r *http.Request, fleetID string) bool {
-	fleet, ok := h.activeFleetForTask(w, r, fleetID)
-	if !ok {
-		return false
-	}
-	_, member, ok := h.fleetTaskActorForFleet(w, r, fleet)
-	if !ok {
-		return false
-	}
-	if !FleetTaskIsCoordinator(member) {
-		writeError(w, http.StatusForbidden, "forbidden", "fleet task requires coordinator access")
-		return false
-	}
-	return true
-}
-
-func (h *Handler) activeFleetForTask(w http.ResponseWriter, r *http.Request, fleetID string) (FleetRecord, bool) {
-	if h.state == nil {
-		writeError(w, http.StatusServiceUnavailable, "fleet_unavailable", "fleet store is not configured")
-		return FleetRecord{}, false
-	}
-	fleet, found, err := h.state.GetFleet(r.Context(), fleetID)
-	if err != nil {
-		h.logger.Error("esphttp: check fleet task access", slog.String("err", err.Error()))
-		writeError(w, http.StatusInternalServerError, "internal_error", "fleet lookup failed")
-		return FleetRecord{}, false
-	}
-	if !found {
-		writeError(w, http.StatusNotFound, "fleet_not_found", "fleet not found")
-		return FleetRecord{}, false
-	}
-	if fleet.Status != FleetStatusActive {
-		writeError(w, http.StatusConflict, "fleet_archived", "fleet is archived")
-		return FleetRecord{}, false
-	}
-	return fleet, true
-}
-
-func (h *Handler) fleetTaskActorForFleet(w http.ResponseWriter, r *http.Request, fleet FleetRecord) (FleetRecord, FleetMemberRecord, bool) {
-	auth := authFromContext(r)
-	if auth.member != nil {
-		member, found, err := h.fleetMemberByID(r.Context(), fleet.FleetID, auth.member.MemberID)
-		if err != nil {
-			h.logger.Error("esphttp: fleet task member lookup", slog.String("err", err.Error()))
-			writeError(w, http.StatusInternalServerError, "internal_error", "fleet member lookup failed")
-			return FleetRecord{}, FleetMemberRecord{}, false
-		}
-		if !found || member.EntmootPubKey != base64.StdEncoding.EncodeToString(auth.member.EntmootPubKey) || !FleetTaskCanMutate(member) {
-			writeError(w, http.StatusForbidden, "forbidden", "signature is not from an active fleet member")
-			return FleetRecord{}, FleetMemberRecord{}, false
-		}
-		return fleet, member, true
-	}
-	if auth.device == nil {
-		writeError(w, http.StatusForbidden, "fleet_signature_required", "fleet task access requires a registered device or active fleet member signature")
-		return FleetRecord{}, FleetMemberRecord{}, false
-	}
-	if auth.device.ID != fleet.CoordinatorDeviceID {
-		if fleet.ControlGroupID == (entmoot.GroupID{}) || (!deviceAllowsGroup(*auth.device, fleet.ControlGroupID) && !deviceCanAdminGroup(*auth.device, fleet.ControlGroupID)) {
-			writeError(w, http.StatusForbidden, "forbidden", "device is not authorized to access fleet")
-			return FleetRecord{}, FleetMemberRecord{}, false
-		}
-		if auth.device.MemberID == (entmoot.MemberID{}) || auth.device.PeerID == "" || len(auth.device.EntmootPubKey) != ed25519.PublicKeySize {
-			writeError(w, http.StatusForbidden, "forbidden", "device is not bound to a fleet member")
-			return FleetRecord{}, FleetMemberRecord{}, false
-		}
-		member, found, err := h.fleetMemberByID(r.Context(), fleet.FleetID, auth.device.MemberID)
-		if err != nil {
-			h.logger.Error("esphttp: fleet task member lookup", slog.String("err", err.Error()))
-			writeError(w, http.StatusInternalServerError, "internal_error", "fleet member lookup failed")
-			return FleetRecord{}, FleetMemberRecord{}, false
-		}
-		if !found || member.EntmootPubKey != base64.StdEncoding.EncodeToString(auth.device.EntmootPubKey) || !FleetTaskCanMutate(member) {
-			writeError(w, http.StatusForbidden, "forbidden", "device is not an active fleet member")
-			return FleetRecord{}, FleetMemberRecord{}, false
-		}
-		return fleet, member, true
-	}
-	member, found, err := h.fleetMemberByID(r.Context(), fleet.FleetID, nodeInfoMemberID(fleet.Coordinator))
-	if err != nil {
-		h.logger.Error("esphttp: fleet task coordinator lookup", slog.String("err", err.Error()))
-		writeError(w, http.StatusInternalServerError, "internal_error", "fleet coordinator lookup failed")
-		return FleetRecord{}, FleetMemberRecord{}, false
-	}
-	coordinatorPub := base64.StdEncoding.EncodeToString(fleet.Coordinator.EntmootPubKey)
-	if !found || member.Role != FleetRoleCoordinator || member.EntmootPubKey != coordinatorPub {
-		member = fleetCoordinatorMember(fleet, h.clock().UnixMilli())
-	}
-	member.Role = FleetRoleCoordinator
-	member.Status = FleetMemberActive
-	return fleet, member, true
-}
-
-func (h *Handler) fleetMemberByID(ctx context.Context, fleetID string, memberID entmoot.MemberID) (FleetMemberRecord, bool, error) {
-	members, err := h.state.ListFleetMembers(ctx, fleetID)
-	if err != nil {
-		return FleetMemberRecord{}, false, err
-	}
-	for _, member := range members {
-		if member.MemberID == memberID {
-			return member, true, nil
-		}
-	}
-	return FleetMemberRecord{}, false, nil
-}
-
-func (h *Handler) memberCanAccessFleet(ctx context.Context, fleet FleetRecord, member MemberAuth) bool {
-	rec, found, err := h.fleetMemberByID(ctx, fleet.FleetID, member.MemberID)
-	if err != nil {
-		h.logger.Error("esphttp: fleet member access lookup", slog.String("err", err.Error()))
-		return false
-	}
-	return found && rec.Status == FleetMemberActive && rec.PeerID == member.PeerID &&
-		rec.EntmootPubKey == base64.StdEncoding.EncodeToString(member.EntmootPubKey)
-}
-
-func fleetCoordinatorMember(fleet FleetRecord, nowMS int64) FleetMemberRecord {
-	return FleetMemberRecord{
-		FleetID:       fleet.FleetID,
-		MemberID:      nodeInfoMemberID(fleet.Coordinator),
-		PeerID:        peerIDForPublicKey(fleet.Coordinator.EntmootPubKey),
-		EntmootPubKey: base64.StdEncoding.EncodeToString(fleet.Coordinator.EntmootPubKey),
-		Role:          FleetRoleCoordinator,
-		Status:        FleetMemberActive,
-		AcceptedAtMS:  fleet.CreatedAtMS,
-		UpdatedAtMS:   nowMS,
-	}
-}
-
-type fleetTaskEventEnvelope struct {
-	Type           string           `json:"type"`
-	FleetID        string           `json:"fleet_id"`
-	ControlGroupID entmoot.GroupID  `json:"control_group_id"`
-	TaskID         string           `json:"task_id"`
-	Action         string           `json:"action"`
-	Status         string           `json:"status"`
-	Title          string           `json:"title"`
-	ActorMemberID  entmoot.MemberID `json:"actor_member_id"`
-	Summary        string           `json:"summary"`
-	CreatedAtMS    int64            `json:"created_at_ms"`
-}
-
-type fleetCommandCreateRequest struct {
-	Target         string           `json:"target"`
-	TargetMemberID entmoot.MemberID `json:"target_member_id"`
-	Action         string           `json:"action"`
-	Args           json.RawMessage  `json:"args"`
-	AutoAccept     *bool            `json:"auto_accept"`
-	ExpiresAtMS    int64            `json:"expires_at_ms"`
-}
-
-func (h *Handler) handleListFleetCommands(w http.ResponseWriter, r *http.Request, fleetID string) {
-	fleet, _, ok := h.fleetTaskActor(w, r, fleetID)
-	if !ok {
-		return
-	}
-	h.reconcileFleetCommandHistory(r.Context(), fleet)
-	filter, ok := fleetCommandListFilterFromRequest(w, r)
-	if !ok {
-		return
-	}
-	commands, err := h.state.ListFleetCommands(r.Context(), fleetID, filter)
-	if err != nil {
-		h.logger.Error("esphttp: list fleet commands", slog.String("err", err.Error()))
-		writeError(w, http.StatusInternalServerError, "internal_error", "fleet command listing failed")
-		return
-	}
-	if commands == nil {
-		commands = []FleetCommandSummaryRecord{}
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"commands": commands})
-}
-
-func (h *Handler) handleFleetCommandSubroute(w http.ResponseWriter, r *http.Request, fleetID, rest string) {
-	escapedCommandID, action, _ := strings.Cut(rest, "/")
-	commandID, err := url.PathUnescape(escapedCommandID)
-	if err != nil || strings.TrimSpace(commandID) == "" {
-		writeError(w, http.StatusBadRequest, "bad_request", "command id is required")
-		return
-	}
-	if action != "" {
-		writeError(w, http.StatusNotFound, "not_found", "not found")
-		return
-	}
-	if r.Method != http.MethodGet {
-		methodNotAllowed(w, http.MethodGet)
-		return
-	}
-	h.handleGetFleetCommand(w, r, fleetID, commandID)
-}
-
-func (h *Handler) handleGetFleetCommand(w http.ResponseWriter, r *http.Request, fleetID, commandID string) {
-	fleet, _, ok := h.fleetTaskActor(w, r, fleetID)
-	if !ok {
-		return
-	}
-	h.reconcileFleetCommandHistory(r.Context(), fleet)
-	detail, found, err := h.state.GetFleetCommandDetail(r.Context(), fleetID, commandID)
-	if err != nil {
-		h.logger.Error("esphttp: get fleet command", slog.String("err", err.Error()))
-		writeError(w, http.StatusInternalServerError, "internal_error", "fleet command lookup failed")
-		return
-	}
-	if !found {
-		writeError(w, http.StatusNotFound, "command_not_found", "command not found")
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"command":       detail.Command,
-		"status":        detail.Status,
-		"results":       detail.Results,
-		"updated_at_ms": detail.UpdatedAtMS,
-	})
-}
-
-func fleetCommandListFilterFromRequest(w http.ResponseWriter, r *http.Request) (FleetCommandListFilter, bool) {
-	q := r.URL.Query()
-	filter := FleetCommandListFilter{
-		Status: strings.TrimSpace(strings.ToLower(q.Get("status"))),
-		Action: NormalizeFleetCommandAction(q.Get("action")),
-		Limit:  50,
-	}
-	if raw := strings.TrimSpace(q.Get("limit")); raw != "" {
-		n, err := strconv.Atoi(raw)
-		if err != nil || n < 1 || n > 200 {
-			writeError(w, http.StatusBadRequest, "bad_request", "limit must be between 1 and 200")
-			return FleetCommandListFilter{}, false
-		}
-		filter.Limit = n
-	}
-	if filter.Status != "" {
-		switch filter.Status {
-		case FleetCommandStatusSent,
-			FleetCommandStatusAccepted,
-			FleetCommandStatusRunning,
-			FleetCommandStatusCompleted,
-			FleetCommandStatusFailed,
-			FleetCommandStatusRejected,
-			FleetCommandStatusExpired,
-			FleetCommandStatusDuplicate:
-		default:
-			writeError(w, http.StatusBadRequest, "bad_request", "invalid command status")
-			return FleetCommandListFilter{}, false
-		}
-	}
-	if raw := strings.TrimSpace(q.Get("agent_member_id")); raw != "" {
-		decoded, err := base64.StdEncoding.DecodeString(raw)
-		if err != nil || len(decoded) != len(entmoot.MemberID{}) {
-			writeError(w, http.StatusBadRequest, "bad_request", "agent_member_id must be a full-width base64 member id")
-			return FleetCommandListFilter{}, false
-		}
-		copy(filter.AgentMemberID[:], decoded)
-	}
-	return filter, true
-}
-
-func (h *Handler) reconcileFleetCommandHistory(ctx context.Context, fleet FleetRecord) {
-	if h.service == nil || h.state == nil || fleet.ControlGroupID == (entmoot.GroupID{}) {
-		return
-	}
-	for _, topic := range []string{"fleet/commands", "fleet/commands/results"} {
-		history, err := h.service.TopicHistory(ctx, fleet.ControlGroupID, topic, 200)
-		if err != nil {
-			h.logger.Debug("esphttp: fleet command history reconcile failed", slog.String("topic", topic), slog.String("err", err.Error()))
-			continue
-		}
-		for _, msg := range history.Messages {
-			switch topic {
-			case "fleet/commands":
-				var cmd FleetCommandEnvelope
-				if err := json.Unmarshal([]byte(msg.Content), &cmd); err == nil &&
-					cmd.Type == FleetCommandMessageType &&
-					cmd.FleetID == fleet.FleetID &&
-					fleetCommandMessageIssuedByCoordinator(msg.AuthorMemberID, cmd, fleet) {
-					if _, err := h.state.UpsertFleetCommand(ctx, cmd); err != nil {
-						h.logger.Debug("esphttp: fleet command projection failed", slog.String("command_id", cmd.CommandID), slog.String("err", err.Error()))
-					}
-				}
-			case "fleet/commands/results":
-				var result FleetCommandResultEnvelope
-				if err := json.Unmarshal([]byte(msg.Content), &result); err == nil &&
-					result.Type == FleetCommandResultType &&
-					result.FleetID == fleet.FleetID &&
-					h.fleetCommandResultAuthoredByAgent(ctx, fleet, msg.AuthorMemberID, result) {
-					if err := h.state.UpsertFleetCommandResult(ctx, result); err != nil {
-						h.logger.Debug("esphttp: fleet command result projection failed", slog.String("command_id", result.CommandID), slog.String("err", err.Error()))
-					}
-				}
-			}
-		}
-	}
-}
-
-func fleetCommandMessageIssuedByCoordinator(authorMemberID entmoot.MemberID, cmd FleetCommandEnvelope, fleet FleetRecord) bool {
-	coordinatorMemberID := nodeInfoMemberID(fleet.Coordinator)
-	if cmd.IssuerMemberID != coordinatorMemberID {
-		return false
-	}
-	if authorMemberID == coordinatorMemberID {
-		return true
-	}
-	return VerifyFleetCommandIssuerProof(cmd, fleet.Coordinator.EntmootPubKey)
-}
-
-func (h *Handler) fleetCommandResultAuthoredByAgent(ctx context.Context, fleet FleetRecord, authorMemberID entmoot.MemberID, result FleetCommandResultEnvelope) bool {
-	if result.AgentMemberID == (entmoot.MemberID{}) || authorMemberID != result.AgentMemberID {
-		return false
-	}
-	member, found, err := h.fleetMemberByID(ctx, fleet.FleetID, result.AgentMemberID)
-	if err != nil {
-		h.logger.Debug("esphttp: fleet command result author lookup failed", slog.String("fleet_id", fleet.FleetID), slog.String("command_id", result.CommandID), slog.String("err", err.Error()))
-		return false
-	}
-	if !found || !FleetTaskCanMutate(member) || member.PeerID != result.AgentPeerID {
-		return false
-	}
-	detail, found, err := h.state.GetFleetCommandDetail(ctx, fleet.FleetID, result.CommandID)
-	if err != nil {
-		h.logger.Debug("esphttp: fleet command result command lookup failed", slog.String("fleet_id", fleet.FleetID), slog.String("command_id", result.CommandID), slog.String("err", err.Error()))
-		return false
-	}
-	if !found || NormalizeFleetCommandAction(detail.Command.Action) != NormalizeFleetCommandAction(result.Action) {
-		return false
-	}
-	return fleetCommandTargetIncludesResultAgent(detail.Command, member)
-}
-
-func fleetCommandTargetIncludesResultAgent(cmd FleetCommandEnvelope, member FleetMemberRecord) bool {
-	switch NormalizeFleetCommandTarget(cmd.Target.Kind) {
-	case FleetCommandTargetAll:
-		return !FleetTaskIsCoordinator(member)
-	case FleetCommandTargetNode:
-		return cmd.Target.MemberID == member.MemberID && cmd.Target.PeerID == member.PeerID
-	default:
-		return false
-	}
-}
-
-func (h *Handler) handleCreateFleetCommand(w http.ResponseWriter, r *http.Request, fleetID string) {
-	fleet, actor, ok := h.fleetTaskCoordinator(w, r, fleetID)
-	if !ok {
-		return
-	}
-	if h.taskEvents == nil {
-		writeError(w, http.StatusServiceUnavailable, "join_unavailable", "no running join publisher configured")
-		return
-	}
-	var req fleetCommandCreateRequest
-	rawBody, ok := decodeRawBody(w, r, 1<<20, &req)
-	if !ok {
-		return
-	}
-	action := NormalizeFleetCommandAction(req.Action)
-	entry, found := FleetCommandCatalogLookup(action)
-	if !found {
-		writeError(w, http.StatusBadRequest, "bad_request", "unsupported fleet command action")
-		return
-	}
-	autoAccept := true
-	if req.AutoAccept != nil {
-		autoAccept = *req.AutoAccept
-	}
-	if autoAccept && !entry.AutoAcceptSafe {
-		writeError(w, http.StatusBadRequest, "bad_request", "command is not safe for auto-accept")
-		return
-	}
-	args, err := DecodeFleetCommandArgs(req.Args)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
-		return
-	}
-	if err := ValidateFleetCommandArgs(action, args); err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
-		return
-	}
-	targetKind := NormalizeFleetCommandTarget(req.Target)
-	target := FleetCommandTarget{Kind: targetKind}
-	var subject *entmoot.NodeInfo
-	if targetKind == FleetCommandTargetNode {
-		if req.TargetMemberID == (entmoot.MemberID{}) {
-			writeError(w, http.StatusBadRequest, "bad_request", "target_member_id is required for target=node")
-			return
-		}
-		member, found, err := h.fleetMemberByID(r.Context(), fleet.FleetID, req.TargetMemberID)
-		if err != nil {
-			h.logger.Error("esphttp: fleet command target lookup", slog.String("err", err.Error()))
-			writeError(w, http.StatusInternalServerError, "internal_error", "fleet member lookup failed")
-			return
-		}
-		if !found || !FleetTaskCanMutate(member) {
-			writeError(w, http.StatusBadRequest, "bad_request", "target must be an active fleet member")
-			return
-		}
-		target.MemberID = member.MemberID
-		target.PeerID = member.PeerID
-		info := FleetTaskActorFromMember(member)
-		subject = &info
-	} else if targetKind != FleetCommandTargetAll {
-		writeError(w, http.StatusBadRequest, "bad_request", "invalid command target")
-		return
-	} else if req.TargetMemberID != (entmoot.MemberID{}) {
-		writeError(w, http.StatusBadRequest, "bad_request", "target_member_id requires target=node")
-		return
-	}
-	now := h.clock().UnixMilli()
-	expiresAtMS := req.ExpiresAtMS
-	if expiresAtMS == 0 {
-		if auth := authFromContext(r); auth.member != nil && auth.member.TimestampMS > 0 {
-			expiresAtMS = auth.member.TimestampMS + DefaultFleetCommandTTL.Milliseconds()
-		} else {
-			expiresAtMS = now + DefaultFleetCommandTTL.Milliseconds()
-		}
-	}
-	if expiresAtMS <= now {
-		writeError(w, http.StatusBadRequest, "bad_request", "command expiration must be in the future")
-		return
-	}
-	auth := authFromContext(r)
-	var issuerProof *FleetCommandIssuerProof
-	var commandID string
-	if auth.member != nil {
-		issuerProof = fleetCommandIssuerProofFromMember(*auth.member, rawBody)
-		commandID = FleetCommandIDFromIssuerProofMaterial(*issuerProof)
-	} else {
-		var err error
-		commandID, err = NewFleetCommandID()
-		if err != nil {
-			h.logger.Error("esphttp: fleet command id", slog.String("err", err.Error()))
-			writeError(w, http.StatusInternalServerError, "internal_error", "fleet command creation failed")
-			return
-		}
-	}
-	command := FleetCommandEnvelope{
-		Type:           FleetCommandMessageType,
-		Version:        2,
-		CommandID:      commandID,
-		FleetID:        fleet.FleetID,
-		ControlGroupID: fleet.ControlGroupID,
-		IssuerMemberID: actor.MemberID,
-		IssuerPeerID:   actor.PeerID,
-		Target:         target,
-		Action:         action,
-		Args:           args,
-		AutoAccept:     autoAccept,
-		CreatedAtMS:    now,
-		ExpiresAtMS:    expiresAtMS,
-		IssuerProof:    issuerProof,
-	}
-	if auth.member == nil {
-		if ok, err := h.taskEventPublisherMatchesCoordinator(r.Context(), fleet.Coordinator); err != nil {
-			h.logger.Error("esphttp: fleet command publisher identity", slog.String("err", err.Error()))
-			writeError(w, http.StatusServiceUnavailable, "join_unavailable", "fleet command publisher identity is unavailable")
-			return
-		} else if !ok {
-			writeError(w, http.StatusConflict, "coordinator_publisher_required", "fleet commands require the local publisher to match the Fleet coordinator")
-			return
-		}
-	}
-	body, err := json.Marshal(command)
-	if err != nil {
-		h.logger.Error("esphttp: marshal fleet command", slog.String("err", err.Error()))
-		writeError(w, http.StatusInternalServerError, "internal_error", "fleet command creation failed")
-		return
-	}
-	publishResult, err := h.taskEvents.PublishTaskEvent(r.Context(), fleet.ControlGroupID, []string{"fleet/commands"}, body)
-	if err != nil {
-		h.writePublishResult(w, publishResult, err)
-		return
-	}
-	if _, err := h.state.UpsertFleetCommand(r.Context(), command); err != nil {
-		h.logger.Warn("esphttp: upsert fleet command failed after publish", slog.String("fleet_id", fleet.FleetID), slog.String("command_id", command.CommandID), slog.String("err", err.Error()))
-	}
-	response := map[string]any{
-		"command":        command,
-		"publish_result": publishResult,
-	}
-	metadata, _ := json.Marshal(map[string]any{
-		"command_id": command.CommandID,
-		"action":     command.Action,
-		"target":     command.Target,
-	})
-	activity, err := h.state.AppendFleetActivity(r.Context(), FleetActivityRecord{
-		FleetID:     fleet.FleetID,
-		Type:        "command.sent",
-		Actor:       FleetTaskActorFromMember(actor),
-		Subject:     subject,
-		Summary:     "Command sent",
-		Metadata:    metadata,
-		CreatedAtMS: now,
-	})
-	if err != nil {
-		h.logger.Warn("esphttp: append fleet command activity failed after publish", slog.String("fleet_id", fleet.FleetID), slog.String("command_id", command.CommandID), slog.String("err", err.Error()))
-	} else {
-		response["activity"] = activity
-	}
-	writeJSON(w, http.StatusAccepted, response)
-}
-
-func fleetCommandIssuerProofFromMember(auth MemberAuth, body []byte) *FleetCommandIssuerProof {
-	return &FleetCommandIssuerProof{
-		Scheme:        FleetCommandIssuerProofMemberV2,
-		MemberID:      auth.MemberID,
-		PeerID:        auth.PeerID,
-		EntmootPubKey: base64.StdEncoding.EncodeToString(auth.EntmootPubKey),
-		Method:        strings.ToUpper(strings.TrimSpace(auth.Method)),
-		Path:          auth.Path,
-		TimestampMS:   auth.TimestampMS,
-		Nonce:         auth.Nonce,
-		Body:          append([]byte(nil), body...),
-		Signature:     auth.Signature,
-	}
-}
-
-func (h *Handler) taskEventPublisherMatchesCoordinator(ctx context.Context, coordinator entmoot.NodeInfo) (bool, error) {
-	infoProvider, ok := h.taskEvents.(TaskEventPublisherInfo)
-	if !ok {
-		return false, nil
-	}
-	info, err := infoProvider.LocalNodeInfo(ctx)
-	if err != nil {
-		return false, err
-	}
-	return nodeInfoMemberID(info) == nodeInfoMemberID(coordinator) &&
-		bytes.Equal(info.EntmootPubKey, coordinator.EntmootPubKey), nil
-}
-
-func (h *Handler) persistFleetTaskMutation(ctx context.Context, mutation FleetTaskMutation, actor FleetMemberRecord) (FleetTaskRecord, FleetActivityRecord, FleetTaskSubmissionRecord, error) {
-	var task FleetTaskRecord
-	var submission FleetTaskSubmissionRecord
-	var err error
-	if mutation.Submission.Content != "" {
-		var submitted bool
-		task, submission, submitted, err = h.state.SubmitFleetTask(ctx, mutation.Task, mutation.ExpectedUpdatedAtMS, mutation.Submission)
-		if err != nil {
-			return FleetTaskRecord{}, FleetActivityRecord{}, FleetTaskSubmissionRecord{}, err
-		}
-		if !submitted {
-			return FleetTaskRecord{}, FleetActivityRecord{}, FleetTaskSubmissionRecord{}, fmt.Errorf("%w: task changed concurrently", ErrFleetTaskInvalidTransition)
-		}
-	} else if mutation.Action == FleetTaskActionClaim {
-		var claimed bool
-		task, claimed, err = h.state.ClaimFleetTask(ctx, mutation.Task)
-		if err != nil {
-			return FleetTaskRecord{}, FleetActivityRecord{}, FleetTaskSubmissionRecord{}, err
-		}
-		if !claimed {
-			return FleetTaskRecord{}, FleetActivityRecord{}, FleetTaskSubmissionRecord{}, fmt.Errorf("%w: task is no longer claimable", ErrFleetTaskInvalidTransition)
-		}
-	} else if mutation.Action == FleetTaskActionCreate {
-		task, err = h.state.UpsertFleetTask(ctx, mutation.Task)
-		if err != nil {
-			return FleetTaskRecord{}, FleetActivityRecord{}, FleetTaskSubmissionRecord{}, err
-		}
-	} else {
-		var updated bool
-		task, updated, err = h.state.UpdateFleetTaskIfCurrent(ctx, mutation.Task, mutation.ExpectedUpdatedAtMS)
-		if err != nil {
-			return FleetTaskRecord{}, FleetActivityRecord{}, FleetTaskSubmissionRecord{}, err
-		}
-		if !updated {
-			return FleetTaskRecord{}, FleetActivityRecord{}, FleetTaskSubmissionRecord{}, fmt.Errorf("%w: task changed concurrently", ErrFleetTaskInvalidTransition)
-		}
-	}
-	metadata, _ := json.Marshal(map[string]any{"task_id": task.TaskID, "task_title": task.Title, "task_status": task.Status})
-	activity := FleetActivityRecord{
-		FleetID:     task.FleetID,
-		Type:        mutation.ActivityType,
-		Actor:       FleetTaskActorFromMember(actor),
-		Subject:     mutation.Subject,
-		Summary:     mutation.Summary,
-		Metadata:    metadata,
-		CreatedAtMS: h.clock().UnixMilli(),
-	}
-	if activity.Type == "" {
-		return task, FleetActivityRecord{}, submission, nil
-	}
-	activity, err = h.state.AppendFleetActivity(ctx, activity)
-	if err != nil {
-		return FleetTaskRecord{}, FleetActivityRecord{}, FleetTaskSubmissionRecord{}, err
-	}
-	h.publishFleetTaskEvent(ctx, mutation, task, actor, activity.CreatedAtMS)
-	return task, activity, submission, nil
-}
-
-func (h *Handler) publishFleetTaskEvent(ctx context.Context, mutation FleetTaskMutation, task FleetTaskRecord, actor FleetMemberRecord, createdAtMS int64) {
-	if h.taskEvents == nil || h.state == nil {
-		return
-	}
-	fleet, found, err := h.state.GetFleet(ctx, task.FleetID)
-	if err != nil {
-		h.logger.Warn("esphttp: fleet task event fleet lookup failed", slog.String("fleet_id", task.FleetID), slog.String("err", err.Error()))
-		return
-	}
-	if !found || fleet.ControlGroupID == (entmoot.GroupID{}) {
-		return
-	}
-	event := fleetTaskEventEnvelope{
-		Type:           "fleet.task",
-		FleetID:        task.FleetID,
-		ControlGroupID: fleet.ControlGroupID,
-		TaskID:         task.TaskID,
-		Action:         mutation.Action,
-		Status:         task.Status,
-		Title:          task.Title,
-		ActorMemberID:  actor.MemberID,
-		Summary:        mutation.Summary,
-		CreatedAtMS:    createdAtMS,
-	}
-	body, err := json.Marshal(event)
-	if err != nil {
-		h.logger.Warn("esphttp: fleet task event marshal failed", slog.String("fleet_id", task.FleetID), slog.String("task_id", task.TaskID), slog.String("err", err.Error()))
-		return
-	}
-	if _, err := h.taskEvents.PublishTaskEvent(ctx, fleet.ControlGroupID, []string{"fleet/tasks"}, body); err != nil {
-		h.logger.Warn("esphttp: fleet task event publish failed", slog.String("fleet_id", task.FleetID), slog.String("task_id", task.TaskID), slog.String("err", err.Error()))
-	}
-}
-
-func (h *Handler) writeFleetTaskError(w http.ResponseWriter, err error) {
-	if status, code, msg, ok := FleetTaskHTTPError(err); ok {
-		writeError(w, status, code, msg)
-		return
-	}
-	h.logger.Error("esphttp: fleet task mutation", slog.String("err", err.Error()))
-	writeError(w, http.StatusInternalServerError, "internal_error", "fleet task mutation failed")
-}
-
-func (h *Handler) handleFleetDiagnostics(w http.ResponseWriter, r *http.Request, fleetID string) {
-	fleet, ok := h.authorizedFleet(w, r, fleetID)
-	if !ok {
-		return
-	}
-	if h.state == nil {
-		writeError(w, http.StatusServiceUnavailable, "fleet_unavailable", "fleet store is not configured")
-		return
-	}
-	if h.diagnostics == nil {
-		writeError(w, http.StatusServiceUnavailable, "diagnostics_unavailable", "diagnostics are not configured")
-		return
-	}
-	h.reconcileFleetAcceptance(r.Context(), fleet)
-	members, err := h.state.ListFleetMembers(r.Context(), fleetID)
-	if err != nil {
-		h.logger.Error("esphttp: fleet diagnostics members", slog.String("err", err.Error()))
-		writeError(w, http.StatusInternalServerError, "internal_error", "fleet member listing failed")
-		return
-	}
-	if members == nil {
-		members = []FleetMemberRecord{}
-	}
-	probe := parseBoolQuery(r.URL.Query().Get("probe"))
-	timeout := 3 * time.Second
-	if raw := strings.TrimSpace(r.URL.Query().Get("timeout")); raw != "" {
-		parsed, err := time.ParseDuration(raw)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, "bad_request", "timeout must be a Go duration such as 3s")
-			return
-		}
-		timeout = parsed
-	}
-	report, err := h.diagnostics.FleetDiagnostics(r.Context(), fleet, members, probe, timeout)
-	if err != nil {
-		var opErr *OperationError
-		if errors.As(err, &opErr) {
-			writeError(w, opErr.HTTPStatus, opErr.Code, opErr.Message)
-			return
-		}
-		h.logger.Error("esphttp: fleet diagnostics", slog.String("err", err.Error()))
-		writeError(w, http.StatusInternalServerError, "internal_error", "fleet diagnostics failed")
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"fleet": report})
-}
-
-func (h *Handler) reconcileFleetAcceptance(ctx context.Context, fleet FleetRecord) {
-	if h.state == nil || h.groups == nil || fleet.ControlGroupID == (entmoot.GroupID{}) || fleet.Status != FleetStatusActive {
-		return
-	}
-	rosterMembers, err := h.groups.ListMembers(ctx, fleet.ControlGroupID)
-	if err != nil {
-		h.logger.Warn("esphttp: reconcile fleet acceptance roster unavailable", slog.String("fleet_id", fleet.FleetID), slog.String("group_id", fleet.ControlGroupID.String()), slog.String("err", err.Error()))
-		return
-	}
-	rosterByIdentity := make(map[string]MemberSummary, len(rosterMembers))
-	for _, member := range rosterMembers {
-		if member.MemberID == (entmoot.MemberID{}) || strings.TrimSpace(member.EntmootPubKey) == "" {
-			continue
-		}
-		rosterByIdentity[fleetIdentityKey(member.MemberID, member.EntmootPubKey)] = member
-	}
-	if len(rosterByIdentity) == 0 {
-		return
-	}
-	members, err := h.state.ListFleetMembers(ctx, fleet.FleetID)
-	if err != nil {
-		h.logger.Warn("esphttp: reconcile fleet acceptance members unavailable", slog.String("fleet_id", fleet.FleetID), slog.String("err", err.Error()))
-		return
-	}
-	invites, err := h.state.ListFleetInvites(ctx, fleet.FleetID)
-	if err != nil {
-		h.logger.Warn("esphttp: reconcile fleet acceptance invites unavailable", slog.String("fleet_id", fleet.FleetID), slog.String("err", err.Error()))
-		return
-	}
-	now := h.clock().UnixMilli()
-	invitesByIdentity := make(map[string][]FleetInviteRecord)
-	for _, invite := range invites {
-		if invite.Status != FleetMemberInvited {
-			continue
-		}
-		key := fleetIdentityKey(invite.MemberID, invite.EntmootPubKey)
-		invitesByIdentity[key] = append(invitesByIdentity[key], invite)
-	}
-	for _, member := range members {
-		if member.Status != FleetMemberInvited || member.Role == FleetRoleCoordinator {
-			continue
-		}
-		key := fleetIdentityKey(member.MemberID, member.EntmootPubKey)
-		rosterMember, joined := rosterByIdentity[key]
-		if !joined {
-			continue
-		}
-		matchingInvites := invitesByIdentity[key]
-		if len(matchingInvites) == 0 {
-			continue
-		}
-		accepted, activity, applied, err := h.state.ReconcileFleetInviteAcceptance(ctx, fleet.FleetID, member.MemberID, member.EntmootPubKey, now, rosterMember.Hostname)
-		if err != nil {
-			h.logger.Warn("esphttp: reconcile fleet acceptance member update failed", slog.String("fleet_id", fleet.FleetID), slog.String("member_id", member.MemberID.String()), slog.String("err", err.Error()))
-			continue
-		}
-		if !applied {
-			continue
-		}
-		h.logger.Debug("esphttp: reconciled fleet invite acceptance", slog.String("fleet_id", fleet.FleetID), slog.String("member_id", accepted.MemberID.String()), slog.String("event_id", activity.EventID))
-	}
-}
-
-func fleetIdentityKey(memberID entmoot.MemberID, pubkey string) string {
-	return memberID.String() + ":" + strings.TrimSpace(pubkey)
-}
-
-func fleetNodeInfoFromMember(member FleetMemberRecord) (entmoot.NodeInfo, bool) {
-	pubkey, err := base64.StdEncoding.DecodeString(member.EntmootPubKey)
-	if err != nil || member.MemberID == (entmoot.MemberID{}) {
-		return entmoot.NodeInfo{}, false
-	}
-	memberID := member.MemberID
-	return entmoot.NodeInfo{MemberID: &memberID, PeerID: member.PeerID, EntmootPubKey: pubkey}, true
-}
-
-func fleetAcceptanceActivityFromMember(member FleetMemberRecord, createdAtMS int64) (FleetActivityRecord, error) {
-	nodeInfo, ok := fleetNodeInfoFromMember(member)
-	if !ok {
-		return FleetActivityRecord{}, fmt.Errorf("invalid fleet member identity")
-	}
-	eventID, err := NewFleetActivityID()
-	if err != nil {
-		return FleetActivityRecord{}, err
-	}
-	return FleetActivityRecord{
-		EventID:     eventID,
-		FleetID:     member.FleetID,
-		Type:        "member.accepted",
-		Actor:       nodeInfo,
-		Subject:     &nodeInfo,
-		Summary:     "Agent joined Fleet",
-		Metadata:    fleetAcceptanceMetadata(member.Hostname),
-		CreatedAtMS: createdAtMS,
-	}, nil
-}
-
-func fleetAcceptanceMetadata(hostname string) json.RawMessage {
-	hostname = strings.TrimSpace(hostname)
-	if hostname == "" {
-		return nil
-	}
-	data, err := json.Marshal(map[string]any{"hostname": hostname})
-	if err != nil {
-		return nil
-	}
-	return data
 }
 
 func (h *Handler) handleSession(w http.ResponseWriter, r *http.Request) {
@@ -1969,7 +558,6 @@ func (h *Handler) handleSession(w http.ResponseWriter, r *http.Request) {
 	resp := map[string]any{
 		"authenticated": true,
 		"auth_mode":     h.authMode,
-		"features":      h.features.Capabilities(),
 	}
 	if auth.device != nil {
 		resp["device"] = deviceView(*auth.device)
@@ -1994,7 +582,6 @@ func (h *Handler) handleStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":          "ok",
 		"auth_mode":       h.authMode,
-		"features":        h.features.Capabilities(),
 		"groups":          groups,
 		"mailbox_enabled": h.service != nil,
 		"publisher":       h.publisher != nil,
@@ -2259,7 +846,7 @@ func (h *Handler) handleGroupSubroute(w http.ResponseWriter, r *http.Request) bo
 }
 
 func (h *Handler) handleGetGroup(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID) {
-	if !h.checkDeviceGroupRead(w, r, groupID) {
+	if !h.checkDeviceGroup(w, r, groupID) {
 		return
 	}
 	if h.groups == nil {
@@ -2280,7 +867,7 @@ func (h *Handler) handleGetGroup(w http.ResponseWriter, r *http.Request, groupID
 }
 
 func (h *Handler) handleGetGroupPolicy(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID) {
-	if !h.checkDeviceGroupRead(w, r, groupID) {
+	if !h.checkDeviceGroup(w, r, groupID) {
 		return
 	}
 	reporter, ok := h.operations.(GroupPolicyReporter)
@@ -2300,7 +887,7 @@ func (h *Handler) handleGetGroupPolicy(w http.ResponseWriter, r *http.Request, g
 }
 
 func (h *Handler) handleListMembers(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID) {
-	if !h.checkDeviceGroupRead(w, r, groupID) {
+	if !h.checkDeviceGroup(w, r, groupID) {
 		return
 	}
 	if h.groups == nil {
@@ -2320,40 +907,6 @@ func (h *Handler) handleListMembers(w http.ResponseWriter, r *http.Request, grou
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"members": members})
-}
-
-func (h *Handler) observeFleetMemberProfiles(ctx context.Context, members []FleetMemberRecord) {
-	if h.state == nil {
-		return
-	}
-	for _, member := range members {
-		profile, ok := nodeProfileFromFleetMember(member)
-		if !ok {
-			continue
-		}
-		if _, _, err := h.state.UpsertNodeProfile(ctx, profile); err != nil {
-			h.logger.Warn("esphttp: fleet member profile cache update failed",
-				slog.String("member_id", member.MemberID.String()),
-				slog.String("err", err.Error()))
-		}
-	}
-}
-
-func (h *Handler) observeFleetInviteProfiles(ctx context.Context, invites []FleetInviteRecord) {
-	if h.state == nil {
-		return
-	}
-	for _, invite := range invites {
-		profile, ok := nodeProfileFromFleetInvite(invite)
-		if !ok {
-			continue
-		}
-		if _, _, err := h.state.UpsertNodeProfile(ctx, profile); err != nil {
-			h.logger.Warn("esphttp: fleet invite profile cache update failed",
-				slog.String("member_id", invite.MemberID.String()),
-				slog.String("err", err.Error()))
-		}
-	}
 }
 
 type liveAgentConfigHTTPPayload struct {
@@ -2414,7 +967,7 @@ func (h *Handler) handleUpsertLiveAgentConfig(w http.ResponseWriter, r *http.Req
 		writeError(w, http.StatusBadRequest, "bad_request", "unknown live actions: "+strings.Join(unknown, ", "))
 		return
 	}
-	actions, ok := h.liveActionsForHTTPPayload(w, mode, payload.AllowedActions)
+	actions, ok := liveActionsForHTTPPayload(w, mode, payload.AllowedActions)
 	if !ok {
 		return
 	}
@@ -2440,7 +993,7 @@ func (h *Handler) handleUpsertLiveAgentConfig(w http.ResponseWriter, r *http.Req
 	writeJSON(w, http.StatusOK, map[string]any{"config": cfg})
 }
 
-func (h *Handler) liveActionsForHTTPPayload(w http.ResponseWriter, mode string, raw []string) ([]string, bool) {
+func liveActionsForHTTPPayload(w http.ResponseWriter, mode string, raw []string) ([]string, bool) {
 	actionsExplicit := raw != nil
 	actions := NormalizeLiveActions(raw)
 	if actionsExplicit && len(actions) == 0 {
@@ -2450,49 +1003,7 @@ func (h *Handler) liveActionsForHTTPPayload(w http.ResponseWriter, mode string, 
 	if mode == LiveModeOperator && len(actions) == 0 && !actionsExplicit {
 		actions = DefaultLiveActions()
 	}
-	disabled := liveActionsDisabledByFeatures(actions, h.features)
-	if len(disabled) == 0 {
-		return actions, true
-	}
-	if actionsExplicit {
-		writeError(w, http.StatusBadRequest, "feature_disabled", "live action(s) require ENTMOOT_ENABLE_FLEET=1 and ENTMOOT_ENABLE_TASKS=1: "+strings.Join(disabled, ", "))
-		return nil, false
-	}
-	return filterLiveActionsDisabledByFeatures(actions, h.features), true
-}
-
-func liveActionsDisabledByFeatures(actions []string, flags entfeatures.Flags) []string {
-	if flags.RequireTasks() == nil {
-		return nil
-	}
-	var disabled []string
-	for _, action := range actions {
-		action = strings.TrimSpace(strings.ToLower(action))
-		if LiveActionRequiresTasks(action) {
-			disabled = append(disabled, action)
-		}
-	}
-	sort.Strings(disabled)
-	return disabled
-}
-
-func filterLiveActionsDisabledByFeatures(actions []string, flags entfeatures.Flags) []string {
-	disabled := liveActionsDisabledByFeatures(actions, flags)
-	if len(disabled) == 0 {
-		return actions
-	}
-	blocked := make(map[string]struct{}, len(disabled))
-	for _, action := range disabled {
-		blocked[action] = struct{}{}
-	}
-	out := make([]string, 0, len(actions)-len(disabled))
-	for _, action := range actions {
-		if _, ok := blocked[strings.TrimSpace(strings.ToLower(action))]; ok {
-			continue
-		}
-		out = append(out, action)
-	}
-	return out
+	return actions, true
 }
 
 func (h *Handler) handleDeleteLiveAgentConfig(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID, nodeID entmoot.MemberID) {
@@ -2563,7 +1074,7 @@ func (h *Handler) handleRevokeOpenInvite(w http.ResponseWriter, r *http.Request,
 }
 
 func (h *Handler) handleGroupDiagnostics(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID) {
-	if !h.checkDeviceGroupRead(w, r, groupID) {
+	if !h.checkDeviceGroup(w, r, groupID) {
 		return
 	}
 	if h.diagnostics == nil {
@@ -3058,7 +1569,6 @@ func (h *Handler) handleSignRequests(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "internal_error", "sign request listing failed")
 		return
 	}
-	requests = h.filterDisabledSignRequests(requests)
 	writeJSON(w, http.StatusOK, map[string]any{"sign_requests": requests})
 }
 
@@ -3117,10 +1627,6 @@ func (h *Handler) authorizeSignRequestCompletion(w http.ResponseWriter, r *http.
 	if !h.signRequestVisible(w, r, req) {
 		return false
 	}
-	if feature, disabled := h.disabledSignRequestFeature(req); disabled {
-		h.writeFeatureDisabled(w, feature)
-		return false
-	}
 	return true
 }
 
@@ -3147,10 +1653,6 @@ func (h *Handler) handleCompleteSignRequest(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	if !h.signRequestVisible(w, r, req) {
-		return
-	}
-	if feature, disabled := h.disabledSignRequestFeature(req); disabled {
-		h.writeFeatureDisabled(w, feature)
 		return
 	}
 	if !h.checkSignRequestPending(w, req) {
@@ -3209,10 +1711,6 @@ func (h *Handler) handleRejectSignRequest(w http.ResponseWriter, r *http.Request
 		return
 	}
 	if !h.signRequestVisible(w, r, req) {
-		return
-	}
-	if feature, disabled := h.disabledSignRequestFeature(req); disabled {
-		h.writeFeatureDisabled(w, feature)
 		return
 	}
 	if !h.checkSignRequestPending(w, req) {
@@ -3663,22 +2161,7 @@ func memberAuthAllowedForRequest(r *http.Request) bool {
 	if r.Method == http.MethodGet && r.URL.Path == "/v1/session" {
 		return true
 	}
-	if r.Method == http.MethodGet && r.URL.Path == "/v1/fleets" {
-		return true
-	}
-	const prefix = "/v1/fleets/"
-	if !strings.HasPrefix(r.URL.Path, prefix) {
-		return memberAuthAllowedForGroupRequest(r)
-	}
-	rest := strings.TrimPrefix(r.URL.Path, prefix)
-	_, suffix, ok := strings.Cut(rest, "/")
-	if !ok {
-		return false
-	}
-	return suffix == "tasks" ||
-		strings.HasPrefix(suffix, "tasks/") ||
-		suffix == "commands" ||
-		strings.HasPrefix(suffix, "commands/")
+	return memberAuthAllowedForGroupRequest(r)
 }
 
 func memberAuthAllowedForGroupRequest(r *http.Request) bool {
@@ -3875,36 +2358,6 @@ func (h *Handler) checkDeviceGroup(w http.ResponseWriter, r *http.Request, group
 	return false
 }
 
-func (h *Handler) checkDeviceGroupRead(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID) bool {
-	auth, _ := r.Context().Value(authContextKey{}).(authContext)
-	if auth.bearer {
-		return true
-	}
-	if auth.device != nil && deviceAllowsGroup(*auth.device, groupID) {
-		return true
-	}
-	if auth.device != nil && h.deviceCanReadFleetControlGroup(r.Context(), *auth.device, groupID) {
-		return true
-	}
-	writeError(w, http.StatusForbidden, "forbidden", "device is not authorized for group")
-	return false
-}
-
-func (h *Handler) deviceCanReadFleetControlGroup(ctx context.Context, device Device, groupID entmoot.GroupID) bool {
-	if h.state == nil {
-		return false
-	}
-	fleet, ok, err := h.state.GetFleetByControlGroup(ctx, groupID)
-	if err != nil {
-		h.logger.Error("esphttp: fleet control group lookup failed", slog.String("err", err.Error()))
-		return false
-	}
-	if !ok || fleet.CoordinatorDeviceID != device.ID {
-		return false
-	}
-	return NormalizeFleetStatus(fleet.Status) != FleetStatusDeleted
-}
-
 func (h *Handler) checkDeviceGroupAdmin(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID) bool {
 	auth, _ := r.Context().Value(authContextKey{}).(authContext)
 	if auth.bearer {
@@ -3929,7 +2382,7 @@ func (h *Handler) checkLiveAgentConfigRead(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusForbidden, "forbidden", "member is not authorized for group")
 		return false
 	}
-	return h.checkDeviceGroupRead(w, r, groupID)
+	return h.checkDeviceGroup(w, r, groupID)
 }
 
 func (h *Handler) checkLiveAgentConfigWrite(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID, nodeID entmoot.MemberID) bool {
@@ -3991,58 +2444,6 @@ func parseLiveAgentNodePath(w http.ResponseWriter, escapedNode string) (entmoot.
 	return memberID, true
 }
 
-func (h *Handler) requireFleetDevice(w http.ResponseWriter, r *http.Request) (*Device, bool) {
-	auth, _ := r.Context().Value(authContextKey{}).(authContext)
-	if auth.device == nil {
-		writeError(w, http.StatusForbidden, "device_signature_required", "fleet access requires a registered device signature")
-		return nil, false
-	}
-	return auth.device, true
-}
-
-func (h *Handler) authorizedFleet(w http.ResponseWriter, r *http.Request, fleetID string) (FleetRecord, bool) {
-	device, ok := h.requireFleetDevice(w, r)
-	if !ok {
-		return FleetRecord{}, false
-	}
-	if h.state == nil {
-		writeError(w, http.StatusServiceUnavailable, "fleet_unavailable", "fleet store is not configured")
-		return FleetRecord{}, false
-	}
-	fleet, found, err := h.state.GetFleet(r.Context(), fleetID)
-	if err != nil {
-		h.logger.Error("esphttp: check fleet access", slog.String("err", err.Error()))
-		writeError(w, http.StatusInternalServerError, "internal_error", "fleet lookup failed")
-		return FleetRecord{}, false
-	}
-	if !found {
-		writeError(w, http.StatusNotFound, "fleet_not_found", "fleet not found")
-		return FleetRecord{}, false
-	}
-	if fleet.CoordinatorDeviceID != device.ID {
-		writeError(w, http.StatusForbidden, "forbidden", "device is not authorized to access fleet")
-		return FleetRecord{}, false
-	}
-	return fleet, true
-}
-
-func (h *Handler) checkDeviceFleetAdmin(w http.ResponseWriter, r *http.Request, fleetID string) bool {
-	_, ok := h.authorizedFleet(w, r, fleetID)
-	return ok
-}
-
-func (h *Handler) checkDeviceActiveFleetAdmin(w http.ResponseWriter, r *http.Request, fleetID string, allowArchived bool) bool {
-	fleet, ok := h.authorizedFleet(w, r, fleetID)
-	if !ok {
-		return false
-	}
-	if !allowArchived && fleet.Status != FleetStatusActive {
-		writeError(w, http.StatusConflict, "fleet_archived", "fleet is archived")
-		return false
-	}
-	return true
-}
-
 func (h *Handler) checkDeviceClient(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID, clientID string) bool {
 	if !h.checkDeviceGroup(w, r, groupID) {
 		return false
@@ -4051,7 +2452,7 @@ func (h *Handler) checkDeviceClient(w http.ResponseWriter, r *http.Request, grou
 }
 
 func (h *Handler) checkDeviceClientRead(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID, clientID string) bool {
-	if !h.checkDeviceGroupRead(w, r, groupID) {
+	if !h.checkDeviceGroup(w, r, groupID) {
 		return false
 	}
 	return h.checkDeviceClientID(w, r, clientID)
@@ -4085,57 +2486,6 @@ func (h *Handler) createSignRequestFromHTTP(w http.ResponseWriter, r *http.Reque
 		body = []byte("{}")
 	}
 	h.createSignRequest(w, r, kind, groupID, body)
-}
-
-func (h *Handler) createFleetSignRequestFromHTTP(w http.ResponseWriter, r *http.Request, kind string, fleetID string) {
-	if !h.checkDeviceActiveFleetAdmin(w, r, fleetID, kind == signRequestKindFleetArchive || kind == signRequestKindFleetRestore) {
-		return
-	}
-	var payload map[string]any
-	body, ok := decodeRawBody(w, r, 16<<20, &payload)
-	if !ok {
-		return
-	}
-	if payload == nil {
-		payload = make(map[string]any)
-	}
-	payload["fleet_id"] = fleetID
-	body, err := json.Marshal(payload)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal_error", "fleet sign request encoding failed")
-		return
-	}
-	h.createSignRequest(w, r, kind, entmoot.GroupID{}, body)
-}
-
-func (h *Handler) createFleetMemberRemoveSignRequest(w http.ResponseWriter, r *http.Request, fleetID string, escapedMember string) {
-	if !h.checkDeviceActiveFleetAdmin(w, r, fleetID, false) {
-		return
-	}
-	memberID, ok := parseLiveAgentNodePath(w, escapedMember)
-	if !ok {
-		return
-	}
-	var body struct {
-		PeerID        string `json:"peer_id"`
-		EntmootPubKey string `json:"entmoot_pubkey"`
-	}
-	if _, ok := decodeRawBody(w, r, 1<<20, &body); !ok {
-		return
-	}
-	payload, err := json.Marshal(map[string]any{
-		"fleet_id": fleetID,
-		"target": map[string]any{
-			"member_id":      memberID,
-			"peer_id":        strings.TrimSpace(body.PeerID),
-			"entmoot_pubkey": strings.TrimSpace(body.EntmootPubKey),
-		},
-	})
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal_error", "fleet member remove payload encoding failed")
-		return
-	}
-	h.createSignRequest(w, r, signRequestKindFleetMemberRemove, entmoot.GroupID{}, payload)
 }
 
 func (h *Handler) createMemberRemoveSignRequest(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID, escapedMember string) {
@@ -4396,10 +2746,6 @@ func (h *Handler) writeSignRequestLookup(w http.ResponseWriter, r *http.Request,
 	if !h.signRequestVisible(w, r, req) {
 		return
 	}
-	if feature, disabled := h.disabledSignRequestFeature(req); disabled {
-		h.writeFeatureDisabled(w, feature)
-		return
-	}
 	writeJSON(w, http.StatusOK, req)
 }
 
@@ -4448,51 +2794,6 @@ func (h *Handler) signRequestVisible(w http.ResponseWriter, r *http.Request, req
 		}
 	}
 	return true
-}
-
-func (h *Handler) filterDisabledSignRequests(requests []SignRequest) []SignRequest {
-	if len(requests) == 0 {
-		return requests
-	}
-	out := requests[:0]
-	for _, req := range requests {
-		if _, disabled := h.disabledSignRequestFeature(req); disabled {
-			continue
-		}
-		out = append(out, req)
-	}
-	return out
-}
-
-func (h *Handler) disabledSignRequestFeature(req SignRequest) (string, bool) {
-	feature, ok := signRequestKindFeature(req.Kind)
-	if !ok {
-		return "", false
-	}
-	switch feature {
-	case entfeatures.FeatureFleet:
-		if err := h.features.RequireFleet(); err != nil {
-			return feature, true
-		}
-	case entfeatures.FeatureTasks:
-		if err := h.features.RequireTasks(); err != nil {
-			return feature, true
-		}
-	}
-	return "", false
-}
-
-func signRequestKindFeature(kind string) (string, bool) {
-	switch strings.TrimSpace(kind) {
-	case signRequestKindFleetCreate,
-		signRequestKindFleetInviteCreate,
-		signRequestKindFleetMemberRemove,
-		signRequestKindFleetArchive,
-		signRequestKindFleetRestore:
-		return entfeatures.FeatureFleet, true
-	default:
-		return "", false
-	}
 }
 
 type idempotencyAuthorizer func(http.ResponseWriter, *http.Request) bool
@@ -4770,7 +3071,6 @@ type errorEnvelope struct {
 type errorBody struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
-	Feature string `json:"feature,omitempty"`
 }
 
 func writeError(w http.ResponseWriter, status int, code, message string) {
