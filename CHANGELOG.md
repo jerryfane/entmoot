@@ -47,6 +47,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   validated and projected, but nothing in the tree mints a rekey record, and
   the deleted `KeyRotation` also carried a founder-authorised mode for a
   member that lost its key. Both gaps are tracked on issue #124.
+- **`MessageStore.IterMessageIDsInIDRange` is removed** along with its SQLite
+  implementation. It existed for the range-based anti-entropy in
+  `pkg/entmoot/reconcile`, which never called it and is itself deleted here, so
+  no production code has ever reached it. History catch-up pages by
+  `(timestamp, author, id)` through `MessageIDsPage`, which is unchanged.
 
 ### Changed
 

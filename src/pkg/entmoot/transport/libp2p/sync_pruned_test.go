@@ -51,9 +51,6 @@ func (w wrappedStore) LatestByTopicBefore(ctx context.Context, group entmoot.Gro
 func (w wrappedStore) MerkleRoot(ctx context.Context, group entmoot.GroupID) ([32]byte, error) {
 	return w.inner.MerkleRoot(ctx, group)
 }
-func (w wrappedStore) IterMessageIDsInIDRange(ctx context.Context, group entmoot.GroupID, loID, hiID entmoot.MessageID) ([]entmoot.MessageID, error) {
-	return w.inner.IterMessageIDsInIDRange(ctx, group, loID, hiID)
-}
 func (w wrappedStore) HasTombstone(ctx context.Context, group entmoot.GroupID, id entmoot.MessageID) (bool, error) {
 	return store.HasTombstone(ctx, w.inner, group, id)
 }

@@ -1001,9 +1001,6 @@ func (n *notifyingStore) LatestByTopicBefore(ctx context.Context, gid entmoot.Gr
 func (n *notifyingStore) MerkleRoot(ctx context.Context, gid entmoot.GroupID) ([32]byte, error) {
 	return n.inner.MerkleRoot(ctx, gid)
 }
-func (n *notifyingStore) IterMessageIDsInIDRange(ctx context.Context, gid entmoot.GroupID, loID, hiID entmoot.MessageID) ([]entmoot.MessageID, error) {
-	return n.inner.IterMessageIDsInIDRange(ctx, gid, loID, hiID)
-}
 func (n *notifyingStore) MessageIDsPage(ctx context.Context, gid entmoot.GroupID, sinceMillis int64, after *store.RangeCursor, expectedGeneration uint64, limit int) (store.MessageIDPage, error) {
 	paged, ok := n.inner.(store.PagedMessageIDStore)
 	if !ok {

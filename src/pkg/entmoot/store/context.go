@@ -116,18 +116,10 @@ func compareMessageRecency(a, b entmoot.Message) int {
 }
 
 func sortMessagesOldestFirst(msgs []entmoot.Message) {
-	sortMessagesByRecency(msgs, false)
-}
-
-func sortMessagesByRecency(msgs []entmoot.Message, newestFirst bool) {
 	if len(msgs) < 2 {
 		return
 	}
 	sort.Slice(msgs, func(i, j int) bool {
-		cmp := compareMessageRecency(msgs[i], msgs[j])
-		if newestFirst {
-			return cmp > 0
-		}
-		return cmp < 0
+		return compareMessageRecency(msgs[i], msgs[j]) < 0
 	})
 }

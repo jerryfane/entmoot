@@ -1320,59 +1320,6 @@ func (s *SQLite) SearchMessages(ctx context.Context, groupID entmoot.GroupID, qu
 	return result, nil
 }
 
-// IterMessageIDsInIDRange implements MessageStore.IterMessageIDsInIDRange.
-// Uses the PRIMARY KEY index on messages.message_id. Verified via
-// EXPLAIN QUERY PLAN to issue "SEARCH messages USING INTEGER PRIMARY KEY"
-// (or the BLOB-PK equivalent) during development.
-func (s *SQLite) IterMessageIDsInIDRange(ctx context.Context, groupID entmoot.GroupID, loID, hiID entmoot.MessageID) ([]entmoot.MessageID, error) {
-	db, exists, err := s.dbForExisting(groupID)
-	if err != nil {
-		return nil, err
-	}
-	if !exists {
-		return []entmoot.MessageID{}, nil
-	}
-
-	var rows *sql.Rows
-	if isZeroMessageID(hiID) {
-		rows, err = db.QueryContext(ctx, `
-			SELECT message_id FROM messages
-			WHERE group_id = ? AND message_id >= ?
-			ORDER BY message_id ASC;`,
-			groupID[:], loID[:],
-		)
-	} else {
-		rows, err = db.QueryContext(ctx, `
-			SELECT message_id FROM messages
-			WHERE group_id = ? AND message_id >= ? AND message_id < ?
-			ORDER BY message_id ASC;`,
-			groupID[:], loID[:], hiID[:],
-		)
-	}
-	if err != nil {
-		return nil, fmt.Errorf("store: iter id range query: %w", err)
-	}
-	defer rows.Close()
-
-	var out []entmoot.MessageID
-	for rows.Next() {
-		var raw []byte
-		if err := rows.Scan(&raw); err != nil {
-			return nil, fmt.Errorf("store: iter id range scan: %w", err)
-		}
-		if len(raw) != 32 {
-			return nil, fmt.Errorf("store: iter id range: message_id has %d bytes, want 32", len(raw))
-		}
-		var id entmoot.MessageID
-		copy(id[:], raw)
-		out = append(out, id)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("store: iter id range iterate: %w", err)
-	}
-	return out, nil
-}
-
 // MerkleRoot implements MessageStore.MerkleRoot.
 func (s *SQLite) MerkleRoot(ctx context.Context, groupID entmoot.GroupID) ([32]byte, error) {
 	db, exists, err := s.dbForExisting(groupID)

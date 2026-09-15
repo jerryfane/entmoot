@@ -98,16 +98,6 @@ type MessageStore interface {
 	// zero root and a nil error.
 	MerkleRoot(ctx context.Context, groupID entmoot.GroupID) ([32]byte, error)
 
-	// IterMessageIDsInIDRange returns every message ID in the given group
-	// whose 32-byte identifier lies in the half-open range [loID, hiID),
-	// sorted ascending by byte order. If hiID is the zero MessageID, the
-	// upper bound is treated as "unbounded" (equivalent to all 0xFF).
-	//
-	// The ordering is by message id, NOT the ordering of Range() (which is
-	// topological / timestamp-based). An empty or unknown group returns an
-	// empty slice and a nil error.
-	IterMessageIDsInIDRange(ctx context.Context, groupID entmoot.GroupID, loID, hiID entmoot.MessageID) ([]entmoot.MessageID, error)
-
 	// Close releases any resources held by the store: for SQLite it closes
 	// the per-group database handles.
 	Close() error
