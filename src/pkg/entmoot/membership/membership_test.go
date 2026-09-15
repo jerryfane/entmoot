@@ -1416,3 +1416,53 @@ func TestAdoptRefusesACheckpointTheFounderDidNotSign(t *testing.T) {
 	}
 	defer adopted.Close()
 }
+
+// A timestamp is not authority. Records merge in timestamp order, so a member
+// that dates one far ahead would win every contest about itself until that
+// date arrives: re-admitting itself over a removal, or keeping a membership it
+// has already left. Nothing in the record itself says it may do that, so the
+// reading node bounds it against its own clock.
+func TestFutureDatedRecordCannotOutrankARemoval(t *testing.T) {
+	f := newFixture(t, DefaultPolicy())
+	evicted := mustIdentity(t)
+	invite := f.invite(f.founder, evicted, 4)
+	f.joinWith(evicted, invite)
+	if !f.group.IsMemberID(f.memberID(evicted)) {
+		t.Fatal("the fixture never admitted the member")
+	}
+	f.tick(10)
+	if _, err := f.group.SignRecord(f.founder, Record{Kind: KindRemove, Subject: f.info(evicted)}); err != nil {
+		t.Fatal(err)
+	}
+	if f.group.IsMemberID(f.memberID(evicted)) {
+		t.Fatal("the removal did not take effect")
+	}
+
+	// A join dated a day ahead, redeeming the invite it still holds. Under
+	// timestamp order alone this beats the removal and puts it back.
+	future := f.sign(evicted, Record{
+		Kind:      KindJoin,
+		Invite:    &invite,
+		Timestamp: f.clockMS + (24 * time.Hour).Milliseconds(),
+	})
+	if _, err := f.group.Apply(future); !errors.Is(err, entmoot.ErrRosterReject) {
+		t.Fatalf("a record dated a day ahead was accepted: %v", err)
+	}
+	if f.group.IsMemberID(f.memberID(evicted)) {
+		t.Fatal("a future-dated join re-admitted a removed member")
+	}
+	// A record inside the tolerated drift still applies, so the bound is a
+	// clock check and not a ban on rejoining.
+	f.tick(10)
+	near := f.sign(evicted, Record{
+		Kind:      KindJoin,
+		Invite:    &invite,
+		Timestamp: f.clockMS + (time.Minute).Milliseconds(),
+	})
+	if _, err := f.group.Apply(near); err != nil {
+		t.Fatalf("a record one minute ahead was refused: %v", err)
+	}
+	if !f.group.IsMemberID(f.memberID(evicted)) {
+		t.Fatal("a valid rejoin was not applied")
+	}
+}

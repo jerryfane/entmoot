@@ -221,8 +221,8 @@ func (r *groupRuntime) retryPendingAdoptions(ctx context.Context, groupIDs []ent
 
 // cmdMembershipAdopt takes a group's first checkpoint from a named peer. It
 // exists for the node the automatic path cannot help: one carried over from
-// the Pilot era, which has no libp2p address for anybody and therefore nothing
-// to ask. The operator supplies one address; everything after that is the same
+// the oldest data layout, which holds no libp2p address for anybody and so has
+// nothing to ask. The operator supplies one address; everything after that is the same
 // verified adoption the daemon performs by itself.
 func cmdMembershipAdopt(gf *globalFlags, args []string) int {
 	fs := flag.NewFlagSet("membership adopt", flag.ContinueOnError)
