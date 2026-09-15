@@ -128,8 +128,13 @@ commitment over the member set, and is not implemented.
 
 ### What a checkpoint may not claim
 
-- A timestamp more than five minutes ahead of the reading node's clock is
-  refused. The timestamp decides which records the checkpoint covers, so one
+- A RECORD more than five minutes ahead of the reading node's clock is refused
+  too. Records merge in timestamp order, so an unbounded timestamp is
+  authority: a member could date one years ahead and win every contest about
+  itself until that date — re-admitting itself over a removal, or keeping a
+  membership it had left — while holding no authority at all.
+- A checkpoint timestamp more than five minutes ahead of the reading node's
+  clock is refused. The timestamp decides which records the checkpoint covers, so one
   dated next year would make every legitimate record stale and freeze the node.
 - A checkpoint that says it replaces a linear roster chain must name the head
   of the chain that node holds. One claiming an upgrade where there is no chain

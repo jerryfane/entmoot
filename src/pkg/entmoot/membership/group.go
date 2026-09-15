@@ -621,6 +621,9 @@ func (g *Group) Apply(rec Record) (bool, error) {
 	if _, exists := g.records[rec.ID]; exists {
 		return false, nil
 	}
+	if err := g.verifyRecordClockLocked(rec); err != nil {
+		return false, err
+	}
 	if rec.Timestamp < g.checkpoints[g.canonicalID].Timestamp {
 		return false, ErrStale
 	}
@@ -694,6 +697,25 @@ func (g *Group) ApplyCheckpoint(cp Checkpoint) (bool, error) {
 		return true, err
 	}
 	return true, nil
+}
+
+// maxRecordSkew bounds how far ahead of this node's clock a record may be
+// dated. Timestamps decide the order records merge in, so an unbounded one is
+// authority: a member could date a record years ahead and win every contest
+// about itself until that date — re-admitting itself over a removal, or
+// keeping a membership it has left — without holding any authority at all.
+//
+// The bound is generous enough for real clock drift and short enough that a
+// future-dated record is refused rather than stored, since a record this node
+// refuses to hold is one it will never serve to anybody else.
+const maxRecordSkew = 5 * time.Minute
+
+func (g *Group) verifyRecordClockLocked(rec Record) error {
+	if limit := g.now().Add(maxRecordSkew).UnixMilli(); rec.Timestamp > limit {
+		return fmt.Errorf("%w: record is dated %d, more than %s ahead of this node's clock",
+			entmoot.ErrRosterReject, rec.Timestamp, maxRecordSkew)
+	}
+	return nil
 }
 
 // maxCheckpointSkew bounds how far ahead of this node's clock a checkpoint may

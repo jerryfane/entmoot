@@ -89,8 +89,8 @@ func cmdMembershipUpgrade(gf *globalFlags, args []string) int {
 		fmt.Fprintf(os.Stderr, "membership upgrade: this identity is not the founder of group %s; run it on the founder\n", gid.String())
 		return exitNotMember
 	}
-	// A chain from the Pilot era names its members by node id and key, with no
-	// member id: those did not exist yet. The checkpoint restates each member
+	// The oldest chains name their members by a retired numeric node id and a
+	// key, with no member id: those did not exist yet. The checkpoint restates each member
 	// under the identity derived from the same key, which is what every
 	// current signature and lookup is keyed by. The key is what carries over;
 	// the node id does not.
@@ -156,8 +156,8 @@ func cmdMembershipUpgrade(gf *globalFlags, args []string) int {
 
 // fullWidthMember restates a member under the identity its key derives: the
 // member id every current signature is keyed by, and the libp2p peer id it
-// dials as. A Pilot-era chain carries neither, only the key and a node id that
-// means nothing now.
+// dials as. The oldest chains carry neither: only the key, and a numeric node
+// id from the retired transport that means nothing now.
 func fullWidthMember(info entmoot.NodeInfo) (entmoot.NodeInfo, error) {
 	memberID, err := entmoot.MemberIDFromPublicKey(info.EntmootPubKey)
 	if err != nil {

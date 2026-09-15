@@ -59,8 +59,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   checkpoints leaves a longer chain behind; `roster status` shows it as the
   gap between the anchor and the canonical sequence.
 
-  A checkpoint dated more than five minutes ahead of the local clock is
-  refused: its timestamp decides which records it covers, so one dated next
+  A record or checkpoint dated more than five minutes ahead of the local clock
+  is refused. For records the reason is that they merge in timestamp order, so
+  an unbounded timestamp would be authority: a member could date one years
+  ahead and win every contest about itself until then, re-admitting itself over
+  a removal or keeping a membership it had left. For checkpoints: its timestamp decides which records it covers, so one dated next
   year would make every legitimate record stale and freeze the node. A
   checkpoint that claims to replace a linear roster chain must name the head
   of the chain the node actually holds, and one that claims an upgrade where
