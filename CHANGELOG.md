@@ -9,14 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
-- **`-trace-reconcile` is gone, and passing it now fails the command.** The
-  flag never enabled any tracing: it was parsed, forwarded to re-exec'd child
-  commands, and read by nothing, while seven documentation pages told operators
-  to pass it. A unit file or script that still passes it exits 5 with `flag
-  provided but not defined`. Use `-log-level debug` for verbose daemon logs.
-- **`pkg/entmoot/reconcile` is deleted.** The range-fingerprint reconciliation
-  session it implemented was never wired to a protocol; catch-up is the
-  cursor-paged `/entmoot/history/2` exchange, which is unchanged.
+- **`-trace-reconcile` is gone, and passing it now fails the command.** It was
+  a live flag until the Pilot cutover: `pkg/entmoot/gossip` read it through
+  `cfg.TraceReconcile` and traced reconciliation sessions with it. When that
+  package was replaced by `transport/libp2p`, the flag kept being parsed and
+  forwarded to re-exec'd child commands but nothing read it again, and seven
+  documentation pages went on telling operators to pass it. A unit file or
+  script that still passes it exits 5 with `flag provided but not defined`.
+  Use `-log-level debug` for verbose daemon logs.
+- **`pkg/entmoot/reconcile` is deleted.** Its range-fingerprint sessions were
+  driven by `pkg/entmoot/gossip` (via `reconcile.NewInitiator`/`NewResponder`)
+  and shipped that way through v1.5.81; they have had no caller since that
+  package was replaced. Catch-up is the cursor-paged `/entmoot/history/2`
+  exchange, which is unchanged.
 - **The message store has one implementation.** `store.Memory` and
   `store.JSONL` (with `store.OpenJSONL` and `store.NewMemory`) are removed;
   `store.OpenSQLite` is what the daemon has always opened. A group directory's
@@ -48,10 +53,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the deleted `KeyRotation` also carried a founder-authorised mode for a
   member that lost its key. Both gaps are tracked on issue #124.
 - **`MessageStore.IterMessageIDsInIDRange` is removed** along with its SQLite
-  implementation. It existed for the range-based anti-entropy in
-  `pkg/entmoot/reconcile`, which never called it and is itself deleted here, so
-  no production code has ever reached it. History catch-up pages by
-  `(timestamp, author, id)` through `MessageIDsPage`, which is unchanged.
+  implementation, and the index that served it,
+  `idx_messages_group_id_range`, is retired. The method backed the
+  range-based anti-entropy in `pkg/entmoot/reconcile`, called through
+  `pkg/entmoot/gossip`'s store adapter and shipped that way through v1.5.81;
+  it has had no caller since that package was replaced. History catch-up pages
+  by `(timestamp, author, id)` through `MessageIDsPage`, which is unchanged.
+
+  **Operators:** opening an existing group database drops that index once, so
+  the first open after upgrading rewrites `messages.sqlite`'s schema. The drop
+  is best-effort and bounded: if another process on the same data root holds
+  the write lock, the open still succeeds and a later open retires the index.
+  No message data is touched and there is nothing to run by hand.
 
 ### Changed
 

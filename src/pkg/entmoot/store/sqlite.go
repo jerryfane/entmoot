@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -52,12 +53,7 @@ CREATE INDEX IF NOT EXISTS idx_messages_group_time
 CREATE INDEX IF NOT EXISTS idx_messages_group_latest
   ON messages(group_id, timestamp_ms DESC, author_member_id DESC, message_id DESC);
 
--- idx_messages_group_id_range served IterMessageIDsInIDRange, which no code
--- ever called and which is removed. Dropping it rather than leaving it costs
--- every existing database one fewer index to maintain on each insert; the
--- keyset queries that remain are all (timestamp_ms, author_member_id,
--- message_id) and are served by idx_messages_group_latest.
-DROP INDEX IF EXISTS idx_messages_group_id_range;
+
 
 CREATE INDEX IF NOT EXISTS idx_messages_group_author
   ON messages(group_id, author_member_id, timestamp_ms DESC);
@@ -1536,6 +1532,29 @@ func openSQLiteDB(dbPath string) (*sql.DB, error) {
 	if _, err := db.Exec(sqliteSchema); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("store: apply schema: %w", err)
+	}
+	// Retire idx_messages_group_id_range, left by binaries that still had
+	// IterMessageIDsInIDRange. This runs outside the schema block on purpose:
+	// DROP INDEX needs a write transaction, and the schema block itself needs
+	// none, so folding it in would make the first open of an existing database
+	// fail with SQLITE_BUSY whenever another process on the same data root
+	// holds the write lock (this fleet runs `serve` and `esp serve` against one
+	// root). Best-effort is correct here: the index is a pure cost, so failing
+	// to drop it now just means the next open tries again.
+	// Bound the wait: the open path's busy_timeout is 5s, and stalling every
+	// upgrade open for that long behind an unrelated writer is worse than
+	// retiring the index on the next open instead.
+	if _, err := db.Exec(`PRAGMA busy_timeout = 200`); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("store: set retire busy_timeout: %w", err)
+	}
+	if _, err := db.Exec(`DROP INDEX IF EXISTS idx_messages_group_id_range`); err != nil {
+		slog.Debug("store: retire idx_messages_group_id_range deferred to a later open",
+			slog.String("path", dbPath), slog.String("err", err.Error()))
+	}
+	if _, err := db.Exec(`PRAGMA busy_timeout = 5000`); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("store: restore busy_timeout: %w", err)
 	}
 	if err := backfillMessageSearchDocs(context.Background(), db); err != nil {
 		_ = db.Close()
