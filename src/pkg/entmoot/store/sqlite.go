@@ -52,8 +52,12 @@ CREATE INDEX IF NOT EXISTS idx_messages_group_time
 CREATE INDEX IF NOT EXISTS idx_messages_group_latest
   ON messages(group_id, timestamp_ms DESC, author_member_id DESC, message_id DESC);
 
-CREATE INDEX IF NOT EXISTS idx_messages_group_id_range
-  ON messages(group_id, message_id ASC);
+-- idx_messages_group_id_range served IterMessageIDsInIDRange, which no code
+-- ever called and which is removed. Dropping it rather than leaving it costs
+-- every existing database one fewer index to maintain on each insert; the
+-- keyset queries that remain are all (timestamp_ms, author_member_id,
+-- message_id) and are served by idx_messages_group_latest.
+DROP INDEX IF EXISTS idx_messages_group_id_range;
 
 CREATE INDEX IF NOT EXISTS idx_messages_group_author
   ON messages(group_id, author_member_id, timestamp_ms DESC);
