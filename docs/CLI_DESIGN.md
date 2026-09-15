@@ -76,8 +76,12 @@ groups/<gid>/...       Membership records, checkpoints, messages, indexes
 mailbox.sqlite         ESP mailbox cursors
 esp.sqlite             ESP and live-agent projections
 runtime.env            Installed wrapper defaults
+esp-devices.json       ESP device key registry
+group-policies.json    Local per-group enforcement policy
+default_moot.json      Recorded owner consent for The Ent Moot
+bootstrap-admission.db Local ledger of invites this node issued
 conversion.sqlite      One-way legacy conversion journal
-conversion-backup/     Pre-conversion copy of the files it rewrites
+conversion-backup/     Pre-conversion copy of every regular file in the root
 conversion.lock        Exclusive lock held for the duration of a conversion
 ```
 
@@ -106,19 +110,26 @@ daemon.
 
 ### 5.2 Framing
 
-Each request and response is one length-prefixed frame: a four-byte big-endian
-length followed by that many bytes of JSON. A zero length is malformed, and a
-length above `ipc.MaxFrameSize` is refused as oversized before the body is
-read, so an oversized prefix costs no allocation.
+Each request and response is one frame:
+
+```text
+[4-byte big-endian length][1-byte message type][JSON body]
+```
+
+The length counts the type byte plus the body, so it is `1 + len(body)`. A
+zero length is malformed, and a length above `ipc.MaxFrameSize` is refused as
+oversized before the body is read, so an oversized prefix costs no allocation.
 
 ### 5.3 Message types
 
 Every frame carries a numeric message type. Types are registered in
-`pkg/entmoot/ipc/types.go`. A request and its response are adjacent
-(`0x10`/`0x11`, `0x1C`/`0x1D`), and the numbering is deliberately stretched to
-leave room for future pairs without renumbering existing ones. The sequence is
-not contiguous: `MsgError` sits at `0x1F`, inside the range, and gaps exist
-where types were retired.
+`pkg/entmoot/ipc/types.go` and the numbering is deliberately stretched to leave
+room for future pairs without renumbering existing ones.
+
+Do not assume a request and its response are adjacent. Most pairs are
+(`0x10`/`0x11`, `0x1C`/`0x1D`), but `MsgInviteAuthorityCheckReq` is `0x1E` and
+its response is `0x20`, split by `MsgError` at `0x1F`. Gaps also exist where
+types were retired. Match on the constants, not on arithmetic.
 
 ### 5.4 Error envelope
 
@@ -228,8 +239,9 @@ replayed, revoked, exhausted, wrong-target or wrong-founder capabilities
 install no partial group state. An invite names the checkpoint its issuer held; later joins do not
 invalidate outstanding invites, while an applicant banned after that checkpoint
 is refused. A refused join reports why — invite revoked, exhausted, expired, banned
-subject, or an issuer without authority at the checkpoint it cites — and
-installs no partial group state.
+subject, or an issuer who may no longer administer the group — and installs no
+partial group state. Issuer authority is judged against current membership, as
+above, not against the checkpoint the invite names.
 
 Open-invite redemption uses the same Entmoot identity. The joiner signs a
 bounded issuer challenge with its Ed25519 key; the issuer verifies the MemberID,

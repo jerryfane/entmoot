@@ -347,22 +347,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`docs/CLI_DESIGN.md` no longer documents commands that do not exist.** It
   still listed `roster add`, `roster repair` and a `roster_divergence` status,
   and described a linear roster chain that two signers could fork — all removed
-  by membership v3. Corrected: the founder command list, the storage layout
-  (which now names `conversion.sqlite`, `conversion-backup/` and
-  `conversion.lock` instead of a `conversion-*` glob that matched none of
-  them), the fork section, and the invite section's account of how a join is
-  refused and which checkpoint an invite may cite. The exit-code table is
-  unchanged.
+  by membership v3. Corrected: the founder command list, the data-root layout
+  (which named a `conversion-*` glob matching neither the journal nor the lock,
+  and omitted `esp-devices.json`, `group-policies.json`, `default_moot.json`
+  and `bootstrap-admission.db`), the fork section, and the invite section's
+  account of how a join is refused. The exit-code table is unchanged.
 
-  Twelve files under `pkg/entmoot/ipc` and `pkg/entmoot/store` cite this doc by
+  Six files under `pkg/entmoot/ipc` and `pkg/entmoot/store` cite this doc by
   section number, including sub-sections 4.2 and 5.2-5.4 that it never actually
-  had. Those sub-sections now exist and say what the code does, so the
-  citations resolve instead of dangling.
+  had. Those sub-sections now exist and describe the wire format the code
+  implements: a frame is `[4-byte big-endian length][1-byte type][JSON body]`
+  with the length counting the type byte. Four `cmd/entmootd` files cited
+  sections 3.1, 3.3, 3.4, 3.5 and 5.5, which the compact rewrite of section 3
+  dropped long ago; those comments now name sections that exist, so no
+  citation in the tree dangles.
 
 - **`README.md` describes the current commands and guarantees.** It listed
   `roster add`, which does not exist (running it exits 5), claimed roster order
   is "monotonic and fork-checked" after membership v3 removed fork detection,
-  advertised a memory message store deleted in the previous release, and called
+  advertised a memory message store deleted earlier in this unreleased cycle, and called
   a join an "enrollment" — there has been no separate enrollment step since the
   libp2p cutover.
 
