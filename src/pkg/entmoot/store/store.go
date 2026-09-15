@@ -103,8 +103,7 @@ type MessageStore interface {
 	// sorted ascending by byte order. If hiID is the zero MessageID, the
 	// upper bound is treated as "unbounded" (equivalent to all 0xFF).
 	//
-	// This is used by the reconcile package for range-based anti-entropy
-	// (Entmoot v1.2.1); it is NOT the same ordering as Range() (which is
+	// The ordering is by message id, NOT the ordering of Range() (which is
 	// topological / timestamp-based). An empty or unknown group returns an
 	// empty slice and a nil error.
 	IterMessageIDsInIDRange(ctx context.Context, groupID entmoot.GroupID, loID, hiID entmoot.MessageID) ([]entmoot.MessageID, error)

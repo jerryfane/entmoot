@@ -73,9 +73,11 @@ func TestThreePeerGossipSubPersistsAndEmitsOnce(t *testing.T) {
 	}
 	waitForStoredMessage(t, ctx, stores[1], groupID, message.ID)
 	waitForStoredMessage(t, ctx, stores[2], groupID, message.ID)
-	if ingests[0].Load() != 1 || ingests[1].Load() != 1 || ingests[2].Load() != 1 {
-		t.Fatalf("ingest counts = %d,%d,%d", ingests[0].Load(), ingests[1].Load(), ingests[2].Load())
-	}
+	// A peer's store Put happens in the pubsub validator; OnIngest fires later,
+	// when the subscription hands the message to the reader goroutine. Waiting
+	// on the store therefore does not imply the callback has run, so poll the
+	// counters. The "exactly once" half is asserted after the settle below.
+	waitForIngestCounts(t, ctx, &ingests, 1, 1, 1)
 	state, err = groups[0].Publish(ctx, message)
 	if err != nil || state != DeliveryAlreadyStored {
 		t.Fatalf("duplicate publish state=%q err=%v", state, err)
@@ -442,6 +444,37 @@ func waitForStoredMessage(t *testing.T, ctx context.Context, messageStore store.
 		select {
 		case <-ctx.Done():
 			t.Fatal(ctx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
+// waitForIngestCounts polls until every peer's OnIngest counter reaches its
+// want, or the context expires. It never passes on a counter that overshoots:
+// a peer that ingested twice fails immediately rather than waiting out the
+// deadline, so the helper cannot hide a duplicate delivery.
+func waitForIngestCounts(t *testing.T, ctx context.Context, counters *[3]atomic.Int32, want ...int32) {
+	t.Helper()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		done := true
+		for i, target := range want {
+			got := counters[i].Load()
+			if got > target {
+				t.Fatalf("peer %d ingested %d times, want %d", i, got, target)
+			}
+			if got != target {
+				done = false
+			}
+		}
+		if done {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("ingest counts = %d,%d,%d, want %v: %v",
+				counters[0].Load(), counters[1].Load(), counters[2].Load(), want, ctx.Err())
 		case <-ticker.C:
 		}
 	}

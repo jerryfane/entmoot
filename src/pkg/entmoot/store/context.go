@@ -67,8 +67,8 @@ type MessageContexter interface {
 	MessageContext(ctx context.Context, groupID entmoot.GroupID, messageID entmoot.MessageID, opts MessageContextOptions) (MessageContextResult, error)
 }
 
-// MessageContext returns a bounded conversation window around messageID using
-// a native store implementation when available, otherwise a deterministic scan.
+// MessageContext returns a bounded conversation window around messageID,
+// normalizing the options first so every implementation sees the same bounds.
 func MessageContext(ctx context.Context, st MessageContexter, groupID entmoot.GroupID, messageID entmoot.MessageID, opts MessageContextOptions) (MessageContextResult, error) {
 	opts = NormalizeMessageContextOptions(opts)
 	return st.MessageContext(ctx, groupID, messageID, opts)
@@ -113,10 +113,6 @@ func compareMessageRecency(a, b entmoot.Message) int {
 		return bytes.Compare(left[:], right[:])
 	}
 	return bytes.Compare(a.ID[:], b.ID[:])
-}
-
-func sortMessagesNewestFirst(msgs []entmoot.Message) {
-	sortMessagesByRecency(msgs, true)
 }
 
 func sortMessagesOldestFirst(msgs []entmoot.Message) {

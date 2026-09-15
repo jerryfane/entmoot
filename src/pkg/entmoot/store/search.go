@@ -1,7 +1,6 @@
 package store
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -49,8 +48,9 @@ type MessageSearcher interface {
 	SearchMessages(ctx context.Context, groupID entmoot.GroupID, query SearchQuery, opts SearchOptions) (SearchResult, error)
 }
 
-// SearchMessages searches st using a native search index when available, or a
-// deterministic in-process scan for stores that do not maintain an index.
+// SearchMessages normalizes the query and options, then searches st's index.
+// An empty or over-long query is rejected here rather than at the store, so
+// every implementation sees the same normalized input.
 func SearchMessages(ctx context.Context, st MessageSearcher, groupID entmoot.GroupID, query string, opts SearchOptions) (SearchResult, error) {
 	normalized, err := NormalizeSearchQuery(query)
 	if err != nil {
@@ -63,8 +63,7 @@ func SearchMessages(ctx context.Context, st MessageSearcher, groupID entmoot.Gro
 	return st.SearchMessages(ctx, groupID, normalized, opts)
 }
 
-// SearchQuery is the normalized representation shared by scan and indexed
-// search paths.
+// SearchQuery is the normalized representation a store's index is given.
 type SearchQuery struct {
 	Query string
 	Terms []string
@@ -118,17 +117,6 @@ func searchTerms(query string) []string {
 
 func quoteFTS5Term(term string) string {
 	return `"` + strings.ReplaceAll(term, `"`, `""`) + `"`
-}
-
-func searchMessageOlderThan(m entmoot.Message, boundary SearchBoundary) bool {
-	if m.Timestamp != boundary.TimestampMS {
-		return m.Timestamp < boundary.TimestampMS
-	}
-	author := messageMemberID(m)
-	if author != boundary.AuthorMemberID {
-		return bytes.Compare(author[:], boundary.AuthorMemberID[:]) < 0
-	}
-	return bytes.Compare(m.ID[:], boundary.MessageID[:]) < 0
 }
 
 func searchBoundaryFromMessage(m entmoot.Message) SearchBoundary {

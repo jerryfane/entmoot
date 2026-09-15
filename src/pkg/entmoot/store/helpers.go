@@ -5,17 +5,6 @@ import (
 	"entmoot/pkg/entmoot/order"
 )
 
-// messageHasTopic reports whether the message carries the exact topic. Topic
-// lists are short, so a scan beats building a set.
-func messageHasTopic(m entmoot.Message, topic string) bool {
-	for _, candidate := range m.Topics {
-		if candidate == topic {
-			return true
-		}
-	}
-	return false
-}
-
 // topoOrder sorts messages so every parent precedes its children. Messages
 // whose ids are not in the resolved order are dropped, which is what callers
 // paging a window want: a child whose parent fell outside the window keeps its
