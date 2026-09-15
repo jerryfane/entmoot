@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"testing"
 	"time"
@@ -229,4 +230,64 @@ func mustSignedMessage(t *testing.T, ctx context.Context, gid entmoot.GroupID, a
 		t.Fatalf("SignMessage: %v", err)
 	}
 	return signed
+}
+
+// Checkpointing is the daemon's job, not an operator's. It has to happen on
+// the cadence even when this node hears from nobody: the records it signs
+// itself count towards the cadence, and a founder alone in a group still has
+// to retire them.
+func TestDaemonCheckpointsOnCadenceWithNoPeers(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	root := t.TempDir()
+	founder, err := keystore.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gid entmoot.GroupID
+	if _, err := rand.Read(gid[:]); err != nil {
+		t.Fatal(err)
+	}
+	policy := membership.DefaultPolicy()
+	policy.JoinRule = membership.JoinRuleOpen
+	policy.CheckpointEvery = 3
+	mustCreateGroup(t, root, gid, founder, policy)
+
+	runtime, session, host := startTestRuntime(t, ctx, root, founder, gid)
+	defer host.Close()
+	defer runtime.Close()
+
+	// Three joins, signed locally: nothing arrives from any peer, and there is
+	// no peer to arrive from.
+	for i := 0; i < 3; i++ {
+		joiner, err := keystore.Generate()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := session.group.SignRecord(joiner, membership.Record{Kind: membership.KindJoin}); err != nil {
+			t.Fatalf("join %d: %v", i, err)
+		}
+	}
+	if got := session.group.Canonical().Sequence; got != 0 {
+		t.Fatalf("canonical sequence = %d before any maintenance round, want 0", got)
+	}
+	if got := len(runtime.membershipPeers(session)); got != 0 {
+		t.Fatalf("the fixture has %d reachable peers, so it does not test the no-peer path", got)
+	}
+
+	runtime.syncMembership(ctx, session)
+
+	canonical := session.group.Canonical()
+	if canonical.Sequence != 1 {
+		t.Fatalf("canonical sequence = %d after the cadence was reached, want 1", canonical.Sequence)
+	}
+	if canonical.Covered != 3 {
+		t.Fatalf("checkpoint covered %d records, want 3", canonical.Covered)
+	}
+	if got := len(session.group.MemberIDs()); got != 4 {
+		t.Fatalf("membership = %d, want the founder plus three joiners", got)
+	}
+	if got := session.group.EffectivePendingCount(); got != 0 {
+		t.Fatalf("%d records are still pending after the checkpoint", got)
+	}
 }

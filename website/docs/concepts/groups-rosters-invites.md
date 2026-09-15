@@ -67,8 +67,16 @@ A checkpoint replaces the records it covers. Records older than the canonical
 checkpoint's timestamp are refused as stale, so a change that was discarded
 cannot come back later on a slow link.
 
-Cadence is group policy (`checkpoint_every`, default 64 effective records).
-`entmootd roster checkpoint` signs one on demand.
+Signing one is the daemon's job, not an operator's. Every maintenance round,
+each node that may sign checks whether the group has reached its cadence
+(`checkpoint_every`, default 64 effective records) and signs if it has —
+including when it has heard from nobody, because the records it signed itself
+count too. `entmootd roster checkpoint` exists for the case where you want one
+now rather than at the cadence.
+
+Several admins reaching the cadence at once each sign one; they all describe
+the same membership, and every node picks the same winner by the rule below, so
+a duplicate costs one signature and nothing else.
 
 ### Who may sign one
 

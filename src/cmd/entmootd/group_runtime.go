@@ -531,6 +531,10 @@ const (
 func (r *groupRuntime) syncMembership(ctx context.Context, session *groupSession) {
 	peers := r.membershipPeers(session)
 	if len(peers) == 0 {
+		// Nobody to pull from, which is not a reason to skip the cadence: a
+		// group whose only online node is the founder still accumulates the
+		// records the founder signs, and still has to retire them.
+		r.signCheckpointIfDue(session)
 		return
 	}
 	progressed := false
@@ -578,8 +582,11 @@ func (r *groupRuntime) syncMembership(ctx context.Context, session *groupSession
 	if progressed {
 		// Messages held for a checkpoint we have now learned can be accepted.
 		r.drainHeldMessages(ctx, session)
-		r.signCheckpointIfDue(session)
 	}
+	// Every round, not only when a pull brought something back: records this
+	// node signed itself count towards the cadence too, so a founder admitting
+	// members while nothing arrives from anybody else must still checkpoint.
+	r.signCheckpointIfDue(session)
 }
 
 // signCheckpointIfDue folds pending records into a checkpoint once the group's

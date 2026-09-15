@@ -35,8 +35,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   new member downloads one checkpoint instead of replaying a group's whole
   past, and looking up membership at a cited checkpoint is constant time: 330ns
   at 1,000 members and 172ns at 100,000, against 3.5ms and 316ms for the chain
-  walk it replaces. Cadence is group policy (`checkpoint_every`, default 64);
-  `roster checkpoint` signs one on demand.
+  walk it replaces. Cadence is group policy (`checkpoint_every`, default 64), and signing is
+  automatic: every maintenance round a node that may sign checks the cadence
+  and signs if it is due, including when it has heard from no peer, since the
+  records it signed itself count towards the cadence too. `roster checkpoint`
+  is for signing one now rather than at the cadence.
 
   Who may sign one is decided by the checkpoint BEFORE it, and never by the
   checkpoint's own claim about the admin set — its signer writes that claim,
