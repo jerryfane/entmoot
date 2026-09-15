@@ -247,7 +247,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   topic `entmoot/profile/1`; every member that receives it records the name,
   and ESP member listings show it. `profile clear` withdraws it and `profile
   show` prints what this node has observed. A name expires after 30 days by
-  default (`-ttl`, `0` disables), so a node that leaves stops being displayed.
+  default; `-ttl` asks for another duration, and 0 or anything above the
+  90-day maximum publishes 90 days, since every receiving node clamps a
+  longer or missing expiry to that bound. So a node that leaves stops being
+  displayed.
 
   This closes a gap, not a new idea: the ESP has always read display names and
   the docs have always promised that "a member may additionally publish a
