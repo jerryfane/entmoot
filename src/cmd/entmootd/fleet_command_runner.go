@@ -488,16 +488,3 @@ func envBool(v string) bool {
 		return false
 	}
 }
-
-func redactCommandMap(in map[string]interface{}) map[string]interface{} {
-	out := make(map[string]interface{}, len(in))
-	for k, v := range in {
-		lower := strings.ToLower(k)
-		if strings.Contains(lower, "token") || strings.Contains(lower, "secret") || strings.Contains(lower, "key") {
-			out[k] = "[redacted]"
-			continue
-		}
-		out[k] = v
-	}
-	return out
-}

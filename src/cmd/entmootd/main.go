@@ -37,7 +37,6 @@ type globalFlags struct {
 	allowNewIdentity bool
 	listenPort       uint
 	logLevel         string
-	traceReconcile   bool
 	connectivity     string
 	controlledRelays stringListFlag
 	features         entfeatures.Flags
@@ -128,8 +127,6 @@ func run() int {
 		"allow first-time Entmoot identity creation when the identity file is absent")
 	fs.UintVar(&gf.listenPort, "listen-port", 1004, "Entmoot listen port")
 	fs.StringVar(&gf.logLevel, "log-level", "info", "slog level: debug|info|warn|error")
-	fs.BoolVar(&gf.traceReconcile, "trace-reconcile", false,
-		"emit verbose reconcile lifecycle traces")
 	fs.StringVar(&gf.connectivity, "connectivity", "direct", "connectivity profile: direct|relay-only")
 	fs.Var(&gf.controlledRelays, "controlled-relay", "controlled Circuit Relay v2 multiaddr ending in /p2p/<peer-id>; repeatable")
 

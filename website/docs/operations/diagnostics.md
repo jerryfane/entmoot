@@ -92,8 +92,8 @@ and a reusable `next_command` that preserves identity and data-root flags.
 For containerized agents, prefer `/data/.entmoot/entmoot`. If `env` reports a
 daemon under `/proc/<pid>/root/...`, run the diagnostic in that container.
 
-Use the trace flag for deep reconciliation diagnostics:
+For deep sync diagnostics, raise the daemon's log level:
 
 ```sh
-entmootd -trace-reconcile serve
+entmootd -log-level debug serve
 ```

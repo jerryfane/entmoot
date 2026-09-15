@@ -71,9 +71,9 @@ of complete history; catch-up logs report `converged_hints` separately.
 ## Controlled Relays and Privacy
 
 Relay-only mode requires explicitly configured controlled relay identities and
-bootstrap multiaddrs. It uses no public DHT or rendezvous. The daemon does not
-start mDNS; SDK callers may explicitly start roster-filtered LAN discovery with
-`StartMemberMDNS` in direct mode.
+bootstrap multiaddrs. It uses no public DHT or rendezvous, and there is no LAN
+discovery: a peer is reachable only through an address carried by an invite, a
+gossiped signed peer record, or a configured relay.
 
 The configured host owns relay reservations, renews near their half-life, and
 withdraws expired or disconnected reservations. Failed attempts back off from

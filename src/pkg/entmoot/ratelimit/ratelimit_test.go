@@ -17,12 +17,19 @@ import (
 // anchor is the reference time used by every test that wires a clock.Fake.
 var anchor = time.Date(2026, 4, 17, 12, 0, 0, 0, time.UTC)
 
-// testLimits is the default v0 shape but with the clock injected via a Fake
-// from the caller.
-func testLimits() ratelimit.Limits { return ratelimit.DefaultLimits() }
+// testLimits is the quota shape the daemon builds from policy, with the clock
+// injected via a Fake by the caller.
+func testLimits() ratelimit.Limits {
+	return ratelimit.Limits{
+		MsgRate:    ratelimit.DefaultMsgRate,
+		MsgBurst:   ratelimit.DefaultMsgBurst,
+		BytesRate:  ratelimit.DefaultBytesRate,
+		BytesBurst: ratelimit.DefaultBytesBurst,
+	}
+}
 
 func TestDefaultLimits_Values(t *testing.T) {
-	l := ratelimit.DefaultLimits()
+	l := testLimits()
 	if l.MsgRate != 100 {
 		t.Errorf("MsgRate: got %v, want 100", l.MsgRate)
 	}
@@ -75,7 +82,7 @@ func TestAllow_MessageBurstThenRejectsUntilRefill(t *testing.T) {
 
 func TestAllow_ByteBurstAcceptsFourMiBRejectsFiveMiB(t *testing.T) {
 	fk := clock.NewFake(anchor)
-	lim := ratelimit.New(ratelimit.DefaultLimits(), fk)
+	lim := ratelimit.New(testLimits(), fk)
 	peer := testMemberID(7)
 
 	// 4 MiB fits the burst exactly.
@@ -98,7 +105,7 @@ func TestAllow_RejectionDoesNotBurnMsgToken(t *testing.T) {
 	// token. We drain 199 msg tokens, then submit an oversized payload; a
 	// final small Allow should still succeed (i.e. we still had 1 of 200).
 	fk := clock.NewFake(anchor)
-	lim := ratelimit.New(ratelimit.DefaultLimits(), fk)
+	lim := ratelimit.New(testLimits(), fk)
 	peer := testMemberID(11)
 
 	// Use 199 cheap messages first.
@@ -204,7 +211,7 @@ func TestAllow_ConcurrentSamePeerIsRaceSafe(t *testing.T) {
 
 func TestReset_RestoresFullBurst(t *testing.T) {
 	fk := clock.NewFake(anchor)
-	lim := ratelimit.New(ratelimit.DefaultLimits(), fk)
+	lim := ratelimit.New(testLimits(), fk)
 	peer := testMemberID(5)
 
 	// Drain the msg burst.
@@ -265,7 +272,7 @@ func TestAllow_UnlimitedSingleBucket(t *testing.T) {
 
 func TestAllow_UnknownPeerStartsWithFullBurst(t *testing.T) {
 	fk := clock.NewFake(anchor)
-	lim := ratelimit.New(ratelimit.DefaultLimits(), fk)
+	lim := ratelimit.New(testLimits(), fk)
 
 	// Peer A drains its burst.
 	a := testMemberID(1)

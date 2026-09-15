@@ -82,12 +82,6 @@ func (m *keyedMutexMap) Lock(key string) func() {
 	}
 }
 
-func (m *keyedMutexMap) Len() int {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return len(m.locks)
-}
-
 func lockFleetMutation(fleetID string) func() {
 	return espFleetMutationLocks.Lock("fleet:" + strings.TrimSpace(fleetID))
 }
@@ -171,9 +165,6 @@ type openInviteRedeemPayload struct {
 	PeerID        string           `json:"peer_id"`
 	EntmootPubKey []byte           `json:"entmoot_pubkey"`
 }
-
-const maxOpenInviteActiveChallenges = 128
-const minOpenInviteActiveChallenges = 8
 
 func (e espOperationExecutor) ExecuteSignRequest(ctx context.Context, req esphttp.SignRequest, _ []byte) (json.RawMessage, error) {
 	switch req.Kind {
@@ -318,57 +309,6 @@ func openInviteStoreError(err error) error {
 	default:
 		return err
 	}
-}
-
-func ensureOpenInviteActive(rec esphttp.OpenInviteRecord, nowMS int64) error {
-	if rec.Revoked {
-		return esphttp.ErrOpenInviteRevoked
-	}
-	if rec.ExpiresAtMS > 0 && rec.ExpiresAtMS <= nowMS {
-		return esphttp.ErrOpenInviteExpired
-	}
-	if esphttp.OpenInviteUseLimitReached(rec) {
-		return esphttp.ErrOpenInviteExhausted
-	}
-	return nil
-}
-
-func openInviteChallengeCap(rec esphttp.OpenInviteRecord) int {
-	if rec.MaxUses == esphttp.OpenInviteUnlimitedMaxUses {
-		return maxOpenInviteActiveChallenges
-	}
-	remaining := rec.MaxUses - rec.UseCount
-	if remaining < 0 {
-		remaining = 0
-	}
-	cap := remaining * 2
-	if cap < minOpenInviteActiveChallenges {
-		cap = minOpenInviteActiveChallenges
-	}
-	if cap > maxOpenInviteActiveChallenges {
-		cap = maxOpenInviteActiveChallenges
-	}
-	return cap
-}
-
-func (e espOperationExecutor) ensureOpenInviteCanIssueChallenge(ctx context.Context, rec esphttp.OpenInviteRecord, tokenHash, redeemerKey string, nowMS int64) error {
-	if rec.Revoked {
-		return esphttp.ErrOpenInviteRevoked
-	}
-	if rec.ExpiresAtMS > 0 && rec.ExpiresAtMS <= nowMS {
-		return esphttp.ErrOpenInviteExpired
-	}
-	if esphttp.OpenInviteUseLimitReached(rec) {
-		if e.stateStore != nil && redeemerKey != "" {
-			if _, ok, err := e.stateStore.GetOpenInviteRedemption(ctx, tokenHash, redeemerKey); err != nil {
-				return err
-			} else if ok {
-				return nil
-			}
-		}
-		return esphttp.ErrOpenInviteExhausted
-	}
-	return nil
 }
 
 type openInviteRedeemResponse struct {
@@ -2070,11 +2010,6 @@ func lockESPInviteRoster(gid entmoot.GroupID) func() {
 func lockESPOpenInviteRedemption(tokenHash string, redeemerKey string) func() {
 	key := tokenHash + "\x00" + redeemerKey
 	return espOpenInviteRedeemLocks.Lock(key)
-}
-
-func sha256Base64(data []byte) string {
-	sum := sha256.Sum256(data)
-	return base64.StdEncoding.EncodeToString(sum[:])
 }
 
 // applyRosterRemove records a removal. There is no matching add: a member

@@ -13,7 +13,6 @@ Common global flags:
 -log-level info
 -connectivity direct
 -controlled-relay <CIRCUIT_RELAY_MULTIADDR>
--trace-reconcile
 ```
 
 Container/OpenClaw-style agents should use the installed wrapper instead of

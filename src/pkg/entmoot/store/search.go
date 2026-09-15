@@ -1,11 +1,9 @@
 package store
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
-	"sort"
 	"strings"
 	"unicode"
 
@@ -50,9 +48,10 @@ type MessageSearcher interface {
 	SearchMessages(ctx context.Context, groupID entmoot.GroupID, query SearchQuery, opts SearchOptions) (SearchResult, error)
 }
 
-// SearchMessages searches st using a native search index when available, or a
-// deterministic in-process scan for stores that do not maintain an index.
-func SearchMessages(ctx context.Context, st MessageStore, groupID entmoot.GroupID, query string, opts SearchOptions) (SearchResult, error) {
+// SearchMessages normalizes the query and options, then searches st's index.
+// An empty or over-long query is rejected here rather than at the store, so
+// every implementation sees the same normalized input.
+func SearchMessages(ctx context.Context, st MessageSearcher, groupID entmoot.GroupID, query string, opts SearchOptions) (SearchResult, error) {
 	normalized, err := NormalizeSearchQuery(query)
 	if err != nil {
 		return SearchResult{}, err
@@ -61,14 +60,10 @@ func SearchMessages(ctx context.Context, st MessageStore, groupID entmoot.GroupI
 	if opts.Limit <= 0 {
 		return SearchResult{Hits: []SearchHit{}}, nil
 	}
-	if searcher, ok := st.(MessageSearcher); ok {
-		return searcher.SearchMessages(ctx, groupID, normalized, opts)
-	}
-	return scanSearchMessages(ctx, st, groupID, normalized, opts)
+	return st.SearchMessages(ctx, groupID, normalized, opts)
 }
 
-// SearchQuery is the normalized representation shared by scan and indexed
-// search paths.
+// SearchQuery is the normalized representation a store's index is given.
 type SearchQuery struct {
 	Query string
 	Terms []string
@@ -122,87 +117,6 @@ func searchTerms(query string) []string {
 
 func quoteFTS5Term(term string) string {
 	return `"` + strings.ReplaceAll(term, `"`, `""`) + `"`
-}
-
-func scanSearchMessages(ctx context.Context, st MessageStore, groupID entmoot.GroupID, query SearchQuery, opts SearchOptions) (SearchResult, error) {
-	msgs, err := st.Range(ctx, groupID, 0, 0)
-	if err != nil {
-		return SearchResult{}, err
-	}
-	hits := make([]SearchHit, 0, len(msgs))
-	for _, msg := range msgs {
-		if opts.Topic != "" && !messageHasTopic(msg, opts.Topic) {
-			continue
-		}
-		if opts.CursorBoundary != nil && !searchMessageOlderThan(msg, *opts.CursorBoundary) {
-			continue
-		}
-		if !messageContentMatches(msg, query.Terms) {
-			continue
-		}
-		hits = append(hits, SearchHit{
-			Message: msg,
-			Snippet: string(msg.Content),
-		})
-	}
-	sortSearchHits(hits)
-	result := SearchResult{Hits: hits}
-	if len(result.Hits) > opts.Limit {
-		result.HasMore = true
-		result.Hits = result.Hits[:opts.Limit]
-	}
-	if result.HasMore && len(result.Hits) > 0 {
-		boundary := searchBoundaryFromMessage(result.Hits[len(result.Hits)-1].Message)
-		result.NextCursorBoundary = &boundary
-	}
-	if result.Hits == nil {
-		result.Hits = []SearchHit{}
-	}
-	return result, nil
-}
-
-func messageContentMatches(msg entmoot.Message, terms []string) bool {
-	contentTerms := searchTerms(string(msg.Content))
-	content := make(map[string]struct{}, len(contentTerms))
-	for _, term := range contentTerms {
-		content[term] = struct{}{}
-	}
-	for _, term := range terms {
-		if _, ok := content[term]; !ok {
-			return false
-		}
-	}
-	return true
-}
-
-func sortSearchHits(hits []SearchHit) {
-	sortSearchMessages(hits, func(i int) entmoot.Message { return hits[i].Message })
-}
-
-func sortSearchMessages[T any](items []T, messageAt func(int) entmoot.Message) {
-	sort.Slice(items, func(i, j int) bool {
-		a := messageAt(i)
-		b := messageAt(j)
-		if a.Timestamp != b.Timestamp {
-			return a.Timestamp > b.Timestamp
-		}
-		authorA, authorB := messageMemberID(a), messageMemberID(b)
-		if authorA != authorB {
-			return bytes.Compare(authorA[:], authorB[:]) > 0
-		}
-		return bytes.Compare(a.ID[:], b.ID[:]) > 0
-	})
-}
-
-func searchMessageOlderThan(m entmoot.Message, boundary SearchBoundary) bool {
-	if m.Timestamp != boundary.TimestampMS {
-		return m.Timestamp < boundary.TimestampMS
-	}
-	author := messageMemberID(m)
-	if author != boundary.AuthorMemberID {
-		return bytes.Compare(author[:], boundary.AuthorMemberID[:]) < 0
-	}
-	return bytes.Compare(m.ID[:], boundary.MessageID[:]) < 0
 }
 
 func searchBoundaryFromMessage(m entmoot.Message) SearchBoundary {

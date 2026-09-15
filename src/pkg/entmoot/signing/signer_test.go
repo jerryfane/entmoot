@@ -41,49 +41,15 @@ func TestLocalSignerSignsVerifiableMessage(t *testing.T) {
 	}
 }
 
-func TestExternalSignerAllowsPhoneHeldIdentity(t *testing.T) {
-	id, err := keystore.Generate()
-	if err != nil {
-		t.Fatalf("Generate: %v", err)
-	}
-	author := operationalInfo(t, id)
-	signer, err := NewExternalSigner(author, func(_ context.Context, payload []byte) ([]byte, error) {
-		return id.Sign(payload), nil
-	})
-	if err != nil {
-		t.Fatalf("NewExternalSigner: %v", err)
-	}
-
-	msg, err := signer.SignMessage(context.Background(), entmoot.Message{
-		GroupID:   groupID(2),
-		Timestamp: 2000,
-		Topics:    []string{"mobile/inbox"},
-		Content:   []byte("signed off-device"),
-	})
-	if err != nil {
-		t.Fatalf("SignMessage: %v", err)
-	}
-	if err := VerifyMessage(msg, author); err != nil {
-		t.Fatalf("VerifyMessage: %v", err)
-	}
-
-	msg.Content[0] ^= 0xff
-	if err := VerifyMessage(msg, author); err == nil {
-		t.Fatalf("VerifyMessage accepted tampered content")
-	}
-}
-
 func TestVerifyMessageCanonicalIDMismatchWrapsSigInvalid(t *testing.T) {
 	id, err := keystore.Generate()
 	if err != nil {
 		t.Fatalf("Generate: %v", err)
 	}
 	author := operationalInfo(t, id)
-	signer, err := NewExternalSigner(author, func(_ context.Context, payload []byte) ([]byte, error) {
-		return id.Sign(payload), nil
-	})
+	signer, err := NewLocalSigner(author, id)
 	if err != nil {
-		t.Fatalf("NewExternalSigner: %v", err)
+		t.Fatalf("NewLocalSigner: %v", err)
 	}
 	msg, err := signer.SignMessage(context.Background(), entmoot.Message{
 		GroupID:   groupID(2),

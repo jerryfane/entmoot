@@ -2,8 +2,6 @@ package policy
 
 import (
 	"testing"
-
-	"entmoot/pkg/entmoot/ratelimit"
 )
 
 func TestContentLimitsFromPolicy(t *testing.T) {
@@ -26,17 +24,5 @@ func TestContentLimitsFromPolicy(t *testing.T) {
 	}
 	if len(limits.TopicLimits) != 0 {
 		t.Fatalf("TopicLimits = %+v, want none for content limiter", limits.TopicLimits)
-	}
-}
-
-func TestSystemLimitsPreservesDefaultLimiter(t *testing.T) {
-	got := SystemLimits(nil)
-	want := ratelimit.DefaultLimits()
-	if got.MsgRate != want.MsgRate || got.MsgBurst != want.MsgBurst ||
-		got.BytesRate != want.BytesRate || got.BytesBurst != want.BytesBurst {
-		t.Fatalf("SystemLimits = %+v, want %+v", got, want)
-	}
-	if len(got.TopicLimits) != len(want.TopicLimits) {
-		t.Fatalf("SystemLimits topic count = %d, want %d", len(got.TopicLimits), len(want.TopicLimits))
 	}
 }

@@ -3,9 +3,11 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -51,8 +53,7 @@ CREATE INDEX IF NOT EXISTS idx_messages_group_time
 CREATE INDEX IF NOT EXISTS idx_messages_group_latest
   ON messages(group_id, timestamp_ms DESC, author_member_id DESC, message_id DESC);
 
-CREATE INDEX IF NOT EXISTS idx_messages_group_id_range
-  ON messages(group_id, message_id ASC);
+
 
 CREATE INDEX IF NOT EXISTS idx_messages_group_author
   ON messages(group_id, author_member_id, timestamp_ms DESC);
@@ -1319,59 +1320,6 @@ func (s *SQLite) SearchMessages(ctx context.Context, groupID entmoot.GroupID, qu
 	return result, nil
 }
 
-// IterMessageIDsInIDRange implements MessageStore.IterMessageIDsInIDRange.
-// Uses the PRIMARY KEY index on messages.message_id. Verified via
-// EXPLAIN QUERY PLAN to issue "SEARCH messages USING INTEGER PRIMARY KEY"
-// (or the BLOB-PK equivalent) during development.
-func (s *SQLite) IterMessageIDsInIDRange(ctx context.Context, groupID entmoot.GroupID, loID, hiID entmoot.MessageID) ([]entmoot.MessageID, error) {
-	db, exists, err := s.dbForExisting(groupID)
-	if err != nil {
-		return nil, err
-	}
-	if !exists {
-		return []entmoot.MessageID{}, nil
-	}
-
-	var rows *sql.Rows
-	if isZeroMessageID(hiID) {
-		rows, err = db.QueryContext(ctx, `
-			SELECT message_id FROM messages
-			WHERE group_id = ? AND message_id >= ?
-			ORDER BY message_id ASC;`,
-			groupID[:], loID[:],
-		)
-	} else {
-		rows, err = db.QueryContext(ctx, `
-			SELECT message_id FROM messages
-			WHERE group_id = ? AND message_id >= ? AND message_id < ?
-			ORDER BY message_id ASC;`,
-			groupID[:], loID[:], hiID[:],
-		)
-	}
-	if err != nil {
-		return nil, fmt.Errorf("store: iter id range query: %w", err)
-	}
-	defer rows.Close()
-
-	var out []entmoot.MessageID
-	for rows.Next() {
-		var raw []byte
-		if err := rows.Scan(&raw); err != nil {
-			return nil, fmt.Errorf("store: iter id range scan: %w", err)
-		}
-		if len(raw) != 32 {
-			return nil, fmt.Errorf("store: iter id range: message_id has %d bytes, want 32", len(raw))
-		}
-		var id entmoot.MessageID
-		copy(id[:], raw)
-		out = append(out, id)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("store: iter id range iterate: %w", err)
-	}
-	return out, nil
-}
-
 // MerkleRoot implements MessageStore.MerkleRoot.
 func (s *SQLite) MerkleRoot(ctx context.Context, groupID entmoot.GroupID) ([32]byte, error) {
 	db, exists, err := s.dbForExisting(groupID)
@@ -1585,6 +1533,29 @@ func openSQLiteDB(dbPath string) (*sql.DB, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("store: apply schema: %w", err)
 	}
+	// Retire idx_messages_group_id_range, left by binaries that still had
+	// IterMessageIDsInIDRange. This runs outside the schema block on purpose:
+	// DROP INDEX needs a write transaction, and the schema block itself needs
+	// none, so folding it in would make the first open of an existing database
+	// fail with SQLITE_BUSY whenever another process on the same data root
+	// holds the write lock (this fleet runs `serve` and `esp serve` against one
+	// root). Best-effort is correct here: the index is a pure cost, so failing
+	// to drop it now just means the next open tries again.
+	// Bound the wait: the open path's busy_timeout is 5s, and stalling every
+	// upgrade open for that long behind an unrelated writer is worse than
+	// retiring the index on the next open instead.
+	if _, err := db.Exec(`PRAGMA busy_timeout = 200`); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("store: set retire busy_timeout: %w", err)
+	}
+	if _, err := db.Exec(`DROP INDEX IF EXISTS idx_messages_group_id_range`); err != nil {
+		slog.Debug("store: retire idx_messages_group_id_range deferred to a later open",
+			slog.String("path", dbPath), slog.String("err", err.Error()))
+	}
+	if _, err := db.Exec(`PRAGMA busy_timeout = 5000`); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("store: restore busy_timeout: %w", err)
+	}
 	if err := backfillMessageSearchDocs(context.Background(), db); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -1693,4 +1664,10 @@ func decodeMessage(canonBytes []byte) (entmoot.Message, error) {
 		return entmoot.Message{}, fmt.Errorf("store: decode canonical: %w", err)
 	}
 	return msg, nil
+}
+
+// encodeGroupDirName names a group's on-disk directory. Raw-url base64 keeps
+// the 32-byte id in one path-safe segment with no padding character.
+func encodeGroupDirName(gid entmoot.GroupID) string {
+	return base64.RawURLEncoding.EncodeToString(gid[:])
 }

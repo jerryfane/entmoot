@@ -30,8 +30,8 @@ Member profiles are app-facing metadata, not consensus. A profile is signed by
 the same Entmoot key that determines the member's libp2p PeerID and is exposed
 only after membership and identity checks.
 
-Trace mode is available for deep reconciliation debugging:
+For deep gossip debugging, raise the daemon's log level:
 
 ```sh
-entmootd -trace-reconcile serve
+entmootd -log-level debug serve
 ```

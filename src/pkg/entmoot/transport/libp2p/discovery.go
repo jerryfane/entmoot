@@ -15,7 +15,6 @@ import (
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/peerstore"
-	mdns "github.com/libp2p/go-libp2p/p2p/discovery/mdns"
 	"github.com/libp2p/go-libp2p/p2p/host/eventbus"
 	rcmgr "github.com/libp2p/go-libp2p/p2p/host/resource-manager"
 	connmgr "github.com/libp2p/go-libp2p/p2p/net/connmgr"
@@ -212,35 +211,6 @@ func VisiblePeerAddresses(h host.Host, peerID peer.ID, mode ConnectivityMode, co
 		return addresses
 	}
 	return filterControlledCircuitAddresses(addresses, allowed)
-}
-
-// StartMemberMDNS enables LAN discovery only after an explicit direct-profile
-// call. Discovered addresses are still accepted only for current roster peers.
-func StartMemberMDNS(h host.Host, r *membership.Group, groupID entmoot.GroupID) (mdns.Service, error) {
-	if h == nil || r == nil {
-		return nil, errors.New("libp2p: host and roster are required for mDNS")
-	}
-	topicSuffix := GroupTopic(groupID)[len("/entmoot/group/2/"):]
-	service := mdns.NewMdnsService(h, "_em-"+topicSuffix[:8]+"._udp", &memberMDNSNotifee{host: h, roster: r})
-	if err := service.Start(); err != nil {
-		return nil, err
-	}
-	return service, nil
-}
-
-type memberMDNSNotifee struct {
-	host   host.Host
-	roster *membership.Group
-}
-
-func (n *memberMDNSNotifee) HandlePeerFound(info peer.AddrInfo) {
-	if !peerIsMember(n.host, n.roster, info.ID) {
-		return
-	}
-	n.host.Peerstore().AddAddrs(info.ID, info.Addrs, maxPeerAddressAge)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	_ = n.host.Connect(ctx, info)
 }
 
 // advertisedRelayAddrs mirrors the reservation manager's circuit addresses so a
