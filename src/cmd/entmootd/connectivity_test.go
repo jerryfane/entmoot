@@ -1,11 +1,17 @@
 package main
 
 import (
+	"context"
+	"crypto/rand"
 	"testing"
+	"time"
+
+	libp2p "github.com/libp2p/go-libp2p"
+	"github.com/libp2p/go-libp2p/core/peer"
 
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/keystore"
-	"entmoot/pkg/entmoot/roster"
+	"entmoot/pkg/entmoot/membership"
 	libp2ptransport "entmoot/pkg/entmoot/transport/libp2p"
 )
 
@@ -75,136 +81,103 @@ func TestDaemonHostConfigRejectsMalformedRelayInDirectProfile(t *testing.T) {
 	}
 }
 
-func TestEnrollmentRetryReturnsExistingMatchingMembership(t *testing.T) {
-	founderIdentity, err := keystore.Generate()
+// One join can reach the same node twice: the joiner hands it over itself,
+// and a member that already took it gossips the same record on. Redelivery is
+// the norm, not a fault — the second arrival must be recognised as the same
+// statement, reported as not applied, and leave one member and one record
+// behind rather than a duplicate admission.
+func TestDuplicateJoinDeliveryIsNotAppliedTwice(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	gid := daemonTestGroupID(0x2a)
+	founder, _ := mustDaemonIdentity(t)
+	joiner, joinerInfo := mustDaemonIdentity(t)
+
+	founderRoot := t.TempDir()
+	mustCreateGroup(t, founderRoot, gid, founder, membership.DefaultPolicy())
+
+	joinerHost, _, err := libp2ptransport.NewHost(ctx, joiner, libp2p.NoListenAddrs)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("NewHost: %v", err)
 	}
-	founderBinding, err := libp2ptransport.BindingFromPublicKey(founderIdentity.PublicKey)
+	defer joinerHost.Close()
+
+	founderRuntime, founderSession, founderHost := startTestRuntime(t, ctx, founderRoot, founder, gid)
+	defer founderRuntime.Close()
+	defer founderHost.Close()
+	founderAddr := peer.AddrInfo{ID: founderHost.ID(), Addrs: founderHost.Addrs()}
+
+	capability := mustBootstrapInvite(t, founderSession.group, founder, joinerInfo, founderHost.ID().String())
+
+	// The real join: read the checkpoint with the invite, sign the join, hand
+	// it to the founder. That is the first delivery.
+	joinerGroup, err := libp2ptransport.JoinGroup(ctx, joinerHost, founderAddr, t.TempDir(), joiner, capability, joinerInfo)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("JoinGroup: %v", err)
 	}
-	targetIdentity, err := keystore.Generate()
+	defer mustCloseGroup(t, joinerGroup)
+	var join membership.Record
+	for _, record := range joinerGroup.Pending() {
+		if record.Kind == membership.KindJoin && record.Subject.MemberID != nil && *record.Subject.MemberID == *joinerInfo.MemberID {
+			join = record
+		}
+	}
+	if join.Kind != membership.KindJoin {
+		t.Fatalf("the joiner kept no join record: %+v", joinerGroup.Pending())
+	}
+	if !founderSession.group.IsMemberID(*joinerInfo.MemberID) {
+		t.Fatal("the founder did not take the pushed join")
+	}
+
+	// Second delivery of the very same record, as gossip performs it.
+	if err := libp2ptransport.PushMembershipRecord(ctx, joinerHost, founderAddr, gid, join, &capability); err != nil {
+		t.Fatalf("redelivering a held join failed: %v", err)
+	}
+
+	// The receiver reports it as not applied rather than refusing it or
+	// taking it again.
+	applied, err := founderSession.group.Apply(join)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("re-applying a held join errored: %v", err)
 	}
-	targetBinding, err := libp2ptransport.BindingFromPublicKey(targetIdentity.PublicKey)
-	if err != nil {
-		t.Fatal(err)
+	if applied {
+		t.Fatal("a record the group already held was reported as applied")
 	}
-	groupID := entmoot.GroupID{9}
-	groupRoster := roster.New(groupID)
-	founder := entmoot.NodeInfo{
-		MemberID: &founderBinding.MemberID, PeerID: founderBinding.PeerID.String(),
-		EntmootPubKey: founderIdentity.PublicKey,
+
+	members := founderSession.group.MemberIDs()
+	if len(members) != 2 || !founderSession.group.IsMemberID(*joinerInfo.MemberID) {
+		t.Fatalf("after three deliveries of one join the group holds %d members", len(members))
 	}
-	if err := groupRoster.Genesis(founderIdentity, founder, 1_000); err != nil {
-		t.Fatal(err)
-	}
-	inviteHead := groupRoster.Head()
-	target := entmoot.NodeInfo{
-		MemberID: &targetBinding.MemberID, PeerID: targetBinding.PeerID.String(),
-		EntmootPubKey: targetIdentity.PublicKey,
-	}
-	add, err := groupRoster.SignEntry(founderIdentity, "add", target, nil, 2_000)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := groupRoster.Apply(add); err != nil {
-		t.Fatal(err)
-	}
-	enrolledHead := groupRoster.Head()
-	enrolledCount := len(groupRoster.Entries())
-	runtime := &groupRuntime{
-		identity: founderIdentity, binding: founderBinding,
-		sessions: map[entmoot.GroupID]*groupSession{groupID: {groupID: groupID, roster: groupRoster}},
-	}
-	response, err := runtime.enroll(nil, entmoot.BootstrapCapability{
-		GroupID: groupID, Founder: founder, RosterHead: inviteHead,
-		TargetPublicKey: targetIdentity.PublicKey, TargetMemberID: targetBinding.MemberID,
-		TargetPeerID: targetBinding.PeerID.String(),
-	}, target)
-	if err != nil {
-		t.Fatalf("idempotent enrollment retry failed: %v", err)
-	}
-	if groupRoster.Head() != enrolledHead || len(groupRoster.Entries()) != enrolledCount {
-		t.Fatalf("idempotent enrollment mutated roster: head=%s entries=%d", groupRoster.Head(), len(groupRoster.Entries()))
-	}
-	if response.RosterHead != enrolledHead || len(response.Entries) != enrolledCount {
-		t.Fatalf("idempotent enrollment response = %+v", response)
+	if pending := founderSession.group.Pending(); len(pending) != 1 {
+		t.Fatalf("one join produced %d stored records", len(pending))
 	}
 }
 
-// One person redeeming two invites at the same instant must end up as one
-// member. The membership check and the roster write are separate steps, so
-// without serialization both attempts pass the check and append an add for the
-// same member: the duplicate-binding guard only rejects a re-add under a
-// different key.
-func TestConcurrentEnrollmentOfOneApplicantAddsOneEntry(t *testing.T) {
-	founderIdentity, err := keystore.Generate()
-	if err != nil {
-		t.Fatal(err)
-	}
-	founderBinding, err := libp2ptransport.BindingFromPublicKey(founderIdentity.PublicKey)
-	if err != nil {
-		t.Fatal(err)
-	}
-	targetIdentity, err := keystore.Generate()
-	if err != nil {
-		t.Fatal(err)
-	}
-	targetBinding, err := libp2ptransport.BindingFromPublicKey(targetIdentity.PublicKey)
-	if err != nil {
-		t.Fatal(err)
-	}
-	groupID := entmoot.GroupID{0x1d}
-	groupRoster := roster.New(groupID)
-	founder := entmoot.NodeInfo{
-		MemberID: &founderBinding.MemberID, PeerID: founderBinding.PeerID.String(),
-		EntmootPubKey: founderIdentity.PublicKey,
-	}
-	if err := groupRoster.Genesis(founderIdentity, founder, 1_000); err != nil {
-		t.Fatal(err)
-	}
-	inviteHead := groupRoster.Head()
-	target := entmoot.NodeInfo{
-		MemberID: &targetBinding.MemberID, PeerID: targetBinding.PeerID.String(),
-		EntmootPubKey: targetIdentity.PublicKey,
-	}
-	runtime := &groupRuntime{
-		identity: founderIdentity, binding: founderBinding,
-		sessions: map[entmoot.GroupID]*groupSession{groupID: {groupID: groupID, roster: groupRoster}},
-	}
+// mustBootstrapInvite mints an invite the joiner may redeem against a named
+// serving peer, which is what a `-bootstrap` invite carries.
+func mustBootstrapInvite(t *testing.T, group *membership.Group, issuer *keystore.Identity, target entmoot.NodeInfo, allowedPeerID string) entmoot.BootstrapCapability {
+	t.Helper()
 	capability := entmoot.BootstrapCapability{
-		GroupID: groupID, Founder: founder, RosterHead: inviteHead,
-		TargetPublicKey: targetIdentity.PublicKey, TargetMemberID: targetBinding.MemberID,
-		TargetPeerID: targetBinding.PeerID.String(),
+		GroupID:         group.GroupID(),
+		Founder:         group.Founder(),
+		RosterHead:      group.Canonical().ID,
+		TargetPublicKey: append([]byte(nil), target.EntmootPubKey...),
+		TargetMemberID:  *target.MemberID,
+		TargetPeerID:    target.PeerID,
+		AllowedPeerIDs:  []string{allowedPeerID},
+		MaxUses:         1,
+		IssuedAtMS:      time.Now().Add(-time.Minute).UnixMilli(),
+		ExpiresAtMS:     time.Now().Add(time.Hour).UnixMilli(),
 	}
-
-	const racers = 8
-	start := make(chan struct{})
-	results := make(chan error, racers)
-	for i := 0; i < racers; i++ {
-		go func() {
-			<-start
-			_, err := runtime.enroll(nil, capability, target)
-			results <- err
-		}()
+	issuerInfo := mustDaemonNodeInfo(t, issuer)
+	if founder := group.Founder(); founder.MemberID == nil || *founder.MemberID != *issuerInfo.MemberID {
+		capability.Issuer = &issuerInfo
 	}
-	close(start)
-	for i := 0; i < racers; i++ {
-		if err := <-results; err != nil {
-			t.Fatalf("concurrent enrollment %d failed: %v", i, err)
-		}
+	if _, err := rand.Read(capability.Nonce[:]); err != nil {
+		t.Fatalf("invite nonce: %v", err)
 	}
-
-	adds := 0
-	for _, entry := range groupRoster.Entries() {
-		if entry.Op == "add" && entry.Subject.MemberID != nil && *entry.Subject.MemberID == targetBinding.MemberID {
-			adds++
-		}
+	if err := membership.SignInvite(issuer, &capability); err != nil {
+		t.Fatalf("SignInvite: %v", err)
 	}
-	if adds != 1 {
-		t.Fatalf("%d concurrent enrollments produced %d add entries for one member", racers, adds)
-	}
+	return capability
 }

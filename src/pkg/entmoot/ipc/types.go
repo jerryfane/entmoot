@@ -68,12 +68,6 @@ const (
 	MsgGroupDeactivateReq MsgType = 0x23
 	// MsgGroupDeactivateResp acknowledges that the group session was stopped.
 	MsgGroupDeactivateResp MsgType = 0x24
-	// MsgRosterRepairReq asks the daemon to adopt a peer's roster chain after
-	// a fork and re-issue the local changes that chain does not carry.
-	MsgRosterRepairReq MsgType = 0x25
-	// MsgRosterRepairResp reports what a repair adopted, discarded and
-	// re-issued.
-	MsgRosterRepairResp MsgType = 0x26
 	// MsgError carries a structured error frame. 0x1F is kept stable so
 	// existing logs and clients can continue spotting error frames.
 	MsgError MsgType = 0x1F
@@ -119,10 +113,6 @@ func (t MsgType) String() string {
 		return "group_deactivate_req"
 	case MsgGroupDeactivateResp:
 		return "group_deactivate_resp"
-	case MsgRosterRepairReq:
-		return "roster_repair_req"
-	case MsgRosterRepairResp:
-		return "roster_repair_resp"
 	case MsgError:
 		return "error"
 	default:
@@ -240,12 +230,10 @@ type MemberRemoveResp struct {
 	GroupID    entmoot.GroupID       `json:"group_id"`
 	RosterHead entmoot.RosterEntryID `json:"roster_head"`
 	Members    int                   `json:"members"`
-	// RevokedInvites counts invites bound to the removed member that this
-	// removal voided.
-	RevokedInvites int `json:"revoked_invites"`
-	// OutstandingOpenInvites lists base64 nonces of the group's remaining
-	// bearer invites. They name no target, so a removal cannot void them and
-	// whoever holds one can still join until it is revoked or expires.
+	// OutstandingOpenInvites lists base64 nonces of bearer invites this node
+	// issued that are still live. A removal does not void them: they name no
+	// target, and they are worth their issuer's authority, so an invite from a
+	// still-serving admin keeps working until revoked or expired.
 	OutstandingOpenInvites []string `json:"outstanding_open_invites,omitempty"`
 	// OutstandingESPOpenInvites counts ESP-hosted open-invite tokens still
 	// redeemable for this group. They are a second bearer path and are revoked
@@ -256,8 +244,8 @@ type MemberRemoveResp struct {
 	// ESPOpenInvitesError reports why the ESP open-invite store could not be
 	// read, when it could not.
 	ESPOpenInvitesError string `json:"esp_open_invites_error,omitempty"`
-	// InviteRevocationError reports that the removal was applied but its
-	// invite cleanup failed, so the caller knows to revoke by hand.
+	// InviteRevocationError reports that the removal was applied but the local
+	// invite ledger could not be read, so the outstanding list is incomplete.
 	InviteRevocationError string `json:"invite_revocation_error,omitempty"`
 }
 
@@ -270,52 +258,6 @@ type GroupDeactivateResp struct {
 	GroupID entmoot.GroupID `json:"group_id"`
 }
 
-// RosterRepairReq asks the daemon to end a roster fork by adopting one peer's
-// chain. Peer is optional when exactly one divergent peer is known.
-type RosterRepairReq struct {
-	GroupID entmoot.GroupID `json:"group_id"`
-	// Peer names the peer whose chain to adopt. Empty means "the only
-	// divergent peer", and the daemon refuses when several disagree.
-	Peer string `json:"peer,omitempty"`
-	// DryRun reports what a repair would do without changing anything.
-	DryRun bool `json:"dry_run,omitempty"`
-}
-
-// RosterRepairResp describes one repair. Discarded and Reissued are
-// human-readable summaries of the entries the repair lost and re-signed.
-type RosterRepairResp struct {
-	Status     string                `json:"status"`
-	GroupID    entmoot.GroupID       `json:"group_id"`
-	Peer       string                `json:"peer"`
-	LocalHead  entmoot.RosterEntryID `json:"local_head"`
-	RemoteHead entmoot.RosterEntryID `json:"remote_head"`
-	RosterHead entmoot.RosterEntryID `json:"roster_head"`
-	// SharedEntries is how many leading entries both chains agreed on: where
-	// the two histories parted.
-	SharedEntries int `json:"shared_entries"`
-	Members       int `json:"members"`
-	// Discarded lists the local entries the adopted chain does not carry.
-	Discarded []RosterRepairEntry `json:"discarded,omitempty"`
-	// Reissued lists the discarded changes this node signed again onto the
-	// adopted head.
-	Reissued []RosterRepairEntry `json:"reissued,omitempty"`
-	// Unrecoverable lists discarded changes this node cannot re-issue, with
-	// the reason. An operator has to redo these by hand from a node that can.
-	Unrecoverable []RosterRepairEntry `json:"unrecoverable,omitempty"`
-}
-
-// RosterRepairEntry identifies one roster change involved in a repair.
-type RosterRepairEntry struct {
-	EntryID string `json:"entry_id"`
-	Op      string `json:"op"`
-	Subject string `json:"subject,omitempty"`
-	Actor   string `json:"actor,omitempty"`
-	Reason  string `json:"reason,omitempty"`
-}
-
-// TailSubscribe opens a live message stream. GroupID is optional (nil
-// means all groups); Topic is an MQTT-style pattern and an empty value is
-// interpreted as "#" (match everything).
 type TailSubscribe struct {
 	// GroupID scopes the subscription. nil means "all joined groups".
 	GroupID *entmoot.GroupID `json:"group_id,omitempty"`

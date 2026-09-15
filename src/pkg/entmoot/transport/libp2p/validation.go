@@ -2,16 +2,14 @@ package libp2ptransport
 
 import (
 	"bytes"
-	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
 
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/canonical"
+	"entmoot/pkg/entmoot/membership"
 	"entmoot/pkg/entmoot/merkle"
-	"entmoot/pkg/entmoot/roster"
 	"entmoot/pkg/entmoot/signing"
 	"entmoot/pkg/entmoot/topic"
 )
@@ -71,25 +69,29 @@ func ValidateMessageShape(message entmoot.Message, now time.Time) error {
 	return nil
 }
 
-// VerifyLiveAuthor validates an author-signed live message against the group's
-// current roster: shape, author membership at the current head, identity
+// VerifyLiveAuthor validates an author-signed live message against the
+// group's membership: shape, that the author is a member now, identity
 // binding, and the author signature.
-func VerifyLiveAuthor(groupRoster *roster.RosterLog, message entmoot.Message, now time.Time) error {
-	if groupRoster == nil {
-		return fmt.Errorf("%w: missing roster", entmoot.ErrNotMember)
+func VerifyLiveAuthor(group *membership.Group, message entmoot.Message, now time.Time) error {
+	if group == nil {
+		return fmt.Errorf("%w: missing group", entmoot.ErrNotMember)
 	}
 	if err := ValidateMessageShape(message, now); err != nil {
 		return err
 	}
 	if message.Version != 2 || message.Author.MemberID == nil || message.RosterHead == nil {
-		return fmt.Errorf("%w: live message must name the current full-width member and roster head", entmoot.ErrNotMember)
+		return fmt.Errorf("%w: live message must name a full-width member and the checkpoint it held", entmoot.ErrNotMember)
 	}
-	if *message.RosterHead != groupRoster.Head() {
-		// A publisher whose roster is ahead of ours names a head we have not
-		// seen yet. That is a synchronization gap, not a bad message: the
-		// caller may hold it briefly and retry after a roster sync. A head we
-		// do know but that is no longer current is a stale publisher.
-		if !groupRoster.HasEntry(*message.RosterHead) {
+	if *message.RosterHead != group.Canonical().ID {
+		// A publisher whose membership is ahead of ours names a checkpoint we
+		// have not seen. That is a synchronization gap, not a bad message: the
+		// caller may hold it briefly and retry after a membership sync.
+		//
+		// A checkpoint we do know but that is no longer canonical is not an
+		// error either: membership is a set, so a member at an older
+		// checkpoint is still a member unless a record says otherwise. That
+		// is checked below, by looking the author up in current state.
+		if !group.HasCheckpoint(*message.RosterHead) && !group.HasRecord(*message.RosterHead) {
 			// Only report a gap for a message that is at least internally
 			// authentic. Without this, unsigned junk naming a fabricated head
 			// would be indistinguishable from a real race and would occupy a
@@ -100,9 +102,8 @@ func VerifyLiveAuthor(groupRoster *roster.RosterLog, message entmoot.Message, no
 			}
 			return fmt.Errorf("%w: live head %s", entmoot.ErrRosterHeadUnknown, message.RosterHead)
 		}
-		return fmt.Errorf("%w: live message names superseded roster head %s", entmoot.ErrNotMember, message.RosterHead)
 	}
-	author, ok := groupRoster.MemberInfoByID(*message.Author.MemberID)
+	author, ok := group.MemberInfoByID(*message.Author.MemberID)
 	if !ok {
 		return fmt.Errorf("%w: live author %s", entmoot.ErrNotMember, message.Author.MemberID.String())
 	}
@@ -115,25 +116,24 @@ func VerifyLiveAuthor(groupRoster *roster.RosterLog, message entmoot.Message, no
 	return signing.VerifyMessage(message, author)
 }
 
-// VerifyLiveMessage authenticates a live message against the roster. Current
-// membership at the named checkpoint is the whole authority: there is no
-// per-message admission certificate, so a group keeps working when any
-// particular member, founder included, is offline.
-func VerifyLiveMessage(groupRoster *roster.RosterLog, message entmoot.Message, now time.Time) error {
-	return VerifyLiveAuthor(groupRoster, message, now)
+// VerifyLiveMessage authenticates a live message. Current membership is the
+// whole authority: there is no per-message admission certificate, so a group
+// keeps working when any particular member, founder included, is offline.
+func VerifyLiveMessage(group *membership.Group, message entmoot.Message, now time.Time) error {
+	return VerifyLiveAuthor(group, message, now)
 }
 
 // VerifyHistoricalMessage accepts version-2 messages at a known roster
 // checkpoint. Version-0 messages require VerifyHistoricalMessageWithProof.
-func VerifyHistoricalMessage(groupRoster *roster.RosterLog, message entmoot.Message, now time.Time) error {
-	return VerifyHistoricalMessageWithProof(groupRoster, message, now, nil)
+func VerifyHistoricalMessage(group *membership.Group, message entmoot.Message, now time.Time) error {
+	return VerifyHistoricalMessageWithProof(group, message, now, nil)
 }
 
 // VerifyHistoricalMessageWithProof accepts immutable legacy messages only when
 // their ID is included in the founder-signed conversion commitment.
-func VerifyHistoricalMessageWithProof(groupRoster *roster.RosterLog, message entmoot.Message, now time.Time, proof *merkle.Proof) error {
-	if groupRoster == nil {
-		return fmt.Errorf("%w: missing roster", entmoot.ErrNotMember)
+func VerifyHistoricalMessageWithProof(group *membership.Group, message entmoot.Message, now time.Time, proof *merkle.Proof) error {
+	if group == nil {
+		return fmt.Errorf("%w: missing group", entmoot.ErrNotMember)
 	}
 	if err := ValidateMessageShape(message, now); err != nil {
 		return err
@@ -142,11 +142,17 @@ func VerifyHistoricalMessageWithProof(groupRoster *roster.RosterLog, message ent
 	case 0:
 		var author entmoot.NodeInfo
 		found := false
-		for _, entry := range groupRoster.Entries() {
-			if entry.Op == "add" && entry.Subject.PilotNodeID == message.Author.PilotNodeID &&
-				bytes.Equal(entry.Subject.EntmootPubKey, message.Author.EntmootPubKey) {
-				author, found = entry.Subject, true
-				break
+		// A version-0 message predates member ids, so its author is matched
+		// by Pilot node id and key against the linear chain the group
+		// upgraded from. Without that chain on disk there is nothing to match.
+		legacy := group.Legacy()
+		if legacy != nil {
+			for _, entry := range legacy.Entries() {
+				if entry.Op == "add" && entry.Subject.PilotNodeID == message.Author.PilotNodeID &&
+					bytes.Equal(entry.Subject.EntmootPubKey, message.Author.EntmootPubKey) {
+					author, found = entry.Subject, true
+					break
+				}
 			}
 		}
 		if !found {
@@ -155,7 +161,7 @@ func VerifyHistoricalMessageWithProof(groupRoster *roster.RosterLog, message ent
 		if proof == nil {
 			return errors.New("libp2p: legacy historical message lacks conversion proof")
 		}
-		root, count, err := legacyHistoryCommitment(groupRoster)
+		root, count, err := legacyHistoryCommitment(group)
 		if err != nil {
 			return err
 		}
@@ -167,7 +173,7 @@ func VerifyHistoricalMessageWithProof(groupRoster *roster.RosterLog, message ent
 		if message.Author.MemberID == nil || message.RosterHead == nil {
 			return fmt.Errorf("%w: incomplete historical member checkpoint", entmoot.ErrNotMember)
 		}
-		author, active, known := groupRoster.MemberInfoAtID(*message.Author.MemberID, *message.RosterHead)
+		author, active, known := group.MemberAt(*message.Author.MemberID, *message.RosterHead)
 		if !known {
 			return fmt.Errorf("%w: historical head %s", entmoot.ErrRosterHeadUnknown, message.RosterHead)
 		}
@@ -186,30 +192,20 @@ func VerifyHistoricalMessageWithProof(groupRoster *roster.RosterLog, message ent
 	}
 }
 
-func legacyHistoryCommitment(groupRoster *roster.RosterLog) ([32]byte, int, error) {
+// legacyHistoryCommitment reads the founder-signed commitment that fixes the
+// set of version-0 messages carried over at conversion. It lives on the linear
+// chain, which is where those messages' authority also lives.
+func legacyHistoryCommitment(group *membership.Group) ([32]byte, int, error) {
 	var root [32]byte
-	for _, entry := range groupRoster.Entries() {
-		if entry.Op != "policy_change" || len(entry.Policy) == 0 {
-			continue
-		}
-		var marker struct {
-			Type string `json:"type"`
-		}
-		if err := json.Unmarshal(entry.Policy, &marker); err != nil || marker.Type != "legacy_identity_upgrade" {
-			continue
-		}
-		var policy entmoot.LegacyIdentityUpgradePolicy
-		if err := json.Unmarshal(entry.Policy, &policy); err != nil {
-			return root, 0, fmt.Errorf("libp2p: malformed legacy history commitment: %w", err)
-		}
-		decoded, err := hex.DecodeString(policy.LegacyHistoryRoot)
-		if err != nil || len(decoded) != len(root) || policy.LegacyHistoryCount < 0 {
-			return root, 0, errors.New("libp2p: malformed legacy history commitment")
-		}
-		copy(root[:], decoded)
-		return root, policy.LegacyHistoryCount, nil
+	legacy := group.Legacy()
+	if legacy == nil {
+		return root, 0, errors.New("libp2p: group holds no legacy chain to verify version-0 messages against")
 	}
-	return root, 0, errors.New("libp2p: missing founder-signed legacy history commitment")
+	root, count, ok := legacy.LegacyHistoryCommitment()
+	if !ok {
+		return root, 0, errors.New("libp2p: missing founder-signed legacy history commitment")
+	}
+	return root, count, nil
 }
 
 func verifyOperationalAuthor(claimed, rosterAuthor entmoot.NodeInfo) error {

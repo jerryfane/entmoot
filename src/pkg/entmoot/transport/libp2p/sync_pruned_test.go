@@ -10,7 +10,6 @@ import (
 
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/merkle"
-	"entmoot/pkg/entmoot/roster"
 	"entmoot/pkg/entmoot/signing"
 	"entmoot/pkg/entmoot/store"
 )
@@ -67,15 +66,9 @@ func (w wrappedStore) Close() error { return nil }
 func TestPrunedHistoryDoesNotStallSyncOrCountAsMissing(t *testing.T) {
 	f := newSnapshotLifecycleFixture(t)
 	group := f.groups[0]
-	for sequence := 3; sequence <= 12; sequence++ {
+	// The fixture seeds sequences 1-4; carry the group up to twelve messages.
+	for sequence := 5; sequence <= 12; sequence++ {
 		f.addMessage(t, group, sequence)
-	}
-	server := &SyncServer{
-		Host: f.serverHost, Admission: NewBootstrapAdmission(), Store: f.store,
-		Roster: func(id entmoot.GroupID) (*roster.RosterLog, bool) { log, ok := f.logs[id]; return log, ok },
-	}
-	if err := server.Install(); err != nil {
-		t.Fatal(err)
 	}
 
 	local, err := store.OpenSQLite(t.TempDir())
@@ -108,8 +101,7 @@ func TestPrunedHistoryDoesNotStallSyncOrCountAsMissing(t *testing.T) {
 	}
 
 	// Later passes must still complete, report the dropped ids as pruned
-	// rather than missing, and never re-insert them.
-	for pass := 0; pass < 3; pass++ {
+	for pass := range 3 {
 		state = new(HistorySyncState)
 		item := SyncFromKeepers(f.ctx, f.client, group, keepers, destination, validate, state)[0]
 		if item.Err != nil {
@@ -162,15 +154,8 @@ func (hidesTombstones) HasTombstone(context.Context, entmoot.GroupID, entmoot.Me
 func TestPruneDuringInsertionIsAnIntentionalGap(t *testing.T) {
 	f := newSnapshotLifecycleFixture(t)
 	group := f.groups[0]
-	for sequence := 3; sequence <= 12; sequence++ {
+	for sequence := 5; sequence <= 12; sequence++ {
 		f.addMessage(t, group, sequence)
-	}
-	server := &SyncServer{
-		Host: f.serverHost, Admission: NewBootstrapAdmission(), Store: f.store,
-		Roster: func(id entmoot.GroupID) (*roster.RosterLog, bool) { log, ok := f.logs[id]; return log, ok },
-	}
-	if err := server.Install(); err != nil {
-		t.Fatal(err)
 	}
 	local, err := store.OpenSQLite(t.TempDir())
 	if err != nil {
@@ -217,15 +202,8 @@ func TestPruneDuringInsertionIsAnIntentionalGap(t *testing.T) {
 func TestRetainedHistoryBelowTheCoverageFloorStillSyncs(t *testing.T) {
 	f := newSnapshotLifecycleFixture(t)
 	group := f.groups[0]
-	for sequence := 3; sequence <= 12; sequence++ {
+	for sequence := 5; sequence <= 12; sequence++ {
 		f.addMessage(t, group, sequence)
-	}
-	server := &SyncServer{
-		Host: f.serverHost, Admission: NewBootstrapAdmission(), Store: f.store,
-		Roster: func(id entmoot.GroupID) (*roster.RosterLog, bool) { log, ok := f.logs[id]; return log, ok },
-	}
-	if err := server.Install(); err != nil {
-		t.Fatal(err)
 	}
 	destination, err := store.OpenSQLite(t.TempDir())
 	if err != nil {
@@ -268,14 +246,15 @@ func TestRetainedHistoryBelowTheCoverageFloorStillSyncs(t *testing.T) {
 	}
 }
 
-// A historical message whose roster checkpoint is not on this node's chain yet
-// cannot be authorized, but it is not junk and it is not the keeper's fault:
-// the pass skips it, keeps the keeper, and must not claim convergence, because
-// claiming it would stop the retry that eventually picks the message up.
+// A historical message whose membership checkpoint is not retained by this
+// node yet cannot be authorized, but it is not junk and it is not the keeper's
+// fault: the pass skips it, keeps the keeper, and must not claim convergence,
+// because claiming it would stop the retry that eventually picks the message
+// up.
 func TestUnknownRosterHeadIsAGapNotConvergence(t *testing.T) {
 	f := newSnapshotLifecycleFixture(t)
 	group := f.groups[0]
-	for sequence := 3; sequence <= 6; sequence++ {
+	for sequence := 5; sequence <= 6; sequence++ {
 		f.addMessage(t, group, sequence)
 	}
 	local, err := store.OpenSQLite(t.TempDir())
@@ -317,11 +296,11 @@ func TestUnknownRosterHeadIsAGapNotConvergence(t *testing.T) {
 		t.Fatalf("an unauthorized message was stored: present=%t err=%v", present, err)
 	}
 
-	// After roster synchronization the retry completes and converges.
+	// After membership synchronization the retry completes and converges.
 	lagging.Store(false)
 	retry := SyncFromKeepers(f.ctx, f.client, group, keepers, local, validate, new(HistorySyncState))[0]
 	if retry.Err != nil || retry.Inserted != 1 || retry.UnknownHeads != 0 {
-		t.Fatalf("retry after roster sync: inserted=%d unknown=%d err=%v", retry.Inserted, retry.UnknownHeads, retry.Err)
+		t.Fatalf("retry after membership sync: inserted=%d unknown=%d err=%v", retry.Inserted, retry.UnknownHeads, retry.Err)
 	}
 	if !retry.ConvergedHint {
 		t.Fatal("a complete pass did not report convergence")

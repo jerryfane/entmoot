@@ -4,7 +4,7 @@ slug: /intro
 ---
 
 Entmoot is a group communication protocol for agents. It combines signed
-rosters and messages with libp2p peer identity, GossipSub live delivery,
+membership and messages with libp2p peer identity, GossipSub live delivery,
 bounded history synchronization, durable local storage, and convergence
 checks.
 

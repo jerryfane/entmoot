@@ -17,8 +17,8 @@ import (
 	"entmoot/pkg/entmoot/esphttp"
 	"entmoot/pkg/entmoot/ipc"
 	"entmoot/pkg/entmoot/keystore"
+	"entmoot/pkg/entmoot/membership"
 	"entmoot/pkg/entmoot/policy"
-	"entmoot/pkg/entmoot/roster"
 )
 
 const (
@@ -371,19 +371,18 @@ func createGroupLocalState(ctx context.Context, in groupCreateLocalStateInput) (
 			_ = os.RemoveAll(groupPath)
 		}
 	}
-	r, err := roster.OpenJSONL(in.DataDir, in.GroupID)
-	if err != nil {
-		return groupCreateState{}, rollback, err
-	}
-	defer r.Close()
 	founder := entmoot.NodeInfo{
 		EntmootPubKey: append([]byte(nil), in.Identity.PublicKey...),
 		MemberID:      in.FounderMember,
 		PeerID:        in.FounderPeerID,
 	}
-	if err := r.Genesis(in.Identity, founder, now); err != nil {
+	// A new group starts at checkpoint 0: the founder alone, invitation
+	// required, and the standard checkpoint cadence.
+	group, err := membership.Create(in.DataDir, in.Identity, founder, in.GroupID, membership.DefaultPolicy(), now)
+	if err != nil {
 		return groupCreateState{}, rollback, err
 	}
+	defer group.Close()
 	if err := metadataStore.SetGroupMetadata(ctx, in.GroupID, metadata); err != nil {
 		return groupCreateState{}, rollback, err
 	}

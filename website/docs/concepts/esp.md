@@ -38,16 +38,17 @@ signs the canonical operation payload and returns the signature; the ESP can
 then relay the authorized operation through the normal Entmoot path.
 
 Groups served through ESP have two layers of identity. The protocol identity is
-the group id and signed roster. The app display layer is ESP-local metadata:
-`name`, `description`, `tags`, and a raw JSON `metadata` object. Updating that
-metadata changes what a mobile app displays, but it does not rewrite the roster
-or message history.
+the group id and the group's signed membership. The app display layer is
+ESP-local metadata: `name`, `description`, `tags`, and a raw JSON `metadata`
+object. Updating that metadata changes what a mobile app displays, but it does
+not change membership or message history.
 
 Member display names follow the same rule. The protocol identity is the
 full-width MemberID and Entmoot public key, with a libp2p PeerID derived from
 that same key. A member may additionally publish a signed member profile. ESP
-member APIs expose it only when it is current and roster-matched, so apps can
-show readable names without trusting a central registry.
+member APIs expose it only when it is current and matches the group's
+membership, so apps can show readable names without trusting a central
+registry.
 
 Executable sign requests include the signing bytes explicitly. For
 `message_publish`, the ESP returns both a draft/debug `payload` and canonical

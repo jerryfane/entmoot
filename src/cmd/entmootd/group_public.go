@@ -18,9 +18,9 @@ import (
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/esphttp"
 	"entmoot/pkg/entmoot/keystore"
+	"entmoot/pkg/entmoot/membership"
 	"entmoot/pkg/entmoot/policy"
 	"entmoot/pkg/entmoot/publicmoot"
-	"entmoot/pkg/entmoot/roster"
 )
 
 type groupPublicOptions struct {
@@ -131,15 +131,12 @@ func buildPublicMootDescriptorWithIdentity(ctx context.Context, dataDir string, 
 	if !pathExists(groupDirPath(dataDir, gid)) {
 		return publicmoot.Descriptor{}, fmt.Errorf("%w: group directory is missing", errGroupPublicNotFound)
 	}
-	r, err := roster.OpenJSONL(dataDir, gid)
+	r, err := membership.Open(dataDir, gid)
 	if err != nil {
 		return publicmoot.Descriptor{}, err
 	}
 	defer r.Close()
-	founder, ok := r.Founder()
-	if !ok {
-		return publicmoot.Descriptor{}, fmt.Errorf("%w: roster founder is missing", errGroupPublicNotFound)
-	}
+	founder := r.Founder()
 	if !bytes.Equal(founder.EntmootPubKey, identity.PublicKey) {
 		return publicmoot.Descriptor{}, fmt.Errorf("%w: local identity is not the group founder", errGroupPublicForbidden)
 	}

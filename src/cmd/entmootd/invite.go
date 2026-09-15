@@ -15,7 +15,7 @@ import (
 	multiaddr "github.com/multiformats/go-multiaddr"
 
 	"entmoot/pkg/entmoot"
-	"entmoot/pkg/entmoot/roster"
+	"entmoot/pkg/entmoot/membership"
 	libp2ptransport "entmoot/pkg/entmoot/transport/libp2p"
 )
 
@@ -112,17 +112,13 @@ func cmdInviteCreate(gf *globalFlags, args []string) int {
 		slog.Error("invite create: setup", slog.String("err", err.Error()))
 		return exitTransport
 	}
-	rlog, err := roster.OpenJSONL(s.dataDir, gid)
+	group, err := membership.Open(s.dataDir, gid)
 	if err != nil {
-		slog.Error("invite create: open roster", slog.String("err", err.Error()))
-		return exitTransport
-	}
-	defer rlog.Close()
-	founder, ok := rlog.Founder()
-	if !ok {
-		fmt.Fprintln(os.Stderr, "invite create: group has no founder")
+		fmt.Fprintf(os.Stderr, "invite create: %v\n", err)
 		return exitGroupNotFound
 	}
+	defer group.Close()
+	founder := group.Founder()
 	founderBinding, err := libp2ptransport.BindingFromPublicKey(founder.EntmootPubKey)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "invite create: founder identity: %v\n", err)
@@ -130,9 +126,10 @@ func cmdInviteCreate(gf *globalFlags, args []string) int {
 	}
 	founder.MemberID = &founderBinding.MemberID
 	// The founder or any delegated admin may invite. The issuer's own host is
-	// what serves enrollment, so the bootstrap addresses must name it.
+	// what serves the checkpoint a joiner reads, so the bootstrap addresses
+	// must name it.
 	localMemberID := mustMemberID(s.identity.PublicKey)
-	if !rlog.CanAdminister(localMemberID) {
+	if !group.CanAdminister(localMemberID) {
 		fmt.Fprintln(os.Stderr, "invite create: local identity is neither the group founder nor a delegated admin")
 		return exitNotMember
 	}
@@ -143,7 +140,7 @@ func cmdInviteCreate(gf *globalFlags, args []string) int {
 	}
 	var issuer *entmoot.NodeInfo
 	if localMemberID != founderBinding.MemberID {
-		info, found := rlog.MemberInfoByID(localMemberID)
+		info, found := group.MemberInfoByID(localMemberID)
 		if !found {
 			fmt.Fprintln(os.Stderr, "invite create: local identity is not a member of this group")
 			return exitNotMember
@@ -201,7 +198,7 @@ func cmdInviteCreate(gf *globalFlags, args []string) int {
 		TargetPeerID:      targetPeerID,
 		Founder:           founder,
 		Issuer:            issuer,
-		RosterHead:        rlog.Head(),
+		RosterHead:        group.Canonical().ID,
 		AllowedPeerIDs:    allowedPeerIDs,
 		AllowedMultiaddrs: allowedAddresses,
 		Relays:            relayHints,
@@ -217,7 +214,7 @@ func cmdInviteCreate(gf *globalFlags, args []string) int {
 		slog.Error("invite create: sign", slog.String("err", err.Error()))
 		return exitTransport
 	}
-	admission, err := libp2ptransport.OpenPersistentBootstrapAdmission(s.dataDir)
+	admission, err := libp2ptransport.OpenInviteLedger(s.dataDir)
 	if err != nil {
 		slog.Error("invite create: open admission", slog.String("err", err.Error()))
 		return exitTransport
@@ -269,7 +266,7 @@ func cmdInviteList(gf *globalFlags, args []string) int {
 		slog.Error("invite list: setup", slog.String("err", err.Error()))
 		return exitTransport
 	}
-	admission, err := libp2ptransport.OpenPersistentBootstrapAdmission(s.dataDir)
+	admission, err := libp2ptransport.OpenInviteLedger(s.dataDir)
 	if err != nil {
 		slog.Error("invite list: open admission", slog.String("err", err.Error()))
 		return exitTransport
@@ -280,14 +277,46 @@ func cmdInviteList(gf *globalFlags, args []string) int {
 		slog.Error("invite list: read invites", slog.String("err", err.Error()))
 		return exitTransport
 	}
+	// Uses and revocations are group state, not ledger columns: the ledger
+	// only records what this node handed out. Open each group once and read
+	// the counts every node agrees on.
+	groups := make(map[entmoot.GroupID]*membership.Group)
+	defer func() {
+		for _, group := range groups {
+			_ = group.Close()
+		}
+	}()
+	groupFor := func(gid entmoot.GroupID) *membership.Group {
+		if group, seen := groups[gid]; seen {
+			return group
+		}
+		group, ok, err := openExistingGroup(s.dataDir, gid)
+		if err != nil || !ok {
+			groups[gid] = nil
+			return nil
+		}
+		groups[gid] = group
+		return group
+	}
+	uses := func(record libp2ptransport.InviteRecord) int {
+		if group := groupFor(record.GroupID); group != nil {
+			return group.InviteUses(record.Nonce)
+		}
+		return 0
+	}
+	revoked := func(record libp2ptransport.InviteRecord) bool {
+		if group := groupFor(record.GroupID); group != nil {
+			return group.IsInviteRevoked(record.Nonce)
+		}
+		return record.RevokedAtMS > 0
+	}
 	type inviteJSON struct {
 		GroupID        string `json:"group_id"`
 		Nonce          string `json:"nonce"`
 		Open           bool   `json:"open"`
 		TargetMemberID string `json:"target_member_id,omitempty"`
 		MaxUses        int    `json:"max_uses"`
-		UsesCommitted  int    `json:"uses_committed"`
-		UsesReserved   int    `json:"uses_reserved"`
+		Uses           int    `json:"uses"`
 		IssuedAtMS     int64  `json:"issued_at_ms"`
 		ExpiresAtMS    int64  `json:"expires_at_ms"`
 		RevokedAtMS    int64  `json:"revoked_at_ms,omitempty"`
@@ -297,15 +326,14 @@ func cmdInviteList(gf *globalFlags, args []string) int {
 	out := make([]inviteJSON, 0, len(records))
 	for _, record := range records {
 		item := inviteJSON{
-			GroupID:       record.GroupID.String(),
-			Nonce:         base64.StdEncoding.EncodeToString(record.Nonce[:]),
-			Open:          record.Open(),
-			MaxUses:       record.MaxUses,
-			UsesCommitted: record.UsesCommitted,
-			UsesReserved:  record.UsesReserved,
-			IssuedAtMS:    record.IssuedAtMS,
-			ExpiresAtMS:   record.ExpiresAtMS,
-			RevokedAtMS:   record.RevokedAtMS,
+			GroupID:     record.GroupID.String(),
+			Nonce:       base64.StdEncoding.EncodeToString(record.Nonce[:]),
+			Open:        record.Open(),
+			MaxUses:     record.MaxUses,
+			Uses:        uses(record),
+			IssuedAtMS:  record.IssuedAtMS,
+			ExpiresAtMS: record.ExpiresAtMS,
+			RevokedAtMS: record.RevokedAtMS,
 		}
 		if record.TargetMemberID != nil {
 			item.TargetMemberID = record.TargetMemberID.String()
@@ -315,7 +343,9 @@ func cmdInviteList(gf *globalFlags, args []string) int {
 			item.State = "revoked"
 		case record.ExpiresAtMS > 0 && record.ExpiresAtMS <= nowMS:
 			item.State = "expired"
-		case record.MaxUses > 0 && record.UsesCommitted >= record.MaxUses:
+		case revoked(record):
+			item.State = "revoked"
+		case record.MaxUses > 0 && uses(record) >= record.MaxUses:
 			item.State = "spent"
 		default:
 			item.State = "open"
@@ -359,25 +389,42 @@ func cmdInviteRevoke(gf *globalFlags, args []string) int {
 		slog.Error("invite revoke: setup", slog.String("err", err.Error()))
 		return exitTransport
 	}
-	admission, err := libp2ptransport.OpenPersistentBootstrapAdmission(s.dataDir)
+	admission, err := libp2ptransport.OpenInviteLedger(s.dataDir)
 	if err != nil {
 		slog.Error("invite revoke: open admission", slog.String("err", err.Error()))
 		return exitTransport
 	}
 	defer admission.Close()
-	revoked, err := admission.RevokeInvite(gid, nonce)
+	// A local ledger row stops this node from advertising the invite. What
+	// stops every other node honouring it is a signed record, so sign one:
+	// without it a revoked invite still works anywhere it is presented.
+	ctx, code, ok := setupAdminRoster(gf, "invite revoke", gid)
+	if !ok {
+		return code
+	}
+	defer ctx.close()
+	record, err := ctx.group.SignRecord(ctx.setup.identity, membership.Record{
+		Kind:        membership.KindRevokeInvite,
+		InviteNonce: nonce,
+	})
 	if err != nil {
-		slog.Error("invite revoke: revoke", slog.String("err", err.Error()))
+		fmt.Fprintf(os.Stderr, "invite revoke: %v\n", err)
+		return exitInvalidArgument
+	}
+	noted, err := admission.MarkRevoked(gid, nonce)
+	if err != nil {
+		slog.Error("invite revoke: ledger", slog.String("err", err.Error()))
 		return exitTransport
 	}
-	status := "already_revoked"
-	if revoked {
-		status = "revoked"
+	status := "revoked"
+	if !noted {
+		status = "revoked_not_issued_here"
 	}
 	encoded, err := json.Marshal(map[string]any{
-		"status":   status,
-		"group_id": gid.String(),
-		"nonce":    base64.StdEncoding.EncodeToString(nonce[:]),
+		"status":    status,
+		"record_id": record.ID,
+		"group_id":  gid.String(),
+		"nonce":     base64.StdEncoding.EncodeToString(nonce[:]),
 	})
 	if err != nil {
 		slog.Error("invite revoke: marshal", slog.String("err", err.Error()))

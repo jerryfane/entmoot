@@ -97,14 +97,19 @@ func run() int {
 		fmt.Fprintln(os.Stderr, "                          Manage local group enforcement policy.")
 		fmt.Fprintln(os.Stderr, "  invite create -group GID -target-pubkey PUBKEY_B64 [-bootstrap MULTIADDR...]")
 		fmt.Fprintln(os.Stderr, "                          Emit a target-bound bootstrap capability.")
-		fmt.Fprintln(os.Stderr, "  roster add -group GID -member MEMBER_ID -peer PEER_ID -pubkey PUBKEY_B64")
-		fmt.Fprintln(os.Stderr, "                          Admit a new member to the roster (founder or delegated admin).")
 		fmt.Fprintln(os.Stderr, "  roster remove -group GID -member MEMBER_ID -peer PEER_ID -pubkey PUBKEY_B64")
-		fmt.Fprintln(os.Stderr, "                          Remove a member from the roster (founder or delegated admin).")
+		fmt.Fprintln(os.Stderr, "                          Remove a member (founder or delegated admin).")
+		fmt.Fprintln(os.Stderr, "  roster ban|unban -group GID -member MEMBER_ID")
+		fmt.Fprintln(os.Stderr, "                          Bar a member from rejoining, or lift it (unban is founder-only).")
+		fmt.Fprintln(os.Stderr, "  roster leave -group GID  Leave a group you are a member of.")
+		fmt.Fprintln(os.Stderr, "  roster checkpoint -group GID")
+		fmt.Fprintln(os.Stderr, "                          Sign a membership checkpoint now, retiring the records it folds in.")
+		fmt.Fprintln(os.Stderr, "  roster status -group GID")
+		fmt.Fprintln(os.Stderr, "                          Print the checkpoint, membership, admins, bans and pending records.")
 		fmt.Fprintln(os.Stderr, "  roster admin <list|grant|revoke>")
 		fmt.Fprintln(os.Stderr, "                          Inspect or change the delegated-admin set (founder-only).")
-		fmt.Fprintln(os.Stderr, "  roster repair -group GID [-peer PEER_ID] [-dry-run]")
-		fmt.Fprintln(os.Stderr, "                          End a roster fork by adopting a peer's chain and re-issuing local changes.")
+		fmt.Fprintln(os.Stderr, "  membership upgrade -group GID")
+		fmt.Fprintln(os.Stderr, "                          Mint checkpoint 0 from a pre-checkpoint group (founder-only).")
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "Opt-in coordination subcommands:")
 		fmt.Fprintln(os.Stderr, "  fleet <list|info|activity|tasks|commands>")
@@ -218,6 +223,8 @@ func run() int {
 		return cmdGroup(gf, args[1:])
 	case "invite":
 		return cmdInvite(gf, args[1:])
+	case "membership":
+		return cmdMembership(gf, args[1:])
 	case "roster":
 		return cmdRoster(gf, args[1:])
 	default:

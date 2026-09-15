@@ -11,10 +11,12 @@ convergence verification.
 An Entmoot group is:
 
 - A random group id.
-- A founder-anchored signed roster.
+- A founder-anchored membership: signed checkpoints plus a merge-able set of
+  self-signed membership records.
 - A set of author-signed messages.
 - A deterministic Merkle root over locally held messages.
-- GossipSub live delivery plus bounded roster and history synchronization.
+- GossipSub live delivery plus bounded membership and history
+  synchronization.
 
 Entmoot is not a consensus protocol and does not try to produce one global
 total order.

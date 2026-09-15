@@ -14,147 +14,58 @@ import (
 	"entmoot/pkg/entmoot"
 )
 
-// reservationTTL bounds how long an unfinished enrollment holds a use of an
-// invite before another applicant may take it.
-const reservationTTL = 30 * time.Second
-
-// PersistentBootstrapAdmission preserves committed uses, short-lived
-// enrollment reservations, issuance records and revocations across daemon
-// restarts. Uses are counted per applicant peer so a multi-use invite admits
-// several identities.
-type PersistentBootstrapAdmission struct {
-	*BootstrapAdmission
+// InviteLedger is the local record of invites this node issued: what was
+// handed out, to whom, and what the operator has withdrawn locally.
+//
+// It is deliberately not an authority. How many times an invite has been
+// redeemed, and whether it still admits anybody, are properties of the
+// group's signed membership state, which every node projects identically.
+// A ledger row that disagrees with that state is a display artefact, not a
+// second opinion: `roster status` reads the state.
+type InviteLedger struct {
 	db *sql.DB
 }
 
-// InviteRecord reports one issued invite and how much of it is spent.
+// InviteRecord reports one issued invite.
 type InviteRecord struct {
 	GroupID        entmoot.GroupID
 	Nonce          [32]byte
 	TargetMemberID *entmoot.MemberID
 	MaxUses        int
-	UsesCommitted  int
-	UsesReserved   int
 	IssuedAtMS     int64
 	ExpiresAtMS    int64
-	RevokedAtMS    int64
+	// RevokedAtMS is when the operator withdrew it here. The withdrawal that
+	// other nodes honour is a signed revoke_invite record; this column is how
+	// `invite list` shows the local decision.
+	RevokedAtMS int64
 }
 
 // Open reports whether the invite is redeemable by any holder.
 func (r InviteRecord) Open() bool { return r.TargetMemberID == nil }
 
-func OpenPersistentBootstrapAdmission(dataDir string) (*PersistentBootstrapAdmission, error) {
+func OpenInviteLedger(dataDir string) (*InviteLedger, error) {
 	if dataDir == "" {
-		return nil, errors.New("libp2p: bootstrap admission data directory is required")
+		return nil, errors.New("libp2p: invite ledger data directory is required")
 	}
 	// The invite CLI opens this database alongside the running daemon, so a
-	// contending writer must wait rather than surface a driver error to a
-	// joiner mid-enrollment.
+	// contending writer must wait rather than surface a driver error.
 	q := url.Values{}
 	q.Add("_pragma", "journal_mode(WAL)")
 	q.Add("_pragma", "synchronous(NORMAL)")
 	q.Add("_pragma", "busy_timeout(5000)")
 	db, err := sql.Open("sqlite", "file:"+filepath.Join(dataDir, "bootstrap-admission.db")+"?"+q.Encode())
 	if err != nil {
-		return nil, fmt.Errorf("libp2p: open bootstrap admission: %w", err)
+		return nil, fmt.Errorf("libp2p: open invite ledger: %w", err)
 	}
-	if err := initBootstrapAdmissionSchema(db); err != nil {
+	if err := initInviteLedgerSchema(db); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
-
-	persistent := &PersistentBootstrapAdmission{db: db}
-	admission := NewBootstrapAdmission()
-	admission.revoked = func(invite capabilityKey) (bool, error) {
-		var revoked bool
-		err := db.QueryRow(`SELECT EXISTS(SELECT 1 FROM bootstrap_invites WHERE group_id=? AND nonce=? AND revoked_at_ms > 0)`,
-			invite.GroupID[:], invite.Nonce[:]).Scan(&revoked)
-		return revoked, err
-	}
-	admission.unavailable = func(key redemptionKey, maxUses int) (bool, error) {
-		tx, err := db.Begin()
-		if err != nil {
-			return false, err
-		}
-		defer tx.Rollback()
-		if err := pruneStaleReservations(tx); err != nil {
-			return false, err
-		}
-		var mine bool
-		if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM bootstrap_redemptions WHERE group_id=? AND nonce=? AND peer_id=?)`,
-			key.GroupID[:], key.Nonce[:], key.Peer).Scan(&mine); err != nil {
-			return false, err
-		}
-		if mine {
-			return true, tx.Commit()
-		}
-		spent, err := countRedemptions(tx, key.capabilityKey)
-		if err != nil {
-			return false, err
-		}
-		return spent >= maxUses, tx.Commit()
-	}
-	admission.reserve = func(key redemptionKey, maxUses int) (bool, error) {
-		tx, err := db.Begin()
-		if err != nil {
-			return false, err
-		}
-		defer tx.Rollback()
-		if err := pruneStaleReservations(tx); err != nil {
-			return false, err
-		}
-		spent, err := countRedemptions(tx, key.capabilityKey)
-		if err != nil {
-			return false, err
-		}
-		if spent >= maxUses {
-			return false, nil
-		}
-		result, err := tx.Exec(`INSERT OR IGNORE INTO bootstrap_redemptions (group_id, nonce, peer_id, state, reserved_at_ms) VALUES (?, ?, ?, 'reserved', ?)`,
-			key.GroupID[:], key.Nonce[:], key.Peer, time.Now().UnixMilli())
-		if err != nil {
-			return false, err
-		}
-		rows, err := result.RowsAffected()
-		if err != nil || rows != 1 {
-			return false, err
-		}
-		return true, tx.Commit()
-	}
-	admission.release = func(key redemptionKey) error {
-		_, err := db.Exec(`DELETE FROM bootstrap_redemptions WHERE group_id=? AND nonce=? AND peer_id=? AND state='reserved'`,
-			key.GroupID[:], key.Nonce[:], key.Peer)
-		return err
-	}
-	admission.commit = func(key redemptionKey) error {
-		result, err := db.Exec(`UPDATE bootstrap_redemptions SET state='used', reserved_at_ms=0 WHERE group_id=? AND nonce=? AND peer_id=? AND state='reserved'`,
-			key.GroupID[:], key.Nonce[:], key.Peer)
-		if err != nil {
-			return err
-		}
-		rows, err := result.RowsAffected()
-		if err != nil {
-			return err
-		}
-		if rows != 1 {
-			return errors.New("bootstrap capability reservation is missing")
-		}
-		return nil
-	}
-	persistent.BootstrapAdmission = admission
-	return persistent, nil
+	return &InviteLedger{db: db}, nil
 }
 
-func initBootstrapAdmissionSchema(db *sql.DB) error {
+func initInviteLedgerSchema(db *sql.DB) error {
 	if _, err := db.Exec(`
-		CREATE TABLE IF NOT EXISTS bootstrap_redemptions (
-			group_id BLOB NOT NULL,
-			nonce BLOB NOT NULL,
-			peer_id TEXT NOT NULL,
-			state TEXT NOT NULL DEFAULT 'used',
-			reserved_at_ms INTEGER NOT NULL DEFAULT 0,
-			PRIMARY KEY (group_id, nonce, peer_id)
-		);
 		CREATE TABLE IF NOT EXISTS bootstrap_invites (
 			group_id BLOB NOT NULL,
 			nonce BLOB NOT NULL,
@@ -165,169 +76,103 @@ func initBootstrapAdmissionSchema(db *sql.DB) error {
 			revoked_at_ms INTEGER NOT NULL DEFAULT 0,
 			PRIMARY KEY (group_id, nonce)
 		);`); err != nil {
-		return fmt.Errorf("libp2p: initialize bootstrap admission: %w", err)
+		return fmt.Errorf("libp2p: initialize invite ledger: %w", err)
 	}
-	legacy, err := tableExists(db, "used_bootstrap_capabilities")
-	if err != nil {
-		return err
-	}
-	if !legacy {
-		return nil
-	}
-	// Single-use rows from before per-applicant counting carry no peer id.
-	// Each committed row still counts as one spent use of its invite.
-	if _, err := db.Exec(`INSERT OR IGNORE INTO bootstrap_redemptions (group_id, nonce, peer_id, state, reserved_at_ms)
-		SELECT group_id, nonce, '', 'used', 0 FROM used_bootstrap_capabilities WHERE state='used' OR state IS NULL`); err != nil {
-		return fmt.Errorf("libp2p: migrate bootstrap admission: %w", err)
-	}
-	if _, err := db.Exec(`DROP TABLE used_bootstrap_capabilities`); err != nil {
-		return fmt.Errorf("libp2p: drop legacy bootstrap admission table: %w", err)
+	// Redemption counting moved into the group's signed state, where every
+	// node reaches the same answer. These tables were the old local tally;
+	// keeping them would invite a reader to trust the wrong one.
+	for _, dead := range []string{"bootstrap_redemptions", "used_bootstrap_capabilities"} {
+		if _, err := db.Exec(`DROP TABLE IF EXISTS ` + dead); err != nil {
+			return fmt.Errorf("libp2p: drop legacy %s: %w", dead, err)
+		}
 	}
 	return nil
 }
 
-func tableExists(db *sql.DB, name string) (bool, error) {
-	var exists bool
-	err := db.QueryRow(`SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?)`, name).Scan(&exists)
-	return exists, err
-}
-
-func pruneStaleReservations(tx *sql.Tx) error {
-	staleBefore := time.Now().Add(-reservationTTL).UnixMilli()
-	_, err := tx.Exec(`DELETE FROM bootstrap_redemptions WHERE state='reserved' AND reserved_at_ms < ?`, staleBefore)
-	return err
-}
-
-func countRedemptions(tx *sql.Tx, invite capabilityKey) (int, error) {
-	var count int
-	err := tx.QueryRow(`SELECT COUNT(*) FROM bootstrap_redemptions WHERE group_id=? AND nonce=?`,
-		invite.GroupID[:], invite.Nonce[:]).Scan(&count)
-	return count, err
-}
-
-// RecordIssuedInvite stores what the issuer handed out so it can be listed and
-// revoked later. Recording is idempotent for the same invite.
-func (a *PersistentBootstrapAdmission) RecordIssuedInvite(capability BootstrapCapability) error {
-	if a == nil || a.db == nil {
-		return errors.New("libp2p: bootstrap admission is not open")
+// RecordIssuedInvite files an invite the local node handed out.
+func (l *InviteLedger) RecordIssuedInvite(capability BootstrapCapability) error {
+	if l == nil || l.db == nil {
+		return errors.New("libp2p: invite ledger is not open")
 	}
-	var target any
+	var target []byte
 	if !capability.IsOpenInvite() {
 		target = capability.TargetMemberID[:]
 	}
-	_, err := a.db.Exec(`INSERT OR IGNORE INTO bootstrap_invites
+	_, err := l.db.Exec(`INSERT OR REPLACE INTO bootstrap_invites
 		(group_id, nonce, target_member_id, max_uses, issued_at_ms, expires_at_ms, revoked_at_ms)
-		VALUES (?, ?, ?, ?, ?, ?, 0)`,
+		VALUES (?, ?, ?, ?, ?, ?, COALESCE((SELECT revoked_at_ms FROM bootstrap_invites WHERE group_id=? AND nonce=?), 0))`,
 		capability.GroupID[:], capability.Nonce[:], target, capability.Uses(),
-		capability.IssuedAtMS, capability.ExpiresAtMS)
-	return err
+		capability.IssuedAtMS, capability.ExpiresAtMS,
+		capability.GroupID[:], capability.Nonce[:])
+	if err != nil {
+		return fmt.Errorf("libp2p: record issued invite: %w", err)
+	}
+	return nil
 }
 
-// RevokeInvite withdraws an invite before it expires. It reports whether this
-// call was the one that revoked it. Revoking an invite this node never
-// recorded still blocks it, so a lost invite file is not a dead end.
-func (a *PersistentBootstrapAdmission) RevokeInvite(groupID entmoot.GroupID, nonce [32]byte) (bool, error) {
-	if a == nil || a.db == nil {
-		return false, errors.New("libp2p: bootstrap admission is not open")
+// MarkRevoked notes locally that an invite was withdrawn. It reports whether a
+// row changed, so a caller can tell "withdrawn now" from "already withdrawn or
+// never issued here".
+func (l *InviteLedger) MarkRevoked(groupID entmoot.GroupID, nonce [32]byte) (bool, error) {
+	if l == nil || l.db == nil {
+		return false, errors.New("libp2p: invite ledger is not open")
 	}
-	now := time.Now().UnixMilli()
-	tx, err := a.db.Begin()
+	result, err := l.db.Exec(`UPDATE bootstrap_invites SET revoked_at_ms=? WHERE group_id=? AND nonce=? AND revoked_at_ms=0`,
+		time.Now().UnixMilli(), groupID[:], nonce[:])
+	if err != nil {
+		return false, fmt.Errorf("libp2p: mark invite revoked: %w", err)
+	}
+	rows, err := result.RowsAffected()
 	if err != nil {
 		return false, err
 	}
-	defer tx.Rollback()
-	var revokedAt int64
-	err = tx.QueryRow(`SELECT revoked_at_ms FROM bootstrap_invites WHERE group_id=? AND nonce=?`, groupID[:], nonce[:]).Scan(&revokedAt)
-	switch {
-	case errors.Is(err, sql.ErrNoRows):
-		if _, err := tx.Exec(`INSERT INTO bootstrap_invites (group_id, nonce, target_member_id, max_uses, issued_at_ms, expires_at_ms, revoked_at_ms)
-			VALUES (?, ?, NULL, 0, 0, 0, ?)`, groupID[:], nonce[:], now); err != nil {
-			return false, err
-		}
-	case err != nil:
-		return false, err
-	case revokedAt > 0:
-		return false, tx.Commit()
-	default:
-		if _, err := tx.Exec(`UPDATE bootstrap_invites SET revoked_at_ms=? WHERE group_id=? AND nonce=?`, now, groupID[:], nonce[:]); err != nil {
-			return false, err
-		}
-	}
-	return true, tx.Commit()
+	return rows == 1, nil
 }
 
-// RevokeInvitesForMember revokes every live invite bound to memberID in this
-// group and returns how many it revoked. A removal has to void the invites
-// that would readmit that identity, or eviction would only last until the
-// evicted member replayed an invite it still holds.
-func (a *PersistentBootstrapAdmission) RevokeInvitesForMember(groupID entmoot.GroupID, memberID entmoot.MemberID) (int, error) {
-	if a == nil || a.db == nil {
-		return 0, errors.New("libp2p: bootstrap admission is not open")
-	}
-	now := time.Now().UnixMilli()
-	result, err := a.db.Exec(`UPDATE bootstrap_invites SET revoked_at_ms=?
-		WHERE group_id=? AND target_member_id=? AND revoked_at_ms=0`,
-		now, groupID[:], memberID[:])
-	if err != nil {
-		return 0, err
-	}
-	affected, err := result.RowsAffected()
-	return int(affected), err
-}
-
-// LiveOpenInvites returns the group's open invites that are neither revoked
-// nor expired and still have uses left. They are bearer credentials with no
-// recorded target, so a removal cannot void them automatically and the
-// operator has to be told they exist.
-func (a *PersistentBootstrapAdmission) LiveOpenInvites(groupID entmoot.GroupID) ([]InviteRecord, error) {
-	records, err := a.ListInvites(&groupID)
+// LiveOpenInvites lists open invites this node issued that it has not revoked
+// locally and that have not expired.
+func (l *InviteLedger) LiveOpenInvites(groupID entmoot.GroupID) ([]InviteRecord, error) {
+	all, err := l.ListInvites(&groupID)
 	if err != nil {
 		return nil, err
 	}
 	now := time.Now().UnixMilli()
-	live := make([]InviteRecord, 0, len(records))
-	for _, record := range records {
+	out := make([]InviteRecord, 0, len(all))
+	for _, record := range all {
 		if !record.Open() || record.RevokedAtMS > 0 {
 			continue
 		}
 		if record.ExpiresAtMS > 0 && record.ExpiresAtMS <= now {
 			continue
 		}
-		if record.MaxUses > 0 && record.UsesCommitted >= record.MaxUses {
-			continue
-		}
-		live = append(live, record)
+		out = append(out, record)
 	}
-	return live, nil
+	return out, nil
 }
 
-// ListInvites returns recorded invites with their spent uses, newest first.
-// A nil groupID lists every group.
-func (a *PersistentBootstrapAdmission) ListInvites(groupID *entmoot.GroupID) ([]InviteRecord, error) {
-	if a == nil || a.db == nil {
-		return nil, errors.New("libp2p: bootstrap admission is not open")
+// ListInvites lists issued invites, for one group or all of them.
+func (l *InviteLedger) ListInvites(groupID *entmoot.GroupID) ([]InviteRecord, error) {
+	if l == nil || l.db == nil {
+		return nil, errors.New("libp2p: invite ledger is not open")
 	}
-	query := `SELECT i.group_id, i.nonce, i.target_member_id, i.max_uses, i.issued_at_ms, i.expires_at_ms, i.revoked_at_ms,
-			(SELECT COUNT(*) FROM bootstrap_redemptions r WHERE r.group_id=i.group_id AND r.nonce=i.nonce AND r.state='used'),
-			(SELECT COUNT(*) FROM bootstrap_redemptions r WHERE r.group_id=i.group_id AND r.nonce=i.nonce AND r.state='reserved')
-		FROM bootstrap_invites i`
+	query := `SELECT group_id, nonce, target_member_id, max_uses, issued_at_ms, expires_at_ms, revoked_at_ms
+		FROM bootstrap_invites`
 	args := []any{}
 	if groupID != nil {
-		query += ` WHERE i.group_id=?`
+		query += ` WHERE group_id=?`
 		args = append(args, groupID[:])
 	}
-	query += ` ORDER BY i.issued_at_ms DESC`
-	rows, err := a.db.Query(query, args...)
+	query += ` ORDER BY issued_at_ms DESC, nonce ASC`
+	rows, err := l.db.Query(query, args...)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("libp2p: list invites: %w", err)
 	}
 	defer rows.Close()
-	var out []InviteRecord
+	out := make([]InviteRecord, 0)
 	for rows.Next() {
-		var group, nonce, target []byte
 		var record InviteRecord
-		if err := rows.Scan(&group, &nonce, &target, &record.MaxUses, &record.IssuedAtMS, &record.ExpiresAtMS,
-			&record.RevokedAtMS, &record.UsesCommitted, &record.UsesReserved); err != nil {
+		var group, nonce, target []byte
+		if err := rows.Scan(&group, &nonce, &target, &record.MaxUses, &record.IssuedAtMS, &record.ExpiresAtMS, &record.RevokedAtMS); err != nil {
 			return nil, err
 		}
 		if len(group) != len(record.GroupID) || len(nonce) != len(record.Nonce) {
@@ -359,9 +204,9 @@ func DecodeInviteNonce(encoded string) ([32]byte, error) {
 	return nonce, nil
 }
 
-func (a *PersistentBootstrapAdmission) Close() error {
-	if a == nil || a.db == nil {
+func (l *InviteLedger) Close() error {
+	if l == nil || l.db == nil {
 		return nil
 	}
-	return a.db.Close()
+	return l.db.Close()
 }

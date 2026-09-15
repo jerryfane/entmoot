@@ -16,7 +16,7 @@ import (
 	"entmoot/pkg/entmoot/esphttp"
 	"entmoot/pkg/entmoot/ipc"
 	"entmoot/pkg/entmoot/keystore"
-	"entmoot/pkg/entmoot/roster"
+	"entmoot/pkg/entmoot/membership"
 )
 
 func TestApplyLiveAgentActionCreatesFleetTask(t *testing.T) {
@@ -450,7 +450,7 @@ func TestApplyLiveAgentActionUpdatesGroupMetadata(t *testing.T) {
 	}
 	founder := testESPNodeInfo(t, id.PublicKey)
 	nodeID := *founder.MemberID
-	createLiveActionRoster(t, dataDir, gid, id, founder)
+	createLiveActionGroup(t, dataDir, gid, id, founder)
 	topicsCh := make(chan []string, 1)
 	contentCh := make(chan []byte, 1)
 	stop := serveLiveInfoPublishCapture(t, controlSocketPath(dataDir), &ipc.InfoResp{
@@ -527,7 +527,7 @@ func TestApplyLiveAgentActionRejectsMetadataUpdateByNonFounder(t *testing.T) {
 	founder := testESPNodeInfo(t, founderID.PublicKey)
 	agent := testESPNodeInfo(t, agentID.PublicKey)
 	agentNodeID := *agent.MemberID
-	createLiveActionRoster(t, dataDir, gid, founderID, founder)
+	createLiveActionGroup(t, dataDir, gid, founderID, founder)
 	topicsCh := make(chan []string, 1)
 	contentCh := make(chan []byte, 1)
 	stop := serveLiveInfoPublishCapture(t, controlSocketPath(dataDir), &ipc.InfoResp{
@@ -559,7 +559,7 @@ func TestApplyLiveAgentActionRejectsMetadataUpdateByNonFounder(t *testing.T) {
 	}
 }
 
-func TestApplyLiveAgentActionRejectsMetadataUpdateWithoutCreatingRoster(t *testing.T) {
+func TestApplyLiveAgentActionRejectsMetadataUpdateWithoutCreatingGroupState(t *testing.T) {
 	ctx := context.Background()
 	gid := testAgentLiveGroupID(37)
 	nodeID := testAgentLiveMemberID(7)
@@ -591,16 +591,16 @@ func TestApplyLiveAgentActionRejectsMetadataUpdateWithoutCreatingRoster(t *testi
 	}
 	applied, err := applyLiveAgentAction(ctx, enableCoordinationFeatures(&globalFlags{data: dataDir}), state, cfg, nil, liveAgentAction{
 		Kind:     liveActionMetadataUpdate,
-		Metadata: json.RawMessage(`{"name":"Missing roster"}`),
+		Metadata: json.RawMessage(`{"name":"Missing group"}`),
 	})
 	if err == nil {
-		t.Fatal("applyLiveAgentAction err = nil, want missing roster authorization error")
+		t.Fatal("applyLiveAgentAction err = nil, want missing membership authorization error")
 	}
 	if applied {
 		t.Fatal("applied = true, want false")
 	}
-	if _, err := os.Stat(groupRosterPath(dataDir, gid)); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("roster stat err = %v, want not exist", err)
+	if membership.Exists(dataDir, gid) {
+		t.Fatal("rejected action created group membership state")
 	}
 }
 
@@ -1796,14 +1796,13 @@ func serveLiveInfoRemoveDrop(t *testing.T, sock string, info *ipc.InfoResp, remo
 	}
 }
 
-func createLiveActionRoster(t *testing.T, dataDir string, gid entmoot.GroupID, founderID *keystore.Identity, founder entmoot.NodeInfo) {
+func createLiveActionGroup(t *testing.T, dataDir string, gid entmoot.GroupID, founderID *keystore.Identity, founder entmoot.NodeInfo) {
 	t.Helper()
-	rlog, err := roster.OpenJSONL(dataDir, gid)
+	group, err := membership.Create(dataDir, founderID, founder, gid, membership.DefaultPolicy(), 1_700_000_000_000)
 	if err != nil {
-		t.Fatalf("OpenJSONL: %v", err)
+		t.Fatalf("membership.Create: %v", err)
 	}
-	defer rlog.Close()
-	if err := rlog.Genesis(founderID, founder, 1_700_000_000_000); err != nil {
-		t.Fatalf("Genesis: %v", err)
+	if err := group.Close(); err != nil {
+		t.Fatalf("membership close: %v", err)
 	}
 }

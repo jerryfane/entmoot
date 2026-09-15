@@ -1,228 +1,187 @@
 package libp2ptransport
 
 import (
-	"context"
-	"crypto/rand"
-	"strings"
+	"errors"
 	"testing"
 	"time"
 
-	"github.com/libp2p/go-libp2p"
-	"github.com/libp2p/go-libp2p/core/host"
-	"github.com/libp2p/go-libp2p/core/peer"
-
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/keystore"
+	"entmoot/pkg/entmoot/membership"
 )
 
-// inviteFixture is a founder enrollment server plus an admission store, so
-// tests exercise the real reserve/commit/revoke paths over a real stream.
-type inviteFixture struct {
-	ctx        context.Context
-	founder    *keystore.Identity
-	founderHos host.Host
-	remote     peer.AddrInfo
-	admission  *PersistentBootstrapAdmission
-	groupID    entmoot.GroupID
-	admitted   []entmoot.MemberID
-	failNext   bool
-}
-
-func newInviteFixture(t *testing.T) *inviteFixture {
+// tryJoinWithInvite signs a join the way a joiner does and reports whether the
+// group admitted it. A join that carries an unusable invite is stored and
+// ignored rather than rejected, so "was it applied" is the wrong question:
+// membership is.
+func tryJoinWithInvite(t *testing.T, group *membership.Group, joiner *keystore.Identity, capability entmoot.BootstrapCapability) (entmoot.MemberID, error) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	t.Cleanup(cancel)
-	founder := mustIdentity(t)
-	founderHost, _, err := NewHost(ctx, founder, libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"))
-	if err != nil {
-		t.Fatal(err)
+	member := *mustNode(t, joiner).MemberID
+	if _, err := group.SignRecord(joiner, membership.Record{Kind: membership.KindJoin, Invite: &capability}); err != nil {
+		return member, err
 	}
-	t.Cleanup(func() { founderHost.Close() })
-	admission, err := OpenPersistentBootstrapAdmission(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { admission.Close() })
-	f := &inviteFixture{
-		ctx:        ctx,
-		founder:    founder,
-		founderHos: founderHost,
-		remote:     peer.AddrInfo{ID: founderHost.ID(), Addrs: founderHost.Addrs()},
-		admission:  admission,
-		groupID:    entmoot.GroupID{9},
-	}
-	server := EnrollmentServer{
-		Admission: admission.BootstrapAdmission,
-		Enroll: func(_ context.Context, _ BootstrapCapability, applicant entmoot.NodeInfo) (EnrollmentResponse, error) {
-			if f.failNext {
-				f.failNext = false
-				return EnrollmentResponse{}, RejectEnrollment(EnrollRejectUnknownCheckpoint, "invite checkpoint is not on this group's roster chain")
-			}
-			f.admitted = append(f.admitted, *applicant.MemberID)
-			return EnrollmentResponse{}, nil
-		},
-	}
-	if err := server.Install(founderHost); err != nil {
-		t.Fatal(err)
-	}
-	return f
-}
-
-// invite mints a signed capability. An empty target means an open invite.
-func (f *inviteFixture) invite(t *testing.T, target *keystore.Identity, maxUses int) BootstrapCapability {
-	t.Helper()
-	now := time.Now()
-	capability := BootstrapCapability{
-		GroupID:        f.groupID,
-		Founder:        mustNodeInfo(t, f.founder.PublicKey),
-		AllowedPeerIDs: []string{f.founderHos.ID().String()},
-		MaxUses:        maxUses,
-		IssuedAtMS:     now.Add(-time.Minute).UnixMilli(),
-		ExpiresAtMS:    now.Add(time.Hour).UnixMilli(),
-	}
-	if target != nil {
-		binding, err := BindingFromPublicKey(target.PublicKey)
-		if err != nil {
-			t.Fatal(err)
-		}
-		capability.TargetPublicKey = target.PublicKey
-		capability.TargetMemberID = binding.MemberID
-		capability.TargetPeerID = binding.PeerID.String()
-	}
-	if _, err := rand.Read(capability.Nonce[:]); err != nil {
-		t.Fatal(err)
-	}
-	if err := SignBootstrapCapability(f.founder, &capability); err != nil {
-		t.Fatal(err)
-	}
-	if err := f.admission.RecordIssuedInvite(capability); err != nil {
-		t.Fatal(err)
-	}
-	return capability
-}
-
-// join runs one real enrollment as a fresh joining identity.
-func (f *inviteFixture) join(t *testing.T, applicant *keystore.Identity, capability BootstrapCapability) error {
-	t.Helper()
-	applicantHost, _, err := NewHost(f.ctx, applicant, libp2p.NoListenAddrs)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer applicantHost.Close()
-	_, err = Enroll(f.ctx, applicantHost, f.remote, capability, applicant.PublicKey)
-	return err
+	return member, nil
 }
 
 // A multi-use invite is what lets an operator hand one link to a small team.
 func TestMultiUseInviteAdmitsDistinctPeersUpToItsLimit(t *testing.T) {
-	f := newInviteFixture(t)
-	capability := f.invite(t, nil, 2)
-	for _, applicant := range []*keystore.Identity{mustIdentity(t), mustIdentity(t)} {
-		if err := f.join(t, applicant, capability); err != nil {
+	founder := mustIdentity(t)
+	_, group := mustInviteOnlyGroup(t, t.TempDir(), founder)
+	capability := mustInvite(t, group, founder, nil, 2, nil)
+
+	for i := range 2 {
+		member, err := tryJoinWithInvite(t, group, mustIdentity(t), capability)
+		if err != nil {
 			t.Fatalf("multi-use invite refused an applicant within its limit: %v", err)
 		}
+		if !group.IsMemberID(member) {
+			t.Fatalf("applicant %d within the limit was not admitted", i)
+		}
 	}
-	err := f.join(t, mustIdentity(t), capability)
-	if err == nil {
+	if uses := group.InviteUses(capability.Nonce); uses != 2 {
+		t.Fatalf("invite uses = %d, want 2", uses)
+	}
+
+	extra, err := tryJoinWithInvite(t, group, mustIdentity(t), capability)
+	if err != nil {
+		t.Fatalf("join past the limit was rejected instead of ignored: %v", err)
+	}
+	if group.IsMemberID(extra) {
 		t.Fatal("multi-use invite admitted more identities than its limit")
 	}
-	if !strings.Contains(err.Error(), EnrollRejectCapability) {
-		t.Fatalf("exhausted invite error = %v, want %s", err, EnrollRejectCapability)
+	if uses := group.InviteUses(capability.Nonce); uses != 2 {
+		t.Fatalf("invite uses after the refused join = %d, want 2", uses)
 	}
-	if len(f.admitted) != 2 {
-		t.Fatalf("admitted %d identities, want 2", len(f.admitted))
+	// Three members: the founder and the two admitted applicants.
+	if members := group.MemberIDs(); len(members) != 3 {
+		t.Fatalf("group holds %d members, want 3", len(members))
 	}
 }
 
 // Single use stays the default: an invite without MaxUses admits one identity.
 func TestInviteWithoutMaxUsesAdmitsOneIdentity(t *testing.T) {
-	f := newInviteFixture(t)
-	capability := f.invite(t, nil, 0)
-	if err := f.join(t, mustIdentity(t), capability); err != nil {
+	founder := mustIdentity(t)
+	_, group := mustInviteOnlyGroup(t, t.TempDir(), founder)
+	capability := mustInvite(t, group, founder, nil, 0, nil)
+
+	first, err := tryJoinWithInvite(t, group, mustIdentity(t), capability)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := f.join(t, mustIdentity(t), capability); err == nil {
+	if !group.IsMemberID(first) {
+		t.Fatal("default invite did not admit its first holder")
+	}
+	second, err := tryJoinWithInvite(t, group, mustIdentity(t), capability)
+	if err != nil {
+		t.Fatalf("second join was rejected instead of ignored: %v", err)
+	}
+	if group.IsMemberID(second) {
 		t.Fatal("default invite admitted a second identity")
 	}
 }
 
 // A target-bound invite is not transferable, so the same link cannot be handed
-// to someone else.
+// to someone else: the stranger cannot even produce a valid join record.
 func TestTargetBoundInviteRefusesAnotherApplicant(t *testing.T) {
-	f := newInviteFixture(t)
+	founder := mustIdentity(t)
 	target := mustIdentity(t)
-	capability := f.invite(t, target, 1)
-	err := f.join(t, mustIdentity(t), capability)
-	if err == nil {
+	_, group := mustInviteOnlyGroup(t, t.TempDir(), founder)
+	capability := mustInvite(t, group, founder, target.PublicKey, 1, nil)
+
+	stranger, err := tryJoinWithInvite(t, group, mustIdentity(t), capability)
+	if !errors.Is(err, entmoot.ErrRosterReject) {
+		t.Fatalf("stranger's join error = %v, want a rejected record", err)
+	}
+	if group.IsMemberID(stranger) {
 		t.Fatal("target-bound invite admitted a different identity")
 	}
-	if !strings.Contains(err.Error(), EnrollRejectApplicant) && !strings.Contains(err.Error(), EnrollRejectCapability) {
-		t.Fatalf("stranger error = %v, want an applicant or capability rejection", err)
-	}
-	if err := f.join(t, target, capability); err != nil {
+	admitted, err := tryJoinWithInvite(t, group, target, capability)
+	if err != nil {
 		t.Fatalf("target-bound invite refused its own target: %v", err)
+	}
+	if !group.IsMemberID(admitted) {
+		t.Fatal("target-bound invite did not admit its target")
 	}
 }
 
-// Revocation is the missing lever: an invite can be withdrawn before expiry,
-// with uses still remaining.
+// Revocation is the lever an operator needs: an invite can be withdrawn before
+// expiry with uses still remaining, and the remaining uses stop working.
 func TestRevokedInviteStopsRemainingUses(t *testing.T) {
-	f := newInviteFixture(t)
-	capability := f.invite(t, nil, 3)
-	if err := f.join(t, mustIdentity(t), capability); err != nil {
-		t.Fatal(err)
-	}
-	revoked, err := f.admission.RevokeInvite(capability.GroupID, capability.Nonce)
-	if err != nil || !revoked {
-		t.Fatalf("RevokeInvite revoked/err = %v/%v", revoked, err)
-	}
-	err = f.join(t, mustIdentity(t), capability)
-	if err == nil {
-		t.Fatal("revoked invite still admitted an identity")
-	}
-	if !strings.Contains(err.Error(), "revoked") {
-		t.Fatalf("revoked invite error = %v, want a revocation reason", err)
-	}
-	records, err := f.admission.ListInvites(&capability.GroupID)
+	founder := mustIdentity(t)
+	_, group := mustInviteOnlyGroup(t, t.TempDir(), founder)
+	capability := mustInvite(t, group, founder, nil, 3, nil)
+
+	admitted, err := tryJoinWithInvite(t, group, mustIdentity(t), capability)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(records) != 1 || records[0].UsesCommitted != 1 || records[0].MaxUses != 3 || records[0].RevokedAtMS == 0 {
-		t.Fatalf("invite records = %+v", records)
+	if !group.IsMemberID(admitted) {
+		t.Fatal("first holder of a three-use invite was not admitted")
+	}
+	if _, err := group.SignRecord(founder, membership.Record{
+		Kind:        membership.KindRevokeInvite,
+		InviteNonce: capability.Nonce,
+	}); err != nil {
+		t.Fatalf("sign revocation: %v", err)
+	}
+
+	refused, err := tryJoinWithInvite(t, group, mustIdentity(t), capability)
+	if err != nil {
+		t.Fatalf("join on a revoked invite was rejected instead of ignored: %v", err)
+	}
+	if group.IsMemberID(refused) {
+		t.Fatal("revoked invite still admitted an identity")
+	}
+	if uses := group.InviteUses(capability.Nonce); uses != 1 {
+		t.Fatalf("invite uses = %d, want the one use it had before revocation", uses)
+	}
+	if err := group.CheckInvite(capability, time.Now().UnixMilli()); !errors.Is(err, membership.ErrInviteDenied) {
+		t.Fatalf("revoked invite still passes the pre-membership gate: %v", err)
+	}
+	// The member admitted before the revocation keeps its membership.
+	if !group.IsMemberID(admitted) {
+		t.Fatal("revoking an invite removed the member it had already admitted")
 	}
 }
 
-// Revoking an invite whose file was lost must still work, so a leaked link is
-// never a dead end.
-func TestRevokeWorksForUnrecordedInvite(t *testing.T) {
-	f := newInviteFixture(t)
-	capability := BootstrapCapability{GroupID: f.groupID}
-	capability.Nonce[0] = 42
-	revoked, err := f.admission.RevokeInvite(capability.GroupID, capability.Nonce)
-	if err != nil || !revoked {
-		t.Fatalf("first revoke = %v/%v", revoked, err)
+// The local ledger is a record of what this node handed out, not an authority,
+// so it must tell "withdrawn now" apart from "never issued here".
+func TestInviteLedgerMarkRevokedReportsUnknownInvite(t *testing.T) {
+	ledger, err := OpenInviteLedger(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
 	}
-	again, err := f.admission.RevokeInvite(capability.GroupID, capability.Nonce)
-	if err != nil || again {
-		t.Fatalf("second revoke = %v/%v, want false/nil", again, err)
-	}
-}
+	t.Cleanup(func() { ledger.Close() })
 
-// A rejection the applicant could fix must not consume a use, and it must say
-// what was wrong instead of one opaque failure code.
-func TestFailedEnrollmentKeepsUseAndReportsReason(t *testing.T) {
-	f := newInviteFixture(t)
-	capability := f.invite(t, nil, 1)
-	applicant := mustIdentity(t)
-	f.failNext = true
-	err := f.join(t, applicant, capability)
-	if err == nil {
-		t.Fatal("rejected enrollment reported success")
+	founder := mustIdentity(t)
+	groupID, group := mustInviteOnlyGroup(t, t.TempDir(), founder)
+	capability := mustInvite(t, group, founder, nil, 1, nil)
+
+	var unknown [32]byte
+	unknown[0] = 42
+	noted, err := ledger.MarkRevoked(groupID, unknown)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(err.Error(), EnrollRejectUnknownCheckpoint) || !strings.Contains(err.Error(), "roster chain") {
-		t.Fatalf("rejection error = %v, want the checkpoint code and reason", err)
+	if noted {
+		t.Fatal("ledger claimed to withdraw an invite it never issued")
 	}
-	if err := f.join(t, applicant, capability); err != nil {
-		t.Fatalf("retry after a failed enrollment was refused: %v", err)
+
+	if err := ledger.RecordIssuedInvite(capability); err != nil {
+		t.Fatal(err)
+	}
+	noted, err = ledger.MarkRevoked(groupID, capability.Nonce)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !noted {
+		t.Fatal("ledger did not withdraw an invite it had issued")
+	}
+	again, err := ledger.MarkRevoked(groupID, capability.Nonce)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again {
+		t.Fatal("ledger withdrew the same invite twice")
 	}
 }

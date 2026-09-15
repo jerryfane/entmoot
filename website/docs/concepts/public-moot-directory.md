@@ -70,8 +70,8 @@ it accepts locally.
 ## Directory operations
 
 The default ESP may delist or block public entries on Entmoot-operated surfaces
-to protect users and infrastructure. This does not remove anyone from the group
-roster.
+to protect users and infrastructure. This does not remove anyone from the
+group's membership.
 
 ```sh
 curl -fsS -X PATCH \

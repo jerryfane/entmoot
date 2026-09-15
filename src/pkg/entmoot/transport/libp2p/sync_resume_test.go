@@ -5,12 +5,13 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/libp2p/go-libp2p/core/peer"
+
 	"entmoot/pkg/entmoot"
+	"entmoot/pkg/entmoot/membership"
 	"entmoot/pkg/entmoot/merkle"
-	"entmoot/pkg/entmoot/roster"
 	"entmoot/pkg/entmoot/signing"
 	"entmoot/pkg/entmoot/store"
-	"github.com/libp2p/go-libp2p/core/peer"
 )
 
 // The observer delegates storage and paging to SQLite. Its only intervention
@@ -41,14 +42,20 @@ func (s *interruptedHistoryStore) MessageIDsPage(ctx context.Context, group entm
 func TestHistoryResumesInterruptedPageWithoutRestartingSnapshot(t *testing.T) {
 	f := newSnapshotLifecycleFixture(t)
 	group := f.groups[0]
-	for sequence := 3; sequence <= 600; sequence++ {
+	// The fixture seeds sequences 1-4; carry the group to 600 messages.
+	for sequence := 5; sequence <= 600; sequence++ {
 		f.addMessage(t, group, sequence)
 	}
 	observed := &interruptedHistoryStore{SQLite: f.store, interrupt: func() error { return f.client.Network().ClosePeer(f.remote.ID) }}
 	// Reuse the real fixture host and authorization, replacing only its store
 	// with an observing decorator. No protocol response is fabricated.
-	remoteHost := f.serverHost
-	server := &SyncServer{Host: remoteHost, Admission: NewBootstrapAdmission(), Store: observed, Roster: func(id entmoot.GroupID) (*roster.RosterLog, bool) { log, ok := f.logs[id]; return log, ok }}
+	server := &SyncServer{
+		Host: f.serverHost, Store: observed,
+		Group: func(id entmoot.GroupID) (*membership.Group, bool) {
+			group, ok := f.membership[id]
+			return group, ok
+		},
+	}
 	if err := server.Install(); err != nil {
 		t.Fatal(err)
 	}

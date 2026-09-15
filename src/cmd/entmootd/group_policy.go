@@ -12,6 +12,7 @@ import (
 
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/ipc"
+	"entmoot/pkg/entmoot/membership"
 	entpolicy "entmoot/pkg/entmoot/policy"
 )
 
@@ -37,7 +38,7 @@ type groupPolicyReport struct {
 
 func cmdGroupPolicy(gf *globalFlags, args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "group policy: missing op (want: status, set, clear)")
+		fmt.Fprintln(os.Stderr, "group policy: missing op (want: status, set, clear, join-rule, checkpoint-every)")
 		return exitInvalidArgument
 	}
 	switch args[0] {
@@ -47,6 +48,10 @@ func cmdGroupPolicy(gf *globalFlags, args []string) int {
 		return cmdGroupPolicySet(gf, args[1:])
 	case "clear":
 		return cmdGroupPolicyClear(gf, args[1:])
+	case "join-rule":
+		return cmdGroupJoinRule(gf, args[1:])
+	case "checkpoint-every":
+		return cmdGroupCheckpointEvery(gf, args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "group policy: unknown op %q\n", args[0])
 		return exitInvalidArgument
@@ -318,4 +323,90 @@ func buildNextPolicyUpdate(ctx context.Context, store *entpolicy.FileStore, gid 
 		seq = current + 1
 	}
 	return entpolicy.NewUpdate(gid, p, now, seq), nil
+}
+
+// cmdGroupJoinRule sets whether joining needs an invite. This is group
+// membership policy, signed into the group, not the local enforcement policy
+// that `group policy set` writes.
+func cmdGroupJoinRule(gf *globalFlags, args []string) int {
+	fs := flag.NewFlagSet("group policy join-rule", flag.ContinueOnError)
+	groupStr := fs.String("group", "", "base64 group id (required)")
+	rule := fs.String("rule", "", "invite|open (required)")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return exitOK
+		}
+		return exitInvalidArgument
+	}
+	switch *rule {
+	case membership.JoinRuleInvite, membership.JoinRuleOpen:
+	default:
+		fmt.Fprintln(os.Stderr, "group policy join-rule: -rule must be invite or open")
+		return exitInvalidArgument
+	}
+	gid, err := decodeGroupID(*groupStr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "group policy join-rule: %v\n", err)
+		return exitInvalidArgument
+	}
+	ctx, code, ok := setupFounderRoster(gf, "group policy join-rule", gid)
+	if !ok {
+		return code
+	}
+	defer ctx.close()
+	policy := ctx.group.Policy()
+	policy.JoinRule = *rule
+	return applyGroupPolicyRecord(ctx, gid, policy, "group policy join-rule")
+}
+
+// cmdGroupCheckpointEvery sets how many membership records accumulate before
+// an admin signs a checkpoint.
+func cmdGroupCheckpointEvery(gf *globalFlags, args []string) int {
+	fs := flag.NewFlagSet("group policy checkpoint-every", flag.ContinueOnError)
+	groupStr := fs.String("group", "", "base64 group id (required)")
+	every := fs.Int("records", membership.DefaultCheckpointEvery, "records between checkpoints (at least 1)")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return exitOK
+		}
+		return exitInvalidArgument
+	}
+	if *every < 1 {
+		fmt.Fprintln(os.Stderr, "group policy checkpoint-every: -records must be at least 1")
+		return exitInvalidArgument
+	}
+	gid, err := decodeGroupID(*groupStr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "group policy checkpoint-every: %v\n", err)
+		return exitInvalidArgument
+	}
+	ctx, code, ok := setupFounderRoster(gf, "group policy checkpoint-every", gid)
+	if !ok {
+		return code
+	}
+	defer ctx.close()
+	policy := ctx.group.Policy()
+	policy.CheckpointEvery = *every
+	return applyGroupPolicyRecord(ctx, gid, policy, "group policy checkpoint-every")
+}
+
+func applyGroupPolicyRecord(ctx founderRosterContext, gid entmoot.GroupID, policy membership.Policy, command string) int {
+	signed, err := ctx.group.SignRecord(ctx.setup.identity, membership.Record{Kind: membership.KindPolicy, Policy: &policy})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s: %v\n", command, err)
+		return exitInvalidArgument
+	}
+	data, err := json.Marshal(map[string]any{
+		"status":           "updated",
+		"group_id":         gid,
+		"record_id":        signed.ID,
+		"join_rule":        policy.JoinRule,
+		"checkpoint_every": policy.CheckpointEvery,
+	})
+	if err != nil {
+		slog.Error(command+": marshal", slog.String("err", err.Error()))
+		return exitTransport
+	}
+	fmt.Println(string(data))
+	return exitOK
 }

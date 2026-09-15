@@ -26,9 +26,9 @@ import (
 	"entmoot/pkg/entmoot/esphttp"
 	"entmoot/pkg/entmoot/ipc"
 	"entmoot/pkg/entmoot/keystore"
+	"entmoot/pkg/entmoot/membership"
 	entpolicy "entmoot/pkg/entmoot/policy"
 	"entmoot/pkg/entmoot/publicmoot"
-	"entmoot/pkg/entmoot/roster"
 	"entmoot/pkg/entmoot/store"
 	libp2ptransport "entmoot/pkg/entmoot/transport/libp2p"
 )
@@ -739,7 +739,7 @@ func (e espOperationExecutor) createGroup(ctx context.Context, req esphttp.SignR
 	deviceGroupGranted := false
 	deviceAdminGroupGranted := false
 	var st *store.SQLite
-	var rlog *roster.RosterLog
+	var rlog *membership.Group
 	defer func() {
 		if rlog != nil {
 			_ = rlog.Close()
@@ -811,10 +811,6 @@ func (e espOperationExecutor) createGroup(ctx context.Context, req esphttp.SignR
 	if err != nil {
 		return nil, err
 	}
-	rlog, err = roster.OpenJSONL(e.dataDir, gid)
-	if err != nil {
-		return nil, err
-	}
 	founder := entmoot.NodeInfo{
 		MemberID:      &info.MemberID,
 		PeerID:        info.PeerID,
@@ -824,12 +820,20 @@ func (e espOperationExecutor) createGroup(ctx context.Context, req esphttp.SignR
 	if now == 0 {
 		now = time.Now().UnixMilli()
 	}
-	if existing, ok := rlog.Founder(); ok {
+	// A deterministic group id may already exist. Reuse it only when it is
+	// this founder's group; otherwise two founders would share an id.
+	if membership.Exists(e.dataDir, gid) {
+		rlog, err = membership.Open(e.dataDir, gid)
+		if err != nil {
+			return nil, err
+		}
+		existing := rlog.Founder()
 		if existing.MemberID == nil || *existing.MemberID != *founder.MemberID || !bytes.Equal(existing.EntmootPubKey, founder.EntmootPubKey) {
 			return nil, &esphttp.OperationError{HTTPStatus: http.StatusConflict, Code: "group_create_conflict", Message: "deterministic group id already belongs to another founder"}
 		}
 	} else {
-		if err := rlog.Genesis(e.identity, founder, now); err != nil {
+		rlog, err = membership.Create(e.dataDir, e.identity, founder, gid, membership.DefaultPolicy(), now)
+		if err != nil {
 			return nil, err
 		}
 	}
@@ -1000,7 +1004,7 @@ func (e espOperationExecutor) createFleetControlGroup(ctx context.Context, contr
 	groupPreexisted := pathExists(groupPath)
 	committed := false
 	metadataWritten := false
-	var rlog *roster.RosterLog
+	var rlog *membership.Group
 	defer func() {
 		if rlog != nil {
 			_ = rlog.Close()
@@ -1024,11 +1028,8 @@ func (e espOperationExecutor) createFleetControlGroup(ctx context.Context, contr
 		now = time.Now().UnixMilli()
 	}
 	var err error
-	rlog, err = roster.OpenJSONL(e.dataDir, controlGID)
+	rlog, err = membership.Create(e.dataDir, e.identity, founder, controlGID, membership.DefaultPolicy(), now)
 	if err != nil {
-		return entmoot.GroupID{}, err
-	}
-	if err := rlog.Genesis(e.identity, founder, now); err != nil {
 		return entmoot.GroupID{}, err
 	}
 	if e.metadataStore != nil {
@@ -1979,16 +1980,15 @@ func (e espOperationExecutor) removeMember(ctx context.Context, req esphttp.Sign
 	if err != nil {
 		return nil, err
 	}
-	// A removal only sticks if the invites that would readmit the member are
-	// gone, and bearer invites cannot be attributed, so the caller is told
-	// what remains — including when a store could not be read, since a zero
-	// there would read as "nothing outstanding".
+	// A removed member's own invites stop working by rule, but bearer invites
+	// from other admins do not, so the caller is told what remains —
+	// including when a store could not be read, since a zero there would read
+	// as "nothing outstanding".
 	out := map[string]any{
 		"status":                       resp.Status,
 		"group_id":                     resp.GroupID,
 		"roster_head":                  resp.RosterHead,
 		"members":                      resp.Members,
-		"revoked_invites":              resp.RevokedInvites,
 		"outstanding_open_invites":     resp.OutstandingOpenInvites,
 		"outstanding_esp_open_invites": resp.OutstandingESPOpenInvites,
 	}
@@ -2077,36 +2077,11 @@ func sha256Base64(data []byte) string {
 	return base64.StdEncoding.EncodeToString(sum[:])
 }
 
-func applyRosterAdd(identity *keystore.Identity, rlog *roster.RosterLog, founder entmoot.NodeInfo, target entmoot.NodeInfo) error {
-	now := time.Now().UnixMilli()
-	entries := rlog.Entries()
-	if len(entries) > 0 && now <= entries[len(entries)-1].Timestamp {
-		now = entries[len(entries)-1].Timestamp + 1
-	}
-	entry, err := rlog.SignEntry(identity, "add", target, nil, now)
-	if err != nil {
-		return err
-	}
-	if err := rlog.Apply(entry); err != nil {
-		if errors.Is(err, entmoot.ErrRosterReject) {
-			return &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "roster_rejected", Message: err.Error()}
-		}
-		return err
-	}
-	return nil
-}
-
-func applyRosterRemove(identity *keystore.Identity, rlog *roster.RosterLog, founder entmoot.NodeInfo, target entmoot.NodeInfo) error {
-	now := time.Now().UnixMilli()
-	entries := rlog.Entries()
-	if len(entries) > 0 && now <= entries[len(entries)-1].Timestamp {
-		now = entries[len(entries)-1].Timestamp + 1
-	}
-	entry, err := rlog.SignEntry(identity, "remove", target, nil, now)
-	if err != nil {
-		return err
-	}
-	if err := rlog.Apply(entry); err != nil {
+// applyRosterRemove records a removal. There is no matching add: a member
+// signs its own join, so an ESP invite hands out a capability rather than
+// writing somebody into the group.
+func applyRosterRemove(identity *keystore.Identity, group *membership.Group, target entmoot.NodeInfo) error {
+	if _, err := group.SignRecord(identity, membership.Record{Kind: membership.KindRemove, Subject: target}); err != nil {
 		if errors.Is(err, entmoot.ErrRosterReject) {
 			return &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "roster_rejected", Message: err.Error()}
 		}

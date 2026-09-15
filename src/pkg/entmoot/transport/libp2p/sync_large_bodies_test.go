@@ -8,8 +8,8 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 
 	"entmoot/pkg/entmoot"
+	"entmoot/pkg/entmoot/membership"
 	"entmoot/pkg/entmoot/merkle"
-	"entmoot/pkg/entmoot/roster"
 	"entmoot/pkg/entmoot/signing"
 	"entmoot/pkg/entmoot/store"
 )
@@ -28,8 +28,8 @@ func TestHistoryTransfersMessagesTooLargeForAFullBatch(t *testing.T) {
 		f.addLargeMessage(t, group, sequence, payload)
 	}
 	server := &SyncServer{
-		Host: f.serverHost, Admission: NewBootstrapAdmission(), Store: f.store,
-		Roster: func(id entmoot.GroupID) (*roster.RosterLog, bool) { log, ok := f.logs[id]; return log, ok },
+		Host: f.serverHost, Store: f.store,
+		Group: func(id entmoot.GroupID) (*membership.Group, bool) { g, ok := f.membership[id]; return g, ok },
 	}
 	if err := server.Install(); err != nil {
 		t.Fatal(err)
@@ -71,8 +71,8 @@ func TestHistoryBodyPageReportsTruncation(t *testing.T) {
 		f.addLargeMessage(t, group, sequence, payload)
 	}
 	server := &SyncServer{
-		Host: f.serverHost, Admission: NewBootstrapAdmission(), Store: f.store,
-		Roster: func(id entmoot.GroupID) (*roster.RosterLog, bool) { log, ok := f.logs[id]; return log, ok },
+		Host: f.serverHost, Store: f.store,
+		Group: func(id entmoot.GroupID) (*membership.Group, bool) { g, ok := f.membership[id]; return g, ok },
 	}
 	if err := server.Install(); err != nil {
 		t.Fatal(err)
@@ -101,7 +101,7 @@ func (f *snapshotLifecycleFixture) addLargeMessage(t *testing.T, groupID entmoot
 	if err != nil {
 		t.Fatal(err)
 	}
-	head := f.logs[groupID].Head()
+	head := f.head(groupID)
 	message, err := signer.SignMessage(f.ctx, entmoot.Message{
 		Version: 2, GroupID: groupID, Timestamp: int64(20_000 + sequence),
 		Topics:     []string{"bulk"},

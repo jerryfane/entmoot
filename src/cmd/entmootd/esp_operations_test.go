@@ -21,9 +21,9 @@ import (
 	"entmoot/pkg/entmoot/ipc"
 	"entmoot/pkg/entmoot/keystore"
 	"entmoot/pkg/entmoot/mailbox"
+	"entmoot/pkg/entmoot/membership"
 	entpolicy "entmoot/pkg/entmoot/policy"
 	"entmoot/pkg/entmoot/publicmoot"
-	"entmoot/pkg/entmoot/roster"
 	"entmoot/pkg/entmoot/store"
 )
 
@@ -196,7 +196,7 @@ func TestESPOperationPublicPublishUsesExecutorIdentity(t *testing.T) {
 		t.Fatalf("Generate: %v", err)
 	}
 	founder := testESPNodeInfo(t, id.PublicKey)
-	createTestRoster(t, dataDir, gid, id, founder)
+	createTestGroup(t, dataDir, gid, id, founder)
 
 	state, err := esphttp.OpenSQLiteStateStore(dataDir)
 	if err != nil {
@@ -261,15 +261,8 @@ func TestLocalGroupCatalogIgnoresBadStoredMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Generate: %v", err)
 	}
-	rlog, err := roster.OpenJSONL(dataDir, gid)
-	if err != nil {
-		t.Fatalf("OpenJSONL: %v", err)
-	}
-	defer rlog.Close()
 	info := testESPNodeInfo(t, id.PublicKey)
-	if err := rlog.Genesis(id, info, 1_000); err != nil {
-		t.Fatalf("Genesis: %v", err)
-	}
+	createTestGroup(t, dataDir, gid, id, info)
 	catalog := localGroupCatalog{
 		dataDir:  dataDir,
 		metadata: rawGroupMetadataStore{raw: json.RawMessage(`[]`)},
@@ -582,15 +575,14 @@ func testUnixSocketPath(t *testing.T) string {
 	return filepath.Join(dir, "sock")
 }
 
-func createTestRoster(t *testing.T, dataDir string, gid entmoot.GroupID, id *keystore.Identity, founder entmoot.NodeInfo) {
+func createTestGroup(t *testing.T, dataDir string, gid entmoot.GroupID, id *keystore.Identity, founder entmoot.NodeInfo) {
 	t.Helper()
-	rlog, err := roster.OpenJSONL(dataDir, gid)
+	group, err := membership.Create(dataDir, id, founder, gid, membership.DefaultPolicy(), 1_700_000_000_000)
 	if err != nil {
-		t.Fatalf("OpenJSONL: %v", err)
+		t.Fatalf("membership.Create: %v", err)
 	}
-	defer rlog.Close()
-	if err := rlog.Genesis(id, founder, 1_700_000_000_000); err != nil {
-		t.Fatalf("Genesis: %v", err)
+	if err := group.Close(); err != nil {
+		t.Fatalf("membership close: %v", err)
 	}
 }
 
@@ -744,15 +736,8 @@ func TestLocalGroupCatalogListMembersIncludesLiveAgentState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Generate: %v", err)
 	}
-	rlog, err := roster.OpenJSONL(dataDir, gid)
-	if err != nil {
-		t.Fatalf("OpenJSONL: %v", err)
-	}
-	defer rlog.Close()
 	info := testESPNodeInfo(t, id.PublicKey)
-	if err := rlog.Genesis(id, info, 1_000); err != nil {
-		t.Fatalf("Genesis: %v", err)
-	}
+	createTestGroup(t, dataDir, gid, id, info)
 	state := esphttp.NewMemoryStateStore()
 	now := time.Now().UnixMilli()
 	if _, err := state.UpsertLiveAgentConfig(ctx, esphttp.LiveAgentConfig{
