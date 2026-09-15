@@ -17,12 +17,14 @@ import (
 // cmdMembership dispatches `membership <op>`.
 func cmdMembership(gf *globalFlags, args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "membership: missing op (want: upgrade)")
+		fmt.Fprintln(os.Stderr, "membership: missing op (want: upgrade, adopt)")
 		return exitInvalidArgument
 	}
 	switch args[0] {
 	case "upgrade":
 		return cmdMembershipUpgrade(gf, args[1:])
+	case "adopt":
+		return cmdMembershipAdopt(gf, args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "membership: unknown op %q\n", args[0])
 		return exitInvalidArgument
@@ -83,9 +85,19 @@ func cmdMembershipUpgrade(gf *globalFlags, args []string) int {
 		return exitGroupNotFound
 	}
 	founder := legacy.Founder()
-	if founder.MemberID == nil || !bytes.Equal(founder.EntmootPubKey, s.identity.PublicKey) {
+	if !bytes.Equal(founder.EntmootPubKey, s.identity.PublicKey) {
 		fmt.Fprintf(os.Stderr, "membership upgrade: this identity is not the founder of group %s; run it on the founder\n", gid.String())
 		return exitNotMember
+	}
+	// A chain from the Pilot era names its members by node id and key, with no
+	// member id: those did not exist yet. The checkpoint restates each member
+	// under the identity derived from the same key, which is what every
+	// current signature and lookup is keyed by. The key is what carries over;
+	// the node id does not.
+	founder, err = fullWidthMember(founder)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "membership upgrade: chain founder is unusable: %v\n", err)
+		return exitTransport
 	}
 
 	head := legacy.Head()
@@ -100,12 +112,12 @@ func cmdMembershipUpgrade(gf *globalFlags, args []string) int {
 		InviteUses:     make(map[[32]byte]int),
 	}
 	for _, member := range legacy.Members() {
-		id, err := entmoot.ResolvedMemberID(member)
+		info, err := fullWidthMember(member)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "membership upgrade: chain member is unresolvable: %v\n", err)
+			fmt.Fprintf(os.Stderr, "membership upgrade: chain member is unusable: %v\n", err)
 			return exitTransport
 		}
-		state.Members[id] = member
+		state.Members[*info.MemberID] = info
 	}
 	body := state.Checkpoint(gid, 0, entmoot.RosterEntryID{}, 0, time.Now().UnixMilli())
 	body.LegacyHead = &head
@@ -140,4 +152,24 @@ func cmdMembershipUpgrade(gf *globalFlags, args []string) int {
 	}
 	fmt.Println(string(data))
 	return exitOK
+}
+
+// fullWidthMember restates a member under the identity its key derives: the
+// member id every current signature is keyed by, and the libp2p peer id it
+// dials as. A Pilot-era chain carries neither, only the key and a node id that
+// means nothing now.
+func fullWidthMember(info entmoot.NodeInfo) (entmoot.NodeInfo, error) {
+	memberID, err := entmoot.MemberIDFromPublicKey(info.EntmootPubKey)
+	if err != nil {
+		return entmoot.NodeInfo{}, err
+	}
+	peerID, err := entmoot.PeerIDFromPublicKey(info.EntmootPubKey)
+	if err != nil {
+		return entmoot.NodeInfo{}, err
+	}
+	return entmoot.NodeInfo{
+		EntmootPubKey: append([]byte(nil), info.EntmootPubKey...),
+		MemberID:      &memberID,
+		PeerID:        peerID,
+	}, nil
 }
