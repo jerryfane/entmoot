@@ -1037,9 +1037,14 @@ func (r *groupRuntime) reconcileProfilesFromHistory(ctx context.Context, session
 		if len(messages) == 0 {
 			return
 		}
-		// The page holds the highest-ranked keys below the boundary, so a
-		// member with any message here has its newest message here.
-		newest := make(map[entmoot.MemberID]entmoot.Message, len(wanted))
+		// Observe every profile message from a member still wanted, and let
+		// the store decide which one wins. Selecting "the newest message" here
+		// was a second ordering rule — message key (timestamp, author, id)
+		// against the store's (issue time, tombstone, hostname) — and the two
+		// only agree while a member's message timestamps track its payload
+		// issue times. A set and a clear published in the same millisecond
+		// disagreed, and the retracted name came back.
+		seen := make(map[entmoot.MemberID]struct{}, len(wanted))
 		oldest := messages[0]
 		for _, message := range messages {
 			if profileMessageNewer(oldest, message) {
@@ -1052,13 +1057,13 @@ func (r *groupRuntime) reconcileProfilesFromHistory(ctx context.Context, session
 			if _, ok := wanted[memberID]; !ok {
 				continue
 			}
-			if held, ok := newest[memberID]; !ok || profileMessageNewer(message, held) {
-				newest[memberID] = message
-			}
-		}
-		for memberID, message := range newest {
-			delete(wanted, memberID)
+			seen[memberID] = struct{}{}
 			r.observeMemberProfile(ctx, session.groupID, message)
+		}
+		// A member with any message in this page has its newest message here,
+		// so the walk need not go further back for it.
+		for memberID := range seen {
+			delete(wanted, memberID)
 		}
 		boundary = &store.PageBoundary{
 			TimestampMS:    oldest.Timestamp,

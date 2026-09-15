@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"testing"
 	"time"
+
+	entmoot "entmoot/pkg/entmoot"
 )
 
 // TestWithdrawalBeatsAnOlderProfileInEveryStore pins that both StateStore
@@ -250,4 +252,114 @@ func TestExpiredRecordsAreReplacedIdenticallyInEveryStore(t *testing.T) {
 			t.Fatal("an older profile resurrected a withdrawn name through the expired bypass")
 		}
 	})
+}
+
+// TestProfileReplacementIsATotalOrderInEveryStore enumerates every ordered
+// pair of record kinds against both stores. Two properties must hold for
+// convergence: the outcome must not depend on which record arrived first, and
+// the two stores must agree. Every earlier defect in this area — the
+// receipt-time ordering, the memory-only expired bypass, the expiry applied
+// before the comparison instead of inside the tie-break — shows up as a
+// failure of one of the two.
+func TestProfileReplacementIsATotalOrderInEveryStore(t *testing.T) {
+	ctx := context.Background()
+	gid := testGroupID(7)
+	const pubkey = "dGVzdC1wdWJrZXk="
+	at := time.Now().UnixMilli()
+
+	type candidate struct {
+		name  string
+		apply func(state StateStore, memberID entmoot.MemberID) error
+	}
+	profileAt := func(label string, issuedAtMS, expiresAtMS int64) candidate {
+		return candidate{
+			name: label,
+			apply: func(state StateStore, memberID entmoot.MemberID) error {
+				return ObserveMemberProfileNodeProfile(ctx, state, gid, memberID, pubkey, label, issuedAtMS, expiresAtMS)
+			},
+		}
+	}
+	withdrawalAt := func(label string, issuedAtMS int64) candidate {
+		return candidate{
+			name: label,
+			apply: func(state StateStore, memberID entmoot.MemberID) error {
+				return WithdrawMemberProfileNodeProfile(ctx, state, gid, memberID, pubkey, issuedAtMS)
+			},
+		}
+	}
+	candidates := []candidate{
+		profileAt("alpha", at, at+3_600_000),
+		profileAt("beta", at, at+3_600_000),
+		profileAt("later", at+1000, at+3_600_000),
+		profileAt("earlier", at-1000, at+3_600_000),
+		profileAt("expired-same-time", at, at-1),
+		// Hostnames chosen to sort AGAINST the rule they test: if expiry stops
+		// deciding the tie, the hostname order alone picks the expired record
+		// here, so a store that drops the stale tie-break is caught.
+		profileAt("aaa-expired", at, at-1),
+		profileAt("zzz-fresh", at, at+3_600_000),
+		profileAt("expired-later", at+1000, at-1),
+		withdrawalAt("withdrawal-same-time", at),
+		withdrawalAt("withdrawal-later", at+1000),
+	}
+
+	outcome := func(state StateStore, memberID entmoot.MemberID, first, second candidate) string {
+		if err := first.apply(state, memberID); err != nil {
+			t.Fatalf("apply %s: %v", first.name, err)
+		}
+		if err := second.apply(state, memberID); err != nil {
+			t.Fatalf("apply %s: %v", second.name, err)
+		}
+		rec, ok, err := state.GetNodeProfile(ctx, memberID)
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		if !ok {
+			return "<none>"
+		}
+		return rec.Hostname
+	}
+
+	stores := []struct {
+		name string
+		make func() StateStore
+	}{
+		{name: "memory", make: func() StateStore { return NewMemoryStateStore() }},
+		{name: "sqlite", make: func() StateStore { return mustOpenTestStateStore(t) }},
+	}
+
+	member := uint32(100)
+	next := func() entmoot.MemberID {
+		member++
+		return testMemberID(member)
+	}
+
+	pairs, orderDependent, divergent := 0, 0, 0
+	for i, a := range candidates {
+		for j, b := range candidates {
+			if i == j {
+				continue
+			}
+			pairs++
+			results := make(map[string][2]string, len(stores))
+			for _, s := range stores {
+				forward := outcome(s.make(), next(), a, b)
+				reverse := outcome(s.make(), next(), b, a)
+				results[s.name] = [2]string{forward, reverse}
+				if forward != reverse {
+					orderDependent++
+					t.Errorf("%s: %s then %s = %q, reversed = %q: arrival order decided the name",
+						s.name, a.name, b.name, forward, reverse)
+				}
+			}
+			if results["memory"] != results["sqlite"] {
+				divergent++
+				t.Errorf("stores disagree on %s/%s: memory %v, sqlite %v", a.name, b.name, results["memory"], results["sqlite"])
+			}
+		}
+	}
+	if pairs != len(candidates)*(len(candidates)-1) {
+		t.Fatalf("enumerated %d pairs, want %d", pairs, len(candidates)*(len(candidates)-1))
+	}
+	t.Logf("%d ordered pairs, %d order-dependent, %d divergent", pairs, orderDependent, divergent)
 }

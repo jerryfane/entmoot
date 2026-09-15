@@ -8,9 +8,10 @@
 // and their bursts). Numbers written here would be a second, unread set.
 //
 // This package exposes the Allow path only: it decides whether a given
-// message + payload pair is within the author's current budget. Backpressure
-// (reads stall) and the sustained-violation hard disconnect are the
-// connection layer's responsibility and live outside this package.
+// message + payload pair is within the author's current budget. It has no
+// opinion about what a caller does with a refusal, and nothing in the tree
+// stalls reads or disconnects a peer for exceeding a budget: the publish and
+// history paths in cmd/entmootd turn a refusal into an error to the caller.
 //
 // A Limiter tracks one pair of buckets per peer, keyed by MemberID. Buckets
 // are created lazily on first contact. Call Reset on disconnect to drop state.
