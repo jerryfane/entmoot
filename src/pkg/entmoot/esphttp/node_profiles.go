@@ -179,12 +179,14 @@ func nodeProfileExpired(rec NodeProfileRecord, nowMS int64) bool {
 }
 
 // isWithdrawalRecord reports the tombstone a withdrawal writes. It is stored
-// permanently expired, so it must not take the expired-record bypass below:
-// the bypass exists so a stale observation is replaced by anything fresher,
-// while a withdrawal has to keep losing to nothing but a later issue time.
-// Without this, the two stores disagree — the SQLite upsert compares
-// observed_at_ms and keeps the withdrawal, while this path would let an older
-// profile arriving late resurrect the withdrawn name.
+// permanently expired, so it must not take the expired-record bypass: the
+// bypass exists so a stale observation is replaced by anything fresher, while
+// a withdrawal has to keep losing to nothing but a later issue time.
+//
+// Both stores implement the bypass and both exempt the tombstone — the SQLite
+// clause below mirrors shouldReplaceNodeProfile clause for clause. For a while
+// only this path had it, so an expired observation blocked a fresher
+// lower-confidence one in production while memory accepted it.
 func isWithdrawalRecord(rec NodeProfileRecord) bool {
 	return rec.Source == NodeProfileSourceMemberProfile && rec.Hostname == WithdrawnNodeProfileHostname
 }
@@ -308,7 +310,8 @@ func (s *SQLiteStateStore) UpsertNodeProfile(ctx context.Context, rec NodeProfil
 	if rec.SourceGroupID != nil {
 		sourceGroup = rec.SourceGroupID[:]
 	}
-	_, err = s.db.ExecContext(ctx, `INSERT INTO esp_node_profile_sources (member_id, entmoot_pubkey, source, source_key, hostname, confidence, observed_at_ms, expires_at_ms, source_group_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(member_id, source_key) DO UPDATE SET entmoot_pubkey=excluded.entmoot_pubkey, source=excluded.source, hostname=excluded.hostname, confidence=excluded.confidence, observed_at_ms=excluded.observed_at_ms, expires_at_ms=excluded.expires_at_ms, source_group_id=excluded.source_group_id WHERE excluded.confidence > esp_node_profile_sources.confidence OR (excluded.confidence = esp_node_profile_sources.confidence AND excluded.observed_at_ms > esp_node_profile_sources.observed_at_ms) OR (excluded.confidence = esp_node_profile_sources.confidence AND excluded.observed_at_ms = esp_node_profile_sources.observed_at_ms AND ((excluded.hostname = '-' AND esp_node_profile_sources.hostname <> '-') OR (((excluded.hostname = '-') = (esp_node_profile_sources.hostname = '-')) AND excluded.hostname < esp_node_profile_sources.hostname)))`, rec.MemberID[:], rec.EntmootPubKey, rec.Source, nodeProfileSourceKey(rec), rec.Hostname, rec.Confidence, rec.ObservedAtMS, rec.ExpiresAtMS, sourceGroup)
+	_, err = s.db.ExecContext(ctx, `INSERT INTO esp_node_profile_sources (member_id, entmoot_pubkey, source, source_key, hostname, confidence, observed_at_ms, expires_at_ms, source_group_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(member_id, source_key) DO UPDATE SET entmoot_pubkey=excluded.entmoot_pubkey, source=excluded.source, hostname=excluded.hostname, confidence=excluded.confidence, observed_at_ms=excluded.observed_at_ms, expires_at_ms=excluded.expires_at_ms, source_group_id=excluded.source_group_id WHERE (esp_node_profile_sources.expires_at_ms > 0 AND esp_node_profile_sources.expires_at_ms <= ? AND esp_node_profile_sources.hostname <> ?) OR excluded.confidence > esp_node_profile_sources.confidence OR (excluded.confidence = esp_node_profile_sources.confidence AND excluded.observed_at_ms > esp_node_profile_sources.observed_at_ms) OR (excluded.confidence = esp_node_profile_sources.confidence AND excluded.observed_at_ms = esp_node_profile_sources.observed_at_ms AND ((excluded.hostname = '-' AND esp_node_profile_sources.hostname <> '-') OR (((excluded.hostname = '-') = (esp_node_profile_sources.hostname = '-')) AND excluded.hostname < esp_node_profile_sources.hostname)))`, rec.MemberID[:], rec.EntmootPubKey, rec.Source, nodeProfileSourceKey(rec), rec.Hostname, rec.Confidence, rec.ObservedAtMS, rec.ExpiresAtMS, sourceGroup,
+		nowMS, WithdrawnNodeProfileHostname)
 	if err != nil {
 		return NodeProfileRecord{}, false, fmt.Errorf("esphttp: upsert node profile: %w", err)
 	}

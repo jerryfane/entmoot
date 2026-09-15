@@ -1004,8 +1004,16 @@ const (
 )
 
 // reconcileProfilesFromHistory observes profiles that arrived by history sync.
-// Ordering is by the author's issue time, so re-observing a message already
-// recorded changes nothing.
+// It walks backwards a page at a time and stops when it holds the newest
+// profile for every current member.
+//
+// Two details are easy to get wrong, and were: the store returns each page in
+// TOPOLOGICAL order (parents before children, ties by timestamp/author/id
+// ASCENDING), not newest-first, so the newest message per member has to be
+// selected explicitly; and the next page's boundary is the OLDEST key in the
+// page, because the boundary is a strict "older than this" filter. Taking the
+// last element of the slice advanced one message per page instead of a whole
+// page, and recorded the oldest name a member had rather than its newest.
 func (r *groupRuntime) reconcileProfilesFromHistory(ctx context.Context, session *groupSession) {
 	if r.profiles == nil {
 		return
@@ -1029,23 +1037,33 @@ func (r *groupRuntime) reconcileProfilesFromHistory(ctx context.Context, session
 		if len(messages) == 0 {
 			return
 		}
+		// The page holds the highest-ranked keys below the boundary, so a
+		// member with any message here has its newest message here.
+		newest := make(map[entmoot.MemberID]entmoot.Message, len(wanted))
+		oldest := messages[0]
 		for _, message := range messages {
+			if profileMessageNewer(oldest, message) {
+				oldest = message
+			}
 			if message.Author.MemberID == nil {
 				continue
 			}
-			// Only the newest profile per member matters: an older one from the
-			// same member would lose the ordering comparison anyway.
-			if _, ok := wanted[*message.Author.MemberID]; !ok {
+			memberID := *message.Author.MemberID
+			if _, ok := wanted[memberID]; !ok {
 				continue
 			}
-			delete(wanted, *message.Author.MemberID)
+			if held, ok := newest[memberID]; !ok || profileMessageNewer(message, held) {
+				newest[memberID] = message
+			}
+		}
+		for memberID, message := range newest {
+			delete(wanted, memberID)
 			r.observeMemberProfile(ctx, session.groupID, message)
 		}
-		last := messages[len(messages)-1]
 		boundary = &store.PageBoundary{
-			TimestampMS:    last.Timestamp,
-			AuthorMemberID: profileMessageAuthor(last),
-			MessageID:      last.ID,
+			TimestampMS:    oldest.Timestamp,
+			AuthorMemberID: profileMessageAuthor(oldest),
+			MessageID:      oldest.ID,
 		}
 	}
 	if len(wanted) > 0 {
@@ -1056,6 +1074,21 @@ func (r *groupRuntime) reconcileProfilesFromHistory(ctx context.Context, session
 			slog.String("group_id", session.groupID.String()),
 			slog.Int("members_without_profile", len(wanted)))
 	}
+}
+
+// profileMessageNewer reports whether a outranks b under the store's paging
+// key: timestamp, then author member id, then message id. It is the same
+// comparison LatestByTopicBefore pages on, so the boundary it produces cannot
+// skip or repeat a row.
+func profileMessageNewer(a, b entmoot.Message) bool {
+	if a.Timestamp != b.Timestamp {
+		return a.Timestamp > b.Timestamp
+	}
+	left, right := profileMessageAuthor(a), profileMessageAuthor(b)
+	if left != right {
+		return bytes.Compare(left[:], right[:]) > 0
+	}
+	return bytes.Compare(a.ID[:], b.ID[:]) > 0
 }
 
 // profileMessageAuthor is the member id a page boundary needs, zero when the

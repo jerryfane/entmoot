@@ -2,6 +2,7 @@ package esphttp
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -174,4 +175,79 @@ func TestEqualIssueTimesBetweenTwoProfilesAreDeterministic(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestExpiredRecordsAreReplacedIdenticallyInEveryStore covers the branch that
+// runs before the tie-break: an expired observation must be replaceable by a
+// fresher one in both stores, and the withdrawal tombstone — which is stored
+// permanently expired on purpose — must not be.
+func TestExpiredRecordsAreReplacedIdenticallyInEveryStore(t *testing.T) {
+	ctx := context.Background()
+	gid := testGroupID(6)
+	const pubkey = "dGVzdC1wdWJrZXk="
+
+	stores := []struct {
+		name string
+		make func() StateStore
+	}{
+		{name: "memory", make: func() StateStore { return NewMemoryStateStore() }},
+		{name: "sqlite", make: func() StateStore { return mustOpenTestStateStore(t) }},
+	}
+
+	t.Run("expired observation is replaced", func(t *testing.T) {
+		at := time.Now().UnixMilli()
+		var results []string
+		for _, s := range stores {
+			state := s.make()
+			memberID := testMemberID(21)
+			// An observation whose expiry is already in the past.
+			if err := ObserveMemberProfileNodeProfile(ctx, state, gid, memberID, pubkey, "stale", at, at-1000); err != nil {
+				t.Fatalf("%s observe stale: %v", s.name, err)
+			}
+			// A fresher one at the same instant, which the tie-break alone
+			// would reject on hostname ordering.
+			if err := ObserveMemberProfileNodeProfile(ctx, state, gid, memberID, pubkey, "zzz-fresh", at, at+3_600_000); err != nil {
+				t.Fatalf("%s observe fresh: %v", s.name, err)
+			}
+			rec, ok, err := state.GetNodeProfile(ctx, memberID)
+			if err != nil {
+				t.Fatalf("%s get: %v", s.name, err)
+			}
+			results = append(results, fmt.Sprintf("visible=%v hostname=%q", ok, rec.Hostname))
+		}
+		if results[0] != results[1] {
+			t.Fatalf("stores disagree about an expired record: memory %s, sqlite %s", results[0], results[1])
+		}
+		if results[0] != `visible=true hostname="zzz-fresh"` {
+			t.Fatalf("expired observation was not replaced: %s", results[0])
+		}
+	})
+
+	t.Run("withdrawal tombstone is not bypassed", func(t *testing.T) {
+		at := time.Now().UnixMilli()
+		var results []bool
+		for _, s := range stores {
+			state := s.make()
+			memberID := testMemberID(22)
+			if err := WithdrawMemberProfileNodeProfile(ctx, state, gid, memberID, pubkey, at); err != nil {
+				t.Fatalf("%s withdraw: %v", s.name, err)
+			}
+			// An older profile arriving afterwards must not resurrect the name,
+			// even though the tombstone is permanently expired.
+			if err := ObserveMemberProfileNodeProfile(ctx, state, gid, memberID, pubkey, "resurrected", at-1000, at+3_600_000); err != nil {
+				t.Fatalf("%s observe: %v", s.name, err)
+			}
+			_, ok, err := state.GetNodeProfile(ctx, memberID)
+			if err != nil {
+				t.Fatalf("%s get: %v", s.name, err)
+			}
+			results = append(results, ok)
+		}
+		if results[0] != results[1] {
+			t.Fatalf("stores disagree about the tombstone: memory visible=%v, sqlite visible=%v", results[0], results[1])
+		}
+		if results[0] {
+			t.Fatal("an older profile resurrected a withdrawn name through the expired bypass")
+		}
+	})
 }
