@@ -107,7 +107,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   existing linear chain, preserving members and delegated admins and recording
   the chain head inside the checkpoint so a fabricated upgrade is detectable.
   It is founder-only, because only the founder's signature anchors a group,
-  and idempotent. The chain stays on disk read-only: version-0 messages that
+  and idempotent. Every other member adopts that checkpoint from a peer when
+  its daemon next starts, and refuses one that disagrees with the chain it
+  already holds: a different founder, a different chain head, or a membership
+  the chain never carried. A follower with no reachable peer keeps asking and
+  names the group it is waiting for. The chain stays on disk read-only: version-0 messages that
   cite it are still verified against it and against the founder-signed
   conversion commitment. A group with no checkpoint is not served — the daemon
   skips it and names it — rather than being served from a chain the protocol

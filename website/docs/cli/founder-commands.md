@@ -165,6 +165,13 @@ and says what to run.
 entmootd membership upgrade -group <GROUP_ID>
 ```
 
+Only the founder runs it. Every other member receives that checkpoint from a
+peer the first time its daemon starts afterwards, and refuses one that
+disagrees with the chain it already holds — a different founder, a different
+chain head, or a membership the chain never carried. A follower that cannot
+reach a peer yet keeps asking every minute and logs which group it is waiting
+for, so upgrading the founder does not mean restarting everything else.
+
 This is founder-only and needs the daemon stopped. It mints checkpoint 0 from
 the existing chain, preserving the members and the delegated-admin set, and
 records the chain's head in the checkpoint so a fabricated upgrade is

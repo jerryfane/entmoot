@@ -9,6 +9,7 @@ import (
 	"os"
 
 	"entmoot/pkg/entmoot"
+	"entmoot/pkg/entmoot/membership"
 )
 
 var (
@@ -57,7 +58,17 @@ func cmdServe(gf *globalFlags, args []string) int {
 		event:   "serving",
 		loadGroups: func(ctx context.Context, runtime *groupRuntime, _ groupDaemonLoadContext) (int, error) {
 			strict := len(groups) > 0
+			// A group carried over from the linear chain has no checkpoint
+			// until its founder mints one, and only the founder can. Take it
+			// from a peer first, and keep trying in the background: an
+			// operator who upgrades the founder should not have to restart
+			// every other node afterwards.
+			runtime.adoptPendingGroups(ctx, selectedGroups)
+			runtime.retryPendingAdoptions(ctx, selectedGroups)
 			for _, gid := range selectedGroups {
+				if !membershipExists(gf.data, gid) {
+					continue
+				}
 				if _, _, err := runtime.AddLocalGroup(ctx, gid); err != nil {
 					switch {
 					case errors.Is(err, errLocalGroupNotMember), errors.Is(err, errLocalGroupIdentityMismatch):
@@ -101,7 +112,7 @@ func selectServeGroupIDs(dataRoot string, selected []string, logger *slog.Logger
 			if _, ok := seen[gid]; ok {
 				continue
 			}
-			if !membershipExists(dataRoot, gid) {
+			if !membershipExists(dataRoot, gid) && !membership.LegacyExists(dataRoot, gid) {
 				return nil, fmt.Errorf("%w: %s", errServeGroupMissing, gid.String())
 			}
 			seen[gid] = struct{}{}
@@ -126,9 +137,9 @@ func selectServeGroupIDs(dataRoot string, selected []string, logger *slog.Logger
 			}
 			continue
 		}
-		if !membershipExists(dataRoot, gid) {
+		if !membershipExists(dataRoot, gid) && !membership.LegacyExists(dataRoot, gid) {
 			if logger != nil {
-				logger.Warn("serve: skipping group without a membership checkpoint",
+				logger.Warn("serve: skipping group with no membership state",
 					slog.String("group_id", gid.String()))
 			}
 			continue
