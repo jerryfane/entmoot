@@ -21,7 +21,7 @@ Defaults:
 - `agent-live enable` defaults to `reply_on_mention`.
 - No `-topic` means `#`.
 - `-max-actions 0` and `-max-action-bytes 0` mean unlimited.
-- Runtime defaults: interval `10s`, lease `45s`, timeout `30s`, scan limit
+- Runtime defaults: interval `10s`, lease `2m30s`, timeout `1m30s`, scan limit
   `20`.
 - Non-listen modes need `-runner` or `ENTMOOT_AGENT_RUNNER`.
 - Config, presence, cursors, and social live state are stored in `esp.sqlite`
