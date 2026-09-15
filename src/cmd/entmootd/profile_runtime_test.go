@@ -363,7 +363,10 @@ func TestHistoryReconciliationIsNotStarvedByOneMember(t *testing.T) {
 		profile.Profile{DisplayName: "quiet-node", IssuedAtMS: quietAt}, quietAt)
 
 	// Now the founder floods the topic with more messages than one page holds.
-	for i := 0; i < profileReconcilePageSize+8; i++ {
+	// More than one page, by a margin no single-page walk could cover: a
+	// boundary bug that advanced one message per page passed the old
+	// page-size+8 flood.
+	for i := 0; i < 3*profileReconcilePageSize+44; i++ {
 		publishProfile(t, ctx, session, founder, founderInfo, gid, profile.Profile{
 			DisplayName: "loud", IssuedAtMS: time.Now().UnixMilli(),
 		})
@@ -406,4 +409,83 @@ func mustStoreProfileAt(t *testing.T, ctx context.Context, runtime *groupRuntime
 		t.Fatalf("Put: %v", err)
 	}
 	return signed
+}
+
+// TestReconciliationAdoptsTheNewestNameInTheWindow pins which message in the
+// window is believed. The store returns each page in topological order, ties
+// ascending, so "the first message from this member in the page" is its
+// OLDEST — adopting that silently rolled a member's name back to a superseded
+// one on every catch-up.
+func TestReconciliationAdoptsTheNewestNameInTheWindow(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	root := t.TempDir()
+	founder, founderInfo := mustDaemonIdentity(t)
+	var gid entmoot.GroupID
+	if _, err := rand.Read(gid[:]); err != nil {
+		t.Fatal(err)
+	}
+	policy := membership.DefaultPolicy()
+	policy.JoinRule = membership.JoinRuleOpen
+	mustCreateGroup(t, root, gid, founder, policy)
+
+	state, err := esphttp.OpenSQLiteStateStore(root)
+	if err != nil {
+		t.Fatalf("OpenSQLiteStateStore: %v", err)
+	}
+	defer state.Close()
+	runtime, session, host := startTestRuntimeWithProfiles(t, ctx, root, founder, gid, state)
+	defer host.Close()
+	defer runtime.Close()
+
+	base := time.Now().Add(-time.Hour).UnixMilli()
+	mustStoreProfileAt(t, ctx, runtime, session, founder, founderInfo, gid,
+		profile.Profile{DisplayName: "old-name", IssuedAtMS: base}, base)
+	mustStoreProfileAt(t, ctx, runtime, session, founder, founderInfo, gid,
+		profile.Profile{DisplayName: "new-name", IssuedAtMS: base + 1000}, base+1000)
+
+	runtime.reconcileProfilesFromHistory(ctx, session)
+
+	want := "new-name#" + founderInfo.MemberID.String()
+	if got := mustDisplayName(t, ctx, state, root, gid, *founderInfo.MemberID); got != want {
+		t.Fatalf("display name = %q, want the newest name in the window (%q)", got, want)
+	}
+}
+
+// TestReconciliationDoesNotSkipAWithdrawal is the same defect with the worst
+// payload: when the newest message is a withdrawal, adopting an older profile
+// republishes a name its owner retracted.
+func TestReconciliationDoesNotSkipAWithdrawal(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	root := t.TempDir()
+	founder, founderInfo := mustDaemonIdentity(t)
+	var gid entmoot.GroupID
+	if _, err := rand.Read(gid[:]); err != nil {
+		t.Fatal(err)
+	}
+	policy := membership.DefaultPolicy()
+	policy.JoinRule = membership.JoinRuleOpen
+	mustCreateGroup(t, root, gid, founder, policy)
+
+	state, err := esphttp.OpenSQLiteStateStore(root)
+	if err != nil {
+		t.Fatalf("OpenSQLiteStateStore: %v", err)
+	}
+	defer state.Close()
+	runtime, session, host := startTestRuntimeWithProfiles(t, ctx, root, founder, gid, state)
+	defer host.Close()
+	defer runtime.Close()
+
+	base := time.Now().Add(-time.Hour).UnixMilli()
+	mustStoreProfileAt(t, ctx, runtime, session, founder, founderInfo, gid,
+		profile.Profile{DisplayName: "retracted", IssuedAtMS: base}, base)
+	mustStoreProfileAt(t, ctx, runtime, session, founder, founderInfo, gid,
+		profile.Profile{DisplayName: "", IssuedAtMS: base + 1000}, base+1000)
+
+	runtime.reconcileProfilesFromHistory(ctx, session)
+
+	if got := mustDisplayName(t, ctx, state, root, gid, *founderInfo.MemberID); got != "member-"+founderInfo.MemberID.String() {
+		t.Fatalf("display name = %q, want the fallback: the withdrawal is the newest message", got)
+	}
 }

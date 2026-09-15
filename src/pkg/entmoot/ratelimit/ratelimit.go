@@ -1,18 +1,16 @@
-// Package ratelimit implements per-peer token-bucket rate limiting for
-// Entmoot connections.
+// Package ratelimit implements token-bucket rate limiting over a pair of
+// buckets — messages and bytes — keyed by MemberID.
 //
-// Every connection is governed by two buckets. ARCHITECTURE.md does not carry
-// a denial-of-service section, so the defaults below are the specification;
-// they are stated here rather than cited from a document that does not
-// document them:
-//
-//   - a message-rate bucket (v0 default: 100 msg/s, burst 200)
-//   - a byte-rate bucket    (v0 default: 1 MiB/s, burst 4 MiB)
+// This package holds no defaults. The limits actually enforced come from the
+// group's enforcement policy: cmd/entmootd builds them with
+// entpolicy.ContentLimits and passes them to New, and the policy presets live
+// in pkg/entmoot/policy (DefaultMessageRatePerAuthor, DefaultByteRatePerAuthor
+// and their bursts). Numbers written here would be a second, unread set.
 //
 // This package exposes the Allow path only: it decides whether a given
-// message + payload pair is within the peer's current budget. Backpressure
-// (reads stall) and the 30 s sustained-violation hard disconnect are the
-// connection layer's responsibility (Phase C) and live outside this package.
+// message + payload pair is within the author's current budget. Backpressure
+// (reads stall) and the sustained-violation hard disconnect are the
+// connection layer's responsibility and live outside this package.
 //
 // A Limiter tracks one pair of buckets per peer, keyed by MemberID. Buckets
 // are created lazily on first contact. Call Reset on disconnect to drop state.
@@ -32,18 +30,6 @@ import (
 	"entmoot/pkg/entmoot/clock"
 
 	"golang.org/x/time/rate"
-)
-
-// Default limits. These constants are the source of truth.
-const (
-	// DefaultMsgRate is the steady-state messages-per-second allowance.
-	DefaultMsgRate rate.Limit = 100
-	// DefaultMsgBurst is the burst capacity of the message bucket.
-	DefaultMsgBurst = 200
-	// DefaultBytesRate is the steady-state bytes-per-second allowance (1 MiB/s).
-	DefaultBytesRate rate.Limit = 1 << 20
-	// DefaultBytesBurst is the burst capacity of the byte bucket (4 MiB).
-	DefaultBytesBurst = 4 << 20
 )
 
 // Limits configure per-peer token-bucket limits.
