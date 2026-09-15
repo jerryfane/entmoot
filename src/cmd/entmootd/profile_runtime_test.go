@@ -196,58 +196,6 @@ func TestProfileClearWithdrawsTheName(t *testing.T) {
 	}
 }
 
-// TestFutureDatedProfileCannotPinAName reproduces the attack the review
-// executed: a profile dated in the year 3000 used to win every comparison, so
-// the member's real name could never be updated again, on any node that saw
-// the message. Ordering is by receipt, so the later honest name must win.
-func TestFutureDatedProfileCannotPinAName(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	root := t.TempDir()
-	identity, member := mustDaemonIdentity(t)
-	var gid entmoot.GroupID
-	if _, err := rand.Read(gid[:]); err != nil {
-		t.Fatal(err)
-	}
-	mustCreateGroup(t, root, gid, identity, membership.DefaultPolicy())
-
-	state, err := esphttp.OpenSQLiteStateStore(root)
-	if err != nil {
-		t.Fatalf("OpenSQLiteStateStore: %v", err)
-	}
-	defer state.Close()
-	runtime, session, host := startTestRuntimeWithProfiles(t, ctx, root, identity, gid, state)
-	defer host.Close()
-	defer runtime.Close()
-
-	memberID := *member.MemberID
-	// Year 3000, and an expiry far beyond any sane lifetime.
-	publishProfile(t, ctx, session, identity, member, gid, profile.Profile{
-		DisplayName: "pinned", IssuedAtMS: 32_503_680_000_000, ExpiresAtMS: 64_000_000_000_000,
-	})
-	if got := mustDisplayName(t, ctx, state, root, gid, memberID); got != "pinned#"+memberID.String() {
-		t.Fatalf("display name = %q, want the crafted name to be recorded normally", got)
-	}
-
-	// The crafted expiry must already be clamped on the record it was written
-	// with — checking after a later publish would only see the later record.
-	crafted, ok, err := state.GetNodeProfile(ctx, memberID)
-	if err != nil || !ok {
-		t.Fatalf("GetNodeProfile ok/err = %v/%v", ok, err)
-	}
-	if limit := time.Now().UnixMilli() + maxProfileLifetimeMS + 1000; crafted.ExpiresAtMS > limit {
-		t.Fatalf("crafted expiry %d exceeds the clamp %d", crafted.ExpiresAtMS, limit)
-	}
-
-	publishProfile(t, ctx, session, identity, member, gid, profile.Profile{
-		DisplayName: "second", IssuedAtMS: time.Now().UnixMilli(),
-	})
-	if got := mustDisplayName(t, ctx, state, root, gid, memberID); got != "second#"+memberID.String() {
-		t.Fatalf("display name = %q, want the later name to win over a future-dated one", got)
-	}
-
-}
-
 func publishProfile(t *testing.T, ctx context.Context, session *groupSession, identity *keystore.Identity, member entmoot.NodeInfo, gid entmoot.GroupID, p profile.Profile) {
 	t.Helper()
 	content, err := profile.Encode(p)
@@ -271,4 +219,105 @@ func publishProfile(t *testing.T, ctx context.Context, session *groupSession, id
 	if _, err := session.live.Publish(ctx, signed); err != nil {
 		t.Fatalf("Publish: %v", err)
 	}
+}
+
+// TestWithdrawalSurvivesAnOlderProfileArrivingLate is the defect receipt-time
+// ordering introduced. A withdrawal must be durable: an older profile that
+// arrives afterwards — history catch-up, or a peer re-gossiping — must not
+// resurrect the withdrawn name, or two nodes disagree about it forever.
+func TestWithdrawalSurvivesAnOlderProfileArrivingLate(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	root := t.TempDir()
+	identity, member := mustDaemonIdentity(t)
+	var gid entmoot.GroupID
+	if _, err := rand.Read(gid[:]); err != nil {
+		t.Fatal(err)
+	}
+	mustCreateGroup(t, root, gid, identity, membership.DefaultPolicy())
+	state, err := esphttp.OpenSQLiteStateStore(root)
+	if err != nil {
+		t.Fatalf("OpenSQLiteStateStore: %v", err)
+	}
+	defer state.Close()
+	runtime, session, host := startTestRuntimeWithProfiles(t, ctx, root, identity, gid, state)
+	defer host.Close()
+	defer runtime.Close()
+	memberID := *member.MemberID
+
+	base := time.Now().UnixMilli()
+	publishProfile(t, ctx, session, identity, member, gid, profile.Profile{DisplayName: "pi-burj", IssuedAtMS: base})
+	publishProfile(t, ctx, session, identity, member, gid, profile.Profile{DisplayName: "", IssuedAtMS: base + 1000})
+	if got := mustDisplayName(t, ctx, state, root, gid, memberID); got != "member-"+memberID.String() {
+		t.Fatalf("display name after withdrawal = %q", got)
+	}
+
+	// The older profile arrives last. It must lose.
+	runtime.observeMemberProfile(ctx, gid, mustProfileMessage(t, ctx, session, identity, member, gid,
+		profile.Profile{DisplayName: "pi-burj", IssuedAtMS: base}))
+	if got := mustDisplayName(t, ctx, state, root, gid, memberID); got != "member-"+memberID.String() {
+		t.Fatalf("an older profile resurrected a withdrawn name: %q", got)
+	}
+}
+
+// TestFutureDatedProfileIsRefused pins the clock bound. Ordering uses the
+// author's timestamp, so a profile from beyond the skew window must be refused
+// outright rather than recorded — recording it would pin the name.
+func TestFutureDatedProfileIsRefused(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	root := t.TempDir()
+	identity, member := mustDaemonIdentity(t)
+	var gid entmoot.GroupID
+	if _, err := rand.Read(gid[:]); err != nil {
+		t.Fatal(err)
+	}
+	mustCreateGroup(t, root, gid, identity, membership.DefaultPolicy())
+	state, err := esphttp.OpenSQLiteStateStore(root)
+	if err != nil {
+		t.Fatalf("OpenSQLiteStateStore: %v", err)
+	}
+	defer state.Close()
+	runtime, session, host := startTestRuntimeWithProfiles(t, ctx, root, identity, gid, state)
+	defer host.Close()
+	defer runtime.Close()
+	memberID := *member.MemberID
+
+	publishProfile(t, ctx, session, identity, member, gid, profile.Profile{
+		DisplayName: "pinned", IssuedAtMS: 32_503_680_000_000,
+	})
+	if got := mustDisplayName(t, ctx, state, root, gid, memberID); got != "member-"+memberID.String() {
+		t.Fatalf("a future-dated profile was recorded: %q", got)
+	}
+
+	// Inside the window it is accepted, so the bound is not simply refusing
+	// everything.
+	publishProfile(t, ctx, session, identity, member, gid, profile.Profile{
+		DisplayName: "ok", IssuedAtMS: time.Now().Add(time.Minute).UnixMilli(),
+	})
+	if got := mustDisplayName(t, ctx, state, root, gid, memberID); got != "ok#"+memberID.String() {
+		t.Fatalf("a profile inside the skew window was refused: %q", got)
+	}
+}
+
+func mustProfileMessage(t *testing.T, ctx context.Context, session *groupSession, identity *keystore.Identity, member entmoot.NodeInfo, gid entmoot.GroupID, p profile.Profile) entmoot.Message {
+	t.Helper()
+	content, err := profile.Encode(p)
+	if err != nil {
+		t.Fatalf("profile.Encode: %v", err)
+	}
+	head := session.group.Canonical().ID
+	message := entmoot.Message{
+		Version: 2, GroupID: gid, Author: member, Timestamp: time.Now().UnixMilli(),
+		Topics: []string{profile.Topic}, Content: content, RosterHead: &head,
+	}
+	signer, err := signing.NewLocalSigner(member, identity)
+	if err != nil {
+		t.Fatalf("NewLocalSigner: %v", err)
+	}
+	signed, err := signing.SignMessage(ctx, signer, message)
+	if err != nil {
+		t.Fatalf("SignMessage: %v", err)
+	}
+	return signed
 }

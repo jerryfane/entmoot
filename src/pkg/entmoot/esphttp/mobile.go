@@ -211,10 +211,6 @@ type StateStore interface {
 	GetPublicMoot(context.Context, entmoot.GroupID) (PublicMootRecord, bool, error)
 	UpdatePublicMootIndexStatus(context.Context, entmoot.GroupID, string, int64) (PublicMootRecord, bool, error)
 	UpsertNodeProfile(context.Context, NodeProfileRecord) (NodeProfileRecord, bool, error)
-	// DeleteNodeProfileSource removes one observation. Withdrawing a name is
-	// a delete: an empty name is not a storable record, so writing one would
-	// leave the previous name in place.
-	DeleteNodeProfileSource(context.Context, entmoot.MemberID, string) error
 	GetNodeProfile(context.Context, entmoot.MemberID) (NodeProfileRecord, bool, error)
 	ListNodeProfiles(context.Context, []entmoot.MemberID) (map[entmoot.MemberID]NodeProfileRecord, error)
 	Close() error

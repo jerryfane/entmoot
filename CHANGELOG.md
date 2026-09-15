@@ -269,12 +269,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   limit matches the store's own cap, so a name that would be silently dropped
   is refused at publish time instead of being reported as published.
 
-  Ordering is by the time a node receives a profile, never by the timestamp
-  inside the payload: a single message dated in the future would otherwise pin
-  a member's name permanently, since a record is only replaced by a strictly
-  newer observation. The author's expiry is honoured when it is shorter than 90
-  days and clamped when it is longer, so one message cannot keep a name alive
-  indefinitely.
+  Ordering is by the author's issue time, and a profile dated more than five
+  minutes ahead of the receiving node's clock is refused — the same bound
+  membership records use. Both halves matter: without the bound, one
+  future-dated message would pin a member's name permanently, since a record is
+  only replaced by a newer one; ordering by receipt time instead would let an
+  old profile arriving late beat the newer one already recorded, so two nodes
+  would disagree about a name depending on what arrived when. A withdrawal is
+  recorded as a tombstone at its own issue time rather than deleted, so an
+  older profile cannot undo it however late it arrives. The author's expiry is
+  honoured when shorter than 90 days and clamped when longer.
+
+  Profiles that arrive by history sync are reconciled after each catch-up:
+  history insertion writes straight to the store, so a name whose only copy
+  arrived that way would never otherwise be learned.
 
 
 - **Delegated admins.** A founder can now name delegated admins with
