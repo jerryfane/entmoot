@@ -14,10 +14,10 @@ import (
 
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/keystore"
-	"entmoot/pkg/entmoot/mailbox"
+	"entmoot/pkg/entmoot/mailbox/mailboxtest"
 	entpolicy "entmoot/pkg/entmoot/policy"
 	"entmoot/pkg/entmoot/publicmoot"
-	"entmoot/pkg/entmoot/store"
+	"entmoot/pkg/entmoot/store/storetest"
 )
 
 func TestHandlerPublicMootsPostListAndGetWithoutMembership(t *testing.T) {
@@ -82,11 +82,8 @@ func TestHandlerPublicMootsReportsMemberMirrorState(t *testing.T) {
 
 func TestHandlerPublicMootsDefaultGroupExistsDoesNotAdvertiseMirrorState(t *testing.T) {
 	gid := testGroupID(162)
-	msgStore := store.NewMemory()
-	svc, err := mailbox.New(msgStore, nil)
-	if err != nil {
-		t.Fatalf("mailbox.New: %v", err)
-	}
+	msgStore := storetest.New(t)
+	svc := mailboxtest.New(t, msgStore, nil)
 	handler, err := NewHandler(Config{
 		Token:    "secret",
 		AuthMode: AuthModeBearer,

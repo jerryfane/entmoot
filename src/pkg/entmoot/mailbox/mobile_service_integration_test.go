@@ -10,10 +10,10 @@ import (
 	"entmoot/pkg/entmoot/keystore"
 	"entmoot/pkg/entmoot/mailbox"
 	"entmoot/pkg/entmoot/signing"
-	"entmoot/pkg/entmoot/store"
+	"entmoot/pkg/entmoot/store/storetest"
 )
 
-func TestMobileServiceExternalSignerMailboxFlow(t *testing.T) {
+func TestMobileServiceMailboxFlowForANonDaemonAuthor(t *testing.T) {
 	ctx := context.Background()
 	gid := groupID(42)
 
@@ -40,7 +40,7 @@ func TestMobileServiceExternalSignerMailboxFlow(t *testing.T) {
 	cancelSub := bus.Subscribe(eventCh)
 	defer cancelSub()
 
-	st := store.NewMemory()
+	st := storetest.New(t)
 	defer func() { _ = st.Close() }()
 	cursorDir := t.TempDir()
 	cursorStore, err := mailbox.OpenSQLiteCursorStore(cursorDir)
@@ -52,13 +52,11 @@ func TestMobileServiceExternalSignerMailboxFlow(t *testing.T) {
 		t.Fatalf("mailbox.NewWithCursorStore: %v", err)
 	}
 
-	externalSigner, err := signing.NewExternalSigner(author, func(_ context.Context, payload []byte) ([]byte, error) {
-		return phoneID.Sign(payload), nil
-	})
+	phoneSigner, err := signing.NewLocalSigner(author, phoneID)
 	if err != nil {
-		t.Fatalf("NewExternalSigner: %v", err)
+		t.Fatalf("NewLocalSigner: %v", err)
 	}
-	msg, err := signing.SignMessage(ctx, externalSigner, entmoot.Message{
+	msg, err := signing.SignMessage(ctx, phoneSigner, entmoot.Message{
 		GroupID:   gid,
 		Timestamp: time.Now().UnixMilli(),
 		Topics:    []string{"mobile/service"},

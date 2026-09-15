@@ -14,8 +14,9 @@ import (
 	"entmoot/pkg/entmoot/esphttp"
 	"entmoot/pkg/entmoot/features"
 	"entmoot/pkg/entmoot/keystore"
-	"entmoot/pkg/entmoot/mailbox"
+	"entmoot/pkg/entmoot/mailbox/mailboxtest"
 	"entmoot/pkg/entmoot/store"
+	"entmoot/pkg/entmoot/store/storetest"
 )
 
 func TestFleetCLIMemberIDAssignmentsAndCommands(t *testing.T) {
@@ -65,11 +66,8 @@ func TestFleetCLIMemberIDAssignmentsAndCommands(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	messages := store.NewMemory()
-	service, err := mailbox.New(messages, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	messages := storetest.New(t)
+	service := mailboxtest.New(t, messages, nil)
 	handler, err := esphttp.NewHandler(esphttp.Config{Token: "unused-bearer-token", Service: service, State: state, Features: features.Flags{FleetEnabled: true, TasksEnabled: true}, TaskEvents: fleetCLIEventPublisher{identities[0], members[0], messages}})
 	if err != nil {
 		t.Fatal(err)

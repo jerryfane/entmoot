@@ -21,7 +21,6 @@ file for restart.
 -connectivity MODE    direct (default) or relay-only
 -controlled-relay MA  Approved Circuit Relay v2 multiaddr; repeatable
 -log-level LEVEL      debug, info, warn, or error
--trace-reconcile      Verbose synchronization lifecycle logging
 ```
 
 Global flags precede the subcommand. Identity creation fails closed unless

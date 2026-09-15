@@ -20,11 +20,11 @@ import (
 	"entmoot/pkg/entmoot/esphttp"
 	"entmoot/pkg/entmoot/ipc"
 	"entmoot/pkg/entmoot/keystore"
-	"entmoot/pkg/entmoot/mailbox"
+	"entmoot/pkg/entmoot/mailbox/mailboxtest"
 	"entmoot/pkg/entmoot/membership"
 	entpolicy "entmoot/pkg/entmoot/policy"
 	"entmoot/pkg/entmoot/publicmoot"
-	"entmoot/pkg/entmoot/store"
+	"entmoot/pkg/entmoot/store/storetest"
 )
 
 func TestESPOperationUpdateGroupRejectsNonObjectMetadata(t *testing.T) {
@@ -784,10 +784,7 @@ func TestLocalGroupCatalogListMembersIncludesLiveAgentState(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	service, err := mailbox.New(store.NewMemory(), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	service := mailboxtest.New(t, storetest.New(t), nil)
 	handler, err := esphttp.NewHandler(esphttp.Config{Token: "catalog-test", Service: service, State: state, Groups: catalog})
 	if err != nil {
 		t.Fatal(err)

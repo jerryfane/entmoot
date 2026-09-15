@@ -11,7 +11,6 @@ Important flags:
 -log-level info
 -connectivity direct
 -controlled-relay <CIRCUIT_RELAY_MULTIADDR>
--trace-reconcile
 ```
 
 Precedence is intentionally simple:

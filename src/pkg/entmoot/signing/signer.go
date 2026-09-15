@@ -1,10 +1,8 @@
 // Package signing owns Entmoot message signing and verification primitives.
 //
 // The package deliberately separates authorship from the process that happens
-// to run entmootd. The default LocalSigner preserves the existing on-disk
-// keystore behavior, while ExternalSigner lets a future mobile/client signer
-// produce the same canonical signatures without giving the service peer the
-// author's private key.
+// to run entmootd: LocalSigner holds the on-disk keystore identity, and
+// signWith produces the canonical payload every verifier re-derives.
 package signing
 
 import (
@@ -62,45 +60,6 @@ func (s *LocalSigner) SignMessage(_ context.Context, msg entmoot.Message) (entmo
 	msg.Author = s.Author()
 	return signWith(msg, func(payload []byte) ([]byte, error) {
 		return s.id.Sign(payload), nil
-	})
-}
-
-// SignFunc is the external/mobile signing callback used by ExternalSigner.
-type SignFunc func(ctx context.Context, payload []byte) ([]byte, error)
-
-// ExternalSigner signs through a caller-supplied callback. It is intentionally
-// small: the callback might be an HTTPS bridge, a local secure enclave bridge,
-// or a test fake, but the canonical payload and returned signature semantics
-// stay identical.
-type ExternalSigner struct {
-	author entmoot.NodeInfo
-	sign   SignFunc
-}
-
-// NewExternalSigner returns a signer that asks sign to sign canonical message
-// bytes for author.
-func NewExternalSigner(author entmoot.NodeInfo, sign SignFunc) (*ExternalSigner, error) {
-	if len(author.EntmootPubKey) != ed25519.PublicKeySize {
-		return nil, fmt.Errorf("%w: author pubkey length %d", ErrInvalidSigner, len(author.EntmootPubKey))
-	}
-	if sign == nil {
-		return nil, fmt.Errorf("%w: nil external sign func", ErrInvalidSigner)
-	}
-	author, err := operationalAuthor(author)
-	if err != nil {
-		return nil, err
-	}
-	return &ExternalSigner{author: author, sign: sign}, nil
-}
-
-func (s *ExternalSigner) Author() entmoot.NodeInfo {
-	return cloneNodeInfo(s.author)
-}
-
-func (s *ExternalSigner) SignMessage(ctx context.Context, msg entmoot.Message) (entmoot.Message, error) {
-	msg.Author = s.Author()
-	return signWith(msg, func(payload []byte) ([]byte, error) {
-		return s.sign(ctx, payload)
 	})
 }
 

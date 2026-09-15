@@ -76,23 +76,6 @@ type TopicLimit struct {
 	MsgBurst int
 }
 
-// DefaultLimits returns the default global quotas. No retired transport
-// control topics receive special operational treatment.
-func DefaultLimits() Limits {
-	return Limits{
-		MsgRate:     DefaultMsgRate,
-		MsgBurst:    DefaultMsgBurst,
-		BytesRate:   DefaultBytesRate,
-		BytesBurst:  DefaultBytesBurst,
-		TopicLimits: DefaultTopicLimits(),
-	}
-}
-
-// DefaultTopicLimits returns no transport-specific topic limits.
-func DefaultTopicLimits() map[string]TopicLimit {
-	return map[string]TopicLimit{}
-}
-
 // peerLimiter holds the pair of buckets for a single peer. A nil bucket
 // means the corresponding Limits.*Rate was zero, i.e. that dimension is
 // unlimited for this peer.

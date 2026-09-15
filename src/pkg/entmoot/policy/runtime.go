@@ -30,8 +30,3 @@ func ContentLimits(p Policy) (ratelimit.Limits, error) {
 		BytesBurst: int(p.ByteBurstPerAuthor),
 	}, nil
 }
-
-// SystemLimits returns the existing Entmoot wire/system-topic limiter defaults.
-func SystemLimits(_ *Policy) ratelimit.Limits {
-	return ratelimit.DefaultLimits()
-}

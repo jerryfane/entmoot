@@ -16,6 +16,7 @@ import (
 	"entmoot/pkg/entmoot/membership"
 	"entmoot/pkg/entmoot/signing"
 	"entmoot/pkg/entmoot/store"
+	"entmoot/pkg/entmoot/store/storetest"
 )
 
 // quarantineFixture is a live group with no router: the quarantine, the drain
@@ -52,7 +53,7 @@ func newQuarantineFixture(t *testing.T) *quarantineFixture {
 		founder: founder,
 		member:  mustIdentity(t),
 		groupID: groupID,
-		store:   store.NewMemory(),
+		store:   storetest.New(t),
 		clock:   time.Now(),
 	}
 	t.Cleanup(func() { f.store.Close() })

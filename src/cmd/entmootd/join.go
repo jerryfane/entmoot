@@ -160,53 +160,6 @@ func resolveJoinInput(ctx context.Context, input joinInput, loadCtx groupDaemonL
 	return capability, exitOK, nil
 }
 
-func joinInputsOverIPC(sockPath string, inputs []joinInput, timeout time.Duration) int {
-	ctx := context.Background()
-	var lastReadiness []byte
-	for _, input := range inputs {
-		resp, frame, err := joinInputOverIPC(ctx, sockPath, input, timeout)
-		if err != nil {
-			slog.Error("join: live daemon join", slog.String("err", err.Error()))
-			if errors.Is(err, errInviteMalformed) {
-				return exitInvalidArgument
-			}
-			return exitTransport
-		}
-		if frame != nil {
-			fmt.Fprintf(os.Stderr, "join: %s: %s\n", frame.Code, frame.Message)
-			return ipc.ExitCode(frame.Code)
-		}
-		if len(resp.Readiness) > 0 {
-			lastReadiness = append(lastReadiness[:0], resp.Readiness...)
-		}
-	}
-	if len(lastReadiness) > 0 {
-		fmt.Println(string(lastReadiness))
-	}
-	return exitOK
-}
-
-func joinInputOverIPC(ctx context.Context, sockPath string, input joinInput, timeout time.Duration) (*ipc.JoinGroupResp, *ipc.ErrorFrame, error) {
-	if input.capability == nil {
-		return nil, nil, fmt.Errorf("invite %s: a bootstrap capability is required", input.source)
-	}
-	req := &ipc.JoinGroupReq{Capability: input.capability}
-	resp, frame, err := joinGroupReqOverIPC(ctx, sockPath, req, timeout)
-	if err != nil || frame != nil {
-		return resp, frame, err
-	}
-	if resp == nil {
-		return nil, nil, fmt.Errorf("invite %s: no join response", input.source)
-	}
-	if input.expectedGroup != nil && resp.GroupID != *input.expectedGroup {
-		return nil, nil, fmt.Errorf("%w: %s redeemed group %s, want signed descriptor group %s", errInviteMalformed, input.source, resp.GroupID.String(), input.expectedGroup.String())
-	}
-	if input.expectedIssuer != nil && (resp.Issuer == nil || !nodeInfoEqual(*resp.Issuer, *input.expectedIssuer)) {
-		return nil, nil, fmt.Errorf("%w: %s redeemed founder does not match signed descriptor founder", errInviteMalformed, input.source)
-	}
-	return resp, nil, nil
-}
-
 func joinGroupReqOverIPC(ctx context.Context, sockPath string, req *ipc.JoinGroupReq, timeout time.Duration) (*ipc.JoinGroupResp, *ipc.ErrorFrame, error) {
 	if timeout <= 0 {
 		timeout = defaultJoinTimeout
@@ -252,21 +205,6 @@ func joinIPCResponseTimeout(bootstrapTimeout time.Duration) time.Duration {
 		margin = 30 * time.Second
 	}
 	return bootstrapTimeout + margin
-}
-
-func remainingJoinBootstrapTimeout(ctx context.Context, fallback time.Duration, now time.Time) (time.Duration, error) {
-	deadline, ok := ctx.Deadline()
-	if !ok {
-		if fallback <= 0 {
-			fallback = defaultJoinTimeout
-		}
-		return fallback, nil
-	}
-	remaining := deadline.Sub(now)
-	if remaining <= 0 {
-		return 0, context.DeadlineExceeded
-	}
-	return remaining, nil
 }
 
 func classifyJoinOpenInviteError(err error) int {
@@ -1063,9 +1001,6 @@ func (n *notifyingStore) LatestByTopicBefore(ctx context.Context, gid entmoot.Gr
 func (n *notifyingStore) MerkleRoot(ctx context.Context, gid entmoot.GroupID) ([32]byte, error) {
 	return n.inner.MerkleRoot(ctx, gid)
 }
-func (n *notifyingStore) IterMessageIDsInIDRange(ctx context.Context, gid entmoot.GroupID, loID, hiID entmoot.MessageID) ([]entmoot.MessageID, error) {
-	return n.inner.IterMessageIDsInIDRange(ctx, gid, loID, hiID)
-}
 func (n *notifyingStore) MessageIDsPage(ctx context.Context, gid entmoot.GroupID, sinceMillis int64, after *store.RangeCursor, expectedGeneration uint64, limit int) (store.MessageIDPage, error) {
 	paged, ok := n.inner.(store.PagedMessageIDStore)
 	if !ok {
@@ -1438,27 +1373,6 @@ func persistJoinGroupMetadata(ctx context.Context, metadataStore esphttp.GroupMe
 	return metadataStore.SetGroupMetadata(ctx, groupID, metadata)
 }
 
-func cloneGroupIDPtr(in *entmoot.GroupID) *entmoot.GroupID {
-	if in == nil {
-		return nil
-	}
-	out := *in
-	return &out
-}
-
-func cloneNodeInfoPtr(in *entmoot.NodeInfo) *entmoot.NodeInfo {
-	if in == nil {
-		return nil
-	}
-	out := *in
-	out.EntmootPubKey = append([]byte(nil), in.EntmootPubKey...)
-	if in.MemberID != nil {
-		memberID := *in.MemberID
-		out.MemberID = &memberID
-	}
-	return &out
-}
-
 func clonePolicyPtr(in *entpolicy.Policy) *entpolicy.Policy {
 	if in == nil {
 		return nil
@@ -1475,19 +1389,6 @@ func nodeInfoEqual(a, b entmoot.NodeInfo) bool {
 		return a.MemberID == nil && b.MemberID == nil
 	}
 	return *a.MemberID == *b.MemberID
-}
-
-func ipcCodeForJoinResolveError(err error) ipc.ErrorCode {
-	switch classifyJoinOpenInviteError(err) {
-	case exitInvalidArgument:
-		return ipc.CodeInvalidArgument
-	case exitNotMember:
-		return ipc.CodeNotMember
-	case exitGroupNotFound:
-		return ipc.CodeGroupNotFound
-	default:
-		return ipc.CodeUnavailable
-	}
 }
 
 func (s *ipcServer) joinReadinessEvent(ctx context.Context) json.RawMessage {

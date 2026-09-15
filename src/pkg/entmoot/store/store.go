@@ -2,18 +2,15 @@
 // in deterministic topological order for Merkle-root computation and range
 // queries.
 //
-// The package defines a small MessageStore interface and ships two
-// implementations:
+// The package defines a small MessageStore interface with one implementation:
+// SQLite, one messages.sqlite per group under <root>/groups/<group_id>/. It
+// also maintains a search index and answers message-context queries, declared
+// as MessageSearcher and MessageContexter and combined in SearchableStore.
+// Callers that need those queries take the capability rather than plain
+// MessageStore, so there is no in-process scan path to fall into.
 //
-//   - Memory: a pure in-memory map-backed store. Fast, volatile. Useful for
-//     tests, ephemeral peers, and anywhere the caller does its own persistence.
-//   - JSONL: an append-only file-backed store using one messages.jsonl file
-//     per group under <root>/groups/<group_id>/. Durable; designed for the
-//     v0 canary binary.
-//
-// All methods are safe for concurrent use. v0 keeps retention flat — every
-// stored message is kept until explicit deletion primitives (not in v0) are
-// added; see ARCHITECTURE.md §8 for the future retention-tier story.
+// All methods are safe for concurrent use. Retention is driven by the pruning
+// primitives below rather than by the store itself; see ARCHITECTURE.md §8.
 package store
 
 import (
@@ -101,20 +98,19 @@ type MessageStore interface {
 	// zero root and a nil error.
 	MerkleRoot(ctx context.Context, groupID entmoot.GroupID) ([32]byte, error)
 
-	// IterMessageIDsInIDRange returns every message ID in the given group
-	// whose 32-byte identifier lies in the half-open range [loID, hiID),
-	// sorted ascending by byte order. If hiID is the zero MessageID, the
-	// upper bound is treated as "unbounded" (equivalent to all 0xFF).
-	//
-	// This is used by the reconcile package for range-based anti-entropy
-	// (Entmoot v1.2.1); it is NOT the same ordering as Range() (which is
-	// topological / timestamp-based). An empty or unknown group returns an
-	// empty slice and a nil error.
-	IterMessageIDsInIDRange(ctx context.Context, groupID entmoot.GroupID, loID, hiID entmoot.MessageID) ([]entmoot.MessageID, error)
-
-	// Close releases any resources held by the store. For Memory this is a
-	// no-op; for JSONL it closes any open file handles.
+	// Close releases any resources held by the store: for SQLite it closes
+	// the per-group database handles.
 	Close() error
+}
+
+// SearchableStore is a MessageStore that also answers search and
+// message-context queries from its own index. SQLite is the only
+// implementation; callers that need those queries take this interface so a
+// store without an index is a compile error rather than a silent full scan.
+type SearchableStore interface {
+	MessageStore
+	MessageSearcher
+	MessageContexter
 }
 
 // RangeCursor is the exclusive keyset boundary for a stable message-id page.
@@ -225,17 +221,6 @@ func PruneBeforeExceptTopics(ctx context.Context, st MessageStore, groupID entmo
 		return 0, nil
 	}
 	return pruner.PruneBefore(ctx, groupID, beforeMillis)
-}
-
-func hasAnyTopic(m entmoot.Message, topics []string) bool {
-	for _, msgTopic := range m.Topics {
-		for _, topic := range topics {
-			if msgTopic == topic {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 // isZeroGroupID reports whether g is the zero GroupID.

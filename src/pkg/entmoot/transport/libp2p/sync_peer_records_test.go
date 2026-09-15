@@ -17,7 +17,7 @@ import (
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/keystore"
 	"entmoot/pkg/entmoot/membership"
-	"entmoot/pkg/entmoot/store"
+	"entmoot/pkg/entmoot/store/storetest"
 )
 
 // A member reaches a peer it cannot dial only if some other member forwards
@@ -43,7 +43,7 @@ func TestPeerRecordsForwardVerifiedMemberAddresses(t *testing.T) {
 	defer founderHost.Close()
 	founderCache := NewPeerRecordCache()
 	founderServer := SyncServer{
-		Host: founderHost, Group: groupFor, Store: store.NewMemory(),
+		Host: founderHost, Group: groupFor, Store: storetest.New(t),
 		PeerRecords: func(want entmoot.GroupID) (*PeerRecordCache, bool) {
 			return founderCache, want == groupID
 		},
@@ -61,7 +61,7 @@ func TestPeerRecordsForwardVerifiedMemberAddresses(t *testing.T) {
 	}
 	defer memberHost.Close()
 	memberServer := SyncServer{
-		Host: memberHost, Group: groupFor, Store: store.NewMemory(),
+		Host: memberHost, Group: groupFor, Store: storetest.New(t),
 	}
 	if err := memberServer.Install(); err != nil {
 		t.Fatal(err)

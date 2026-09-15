@@ -6,11 +6,6 @@ import "errors"
 // the Ed25519 signature does not match the signed payload.
 var ErrSigInvalid = errors.New("entmoot: signature invalid")
 
-// ErrReplay is returned by the wire layer when a received message falls
-// outside the 5m-past/30s-future timestamp window or its hash has already
-// been seen (dedupe set).
-var ErrReplay = errors.New("entmoot: replay rejected")
-
 // ErrRosterReject is returned by the roster layer when an Apply is rejected
 // (non-founder signature in v0).
 var ErrRosterReject = errors.New("entmoot: roster apply rejected")
@@ -38,10 +33,6 @@ var ErrNotMember = errors.New("entmoot: author not a group member")
 // ErrRosterHeadUnknown means message verification needs an authenticated
 // roster update before it can decide historical authorization.
 var ErrRosterHeadUnknown = errors.New("entmoot: roster head unknown")
-
-// ErrRosterHeadUnrelated means authenticated roster synchronization completed
-// without finding the message's asserted head.
-var ErrRosterHeadUnrelated = errors.New("entmoot: roster head unrelated")
 
 // ErrInviteExpired is returned by gossip.Join when the invite's ValidUntil
 // timestamp is in the past relative to the local clock.

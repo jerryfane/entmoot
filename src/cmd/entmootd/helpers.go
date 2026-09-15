@@ -163,29 +163,6 @@ func decodeMessageID(s string) (entmoot.MessageID, error) {
 	return id, nil
 }
 
-// parsePeerList parses "123,456,789" into a slice of NodeIDs. Empty string
-// yields nil with no error. Whitespace around entries is trimmed.
-func parsePeerList(s string) ([]entmoot.NodeID, error) {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return nil, nil
-	}
-	parts := strings.Split(s, ",")
-	out := make([]entmoot.NodeID, 0, len(parts))
-	for _, p := range parts {
-		p = strings.TrimSpace(p)
-		if p == "" {
-			continue
-		}
-		n, err := strconv.ParseUint(p, 10, 32)
-		if err != nil {
-			return nil, fmt.Errorf("peer %q: %w", p, err)
-		}
-		out = append(out, entmoot.NodeID(uint32(n)))
-	}
-	return out, nil
-}
-
 // parseTopicList splits "a,b,c" into a trimmed slice. Empty input yields
 // nil.
 func parseTopicList(s string) []string {

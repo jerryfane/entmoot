@@ -24,6 +24,7 @@ import (
 	"entmoot/pkg/entmoot/merkle"
 	"entmoot/pkg/entmoot/signing"
 	"entmoot/pkg/entmoot/store"
+	"entmoot/pkg/entmoot/store/storetest"
 )
 
 func TestThreePeerGossipSubPersistsAndEmitsOnce(t *testing.T) {
@@ -45,7 +46,7 @@ func TestThreePeerGossipSubPersistsAndEmitsOnce(t *testing.T) {
 		}
 	}
 	groupID, group := mustOpenGroup(t, identities[0], identities[1], identities[2])
-	stores := []store.MessageStore{store.NewMemory(), store.NewMemory(), store.NewMemory()}
+	stores := []store.MessageStore{storetest.New(t), storetest.New(t), storetest.New(t)}
 	groups := make([]*LiveGroup, 3)
 	var ingests [3]atomic.Int32
 	for i := range groups {
@@ -72,9 +73,11 @@ func TestThreePeerGossipSubPersistsAndEmitsOnce(t *testing.T) {
 	}
 	waitForStoredMessage(t, ctx, stores[1], groupID, message.ID)
 	waitForStoredMessage(t, ctx, stores[2], groupID, message.ID)
-	if ingests[0].Load() != 1 || ingests[1].Load() != 1 || ingests[2].Load() != 1 {
-		t.Fatalf("ingest counts = %d,%d,%d", ingests[0].Load(), ingests[1].Load(), ingests[2].Load())
-	}
+	// A peer's store Put happens in the pubsub validator; OnIngest fires later,
+	// when the subscription hands the message to the reader goroutine. Waiting
+	// on the store therefore does not imply the callback has run, so poll the
+	// counters. The "exactly once" half is asserted after the settle below.
+	waitForIngestCounts(t, ctx, &ingests, 1, 1, 1)
 	state, err = groups[0].Publish(ctx, message)
 	if err != nil || state != DeliveryAlreadyStored {
 		t.Fatalf("duplicate publish state=%q err=%v", state, err)
@@ -121,7 +124,7 @@ func TestUnauthorizedPeerCannotJoinAuthorizedTopic(t *testing.T) {
 	}
 	defer outsiderHost.Close()
 	groupID, group := mustOpenGroup(t, founder, member)
-	if _, err := NewLiveGroup(ctx, LiveConfig{Host: outsiderHost, GroupID: groupID, Group: group, Store: store.NewMemory()}); err == nil {
+	if _, err := NewLiveGroup(ctx, LiveConfig{Host: outsiderHost, GroupID: groupID, Group: group, Store: storetest.New(t)}); err == nil {
 		t.Fatal("non-member created an authorized live group")
 	}
 	if err := memberHost.Connect(ctx, peer.AddrInfo{ID: founderHost.ID(), Addrs: founderHost.Addrs()}); err != nil {
@@ -130,12 +133,12 @@ func TestUnauthorizedPeerCannotJoinAuthorizedTopic(t *testing.T) {
 	if err := outsiderHost.Connect(ctx, peer.AddrInfo{ID: founderHost.ID(), Addrs: founderHost.Addrs()}); err != nil {
 		t.Fatal(err)
 	}
-	founderLive, err := NewLiveGroup(ctx, LiveConfig{Host: founderHost, GroupID: groupID, Group: group, Store: store.NewMemory()})
+	founderLive, err := NewLiveGroup(ctx, LiveConfig{Host: founderHost, GroupID: groupID, Group: group, Store: storetest.New(t)})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer founderLive.Close()
-	memberLive, err := NewLiveGroup(ctx, LiveConfig{Host: memberHost, GroupID: groupID, Group: group, Store: store.NewMemory()})
+	memberLive, err := NewLiveGroup(ctx, LiveConfig{Host: memberHost, GroupID: groupID, Group: group, Store: storetest.New(t)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -181,7 +184,7 @@ func TestSharedRouterCarriesMultipleGroups(t *testing.T) {
 	}
 	groupOne, membershipOne := mustOpenGroup(t, identities[0], identities[1])
 	groupTwo, membershipTwo := mustOpenGroup(t, identities[0], identities[1])
-	stores := []store.MessageStore{store.NewMemory(), store.NewMemory()}
+	stores := []store.MessageStore{storetest.New(t), storetest.New(t)}
 	defer stores[0].Close()
 	defer stores[1].Close()
 	specs := []struct {
@@ -228,7 +231,7 @@ func TestLocalPublishChargesAuthorizationOnce(t *testing.T) {
 	}
 	defer localHost.Close()
 	groupID, membershipGroup := mustOpenGroup(t, identity)
-	messageStore := store.NewMemory()
+	messageStore := storetest.New(t)
 	defer messageStore.Close()
 	var calls atomic.Int32
 	group, err := NewLiveGroup(ctx, LiveConfig{
@@ -441,6 +444,37 @@ func waitForStoredMessage(t *testing.T, ctx context.Context, messageStore store.
 		select {
 		case <-ctx.Done():
 			t.Fatal(ctx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
+// waitForIngestCounts polls until every peer's OnIngest counter reaches its
+// want, or the context expires. It never passes on a counter that overshoots:
+// a peer that ingested twice fails immediately rather than waiting out the
+// deadline, so the helper cannot hide a duplicate delivery.
+func waitForIngestCounts(t *testing.T, ctx context.Context, counters *[3]atomic.Int32, want ...int32) {
+	t.Helper()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		done := true
+		for i, target := range want {
+			got := counters[i].Load()
+			if got > target {
+				t.Fatalf("peer %d ingested %d times, want %d", i, got, target)
+			}
+			if got != target {
+				done = false
+			}
+		}
+		if done {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("ingest counts = %d,%d,%d, want %v: %v",
+				counters[0].Load(), counters[1].Load(), counters[2].Load(), want, ctx.Err())
 		case <-ticker.C:
 		}
 	}
