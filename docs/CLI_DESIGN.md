@@ -207,8 +207,8 @@ bootstrap peers/addresses, use limit, expiry, and capability nonce.
 
 The founder or any delegated admin may issue invites and apply membership
 changes. `roster admin grant|revoke` rewrites the delegated-admin set in one
-founder-signed `policy_change` entry (`type: admins/v1`, ceiling 16) and
-`roster admin list` reports it. An admin may add and remove ordinary members;
+founder-signed membership record of kind `policy`, carrying the complete set
+(ceiling 16), and `roster admin list` reports it. An admin may add and remove ordinary members;
 it cannot remove the founder, remove another admin, or change the admin set.
 Losing membership or delegation ends the authority at once, including for
 invites that admin already issued. A join requires the invite's `founder` field to be the group's real founder,

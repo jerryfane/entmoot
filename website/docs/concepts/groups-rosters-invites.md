@@ -16,10 +16,13 @@ A joiner signs its own admission record (`kind: join`) and attaches the invite
 that authorises it. The invite is a founder- or admin-signed
 `BootstrapCapability`; the joiner's own signature is the act of joining.
 
-Nobody has to be online to write a joiner in. The joiner reads a checkpoint
-from any reachable member, signs its join against that checkpoint, pushes the
-record to that member, and the member forwards it to the group's other
-reachable members. The issuer of the invite may be offline the whole time.
+Nobody has to be online to write a joiner in: the joiner signs its own join
+record, so no admin has to sign anything at redemption time. The issuer does
+still have to serve the redemption. An invite names bootstrap addresses, and
+`invite create` accepts only the issuing node's own peer id, so the issuer is
+the only peer authorised to serve the checkpoint and accept the join record.
+Once the record is accepted, the issuer forwards it to the group's other
+reachable members and no further contact with it is needed.
 
 ## Membership is a set
 

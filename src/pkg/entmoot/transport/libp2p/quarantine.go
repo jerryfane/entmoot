@@ -18,9 +18,10 @@ const (
 	// maxQuarantinedHeads bounds how many distinct unknown heads are held, so
 	// fabricated heads cannot fan the buffer out.
 	maxQuarantinedHeads = 8
-	// quarantineTTL bounds how long a held message waits for the roster entry
-	// that would authorize it. Roster sync runs every two seconds, so a head
-	// still unknown after this is not a race.
+	// quarantineTTL bounds how long a held message waits for the membership
+	// record that would authorize it. Membership sync runs every 15s
+	// (membershipSyncInterval), so this window covers several rounds and a
+	// head still unknown after it is not a race.
 	quarantineTTL = 2 * time.Minute
 )
 

@@ -930,11 +930,12 @@ func (g *Group) settleCanonicalLocked() error {
 	//     and stops records being retired at all.
 	//   - A joiner can only anchor on a founder-signed checkpoint: the invite
 	//     pins the founder's key and nothing else, so that signature is the
-	//     one thing a node with no group state can check. Keeping the newest
-	//     one, and everything after it, is what lets a group admit members
-	//     while its founder is away. The cost is that a founder who never
-	//     checkpoints leaves a longer chain behind, which `roster status`
-	//     shows as the gap between the anchor and the canonical sequence.
+	//     one thing a node with no group state can check. So every
+	//     founder-signed checkpoint still on the canonical chain is kept, and
+	//     retention starts from the OLDEST of them: that is what lets a group
+	//     admit members while its founder is away. The cost is that a founder
+	//     who never checkpoints again leaves the whole chain behind it in
+	//     place.
 	keepFrom := best.Sequence
 	if best.Sequence > 0 {
 		keepFrom = best.Sequence - 1

@@ -12,9 +12,11 @@ group, and exits. When an Entmoot daemon is already running for the same data
 root, `join` sends the invite to that daemon over the local control socket so
 agents can join new groups without stopping `serve`.
 
-The invite's issuer does not have to be online. Any reachable member serves the
-checkpoint and accepts the join record, then forwards it to the group's other
-reachable members. `join` fails with the projected reason — for example an
+The issuing node serves the redemption: an invite carries bootstrap addresses
+that must name the issuer's own peer id, and only a peer named there is
+authorised to serve the checkpoint and accept the join record. It then forwards
+the record to the group's other reachable members, so the joiner needs the
+issuer once and no admin signature at all. `join` fails with the projected reason — for example an
 exhausted or revoked invite, a banned key, or an issuer that no longer holds
 authority — rather than leaving a half-joined group behind.
 
