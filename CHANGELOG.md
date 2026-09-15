@@ -353,14 +353,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `bootstrap-admission.db`), the fork section, and the invite section's
   account of how a join is refused. The exit-code table is unchanged.
 
-  Six files under `pkg/entmoot/ipc` and `pkg/entmoot/store` cite this doc by
+  Seven files under `pkg/entmoot/ipc` and `pkg/entmoot/store` cite this doc by
   section number, including sub-sections 4.2 and 5.2-5.4 that it never actually
   had. Those sub-sections now exist and describe the wire format the code
   implements: a frame is `[4-byte big-endian length][1-byte type][JSON body]`
   with the length counting the type byte. Four `cmd/entmootd` files cited
   sections 3.1, 3.3, 3.4, 3.5 and 5.5, which the compact rewrite of section 3
-  dropped long ago; those comments now name sections that exist, so no
-  citation in the tree dangles.
+  dropped long ago; those comments now name sections that exist, so every
+  `CLI_DESIGN` citation in the tree resolves. Two `ARCHITECTURE.md` citations
+  are also repointed: `§3.4` and `§3.2` never existed, and the rule one of them
+  claimed is not written down anywhere, so the comments now state it
+  themselves.
 
 - **`README.md` describes the current commands and guarantees.** It listed
   `roster add`, which does not exist (running it exits 5), claimed roster order
