@@ -221,31 +221,6 @@ type RosterEntry struct {
 // package, added in phase A1).
 type Filter []string
 
-// NodeEndpoint describes one transport endpoint (network+addr). Used in
-// BootstrapPeer.Endpoints (invite-embedded hints for newcomers) and
-// wire.TransportAd.Endpoints (gossiped advertisements). Shape mirrors
-// registry.NodeEndpoint for easy cross-serialisation. (v1.2.0)
-type NodeEndpoint struct {
-	Network string `json:"network"`
-	Addr    string `json:"addr"`
-}
-
-// BootstrapPeer names one candidate peer for joining a group. Hostname is
-// optional and only useful when the dialer wants a direct address hint.
-type BootstrapPeer struct {
-	// NodeID is the Pilot node id of the peer.
-	NodeID NodeID `json:"node_id"`
-	// Hostname is an optional address hint (e.g. IP:port or DNS name).
-	Hostname string `json:"hostname,omitempty"`
-	// Endpoints is an optional list of transport endpoints the peer is
-	// reachable at. Added in v1.2.0 so invites can embed authoritative
-	// address hints that don't require the joiner to consult a Pilot
-	// registry. omitempty is load-bearing: legacy invites without the
-	// field produce the same canonical bytes they always did, so their
-	// signatures continue to verify after the upgrade. (v1.2.0)
-	Endpoints []NodeEndpoint `json:"endpoints,omitempty"`
-}
-
 // BootstrapCapability is an issuer-signed, expiring grant for a bounded set of
 // bootstrap endpoints. Target fields bind it to one fresh identity; leaving
 // them empty makes it an open invite that any holder may redeem. MaxUses caps

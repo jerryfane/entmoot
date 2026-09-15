@@ -27,7 +27,7 @@ func TestNormalizeMessageContextOptions(t *testing.T) {
 }
 
 func TestMessageContext(t *testing.T) {
-	run := func(t *testing.T, newStore func(t *testing.T) MessageStore) {
+	run := func(t *testing.T, newStore func(t *testing.T) SearchableStore) {
 		t.Helper()
 		ctx := context.Background()
 		s := newStore(t)
@@ -92,17 +92,7 @@ func TestMessageContext(t *testing.T) {
 		}
 	}
 
-	// native: SQLite's own MessageContext. scan: the same store behind a
-	// wrapper that hides it, which is the shape the daemon passes to the
-	// mailbox, so this arm covers the daemon's message-context path.
-	t.Run("native", func(t *testing.T) {
-		run(t, func(t *testing.T) MessageStore { return mustOpenSQLite(t) })
-	})
-	t.Run("scan", func(t *testing.T) {
-		run(t, func(t *testing.T) MessageStore {
-			return hiddenNativeStore{MessageStore: mustOpenSQLite(t)}
-		})
-	})
+	run(t, func(t *testing.T) SearchableStore { return mustOpenSQLite(t) })
 }
 
 func TestMessageContextAtEdges(t *testing.T) {

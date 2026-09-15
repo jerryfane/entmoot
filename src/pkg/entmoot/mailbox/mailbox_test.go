@@ -308,7 +308,7 @@ func groupID(seed byte) entmoot.GroupID {
 
 // newTestService builds a mailbox service whose cursors live in a throwaway
 // SQLite database, which is the cursor store the daemon constructs.
-func newTestService(t *testing.T, st store.MessageStore, sink events.Sink) *Service {
+func newTestService(t *testing.T, st store.SearchableStore, sink events.Sink) *Service {
 	t.Helper()
 	svc, err := NewWithCursorStore(st, mustCursorStore(t), sink)
 	if err != nil {

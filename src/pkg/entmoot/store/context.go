@@ -69,61 +69,9 @@ type MessageContexter interface {
 
 // MessageContext returns a bounded conversation window around messageID using
 // a native store implementation when available, otherwise a deterministic scan.
-func MessageContext(ctx context.Context, st MessageStore, groupID entmoot.GroupID, messageID entmoot.MessageID, opts MessageContextOptions) (MessageContextResult, error) {
+func MessageContext(ctx context.Context, st MessageContexter, groupID entmoot.GroupID, messageID entmoot.MessageID, opts MessageContextOptions) (MessageContextResult, error) {
 	opts = NormalizeMessageContextOptions(opts)
-	if contexter, ok := st.(MessageContexter); ok {
-		return contexter.MessageContext(ctx, groupID, messageID, opts)
-	}
-	return scanMessageContext(ctx, st, groupID, messageID, opts)
-}
-
-func scanMessageContext(ctx context.Context, st MessageStore, groupID entmoot.GroupID, messageID entmoot.MessageID, opts MessageContextOptions) (MessageContextResult, error) {
-	target, err := st.Get(ctx, groupID, messageID)
-	if err != nil {
-		return MessageContextResult{}, err
-	}
-	if opts.Topic != "" && !messageHasTopic(target, opts.Topic) {
-		return MessageContextResult{}, ErrNotFound
-	}
-	msgs, err := st.Range(ctx, groupID, 0, 0)
-	if err != nil {
-		return MessageContextResult{}, err
-	}
-
-	var older, newer []entmoot.Message
-	for _, msg := range msgs {
-		if msg.ID == target.ID {
-			continue
-		}
-		if opts.Topic != "" && !messageHasTopic(msg, opts.Topic) {
-			continue
-		}
-		cmp := compareMessageRecency(msg, target)
-		switch {
-		case cmp < 0:
-			older = append(older, msg)
-		case cmp > 0:
-			newer = append(newer, msg)
-		}
-	}
-	sortMessagesNewestFirst(older)
-	sortMessagesOldestFirst(newer)
-
-	hasMoreOlder := len(older) > opts.Before
-	if hasMoreOlder {
-		older = older[:opts.Before]
-	}
-	sortMessagesOldestFirst(older)
-	if len(newer) > opts.After {
-		newer = newer[:opts.After]
-	}
-
-	messages := make([]entmoot.Message, 0, len(older)+1+len(newer))
-	messages = append(messages, older...)
-	messages = append(messages, target)
-	messages = append(messages, newer...)
-
-	return messageContextResult(target, messages, hasMoreOlder), nil
+	return st.MessageContext(ctx, groupID, messageID, opts)
 }
 
 func messageContextResult(target entmoot.Message, messages []entmoot.Message, hasMoreOlder bool) MessageContextResult {

@@ -13,7 +13,7 @@ import (
 
 // New returns a mailbox service over st whose cursors live in a throwaway
 // SQLite database. sink may be nil.
-func New(tb testing.TB, st store.MessageStore, sink events.Sink) *mailbox.Service {
+func New(tb testing.TB, st store.SearchableStore, sink events.Sink) *mailbox.Service {
 	tb.Helper()
 	cursors, err := mailbox.OpenSQLiteCursorStore(tb.TempDir())
 	if err != nil {

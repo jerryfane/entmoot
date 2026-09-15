@@ -35,13 +35,13 @@ type CursorStore interface {
 
 // Service tracks per-client cursors over an existing MessageStore.
 type Service struct {
-	store   store.MessageStore
+	store   store.SearchableStore
 	cursors CursorStore
 	sink    events.Sink
 }
 
 // NewWithCursorStore returns a mailbox service backed by st and cursors.
-func NewWithCursorStore(st store.MessageStore, cursors CursorStore, sink events.Sink) (*Service, error) {
+func NewWithCursorStore(st store.SearchableStore, cursors CursorStore, sink events.Sink) (*Service, error) {
 	if st == nil {
 		return nil, errors.New("mailbox: nil store")
 	}

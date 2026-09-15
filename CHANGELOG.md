@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`-trace-reconcile` is gone, and passing it now fails the command.** The
   flag never enabled any tracing: it was parsed, forwarded to re-exec'd child
-  commands, and read by nothing, while six documentation pages told operators
+  commands, and read by nothing, while seven documentation pages told operators
   to pass it. A unit file or script that still passes it exits 5 with `flag
   provided but not defined`. Use `-log-level debug` for verbose daemon logs.
 - **`pkg/entmoot/reconcile` is deleted.** The range-fingerprint reconciliation
@@ -21,18 +21,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `store.JSONL` (with `store.OpenJSONL` and `store.NewMemory`) are removed;
   `store.OpenSQLite` is what the daemon has always opened. A group directory's
   `messages.jsonl` is no longer readable by this binary.
-- **Removed unused API surface:** `mailbox.New` and
-  `mailbox.MemoryCursorStore` (use `mailbox.NewWithCursorStore` with
-  `mailbox.OpenSQLiteCursorStore`), `signing.ExternalSigner` with `SignFunc`
-  and `NewExternalSigner`, `entmoot.Invite` and its JSON methods (superseded
-  by `entmoot.BootstrapCapability`), `entmoot.KeyRotation` with
-  `SignKeyRotation` and `VerifyKeyRotation` (membership `rekey` records
-  replace self-rotation; founder-authorised emergency rotation is not
-  implemented — see issue #124), `policy.SystemLimits`,
+- **The mailbox service requires a store that can search.**
+  `mailbox.NewWithCursorStore` now takes `store.SearchableStore`
+  (`MessageStore` plus `MessageSearcher` and `MessageContexter`), and
+  `store.SearchMessages`/`store.MessageContext` take the capability
+  interfaces instead of `MessageStore`. The in-process scan fallbacks they
+  used for a store without an index are gone: SQLite is the only
+  implementation and every production call site passes it directly, so the
+  scan was unreachable. A store lacking the index is now a compile error
+  rather than a silent full-history scan.
+- **Removed unused API surface:** `mailbox.New` with
+  `mailbox.MemoryCursorStore` and `mailbox.NewMemoryCursorStore` (use
+  `mailbox.NewWithCursorStore` with `mailbox.OpenSQLiteCursorStore`),
+  `signing.ExternalSigner` with `SignFunc` and `NewExternalSigner`,
+  `entmoot.Invite` and its JSON methods (superseded by
+  `entmoot.BootstrapCapability`) together with the now-unreferenced
+  `entmoot.BootstrapPeer` and `entmoot.NodeEndpoint`, `entmoot.KeyRotation`
+  with `SignKeyRotation` and `VerifyKeyRotation`, `policy.SystemLimits`,
   `libp2p.StartMemberMDNS` (the daemon never started mDNS),
   `libp2p.SyncShortChain`, `ratelimit.DefaultLimits` and
   `ratelimit.DefaultTopicLimits`, and the `entmoot.ErrReplay` and
   `entmoot.ErrRosterHeadUnrelated` sentinels.
+
+  Key rotation is not replaced by this removal. `membership.KindRekey` is
+  validated and projected, but nothing in the tree mints a rekey record, and
+  the deleted `KeyRotation` also carried a founder-authorised mode for a
+  member that lost its key. Both gaps are tracked on issue #124.
 
 ### Changed
 

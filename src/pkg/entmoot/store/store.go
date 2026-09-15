@@ -4,11 +4,10 @@
 //
 // The package defines a small MessageStore interface with one implementation:
 // SQLite, one messages.sqlite per group under <root>/groups/<group_id>/. It
-// also carries a native search index and message-context lookup, offered
-// through the optional MessageSearcher and MessageContexter interfaces; the
-// package-level SearchMessages and MessageContext fall back to a deterministic
-// in-process scan for a store that does not implement them, which is what a
-// wrapping store (cmd/entmootd's notifyingStore) gets.
+// also maintains a search index and answers message-context queries, declared
+// as MessageSearcher and MessageContexter and combined in SearchableStore.
+// Callers that need those queries take the capability rather than plain
+// MessageStore, so there is no in-process scan path to fall into.
 //
 // All methods are safe for concurrent use. Retention is driven by the pruning
 // primitives below rather than by the store itself; see ARCHITECTURE.md §8.
@@ -113,6 +112,16 @@ type MessageStore interface {
 	// Close releases any resources held by the store: for SQLite it closes
 	// the per-group database handles.
 	Close() error
+}
+
+// SearchableStore is a MessageStore that also answers search and
+// message-context queries from its own index. SQLite is the only
+// implementation; callers that need those queries take this interface so a
+// store without an index is a compile error rather than a silent full scan.
+type SearchableStore interface {
+	MessageStore
+	MessageSearcher
+	MessageContexter
 }
 
 // RangeCursor is the exclusive keyset boundary for a stable message-id page.
@@ -223,17 +232,6 @@ func PruneBeforeExceptTopics(ctx context.Context, st MessageStore, groupID entmo
 		return 0, nil
 	}
 	return pruner.PruneBefore(ctx, groupID, beforeMillis)
-}
-
-func hasAnyTopic(m entmoot.Message, topics []string) bool {
-	for _, msgTopic := range m.Topics {
-		for _, topic := range topics {
-			if msgTopic == topic {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 // isZeroGroupID reports whether g is the zero GroupID.

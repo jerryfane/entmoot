@@ -75,8 +75,8 @@ func TestSQLiteFTS5Available(t *testing.T) {
 	}
 }
 
-func TestSearchMessagesFallback(t *testing.T) {
-	run := func(t *testing.T, newStore func(t *testing.T) MessageStore) {
+func TestSearchMessages(t *testing.T) {
+	run := func(t *testing.T, newStore func(t *testing.T) SearchableStore) {
 		t.Helper()
 		ctx := context.Background()
 		s := newStore(t)
@@ -132,17 +132,7 @@ func TestSearchMessagesFallback(t *testing.T) {
 		}
 	}
 
-	// indexed: SQLite's FTS path. scan: the same store behind a wrapper that
-	// hides SearchMessages, which is what cmd/entmootd's notifyingStore does
-	// to the daemon's store, so this arm covers the daemon's search path.
-	t.Run("indexed", func(t *testing.T) {
-		run(t, func(t *testing.T) MessageStore { return mustOpenSQLite(t) })
-	})
-	t.Run("scan", func(t *testing.T) {
-		run(t, func(t *testing.T) MessageStore {
-			return hiddenNativeStore{MessageStore: mustOpenSQLite(t)}
-		})
-	})
+	run(t, func(t *testing.T) SearchableStore { return mustOpenSQLite(t) })
 }
 
 func TestSQLiteSearchIndexMaintenance(t *testing.T) {
