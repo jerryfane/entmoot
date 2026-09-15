@@ -57,9 +57,10 @@ group create
 group policy status|set|clear
 group public descriptor|publish
 invite create|list|revoke
-roster add|remove
+roster remove|ban|unban
 roster admin list|grant|revoke
-roster repair
+roster leave|checkpoint|status
+membership upgrade|adopt
 ```
 
 ## 4. Storage and Ownership
@@ -69,20 +70,20 @@ The data root contains:
 ```text
 identity.json          Persistent Ed25519 member identity
 control.sock           Local daemon control socket
-groups/<gid>/...       Roster, messages, indexes, and sync state
+groups/<gid>/...       Membership records, checkpoints, messages, indexes
 mailbox.sqlite         ESP mailbox cursors
 esp.sqlite             ESP and live-agent projections
 runtime.env            Installed wrapper defaults
 conversion-*           One-way legacy conversion journal and backup
 ```
 
-Per-group SQLite schemas store immutable signed bytes, roster state, query
-indexes, and generation-bound coverage data. Store writes are
+Per-group SQLite schemas store immutable signed bytes, membership records and
+checkpoints, query indexes, and generation-bound coverage data. Store writes are
 transactional and return whether a message was newly inserted so local delivery
 and network propagation happen once per process.
 
-The data-root owner serializes roster and message mutations. Offline maintenance
-requires the owner to be stopped and uses the same exclusive lock.
+The data-root owner serializes membership and message mutations. Offline
+maintenance requires the owner to be stopped and uses the same exclusive lock.
 
 ## 5. IPC and Lifecycle
 
@@ -165,8 +166,8 @@ founder-signed `policy_change` entry (`type: admins/v1`, ceiling 16) and
 `roster admin list` reports it. An admin may add and remove ordinary members;
 it cannot remove the founder, remove another admin, or change the admin set.
 Losing membership or delegation ends the authority at once, including for
-invites that admin already issued. Enrollment requires the invite's `founder`
-field to be the group's real founder, since that is the anchor the joiner pins.
+invites that admin already issued. A join requires the invite's `founder` field to be the group's real founder,
+since that is the anchor the joiner pins.
 
 `invite list` shows issued invites with uses spent and state
 (open/spent/expired/revoked). `invite revoke` withdraws an invite before it
@@ -176,29 +177,28 @@ remove` revokes the invites bound to the removed member, reports the count, and
 lists the group's remaining open nonces, which name nobody and therefore cannot
 be revoked automatically.
 
-Two authorised signers who write against the same roster head produce two
-chains, and the log is strictly linear, so nothing merges them: the group
-splits and `status` reports `roster_divergence`. `roster repair -group <id>`
-ends that split from the losing side. It asks the named peer (`-peer`, or the
-only divergent peer) for its chain, validates it from the shared genesis,
-adopts it, and re-signs the local changes the adopted chain does not carry.
-`-dry-run` reports what would be discarded first. The command needs a running
-daemon, because the daemon holds the roster writer lease and the peer
-connections. A change this node may no longer author is reported as
-unrecoverable, with a non-zero exit, instead of being dropped in silence; a
-message published in the fork window and naming a discarded head cannot be
-verified against the adopted chain.
+Two authorised signers may write at the same time without consequence.
+Membership is a set of signed records merged in one deterministic order, so
+there is no head to race and no fork to detect: both records simply apply.
+There is no `roster repair` and no `roster_divergence` status, because neither
+condition can arise. `roster status` reports the canonical checkpoint, the
+member set, admins, bans, the pending record count, and the policy.
 
-Join validates the complete capability before network use, fetches roster state
+Every `checkpoint_every` records an admin signs a checkpoint that replaces the
+records before it, so storage follows group size rather than group age. A
+checkpoint is only accepted when its signer had authority in the checkpoint
+before it, and a node that holds the covered records verifies the projection
+matches before adopting.
+
+Join validates the complete capability before network use, fetches membership state
 only from an allowed serving peer, binds the fetched founder and its own
 resulting membership, and persists consumption per applicant. Invalid, expired,
 replayed, revoked, exhausted, wrong-target or wrong-founder capabilities
-install no partial group state. An invite's checkpoint only has to be on the
-group's roster chain: earlier joins advance the head without invalidating
-outstanding invites, while an applicant removed after that checkpoint is
-refused. Enrollment rejections carry a typed code and a reason; a rejection the
-applicant could fix does not spend a use, and an admission-store failure is
-reported as an internal condition without leaking store detail.
+install no partial group state. An invite names the checkpoint its issuer held; later joins do not
+invalidate outstanding invites, while an applicant banned after that checkpoint
+is refused. A refused join reports why — invite revoked, exhausted, expired, banned
+subject, or an issuer without authority at the checkpoint it cites — and
+installs no partial group state.
 
 Open-invite redemption uses the same Entmoot identity. The joiner signs a
 bounded issuer challenge with its Ed25519 key; the issuer verifies the MemberID,
