@@ -147,3 +147,30 @@ func TestOpenSucceedsWhileAnotherWriterHoldsTheLock(t *testing.T) {
 		t.Fatalf("retired index survived an uncontended open")
 	}
 }
+
+// TestOpenRestoresBusyTimeout pins that the short timeout used to retire the
+// legacy index does not leak into the connection later queries run on.
+func TestOpenRestoresBusyTimeout(t *testing.T) {
+	root := t.TempDir()
+	gid := randGroupID(t)
+	s, err := OpenSQLite(root)
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	defer s.Close()
+	author := testAuthor(1, 0xAA)
+	if _, err := s.Put(context.Background(), gid, mkMsg(t, gid, author, 10, "seed")); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	db, ok, err := s.dbForExisting(gid)
+	if err != nil || !ok {
+		t.Fatalf("dbForExisting: ok=%v err=%v", ok, err)
+	}
+	var ms int
+	if err := db.QueryRow(`PRAGMA busy_timeout`).Scan(&ms); err != nil {
+		t.Fatalf("read busy_timeout: %v", err)
+	}
+	if ms != 5000 {
+		t.Fatalf("busy_timeout = %d, want 5000 (the retirement's short timeout leaked)", ms)
+	}
+}
