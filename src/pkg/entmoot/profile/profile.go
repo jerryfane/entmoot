@@ -34,6 +34,13 @@ const payloadType = "entmoot/profile/1"
 // a non-Latin script is not cut shorter than a Latin one.
 const MaxDisplayNameLength = 64
 
+// MaxDisplayNameBytes must not exceed the store's own hostname cap
+// (esphttp.MaxNodeProfileHostnameBytes). Both limits are enforced here so a
+// name that the store would silently drop is refused at publish time instead
+// of being reported as published. 64 four-byte runes are 256 bytes, so without
+// this the two limits disagree by exactly one name shape.
+const MaxDisplayNameBytes = 255
+
 // ErrNotProfile is returned when content is not a profile payload at all. It
 // is distinct from a validation error: an unrecognised payload on the reserved
 // topic is ignored, while a malformed profile is worth reporting.
@@ -59,9 +66,21 @@ type wireProfile struct {
 
 // NormalizeDisplayName trims a name and reports whether it is usable.
 //
-// Control characters are refused rather than stripped: a name containing them
-// is a mistake or an attempt to forge a line break in someone's UI, and
-// silently rewriting it would hide both.
+// Refusals rather than rewrites: a name carrying a control or formatting
+// character is either a mistake or an attempt to forge output, and silently
+// stripping it would hide both. A name is displayed as "name#MemberID", a bare
+// concatenation, so the name must not be able to reach past its own field:
+//
+//   - Cc control characters, and \n and \r explicitly, would split a line.
+//   - Cf format characters include the bidi overrides (U+202E RLO and friends)
+//     and zero-width characters; a trailing override reverses the appended
+//     "#MemberID" run in any bidi-aware renderer, so the identity that is
+//     supposed to travel with the name can be made to read as something else.
+//   - Zl and Zp (U+2028, U+2029) are line and paragraph separators in most
+//     renderers even though they are not Cc.
+//   - '#' is the separator itself. Allowing it lets a name contain a plausible
+//     "#<something>" tail, so a reader cannot tell which '#' begins the real
+//     MemberID.
 func NormalizeDisplayName(name string) (string, error) {
 	trimmed := strings.TrimSpace(name)
 	if trimmed == "" {
@@ -73,12 +92,21 @@ func NormalizeDisplayName(name string) (string, error) {
 	if n := utf8.RuneCountInString(trimmed); n > MaxDisplayNameLength {
 		return "", fmt.Errorf("profile: display name is %d runes, limit %d", n, MaxDisplayNameLength)
 	}
+	if n := len(trimmed); n > MaxDisplayNameBytes {
+		return "", fmt.Errorf("profile: display name is %d bytes, limit %d", n, MaxDisplayNameBytes)
+	}
 	for _, r := range trimmed {
-		if r == '\n' || r == '\r' {
+		switch {
+		case r == '\n' || r == '\r':
 			return "", errors.New("profile: display name contains a line break")
-		}
-		if unicode.IsControl(r) {
+		case r == '#':
+			return "", errors.New("profile: display name contains '#', which separates the name from the member id")
+		case unicode.IsControl(r):
 			return "", errors.New("profile: display name contains a control character")
+		case unicode.Is(unicode.Cf, r):
+			return "", fmt.Errorf("profile: display name contains the formatting character %U, which can reorder or hide text", r)
+		case unicode.Is(unicode.Zl, r) || unicode.Is(unicode.Zp, r):
+			return "", fmt.Errorf("profile: display name contains the line separator %U", r)
 		}
 	}
 	return trimmed, nil

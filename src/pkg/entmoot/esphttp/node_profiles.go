@@ -99,6 +99,22 @@ func nodeProfileVisibleForMember(profile NodeProfileRecord, publicKey string) bo
 		(strings.TrimSpace(profile.EntmootPubKey) != "" && strings.TrimSpace(profile.EntmootPubKey) == strings.TrimSpace(publicKey))
 }
 
+// WithdrawMemberProfileNodeProfile removes a member's published name for a
+// group. Withdrawal is a delete, not an empty name: an empty hostname is not a
+// storable record, so an "empty" observation would leave the previous name in
+// place and every reader would keep serving it.
+func WithdrawMemberProfileNodeProfile(ctx context.Context, state StateStore, groupID entmoot.GroupID, memberID entmoot.MemberID, publicKey string) error {
+	if state == nil || memberID == (entmoot.MemberID{}) {
+		return nil
+	}
+	key := nodeProfileSourceKey(NodeProfileRecord{
+		Source:        NodeProfileSourceMemberProfile,
+		SourceGroupID: &groupID,
+		EntmootPubKey: strings.TrimSpace(publicKey),
+	})
+	return state.DeleteNodeProfileSource(ctx, memberID, key)
+}
+
 func ObserveMemberProfileNodeProfile(ctx context.Context, state StateStore, groupID entmoot.GroupID, memberID entmoot.MemberID, publicKey, hostname string, observedAtMS, expiresAtMS int64) error {
 	if state == nil || memberID == (entmoot.MemberID{}) {
 		return nil
@@ -207,6 +223,19 @@ func (s *MemoryStateStore) UpsertNodeProfile(_ context.Context, rec NodeProfileR
 	defer s.mu.Unlock()
 	return s.upsertNodeProfileLocked(rec, s.nowMS())
 }
+func (s *MemoryStateStore) DeleteNodeProfileSource(_ context.Context, id entmoot.MemberID, sourceKey string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	records := s.nodeProfiles[id]
+	if records == nil {
+		return nil
+	}
+	delete(records, sourceKey)
+	if len(records) == 0 {
+		delete(s.nodeProfiles, id)
+	}
+	return nil
+}
 func (s *MemoryStateStore) GetNodeProfile(_ context.Context, id entmoot.MemberID) (NodeProfileRecord, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -260,6 +289,12 @@ func (s *SQLiteStateStore) UpsertNodeProfile(ctx context.Context, rec NodeProfil
 		return rec, true, nil
 	}
 	return best, nodeProfileSourceKey(best) == nodeProfileSourceKey(rec), nil
+}
+func (s *SQLiteStateStore) DeleteNodeProfileSource(ctx context.Context, id entmoot.MemberID, sourceKey string) error {
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM esp_node_profile_sources WHERE member_id = ? AND source_key = ?`, id[:], sourceKey); err != nil {
+		return fmt.Errorf("esphttp: delete node profile source: %w", err)
+	}
+	return nil
 }
 func (s *SQLiteStateStore) GetNodeProfile(ctx context.Context, id entmoot.MemberID) (NodeProfileRecord, bool, error) {
 	return getNodeProfile(ctx, s.db, id, time.Now().UnixMilli(), nil, "")

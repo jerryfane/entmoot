@@ -33,8 +33,18 @@ for good eventually stops being displayed.
 - It cannot be set by a removed member. Publishing requires membership.
 - It cannot be smuggled in on another topic. A profile payload published on
   any topic other than the reserved one is ignored.
-- It cannot break a client's layout: a name containing a line break or any
-  control character is refused at publish time.
+- It cannot break or forge a client's layout. Because the display form is a
+  bare `name#MemberID`, a name may not contain `#`, a control character, a
+  Unicode format character (the bidi overrides such as U+202E would otherwise
+  reverse the appended MemberID, and zero-width characters would hide text) or
+  a line or paragraph separator (U+2028, U+2029).
+- It cannot be pinned. A node orders profiles by when it received them, not by
+  the timestamp in the payload, so a message dated in the future cannot freeze
+  a member's name against later updates.
 
-Names are limited to 64 runes, counted in runes rather than bytes so a name in
-a non-Latin script is not cut shorter than a Latin one.
+Names are limited to 64 runes and 255 bytes. The rune limit is what a user
+notices, so a name in a non-Latin script is not cut shorter than a Latin one;
+the byte limit matches the store's own cap, so a name that could not be stored
+is refused at publish time rather than reported as published and dropped.
+
+An expiry longer than 90 days is clamped to 90 days.
