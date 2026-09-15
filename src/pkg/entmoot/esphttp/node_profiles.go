@@ -199,7 +199,19 @@ func shouldReplaceNodeProfile(existing, incoming NodeProfileRecord, nowMS int64)
 	if incoming.Confidence != existing.Confidence {
 		return incoming.Confidence > existing.Confidence
 	}
-	return incoming.ObservedAtMS > existing.ObservedAtMS
+	if incoming.ObservedAtMS != existing.ObservedAtMS {
+		return incoming.ObservedAtMS > existing.ObservedAtMS
+	}
+	// Equal issue times must not resolve by arrival order, or two nodes that
+	// saw the same pair in opposite orders keep different names indefinitely.
+	// A withdrawal wins the tie — the safe direction, since the alternative is
+	// showing a name its owner asked to retract — and two profiles tie-break
+	// on the hostname, which is a total order every node computes the same
+	// way. This only decides a same-millisecond collision.
+	if isWithdrawalRecord(incoming) != isWithdrawalRecord(existing) {
+		return isWithdrawalRecord(incoming)
+	}
+	return incoming.Hostname < existing.Hostname
 }
 func cloneNodeProfileRecord(rec NodeProfileRecord) NodeProfileRecord {
 	if rec.SourceGroupID != nil {
@@ -296,7 +308,7 @@ func (s *SQLiteStateStore) UpsertNodeProfile(ctx context.Context, rec NodeProfil
 	if rec.SourceGroupID != nil {
 		sourceGroup = rec.SourceGroupID[:]
 	}
-	_, err = s.db.ExecContext(ctx, `INSERT INTO esp_node_profile_sources (member_id, entmoot_pubkey, source, source_key, hostname, confidence, observed_at_ms, expires_at_ms, source_group_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(member_id, source_key) DO UPDATE SET entmoot_pubkey=excluded.entmoot_pubkey, source=excluded.source, hostname=excluded.hostname, confidence=excluded.confidence, observed_at_ms=excluded.observed_at_ms, expires_at_ms=excluded.expires_at_ms, source_group_id=excluded.source_group_id WHERE excluded.confidence > esp_node_profile_sources.confidence OR (excluded.confidence = esp_node_profile_sources.confidence AND excluded.observed_at_ms > esp_node_profile_sources.observed_at_ms)`, rec.MemberID[:], rec.EntmootPubKey, rec.Source, nodeProfileSourceKey(rec), rec.Hostname, rec.Confidence, rec.ObservedAtMS, rec.ExpiresAtMS, sourceGroup)
+	_, err = s.db.ExecContext(ctx, `INSERT INTO esp_node_profile_sources (member_id, entmoot_pubkey, source, source_key, hostname, confidence, observed_at_ms, expires_at_ms, source_group_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(member_id, source_key) DO UPDATE SET entmoot_pubkey=excluded.entmoot_pubkey, source=excluded.source, hostname=excluded.hostname, confidence=excluded.confidence, observed_at_ms=excluded.observed_at_ms, expires_at_ms=excluded.expires_at_ms, source_group_id=excluded.source_group_id WHERE excluded.confidence > esp_node_profile_sources.confidence OR (excluded.confidence = esp_node_profile_sources.confidence AND excluded.observed_at_ms > esp_node_profile_sources.observed_at_ms) OR (excluded.confidence = esp_node_profile_sources.confidence AND excluded.observed_at_ms = esp_node_profile_sources.observed_at_ms AND ((excluded.hostname = '-' AND esp_node_profile_sources.hostname <> '-') OR (((excluded.hostname = '-') = (esp_node_profile_sources.hostname = '-')) AND excluded.hostname < esp_node_profile_sources.hostname)))`, rec.MemberID[:], rec.EntmootPubKey, rec.Source, nodeProfileSourceKey(rec), rec.Hostname, rec.Confidence, rec.ObservedAtMS, rec.ExpiresAtMS, sourceGroup)
 	if err != nil {
 		return NodeProfileRecord{}, false, fmt.Errorf("esphttp: upsert node profile: %w", err)
 	}

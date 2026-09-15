@@ -321,3 +321,89 @@ func mustProfileMessage(t *testing.T, ctx context.Context, session *groupSession
 	}
 	return signed
 }
+
+// TestHistoryReconciliationIsNotStarvedByOneMember pins the bound that matters.
+// The first version counted messages, so one member republishing on the topic
+// pushed every other member's name out of the window and those names were
+// never learned. The walk now stops per member, not per message.
+func TestHistoryReconciliationIsNotStarvedByOneMember(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	root := t.TempDir()
+	founder, founderInfo := mustDaemonIdentity(t)
+	var gid entmoot.GroupID
+	if _, err := rand.Read(gid[:]); err != nil {
+		t.Fatal(err)
+	}
+	policy := membership.DefaultPolicy()
+	policy.JoinRule = membership.JoinRuleOpen
+	mustCreateGroup(t, root, gid, founder, policy)
+
+	state, err := esphttp.OpenSQLiteStateStore(root)
+	if err != nil {
+		t.Fatalf("OpenSQLiteStateStore: %v", err)
+	}
+	defer state.Close()
+	runtime, session, host := startTestRuntimeWithProfiles(t, ctx, root, founder, gid, state)
+	defer host.Close()
+	defer runtime.Close()
+
+	// A second member joins itself in, which is the ordinary path under an
+	// open join rule, and publishes its name long ago.
+	quiet, quietInfo := mustDaemonIdentity(t)
+	if _, err := session.group.SignRecord(quiet, membership.Record{Kind: membership.KindJoin}); err != nil {
+		t.Fatalf("join: %v", err)
+	}
+	if !session.group.IsMemberID(*quietInfo.MemberID) {
+		t.Fatalf("the second member did not join, so the flood below would prove nothing")
+	}
+
+	quietAt := time.Now().Add(-48 * time.Hour).UnixMilli()
+	mustStoreProfileAt(t, ctx, runtime, session, quiet, quietInfo, gid,
+		profile.Profile{DisplayName: "quiet-node", IssuedAtMS: quietAt}, quietAt)
+
+	// Now the founder floods the topic with more messages than one page holds.
+	for i := 0; i < profileReconcilePageSize+8; i++ {
+		publishProfile(t, ctx, session, founder, founderInfo, gid, profile.Profile{
+			DisplayName: "loud", IssuedAtMS: time.Now().UnixMilli(),
+		})
+	}
+
+	// Wipe what the live hook learned, so reconciliation has to find it again.
+	if err := esphttp.WithdrawMemberProfileNodeProfile(ctx, state, gid, *quietInfo.MemberID,
+		encodeBase64(quietInfo.EntmootPubKey), quietAt-1); err != nil {
+		t.Fatalf("reset: %v", err)
+	}
+	runtime.reconcileProfilesFromHistory(ctx, session)
+
+	if got := mustDisplayName(t, ctx, state, root, gid, *quietInfo.MemberID); got != "quiet-node#"+quietInfo.MemberID.String() {
+		t.Fatalf("quiet member's name = %q, want it recovered from history despite the flood", got)
+	}
+}
+
+func mustStoreProfileAt(t *testing.T, ctx context.Context, runtime *groupRuntime, session *groupSession, identity *keystore.Identity, member entmoot.NodeInfo, gid entmoot.GroupID, p profile.Profile, timestampMS int64) entmoot.Message {
+	t.Helper()
+	content, err := profile.Encode(p)
+	if err != nil {
+		t.Fatalf("profile.Encode: %v", err)
+	}
+	head := session.group.Canonical().ID
+	message := entmoot.Message{
+		Version: 2, GroupID: gid, Author: member, Timestamp: timestampMS,
+		Topics: []string{profile.Topic}, Content: content, RosterHead: &head,
+	}
+	signer, err := signing.NewLocalSigner(member, identity)
+	if err != nil {
+		t.Fatalf("NewLocalSigner: %v", err)
+	}
+	signed, err := signing.SignMessage(ctx, signer, message)
+	if err != nil {
+		t.Fatalf("SignMessage: %v", err)
+	}
+	// History sync inserts straight into the store, bypassing the live path;
+	// that is exactly the case reconciliation has to cover.
+	if _, err := runtime.store.Put(ctx, gid, signed); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	return signed
+}

@@ -122,7 +122,7 @@ func (t MsgType) String() string {
 
 // PublishReq is the request body a client sends to author a message in a
 // group. GroupID is optional: a nil GroupID means "auto-pick if exactly
-// one group is joined" (CLI_DESIGN §3: publish -group is optional when
+// one group is joined" (publish -group is optional when
 // there's only one choice). The daemon resolves GroupID before signing.
 type PublishReq struct {
 	// GroupID names the target group. nil means "auto-pick the single
@@ -130,7 +130,7 @@ type PublishReq struct {
 	// would be ambiguous.
 	GroupID *entmoot.GroupID `json:"group_id,omitempty"`
 	// Topics are MQTT-style hierarchical topic strings. A single message
-	// can carry multiple topics (CLI_DESIGN §9 decision #4).
+	// can carry multiple topics.
 	Topics []string `json:"topics"`
 	// Content is opaque application bytes. encoding/json base64s it.
 	Content []byte `json:"content"`

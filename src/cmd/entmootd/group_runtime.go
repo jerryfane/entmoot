@@ -991,10 +991,17 @@ func (r *groupRuntime) observeMemberProfile(ctx context.Context, groupID entmoot
 	}
 }
 
-// maxProfilesReconciledPerCatchUp bounds the work one catch-up does. A group
-// has one current profile per member, so the newest few on the topic cover
-// every name worth learning; anything older has already been superseded.
-const maxProfilesReconciledPerCatchUp = 256
+// profileReconcilePageSize and maxProfileReconcilePages bound the work one
+// catch-up does. The bound is pages of messages, but the STOP condition is
+// per member: reconciliation walks back until it has the newest profile for
+// every current member, so a member republishing on the topic cannot crowd
+// another member's name out of the window. Counting messages alone was the
+// defect — 256 recent messages from one prolific or hostile member starved
+// everyone else's name out of catch-up entirely.
+const (
+	profileReconcilePageSize = 256
+	maxProfileReconcilePages = 16
+)
 
 // reconcileProfilesFromHistory observes profiles that arrived by history sync.
 // Ordering is by the author's issue time, so re-observing a message already
@@ -1003,14 +1010,59 @@ func (r *groupRuntime) reconcileProfilesFromHistory(ctx context.Context, session
 	if r.profiles == nil {
 		return
 	}
-	messages, err := r.store.LatestByTopic(ctx, session.groupID, profile.Topic, maxProfilesReconciledPerCatchUp)
-	if err != nil {
-		r.logger.Warn("member profiles not reconciled from history",
-			slog.String("group_id", session.groupID.String()),
-			slog.String("err", err.Error()))
+	wanted := make(map[entmoot.MemberID]struct{})
+	for _, memberID := range session.group.MemberIDs() {
+		wanted[memberID] = struct{}{}
+	}
+	if len(wanted) == 0 {
 		return
 	}
-	for _, message := range messages {
-		r.observeMemberProfile(ctx, session.groupID, message)
+	var boundary *store.PageBoundary
+	for page := 0; page < maxProfileReconcilePages && len(wanted) > 0; page++ {
+		messages, err := r.store.LatestByTopicBefore(ctx, session.groupID, profile.Topic, profileReconcilePageSize, boundary)
+		if err != nil {
+			r.logger.Warn("member profiles not reconciled from history",
+				slog.String("group_id", session.groupID.String()),
+				slog.String("err", err.Error()))
+			return
+		}
+		if len(messages) == 0 {
+			return
+		}
+		for _, message := range messages {
+			if message.Author.MemberID == nil {
+				continue
+			}
+			// Only the newest profile per member matters: an older one from the
+			// same member would lose the ordering comparison anyway.
+			if _, ok := wanted[*message.Author.MemberID]; !ok {
+				continue
+			}
+			delete(wanted, *message.Author.MemberID)
+			r.observeMemberProfile(ctx, session.groupID, message)
+		}
+		last := messages[len(messages)-1]
+		boundary = &store.PageBoundary{
+			TimestampMS:    last.Timestamp,
+			AuthorMemberID: profileMessageAuthor(last),
+			MessageID:      last.ID,
+		}
 	}
+	if len(wanted) > 0 {
+		// Not an error: the remaining members may simply never have published
+		// a name. It is logged because the alternative reading — a topic so
+		// busy that the walk ran out of pages — is worth seeing.
+		r.logger.Debug("member profile reconciliation stopped early",
+			slog.String("group_id", session.groupID.String()),
+			slog.Int("members_without_profile", len(wanted)))
+	}
+}
+
+// profileMessageAuthor is the member id a page boundary needs, zero when the
+// message predates member ids.
+func profileMessageAuthor(message entmoot.Message) entmoot.MemberID {
+	if message.Author.MemberID == nil {
+		return entmoot.MemberID{}
+	}
+	return *message.Author.MemberID
 }

@@ -75,3 +75,103 @@ func mustOpenTestStateStore(t *testing.T) StateStore {
 	t.Cleanup(func() { _ = state.Close() })
 	return state
 }
+
+// TestEqualIssueTimesResolveTheSameWayInEveryStore pins the tie-break. Two
+// nodes that see the same profile and withdrawal in opposite orders must end
+// up with the same name, or they disagree indefinitely — which is the whole
+// point of ordering by the author's clock rather than by arrival.
+func TestEqualIssueTimesResolveTheSameWayInEveryStore(t *testing.T) {
+	ctx := context.Background()
+	gid := testGroupID(4)
+	memberID := testMemberID(11)
+	const pubkey = "dGVzdC1wdWJrZXk="
+
+	for _, tc := range []struct{ name string }{{name: "memory"}, {name: "sqlite"}} {
+		t.Run(tc.name, func(t *testing.T) {
+			newStore := func() StateStore {
+				if tc.name == "memory" {
+					return NewMemoryStateStore()
+				}
+				return mustOpenTestStateStore(t)
+			}
+			at := time.Now().UnixMilli()
+
+			// Profile first, then the withdrawal at the same millisecond.
+			a := newStore()
+			if err := ObserveMemberProfileNodeProfile(ctx, a, gid, memberID, pubkey, "pi-burj", at, at+3_600_000); err != nil {
+				t.Fatalf("observe: %v", err)
+			}
+			if err := WithdrawMemberProfileNodeProfile(ctx, a, gid, memberID, pubkey, at); err != nil {
+				t.Fatalf("withdraw: %v", err)
+			}
+			_, okA, err := a.GetNodeProfile(ctx, memberID)
+			if err != nil {
+				t.Fatalf("get: %v", err)
+			}
+
+			// The opposite arrival order.
+			b := newStore()
+			if err := WithdrawMemberProfileNodeProfile(ctx, b, gid, memberID, pubkey, at); err != nil {
+				t.Fatalf("withdraw: %v", err)
+			}
+			if err := ObserveMemberProfileNodeProfile(ctx, b, gid, memberID, pubkey, "pi-burj", at, at+3_600_000); err != nil {
+				t.Fatalf("observe: %v", err)
+			}
+			_, okB, err := b.GetNodeProfile(ctx, memberID)
+			if err != nil {
+				t.Fatalf("get: %v", err)
+			}
+
+			if okA != okB {
+				t.Fatalf("arrival order changed the outcome: profile-first visible=%v, withdrawal-first visible=%v", okA, okB)
+			}
+			if okA {
+				t.Fatal("a withdrawal issued in the same millisecond lost to the profile; the tie must favour withdrawal")
+			}
+		})
+	}
+}
+
+// TestEqualIssueTimesBetweenTwoProfilesAreDeterministic covers the other tie:
+// two names at the same millisecond must resolve by a rule every node computes
+// identically, not by which arrived first.
+func TestEqualIssueTimesBetweenTwoProfilesAreDeterministic(t *testing.T) {
+	ctx := context.Background()
+	gid := testGroupID(5)
+	memberID := testMemberID(12)
+	const pubkey = "dGVzdC1wdWJrZXk="
+	at := time.Now().UnixMilli()
+
+	outcome := func(first, second string, state StateStore) string {
+		if err := ObserveMemberProfileNodeProfile(ctx, state, gid, memberID, pubkey, first, at, at+3_600_000); err != nil {
+			t.Fatalf("observe %q: %v", first, err)
+		}
+		if err := ObserveMemberProfileNodeProfile(ctx, state, gid, memberID, pubkey, second, at, at+3_600_000); err != nil {
+			t.Fatalf("observe %q: %v", second, err)
+		}
+		rec, ok, err := state.GetNodeProfile(ctx, memberID)
+		if err != nil || !ok {
+			t.Fatalf("get: ok=%v err=%v", ok, err)
+		}
+		return rec.Hostname
+	}
+
+	for _, store := range []struct {
+		name string
+		make func() StateStore
+	}{
+		{name: "memory", make: func() StateStore { return NewMemoryStateStore() }},
+		{name: "sqlite", make: func() StateStore { return mustOpenTestStateStore(t) }},
+	} {
+		t.Run(store.name, func(t *testing.T) {
+			forward := outcome("alpha", "beta", store.make())
+			reverse := outcome("beta", "alpha", store.make())
+			if forward != reverse {
+				t.Fatalf("arrival order decided the name: %q vs %q", forward, reverse)
+			}
+			if forward != "alpha" {
+				t.Fatalf("tie resolved to %q, want the lower hostname", forward)
+			}
+		})
+	}
+}
