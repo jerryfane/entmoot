@@ -71,6 +71,16 @@ func TestDisplayNameRules(t *testing.T) {
 		{name: "newline refused", input: "burj\nadmin", wantErr: true},
 		{name: "carriage return refused", input: "burj\radmin", wantErr: true},
 		{name: "control char refused", input: "burj\x07", wantErr: true},
+		// A name is displayed as name#MemberID, a bare concatenation, so a
+		// name must not be able to reach past its own field.
+		{name: "bidi override refused", input: "rev\u202Eevil", wantErr: true},
+		{name: "right-to-left mark refused", input: "burj\u200F", wantErr: true},
+		{name: "zero width space refused", input: "bu\u200Brj", wantErr: true},
+		{name: "byte order mark refused", input: "\uFEFFburj", wantErr: true},
+		{name: "line separator refused", input: "a\u2028b", wantErr: true},
+		{name: "paragraph separator refused", input: "a\u2029b", wantErr: true},
+		{name: "hash refused", input: "pi-burj#AAAA", wantErr: true},
+		{name: "byte cap refused", input: strings.Repeat("\U0001F6F0", 64), wantErr: true},
 		{name: "at the limit", input: strings.Repeat("ф", MaxDisplayNameLength), want: strings.Repeat("ф", MaxDisplayNameLength)},
 		{name: "over the limit", input: strings.Repeat("ф", MaxDisplayNameLength+1), wantErr: true},
 	} {

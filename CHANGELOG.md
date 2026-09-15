@@ -262,6 +262,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `name#MemberID`, so choosing somebody else's name cannot impersonate them,
   and a payload carrying a name on any other topic is ignored.
 
+  Because that display form is a bare concatenation, a name may not contain
+  `#`, a control character, a Unicode format character (which includes the
+  bidi overrides that would reverse the appended MemberID) or a line or
+  paragraph separator. Names are limited to 64 runes and 255 bytes; the byte
+  limit matches the store's own cap, so a name that would be silently dropped
+  is refused at publish time instead of being reported as published.
+
+  Ordering is by the time a node receives a profile, never by the timestamp
+  inside the payload: a single message dated in the future would otherwise pin
+  a member's name permanently, since a record is only replaced by a strictly
+  newer observation. The author's expiry is honoured when it is shorter than 90
+  days and clamped when it is longer, so one message cannot keep a name alive
+  indefinitely.
+
 
 - **Delegated admins.** A founder can now name delegated admins with
   `roster admin grant|revoke|list`, carried as a founder-signed
@@ -370,8 +384,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and described a linear roster chain that two signers could fork — all removed
   by membership v3. Corrected: the founder command list, the data-root layout
   (which named a `conversion-*` glob matching neither the journal nor the lock,
-  and omitted `esp-devices.json`, `group-policies.json`, `default_moot.json`
-  and `bootstrap-admission.db`), the fork section, and the invite section's
+  and omitted `esp-devices.json`, `default_moot.json`, `relays.json`,
+  `bootstrap-admission.db` and the `policies/` directory that actually holds
+  `group-policies.json`), the fork section, and the invite section's
   account of how a join is refused. The exit-code table is unchanged.
 
   Seven files under `pkg/entmoot/ipc` and `pkg/entmoot/store` cite this doc by

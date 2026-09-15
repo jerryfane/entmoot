@@ -30,6 +30,12 @@ import (
 	libp2ptransport "entmoot/pkg/entmoot/transport/libp2p"
 )
 
+// maxProfileLifetimeMS bounds how long one published name stays current
+// without being republished. The author's own expiry is honoured when it is
+// shorter; a longer or missing one is clamped to this, so a single message
+// cannot keep a name alive indefinitely.
+const maxProfileLifetimeMS = int64(90 * 24 * 60 * 60 * 1000)
+
 var (
 	errLocalGroupNotMember        = errors.New("local identity is not a current group member")
 	errLocalGroupIdentityMismatch = errors.New("local identity does not match group roster member")
@@ -926,15 +932,40 @@ func (r *groupRuntime) observeMemberProfile(ctx context.Context, groupID entmoot
 		}
 		return
 	}
-	// The author's own timestamp orders profiles from the same member; the
-	// store keeps the newest. It is not trusted for anything else.
-	observedAt := parsed.IssuedAtMS
-	if observedAt <= 0 {
-		observedAt = message.Timestamp
+	// Order by when this node received the profile, never by a timestamp
+	// inside the payload. The payload's clock is the author's claim: a single
+	// message dated far in the future would otherwise pin a member's name
+	// forever, because the store only replaces a record with a strictly newer
+	// observation, so every later honest update would be silently discarded.
+	// A replay of that one message would do the same on every node that saw
+	// it. Receipt time makes the newest thing this node actually saw win.
+	observedAt := time.Now().UnixMilli()
+
+	// An empty name withdraws the published one. That has to be a delete: an
+	// empty hostname is not a storable record, so observing one would leave
+	// the previous name in place and every reader would keep serving it.
+	if parsed.DisplayName == "" {
+		if err := esphttp.WithdrawMemberProfileNodeProfile(ctx, r.profiles, groupID,
+			*message.Author.MemberID, encodeBase64(message.Author.EntmootPubKey)); err != nil {
+			r.logger.Warn("member profile not withdrawn",
+				slog.String("group_id", groupID.String()),
+				slog.String("member_id", message.Author.MemberID.String()),
+				slog.String("err", err.Error()))
+		}
+		return
 	}
+
+	// Bound how long one message can keep a name alive, for the same reason:
+	// the expiry is the author's claim too.
+	expiresAt := parsed.ExpiresAtMS
+	maxExpiry := observedAt + maxProfileLifetimeMS
+	if expiresAt <= 0 || expiresAt > maxExpiry {
+		expiresAt = maxExpiry
+	}
+
 	if err := esphttp.ObserveMemberProfileNodeProfile(ctx, r.profiles, groupID,
 		*message.Author.MemberID, encodeBase64(message.Author.EntmootPubKey),
-		parsed.DisplayName, observedAt, parsed.ExpiresAtMS); err != nil {
+		parsed.DisplayName, observedAt, expiresAt); err != nil {
 		r.logger.Warn("member profile not recorded",
 			slog.String("group_id", groupID.String()),
 			slog.String("member_id", message.Author.MemberID.String()),
