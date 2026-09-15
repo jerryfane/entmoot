@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -501,9 +502,14 @@ func TestReconciliationLetsTheStoreOrderAMillisecondTie(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
 		clearOffset int64
+		clearIssue  int64
 	}{
-		{name: "same_millisecond", clearOffset: 0},
-		{name: "clear_message_older_issue_newer", clearOffset: -1000},
+		{name: "same_millisecond", clearOffset: 0, clearIssue: 1},
+		{name: "clear_message_older_issue_newer", clearOffset: -1000, clearIssue: 1},
+		// Equal issue times: nothing but the store's tombstone rule can
+		// decide this, so a ranking that compares issue times alone picks by
+		// encounter order and the retracted name comes back.
+		{name: "equal_issue_times", clearOffset: -1000, clearIssue: 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
@@ -534,7 +540,7 @@ func TestReconciliationLetsTheStoreOrderAMillisecondTie(t *testing.T) {
 			// The withdrawal: issued strictly later, but its MESSAGE may carry
 			// the same or an older timestamp, which is what broke selection.
 			mustStoreProfileAt(t, ctx, runtime, session, founder, founderInfo, gid,
-				profile.Profile{DisplayName: "", IssuedAtMS: at + 1}, at+tc.clearOffset)
+				profile.Profile{DisplayName: "", IssuedAtMS: at + tc.clearIssue}, at+tc.clearOffset)
 
 			runtime.reconcileProfilesFromHistory(ctx, session)
 
@@ -542,5 +548,53 @@ func TestReconciliationLetsTheStoreOrderAMillisecondTie(t *testing.T) {
 				t.Fatalf("display name = %q, want the fallback: the withdrawal was issued later", got)
 			}
 		})
+	}
+}
+
+// TestReconciliationFindsARetractionADeeperPageAway is the defect that
+// survived observing every message in a page: the member was dropped from the
+// walk as soon as ANY of its messages appeared, so a withdrawal sitting one
+// page deeper — older by message timestamp, NEWER by issue time — was never
+// read. Message order and issue order are independent, so the walk cannot use
+// the message key to decide it is finished with a member.
+func TestReconciliationFindsARetractionADeeperPageAway(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	root := t.TempDir()
+	founder, founderInfo := mustDaemonIdentity(t)
+	var gid entmoot.GroupID
+	if _, err := rand.Read(gid[:]); err != nil {
+		t.Fatal(err)
+	}
+	policy := membership.DefaultPolicy()
+	policy.JoinRule = membership.JoinRuleOpen
+	mustCreateGroup(t, root, gid, founder, policy)
+
+	state, err := esphttp.OpenSQLiteStateStore(root)
+	if err != nil {
+		t.Fatalf("OpenSQLiteStateStore: %v", err)
+	}
+	defer state.Close()
+	runtime, session, host := startTestRuntimeWithProfiles(t, ctx, root, founder, gid, state)
+	defer host.Close()
+	defer runtime.Close()
+
+	base := time.Now().Add(-2 * time.Hour).UnixMilli()
+	// Oldest by message timestamp, newest by issue time: the retraction.
+	mustStoreProfileAt(t, ctx, runtime, session, founder, founderInfo, gid,
+		profile.Profile{DisplayName: "", IssuedAtMS: base + 100_000}, base)
+	// A page and a half of unrelated traffic between the two.
+	for i := 0; i < profileReconcilePageSize+44; i++ {
+		mustStoreProfileAt(t, ctx, runtime, session, founder, founderInfo, gid,
+			profile.Profile{DisplayName: fmt.Sprintf("noise-%d", i), IssuedAtMS: base + 1_000}, base+int64(1_000+i))
+	}
+	// Newest by message timestamp, older by issue time: the superseded name.
+	mustStoreProfileAt(t, ctx, runtime, session, founder, founderInfo, gid,
+		profile.Profile{DisplayName: "retracted", IssuedAtMS: base + 2_000}, base+5_000_000)
+
+	runtime.reconcileProfilesFromHistory(ctx, session)
+
+	if got := mustDisplayName(t, ctx, state, root, gid, *founderInfo.MemberID); got != "member-"+founderInfo.MemberID.String() {
+		t.Fatalf("display name = %q, want the fallback: the withdrawal has the newest issue time in the window", got)
 	}
 }

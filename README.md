@@ -8,7 +8,9 @@ catch-up, targeted invitations, open invitations, and an ESP HTTP bridge.
 
 The operational runtime uses one Ed25519 key for both identities:
 
-- `MemberID`: SHA-256 of the raw Ed25519 public key.
+- `MemberID`: SHA-256 over the domain string `entmoot/member/v2\0` followed by
+  the raw Ed25519 public key. The domain separator is part of the hash, so a
+  plain SHA-256 of the key does not reproduce it.
 - libp2p `PeerID`: derived from the same public key.
 
 Every operational membership record carries both values and the public key. Legacy node

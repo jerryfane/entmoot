@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -111,24 +112,47 @@ const WithdrawnNodeProfileHostname = "-"
 // group by recording a tombstone at the withdrawal's own issue time. Ordering
 // is by that time, so a profile issued earlier cannot undo it however late it
 // arrives.
+// MemberProfileRecord is the record a published profile becomes. An empty
+// displayName is a withdrawal, stored as a tombstone: ObservedAtMS carries the
+// withdrawal's own issue time, which is what orders it against profiles, and
+// the expiry is a fixed point in the past so the tombstone is expired for
+// every reader's clock, however far ahead or behind. Using the issue time as
+// the expiry would leave a withdrawal briefly unexpired and the placeholder
+// briefly visible.
+//
+// Everything that publishes, withdraws or ranks a member profile builds the
+// record here, so there is one mapping from a claim to a stored row.
+func MemberProfileRecord(groupID entmoot.GroupID, memberID entmoot.MemberID, publicKey, displayName string, issuedAtMS, expiresAtMS int64) NodeProfileRecord {
+	rec := NodeProfileRecord{
+		MemberID:      memberID,
+		EntmootPubKey: strings.TrimSpace(publicKey),
+		Hostname:      displayName,
+		Source:        NodeProfileSourceMemberProfile,
+		ObservedAtMS:  issuedAtMS,
+		ExpiresAtMS:   expiresAtMS,
+		SourceGroupID: &groupID,
+	}
+	if displayName == "" {
+		rec.Hostname = WithdrawnNodeProfileHostname
+		rec.ExpiresAtMS = 1
+	}
+	return rec
+}
+
+// BetterMemberProfileRecord reports whether a would replace b. It is the same
+// comparison every StateStore applies on upsert, exported so a caller holding
+// several claims for one member picks the winner without inventing a second
+// ordering rule — which is exactly the defect that made history catch-up
+// re-show retracted names.
+func BetterMemberProfileRecord(a, b NodeProfileRecord) bool {
+	return shouldReplaceNodeProfile(b, a)
+}
+
 func WithdrawMemberProfileNodeProfile(ctx context.Context, state StateStore, groupID entmoot.GroupID, memberID entmoot.MemberID, publicKey string, issuedAtMS int64) error {
 	if state == nil || memberID == (entmoot.MemberID{}) {
 		return nil
 	}
-	_, _, err := state.UpsertNodeProfile(ctx, NodeProfileRecord{
-		MemberID:      memberID,
-		EntmootPubKey: strings.TrimSpace(publicKey),
-		Hostname:      WithdrawnNodeProfileHostname,
-		Source:        NodeProfileSourceMemberProfile,
-		// ObservedAtMS carries the withdrawal's own issue time, which is what
-		// orders it against profiles; the expiry is a fixed point in the past
-		// so the tombstone is expired for every reader's clock, however far
-		// ahead or behind. Using the issue time here would leave a withdrawal
-		// briefly unexpired and the placeholder briefly visible.
-		ObservedAtMS:  issuedAtMS,
-		ExpiresAtMS:   1,
-		SourceGroupID: &groupID,
-	})
+	_, _, err := state.UpsertNodeProfile(ctx, MemberProfileRecord(groupID, memberID, publicKey, "", issuedAtMS, 0))
 	return err
 }
 
@@ -139,7 +163,7 @@ func ObserveMemberProfileNodeProfile(ctx context.Context, state StateStore, grou
 	if _, ok := NormalizeNodeProfileHostname(hostname); !ok {
 		return nil
 	}
-	_, _, err := state.UpsertNodeProfile(ctx, NodeProfileRecord{MemberID: memberID, EntmootPubKey: strings.TrimSpace(publicKey), Hostname: hostname, Source: NodeProfileSourceMemberProfile, ObservedAtMS: observedAtMS, ExpiresAtMS: expiresAtMS, SourceGroupID: &groupID})
+	_, _, err := state.UpsertNodeProfile(ctx, MemberProfileRecord(groupID, memberID, publicKey, hostname, observedAtMS, expiresAtMS))
 	return err
 }
 
@@ -174,24 +198,28 @@ func normalizeNodeProfileRecord(rec NodeProfileRecord, nowMS int64) (NodeProfile
 	return rec, true, nil
 }
 
+// nodeProfileExpiryRank orders expiries with 0 meaning "never expires", so it
+// sorts above every finite one.
+func nodeProfileExpiryRank(rec NodeProfileRecord) int64 {
+	if rec.ExpiresAtMS <= 0 {
+		return math.MaxInt64
+	}
+	return rec.ExpiresAtMS
+}
+
 func nodeProfileExpired(rec NodeProfileRecord, nowMS int64) bool {
 	return rec.ExpiresAtMS > 0 && rec.ExpiresAtMS <= nowMS
 }
 
 // isWithdrawalRecord reports the tombstone a withdrawal writes. It is stored
-// permanently expired, so it must not take the expired-record bypass: the
-// bypass exists so a stale observation is replaced by anything fresher, while
-// a withdrawal has to keep losing to nothing but a later issue time.
-//
-// Both stores implement the bypass and both exempt the tombstone — the SQLite
-// clause below mirrors shouldReplaceNodeProfile clause for clause. For a while
-// only this path had it, so an expired observation blocked a fresher
-// lower-confidence one in production while memory accepted it.
+// permanently expired, so the expiry clause in the tie-break must not judge
+// it: a withdrawal loses to nothing but a later issue time. The tombstone has
+// its own clause, ahead of the expiry one.
 func isWithdrawalRecord(rec NodeProfileRecord) bool {
 	return rec.Source == NodeProfileSourceMemberProfile && rec.Hostname == WithdrawnNodeProfileHostname
 }
 
-func shouldReplaceNodeProfile(existing, incoming NodeProfileRecord, nowMS int64) bool {
+func shouldReplaceNodeProfile(existing, incoming NodeProfileRecord) bool {
 	if existing.MemberID == (entmoot.MemberID{}) {
 		return true
 	}
@@ -207,18 +235,19 @@ func shouldReplaceNodeProfile(existing, incoming NodeProfileRecord, nowMS int64)
 	// same whichever arrived first.
 	//
 	// A withdrawal wins first — the safe direction, since the alternative is
-	// showing a name its owner asked to retract. Then a record whose expiry
-	// has passed loses to one whose has not, so an exact tie prefers the
-	// usable record; this is where expiry belongs. Applying expiry BEFORE the
-	// comparison instead made the branch asymmetric, because an expired
-	// incoming record could win the hostname tie-break outright. Hostname
-	// order settles the rest, and is a total order every node computes the
-	// same way.
+	// showing a name its owner asked to retract. Then the longer-lived claim
+	// wins, which is the clock-free way to prefer the usable record: asking
+	// whether a record is expired RIGHT NOW made the stored winner depend on
+	// when the loser arrived, so two nodes holding the same two claims could
+	// disagree until the nearer expiry passed. Comparing the expiries decides
+	// the same cases without consulting any clock. Hostname order settles the
+	// rest; every clause is a total order, so the winner is the maximum of a
+	// total order and arrival cannot change it.
 	if isWithdrawalRecord(incoming) != isWithdrawalRecord(existing) {
 		return isWithdrawalRecord(incoming)
 	}
-	if stale := nodeProfileExpired(existing, nowMS); stale != nodeProfileExpired(incoming, nowMS) {
-		return stale
+	if incoming.ExpiresAtMS != existing.ExpiresAtMS {
+		return nodeProfileExpiryRank(incoming) > nodeProfileExpiryRank(existing)
 	}
 	return incoming.Hostname < existing.Hostname
 }
@@ -246,7 +275,7 @@ func bestNodeProfile(records map[string]NodeProfileRecord, nowMS int64, groupID 
 				continue
 			}
 		}
-		if shouldReplaceNodeProfile(best, rec, nowMS) {
+		if shouldReplaceNodeProfile(best, rec) {
 			best = rec
 		}
 	}
@@ -264,7 +293,7 @@ func (s *MemoryStateStore) upsertNodeProfileLocked(rec NodeProfileRecord, nowMS 
 		s.nodeProfiles[rec.MemberID] = records
 	}
 	key := nodeProfileSourceKey(rec)
-	if existing := records[key]; existing.MemberID != (entmoot.MemberID{}) && !shouldReplaceNodeProfile(existing, rec, nowMS) {
+	if existing := records[key]; existing.MemberID != (entmoot.MemberID{}) && !shouldReplaceNodeProfile(existing, rec) {
 		return cloneNodeProfileRecord(existing), false, nil
 	}
 	records[key] = cloneNodeProfileRecord(rec)
@@ -318,13 +347,13 @@ func (s *SQLiteStateStore) UpsertNodeProfile(ctx context.Context, rec NodeProfil
 		sourceGroup = rec.SourceGroupID[:]
 	}
 	// The predicates below mirror shouldReplaceNodeProfile clause for clause.
-	stale := func(table string) string {
-		return "(" + table + ".expires_at_ms > 0 AND " + table + ".expires_at_ms <= :now)"
+	expiryRank := func(table string) string {
+		return "(CASE WHEN " + table + ".expires_at_ms <= 0 THEN 9223372036854775807 ELSE " + table + ".expires_at_ms END)"
 	}
 	tombstone := func(table string) string {
 		return "(" + table + ".source = :member_profile AND " + table + ".hostname = :tombstone)"
 	}
-	existingStale, incomingStale := stale("esp_node_profile_sources"), stale("excluded")
+	existingExpiryRank, incomingExpiryRank := expiryRank("esp_node_profile_sources"), expiryRank("excluded")
 	existingTombstone, incomingTombstone := tombstone("esp_node_profile_sources"), tombstone("excluded")
 	_, err = s.db.ExecContext(ctx, `INSERT INTO esp_node_profile_sources
 			(member_id, entmoot_pubkey, source, source_key, hostname, confidence, observed_at_ms, expires_at_ms, source_group_id)
@@ -338,7 +367,8 @@ func (s *SQLiteStateStore) UpsertNodeProfile(ctx context.Context, rec NodeProfil
 				OR (excluded.confidence = esp_node_profile_sources.confidence AND excluded.observed_at_ms = esp_node_profile_sources.observed_at_ms
 					AND (CASE
 						WHEN `+incomingTombstone+` <> `+existingTombstone+` THEN `+incomingTombstone+`
-						WHEN `+incomingStale+` <> `+existingStale+` THEN `+existingStale+`
+						WHEN excluded.expires_at_ms <> esp_node_profile_sources.expires_at_ms
+							THEN `+incomingExpiryRank+` > `+existingExpiryRank+`
 						ELSE excluded.hostname < esp_node_profile_sources.hostname END))`,
 		sql.Named("member_id", rec.MemberID[:]),
 		sql.Named("pubkey", rec.EntmootPubKey),

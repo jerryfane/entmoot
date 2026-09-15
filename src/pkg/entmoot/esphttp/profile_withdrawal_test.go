@@ -179,10 +179,11 @@ func TestEqualIssueTimesBetweenTwoProfilesAreDeterministic(t *testing.T) {
 	}
 }
 
-// TestExpiredRecordsAreReplacedIdenticallyInEveryStore covers the branch that
-// runs before the tie-break: an expired observation must be replaceable by a
-// fresher one in both stores, and the withdrawal tombstone — which is stored
-// permanently expired on purpose — must not be.
+// TestExpiredRecordsAreReplacedIdenticallyInEveryStore covers the expiry
+// clause of the tie-break in both stores: at an exact tie the longer-lived
+// claim wins, so a short-lived observation gives way to a fresher one, while
+// the withdrawal tombstone — stored permanently expired on purpose — is
+// ordered by the tombstone clause ahead of it and holds.
 func TestExpiredRecordsAreReplacedIdenticallyInEveryStore(t *testing.T) {
 	ctx := context.Background()
 	gid := testGroupID(6)
@@ -225,7 +226,7 @@ func TestExpiredRecordsAreReplacedIdenticallyInEveryStore(t *testing.T) {
 		}
 	})
 
-	t.Run("withdrawal tombstone is not bypassed", func(t *testing.T) {
+	t.Run("withdrawal tombstone still wins", func(t *testing.T) {
 		at := time.Now().UnixMilli()
 		var results []bool
 		for _, s := range stores {
@@ -249,7 +250,7 @@ func TestExpiredRecordsAreReplacedIdenticallyInEveryStore(t *testing.T) {
 			t.Fatalf("stores disagree about the tombstone: memory visible=%v, sqlite visible=%v", results[0], results[1])
 		}
 		if results[0] {
-			t.Fatal("an older profile resurrected a withdrawn name through the expired bypass")
+			t.Fatal("an older profile resurrected a withdrawn name")
 		}
 	})
 }
@@ -258,8 +259,9 @@ func TestExpiredRecordsAreReplacedIdenticallyInEveryStore(t *testing.T) {
 // pair of record kinds against both stores. Two properties must hold for
 // convergence: the outcome must not depend on which record arrived first, and
 // the two stores must agree. Every earlier defect in this area — the
-// receipt-time ordering, the memory-only expired bypass, the expiry applied
-// before the comparison instead of inside the tie-break — shows up as a
+// receipt-time ordering, the memory-only expiry bypass, the expiry applied
+// before the comparison instead of inside the tie-break, the clock consulted
+// at write time — shows up as a
 // failure of one of the two.
 func TestProfileReplacementIsATotalOrderInEveryStore(t *testing.T) {
 	ctx := context.Background()
@@ -362,4 +364,52 @@ func TestProfileReplacementIsATotalOrderInEveryStore(t *testing.T) {
 		t.Fatalf("enumerated %d pairs, want %d", pairs, len(candidates)*(len(candidates)-1))
 	}
 	t.Logf("%d ordered pairs, %d order-dependent, %d divergent", pairs, orderDependent, divergent)
+}
+
+// TestStoredWinnerDoesNotDependOnWhenItWasIngested pins that the comparison is
+// clock-free. It used to ask "is the stored record expired right now", and the
+// loser of a comparison is discarded rather than kept — so two nodes holding
+// the same two claims stored different winners depending on whether the second
+// arrived before or after the first expired, and disagreed until the nearer
+// expiry passed. The claims below have equal confidence and equal issue times
+// and differ only in expiry, which is the pair that exposed it.
+func TestStoredWinnerDoesNotDependOnWhenItWasIngested(t *testing.T) {
+	ctx := context.Background()
+	gid := testGroupID(8)
+	const pubkey = "dGVzdC1wdWJrZXk="
+	at := int64(1_700_000_000_000)
+
+	shortLived := MemberProfileRecord(gid, testMemberID(31), pubkey, "aaa", at, at+2_000)
+	longLived := MemberProfileRecord(gid, testMemberID(31), pubkey, "zzz", at, at+3_600_000)
+
+	ingest := func(clockAtSecond int64, first, second NodeProfileRecord) string {
+		state := NewMemoryStateStore()
+		state.clock = func() time.Time { return time.UnixMilli(at + clockAtSecond*1000) }
+		if _, _, err := state.UpsertNodeProfile(ctx, first); err != nil {
+			t.Fatalf("upsert first: %v", err)
+		}
+		if _, _, err := state.UpsertNodeProfile(ctx, second); err != nil {
+			t.Fatalf("upsert second: %v", err)
+		}
+		rec, ok, err := state.GetNodeProfile(ctx, first.MemberID)
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		if !ok {
+			return "<none>"
+		}
+		return rec.Hostname
+	}
+
+	// Node A sees both claims while both are live; node B sees the second only
+	// after the short-lived one has expired. Same claims, same reading instant.
+	nodeA := ingest(0, shortLived, longLived)
+	nodeB := ingest(10, shortLived, longLived)
+	reversed := ingest(10, longLived, shortLived)
+	if nodeA != nodeB || nodeB != reversed {
+		t.Fatalf("stored winner varies with ingest time or order: both-live %q, after-expiry %q, reversed %q", nodeA, nodeB, reversed)
+	}
+	if nodeA != "zzz" {
+		t.Fatalf("stored winner = %q, want the longer-lived claim", nodeA)
+	}
 }
