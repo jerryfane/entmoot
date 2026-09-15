@@ -135,8 +135,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   admitting a member no longer requires the founder or a delegated admin to be
   online and writing. Records (`join`, `leave`, `rekey`, `remove`, `unban`,
   `policy`, `revoke_invite`) merge by one deterministic total order —
-  timestamp, then kind, then id — with joins applied before rekeys, authority
-  records, and leaves. The kind order is a decision, not an accident: a
+  timestamp, then kind, then the founder's record before a delegated admin's,
+  then record id — with joins applied before rekeys, authority records, and
+  leaves. The kind order is a decision, not an accident: a
   removal beats a simultaneous join, and a leave always sticks, because
   admitting someone by mistake is recoverable and failing to remove them is
   not.
@@ -322,8 +323,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   backoff, a newly-downloaded-entry ceiling, paging-snapshot hand-back,
   `short_chain`/`head_only` negotiation, `roster_divergence` reporting and
   `roster repair` — was deleted later in this same unreleased cycle, before
-  any release carried it; the deletion is recorded under Changed and Fixed
-  above, not under Removed. Membership v3 has no
+  any release carried it; the deletion is recorded under Changed above and
+  Fixed below, not under Removed. Membership v3 has no
   fork to detect, adopt or repair: records merge as a set, so a pull is a
   checkpoint plus a cursor and two nodes holding the same records project the
   same membership. None of those commands or status fields exist; `roster

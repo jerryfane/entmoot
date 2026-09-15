@@ -9,8 +9,11 @@
 //
 // Records never conflict in a way that needs repair. Joins are a set union;
 // the small number of records that do carry authority are ordered by one fixed
-// rule (founder first, then timestamp, then id), so every node that holds the
-// same records computes the same membership.
+// rule — timestamp, then kind (join, rekey, authority, leave), then the
+// founder's record before a delegated admin's, then record id — so every node
+// that holds the same records computes the same membership. The kind rank is
+// deliberate: it is what makes a removal beat a join issued in the same
+// instant.
 package membership
 
 import (

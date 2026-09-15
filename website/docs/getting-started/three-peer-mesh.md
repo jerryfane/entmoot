@@ -48,11 +48,21 @@ named in the other's invite.
 No admin signs a join, but the issuing node must be reachable when its invite
 is used: `invite create` refuses any `-bootstrap` that does not end in the
 issuing node's own peer id, so an invite cannot point a newcomer at a different
-member. To admit C while A is stopped, have B — a member with admin authority —
-issue the invite from its own host:
+member. To admit C while A is stopped, B has to issue the invite itself, which
+means A must delegate admin authority to B first — `invite create` exits 2 for
+a member that is neither founder nor delegated admin. Both steps take the
+group's writer lease, so each runs with that node's daemon stopped:
 
 ```sh
-# on B
+# on A, daemon stopped
+entmootd roster admin grant -group <GROUP_ID> -member <B_MEMBER_ID>
+```
+
+Restart A long enough for B to sync the policy record (`entmootd roster status
+-group <GROUP_ID>` on B lists B under `admins`), then stop A and issue from B:
+
+```sh
+# on B, daemon stopped
 entmootd invite create -group <GROUP_ID> -target-pubkey <C_PUBKEY_B64> \
   -bootstrap /ip4/<B_IP>/tcp/1004/p2p/<B_PEER_ID> -valid-for 24h > invite-c.json
 ```

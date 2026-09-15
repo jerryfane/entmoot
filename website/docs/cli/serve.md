@@ -26,11 +26,17 @@ Useful global flags:
 -listen-port 1004
 ```
 
-Without `-group`, every locally joined group with membership state is served —
-a membership store, or the pre-checkpoint roster chain, which is served while
-it awaits its checkpoint 0. A group directory with neither is skipped with the
-warning `serve: skipping group with no membership state`; naming such a group
-with `-group` is an error instead. Run
+Without `-group`, every locally joined group with a membership store is
+served. A group that still holds only the pre-checkpoint roster chain is NOT
+served: on start the daemon tries to adopt a founder-signed checkpoint 0 for
+it and warns `membership adopt: group awaits checkpoint 0 from its founder`
+when no peer offers one (or `membership adopt: no checkpoint yet` when the
+chain itself cannot be read). If no other group qualifies, `serve` then exits
+3 with `serve: no joined groups found`. Adoption is retried on every start and
+on the maintenance tick, so the group begins being served as soon as a peer
+supplies checkpoint 0. A directory with neither store is skipped with the
+warning `serve: skipping group with no membership state`, and naming it with
+`-group` is an error instead. Run
 `entmootd membership upgrade -group <GROUP_ID>` on the founder to mint
 checkpoint 0.
 

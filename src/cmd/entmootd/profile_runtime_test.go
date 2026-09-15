@@ -328,9 +328,11 @@ func mustProfileMessage(t *testing.T, ctx context.Context, session *groupSession
 // TestHistoryReconciliationIsNotStarvedByOneMember pins the bound that matters.
 // The first version counted messages, so one member republishing on the topic
 // pushed every other member's name out of the window and those names were
-// never learned. The walk now bounds messages read rather than members
-// covered: it visits every message of every page in the window and keeps a
-// per-member best, so one member's volume cannot consume another's place.
+// never learned. The walk now visits every message of every page in the
+// window and keeps a per-member best, so a flood SMALLER than the window — as
+// here, three pages and change against a sixteen-page window — cannot crowd
+// another member out. A flood larger than the window still can; that bound is
+// documented where the constants are.
 func TestHistoryReconciliationIsNotStarvedByOneMember(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
