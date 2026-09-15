@@ -198,8 +198,10 @@ func normalizeNodeProfileRecord(rec NodeProfileRecord, nowMS int64) (NodeProfile
 	return rec, true, nil
 }
 
-// nodeProfileExpiryRank orders expiries with 0 meaning "never expires", so it
-// sorts above every finite one.
+// nodeProfileExpiryRank orders expiries with any non-positive value meaning
+// "never expires", so it sorts above every finite one. Callers must compare
+// ranks rather than raw expiries, or two never-expires claims written with
+// different sentinels compare as different lifetimes.
 func nodeProfileExpiryRank(rec NodeProfileRecord) int64 {
 	if rec.ExpiresAtMS <= 0 {
 		return math.MaxInt64
@@ -246,8 +248,12 @@ func shouldReplaceNodeProfile(existing, incoming NodeProfileRecord) bool {
 	if isWithdrawalRecord(incoming) != isWithdrawalRecord(existing) {
 		return isWithdrawalRecord(incoming)
 	}
-	if incoming.ExpiresAtMS != existing.ExpiresAtMS {
-		return nodeProfileExpiryRank(incoming) > nodeProfileExpiryRank(existing)
+	// Compare the RANKS, not the raw expiries: every non-positive value means
+	// never-expires, so 0 and -1 are the same claim about lifetime. Guarding
+	// on the raw values made two such claims mutually non-replacing — the
+	// first one stored won, and the relation was not even transitive.
+	if incomingRank, existingRank := nodeProfileExpiryRank(incoming), nodeProfileExpiryRank(existing); incomingRank != existingRank {
+		return incomingRank > existingRank
 	}
 	return incoming.Hostname < existing.Hostname
 }
@@ -367,7 +373,7 @@ func (s *SQLiteStateStore) UpsertNodeProfile(ctx context.Context, rec NodeProfil
 				OR (excluded.confidence = esp_node_profile_sources.confidence AND excluded.observed_at_ms = esp_node_profile_sources.observed_at_ms
 					AND (CASE
 						WHEN `+incomingTombstone+` <> `+existingTombstone+` THEN `+incomingTombstone+`
-						WHEN excluded.expires_at_ms <> esp_node_profile_sources.expires_at_ms
+						WHEN `+incomingExpiryRank+` <> `+existingExpiryRank+`
 							THEN `+incomingExpiryRank+` > `+existingExpiryRank+`
 						ELSE excluded.hostname < esp_node_profile_sources.hostname END))`,
 		sql.Named("member_id", rec.MemberID[:]),
@@ -379,7 +385,6 @@ func (s *SQLiteStateStore) UpsertNodeProfile(ctx context.Context, rec NodeProfil
 		sql.Named("observed_at", rec.ObservedAtMS),
 		sql.Named("expires_at", rec.ExpiresAtMS),
 		sql.Named("source_group", sourceGroup),
-		sql.Named("now", nowMS),
 		sql.Named("tombstone", WithdrawnNodeProfileHostname),
 		sql.Named("member_profile", NodeProfileSourceMemberProfile),
 	)
