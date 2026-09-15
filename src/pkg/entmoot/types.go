@@ -1,9 +1,11 @@
 // Package entmoot defines the core data model shared by every sub-package:
 // group identifiers, messages, roster entries, invites, and supporting types.
 //
-// All fields carry snake_case JSON tags so wire and on-disk representations
-// match the spec in ARCHITECTURE.md. 32-byte identifier types marshal as
-// base64 strings rather than Go's default array-of-numbers encoding.
+// All fields carry snake_case JSON tags, so the wire form and the on-disk
+// form are the same bytes; pkg/entmoot/canonical encodes these types for
+// signing, so a tag change breaks existing signatures. 32-byte identifier
+// types marshal as base64 strings rather than Go's default
+// array-of-numbers encoding.
 package entmoot
 
 import (

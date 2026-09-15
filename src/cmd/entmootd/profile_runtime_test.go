@@ -489,3 +489,58 @@ func TestReconciliationDoesNotSkipAWithdrawal(t *testing.T) {
 		t.Fatalf("display name = %q, want the fallback: the withdrawal is the newest message", got)
 	}
 }
+
+// TestReconciliationLetsTheStoreOrderAMillisecondTie is the defect selection
+// introduced: the walk ranked messages by (timestamp, author, id) while the
+// store ranks records by issue time, tombstone, hostname. A set and a clear
+// published in the same millisecond have an equal message key, so "the newest
+// message" was whichever id sorted higher — and when that was the profile, the
+// retracted name came back on a history-only node. Observing both and letting
+// the store decide removes the second ordering rule entirely.
+func TestReconciliationLetsTheStoreOrderAMillisecondTie(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		clearOffset int64
+	}{
+		{name: "same_millisecond", clearOffset: 0},
+		{name: "clear_message_older_issue_newer", clearOffset: -1000},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			root := t.TempDir()
+			founder, founderInfo := mustDaemonIdentity(t)
+			var gid entmoot.GroupID
+			if _, err := rand.Read(gid[:]); err != nil {
+				t.Fatal(err)
+			}
+			policy := membership.DefaultPolicy()
+			policy.JoinRule = membership.JoinRuleOpen
+			mustCreateGroup(t, root, gid, founder, policy)
+
+			state, err := esphttp.OpenSQLiteStateStore(root)
+			if err != nil {
+				t.Fatalf("OpenSQLiteStateStore: %v", err)
+			}
+			defer state.Close()
+			runtime, session, host := startTestRuntimeWithProfiles(t, ctx, root, founder, gid, state)
+			defer host.Close()
+			defer runtime.Close()
+
+			at := time.Now().Add(-time.Hour).UnixMilli()
+			// The profile: message timestamp and issue time agree.
+			mustStoreProfileAt(t, ctx, runtime, session, founder, founderInfo, gid,
+				profile.Profile{DisplayName: "retracted", IssuedAtMS: at}, at)
+			// The withdrawal: issued strictly later, but its MESSAGE may carry
+			// the same or an older timestamp, which is what broke selection.
+			mustStoreProfileAt(t, ctx, runtime, session, founder, founderInfo, gid,
+				profile.Profile{DisplayName: "", IssuedAtMS: at + 1}, at+tc.clearOffset)
+
+			runtime.reconcileProfilesFromHistory(ctx, session)
+
+			if got := mustDisplayName(t, ctx, state, root, gid, *founderInfo.MemberID); got != "member-"+founderInfo.MemberID.String() {
+				t.Fatalf("display name = %q, want the fallback: the withdrawal was issued later", got)
+			}
+		})
+	}
+}

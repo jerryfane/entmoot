@@ -195,9 +195,6 @@ func shouldReplaceNodeProfile(existing, incoming NodeProfileRecord, nowMS int64)
 	if existing.MemberID == (entmoot.MemberID{}) {
 		return true
 	}
-	if nodeProfileExpired(existing, nowMS) && !isWithdrawalRecord(existing) {
-		return true
-	}
 	if incoming.Confidence != existing.Confidence {
 		return incoming.Confidence > existing.Confidence
 	}
@@ -206,12 +203,22 @@ func shouldReplaceNodeProfile(existing, incoming NodeProfileRecord, nowMS int64)
 	}
 	// Equal issue times must not resolve by arrival order, or two nodes that
 	// saw the same pair in opposite orders keep different names indefinitely.
-	// A withdrawal wins the tie — the safe direction, since the alternative is
-	// showing a name its owner asked to retract — and two profiles tie-break
-	// on the hostname, which is a total order every node computes the same
-	// way. This only decides a same-millisecond collision.
+	// Everything below is a total order over the pair, so the outcome is the
+	// same whichever arrived first.
+	//
+	// A withdrawal wins first — the safe direction, since the alternative is
+	// showing a name its owner asked to retract. Then a record whose expiry
+	// has passed loses to one whose has not, so an exact tie prefers the
+	// usable record; this is where expiry belongs. Applying expiry BEFORE the
+	// comparison instead made the branch asymmetric, because an expired
+	// incoming record could win the hostname tie-break outright. Hostname
+	// order settles the rest, and is a total order every node computes the
+	// same way.
 	if isWithdrawalRecord(incoming) != isWithdrawalRecord(existing) {
 		return isWithdrawalRecord(incoming)
+	}
+	if stale := nodeProfileExpired(existing, nowMS); stale != nodeProfileExpired(incoming, nowMS) {
+		return stale
 	}
 	return incoming.Hostname < existing.Hostname
 }
@@ -310,8 +317,42 @@ func (s *SQLiteStateStore) UpsertNodeProfile(ctx context.Context, rec NodeProfil
 	if rec.SourceGroupID != nil {
 		sourceGroup = rec.SourceGroupID[:]
 	}
-	_, err = s.db.ExecContext(ctx, `INSERT INTO esp_node_profile_sources (member_id, entmoot_pubkey, source, source_key, hostname, confidence, observed_at_ms, expires_at_ms, source_group_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(member_id, source_key) DO UPDATE SET entmoot_pubkey=excluded.entmoot_pubkey, source=excluded.source, hostname=excluded.hostname, confidence=excluded.confidence, observed_at_ms=excluded.observed_at_ms, expires_at_ms=excluded.expires_at_ms, source_group_id=excluded.source_group_id WHERE (esp_node_profile_sources.expires_at_ms > 0 AND esp_node_profile_sources.expires_at_ms <= ? AND esp_node_profile_sources.hostname <> ?) OR excluded.confidence > esp_node_profile_sources.confidence OR (excluded.confidence = esp_node_profile_sources.confidence AND excluded.observed_at_ms > esp_node_profile_sources.observed_at_ms) OR (excluded.confidence = esp_node_profile_sources.confidence AND excluded.observed_at_ms = esp_node_profile_sources.observed_at_ms AND ((excluded.hostname = '-' AND esp_node_profile_sources.hostname <> '-') OR (((excluded.hostname = '-') = (esp_node_profile_sources.hostname = '-')) AND excluded.hostname < esp_node_profile_sources.hostname)))`, rec.MemberID[:], rec.EntmootPubKey, rec.Source, nodeProfileSourceKey(rec), rec.Hostname, rec.Confidence, rec.ObservedAtMS, rec.ExpiresAtMS, sourceGroup,
-		nowMS, WithdrawnNodeProfileHostname)
+	// The predicates below mirror shouldReplaceNodeProfile clause for clause.
+	stale := func(table string) string {
+		return "(" + table + ".expires_at_ms > 0 AND " + table + ".expires_at_ms <= :now)"
+	}
+	tombstone := func(table string) string {
+		return "(" + table + ".source = :member_profile AND " + table + ".hostname = :tombstone)"
+	}
+	existingStale, incomingStale := stale("esp_node_profile_sources"), stale("excluded")
+	existingTombstone, incomingTombstone := tombstone("esp_node_profile_sources"), tombstone("excluded")
+	_, err = s.db.ExecContext(ctx, `INSERT INTO esp_node_profile_sources
+			(member_id, entmoot_pubkey, source, source_key, hostname, confidence, observed_at_ms, expires_at_ms, source_group_id)
+		VALUES (:member_id, :pubkey, :source, :source_key, :hostname, :confidence, :observed_at, :expires_at, :source_group)
+		ON CONFLICT(member_id, source_key) DO UPDATE SET
+			entmoot_pubkey=excluded.entmoot_pubkey, source=excluded.source, hostname=excluded.hostname,
+			confidence=excluded.confidence, observed_at_ms=excluded.observed_at_ms,
+			expires_at_ms=excluded.expires_at_ms, source_group_id=excluded.source_group_id
+		WHERE excluded.confidence > esp_node_profile_sources.confidence
+				OR (excluded.confidence = esp_node_profile_sources.confidence AND excluded.observed_at_ms > esp_node_profile_sources.observed_at_ms)
+				OR (excluded.confidence = esp_node_profile_sources.confidence AND excluded.observed_at_ms = esp_node_profile_sources.observed_at_ms
+					AND (CASE
+						WHEN `+incomingTombstone+` <> `+existingTombstone+` THEN `+incomingTombstone+`
+						WHEN `+incomingStale+` <> `+existingStale+` THEN `+existingStale+`
+						ELSE excluded.hostname < esp_node_profile_sources.hostname END))`,
+		sql.Named("member_id", rec.MemberID[:]),
+		sql.Named("pubkey", rec.EntmootPubKey),
+		sql.Named("source", rec.Source),
+		sql.Named("source_key", nodeProfileSourceKey(rec)),
+		sql.Named("hostname", rec.Hostname),
+		sql.Named("confidence", rec.Confidence),
+		sql.Named("observed_at", rec.ObservedAtMS),
+		sql.Named("expires_at", rec.ExpiresAtMS),
+		sql.Named("source_group", sourceGroup),
+		sql.Named("now", nowMS),
+		sql.Named("tombstone", WithdrawnNodeProfileHostname),
+		sql.Named("member_profile", NodeProfileSourceMemberProfile),
+	)
 	if err != nil {
 		return NodeProfileRecord{}, false, fmt.Errorf("esphttp: upsert node profile: %w", err)
 	}
