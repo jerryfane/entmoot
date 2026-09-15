@@ -19,10 +19,12 @@ import (
 
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/conversion"
+	"entmoot/pkg/entmoot/esphttp"
 	"entmoot/pkg/entmoot/keystore"
 	"entmoot/pkg/entmoot/membership"
 	"entmoot/pkg/entmoot/merkle"
 	entpolicy "entmoot/pkg/entmoot/policy"
+	"entmoot/pkg/entmoot/profile"
 	"entmoot/pkg/entmoot/ratelimit"
 	"entmoot/pkg/entmoot/store"
 	libp2ptransport "entmoot/pkg/entmoot/transport/libp2p"
@@ -41,6 +43,9 @@ type groupRuntimeConfig struct {
 	Host     host.Host
 	Binding  libp2ptransport.Binding
 	Logger   *slog.Logger
+	// Profiles records member display names observed from the group. Optional:
+	// a runtime without it simply does not learn names.
+	Profiles esphttp.StateStore
 	// Mode and ControlledRelays mirror the host's connectivity profile so
 	// forwarded member addresses are filtered exactly as dial hints are.
 	Mode             libp2ptransport.ConnectivityMode
@@ -61,6 +66,7 @@ type groupRuntime struct {
 	invites          *libp2ptransport.InviteLedger
 	liveRouter       *libp2ptransport.LiveRouter
 	policyEnforcers  map[entmoot.GroupID]*groupPolicyEnforcer
+	profiles         esphttp.StateStore
 
 	mu       sync.RWMutex
 	sessions map[entmoot.GroupID]*groupSession
@@ -124,6 +130,7 @@ func newGroupRuntime(cfg groupRuntimeConfig) (*groupRuntime, error) {
 		mode:             cfg.Mode,
 		controlledRelays: cfg.ControlledRelays,
 		policyStore:      policyStore,
+		profiles:         cfg.Profiles,
 		invites:          invites,
 		liveRouter:       liveRouter,
 		sessions:         make(map[entmoot.GroupID]*groupSession),
@@ -266,6 +273,13 @@ func (r *groupRuntime) AddLocalGroup(ctx context.Context, groupID entmoot.GroupI
 		Host: r.host, GroupID: groupID, Group: group, Store: r.notify,
 		Authorize: func(message entmoot.Message) error {
 			return r.enforceGroupPolicy(context.Background(), groupID, message)
+		},
+		// A profile arrives as an ordinary message, so validation has already
+		// established the author is a current member and the signature holds.
+		// OnIngest fires for locally published messages too, so a node records
+		// its own name by the same path as everyone else's.
+		OnIngest: func(message entmoot.Message) {
+			r.observeMemberProfile(sessionCtx, groupID, message)
 		},
 	})
 	if err != nil {
@@ -887,4 +901,43 @@ func groupHasLocalIdentityPubKey(group *membership.Group, publicKey []byte) bool
 	}
 	member, ok := group.MemberInfoByID(memberID)
 	return ok && bytes.Equal(member.EntmootPubKey, publicKey)
+}
+
+// observeMemberProfile records a member's self-chosen display name.
+//
+// It is called for every ingested message, so it must be cheap for the common
+// case: the topic check runs before anything is decoded. A malformed payload
+// on the reserved topic is logged once and dropped — a name is a display hint,
+// so a bad one must never affect delivery of the message that carried it.
+func (r *groupRuntime) observeMemberProfile(ctx context.Context, groupID entmoot.GroupID, message entmoot.Message) {
+	if r.profiles == nil || !profile.HasTopic(message.Topics) {
+		return
+	}
+	if message.Author.MemberID == nil {
+		return
+	}
+	parsed, err := profile.Decode(message.Content)
+	if err != nil {
+		if !errors.Is(err, profile.ErrNotProfile) {
+			r.logger.Warn("member profile ignored",
+				slog.String("group_id", groupID.String()),
+				slog.String("member_id", message.Author.MemberID.String()),
+				slog.String("err", err.Error()))
+		}
+		return
+	}
+	// The author's own timestamp orders profiles from the same member; the
+	// store keeps the newest. It is not trusted for anything else.
+	observedAt := parsed.IssuedAtMS
+	if observedAt <= 0 {
+		observedAt = message.Timestamp
+	}
+	if err := esphttp.ObserveMemberProfileNodeProfile(ctx, r.profiles, groupID,
+		*message.Author.MemberID, encodeBase64(message.Author.EntmootPubKey),
+		parsed.DisplayName, observedAt, parsed.ExpiresAtMS); err != nil {
+		r.logger.Warn("member profile not recorded",
+			slog.String("group_id", groupID.String()),
+			slog.String("member_id", message.Author.MemberID.String()),
+			slog.String("err", err.Error()))
+	}
 }
