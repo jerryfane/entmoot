@@ -38,13 +38,19 @@ for good eventually stops being displayed.
   Unicode format character (the bidi overrides such as U+202E would otherwise
   reverse the appended MemberID, and zero-width characters would hide text) or
   a line or paragraph separator (U+2028, U+2029).
-- It cannot be pinned. A node orders profiles by when it received them, not by
-  the timestamp in the payload, so a message dated in the future cannot freeze
-  a member's name against later updates.
+- It cannot be pinned. A node orders profiles by the author's issue time and
+  refuses one dated more than five minutes ahead of its own clock, so a
+  message from the future is discarded rather than winning every later
+  comparison. An old profile arriving late — by history catch-up, or a peer
+  re-gossiping — loses to the newer one already recorded.
 
 Names are limited to 64 runes and 255 bytes. The rune limit is what a user
 notices, so a name in a non-Latin script is not cut shorter than a Latin one;
 the byte limit matches the store's own cap, so a name that could not be stored
 is refused at publish time rather than reported as published and dropped.
 
-An expiry longer than 90 days is clamped to 90 days.
+An expiry longer than 90 days is clamped to 90 days, and `set` reports the
+`ttl` it actually published rather than the one asked for.
+
+`set` refuses a name that is only whitespace: that normalizes to empty, which
+is the withdrawal payload, and clearing must be deliberate. Use `clear`.

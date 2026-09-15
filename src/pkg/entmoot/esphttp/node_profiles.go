@@ -99,20 +99,37 @@ func nodeProfileVisibleForMember(profile NodeProfileRecord, publicKey string) bo
 		(strings.TrimSpace(profile.EntmootPubKey) != "" && strings.TrimSpace(profile.EntmootPubKey) == strings.TrimSpace(publicKey))
 }
 
-// WithdrawMemberProfileNodeProfile removes a member's published name for a
-// group. Withdrawal is a delete, not an empty name: an empty hostname is not a
-// storable record, so an "empty" observation would leave the previous name in
-// place and every reader would keep serving it.
-func WithdrawMemberProfileNodeProfile(ctx context.Context, state StateStore, groupID entmoot.GroupID, memberID entmoot.MemberID, publicKey string) error {
+// WithdrawnNodeProfileHostname is the placeholder a withdrawal record holds.
+// A withdrawal must be a record rather than a delete, because a delete carries
+// no timestamp: an older profile arriving afterwards — from history catch-up,
+// or a peer re-gossiping — would then win and resurrect the withdrawn name,
+// and nodes would disagree permanently. The record is written already expired,
+// so no reader ever shows the placeholder.
+const WithdrawnNodeProfileHostname = "-"
+
+// WithdrawMemberProfileNodeProfile withdraws a member's published name for a
+// group by recording a tombstone at the withdrawal's own issue time. Ordering
+// is by that time, so a profile issued earlier cannot undo it however late it
+// arrives.
+func WithdrawMemberProfileNodeProfile(ctx context.Context, state StateStore, groupID entmoot.GroupID, memberID entmoot.MemberID, publicKey string, issuedAtMS int64) error {
 	if state == nil || memberID == (entmoot.MemberID{}) {
 		return nil
 	}
-	key := nodeProfileSourceKey(NodeProfileRecord{
-		Source:        NodeProfileSourceMemberProfile,
-		SourceGroupID: &groupID,
+	_, _, err := state.UpsertNodeProfile(ctx, NodeProfileRecord{
+		MemberID:      memberID,
 		EntmootPubKey: strings.TrimSpace(publicKey),
+		Hostname:      WithdrawnNodeProfileHostname,
+		Source:        NodeProfileSourceMemberProfile,
+		// ObservedAtMS carries the withdrawal's own issue time, which is what
+		// orders it against profiles; the expiry is a fixed point in the past
+		// so the tombstone is expired for every reader's clock, however far
+		// ahead or behind. Using the issue time here would leave a withdrawal
+		// briefly unexpired and the placeholder briefly visible.
+		ObservedAtMS:  issuedAtMS,
+		ExpiresAtMS:   1,
+		SourceGroupID: &groupID,
 	})
-	return state.DeleteNodeProfileSource(ctx, memberID, key)
+	return err
 }
 
 func ObserveMemberProfileNodeProfile(ctx context.Context, state StateStore, groupID entmoot.GroupID, memberID entmoot.MemberID, publicKey, hostname string, observedAtMS, expiresAtMS int64) error {
@@ -160,8 +177,23 @@ func normalizeNodeProfileRecord(rec NodeProfileRecord, nowMS int64) (NodeProfile
 func nodeProfileExpired(rec NodeProfileRecord, nowMS int64) bool {
 	return rec.ExpiresAtMS > 0 && rec.ExpiresAtMS <= nowMS
 }
+
+// isWithdrawalRecord reports the tombstone a withdrawal writes. It is stored
+// permanently expired, so it must not take the expired-record bypass below:
+// the bypass exists so a stale observation is replaced by anything fresher,
+// while a withdrawal has to keep losing to nothing but a later issue time.
+// Without this, the two stores disagree — the SQLite upsert compares
+// observed_at_ms and keeps the withdrawal, while this path would let an older
+// profile arriving late resurrect the withdrawn name.
+func isWithdrawalRecord(rec NodeProfileRecord) bool {
+	return rec.Source == NodeProfileSourceMemberProfile && rec.Hostname == WithdrawnNodeProfileHostname
+}
+
 func shouldReplaceNodeProfile(existing, incoming NodeProfileRecord, nowMS int64) bool {
-	if existing.MemberID == (entmoot.MemberID{}) || nodeProfileExpired(existing, nowMS) {
+	if existing.MemberID == (entmoot.MemberID{}) {
+		return true
+	}
+	if nodeProfileExpired(existing, nowMS) && !isWithdrawalRecord(existing) {
 		return true
 	}
 	if incoming.Confidence != existing.Confidence {
@@ -223,19 +255,6 @@ func (s *MemoryStateStore) UpsertNodeProfile(_ context.Context, rec NodeProfileR
 	defer s.mu.Unlock()
 	return s.upsertNodeProfileLocked(rec, s.nowMS())
 }
-func (s *MemoryStateStore) DeleteNodeProfileSource(_ context.Context, id entmoot.MemberID, sourceKey string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	records := s.nodeProfiles[id]
-	if records == nil {
-		return nil
-	}
-	delete(records, sourceKey)
-	if len(records) == 0 {
-		delete(s.nodeProfiles, id)
-	}
-	return nil
-}
 func (s *MemoryStateStore) GetNodeProfile(_ context.Context, id entmoot.MemberID) (NodeProfileRecord, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -289,12 +308,6 @@ func (s *SQLiteStateStore) UpsertNodeProfile(ctx context.Context, rec NodeProfil
 		return rec, true, nil
 	}
 	return best, nodeProfileSourceKey(best) == nodeProfileSourceKey(rec), nil
-}
-func (s *SQLiteStateStore) DeleteNodeProfileSource(ctx context.Context, id entmoot.MemberID, sourceKey string) error {
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM esp_node_profile_sources WHERE member_id = ? AND source_key = ?`, id[:], sourceKey); err != nil {
-		return fmt.Errorf("esphttp: delete node profile source: %w", err)
-	}
-	return nil
 }
 func (s *SQLiteStateStore) GetNodeProfile(ctx context.Context, id entmoot.MemberID) (NodeProfileRecord, bool, error) {
 	return getNodeProfile(ctx, s.db, id, time.Now().UnixMilli(), nil, "")

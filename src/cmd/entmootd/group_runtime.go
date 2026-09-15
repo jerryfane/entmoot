@@ -34,7 +34,10 @@ import (
 // without being republished. The author's own expiry is honoured when it is
 // shorter; a longer or missing one is clamped to this, so a single message
 // cannot keep a name alive indefinitely.
-const maxProfileLifetimeMS = int64(90 * 24 * 60 * 60 * 1000)
+const maxProfileLifetime = 90 * 24 * time.Hour
+
+// maxProfileLifetimeMS is the same bound in the unit the records carry.
+const maxProfileLifetimeMS = int64(maxProfileLifetime / time.Millisecond)
 
 var (
 	errLocalGroupNotMember        = errors.New("local identity is not a current group member")
@@ -768,6 +771,13 @@ retry:
 		slog.Int("unknown_heads", summary.UnknownHeads),
 		slog.Int("converged_hints", summary.ConvergedHints),
 		slog.String("last_error", lastErr))
+	// History insertion writes straight to the store, so it never passes
+	// through the live OnIngest hook: a name whose only copy arrived by
+	// catch-up would otherwise never be learned. Re-observing from the store
+	// is safe to repeat, because ordering is by the author's issue time.
+	if summary.Inserted > 0 {
+		r.reconcileProfilesFromHistory(ctx, session)
+	}
 }
 
 // keepersFor lists members with at least one known address, combining
@@ -932,21 +942,29 @@ func (r *groupRuntime) observeMemberProfile(ctx context.Context, groupID entmoot
 		}
 		return
 	}
-	// Order by when this node received the profile, never by a timestamp
-	// inside the payload. The payload's clock is the author's claim: a single
-	// message dated far in the future would otherwise pin a member's name
-	// forever, because the store only replaces a record with a strictly newer
-	// observation, so every later honest update would be silently discarded.
-	// A replay of that one message would do the same on every node that saw
-	// it. Receipt time makes the newest thing this node actually saw win.
-	observedAt := time.Now().UnixMilli()
+	// Order by the author's own issue time, and refuse a profile dated further
+	// ahead than the clock bound. Receipt time was the wrong answer: it does
+	// stop a future-dated message pinning a name, but it makes an old message
+	// arriving late — from history catch-up, or a peer re-gossiping — beat the
+	// newer profile already recorded, so two nodes end up disagreeing about a
+	// member's name depending on what arrived when. The author's clock ordered
+	// and bounded gives both: a crafted future date is rejected outright, and
+	// a replay of an old profile loses to the newer one on every node.
+	now := time.Now()
+	if err := profile.CheckClock(parsed, now); err != nil {
+		r.logger.Warn("member profile refused",
+			slog.String("group_id", groupID.String()),
+			slog.String("member_id", message.Author.MemberID.String()),
+			slog.String("err", err.Error()))
+		return
+	}
+	observedAt := parsed.IssuedAtMS
 
-	// An empty name withdraws the published one. That has to be a delete: an
-	// empty hostname is not a storable record, so observing one would leave
-	// the previous name in place and every reader would keep serving it.
+	// An empty name withdraws the published one, recorded as a tombstone at
+	// the same issue time so a profile issued earlier cannot undo it.
 	if parsed.DisplayName == "" {
 		if err := esphttp.WithdrawMemberProfileNodeProfile(ctx, r.profiles, groupID,
-			*message.Author.MemberID, encodeBase64(message.Author.EntmootPubKey)); err != nil {
+			*message.Author.MemberID, encodeBase64(message.Author.EntmootPubKey), observedAt); err != nil {
 			r.logger.Warn("member profile not withdrawn",
 				slog.String("group_id", groupID.String()),
 				slog.String("member_id", message.Author.MemberID.String()),
@@ -955,8 +973,8 @@ func (r *groupRuntime) observeMemberProfile(ctx context.Context, groupID entmoot
 		return
 	}
 
-	// Bound how long one message can keep a name alive, for the same reason:
-	// the expiry is the author's claim too.
+	// Bound how long one message can keep a name alive: the expiry is the
+	// author's claim too.
 	expiresAt := parsed.ExpiresAtMS
 	maxExpiry := observedAt + maxProfileLifetimeMS
 	if expiresAt <= 0 || expiresAt > maxExpiry {
@@ -970,5 +988,29 @@ func (r *groupRuntime) observeMemberProfile(ctx context.Context, groupID entmoot
 			slog.String("group_id", groupID.String()),
 			slog.String("member_id", message.Author.MemberID.String()),
 			slog.String("err", err.Error()))
+	}
+}
+
+// maxProfilesReconciledPerCatchUp bounds the work one catch-up does. A group
+// has one current profile per member, so the newest few on the topic cover
+// every name worth learning; anything older has already been superseded.
+const maxProfilesReconciledPerCatchUp = 256
+
+// reconcileProfilesFromHistory observes profiles that arrived by history sync.
+// Ordering is by the author's issue time, so re-observing a message already
+// recorded changes nothing.
+func (r *groupRuntime) reconcileProfilesFromHistory(ctx context.Context, session *groupSession) {
+	if r.profiles == nil {
+		return
+	}
+	messages, err := r.store.LatestByTopic(ctx, session.groupID, profile.Topic, maxProfilesReconciledPerCatchUp)
+	if err != nil {
+		r.logger.Warn("member profiles not reconciled from history",
+			slog.String("group_id", session.groupID.String()),
+			slog.String("err", err.Error()))
+		return
+	}
+	for _, message := range messages {
+		r.observeMemberProfile(ctx, session.groupID, message)
 	}
 }

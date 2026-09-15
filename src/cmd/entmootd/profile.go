@@ -51,7 +51,7 @@ func cmdProfileSet(gf *globalFlags, args []string, clear bool) int {
 	fs := flag.NewFlagSet("profile set", flag.ContinueOnError)
 	nameFlag := fs.String("name", "", "display name to publish (required unless clearing)")
 	groupStr := fs.String("group", "", "base64 group id (optional when exactly one group is joined)")
-	ttlFlag := fs.Duration("ttl", defaultProfileTTL, "how long the name stays current; 0 means no expiry")
+	ttlFlag := fs.Duration("ttl", defaultProfileTTL, "how long the name stays current; 0 or a longer value uses the "+maxProfileLifetime.String()+" maximum")
 	timeoutFlag := fs.Duration("timeout", 30*time.Second, "IPC response deadline")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -74,6 +74,13 @@ func cmdProfileSet(gf *globalFlags, args []string, clear bool) int {
 		fmt.Fprintf(os.Stderr, "profile set: %v\n", err)
 		return exitInvalidArgument
 	}
+	// A name that is only whitespace normalizes to empty, which is the
+	// withdrawal payload. Setting must never clear by accident: clearing is
+	// what `profile clear` is for, and it says so.
+	if !clear && normalized == "" {
+		fmt.Fprintln(os.Stderr, `profile set: -name is only whitespace; use "profile clear" to withdraw a published name`)
+		return exitInvalidArgument
+	}
 	if *ttlFlag < 0 {
 		fmt.Fprintln(os.Stderr, "profile set: -ttl must not be negative")
 		return exitInvalidArgument
@@ -91,9 +98,16 @@ func cmdProfileSet(gf *globalFlags, args []string, clear bool) int {
 
 	now := time.Now()
 	payload := profile.Profile{DisplayName: normalized, IssuedAtMS: now.UnixMilli()}
-	if *ttlFlag > 0 {
-		payload.ExpiresAtMS = now.Add(*ttlFlag).UnixMilli()
+	// A receiving node clamps an expiry beyond its own lifetime bound, so echo
+	// the value that will actually be honoured rather than the one asked for.
+	ttl := *ttlFlag
+	if ttl == 0 || ttl > maxProfileLifetime {
+		if ttl > maxProfileLifetime {
+			fmt.Fprintf(os.Stderr, "profile set: -ttl %s exceeds the %s limit a node will honour; using %s\n", ttl, maxProfileLifetime, maxProfileLifetime)
+		}
+		ttl = maxProfileLifetime
 	}
+	payload.ExpiresAtMS = now.Add(ttl).UnixMilli()
 	content, err := profile.Encode(payload)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "profile set: %v\n", err)
@@ -136,9 +150,8 @@ func cmdProfileSet(gf *globalFlags, args []string, clear bool) int {
 			"message_id":   v.MessageID,
 			"timestamp_ms": v.TimestampMS,
 		}
-		if payload.ExpiresAtMS > 0 {
-			out["expires_at_ms"] = payload.ExpiresAtMS
-		}
+		out["expires_at_ms"] = payload.ExpiresAtMS
+		out["ttl"] = ttl.String()
 		if normalized == "" {
 			out["cleared"] = true
 		}

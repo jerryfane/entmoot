@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 	"unicode"
 	"unicode/utf8"
 )
@@ -33,6 +34,14 @@ const payloadType = "entmoot/profile/1"
 // MaxDisplayNameLength bounds a name in runes rather than bytes, so a name in
 // a non-Latin script is not cut shorter than a Latin one.
 const MaxDisplayNameLength = 64
+
+// MaxClockSkew bounds how far ahead of the receiving node a profile may be
+// dated. Ordering uses the author's own timestamp, so without a bound one
+// message dated far in the future would win every later comparison and pin a
+// member's name permanently. The same 5 minutes bounds membership records, for
+// the same reason: see maxRecordSkew in pkg/entmoot/membership/group.go, which
+// is unexported, so this constant is a deliberate copy rather than a reference.
+const MaxClockSkew = 5 * time.Minute
 
 // MaxDisplayNameBytes must not exceed the store's own hostname cap
 // (esphttp.MaxNodeProfileHostnameBytes). Both limits are enforced here so a
@@ -99,8 +108,8 @@ func NormalizeDisplayName(name string) (string, error) {
 		switch {
 		case r == '\n' || r == '\r':
 			return "", errors.New("profile: display name contains a line break")
-		case r == '#':
-			return "", errors.New("profile: display name contains '#', which separates the name from the member id")
+		case isHashLike(r):
+			return "", fmt.Errorf("profile: display name contains %U, a form of '#', which separates the name from the member id", r)
 		case unicode.IsControl(r):
 			return "", errors.New("profile: display name contains a control character")
 		case unicode.Is(unicode.Cf, r):
@@ -110,6 +119,32 @@ func NormalizeDisplayName(name string) (string, error) {
 		}
 	}
 	return trimmed, nil
+}
+
+// isHashLike reports the separator character and the forms that render like
+// it. A fullwidth or small-form hash is visually a '#' in most fonts, so
+// allowing one would make "name#MemberID" ambiguous to a reader even though
+// the bytes differ.
+func isHashLike(r rune) bool {
+	switch r {
+	case '#', // U+0023
+		'\uFF03', // fullwidth
+		'\uFE5F', // small form
+		'\u266F': // music sharp sign, renders as a hash in many fonts
+		return true
+	}
+	return false
+}
+
+// CheckClock reports whether a profile's issue time is acceptable to a node
+// whose clock reads now. A profile from the future is refused rather than
+// clamped: clamping would let the crafted value win the ordering comparison
+// anyway.
+func CheckClock(p Profile, now time.Time) error {
+	if p.IssuedAtMS > now.Add(MaxClockSkew).UnixMilli() {
+		return fmt.Errorf("profile: issued_at_ms %d is more than %s ahead of this node's clock", p.IssuedAtMS, MaxClockSkew)
+	}
+	return nil
 }
 
 // Encode validates a profile and returns the message content to publish.
