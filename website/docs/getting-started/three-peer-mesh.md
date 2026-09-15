@@ -45,12 +45,14 @@ and pushes it. The peer that accepts the record forwards it to the group's
 other reachable members, so C learns about B without either of them being
 named in the other's invite.
 
-The issuer does not have to be online when an invite is used. If A is stopped
-after B has joined, an invite A already minted still works as long as the
-invite names a reachable member as a bootstrap peer and A still holds
-authority in the group. Point the third invite at B:
+No admin signs a join, but the issuing node must be reachable when its invite
+is used: `invite create` refuses any `-bootstrap` that does not end in the
+issuing node's own peer id, so an invite cannot point a newcomer at a different
+member. To admit C while A is stopped, have B — a member with admin authority —
+issue the invite from its own host:
 
 ```sh
+# on B
 entmootd invite create -group <GROUP_ID> -target-pubkey <C_PUBKEY_B64> \
   -bootstrap /ip4/<B_IP>/tcp/1004/p2p/<B_PEER_ID> -valid-for 24h > invite-c.json
 ```

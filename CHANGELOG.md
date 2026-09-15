@@ -174,10 +174,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   signature such a node can check. Admins may still sign checkpoints — that is
   what lets a group retire history while the founder is away — and at one
   sequence a founder-signed checkpoint wins over an admin-signed one, so the
-  chain a joiner walks stays anchored. Each node keeps the chain from its
-  newest founder-signed checkpoint forward, so a founder that never
-  checkpoints leaves a longer chain behind; `roster status` shows it as the
-  gap between the anchor and the canonical sequence.
+  chain a joiner walks stays anchored. Retention keeps every founder-signed
+  checkpoint still on the canonical chain, so it starts from the oldest of
+  them: a founder that never checkpoints again leaves the whole chain behind
+  it in place.
 
   A record or checkpoint dated more than five minutes ahead of the local clock
   is refused. For records the reason is that they merge in timestamp order, so
@@ -289,10 +289,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 - **Delegated admins.** A founder can now name delegated admins with
-  `roster admin grant|revoke|list`, carried as a founder-signed
-  `policy_change` entry holding the complete set (`type: admins/v1`, ceiling
-  16). An admin may issue invites from its own host (`invite create`, IPC
-  `invite_create`) that newcomers sign themselves in with, and may remove
+  `roster admin grant|revoke|list`, carried as a founder-signed membership
+  record of kind `policy` holding the complete set (ceiling 16). The
+  `policy_change` entry with `type: admins/v1` is the legacy linear-chain
+  form: membership v3 reads it when projecting a legacy chain, and the only
+  path that still writes a `policy_change` at all is the legacy
+  identity-upgrade conversion, which mints one as its upgrade entry. An admin
+  may issue invites from its own host (`invite create`, IPC `invite_create`)
+  that newcomers sign themselves in with, and may remove
   ordinary members (`roster remove`, the IPC member-remove path, the ESP
   member_remove operation), so a group keeps admitting and evicting members
   while the founder is away. An admin cannot
@@ -310,14 +314,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   who may sign.
 - **Membership state travels between members, not just from the founder.**
   Every node pulls from up to eight reachable members, founder first, and the
-  founder pulls too. Without this, an admin-authored admission or removal
-  stayed on one node.
+  founder pulls too. Without this, a record authored away from the founder — a
+  self-signed join, a leave, an admin-signed removal — stayed on the node that
+  accepted it.
 
   The linear-chain machinery this bullet originally described — per-peer
   backoff, a newly-downloaded-entry ceiling, paging-snapshot hand-back,
   `short_chain`/`head_only` negotiation, `roster_divergence` reporting and
   `roster repair` — was deleted later in this same unreleased cycle, before
-  any release carried it, and is recorded under Removed. Membership v3 has no
+  any release carried it; the deletion is recorded under Changed and Fixed
+  above, not under Removed. Membership v3 has no
   fork to detect, adopt or repair: records merge as a set, so a pull is a
   checkpoint plus a cursor and two nodes holding the same records project the
   same membership. None of those commands or status fields exist; `roster
