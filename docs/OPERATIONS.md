@@ -109,7 +109,7 @@ Check the current process view with:
 
 ```sh
 entmootd env --json
-curl -fsS https://esp.entmoot.xyz/v1/status
+curl -fsS https://esp.entmoot.xyz/v1/capabilities
 ```
 
 ## Release Checklist

@@ -26,10 +26,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     gone with the instruction queue they fed. `--runner`, `--runner-command`,
     `ENTMOOT_AGENT_RUNNER` and the OpenClaw adapter stay; they belong to
     `agent-live`.
-  - All `/v1/fleets*` ESP routes are gone. `GET /v1/capabilities` no longer
-    emits the `features` key; the iOS client decodes it with
-    `decodeIfPresent(...) ?? .disabled` and each field with `?? false`, so an
-    absent key keeps the Fleet UI hidden on existing installs.
+  - All `/v1/fleets*` ESP routes are gone. `GET /v1/capabilities`, `/v1/status`
+    and `/v1/session` no longer emit the `features` key. The iOS client
+    tolerates its absence on both paths it reads: capabilities decodes it with
+    `decodeIfPresent(...) ?? .disabled`, and `ESPSessionResponse.features` is
+    optional and resolved with `?? .disabled`
+    (`ESPAppModel.swift:461`), so an absent key keeps the Fleet UI hidden on
+    existing installs.
   - Live-agent actions are now exactly `reply`, `message.summarize`,
     `alert.owner` and `metadata.update`. The ten coordination actions
     (`task.create`, `task.comment`, `task.assign_self`, `task.update_own`,
@@ -44,6 +47,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not migrated. The rows from the live deployment were exported to
   `/root/backups-fleet-removal/` on the machine before the drop; that backup
   lives on the host, not in this repository.
+
+  A pre-libp2p data root drops them during conversion instead, before its
+  identity rewrite walks the tables — otherwise a legacy node id that had been
+  reassigned between keys would fail closed inside a Fleet row and abort the
+  conversion, leaving the daemon unable to start.
+
+  A group the removed fleet-create path had marked `fleet_control` in its
+  metadata stays hidden from `GET /v1/groups`, as it was before. Nothing
+  clears that marker, so honouring it keeps those groups out of a user's moot
+  list rather than surfacing them on upgrade.
 
 - **`-trace-reconcile` is gone, and passing it now fails the command.** It was
   a live flag until the Pilot cutover: `pkg/entmoot/gossip` read it through

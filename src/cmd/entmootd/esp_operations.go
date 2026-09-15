@@ -1043,37 +1043,6 @@ func (e espOperationExecutor) removeMember(ctx context.Context, req esphttp.Sign
 	return json.Marshal(out)
 }
 
-func buildInviteCreateIPCRequest(gid entmoot.GroupID, payload inviteCreatePayload) (*ipc.InviteCreateReq, error) {
-	if gid == (entmoot.GroupID{}) {
-		return nil, &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request", Message: "invite_create requires group_id"}
-	}
-	target, err := validateInviteTarget(payload.Target)
-	if err != nil {
-		return nil, err
-	}
-	ttl := 24 * time.Hour
-	if payload.ValidFor != "" {
-		parsed, err := parseDurationDays(payload.ValidFor)
-		if err != nil {
-			return nil, &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request", Message: "invalid valid_for"}
-		}
-		if parsed <= 0 {
-			return nil, &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request", Message: "valid_for must be positive"}
-		}
-		if parsed < time.Millisecond {
-			return nil, &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request", Message: "valid_for must be at least 1ms"}
-		}
-		ttl = parsed
-	}
-	return &ipc.InviteCreateReq{
-		GroupID:             gid,
-		TargetPublicKey:     append([]byte(nil), target.EntmootPubKey...),
-		BootstrapMultiaddrs: append([]string(nil), payload.BootstrapMultiaddrs...),
-		ValidForMS:          ttl.Milliseconds(),
-		ValidUntilMS:        payload.ValidUntilMS,
-	}, nil
-}
-
 func validateInviteTarget(target *inviteTargetPayload) (entmoot.NodeInfo, error) {
 	if target == nil {
 		return entmoot.NodeInfo{}, &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "target_required", Message: "invite_create requires target agent identity"}
@@ -1486,12 +1455,4 @@ func operationIPCError(frame *ipc.ErrorFrame) error {
 		status, code = http.StatusInternalServerError, "internal"
 	}
 	return &esphttp.OperationError{HTTPStatus: status, Code: code, Message: frame.Message}
-}
-
-func operationErrorCode(err error) string {
-	var opErr *esphttp.OperationError
-	if errors.As(err, &opErr) && opErr != nil {
-		return opErr.Code
-	}
-	return ""
 }

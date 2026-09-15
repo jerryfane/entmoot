@@ -1630,11 +1630,16 @@ func deviceIDForRequest(auth authContext) string {
 	return strings.TrimSpace(auth.device.ID)
 }
 
-// retiredFleetTables are the tables of the removed Fleet/tasks/agent-commands
+// RetiredFleetTables are the tables of the removed Fleet/tasks/agent-commands
 // feature. They are dropped rather than left in place so an upgraded node stops
 // carrying rows nothing can read, and so a later reader cannot mistake stale
 // fleet state for something live.
-var retiredFleetTables = []string{
+//
+// Exported because the legacy-root conversion has to drop them too, and for the
+// same reason it drops esp_open_invite_challenges: it rewrites identities table
+// by table, and a table whose rows can no longer be keyed or scoped must be
+// gone before that walk rather than fail it.
+var RetiredFleetTables = []string{
 	"esp_fleet_command_results",
 	"esp_fleet_commands",
 	"esp_fleet_task_submissions",
@@ -1666,7 +1671,7 @@ func retireFleetTables(db *sql.DB, dbPath string) {
 				slog.String("path", dbPath), slog.String("err", err.Error()))
 		}
 	}()
-	for _, table := range retiredFleetTables {
+	for _, table := range RetiredFleetTables {
 		if _, err := db.Exec(`DROP TABLE IF EXISTS ` + table); err != nil {
 			slog.Debug("esphttp: retire fleet table deferred to a later open",
 				slog.String("path", dbPath), slog.String("table", table), slog.String("err", err.Error()))

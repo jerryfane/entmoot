@@ -16,7 +16,7 @@ func TestOpenRetiresFleetTables(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open legacy: %v", err)
 	}
-	for _, table := range retiredFleetTables {
+	for _, table := range RetiredFleetTables {
 		if _, err := legacy.Exec(`CREATE TABLE ` + table + ` (id TEXT PRIMARY KEY, note TEXT)`); err != nil {
 			t.Fatalf("create %s: %v", table, err)
 		}
@@ -39,7 +39,7 @@ func TestOpenRetiresFleetTables(t *testing.T) {
 		t.Fatalf("open probe: %v", err)
 	}
 	defer probe.Close()
-	for _, table := range retiredFleetTables {
+	for _, table := range RetiredFleetTables {
 		var n int
 		if err := probe.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&n); err != nil {
 			t.Fatalf("count %s: %v", table, err)

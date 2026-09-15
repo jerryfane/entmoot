@@ -20,6 +20,7 @@ import (
 
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/canonical"
+	"entmoot/pkg/entmoot/esphttp"
 	"entmoot/pkg/entmoot/keystore"
 	"entmoot/pkg/entmoot/merkle"
 	"entmoot/pkg/entmoot/order"
@@ -1035,7 +1036,6 @@ type legacyIdentityInterval struct {
 
 type legacyIdentityResolver struct {
 	byNode         map[entmoot.NodeID]map[entmoot.MemberID]struct{}
-	publicKeys     map[entmoot.MemberID][]byte
 	intervals      map[entmoot.NodeID][]legacyIdentityInterval
 	byGroup        map[string]map[entmoot.NodeID]map[entmoot.MemberID]struct{}
 	groupIntervals map[string]map[entmoot.NodeID][]legacyIdentityInterval
@@ -1044,7 +1044,6 @@ type legacyIdentityResolver struct {
 func loadMappings(groups []groupState) (*legacyIdentityResolver, error) {
 	out := &legacyIdentityResolver{
 		byNode:         map[entmoot.NodeID]map[entmoot.MemberID]struct{}{},
-		publicKeys:     map[entmoot.MemberID][]byte{},
 		intervals:      map[entmoot.NodeID][]legacyIdentityInterval{},
 		byGroup:        map[string]map[entmoot.NodeID]map[entmoot.MemberID]struct{}{},
 		groupIntervals: map[string]map[entmoot.NodeID][]legacyIdentityInterval{},
@@ -1078,7 +1077,6 @@ func loadMappings(groups []groupState) (*legacyIdentityResolver, error) {
 				groupMembers[mapping.LegacyNodeID] = members
 			}
 			members[mapping.MemberID] = struct{}{}
-			out.publicKeys[mapping.MemberID] = append([]byte(nil), mapping.MemberPubKey...)
 		}
 
 		type activeKey struct {
@@ -1175,14 +1173,6 @@ func (r *legacyIdentityResolver) resolveMapped(nodeID entmoot.NodeID, encodedPub
 		}
 	}
 	return entmoot.MemberID{}, fmt.Errorf("legacy node %d is ambiguous at timestamp %d without a signing key", nodeID, timestampMS)
-}
-
-func (r *legacyIdentityResolver) peerID(memberID entmoot.MemberID) (string, error) {
-	publicKey := r.publicKeys[memberID]
-	if len(publicKey) == 0 {
-		return "", fmt.Errorf("member %s has no founder-mapped public key", memberID)
-	}
-	return entmoot.PeerIDFromPublicKey(publicKey)
 }
 
 func migrateOperationalSchemas(root string, mappings *legacyIdentityResolver) error {
@@ -1329,6 +1319,17 @@ func migrateESP(path string, mappings *legacyIdentityResolver) error {
 	if _, err = tx.Exec(`DROP TABLE IF EXISTS esp_open_invite_challenges`); err != nil {
 		return err
 	}
+	// The removed Fleet feature's tables go before the identity walk below.
+	// They are dropped on ESP open too, but conversion runs first on a legacy
+	// root (setup() converts before anything opens the ESP store), and the walk
+	// would otherwise try to rewrite rows it can no longer key or scope: a
+	// reassigned legacy node id in a fleet row would fail closed and abort the
+	// whole conversion, leaving the daemon unable to start.
+	for _, table := range esphttp.RetiredFleetTables {
+		if _, err = tx.Exec(`DROP TABLE IF EXISTS ` + table); err != nil {
+			return err
+		}
+	}
 	renames := map[string]string{"node_id": "member_id", "coordinator_node_id": "coordinator_member_id", "actor_node_id": "actor_member_id", "subject_node_id": "subject_member_id", "creator_node_id": "creator_member_id", "assignee_node_id": "assignee_member_id", "author_node_id": "author_member_id", "issuer_node_id": "issuer_member_id", "agent_node_id": "agent_member_id", "last_seen_author_node_id": "last_seen_author_member_id"}
 	tables, err := tableNames(tx)
 	if err != nil {
@@ -1461,81 +1462,6 @@ func espIdentityTimestampExpression(cols map[string]bool) string {
 		return "0"
 	}
 	return "COALESCE(" + strings.Join(candidates, ",") + ",0)"
-}
-func espCommandJSONTimestampExpression(table string, cols map[string]bool) string {
-	var preferred []string
-	switch table {
-	case "esp_fleet_commands", "esp_agent_commands":
-		preferred = []string{"created_at_ms", "updated_at_ms"}
-	case "esp_fleet_command_results":
-		preferred = []string{"completed_at_ms", "started_at_ms", "updated_at_ms"}
-	}
-	for _, name := range preferred {
-		if cols[name] {
-			return fmt.Sprintf("COALESCE(%s,0)", quoteIdent(name))
-		}
-	}
-	return espIdentityTimestampExpression(cols)
-}
-
-func migrateESPJSONIdentities(object map[string]any, groupID []byte, timestampMS int64, mappings *legacyIdentityResolver) (bool, error) {
-	changed, err := migrateESPJSONIdentity(object, groupID, timestampMS, mappings)
-	if err != nil {
-		return false, err
-	}
-	for _, field := range []string{"target", "command", "result", "payload"} {
-		child, ok := object[field].(map[string]any)
-		if !ok {
-			continue
-		}
-		childChanged, err := migrateESPJSONIdentities(child, groupID, timestampMS, mappings)
-		if err != nil {
-			return false, fmt.Errorf("%s: %w", field, err)
-		}
-		changed = changed || childChanged
-	}
-	return changed, nil
-}
-
-func migrateESPJSONIdentity(object map[string]any, groupID []byte, timestampMS int64, mappings *legacyIdentityResolver) (bool, error) {
-	changed := false
-	for _, spec := range []struct {
-		legacyFields []string
-		memberField  string
-		peerField    string
-	}{
-		{legacyFields: []string{"pilot_node_id", "node_id"}, memberField: "member_id", peerField: "peer_id"},
-		{legacyFields: []string{"issuer_node_id"}, memberField: "issuer_member_id", peerField: "issuer_peer_id"},
-		{legacyFields: []string{"agent_node_id"}, memberField: "agent_member_id", peerField: "agent_peer_id"},
-	} {
-		for _, legacyField := range spec.legacyFields {
-			raw, ok := object[legacyField]
-			if !ok {
-				continue
-			}
-			numeric, ok := raw.(float64)
-			if !ok || numeric < 0 || numeric != float64(entmoot.NodeID(numeric)) {
-				return false, fmt.Errorf("%s is not a valid legacy node id", legacyField)
-			}
-			nodeID := entmoot.NodeID(numeric)
-			delete(object, legacyField)
-			changed = true
-			if nodeID == 0 {
-				continue
-			}
-			memberID, err := mappings.resolveForGroup(groupID, nodeID, "", timestampMS)
-			if err != nil {
-				return false, err
-			}
-			peerID, err := mappings.peerID(memberID)
-			if err != nil {
-				return false, err
-			}
-			object[spec.memberField] = memberID.String()
-			object[spec.peerField] = peerID
-		}
-	}
-	return changed, nil
 }
 
 func tableNames(tx *sql.Tx) ([]string, error) {

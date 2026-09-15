@@ -134,6 +134,14 @@ func TestHandlerCapabilitiesAreUnauthenticatedAndOmitFeatures(t *testing.T) {
 	if _, ok := status["features"]; ok {
 		t.Fatalf("status = %+v, want no features key", status)
 	}
+
+	// The phone reads the key on this route too: ESPSessionResponse.features is
+	// an optional decoded with `?? .disabled` (ESPAppModel.swift:461), so an
+	// absent key must keep meaning "disabled" rather than arrive as false.
+	session := doJSONRequest[map[string]any](t, handler, http.MethodGet, "/v1/session", nil, http.StatusOK)
+	if _, ok := session["features"]; ok {
+		t.Fatalf("session = %+v, want no features key", session)
+	}
 }
 
 func TestHandlerSignedPublish(t *testing.T) {

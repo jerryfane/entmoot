@@ -3112,14 +3112,6 @@ func decodeBase64Array32(name, s string) ([]byte, error) {
 	return raw, nil
 }
 
-func nodeInfoMemberID(info entmoot.NodeInfo) entmoot.MemberID {
-	if info.MemberID != nil {
-		return *info.MemberID
-	}
-	memberID, _ := entmoot.MemberIDFromPublicKey(info.EntmootPubKey)
-	return memberID
-}
-
 func peerIDForPublicKey(publicKey []byte) string {
 	peerID, err := entmoot.PeerIDFromPublicKey(publicKey)
 	if err != nil {

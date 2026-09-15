@@ -71,12 +71,23 @@ func groupVisibleForList(meta map[string]interface{}, opts esphttp.GroupListOpti
 	return true
 }
 
+// groupHidden reports whether a group is kept out of listings.
+//
+// `fleet_control` is a leftover marker: the removed fleet-create path wrote it
+// on the group it used as a control channel, and that marker hid the group from
+// GET /v1/groups and so from the phone's moot list. Nothing migrates or clears
+// the metadata, so it is still honoured here — otherwise removing Fleet would
+// make those groups appear in a user's list, a visible change to a surface that
+// has nothing to do with the feature.
 func groupHidden(meta map[string]interface{}) bool {
 	if meta == nil {
 		return false
 	}
-	hidden, ok := meta["hidden"].(bool)
-	return ok && hidden
+	if hidden, ok := meta["hidden"].(bool); ok && hidden {
+		return true
+	}
+	legacyControl, ok := meta["fleet_control"].(bool)
+	return ok && legacyControl
 }
 
 func (c localGroupCatalog) GetGroup(ctx context.Context, gid entmoot.GroupID) (esphttp.GroupSummary, bool, error) {
