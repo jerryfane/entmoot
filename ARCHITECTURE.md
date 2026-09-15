@@ -16,7 +16,8 @@ relay operator.
 
 One persisted Ed25519 key determines all operational identities:
 
-- `MemberID`: SHA-256 of the raw Ed25519 public key.
+- `MemberID`: SHA-256 over the domain string `entmoot/member/v2\0` followed by
+  the raw Ed25519 public key; a plain SHA-256 of the key does not reproduce it.
 - libp2p `PeerID`: libp2p's identifier derived from the same public key.
 - Message and membership signatures: produced by that Ed25519 key.
 
@@ -90,8 +91,9 @@ running owner or an exclusive offline maintenance boundary.
 ### Direct
 
 Direct mode is the default. The daemon listens on
-`/ip4/0.0.0.0/tcp/<listen-port>` and may use signed bootstrap/static hints and
-membership-restricted LAN discovery. It is suitable for publicly reachable hosts or
+`/ip4/0.0.0.0/tcp/<listen-port>` and learns addresses from signed
+bootstrap/static hints and gossiped signed peer records. There is no LAN
+discovery in either mode. It is suitable for publicly reachable hosts or
 networks that permit direct connections.
 
 ### Relay-only
@@ -149,8 +151,11 @@ recoverable through synchronization.
 ## 8. Membership and History Synchronization
 
 Membership is a set of self-signed records plus signed checkpoints, not a chain.
-A pull sends the checkpoint a node projects from and the record ids it holds; the
-answer carries newer checkpoints and the records it is missing. Two nodes holding
+A pull sends the checkpoint a node projects from — by sequence and by id, since
+two checkpoints can share a sequence — plus a cursor into the record order
+(timestamp, then id); the answer carries newer checkpoints and the records
+after that cursor. A cursor rather than a list of held ids: a list long enough
+to describe a real backlog does not fit in the request frame. Two nodes holding
 the same records project the same membership whatever order those records
 arrived in, so there is no fork to detect, adopt or repair.
 

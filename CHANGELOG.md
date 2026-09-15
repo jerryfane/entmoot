@@ -308,66 +308,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   would leave this node honouring admins the founder may have just removed
   while a newer peer applied the change, and the two would then disagree about
   who may sign.
-- **Roster state travels between members, not just from the founder.** Every
-  node now pulls roster entries from up to eight reachable members, founder
-  first, and the founder pulls too. Without this, an admin-authored add or
-  removal stayed on one node and the group ran on two heads. One full chain
-  pull per round, a per-peer exponential backoff (30s to 15m) after a pull
-  that cannot be taken, and a ceiling of 4096 *newly downloaded* entries per
-  pull bound what one member can cost. The ceiling does not count the local
-  prefix and does not discard progress: a pull that stops at the ceiling
-  returns the validated entries it did take, so a node further behind than one
-  round converges over several rounds instead of re-downloading the same pages
-  forever, and a peer serving progress is not backed off. An unfinished round
-  hands its paging snapshot back (`release_snapshot`), so chaining rounds does
-  not exhaust the peer's four per-peer slots and stall the catch-up it is
-  meant to make; a peer that does not know the field keeps the snapshot until
-  it expires, as before. A pull that applied some entries and then hit a
-  rejection keeps its divergence record: part landing does not mean the chains
-  agree. The head probe that
-  decides whether a pull is worth it reserves no paging snapshot on the peer,
-  so probing every tick cannot starve the pull it is probing for. A peer whose
-  chain does not extend ours is reported as `roster_divergence` in status
-  output, with both heads, the reason and when it started; a timeout, an
-  exhausted server slot or a rotated snapshot earns the same backoff but is
-  not reported as divergence, and a report is dropped as soon as the head it
-  names turns out to be on our chain. A peer holding fewer entries than our
-  prefix now answers `short_chain` rather than `malformed`, so a fork with a
-  shorter chain is reported as one instead of looking like a transport error;
-  that reading requires the head to be off our chain as well, which the caller
-  supplies, because the server cannot know our head.
-  Fork evidence is sticky: a later timeout does not erase a standing report,
-  only a successful exchange does. The head probe falls back to the paged
-  request against a peer built before the `head_only` field, so probing keeps
-  working across versions. Enrollment retries its own entry against
-  a moved head instead of failing, and one group admits one applicant at a
-  time, so two invites redeemed for the same person in the same instant cost a
-  retry rather than two roster entries for one member.
-- **`roster repair` ends a fork.** The roster is strictly linear (one parent,
-  which must be the current head), so two authorised signers who commit
-  against the same head while partitioned produce two chains that no retry can
-  merge. Enrollment retrying against a moved head shrinks the window to the
-  write itself and `roster_divergence` makes a split visible; this closes it.
-  `roster repair -group <id> [-peer <peer>] [-dry-run]` asks a peer for its
-  chain, validates it from the shared genesis under the ordinary acceptance
-  rules, adopts it in one transaction, and re-signs the local changes the
-  adopted chain does not carry. It reports what it discarded, what it
-  re-issued, what the adopted chain already satisfied, and — with a non-zero
-  exit — any change this node may no longer author, so nothing goes missing in
-  silence. The command needs the running daemon, which holds the roster writer
-  lease and the peer connections. A repair never changes group or founder: a
-  chain with a different genesis, a bad signature or a gap is refused with the
-  log untouched, and so is a peer that is merely behind, whose whole chain is
-  already on ours — adopting that would delete committed history to fix
-  nothing. If the durable swap reports an error, the store is read back and the
-  in-memory view follows whatever it actually holds, because a failed commit is
-  not proof the write did not land; the error then names the changes the
-  interrupted repair did not re-issue, and when the store cannot be read it
-  says the group's state is unknown instead of guessing. A repair takes a chain
-  longer than one pull by chaining pulls, up to 16 rounds. A message published in
-  the fork window naming a discarded head cannot be verified against the
-  adopted chain; that is the cost of converging. `roster admin` remains offline
-  maintenance only, like `roster remove`.
+- **Membership state travels between members, not just from the founder.**
+  Every node pulls from up to eight reachable members, founder first, and the
+  founder pulls too. Without this, an admin-authored admission or removal
+  stayed on one node.
+
+  The linear-chain machinery this bullet originally described — per-peer
+  backoff, a newly-downloaded-entry ceiling, paging-snapshot hand-back,
+  `short_chain`/`head_only` negotiation, `roster_divergence` reporting and
+  `roster repair` — was deleted later in this same unreleased cycle, before
+  any release carried it, and is recorded under Removed. Membership v3 has no
+  fork to detect, adopt or repair: records merge as a set, so a pull is a
+  checkpoint plus a cursor and two nodes holding the same records project the
+  same membership. None of those commands or status fields exist; `roster
+  repair` exits 5.
 - **Removal reporting is complete and survives cleanup failure.** `roster
   remove`, the IPC member-remove path and the ESP member_remove operation now
   report the removal result even when invite revocation fails, carrying

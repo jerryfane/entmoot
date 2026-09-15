@@ -160,7 +160,9 @@ func mustDisplayName(t *testing.T, ctx context.Context, state esphttp.StateStore
 
 // TestProfileClearWithdrawsTheName pins the defect the review found: `profile
 // clear` published an empty name, printed success, and changed nothing,
-// because an empty hostname is not a storable record. Withdrawal must delete.
+// because an empty hostname was dropped before any write. A withdrawal is a
+// record, not a delete — a tombstone carrying its own issue time, so an older
+// profile arriving later cannot resurrect the name.
 func TestProfileClearWithdrawsTheName(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -326,7 +328,9 @@ func mustProfileMessage(t *testing.T, ctx context.Context, session *groupSession
 // TestHistoryReconciliationIsNotStarvedByOneMember pins the bound that matters.
 // The first version counted messages, so one member republishing on the topic
 // pushed every other member's name out of the window and those names were
-// never learned. The walk now stops per member, not per message.
+// never learned. The walk now bounds messages read rather than members
+// covered: it visits every message of every page in the window and keeps a
+// per-member best, so one member's volume cannot consume another's place.
 func TestHistoryReconciliationIsNotStarvedByOneMember(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

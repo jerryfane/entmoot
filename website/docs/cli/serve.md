@@ -28,8 +28,8 @@ Useful global flags:
 
 Without `-group`, all locally joined groups that have a membership checkpoint
 are served. A group directory holding only the pre-checkpoint roster chain is
-skipped with the warning `serve: skipping group without a membership
-checkpoint`, because a group with no checkpoint cannot answer a membership
+skipped with the warning `serve: skipping group with no membership state`,
+because a group with no checkpoint cannot answer a membership
 request; naming it with `-group` is an error instead. Run
 `entmootd membership upgrade -group <GROUP_ID>` on the founder to mint
 checkpoint 0.

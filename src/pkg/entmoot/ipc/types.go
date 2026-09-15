@@ -48,7 +48,8 @@ const (
 	// MsgJoinGroupResp acknowledges that a group session exists.
 	MsgJoinGroupResp MsgType = 0x19
 	// MsgInviteCreateReq asks the running daemon to create a signed invite
-	// for an active group, applying any target roster add to the live session.
+	// for an active group; the invited node signs itself in when it redeems
+	// the invite, so creating one does not change membership here.
 	MsgInviteCreateReq MsgType = 0x1A
 	// MsgInviteCreateResp returns the signed invite created from live daemon
 	// state, including the roster head the daemon can serve.
