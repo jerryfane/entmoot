@@ -9,6 +9,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- **Fleet, tasks and agent-commands are gone.** The whole coordination concept
+  is removed, not disabled: Fleets, Fleet membership and Fleet invites, Fleet
+  activity, the task queue (create, approve, assign, claim, submit, complete,
+  reject, cancel), Fleet commands, the coordinator role and its powers, remote
+  agent-commands, and the per-daemon Fleet command runner. Entmoot is group
+  messaging: moots, messages, history, search, invites, open invites, policy,
+  members, diagnostics, public moots, and live-agent chat.
+
+  - `entmootd fleet` and `entmootd agent-commands` no longer exist. Any script
+    or supervisor invoking them fails with an unknown-command exit.
+  - `ENTMOOT_ENABLE_FLEET` and `ENTMOOT_ENABLE_TASKS` are gone, along with the
+    `pkg/entmoot/features` gate behind them. Setting them has no effect; there
+    is no feature to enable.
+  - `bootstrap agent --agent-instructions` and `ENTMOOT_AGENT_INSTRUCTIONS` are
+    gone with the instruction queue they fed. `--runner`, `--runner-command`,
+    `ENTMOOT_AGENT_RUNNER` and the OpenClaw adapter stay; they belong to
+    `agent-live`.
+  - All `/v1/fleets*` ESP routes are gone. `GET /v1/capabilities`, `/v1/status`
+    and `/v1/session` no longer emit the `features` key. The iOS client
+    tolerates its absence on both paths it reads: capabilities decodes it with
+    `decodeIfPresent(...) ?? .disabled`, and `ESPSessionResponse.features` is
+    optional and resolved with `?? .disabled`
+    (`ESPAppModel.swift:461`), so an absent key keeps the Fleet UI hidden on
+    existing installs.
+  - Live-agent actions are now exactly `reply`, `message.summarize`,
+    `alert.owner` and `metadata.update`. The ten coordination actions
+    (`task.create`, `task.comment`, `task.assign_self`, `task.update_own`,
+    `task.assign_others`, `command.request`, `command.send`, `invite.create`,
+    `member.remove`, `external.message.send`) are removed, and nothing is
+    gated any more.
+
+  **Operators:** opening `esp.sqlite` drops nine tables once — `esp_fleets`,
+  `esp_fleet_members`, `esp_fleet_invites`, `esp_fleet_activity`,
+  `esp_fleet_tasks`, `esp_fleet_task_submissions`, `esp_fleet_commands`,
+  `esp_fleet_command_results` and `esp_agent_commands`. That data is deleted,
+  not migrated. The rows from the live deployment were exported to
+  `/root/backups-fleet-removal/` on the machine before the drop; that backup
+  lives on the host, not in this repository.
+
+  A pre-libp2p data root drops them during conversion instead, before its
+  identity rewrite walks the tables — otherwise a legacy node id that had been
+  reassigned between keys would fail closed inside a Fleet row and abort the
+  conversion, leaving the daemon unable to start.
+
+  A group the removed fleet-create path had marked `fleet_control` in its
+  metadata stays hidden from `GET /v1/groups`, as it was before. Nothing
+  clears that marker, so honouring it keeps those groups out of a user's moot
+  list rather than surfacing them on upgrade.
+
 - **`-trace-reconcile` is gone, and passing it now fails the command.** It was
   a live flag until the Pilot cutover: `pkg/entmoot/gossip` read it through
   `cfg.TraceReconcile` and traced reconciliation sessions with it. When that

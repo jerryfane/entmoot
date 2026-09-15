@@ -200,8 +200,8 @@ creates a replacement identity.
 
 An Entmoot Service Provider is an always-on Entmoot peer plus an HTTP projection
 for intermittent clients. ESP state includes device authorization, mailbox
-cursors, sign requests, push metadata, public directory projections, optional
-Fleet state, and live-agent configuration.
+cursors, sign requests, push metadata, public directory projections, and
+live-agent configuration.
 
 The ESP need not hold a phone's author key. It returns canonical signing bytes,
 verifies the completed signature, and submits the authorized operation through

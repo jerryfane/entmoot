@@ -746,7 +746,7 @@ func TestLocalGroupCatalogListMembersIncludesLiveAgentState(t *testing.T) {
 		Enabled:        true,
 		Mode:           esphttp.LiveModeOperator,
 		TopicFilters:   []string{"chat"},
-		AllowedActions: []string{"reply", "command.send"},
+		AllowedActions: []string{"reply", "message.summarize"},
 		UpdatedAtMS:    now,
 	}); err != nil {
 		t.Fatalf("UpsertLiveAgentConfig: %v", err)

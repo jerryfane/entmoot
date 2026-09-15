@@ -2,7 +2,6 @@ package conversion
 
 import (
 	"bytes"
-	"context"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
@@ -12,7 +11,6 @@ import (
 
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/canonical"
-	"entmoot/pkg/entmoot/esphttp"
 	"entmoot/pkg/entmoot/keystore"
 	"entmoot/pkg/entmoot/roster"
 
@@ -126,24 +124,19 @@ func TestRunConvertsLegacyRootWithoutChangingSignedBytes(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer espDB.Close()
-	espCols, err := columns(espDB, "esp_fleets")
+	espCols, err := columns(espDB, "esp_node_profile_sources")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if espCols["coordinator_node_id"] || !espCols["coordinator_member_id"] || !espCols["coordinator_peer_id"] {
-		t.Fatalf("converted ESP columns = %+v", espCols)
+	if espCols["node_id"] || !espCols["member_id"] {
+		t.Fatalf("converted ESP columns = %+v, want node_id renamed to member_id", espCols)
 	}
-	var coordinatorMember []byte
-	var coordinatorPeer string
-	if err := espDB.QueryRow(`SELECT coordinator_member_id,coordinator_peer_id FROM esp_fleets WHERE fleet_id='legacy-fleet'`).Scan(&coordinatorMember, &coordinatorPeer); err != nil {
+	var sourceMember []byte
+	if err := espDB.QueryRow(`SELECT member_id FROM esp_node_profile_sources WHERE source_key='legacy-source'`).Scan(&sourceMember); err != nil {
 		t.Fatal(err)
 	}
-	wantPeer, err := entmoot.PeerIDFromPublicKey(founder.PublicKey)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(coordinatorMember, wantMember[:]) || coordinatorPeer != wantPeer {
-		t.Fatalf("converted ESP identity = (%x, %q), want (%x, %q)", coordinatorMember, coordinatorPeer, wantMember, wantPeer)
+	if !bytes.Equal(sourceMember, wantMember[:]) {
+		t.Fatalf("converted ESP identity = %x, want %x", sourceMember, wantMember)
 	}
 	checkpointBytes, err := os.ReadFile(filepath.Join(groupDir, checkpointName))
 	if err != nil {
@@ -265,118 +258,33 @@ func TestRunConvertsReassignedLegacyNodeIDBySignedIdentityAndTime(t *testing.T) 
 	}
 	firstKey := base64.StdEncoding.EncodeToString(first.PublicKey)
 	replacementKey := base64.StdEncoding.EncodeToString(replacement.PublicKey)
-	founderKey := base64.StdEncoding.EncodeToString(founder.PublicKey)
+	// esp_node_profile_sources is the surviving ESP table keyed by a legacy
+	// node id, so it is what proves the reassignment rule: two rows carrying
+	// the same node id at different times must resolve to the two different
+	// keys that held that id then.
 	if _, err := db.Exec(`
-CREATE TABLE esp_fleets(
-  fleet_id TEXT PRIMARY KEY,
-  name TEXT NOT NULL,
-  control_group_id BLOB,
-  coordinator_node_id INTEGER NOT NULL,
-  coordinator_pubkey TEXT NOT NULL,
-  coordinator_device_id TEXT NOT NULL DEFAULT '',
-  created_at_ms INTEGER NOT NULL,
-  updated_at_ms INTEGER NOT NULL,
-  status TEXT NOT NULL DEFAULT 'active',
-  archived_at_ms INTEGER NOT NULL DEFAULT 0,
-  deleted_at_ms INTEGER NOT NULL DEFAULT 0
-);
-CREATE TABLE esp_fleet_activity(
-  event_id TEXT PRIMARY KEY,
-  fleet_id TEXT NOT NULL,
-  type TEXT NOT NULL,
-  actor_node_id INTEGER NOT NULL,
-  actor_pubkey TEXT NOT NULL,
-  subject_node_id INTEGER NOT NULL,
-  subject_pubkey TEXT NOT NULL,
-  created_at_ms INTEGER NOT NULL
-);
-CREATE TABLE esp_fleet_command_results(
-  command_id TEXT PRIMARY KEY,
-  fleet_id TEXT NOT NULL,
-  agent_node_id INTEGER NOT NULL,
-  started_at_ms INTEGER NOT NULL,
-  completed_at_ms INTEGER NOT NULL,
-  updated_at_ms INTEGER NOT NULL,
-  result BLOB NOT NULL
-);
-CREATE TABLE esp_agent_commands (
-  command_id TEXT PRIMARY KEY,
-  fleet_id TEXT NOT NULL,
-  control_group_id BLOB NOT NULL,
-  issuer_node_id INTEGER NOT NULL,
-  agent_node_id INTEGER NOT NULL,
-  action TEXT NOT NULL,
-  target BLOB NOT NULL,
-  instruction TEXT NOT NULL,
-  context BLOB,
-  args BLOB,
-  command BLOB NOT NULL,
-  payload BLOB NOT NULL,
-  status TEXT NOT NULL,
-  attempts INTEGER NOT NULL DEFAULT 0,
-  lease_owner TEXT NOT NULL DEFAULT '',
-  lease_until_ms INTEGER NOT NULL DEFAULT 0,
-  created_at_ms INTEGER NOT NULL,
+CREATE TABLE esp_node_profile_sources(
+  node_id INTEGER NOT NULL,
+  entmoot_pubkey TEXT NOT NULL DEFAULT '',
+  source TEXT NOT NULL,
+  source_key TEXT NOT NULL,
+  hostname TEXT NOT NULL,
+  confidence INTEGER NOT NULL,
+  observed_at_ms INTEGER NOT NULL,
   expires_at_ms INTEGER NOT NULL DEFAULT 0,
-  received_at_ms INTEGER NOT NULL,
-  started_at_ms INTEGER NOT NULL DEFAULT 0,
-  completed_at_ms INTEGER NOT NULL DEFAULT 0,
-  updated_at_ms INTEGER NOT NULL,
-  result BLOB,
-  last_error TEXT NOT NULL DEFAULT ''
+  source_group_id BLOB,
+  PRIMARY KEY(node_id, source_key)
 );`); err != nil {
 		db.Close()
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`INSERT INTO esp_fleets(fleet_id,name,control_group_id,coordinator_node_id,coordinator_pubkey,created_at_ms,updated_at_ms) VALUES ('fleet-a','Fleet A',?,45981,?,1700000001000,1700000001000)`, gid[:], founderKey); err != nil {
-		db.Close()
-		t.Fatal(err)
-	}
 	if _, err := db.Exec(`
-INSERT INTO esp_fleet_activity VALUES
-  ('replacement','fleet-a','command.sent',45981,?,133053,?,1700000004500),
-  ('restored','fleet-a','command.sent',45981,?,133053,?,1700000006500);
-`, founderKey, replacementKey, founderKey, firstKey); err != nil {
-		db.Close()
-		t.Fatal(err)
-	}
-	if _, err := db.Exec(`
-INSERT INTO esp_fleet_command_results VALUES
-  ('replacement','fleet-a',133053,1700000004500,1700000004501,1700000004501,?),
-  ('restored','fleet-a',133053,1700000006500,1700000006501,1700000006501,?);
-`,
-		[]byte(`{"type":"fleet.command.result","version":1,"command_id":"replacement","fleet_id":"fleet-a","agent_node_id":133053,"completed_at_ms":1700000004501}`),
-		[]byte(`{"type":"fleet.command.result","version":1,"command_id":"restored","fleet_id":"fleet-a","agent_node_id":133053,"completed_at_ms":1700000006501}`),
-	); err != nil {
-		db.Close()
-		t.Fatal(err)
-	}
-	agentPayload, err := json.Marshal(map[string]any{
-		"type":             esphttp.AgentInstructionPayloadType,
-		"version":          1,
-		"command_id":       "queued-replacement",
-		"fleet_id":         "fleet-a",
-		"control_group_id": base64.StdEncoding.EncodeToString(gid[:]),
-		"issuer_node_id":   45981,
-		"target":           map[string]any{"kind": "node", "pilot_node_id": 133053},
-		"agent_node_id":    133053,
-		"action":           "agent.instruction",
-		"instruction":      "conversion claim regression",
-		"timeout_ms":       30_000,
-		"created_at_ms":    int64(1_700_000_004_500),
-		"received_at_ms":   int64(1_700_000_004_500),
-	})
-	if err != nil {
-		db.Close()
-		t.Fatal(err)
-	}
-	if _, err := db.Exec(`
-INSERT INTO esp_agent_commands (
-  command_id,fleet_id,control_group_id,issuer_node_id,agent_node_id,action,target,
-  instruction,command,payload,status,created_at_ms,received_at_ms,updated_at_ms
-) VALUES ('queued-replacement','fleet-a',?,45981,133053,'agent.instruction',?,
-  'conversion claim regression','null',?,'running',1700000004500,1700000004500,1700000004500)
-`, gid[:], []byte(`{"kind":"node","pilot_node_id":133053}`), agentPayload); err != nil {
+INSERT INTO esp_node_profile_sources
+  (node_id, entmoot_pubkey, source, source_key, hostname, confidence, observed_at_ms, source_group_id)
+VALUES
+  (133053, ?, 'member_profile', 'replacement', 'replacement-host', 1, 1700000004500, ?),
+  (133053, ?, 'member_profile', 'restored', 'restored-host', 1, 1700000006500, ?);
+`, replacementKey, gid[:], firstKey, gid[:]); err != nil {
 		db.Close()
 		t.Fatal(err)
 	}
@@ -415,61 +323,30 @@ INSERT INTO esp_agent_commands (
 	replacementMember, _ := entmoot.MemberIDFromPublicKey(replacement.PublicKey)
 	firstPeer, _ := entmoot.PeerIDFromPublicKey(first.PublicKey)
 	replacementPeer, _ := entmoot.PeerIDFromPublicKey(replacement.PublicKey)
-	for _, want := range []struct {
-		id     string
-		member entmoot.MemberID
-		peer   string
-	}{
-		{id: "replacement", member: replacementMember, peer: replacementPeer},
-		{id: "restored", member: firstMember, peer: firstPeer},
-	} {
-		var activityMember, resultMember, resultJSON []byte
-		var activityPeer, resultPeer string
-		if err := converted.QueryRow(`SELECT subject_member_id,subject_peer_id FROM esp_fleet_activity WHERE event_id=?`, want.id).Scan(&activityMember, &activityPeer); err != nil {
-			t.Fatal(err)
-		}
-		if err := converted.QueryRow(`SELECT agent_member_id,agent_peer_id,result FROM esp_fleet_command_results WHERE command_id=?`, want.id).Scan(&resultMember, &resultPeer, &resultJSON); err != nil {
-			t.Fatal(err)
-		}
-		if !bytes.Equal(activityMember, want.member[:]) || activityPeer != want.peer {
-			t.Fatalf("%s activity identity = (%x, %q), want (%x, %q)", want.id, activityMember, activityPeer, want.member, want.peer)
-		}
-		if !bytes.Equal(resultMember, want.member[:]) || resultPeer != want.peer {
-			t.Fatalf("%s result identity = (%x, %q), want (%x, %q)", want.id, resultMember, resultPeer, want.member, want.peer)
-		}
-		var result map[string]any
-		if err := json.Unmarshal(resultJSON, &result); err != nil {
-			t.Fatal(err)
-		}
-		if _, ok := result["agent_node_id"]; ok {
-			t.Fatalf("%s result retained legacy agent_node_id: %s", want.id, resultJSON)
-		}
-		if result["agent_member_id"] != want.member.String() || result["agent_peer_id"] != want.peer {
-			t.Fatalf("%s result JSON identity = (%v, %v), want (%s, %s)", want.id, result["agent_member_id"], result["agent_peer_id"], want.member, want.peer)
-		}
-	}
-	if err := converted.Close(); err != nil {
+	cols, err := columns(converted, "esp_node_profile_sources")
+	if err != nil {
 		t.Fatal(err)
 	}
-	state, err := esphttp.OpenSQLiteStateStore(root)
-	if err != nil {
-		t.Fatalf("OpenSQLiteStateStore: %v", err)
+	if cols["node_id"] || !cols["member_id"] {
+		t.Fatalf("converted ESP columns = %+v, want node_id renamed to member_id", cols)
 	}
-	defer state.Close()
-	claimed, ok, err := state.ClaimNextAgentCommand(context.Background(), "conversion-test", 1_700_000_004_600, 1_700_000_005_600, 3)
-	if err != nil || !ok {
-		t.Fatalf("ClaimNextAgentCommand ok/err = %v/%v", ok, err)
+	for _, want := range []struct {
+		sourceKey string
+		member    entmoot.MemberID
+	}{
+		{sourceKey: "replacement", member: replacementMember},
+		{sourceKey: "restored", member: firstMember},
+	} {
+		var member []byte
+		if err := converted.QueryRow(`SELECT member_id FROM esp_node_profile_sources WHERE source_key=?`, want.sourceKey).Scan(&member); err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(member, want.member[:]) {
+			t.Fatalf("%s identity = %x, want %x", want.sourceKey, member, want.member)
+		}
 	}
-	founderMember, _ := entmoot.MemberIDFromPublicKey(founder.PublicKey)
-	founderPeer, _ := entmoot.PeerIDFromPublicKey(founder.PublicKey)
-	if claimed.Payload.IssuerMemberID != founderMember || claimed.Payload.IssuerPeerID != founderPeer {
-		t.Fatalf("claimed issuer identity = (%s, %s), want (%s, %s)", claimed.Payload.IssuerMemberID, claimed.Payload.IssuerPeerID, founderMember, founderPeer)
-	}
-	if claimed.Payload.AgentMemberID != replacementMember || claimed.Payload.AgentPeerID != replacementPeer {
-		t.Fatalf("claimed agent identity = (%s, %s), want (%s, %s)", claimed.Payload.AgentMemberID, claimed.Payload.AgentPeerID, replacementMember, replacementPeer)
-	}
-	if claimed.Payload.Target.MemberID != replacementMember || claimed.Payload.Target.PeerID != replacementPeer {
-		t.Fatalf("claimed target identity = (%s, %s), want (%s, %s)", claimed.Payload.Target.MemberID, claimed.Payload.Target.PeerID, replacementMember, replacementPeer)
+	if firstPeer == replacementPeer {
+		t.Fatal("test fixture is degenerate: both keys derive the same peer id")
 	}
 }
 
@@ -617,7 +494,7 @@ func seedLegacyESP(t *testing.T, path string, nodeID entmoot.NodeID, publicKey [
 		t.Fatal(err)
 	}
 	defer db.Close()
-	if _, err := db.Exec(`CREATE TABLE esp_fleets(fleet_id TEXT PRIMARY KEY,coordinator_node_id INTEGER NOT NULL,coordinator_pubkey TEXT NOT NULL); INSERT INTO esp_fleets VALUES(?,?,?)`, "legacy-fleet", int64(nodeID), base64.StdEncoding.EncodeToString(publicKey)); err != nil {
+	if _, err := db.Exec(`CREATE TABLE esp_node_profile_sources(node_id INTEGER NOT NULL,entmoot_pubkey TEXT NOT NULL DEFAULT '',source TEXT NOT NULL,source_key TEXT NOT NULL,hostname TEXT NOT NULL,confidence INTEGER NOT NULL,observed_at_ms INTEGER NOT NULL,PRIMARY KEY(node_id,source_key)); INSERT INTO esp_node_profile_sources VALUES(?,?,'member_profile','legacy-source','legacy-host',1,1700000002000)`, int64(nodeID), base64.StdEncoding.EncodeToString(publicKey)); err != nil {
 		t.Fatal(err)
 	}
 }
