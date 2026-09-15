@@ -118,8 +118,9 @@ Authority:
 - `admin grant` / `admin revoke`: founder only. Each writes a `policy` record
   carrying the complete admin set.
 
-Every command in that list except `status` writes a signed record and takes the
-group's writer lease, so stop the local daemon before running it. Member
+Every command in that list writes a signed record and takes the group's writer
+lease, so stop the local daemon before running it — except `status` and `admin
+list`, which only read local state. Member
 removal while the daemon is running goes through the ESP `member_remove`
 operation or the control socket instead.
 

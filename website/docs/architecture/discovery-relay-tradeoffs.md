@@ -3,8 +3,9 @@ title: Discovery and Relay Tradeoffs
 ---
 
 Entmoot uses signed, membership-bound peer hints rather than a public DHT or
-rendezvous registry. LAN discovery is available only in direct mode and accepts
-addresses only for current members.
+rendezvous registry. There is no LAN discovery in either mode: addresses reach
+a node only through invites, gossiped signed peer records and configured
+relays.
 
 Direct mode gives the simplest path and lowest relay cost, but authorized peers
 can observe direct addresses and NAT or firewall policy may prevent a
