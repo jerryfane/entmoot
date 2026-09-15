@@ -166,9 +166,6 @@ type openInviteRedeemPayload struct {
 	EntmootPubKey []byte           `json:"entmoot_pubkey"`
 }
 
-const maxOpenInviteActiveChallenges = 128
-const minOpenInviteActiveChallenges = 8
-
 func (e espOperationExecutor) ExecuteSignRequest(ctx context.Context, req esphttp.SignRequest, _ []byte) (json.RawMessage, error) {
 	switch req.Kind {
 	case "invite_accept":

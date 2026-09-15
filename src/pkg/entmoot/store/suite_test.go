@@ -610,7 +610,7 @@ func mkID(prefix, tag byte) entmoot.MessageID {
 
 // testIterMessageIDsInIDRange exercises the IterMessageIDsInIDRange contract
 // on whichever MessageStore newStore returns. It is invoked from the main
-// suite so all three backends (Memory / JSONL / SQLite) share one test body.
+// suite so every store arm shares one test body.
 func testIterMessageIDsInIDRange(t *testing.T, newStore func(t *testing.T) MessageStore) {
 	t.Helper()
 	ctx := context.Background()

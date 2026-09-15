@@ -92,14 +92,15 @@ func TestMessageContext(t *testing.T) {
 		}
 	}
 
-	t.Run("sqlite", func(t *testing.T) {
+	// native: SQLite's own MessageContext. scan: the same store behind a
+	// wrapper that hides it, which is the shape the daemon passes to the
+	// mailbox, so this arm covers the daemon's message-context path.
+	t.Run("native", func(t *testing.T) {
+		run(t, func(t *testing.T) MessageStore { return mustOpenSQLite(t) })
+	})
+	t.Run("scan", func(t *testing.T) {
 		run(t, func(t *testing.T) MessageStore {
-			s, err := OpenSQLite(t.TempDir())
-			if err != nil {
-				t.Fatalf("OpenSQLite: %v", err)
-			}
-			t.Cleanup(func() { _ = s.Close() })
-			return s
+			return hiddenNativeStore{MessageStore: mustOpenSQLite(t)}
 		})
 	})
 }

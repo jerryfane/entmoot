@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- **`-trace-reconcile` is gone, and passing it now fails the command.** The
+  flag never enabled any tracing: it was parsed, forwarded to re-exec'd child
+  commands, and read by nothing, while six documentation pages told operators
+  to pass it. A unit file or script that still passes it exits 5 with `flag
+  provided but not defined`. Use `-log-level debug` for verbose daemon logs.
+- **`pkg/entmoot/reconcile` is deleted.** The range-fingerprint reconciliation
+  session it implemented was never wired to a protocol; catch-up is the
+  cursor-paged `/entmoot/history/2` exchange, which is unchanged.
+- **The message store has one implementation.** `store.Memory` and
+  `store.JSONL` (with `store.OpenJSONL` and `store.NewMemory`) are removed;
+  `store.OpenSQLite` is what the daemon has always opened. A group directory's
+  `messages.jsonl` is no longer readable by this binary.
+- **Removed unused API surface:** `mailbox.New` and
+  `mailbox.MemoryCursorStore` (use `mailbox.NewWithCursorStore` with
+  `mailbox.OpenSQLiteCursorStore`), `signing.ExternalSigner` with `SignFunc`
+  and `NewExternalSigner`, `entmoot.Invite` and its JSON methods (superseded
+  by `entmoot.BootstrapCapability`), `entmoot.KeyRotation` with
+  `SignKeyRotation` and `VerifyKeyRotation` (membership `rekey` records
+  replace self-rotation; founder-authorised emergency rotation is not
+  implemented — see issue #124), `policy.SystemLimits`,
+  `libp2p.StartMemberMDNS` (the daemon never started mDNS),
+  `libp2p.SyncShortChain`, `ratelimit.DefaultLimits` and
+  `ratelimit.DefaultTopicLimits`, and the `entmoot.ErrReplay` and
+  `entmoot.ErrRosterHeadUnrelated` sentinels.
+
 ### Changed
 
 - **Group membership is now a set of self-signed records with signed

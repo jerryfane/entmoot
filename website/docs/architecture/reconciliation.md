@@ -17,6 +17,12 @@ message that arrives before its author's membership record is held in the
 quarantine buffer and re-checked after the next membership sync, rather than
 triggering a separate repair protocol.
 
-Operationally, two synced peers should report matching message counts and
-Merkle roots for a group. `entmootd doctor -group <id>` prints both, along with
-the number of quarantined messages and any unknown checkpoint ids.
+Operationally, two synced peers should report the same message count for a
+group: `entmootd doctor -group <id>` prints `members=` and `messages=` per
+group, and `--json` adds each group's Merkle root, which is the value to
+compare across peers.
+
+Messages waiting on a membership record are not a doctor field. The counts
+`quarantined_messages` and `unknown_head_messages` appear in the `health`
+block of the readiness event that `join` prints and that a joined daemon
+emits on its control socket.

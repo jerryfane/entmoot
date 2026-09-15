@@ -2,18 +2,16 @@
 // in deterministic topological order for Merkle-root computation and range
 // queries.
 //
-// The package defines a small MessageStore interface and ships two
-// implementations:
+// The package defines a small MessageStore interface with one implementation:
+// SQLite, one messages.sqlite per group under <root>/groups/<group_id>/. It
+// also carries a native search index and message-context lookup, offered
+// through the optional MessageSearcher and MessageContexter interfaces; the
+// package-level SearchMessages and MessageContext fall back to a deterministic
+// in-process scan for a store that does not implement them, which is what a
+// wrapping store (cmd/entmootd's notifyingStore) gets.
 //
-//   - Memory: a pure in-memory map-backed store. Fast, volatile. Useful for
-//     tests, ephemeral peers, and anywhere the caller does its own persistence.
-//   - JSONL: an append-only file-backed store using one messages.jsonl file
-//     per group under <root>/groups/<group_id>/. Durable; designed for the
-//     v0 canary binary.
-//
-// All methods are safe for concurrent use. v0 keeps retention flat — every
-// stored message is kept until explicit deletion primitives (not in v0) are
-// added; see ARCHITECTURE.md §8 for the future retention-tier story.
+// All methods are safe for concurrent use. Retention is driven by the pruning
+// primitives below rather than by the store itself; see ARCHITECTURE.md §8.
 package store
 
 import (
@@ -112,8 +110,8 @@ type MessageStore interface {
 	// empty slice and a nil error.
 	IterMessageIDsInIDRange(ctx context.Context, groupID entmoot.GroupID, loID, hiID entmoot.MessageID) ([]entmoot.MessageID, error)
 
-	// Close releases any resources held by the store. For Memory this is a
-	// no-op; for JSONL it closes any open file handles.
+	// Close releases any resources held by the store: for SQLite it closes
+	// the per-group database handles.
 	Close() error
 }
 

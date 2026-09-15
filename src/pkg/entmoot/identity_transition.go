@@ -9,10 +9,7 @@ import (
 	"entmoot/pkg/entmoot/keystore"
 )
 
-const (
-	legacyIdentityMappingDomain = "entmoot/legacy-identity-map/v1\x00"
-	keyRotationDomain           = "entmoot/key-rotation/v1\x00"
-)
+const legacyIdentityMappingDomain = "entmoot/legacy-identity-map/v1\x00"
 
 // LegacyIdentityMapping is the only bridge from a legacy Pilot NodeID to a
 // full-width MemberID. The current founder signs it for one group/checkpoint.
