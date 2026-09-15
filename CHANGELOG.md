@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- **Five one-off files are removed from the repository root.**
+  `GOAL-social-mode-disable-fleet-tasks.md` (the prompt for work that shipped,
+  and whose feature is now deleted outright), `jj3-connectivity-summary-and-fix.md`,
+  `jj3-repair-plan.md` and `asia-155760-fix-steps.md` (June-2026 incident notes
+  for a Pilot runtime that no longer exists, so their instructions contradict
+  the current docs), and `arxiv_endorser_candidates.csv`.
+
+  The CSV held 22 named people with their email addresses and affiliations in a
+  public repository. Deleting it here stops it being served from the default
+  branch, but it remains in the commit history and is still fetchable; purging
+  that needs a history rewrite and a force-push, which is an owner decision.
+
 - **Fleet, tasks and agent-commands are gone.** The whole coordination concept
   is removed, not disabled: Fleets, Fleet membership and Fleet invites, Fleet
   activity, the task queue (create, approve, assign, claim, submit, complete,
@@ -331,6 +343,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   carries the same `max_uses` and an explicit `open` flag.
 
 ### Fixed
+
+- **`docs/CLI_DESIGN.md` no longer documents commands that do not exist.** It
+  still listed `roster add`, `roster repair` and a `roster_divergence` status,
+  and described a linear roster chain that two signers could fork — all removed
+  by membership v3. The founder command list, the storage description and the
+  fork section now match the code, and the IPC, exit-code and invite sections
+  that twelve source files cite are unchanged. `README.md` no longer calls a
+  join an "enrollment"; there has been no separate enrollment step since the
+  libp2p cutover.
 
 - **Roster-ahead messages are held, not lost.** A publisher whose roster moved
   first names a head the receiver has not synchronized, and live validation
