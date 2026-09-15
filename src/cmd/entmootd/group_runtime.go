@@ -1009,9 +1009,17 @@ func (r *groupRuntime) storeMemberProfile(ctx context.Context, groupID entmoot.G
 // The bound is on messages, so a member CAN be crowded out: 4096 profile
 // messages outranking another member's newest claim leave that member at the
 // member-id fallback until it republishes. Earlier shapes were far worse — 256
-// messages, then 271 — but the limit is a window, not an absence of one. What
-// the window does guarantee is that every claim inside it is ranked, so volume
-// cannot make a member adopt a superseded name, only miss one entirely.
+// messages, then 271 — but the limit is a window, not an absence of one.
+//
+// Nor is being crowded out always a clean miss. Every claim INSIDE the window
+// is ranked correctly, so while a member's paging keys track its issue times
+// the worst a flood does is leave it at the fallback. When they do not — a
+// clock step, or a crafted profile, which this walk cannot rule out — the
+// boundary can fall between two of one member's claims, and the older one is
+// then the only one read: a node that never saw the newer records a
+// superseded name, or a name whose retraction sits just outside the window.
+// Widening the window shifts that boundary without removing it; removing it
+// needs an index on issue time, which the message store does not have.
 const (
 	profileReconcilePageSize = 256
 	maxProfileReconcilePages = 16
