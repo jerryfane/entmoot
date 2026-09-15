@@ -11,7 +11,7 @@ The operational runtime uses one Ed25519 key for both identities:
 - `MemberID`: SHA-256 of the raw Ed25519 public key.
 - libp2p `PeerID`: derived from the same public key.
 
-Every operational roster entry carries both values and the public key. Legacy node
+Every operational membership record carries both values and the public key. Legacy node
 identifiers exist only in immutable imported records and founder-signed conversion
 mappings. They are not accepted as live transport identities.
 
@@ -116,20 +116,20 @@ current roster keepers after restart.
 ## Runtime commands
 
 ```text
-join                 Enroll with targeted capabilities or open-invite descriptors
+join                 Join with targeted capabilities or open-invite descriptors
 serve                Restart groups from persistent state
 relay serve           Run a bounded, allowlisted Circuit Relay v2 service
 publish              Sign and publish a message
 tail                  Read backfill and subscribe to live messages
 query                 Query durable local history
 info                  Show local identity and group state
-doctor                Validate identity, roster, and connectivity
+doctor                Validate identity, membership, and connectivity
 peers                 Show group peer health
 group create          Create a founder-owned group
 invite create         Create a join capability (targeted or open)
 invite list           Show issued invites, uses spent, and state
 invite revoke         Withdraw an outstanding invite before it expires
-roster add/remove     Apply membership changes as founder or delegated admin
+roster remove|ban     Remove or ban a member (founder or delegated admin)
 roster admin          Grant, revoke, or list delegated admins (founder only)
 esp serve             Run the local ESP mailbox HTTP API
 esp device            Manage ESP device authorization
@@ -189,7 +189,8 @@ ready; relay-only application peers pass one of them to `-controlled-relay`.
 
 ## Persistence and conversion
 
-The SQLite store contains signed messages, roster state, invitation consumption,
+The SQLite store contains signed messages, membership records and checkpoints,
+invitation consumption,
 mailbox cursors, and conversion checkpoints. Startup conversion is transactional,
 idempotent, and hash-bound to its source files. Before conversion it copies and
 verifies every regular file in the data root, including identity and runtime
@@ -268,12 +269,14 @@ go test ./...
 
 ## Security model
 
-- Ed25519 signs identities, roster entries, capabilities, and messages.
+- Ed25519 signs identities, membership records, checkpoints, capabilities, and
+  messages.
 - MemberID and PeerID must resolve to the same public key.
-- Founder-signed roster order is monotonic and fork-checked.
+- Membership records merge in one deterministic order, so concurrent writers
+  cannot fork the member set.
 - Removed or unknown members cannot publish or subscribe to a group topic.
 - Invitation expiry, target binding, and replay state are checked before a join is accepted.
-- History synchronization revalidates message signatures and current roster policy.
+- History synchronization revalidates message signatures and current membership.
 - Open-invite and ESP requests use the same operational identity checks.
 
 ## Repository layout
@@ -281,8 +284,8 @@ go test ./...
 ```text
 src/cmd/entmootd/                  CLI, daemon, IPC, ESP, and runtime wiring
 src/pkg/entmoot/                   protocol types and identity validation
-src/pkg/entmoot/roster/            signed membership log
-src/pkg/entmoot/store/             memory and SQLite message stores
+src/pkg/entmoot/roster/            legacy linear roster chain, read-only
+src/pkg/entmoot/store/             SQLite message store, search, and paging
 src/pkg/entmoot/transport/libp2p/  membership sync, GossipSub, and history sync
 src/pkg/entmoot/conversion/        durable legacy-data conversion
 scripts/canary-libp2p.sh           isolated end-to-end runtime canary

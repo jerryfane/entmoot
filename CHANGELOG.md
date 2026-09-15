@@ -347,10 +347,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`docs/CLI_DESIGN.md` no longer documents commands that do not exist.** It
   still listed `roster add`, `roster repair` and a `roster_divergence` status,
   and described a linear roster chain that two signers could fork — all removed
-  by membership v3. The founder command list, the storage description and the
-  fork section now match the code, and the IPC, exit-code and invite sections
-  that twelve source files cite are unchanged. `README.md` no longer calls a
-  join an "enrollment"; there has been no separate enrollment step since the
+  by membership v3. Corrected: the founder command list, the storage layout
+  (which now names `conversion.sqlite`, `conversion-backup/` and
+  `conversion.lock` instead of a `conversion-*` glob that matched none of
+  them), the fork section, and the invite section's account of how a join is
+  refused and which checkpoint an invite may cite. The exit-code table is
+  unchanged.
+
+  Twelve files under `pkg/entmoot/ipc` and `pkg/entmoot/store` cite this doc by
+  section number, including sub-sections 4.2 and 5.2-5.4 that it never actually
+  had. Those sub-sections now exist and say what the code does, so the
+  citations resolve instead of dangling.
+
+- **`README.md` describes the current commands and guarantees.** It listed
+  `roster add`, which does not exist (running it exits 5), claimed roster order
+  is "monotonic and fork-checked" after membership v3 removed fork detection,
+  advertised a memory message store deleted in the previous release, and called
+  a join an "enrollment" — there has been no separate enrollment step since the
   libp2p cutover.
 
 - **Roster-ahead messages are held, not lost.** A publisher whose roster moved
