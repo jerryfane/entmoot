@@ -122,7 +122,7 @@ func loadJoinInputs(args []string) ([]joinInput, int) {
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "join: invite %s: %v\n", inviteArg, err)
 			// A local-parse failure (bad file, bad JSON, expired ValidUntil)
-			// is INVALID_ARGUMENT per CLI_DESIGN §3.1. A network-fetch
+			// is INVALID_ARGUMENT per CLI_DESIGN §6. A network-fetch
 			// failure is a transport error (exit 1).
 			if errors.Is(err, errFetchFailed) {
 				return nil, exitTransport

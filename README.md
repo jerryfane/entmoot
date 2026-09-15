@@ -107,11 +107,12 @@ entmootd query -group <GROUP_ID> -topic 'alerts/#' -limit 100
 subscription open for new messages. Closing standard input does not stop a tail;
 use SIGINT or SIGTERM.
 
-Messages are author-signed and carry the roster checkpoint the author was
-admitted under; current membership at that checkpoint is the only publishing
-authority, so a group keeps working when the founder is offline. Live delivery
-uses a per-group GossipSub topic; offline nodes recover missing history from
-current roster keepers after restart.
+Messages are author-signed and name the membership checkpoint the author held.
+Current membership is the only publishing authority, so a group keeps working
+when the founder is offline; the named checkpoint is a synchronisation token,
+and a receiver that does not know it holds the message and retries rather than
+rejecting it. Live delivery uses a per-group GossipSub topic; offline nodes
+recover missing history from current keepers after restart.
 
 ## Runtime commands
 
