@@ -65,29 +65,39 @@ func (c localGroupCatalog) ListGroupsWithOptions(ctx context.Context, opts espht
 }
 
 func groupVisibleForList(meta map[string]interface{}, opts esphttp.GroupListOptions) bool {
+	// The legacy control marker is not subject to IncludeHidden, matching the
+	// behaviour before Fleet was removed: a control group was never listed,
+	// even for a caller explicitly asking for hidden groups.
+	if groupLegacyFleetControl(meta) {
+		return false
+	}
 	if !opts.IncludeHidden && groupHidden(meta) {
 		return false
 	}
 	return true
 }
 
-// groupHidden reports whether a group is kept out of listings.
-//
-// `fleet_control` is a leftover marker: the removed fleet-create path wrote it
-// on the group it used as a control channel, and that marker hid the group from
-// GET /v1/groups and so from the phone's moot list. Nothing migrates or clears
-// the metadata, so it is still honoured here — otherwise removing Fleet would
-// make those groups appear in a user's list, a visible change to a surface that
-// has nothing to do with the feature.
+// groupLegacyFleetControl reports the leftover marker the removed fleet-create
+// path wrote on the group it used as a control channel. Nothing migrates or
+// clears that metadata, so it is still honoured: dropping it would surface
+// those groups in a user's moot list, a visible change to a surface that has
+// nothing to do with the removed feature.
+func groupLegacyFleetControl(meta map[string]interface{}) bool {
+	if meta == nil {
+		return false
+	}
+	control, ok := meta["fleet_control"].(bool)
+	return ok && control
+}
+
+// groupHidden reports whether a group opted out of listings through its own
+// metadata. IncludeHidden overrides this one.
 func groupHidden(meta map[string]interface{}) bool {
 	if meta == nil {
 		return false
 	}
-	if hidden, ok := meta["hidden"].(bool); ok && hidden {
-		return true
-	}
-	legacyControl, ok := meta["fleet_control"].(bool)
-	return ok && legacyControl
+	hidden, ok := meta["hidden"].(bool)
+	return ok && hidden
 }
 
 func (c localGroupCatalog) GetGroup(ctx context.Context, gid entmoot.GroupID) (esphttp.GroupSummary, bool, error) {
