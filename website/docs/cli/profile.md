@@ -20,8 +20,9 @@ ESP member listings show it.
 `clear` publishes an empty name, withdrawing it. `show` prints the names this
 node has observed for the group's members and works with the daemon stopped.
 
-A name expires after 30 days unless `-ttl` says otherwise; `-ttl 0` means no
-expiry. Republishing before then extends it. Expiry is why a node that leaves
+A name expires after 30 days unless `-ttl` says otherwise. Republishing before
+then extends it. There is no "never expires": `-ttl 0`, or any value above the
+90-day maximum a node will honour, publishes 90 days. Expiry is why a node that leaves
 for good eventually stops being displayed.
 
 ## What a name cannot do

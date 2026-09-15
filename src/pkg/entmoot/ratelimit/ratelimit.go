@@ -1,8 +1,10 @@
 // Package ratelimit implements per-peer token-bucket rate limiting for
 // Entmoot connections.
 //
-// Per ARCHITECTURE.md §10 (Denial of service), every :1004 connection is
-// governed by two buckets:
+// Every connection is governed by two buckets. ARCHITECTURE.md does not carry
+// a denial-of-service section, so the defaults below are the specification;
+// they are stated here rather than cited from a document that does not
+// document them:
 //
 //   - a message-rate bucket (v0 default: 100 msg/s, burst 200)
 //   - a byte-rate bucket    (v0 default: 1 MiB/s, burst 4 MiB)
@@ -32,7 +34,7 @@ import (
 	"golang.org/x/time/rate"
 )
 
-// V0 default limits, mirrored from ARCHITECTURE.md §10.
+// Default limits. These constants are the source of truth.
 const (
 	// DefaultMsgRate is the steady-state messages-per-second allowance.
 	DefaultMsgRate rate.Limit = 100
