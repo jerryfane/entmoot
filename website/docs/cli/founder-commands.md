@@ -165,7 +165,15 @@ and says what to run.
 entmootd membership upgrade -group <GROUP_ID>
 ```
 
-Only the founder runs it. Every other member receives that checkpoint from a
+```sh
+entmootd membership adopt -group <GROUP_ID> -peer /ip4/<host>/tcp/<port>/p2p/<peer-id>
+```
+
+A member whose data root predates libp2p has no address for anybody, so the
+automatic path has nothing to ask: give it one address with `membership adopt`
+and it performs the same verified adoption by hand, once.
+
+Only the founder runs `membership upgrade`. Every other member receives that checkpoint from a
 peer the first time its daemon starts afterwards, and refuses one that
 disagrees with the chain it already holds — a different founder, a different
 chain head, or a membership the chain never carried. A follower that cannot

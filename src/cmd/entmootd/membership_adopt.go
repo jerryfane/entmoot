@@ -2,10 +2,16 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"log/slog"
+	"os"
 	"time"
+
+	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/multiformats/go-multiaddr"
 
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/membership"
@@ -211,4 +217,97 @@ func (r *groupRuntime) retryPendingAdoptions(ctx context.Context, groupIDs []ent
 			pending = remaining
 		}
 	}()
+}
+
+// cmdMembershipAdopt takes a group's first checkpoint from a named peer. It
+// exists for the node the automatic path cannot help: one carried over from
+// the Pilot era, which has no libp2p address for anybody and therefore nothing
+// to ask. The operator supplies one address; everything after that is the same
+// verified adoption the daemon performs by itself.
+func cmdMembershipAdopt(gf *globalFlags, args []string) int {
+	fs := flag.NewFlagSet("membership adopt", flag.ContinueOnError)
+	groupStr := fs.String("group", "", "base64 group id (required)")
+	peerAddr := fs.String("peer", "", "multiaddr of a member that holds the checkpoint, ending in /p2p/<peer-id> (required)")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return exitOK
+		}
+		return exitInvalidArgument
+	}
+	gid, err := decodeGroupID(*groupStr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "membership adopt: %v\n", err)
+		return exitInvalidArgument
+	}
+	if *peerAddr == "" {
+		fmt.Fprintln(os.Stderr, "membership adopt: -peer is required")
+		return exitInvalidArgument
+	}
+	address, err := multiaddr.NewMultiaddr(*peerAddr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "membership adopt: -peer: %v\n", err)
+		return exitInvalidArgument
+	}
+	info, err := peer.AddrInfoFromP2pAddr(address)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "membership adopt: -peer must end in /p2p/<peer-id>: %v\n", err)
+		return exitInvalidArgument
+	}
+	s, err := setup(gf)
+	if err != nil {
+		slog.Error("membership adopt: setup", slog.String("err", err.Error()))
+		return exitTransport
+	}
+	if membership.Exists(s.dataDir, gid) {
+		fmt.Fprintf(os.Stderr, "membership adopt: group %s already holds a checkpoint\n", gid.String())
+		return exitOK
+	}
+	if err := persistGroupPeer(s.dataDir, gid, *info); err != nil {
+		slog.Error("membership adopt: remember peer", slog.String("err", err.Error()))
+		return exitTransport
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	hostConfig, err := daemonHostConfig(gf)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "membership adopt: %v\n", err)
+		return exitInvalidArgument
+	}
+	host, binding, err := libp2ptransport.NewConfiguredHost(ctx, s.identity, hostConfig)
+	if err != nil {
+		slog.Error("membership adopt: host", slog.String("err", err.Error()))
+		return exitTransport
+	}
+	defer host.Close()
+	runtime := &groupRuntime{
+		identity: s.identity,
+		dataDir:  s.dataDir,
+		host:     host,
+		binding:  binding,
+		logger:   slog.Default(),
+	}
+	checkpoint, ok, err := runtime.adoptCheckpointZero(ctx, gid)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "membership adopt: %v\n", err)
+		return exitTransport
+	}
+	if !ok {
+		fmt.Fprintf(os.Stderr, "membership adopt: %s served no checkpoint for this group; run `membership upgrade` on the founder first\n", info.ID.String())
+		return exitGroupNotFound
+	}
+	data, err := json.Marshal(map[string]any{
+		"status":     "adopted",
+		"group_id":   gid,
+		"checkpoint": checkpoint.ID,
+		"sequence":   checkpoint.Sequence,
+		"members":    len(checkpoint.Members),
+		"peer_id":    info.ID.String(),
+	})
+	if err != nil {
+		slog.Error("membership adopt: marshal", slog.String("err", err.Error()))
+		return exitTransport
+	}
+	fmt.Println(string(data))
+	return exitOK
 }
