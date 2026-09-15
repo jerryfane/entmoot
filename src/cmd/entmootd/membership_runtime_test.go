@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"errors"
+	"log/slog"
 	"testing"
 	"time"
 
@@ -289,5 +290,89 @@ func TestDaemonCheckpointsOnCadenceWithNoPeers(t *testing.T) {
 	}
 	if got := session.group.EffectivePendingCount(); got != 0 {
 		t.Fatalf("%d records are still pending after the checkpoint", got)
+	}
+}
+
+// A follower adopting checkpoint 0 has only its own chain to judge it by, so
+// that judgement is the whole defence: this is the one moment a node holds no
+// checkpoint to compare against, and it is exactly when a hostile peer would
+// try to rewrite who is in the group.
+func TestFollowerRefusesACheckpointThatDisagreesWithItsChain(t *testing.T) {
+	founder, err := keystore.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	member, err := keystore.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stranger, err := keystore.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	founderInfo := mustDaemonNodeInfo(t, founder)
+	memberInfo := mustDaemonNodeInfo(t, member)
+	strangerInfo := mustDaemonNodeInfo(t, stranger)
+
+	var gid entmoot.GroupID
+	if _, err := rand.Read(gid[:]); err != nil {
+		t.Fatal(err)
+	}
+	head := entmoot.RosterEntryID{0x11}
+	chain := map[entmoot.MemberID]struct{}{
+		*founderInfo.MemberID: {},
+		*memberInfo.MemberID:  {},
+	}
+	runtime := &groupRuntime{logger: slog.Default()}
+
+	good := membership.Checkpoint{
+		Version:    membership.Version,
+		GroupID:    gid,
+		Sequence:   0,
+		Founder:    founderInfo,
+		Members:    []entmoot.NodeInfo{founderInfo, memberInfo},
+		LegacyHead: &head,
+	}
+	if err := runtime.checkpointZeroMatchesChain(good, *founderInfo.MemberID, founderInfo, head, chain); err != nil {
+		t.Fatalf("a checkpoint describing this node's own chain was refused: %v", err)
+	}
+
+	otherHead := entmoot.RosterEntryID{0x22}
+	cases := map[string]func(membership.Checkpoint) membership.Checkpoint{
+		"names another chain": func(cp membership.Checkpoint) membership.Checkpoint {
+			cp.LegacyHead = &otherHead
+			return cp
+		},
+		"names no chain at all": func(cp membership.Checkpoint) membership.Checkpoint {
+			cp.LegacyHead = nil
+			return cp
+		},
+		"adds a member the chain never carried": func(cp membership.Checkpoint) membership.Checkpoint {
+			cp.Members = append(append([]entmoot.NodeInfo(nil), cp.Members...), strangerInfo)
+			return cp
+		},
+		"drops a member the chain carries": func(cp membership.Checkpoint) membership.Checkpoint {
+			cp.Members = []entmoot.NodeInfo{founderInfo}
+			return cp
+		},
+		"substitutes one member for another": func(cp membership.Checkpoint) membership.Checkpoint {
+			cp.Members = []entmoot.NodeInfo{founderInfo, strangerInfo}
+			return cp
+		},
+		"claims a different founder": func(cp membership.Checkpoint) membership.Checkpoint {
+			cp.Founder = strangerInfo
+			return cp
+		},
+		"is not a starting point": func(cp membership.Checkpoint) membership.Checkpoint {
+			cp.Sequence = 3
+			return cp
+		},
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			if err := runtime.checkpointZeroMatchesChain(mutate(good), *founderInfo.MemberID, founderInfo, head, chain); err == nil {
+				t.Fatalf("a checkpoint that %s was accepted", name)
+			}
+		})
 	}
 }
