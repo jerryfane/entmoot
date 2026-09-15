@@ -102,8 +102,8 @@ no operation executor configured, executable operation completion fails with
 `operation_unavailable`.
 
 Group updates are ESP-local display metadata. They do not mutate Entmoot's
-roster protocol. Device-auth callers for admin-scoped operations must have the
-group in both `groups` and `admin_groups`; membership and admin rights are
+membership protocol. Device-auth callers for admin-scoped operations must have
+the group in both `groups` and `admin_groups`; membership and admin rights are
 checked again when the sign request is completed.
 
 Group list/get responses may include `name`, `description`, `tags`, and an
@@ -205,12 +205,12 @@ Example public directory entry shape:
 
 `visibility=public` and `join_mode=open_invite` are independent values.
 Operators may set a listed descriptor to `pending`, `delisted`, or `blocked`
-for Entmoot-operated surfaces without changing the group roster.
+for Entmoot-operated surfaces without changing group membership.
 
 Member list responses include `display_name` and may include profile and live
 state. A member profile is signed with the same Entmoot key that derives the
 full-width MemberID and libp2p PeerID. ESP exposes it only after the profile
-author still matches the current roster. ESP-local profile observations are
+author still matches current membership. ESP-local profile observations are
 display hints, not identity authority. `display_name` is stable for clients and
 falls back to a short presentation of the MemberID when no approved name is
 available. `live` is ESP-local state with `enabled`, `status`, `mode`, topic
@@ -234,11 +234,12 @@ match the CLI: mode `reply_on_mention`, topics `#`, and `0` for
 Admin invite and member-management routes:
 
 - `DELETE /v1/groups/{group_id}/members/{node_id}` creates a
-  `member_remove` sign request. Completion appends the signed roster removal
-  through the running daemon and fans out the new roster head.
+  `member_remove` sign request. Completion signs a `remove` membership record
+  through the running daemon and propagates it to the group's other members.
 - `POST /v1/groups/{group_id}/invites` creates an `invite_create` sign request
   and returns a targeted signed invite after completion. Entmoot verifies the
-  target MemberID, PeerID, and public-key binding before adding the roster entry.
+  target MemberID, PeerID, and public-key binding. It does not add a member:
+  the target signs its own join record when it redeems the invite.
 - `POST /v1/groups/{group_id}/open-invites` creates an
   `open_invite_create` sign request. Completion stores an issuer-scoped token
   with expiry, max-use count, and optional bootstrap peers, and returns

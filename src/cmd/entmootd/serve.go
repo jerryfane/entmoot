@@ -101,7 +101,7 @@ func selectServeGroupIDs(dataRoot string, selected []string, logger *slog.Logger
 			if _, ok := seen[gid]; ok {
 				continue
 			}
-			if !rosterFileExists(dataRoot, gid) {
+			if !membershipExists(dataRoot, gid) {
 				return nil, fmt.Errorf("%w: %s", errServeGroupMissing, gid.String())
 			}
 			seen[gid] = struct{}{}
@@ -126,9 +126,9 @@ func selectServeGroupIDs(dataRoot string, selected []string, logger *slog.Logger
 			}
 			continue
 		}
-		if !rosterFileExists(dataRoot, gid) {
+		if !membershipExists(dataRoot, gid) {
 			if logger != nil {
-				logger.Warn("serve: skipping group without roster",
+				logger.Warn("serve: skipping group without a membership checkpoint",
 					slog.String("group_id", gid.String()))
 			}
 			continue
@@ -141,6 +141,6 @@ func selectServeGroupIDs(dataRoot string, selected []string, logger *slog.Logger
 	return out, nil
 }
 
-func rosterFileExists(dataRoot string, gid entmoot.GroupID) bool {
-	return groupRosterExists(dataRoot, gid)
+func membershipExists(dataRoot string, gid entmoot.GroupID) bool {
+	return groupMembershipExists(dataRoot, gid)
 }

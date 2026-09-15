@@ -15,19 +15,34 @@ Default locations:
 ~/.entmoot/entmoot
 ```
 
-Group SQLite stores live under the Entmoot data root. Back up the data root
-and identity file together. Do not publish private keys or device private keys.
+Group SQLite stores live under the Entmoot data root, one directory per group
+beneath `groups/`. Back up the data root and identity file together. Do not
+publish private keys or device private keys.
 
 State ownership:
 
 | Path | Stores |
 |---|---|
 | `identity.json` | Local Entmoot author key. |
-| group SQLite files | Group rosters, messages, Merkle state, profiles, and gossip state. |
+| `groups/<group>/membership.sqlite` | The group's signed membership: checkpoints and the records not yet folded into one. |
+| `groups/<group>/membership.writer.lock` | Single-writer lease over that group's membership. |
+| other group SQLite files | Messages, Merkle state, profiles, and gossip state. |
+| `bootstrap-admission.db` | Local record of the invites this node issued, used by `invite list`. Not an authority: invite use limits and revocations are projected from the group's signed state. |
 | `mailbox.sqlite` | Durable ESP mailbox cursors. |
 | `esp.sqlite` | Sign requests, push tokens, notification preferences, Fleets, Fleet members, tasks, commands, local agent-command queue, live-agent configs, presence, and cursors. |
 | `esp-devices.json` | Local ESP device registry. |
 | `runtime.env` | Installed wrapper defaults for data path, identity, and connectivity. |
+
+Legacy state, present only in groups created before signed checkpoints:
+
+| Path | Stores |
+|---|---|
+| `groups/<group>/roster.sqlite` | The pre-checkpoint linear roster chain. Read-only. `entmootd membership upgrade` mints checkpoint 0 from it, and it stays on disk afterwards so version-0 messages that cite one of its entries can still be verified. |
+| `groups/<group>/roster.jsonl` | Older import form of the same chain. |
+
+A group directory that holds only the legacy chain and no
+`membership.sqlite` is not serveable until the founder runs
+`entmootd membership upgrade`.
 
 Container/OpenClaw agents normally keep all Entmoot runtime state under
 `/data/.entmoot`:

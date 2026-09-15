@@ -227,7 +227,7 @@ func (r *fleetCommandRunner) commandContextFromControlRoster(ctx context.Context
 	if err != nil || !ok {
 		return fleetCommandContext{}, false, err
 	}
-	rlog, ok, err := openExistingRosterLog(r.server.dataDir, groupID)
+	rlog, ok, err := openExistingGroup(r.server.dataDir, groupID)
 	if err != nil || !ok {
 		return fleetCommandContext{}, false, err
 	}
@@ -240,10 +240,7 @@ func (r *fleetCommandRunner) commandContextFromControlRoster(ctx context.Context
 	if !ok || !bytes.Equal(localInfo.EntmootPubKey, r.server.identity.PublicKey) {
 		return fleetCommandContext{}, false, nil
 	}
-	founder, ok := rlog.Founder()
-	if !ok {
-		return fleetCommandContext{}, false, nil
-	}
+	founder := rlog.Founder()
 	role := esphttp.FleetRoleAgent
 	if bytes.Equal(founder.EntmootPubKey, localInfo.EntmootPubKey) {
 		role = esphttp.FleetRoleCoordinator

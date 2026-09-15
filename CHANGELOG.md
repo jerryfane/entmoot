@@ -7,6 +7,112 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Group membership is now a set of self-signed records with signed
+  checkpoints, replacing the linear founder/admin-signed roster chain.** A
+  joiner signs its own admission, redeeming an invite that authorises it, so
+  admitting a member no longer requires the founder or a delegated admin to be
+  online and writing. Records (`join`, `leave`, `rekey`, `remove`, `unban`,
+  `policy`, `revoke_invite`) merge by one deterministic total order —
+  timestamp, then kind, then id — with joins applied before rekeys, authority
+  records, and leaves. The kind order is a decision, not an accident: a
+  removal beats a simultaneous join, and a leave always sticks, because
+  admitting someone by mistake is recoverable and failing to remove them is
+  not.
+
+  Because membership is a set, two nodes holding the same records project the
+  same membership whatever order those records arrived in. That removes the
+  fork as a concept, and with it `roster repair`, per-peer roster backoff,
+  fork classification, divergence reports and the `roster_divergence` status
+  field. Join health now reports `pending_membership_records` instead, which
+  is the growth an operator can actually act on.
+
+  Any admin — not only the founder — periodically signs a checkpoint: the
+  complete member set, policy, bans and invite-use counts, chained to the
+  previous checkpoint. A checkpoint replaces the records it covers, so records
+  older than it are refused as stale and a discarded change cannot return. A
+  new member downloads one checkpoint instead of replaying a group's whole
+  past, and looking up membership at a cited checkpoint is constant time: 330ns
+  at 1,000 members and 172ns at 100,000, against 3.5ms and 316ms for the chain
+  walk it replaces. Cadence is group policy (`checkpoint_every`, default 64), and signing is
+  automatic: every maintenance round a node that may sign checks the cadence
+  and signs if it is due, including when it has heard from no peer, since the
+  records it signed itself count towards the cadence too. `roster checkpoint`
+  is for signing one now rather than at the cadence.
+
+  Who may sign one is decided by the checkpoint BEFORE it, and never by the
+  checkpoint's own claim about the admin set — its signer writes that claim,
+  so reading authority from it let any peer name itself an admin and be
+  believed by a node that held no record from the covered window. The same
+  rule is why a freshly granted admin signs the checkpoint after next rather
+  than the one carrying its own grant: a checkpoint nobody else could verify
+  would make every later one unreachable too.
+
+  A node starting from nothing adopts a FOUNDER-signed checkpoint, because the
+  founder's key is the only thing an invite pins and therefore the only
+  signature such a node can check. Admins may still sign checkpoints — that is
+  what lets a group retire history while the founder is away — and at one
+  sequence a founder-signed checkpoint wins over an admin-signed one, so the
+  chain a joiner walks stays anchored. Each node keeps the chain from its
+  newest founder-signed checkpoint forward, so a founder that never
+  checkpoints leaves a longer chain behind; `roster status` shows it as the
+  gap between the anchor and the canonical sequence.
+
+  A checkpoint dated more than five minutes ahead of the local clock is
+  refused: its timestamp decides which records it covers, so one dated next
+  year would make every legitimate record stale and freeze the node. A
+  checkpoint that claims to replace a linear roster chain must name the head
+  of the chain the node actually holds, and one that claims an upgrade where
+  there is no chain is refused rather than installed.
+
+  An invite is now worth exactly its issuer's current authority. Remove or
+  demote the issuer and its outstanding invites stop working on every node at
+  once, with no revocation step and nothing to fail. Use limits and
+  `revoke_invite` records are projected from the group's own signed state, so
+  every node reaches the same answer offline; the per-node reservation ledger
+  that used to count redemptions is gone, and `bootstrap-admission.db` is now
+  only a local record of what this node issued, for `invite list`.
+- **Transport.** `/entmoot/membership/1` serves checkpoints plus the records a
+  caller does not hold, and `/entmoot/membership-push/1` accepts one signed
+  record, which is how a joiner delivers its own join and how a member
+  propagates a change without waiting for the next round. A node that accepts
+  a pushed record forwards it once to the group's other reachable members, so
+  a join reaches members the joiner never contacted. Membership answers carry
+  no paging snapshot: they are computed from live state, partial progress is
+  always safe, and a truncated answer means "ask again". `/entmoot/roster/2`
+  and `/entmoot/enrollment/3` are removed. History sync and peer records are
+  unchanged.
+
+  A pull names the checkpoint it projects from and a cursor into the group's
+  record order; the answer carries what follows and the cursor to continue
+  from, and one pull pages up to 32 times. The cursor replaced a list of held
+  record ids, which did not fit in the request frame once a node held a few
+  hundred records and, when truncated, made the server re-serve records the
+  caller already had round after round without ever reaching the ones it
+  lacked — a silent livelock rather than a visible failure.
+
+  One response is capped at 4 MiB, which bounds a group at roughly 20,000
+  members: a larger group cannot carry its checkpoint in one answer and says
+  so, rather than syncing half a membership. Records are capped at 512 per
+  answer and checkpoints at four, served oldest first so a caller far behind
+  can walk them in the order it must verify them.
+- **Commands.** `roster remove` (founder or admin; only the founder may remove
+  an admin), `roster ban`/`roster unban` (unban is founder-only), `roster
+  leave` (any member, about itself), `roster checkpoint`, `roster status`,
+  `group policy join-rule`, `group policy checkpoint-every`. `roster add` is
+  gone: a member signs itself in with an invite. `roster repair` is gone: there
+  is no fork to repair.
+- **Migration.** `membership upgrade -group GID` mints checkpoint 0 from an
+  existing linear chain, preserving members and delegated admins and recording
+  the chain head inside the checkpoint so a fabricated upgrade is detectable.
+  It is founder-only, because only the founder's signature anchors a group,
+  and idempotent. The chain stays on disk read-only: version-0 messages that
+  cite it are still verified against it and against the founder-signed
+  conversion commitment. A group with no checkpoint is not served — the daemon
+  skips it and names it — rather than being served from a chain the protocol
+  no longer speaks.
+
 ### Added
 
 - **Delegated admins.** A founder can now name delegated admins with

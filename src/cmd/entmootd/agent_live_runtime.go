@@ -18,8 +18,8 @@ import (
 
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/esphttp"
+	"entmoot/pkg/entmoot/membership"
 	entpolicy "entmoot/pkg/entmoot/policy"
-	"entmoot/pkg/entmoot/roster"
 	"entmoot/pkg/entmoot/store"
 
 	"golang.org/x/time/rate"
@@ -1298,18 +1298,12 @@ func liveActionRequireGroupFounderPublisher(ctx context.Context, gf *globalFlags
 	if err != nil || infoMemberID != nodeID {
 		return fmt.Errorf("live action metadata.update requires the local publisher to match live member %s", nodeID.String())
 	}
-	if !groupRosterExists(gf.data, groupID) {
-		return fmt.Errorf("live action metadata.update requires group roster")
-	}
-	rlog, err := roster.OpenJSONL(gf.data, groupID)
+	group, err := membership.Open(gf.data, groupID)
 	if err != nil {
-		return err
+		return fmt.Errorf("live action metadata.update requires group membership: %w", err)
 	}
-	defer rlog.Close()
-	founder, ok := rlog.Founder()
-	if !ok {
-		return fmt.Errorf("live action metadata.update requires group founder")
-	}
+	defer group.Close()
+	founder := group.Founder()
 	if !bytes.Equal(founder.EntmootPubKey, info.EntmootPubKey) {
 		return errors.New("live action metadata.update requires the local publisher to match the group founder")
 	}

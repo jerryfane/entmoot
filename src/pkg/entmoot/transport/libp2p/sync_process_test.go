@@ -3,6 +3,7 @@ package libp2ptransport
 import (
 	"bufio"
 	"context"
+	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -17,8 +18,9 @@ import (
 	multiaddr "github.com/multiformats/go-multiaddr"
 
 	"entmoot/pkg/entmoot"
+	"entmoot/pkg/entmoot/keystore"
+	"entmoot/pkg/entmoot/membership"
 	"entmoot/pkg/entmoot/merkle"
-	"entmoot/pkg/entmoot/roster"
 	"entmoot/pkg/entmoot/signing"
 	"entmoot/pkg/entmoot/store"
 )
@@ -33,7 +35,9 @@ func TestHistorySyncAcrossSeparateProcessWithoutPilot(t *testing.T) {
 	command := exec.Command(os.Args[0], "-test.run=^TestHistorySyncSeparateProcessServer$", "-test.v=false")
 	command.Env = append(os.Environ(),
 		"ENTMOOT_SYNC_HELPER=1",
-		"ENTMOOT_SYNC_CLIENT_KEY="+base64.StdEncoding.EncodeToString(clientIdentity.PublicKey),
+		// A join is self-signed now, so the helper needs the client's key to
+		// admit it to the group it serves.
+		"ENTMOOT_SYNC_CLIENT_SECRET="+base64.StdEncoding.EncodeToString(clientIdentity.PrivateKey),
 		"ENTMOOT_SYNC_DATA="+t.TempDir(),
 	)
 	stdin, err := command.StdinPipe()
@@ -98,9 +102,17 @@ func TestHistorySyncSeparateProcessServer(t *testing.T) {
 	if os.Getenv("ENTMOOT_SYNC_HELPER") != "1" {
 		t.Skip("helper process")
 	}
-	clientPublicKey, err := base64.StdEncoding.DecodeString(os.Getenv("ENTMOOT_SYNC_CLIENT_KEY"))
+	clientSecret, err := base64.StdEncoding.DecodeString(os.Getenv("ENTMOOT_SYNC_CLIENT_SECRET"))
 	if err != nil {
 		t.Fatal(err)
+	}
+	if len(clientSecret) != ed25519.PrivateKeySize {
+		t.Fatalf("client secret is %d bytes", len(clientSecret))
+	}
+	clientPrivateKey := ed25519.PrivateKey(clientSecret)
+	clientIdentity := &keystore.Identity{
+		PrivateKey: clientPrivateKey,
+		PublicKey:  clientPrivateKey.Public().(ed25519.PublicKey),
 	}
 	serverIdentity := mustIdentity(t)
 	ctx := context.Background()
@@ -110,16 +122,15 @@ func TestHistorySyncSeparateProcessServer(t *testing.T) {
 	}
 	defer serverHost.Close()
 	groupID := processSyncGroupID()
-	rosterLog := roster.New(groupID)
 	founder := mustNodeInfo(t, serverIdentity.PublicKey)
-	if err := rosterLog.Genesis(serverIdentity, founder, 1_000); err != nil {
-		t.Fatal(err)
-	}
-	entry, err := rosterLog.SignEntry(serverIdentity, "add", mustNodeInfo(t, clientPublicKey), nil, 2_000)
+	policy := membership.DefaultPolicy()
+	policy.JoinRule = membership.JoinRuleOpen
+	group, err := membership.Create(t.TempDir(), serverIdentity, founder, groupID, policy, 1_000)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := rosterLog.Apply(entry); err != nil {
+	defer group.Close()
+	if _, err := group.SignRecord(clientIdentity, membership.Record{Kind: membership.KindJoin}); err != nil {
 		t.Fatal(err)
 	}
 	source, err := store.OpenSQLite(os.Getenv("ENTMOOT_SYNC_DATA"))
@@ -132,7 +143,7 @@ func TestHistorySyncSeparateProcessServer(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := 0; i < 12; i++ {
-		head := rosterLog.Head()
+		head := group.Canonical().ID
 		message, err := signer.SignMessage(ctx, entmoot.Message{Version: 2, GroupID: groupID, Timestamp: int64(3_000 + i), Topics: []string{"process"}, Content: []byte(fmt.Sprintf("process-%02d", i)), RosterHead: &head})
 		if err != nil {
 			t.Fatal(err)
@@ -142,10 +153,9 @@ func TestHistorySyncSeparateProcessServer(t *testing.T) {
 		}
 	}
 	server := SyncServer{
-		Host:      serverHost,
-		Admission: NewBootstrapAdmission(),
-		Roster: func(want entmoot.GroupID) (*roster.RosterLog, bool) {
-			return rosterLog, want == groupID
+		Host: serverHost,
+		Group: func(want entmoot.GroupID) (*membership.Group, bool) {
+			return group, want == groupID
 		},
 		Store: source,
 	}

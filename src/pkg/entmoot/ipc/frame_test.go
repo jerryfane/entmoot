@@ -197,8 +197,6 @@ func TestMsgTypeString(t *testing.T) {
 		MsgInviteAuthorityCheckResp: "invite_authority_check_resp",
 		MsgGroupDeactivateReq:       "group_deactivate_req",
 		MsgGroupDeactivateResp:      "group_deactivate_resp",
-		MsgRosterRepairReq:          "roster_repair_req",
-		MsgRosterRepairResp:         "roster_repair_resp",
 		MsgTailSubscribe:            "tail_subscribe",
 		MsgTailEvent:                "tail_event",
 		MsgInfoReq:                  "info_req",

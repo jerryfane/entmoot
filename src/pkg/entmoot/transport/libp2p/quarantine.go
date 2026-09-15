@@ -148,17 +148,17 @@ func (q *rosterAheadQuarantine) len() int {
 // run it after a roster synchronization; messages whose head is still unknown
 // keep waiting until they expire.
 //
-// A roster sync can apply several entries at once, so by drain time a held
-// message may name a head that is already superseded. It is still authentic
-// history, authorized at the head it names, so it is verified as historical
-// rather than discarded for being late.
+// A membership sync can adopt a checkpoint and several records at once, so by
+// drain time a held message may name a checkpoint that is no longer canonical.
+// It is still authentic history, authorised at the checkpoint it names, so it
+// is verified as historical rather than discarded for being late.
 func (g *LiveGroup) DrainQuarantine(ctx context.Context) (ingested int, dropped int) {
 	if g == nil || g.quarantine == nil {
 		return 0, 0
 	}
-	ready := g.quarantine.take(g.cfg.Roster.HasEntry)
+	ready := g.quarantine.take(g.known)
 	for _, message := range ready {
-		// The roster moved on since the message arrived, so re-run the full
+		// Membership moved on since the message arrived, so re-run the full
 		// check rather than trusting the earlier partial result.
 		if err := g.authorizeDrained(message); err != nil {
 			dropped++
@@ -181,16 +181,23 @@ func (g *LiveGroup) DrainQuarantine(ctx context.Context) (ingested int, dropped 
 }
 
 // authorizeDrained applies the live rule when the held message still names the
-// current head, and the historical rule when the roster has moved past it. A
+// canonical checkpoint, and the historical rule once membership has moved on. A
 // message is never accepted on weaker grounds than it would have been at
 // arrival: both paths verify author authority at the named head and the author
 // signature.
+// known reports whether this node can now place a cited head: either a
+// checkpoint it holds, or a record it holds, which is what the live rule needs
+// to tell a synchronisation gap from a fabricated head.
+func (g *LiveGroup) known(head entmoot.RosterEntryID) bool {
+	return g.cfg.Group.HasCheckpoint(head) || g.cfg.Group.HasRecord(head)
+}
+
 func (g *LiveGroup) authorizeDrained(message entmoot.Message) error {
-	if message.RosterHead != nil && *message.RosterHead != g.cfg.Roster.Head() {
-		if err := VerifyHistoricalMessage(g.cfg.Roster, message, g.now()); err != nil {
+	if message.RosterHead != nil && *message.RosterHead != g.cfg.Group.Canonical().ID {
+		if err := VerifyHistoricalMessage(g.cfg.Group, message, g.now()); err != nil {
 			return err
 		}
-	} else if err := VerifyLiveMessage(g.cfg.Roster, message, g.now()); err != nil {
+	} else if err := VerifyLiveMessage(g.cfg.Group, message, g.now()); err != nil {
 		return err
 	}
 	if g.cfg.Authorize != nil {

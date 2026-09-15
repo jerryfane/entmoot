@@ -1,55 +1,42 @@
 package libp2ptransport
 
 import (
-	"context"
+	"errors"
 	"testing"
 	"time"
 
-	libp2p "github.com/libp2p/go-libp2p"
-	"github.com/libp2p/go-libp2p/core/protocol"
-
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/keystore"
+	"entmoot/pkg/entmoot/membership"
 )
 
-func TestBootstrapCapabilityAdmitsFreshNonMemberOnce(t *testing.T) {
+// An invite is verifiable on its own: signature, shape and validity window.
+// Nothing else about it can be checked before a joiner has group state, so
+// this is the whole of the host-free gate.
+func TestBootstrapCapabilityVerifiesInsideItsWindowOnly(t *testing.T) {
 	founder := mustIdentity(t)
-	target := mustIdentity(t)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	targetHost, targetBinding, err := NewHost(ctx, target, libp2p.NoListenAddrs)
+	_, group := mustInviteOnlyGroup(t, t.TempDir(), founder)
+	capability := mustInvite(t, group, founder, nil, 1, nil)
+	holder := mustIdentity(t)
+	holderBinding, err := BindingFromPublicKey(holder.PublicKey)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer targetHost.Close()
-	now := time.UnixMilli(10_000)
-	capability := BootstrapCapability{
-		TargetPublicKey: target.PublicKey,
-		TargetMemberID:  targetBinding.MemberID,
-		TargetPeerID:    targetBinding.PeerID.String(),
-		Founder:         mustNodeInfo(t, founder.PublicKey),
-		AllowedPeerIDs:  []string{targetBinding.PeerID.String()},
-		IssuedAtMS:      now.Add(-time.Minute).UnixMilli(),
-		ExpiresAtMS:     now.Add(time.Minute).UnixMilli(),
+	if err := VerifyBootstrapCapability(capability, holderBinding.PeerID, time.Now()); err != nil {
+		t.Fatalf("live bearer invite refused: %v", err)
 	}
-	capability.GroupID[0] = 1
-	capability.RosterHead[0] = 2
-	capability.Nonce[0] = 3
-	if err := SignBootstrapCapability(founder, &capability); err != nil {
-		t.Fatal(err)
+	expired := time.UnixMilli(capability.ExpiresAtMS).Add(time.Millisecond)
+	if err := VerifyBootstrapCapability(capability, holderBinding.PeerID, expired); !errors.Is(err, ErrBootstrapDenied) {
+		t.Fatalf("expired invite error = %v, want %v", err, ErrBootstrapDenied)
 	}
-	admission := NewBootstrapAdmission()
-	if err := admission.Authorize(capability, targetHost.ID(), protocol.ID("/entmoot/gossip/2"), now); err == nil {
-		t.Fatal("pre-member gossip was authorized")
-	}
-	if err := admission.Authorize(capability, targetHost.ID(), EnrollmentProtocol, now); err != nil {
-		t.Fatalf("fresh non-member enrollment denied: %v", err)
-	}
-	if err := admission.Authorize(capability, targetHost.ID(), EnrollmentProtocol, now); err == nil {
-		t.Fatal("single-use capability was replayed")
+	tooEarly := time.UnixMilli(capability.IssuedAtMS).Add(-time.Millisecond)
+	if err := VerifyBootstrapCapability(capability, holderBinding.PeerID, tooEarly); !errors.Is(err, ErrBootstrapDenied) {
+		t.Fatalf("not-yet-valid invite error = %v, want %v", err, ErrBootstrapDenied)
 	}
 }
 
+// A target-bound invite is bound to the secure transport identity redeeming
+// it, so a leaked link cannot be used from another peer.
 func TestBootstrapCapabilityRejectsInvalidPeerBinding(t *testing.T) {
 	founder := mustIdentity(t)
 	target := mustIdentity(t)
@@ -62,115 +49,142 @@ func TestBootstrapCapabilityRejectsInvalidPeerBinding(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	now := time.UnixMilli(20_000)
-	capability := BootstrapCapability{
-		TargetPublicKey: target.PublicKey,
-		TargetMemberID:  targetBinding.MemberID,
-		TargetPeerID:    targetBinding.PeerID.String(),
-		Founder:         mustNodeInfo(t, founder.PublicKey),
-		AllowedPeerIDs:  []string{targetBinding.PeerID.String()},
-		IssuedAtMS:      now.Add(-time.Minute).UnixMilli(),
-		ExpiresAtMS:     now.Add(time.Minute).UnixMilli(),
-	}
-	capability.GroupID[0] = 1
-	capability.Nonce[0] = 1
-	if err := SignBootstrapCapability(founder, &capability); err != nil {
-		t.Fatal(err)
-	}
-	if err := NewBootstrapAdmission().Authorize(capability, attackerBinding.PeerID, EnrollmentProtocol, now); err == nil {
-		t.Fatal("capability accepted from a different secure transport identity")
-	}
-}
-
-func TestBootstrapCapabilityReplayRejectedAfterRestart(t *testing.T) {
-	founder := mustIdentity(t)
-	target := mustIdentity(t)
-	targetBinding, err := BindingFromPublicKey(target.PublicKey)
-	if err != nil {
-		t.Fatal(err)
-	}
-	now := time.UnixMilli(30_000)
-	capability := BootstrapCapability{
-		TargetPublicKey: target.PublicKey,
-		TargetMemberID:  targetBinding.MemberID,
-		TargetPeerID:    targetBinding.PeerID.String(),
-		Founder:         mustNodeInfo(t, founder.PublicKey),
-		AllowedPeerIDs:  []string{targetBinding.PeerID.String()},
-		IssuedAtMS:      now.Add(-time.Minute).UnixMilli(),
-		ExpiresAtMS:     now.Add(time.Minute).UnixMilli(),
-	}
-	capability.GroupID[0] = 4
-	capability.Nonce[0] = 5
-	if err := SignBootstrapCapability(founder, &capability); err != nil {
-		t.Fatal(err)
-	}
-	dir := t.TempDir()
-	first, err := OpenPersistentBootstrapAdmission(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := first.Authorize(capability, targetBinding.PeerID, EnrollmentProtocol, now); err != nil {
-		t.Fatal(err)
-	}
-	if err := first.Close(); err != nil {
-		t.Fatal(err)
-	}
-	second, err := OpenPersistentBootstrapAdmission(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer second.Close()
-	if err := second.Authorize(capability, targetBinding.PeerID, EnrollmentProtocol, now); err == nil {
-		t.Fatal("capability replay succeeded after admission restart")
-	}
-}
-
-func TestPersistentReservationExpiresAfterRestart(t *testing.T) {
-	founder := mustIdentity(t)
-	target := mustIdentity(t)
-	targetBinding, err := BindingFromPublicKey(target.PublicKey)
-	if err != nil {
-		t.Fatal(err)
-	}
+	_, group := mustInviteOnlyGroup(t, t.TempDir(), founder)
+	capability := mustInvite(t, group, founder, target.PublicKey, 1, nil)
 	now := time.Now()
-	capability := BootstrapCapability{
-		TargetPublicKey: target.PublicKey,
-		TargetMemberID:  targetBinding.MemberID,
-		TargetPeerID:    targetBinding.PeerID.String(),
-		Founder:         mustNodeInfo(t, founder.PublicKey),
-		AllowedPeerIDs:  []string{targetBinding.PeerID.String()},
-		IssuedAtMS:      now.Add(-time.Minute).UnixMilli(),
-		ExpiresAtMS:     now.Add(time.Hour).UnixMilli(),
+	if err := VerifyBootstrapCapability(capability, attackerBinding.PeerID, now); !errors.Is(err, ErrBootstrapDenied) {
+		t.Fatalf("capability accepted from a different secure transport identity: %v", err)
 	}
-	capability.GroupID[0] = 6
-	capability.Nonce[0] = 7
-	if err := SignBootstrapCapability(founder, &capability); err != nil {
-		t.Fatal(err)
+	if err := VerifyBootstrapCapability(capability, targetBinding.PeerID, now); err != nil {
+		t.Fatalf("target-bound invite refused its own target: %v", err)
 	}
-	dir := t.TempDir()
-	first, err := OpenPersistentBootstrapAdmission(dir)
-	if err != nil {
-		t.Fatal(err)
+}
+
+// The signature on an invite only means something once it is bound to who may
+// administer the group right now: the founder always, a delegated admin while
+// it holds that delegation.
+func TestAuthorizedIssuerRequiresCurrentAdministrator(t *testing.T) {
+	founder := mustIdentity(t)
+	admin := mustIdentity(t)
+	stranger := mustIdentity(t)
+	_, group := mustOpenGroup(t, founder, admin)
+	adminNode := mustNode(t, admin)
+	setInviteTestAdmins(t, group, founder, *adminNode.MemberID)
+
+	if err := AuthorizedIssuer(group, mustNode(t, founder)); err != nil {
+		t.Fatalf("founder refused as issuer: %v", err)
 	}
-	if err := first.Reserve(capability, targetBinding.PeerID, EnrollmentProtocol, now); err != nil {
-		t.Fatal(err)
+	if err := AuthorizedIssuer(group, adminNode); err != nil {
+		t.Fatalf("delegated admin refused as issuer: %v", err)
 	}
-	if err := first.Close(); err != nil {
-		t.Fatal(err)
+	if err := AuthorizedIssuer(group, mustNode(t, stranger)); !errors.Is(err, ErrBootstrapDenied) {
+		t.Fatalf("non-member accepted as issuer: %v", err)
 	}
-	second, err := OpenPersistentBootstrapAdmission(dir)
-	if err != nil {
-		t.Fatal(err)
+
+	setInviteTestAdmins(t, group, founder)
+	if err := AuthorizedIssuer(group, adminNode); !errors.Is(err, ErrBootstrapDenied) {
+		t.Fatalf("demoted admin accepted as issuer: %v", err)
 	}
-	defer second.Close()
-	if err := second.Reserve(capability, targetBinding.PeerID, EnrollmentProtocol, now); err == nil {
-		t.Fatal("fresh reservation was stolen after restart")
+	if !group.IsMemberID(*adminNode.MemberID) {
+		t.Fatal("demotion removed the member as well as the delegation")
 	}
-	if _, err := second.db.Exec(`UPDATE bootstrap_redemptions SET reserved_at_ms=0 WHERE group_id=? AND nonce=?`, capability.GroupID[:], capability.Nonce[:]); err != nil {
-		t.Fatal(err)
+}
+
+// CheckInvite is the pre-membership gate, and it answers from the group's own
+// signed state so every node answers the same way.
+func TestCheckInviteAcceptsLiveInviteAndRefusesForeignGroup(t *testing.T) {
+	founder := mustIdentity(t)
+	_, group := mustInviteOnlyGroup(t, t.TempDir(), founder)
+	live := mustInvite(t, group, founder, nil, 1, nil)
+	if err := group.CheckInvite(live, time.Now().UnixMilli()); err != nil {
+		t.Fatalf("live invite refused: %v", err)
 	}
-	if err := second.Reserve(capability, targetBinding.PeerID, EnrollmentProtocol, now); err != nil {
-		t.Fatalf("stale reservation did not recover: %v", err)
+
+	otherFounder := mustIdentity(t)
+	_, other := mustInviteOnlyGroup(t, t.TempDir(), otherFounder)
+	foreign := mustInvite(t, other, otherFounder, nil, 1, nil)
+	if err := group.CheckInvite(foreign, time.Now().UnixMilli()); !errors.Is(err, membership.ErrInviteDenied) {
+		t.Fatalf("invite for another group accepted: %v", err)
+	}
+}
+
+// Revocation travels as a signed record, so an invite withdrawn with uses left
+// stops working from the group's state rather than from a local note.
+func TestCheckInviteRefusesRevokedInvite(t *testing.T) {
+	founder := mustIdentity(t)
+	_, group := mustInviteOnlyGroup(t, t.TempDir(), founder)
+	capability := mustInvite(t, group, founder, nil, 3, nil)
+	if _, err := group.SignRecord(founder, membership.Record{
+		Kind:        membership.KindRevokeInvite,
+		InviteNonce: capability.Nonce,
+	}); err != nil {
+		t.Fatalf("sign revocation: %v", err)
+	}
+	if !group.IsInviteRevoked(capability.Nonce) {
+		t.Fatal("group state does not report the invite as revoked")
+	}
+	if err := group.CheckInvite(capability, time.Now().UnixMilli()); !errors.Is(err, membership.ErrInviteDenied) {
+		t.Fatalf("revoked invite accepted: %v", err)
+	}
+}
+
+// Uses are counted from the joins that actually landed, so an exhausted invite
+// is refused even though its window is still open.
+func TestCheckInviteRefusesExhaustedInvite(t *testing.T) {
+	founder := mustIdentity(t)
+	_, group := mustInviteOnlyGroup(t, t.TempDir(), founder)
+	capability := mustInvite(t, group, founder, nil, 1, nil)
+	joiner := mustIdentity(t)
+	mustJoinWithInvite(t, group, joiner, capability)
+	if !group.IsMemberID(*mustNode(t, joiner).MemberID) {
+		t.Fatal("redeeming a live invite did not admit the joiner")
+	}
+	if uses := group.InviteUses(capability.Nonce); uses != 1 {
+		t.Fatalf("invite uses = %d, want 1", uses)
+	}
+	if err := group.CheckInvite(capability, time.Now().UnixMilli()); !errors.Is(err, membership.ErrInviteDenied) {
+		t.Fatalf("exhausted invite accepted: %v", err)
+	}
+}
+
+// An admin's outstanding invites are worth exactly its authority now: removing
+// the admin withdraws them without anybody revoking them one by one.
+func TestCheckInviteRefusesInviteFromRemovedAdmin(t *testing.T) {
+	founder := mustIdentity(t)
+	admin := mustIdentity(t)
+	_, group := mustInviteOnlyGroup(t, t.TempDir(), founder)
+	adminNode := mustNode(t, admin)
+	mustJoinWithInvite(t, group, admin, mustInvite(t, group, founder, admin.PublicKey, 1, nil))
+	setInviteTestAdmins(t, group, founder, *adminNode.MemberID)
+
+	delegated := mustInvite(t, group, admin, nil, 2, nil)
+	if err := group.CheckInvite(delegated, time.Now().UnixMilli()); err != nil {
+		t.Fatalf("invite from a serving admin refused: %v", err)
+	}
+	if _, err := group.SignRecord(founder, membership.Record{
+		Kind:    membership.KindRemove,
+		Subject: adminNode,
+	}); err != nil {
+		t.Fatalf("remove admin: %v", err)
+	}
+	if err := group.CheckInvite(delegated, time.Now().UnixMilli()); !errors.Is(err, membership.ErrInviteDenied) {
+		t.Fatalf("invite from a removed admin accepted: %v", err)
+	}
+}
+
+// setInviteTestAdmins replaces the delegated-admin set with a founder-signed
+// policy record, leaving the rest of the policy as it stands.
+func setInviteTestAdmins(t *testing.T, group *membership.Group, founder *keystore.Identity, admins ...entmoot.MemberID) {
+	t.Helper()
+	policy := group.Policy()
+	policy.Admins = membership.SortAdmins(admins)
+	if _, err := group.SignRecord(founder, membership.Record{Kind: membership.KindPolicy, Policy: &policy}); err != nil {
+		t.Fatalf("set admins: %v", err)
+	}
+	for _, admin := range admins {
+		if !group.CanAdminister(admin) {
+			t.Fatalf("policy record did not grant admin %s", admin.String())
+		}
 	}
 }
 

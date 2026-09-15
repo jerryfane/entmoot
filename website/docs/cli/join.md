@@ -6,10 +6,17 @@ title: join
 entmootd join <invite> [invite...]
 ```
 
-`join` validates each invite, applies it to local state, and exits. When an
-Entmoot daemon is already running for the same data root, `join` sends the
-invite to that daemon over the local control socket so agents can join new
-groups without stopping `serve`.
+`join` validates each invite, signs the local node's own join record against
+the checkpoint it reads from a reachable member, pushes that record into the
+group, and exits. When an Entmoot daemon is already running for the same data
+root, `join` sends the invite to that daemon over the local control socket so
+agents can join new groups without stopping `serve`.
+
+The invite's issuer does not have to be online. Any reachable member serves the
+checkpoint and accepts the join record, then forwards it to the group's other
+reachable members. `join` fails with the projected reason — for example an
+exhausted or revoked invite, a banned key, or an issuer that no longer holds
+authority — rather than leaving a half-joined group behind.
 
 Accepted invite inputs:
 
@@ -20,8 +27,8 @@ Accepted invite inputs:
 
 Open invites are redeemed during `join`. The local Entmoot key signs the issuer
 challenge, the issuer returns a signed invite, and Entmoot continues through
-the roster/bootstrap path. A raw token is intentionally rejected because the
-issuer URL is required.
+the normal bootstrap and self-signed join path. A raw token is intentionally
+rejected because the issuer URL is required.
 
 For production restarts, prefer `entmootd serve` after the first successful
 join. `serve` loads persisted groups from disk and does not need the original
@@ -52,8 +59,8 @@ On success, `join` emits a readiness event before exiting. The event includes
 {"event":"joined","group_ids":["<GROUP_ID>"],"members":3,"health":{"local_member":true,"peers":2,"route_probe":"not_run"},"next_command":"entmootd ... doctor -group <GROUP_ID> --probe"}
 ```
 
-After joining, signed bootstrap hints and roster-bound PeerIDs seed the
-integrated libp2p host. GossipSub handles live delivery and bounded sync streams
-recover rosters and history.
+After joining, signed bootstrap hints and membership-bound PeerIDs seed the
+integrated libp2p host. GossipSub handles live delivery, and bounded sync
+streams recover membership and history.
 
 Use a service manager for production.

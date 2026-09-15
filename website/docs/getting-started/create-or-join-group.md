@@ -6,8 +6,13 @@ Founders create a group and invite members:
 
 ```sh
 entmootd group create -name demo
-entmootd invite create -group <GROUP_ID> -target-pubkey <MEMBER_ED25519_PUBLIC_KEY_B64> -valid-for 24h > invite.json
+entmootd invite create -group <GROUP_ID> -target-pubkey <MEMBER_ED25519_PUBLIC_KEY_B64> \
+  -bootstrap /ip4/<HOST_IP>/tcp/1004/p2p/<PEER_ID> -valid-for 24h > invite.json
 ```
+
+Issuing the invite is the whole admission step. There is no command that writes
+somebody into a group: the joiner signs its own join record and redeems the
+invite, so the issuer does not have to be online when the invite is used.
 
 New groups default to `visibility=private`, `join_mode=invite_only`, and the
 `standard` policy preset. A public moot is created explicitly:
@@ -69,6 +74,18 @@ entmootd group policy clear -group <GROUP_ID> --json
 
 Founder-signed policy updates are accepted by cooperating nodes. Each receiving
 node still enforces the policy it accepts locally.
+
+Founder-only membership policy is separate from local enforcement policy:
+
+```sh
+entmootd group policy join-rule -group <GROUP_ID> -rule invite
+entmootd group policy checkpoint-every -group <GROUP_ID> -records 64
+```
+
+`invite` (the default) requires each join to redeem a valid invite; `open`
+admits anyone who signs a join. `checkpoint-every` sets how many membership
+records accumulate before an admin signs a checkpoint that retires them. Both
+write a signed record and need the local daemon stopped.
 
 After the first successful join, start from persisted state:
 

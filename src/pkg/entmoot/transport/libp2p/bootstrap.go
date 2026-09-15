@@ -2,11 +2,7 @@ package libp2ptransport
 
 import (
 	"bytes"
-	"crypto/ed25519"
-	"encoding/json"
-	"errors"
 	"fmt"
-	"sync"
 	"time"
 
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -14,357 +10,84 @@ import (
 
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/keystore"
-	"entmoot/pkg/entmoot/roster"
+	"entmoot/pkg/entmoot/membership"
 )
 
 const (
-	EnrollmentProtocol protocol.ID = "/entmoot/enrollment/3"
-	RosterProtocol     protocol.ID = "/entmoot/roster/2"
-	HistoryProtocol    protocol.ID = "/entmoot/history/2"
+	// MembershipProtocol serves checkpoints and membership records. A member
+	// reads it under its membership; a joiner reads it with an invite, because
+	// it must see the checkpoint before it can sign itself into the group.
+	MembershipProtocol protocol.ID = "/entmoot/membership/1"
+	// MembershipPushProtocol accepts one signed record. A joiner uses it to
+	// hand over its own join.
+	MembershipPushProtocol protocol.ID = "/entmoot/membership-push/1"
+	HistoryProtocol        protocol.ID = "/entmoot/history/2"
 	// PeerRecordProtocol serves members the signed peer records this node holds
 	// for other members. It is members-only and never a bootstrap target.
 	PeerRecordProtocol protocol.ID = "/entmoot/peer-records/1"
-
-	bootstrapCapabilityDomain = "entmoot/bootstrap-capability/v1\x00"
-
-	// MaxCapabilityRelays bounds the relay hints one invite may carry, so an
-	// invite cannot fan a joiner out across an unbounded relay set.
-	MaxCapabilityRelays = 8
 )
 
-var (
-	// ErrBootstrapDenied means the grant itself was refused: expired, revoked,
-	// exhausted, replayed, or bound to another identity. It is safe to report.
-	ErrBootstrapDenied = errors.New("libp2p: bootstrap capability denied")
-	// ErrBootstrapUnavailable means admission state could not be read or
-	// written, so the request was refused without judging the grant. Callers
-	// report it as an internal condition and keep the detail local.
-	ErrBootstrapUnavailable = errors.New("libp2p: bootstrap admission unavailable")
-)
+// MaxCapabilityRelays bounds the relay hints one invite may carry.
+const MaxCapabilityRelays = membership.MaxCapabilityRelays
+
+// ErrBootstrapDenied means the grant itself was refused: expired, revoked,
+// exhausted, or bound to another identity. It is safe to report.
+var ErrBootstrapDenied = membership.ErrInviteDenied
 
 type BootstrapCapability = entmoot.BootstrapCapability
 
-func bootstrapSigningBytes(capability BootstrapCapability) ([]byte, error) {
-	capability.Signature = nil
-	payload, err := json.Marshal(capability)
-	if err != nil {
-		return nil, err
-	}
-	return append([]byte(bootstrapCapabilityDomain), payload...), nil
+// SignBootstrapCapability binds the grant to the issuing identity.
+func SignBootstrapCapability(issuer *keystore.Identity, capability *BootstrapCapability) error {
+	return membership.SignInvite(issuer, capability)
 }
 
-// SignBootstrapCapability binds the grant to the issuing identity: the founder,
-// or the delegated admin named in Issuer. An open invite carries no target
-// identity and is redeemable by any holder while uses remain.
-func SignBootstrapCapability(issuer *keystore.Identity, capability *BootstrapCapability) error {
-	if issuer == nil || capability == nil {
-		return errors.New("libp2p: issuer and capability are required")
-	}
-	authority := capability.SigningAuthority()
-	if !bytes.Equal(issuer.PublicKey, authority.EntmootPubKey) {
-		return errors.New("libp2p: capability signing authority does not match signing key")
-	}
-	if err := entmoot.ValidateOperationalMemberInfo(capability.Founder); err != nil {
-		return fmt.Errorf("libp2p: invalid capability founder: %w", err)
-	}
-	if capability.Issuer != nil {
-		if err := entmoot.ValidateOperationalMemberInfo(*capability.Issuer); err != nil {
-			return fmt.Errorf("libp2p: invalid capability issuer: %w", err)
-		}
-	}
-	if capability.MaxUses < 0 {
-		return errors.New("libp2p: capability max uses cannot be negative")
-	}
-	if capability.IsOpenInvite() {
-		if capability.TargetMemberID != (entmoot.MemberID{}) || capability.TargetPeerID != "" {
-			return errors.New("libp2p: open invite must not carry a target identity")
-		}
-	} else {
-		targetBinding, err := BindingFromPublicKey(capability.TargetPublicKey)
-		if err != nil {
-			return fmt.Errorf("libp2p: derive target identity: %w", err)
-		}
-		if capability.TargetMemberID != targetBinding.MemberID || capability.TargetPeerID != targetBinding.PeerID.String() {
-			return errors.New("libp2p: capability target identity binding mismatch")
-		}
-	}
-	payload, err := bootstrapSigningBytes(*capability)
-	if err != nil {
+// VerifyBootstrapCapability validates the invite's signature and shape, and
+// binds a target-bound invite to the peer redeeming it. Whether the invite is
+// still usable — revoked, exhausted, or issued by a demoted admin — is a
+// question about group state, answered by Group.CheckInvite.
+func VerifyBootstrapCapability(capability BootstrapCapability, remotePeer peer.ID, now time.Time) error {
+	if err := membership.VerifyInviteSignature(capability); err != nil {
 		return err
 	}
-	capability.Signature = issuer.Sign(payload)
-	return nil
-}
-
-// VerifyBootstrapCapability validates the signature, the use limit and, for a
-// target-bound capability, that the redeeming peer is its target. It does not
-// anchor the signer to a group's roster or check enrollment state.
-func VerifyBootstrapCapability(capability BootstrapCapability, remotePeer peer.ID, now time.Time) error {
-	if capability.ExpiresAtMS <= capability.IssuedAtMS || now.UnixMilli() < capability.IssuedAtMS || now.UnixMilli() > capability.ExpiresAtMS {
-		return fmt.Errorf("%w: capability is outside its validity window", ErrBootstrapDenied)
+	if err := membership.InviteValidAt(capability, now.UnixMilli()); err != nil {
+		return err
 	}
-	if capability.Nonce == ([32]byte{}) {
-		return fmt.Errorf("%w: zero nonce", ErrBootstrapDenied)
-	}
-	if capability.MaxUses < 0 {
-		return fmt.Errorf("%w: negative max uses", ErrBootstrapDenied)
-	}
-	if len(capability.Relays) > MaxCapabilityRelays {
-		return fmt.Errorf("%w: capability advertises %d relays, cap is %d",
-			ErrBootstrapDenied, len(capability.Relays), MaxCapabilityRelays)
-	}
-	if err := entmoot.ValidateMemberInfo(capability.Founder); err != nil {
-		return fmt.Errorf("%w: invalid founder: %v", ErrBootstrapDenied, err)
-	}
-	if capability.Issuer != nil {
-		if err := entmoot.ValidateMemberInfo(*capability.Issuer); err != nil {
-			return fmt.Errorf("%w: invalid issuer: %v", ErrBootstrapDenied, err)
-		}
-	}
-	if capability.IsOpenInvite() {
-		if capability.TargetMemberID != (entmoot.MemberID{}) || capability.TargetPeerID != "" {
-			return fmt.Errorf("%w: open invite carries a partial target identity", ErrBootstrapDenied)
-		}
-	} else {
+	if !capability.IsOpenInvite() {
 		target, err := BindingFromPublicKey(capability.TargetPublicKey)
 		if err != nil {
 			return fmt.Errorf("%w: invalid target key: %v", ErrBootstrapDenied, err)
 		}
-		if target.MemberID != capability.TargetMemberID || target.PeerID.String() != capability.TargetPeerID || target.PeerID != remotePeer {
+		if target.PeerID != remotePeer {
 			return fmt.Errorf("%w: target identity binding mismatch", ErrBootstrapDenied)
 		}
-	}
-	payload, err := bootstrapSigningBytes(capability)
-	if err != nil {
-		return fmt.Errorf("%w: encode capability: %v", ErrBootstrapDenied, err)
-	}
-	authority := capability.SigningAuthority()
-	if len(authority.EntmootPubKey) != ed25519.PublicKeySize || !keystore.Verify(authority.EntmootPubKey, payload, capability.Signature) {
-		return fmt.Errorf("%w: invalid issuer signature", ErrBootstrapDenied)
 	}
 	return nil
 }
 
-// authorizedIssuer requires the identity that signed a capability to be a
-// member who may currently administer the group, with the key the roster
+// AuthorizedIssuer requires the identity that signed a capability to be a
+// member who may currently administer the group, with the key the group
 // records for it. The signing authority travels in the capability, so binding
-// it to roster state is what makes the signature mean anything.
-func AuthorizedIssuer(groupRoster *roster.RosterLog, issuer entmoot.NodeInfo) error {
-	if groupRoster == nil {
-		return fmt.Errorf("%w: missing roster", ErrBootstrapDenied)
+// it to membership state is what makes the signature mean anything.
+func AuthorizedIssuer(group *membership.Group, issuer entmoot.NodeInfo) error {
+	if group == nil {
+		return fmt.Errorf("%w: missing group", ErrBootstrapDenied)
 	}
 	issuerMemberID, err := entmoot.ResolvedMemberID(issuer)
 	if err != nil {
 		return fmt.Errorf("%w: issuer identity is incomplete", ErrBootstrapDenied)
 	}
-	if !groupRoster.CanAdminister(issuerMemberID) {
+	if !group.CanAdminister(issuerMemberID) {
 		return fmt.Errorf("%w: issuer cannot administer this group", ErrBootstrapDenied)
 	}
-	if known, found := groupRoster.MemberInfoByID(issuerMemberID); found {
+	if known, found := group.MemberInfoByID(issuerMemberID); found {
 		if !bytes.Equal(known.EntmootPubKey, issuer.EntmootPubKey) {
-			return fmt.Errorf("%w: issuer key does not match the roster record", ErrBootstrapDenied)
+			return fmt.Errorf("%w: issuer key does not match its member record", ErrBootstrapDenied)
 		}
 		return nil
 	}
-	founder, ok := groupRoster.Founder()
-	if !ok || !bytes.Equal(founder.EntmootPubKey, issuer.EntmootPubKey) {
+	founder := group.Founder()
+	if !bytes.Equal(founder.EntmootPubKey, issuer.EntmootPubKey) {
 		return fmt.Errorf("%w: issuer is not a member of this group", ErrBootstrapDenied)
-	}
-	return nil
-}
-
-// capabilityKey identifies one issued invite.
-type capabilityKey struct {
-	GroupID entmoot.GroupID
-	Nonce   [32]byte
-}
-
-// redemptionKey identifies one invite redeemed by one applicant peer. Uses are
-// counted per invite, so a multi-use invite admits distinct peers up to its
-// limit while a repeat from the same peer is still a replay.
-type redemptionKey struct {
-	capabilityKey
-	Peer string
-}
-
-// BootstrapAdmission reserves then commits invite redemptions. Uses are
-// counted per invite and keyed per applicant peer, so a multi-use invite
-// admits distinct peers up to its limit while a repeat from the same peer is
-// refused. Enrollment releases a reservation on failure, which leaves the use
-// available for a retry; direct Authorize callers reserve and commit in one
-// operation.
-type BootstrapAdmission struct {
-	mu          sync.Mutex
-	used        map[redemptionKey]struct{}
-	reserved    map[redemptionKey]struct{}
-	reserve     func(key redemptionKey, maxUses int) (bool, error)
-	release     func(redemptionKey) error
-	commit      func(redemptionKey) error
-	unavailable func(key redemptionKey, maxUses int) (bool, error)
-	revoked     func(capabilityKey) (bool, error)
-}
-
-func NewBootstrapAdmission() *BootstrapAdmission {
-	return &BootstrapAdmission{
-		used:     make(map[redemptionKey]struct{}),
-		reserved: make(map[redemptionKey]struct{}),
-	}
-}
-
-func validateBootstrapRequest(capability BootstrapCapability, remotePeer peer.ID, requested protocol.ID, now time.Time) error {
-	switch requested {
-	case EnrollmentProtocol, RosterProtocol, HistoryProtocol:
-	default:
-		return fmt.Errorf("%w: protocol %q is not available before membership", ErrBootstrapDenied, requested)
-	}
-	return VerifyBootstrapCapability(capability, remotePeer, now)
-}
-
-func redemption(capability BootstrapCapability, remotePeer peer.ID) redemptionKey {
-	return redemptionKey{
-		capabilityKey: capabilityKey{GroupID: capability.GroupID, Nonce: capability.Nonce},
-		Peer:          remotePeer.String(),
-	}
-}
-
-// localUses counts reservations and commitments this process knows about for
-// one invite. a.mu must be held.
-func (a *BootstrapAdmission) localUses(invite capabilityKey) int {
-	count := 0
-	for key := range a.used {
-		if key.capabilityKey == invite {
-			count++
-		}
-	}
-	for key := range a.reserved {
-		if key.capabilityKey == invite {
-			count++
-		}
-	}
-	return count
-}
-
-// checkRevoked refuses an invite the issuer has withdrawn. a.mu must be held.
-func (a *BootstrapAdmission) checkRevoked(invite capabilityKey) error {
-	if a.revoked == nil {
-		return nil
-	}
-	revoked, err := a.revoked(invite)
-	if err != nil {
-		return fmt.Errorf("%w: read revocation state: %v", ErrBootstrapUnavailable, err)
-	}
-	if revoked {
-		return fmt.Errorf("%w: capability is revoked", ErrBootstrapDenied)
-	}
-	return nil
-}
-
-// Verify checks a redeemable bootstrap grant without consuming it. Callers
-// must also bind its founder and checkpoint to the group's authoritative
-// roster.
-func (a *BootstrapAdmission) Verify(capability BootstrapCapability, remotePeer peer.ID, requested protocol.ID, now time.Time) error {
-	if a == nil {
-		return fmt.Errorf("%w: missing admission controller", ErrBootstrapDenied)
-	}
-	if err := validateBootstrapRequest(capability, remotePeer, requested, now); err != nil {
-		return err
-	}
-	key := redemption(capability, remotePeer)
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if err := a.checkRevoked(key.capabilityKey); err != nil {
-		return err
-	}
-	if _, exists := a.used[key]; exists {
-		return fmt.Errorf("%w: capability already used", ErrBootstrapDenied)
-	}
-	if _, exists := a.reserved[key]; exists {
-		return fmt.Errorf("%w: capability already reserved", ErrBootstrapDenied)
-	}
-	if a.localUses(key.capabilityKey) >= capability.Uses() {
-		return fmt.Errorf("%w: capability use limit reached", ErrBootstrapDenied)
-	}
-	if a.unavailable != nil {
-		unavailable, err := a.unavailable(key, capability.Uses())
-		if err != nil {
-			return fmt.Errorf("%w: read nonce state: %v", ErrBootstrapUnavailable, err)
-		}
-		if unavailable {
-			return fmt.Errorf("%w: capability already used or reserved", ErrBootstrapDenied)
-		}
-	}
-	return nil
-}
-
-func (a *BootstrapAdmission) Reserve(capability BootstrapCapability, remotePeer peer.ID, requested protocol.ID, now time.Time) error {
-	if err := validateBootstrapRequest(capability, remotePeer, requested, now); err != nil {
-		return err
-	}
-	key := redemption(capability, remotePeer)
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if err := a.checkRevoked(key.capabilityKey); err != nil {
-		return err
-	}
-	if _, exists := a.used[key]; exists {
-		return fmt.Errorf("%w: capability already used", ErrBootstrapDenied)
-	}
-	if _, exists := a.reserved[key]; exists {
-		return fmt.Errorf("%w: capability already reserved", ErrBootstrapDenied)
-	}
-	if a.localUses(key.capabilityKey) >= capability.Uses() {
-		return fmt.Errorf("%w: capability use limit reached", ErrBootstrapDenied)
-	}
-	if a.reserve != nil {
-		reserved, err := a.reserve(key, capability.Uses())
-		if err != nil {
-			return fmt.Errorf("%w: persist nonce reservation: %v", ErrBootstrapUnavailable, err)
-		}
-		if !reserved {
-			return fmt.Errorf("%w: capability already used or reserved", ErrBootstrapDenied)
-		}
-	}
-	a.reserved[key] = struct{}{}
-	return nil
-}
-
-func (a *BootstrapAdmission) Release(capability BootstrapCapability, remotePeer peer.ID) error {
-	key := redemption(capability, remotePeer)
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	var err error
-	if a.release != nil {
-		err = a.release(key)
-	}
-	delete(a.reserved, key)
-	return err
-}
-
-func (a *BootstrapAdmission) Commit(capability BootstrapCapability, remotePeer peer.ID) error {
-	key := redemption(capability, remotePeer)
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if _, exists := a.reserved[key]; !exists {
-		return fmt.Errorf("%w: capability is not reserved", ErrBootstrapDenied)
-	}
-	if a.commit != nil {
-		if err := a.commit(key); err != nil {
-			return err
-		}
-	}
-	delete(a.reserved, key)
-	a.used[key] = struct{}{}
-	return nil
-}
-
-// Authorize consumes one use for bootstrap roster/history calls.
-func (a *BootstrapAdmission) Authorize(capability BootstrapCapability, remotePeer peer.ID, requested protocol.ID, now time.Time) error {
-	if err := a.Reserve(capability, remotePeer, requested, now); err != nil {
-		return err
-	}
-	if err := a.Commit(capability, remotePeer); err != nil {
-		_ = a.Release(capability, remotePeer)
-		return err
 	}
 	return nil
 }

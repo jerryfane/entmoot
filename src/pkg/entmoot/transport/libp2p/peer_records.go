@@ -10,7 +10,7 @@ import (
 	multiaddr "github.com/multiformats/go-multiaddr"
 
 	"entmoot/pkg/entmoot"
-	"entmoot/pkg/entmoot/roster"
+	"entmoot/pkg/entmoot/membership"
 )
 
 // PeerRecordCache holds the newest verified signed peer record per member so a
@@ -118,7 +118,7 @@ func (c *PeerRecordCache) Len() int {
 // address, because losing a working address to an unusable update would make a
 // reachable member unreachable. Accepted records are cached for forwarding.
 // Returns the number of records that installed an address.
-func InstallPeerRecords(h host.Host, r *roster.RosterLog, records [][]byte, mode ConnectivityMode, controlledRelays []peer.AddrInfo, cache *PeerRecordCache) int {
+func InstallPeerRecords(h host.Host, r *membership.Group, records [][]byte, mode ConnectivityMode, controlledRelays []peer.AddrInfo, cache *PeerRecordCache) int {
 	if h == nil || r == nil {
 		return 0
 	}
