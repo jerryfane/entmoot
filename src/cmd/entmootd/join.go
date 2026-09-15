@@ -356,6 +356,7 @@ func runGroupDaemon(gf *globalFlags, opts groupDaemonOptions) int {
 		Host:             libp2pHost,
 		Binding:          binding,
 		Logger:           slog.Default(),
+		Profiles:         espState,
 		Mode:             hostConfig.Mode,
 		ControlledRelays: hostConfig.ControlledRelays,
 	})

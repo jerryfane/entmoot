@@ -242,6 +242,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Members can publish a display name again.** `entmootd profile set -name
+  pi-burj` publishes the name as an ordinary signed message on the reserved
+  topic `entmoot/profile/1`; every member that receives it records the name,
+  and ESP member listings show it. `profile clear` withdraws it and `profile
+  show` prints what this node has observed. A name expires after 30 days by
+  default (`-ttl`, `0` disables), so a node that leaves stops being displayed.
+
+  This closes a gap, not a new idea: the ESP has always read display names and
+  the docs have always promised that "a member may additionally publish a
+  signed member profile", but the writer lived in the pre-libp2p gossip layer.
+  When that was replaced nothing took over, so `UpsertNodeProfile` had no
+  caller and no member could set a name at all — every member was shown as its
+  own key.
+
+  A name is a hint, never authority. It travels as a normal message, so the
+  author is already known to be a current member with a valid signature, and a
+  removed member cannot publish a new one. Display output stays
+  `name#MemberID`, so choosing somebody else's name cannot impersonate them,
+  and a payload carrying a name on any other topic is ignored.
+
+
 - **Delegated admins.** A founder can now name delegated admins with
   `roster admin grant|revoke|list`, carried as a founder-signed
   `policy_change` entry holding the complete set (`type: admins/v1`, ceiling

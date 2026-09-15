@@ -58,6 +58,8 @@ func run() int {
 		fmt.Fprintln(os.Stderr, "                          Restart joined groups from persistent local state.")
 		fmt.Fprintln(os.Stderr, "  publish -topic T (-content S|-file PATH| -file -) [-group GID]")
 		fmt.Fprintln(os.Stderr, "                          Author and gossip a message via the control socket.")
+		fmt.Fprintln(os.Stderr, "  profile <set|clear|show> [-name NAME] [-group GID] [-ttl DUR]")
+		fmt.Fprintln(os.Stderr, "                          Publish this node's display name, or list observed names.")
 		fmt.Fprintln(os.Stderr, "  doctor [-group GID] [--probe] [--json]")
 		fmt.Fprintln(os.Stderr, "                          Diagnose local libp2p identity, groups, and peer bindings.")
 		fmt.Fprintln(os.Stderr, "  peers -group GID [--probe] [--json]")
@@ -167,6 +169,8 @@ func run() int {
 		return cmdServe(gf, args[1:])
 	case "publish":
 		return cmdPublish(gf, args[1:])
+	case "profile":
+		return cmdProfile(gf, args[1:])
 	case "doctor":
 		return cmdDoctor(gf, args[1:])
 	case "peers":
