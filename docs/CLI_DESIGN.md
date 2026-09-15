@@ -77,11 +77,14 @@ mailbox.sqlite         ESP mailbox cursors
 esp.sqlite             ESP and live-agent projections
 runtime.env            Installed wrapper defaults
 esp-devices.json       ESP device key registry
-group-policies.json    Local per-group enforcement policy
 default_moot.json      Recorded owner consent for The Ent Moot
+relays.json            Relay hints adopted from an invite, reused on restart
 bootstrap-admission.db Local ledger of invites this node issued
+policies/              Local per-group enforcement policy and its lock
 conversion.sqlite      One-way legacy conversion journal
-conversion-backup/     Pre-conversion copy of every regular file in the root
+conversion-backup/     Pre-conversion copy of the root's regular files,
+                       excluding the journal, the lock files and the per-group
+                       upgrade checkpoint
 conversion.lock        Exclusive lock held for the duration of a conversion
 ```
 

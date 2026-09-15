@@ -167,9 +167,10 @@ type Message struct {
 	Timestamp int64 `json:"timestamp"`
 	// Topics are MQTT-style hierarchical topic strings used by subscribers.
 	Topics []string `json:"topics,omitempty"`
-	// Parents are the (at most three, per ARCHITECTURE §3.2) highest-timestamp
-	// message ids the author had seen when composing. Genesis messages have
-	// an empty slice.
+	// Parents are the highest-timestamp message ids the author had seen when
+	// composing. Genesis messages have an empty slice. The compose path takes
+	// up to three (cmd/entmootd/join.go); that is a convention of the author,
+	// not a validated limit, so a receiver must not assume a maximum.
 	Parents []MessageID `json:"parents,omitempty"`
 	// Content is opaque application bytes.
 	Content []byte `json:"content,omitempty"`
