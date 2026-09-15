@@ -12,6 +12,7 @@ import (
 	"entmoot/pkg/entmoot/merkle"
 	"entmoot/pkg/entmoot/signing"
 	"entmoot/pkg/entmoot/store"
+	"entmoot/pkg/entmoot/store/storetest"
 )
 
 // The observer delegates storage and paging to SQLite. Its only intervention
@@ -59,7 +60,7 @@ func TestHistoryResumesInterruptedPageWithoutRestartingSnapshot(t *testing.T) {
 	if err := server.Install(); err != nil {
 		t.Fatal(err)
 	}
-	destination := store.NewMemory()
+	destination := storetest.New(t)
 	defer destination.Close()
 	state := new(HistorySyncState)
 	validate := func(message entmoot.Message, _ *merkle.Proof) error {

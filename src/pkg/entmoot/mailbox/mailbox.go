@@ -40,11 +40,6 @@ type Service struct {
 	sink    events.Sink
 }
 
-// New returns a mailbox service backed by st and an in-memory cursor store.
-func New(st store.MessageStore, sink events.Sink) (*Service, error) {
-	return NewWithCursorStore(st, NewMemoryCursorStore(), sink)
-}
-
 // NewWithCursorStore returns a mailbox service backed by st and cursors.
 func NewWithCursorStore(st store.MessageStore, cursors CursorStore, sink events.Sink) (*Service, error) {
 	if st == nil {

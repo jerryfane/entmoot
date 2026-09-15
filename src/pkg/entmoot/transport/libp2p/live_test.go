@@ -24,6 +24,7 @@ import (
 	"entmoot/pkg/entmoot/merkle"
 	"entmoot/pkg/entmoot/signing"
 	"entmoot/pkg/entmoot/store"
+	"entmoot/pkg/entmoot/store/storetest"
 )
 
 func TestThreePeerGossipSubPersistsAndEmitsOnce(t *testing.T) {
@@ -45,7 +46,7 @@ func TestThreePeerGossipSubPersistsAndEmitsOnce(t *testing.T) {
 		}
 	}
 	groupID, group := mustOpenGroup(t, identities[0], identities[1], identities[2])
-	stores := []store.MessageStore{store.NewMemory(), store.NewMemory(), store.NewMemory()}
+	stores := []store.MessageStore{storetest.New(t), storetest.New(t), storetest.New(t)}
 	groups := make([]*LiveGroup, 3)
 	var ingests [3]atomic.Int32
 	for i := range groups {
@@ -121,7 +122,7 @@ func TestUnauthorizedPeerCannotJoinAuthorizedTopic(t *testing.T) {
 	}
 	defer outsiderHost.Close()
 	groupID, group := mustOpenGroup(t, founder, member)
-	if _, err := NewLiveGroup(ctx, LiveConfig{Host: outsiderHost, GroupID: groupID, Group: group, Store: store.NewMemory()}); err == nil {
+	if _, err := NewLiveGroup(ctx, LiveConfig{Host: outsiderHost, GroupID: groupID, Group: group, Store: storetest.New(t)}); err == nil {
 		t.Fatal("non-member created an authorized live group")
 	}
 	if err := memberHost.Connect(ctx, peer.AddrInfo{ID: founderHost.ID(), Addrs: founderHost.Addrs()}); err != nil {
@@ -130,12 +131,12 @@ func TestUnauthorizedPeerCannotJoinAuthorizedTopic(t *testing.T) {
 	if err := outsiderHost.Connect(ctx, peer.AddrInfo{ID: founderHost.ID(), Addrs: founderHost.Addrs()}); err != nil {
 		t.Fatal(err)
 	}
-	founderLive, err := NewLiveGroup(ctx, LiveConfig{Host: founderHost, GroupID: groupID, Group: group, Store: store.NewMemory()})
+	founderLive, err := NewLiveGroup(ctx, LiveConfig{Host: founderHost, GroupID: groupID, Group: group, Store: storetest.New(t)})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer founderLive.Close()
-	memberLive, err := NewLiveGroup(ctx, LiveConfig{Host: memberHost, GroupID: groupID, Group: group, Store: store.NewMemory()})
+	memberLive, err := NewLiveGroup(ctx, LiveConfig{Host: memberHost, GroupID: groupID, Group: group, Store: storetest.New(t)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -181,7 +182,7 @@ func TestSharedRouterCarriesMultipleGroups(t *testing.T) {
 	}
 	groupOne, membershipOne := mustOpenGroup(t, identities[0], identities[1])
 	groupTwo, membershipTwo := mustOpenGroup(t, identities[0], identities[1])
-	stores := []store.MessageStore{store.NewMemory(), store.NewMemory()}
+	stores := []store.MessageStore{storetest.New(t), storetest.New(t)}
 	defer stores[0].Close()
 	defer stores[1].Close()
 	specs := []struct {
@@ -228,7 +229,7 @@ func TestLocalPublishChargesAuthorizationOnce(t *testing.T) {
 	}
 	defer localHost.Close()
 	groupID, membershipGroup := mustOpenGroup(t, identity)
-	messageStore := store.NewMemory()
+	messageStore := storetest.New(t)
 	defer messageStore.Close()
 	var calls atomic.Int32
 	group, err := NewLiveGroup(ctx, LiveConfig{

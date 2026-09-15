@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1693,4 +1694,10 @@ func decodeMessage(canonBytes []byte) (entmoot.Message, error) {
 		return entmoot.Message{}, fmt.Errorf("store: decode canonical: %w", err)
 	}
 	return msg, nil
+}
+
+// encodeGroupDirName names a group's on-disk directory. Raw-url base64 keeps
+// the 32-byte id in one path-safe segment with no padding character.
+func encodeGroupDirName(gid entmoot.GroupID) string {
+	return base64.RawURLEncoding.EncodeToString(gid[:])
 }

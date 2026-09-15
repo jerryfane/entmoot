@@ -24,7 +24,6 @@ Useful global flags:
 -connectivity direct|relay-only
 -controlled-relay <CIRCUIT_RELAY_MULTIADDR>
 -listen-port 1004
--trace-reconcile
 ```
 
 Without `-group`, all locally joined groups that have a membership checkpoint

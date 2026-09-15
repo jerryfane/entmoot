@@ -826,23 +826,6 @@ func testIterMessageIDsInIDRange(t *testing.T, newStore func(t *testing.T) Messa
 	})
 }
 
-// TestMemory runs the shared suite against Memory.
-func TestMemory(t *testing.T) {
-	runStoreSuite(t, func(_ *testing.T) MessageStore { return NewMemory() })
-}
-
-// TestJSONL runs the shared suite against JSONL using a per-subtest TempDir.
-func TestJSONL(t *testing.T) {
-	runStoreSuite(t, func(t *testing.T) MessageStore {
-		s, err := OpenJSONL(t.TempDir())
-		if err != nil {
-			t.Fatalf("OpenJSONL: %v", err)
-		}
-		t.Cleanup(func() { _ = s.Close() })
-		return s
-	})
-}
-
 // TestSQLite runs the shared suite against SQLite using a per-subtest TempDir.
 func TestSQLite(t *testing.T) {
 	runStoreSuite(t, func(t *testing.T) MessageStore {

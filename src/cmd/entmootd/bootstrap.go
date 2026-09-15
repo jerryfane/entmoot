@@ -364,9 +364,6 @@ func entmootCommand(gf *globalFlags, report runtimeReport, args ...string) strin
 	if strings.TrimSpace(gf.logLevel) != "" {
 		parts = append(parts, "-log-level", gf.logLevel)
 	}
-	if gf.traceReconcile {
-		parts = append(parts, "-trace-reconcile")
-	}
 	parts = append(parts, args...)
 	return shellCommand(parts...)
 }
@@ -535,8 +532,4 @@ func promptBool(reader *bufio.Reader, label string, current bool) (bool, error) 
 	default:
 		return false, fmt.Errorf("invalid boolean for %s", label)
 	}
-}
-
-func nodeDefault(member string) string {
-	return strings.TrimSpace(member)
 }

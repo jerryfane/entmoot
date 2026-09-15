@@ -17,7 +17,7 @@ import (
 	"entmoot/pkg/entmoot/esphttp"
 	"entmoot/pkg/entmoot/ipc"
 	entpolicy "entmoot/pkg/entmoot/policy"
-	"entmoot/pkg/entmoot/store"
+	"entmoot/pkg/entmoot/store/storetest"
 )
 
 type testLivePolicyStore struct {
@@ -34,7 +34,7 @@ func TestRunAgentLiveScanListenAdvancesCursorWithoutRunner(t *testing.T) {
 	gid := testAgentLiveGroupID(1)
 	nodeID := testAgentLiveMemberID(7)
 	state := esphttp.NewMemoryStateStore()
-	msgStore := store.NewMemory()
+	msgStore := storetest.New(t)
 	msg := testAgentLiveMessage(gid, 11, 100, "chat", "hello")
 	if _, err := msgStore.Put(ctx, msg.GroupID, msg); err != nil {
 		t.Fatalf("Put: %v", err)
@@ -79,7 +79,7 @@ func TestRunAgentLiveScanFirstRunUsesConfigUpdatedAtFloor(t *testing.T) {
 	gid := testAgentLiveGroupID(2)
 	nodeID := testAgentLiveMemberID(7)
 	state := esphttp.NewMemoryStateStore()
-	msgStore := store.NewMemory()
+	msgStore := storetest.New(t)
 	msg := testAgentLiveMessage(gid, 11, 100, "chat", "old")
 	if _, err := msgStore.Put(ctx, msg.GroupID, msg); err != nil {
 		t.Fatalf("Put: %v", err)
@@ -117,7 +117,7 @@ func TestRunAgentLiveScanCursorTieBreakerProcessesSameTimestamp(t *testing.T) {
 	gid := testAgentLiveGroupID(3)
 	nodeID := testAgentLiveMemberID(7)
 	state := esphttp.NewMemoryStateStore()
-	msgStore := store.NewMemory()
+	msgStore := storetest.New(t)
 	first := testAgentLiveMessage(gid, 11, 100, "chat", "first")
 	second := testAgentLiveMessage(gid, 12, 100, "chat", "second")
 	if bytes.Compare(first.Author.MemberID[:], second.Author.MemberID[:]) > 0 {
@@ -168,7 +168,7 @@ func TestRunAgentLiveScanSeenIDsCatchDelayedOlderTimestamp(t *testing.T) {
 	gid := testAgentLiveGroupID(8)
 	nodeID := testAgentLiveMemberID(7)
 	state := esphttp.NewMemoryStateStore()
-	msgStore := store.NewMemory()
+	msgStore := storetest.New(t)
 	alreadySeen := testAgentLiveMessage(gid, 11, 200, "chat", "seen")
 	delayed := testAgentLiveMessage(gid, 12, 150, "chat", "delayed")
 	if _, err := msgStore.Put(ctx, delayed.GroupID, delayed); err != nil {
@@ -217,7 +217,7 @@ func TestRunAgentLiveScanSeenIDEvictionDoesNotReplayOldMessages(t *testing.T) {
 	gid := testAgentLiveGroupID(10)
 	nodeID := testAgentLiveMemberID(7)
 	state := esphttp.NewMemoryStateStore()
-	msgStore := store.NewMemory()
+	msgStore := storetest.New(t)
 	old := testAgentLiveMessage(gid, 11, 900, "chat", "old")
 	fresh := testAgentLiveMessage(gid, 13, 1001, "chat", "fresh")
 	for _, msg := range []entmoot.Message{old, fresh} {
@@ -309,7 +309,7 @@ func TestRunAgentLiveScanPublishFailureKeepsCursor(t *testing.T) {
 	gid := testAgentLiveGroupID(4)
 	nodeID := testAgentLiveMemberID(7)
 	state := esphttp.NewMemoryStateStore()
-	msgStore := store.NewMemory()
+	msgStore := storetest.New(t)
 	msg := testAgentLiveMessage(gid, 11, 100, "chat", "hello")
 	if _, err := msgStore.Put(ctx, msg.GroupID, msg); err != nil {
 		t.Fatalf("Put: %v", err)
@@ -349,7 +349,7 @@ func TestRunAgentLiveScanPartialPublishFailurePersistsCursor(t *testing.T) {
 	gid := testAgentLiveGroupID(9)
 	nodeID := testAgentLiveMemberID(7)
 	state := esphttp.NewMemoryStateStore()
-	msgStore := store.NewMemory()
+	msgStore := storetest.New(t)
 	msg := testAgentLiveMessage(gid, 11, 100, "chat", "hello")
 	if _, err := msgStore.Put(ctx, msg.GroupID, msg); err != nil {
 		t.Fatalf("Put: %v", err)
@@ -403,7 +403,7 @@ func TestRunAgentLiveScanHonorsMaxActionsPerScan(t *testing.T) {
 	gid := testAgentLiveGroupID(14)
 	nodeID := testAgentLiveMemberID(7)
 	state := esphttp.NewMemoryStateStore()
-	msgStore := store.NewMemory()
+	msgStore := storetest.New(t)
 	msg := testAgentLiveMessage(gid, 11, 100, "chat", "hello")
 	if _, err := msgStore.Put(ctx, msg.GroupID, msg); err != nil {
 		t.Fatalf("Put: %v", err)
@@ -453,7 +453,7 @@ func TestRunAgentLiveScanUnwrapsCommandRunnerOutput(t *testing.T) {
 	gid := testAgentLiveGroupID(55)
 	nodeID := testAgentLiveMemberID(7)
 	state := esphttp.NewMemoryStateStore()
-	msgStore := store.NewMemory()
+	msgStore := storetest.New(t)
 	msg := testAgentLiveMessage(gid, 11, 100, "chat", "hello")
 	if _, err := msgStore.Put(ctx, msg.GroupID, msg); err != nil {
 		t.Fatalf("Put: %v", err)
@@ -515,7 +515,7 @@ func TestRunAgentLiveScanLimitAdvancesOnlySentBatch(t *testing.T) {
 	gid := testAgentLiveGroupID(5)
 	nodeID := testAgentLiveMemberID(7)
 	state := esphttp.NewMemoryStateStore()
-	msgStore := store.NewMemory()
+	msgStore := storetest.New(t)
 	msgs := []entmoot.Message{
 		testAgentLiveMessage(gid, 11, 100, "chat", "one"),
 		testAgentLiveMessage(gid, 12, 101, "chat", "two"),
@@ -828,7 +828,7 @@ func TestScanAgentLiveRunGroupsTimeoutDegradesAndBacksOff(t *testing.T) {
 	gid := testAgentLiveGroupID(53)
 	nodeID := testAgentLiveMemberID(7)
 	state := esphttp.NewMemoryStateStore()
-	msgStore := store.NewMemory()
+	msgStore := storetest.New(t)
 	msg := testAgentLiveMessage(gid, 11, 100, "chat", "hello")
 	if _, err := msgStore.Put(ctx, msg.GroupID, msg); err != nil {
 		t.Fatalf("Put: %v", err)
@@ -929,7 +929,7 @@ func TestScanAgentLiveRunGroupsActionTransportDegrades(t *testing.T) {
 	gid := testAgentLiveGroupID(54)
 	nodeID := testAgentLiveMemberID(7)
 	state := esphttp.NewMemoryStateStore()
-	msgStore := store.NewMemory()
+	msgStore := storetest.New(t)
 	msg := testAgentLiveMessage(gid, 11, 100, "chat", "hello")
 	if _, err := msgStore.Put(ctx, msg.GroupID, msg); err != nil {
 		t.Fatalf("Put: %v", err)
@@ -970,7 +970,7 @@ func TestScanAgentLiveRunGroupsInvalidWrapperDoesNotAdvanceCursor(t *testing.T) 
 	gid := testAgentLiveGroupID(56)
 	nodeID := testAgentLiveMemberID(7)
 	state := esphttp.NewMemoryStateStore()
-	msgStore := store.NewMemory()
+	msgStore := storetest.New(t)
 	msg := testAgentLiveMessage(gid, 11, 100, "chat", "hello")
 	if _, err := msgStore.Put(ctx, msg.GroupID, msg); err != nil {
 		t.Fatalf("Put: %v", err)
@@ -1016,7 +1016,7 @@ func TestRunAgentLiveScanPolicyTriggerLimiterSkipsRunnerWithoutAdvancingCursor(t
 	gid := testAgentLiveGroupID(57)
 	nodeID := testAgentLiveMemberID(7)
 	state := esphttp.NewMemoryStateStore()
-	msgStore := store.NewMemory()
+	msgStore := storetest.New(t)
 	first := testAgentLiveMessage(gid, 11, 100, "chat", "first")
 	second := testAgentLiveMessage(gid, 12, 200, "chat", "second")
 	if _, err := msgStore.Put(ctx, first.GroupID, first); err != nil {

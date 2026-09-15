@@ -11,7 +11,7 @@ import (
 	"entmoot/pkg/entmoot/membership"
 	"entmoot/pkg/entmoot/merkle"
 	"entmoot/pkg/entmoot/signing"
-	"entmoot/pkg/entmoot/store"
+	"entmoot/pkg/entmoot/store/storetest"
 )
 
 // Bodies are batched by item count, so a group of large messages used to build
@@ -34,7 +34,7 @@ func TestHistoryTransfersMessagesTooLargeForAFullBatch(t *testing.T) {
 	if err := server.Install(); err != nil {
 		t.Fatal(err)
 	}
-	destination := store.NewMemory()
+	destination := storetest.New(t)
 	defer destination.Close()
 	validate := func(message entmoot.Message, _ *merkle.Proof) error {
 		return signing.VerifyMessage(message, message.Author)

@@ -246,38 +246,6 @@ type BootstrapPeer struct {
 	Endpoints []NodeEndpoint `json:"endpoints,omitempty"`
 }
 
-// Invite is an out-of-band bundle produced by an existing group member that
-// lets a new peer join: founder anchor, an authenticated roster head, and a
-// short list of reachable bootstrap peers. See ARCHITECTURE §5.1.
-type Invite struct {
-	// GroupID identifies the target group.
-	GroupID GroupID `json:"group_id"`
-	// Founder is the group's founder, used to anchor roster signature
-	// validation.
-	Founder NodeInfo `json:"founder"`
-	// RosterHead is the id of the roster head the issuer vouches for.
-	RosterHead RosterEntryID `json:"roster_head"`
-	// MerkleRoot is the current message Merkle root the issuer advertises.
-	MerkleRoot [32]byte `json:"merkle_root"`
-	// BootstrapPeers is a short list (3-5) of recently-online members the new
-	// node should try first.
-	BootstrapPeers []BootstrapPeer `json:"bootstrap_peers"`
-	// IssuedAt is the unix-milliseconds timestamp when the invite was produced.
-	IssuedAt int64 `json:"issued_at"`
-	// ValidUntil is the unix-milliseconds timestamp after which the invite
-	// must be rejected by joiners. Zero means "no expiry asserted" and is
-	// only accepted for backwards compatibility with pre-v1 bundles and
-	// test fixtures; real v1 issuers always set it (default IssuedAt + 24h
-	// per docs/CLI_DESIGN.md §9).
-	ValidUntil int64 `json:"valid_until"`
-	// Issuer is the group member that produced this invite (often but not
-	// always the founder).
-	Issuer NodeInfo `json:"issuer"`
-	// Signature is the Ed25519 signature over the canonical encoding of the
-	// invite with Signature zeroed, signed by the issuer.
-	Signature []byte `json:"signature,omitempty"`
-}
-
 // BootstrapCapability is an issuer-signed, expiring grant for a bounded set of
 // bootstrap endpoints. Target fields bind it to one fresh identity; leaving
 // them empty makes it an open invite that any holder may redeem. MaxUses caps
@@ -331,32 +299,6 @@ func (c BootstrapCapability) Uses() int {
 		return 1
 	}
 	return c.MaxUses
-}
-
-// MarshalJSON encodes Invite with MerkleRoot as base64 rather than a numeric
-// array.
-func (i Invite) MarshalJSON() ([]byte, error) {
-	type alias Invite
-	return json.Marshal(&struct {
-		MerkleRoot string `json:"merkle_root"`
-		*alias
-	}{
-		MerkleRoot: base64.StdEncoding.EncodeToString(i.MerkleRoot[:]),
-		alias:      (*alias)(&i),
-	})
-}
-
-// UnmarshalJSON decodes Invite, accepting MerkleRoot as a base64 string.
-func (i *Invite) UnmarshalJSON(data []byte) error {
-	type alias Invite
-	aux := &struct {
-		MerkleRoot string `json:"merkle_root"`
-		*alias
-	}{alias: (*alias)(i)}
-	if err := json.Unmarshal(data, aux); err != nil {
-		return err
-	}
-	return decodeBase64Into("merkle_root", aux.MerkleRoot, i.MerkleRoot[:])
 }
 
 // decodeBase64Array32 unmarshals a base64 JSON string into a 32-byte slice.

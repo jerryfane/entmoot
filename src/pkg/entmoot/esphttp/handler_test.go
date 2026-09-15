@@ -21,8 +21,10 @@ import (
 	"entmoot/pkg/entmoot/espnotify"
 	entfeatures "entmoot/pkg/entmoot/features"
 	"entmoot/pkg/entmoot/mailbox"
+	"entmoot/pkg/entmoot/mailbox/mailboxtest"
 	"entmoot/pkg/entmoot/signing"
 	"entmoot/pkg/entmoot/store"
+	"entmoot/pkg/entmoot/store/storetest"
 )
 
 func TestHandlerPullAckCursor(t *testing.T) {
@@ -490,7 +492,7 @@ func TestHandlerGroupSubrouteEscapedSlashInGroupID(t *testing.T) {
 
 func TestHandlerGroupHistoryReturnsLatestWithoutAdvancingCursor(t *testing.T) {
 	gid := testGroupID(1)
-	st := store.NewMemory()
+	st := storetest.New(t)
 	for _, msg := range []entmoot.Message{
 		testMessage(gid, 1, "first"),
 		testMessage(gid, 2, "second"),
@@ -500,10 +502,7 @@ func TestHandlerGroupHistoryReturnsLatestWithoutAdvancingCursor(t *testing.T) {
 			t.Fatalf("Put: %v", err)
 		}
 	}
-	svc, err := mailbox.New(st, nil)
-	if err != nil {
-		t.Fatalf("mailbox.New: %v", err)
-	}
+	svc := mailboxtest.New(t, st, nil)
 	if err := svc.AckCursorContext(context.Background(), gid, "ios-1", mailbox.Cursor{
 		MessageID:   testMessage(gid, 2, "second").ID,
 		TimestampMS: 2,
@@ -549,7 +548,7 @@ func TestHandlerGroupHistoryReturnsLatestWithoutAdvancingCursor(t *testing.T) {
 
 func TestHandlerGroupSearchReturnsPagedResults(t *testing.T) {
 	gid := testGroupIDWithSlash()
-	st := store.NewMemory()
+	st := storetest.New(t)
 	withTopics := func(ts int64, content string, topics ...string) entmoot.Message {
 		msg := testMessage(gid, ts, content)
 		msg.Topics = topics
@@ -565,10 +564,7 @@ func TestHandlerGroupSearchReturnsPagedResults(t *testing.T) {
 			t.Fatalf("Put: %v", err)
 		}
 	}
-	svc, err := mailbox.New(st, nil)
-	if err != nil {
-		t.Fatalf("mailbox.New: %v", err)
-	}
+	svc := mailboxtest.New(t, st, nil)
 	if err := svc.AckCursorContext(context.Background(), gid, "ios-1", mailbox.Cursor{
 		MessageID:   midChat.ID,
 		TimestampMS: midChat.Timestamp,
@@ -632,7 +628,7 @@ func TestHandlerGroupSearchReturnsPagedResults(t *testing.T) {
 
 func TestHandlerGroupMessageContextReturnsTargetWindow(t *testing.T) {
 	gid := testGroupIDWithSlash()
-	st := store.NewMemory()
+	st := storetest.New(t)
 	withTopics := func(ts int64, content string, topics ...string) entmoot.Message {
 		msg := testMessage(gid, ts, content)
 		msg.Topics = topics
@@ -651,10 +647,7 @@ func TestHandlerGroupMessageContextReturnsTargetWindow(t *testing.T) {
 			t.Fatalf("Put: %v", err)
 		}
 	}
-	svc, err := mailbox.New(st, nil)
-	if err != nil {
-		t.Fatalf("mailbox.New: %v", err)
-	}
+	svc := mailboxtest.New(t, st, nil)
 	if err := svc.AckCursorContext(context.Background(), gid, "ios-1", mailbox.Cursor{
 		MessageID:   target.ID,
 		TimestampMS: target.Timestamp,
@@ -749,7 +742,7 @@ func TestHistoryCursorAcceptsZeroBoundaryFields(t *testing.T) {
 
 func TestHandlerGroupTopicsAndTopicHistory(t *testing.T) {
 	gid := testGroupID(1)
-	st := store.NewMemory()
+	st := storetest.New(t)
 	withTopics := func(ts int64, content string, topics ...string) entmoot.Message {
 		msg := testMessage(gid, ts, content)
 		msg.Topics = topics
@@ -764,10 +757,7 @@ func TestHandlerGroupTopicsAndTopicHistory(t *testing.T) {
 			t.Fatalf("Put: %v", err)
 		}
 	}
-	svc, err := mailbox.New(st, nil)
-	if err != nil {
-		t.Fatalf("mailbox.New: %v", err)
-	}
+	svc := mailboxtest.New(t, st, nil)
 	handler, err := NewHandler(Config{
 		Token:   "secret",
 		Service: svc,
@@ -1549,11 +1539,8 @@ func TestHandlerDualAuthBearerCannotCreateExecutableOperation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDeviceRegistry: %v", err)
 	}
-	st := store.NewMemory()
-	svc, err := mailbox.New(st, nil)
-	if err != nil {
-		t.Fatalf("mailbox.New: %v", err)
-	}
+	st := storetest.New(t)
+	svc := mailboxtest.New(t, st, nil)
 	handler, err := NewHandler(Config{
 		Token:    "secret",
 		AuthMode: AuthModeDual,
@@ -1674,14 +1661,11 @@ func TestHandlerDualAuthAcceptsBearerAndDevice(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDeviceRegistry: %v", err)
 	}
-	st := store.NewMemory()
+	st := storetest.New(t)
 	if _, err := st.Put(context.Background(), testMessage(gid, 1, "first").GroupID, testMessage(gid, 1, "first")); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
-	svc, err := mailbox.New(st, nil)
-	if err != nil {
-		t.Fatalf("mailbox.New: %v", err)
-	}
+	svc := mailboxtest.New(t, st, nil)
 	handler, err := NewHandler(Config{
 		Token:    "secret",
 		AuthMode: AuthModeDual,
@@ -1744,16 +1728,13 @@ func testHandler(t *testing.T) (entmoot.GroupID, []entmoot.Message, http.Handler
 		testMessage(gid, 1, "first"),
 		testMessage(gid, 2, "second"),
 	}
-	st := store.NewMemory()
+	st := storetest.New(t)
 	for _, msg := range msgs {
 		if _, err := st.Put(context.Background(), msg.GroupID, msg); err != nil {
 			t.Fatalf("Put: %v", err)
 		}
 	}
-	svc, err := mailbox.New(st, nil)
-	if err != nil {
-		t.Fatalf("mailbox.New: %v", err)
-	}
+	svc := mailboxtest.New(t, st, nil)
 	handler, err := NewHandler(Config{
 		Token:   "secret",
 		Service: svc,
@@ -1769,11 +1750,8 @@ func testHandler(t *testing.T) (entmoot.GroupID, []entmoot.Message, http.Handler
 
 func testHandlerWithPublisher(t *testing.T, gid entmoot.GroupID, publisher Publisher) http.Handler {
 	t.Helper()
-	st := store.NewMemory()
-	svc, err := mailbox.New(st, nil)
-	if err != nil {
-		t.Fatalf("mailbox.New: %v", err)
-	}
+	st := storetest.New(t)
+	svc := mailboxtest.New(t, st, nil)
 	handler, err := NewHandler(Config{
 		Token:     "secret",
 		Service:   svc,
@@ -1800,16 +1778,13 @@ func testMobileHandlerWithPublisher(t *testing.T, gid entmoot.GroupID, publisher
 
 func testMobileHandlerFull(t *testing.T, gid entmoot.GroupID, reg *DeviceRegistry, catalog GroupCatalog, clock func() time.Time, publisher Publisher, state StateStore, notifier espnotify.Notifier) http.Handler {
 	t.Helper()
-	st := store.NewMemory()
+	st := storetest.New(t)
 	for _, msg := range []entmoot.Message{testMessage(gid, 1, "first")} {
 		if _, err := st.Put(context.Background(), msg.GroupID, msg); err != nil {
 			t.Fatalf("Put: %v", err)
 		}
 	}
-	svc, err := mailbox.New(st, nil)
-	if err != nil {
-		t.Fatalf("mailbox.New: %v", err)
-	}
+	svc := mailboxtest.New(t, st, nil)
 	mode := AuthModeBearer
 	if reg != nil {
 		mode = AuthModeDevice
@@ -1844,16 +1819,13 @@ func testCoordinationFeatures() entfeatures.Flags {
 
 func testDeviceHandler(t *testing.T, gid entmoot.GroupID, reg *DeviceRegistry, now time.Time) http.Handler {
 	t.Helper()
-	st := store.NewMemory()
+	st := storetest.New(t)
 	for _, msg := range []entmoot.Message{testMessage(gid, 1, "first")} {
 		if _, err := st.Put(context.Background(), msg.GroupID, msg); err != nil {
 			t.Fatalf("Put: %v", err)
 		}
 	}
-	svc, err := mailbox.New(st, nil)
-	if err != nil {
-		t.Fatalf("mailbox.New: %v", err)
-	}
+	svc := mailboxtest.New(t, st, nil)
 	handler, err := NewHandler(Config{
 		AuthMode: AuthModeDevice,
 		Devices:  reg,
@@ -1997,14 +1969,11 @@ func (p *fakeTaskEventPublisher) LocalNodeInfo(_ context.Context) (entmoot.NodeI
 
 func mustMailboxService(t *testing.T, gid entmoot.GroupID) *mailbox.Service {
 	t.Helper()
-	st := store.NewMemory()
+	st := storetest.New(t)
 	if _, err := st.Put(context.Background(), testMessage(gid, 1, "first").GroupID, testMessage(gid, 1, "first")); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
-	svc, err := mailbox.New(st, nil)
-	if err != nil {
-		t.Fatalf("mailbox.New: %v", err)
-	}
+	svc := mailboxtest.New(t, st, nil)
 	return svc
 }
 

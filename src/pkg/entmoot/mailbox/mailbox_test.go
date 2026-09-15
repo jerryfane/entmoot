@@ -7,22 +7,21 @@ import (
 
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/canonical"
+	"entmoot/pkg/entmoot/events"
 	"entmoot/pkg/entmoot/store"
+	"entmoot/pkg/entmoot/store/storetest"
 )
 
 func TestMessagesSinceAndAckCursor(t *testing.T) {
 	ctx := context.Background()
-	st := store.NewMemory()
+	st := storetest.New(t)
 	gid := groupID(1)
 	for i := 1; i <= 3; i++ {
 		if _, err := st.Put(ctx, message(gid, int64(i)).GroupID, message(gid, int64(i))); err != nil {
 			t.Fatalf("Put %d: %v", i, err)
 		}
 	}
-	svc, err := New(st, nil)
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
+	svc := newTestService(t, st, nil)
 
 	msgs, next, err := svc.MessagesSince(ctx, gid, "ios-1", Cursor{}, 2)
 	if err != nil {
@@ -52,10 +51,7 @@ func TestMessagesSinceAndAckCursor(t *testing.T) {
 }
 
 func TestMessagesSinceRejectsEmptyClient(t *testing.T) {
-	svc, err := New(store.NewMemory(), nil)
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
+	svc := newTestService(t, storetest.New(t), nil)
 	if _, _, err := svc.MessagesSince(context.Background(), groupID(1), "", Cursor{}, 0); err == nil {
 		t.Fatalf("MessagesSince accepted empty client")
 	}
@@ -63,17 +59,14 @@ func TestMessagesSinceRejectsEmptyClient(t *testing.T) {
 
 func TestHistoryLimitZeroReturnsEmptyPage(t *testing.T) {
 	ctx := context.Background()
-	st := store.NewMemory()
+	st := storetest.New(t)
 	gid := groupID(1)
 	for i := 1; i <= 3; i++ {
 		if _, err := st.Put(ctx, message(gid, int64(i)).GroupID, message(gid, int64(i))); err != nil {
 			t.Fatalf("Put %d: %v", i, err)
 		}
 	}
-	svc, err := New(st, nil)
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
+	svc := newTestService(t, st, nil)
 
 	history, err := svc.History(ctx, gid, 0)
 	if err != nil {
@@ -86,7 +79,7 @@ func TestHistoryLimitZeroReturnsEmptyPage(t *testing.T) {
 
 func TestHistoryReturnsLatestTopologicalPage(t *testing.T) {
 	ctx := context.Background()
-	st := store.NewMemory()
+	st := storetest.New(t)
 	gid := groupID(1)
 	parent := message(gid, 100)
 	parent.Content = []byte("parent")
@@ -100,10 +93,7 @@ func TestHistoryReturnsLatestTopologicalPage(t *testing.T) {
 			t.Fatalf("Put: %v", err)
 		}
 	}
-	svc, err := New(st, nil)
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
+	svc := newTestService(t, st, nil)
 
 	history, err := svc.History(ctx, gid, 2)
 	if err != nil {
@@ -124,7 +114,7 @@ func TestHistoryReturnsLatestTopologicalPage(t *testing.T) {
 
 func TestSearchReturnsNewestFirstWithoutAdvancingCursor(t *testing.T) {
 	ctx := context.Background()
-	st := store.NewMemory()
+	st := storetest.New(t)
 	gid := groupID(1)
 	old := messageWithContent(gid, 1, "mars policy limits old", "ops")
 	mid := messageWithContent(gid, 2, "mars policy limits middle", "chat")
@@ -135,10 +125,7 @@ func TestSearchReturnsNewestFirstWithoutAdvancingCursor(t *testing.T) {
 			t.Fatalf("Put: %v", err)
 		}
 	}
-	svc, err := New(st, nil)
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
+	svc := newTestService(t, st, nil)
 	if err := svc.AckCursorContext(ctx, gid, "ios-1", Cursor{MessageID: mid.ID, TimestampMS: mid.Timestamp}); err != nil {
 		t.Fatalf("AckCursorContext: %v", err)
 	}
@@ -184,7 +171,7 @@ func TestSearchReturnsNewestFirstWithoutAdvancingCursor(t *testing.T) {
 
 func TestMessageContextReturnsConversationWindowWithoutAdvancingCursor(t *testing.T) {
 	ctx := context.Background()
-	st := store.NewMemory()
+	st := storetest.New(t)
 	gid := groupID(1)
 	old := messageWithContent(gid, 10, "old", "ops")
 	target := messageWithContent(gid, 20, "target", "ops")
@@ -196,10 +183,7 @@ func TestMessageContextReturnsConversationWindowWithoutAdvancingCursor(t *testin
 			t.Fatalf("Put: %v", err)
 		}
 	}
-	svc, err := New(st, nil)
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
+	svc := newTestService(t, st, nil)
 	if err := svc.AckCursorContext(ctx, gid, "ios-1", Cursor{MessageID: target.ID, TimestampMS: target.Timestamp}); err != nil {
 		t.Fatalf("AckCursorContext: %v", err)
 	}
@@ -237,9 +221,9 @@ func TestMessageContextReturnsConversationWindowWithoutAdvancingCursor(t *testin
 	}
 }
 
-func TestMemoryCursorStoreIsMonotonic(t *testing.T) {
+func TestCursorStoreIsMonotonic(t *testing.T) {
 	ctx := context.Background()
-	cursors := NewMemoryCursorStore()
+	cursors := mustCursorStore(t)
 	gid := groupID(1)
 	newer := Cursor{MessageID: messageID(2), TimestampMS: 2}
 	older := Cursor{MessageID: messageID(1), TimestampMS: 1}
@@ -269,17 +253,14 @@ func TestMemoryCursorStoreIsMonotonic(t *testing.T) {
 
 func TestMessagesSinceFallsBackToTimestampWhenCursorIDMissing(t *testing.T) {
 	ctx := context.Background()
-	st := store.NewMemory()
+	st := storetest.New(t)
 	gid := groupID(1)
 	for i := 1; i <= 3; i++ {
 		if _, err := st.Put(ctx, message(gid, int64(i)).GroupID, message(gid, int64(i))); err != nil {
 			t.Fatalf("Put %d: %v", i, err)
 		}
 	}
-	svc, err := New(st, nil)
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
+	svc := newTestService(t, st, nil)
 
 	msgs, next, err := svc.MessagesSince(ctx, gid, "ios-1", Cursor{MessageID: messageID(99), TimestampMS: 2}, 0)
 	if err != nil {
@@ -323,4 +304,26 @@ func groupID(seed byte) entmoot.GroupID {
 	var gid entmoot.GroupID
 	gid[0] = seed
 	return gid
+}
+
+// newTestService builds a mailbox service whose cursors live in a throwaway
+// SQLite database, which is the cursor store the daemon constructs.
+func newTestService(t *testing.T, st store.MessageStore, sink events.Sink) *Service {
+	t.Helper()
+	svc, err := NewWithCursorStore(st, mustCursorStore(t), sink)
+	if err != nil {
+		t.Fatalf("NewWithCursorStore: %v", err)
+	}
+	return svc
+}
+
+// mustCursorStore opens a SQLite cursor store under the test's temp dir.
+func mustCursorStore(t *testing.T) CursorStore {
+	t.Helper()
+	cursors, err := OpenSQLiteCursorStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenSQLiteCursorStore: %v", err)
+	}
+	t.Cleanup(func() { _ = cursors.Close() })
+	return cursors
 }

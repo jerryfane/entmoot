@@ -92,21 +92,6 @@ func TestMessageContext(t *testing.T) {
 		}
 	}
 
-	t.Run("memory", func(t *testing.T) {
-		run(t, func(t *testing.T) MessageStore {
-			return NewMemory()
-		})
-	})
-	t.Run("jsonl", func(t *testing.T) {
-		run(t, func(t *testing.T) MessageStore {
-			s, err := OpenJSONL(t.TempDir())
-			if err != nil {
-				t.Fatalf("OpenJSONL: %v", err)
-			}
-			t.Cleanup(func() { _ = s.Close() })
-			return s
-		})
-	})
 	t.Run("sqlite", func(t *testing.T) {
 		run(t, func(t *testing.T) MessageStore {
 			s, err := OpenSQLite(t.TempDir())
@@ -121,7 +106,7 @@ func TestMessageContext(t *testing.T) {
 
 func TestMessageContextAtEdges(t *testing.T) {
 	ctx := context.Background()
-	s := NewMemory()
+	s := mustOpenSQLite(t)
 	gid := randGroupID(t)
 	author := testAuthor(1, 0xAA)
 	oldest := mkContextMsg(t, gid, author, 10, "oldest")
@@ -182,4 +167,15 @@ func equalStrings(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// mustOpenSQLite opens a SQLite store under the test's temporary directory.
+func mustOpenSQLite(t *testing.T) *SQLite {
+	t.Helper()
+	s, err := OpenSQLite(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	return s
 }

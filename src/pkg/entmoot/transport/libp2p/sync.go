@@ -56,12 +56,6 @@ const (
 	// that has been removed can stop trying, and one that has merely lost a
 	// race cannot.
 	SyncNotMember SyncErrorCode = "not_member"
-	// SyncShortChain says the caller asked for entries past the end of this
-	// peer's chain: it holds fewer entries than the caller's prefix. That is
-	// not a malformed request, and the difference matters — a caller whose
-	// head is not on this peer's chain and whose prefix is longer is looking
-	// at a fork, which no retry repairs.
-	SyncShortChain SyncErrorCode = "short_chain"
 )
 
 type HistorySyncRequest struct {

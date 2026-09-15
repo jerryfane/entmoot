@@ -49,7 +49,6 @@ Useful flags:
 ```sh
 -connectivity direct|relay-only
 -controlled-relay <CIRCUIT_RELAY_MULTIADDR>
--trace-reconcile
 ```
 
 On success, `join` emits a readiness event before exiting. The event includes

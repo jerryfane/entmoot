@@ -18,6 +18,7 @@ import (
 	"entmoot/pkg/entmoot/merkle"
 	"entmoot/pkg/entmoot/signing"
 	"entmoot/pkg/entmoot/store"
+	"entmoot/pkg/entmoot/store/storetest"
 )
 
 // membershipSyncPair is a served group plus a member that pulls from it over a
@@ -59,7 +60,7 @@ func newMembershipSyncPair(t *testing.T, joiners ...*keystore.Identity) *members
 	}
 	t.Cleanup(func() { _ = clientHost.Close() })
 	groupID, group := mustOpenGroup(t, founder, append([]*keystore.Identity{member}, joiners...)...)
-	messages := store.NewMemory()
+	messages := storetest.New(t)
 	t.Cleanup(func() { _ = messages.Close() })
 	server := &SyncServer{
 		Host:  serverHost,
@@ -241,7 +242,7 @@ func TestMembershipReadRequiresMembershipOrALiveInvite(t *testing.T) {
 	}
 	defer joinerHost.Close()
 	groupID, group := mustInviteOnlyGroup(t, t.TempDir(), founder)
-	messages := store.NewMemory()
+	messages := storetest.New(t)
 	defer messages.Close()
 	server := SyncServer{
 		Host:  serverHost,
@@ -304,7 +305,7 @@ func TestJoinGroupAdmitsTheJoinerOnBothSides(t *testing.T) {
 	}
 	defer joinerHost.Close()
 	groupID, group := mustInviteOnlyGroup(t, t.TempDir(), founder)
-	messages := store.NewMemory()
+	messages := storetest.New(t)
 	defer messages.Close()
 	server := SyncServer{
 		Host:  serverHost,

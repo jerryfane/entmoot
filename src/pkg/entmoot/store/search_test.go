@@ -132,21 +132,6 @@ func TestSearchMessagesFallback(t *testing.T) {
 		}
 	}
 
-	t.Run("memory", func(t *testing.T) {
-		run(t, func(t *testing.T) MessageStore {
-			return NewMemory()
-		})
-	})
-	t.Run("jsonl", func(t *testing.T) {
-		run(t, func(t *testing.T) MessageStore {
-			s, err := OpenJSONL(t.TempDir())
-			if err != nil {
-				t.Fatalf("OpenJSONL: %v", err)
-			}
-			t.Cleanup(func() { _ = s.Close() })
-			return s
-		})
-	})
 	t.Run("sqlite", func(t *testing.T) {
 		run(t, func(t *testing.T) MessageStore {
 			s, err := OpenSQLite(t.TempDir())
