@@ -288,10 +288,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Delegated admins.** A founder can now name delegated admins with
   `roster admin grant|revoke|list`, carried as a founder-signed
   `policy_change` entry holding the complete set (`type: admins/v1`, ceiling
-  16). An admin may add and remove ordinary members (`roster add|remove`, the
-  IPC member-remove path, the ESP member_remove operation) and issue invites
-  from its own host (`invite create`, IPC `invite_create`), so a group keeps
-  admitting and evicting members while the founder is away. An admin cannot
+  16). An admin may issue invites from its own host (`invite create`, IPC
+  `invite_create`) that newcomers sign themselves in with, and may remove
+  ordinary members (`roster remove`, the IPC member-remove path, the ESP
+  member_remove operation), so a group keeps admitting and evicting members
+  while the founder is away. An admin cannot
   remove the founder, remove another admin, or change the admin set; losing
   membership or delegation removes the authority at once. Invites gained an
   optional `issuer` field: `founder` stays the anchor a joiner pins, while
@@ -363,7 +364,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   longer than one pull by chaining pulls, up to 16 rounds. A message published in
   the fork window naming a discarded head cannot be verified against the
   adopted chain; that is the cost of converging. `roster admin` remains offline
-  maintenance only, like `roster add|remove`.
+  maintenance only, like `roster remove`.
 - **Removal reporting is complete and survives cleanup failure.** `roster
   remove`, the IPC member-remove path and the ESP member_remove operation now
   report the removal result even when invite revocation fails, carrying

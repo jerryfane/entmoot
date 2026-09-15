@@ -1003,9 +1003,15 @@ func (r *groupRuntime) storeMemberProfile(ctx context.Context, groupID entmoot.G
 }
 
 // profileReconcilePageSize and maxProfileReconcilePages bound the window one
-// catch-up considers: the newest 16 x 256 messages on the profile topic by the
-// store's paging key. The bound is on messages read, not on members, so no
-// member can be crowded out of the window by another member's volume.
+// catch-up considers: the newest 4096 messages on the profile topic by the
+// store's paging key.
+//
+// The bound is on messages, so a member CAN be crowded out: 4096 profile
+// messages outranking another member's newest claim leave that member at the
+// member-id fallback until it republishes. Earlier shapes were far worse — 256
+// messages, then 271 — but the limit is a window, not an absence of one. What
+// the window does guarantee is that every claim inside it is ranked, so volume
+// cannot make a member adopt a superseded name, only miss one entirely.
 const (
 	profileReconcilePageSize = 256
 	maxProfileReconcilePages = 16

@@ -300,6 +300,11 @@ func TestProfileReplacementIsATotalOrderInEveryStore(t *testing.T) {
 		// here, so a store that drops the stale tie-break is caught.
 		profileAt("aaa-expired", at, at-1),
 		profileAt("zzz-fresh", at, at+3_600_000),
+		// Two never-expires sentinels: 0 and -1 are the same claim about
+		// lifetime, so comparing raw expiries leaves them mutually
+		// non-replacing and the first one stored wins.
+		profileAt("zzz-never", at, 0),
+		profileAt("aaa-never", at, -1),
 		profileAt("expired-later", at+1000, at-1),
 		withdrawalAt("withdrawal-same-time", at),
 		withdrawalAt("withdrawal-later", at+1000),
