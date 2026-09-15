@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -18,6 +19,24 @@ import (
 	"entmoot/pkg/entmoot/keystore"
 	"entmoot/pkg/entmoot/membership"
 )
+
+// withBackgroundTimeout is the standard control-socket deadline for one-shot
+// CLI commands that talk to a running daemon.
+func withBackgroundTimeout() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), 10*time.Second)
+}
+
+// printJSON writes v as a single JSON line on stdout and returns the CLI exit
+// code for the write.
+func printJSON(v any) int {
+	data, err := json.Marshal(v)
+	if err != nil {
+		slog.Error("json marshal", slog.String("err", err.Error()))
+		return exitTransport
+	}
+	fmt.Println(string(data))
+	return exitOK
+}
 
 // setupResult carries resources assembled by setup.
 type setupResult struct {

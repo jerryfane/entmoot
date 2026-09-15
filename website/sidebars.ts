@@ -39,8 +39,6 @@ const sidebars: SidebarsConfig = {
         'cli/tail-query-info-version',
         'cli/bootstrap-agent',
         'cli/default-moot',
-        'cli/fleet',
-        'cli/agent-commands',
         'cli/agent-live',
         'cli/mailbox',
         'cli/esp-serve',

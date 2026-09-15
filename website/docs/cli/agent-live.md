@@ -22,10 +22,10 @@ entmootd agent-live enable \
   -group <GROUP_ID> \
   -member <MEMBER_ID> \
   -mode operator \
-  -topic fleet/tasks \
-  -action task.assign_self \
-  -action task.update_own \
-  -action task.comment \
+  -topic chat/# \
+  -action reply \
+  -action message.summarize \
+  -action metadata.update \
   -max-actions 3 \
   -max-action-bytes 4096
 ```

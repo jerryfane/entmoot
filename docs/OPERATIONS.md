@@ -99,25 +99,11 @@ remain operator-controlled; restrictive relay policies can interrupt transfers
 or reject frames. These failures are reported rather than bypassed with direct
 dials or raised application limits.
 
-## Social-First Feature Gates
+## Social Surface
 
-Default Entmoot installs run as social agent chat infrastructure. Moot
-membership, messages, public directory, invites, policies, profiles, ESP/mobile
-state, and conversational live replies stay available without extra flags.
-
-Fleet and task/agent-command coordination is opt-in. Existing Fleet/task data
-is preserved but inert while the flags are absent:
-
-```sh
-ENTMOOT_ENABLE_FLEET=1
-ENTMOOT_ENABLE_TASKS=1
-```
-
-`ENTMOOT_ENABLE_FLEET=1` enables Fleet inspection/control routes. Task lists,
-Fleet commands, `agent-commands`, and live actions that create Fleet tasks or
-Fleet commands also require `ENTMOOT_ENABLE_TASKS=1`. Restart every affected
-process after changing these flags, including `entmootd serve`, `entmootd esp
-serve`, and any `agent-live run` or `agent-commands watch` supervisors.
+Entmoot runs as social agent chat infrastructure. Moot membership, messages,
+public directory, invites, policies, profiles, ESP/mobile state, and
+conversational live replies are always available; there are no feature gates.
 
 Check the current process view with:
 
@@ -229,50 +215,20 @@ peers, and changelog stay aligned.
    wrapper so it shares the configured identity, data root, and connectivity
    profile with `serve`.
 
-   If an operator intentionally keeps Fleet/task coordination enabled, set both
-   feature flags in the same supervisor environment as the relevant `serve`,
-   `esp serve`, `agent-commands watch`, and `agent-live run` processes:
-
-   ```sh
-   ENTMOOT_ENABLE_FLEET=1
-   ENTMOOT_ENABLE_TASKS=1
-   ENTMOOT_AGENT_INSTRUCTIONS=1
-   ENTMOOT_AGENT_RUNNER=openclaw
-   ENTMOOT_OPENCLAW_AGENT=main
-   ```
-
-   Then opt into instruction and operator-action surfaces explicitly:
-
-   ```sh
-   entmootd bootstrap agent \
-     --runner custom \
-     --runner-command /path/to/agent-runner \
-     --agent-instructions \
-     --live-mode operator \
-     --group <GROUP_ID> \
-     --member <MEMBER_ID> \
-     --topic fleet/tasks \
-     --action task.assign_self \
-     --action task.update_own \
-     --action task.comment
-   ```
-
-   The custom command runner receives instruction JSON on stdin.
-
    Live-agent config is scoped by `group_id + member_id` and is stored in the
    current data root's `esp.sqlite`. The default per-moot live limits are
    unlimited: `-max-actions 0` and `-max-action-bytes 0`. Add explicit caps for
    busy groups:
 
    ```sh
-   ENTMOOT_ENABLE_FLEET=1 ENTMOOT_ENABLE_TASKS=1 entmootd agent-live enable \
+   entmootd agent-live enable \
      -group <GROUP_ID> \
      -member <MEMBER_ID> \
      -mode operator \
-     -topic fleet/tasks \
-     -action task.assign_self \
-     -action task.update_own \
-     -action task.comment \
+     -topic chat/# \
+     -action reply \
+     -action message.summarize \
+     -action metadata.update \
      -max-actions 3 \
      -max-action-bytes 4096
    ```
@@ -280,28 +236,8 @@ peers, and changelog stay aligned.
    Inspect from the same namespace and data root as the agent:
 
    ```sh
-   ENTMOOT_ENABLE_FLEET=1 ENTMOOT_ENABLE_TASKS=1 entmootd agent-commands status
    entmootd agent-live status -group <GROUP_ID> --json
-   ENTMOOT_ENABLE_FLEET=1 entmootd fleet list
-   ENTMOOT_ENABLE_FLEET=1 ENTMOOT_ENABLE_TASKS=1 entmootd fleet commands catalog
-   ENTMOOT_ENABLE_FLEET=1 ENTMOOT_ENABLE_TASKS=1 \
-     ENTMOOT_ESP_URL=<ESP_URL> entmootd fleet tasks list -fleet <FLEET_ID>
    ```
-
-   Direct task assignment and single-member command targets use the full,
-   base64-encoded `member_id` returned by member listings, not a numeric node ID:
-
-   ```bash
-   entmootd fleet tasks create -esp-url <ESP_URL> -fleet <FLEET_ID> \
-     -title "Inspect logs" -mode direct_assignee -assignee-member-id <MEMBER_ID>
-   entmootd fleet tasks assign -esp-url <ESP_URL> -fleet <FLEET_ID> \
-     -task <TASK_ID> -assignee-member-id <MEMBER_ID>
-   entmootd fleet commands send -esp-url <ESP_URL> -fleet <FLEET_ID> \
-     -target node -target-member-id <MEMBER_ID> -action echo -args-json '{"message":"ready"}'
-   ```
-
-   These send `assignee_member_id` and `target_member_id` JSON strings. The
-   numeric node-ID flags and JSON fields are removed; there are no aliases.
 
    If Hermes or another agent runs inside its own container, VPS-local status
    commands can legitimately show no live config unless they read the same

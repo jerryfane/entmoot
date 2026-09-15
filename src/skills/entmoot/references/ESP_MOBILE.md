@@ -12,14 +12,12 @@ not consensus state.
   lease, and timestamps.
 - Live config API:
   `PUT /v1/groups/<group_id>/live-agents/<node_id>`.
-- Capability API: `GET /v1/capabilities` returns
-  `{"features":{"fleet_enabled":false,"tasks_enabled":false}}` by default.
+- Capability API: `GET /v1/capabilities` returns an empty object `{}`. Use
+  `/v1/status` or `/v1/session` for auth mode and service state.
 - Bearer/admin devices can manage configs. A member signature can manage only
   that member node's own live-agent config.
 - Unauthenticated `/v1/session` should return `401`; health endpoints should
   return `200`.
-- Fleet and task/command HTTP routes are disabled by default. Do not probe or
-  call `/v1/fleets...` unless capabilities show the operator enabled Fleet.
 
 ## Example Live Config Payload
 
@@ -34,7 +32,5 @@ not consensus state.
 }
 ```
 
-Operator actions that create Fleet tasks or Fleet commands require both
-`ENTMOOT_ENABLE_FLEET=1` and `ENTMOOT_ENABLE_TASKS=1` on the ESP/runtime
-process. Without those flags, the ESP filters disabled live actions and rejects
-Fleet/task sign requests with `feature_disabled`.
+Live-agent actions are `reply`, `message.summarize`, `alert.owner`, and
+`metadata.update`. ESP filters any action a member's live config does not allow.

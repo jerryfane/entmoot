@@ -62,9 +62,6 @@ roster admin list|grant|revoke
 roster repair
 ```
 
-Fleet and agent-command surfaces are disabled unless their explicit environment
-feature flags are enabled.
-
 ## 4. Storage and Ownership
 
 The data root contains:
@@ -74,7 +71,7 @@ identity.json          Persistent Ed25519 member identity
 control.sock           Local daemon control socket
 groups/<gid>/...       Roster, messages, indexes, and sync state
 mailbox.sqlite         ESP mailbox cursors
-esp.sqlite             ESP, Fleet, live-agent, and command projections
+esp.sqlite             ESP and live-agent projections
 runtime.env            Installed wrapper defaults
 conversion-*           One-way legacy conversion journal and backup
 ```
@@ -140,15 +137,14 @@ The relay identity must differ from every application identity. At least one
 allowlisted PeerID and positive resource limits are mandatory. Both circuit
 endpoints must be allowlisted.
 
-## 8. ESP, Fleet, and Live Agents
+## 8. ESP and Live Agents
 
 `entmootd esp serve` is supervised separately from `entmootd serve` when exposed
 through a public reverse proxy. ESP device/bearer authorization is independent
 of Entmoot author identity.
 
-Fleet and task/command coordination require `ENTMOOT_ENABLE_FLEET=1` and, for
-tasks or commands, `ENTMOOT_ENABLE_TASKS=1`. Live-agent configuration uses the
-full-width MemberID. Enabling config does not start a runner.
+Live-agent configuration uses the full-width MemberID. Enabling config does not
+start a runner.
 
 ## 9. Invite and Bootstrap Contract
 

@@ -288,15 +288,26 @@ func TestLiveAgentConfigRejectsUnknownActions(t *testing.T) {
 	}
 }
 
-func TestDefaultLiveActionsExcludeUnsupportedExecutors(t *testing.T) {
-	unknown := UnknownLiveActions([]string{"webhook.call", "shell.run"})
-	if len(unknown) != 2 || unknown[0] != "shell.run" || unknown[1] != "webhook.call" {
-		t.Fatalf("unsupported executor actions = %v, want shell.run and webhook.call rejected", unknown)
-	}
-	for _, action := range DefaultLiveActions() {
-		if action == "webhook.call" || action == "shell.run" {
-			t.Fatalf("DefaultLiveActions includes unsupported executor action %q", action)
+func TestDefaultLiveActionsAreTheFourChatActions(t *testing.T) {
+	equal := func(got, want []string) bool {
+		if len(got) != len(want) {
+			return false
 		}
+		for i := range want {
+			if got[i] != want[i] {
+				return false
+			}
+		}
+		return true
+	}
+	want := []string{"reply", "message.summarize", "alert.owner", "metadata.update"}
+	if got := DefaultLiveActions(); !equal(got, want) {
+		t.Fatalf("DefaultLiveActions() = %v, want %v", got, want)
+	}
+	rejected := UnknownLiveActions([]string{"webhook.call", "task.create", "command.send", "member.remove"})
+	wantRejected := []string{"command.send", "member.remove", "task.create", "webhook.call"}
+	if !equal(rejected, wantRejected) {
+		t.Fatalf("UnknownLiveActions = %v, want %v", rejected, wantRejected)
 	}
 }
 

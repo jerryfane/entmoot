@@ -21,10 +21,9 @@ Precedence is intentionally simple:
 4. Built-in defaults.
 
 Long-lived services must be restarted after changing startup environment such
-as `ENTMOOT_AGENT_INSTRUCTIONS`, runner selection, identity, data root,
-connectivity profile, controlled relays, or OpenClaw selector. `entmootd env
---json` is the first check for the effective binary, identity, data root,
-control socket, wrapper, and namespace.
+as runner selection, identity, data root, connectivity profile, controlled
+relays, or OpenClaw selector. `entmootd env --json` is the first check for the
+effective binary, identity, data root, control socket, wrapper, and namespace.
 
 For long-lived container/OpenClaw agents, use the installed wrapper
 instead of raw flags:
@@ -38,10 +37,9 @@ The wrapper and supervised daemon must use the same identity, data root, and
 connectivity profile. Relay-only mode requires at least one full Circuit Relay
 v2 multiaddr ending in `/p2p/<peer-id>`.
 
-Agent instruction watcher settings:
+Live-agent runner settings:
 
 ```sh
-ENTMOOT_AGENT_INSTRUCTIONS=1
 ENTMOOT_AGENT_RUNNER=openclaw
 ENTMOOT_OPENCLAW_AGENT=main
 ```
@@ -50,8 +48,8 @@ Agent and runner environment:
 
 | Setting | Used by | Default | Meaning |
 |---|---|---:|---|
-| `ENTMOOT_AGENT_INSTRUCTIONS` | `serve` | off | Allows `serve` to queue `agent.instruction` commands. |
-| `ENTMOOT_AGENT_RUNNER` | `agent-commands`, `agent-live` | unset | Runner command or `openclaw`. |
+| `ENTMOOT_AGENT_RUNNER` | `agent-live` | unset | Runner command or `openclaw`. |
+| `ENTMOOT_AGENT_COMMAND_HOOK` | `agent-live` | unset | Legacy fallback for `ENTMOOT_AGENT_RUNNER`. |
 | `ENTMOOT_OPENCLAW_AGENT` | OpenClaw adapter | `main` | OpenClaw agent selector. |
 | `ENTMOOT_OPENCLAW_SESSION_ID` | OpenClaw adapter | unset | Target a specific OpenClaw session. |
 | `ENTMOOT_OPENCLAW_TO` | OpenClaw adapter | unset | Target a specific OpenClaw recipient. |
@@ -77,8 +75,7 @@ custom runner:
 ```sh
 entmootd bootstrap agent \
   --runner custom \
-  --runner-command /path/to/agent-runner \
-  --agent-instructions
+  --runner-command /path/to/agent-runner
 ```
 
 `ENTMOOT_AGENT_RUNNER=openclaw` uses Entmoot's built-in OpenClaw adapter. It
@@ -86,20 +83,12 @@ calls `openclaw agent` with one selector, defaulting to `--agent main`. Override
 the selector with `ENTMOOT_OPENCLAW_SESSION_ID`, `ENTMOOT_OPENCLAW_TO`, or
 `ENTMOOT_OPENCLAW_AGENT`; the matching `OPENCLAW_SESSION_ID`, `OPENCLAW_TO`,
 and `OPENCLAW_AGENT_ID` aliases are also honored. Set `OPENCLAW_BIN` only when
-the CLI is not named `openclaw` on `$PATH`. When `agent.instruction` includes
-structured `actions`, Entmoot uses OpenClaw delivery/tool evidence for required
-external-action success and publishes compact results instead of OpenClaw run
-metadata.
+the CLI is not named `openclaw` on `$PATH`.
 
 Custom runners:
 
-- `agent-commands watch -runner <path>` sends one instruction payload on stdin
-  and expects terminal JSON on stdout, for example
-  `{"status":"completed","summary":"done"}`.
 - `agent-live run -runner <path>` sends live context JSON on stdin and expects
   `{"actions":[...]}` on stdout.
-- Empty stdout from an instruction runner is treated as completed; debug
-  runners should emit explicit JSON.
 
 Live-agent defaults:
 
