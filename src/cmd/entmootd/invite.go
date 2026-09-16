@@ -726,9 +726,12 @@ func boundInviteRelays(hints []string) []string {
 	return out
 }
 
-// multiaddrIsLoopback reports a literal loopback address, which is the one
-// class never worth attaching: it names the newcomer's own machine, not a
-// member.
+// multiaddrIsLoopback reports a literal loopback or unspecified address. Its
+// two callers treat that differently and both are right: the fallback set
+// never attaches one, because it would name the newcomer's own machine rather
+// than the member it claims to describe, while the daemon's own-address fill
+// uses one as a last resort, because a development host may have nothing else
+// and an invite naming nothing cannot be redeemed at all.
 func multiaddrIsLoopback(addr multiaddr.Multiaddr) bool {
 	for _, code := range []int{multiaddr.P_IP4, multiaddr.P_IP6} {
 		if value, err := addr.ValueForProtocol(code); err == nil {
