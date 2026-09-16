@@ -62,7 +62,6 @@ func (g GroupID) MarshalJSON() ([]byte, error) {
 	return json.Marshal(g.String())
 }
 
-// UnmarshalJSON decodes a base64 JSON string into the 32-byte group id.
 // MarshalText and UnmarshalText let a GroupID be a JSON map key, for the same
 // reason MemberID needs them.
 func (g GroupID) MarshalText() ([]byte, error) {
@@ -73,6 +72,7 @@ func (g *GroupID) UnmarshalText(text []byte) error {
 	return decodeBase64Array32("GroupID", []byte(strconv.Quote(string(text))), g[:])
 }
 
+// UnmarshalJSON decodes a base64 JSON string into the 32-byte group id.
 func (g *GroupID) UnmarshalJSON(data []byte) error {
 	return decodeBase64Array32("GroupID", data, g[:])
 }
