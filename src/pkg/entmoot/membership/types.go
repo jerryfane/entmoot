@@ -3,9 +3,12 @@
 //
 // Two properties follow from that shape, and both are the reason it exists.
 // A joiner signs its own admission under a rule the founder signed earlier, so
-// nobody has to be online to admit anyone. And a checkpoint states the
-// complete membership, so the records behind it can be discarded: storage
-// follows how many members a group has, not how many changes it has ever made.
+// no admin has to SIGN anything when the invite is used — though the issuing
+// node must be reachable to serve the redemption, and must still hold
+// authority at that moment, which the transport checks. And a checkpoint
+// states the complete membership, so the records behind it can be discarded:
+// storage follows how many members a group has, not how many changes it has
+// ever made.
 //
 // Records never conflict in a way that needs repair. Joins are a set union;
 // the small number of records that do carry authority are ordered by one fixed
