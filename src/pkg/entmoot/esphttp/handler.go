@@ -476,7 +476,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			methodNotAllowed(w, http.MethodGet)
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+		h.writeJSON(w, r, http.StatusOK, map[string]string{"status": "ok"})
 		return
 	}
 	if !strings.HasPrefix(r.URL.Path, "/v1/") {
@@ -545,7 +545,7 @@ func (h *Handler) handleCapabilities(w http.ResponseWriter, r *http.Request) boo
 		methodNotAllowed(w, http.MethodGet)
 		return true
 	}
-	writeJSON(w, http.StatusOK, map[string]any{})
+	h.writeJSON(w, r, http.StatusOK, map[string]any{})
 	return true
 }
 
@@ -565,7 +565,7 @@ func (h *Handler) handleSession(w http.ResponseWriter, r *http.Request) {
 	if auth.member != nil {
 		resp["member"] = memberAuthView(*auth.member)
 	}
-	writeJSON(w, http.StatusOK, resp)
+	h.writeJSON(w, r, http.StatusOK, resp)
 }
 
 func (h *Handler) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -579,7 +579,7 @@ func (h *Handler) handleStatus(w http.ResponseWriter, r *http.Request) {
 			groups = len(list)
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	h.writeJSON(w, r, http.StatusOK, map[string]any{
 		"status":          "ok",
 		"auth_mode":       h.authMode,
 		"groups":          groups,
@@ -605,7 +605,7 @@ func (h *Handler) handleGroups(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleListGroups(w http.ResponseWriter, r *http.Request) {
 	if h.groups == nil {
-		writeJSON(w, http.StatusOK, map[string]any{"groups": []GroupSummary{}})
+		h.writeJSON(w, r, http.StatusOK, map[string]any{"groups": []GroupSummary{}})
 		return
 	}
 	groups, err := h.listGroupsForRequest(r)
@@ -624,7 +624,7 @@ func (h *Handler) handleListGroups(w http.ResponseWriter, r *http.Request) {
 		}
 		groups = filtered
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"groups": groups})
+	h.writeJSON(w, r, http.StatusOK, map[string]any{"groups": groups})
 }
 
 func (h *Handler) listGroupsForRequest(r *http.Request) ([]GroupSummary, error) {
@@ -863,7 +863,7 @@ func (h *Handler) handleGetGroup(w http.ResponseWriter, r *http.Request, groupID
 		writeError(w, http.StatusNotFound, "group_not_found", "group not joined")
 		return
 	}
-	writeJSON(w, http.StatusOK, group)
+	h.writeJSON(w, r, http.StatusOK, group)
 }
 
 func (h *Handler) handleGetGroupPolicy(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID) {
@@ -883,7 +883,7 @@ func (h *Handler) handleGetGroupPolicy(w http.ResponseWriter, r *http.Request, g
 	if len(bytes.TrimSpace(raw)) == 0 {
 		raw = json.RawMessage(`{}`)
 	}
-	writeJSON(w, http.StatusOK, raw)
+	h.writeJSON(w, r, http.StatusOK, raw)
 }
 
 func (h *Handler) handleListMembers(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID) {
@@ -891,7 +891,7 @@ func (h *Handler) handleListMembers(w http.ResponseWriter, r *http.Request, grou
 		return
 	}
 	if h.groups == nil {
-		writeJSON(w, http.StatusOK, map[string]any{"members": []MemberSummary{}})
+		h.writeJSON(w, r, http.StatusOK, map[string]any{"members": []MemberSummary{}})
 		return
 	}
 	members, err := h.groups.ListMembers(r.Context(), groupID)
@@ -906,7 +906,7 @@ func (h *Handler) handleListMembers(w http.ResponseWriter, r *http.Request, grou
 		writeError(w, http.StatusInternalServerError, "internal_error", "member listing failed")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"members": members})
+	h.writeJSON(w, r, http.StatusOK, map[string]any{"members": members})
 }
 
 type liveAgentConfigHTTPPayload struct {
@@ -935,7 +935,7 @@ func (h *Handler) handleListLiveAgentConfigs(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	states := LiveAgentStatesByMember(configs, presence, h.clock().UnixMilli())
-	writeJSON(w, http.StatusOK, map[string]any{"configs": configs, "presence": presence, "members": states})
+	h.writeJSON(w, r, http.StatusOK, map[string]any{"configs": configs, "presence": presence, "members": states})
 }
 
 func (h *Handler) handleUpsertLiveAgentConfig(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID, nodeID entmoot.MemberID) {
@@ -990,7 +990,7 @@ func (h *Handler) handleUpsertLiveAgentConfig(w http.ResponseWriter, r *http.Req
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"config": cfg})
+	h.writeJSON(w, r, http.StatusOK, map[string]any{"config": cfg})
 }
 
 func liveActionsForHTTPPayload(w http.ResponseWriter, mode string, raw []string) ([]string, bool) {
@@ -1015,7 +1015,7 @@ func (h *Handler) handleDeleteLiveAgentConfig(w http.ResponseWriter, r *http.Req
 		writeError(w, http.StatusInternalServerError, "internal_error", "live agent config delete failed")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"group_id": groupID, "node_id": nodeID, "enabled": false})
+	h.writeJSON(w, r, http.StatusOK, map[string]any{"group_id": groupID, "node_id": nodeID, "enabled": false})
 }
 
 func (h *Handler) handleListOpenInvites(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID) {
@@ -1033,7 +1033,7 @@ func (h *Handler) handleListOpenInvites(w http.ResponseWriter, r *http.Request, 
 	for _, rec := range records {
 		out = append(out, OpenInviteSummaryFromRecord(rec, now))
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"open_invites": out})
+	h.writeJSON(w, r, http.StatusOK, map[string]any{"open_invites": out})
 }
 
 func (h *Handler) handleRevokeOpenInvite(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID, escapedInviteID string) {
@@ -1070,7 +1070,7 @@ func (h *Handler) handleRevokeOpenInvite(w http.ResponseWriter, r *http.Request,
 		writeError(w, http.StatusNotFound, "open_invite_not_found", "open invite not found")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"open_invite": OpenInviteSummaryFromRecord(rec, h.clock().UnixMilli())})
+	h.writeJSON(w, r, http.StatusOK, map[string]any{"open_invite": OpenInviteSummaryFromRecord(rec, h.clock().UnixMilli())})
 }
 
 func (h *Handler) handleGroupDiagnostics(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID) {
@@ -1102,7 +1102,7 @@ func (h *Handler) handleGroupDiagnostics(w http.ResponseWriter, r *http.Request,
 		writeError(w, http.StatusInternalServerError, "internal_error", "diagnostics failed")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"group": report})
+	h.writeJSON(w, r, http.StatusOK, map[string]any{"group": report})
 }
 
 func (h *Handler) handleGroupMessages(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID) {
@@ -1129,7 +1129,7 @@ func (h *Handler) handleGroupMessages(w http.ResponseWriter, r *http.Request, gr
 		limit = n
 	}
 	result, err := h.service.Pull(r.Context(), groupID, clientID, limit)
-	h.writeMailboxResult(w, "group messages", result, err)
+	h.writeMailboxResult(w, r, "group messages", result, err)
 }
 
 func (h *Handler) handleGroupHistory(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID) {
@@ -1166,14 +1166,14 @@ func (h *Handler) handleGroupHistory(w http.ResponseWriter, r *http.Request, gro
 		if err == nil {
 			result.NextCursor = encodeHistoryCursor(groupID, topic, result.NextCursorBoundary)
 		}
-		h.writeMailboxResult(w, "group topic history", result, err)
+		h.writeMailboxResult(w, r, "group topic history", result, err)
 		return
 	}
 	result, err := h.service.HistoryBefore(r.Context(), groupID, limit, boundary)
 	if err == nil {
 		result.NextCursor = encodeHistoryCursor(groupID, topic, result.NextCursorBoundary)
 	}
-	h.writeMailboxResult(w, "group history", result, err)
+	h.writeMailboxResult(w, r, "group history", result, err)
 }
 
 func (h *Handler) handleGroupSearch(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID) {
@@ -1216,7 +1216,7 @@ func (h *Handler) handleGroupSearch(w http.ResponseWriter, r *http.Request, grou
 	if err == nil {
 		result.NextCursor = encodeSearchCursor(groupID, topic, queryHash, result.NextCursorBoundary)
 	}
-	h.writeMailboxResult(w, "group search", result, err)
+	h.writeMailboxResult(w, r, "group search", result, err)
 }
 
 func (h *Handler) handleGroupMessageContext(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID) {
@@ -1250,7 +1250,7 @@ func (h *Handler) handleGroupMessageContext(w http.ResponseWriter, r *http.Reque
 	if err == nil {
 		result.OlderCursor = encodeHistoryCursor(groupID, topic, result.OlderCursorBoundary)
 	}
-	h.writeMessageContextResult(w, result, err)
+	h.writeMessageContextResult(w, r, result, err)
 }
 
 func parseMessageIDQuery(w http.ResponseWriter, raw string) (entmoot.MessageID, bool) {
@@ -1282,9 +1282,9 @@ func parseContextSideQuery(w http.ResponseWriter, r *http.Request, name string, 
 	return n, true
 }
 
-func (h *Handler) writeMessageContextResult(w http.ResponseWriter, result mailbox.MessageContextResult, err error) {
+func (h *Handler) writeMessageContextResult(w http.ResponseWriter, r *http.Request, result mailbox.MessageContextResult, err error) {
 	if err == nil {
-		writeJSON(w, http.StatusOK, result)
+		h.writeJSON(w, r, http.StatusOK, result)
 		return
 	}
 	switch {
@@ -1439,7 +1439,7 @@ func (h *Handler) handleGroupTopics(w http.ResponseWriter, r *http.Request, grou
 		limit = n
 	}
 	result, err := h.service.Topics(r.Context(), groupID, limit)
-	h.writeMailboxResult(w, "group topics", result, err)
+	h.writeMailboxResult(w, r, "group topics", result, err)
 }
 
 func (h *Handler) handleGroupMessagePublish(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID) {
@@ -1466,7 +1466,7 @@ func (h *Handler) handleGroupMessagePublish(w http.ResponseWriter, r *http.Reque
 			return
 		}
 		result, err := h.publisher.PublishSigned(r.Context(), msg)
-		h.writePublishResult(w, result, err)
+		h.writePublishResult(w, r, result, err)
 		return
 	}
 	var draft messagePublishDraft
@@ -1569,7 +1569,7 @@ func (h *Handler) handleSignRequests(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "internal_error", "sign request listing failed")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"sign_requests": requests})
+	h.writeJSON(w, r, http.StatusOK, map[string]any{"sign_requests": requests})
 }
 
 func (h *Handler) handleSignRequestSubroute(w http.ResponseWriter, r *http.Request) bool {
@@ -1617,11 +1617,11 @@ func (h *Handler) handleSignRequestSubroute(w http.ResponseWriter, r *http.Reque
 func (h *Handler) authorizeSignRequestCompletion(w http.ResponseWriter, r *http.Request, id string) bool {
 	req, found, err := h.state.GetSignRequest(r.Context(), id)
 	if err != nil {
-		h.writeSignRequestMutation(w, SignRequest{}, err)
+		h.writeSignRequestMutation(w, r, SignRequest{}, err)
 		return false
 	}
 	if !found {
-		h.writeSignRequestMutation(w, SignRequest{}, sql.ErrNoRows)
+		h.writeSignRequestMutation(w, r, SignRequest{}, sql.ErrNoRows)
 		return false
 	}
 	if !h.signRequestVisible(w, r, req) {
@@ -1645,11 +1645,11 @@ func (h *Handler) handleCompleteSignRequest(w http.ResponseWriter, r *http.Reque
 	}
 	req, ok, err := h.state.GetSignRequest(r.Context(), id)
 	if err != nil {
-		h.writeSignRequestMutation(w, SignRequest{}, err)
+		h.writeSignRequestMutation(w, r, SignRequest{}, err)
 		return
 	}
 	if !ok {
-		h.writeSignRequestMutation(w, SignRequest{}, sql.ErrNoRows)
+		h.writeSignRequestMutation(w, r, SignRequest{}, sql.ErrNoRows)
 		return
 	}
 	if !h.signRequestVisible(w, r, req) {
@@ -1693,7 +1693,7 @@ func (h *Handler) handleCompleteSignRequest(w http.ResponseWriter, r *http.Reque
 		operationResult = result
 	}
 	req, err = h.state.CompleteSignRequest(r.Context(), id, signatureText, publishResult, operationResult)
-	h.writeSignRequestMutation(w, req, err)
+	h.writeSignRequestMutation(w, r, req, err)
 }
 
 func signRequestRequiresPayloadDigest(kind string) bool {
@@ -1703,11 +1703,11 @@ func signRequestRequiresPayloadDigest(kind string) bool {
 func (h *Handler) handleRejectSignRequest(w http.ResponseWriter, r *http.Request, id string) {
 	req, ok, err := h.state.GetSignRequest(r.Context(), id)
 	if err != nil {
-		h.writeSignRequestMutation(w, SignRequest{}, err)
+		h.writeSignRequestMutation(w, r, SignRequest{}, err)
 		return
 	}
 	if !ok {
-		h.writeSignRequestMutation(w, SignRequest{}, sql.ErrNoRows)
+		h.writeSignRequestMutation(w, r, SignRequest{}, sql.ErrNoRows)
 		return
 	}
 	if !h.signRequestVisible(w, r, req) {
@@ -1717,7 +1717,7 @@ func (h *Handler) handleRejectSignRequest(w http.ResponseWriter, r *http.Request
 		return
 	}
 	req, err = h.state.RejectSignRequest(r.Context(), id)
-	h.writeSignRequestMutation(w, req, err)
+	h.writeSignRequestMutation(w, r, req, err)
 }
 
 func (h *Handler) handleCurrentDevice(w http.ResponseWriter, r *http.Request) {
@@ -1727,7 +1727,7 @@ func (h *Handler) handleCurrentDevice(w http.ResponseWriter, r *http.Request) {
 	}
 	auth, _ := r.Context().Value(authContextKey{}).(authContext)
 	if auth.device == nil {
-		writeJSON(w, http.StatusOK, map[string]any{"device": nil, "auth_mode": h.authMode})
+		h.writeJSON(w, r, http.StatusOK, map[string]any{"device": nil, "auth_mode": h.authMode})
 		return
 	}
 	state, err := h.state.GetDeviceState(r.Context(), auth.device.ID)
@@ -1736,7 +1736,7 @@ func (h *Handler) handleCurrentDevice(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "internal_error", "device lookup failed")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"device": deviceView(*auth.device), "state": state})
+	h.writeJSON(w, r, http.StatusOK, map[string]any{"device": deviceView(*auth.device), "state": state})
 }
 
 func (h *Handler) handlePushToken(w http.ResponseWriter, r *http.Request) {
@@ -1781,7 +1781,7 @@ func (h *Handler) handlePushTokenMutation(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusInternalServerError, "internal_error", "push token update failed")
 		return
 	}
-	writeJSON(w, http.StatusOK, state)
+	h.writeJSON(w, r, http.StatusOK, state)
 }
 
 func (h *Handler) handleNotificationPreferences(w http.ResponseWriter, r *http.Request) {
@@ -1798,7 +1798,7 @@ func (h *Handler) handleNotificationPreferences(w http.ResponseWriter, r *http.R
 			writeError(w, http.StatusInternalServerError, "internal_error", "notification preference lookup failed")
 			return
 		}
-		writeJSON(w, http.StatusOK, state.NotificationPreferences)
+		h.writeJSON(w, r, http.StatusOK, state.NotificationPreferences)
 	case http.MethodPatch:
 		var prefs NotificationPreferences
 		if _, ok := decodeRawBody(w, r, 1<<20, &prefs); !ok {
@@ -1810,7 +1810,7 @@ func (h *Handler) handleNotificationPreferences(w http.ResponseWriter, r *http.R
 			writeError(w, http.StatusInternalServerError, "internal_error", "notification preference update failed")
 			return
 		}
-		writeJSON(w, http.StatusOK, state.NotificationPreferences)
+		h.writeJSON(w, r, http.StatusOK, state.NotificationPreferences)
 	default:
 		methodNotAllowed(w, http.MethodGet+", "+http.MethodPatch)
 	}
@@ -1858,7 +1858,7 @@ func (h *Handler) handleNotificationTest(w http.ResponseWriter, r *http.Request)
 		writeError(w, status, code, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusAccepted, map[string]any{
+	h.writeJSON(w, r, http.StatusAccepted, map[string]any{
 		"status":      result.Status,
 		"device_id":   auth.device.ID,
 		"provider_id": result.ProviderID,
@@ -1892,7 +1892,7 @@ func (h *Handler) handlePull(w http.ResponseWriter, r *http.Request) {
 		limit = n
 	}
 	result, err := h.service.Pull(r.Context(), groupID, clientID, limit)
-	h.writeMailboxResult(w, "mailbox pull", result, err)
+	h.writeMailboxResult(w, r, "mailbox pull", result, err)
 }
 
 func (h *Handler) handleAck(w http.ResponseWriter, r *http.Request) {
@@ -1930,7 +1930,7 @@ func (h *Handler) handleAck(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	result, err := h.service.AckMessage(r.Context(), req.GroupID, strings.TrimSpace(req.ClientID), req.MessageID)
-	h.writeMailboxResult(w, "mailbox ack", result, err)
+	h.writeMailboxResult(w, r, "mailbox ack", result, err)
 }
 
 func (h *Handler) handleCursor(w http.ResponseWriter, r *http.Request) {
@@ -1951,7 +1951,7 @@ func (h *Handler) handleCursor(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	result, err := h.service.CursorStatus(r.Context(), groupID, clientID)
-	h.writeMailboxResult(w, "mailbox cursor", result, err)
+	h.writeMailboxResult(w, r, "mailbox cursor", result, err)
 }
 
 func (h *Handler) handleMessagePublish(w http.ResponseWriter, r *http.Request) {
@@ -1994,7 +1994,7 @@ func (h *Handler) handleMessagePublish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	result, err := h.publisher.PublishSigned(r.Context(), req.Message)
-	h.writePublishResult(w, result, err)
+	h.writePublishResult(w, r, result, err)
 }
 
 func (h *Handler) requireGroup(w http.ResponseWriter, r *http.Request) (entmoot.GroupID, bool) {
@@ -2035,9 +2035,9 @@ func (h *Handler) checkGroupExists(w http.ResponseWriter, r *http.Request, group
 	return true
 }
 
-func (h *Handler) writePublishResult(w http.ResponseWriter, result PublishResult, err error) {
+func (h *Handler) writePublishResult(w http.ResponseWriter, r *http.Request, result PublishResult, err error) {
 	if err == nil {
-		writeJSON(w, http.StatusAccepted, result)
+		h.writeJSON(w, r, http.StatusAccepted, result)
 		return
 	}
 	var pubErr *PublishError
@@ -2053,9 +2053,9 @@ func (h *Handler) writePublishResult(w http.ResponseWriter, result PublishResult
 	writeError(w, http.StatusInternalServerError, "internal_error", "signed publish failed")
 }
 
-func (h *Handler) writeMailboxResult(w http.ResponseWriter, op string, result any, err error) {
+func (h *Handler) writeMailboxResult(w http.ResponseWriter, r *http.Request, op string, result any, err error) {
 	if err == nil {
-		writeJSON(w, http.StatusOK, result)
+		h.writeJSON(w, r, http.StatusOK, result)
 		return
 	}
 	switch {
@@ -2559,7 +2559,7 @@ func (h *Handler) createSignRequest(w http.ResponseWriter, r *http.Request, kind
 		return
 	}
 	h.notifyDeviceSignRequest(r.Context(), req)
-	writeJSON(w, http.StatusAccepted, map[string]any{"sign_request": req})
+	h.writeJSON(w, r, http.StatusAccepted, map[string]any{"sign_request": req})
 }
 
 func (h *Handler) createMessagePublishSignRequest(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID, draft messagePublishDraft) {
@@ -2579,7 +2579,7 @@ func (h *Handler) createMessagePublishSignRequest(w http.ResponseWriter, r *http
 		return
 	}
 	h.notifyDeviceSignRequest(r.Context(), req)
-	writeJSON(w, http.StatusAccepted, map[string]any{"sign_request": req})
+	h.writeJSON(w, r, http.StatusAccepted, map[string]any{"sign_request": req})
 }
 
 func (h *Handler) notifyDeviceSignRequest(ctx context.Context, req SignRequest) {
@@ -2633,7 +2633,7 @@ func (h *Handler) completeMessagePublishSignRequest(w http.ResponseWriter, r *ht
 	}
 	result, err := h.publisher.PublishSigned(r.Context(), msg)
 	if err != nil {
-		h.writePublishResult(w, result, err)
+		h.writePublishResult(w, r, result, err)
 		return PublishResult{}, false
 	}
 	return result, true
@@ -2753,12 +2753,12 @@ func (h *Handler) writeSignRequestLookup(w http.ResponseWriter, r *http.Request,
 	if !h.signRequestVisible(w, r, req) {
 		return
 	}
-	writeJSON(w, http.StatusOK, req)
+	h.writeJSON(w, r, http.StatusOK, req)
 }
 
-func (h *Handler) writeSignRequestMutation(w http.ResponseWriter, req SignRequest, err error) {
+func (h *Handler) writeSignRequestMutation(w http.ResponseWriter, r *http.Request, req SignRequest, err error) {
 	if err == nil {
-		writeJSON(w, http.StatusOK, req)
+		h.writeJSON(w, r, http.StatusOK, req)
 		return
 	}
 	if errors.Is(err, sql.ErrNoRows) {
@@ -3080,8 +3080,14 @@ type errorBody struct {
 	Message string `json:"message"`
 }
 
+// writeError sends an error envelope. Unlike writeJSON it logs nothing, and
+// the reason is narrower than "it cannot fail": an envelope of two strings
+// cannot fail to ENCODE, so the only failure left is the write itself, which
+// means the client is already gone. There is nothing an operator can do with
+// that, and writeError is called from package-level helpers that hold no
+// handler, so it stays a function.
 func writeError(w http.ResponseWriter, status int, code, message string) {
-	writeJSON(w, status, errorEnvelope{Error: errorBody{Code: code, Message: message}})
+	_ = encodeJSONBody(w, status, errorEnvelope{Error: errorBody{Code: code, Message: message}})
 }
 
 func methodNotAllowed(w http.ResponseWriter, allowed string) {
@@ -3089,10 +3095,32 @@ func methodNotAllowed(w http.ResponseWriter, allowed string) {
 	writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
 }
 
-func writeJSON(w http.ResponseWriter, status int, v any) {
+// encodeJSONBody sends the status line and then the body. It returns whatever
+// Encode returned — an encoding failure, or a write failure once the client has
+// gone — which a caller can only log, because the status is already on the wire.
+func encodeJSONBody(w http.ResponseWriter, status int, v any) error {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
+	return json.NewEncoder(w).Encode(v)
+}
+
+// writeJSON sends a JSON body and reports a failure to the handler's own
+// logger, naming the route. A failure cannot become an error response at that
+// point, but it must not be silent either: discarding it is how the live-agent
+// listing served 200 with an empty body, its response being keyed by MemberID,
+// which had no TextMarshaler.
+//
+// r is always the request being served; the nil check exists so a future caller
+// that forgets it loses the route attribution instead of panicking inside a
+// log call.
+func (h *Handler) writeJSON(w http.ResponseWriter, r *http.Request, status int, v any) {
+	if err := encodeJSONBody(w, status, v); err != nil {
+		attrs := []any{slog.Int("status", status), slog.String("err", err.Error())}
+		if r != nil {
+			attrs = append(attrs, slog.String("method", r.Method), slog.String("path", r.URL.Path))
+		}
+		h.logger.Error("esphttp: response encoding failed after status was sent", attrs...)
+	}
 }
 
 func decodeGroupID(s string) (entmoot.GroupID, error) {

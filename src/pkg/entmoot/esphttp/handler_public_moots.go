@@ -88,7 +88,7 @@ func (h *Handler) handleListPublicMoots(w http.ResponseWriter, r *http.Request) 
 		}
 		entries = append(entries, entry)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"public_moots": entries})
+	h.writeJSON(w, r, http.StatusOK, map[string]any{"public_moots": entries})
 }
 
 func (h *Handler) handleGetPublicMoot(w http.ResponseWriter, r *http.Request, groupID entmoot.GroupID) {
@@ -108,7 +108,7 @@ func (h *Handler) handleGetPublicMoot(w http.ResponseWriter, r *http.Request, gr
 		writeError(w, http.StatusInternalServerError, "internal_error", "public moot mirror lookup failed")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"public_moot": entry})
+	h.writeJSON(w, r, http.StatusOK, map[string]any{"public_moot": entry})
 }
 
 func (h *Handler) handlePostPublicMoot(w http.ResponseWriter, r *http.Request) {
@@ -156,7 +156,7 @@ func (h *Handler) handlePostPublicMoot(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "internal_error", "public moot mirror lookup failed")
 		return
 	}
-	writeJSON(w, code, map[string]any{
+	h.writeJSON(w, r, code, map[string]any{
 		"status":      status,
 		"public_moot": entry,
 	})
@@ -201,7 +201,7 @@ func (h *Handler) handlePatchPublicMootIndexStatus(w http.ResponseWriter, r *htt
 		writeError(w, http.StatusInternalServerError, "internal_error", "public moot mirror lookup failed")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"public_moot": entry})
+	h.writeJSON(w, r, http.StatusOK, map[string]any{"public_moot": entry})
 }
 
 func readPublicMootRequestBody(w http.ResponseWriter, r *http.Request) ([]byte, error) {

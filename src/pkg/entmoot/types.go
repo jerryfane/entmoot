@@ -10,6 +10,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"strconv"
 )
 
 // NodeID is retained only for immutable Pilot-era signed records and upgrade mappings.
@@ -31,6 +32,20 @@ func (m *MemberID) UnmarshalJSON(data []byte) error {
 	return decodeBase64Array32("MemberID", data, m[:])
 }
 
+// MarshalText and UnmarshalText exist so a MemberID can be a JSON MAP KEY.
+// encoding/json uses TextMarshaler, not Marshaler, for keys, and silently
+// fails the whole document without it: GET /v1/groups/<gid>/live-agents
+// returned 200 with an empty body for exactly that reason, because its
+// response is keyed by member. Values keep using MarshalJSON, which
+// encoding/json prefers, so the encoding is the same base64 string either way.
+func (m MemberID) MarshalText() ([]byte, error) {
+	return []byte(m.String()), nil
+}
+
+func (m *MemberID) UnmarshalText(text []byte) error {
+	return decodeBase64Array32("MemberID", []byte(strconv.Quote(string(text))), m[:])
+}
+
 // GroupID is the 32-byte random identifier of an Entmoot group.
 //
 // It is content-independent; two groups with the same name have distinct IDs.
@@ -45,6 +60,16 @@ func (g GroupID) String() string {
 // MarshalJSON encodes the group id as a base64 JSON string.
 func (g GroupID) MarshalJSON() ([]byte, error) {
 	return json.Marshal(g.String())
+}
+
+// MarshalText and UnmarshalText let a GroupID be a JSON map key, for the same
+// reason MemberID needs them.
+func (g GroupID) MarshalText() ([]byte, error) {
+	return []byte(g.String()), nil
+}
+
+func (g *GroupID) UnmarshalText(text []byte) error {
+	return decodeBase64Array32("GroupID", []byte(strconv.Quote(string(text))), g[:])
 }
 
 // UnmarshalJSON decodes a base64 JSON string into the 32-byte group id.
