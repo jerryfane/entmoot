@@ -760,3 +760,44 @@ func TestBoundaryWalkCoversEveryRowExactlyOnce(t *testing.T) {
 		t.Fatalf("walk saw %d distinct messages, stored %d", len(seen), len(stored))
 	}
 }
+
+// TestNextProfileBoundaryScansAPageInTopologicalOrder covers the min-scan. A
+// page does not arrive sorted: store.LatestByTopicBefore queries newest-first
+// and then returns order.Topological, so a parent is placed before its child
+// even when the child sorts below it. messages[0] is therefore the minimum of
+// the topological frontier, not of the page, and taking it as the cursor
+// re-serves every row between the two - which is why the scan exists.
+func TestNextProfileBoundaryScansAPageInTopologicalOrder(t *testing.T) {
+	author := entmoot.MemberID{9}
+	same := int64(1_700_000_000_000)
+	newer := entmoot.Message{
+		ID:        entmoot.MessageID{0xF0},
+		Timestamp: same,
+		Author:    entmoot.NodeInfo{MemberID: &author},
+	}
+	older := entmoot.Message{
+		ID:        entmoot.MessageID{0x0F},
+		Timestamp: same,
+		Author:    entmoot.NodeInfo{MemberID: &author},
+		Parents:   []entmoot.MessageID{newer.ID},
+	}
+	// The order a topological page puts them in: the parent first, though it
+	// is the larger of the two under the paging key.
+	page := []entmoot.Message{newer, older}
+
+	boundary := nextProfileBoundary(page)
+	if boundary == nil {
+		t.Fatal("no boundary for a non-empty page")
+	}
+	if boundary.MessageID != older.ID {
+		t.Fatalf("cursor names %s, want the page's smallest row %s: taking the first row re-serves everything between them",
+			boundary.MessageID, older.ID)
+	}
+	if boundary.AuthorMemberID != author || boundary.TimestampMS != same {
+		t.Fatalf("cursor = {%d, %s, %s}, want the smallest row's own three fields",
+			boundary.TimestampMS, boundary.AuthorMemberID, boundary.MessageID)
+	}
+	if nextProfileBoundary(nil) != nil {
+		t.Fatal("an empty page must produce no cursor, or the walk restarts from the newest row")
+	}
+}
