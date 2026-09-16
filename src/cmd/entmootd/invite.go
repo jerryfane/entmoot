@@ -508,20 +508,18 @@ func groupMemberPeerIDs(group *membership.Group) (map[peer.ID]struct{}, error) {
 // membership-sync request with an 8 KiB ceiling, so a member-only cap let an
 // invite grow past the size at which it could be redeemed at all.
 //
-// maxInviteFallbackBytes is the only one a size test pins: raise it and
-// TestOpenInviteSizeEstimateCoversTheMintedCapability fails, because the
-// estimate charges the byte budget once while the mint attaches per address.
-// The peer and count caps are charged into that same estimate
-// (esp_operations.go), so the estimate grows with them and a modest raise
-// changes nothing a size test can see - only a raise large enough to push the
-// estimate past a joiner's frame is caught.
+// What the tests actually pin, measured one constant at a time rather than
+// argued: maxInviteFallbackAddrsPeer and maxInviteAddrBytes have tests that
+// fail on the SHAPE a user would notice - one multi-homed member spending the
+// whole budget so the invite names one door instead of four, and one long
+// address starving the rest. A large move in maxInviteFallbackBytes or
+// maxInviteFallbackAddrs is caught by the size tests.
 //
-// What the remaining caps buy is the SHAPE of what gets attached, and those
-// failures are the ones a user notices: without maxInviteFallbackAddrsPeer one
-// multi-homed member spends the whole budget and the invite names one door
-// instead of four; without maxInviteAddrBytes a single long address starves
-// the rest. Both have tests that fail on exactly that. Lowering any count cap
-// is caught too, because too few doors is also a defect.
+// What nothing pins: a small change to any of the three count caps. They are
+// charged into the same estimate they bound (esp_operations.go), so estimate
+// and mint move together, and lowering one by a step only makes an invite
+// carry fewer doors - which no test calls a failure. Treat them as defence in
+// depth and re-justify against the frame budget before moving them.
 const (
 	maxInviteFallbackPeers     = 4
 	maxInviteFallbackAddrs     = 8
