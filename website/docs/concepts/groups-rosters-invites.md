@@ -43,7 +43,8 @@ Record kinds:
 | `revoke_invite` | founder or delegated admin | invalidates one invite by nonce |
 
 Records are merged by a deterministic total order derived from their contents:
-timestamp first, then kind rank, then record id. Kind rank is a decision, not
+timestamp first, then kind rank, then the founder's record before a delegated
+admin's, then record id. Kind rank is a decision, not
 an accident:
 
 1. `join` — somebody admitted in the same instant is a member when the records

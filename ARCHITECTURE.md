@@ -42,7 +42,7 @@ A group contains:
 Membership is a set, not a chain. Each record is a signed statement — a member
 admitting itself under an invite, leaving, rekeying; an admin removing, banning,
 unbanning, revoking an invite, or replacing policy — and records merge by one
-deterministic total order: timestamp, then kind, then id. Joins apply before
+deterministic total order: timestamp, then kind, then the founder's record before a delegated admin's, then id. Joins apply before
 rekeys, then authority records, then leaves, so a removal beats a simultaneous
 join and a leave always sticks: admitting someone by mistake is recoverable,
 failing to remove them is not.

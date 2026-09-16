@@ -261,8 +261,8 @@ func shouldReplaceNodeProfile(existing, incoming NodeProfileRecord) bool {
 	// Two rows for one member can agree on everything above and still be
 	// different rows, because the upsert key is (member_id, source_key): a
 	// member signature and an observation from another source coexist. Without
-	// this
-	// last clause the relation is false in both directions for such a pair,
+	// this last clause the relation is false in both directions for such a
+	// pair,
 	// and bestNodeProfile picks while ranging a Go map — so the served name
 	// would depend on iteration order, which is exactly the arrival-order
 	// dependence the clauses above exist to remove.
