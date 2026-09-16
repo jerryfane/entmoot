@@ -1520,38 +1520,32 @@ func validateOpenInviteBootstrap(addresses, memberPeerIDs []string, localPeerID 
 	return nil
 }
 
-// openInviteCapabilityTooLarge estimates the signed capability an open invite
-// will mint. Every field is sized at its real width, and the fallback slots are
-// counted unless the caller opted out, so the estimate is an upper bound on
-// what the mint will produce rather than a lower one.
+// openInviteCapabilityTooLarge reports whether a bootstrap list would mint a
+// capability too large to redeem.
+//
+// It does NOT model the JSON. Three attempts at that undercounted in turn: the
+// fallback slots, then the relay bytes, then the nonce, the timestamps and the
+// per-element array overhead. The size of a document is a fact about the
+// encoder, not something to reason about in prose, so the arithmetic here is
+// deliberately coarse and one-directional: everything the caller did not name
+// is charged at its enforced ceiling, and the fixed fields are charged at
+// maxInviteCapabilityOverhead, a constant TestCapabilityOverheadIsBounded
+// measures against a capability built the way the mint builds one.
 func openInviteCapabilityTooLarge(addresses, peerIDs []string, noFallback bool) (int, bool) {
-	var key [32]byte
-	var signature [64]byte
-	node := entmoot.NodeInfo{EntmootPubKey: key[:], MemberID: &entmoot.MemberID{}, PeerID: strings.Repeat("Q", 52)}
-	probe := entmoot.BootstrapCapability{
-		AllowedMultiaddrs: append([]string(nil), addresses...),
-		AllowedPeerIDs:    append([]string(nil), peerIDs...),
-		Founder:           node,
-		Issuer:            &node,
-		TargetPublicKey:   key[:],
-		TargetMemberID:    entmoot.MemberID{},
-		TargetPeerID:      node.PeerID,
-		Signature:         signature[:],
+	// Each array element costs its own quotes and comma on the wire.
+	const perElement = 4
+	size := maxInviteCapabilityOverhead
+	for _, addr := range addresses {
+		size += len(addr) + perElement
 	}
-	// Relay hints come from this node's configuration, so they cost bytes the
-	// caller never named. Both they and the fallback slots are sized at the
-	// width attachment enforces, which is what makes this an upper bound: the
-	// previous version sized them from the addresses the OPERATOR named and
-	// undershot by a factor of two against a peer cache full of webtransport
-	// addresses.
-	// Both sets are bounded in BYTES by attachment, so one string of that
-	// size models the worst case exactly.
-	probe.Relays = append(probe.Relays, strings.Repeat("r", maxInviteFallbackBytes))
+	for _, id := range peerIDs {
+		size += len(id) + perElement
+	}
+	// Relay hints come from this node's configuration, not the caller.
+	size += maxInviteFallbackBytes + libp2ptransport.MaxCapabilityRelays*perElement
 	if !noFallback {
-		probe.AllowedMultiaddrs = append(probe.AllowedMultiaddrs, strings.Repeat("a", maxInviteFallbackBytes))
-		for i := 0; i < maxInviteFallbackPeers; i++ {
-			probe.AllowedPeerIDs = append(probe.AllowedPeerIDs, node.PeerID)
-		}
+		size += maxInviteFallbackBytes + maxInviteFallbackAddrs*perElement
+		size += maxInviteFallbackPeers * (maxPeerIDBytes + perElement)
 	}
-	return libp2ptransport.CapabilityTooLarge(probe)
+	return size, size > libp2ptransport.MaxCapabilityBytes
 }

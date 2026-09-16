@@ -1475,7 +1475,7 @@ func (s *ipcServer) handleInviteCreate(_ context.Context, c net.Conn, req *ipc.I
 		RosterHead:        session.group.Canonical().ID,
 		AllowedPeerIDs:    allowedPeerIDs,
 		AllowedMultiaddrs: allowedAddresses,
-		Relays:            boundInviteRelays(s.runtime.relayHints()),
+		Relays:            s.runtime.relayHints(),
 		MaxUses:           req.MaxUses,
 		IssuedAtMS:        now.UnixMilli(),
 		ExpiresAtMS:       expires.UnixMilli(),

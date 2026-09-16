@@ -21,10 +21,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   members because a multi-homed host holds dozens, and a capability travels in
   one request frame with an 8 KiB ceiling: bounding members alone produced
   invites too large to redeem. Every mint path refuses a capability over the
-  budget, and the budget itself is pinned by a test that puts a capability of
-  that size into a real read request and a real push: counts alone were not
-  enough, because eight full-width addresses plus eight relay hints consumed
-  the whole allowance before the operator named anything.
+  budget, the budget is pinned by a test that puts a capability of that size
+  into a real read request, and the creation-time check charges everything the
+  caller did not name at its enforced ceiling rather than modelling the JSON:
+  three attempts at modelling it undercounted in turn, on the fallback slots,
+  then the relay bytes, then the nonce and timestamps. The fixed-field
+  allowance is measured by a test against a capability built the way the mint
+  builds one.
 
   Routable addresses are preferred. A member known only on a non-routable one —
   a LAN, a ULA, a link-local or a carrier-NAT address — still gets a single

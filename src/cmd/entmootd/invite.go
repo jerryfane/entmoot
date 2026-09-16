@@ -218,6 +218,15 @@ func cmdInviteCreate(gf *globalFlags, args []string) int {
 		fmt.Fprintln(os.Stderr, "invite create: every -relay must be a multiaddr ending in /p2p/<relay-peer-id>")
 		return exitInvalidArgument
 	}
+	// An invite carries a bounded number of relay BYTES, so a large hint set
+	// is trimmed here rather than silently later. Say so: dropping a relay an
+	// operator named without a word is how a joiner ends up unable to reach
+	// the group through the path the operator intended.
+	if bounded := boundInviteRelays(relayHints); len(bounded) != len(relayHints) {
+		fmt.Fprintf(os.Stderr, "invite create: carrying %d of %d relay hints; the rest do not fit the invite's %d-byte relay budget\n",
+			len(bounded), len(relayHints), maxInviteFallbackBytes)
+		relayHints = bounded
+	}
 	now := time.Now()
 	capability := entmoot.BootstrapCapability{
 		GroupID:           gid,
@@ -229,7 +238,7 @@ func cmdInviteCreate(gf *globalFlags, args []string) int {
 		RosterHead:        group.Canonical().ID,
 		AllowedPeerIDs:    allowedPeerIDs,
 		AllowedMultiaddrs: allowedAddresses,
-		Relays:            boundInviteRelays(relayHints),
+		Relays:            relayHints,
 		MaxUses:           *maxUses,
 		IssuedAtMS:        now.UnixMilli(),
 		ExpiresAtMS:       now.Add(ttl).UnixMilli(),
@@ -514,6 +523,16 @@ const (
 	// it before the capability exists.
 	maxInviteAddrBytes     = 256
 	maxInviteFallbackBytes = 1 << 10
+	// maxPeerIDBytes bounds a base58 libp2p peer id string; ed25519 identity
+	// peer ids are 52 characters, and this leaves room for other key types.
+	maxPeerIDBytes = 64
+	// maxInviteCapabilityOverhead charges every field of a capability that is
+	// not an address or a peer id: both identities, the checkpoint id, nonce,
+	// signature, timestamps, target fields and the JSON structure itself.
+	// TestCapabilityOverheadIsBounded measures a capability built the way the
+	// mint builds one and fails if this stops being an upper bound, so the
+	// number is checked against the encoder rather than argued for.
+	maxInviteCapabilityOverhead = 1536
 )
 
 // routableInviteAddress reports whether an address is reachable from outside

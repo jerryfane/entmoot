@@ -7,6 +7,9 @@ import (
 
 	entmoot "entmoot/pkg/entmoot"
 	libp2ptransport "entmoot/pkg/entmoot/transport/libp2p"
+
+	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/multiformats/go-multiaddr"
 )
 
 // TestESPInvitePayloadsCarryTheFallbackOptOut pins that the escape hatch is
@@ -147,59 +150,81 @@ func TestAttachmentHonoursTheBytePremiseTheEstimateReliesOn(t *testing.T) {
 	}
 }
 
-// TestCreationEstimateIsAnUpperBoundOnTheMint pins the property the estimate
-// needs and twice did not have: whatever passes creation must pass the mint.
-// Sizing the fallback slots from the operator's own short addresses let a
-// 15-address list through while the daemon, filling those slots from a peer
-// cache of long webtransport addresses, signed something the joiner could not
-// send.
-func TestCreationEstimateIsAnUpperBoundOnTheMint(t *testing.T) {
+// TestCapabilityOverheadIsBounded measures the constant the creation-time
+// check charges for everything that is not an address or a peer id. Three
+// earlier versions of that check reasoned about JSON byte counts in prose and
+// undercounted each time — the fallback slots, the relay bytes, then the nonce
+// and timestamps. This measures instead: a capability shaped the way the mint
+// builds one, with every fixed field at its widest, minus the address and
+// peer-id bytes the check charges separately.
+func TestCapabilityOverheadIsBounded(t *testing.T) {
 	_, info := mustDaemonIdentity(t)
 	binding, err := libp2ptransport.BindingFromPublicKey(info.EntmootPubKey)
 	if err != nil {
 		t.Fatal(err)
 	}
-	members := []string{binding.PeerID.String()}
-	named := "/ip4/203.0.113.7/tcp/1004/p2p/" + binding.PeerID.String()
-
-	for n := 1; n <= 40; n++ {
-		list := make([]string, 0, n)
-		for i := 0; i < n; i++ {
-			list = append(list, named)
-		}
-		creationOK := validateOpenInviteBootstrap(list, members, "", false) == nil
-		if !creationOK {
-			continue
-		}
-		// The worst capability the mint could sign from this list: every
-		// fallback and relay slot filled at the width attachment enforces.
-		minted := mintedWorstCase(t, list, binding.PeerID.String())
-		if size, tooLarge := libp2ptransport.CapabilityTooLarge(minted); tooLarge {
-			t.Fatalf("%d addresses passed creation while the worst-case mint is %d bytes, over %d", n, size, libp2ptransport.MaxCapabilityBytes)
-		}
+	node := entmoot.NodeInfo{EntmootPubKey: info.EntmootPubKey, MemberID: info.MemberID, PeerID: binding.PeerID.String()}
+	var signature [64]byte
+	for i := range signature {
+		signature[i] = 0xff
+	}
+	capability := entmoot.BootstrapCapability{
+		GroupID:         entmoot.GroupID{0xff},
+		Founder:         node,
+		Issuer:          &node,
+		RosterHead:      entmoot.RosterEntryID{0xff},
+		TargetPublicKey: info.EntmootPubKey,
+		TargetMemberID:  *info.MemberID,
+		TargetPeerID:    binding.PeerID.String(),
+		MaxUses:         1 << 31,
+		IssuedAtMS:      1 << 44,
+		ExpiresAtMS:     1 << 44,
+		Signature:       signature[:],
+	}
+	for i := range capability.Nonce {
+		capability.Nonce[i] = 0xff
+	}
+	encoded, err := json.Marshal(capability)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(encoded) > maxInviteCapabilityOverhead {
+		t.Fatalf("a capability with no addresses encodes to %d bytes, over the %d charged as overhead: the creation-time check would undercount",
+			len(encoded), maxInviteCapabilityOverhead)
 	}
 }
 
-func mintedWorstCase(t *testing.T, named []string, peerID string) entmoot.BootstrapCapability {
-	t.Helper()
-	var key [32]byte
-	var signature [64]byte
-	node := entmoot.NodeInfo{EntmootPubKey: key[:], MemberID: &entmoot.MemberID{}, PeerID: peerID}
-	capability := entmoot.BootstrapCapability{
-		GroupID:           entmoot.GroupID{7},
-		AllowedMultiaddrs: append([]string(nil), named...),
-		AllowedPeerIDs:    []string{peerID},
-		Founder:           node,
-		Issuer:            &node,
-		TargetPublicKey:   key[:],
-		TargetPeerID:      peerID,
-		Signature:         signature[:],
-		RosterHead:        entmoot.RosterEntryID{9},
+// TestRelayHintsFromTheRuntimeAreBounded pins the bound at its producer. It
+// used to live at each mint site, so reverting one of them left every test
+// green while the capability-size check silently stopped being an upper bound.
+func TestRelayHintsFromTheRuntimeAreBounded(t *testing.T) {
+	_, info := mustDaemonIdentity(t)
+	binding, err := libp2ptransport.BindingFromPublicKey(info.EntmootPubKey)
+	if err != nil {
+		t.Fatal(err)
 	}
-	capability.Relays = append(capability.Relays, strings.Repeat("r", maxInviteFallbackBytes))
-	capability.AllowedMultiaddrs = append(capability.AllowedMultiaddrs, strings.Repeat("a", maxInviteFallbackBytes))
-	for i := 0; i < maxInviteFallbackPeers; i++ {
-		capability.AllowedPeerIDs = append(capability.AllowedPeerIDs, peerID)
+	// A long but valid address: dnsaddr names are the widest real shape.
+	long := "/dnsaddr/" + strings.Repeat("relay-host-segment.", 6) + "example.com/tcp/4001"
+	relay := peer.AddrInfo{ID: binding.PeerID}
+	for i := 0; i < 16; i++ {
+		relay.Addrs = append(relay.Addrs, multiaddr.StringCast(long))
 	}
-	return capability
+	runtime := &groupRuntime{controlledRelays: []peer.AddrInfo{relay}}
+
+	hints := runtime.relayHints()
+	total := 0
+	for _, hint := range hints {
+		total += len(hint)
+	}
+	if total > maxInviteFallbackBytes {
+		t.Fatalf("relayHints returned %d bytes over %d: the size check models this bound", total, maxInviteFallbackBytes)
+	}
+	if len(hints) == 0 {
+		t.Fatal("relayHints returned nothing, so the bound refuses rather than trims")
+	}
+	for _, hint := range hints {
+		if len(hint) > maxInviteAddrBytes {
+			t.Fatalf("relayHints returned a %d-byte hint, over the %d-byte per-address bound", len(hint), maxInviteAddrBytes)
+		}
+	}
 }

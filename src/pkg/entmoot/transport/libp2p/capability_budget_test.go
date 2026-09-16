@@ -7,7 +7,6 @@ import (
 	"time"
 
 	entmoot "entmoot/pkg/entmoot"
-	"entmoot/pkg/entmoot/membership"
 )
 
 // TestJoinRequestFitsTheFrame pins the reserve behind MaxCapabilityBytes. A
@@ -23,11 +22,6 @@ import (
 func TestJoinRequestFitsTheFrame(t *testing.T) {
 	identity := mustIdentity(t)
 	_, group := mustInviteOnlyGroup(t, t.TempDir(), identity)
-	record, err := group.SignRecord(identity, membership.Record{Kind: membership.KindJoin})
-	if err != nil {
-		t.Fatalf("SignRecord: %v", err)
-	}
-
 	// A capability filled to exactly the budget.
 	capability := entmoot.BootstrapCapability{
 		GroupID:     group.GroupID(),
@@ -71,19 +65,9 @@ func TestJoinRequestFitsTheFrame(t *testing.T) {
 			len(encoded), maxSyncRequestBytes)
 	}
 
-	push := MembershipPushRequest{
-		Version:    1,
-		RequestID:  strings.Repeat("r", 36),
-		GroupID:    group.GroupID(),
-		Capability: &capability,
-		Record:     record,
-	}
-	encoded, err = json.Marshal(push)
-	if err != nil {
-		t.Fatalf("Marshal push request: %v", err)
-	}
-	if len(encoded) > maxMembershipResponse {
-		t.Fatalf("a capability at the budget plus a join record makes a %d-byte push, over its %d-byte limit",
-			len(encoded), maxMembershipResponse)
-	}
+	// No push assertion here on purpose: the push protocol decodes against
+	// maxMembershipResponse (4 MiB), so any assertion a capability could
+	// satisfy would be a tautology. The read shape is the binding constraint,
+	// and it is the one a joiner actually sends.
+
 }
