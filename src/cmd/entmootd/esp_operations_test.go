@@ -646,7 +646,7 @@ func serveESPGroupCreateIPC(t *testing.T, sock string, pub []byte, joinOK bool) 
 			case *ipc.JoinGroupReq:
 				if joinOK {
 					if v.LocalGroupID == nil {
-						t.Error("create join request must activate the enrolled local group")
+						t.Error("create join request must activate the joined local group")
 					} else {
 						_ = ipc.EncodeAndWrite(conn, &ipc.JoinGroupResp{Status: "joined", GroupID: *v.LocalGroupID, Members: 1})
 					}

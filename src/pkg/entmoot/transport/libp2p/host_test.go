@@ -70,9 +70,11 @@ func TestFreshHostsConnectWithoutPilot(t *testing.T) {
 	if err := VerifyBinding(secondIdentity.PublicKey, secondBinding.MemberID, second.ID()); err != nil {
 		t.Fatal(err)
 	}
-	const enrollmentProtocol = protocol.ID("/entmoot/enrollment/2")
+	// An arbitrary protocol id: this test only needs two hosts to speak
+	// something. It deliberately does not name a real Entmoot protocol.
+	const probeProtocol = protocol.ID("/entmoot/host-test-probe/1")
 	accepted := make(chan string, 1)
-	first.SetStreamHandler(enrollmentProtocol, func(stream network.Stream) {
+	first.SetStreamHandler(probeProtocol, func(stream network.Stream) {
 		defer stream.Close()
 		data, _ := io.ReadAll(io.LimitReader(stream, 64))
 		accepted <- string(data)
@@ -80,9 +82,9 @@ func TestFreshHostsConnectWithoutPilot(t *testing.T) {
 	if err := second.Connect(ctx, peer.AddrInfo{ID: first.ID(), Addrs: first.Addrs()}); err != nil {
 		t.Fatalf("connect fresh hosts: %v", err)
 	}
-	stream, err := second.NewStream(ctx, first.ID(), enrollmentProtocol)
+	stream, err := second.NewStream(ctx, first.ID(), probeProtocol)
 	if err != nil {
-		t.Fatalf("open enrollment stream: %v", err)
+		t.Fatalf("open probe stream: %v", err)
 	}
 	if _, err := stream.Write([]byte("bounded invite bootstrap")); err != nil {
 		t.Fatal(err)

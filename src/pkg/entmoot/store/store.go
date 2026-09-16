@@ -10,7 +10,9 @@
 // MessageStore, so there is no in-process scan path to fall into.
 //
 // All methods are safe for concurrent use. Retention is driven by the pruning
-// primitives below rather than by the store itself; see ARCHITECTURE.md §8.
+// primitives below rather than by the store itself: the store never drops a
+// message on its own, and every deletion enters through PruneBefore or
+// PruneBeforeExceptTopics.
 package store
 
 import (

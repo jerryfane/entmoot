@@ -524,8 +524,9 @@ func cmdRosterStatus(gf *globalFlags, args []string) int {
 }
 
 // cmdRosterRemove removes an existing member from a group's roster. The
-// founder or a delegated admin may sign it, matching roster add and the ESP
-// member_remove operation; only the founder may remove an admin.
+// founder or a delegated admin may sign it, the same authority that admits a
+// member through `invite create`, and the same the ESP member_remove
+// operation requires; only the founder may remove an admin.
 func cmdRosterRemove(gf *globalFlags, args []string) int {
 	fs := flag.NewFlagSet("roster remove", flag.ContinueOnError)
 	memberFlags := addRosterMemberFlags(fs)

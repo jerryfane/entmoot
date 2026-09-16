@@ -48,7 +48,8 @@ const (
 	// MsgJoinGroupResp acknowledges that a group session exists.
 	MsgJoinGroupResp MsgType = 0x19
 	// MsgInviteCreateReq asks the running daemon to create a signed invite
-	// for an active group, applying any target roster add to the live session.
+	// for an active group; the invited node signs itself in when it redeems
+	// the invite, so creating one does not change membership here.
 	MsgInviteCreateReq MsgType = 0x1A
 	// MsgInviteCreateResp returns the signed invite created from live daemon
 	// state, including the roster head the daemon can serve.
@@ -122,7 +123,7 @@ func (t MsgType) String() string {
 
 // PublishReq is the request body a client sends to author a message in a
 // group. GroupID is optional: a nil GroupID means "auto-pick if exactly
-// one group is joined" (CLI_DESIGN §3: publish -group is optional when
+// one group is joined" (publish -group is optional when
 // there's only one choice). The daemon resolves GroupID before signing.
 type PublishReq struct {
 	// GroupID names the target group. nil means "auto-pick the single
@@ -130,7 +131,7 @@ type PublishReq struct {
 	// would be ambiguous.
 	GroupID *entmoot.GroupID `json:"group_id,omitempty"`
 	// Topics are MQTT-style hierarchical topic strings. A single message
-	// can carry multiple topics (CLI_DESIGN §9 decision #4).
+	// can carry multiple topics.
 	Topics []string `json:"topics"`
 	// Content is opaque application bytes. encoding/json base64s it.
 	Content []byte `json:"content"`
@@ -168,7 +169,7 @@ type SignedPublishResp struct {
 }
 
 // JoinGroupReq carries a target-bound bootstrap capability or requests
-// activation of a group already enrolled in persistent local state.
+// activation of a group already joined in persistent local state.
 type JoinGroupReq struct {
 	Capability    *entmoot.BootstrapCapability `json:"capability,omitempty"`
 	LocalGroupID  *entmoot.GroupID             `json:"local_group_id,omitempty"`
@@ -189,7 +190,7 @@ type JoinGroupResp struct {
 // InviteCreateReq asks the live founder daemon to mint a bootstrap capability
 // from its current roster and advertised addresses. TargetPublicKey is
 // required unless Open is set, which mints a bearer invite any holder may
-// redeem; MaxUses caps how many distinct identities may enroll with it (zero
+// redeem; MaxUses caps how many distinct identities may redeem it (zero
 // means one).
 type InviteCreateReq struct {
 	GroupID             entmoot.GroupID `json:"group_id"`

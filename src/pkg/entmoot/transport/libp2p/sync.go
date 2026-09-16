@@ -162,7 +162,7 @@ func (s *SyncServer) Install() error {
 
 // handlePeerRecords serves this node's own signed peer record plus the verified
 // records it holds for other members. Membership is the only credential: a
-// bootstrap capability cannot open this protocol, so an enrolling peer learns
+// bootstrap capability cannot open this protocol, so a joining peer learns
 // no member addresses here.
 func (s *SyncServer) handlePeerRecords(stream network.Stream) {
 	defer stream.Close()
@@ -244,8 +244,9 @@ func (s *SyncServer) authorize(stream network.Stream, groupID entmoot.GroupID, c
 		return ErrBootstrapDenied
 	}
 	// The signature verifies against the authority the capability names, which
-	// its holder chooses, so that authority must be a member who may currently
-	// administer the group. Without this, anyone could name the real founder as
+	// its holder chooses, so that authority must be able to administer the
+	// group right now: the founder always, a delegated admin only while it is
+	// still an unbanned member. Without this, anyone could name the real founder as
 	// the anchor, name itself as issuer, self-sign, and read membership and history
 	// before membership.
 	if err := AuthorizedIssuer(group, capability.SigningAuthority()); err != nil {

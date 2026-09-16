@@ -1,9 +1,11 @@
 // Package entmoot defines the core data model shared by every sub-package:
 // group identifiers, messages, roster entries, invites, and supporting types.
 //
-// All fields carry snake_case JSON tags so wire and on-disk representations
-// match the spec in ARCHITECTURE.md. 32-byte identifier types marshal as
-// base64 strings rather than Go's default array-of-numbers encoding.
+// All fields carry snake_case JSON tags, so the wire form and the on-disk
+// form are the same bytes; pkg/entmoot/canonical encodes these types for
+// signing, so a tag change breaks existing signatures. 32-byte identifier
+// types marshal as base64 strings rather than Go's default
+// array-of-numbers encoding.
 package entmoot
 
 import (
@@ -167,9 +169,10 @@ type Message struct {
 	Timestamp int64 `json:"timestamp"`
 	// Topics are MQTT-style hierarchical topic strings used by subscribers.
 	Topics []string `json:"topics,omitempty"`
-	// Parents are the (at most three, per ARCHITECTURE §3.2) highest-timestamp
-	// message ids the author had seen when composing. Genesis messages have
-	// an empty slice.
+	// Parents are the highest-timestamp message ids the author had seen when
+	// composing. Genesis messages have an empty slice. The compose path takes
+	// up to three (cmd/entmootd/join.go); that is a convention of the author,
+	// not a validated limit, so a receiver must not assume a maximum.
 	Parents []MessageID `json:"parents,omitempty"`
 	// Content is opaque application bytes.
 	Content []byte `json:"content,omitempty"`
@@ -224,7 +227,7 @@ type Filter []string
 // BootstrapCapability is an issuer-signed, expiring grant for a bounded set of
 // bootstrap endpoints. Target fields bind it to one fresh identity; leaving
 // them empty makes it an open invite that any holder may redeem. MaxUses caps
-// how many distinct identities may enroll with it (absent or zero means one).
+// how many distinct identities may redeem it (absent or zero means one).
 //
 // Founder is the group's trust anchor, which the joiner pins. Issuer is the
 // member that actually signed the grant: absent when the founder issued it,
@@ -267,7 +270,7 @@ func (c BootstrapCapability) IsOpenInvite() bool {
 	return len(c.TargetPublicKey) == 0
 }
 
-// Uses returns the number of distinct identities permitted to enroll with this
+// Uses returns the number of distinct identities permitted to redeem this
 // capability. Zero or negative MaxUses means one.
 func (c BootstrapCapability) Uses() int {
 	if c.MaxUses <= 0 {

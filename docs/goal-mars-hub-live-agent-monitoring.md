@@ -93,7 +93,6 @@ Task 1: Read-only Mars Hub conversation monitor
    - recent message IDs, authors, topics, timestamps, and content summaries;
    - `entmootd agent-live status -group <GROUP_ID> --json`;
    - `entmootd env --json`;
-   - `entmootd agent-commands status`;
    - process tree and container state;
    - recent relevant Entmoot, Pilot, OpenClaw, or Hermes logs.
 6. If this task proves they are conversating and both runtimes are healthy,
@@ -196,7 +195,6 @@ Release and peer update gate:
    - `entmootd version`;
    - `entmootd env --json`;
    - `agent-live status --json`;
-   - `agent-commands status`;
    - direct publish/query smoke;
    - process tree/container child health;
    - relevant health endpoints if exposed.

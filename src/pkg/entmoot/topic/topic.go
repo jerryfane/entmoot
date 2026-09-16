@@ -1,5 +1,7 @@
 // Package topic implements the MQTT-style topic pattern matcher used by
-// Entmoot subscriber filters (see ARCHITECTURE.md §3.4).
+// Entmoot subscriber filters. The syntax below is the whole specification;
+// ARCHITECTURE.md describes where filters sit in the delivery path, not the
+// pattern grammar.
 //
 // Syntax rules (enforced by ValidPattern):
 //

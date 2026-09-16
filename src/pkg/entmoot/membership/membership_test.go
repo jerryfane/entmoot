@@ -1466,3 +1466,40 @@ func TestFutureDatedRecordCannotOutrankARemoval(t *testing.T) {
 		t.Fatal("a valid rejoin was not applied")
 	}
 }
+
+// TestFounderIssuesAfterLeavingWhileADemotedAdminCannot pins the asymmetry the
+// documentation states. CanAdminister answers the founder before it looks at
+// Members or Banned, so a founder that removed itself can still authorise an
+// invite; a delegated admin cannot, because its authority is exactly its
+// membership plus its delegation. Writing "the issuer must be a current
+// member" flattened the two, which is how the docs came to describe a rule the
+// code does not have.
+func TestFounderIssuesAfterLeavingWhileADemotedAdminCannot(t *testing.T) {
+	policy := DefaultPolicy()
+	policy.JoinRule = JoinRuleOpen
+	f := newFixture(t, policy)
+
+	admin := mustIdentity(t)
+	f.apply(f.sign(admin, Record{Kind: KindJoin}))
+	adminPolicy := policy
+	adminPolicy.Admins = []entmoot.MemberID{f.memberID(admin)}
+	f.apply(f.sign(f.founder, Record{Kind: KindPolicy, Policy: &adminPolicy}))
+	if !f.group.CanAdminister(f.memberID(admin)) {
+		t.Fatal("the delegated admin did not gain authority")
+	}
+
+	// The founder stands down.
+	f.apply(f.sign(f.founder, Record{Kind: KindLeave}))
+	if f.group.IsMemberID(f.memberID(f.founder)) {
+		t.Fatal("the founder is still a member, so this does not test the case")
+	}
+	if !f.group.CanAdminister(f.memberID(f.founder)) {
+		t.Fatal("a founder that left lost the authority to issue invites")
+	}
+
+	// The admin is removed, which takes its authority with it.
+	f.apply(f.sign(f.founder, Record{Kind: KindRemove, Subject: f.info(admin)}))
+	if f.group.CanAdminister(f.memberID(admin)) {
+		t.Fatal("a removed admin kept the authority to issue invites")
+	}
+}

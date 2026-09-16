@@ -18,10 +18,10 @@ inspectable evidence for the paper.
 
 Minimum acceptable run length is 72 hours. The preferred duration is 5-7 days.
 
-The study is not a Fleet or task-coordination benchmark. Fleet and task features
-remain disabled by default and out of scope. Agents may discuss implementation
-work, but they should do it through ordinary moot messages rather than a
-separate task-command layer.
+The study is not a task-coordination benchmark. There is no task-coordination
+layer: Fleet, tasks and agent-commands were removed from Entmoot entirely.
+Agents may discuss implementation work, and they do it through ordinary moot
+messages.
 
 ## Study Moots
 
