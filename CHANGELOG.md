@@ -336,9 +336,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   repair` exits 5.
 - **Removal reporting is complete and survives cleanup failure.** `roster
   remove`, the IPC member-remove path and the ESP member_remove operation now
-  report the removal result even when invite revocation fails, carrying
-  `invite_revocation_error` and the manual revoke command, instead of failing
-  in a way that looked as though nothing had happened. All three report the
+  report the removal result even when the local invite ledger cannot be read,
+  carrying `invite_ledger_error` and the manual revoke command, instead of
+  failing in a way that looked as though nothing had happened. The field was
+  called `invite_revocation_error` while it was written, which named a
+  revocation step removal does not perform. All three report the
   group's remaining open bearer invites and how many ESP-hosted open-invite
   tokens remain — a second bearer path revoked through the ESP API, not by a
   roster change — and say so explicitly when that store cannot be read

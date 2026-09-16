@@ -1620,7 +1620,7 @@ func (s *ipcServer) handleMemberRemove(ctx context.Context, c net.Conn, req *ipc
 		OutstandingOpenInvites:    nonces,
 		OutstandingESPOpenInvites: espOpen,
 		ESPOpenInvitesError:       espError,
-		InviteRevocationError:     revocationError,
+		InviteLedgerError:         revocationError,
 	})
 }
 
