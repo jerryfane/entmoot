@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"time"
 
@@ -45,7 +46,7 @@ func cmdInvite(gf *globalFlags, args []string) int {
 // cmdInviteCreate emits a bootstrap capability. It is bound to one target
 // identity unless -open is given, which mints a bearer invite any holder may
 // redeem while uses remain. Bootstrap addresses must be full multiaddrs
-// ending in /p2p/<founder-peer-id>.
+// ending in /p2p/<peer-id>, naming this node or another current member.
 func cmdInviteCreate(gf *globalFlags, args []string) int {
 	fs := flag.NewFlagSet("invite create", flag.ContinueOnError)
 	groupStr := fs.String("group", "", "base64 group id (required)")
@@ -54,7 +55,8 @@ func cmdInviteCreate(gf *globalFlags, args []string) int {
 	maxUses := fs.Int("max-uses", 1, "how many distinct identities may join with this invite")
 	validFor := fs.String("valid-for", "24h", "capability TTL (time.ParseDuration or <N>d)")
 	var bootstrap stringListFlag
-	fs.Var(&bootstrap, "bootstrap", "issuing node's libp2p multiaddr ending in /p2p/<peer-id>; repeatable")
+	fs.Var(&bootstrap, "bootstrap", "libp2p multiaddr of this node or another current member, ending in /p2p/<peer-id>; repeatable")
+	noFallback := fs.Bool("no-fallback-peers", false, "do not attach other members' known addresses as fallback bootstrap peers")
 	var relays stringListFlag
 	fs.Var(&relays, "relay", "controlled-relay multiaddr the joiner should adopt, ending in /p2p/<relay-peer-id>; repeatable; defaults to this data root's own relays")
 	if err := fs.Parse(args); err != nil {
@@ -125,9 +127,10 @@ func cmdInviteCreate(gf *globalFlags, args []string) int {
 		return exitTransport
 	}
 	founder.MemberID = &founderBinding.MemberID
-	// The founder or any delegated admin may invite. The issuer's own host is
-	// what serves the checkpoint a joiner reads, so the bootstrap addresses
-	// must name it.
+	// The founder or any delegated admin may invite. Whichever member the
+	// bootstrap addresses name is what serves the checkpoint a joiner reads —
+	// not necessarily this node, which is what lets an invite outlive its
+	// issuer's uptime.
 	localMemberID := mustMemberID(s.identity.PublicKey)
 	if !group.CanAdminister(localMemberID) {
 		fmt.Fprintln(os.Stderr, "invite create: local identity is neither the group founder nor a delegated admin")
@@ -186,8 +189,10 @@ func cmdInviteCreate(gf *globalFlags, args []string) int {
 			allowedPeerIDs = append(allowedPeerIDs, info.ID.String())
 		}
 	}
-	allowedAddresses, allowedPeerIDs = addKnownMemberPeers(s.dataDir, gid, memberPeers,
-		localBinding.PeerID, allowedAddresses, allowedPeerIDs, seen)
+	if !*noFallback {
+		allowedAddresses, allowedPeerIDs = addKnownMemberPeers(s.dataDir, gid, memberPeers,
+			localBinding.PeerID, allowedAddresses, allowedPeerIDs, seen)
+	}
 
 	// Relay hints default to whatever this node itself relays through, since
 	// that is the set already known to accept it.
@@ -480,24 +485,58 @@ func groupMemberPeerIDs(group *membership.Group) (map[peer.ID]struct{}, error) {
 	return out, nil
 }
 
-// maxInviteFallbackPeers bounds how many extra member addresses an invite
-// carries. The list is a convenience for the newcomer's first contact, not a
-// membership projection, and every entry costs invite size.
-const maxInviteFallbackPeers = 4
+// Auto-attached fallback bounds. The cap that matters is on ADDRESSES, not
+// members: a multi-homed node can hold thirty of them, and a capability is
+// carried in one request frame with an 8 KiB ceiling, so bounding members
+// alone let an invite grow past the size at which it can be redeemed at all.
+const (
+	maxInviteFallbackPeers     = 4
+	maxInviteFallbackAddrs     = 8
+	maxInviteFallbackAddrsPeer = 2
+)
+
+// routableInviteAddress reports whether an address is worth putting in an
+// invite that may travel outside this host. Loopback and private ranges are
+// skipped: they cannot help a newcomer elsewhere, and an invite — especially
+// an open bearer invite whose link gets shared — should not enumerate a
+// member's internal network. Keeping them would also spend the byte budget on
+// addresses that never work.
+func routableInviteAddress(addr multiaddr.Multiaddr) bool {
+	value, err := addr.ValueForProtocol(multiaddr.P_IP4)
+	if err != nil {
+		if value, err = addr.ValueForProtocol(multiaddr.P_IP6); err != nil {
+			// A DNS or relay address carries no literal to judge; keep it.
+			return true
+		}
+	}
+	ip := net.ParseIP(value)
+	if ip == nil {
+		return false
+	}
+	if ip.IsLoopback() || ip.IsUnspecified() || ip.IsLinkLocalUnicast() || ip.IsPrivate() {
+		return false
+	}
+	// 100.64.0.0/10, carrier-grade NAT: reachable only inside one provider.
+	if ip4 := ip.To4(); ip4 != nil && ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127 {
+		return false
+	}
+	return true
+}
 
 // addKnownMemberPeers appends addresses of OTHER current members this node has
 // seen, so an invite keeps working when the issuer is down. It never fails the
-// invite: an unknown address set just means the newcomer has fewer doors to
-// try, and the operator can always name peers explicitly.
+// invite: fewer addresses just means the newcomer has fewer doors to try, and
+// the operator can always name peers explicitly, or pass -no-fallback-peers to
+// attach none.
 func addKnownMemberPeers(dataDir string, groupID entmoot.GroupID, memberPeers map[peer.ID]struct{}, self peer.ID,
 	addresses []string, peerIDs []string, seen map[peer.ID]struct{}) ([]string, []string) {
 	cached, err := loadGroupPeers(dataDir, groupID)
 	if err != nil {
 		return addresses, peerIDs
 	}
-	added := 0
+	peers, addrs := 0, 0
 	for _, info := range cached {
-		if added >= maxInviteFallbackPeers {
+		if peers >= maxInviteFallbackPeers || addrs >= maxInviteFallbackAddrs {
 			break
 		}
 		if info.ID == self {
@@ -509,18 +548,24 @@ func addKnownMemberPeers(dataDir string, groupID entmoot.GroupID, memberPeers ma
 		if _, ok := seen[info.ID]; ok {
 			continue
 		}
-		var kept bool
+		kept := 0
 		for _, addr := range info.Addrs {
-			full := addr.String() + "/p2p/" + info.ID.String()
-			addresses = append(addresses, full)
-			kept = true
+			if kept >= maxInviteFallbackAddrsPeer || addrs >= maxInviteFallbackAddrs {
+				break
+			}
+			if !routableInviteAddress(addr) {
+				continue
+			}
+			addresses = append(addresses, addr.String()+"/p2p/"+info.ID.String())
+			kept++
+			addrs++
 		}
-		if !kept {
+		if kept == 0 {
 			continue
 		}
 		seen[info.ID] = struct{}{}
 		peerIDs = append(peerIDs, info.ID.String())
-		added++
+		peers++
 	}
 	return addresses, peerIDs
 }

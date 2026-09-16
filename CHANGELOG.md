@@ -13,13 +13,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   only the issuing node's own address as a bootstrap peer, and a peer serves a
   newcomer only when the capability names it, so the issuer had to be running
   for its own invite to work — the one thing self-signed admission was meant to
-  remove. A bootstrap address may now name any CURRENT member; the issuer also
-  attaches up to four member addresses it already knows, so an ordinary
-  `invite create` survives its author going down without the operator naming
-  anybody.
+  remove. A bootstrap address may now name any CURRENT member. The issuer also
+  attaches known addresses of up to four other members — at most two each and
+  eight in total, routable ones only — so an ordinary `invite create` survives
+  its author going down without the operator naming anybody. The cap is on
+  ADDRESSES as well as members because a multi-homed host holds dozens, and a
+  capability travels in one request frame with an 8 KiB ceiling: bounding
+  members alone produced invites too large to redeem. Private, loopback and
+  carrier-NAT addresses are skipped, so an invite — an open bearer link
+  especially — does not enumerate a member's internal network.
+  `-no-fallback-peers` attaches none.
 
-  A non-member's address is still refused, and a removed member stops being
-  serveable the moment its removal projects. Naming another member is safe
+  A non-member's address is still refused, and a removed or banned member stops
+  being serveable the moment its removal projects — enforced where it matters,
+  at the serving node: being named by an invite is not sufficient, because an
+  invite is minted against the membership of one moment and then lives for its
+  whole TTL. The issuer itself is exempt, since its authority is checked on
+  every read and a founder may issue after removing itself. Naming another member is safe
   because the newcomer pins the founder's key from the invite and verifies the
   membership it is served against that key: a named peer can serve or fail, not
   forge. The serving peer evaluates the issuer's authority against its own view

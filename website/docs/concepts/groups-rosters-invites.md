@@ -21,8 +21,7 @@ still checked at redemption, against group state rather than a fresh signature:
 the founder may always issue, and a delegated admin may issue only while it is
 still an unbanned member — which is why an invite from a demoted, removed or
 banned admin stops working everywhere at once, while a founder's invite keeps
-working regardless of the founder's own membership. The issuer does still have
-to serve the redemption. An invite names bootstrap addresses, and
+working regardless of the founder's own membership. An invite names bootstrap addresses, and
 `invite create` accepts any current member's address — the issuing node's own,
 any you name, and up to four more it already knows — and only a peer the invite
 names may serve the checkpoint and accept the join record. So a newcomer can
