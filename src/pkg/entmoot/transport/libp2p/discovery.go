@@ -194,7 +194,9 @@ func profileAddresses(peerID peer.ID, addresses []multiaddr.Multiaddr, mode Conn
 	return filtered
 }
 
-// VisiblePeerAddresses is the only diagnostics-facing peerstore projection.
+// VisiblePeerAddresses reports the peerstore addresses a caller may show for
+// a peer, hiding direct addresses in relay-only mode so a privacy setting is
+// not defeated by a listing.
 func VisiblePeerAddresses(h host.Host, peerID peer.ID, mode ConnectivityMode, controlledRelays []peer.AddrInfo) []multiaddr.Multiaddr {
 	if h == nil {
 		return nil

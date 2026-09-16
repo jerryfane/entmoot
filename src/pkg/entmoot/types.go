@@ -115,11 +115,6 @@ func (r *RosterEntryID) UnmarshalJSON(data []byte) error {
 	return decodeBase64Array32("RosterEntryID", data, r[:])
 }
 
-// merkleRoot is a private helper alias used to give Group.MerkleRoot the same
-// base64 JSON treatment as the id types without introducing a new exported
-// type.
-type merkleRoot [32]byte
-
 // NodeInfo binds an Entmoot signing key to its application and transport
 // identities. PilotNodeID is serialized only for immutable legacy records.
 type NodeInfo struct {
@@ -132,51 +127,6 @@ type NodeInfo struct {
 	MemberID *MemberID `json:"member_id,omitempty"`
 	// PeerID is the same-key libp2p identity for operational records.
 	PeerID string `json:"peer_id,omitempty"`
-}
-
-// Group is the top-level record for an Entmoot group: identity, founder,
-// membership policy, current roster head, and current Merkle root.
-type Group struct {
-	// ID is the 32-byte group identifier.
-	ID GroupID `json:"id"`
-	// Name is an informational UTF-8 display name (not unique).
-	Name string `json:"name"`
-	// Founder is the node that created the group; anchors roster signature
-	// validation in v0.
-	Founder NodeInfo `json:"founder"`
-	// Policy is an opaque membership-policy blob. v0 is founder-only; this
-	// field is reserved for v1+ multi-admin/quorum schemes.
-	Policy json.RawMessage `json:"policy,omitempty"`
-	// RosterHead is the id of the current head of the roster log.
-	RosterHead RosterEntryID `json:"roster_head"`
-	// MerkleRoot is the current root of the group's message Merkle tree.
-	MerkleRoot [32]byte `json:"merkle_root"`
-}
-
-// MarshalJSON encodes Group with MerkleRoot as base64 rather than a numeric
-// array.
-func (g Group) MarshalJSON() ([]byte, error) {
-	type alias Group
-	return json.Marshal(&struct {
-		MerkleRoot string `json:"merkle_root"`
-		*alias
-	}{
-		MerkleRoot: base64.StdEncoding.EncodeToString(g.MerkleRoot[:]),
-		alias:      (*alias)(&g),
-	})
-}
-
-// UnmarshalJSON decodes Group, accepting MerkleRoot as a base64 string.
-func (g *Group) UnmarshalJSON(data []byte) error {
-	type alias Group
-	aux := &struct {
-		MerkleRoot string `json:"merkle_root"`
-		*alias
-	}{alias: (*alias)(g)}
-	if err := json.Unmarshal(data, aux); err != nil {
-		return err
-	}
-	return decodeBase64Into("merkle_root", aux.MerkleRoot, g.MerkleRoot[:])
 }
 
 // Message is a single group message. Messages form a DAG via Parents.

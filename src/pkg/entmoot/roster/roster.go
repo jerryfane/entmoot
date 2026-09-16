@@ -31,25 +31,9 @@ import (
 	"entmoot/pkg/entmoot/keystore"
 )
 
-// subscribeBufferCap is the per-subscriber channel buffer size. Slow readers
-// drop events once the buffer fills; see Subscribe.
-const subscribeBufferCap = 16
-
-// RosterEvent is emitted on state-changing Apply calls — that is, on Genesis
-// and on every subsequent Apply that succeeds.
-
 // CurrentEntryVersion is the group-bound, domain-separated roster format used
 // for every newly signed entry.
 const CurrentEntryVersion uint8 = 2
-
-type RosterEvent struct {
-	// Entry is the roster entry that was just applied.
-	Entry entmoot.RosterEntry
-	// Heads is the new set of log heads after the apply. It is always a
-	// single-element slice: the log is strictly linear, so branches cannot
-	// arise even with several authorised signers.
-	Heads []entmoot.RosterEntryID
-}
 
 // RosterLog is the concurrency-safe in-memory projection of a single group's
 // signed roster log. Mutation validation, durable commit, and projection
@@ -76,10 +60,6 @@ type RosterLog struct {
 	// head is the id of the most-recently-applied entry; zero on empty log.
 	head entmoot.RosterEntryID
 
-	// sinks is the set of active subscribers; guarded by subsMu.
-	subsMu sync.Mutex
-	sinks  map[*subscriber]struct{}
-
 	// persist commits one validated entry before the in-memory projection
 	// advances. Persistent logs store entries and projections transactionally.
 	persist func(entmoot.RosterEntry) error
@@ -103,13 +83,6 @@ type RosterLog struct {
 	closeFn   func() error
 }
 
-// subscriber is one live subscription. cancel is idempotent.
-type subscriber struct {
-	ch         chan RosterEvent
-	cancelOnce sync.Once
-	cancelled  chan struct{}
-}
-
 // New constructs an empty in-memory RosterLog for the given group.
 //
 // The returned log is NOT yet valid for queries (Members is empty, Head is
@@ -121,7 +94,6 @@ func New(groupID entmoot.GroupID) *RosterLog {
 		byID:        make(map[entmoot.RosterEntryID]int),
 		members:     make(map[entmoot.NodeID]entmoot.NodeInfo),
 		membersByID: make(map[entmoot.MemberID]entmoot.NodeInfo),
-		sinks:       make(map[*subscriber]struct{}),
 		logger:      slog.Default(),
 		admins:      make(map[entmoot.MemberID]struct{}),
 	}
@@ -228,10 +200,7 @@ func (r *RosterLog) Genesis(founder *keystore.Identity, founderInfo entmoot.Node
 	}
 	r.founder = founderInfo
 	r.applyLocked(entry)
-	heads := []entmoot.RosterEntryID{r.head}
 	r.mu.Unlock()
-
-	r.emit(RosterEvent{Entry: entry, Heads: heads})
 	return nil
 }
 
@@ -247,7 +216,7 @@ func (r *RosterLog) Genesis(founder *keystore.Identity, founderInfo entmoot.Node
 //   - entry.ID does not match canonical.RosterEntryID of its signing form,
 //   - signature verification fails.
 //
-// On success, emits a RosterEvent identical to what Genesis would have. This
+// On success it leaves the log in exactly the state Genesis would have. This
 // mirrors the JSONL loader's first-entry path: the founder is adopted from
 // entry.Subject rather than being supplied separately by the caller.
 func (r *RosterLog) AcceptGenesis(entry entmoot.RosterEntry) error {
@@ -266,10 +235,7 @@ func (r *RosterLog) AcceptGenesis(entry entmoot.RosterEntry) error {
 	}
 	r.founder = entry.Subject
 	r.applyLocked(entry)
-	heads := []entmoot.RosterEntryID{r.head}
 	r.mu.Unlock()
-
-	r.emit(RosterEvent{Entry: entry, Heads: heads})
 	return nil
 }
 
@@ -306,10 +272,7 @@ func (r *RosterLog) Apply(entry entmoot.RosterEntry) error {
 		return err
 	}
 	r.applyLocked(entry)
-	heads := []entmoot.RosterEntryID{r.head}
 	r.mu.Unlock()
-
-	r.emit(RosterEvent{Entry: entry, Heads: heads})
 	return nil
 }
 
@@ -829,63 +792,6 @@ func cloneEntry(entry entmoot.RosterEntry) entmoot.RosterEntry {
 		out.GroupID = &groupID
 	}
 	return out
-}
-
-// Subscribe registers a subscriber for RosterEvent notifications.
-//
-// Every successful Apply (including Genesis) produces one event delivered to
-// every live subscriber. The returned channel has a small buffer
-// (subscribeBufferCap); if a subscriber falls behind, new events for that
-// subscriber are DROPPED and a warning is logged via slog. Callers that need
-// loss-free delivery must keep up.
-//
-// cancel stops the subscription and closes the channel. It is idempotent.
-func (r *RosterLog) Subscribe() (<-chan RosterEvent, func()) {
-	s := &subscriber{
-		ch:        make(chan RosterEvent, subscribeBufferCap),
-		cancelled: make(chan struct{}),
-	}
-	r.subsMu.Lock()
-	r.sinks[s] = struct{}{}
-	r.subsMu.Unlock()
-
-	cancel := func() {
-		s.cancelOnce.Do(func() {
-			r.subsMu.Lock()
-			delete(r.sinks, s)
-			r.subsMu.Unlock()
-			close(s.cancelled)
-			close(s.ch)
-		})
-	}
-	return s.ch, cancel
-}
-
-// emit delivers ev to every live subscriber. Delivery is non-blocking: if a
-// subscriber's channel is full we drop and log rather than stall Apply.
-func (r *RosterLog) emit(ev RosterEvent) {
-	r.subsMu.Lock()
-	sinks := make([]*subscriber, 0, len(r.sinks))
-	for s := range r.sinks {
-		sinks = append(sinks, s)
-	}
-	r.subsMu.Unlock()
-
-	for _, s := range sinks {
-		select {
-		case <-s.cancelled:
-			// Subscriber went away between snapshot and send; skip.
-			continue
-		default:
-		}
-		select {
-		case s.ch <- ev:
-		default:
-			r.logger.Warn("roster: dropping event for slow subscriber",
-				slog.String("group_id", r.groupID.String()),
-				slog.String("entry_id", ev.Entry.ID.String()))
-		}
-	}
 }
 
 // Close releases persistent resources and any writer lease. It serializes

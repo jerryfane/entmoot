@@ -108,10 +108,6 @@ func nodeProfileVisibleForMember(profile NodeProfileRecord, publicKey string) bo
 // so no reader ever shows the placeholder.
 const WithdrawnNodeProfileHostname = "-"
 
-// WithdrawMemberProfileNodeProfile withdraws a member's published name for a
-// group by recording a tombstone at the withdrawal's own issue time. Ordering
-// is by that time, so a profile issued earlier cannot undo it however late it
-// arrives.
 // MemberProfileRecord is the record a published profile becomes. An empty
 // displayName is a withdrawal, stored as a tombstone: ObservedAtMS carries the
 // withdrawal's own issue time, which is what orders it against profiles, and
@@ -148,6 +144,10 @@ func BetterMemberProfileRecord(a, b NodeProfileRecord) bool {
 	return shouldReplaceNodeProfile(b, a)
 }
 
+// WithdrawMemberProfileNodeProfile withdraws a member's published name for a
+// group by recording a tombstone at the withdrawal's own issue time. Ordering
+// is by that time, so a profile issued earlier cannot undo it however late it
+// arrives.
 func WithdrawMemberProfileNodeProfile(ctx context.Context, state StateStore, groupID entmoot.GroupID, memberID entmoot.MemberID, publicKey string, issuedAtMS int64) error {
 	if state == nil || memberID == (entmoot.MemberID{}) {
 		return nil
@@ -156,6 +156,9 @@ func WithdrawMemberProfileNodeProfile(ctx context.Context, state StateStore, gro
 	return err
 }
 
+// ObserveMemberProfileNodeProfile records a member's currently advertised
+// name. An unusable hostname is dropped rather than stored, so an observation
+// never overwrites a good name with a rejected one.
 func ObserveMemberProfileNodeProfile(ctx context.Context, state StateStore, groupID entmoot.GroupID, memberID entmoot.MemberID, publicKey, hostname string, observedAtMS, expiresAtMS int64) error {
 	if state == nil || memberID == (entmoot.MemberID{}) {
 		return nil

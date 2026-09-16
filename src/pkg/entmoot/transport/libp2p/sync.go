@@ -113,20 +113,14 @@ type PeerRecordResponse struct {
 	Error   SyncErrorCode `json:"error,omitempty"`
 }
 
+// syncSnapshot is a held history cursor. Membership answers carry no
+// snapshot, so history is the only kind there is.
 type syncSnapshot struct {
 	peerID     peer.ID
 	groupID    entmoot.GroupID
-	kind       protocolKind
 	expires    time.Time
-	pageSize   int
 	generation uint64
 }
-
-type protocolKind uint8
-
-const (
-	historySnapshot protocolKind = iota + 1
-)
 
 // SyncServer serves bounded authenticated membership and history pages.
 type SyncServer struct {
@@ -486,10 +480,10 @@ func boundedLimit(value, fallback, maximum int) int {
 }
 
 func (s *SyncServer) historySnapshot(peerID peer.ID, request HistorySyncRequest, generation uint64) (syncSnapshot, string, SyncErrorCode) {
-	return s.snapshot(peerID, request.GroupID, historySnapshot, request.SnapshotToken, 0, generation)
+	return s.snapshot(peerID, request.GroupID, request.SnapshotToken, generation)
 }
 
-func (s *SyncServer) snapshot(peerID peer.ID, groupID entmoot.GroupID, kind protocolKind, token string, pageSize int, generation uint64) (syncSnapshot, string, SyncErrorCode) {
+func (s *SyncServer) snapshot(peerID peer.ID, groupID entmoot.GroupID, token string, generation uint64) (syncSnapshot, string, SyncErrorCode) {
 	now := s.now()
 	s.snapshotMu.Lock()
 	defer s.snapshotMu.Unlock()
@@ -500,10 +494,10 @@ func (s *SyncServer) snapshot(peerID peer.ID, groupID entmoot.GroupID, kind prot
 	}
 	if token != "" {
 		value, ok := s.snapshots[token]
-		if !ok || value.peerID != peerID || value.groupID != groupID || value.kind != kind || !value.expires.After(now) {
+		if !ok || value.peerID != peerID || value.groupID != groupID || !value.expires.After(now) {
 			return syncSnapshot{}, "", SyncSnapshotExpired
 		}
-		if kind == historySnapshot && value.generation != generation {
+		if value.generation != generation {
 			delete(s.snapshots, token)
 			return syncSnapshot{}, "", SyncSnapshotExpired
 		}
@@ -523,7 +517,7 @@ func (s *SyncServer) snapshot(peerID peer.ID, groupID entmoot.GroupID, kind prot
 		return syncSnapshot{}, "", SyncInternal
 	}
 	token = base64.RawURLEncoding.EncodeToString(random[:])
-	value := syncSnapshot{peerID: peerID, groupID: groupID, kind: kind, expires: now.Add(syncSnapshotLifetime), pageSize: pageSize, generation: generation}
+	value := syncSnapshot{peerID: peerID, groupID: groupID, expires: now.Add(syncSnapshotLifetime), generation: generation}
 	s.snapshots[token] = value
 	return value, token, ""
 }

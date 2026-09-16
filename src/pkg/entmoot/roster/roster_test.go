@@ -542,98 +542,6 @@ func TestJSONLRejectsMalformedLineWithoutChangingSource(t *testing.T) {
 	}
 }
 
-// 11. Subscribe receives events for successful Apply, not for rejected ones.
-func TestSubscribeReceivesSuccessfulApplies(t *testing.T) {
-	t.Parallel()
-	founder, founderInfo := newFounder(t, 100)
-	bob, bobInfo := newFounder(t, 200)
-
-	r := New(testGroupID())
-	ch, cancel := r.Subscribe()
-	defer cancel()
-
-	if err := r.Genesis(founder, founderInfo, 1_000); err != nil {
-		t.Fatalf("Genesis: %v", err)
-	}
-	// Rejected: non-founder signer.
-	bad := mkEntry(t, r, bob, bobInfo.PilotNodeID, "add", bobInfo, 2_000,
-		[]entmoot.RosterEntryID{r.Head()})
-	if err := r.Apply(bad); !errors.Is(err, entmoot.ErrRosterReject) {
-		t.Fatalf("bad Apply expected ErrRosterReject, got %v", err)
-	}
-	good := mkEntry(t, r, founder, founderInfo.PilotNodeID, "add", bobInfo, 2_000,
-		[]entmoot.RosterEntryID{r.Head()})
-	if err := r.Apply(good); err != nil {
-		t.Fatalf("good Apply: %v", err)
-	}
-
-	// We expect exactly 2 events (Genesis, good Apply) and nothing else.
-	got := drainEvents(t, ch, 2, 250*time.Millisecond)
-	if len(got) != 2 {
-		t.Fatalf("got %d events, want 2", len(got))
-	}
-	if got[0].Entry.Op != "add" || got[0].Entry.Subject.MemberID == nil || *got[0].Entry.Subject.MemberID != *founderInfo.MemberID {
-		t.Fatalf("first event not Genesis add(founder): %+v", got[0])
-	}
-	if got[1].Entry.Op != "add" || got[1].Entry.Subject.MemberID == nil || *got[1].Entry.Subject.MemberID != *bobInfo.MemberID {
-		t.Fatalf("second event not add(bob): %+v", got[1])
-	}
-	for _, ev := range got {
-		if len(ev.Heads) != 1 {
-			t.Fatalf("expected single head, got %d", len(ev.Heads))
-		}
-	}
-	// No further event should arrive within a short window.
-	select {
-	case ev, ok := <-ch:
-		if ok {
-			t.Fatalf("unexpected extra event: %+v", ev)
-		}
-	case <-time.After(50 * time.Millisecond):
-	}
-}
-
-//  12. Subscribe cancel() closes the channel and is idempotent; events after
-//     cancel do not panic.
-func TestSubscribeCancelIdempotent(t *testing.T) {
-	t.Parallel()
-	founder, founderInfo := newFounder(t, 100)
-	_, bobInfo := newFounder(t, 200)
-
-	r := New(testGroupID())
-
-	ch, cancel := r.Subscribe()
-
-	if err := r.Genesis(founder, founderInfo, 1_000); err != nil {
-		t.Fatalf("Genesis: %v", err)
-	}
-	// Drain the one event we expect.
-	select {
-	case <-ch:
-	case <-time.After(250 * time.Millisecond):
-		t.Fatalf("did not receive genesis event")
-	}
-
-	cancel()
-	cancel() // must not panic; idempotent.
-
-	// Channel must be closed.
-	select {
-	case _, ok := <-ch:
-		if ok {
-			t.Fatalf("channel yielded a value after cancel")
-		}
-	case <-time.After(250 * time.Millisecond):
-		t.Fatalf("channel not closed after cancel")
-	}
-
-	// Further Applies must not panic even though the subscriber is gone.
-	add := mkEntry(t, r, founder, founderInfo.PilotNodeID, "add", bobInfo, 2_000,
-		[]entmoot.RosterEntryID{r.Head()})
-	if err := r.Apply(add); err != nil {
-		t.Fatalf("Apply after cancel: %v", err)
-	}
-}
 func TestConcurrentApplyAcceptsOneChildAndPersistsHead(t *testing.T) {
 	dir := t.TempDir()
 	gid := testGroupID()
@@ -1065,27 +973,6 @@ func TestAcceptGenesis_NonEmptyParents(t *testing.T) {
 	if !errors.Is(gotErr, entmoot.ErrRosterReject) {
 		t.Fatalf("expected ErrRosterReject, got %v", gotErr)
 	}
-}
-
-// drainEvents collects up to n events from ch or returns whatever it got
-// within deadline.
-func drainEvents(t *testing.T, ch <-chan RosterEvent, n int, deadline time.Duration) []RosterEvent {
-	t.Helper()
-	timer := time.NewTimer(deadline)
-	defer timer.Stop()
-	out := make([]RosterEvent, 0, n)
-	for len(out) < n {
-		select {
-		case ev, ok := <-ch:
-			if !ok {
-				return out
-			}
-			out = append(out, ev)
-		case <-timer.C:
-			return out
-		}
-	}
-	return out
 }
 
 // equalNodeIDs reports whether two slices of NodeIDs are equal after sort.

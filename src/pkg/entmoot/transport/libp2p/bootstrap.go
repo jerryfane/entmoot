@@ -37,7 +37,6 @@ var ErrBootstrapDenied = membership.ErrInviteDenied
 
 type BootstrapCapability = entmoot.BootstrapCapability
 
-// SignBootstrapCapability binds the grant to the issuing identity.
 // MaxCapabilityBytes bounds a capability that must still be redeemable. A
 // joiner sends the whole capability inside one membership-sync request, which
 // the server refuses over maxSyncRequestBytes, so a capability minted past
@@ -62,6 +61,7 @@ func CapabilityTooLarge(c entmoot.BootstrapCapability) (int, bool) {
 	return len(encoded), len(encoded) > MaxCapabilityBytes
 }
 
+// SignBootstrapCapability binds the grant to the issuing identity.
 func SignBootstrapCapability(issuer *keystore.Identity, capability *BootstrapCapability) error {
 	return membership.SignInvite(issuer, capability)
 }

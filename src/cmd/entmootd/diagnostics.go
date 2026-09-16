@@ -69,6 +69,7 @@ func cmdDoctor(gf *globalFlags, args []string) int {
 	probe := fs.Bool("probe", false, "include live daemon status")
 	timeout := fs.Duration("timeout", 3*time.Second, "diagnostic timeout")
 	jsonOutput := fs.Bool("json", false, "print JSON")
+	redact := fs.Bool("redact", false, "omit local runtime paths and the data directory, for sharing a report")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return exitOK
@@ -88,6 +89,9 @@ func cmdDoctor(gf *globalFlags, args []string) int {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "doctor: %v\n", err)
 		return exitTransport
+	}
+	if *redact {
+		redactDoctorReport(report)
 	}
 	if *jsonOutput {
 		data, err := json.Marshal(report)

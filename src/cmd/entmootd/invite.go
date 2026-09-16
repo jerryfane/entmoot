@@ -503,10 +503,19 @@ func groupMemberPeerIDs(group *membership.Group) (map[peer.ID]struct{}, error) {
 	return out, nil
 }
 
-// Auto-attached fallback bounds. The cap that matters is on ADDRESSES, not
-// members: a multi-homed node can hold thirty of them, and a capability is
-// carried in one request frame with an 8 KiB ceiling, so bounding members
-// alone let an invite grow past the size at which it can be redeemed at all.
+// Auto-attached fallback bounds. Bounding members alone was not enough: a
+// multi-homed node can hold thirty addresses, and a capability travels in one
+// membership-sync request with an 8 KiB ceiling, so a member-only cap let an
+// invite grow past the size at which it could be redeemed at all.
+//
+// Of the five, maxInviteFallbackBytes and maxInviteFallbackPeers are what keep
+// a minted invite redeemable - raising either one fails the size tests. The
+// three count/width caps below bound the SHAPE of what is attached, and their
+// failures are the ones a user notices: without maxInviteFallbackAddrsPeer one
+// multi-homed member spends the whole budget and the invite names one door
+// instead of four; without maxInviteAddrBytes a single long address starves
+// the rest. maxInviteFallbackAddrs is the remaining belt-and-braces count, and
+// lowering it is what the tests catch.
 const (
 	maxInviteFallbackPeers     = 4
 	maxInviteFallbackAddrs     = 8

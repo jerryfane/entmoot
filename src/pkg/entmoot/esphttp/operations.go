@@ -3,7 +3,6 @@ package esphttp
 import (
 	"context"
 	"encoding/json"
-	"net/http"
 
 	"entmoot/pkg/entmoot"
 )
@@ -34,19 +33,6 @@ func (e *OperationError) Error() string {
 		return ""
 	}
 	return e.Message
-}
-
-func operationHTTPError(status int, code, message string) *OperationError {
-	if status == 0 {
-		status = http.StatusInternalServerError
-	}
-	if code == "" {
-		code = "internal_error"
-	}
-	if message == "" {
-		message = "operation failed"
-	}
-	return &OperationError{HTTPStatus: status, Code: code, Message: message}
 }
 
 func executableOperationKind(kind string) bool {
