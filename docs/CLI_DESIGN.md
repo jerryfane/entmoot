@@ -196,9 +196,11 @@ start a runner.
 
 `invite create` accepts one or more libp2p bootstrap multiaddrs naming this
 node or any current member, and either a target Ed25519 public key or `-open`.
-It also attaches a bounded set of other members' known routable addresses
-unless `-no-fallback-peers` is given, so an invite outlives its issuer's
-uptime. With a target,
+It also attaches a bounded set of other members' known addresses unless
+`-no-fallback-peers` is given, so an invite outlives its issuer's uptime:
+routable addresses first, and one slot for a member known only on a LAN, ULA,
+link-local or carrier-NAT address, since on that network it is the address
+that works. Loopback is never attached. With a target,
 the MemberID and PeerID are derived from that key and only that identity may
 redeem the invite. With `-open` the invite is a bearer credential: any holder
 may redeem it while uses remain, which is how a small team joins from one link.

@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -525,14 +526,15 @@ func (e espOperationExecutor) createOpenInvite(ctx context.Context, req esphttp.
 	if expires <= now {
 		return nil, &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request", Message: "open invite expiry must be in the future"}
 	}
-	if _, err := e.checkInviteAuthorityOverIPC(ctx, &ipc.InviteAuthorityCheckReq{GroupID: req.GroupID}); err != nil {
+	authority, err := e.checkInviteAuthorityOverIPC(ctx, &ipc.InviteAuthorityCheckReq{GroupID: req.GroupID})
+	if err != nil {
 		return nil, err
 	}
 	// Validate the addresses here, not at redemption. The token this call
 	// returns is the thing that gets shared, and no capability exists yet, so
-	// a malformed or over-long list would otherwise produce a link that fails
-	// for every joiner with an error the joiner cannot act on.
-	if err := validateOpenInviteBootstrap(payload.BootstrapMultiaddrs); err != nil {
+	// a malformed, non-member or over-long list would otherwise produce a link
+	// that fails for every joiner with an error the joiner cannot act on.
+	if err := validateOpenInviteBootstrap(payload.BootstrapMultiaddrs, authority.MemberPeerIDs, payload.NoFallbackPeers); err != nil {
 		return nil, err
 	}
 	token, tokenHash, err := esphttp.NewOpenInviteToken()
@@ -1477,31 +1479,80 @@ func operationIPCError(frame *ipc.ErrorFrame) error {
 }
 
 // validateOpenInviteBootstrap rejects a bootstrap list that cannot produce a
-// redeemable capability: a malformed multiaddr, or so many addresses that the
-// minted capability would not fit the request a joiner sends.
-func validateOpenInviteBootstrap(addresses []string) error {
+// redeemable capability: a malformed multiaddr, an address naming no current
+// member, or so many addresses that the minted capability would not fit the
+// request a joiner sends.
+//
+// The size check must model what the MINT will sign, not just the list: a
+// capability also carries founder and issuer identities, the checkpoint id, a
+// nonce, a signature, target fields and relay hints, plus the fallback member
+// addresses the daemon attaches when the opt-out is off. Measuring the bare
+// list accepted 26 addresses that the mint then refused, which is the failure
+// this check exists to prevent, moved one step earlier.
+func validateOpenInviteBootstrap(addresses, memberPeerIDs []string, noFallback bool) error {
+	peerIDs := make([]string, 0, len(addresses))
 	for _, raw := range addresses {
 		address, err := multiaddr.NewMultiaddr(raw)
 		if err != nil {
 			return &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request",
 				Message: fmt.Sprintf("invalid bootstrap multiaddr %q", raw)}
 		}
-		if _, err := libpeer.AddrInfoFromP2pAddr(address); err != nil {
+		info, err := libpeer.AddrInfoFromP2pAddr(address)
+		if err != nil {
 			return &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request",
 				Message: fmt.Sprintf("bootstrap multiaddr %q must end in /p2p/<peer-id>", raw)}
 		}
-	}
-	probe := entmoot.BootstrapCapability{AllowedMultiaddrs: append([]string(nil), addresses...)}
-	for _, raw := range addresses {
-		if address, err := multiaddr.NewMultiaddr(raw); err == nil {
-			if info, err := libpeer.AddrInfoFromP2pAddr(address); err == nil {
-				probe.AllowedPeerIDs = append(probe.AllowedPeerIDs, info.ID.String())
-			}
+		// Membership can change before redemption, but an address naming
+		// nobody today is knowable now.
+		if len(memberPeerIDs) > 0 && !slices.Contains(memberPeerIDs, info.ID.String()) {
+			return &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request",
+				Message: fmt.Sprintf("bootstrap multiaddr %q does not name a member of this group", raw)}
 		}
+		peerIDs = append(peerIDs, info.ID.String())
 	}
-	if size, tooLarge := libp2ptransport.CapabilityTooLarge(probe); tooLarge {
+	if size, tooLarge := openInviteCapabilityTooLarge(addresses, peerIDs, noFallback); tooLarge {
 		return &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request",
-			Message: fmt.Sprintf("bootstrap list alone is %d bytes, over the %d-byte limit a joiner can send", size, libp2ptransport.MaxCapabilityBytes)}
+			Message: fmt.Sprintf("the invite this list would mint is about %d bytes, over the %d-byte limit a joiner can send", size, libp2ptransport.MaxCapabilityBytes)}
 	}
 	return nil
+}
+
+// openInviteCapabilityTooLarge estimates the signed capability an open invite
+// will mint. Every field is sized at its real width, and the fallback slots are
+// counted unless the caller opted out, so the estimate is an upper bound on
+// what the mint will produce rather than a lower one.
+func openInviteCapabilityTooLarge(addresses, peerIDs []string, noFallback bool) (int, bool) {
+	var key [32]byte
+	var signature [64]byte
+	node := entmoot.NodeInfo{EntmootPubKey: key[:], MemberID: &entmoot.MemberID{}, PeerID: strings.Repeat("Q", 52)}
+	probe := entmoot.BootstrapCapability{
+		AllowedMultiaddrs: append([]string(nil), addresses...),
+		AllowedPeerIDs:    append([]string(nil), peerIDs...),
+		Founder:           node,
+		Issuer:            &node,
+		TargetPublicKey:   key[:],
+		TargetMemberID:    entmoot.MemberID{},
+		TargetPeerID:      node.PeerID,
+		Signature:         signature[:],
+	}
+	if !noFallback {
+		// Worst case: every fallback slot filled with an address as long as
+		// the longest the operator named, so the estimate cannot undershoot.
+		longest := 0
+		for _, addr := range addresses {
+			if len(addr) > longest {
+				longest = len(addr)
+			}
+		}
+		if longest == 0 {
+			longest = 64
+		}
+		for i := 0; i < maxInviteFallbackAddrs; i++ {
+			probe.AllowedMultiaddrs = append(probe.AllowedMultiaddrs, strings.Repeat("a", longest))
+		}
+		for i := 0; i < maxInviteFallbackPeers; i++ {
+			probe.AllowedPeerIDs = append(probe.AllowedPeerIDs, node.PeerID)
+		}
+	}
+	return libp2ptransport.CapabilityTooLarge(probe)
 }

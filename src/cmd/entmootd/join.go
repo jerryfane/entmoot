@@ -19,6 +19,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -1529,11 +1530,20 @@ func (s *ipcServer) handleInviteAuthorityCheck(ctx context.Context, c net.Conn, 
 		})
 		return
 	}
+	memberPeers, peersErr := groupMemberPeerIDs(sess.group)
+	peerIDs := make([]string, 0, len(memberPeers))
+	if peersErr == nil {
+		for id := range memberPeers {
+			peerIDs = append(peerIDs, id.String())
+		}
+		sort.Strings(peerIDs)
+	}
 	_ = ipc.EncodeAndWrite(c, &ipc.InviteAuthorityCheckResp{
-		Status:     "ok",
-		GroupID:    gid,
-		RosterHead: sess.group.Canonical().ID,
-		Members:    len(sess.group.MemberIDs()),
+		Status:        "ok",
+		GroupID:       gid,
+		RosterHead:    sess.group.Canonical().ID,
+		Members:       len(sess.group.MemberIDs()),
+		MemberPeerIDs: peerIDs,
 	})
 }
 

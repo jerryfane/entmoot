@@ -224,6 +224,12 @@ type InviteAuthorityCheckResp struct {
 	GroupID    entmoot.GroupID       `json:"group_id"`
 	RosterHead entmoot.RosterEntryID `json:"roster_head"`
 	Members    int                   `json:"members"`
+	// MemberPeerIDs are the transport peer ids of the group's current members,
+	// which is the set an invite's bootstrap addresses may name. A caller that
+	// stores a bootstrap list before any capability exists — an ESP open
+	// invite — needs it to refuse an address naming nobody, rather than
+	// handing out a link every redemption will reject.
+	MemberPeerIDs []string `json:"member_peer_ids,omitempty"`
 }
 
 type MemberRemoveReq struct {
