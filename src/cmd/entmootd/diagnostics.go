@@ -71,7 +71,12 @@ type doctorPeerReport struct {
 }
 
 type doctorPeerProbe struct {
-	Reachable bool   `json:"reachable"`
+	Reachable bool `json:"reachable"`
+	// Answered without Reachable is a peer that replied and refused: the
+	// membership it serves does not admit this node. Reporting that as
+	// unreachable would send an operator after a network fault instead.
+	Answered  bool   `json:"answered,omitempty"`
+	Refusal   string `json:"refusal,omitempty"`
 	Relayed   bool   `json:"relayed,omitempty"`
 	LatencyMS int64  `json:"latency_ms,omitempty"`
 	Addresses int    `json:"addresses"`
@@ -151,8 +156,16 @@ func cmdPeers(gf *globalFlags, args []string) int {
 		fmt.Fprintln(os.Stderr, "peers: group not found")
 		return exitGroupNotFound
 	}
+	group := report.Groups[0]
+	if *probe && group.ProbeStatus != "" && group.ProbeStatus != "ok" {
+		// The status is the difference between "nobody answered" and "no probe
+		// ran". Printing only the rows would make -probe indistinguishable
+		// from no flag when the daemon is absent. It goes to stderr so the
+		// documented JSON shape - an array of peers - is unchanged.
+		fmt.Fprintf(os.Stderr, "peers: probe %s\n", group.ProbeStatus)
+	}
 	if *jsonOutput {
-		data, err := json.Marshal(report.Groups[0].Peers)
+		data, err := json.Marshal(group.Peers)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "peers: marshal: %v\n", err)
 			return exitTransport
@@ -160,7 +173,7 @@ func cmdPeers(gf *globalFlags, args []string) int {
 		fmt.Println(string(data))
 		return exitOK
 	}
-	printPeersTable(report.Groups[0].Peers)
+	printPeersTable(group.Peers)
 	return exitOK
 }
 
@@ -276,18 +289,24 @@ func printDoctorHuman(report *doctorReport) {
 	for _, group := range report.Groups {
 		fmt.Printf("group=%s running=%t local_member=%t members=%d messages=%d", group.GroupID.String(), group.Running, group.LocalMember, group.Members, group.Messages)
 		if group.ProbeStatus != "" {
-			reachable := 0
-			probed := 0
+			reachable, refused, probed := 0, 0, 0
 			for _, peer := range group.Peers {
 				if peer.Self || peer.Probe == nil {
 					continue
 				}
 				probed++
-				if peer.Probe.Reachable {
+				switch {
+				case peer.Probe.Reachable:
 					reachable++
+				case peer.Probe.Answered:
+					refused++
 				}
 			}
-			fmt.Printf(" reachable=%d/%d probe=%q", reachable, probed, group.ProbeStatus)
+			fmt.Printf(" reachable=%d/%d", reachable, probed)
+			if refused > 0 {
+				fmt.Printf(" refused=%d", refused)
+			}
+			fmt.Printf(" probe=%q", group.ProbeStatus)
 		}
 		if group.Error != "" {
 			fmt.Printf(" error=%q", group.Error)
@@ -298,7 +317,10 @@ func printDoctorHuman(report *doctorReport) {
 				continue
 			}
 			fmt.Printf("  member=%s reachable=%t", peer.MemberID.String(), peer.Probe.Reachable)
-			if peer.Probe.Reachable {
+			if peer.Probe.Answered && !peer.Probe.Reachable {
+				fmt.Printf(" answered=true refusal=%q", peer.Probe.Refusal)
+			}
+			if peer.Probe.Answered {
 				fmt.Printf(" latency_ms=%d relayed=%t", peer.Probe.LatencyMS, peer.Probe.Relayed)
 			}
 			fmt.Printf(" addresses=%d", peer.Probe.Addresses)
@@ -315,7 +337,10 @@ func printPeersTable(peers []doctorPeerReport) {
 		fmt.Printf("member=%s peer=%s self=%t", peer.MemberID.String(), peer.PeerID, peer.Self)
 		if peer.Probe != nil && !peer.Self {
 			fmt.Printf(" reachable=%t addresses=%d", peer.Probe.Reachable, peer.Probe.Addresses)
-			if peer.Probe.Reachable {
+			if peer.Probe.Answered && !peer.Probe.Reachable {
+				fmt.Printf(" answered=true refusal=%q", peer.Probe.Refusal)
+			}
+			if peer.Probe.Answered {
 				fmt.Printf(" latency_ms=%d relayed=%t", peer.Probe.LatencyMS, peer.Probe.Relayed)
 			}
 			if peer.Probe.Error != "" {

@@ -1567,9 +1567,11 @@ func (s *ipcServer) handleInviteAuthorityCheck(ctx context.Context, c net.Conn, 
 	})
 }
 
-// handlePeerProbe answers a reachability probe. The read deadline set on the
-// connection bounds the client, so the probe budget is clamped below it: a
-// probe that outlived the socket would report nothing at all.
+// handlePeerProbe answers a reachability probe. The budget is clamped to
+// maxProbeBudget and the write deadline is set past it, because handleConn's
+// 10s READ deadline does not bound the write and a probe may legitimately run
+// longer than it. Nothing here clamps the budget below that read deadline;
+// saying otherwise would describe a mechanism this code does not have.
 func (s *ipcServer) handlePeerProbe(ctx context.Context, c net.Conn, req *ipc.PeerProbeReq) {
 	gid := req.GroupID
 	if s.runtime == nil {

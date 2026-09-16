@@ -256,18 +256,28 @@ type PeerProbeReq struct {
 	BudgetMS int64           `json:"budget_ms,omitempty"`
 }
 
-// PeerProbeResult is one member's outcome. Reachable means a stream to the
-// membership protocol was opened and closed, which proves the peer is up AND
-// serving this group - a connection alone does not.
+// PeerProbeResult is one member's outcome.
+//
+// Three outcomes, not two. Reachable means the peer answered a membership read
+// for this group: it is up, speaks the protocol, and serves us. Answered
+// without Reachable means it replied and refused - the group it serves does not
+// admit this node, which is what a removed member sees from every peer, and
+// reporting that as a network fault would send an operator hunting a firewall.
+// Neither means nothing answered.
 type PeerProbeResult struct {
 	MemberID  entmoot.MemberID `json:"member_id"`
 	PeerID    string           `json:"peer_id,omitempty"`
 	Self      bool             `json:"self,omitempty"`
 	Reachable bool             `json:"reachable"`
-	Relayed   bool             `json:"relayed,omitempty"`
-	LatencyMS int64            `json:"latency_ms,omitempty"`
-	Addresses int              `json:"addresses"`
-	Error     string           `json:"error,omitempty"`
+	// Answered is true whenever the peer replied at all, including a refusal.
+	Answered bool `json:"answered,omitempty"`
+	// Refusal carries the peer's own error code when it answered and refused,
+	// for example "unauthorized" or "not_member".
+	Refusal   string `json:"refusal,omitempty"`
+	Relayed   bool   `json:"relayed,omitempty"`
+	LatencyMS int64  `json:"latency_ms,omitempty"`
+	Addresses int    `json:"addresses"`
+	Error     string `json:"error,omitempty"`
 }
 
 type PeerProbeResp struct {

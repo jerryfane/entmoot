@@ -27,7 +27,10 @@ const (
 	defaultProbeBudget = 5 * time.Second
 	maxProbeBudget     = 60 * time.Second
 	// minProbeSlice is the least time worth giving one peer: below this a
-	// healthy peer on a slow path would be reported unreachable.
+	// healthy peer on a slow path would be reported unreachable. Both uses of
+	// it are uncovered on purpose - a loopback peer answers inside a
+	// millisecond, so no local test can tell the floor from its absence, and
+	// a test that pretended otherwise would pass either way.
 	minProbeSlice = 500 * time.Millisecond
 	// maxProbeParallel bounds concurrent dials so a large group does not open
 	// a connection per member at once.
@@ -101,7 +104,15 @@ func (r *groupRuntime) probePeers(ctx context.Context, groupID entmoot.GroupID, 
 			}
 			attempt := slice
 			if attempt > remaining {
+				// Never below the floor: a peer given a sub-millisecond
+				// deadline is reported unreachable for arithmetic reasons,
+				// which is a wrong answer rather than a slow one. Going over
+				// the budget by one slice is the lesser fault, and the
+				// remaining peers are reported as not attempted.
 				attempt = remaining
+				if attempt < minProbeSlice {
+					attempt = minProbeSlice
+				}
 			}
 			out[index] = r.probeOne(ctx, session, target, attempt)
 		}()
@@ -188,15 +199,25 @@ func (r *groupRuntime) probeOne(ctx context.Context, session *groupSession, targ
 		HaveCheckpoint: canonical.ID,
 	}
 	started := time.Now()
-	// The answer is discarded on purpose: a probe reports reachability and
-	// must not be a second path for adopting a peer's records.
-	if _, err := libp2ptransport.RequestMembership(probeCtx, r.host, target.info, request); err != nil {
+	// The response body is discarded on purpose: a probe reports reachability
+	// and must not be a second path for adopting a peer's records. Only its
+	// error code is read, to tell a refusal from silence.
+	response, err := libp2ptransport.RequestMembership(probeCtx, r.host, target.info, request)
+	result.LatencyMS = time.Since(started).Milliseconds()
+	if err != nil {
+		if response.Error != "" {
+			// The peer replied. It served the stream and refused us, which is
+			// an answer about membership, not about the network.
+			result.Answered = true
+			result.Refusal = string(response.Error)
+			result.Relayed = connectionIsRelayed(r, target.info.ID)
+			return result
+		}
 		result.Error = summarizeProbeError(err, len(target.info.Addrs))
-		result.LatencyMS = time.Since(started).Milliseconds()
 		return result
 	}
 	result.Reachable = true
-	result.LatencyMS = time.Since(started).Milliseconds()
+	result.Answered = true
 	result.Relayed = connectionIsRelayed(r, target.info.ID)
 	return result
 }
@@ -301,6 +322,8 @@ func applyPeerProbe(ctx context.Context, group *doctorGroupReport, sockPath stri
 		}
 		group.Peers[i].Probe = &doctorPeerProbe{
 			Reachable: result.Reachable,
+			Answered:  result.Answered,
+			Refusal:   result.Refusal,
 			Relayed:   result.Relayed,
 			LatencyMS: result.LatencyMS,
 			Addresses: result.Addresses,

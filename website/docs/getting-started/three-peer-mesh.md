@@ -82,8 +82,11 @@ entmootd query --limit 1000 | wc -l
 Compare those outputs across peers. `doctor` should show the same current
 membership on each, with one row per member. Add `--probe` and each peer row
 says whether that member answered a membership read, with its latency and
-whether the path was relayed - on a healthy three-peer mesh every non-self row
-reads `reachable=true`. `roster status` should show the same `checkpoint` and
+whether the path was relayed. A row can read `reachable=false` for three
+different reasons, and the row says which: `no address known for this member`
+while addresses are still propagating, `answered=true` with a `refusal` when
+the peer serves a membership that does not include this node, and a dial error
+when nothing answered. `roster status` should show the same `checkpoint` and
 `sequence` on every peer once a checkpoint has been signed, and the same member
 list.
 
