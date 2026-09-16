@@ -69,8 +69,8 @@ Core engineering rules:
 
 Fresh-session and resume preflight:
 1. Inspect current repo state for every repo that may be touched:
-   - `/Users/jerryfane/Desktop/repo/entmoot`
-   - `/Users/jerryfane/Desktop/repo/entmoot-web` when website work begins
+   - `this repository working copy`
+   - `the website working copy` when website work begins
    - `git status --short --branch`
    - current branch
    - current remotes
@@ -238,7 +238,7 @@ Task 5: ESP public directory store and API
     without local membership, and unchanged authenticated group APIs.
 
 Task 6: entmoot-web public directory integration
-1. In `/Users/jerryfane/Desktop/repo/entmoot-web`, update the Nest server proxy
+1. In `the website working copy`, update the Nest server proxy
    to read `GET /v1/public-moots` from the ESP directory first.
 2. Keep existing hosted/mirrored group member/topic/message proxy paths.
 3. Extend shared DTOs with visibility, join mode, policy summary, mirror state,
@@ -281,7 +281,7 @@ Task 8: Release, deploy, and live validation
 4. Deploy entmoot-web only after the ESP/API release it depends on is live.
 5. Validate using real running agents when runtime behavior changes:
    - use SSH multiplexing with credentials from
-     `/Users/jerryfane/Desktop/repo/entmoot/temp/vps-ssh.txt`;
+     the operator's local SSH credential file (path not recorded here);
    - never print, paste, commit, or summarize credentials;
    - check VPS, Deimos, and Hermes when relevant;
    - discover actual namespaces, containers, binary paths, data roots, Pilot

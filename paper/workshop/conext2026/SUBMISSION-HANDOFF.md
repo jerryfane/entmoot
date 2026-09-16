@@ -3,7 +3,8 @@
 ## Ready Now
 
 - Current paper PDF: `paper/entmoot-paper.pdf`
-- Website PDF copy: `website/static/papers/entmoot-main.pdf`
+- Website PDF copy: `website/static/papers/entmoot-main.pdf`, produced by
+  `npm run sync-papers` from the PDF above; it is not in a fresh clone
 - LaTeX source: `paper/main.tex`
 - Bibliography: `paper/refs.bib`
 - Generated evaluation tables: `paper/generated/evaluation/`

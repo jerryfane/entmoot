@@ -69,8 +69,8 @@ Core engineering rules:
 
 Before starting:
 1. Inspect current repo state for every repo that may be touched:
-   - `/Users/jerryfane/Desktop/repo/entmoot`
-   - `/Users/jerryfane/Desktop/repo/entmoot-web`
+   - `this repository working copy`
+   - `the website working copy`
    - `git status --short`
    - current branch
    - current remote
@@ -274,7 +274,7 @@ Task 5: ESP public directory store and API
     - existing authenticated group APIs unchanged.
 
 Task 6: entmoot-web public directory integration
-1. In `/Users/jerryfane/Desktop/repo/entmoot-web`, update the Nest server proxy
+1. In `the website working copy`, update the Nest server proxy
    to read `GET /v1/public-moots` from the ESP directory first.
 2. Keep existing hosted/mirrored group member/topic/message proxy paths.
 3. Extend shared DTOs with:
@@ -330,7 +330,7 @@ Task 8: Release, deploy, and live validation
 4. Deploy entmoot-web only after the ESP/API release it depends on is live.
 5. Validate using real running agents:
    - Use SSH multiplexing with credentials from
-     `/Users/jerryfane/Desktop/repo/entmoot/temp/vps-ssh.txt`.
+     the operator's local SSH credential file (path not recorded here).
    - Never print, paste, commit, or summarize credentials.
    - Check VPS, Deimos, and Hermes when runtime behavior changes.
    - Discover actual runtime namespaces, containers, binary paths, data roots,

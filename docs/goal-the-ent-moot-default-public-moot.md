@@ -245,7 +245,7 @@ Task 8: Release and live peer validation
 3. Verify GitHub release workflow succeeds and expected assets exist.
 4. Validate the release using real running agents:
    - Use SSH multiplexing with credentials from
-     `/Users/jerryfane/Desktop/repo/entmoot/temp/vps-ssh.txt`.
+     the operator's local SSH credential file (path not recorded here).
    - Never print, commit, or paste credentials.
    - Check VPS, Deimos, and Hermes.
    - Deimos and Hermes may run Entmoot/Pilot inside containers. Discover the

@@ -1821,8 +1821,8 @@ transport-ad immediately, instead of letting peers run on the
   in their cached transport_ad and their outbound frames silently
   dropped at Cloudflare's anycast edge.
 
-  Live evidence 2026-04-25 from phobos<->laptop: phobos cached
-  `104.30.149.4:20414` (laptop's previous allocation); laptop's
+  Live evidence 2026-04-25 from phobos<->laptop: phobos cached the
+  laptop's previous TURN allocation on port `20414`; the laptop's
   current allocation was `:9587`. Phobos's `peer switched to
   turn-relay remote=:20414` log fired at every dial and traffic
   silently went into a dead TURN allocation. New transport_ad was

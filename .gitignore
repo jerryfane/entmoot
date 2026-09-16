@@ -5,6 +5,10 @@ CLAUDE.md
 
 .DS_Store
 
+# Python caches from scripts/
+__pycache__/
+*.pyc
+
 # Go build artifacts
 *.test
 coverage.out
