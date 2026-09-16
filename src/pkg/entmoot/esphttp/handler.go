@@ -3073,9 +3073,13 @@ type errorBody struct {
 	Message string `json:"message"`
 }
 
+// writeError sends an error envelope. Unlike writeJSON it logs nothing, and
+// the reason is narrower than "it cannot fail": an envelope of two strings
+// cannot fail to ENCODE, so the only failure left is the write itself, which
+// means the client is already gone. There is nothing an operator can do with
+// that, and writeError is called from package-level helpers that hold no
+// handler, so it stays a function.
 func writeError(w http.ResponseWriter, status int, code, message string) {
-	// An error envelope is two strings, so encoding cannot fail for reasons a
-	// caller could act on; unlike writeJSON there is nothing to diagnose here.
 	_ = encodeJSONBody(w, status, errorEnvelope{Error: errorBody{Code: code, Message: message}})
 }
 
@@ -3084,20 +3088,24 @@ func methodNotAllowed(w http.ResponseWriter, allowed string) {
 	writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
 }
 
-// writeJSON sends a JSON body after the status line. An encoding failure
-// cannot become an error response at that point, but it must not be silent
-// either: discarding it is how the live-agent listing served 200 with an empty
-// body, its response being keyed by MemberID, which had no TextMarshaler. The
-// log goes through the handler's own logger and names the route, so an
-// operator can find the request that produced it.
-// encodeJSONBody sends the status line and the body. It returns the encoder
-// error, which the caller can only log: the status is already on the wire.
+// encodeJSONBody sends the status line and then the body. It returns whatever
+// Encode returned — an encoding failure, or a write failure once the client has
+// gone — which a caller can only log, because the status is already on the wire.
 func encodeJSONBody(w http.ResponseWriter, status int, v any) error {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	return json.NewEncoder(w).Encode(v)
 }
 
+// writeJSON sends a JSON body and reports a failure to the handler's own
+// logger, naming the route. A failure cannot become an error response at that
+// point, but it must not be silent either: discarding it is how the live-agent
+// listing served 200 with an empty body, its response being keyed by MemberID,
+// which had no TextMarshaler.
+//
+// r is always the request being served; the nil check exists so a future caller
+// that forgets it loses the route attribution instead of panicking inside a
+// log call.
 func (h *Handler) writeJSON(w http.ResponseWriter, r *http.Request, status int, v any) {
 	if err := encodeJSONBody(w, status, v); err != nil {
 		attrs := []any{slog.Int("status", status), slog.String("err", err.Error())}
