@@ -12,7 +12,7 @@ group, and exits. When an Entmoot daemon is already running for the same data
 root, `join` sends the invite to that daemon over the local control socket so
 agents can join new groups without stopping `serve`.
 
-A named member serves the redemption: an invite carries bootstrap addresses
+A named peer entitled to serve it — a current member, or the invite's own issuer — serves the redemption: an invite carries bootstrap addresses
 that name current members of the group. Only a peer named there is
 authorised to serve the checkpoint and accept the join record. It then forwards
 the record to the group's other reachable members, so the joiner needs the

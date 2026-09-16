@@ -7,6 +7,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -218,15 +219,12 @@ func cmdInviteCreate(gf *globalFlags, args []string) int {
 		fmt.Fprintln(os.Stderr, "invite create: every -relay must be a multiaddr ending in /p2p/<relay-peer-id>")
 		return exitInvalidArgument
 	}
-	// An invite carries a bounded number of relay BYTES, so a large hint set
-	// is trimmed here rather than silently later. Say so: dropping a relay an
-	// operator named without a word is how a joiner ends up unable to reach
-	// the group through the path the operator intended.
-	if bounded := boundInviteRelays(relayHints); len(bounded) != len(relayHints) {
-		fmt.Fprintf(os.Stderr, "invite create: carrying %d of %d relay hints; the rest do not fit the invite's %d-byte relay budget\n",
-			len(bounded), len(relayHints), maxInviteFallbackBytes)
-		relayHints = bounded
-	}
+	// An invite carries a bounded number of relay BYTES. The trim happens in
+	// resolveInviteRelayHints so that it cannot be left out by a call site —
+	// the size check depends on the bound holding — and it reports what it
+	// dropped, because losing a relay an operator named without a word is how
+	// a joiner ends up unable to reach the group by the intended path.
+	relayHints = resolveInviteRelayHints(relayHints, os.Stderr)
 	now := time.Now()
 	capability := entmoot.BootstrapCapability{
 		GroupID:           gid,
@@ -635,6 +633,71 @@ func addKnownMemberPeers(dataDir string, groupID entmoot.GroupID, memberPeers ma
 		peers++
 	}
 	return addresses, peerIDs, private
+}
+
+// resolveInviteRelayHints bounds a relay set for an invite and reports any
+// trim to w. Every CLI mint goes through it, so the bound is not a call-site
+// decision: a revert there used to leave the whole suite green while the
+// capability-size check quietly stopped being an upper bound.
+func resolveInviteRelayHints(hints []string, w io.Writer) []string {
+	bounded := boundInviteRelays(hints)
+	if len(bounded) != len(hints) && w != nil {
+		fmt.Fprintf(w, "invite create: carrying %d of %d relay hints; the rest do not fit the invite's %d-byte relay budget\n",
+			len(bounded), len(hints), maxInviteFallbackBytes)
+	}
+	return bounded
+}
+
+// boundInviteAddresses trims any address set the daemon attaches on its own
+// initiative — its own host addresses when a request names none, and the
+// fallback members — to what a capability can carry: each address at most
+// maxInviteAddrBytes, the set at most maxInviteFallbackAddrs entries and
+// maxInviteFallbackBytes in total, routable ones first.
+//
+// Anything the daemon fills in without being asked has to be bounded here,
+// because the size check a caller runs before the capability exists can only
+// model sets whose ceiling is enforced.
+func boundInviteAddresses(addresses []string) []string {
+	const (
+		tierRoutable = iota
+		tierPrivate
+		tierLoopback
+	)
+	tierOf := func(addr multiaddr.Multiaddr) int {
+		switch {
+		case multiaddrIsLoopback(addr):
+			return tierLoopback
+		case routableInviteAddress(addr):
+			return tierRoutable
+		default:
+			return tierPrivate
+		}
+	}
+	out := make([]string, 0, len(addresses))
+	total := 0
+	// Routable first, then private, and loopback only if nothing else exists
+	// — a daemon on a development machine may have no other address, and
+	// attaching nothing there would make its invites unusable.
+	for _, tier := range []int{tierRoutable, tierPrivate, tierLoopback} {
+		if tier == tierLoopback && len(out) > 0 {
+			break
+		}
+		for _, addr := range addresses {
+			if len(out) >= maxInviteFallbackAddrs || total+len(addr) > maxInviteFallbackBytes {
+				return out
+			}
+			if len(addr) > maxInviteAddrBytes {
+				continue
+			}
+			parsed, err := multiaddr.NewMultiaddr(addr)
+			if err != nil || tierOf(parsed) != tier {
+				continue
+			}
+			out = append(out, addr)
+			total += len(addr)
+		}
+	}
+	return out
 }
 
 // boundInviteRelays trims a relay set to what a capability can carry: each

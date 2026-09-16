@@ -46,8 +46,9 @@ other reachable members, so C learns about B without either of them being
 named in the other's invite.
 
 No admin signs a join, and the issuer need not be running either: an invite
-may name any current member as a bootstrap peer, and whichever named member is
-reachable serves the redemption. To admit C while A is stopped, A mints C's
+may name any current member as a bootstrap peer, and whichever named peer is
+reachable and still entitled to serve — a current member, or the invite's own
+issuer — serves the redemption. To admit C while A is stopped, A mints C's
 invite ahead of time pointing at B:
 
 ```sh

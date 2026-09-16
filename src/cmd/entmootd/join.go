@@ -1400,10 +1400,17 @@ func (s *ipcServer) handleInviteCreate(_ context.Context, c net.Conn, req *ipc.I
 		targetPeerID = targetBinding.PeerID.String()
 	}
 	if len(req.BootstrapMultiaddrs) == 0 {
-		req.BootstrapMultiaddrs = make([]string, 0, len(s.runtime.host.Addrs()))
+		// A request that names nothing gets this node's own addresses — and a
+		// libp2p host on a multi-homed machine reports dozens, so this fill
+		// has to obey the same bounds as everything else the daemon attaches
+		// without being asked. It did not, which is how an ESP open invite
+		// created with no address list (the group_create open-invite mode
+		// never supplies one) minted a capability too large to redeem.
+		own := make([]string, 0, len(s.runtime.host.Addrs()))
 		for _, address := range s.runtime.host.Addrs() {
-			req.BootstrapMultiaddrs = append(req.BootstrapMultiaddrs, address.Encapsulate(multiaddr.StringCast("/p2p/"+localBinding.PeerID.String())).String())
+			own = append(own, address.Encapsulate(multiaddr.StringCast("/p2p/"+localBinding.PeerID.String())).String())
 		}
+		req.BootstrapMultiaddrs = boundInviteAddresses(own)
 	}
 	// Any current member may be named as a bootstrap peer, so an invite stays
 	// usable while its issuer is down. See the comment in cmdInviteCreate.

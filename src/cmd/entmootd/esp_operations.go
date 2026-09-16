@@ -1514,8 +1514,12 @@ func validateOpenInviteBootstrap(addresses, memberPeerIDs []string, localPeerID 
 		peerIDs = append(peerIDs, info.ID.String())
 	}
 	if size, tooLarge := openInviteCapabilityTooLarge(addresses, peerIDs, noFallback); tooLarge {
+		// The figure is an upper bound, not a prediction: everything the
+		// caller did not name is charged at its ceiling, so say so rather
+		// than report it as the size the invite will have. Name the remedy
+		// too — declining the fallback peers buys most of the allowance back.
 		return &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request",
-			Message: fmt.Sprintf("the invite this list would mint is about %d bytes, over the %d-byte limit a joiner can send", size, libp2ptransport.MaxCapabilityBytes)}
+			Message: fmt.Sprintf("this list could mint an invite of up to %d bytes, over the %d a joiner can send; name fewer addresses, or set no_fallback_peers to stop the daemon attaching others", size, libp2ptransport.MaxCapabilityBytes)}
 	}
 	return nil
 }

@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -226,5 +227,54 @@ func TestRelayHintsFromTheRuntimeAreBounded(t *testing.T) {
 		if len(hint) > maxInviteAddrBytes {
 			t.Fatalf("relayHints returned a %d-byte hint, over the %d-byte per-address bound", len(hint), maxInviteAddrBytes)
 		}
+	}
+}
+
+// TestTheDaemonsOwnAddressFillIsBounded pins the set the daemon substitutes
+// when a request names no bootstrap address — which is what every
+// group_create open invite does, since that path stores no list at all. A
+// libp2p host on a multi-homed machine reports dozens of addresses, and this
+// fill bypassed every bound, so those tokens minted capabilities too large to
+// redeem.
+func TestTheDaemonsOwnAddressFillIsBounded(t *testing.T) {
+	_, info := mustDaemonIdentity(t)
+	binding, err := libp2ptransport.BindingFromPublicKey(info.EntmootPubKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	suffix := "/p2p/" + binding.PeerID.String()
+
+	var own []string
+	for i := 0; i < 12; i++ {
+		own = append(own, fmt.Sprintf("/ip4/172.%d.0.1/tcp/1004", 17+i)+suffix)
+	}
+	for i := 0; i < 12; i++ {
+		own = append(own, fmt.Sprintf("/ip4/203.0.113.%d/tcp/1004", 10+i)+suffix)
+	}
+	own = append(own, "/ip4/127.0.0.1/tcp/1004"+suffix)
+
+	bounded := boundInviteAddresses(own)
+	if len(bounded) == 0 || len(bounded) > maxInviteFallbackAddrs {
+		t.Fatalf("filled %d addresses, want between 1 and %d", len(bounded), maxInviteFallbackAddrs)
+	}
+	total := 0
+	for _, addr := range bounded {
+		total += len(addr)
+	}
+	if total > maxInviteFallbackBytes {
+		t.Fatalf("filled %d bytes, over the %d the size check models", total, maxInviteFallbackBytes)
+	}
+	// Routable first: a newcomer elsewhere can only use those.
+	for _, addr := range bounded {
+		if strings.HasPrefix(addr, "/ip4/172.") || strings.HasPrefix(addr, "/ip4/127.") {
+			t.Fatalf("filled %q while routable addresses were available", addr)
+		}
+	}
+
+	// A host with nothing but loopback must still produce something, or its
+	// invites cannot be redeemed at all on a development machine.
+	loopbackOnly := boundInviteAddresses([]string{"/ip4/127.0.0.1/tcp/1004" + suffix})
+	if len(loopbackOnly) != 1 {
+		t.Fatalf("a loopback-only host filled %d addresses, want 1 as a last resort", len(loopbackOnly))
 	}
 }
