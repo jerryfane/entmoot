@@ -3085,7 +3085,16 @@ func methodNotAllowed(w http.ResponseWriter, allowed string) {
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
+	// The status line is already sent, so an encoding failure cannot become an
+	// error response — but it must not be silent either. Discarding it is how
+	// the live-agent listing served 200 with an empty body for months: its
+	// response is keyed by MemberID, which had no TextMarshaler.
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		h := slog.Default()
+		h.Error("esphttp: response encoding failed after status was sent",
+			slog.Int("status", status),
+			slog.String("err", err.Error()))
+	}
 }
 
 func decodeGroupID(s string) (entmoot.GroupID, error) {
