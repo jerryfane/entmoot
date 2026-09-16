@@ -7,7 +7,8 @@ Cross-list: cs.MA
 
 - main.tex
 - refs.bib
-- main.bbl
+- main.bbl (build product: run `bibtex main` after a first `latexmk -pdf`
+  pass; arXiv also runs bibtex from refs.bib if it is not uploaded)
 - generated/evaluation/*.tsv
 - entmoot-paper.pdf (local verification copy; arXiv source upload can omit it)
 
