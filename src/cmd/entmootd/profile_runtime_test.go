@@ -14,6 +14,7 @@ import (
 	"entmoot/pkg/entmoot/membership"
 	"entmoot/pkg/entmoot/profile"
 	"entmoot/pkg/entmoot/signing"
+	"entmoot/pkg/entmoot/store"
 )
 
 // TestPublishedProfileBecomesADisplayName is the whole point of the feature:
@@ -605,70 +606,6 @@ func TestReconciliationFindsARetractionADeeperPageAway(t *testing.T) {
 	}
 }
 
-// TestReconciliationPagesThroughATimestampTie pins the page boundary's
-// tiebreaks. Every message in the flood below carries the same timestamp, so
-// the author and message-id comparisons are the only thing that identifies the
-// oldest row in a page. Get them wrong and the boundary stops advancing: the
-// next page re-serves rows already seen, the window never reaches the quiet
-// member, and its name is silently lost. The existing flood test cannot see
-// this, because it publishes with time.Now() and never produces a tie.
-func TestReconciliationPagesThroughATimestampTie(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	root := t.TempDir()
-	founder, _ := mustDaemonIdentity(t)
-	var gid entmoot.GroupID
-	if _, err := rand.Read(gid[:]); err != nil {
-		t.Fatal(err)
-	}
-	policy := membership.DefaultPolicy()
-	policy.JoinRule = membership.JoinRuleOpen
-	mustCreateGroup(t, root, gid, founder, policy)
-
-	state, err := esphttp.OpenSQLiteStateStore(root)
-	if err != nil {
-		t.Fatalf("OpenSQLiteStateStore: %v", err)
-	}
-	defer state.Close()
-	runtime, session, host := startTestRuntimeWithProfiles(t, ctx, root, founder, gid, state)
-	defer host.Close()
-	defer runtime.Close()
-
-	quiet, quietInfo := mustDaemonIdentity(t)
-	if _, err := session.group.SignRecord(quiet, membership.Record{Kind: membership.KindJoin}); err != nil {
-		t.Fatalf("join: %v", err)
-	}
-	quietAt := time.Now().Add(-48 * time.Hour).UnixMilli()
-	mustStoreProfileAt(t, ctx, runtime, session, quiet, quietInfo, gid,
-		profile.Profile{DisplayName: "quiet-node", IssuedAtMS: quietAt}, quietAt)
-
-	// Three members flood the topic at ONE timestamp, so ties are broken by
-	// author for messages from different members and by message id within a
-	// member. Deep enough that a boundary which fails to advance cannot reach
-	// the quiet member inside maxProfileReconcilePages.
-	tie := time.Now().UnixMilli()
-	for i := 0; i < 3; i++ {
-		loud, loudInfo := mustDaemonIdentity(t)
-		if _, err := session.group.SignRecord(loud, membership.Record{Kind: membership.KindJoin}); err != nil {
-			t.Fatalf("join loud %d: %v", i, err)
-		}
-		for j := 0; j < profileReconcilePageSize; j++ {
-			mustStoreProfileAt(t, ctx, runtime, session, loud, loudInfo, gid,
-				profile.Profile{DisplayName: fmt.Sprintf("loud-%d-%d", i, j), IssuedAtMS: tie}, tie)
-		}
-	}
-
-	if err := esphttp.WithdrawMemberProfileNodeProfile(ctx, state, gid, *quietInfo.MemberID,
-		encodeBase64(quietInfo.EntmootPubKey), quietAt-1); err != nil {
-		t.Fatalf("reset: %v", err)
-	}
-	runtime.reconcileProfilesFromHistory(ctx, session)
-
-	if got := mustDisplayName(t, ctx, state, root, gid, *quietInfo.MemberID); got != "quiet-node#"+quietInfo.MemberID.String() {
-		t.Fatalf("quiet member's name = %q, want it recovered: the boundary stopped advancing through the tie", got)
-	}
-}
-
 // TestPageBoundaryComparatorAgreesWithTheStore pins each tiebreak separately.
 // profileMessageNewer exists to name the oldest row of a page in the SAME
 // order the store pages on, so the boundary it builds can neither skip nor
@@ -735,15 +672,92 @@ func TestPageBoundaryComparatorAgreesWithTheStore(t *testing.T) {
 				i+1, profileMessageAuthor(message), message.ID, profileMessageAuthor(oldest), oldest.ID)
 		}
 	}
+}
 
-	// And the walk the runtime actually performs must arrive at that same row.
-	found := page[0]
-	for _, message := range page {
-		if profileMessageNewer(found, message) {
-			found = message
+// TestBoundaryWalkCoversEveryRowExactlyOnce covers the other half of the
+// boundary contract. The comparator test proves the boundary names the page's
+// oldest row; this proves that using it as a cursor neither skips nor repeats
+// a row, which is the property reconciliation depends on and the one a wrong
+// boundary field breaks silently. It pages with a small limit so several pages
+// are needed, and every timestamp is shared so the tiebreaks carry the order.
+func TestBoundaryWalkCoversEveryRowExactlyOnce(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	root := t.TempDir()
+	founder, _ := mustDaemonIdentity(t)
+	var gid entmoot.GroupID
+	if _, err := rand.Read(gid[:]); err != nil {
+		t.Fatal(err)
+	}
+	policy := membership.DefaultPolicy()
+	policy.JoinRule = membership.JoinRuleOpen
+	mustCreateGroup(t, root, gid, founder, policy)
+	state, err := esphttp.OpenSQLiteStateStore(root)
+	if err != nil {
+		t.Fatalf("OpenSQLiteStateStore: %v", err)
+	}
+	defer state.Close()
+	runtime, session, host := startTestRuntimeWithProfiles(t, ctx, root, founder, gid, state)
+	defer host.Close()
+	defer runtime.Close()
+
+	const authors = 9
+	const perAuthor = 3
+	const pageLimit = 4
+	base := time.Now().UnixMilli()
+	stored := make(map[entmoot.MessageID]struct{}, authors*perAuthor)
+	for i := 0; i < authors; i++ {
+		author, authorInfo := mustDaemonIdentity(t)
+		if _, err := session.group.SignRecord(author, membership.Record{Kind: membership.KindJoin}); err != nil {
+			t.Fatalf("join %d: %v", i, err)
+		}
+		for j := 0; j < perAuthor; j++ {
+			// Three timestamps only, so most comparisons are ties and the
+			// author and id tiebreaks decide where a page ends.
+			message := mustStoreProfileAt(t, ctx, runtime, session, author, authorInfo, gid,
+				profile.Profile{DisplayName: fmt.Sprintf("member-%d-%d", i, j), IssuedAtMS: base}, base+int64(j))
+			stored[message.ID] = struct{}{}
 		}
 	}
-	if found.ID != oldest.ID {
-		t.Fatalf("the runtime's scan picked %s as the page's oldest row, the store's order says %s", found.ID, oldest.ID)
+
+	seen := make(map[entmoot.MessageID]int, len(stored))
+	var boundary *store.PageBoundary
+	for page := 0; page < len(stored)+2; page++ {
+		messages, err := runtime.store.LatestByTopicBefore(ctx, gid, profile.Topic, pageLimit, boundary)
+		if err != nil {
+			t.Fatalf("page %d: %v", page, err)
+		}
+		if len(messages) == 0 {
+			break
+		}
+		// The same rule the runtime uses to turn a page into the next cursor.
+		oldest := messages[0]
+		for _, message := range messages {
+			seen[message.ID]++
+			if profileMessageNewer(oldest, message) {
+				oldest = message
+			}
+		}
+		if len(messages) < pageLimit {
+			break
+		}
+		boundary = &store.PageBoundary{
+			TimestampMS:    oldest.Timestamp,
+			AuthorMemberID: profileMessageAuthor(oldest),
+			MessageID:      oldest.ID,
+		}
+	}
+
+	for id := range stored {
+		switch seen[id] {
+		case 1:
+		case 0:
+			t.Fatalf("message %s was skipped by the boundary walk: a member's name can be lost this way", id)
+		default:
+			t.Fatalf("message %s was served %d times: the boundary did not advance past it", id, seen[id])
+		}
+	}
+	if len(seen) != len(stored) {
+		t.Fatalf("walk saw %d distinct messages, stored %d", len(seen), len(stored))
 	}
 }

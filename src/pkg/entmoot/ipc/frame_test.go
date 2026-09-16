@@ -215,9 +215,11 @@ func TestMsgTypeString(t *testing.T) {
 	if got := MsgType(0xFF).String(); got != "unknown(0xff)" {
 		t.Errorf("0xFF String() = %q", got)
 	}
-	// Every byte with no constant must report as unknown. Derived from the
-	// table above rather than a literal, which went stale as soon as the
-	// deleted roster-repair frames freed up their numbers.
+	// Every byte with no constant must report as unknown. The old check named
+	// one free byte out of 237, so it could not see a stray label on any
+	// other; deriving the set from the table above covers all of them, and
+	// couples this test to the table deliberately - a new MsgType has to be
+	// added here too.
 	for b := 0; b <= 0xFF; b++ {
 		if _, assigned := cases[MsgType(b)]; assigned {
 			continue
