@@ -1547,6 +1547,13 @@ func openInviteCapabilityTooLarge(addresses, peerIDs []string, noFallback bool) 
 	}
 	// Relay hints come from this node's configuration, not the caller.
 	size += maxInviteFallbackBytes + libp2ptransport.MaxCapabilityRelays*perElement
+	if len(addresses) == 0 {
+		// A request naming nothing is filled with this node's own addresses,
+		// and that happens whether or not the caller declined the fallback
+		// members: no_fallback_peers gates addKnownMemberPeers only.
+		size += maxInviteFallbackBytes + maxInviteFallbackAddrs*perElement
+		size += maxPeerIDBytes + perElement
+	}
 	if !noFallback {
 		size += maxInviteFallbackBytes + maxInviteFallbackAddrs*perElement
 		size += maxInviteFallbackPeers * (maxPeerIDBytes + perElement)

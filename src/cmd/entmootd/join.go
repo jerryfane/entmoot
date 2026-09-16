@@ -1370,7 +1370,7 @@ func (s *ipcServer) handleInviteCreate(_ context.Context, c net.Conn, req *ipc.I
 	founder.MemberID = &founderBinding.MemberID
 	founder.PeerID = founderBinding.PeerID.String()
 	// Whichever named peer is entitled to serve does so — a current member, or
-	// this node as the issuer — so the invite
+	// this node as the capability's own issuer. So the invite carries those
 	// addresses and, when it is not the founder, this node as the issuer.
 	localBinding, err := libp2ptransport.BindingFromPublicKey(s.identity.PublicKey)
 	if err != nil || localBinding.PeerID != s.runtime.host.ID() {

@@ -4,9 +4,11 @@
 // Two properties follow from that shape, and both are the reason it exists.
 // A joiner signs its own admission under a rule the founder signed earlier, so
 // no admin has to SIGN anything when the invite is used, and no particular
-// node has to be up: the invite names current members, any of which may serve
-// the redemption. The issuer must still hold authority at that moment, which
-// the serving peer checks against its own view of the group. And a checkpoint
+// node has to be up: the invite names current members, any of which may be
+// reachable. A named peer serves the redemption only while it is entitled to —
+// a current, unbanned member, or the invite's own issuer, which may serve even
+// after leaving because its authority is re-checked on every read against the
+// serving node's own view of the group. And a checkpoint
 // states the complete membership, so the records behind it can be discarded:
 // storage follows how many members a group has, not how many changes it has
 // ever made.
