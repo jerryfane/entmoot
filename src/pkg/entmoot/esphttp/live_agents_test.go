@@ -288,7 +288,10 @@ func TestLiveAgentConfigRejectsUnknownActions(t *testing.T) {
 	}
 }
 
-func TestDefaultLiveActionsAreTheFourChatActions(t *testing.T) {
+// A retired action creeping back into the default set is the bug here: task
+// and command actions were removed with Fleet, and an agent must not be able
+// to take them by default again.
+func TestOnlyTheFourChatActionsAreAllowedByDefault(t *testing.T) {
 	equal := func(got, want []string) bool {
 		if len(got) != len(want) {
 			return false
