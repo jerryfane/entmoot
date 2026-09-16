@@ -3,14 +3,18 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/libp2p/go-libp2p"
+	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/multiformats/go-multiaddr"
 
@@ -520,5 +524,209 @@ func TestProbeAgainstALiveServingPeer(t *testing.T) {
 	}
 	if refused.Error != "" {
 		t.Fatalf("a refusal must not also be reported as a transport error: %+v", refused)
+	}
+}
+
+// TestRefusalTextIsBounded pins that a member cannot decide how large this
+// daemon's answer is. The refusal field is the peer's own text and the
+// membership response allows megabytes, so a handful of hostile rows would
+// push the probe answer past the control socket's frame limit and destroy it
+// entirely - the one part of the report an operator most needs when peers are
+// refusing them.
+func TestRefusalTextIsBounded(t *testing.T) {
+	hostile := strings.Repeat("A", 3<<20)
+	got := boundRefusal(hostile)
+	if len(got) > maxProbeRefusalBytes+8 {
+		t.Fatalf("a %d-byte refusal became %d bytes; the cap is %d", len(hostile), len(got), maxProbeRefusalBytes)
+	}
+	if !strings.HasSuffix(got, "...") {
+		t.Fatalf("a truncated refusal must say it was truncated: %q", got)
+	}
+	if got := boundRefusal("not_member"); got != "not_member" {
+		t.Fatalf("a real code must survive intact: %q", got)
+	}
+	if got := boundRefusal("unauthorized\n  serving\tnode"); got != "unauthorized serving node" {
+		t.Fatalf("whitespace must collapse so one peer stays one line: %q", got)
+	}
+}
+
+// TestProbeGivesEachPeerTheFloor pins the budget floor, which nothing else
+// can: a loopback peer answers inside a millisecond, so a fast peer cannot
+// tell a 500ms deadline from a 1ms one. A silent listener can. It accepts the
+// connection and never writes, so the probe can only end at the deadline it
+// handed out, and the elapsed time IS the deadline. Without the floor a peer
+// gets a sub-millisecond deadline and is called unreachable for arithmetic
+// reasons rather than network ones.
+func TestProbeGivesEachPeerTheFloor(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	root := t.TempDir()
+	founder, _ := mustDaemonIdentity(t)
+	var gid entmoot.GroupID
+	if _, err := rand.Read(gid[:]); err != nil {
+		t.Fatal(err)
+	}
+	policy := membership.DefaultPolicy()
+	policy.JoinRule = membership.JoinRuleOpen
+	mustCreateGroup(t, root, gid, founder, policy)
+	runtime, session, host := startTestRuntime(t, ctx, root, founder, gid)
+	defer host.Close()
+	defer runtime.Close()
+
+	// Four silent members, not one: with a single peer only the
+	// remaining-time clamp is reached, while several peers divide the budget
+	// and exercise the per-slice floor as well.
+	const silentMembers = 4
+	var bindings []libp2ptransport.Binding
+	for i := 0; i < silentMembers; i++ {
+		silent, silentInfo := mustDaemonIdentity(t)
+		if _, err := session.group.SignRecord(silent, membership.Record{Kind: membership.KindJoin}); err != nil {
+			t.Fatalf("join %d: %v", i, err)
+		}
+		binding, err := libp2ptransport.BindingFromPublicKey(silentInfo.EntmootPubKey)
+		if err != nil {
+			t.Fatal(err)
+		}
+		bindings = append(bindings, binding)
+	}
+
+	// A listener that accepts and never speaks: the libp2p handshake cannot
+	// complete, so only the deadline ends the attempt.
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer listener.Close()
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			// Hold it open and write nothing.
+			t.Cleanup(func() { _ = conn.Close() })
+		}
+	}()
+	addr := listener.Addr().(*net.TCPAddr)
+	for _, binding := range bindings {
+		if err := persistGroupPeer(root, gid, peer.AddrInfo{
+			ID:    binding.PeerID,
+			Addrs: []multiaddr.Multiaddr{mustMultiaddr(t, fmt.Sprintf("/ip4/127.0.0.1/tcp/%d", addr.Port))},
+		}); err != nil {
+			t.Fatalf("persistGroupPeer: %v", err)
+		}
+	}
+
+	// A millisecond of budget across four peers. Both floors must lift it.
+	started := time.Now()
+	results, _, err := runtime.probePeers(ctx, gid, time.Millisecond)
+	if err != nil {
+		t.Fatalf("probePeers: %v", err)
+	}
+	elapsed := time.Since(started)
+	if len(results) != silentMembers {
+		t.Fatalf("got %d rows, want %d: %+v", len(results), silentMembers, results)
+	}
+	for _, result := range results {
+		if result.Answered {
+			t.Fatalf("a listener that never writes was reported as answering: %+v", result)
+		}
+	}
+	// Half the floor, to leave room for scheduling without accepting a probe
+	// that gave up in microseconds.
+	if elapsed < minProbeSlice/2 {
+		t.Fatalf("the probe gave up after %s; with a %s floor it must wait about that long before calling a peer unreachable",
+			elapsed, minProbeSlice)
+	}
+}
+
+// TestHostileRefusalCannotInflateTheAnswer drives the cap through the real
+// path with a peer that answers a well-formed refusal whose error text is
+// megabytes. Without the cap at the point the refusal is recorded, a few such
+// members push the probe answer past the control socket's frame limit, and the
+// operator gets nothing at all.
+func TestHostileRefusalCannotInflateTheAnswer(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	root := t.TempDir()
+	founder, _ := mustDaemonIdentity(t)
+	var gid entmoot.GroupID
+	if _, err := rand.Read(gid[:]); err != nil {
+		t.Fatal(err)
+	}
+	policy := membership.DefaultPolicy()
+	policy.JoinRule = membership.JoinRuleOpen
+	mustCreateGroup(t, root, gid, founder, policy)
+	runtime, session, host := startTestRuntime(t, ctx, root, founder, gid)
+	defer host.Close()
+	defer runtime.Close()
+
+	hostile, hostileInfo := mustDaemonIdentity(t)
+	if _, err := session.group.SignRecord(hostile, membership.Record{Kind: membership.KindJoin}); err != nil {
+		t.Fatalf("join: %v", err)
+	}
+	hostileHost, _, err := libp2ptransport.NewHost(ctx, hostile, libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"))
+	if err != nil {
+		t.Fatalf("NewHost: %v", err)
+	}
+	defer hostileHost.Close()
+
+	// A member that speaks the protocol and answers every read with a refusal
+	// whose text it chooses.
+	shout := strings.Repeat("A", 2<<20)
+	hostileHost.SetStreamHandler(libp2ptransport.MembershipProtocol, func(stream network.Stream) {
+		defer stream.Close()
+		var request libp2ptransport.MembershipSyncRequest
+		if err := json.NewDecoder(io.LimitReader(stream, 1<<20)).Decode(&request); err != nil {
+			return
+		}
+		payload, err := json.Marshal(libp2ptransport.MembershipSyncResponse{
+			Version:   1,
+			RequestID: request.RequestID,
+			GroupID:   request.GroupID,
+			Error:     libp2ptransport.SyncErrorCode(shout),
+		})
+		if err != nil {
+			return
+		}
+		_, _ = stream.Write(append(payload, '\n'))
+	})
+
+	if err := persistGroupPeer(root, gid, peer.AddrInfo{ID: hostileHost.ID(), Addrs: hostileHost.Addrs()}); err != nil {
+		t.Fatalf("persistGroupPeer: %v", err)
+	}
+
+	results, _, err := runtime.probePeers(ctx, gid, 3*time.Second)
+	if err != nil {
+		t.Fatalf("probePeers: %v", err)
+	}
+	var row *ipc.PeerProbeResult
+	for i := range results {
+		if results[i].MemberID == *hostileInfo.MemberID {
+			row = &results[i]
+		}
+	}
+	if row == nil {
+		t.Fatalf("probe omitted the hostile member: %+v", results)
+	}
+	if !row.Answered {
+		t.Fatalf("a peer that served a refusal was reported silent: %+v", row)
+	}
+	if len(row.Refusal) > maxProbeRefusalBytes+8 {
+		t.Fatalf("the peer put %d bytes into this daemon's answer, cap is %d", len(row.Refusal), maxProbeRefusalBytes)
+	}
+	if len(row.Error) > maxProbeErrorBytes+64 {
+		t.Fatalf("the error field carries %d bytes", len(row.Error))
+	}
+
+	// And the whole answer must still fit the control socket's frame.
+	encoded, err := json.Marshal(&ipc.PeerProbeResp{Status: "probed", GroupID: gid, Peers: results})
+	if err != nil {
+		t.Fatalf("marshal probe response: %v", err)
+	}
+	if len(encoded) > ipc.MaxFrameSize {
+		t.Fatalf("probe answer is %d bytes, over the %d-byte ipc frame", len(encoded), ipc.MaxFrameSize)
 	}
 }

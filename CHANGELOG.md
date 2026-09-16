@@ -13,10 +13,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   claimed. The running daemon dials every other member of the group and
   performs one membership read: that proves the peer is up, speaks the
   protocol and serves this group to this node, where a connection alone would
-  not. Each peer row gains `reachable`, `latency_ms`, `relayed` and how many
-  addresses were tried, with a one-line reason on failure - a multi-homed
-  member's dial error is summarised rather than pasted, because the raw form
-  runs to a line per address.
+  not. Each peer row gains `reachable`, `answered`, `refusal`, `latency_ms`,
+  `relayed` and how many addresses were tried, with a one-line reason on
+  failure. Three outcomes, not two: `answered` without `reachable` is a peer
+  that replied and refused this node, which is what a removed member sees from
+  every peer and must not read as a network fault. A multi-homed member's dial
+  error is summarised rather than pasted, and the peer's own refusal text is
+  capped, because otherwise a member decides how large this daemon's answer
+  is.
 
   The probe lives in the daemon because the daemon owns the libp2p host, the
   peerstore and the relay configuration; a second process dialling with its

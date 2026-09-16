@@ -27,16 +27,22 @@ const (
 	defaultProbeBudget = 5 * time.Second
 	maxProbeBudget     = 60 * time.Second
 	// minProbeSlice is the least time worth giving one peer: below this a
-	// healthy peer on a slow path would be reported unreachable. Both uses of
-	// it are uncovered on purpose - a loopback peer answers inside a
-	// millisecond, so no local test can tell the floor from its absence, and
-	// a test that pretended otherwise would pass either way.
+	// healthy peer on a slow path would be reported unreachable for
+	// arithmetic reasons. TestProbeGivesEachPeerTheFloor pins both uses of it
+	// against a listener that accepts and never writes, where the elapsed
+	// time is the deadline that was handed out.
 	minProbeSlice = 500 * time.Millisecond
 	// maxProbeParallel bounds concurrent dials so a large group does not open
 	// a connection per member at once.
 	maxProbeParallel = 8
 	// maxProbeErrorBytes bounds one peer's error in the report.
 	maxProbeErrorBytes = 200
+	// maxProbeRefusalBytes bounds the peer's OWN text. A refusal is a short
+	// code - "unauthorized", "not_member" - but the field is remote-controlled
+	// and the response frame allows megabytes, so without a cap a member
+	// decides how large this daemon's answer is, and a few of them push it
+	// past the control socket's frame limit and destroy the whole probe.
+	maxProbeRefusalBytes = 64
 )
 
 // probePeers dials every other member of a group and reports which of them
@@ -209,7 +215,7 @@ func (r *groupRuntime) probeOne(ctx context.Context, session *groupSession, targ
 			// The peer replied. It served the stream and refused us, which is
 			// an answer about membership, not about the network.
 			result.Answered = true
-			result.Refusal = string(response.Error)
+			result.Refusal = boundRefusal(string(response.Error))
 			result.Relayed = connectionIsRelayed(r, target.info.ID)
 			return result
 		}
@@ -354,6 +360,17 @@ func summarizeProbeError(err error, addresses int) string {
 	}
 	if addresses > 1 {
 		return fmt.Sprintf("%s (%d addresses tried)", text, addresses)
+	}
+	return text
+}
+
+// boundRefusal trims a peer's refusal text to something this daemon is willing
+// to put in its own answer. Whitespace goes too: a code with a newline in it
+// would break the one-line-per-peer shape an operator reads.
+func boundRefusal(text string) string {
+	text = strings.Join(strings.Fields(text), " ")
+	if len(text) > maxProbeRefusalBytes {
+		return text[:maxProbeRefusalBytes] + "..."
 	}
 	return text
 }
