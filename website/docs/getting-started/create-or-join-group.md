@@ -14,7 +14,8 @@ Issuing the invite is the whole admission step. There is no command that writes
 somebody into a group: the joiner signs its own join record and redeems the
 invite, so nobody signs on its behalf. The issuing node does have to be
 reachable when the invite is used, because an invite may only name the
-issuer's own peer id as a bootstrap address.
+address of any current member as a bootstrap peer, including its own, so the
+invite still works while the issuer is offline.
 
 New groups default to `visibility=private`, `join_mode=invite_only`, and the
 `standard` policy preset. A public moot is created explicitly:

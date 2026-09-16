@@ -150,6 +150,18 @@ func cmdInviteCreate(gf *globalFlags, args []string) int {
 		info.PeerID = localBinding.PeerID.String()
 		issuer = &info
 	}
+	// A bootstrap address may name ANY current member, not only the issuer.
+	// The newcomer pins the founder's key from this capability and verifies
+	// the checkpoint it is served against that key, so a named peer cannot
+	// forge membership — it can only serve or fail. Restricting the list to
+	// the issuer meant the issuer had to be running for its own invite to be
+	// usable, which is the one thing self-signed admission was supposed to
+	// remove.
+	memberPeers, err := groupMemberPeerIDs(group)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "invite create: read group members: %v\n", err)
+		return exitTransport
+	}
 	allowedPeerIDs := make([]string, 0, len(bootstrap))
 	allowedAddresses := make([]string, 0, len(bootstrap))
 	seen := make(map[peer.ID]struct{})
@@ -160,8 +172,12 @@ func cmdInviteCreate(gf *globalFlags, args []string) int {
 			return exitInvalidArgument
 		}
 		info, err := peer.AddrInfoFromP2pAddr(address)
-		if err != nil || info.ID != localBinding.PeerID {
-			fmt.Fprintf(os.Stderr, "invite create: bootstrap must end in the issuing node's peer id %s\n", localBinding.PeerID)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "invite create: -bootstrap must end in /p2p/<peer-id>: %s\n", raw)
+			return exitInvalidArgument
+		}
+		if _, ok := memberPeers[info.ID]; !ok && info.ID != localBinding.PeerID {
+			fmt.Fprintf(os.Stderr, "invite create: bootstrap peer %s is not a member of this group; name this node or another member\n", info.ID)
 			return exitInvalidArgument
 		}
 		allowedAddresses = append(allowedAddresses, address.String())
@@ -170,6 +186,9 @@ func cmdInviteCreate(gf *globalFlags, args []string) int {
 			allowedPeerIDs = append(allowedPeerIDs, info.ID.String())
 		}
 	}
+	allowedAddresses, allowedPeerIDs = addKnownMemberPeers(s.dataDir, gid, memberPeers,
+		localBinding.PeerID, allowedAddresses, allowedPeerIDs, seen)
+
 	// Relay hints default to whatever this node itself relays through, since
 	// that is the set already known to accept it.
 	relayHints := []string(relays)
@@ -440,4 +459,68 @@ func mustMemberID(publicKey []byte) entmoot.MemberID {
 		panic(err)
 	}
 	return memberID
+}
+
+// groupMemberPeerIDs maps the group's current members to their transport peer
+// ids. Both are derived from the same Ed25519 key, so membership is what makes
+// a peer id serveable: no separate list has to be maintained.
+func groupMemberPeerIDs(group *membership.Group) (map[peer.ID]struct{}, error) {
+	out := make(map[peer.ID]struct{})
+	for _, memberID := range group.MemberIDs() {
+		info, ok := group.MemberInfoByID(memberID)
+		if !ok || len(info.EntmootPubKey) == 0 {
+			continue
+		}
+		binding, err := libp2ptransport.BindingFromPublicKey(info.EntmootPubKey)
+		if err != nil {
+			return nil, err
+		}
+		out[binding.PeerID] = struct{}{}
+	}
+	return out, nil
+}
+
+// maxInviteFallbackPeers bounds how many extra member addresses an invite
+// carries. The list is a convenience for the newcomer's first contact, not a
+// membership projection, and every entry costs invite size.
+const maxInviteFallbackPeers = 4
+
+// addKnownMemberPeers appends addresses of OTHER current members this node has
+// seen, so an invite keeps working when the issuer is down. It never fails the
+// invite: an unknown address set just means the newcomer has fewer doors to
+// try, and the operator can always name peers explicitly.
+func addKnownMemberPeers(dataDir string, groupID entmoot.GroupID, memberPeers map[peer.ID]struct{}, self peer.ID,
+	addresses []string, peerIDs []string, seen map[peer.ID]struct{}) ([]string, []string) {
+	cached, err := loadGroupPeers(dataDir, groupID)
+	if err != nil {
+		return addresses, peerIDs
+	}
+	added := 0
+	for _, info := range cached {
+		if added >= maxInviteFallbackPeers {
+			break
+		}
+		if info.ID == self {
+			continue
+		}
+		if _, ok := memberPeers[info.ID]; !ok {
+			continue
+		}
+		if _, ok := seen[info.ID]; ok {
+			continue
+		}
+		var kept bool
+		for _, addr := range info.Addrs {
+			full := addr.String() + "/p2p/" + info.ID.String()
+			addresses = append(addresses, full)
+			kept = true
+		}
+		if !kept {
+			continue
+		}
+		seen[info.ID] = struct{}{}
+		peerIDs = append(peerIDs, info.ID.String())
+		added++
+	}
+	return addresses, peerIDs
 }

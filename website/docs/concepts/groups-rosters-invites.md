@@ -23,10 +23,14 @@ still an unbanned member — which is why an invite from a demoted, removed or
 banned admin stops working everywhere at once, while a founder's invite keeps
 working regardless of the founder's own membership. The issuer does still have
 to serve the redemption. An invite names bootstrap addresses, and
-`invite create` accepts only the issuing node's own peer id, so the issuer is
-the only peer authorised to serve the checkpoint and accept the join record.
-Once the record is accepted, the issuer forwards it to the group's other
-reachable members and no further contact with it is needed.
+`invite create` accepts any current member's address — the issuing node's own,
+any you name, and up to four more it already knows — and only a peer the invite
+names may serve the checkpoint and accept the join record. So a newcomer can
+join while the issuer is offline, as long as one named member is reachable.
+Naming other members is safe because the newcomer pins the founder's key from
+the invite and verifies the membership it is served against that key: a named
+peer can serve or fail, not forge. Once the record is accepted, the serving
+peer forwards it to the group's other reachable members.
 
 ## Membership is a set
 

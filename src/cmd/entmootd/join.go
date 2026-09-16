@@ -1404,7 +1404,16 @@ func (s *ipcServer) handleInviteCreate(_ context.Context, c net.Conn, req *ipc.I
 			req.BootstrapMultiaddrs = append(req.BootstrapMultiaddrs, address.Encapsulate(multiaddr.StringCast("/p2p/"+localBinding.PeerID.String())).String())
 		}
 	}
+	// Any current member may be named as a bootstrap peer, so an invite stays
+	// usable while its issuer is down. See the comment in cmdInviteCreate.
+	memberPeers, err := groupMemberPeerIDs(session.group)
+	if err != nil {
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInternal, GroupID: &gid, Message: "read group members"})
+		return
+	}
 	allowedAddresses := make([]string, 0, len(req.BootstrapMultiaddrs))
+	allowedPeerIDs := make([]string, 0, len(req.BootstrapMultiaddrs)+1)
+	seenPeers := make(map[libpeer.ID]struct{})
 	for _, raw := range req.BootstrapMultiaddrs {
 		address, err := multiaddr.NewMultiaddr(raw)
 		if err != nil {
@@ -1412,12 +1421,26 @@ func (s *ipcServer) handleInviteCreate(_ context.Context, c net.Conn, req *ipc.I
 			return
 		}
 		info, err := libpeer.AddrInfoFromP2pAddr(address)
-		if err != nil || info.ID != localBinding.PeerID {
-			_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInvalidArgument, GroupID: &gid, Message: "bootstrap address does not name the issuing host"})
+		if err != nil {
+			_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInvalidArgument, GroupID: &gid, Message: "bootstrap address must end in /p2p/<peer-id>"})
+			return
+		}
+		if _, ok := memberPeers[info.ID]; !ok && info.ID != localBinding.PeerID {
+			_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInvalidArgument, GroupID: &gid, Message: "bootstrap address does not name a member of this group"})
 			return
 		}
 		allowedAddresses = append(allowedAddresses, address.String())
+		if _, ok := seenPeers[info.ID]; !ok {
+			seenPeers[info.ID] = struct{}{}
+			allowedPeerIDs = append(allowedPeerIDs, info.ID.String())
+		}
 	}
+	if len(allowedPeerIDs) == 0 {
+		allowedPeerIDs = append(allowedPeerIDs, localBinding.PeerID.String())
+		seenPeers[localBinding.PeerID] = struct{}{}
+	}
+	allowedAddresses, allowedPeerIDs = addKnownMemberPeers(s.dataDir, gid, memberPeers,
+		localBinding.PeerID, allowedAddresses, allowedPeerIDs, seenPeers)
 	now := time.Now()
 	expires := now.Add(24 * time.Hour)
 	if req.ValidForMS > 0 {
@@ -1438,7 +1461,7 @@ func (s *ipcServer) handleInviteCreate(_ context.Context, c net.Conn, req *ipc.I
 		Founder:           founder,
 		Issuer:            issuer,
 		RosterHead:        session.group.Canonical().ID,
-		AllowedPeerIDs:    []string{localBinding.PeerID.String()},
+		AllowedPeerIDs:    allowedPeerIDs,
 		AllowedMultiaddrs: allowedAddresses,
 		Relays:            s.runtime.relayHints(),
 		MaxUses:           req.MaxUses,

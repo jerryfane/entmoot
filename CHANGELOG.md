@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **An invite no longer needs its issuer online.** `invite create` accepted
+  only the issuing node's own address as a bootstrap peer, and a peer serves a
+  newcomer only when the capability names it, so the issuer had to be running
+  for its own invite to work — the one thing self-signed admission was meant to
+  remove. A bootstrap address may now name any CURRENT member; the issuer also
+  attaches up to four member addresses it already knows, so an ordinary
+  `invite create` survives its author going down without the operator naming
+  anybody.
+
+  A non-member's address is still refused, and a removed member stops being
+  serveable the moment its removal projects. Naming another member is safe
+  because the newcomer pins the founder's key from the invite and verifies the
+  membership it is served against that key: a named peer can serve or fail, not
+  forge. The serving peer evaluates the issuer's authority against its own view
+  of the group, so a demoted issuer's invite fails wherever it is presented.
+
+  Proved on three daemons: the founder mints an invite naming a plain member,
+  the founder is stopped, and the newcomer joins through that member in under a
+  second, with both live nodes converging on three members and one checkpoint.
+  The same command on the previous build exits 5.
+
+
 ### Removed
 
 - **Five one-off files are removed from the repository root.**
