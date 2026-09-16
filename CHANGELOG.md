@@ -308,9 +308,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   remove the founder, remove another admin, or change the admin set; losing
   membership or delegation removes the authority at once. Invites gained an
   optional `issuer` field: `founder` stays the anchor a joiner pins, while
-  `issuer` names the admin that signed. Enrollment and pre-membership
-  roster/history reads both require that signer to be a member who may
-  currently administer the group, so naming yourself as issuer buys nothing.
+  `issuer` names the admin that signed. Every pre-membership read, and the join
+  push itself, require that signer to be able to administer the group at that
+  moment — the founder always, a delegated admin only while it is still an
+  unbanned member — so naming yourself as issuer buys nothing.
   Policy payloads of other families (the legacy identity-upgrade checkpoint)
   pass through untouched, but one that claims to change the admin set in a
   version this build cannot apply is refused rather than ignored: accepting it
@@ -420,15 +421,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `missing_bodies`, so differing retention windows read as a coverage
   difference and not as incomplete sync. Part of #101.
 
-- **Outstanding invites survive the first join.** Enrollment required the
-  invite to name the *current* roster head, so the first joiner invalidated
-  every other invite the founder had handed out; those joiners saw only
-  `enrollment_failed`. An invite is now accepted at any checkpoint on the
-  group's roster chain. Enrollment rejections carry a typed code and a reason
-  (unknown group, not issuer, unknown checkpoint, identity conflict, applicant
-  mismatch, capability denied), and a rejection the applicant can fix leaves
-  the invite's uses intact. Roster adds also advance their timestamp past the
-  head, so two joiners redeeming one invite in the same millisecond both apply.
+- **Outstanding invites survive the first join.** The invite used to have to
+  name the *current* roster head, so the first joiner invalidated every other
+  invite the founder had handed out. An invite is now accepted at any retained
+  checkpoint.
+
+  The enrollment protocol this bullet originally described — its typed
+  rejection codes, its applicant queue, its retry against a moved head — was
+  deleted later in this same unreleased cycle, before any release carried it,
+  and is recorded under Changed above. A joiner now signs its own join record
+  and pushes it over the membership sync protocol; a refusal is projected from
+  group state by `membership.ExplainJoin` rather than returned by an
+  enrollment server — "the invite was revoked", "the invite has no uses left",
+  "this identity is banned from the group", "the invite issuer may no longer
+  administer this group" — and two joiners redeeming one invite in the same
+  millisecond both apply because the records merge as a set.
 - **Removal stays a removal.** Because an invite is no longer tied to one exact
   head, `roster remove` and the IPC member-remove path now revoke every invite
   bound to the removed member and report how many; enrollment separately
