@@ -30,6 +30,8 @@ import (
 	"entmoot/pkg/entmoot/publicmoot"
 	"entmoot/pkg/entmoot/store"
 	libp2ptransport "entmoot/pkg/entmoot/transport/libp2p"
+	libpeer "github.com/libp2p/go-libp2p/core/peer"
+	"github.com/multiformats/go-multiaddr"
 )
 
 type espOperationExecutor struct {
@@ -104,6 +106,9 @@ type inviteCreatePayload struct {
 	ValidUntilMS        int64                `json:"valid_until_ms,omitempty"`
 	BootstrapMultiaddrs []string             `json:"bootstrap_multiaddrs,omitempty"`
 	Target              *inviteTargetPayload `json:"target,omitempty"`
+	// NoFallbackPeers declines the other-member addresses the daemon would
+	// attach so the invite outlives this node's uptime.
+	NoFallbackPeers bool `json:"no_fallback_peers,omitempty"`
 }
 
 type openInviteCreatePayload struct {
@@ -111,6 +116,10 @@ type openInviteCreatePayload struct {
 	ValidUntilMS        int64    `json:"valid_until_ms,omitempty"`
 	MaxUses             *int     `json:"max_uses"`
 	BootstrapMultiaddrs []string `json:"bootstrap_multiaddrs,omitempty"`
+	// NoFallbackPeers is carried to redemption, when the capability is
+	// actually minted, so a widely shared link can decline to disclose other
+	// members' addresses.
+	NoFallbackPeers bool `json:"no_fallback_peers,omitempty"`
 }
 
 type openInviteAcceptPayload struct {
@@ -233,6 +242,7 @@ func (e espOperationExecutor) RedeemOpenInvite(ctx context.Context, token string
 		GroupID:             rec.GroupID,
 		TargetPublicKey:     append([]byte(nil), payload.EntmootPubKey...),
 		BootstrapMultiaddrs: append([]string(nil), rec.BootstrapMultiaddrs...),
+		NoFallbackPeers:     rec.NoFallbackPeers,
 	})
 	if err != nil {
 		if (!resp.sent || resp.rejected) && !alreadyRedeemed {
@@ -462,6 +472,7 @@ func (e espOperationExecutor) createInvite(ctx context.Context, req esphttp.Sign
 		TargetPublicKey:     target.EntmootPubKey,
 		BootstrapMultiaddrs: append([]string(nil), payload.BootstrapMultiaddrs...),
 		ValidUntilMS:        payload.ValidUntilMS,
+		NoFallbackPeers:     payload.NoFallbackPeers,
 	}
 	if payload.ValidFor != "" {
 		ttl, err := parseDurationDays(payload.ValidFor)
@@ -517,6 +528,13 @@ func (e espOperationExecutor) createOpenInvite(ctx context.Context, req esphttp.
 	if _, err := e.checkInviteAuthorityOverIPC(ctx, &ipc.InviteAuthorityCheckReq{GroupID: req.GroupID}); err != nil {
 		return nil, err
 	}
+	// Validate the addresses here, not at redemption. The token this call
+	// returns is the thing that gets shared, and no capability exists yet, so
+	// a malformed or over-long list would otherwise produce a link that fails
+	// for every joiner with an error the joiner cannot act on.
+	if err := validateOpenInviteBootstrap(payload.BootstrapMultiaddrs); err != nil {
+		return nil, err
+	}
 	token, tokenHash, err := esphttp.NewOpenInviteToken()
 	if err != nil {
 		return nil, err
@@ -527,6 +545,7 @@ func (e espOperationExecutor) createOpenInvite(ctx context.Context, req esphttp.
 		DeviceID:            req.DeviceID,
 		MaxUses:             maxUses,
 		BootstrapMultiaddrs: append([]string(nil), payload.BootstrapMultiaddrs...),
+		NoFallbackPeers:     payload.NoFallbackPeers,
 		CreatedAtMS:         now,
 		ExpiresAtMS:         expires,
 	})
@@ -1455,4 +1474,34 @@ func operationIPCError(frame *ipc.ErrorFrame) error {
 		status, code = http.StatusInternalServerError, "internal"
 	}
 	return &esphttp.OperationError{HTTPStatus: status, Code: code, Message: frame.Message}
+}
+
+// validateOpenInviteBootstrap rejects a bootstrap list that cannot produce a
+// redeemable capability: a malformed multiaddr, or so many addresses that the
+// minted capability would not fit the request a joiner sends.
+func validateOpenInviteBootstrap(addresses []string) error {
+	for _, raw := range addresses {
+		address, err := multiaddr.NewMultiaddr(raw)
+		if err != nil {
+			return &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request",
+				Message: fmt.Sprintf("invalid bootstrap multiaddr %q", raw)}
+		}
+		if _, err := libpeer.AddrInfoFromP2pAddr(address); err != nil {
+			return &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request",
+				Message: fmt.Sprintf("bootstrap multiaddr %q must end in /p2p/<peer-id>", raw)}
+		}
+	}
+	probe := entmoot.BootstrapCapability{AllowedMultiaddrs: append([]string(nil), addresses...)}
+	for _, raw := range addresses {
+		if address, err := multiaddr.NewMultiaddr(raw); err == nil {
+			if info, err := libpeer.AddrInfoFromP2pAddr(address); err == nil {
+				probe.AllowedPeerIDs = append(probe.AllowedPeerIDs, info.ID.String())
+			}
+		}
+	}
+	if size, tooLarge := libp2ptransport.CapabilityTooLarge(probe); tooLarge {
+		return &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request",
+			Message: fmt.Sprintf("bootstrap list alone is %d bytes, over the %d-byte limit a joiner can send", size, libp2ptransport.MaxCapabilityBytes)}
+	}
+	return nil
 }

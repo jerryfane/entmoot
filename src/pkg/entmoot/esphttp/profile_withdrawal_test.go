@@ -2,7 +2,9 @@ package esphttp
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -459,4 +461,54 @@ func TestTwoSourcesWithTheSameNameResolveDeterministically(t *testing.T) {
 		}
 	}
 	_ = ctx
+}
+
+// TestOpenInviteSchemaMigratesFromTheOldShape pins the migration, not the
+// CREATE TABLE. A deployed ESP already has esp_open_invites without
+// no_fallback_peers, and CREATE TABLE IF NOT EXISTS would leave it that way —
+// every open-invite read then fails on the missing column.
+func TestOpenInviteSchemaMigratesFromTheOldShape(t *testing.T) {
+	dir := t.TempDir()
+	old, err := sql.Open("sqlite", filepath.Join(dir, "esp.sqlite"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	// The table exactly as an older build wrote it.
+	if _, err := old.Exec(`CREATE TABLE esp_open_invites (
+  token_hash TEXT PRIMARY KEY,
+  group_id BLOB NOT NULL,
+  device_id TEXT NOT NULL DEFAULT '',
+  max_uses INTEGER NOT NULL,
+  use_count INTEGER NOT NULL DEFAULT 0,
+  revoked INTEGER NOT NULL DEFAULT 0,
+  bootstrap_multiaddrs BLOB,
+  created_at_ms INTEGER NOT NULL,
+  updated_at_ms INTEGER NOT NULL,
+  expires_at_ms INTEGER NOT NULL
+);`); err != nil {
+		t.Fatalf("seed old schema: %v", err)
+	}
+	gid := testGroupID(3)
+	if _, err := old.Exec(`INSERT INTO esp_open_invites
+ (token_hash, group_id, device_id, max_uses, use_count, revoked, bootstrap_multiaddrs, created_at_ms, updated_at_ms, expires_at_ms)
+ VALUES ('hash', ?, 'dev', 1, 0, 0, NULL, 1, 1, 9999999999999)`, gid[:]); err != nil {
+		t.Fatalf("seed row: %v", err)
+	}
+	if err := old.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	state, err := OpenSQLiteStateStore(dir)
+	if err != nil {
+		t.Fatalf("OpenSQLiteStateStore on an old database: %v", err)
+	}
+	defer state.Close()
+
+	invites, err := state.ListOpenInvitesByGroup(context.Background(), gid)
+	if err != nil {
+		t.Fatalf("reading open invites after migration: %v", err)
+	}
+	if len(invites) != 1 || invites[0].NoFallbackPeers {
+		t.Fatalf("migrated rows = %+v, want the seeded row with no_fallback_peers false", invites)
+	}
 }
