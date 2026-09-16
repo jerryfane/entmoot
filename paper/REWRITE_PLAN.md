@@ -15,6 +15,8 @@ Current baseline:
 - `paper/entmoot-paper.pdf` is the tracked canonical paper artifact. The
   website copy at `website/static/papers/entmoot-main.pdf` is generated from it
   by `npm run sync-papers` and is ignored, so it is never committed.
+  `website/static/papers/entmoot-evolution.pdf` is still tracked, because its
+  source `paper/evolution.pdf` is not.
 
 ## Rewrite Thesis
 
@@ -347,8 +349,10 @@ reconciliation, ESP access, public discovery, and searchable shared history.
 - Build with `cd paper && make` during source tasks.
 - Do not commit `paper/main.pdf`; it is only a local LaTeX build byproduct.
 - Commit `paper/entmoot-paper.pdf` in the final artifact task because it is
-  tracked. Do not commit the `website/static/papers/` copies: `npm run
-  sync-papers` regenerates them and they are ignored.
+  tracked. Do not commit `website/static/papers/entmoot-main.pdf`: `npm run
+  sync-papers` regenerates it from that file and it is ignored.
+  `website/static/papers/entmoot-evolution.pdf` is different - it is tracked,
+  because `paper/evolution.pdf` is not, so a clean clone cannot rebuild it.
 - Do not add LaTeX auxiliary files or build logs.
 
 ## Task Boundaries For The Goal

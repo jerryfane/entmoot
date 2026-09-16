@@ -416,8 +416,9 @@ Details:
   - `cd paper && make`
 - Review build warnings and fix missing references/citations.
 - Update `paper/entmoot-paper.pdf`.
-- Do not touch `website/static/papers/`: `npm run sync-papers` copies the
-  built PDF there on every website build, and the copies are ignored.
+- Do not commit `website/static/papers/entmoot-main.pdf`: `npm run
+  sync-papers` copies it there on every website build, and it is ignored. The
+  evolution PDF in that directory is still tracked.
 - Verify `website/docs/reference/papers.md` still points to the right artifact.
 - Verify issue #63 is not closed by this task if the Results section still
   contains only the evaluation plan. If a separate tracking issue is preferred,
