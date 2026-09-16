@@ -33,4 +33,6 @@ not consensus state.
 ```
 
 Live-agent actions are `reply`, `message.summarize`, `alert.owner`, and
-`metadata.update`. ESP filters any action a member's live config does not allow.
+`metadata.update`. The ESP stores and validates the allow-list when the config
+is written; the daemon's live runner enforces it when an action is applied, so
+a refused action is refused there, not at the ESP.

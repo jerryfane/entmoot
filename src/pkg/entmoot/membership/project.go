@@ -36,7 +36,8 @@ func kindRank(kind Kind) int {
 //
 // Every node that holds the same records computes the same membership, because
 // the records are applied in an order derived from their contents — timestamp,
-// then kind, then id — and never in the order they arrived. That is what makes
+// then kind, then the founder's record before a delegated admin's, then id —
+// and never in the order they arrived. That is what makes
 // concurrent writers safe: there is no head to contend for and nothing to
 // repair afterwards.
 //

@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- **Five one-off files are removed from the repository root.**
+  `GOAL-social-mode-disable-fleet-tasks.md` (the prompt for work that shipped,
+  and whose feature is now deleted outright), `jj3-connectivity-summary-and-fix.md`,
+  `jj3-repair-plan.md` and `asia-155760-fix-steps.md` (June-2026 incident notes
+  for a Pilot runtime that no longer exists, so their instructions contradict
+  the current docs), and `arxiv_endorser_candidates.csv`.
+
+  The CSV held 22 named people with their email addresses and affiliations in a
+  public repository. Deleting it here stops it being served from the default
+  branch, but it remains in the commit history and is still fetchable; purging
+  that needs a history rewrite and a force-push, which is an owner decision.
+
 - **Fleet, tasks and agent-commands are gone.** The whole coordination concept
   is removed, not disabled: Fleets, Fleet membership and Fleet invites, Fleet
   activity, the task queue (create, approve, assign, claim, submit, complete,
@@ -120,11 +132,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Group membership is now a set of self-signed records with signed
   checkpoints, replacing the linear founder/admin-signed roster chain.** A
   joiner signs its own admission, redeeming an invite that authorises it, so
-  admitting a member no longer requires the founder or a delegated admin to be
-  online and writing. Records (`join`, `leave`, `rekey`, `remove`, `unban`,
+  no founder or admin has to sign anything when the invite is used. The
+  ISSUING node does still have to be reachable then: an invite may only name
+  its issuer's own peer id as a bootstrap address (invite.go), and a peer
+  serves a pre-membership redemption only if it is named there (the transport
+  checks the capability's allowed peer ids), so the issuer is the only peer
+  that can serve one. Records (`join`, `leave`, `rekey`, `remove`, `unban`,
   `policy`, `revoke_invite`) merge by one deterministic total order —
-  timestamp, then kind, then id — with joins applied before rekeys, authority
-  records, and leaves. The kind order is a decision, not an accident: a
+  timestamp, then kind, then the founder's record before a delegated admin's,
+  then record id — with joins applied before rekeys, authority records, and
+  leaves. The kind order is a decision, not an accident: a
   removal beats a simultaneous join, and a leave always sticks, because
   admitting someone by mistake is recoverable and failing to remove them is
   not.
@@ -162,10 +179,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   signature such a node can check. Admins may still sign checkpoints — that is
   what lets a group retire history while the founder is away — and at one
   sequence a founder-signed checkpoint wins over an admin-signed one, so the
-  chain a joiner walks stays anchored. Each node keeps the chain from its
-  newest founder-signed checkpoint forward, so a founder that never
-  checkpoints leaves a longer chain behind; `roster status` shows it as the
-  gap between the anchor and the canonical sequence.
+  chain a joiner walks stays anchored. Retention keeps every founder-signed
+  checkpoint still on the canonical chain, so it starts from the oldest of
+  them: a founder that never checkpoints again leaves the whole chain behind
+  it in place.
 
   A record or checkpoint dated more than five minutes ahead of the local clock
   is refused. For records the reason is that they merge in timestamp order, so
@@ -230,90 +247,100 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Members can publish a display name again.** `entmootd profile set -name
+  pi-burj` publishes the name as an ordinary signed message on the reserved
+  topic `entmoot/profile/1`; every member that receives it records the name,
+  and ESP member listings show it. `profile clear` withdraws it and `profile
+  show` prints what this node has observed. A name expires after 30 days by
+  default; `-ttl` asks for another duration, and 0 or anything above the
+  90-day maximum publishes 90 days, since every receiving node clamps a
+  longer or missing expiry to that bound. So a node that leaves stops being
+  displayed.
+
+  This closes a gap, not a new idea: the ESP has always read display names and
+  the docs have always promised that "a member may additionally publish a
+  signed member profile", but the writer lived in the pre-libp2p gossip layer.
+  When that was replaced nothing took over, so `UpsertNodeProfile` had no
+  caller and no member could set a name at all — every member was shown as its
+  own key.
+
+  A name is a hint, never authority. It travels as a normal message, so the
+  author is already known to be a current member with a valid signature, and a
+  removed member cannot publish a new one. Display output stays
+  `name#MemberID`, so choosing somebody else's name cannot impersonate them,
+  and a payload carrying a name on any other topic is ignored.
+
+  Because that display form is a bare concatenation, a name may not contain
+  `#`, a control character, a Unicode format character (which includes the
+  bidi overrides that would reverse the appended MemberID) or a line or
+  paragraph separator. Names are limited to 64 runes and 255 bytes; the byte
+  limit matches the store's own cap, so a name that would be silently dropped
+  is refused at publish time instead of being reported as published.
+
+  Ordering is by the author's issue time, and a profile dated more than five
+  minutes ahead of the receiving node's clock is refused — the same bound
+  membership records use. Both halves matter: without the bound, one
+  future-dated message would pin a member's name permanently, since a record is
+  only replaced by a newer one; ordering by receipt time instead would let an
+  old profile arriving late beat the newer one already recorded, so two nodes
+  would disagree about a name depending on what arrived when. A withdrawal is
+  recorded as a tombstone at its own issue time rather than deleted, so an
+  older profile cannot undo it however late it arrives. The author's expiry is
+  honoured when shorter than 90 days and clamped when longer.
+
+  Profiles that arrive by history sync are reconciled after each catch-up:
+  history insertion writes straight to the store, so a name whose only copy
+  arrived that way would never otherwise be learned.
+
+
 - **Delegated admins.** A founder can now name delegated admins with
-  `roster admin grant|revoke|list`, carried as a founder-signed
-  `policy_change` entry holding the complete set (`type: admins/v1`, ceiling
-  16). An admin may add and remove ordinary members (`roster add|remove`, the
-  IPC member-remove path, the ESP member_remove operation) and issue invites
-  from its own host (`invite create`, IPC `invite_create`), so a group keeps
-  admitting and evicting members while the founder is away. An admin cannot
+  `roster admin grant|revoke|list`, carried as a founder-signed membership
+  record of kind `policy` holding the complete set (ceiling 16). The
+  `policy_change` entry with `type: admins/v1` is the legacy linear-chain
+  form: membership v3 reads it when projecting a legacy chain, and the only
+  path that still writes a `policy_change` at all is the legacy
+  identity-upgrade conversion, which mints one as its upgrade entry. An admin
+  may issue invites from its own host (`invite create`, IPC `invite_create`)
+  that newcomers sign themselves in with, and may remove
+  ordinary members (`roster remove`, the IPC member-remove path, the ESP
+  member_remove operation), so a group keeps admitting and evicting members
+  while the founder is away. An admin cannot
   remove the founder, remove another admin, or change the admin set; losing
   membership or delegation removes the authority at once. Invites gained an
   optional `issuer` field: `founder` stays the anchor a joiner pins, while
-  `issuer` names the admin that signed. Enrollment and pre-membership
-  roster/history reads both require that signer to be a member who may
-  currently administer the group, so naming yourself as issuer buys nothing.
+  `issuer` names the admin that signed. Every pre-membership read, and the join
+  push itself, require that signer to be able to administer the group at that
+  moment — the founder always, a delegated admin only while it is still an
+  unbanned member — so naming yourself as issuer buys nothing.
   Policy payloads of other families (the legacy identity-upgrade checkpoint)
   pass through untouched, but one that claims to change the admin set in a
   version this build cannot apply is refused rather than ignored: accepting it
   would leave this node honouring admins the founder may have just removed
   while a newer peer applied the change, and the two would then disagree about
   who may sign.
-- **Roster state travels between members, not just from the founder.** Every
-  node now pulls roster entries from up to eight reachable members, founder
-  first, and the founder pulls too. Without this, an admin-authored add or
-  removal stayed on one node and the group ran on two heads. One full chain
-  pull per round, a per-peer exponential backoff (30s to 15m) after a pull
-  that cannot be taken, and a ceiling of 4096 *newly downloaded* entries per
-  pull bound what one member can cost. The ceiling does not count the local
-  prefix and does not discard progress: a pull that stops at the ceiling
-  returns the validated entries it did take, so a node further behind than one
-  round converges over several rounds instead of re-downloading the same pages
-  forever, and a peer serving progress is not backed off. An unfinished round
-  hands its paging snapshot back (`release_snapshot`), so chaining rounds does
-  not exhaust the peer's four per-peer slots and stall the catch-up it is
-  meant to make; a peer that does not know the field keeps the snapshot until
-  it expires, as before. A pull that applied some entries and then hit a
-  rejection keeps its divergence record: part landing does not mean the chains
-  agree. The head probe that
-  decides whether a pull is worth it reserves no paging snapshot on the peer,
-  so probing every tick cannot starve the pull it is probing for. A peer whose
-  chain does not extend ours is reported as `roster_divergence` in status
-  output, with both heads, the reason and when it started; a timeout, an
-  exhausted server slot or a rotated snapshot earns the same backoff but is
-  not reported as divergence, and a report is dropped as soon as the head it
-  names turns out to be on our chain. A peer holding fewer entries than our
-  prefix now answers `short_chain` rather than `malformed`, so a fork with a
-  shorter chain is reported as one instead of looking like a transport error;
-  that reading requires the head to be off our chain as well, which the caller
-  supplies, because the server cannot know our head.
-  Fork evidence is sticky: a later timeout does not erase a standing report,
-  only a successful exchange does. The head probe falls back to the paged
-  request against a peer built before the `head_only` field, so probing keeps
-  working across versions. Enrollment retries its own entry against
-  a moved head instead of failing, and one group admits one applicant at a
-  time, so two invites redeemed for the same person in the same instant cost a
-  retry rather than two roster entries for one member.
-- **`roster repair` ends a fork.** The roster is strictly linear (one parent,
-  which must be the current head), so two authorised signers who commit
-  against the same head while partitioned produce two chains that no retry can
-  merge. Enrollment retrying against a moved head shrinks the window to the
-  write itself and `roster_divergence` makes a split visible; this closes it.
-  `roster repair -group <id> [-peer <peer>] [-dry-run]` asks a peer for its
-  chain, validates it from the shared genesis under the ordinary acceptance
-  rules, adopts it in one transaction, and re-signs the local changes the
-  adopted chain does not carry. It reports what it discarded, what it
-  re-issued, what the adopted chain already satisfied, and — with a non-zero
-  exit — any change this node may no longer author, so nothing goes missing in
-  silence. The command needs the running daemon, which holds the roster writer
-  lease and the peer connections. A repair never changes group or founder: a
-  chain with a different genesis, a bad signature or a gap is refused with the
-  log untouched, and so is a peer that is merely behind, whose whole chain is
-  already on ours — adopting that would delete committed history to fix
-  nothing. If the durable swap reports an error, the store is read back and the
-  in-memory view follows whatever it actually holds, because a failed commit is
-  not proof the write did not land; the error then names the changes the
-  interrupted repair did not re-issue, and when the store cannot be read it
-  says the group's state is unknown instead of guessing. A repair takes a chain
-  longer than one pull by chaining pulls, up to 16 rounds. A message published in
-  the fork window naming a discarded head cannot be verified against the
-  adopted chain; that is the cost of converging. `roster admin` remains offline
-  maintenance only, like `roster add|remove`.
+- **Membership state travels between members, not just from the founder.**
+  Every node pulls from up to eight reachable members, founder first, and the
+  founder pulls too. Without this, a record authored away from the founder — a
+  self-signed join, a leave, an admin-signed removal — stayed on the node that
+  accepted it.
+
+  The linear-chain machinery this bullet originally described — per-peer
+  backoff, a newly-downloaded-entry ceiling, paging-snapshot hand-back,
+  `short_chain`/`head_only` negotiation, `roster_divergence` reporting and
+  `roster repair` — was deleted later in this same unreleased cycle, before
+  any release carried it; the deletion is recorded under Changed above and
+  Fixed below, not under Removed. Membership v3 has no
+  fork to detect, adopt or repair: records merge as a set, so a pull is a
+  checkpoint plus a cursor and two nodes holding the same records project the
+  same membership. None of those commands or status fields exist; `roster
+  repair` exits 5.
 - **Removal reporting is complete and survives cleanup failure.** `roster
   remove`, the IPC member-remove path and the ESP member_remove operation now
-  report the removal result even when invite revocation fails, carrying
-  `invite_revocation_error` and the manual revoke command, instead of failing
-  in a way that looked as though nothing had happened. All three report the
+  report the removal result even when the local invite ledger cannot be read,
+  carrying `invite_ledger_error` and the manual revoke command, instead of
+  failing in a way that looked as though nothing had happened. The field was
+  called `invite_revocation_error` while it was written, which named a
+  revocation step removal does not perform. All three report the
   group's remaining open bearer invites and how many ESP-hosted open-invite
   tokens remain — a second bearer path revoked through the ESP API, not by a
   roster change — and say so explicitly when that store cannot be read
@@ -331,6 +358,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   carries the same `max_uses` and an explicit `open` flag.
 
 ### Fixed
+
+- **`docs/CLI_DESIGN.md` no longer documents commands that do not exist.** It
+  still listed `roster add`, `roster repair` and a `roster_divergence` status,
+  and described a linear roster chain that two signers could fork — all removed
+  by membership v3. Corrected: the founder command list, the data-root layout
+  (which named a `conversion-*` glob matching neither the journal nor the lock,
+  and omitted `esp-devices.json`, `default_moot.json`, `relays.json`,
+  `bootstrap-admission.db` and the `policies/` directory that actually holds
+  `group-policies.json`), the fork section, and the invite section's
+  account of how a join is refused. The exit-code table is unchanged.
+
+  Seven files under `pkg/entmoot/ipc` and `pkg/entmoot/store` cite this doc by
+  section number, including sub-sections 4.2 and 5.2-5.4 that it never actually
+  had. Those sub-sections now exist and describe the wire format the code
+  implements: a frame is `[4-byte big-endian length][1-byte type][JSON body]`
+  with the length counting the type byte. Four `cmd/entmootd` files cited
+  sections 3.1, 3.3, 3.4, 3.5 and 5.5, which the compact rewrite of section 3
+  dropped long ago; those comments now name sections that exist, so every
+  `CLI_DESIGN` citation in the tree resolves. Two `ARCHITECTURE.md` citations
+  are also repointed: `§3.4` and `§3.2` never existed, and the rule one of them
+  claimed is not written down anywhere, so the comments now state it
+  themselves.
+
+- **`README.md` describes the current commands and guarantees.** It listed
+  `roster add`, which does not exist (running it exits 5), claimed roster order
+  is "monotonic and fork-checked" after membership v3 removed fork detection,
+  advertised a memory message store deleted earlier in this unreleased cycle, and called
+  a join an "enrollment" — a separate enrollment protocol did exist, from the
+  libp2p cutover until membership v3 deleted it earlier in this same cycle, so
+  the word is stale rather than never-true.
 
 - **Roster-ahead messages are held, not lost.** A publisher whose roster moved
   first names a head the receiver has not synchronized, and live validation
@@ -367,21 +424,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `missing_bodies`, so differing retention windows read as a coverage
   difference and not as incomplete sync. Part of #101.
 
-- **Outstanding invites survive the first join.** Enrollment required the
-  invite to name the *current* roster head, so the first joiner invalidated
-  every other invite the founder had handed out; those joiners saw only
-  `enrollment_failed`. An invite is now accepted at any checkpoint on the
-  group's roster chain. Enrollment rejections carry a typed code and a reason
-  (unknown group, not issuer, unknown checkpoint, identity conflict, applicant
-  mismatch, capability denied), and a rejection the applicant can fix leaves
-  the invite's uses intact. Roster adds also advance their timestamp past the
-  head, so two joiners redeeming one invite in the same millisecond both apply.
-- **Removal stays a removal.** Because an invite is no longer tied to one exact
-  head, `roster remove` and the IPC member-remove path now revoke every invite
-  bound to the removed member and report how many; enrollment separately
-  refuses any applicant removed after the invite's checkpoint. Open bearer
-  invites name no target, so they cannot be attributed: both paths list the
-  remaining open nonces so an operator can revoke them.
+- **Outstanding invites survive the first join.** The invite used to have to
+  name the *current* roster head, so the first joiner invalidated every other
+  invite the founder had handed out. An invite is now accepted at any retained
+  checkpoint.
+
+  The enrollment protocol this bullet originally described — its typed
+  rejection codes and its separate protocol — was
+  deleted later in this same unreleased cycle, before any release carried it,
+  and is recorded under Changed above. A joiner now signs its own join record
+  and pushes it over the membership sync protocol; a refusal is projected from
+  group state by `membership.ExplainJoin` rather than returned by an
+  enrollment server — "the invite was revoked", "the invite has no uses left",
+  "this identity is banned from the group", "the invite issuer may no longer
+  administer this group" — and two joiners redeeming one invite in the same
+  millisecond both apply because the records merge as a set.
+- **Removal stays a removal.** Removal alone voids the invites the removed
+  member issued: an invite carries its issuer's current authority, and the
+  removal takes that authority away, so there is no revocation step and no
+  count to report. What `roster remove` and the IPC member-remove path do
+  report is the group's remaining OPEN bearer invites, from this node's ledger
+  and from the ESP store — those name no target, so removing a member says
+  nothing about them and anyone holding one can still join. A plainly removed
+  identity that redeems a fresh invite is admitted again, by design; only a ban
+  refuses it ("this identity is banned from the group").
 
 ### Changed
 

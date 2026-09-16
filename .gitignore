@@ -10,7 +10,7 @@ CLAUDE.md
 coverage.out
 /src/entmoot
 /src/entmootd
-# release artifacts built under src/dist/
+# local build output; releases are published as GitHub release archives
 /src/dist/
 
 .claude/

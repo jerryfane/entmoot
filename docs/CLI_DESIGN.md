@@ -57,34 +57,50 @@ group create
 group policy status|set|clear
 group public descriptor|publish
 invite create|list|revoke
-roster add|remove
+roster remove|ban|unban
 roster admin list|grant|revoke
-roster repair
+roster leave|checkpoint|status
+membership upgrade|adopt
 ```
 
 ## 4. Storage and Ownership
+
+### 4.1 Data root
 
 The data root contains:
 
 ```text
 identity.json          Persistent Ed25519 member identity
 control.sock           Local daemon control socket
-groups/<gid>/...       Roster, messages, indexes, and sync state
+groups/<gid>/...       Membership records, checkpoints, messages, indexes
 mailbox.sqlite         ESP mailbox cursors
 esp.sqlite             ESP and live-agent projections
 runtime.env            Installed wrapper defaults
-conversion-*           One-way legacy conversion journal and backup
+esp-devices.json       ESP device key registry
+default_moot.json      Recorded owner consent for The Ent Moot
+relays.json            Relay hints adopted from an invite, reused on restart
+bootstrap-admission.db Local ledger of invites this node issued
+policies/              Local per-group enforcement policy and its lock
+conversion.sqlite      One-way legacy conversion journal
+conversion-backup/     Pre-conversion copy of the root's regular files,
+                       excluding the journal, the lock files and the per-group
+                       upgrade checkpoint
+conversion.lock        Exclusive lock held for the duration of a conversion
 ```
 
-Per-group SQLite schemas store immutable signed bytes, roster state, query
-indexes, and generation-bound coverage data. Store writes are
+### 4.2 Per-group schemas
+
+Per-group SQLite schemas store immutable signed bytes, membership records and
+checkpoints, query indexes, and generation-bound coverage data. Store writes are
 transactional and return whether a message was newly inserted so local delivery
 and network propagation happen once per process.
 
-The data-root owner serializes roster and message mutations. Offline maintenance
-requires the owner to be stopped and uses the same exclusive lock.
+The data-root owner serializes membership and message mutations. Offline
+maintenance requires the owner to be stopped and uses the same exclusive lock.
 
 ## 5. IPC and Lifecycle
+
+### 5.1 Socket lifecycle
 
 The daemon creates `<data>/control.sock`. A stale socket is removed only after a
 bounded liveness check proves no daemon owns it. Control requests have bounded
@@ -94,6 +110,36 @@ the libp2p host, group runtimes, stores, and socket in ownership order.
 `publish`, live `tail`, online joins, and administrative mutations use this
 boundary. Read-only `query`, `info`, and `version` do not require a running
 daemon.
+
+### 5.2 Framing
+
+Each request and response is one frame:
+
+```text
+[4-byte big-endian length][1-byte message type][JSON body]
+```
+
+The length counts the type byte plus the body, so it is `1 + len(body)`. A
+zero length is malformed, and a length above `ipc.MaxFrameSize` is refused as
+oversized before the body is read, so an oversized prefix costs no allocation.
+
+### 5.3 Message types
+
+Every frame carries a numeric message type. Types are registered in
+`pkg/entmoot/ipc/types.go` and the numbering is deliberately stretched to leave
+room for future pairs without renumbering existing ones.
+
+Do not assume a request and its response are adjacent. Most pairs are
+(`0x10`/`0x11`, `0x1C`/`0x1D`), but `MsgInviteAuthorityCheckReq` is `0x1E` and
+its response is `0x20`, split by `MsgError` at `0x1F`. Gaps also exist where
+types were retired. Match on the constants, not on arithmetic.
+
+### 5.4 Error envelope
+
+An error response has `type` set to the literal string `error` and carries a
+short uppercase code plus a human-readable reason. Codes are registered in
+`pkg/entmoot/ipc/error.go` and map to the process exit codes in section 6; an
+unrecognised code maps to exit 1.
 
 ## 6. Exit Codes
 
@@ -161,44 +207,46 @@ bootstrap peers/addresses, use limit, expiry, and capability nonce.
 
 The founder or any delegated admin may issue invites and apply membership
 changes. `roster admin grant|revoke` rewrites the delegated-admin set in one
-founder-signed `policy_change` entry (`type: admins/v1`, ceiling 16) and
-`roster admin list` reports it. An admin may add and remove ordinary members;
+founder-signed membership record of kind `policy`, carrying the complete set
+(ceiling 16), and `roster admin list` reports it. An admin may add and remove ordinary members;
 it cannot remove the founder, remove another admin, or change the admin set.
 Losing membership or delegation ends the authority at once, including for
-invites that admin already issued. Enrollment requires the invite's `founder`
-field to be the group's real founder, since that is the anchor the joiner pins.
+invites that admin already issued. A join requires the invite's `founder` field to be the group's real founder,
+since that is the anchor the joiner pins.
 
 `invite list` shows issued invites with uses spent and state
 (open/spent/expired/revoked). `invite revoke` withdraws an invite before it
 expires, blocking every remaining use; revoking a nonce this data root never
 recorded also blocks it, so a leaked invite file is recoverable. `roster
-remove` revokes the invites bound to the removed member, reports the count, and
-lists the group's remaining open nonces, which name nobody and therefore cannot
-be revoked automatically.
+remove` needs no revocation step for the invites the removed member issued:
+each carries its issuer's authority, which the removal takes away. It lists the
+group's remaining open nonces, which name nobody and therefore cannot be
+revoked automatically.
 
-Two authorised signers who write against the same roster head produce two
-chains, and the log is strictly linear, so nothing merges them: the group
-splits and `status` reports `roster_divergence`. `roster repair -group <id>`
-ends that split from the losing side. It asks the named peer (`-peer`, or the
-only divergent peer) for its chain, validates it from the shared genesis,
-adopts it, and re-signs the local changes the adopted chain does not carry.
-`-dry-run` reports what would be discarded first. The command needs a running
-daemon, because the daemon holds the roster writer lease and the peer
-connections. A change this node may no longer author is reported as
-unrecoverable, with a non-zero exit, instead of being dropped in silence; a
-message published in the fork window and naming a discarded head cannot be
-verified against the adopted chain.
+Two authorised signers may write at the same time without consequence.
+Membership is a set of signed records merged in one deterministic order, so
+there is no head to race and no fork to detect: both records simply apply.
+There is no `roster repair` and no `roster_divergence` status, because neither
+condition can arise. `roster status` reports the canonical checkpoint, the
+member set, admins, bans, the pending record count, and the policy.
 
-Join validates the complete capability before network use, fetches roster state
+Every `checkpoint_every` records an admin signs a checkpoint that replaces the
+records before it, so storage follows group size rather than group age. A
+checkpoint is only accepted when its signer had authority in the checkpoint
+before it, and a node that holds the covered records verifies the projection
+matches before adopting.
+
+Join validates the complete capability before network use, fetches membership state
 only from an allowed serving peer, binds the fetched founder and its own
 resulting membership, and persists consumption per applicant. Invalid, expired,
 replayed, revoked, exhausted, wrong-target or wrong-founder capabilities
-install no partial group state. An invite's checkpoint only has to be on the
-group's roster chain: earlier joins advance the head without invalidating
-outstanding invites, while an applicant removed after that checkpoint is
-refused. Enrollment rejections carry a typed code and a reason; a rejection the
-applicant could fix does not spend a use, and an admission-store failure is
-reported as an internal condition without leaking store detail.
+install no partial group state. An invite names the checkpoint its issuer held; later joins do not
+invalidate outstanding invites, while an applicant banned after that checkpoint
+is refused. A refused join reports why — invite revoked, exhausted, expired, banned
+subject, or an issuer who may no longer administer the group — and installs no
+partial group state. Issuer authority is judged against current group
+state, not against the checkpoint the invite names: the founder may always
+issue, and a delegated admin only while it is still an unbanned member.
 
 Open-invite redemption uses the same Entmoot identity. The joiner signs a
 bounded issuer challenge with its Ed25519 key; the issuer verifies the MemberID,

@@ -52,9 +52,11 @@ entmootd membership upgrade -group <GROUP_ID>
 entmootd group public descriptor|publish -group <GROUP_ID> [flags]
 ```
 
-Everything under `roster` except `status`, both membership `group policy`
-subcommands, and `membership upgrade` write a signed record and take the
-group's writer lease, so stop the local daemon before running them.
+Everything under `roster` except `status` and `admin list`, the two membership
+`group policy` subcommands `join-rule` and `checkpoint-every`, and `membership
+upgrade` write a signed record and take the group's writer lease, so stop the
+local daemon before running them. `roster status`, `roster admin list` and
+`group policy status` only read local state.
 See [Founder Commands](./founder-commands).
 
 Public listing, open invites, ESP membership, message-history indexing, and

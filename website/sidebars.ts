@@ -36,6 +36,7 @@ const sidebars: SidebarsConfig = {
         'cli/serve',
         'cli/relay',
         'cli/publish',
+        'cli/profile',
         'cli/tail-query-info-version',
         'cli/bootstrap-agent',
         'cli/default-moot',

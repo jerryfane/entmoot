@@ -171,7 +171,7 @@ try:
     assert_unjoined('c', group2)
     print('PASS full three-daemon restart, persisted membership/peers/history, both-group delivery', flush=True)
     success = True
-    print('LIBP2P CANARY PASSED: 3 daemons; 2 groups; fresh enrollment, live fanout, member publishing, group separation, offline/full restart catchup', flush=True)
+    print('LIBP2P CANARY PASSED: 3 daemons; 2 groups; fresh joins, live fanout, member publishing, group separation, offline/full restart catchup', flush=True)
 finally:
     for name in list(processes):
         stop(name)

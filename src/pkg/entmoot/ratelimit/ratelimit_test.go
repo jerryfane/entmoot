@@ -21,10 +21,12 @@ var anchor = time.Date(2026, 4, 17, 12, 0, 0, 0, time.UTC)
 // injected via a Fake by the caller.
 func testLimits() ratelimit.Limits {
 	return ratelimit.Limits{
-		MsgRate:    ratelimit.DefaultMsgRate,
-		MsgBurst:   ratelimit.DefaultMsgBurst,
-		BytesRate:  ratelimit.DefaultBytesRate,
-		BytesBurst: ratelimit.DefaultBytesBurst,
+		// Representative numbers for the bucket maths under test; the
+		// enforced values come from the group policy, not from here.
+		MsgRate:    100,
+		MsgBurst:   200,
+		BytesRate:  1 << 20,
+		BytesBurst: 4 << 20,
 	}
 }
 
