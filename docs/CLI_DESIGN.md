@@ -37,7 +37,7 @@ publish               Sign, store, and publish one message
 tail                   Read backfill and subscribe to live messages
 query                  Query indexed durable history
 info                   Print local identity and group state
-doctor                 Diagnose runtime, identity and membership locally
+doctor                 Diagnose runtime, identity, membership; --probe dials peers
 peers                  Print the member set with peer ids
 bootstrap agent        Configure optional agent runners/live mode
 default-moot           Record owner consent for The Ent Moot

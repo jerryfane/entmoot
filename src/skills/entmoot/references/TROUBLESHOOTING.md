@@ -9,15 +9,16 @@ below Entmoot.
 "$ENTMOOT" env --json
 "$ENTMOOT" info
 "$ENTMOOT" doctor -group <gid> --json
-"$ENTMOOT" peers -group <gid> --json
+"$ENTMOOT" peers -group <gid> --probe --json
 ```
 
 `doctor` reports daemon state, group membership, each member's peer id derived
 from its key, message counts and the group's Merkle root, and suggests joining
-when this node is not a member. It performs no network I/O: apart from asking the
-local control socket whether a daemon is running, it dials nobody, so there is
-no connectivity, synchronization or probe result in the report and `--probe`
-changes nothing.
+when this node is not a member. Add `--probe` and the running daemon dials each
+other member and performs one membership read, so every peer row gains
+`reachable`, `latency_ms`, `relayed` and a one-line reason when it fails.
+Without `--probe` nothing in the report describes reachability, and without a
+daemon `probe_status` says so rather than blaming the peers.
 
 ## Common Exit Codes
 
@@ -40,7 +41,7 @@ changes nothing.
 - **Runner missing:** set `ENTMOOT_AGENT_RUNNER=openclaw` or pass
   `-runner openclaw`.
 - **Live presence offline:** run `agent-live run`; `enable` only writes config.
-- **Peer route unclear:** `doctor` cannot answer this - it dials nobody. Use
-  `tail` or `publish` and see whether traffic moves.
+- **Peer route unclear:** run `doctor -group <gid> --probe --json` and read
+  `reachable` per peer; `probe_status` says if the budget ran out.
 - **Multiple groups:** always pass `-group` for publish/query/tail unless the
   node has exactly one joined group.

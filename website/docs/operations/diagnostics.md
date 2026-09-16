@@ -10,17 +10,30 @@ entmootd version
 entmootd env --json
 entmootd info
 entmootd doctor --json
-entmootd doctor -group <GROUP_ID>
-entmootd peers -group <GROUP_ID>
+entmootd doctor -group <GROUP_ID> --probe
+entmootd peers -group <GROUP_ID> --probe
 ```
 
 `doctor` reports the local daemon, identity and libp2p PeerID, joined groups,
 their membership and message counts, each group's Merkle root, and one row per
-member with the peer id derived from its key. It performs no network I/O: the
-`--probe` and `--timeout` flags are accepted but currently change nothing, and
-the member rows come from local membership state rather than from dialling
-anybody. Use `--json` for automation, and strip the data directory and
-identity paths yourself before sharing a report.
+member with the peer id derived from its key. Without `--probe` those rows come
+from local state and say nothing about whether a peer answers.
+
+`--probe` asks the running daemon to dial every other member and perform one
+membership read for the group, which is the question behind "why will this
+group not converge": it proves the peer is up, speaks the protocol, and serves
+this group to this node. A connection alone would not. Each peer row then
+carries `reachable`, `latency_ms`, `relayed`, how many addresses were tried,
+and a one-line reason when it failed.
+
+The probe runs in the daemon, because the daemon owns the libp2p host, the
+peerstore and the relay configuration; a second process dialling with its own
+identity would answer a different question. Without a daemon the group reports
+`probe_status: runtime_unavailable` and no peer row claims anything.
+
+`--timeout` is the budget for the whole probe, not per peer, so a thirty-member
+group does not cost thirty timeouts; `probe_status` reads `incomplete` when it
+ran out. Use `--json` for automation, and `--redact` when sharing a report.
 
 Use `env` when a node reports `no running Entmoot daemon found` even though a
 daemon process exists. It detects common wrong-namespace cases where the host
@@ -37,10 +50,9 @@ Use these commands from the same runtime namespace and data root as the agent.
 Live config, presence, and live cursors are in `esp.sqlite` for the current
 `-data` path.
 
-`peers` prints the same member rows `doctor` builds, from the same local
-state, so it too opens no streams: a listed peer means a member whose key is in
-the group, not a peer proved reachable. Use `tail`, `publish` or a join to
-exercise reachability.
+`peers` prints the same member rows `doctor` builds and takes the same
+`--probe` and `--timeout`. Without `--probe` a listed peer means a member whose
+key is in the group, not a peer proved reachable.
 
 Common diagnoses:
 

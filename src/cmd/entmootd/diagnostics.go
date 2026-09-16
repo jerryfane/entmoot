@@ -53,6 +53,10 @@ type doctorGroupReport struct {
 	Peers             []doctorPeerReport `json:"peers"`
 	Error             string             `json:"error,omitempty"`
 	Suggestion        string             `json:"suggestion,omitempty"`
+	// ProbeStatus is empty without -probe. With it: "ok", "incomplete" when
+	// the budget ran out before every member was tried, or the reason no
+	// probe ran at all - a probe needs the daemon, which owns the host.
+	ProbeStatus string `json:"probe_status,omitempty"`
 }
 
 type doctorPeerReport struct {
@@ -61,13 +65,24 @@ type doctorPeerReport struct {
 	Self     bool             `json:"self"`
 	Roster   bool             `json:"roster"`
 	Error    string           `json:"error,omitempty"`
+	// Probe is present only with -probe. Without it the rows above describe
+	// membership, which says nothing about whether a peer answers.
+	Probe *doctorPeerProbe `json:"probe,omitempty"`
+}
+
+type doctorPeerProbe struct {
+	Reachable bool   `json:"reachable"`
+	Relayed   bool   `json:"relayed,omitempty"`
+	LatencyMS int64  `json:"latency_ms,omitempty"`
+	Addresses int    `json:"addresses"`
+	Error     string `json:"error,omitempty"`
 }
 
 func cmdDoctor(gf *globalFlags, args []string) int {
 	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
 	groupStr := fs.String("group", "", "base64 group id (optional; defaults to all groups)")
-	probe := fs.Bool("probe", false, "include live daemon status")
-	timeout := fs.Duration("timeout", 3*time.Second, "diagnostic timeout")
+	probe := fs.Bool("probe", false, "ask the running daemon to dial each other member and report which answer")
+	timeout := fs.Duration("timeout", defaultProbeBudget, "budget for the whole probe, not per peer")
 	jsonOutput := fs.Bool("json", false, "print JSON")
 	redact := fs.Bool("redact", false, "omit local runtime paths and the data directory, for sharing a report")
 	if err := fs.Parse(args); err != nil {
@@ -109,8 +124,8 @@ func cmdDoctor(gf *globalFlags, args []string) int {
 func cmdPeers(gf *globalFlags, args []string) int {
 	fs := flag.NewFlagSet("peers", flag.ContinueOnError)
 	groupStr := fs.String("group", "", "base64 group id (required)")
-	probe := fs.Bool("probe", false, "include live daemon status")
-	timeout := fs.Duration("timeout", 3*time.Second, "diagnostic timeout")
+	probe := fs.Bool("probe", false, "ask the running daemon to dial each other member and report which answer")
+	timeout := fs.Duration("timeout", defaultProbeBudget, "budget for the whole probe, not per peer")
 	jsonOutput := fs.Bool("json", false, "print JSON")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -149,7 +164,7 @@ func cmdPeers(gf *globalFlags, args []string) int {
 	return exitOK
 }
 
-func buildDoctorReport(ctx context.Context, gf *globalFlags, groupFilter *entmoot.GroupID, _ bool, _ time.Duration) (*doctorReport, error) {
+func buildDoctorReport(ctx context.Context, gf *globalFlags, groupFilter *entmoot.GroupID, probe bool, timeout time.Duration) (*doctorReport, error) {
 	setupResult, err := setup(gf)
 	if err != nil {
 		return nil, err
@@ -195,8 +210,13 @@ func buildDoctorReport(ctx context.Context, gf *globalFlags, groupFilter *entmoo
 		return nil, err
 	}
 	defer messageStore.Close()
+	socket := controlSocketPath(setupResult.dataDir)
 	for _, gid := range groups {
-		report.Groups = append(report.Groups, buildDoctorGroup(ctx, messageStore, setupResult.dataDir, gid, binding.MemberID, liveByGroup[gid]))
+		group := buildDoctorGroup(ctx, messageStore, setupResult.dataDir, gid, binding.MemberID, liveByGroup[gid])
+		if probe {
+			applyPeerProbe(ctx, &group, socket, report.Entmoot.Running, timeout)
+		}
+		report.Groups = append(report.Groups, group)
 	}
 	return report, nil
 }
@@ -255,16 +275,53 @@ func printDoctorHuman(report *doctorReport) {
 	}
 	for _, group := range report.Groups {
 		fmt.Printf("group=%s running=%t local_member=%t members=%d messages=%d", group.GroupID.String(), group.Running, group.LocalMember, group.Members, group.Messages)
+		if group.ProbeStatus != "" {
+			reachable := 0
+			probed := 0
+			for _, peer := range group.Peers {
+				if peer.Self || peer.Probe == nil {
+					continue
+				}
+				probed++
+				if peer.Probe.Reachable {
+					reachable++
+				}
+			}
+			fmt.Printf(" reachable=%d/%d probe=%q", reachable, probed, group.ProbeStatus)
+		}
 		if group.Error != "" {
 			fmt.Printf(" error=%q", group.Error)
 		}
 		fmt.Println()
+		for _, peer := range group.Peers {
+			if peer.Probe == nil || peer.Self {
+				continue
+			}
+			fmt.Printf("  member=%s reachable=%t", peer.MemberID.String(), peer.Probe.Reachable)
+			if peer.Probe.Reachable {
+				fmt.Printf(" latency_ms=%d relayed=%t", peer.Probe.LatencyMS, peer.Probe.Relayed)
+			}
+			fmt.Printf(" addresses=%d", peer.Probe.Addresses)
+			if peer.Probe.Error != "" {
+				fmt.Printf(" error=%q", peer.Probe.Error)
+			}
+			fmt.Println()
+		}
 	}
 }
 
 func printPeersTable(peers []doctorPeerReport) {
 	for _, peer := range peers {
 		fmt.Printf("member=%s peer=%s self=%t", peer.MemberID.String(), peer.PeerID, peer.Self)
+		if peer.Probe != nil && !peer.Self {
+			fmt.Printf(" reachable=%t addresses=%d", peer.Probe.Reachable, peer.Probe.Addresses)
+			if peer.Probe.Reachable {
+				fmt.Printf(" latency_ms=%d relayed=%t", peer.Probe.LatencyMS, peer.Probe.Relayed)
+			}
+			if peer.Probe.Error != "" {
+				fmt.Printf(" probe_error=%q", peer.Probe.Error)
+			}
+		}
 		if peer.Error != "" {
 			fmt.Printf(" error=%q", peer.Error)
 		}

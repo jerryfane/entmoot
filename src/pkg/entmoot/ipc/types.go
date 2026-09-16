@@ -69,6 +69,12 @@ const (
 	MsgGroupDeactivateReq MsgType = 0x23
 	// MsgGroupDeactivateResp acknowledges that the group session was stopped.
 	MsgGroupDeactivateResp MsgType = 0x24
+	// MsgPeerProbeReq asks the daemon to dial each other member of a group
+	// and report whether it answers. Only the daemon can do this: it owns the
+	// libp2p host, the peerstore and the relay configuration.
+	MsgPeerProbeReq MsgType = 0x25
+	// MsgPeerProbeResp returns one result per member probed.
+	MsgPeerProbeResp MsgType = 0x26
 	// MsgError carries a structured error frame. 0x1F is kept stable so
 	// existing logs and clients can continue spotting error frames.
 	MsgError MsgType = 0x1F
@@ -114,6 +120,10 @@ func (t MsgType) String() string {
 		return "group_deactivate_req"
 	case MsgGroupDeactivateResp:
 		return "group_deactivate_resp"
+	case MsgPeerProbeReq:
+		return "peer_probe_req"
+	case MsgPeerProbeResp:
+		return "peer_probe_resp"
 	case MsgError:
 		return "error"
 	default:
@@ -235,6 +245,38 @@ type InviteAuthorityCheckResp struct {
 	// issue after standing down — so a caller validating a list early needs it
 	// to avoid being stricter than the mint.
 	LocalPeerID string `json:"local_peer_id,omitempty"`
+}
+
+// PeerProbeReq asks for a reachability probe of one group's members. Budget
+// bounds the whole probe, not each peer: an operator waiting on `doctor`
+// cares about the total, and a group with thirty members must not take thirty
+// timeouts to answer.
+type PeerProbeReq struct {
+	GroupID  entmoot.GroupID `json:"group_id"`
+	BudgetMS int64           `json:"budget_ms,omitempty"`
+}
+
+// PeerProbeResult is one member's outcome. Reachable means a stream to the
+// membership protocol was opened and closed, which proves the peer is up AND
+// serving this group - a connection alone does not.
+type PeerProbeResult struct {
+	MemberID  entmoot.MemberID `json:"member_id"`
+	PeerID    string           `json:"peer_id,omitempty"`
+	Self      bool             `json:"self,omitempty"`
+	Reachable bool             `json:"reachable"`
+	Relayed   bool             `json:"relayed,omitempty"`
+	LatencyMS int64            `json:"latency_ms,omitempty"`
+	Addresses int              `json:"addresses"`
+	Error     string           `json:"error,omitempty"`
+}
+
+type PeerProbeResp struct {
+	Status  string            `json:"status"`
+	GroupID entmoot.GroupID   `json:"group_id"`
+	Peers   []PeerProbeResult `json:"peers"`
+	// Incomplete is set when the budget ran out before every member was
+	// probed, so a caller does not read "not reachable" into "not attempted".
+	Incomplete bool `json:"incomplete,omitempty"`
 }
 
 type MemberRemoveReq struct {

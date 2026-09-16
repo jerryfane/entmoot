@@ -1029,6 +1029,8 @@ func (s *ipcServer) handleConn(ctx context.Context, c net.Conn) {
 		s.handleInviteAuthorityCheck(ctx, c, v)
 	case *ipc.MemberRemoveReq:
 		s.handleMemberRemove(ctx, c, v)
+	case *ipc.PeerProbeReq:
+		s.handlePeerProbe(ctx, c, v)
 	case *ipc.GroupDeactivateReq:
 		s.handleGroupDeactivate(c, v)
 	case *ipc.InfoReq:
@@ -1563,6 +1565,42 @@ func (s *ipcServer) handleInviteAuthorityCheck(ctx context.Context, c net.Conn, 
 		MemberPeerIDs: peerIDs,
 		LocalPeerID:   s.peerID,
 	})
+}
+
+// handlePeerProbe answers a reachability probe. The read deadline set on the
+// connection bounds the client, so the probe budget is clamped below it: a
+// probe that outlived the socket would report nothing at all.
+func (s *ipcServer) handlePeerProbe(ctx context.Context, c net.Conn, req *ipc.PeerProbeReq) {
+	gid := req.GroupID
+	if s.runtime == nil {
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeGroupNotFound, GroupID: &gid, Message: "no group runtime"})
+		return
+	}
+	if gid == (entmoot.GroupID{}) {
+		resolved, ok := s.runtime.SingleGroup()
+		if !ok {
+			_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInvalidArgument, Message: "peer_probe requires group_id unless exactly one group is joined"})
+			return
+		}
+		gid = resolved
+	}
+	budget := time.Duration(req.BudgetMS) * time.Millisecond
+	if budget <= 0 {
+		budget = defaultProbeBudget
+	}
+	if budget > maxProbeBudget {
+		budget = maxProbeBudget
+	}
+	// The client is waiting on one socket read; give the answer room to land.
+	_ = c.SetWriteDeadline(time.Now().Add(budget + 5*time.Second))
+	probeCtx, cancel := context.WithTimeout(ctx, budget+time.Second)
+	defer cancel()
+	peers, incomplete, err := s.runtime.probePeers(probeCtx, gid, budget)
+	if err != nil {
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeGroupNotFound, GroupID: &gid, Message: err.Error()})
+		return
+	}
+	_ = ipc.EncodeAndWrite(c, &ipc.PeerProbeResp{Status: "probed", GroupID: gid, Peers: peers, Incomplete: incomplete})
 }
 
 func (s *ipcServer) handleGroupDeactivate(c net.Conn, req *ipc.GroupDeactivateReq) {

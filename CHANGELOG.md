@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `entmootd doctor --probe` and `peers --probe` now do what they always
+  claimed. The running daemon dials every other member of the group and
+  performs one membership read: that proves the peer is up, speaks the
+  protocol and serves this group to this node, where a connection alone would
+  not. Each peer row gains `reachable`, `latency_ms`, `relayed` and how many
+  addresses were tried, with a one-line reason on failure - a multi-homed
+  member's dial error is summarised rather than pasted, because the raw form
+  runs to a line per address.
+
+  The probe lives in the daemon because the daemon owns the libp2p host, the
+  peerstore and the relay configuration; a second process dialling with its
+  own identity would answer a different question. Without a daemon the group
+  reports `probe_status: runtime_unavailable` and no peer row claims anything.
+  `--timeout` is the budget for the whole probe, not per peer, and
+  `probe_status` reads `incomplete` if it runs out. New IPC frames
+  `peer_probe_req`/`peer_probe_resp` (0x25/0x26) carry it.
+
 ### Fixed
 
 - `entmootd doctor` now has the `-redact` flag its documentation already

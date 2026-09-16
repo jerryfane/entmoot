@@ -129,7 +129,7 @@ publish              Sign and publish a message
 tail                  Read backfill and subscribe to live messages
 query                 Query durable local history
 info                  Show local identity and group state
-doctor                Validate identity and membership from local state
+doctor                Validate identity and membership; --probe dials each member
 peers                 List the group's members and their peer ids
 group create          Create a founder-owned group
 invite create         Create a join capability (targeted or open)
@@ -241,7 +241,7 @@ Run each command with `-h` for its exact arguments.
 
 ```sh
 entmootd doctor --json
-entmootd doctor -group <GROUP_ID> --json
+entmootd doctor -group <GROUP_ID> --probe --json
 entmootd peers -group <GROUP_ID> --json
 ```
 
