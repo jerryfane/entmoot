@@ -243,8 +243,9 @@ install no partial group state. An invite names the checkpoint its issuer held; 
 invalidate outstanding invites, while an applicant banned after that checkpoint
 is refused. A refused join reports why — invite revoked, exhausted, expired, banned
 subject, or an issuer who may no longer administer the group — and installs no
-partial group state. Issuer authority is judged against current membership, as
-above, not against the checkpoint the invite names.
+partial group state. Issuer authority is judged against current group
+state, not against the checkpoint the invite names: the founder may always
+issue, and a delegated admin only while it is still an unbanned member.
 
 Open-invite redemption uses the same Entmoot identity. The joiner signs a
 bounded issuer challenge with its Ed25519 key; the issuer verifies the MemberID,

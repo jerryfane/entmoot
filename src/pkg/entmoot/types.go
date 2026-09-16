@@ -252,7 +252,7 @@ type Filter []string
 // BootstrapCapability is an issuer-signed, expiring grant for a bounded set of
 // bootstrap endpoints. Target fields bind it to one fresh identity; leaving
 // them empty makes it an open invite that any holder may redeem. MaxUses caps
-// how many distinct identities may enroll with it (absent or zero means one).
+// how many distinct identities may redeem it (absent or zero means one).
 //
 // Founder is the group's trust anchor, which the joiner pins. Issuer is the
 // member that actually signed the grant: absent when the founder issued it,
@@ -295,7 +295,7 @@ func (c BootstrapCapability) IsOpenInvite() bool {
 	return len(c.TargetPublicKey) == 0
 }
 
-// Uses returns the number of distinct identities permitted to enroll with this
+// Uses returns the number of distinct identities permitted to redeem this
 // capability. Zero or negative MaxUses means one.
 func (c BootstrapCapability) Uses() int {
 	if c.MaxUses <= 0 {

@@ -169,7 +169,7 @@ type SignedPublishResp struct {
 }
 
 // JoinGroupReq carries a target-bound bootstrap capability or requests
-// activation of a group already enrolled in persistent local state.
+// activation of a group already joined in persistent local state.
 type JoinGroupReq struct {
 	Capability    *entmoot.BootstrapCapability `json:"capability,omitempty"`
 	LocalGroupID  *entmoot.GroupID             `json:"local_group_id,omitempty"`
@@ -190,7 +190,7 @@ type JoinGroupResp struct {
 // InviteCreateReq asks the live founder daemon to mint a bootstrap capability
 // from its current roster and advertised addresses. TargetPublicKey is
 // required unless Open is set, which mints a bearer invite any holder may
-// redeem; MaxUses caps how many distinct identities may enroll with it (zero
+// redeem; MaxUses caps how many distinct identities may redeem it (zero
 // means one).
 type InviteCreateReq struct {
 	GroupID             entmoot.GroupID `json:"group_id"`

@@ -43,7 +43,7 @@ const defaultJoinTimeout = 90 * time.Second
 func cmdJoin(gf *globalFlags, args []string) int {
 	fs := flag.NewFlagSet("join", flag.ContinueOnError)
 	serveAfterJoin := fs.Bool("serve", false, "after joining, keep running as the Entmoot daemon")
-	timeout := fs.Duration("timeout", defaultJoinTimeout, "enrollment deadline")
+	timeout := fs.Duration("timeout", defaultJoinTimeout, "deadline for the whole join")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return exitOK
@@ -60,7 +60,7 @@ func cmdJoin(gf *globalFlags, args []string) int {
 	}
 	sockPath := controlSocketPath(gf.data)
 	if controlSocketAlive(sockPath, 200*time.Millisecond) {
-		fmt.Fprintln(os.Stderr, "join: stop the running daemon before enrolling a new group")
+		fmt.Fprintln(os.Stderr, "join: stop the running daemon before joining a new group")
 		return exitControlUnavail
 	}
 	// A brand-new node has no way to find a relay, so adopt the ones the
@@ -93,11 +93,11 @@ func cmdJoin(gf *globalFlags, args []string) int {
 				if err != nil {
 					return code, err
 				}
-				enrollCtx, cancel := context.WithTimeout(ctx, *timeout)
-				_, _, err = runtime.AddCapability(enrollCtx, *capability)
+				joinCtx, cancel := context.WithTimeout(ctx, *timeout)
+				_, _, err = runtime.AddCapability(joinCtx, *capability)
 				cancel()
 				if err != nil {
-					return exitTransport, fmt.Errorf("enroll group %s: %w", capability.GroupID.String(), err)
+					return exitTransport, fmt.Errorf("join group %s: %w", capability.GroupID.String(), err)
 				}
 				if err := persistJoinGroupMetadata(ctx, loadCtx.metadataStore, capability.GroupID, input.groupMetadata); err != nil {
 					return exitTransport, fmt.Errorf("persist group metadata %s: %w", capability.GroupID.String(), err)
@@ -1368,7 +1368,7 @@ func (s *ipcServer) handleInviteCreate(_ context.Context, c net.Conn, req *ipc.I
 	}
 	founder.MemberID = &founderBinding.MemberID
 	founder.PeerID = founderBinding.PeerID.String()
-	// This node serves the enrollment, so the invite must name this node's
+	// This node serves the redemption, so the invite must name this node's
 	// addresses and, when it is not the founder, this node as the issuer.
 	localBinding, err := libp2ptransport.BindingFromPublicKey(s.identity.PublicKey)
 	if err != nil || localBinding.PeerID != s.runtime.host.ID() {
