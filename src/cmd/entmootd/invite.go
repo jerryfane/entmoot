@@ -508,18 +508,19 @@ func groupMemberPeerIDs(group *membership.Group) (map[peer.ID]struct{}, error) {
 // membership-sync request with an 8 KiB ceiling, so a member-only cap let an
 // invite grow past the size at which it could be redeemed at all.
 //
-// What the tests actually pin, measured one constant at a time rather than
-// argued: maxInviteFallbackAddrsPeer and maxInviteAddrBytes have tests that
-// fail on the SHAPE a user would notice - one multi-homed member spending the
-// whole budget so the invite names one door instead of four, and one long
-// address starving the rest. A large move in maxInviteFallbackBytes or
-// maxInviteFallbackAddrs is caught by the size tests.
+// Each cap has one job. maxInviteFallbackPeers and maxInviteFallbackAddrsPeer
+// spread the budget across members, so an invite names several doors rather
+// than one multi-homed member's many - TestFallbackSpreadsAcrossMembers.
+// maxInviteAddrBytes stops one pathological address starving the rest -
+// TestAnOverlongAddressDoesNotStarveOtherMembers. maxInviteFallbackBytes and
+// maxInviteFallbackAddrs keep the minted capability inside what a joiner can
+// send, which the creation-estimate tests measure.
 //
-// What nothing pins: a small change to any of the three count caps. They are
-// charged into the same estimate they bound (esp_operations.go), so estimate
-// and mint move together, and lowering one by a step only makes an invite
-// carry fewer doors - which no test calls a failure. Treat them as defence in
-// depth and re-justify against the frame budget before moving them.
+// These numbers are also charged into the pre-mint size estimate
+// (esp_operations.go), so moving one changes both what is attached and what
+// the estimate allows. Re-justify against the frame budget when you move one,
+// and check the named tests still describe what you intended - do not assume
+// a test will object.
 const (
 	maxInviteFallbackPeers     = 4
 	maxInviteFallbackAddrs     = 8
