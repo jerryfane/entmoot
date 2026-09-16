@@ -20,7 +20,6 @@ import (
 	"errors"
 
 	"entmoot/pkg/entmoot"
-	"entmoot/pkg/entmoot/merkle"
 )
 
 // ErrNotFound is returned by MessageStore.Get when the requested message id is
@@ -172,24 +171,6 @@ func HasTombstone(ctx context.Context, st MessageStore, groupID entmoot.GroupID,
 		return tombstoned.HasTombstone(ctx, groupID, id)
 	}
 	return false, nil
-}
-
-// MerkleRootSince returns the deterministic root for messages at or after the
-// agreed retention floor. The full-history path retains the store's cached
-// MerkleRoot implementation.
-func MerkleRootSince(ctx context.Context, st MessageStore, groupID entmoot.GroupID, sinceMillis int64) ([32]byte, error) {
-	if sinceMillis <= 0 {
-		return st.MerkleRoot(ctx, groupID)
-	}
-	messages, err := st.Range(ctx, groupID, sinceMillis, 0)
-	if err != nil {
-		return [32]byte{}, err
-	}
-	ids := make([]entmoot.MessageID, len(messages))
-	for i := range messages {
-		ids[i] = messages[i].ID
-	}
-	return merkle.New(ids).Root(), nil
 }
 
 // RetentionPruner is implemented by stores that can remove old persisted

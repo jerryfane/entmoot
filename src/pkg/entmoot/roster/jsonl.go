@@ -134,12 +134,6 @@ func OpenJSONL(root string, groupID entmoot.GroupID) (*RosterLog, error) {
 	r.persist = func(entry entmoot.RosterEntry) error {
 		return persistRosterEntry(context.Background(), db, groupID, entry)
 	}
-	r.replace = func(chain []entmoot.RosterEntry) error {
-		return replaceRosterChain(context.Background(), db, groupID, chain)
-	}
-	r.storedChain = func() ([]entmoot.RosterEntry, error) {
-		return readRosterChain(context.Background(), db, groupID)
-	}
 	r.closeFn = func() error {
 		leaseErr := lease.close()
 		dbErr := db.Close()
@@ -584,67 +578,4 @@ func persistRosterEntryTx(ctx context.Context, tx *sql.Tx, groupID entmoot.Group
 		return fmt.Errorf("advance head: %w", err)
 	}
 	return nil
-}
-
-// replaceRosterChain rewrites one group's committed chain in a single
-// transaction. The caller has already validated the chain; this is the durable
-// half of RosterLog.ReplaceChain, so a crash either leaves the previous chain
-// or lands the new one whole.
-func replaceRosterChain(ctx context.Context, db *sql.DB, groupID entmoot.GroupID, chain []entmoot.RosterEntry) error {
-	if len(chain) == 0 {
-		return errors.New("roster: replacement chain is empty")
-	}
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("begin replace: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-	if _, err := tx.ExecContext(ctx, `DELETE FROM roster_entries WHERE group_id = ?;`, groupID[:]); err != nil {
-		return fmt.Errorf("clear entries: %w", err)
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM roster_meta WHERE group_id = ?;`, groupID[:]); err != nil {
-		return fmt.Errorf("clear metadata: %w", err)
-	}
-	for _, entry := range chain {
-		if err := persistRosterEntryTx(ctx, tx, groupID, entry); err != nil {
-			return fmt.Errorf("commit replacement entry %s: %w", entry.ID, err)
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit replace: %w", err)
-	}
-	return nil
-}
-
-// readRosterChain returns the committed chain in sequence order, decoded from
-// its stored canonical bytes. Repair uses it to find out what the store
-// actually holds after a write whose outcome is unknown.
-func readRosterChain(ctx context.Context, db *sql.DB, groupID entmoot.GroupID) ([]entmoot.RosterEntry, error) {
-	rows, err := db.QueryContext(ctx, `
-		SELECT canonical_bytes FROM roster_entries
-		WHERE group_id = ? ORDER BY sequence;`, groupID[:])
-	if err != nil {
-		return nil, fmt.Errorf("read chain: %w", err)
-	}
-	defer rows.Close()
-	var out []entmoot.RosterEntry
-	for rows.Next() {
-		var raw []byte
-		if err := rows.Scan(&raw); err != nil {
-			return nil, fmt.Errorf("scan entry: %w", err)
-		}
-		var entry entmoot.RosterEntry
-		if err := json.Unmarshal(raw, &entry); err != nil {
-			return nil, fmt.Errorf("decode entry: %w", err)
-		}
-		encoded, err := canonical.Encode(entry)
-		if err != nil || !bytes.Equal(encoded, raw) {
-			return nil, errors.New("stored entry canonical bytes are corrupt")
-		}
-		out = append(out, entry)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate entries: %w", err)
-	}
-	return out, nil
 }

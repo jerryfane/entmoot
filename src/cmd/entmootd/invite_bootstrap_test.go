@@ -248,3 +248,139 @@ func TestAnInviteTooLargeToRedeemIsRefused(t *testing.T) {
 		t.Fatalf("a %d-byte capability is not reported as too large (limit %d)", size, libp2ptransport.MaxCapabilityBytes)
 	}
 }
+
+// TestFallbackSpreadsAcrossMembers pins what the per-member address cap is
+// for. An invite exists so a newcomer can reach the group when the issuer is
+// down; if one multi-homed member could spend the whole address budget, the
+// invite would name that member's six doors instead of four members' doors,
+// and it would fail exactly when that member is the one that is offline.
+func TestFallbackSpreadsAcrossMembers(t *testing.T) {
+	root := t.TempDir()
+	founder, founderInfo := mustDaemonIdentity(t)
+	var gid entmoot.GroupID
+	if _, err := rand.Read(gid[:]); err != nil {
+		t.Fatal(err)
+	}
+	policy := membership.DefaultPolicy()
+	policy.JoinRule = membership.JoinRuleOpen
+	mustCreateGroup(t, root, gid, founder, policy)
+	group, err := membership.Open(root, gid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer group.Close()
+
+	members := make(map[peer.ID]struct{})
+	wantPeers := 0
+	for i := 0; i < 6; i++ {
+		identity, info := mustDaemonIdentity(t)
+		if _, err := group.SignRecord(identity, membership.Record{Kind: membership.KindJoin}); err != nil {
+			t.Fatalf("join %d: %v", i, err)
+		}
+		binding, err := libp2ptransport.BindingFromPublicKey(info.EntmootPubKey)
+		if err != nil {
+			t.Fatal(err)
+		}
+		members[binding.PeerID] = struct{}{}
+		wantPeers++
+		// Every member is reachable on six routable addresses, so any one of
+		// them could fill the whole budget on its own.
+		addrs := []multiaddr.Multiaddr{}
+		for j := 0; j < 6; j++ {
+			addrs = append(addrs, mustMultiaddr(t, fmt.Sprintf("/ip4/37.27.59.%d/tcp/%d", 80+i, 1004+j)))
+		}
+		if err := persistGroupPeer(root, gid, peer.AddrInfo{ID: binding.PeerID, Addrs: addrs}); err != nil {
+			t.Fatalf("persistGroupPeer: %v", err)
+		}
+	}
+	if wantPeers <= maxInviteFallbackPeers {
+		t.Fatalf("fixture offers %d members, want more than the %d an invite carries", wantPeers, maxInviteFallbackPeers)
+	}
+
+	selfBinding, err := libp2ptransport.BindingFromPublicKey(founderInfo.EntmootPubKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	addresses, peerIDs, _ := addKnownMemberPeers(root, gid, members, selfBinding.PeerID, nil, nil, map[peer.ID]struct{}{})
+
+	covered := make(map[string]int)
+	for _, addr := range addresses {
+		idx := strings.LastIndex(addr, "/p2p/")
+		if idx < 0 {
+			t.Fatalf("attached %q without a peer id", addr)
+		}
+		covered[addr[idx+len("/p2p/"):]]++
+	}
+	if len(covered) != maxInviteFallbackPeers {
+		t.Fatalf("attached addresses for %d members, want %d: one member's addresses crowded the others out of the budget",
+			len(covered), maxInviteFallbackPeers)
+	}
+	if len(peerIDs) != len(covered) {
+		t.Fatalf("named %d peers but attached addresses for %d: a named peer with no address is a door the newcomer cannot open",
+			len(peerIDs), len(covered))
+	}
+}
+
+// TestAnOverlongAddressDoesNotStarveOtherMembers pins the per-address width
+// bound by its consequence rather than its value: one member advertising a
+// pathological address must not spend the budget the other members need.
+func TestAnOverlongAddressDoesNotStarveOtherMembers(t *testing.T) {
+	root := t.TempDir()
+	founder, founderInfo := mustDaemonIdentity(t)
+	var gid entmoot.GroupID
+	if _, err := rand.Read(gid[:]); err != nil {
+		t.Fatal(err)
+	}
+	policy := membership.DefaultPolicy()
+	policy.JoinRule = membership.JoinRuleOpen
+	mustCreateGroup(t, root, gid, founder, policy)
+	group, err := membership.Open(root, gid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer group.Close()
+
+	// A fixed 300-byte hostname, not one derived from the bound under test: a
+	// fixture built from the same constant as the code cannot detect the
+	// constant moving. 300 bytes is a real peer-cache shape - a quic-v1
+	// webtransport address with two certhashes already runs past 190.
+	overlong := "/dns4/" + strings.Repeat("a", 300) + ".example.com/tcp/1004"
+	members := make(map[peer.ID]struct{})
+	for i := 0; i < maxInviteFallbackPeers; i++ {
+		identity, info := mustDaemonIdentity(t)
+		if _, err := group.SignRecord(identity, membership.Record{Kind: membership.KindJoin}); err != nil {
+			t.Fatalf("join %d: %v", i, err)
+		}
+		binding, err := libp2ptransport.BindingFromPublicKey(info.EntmootPubKey)
+		if err != nil {
+			t.Fatal(err)
+		}
+		members[binding.PeerID] = struct{}{}
+		addrs := []multiaddr.Multiaddr{
+			mustMultiaddr(t, overlong),
+			mustMultiaddr(t, fmt.Sprintf("/ip4/37.27.59.%d/tcp/1004", 80+i)),
+		}
+		if err := persistGroupPeer(root, gid, peer.AddrInfo{ID: binding.PeerID, Addrs: addrs}); err != nil {
+			t.Fatalf("persistGroupPeer: %v", err)
+		}
+	}
+
+	selfBinding, err := libp2ptransport.BindingFromPublicKey(founderInfo.EntmootPubKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	addresses, peerIDs, _ := addKnownMemberPeers(root, gid, members, selfBinding.PeerID, nil, nil, map[peer.ID]struct{}{})
+
+	if len(peerIDs) != maxInviteFallbackPeers {
+		t.Fatalf("served %d of %d members: one member's oversized address consumed the budget",
+			len(peerIDs), maxInviteFallbackPeers)
+	}
+	for _, addr := range addresses {
+		if strings.Contains(addr, "aaaa") {
+			t.Fatalf("attached the oversized address %q", addr[:64])
+		}
+	}
+	if len(addresses) != maxInviteFallbackPeers {
+		t.Fatalf("attached %d addresses for %d members, want one each", len(addresses), maxInviteFallbackPeers)
+	}
+}

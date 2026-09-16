@@ -22,7 +22,7 @@ func TestOperationalTreeHasNoPilotDependency(t *testing.T) {
 		"src/pkg/entmoot/identity_transition.go":         "founder-signed legacy identity mapping",
 		"src/pkg/entmoot/conversion/conversion.go":       "one-way durable conversion",
 		"src/pkg/entmoot/order/order.go":                 "ordering immutable legacy messages",
-		"src/pkg/entmoot/roster/roster.go":               "validating and projecting immutable legacy rosters",
+		"src/pkg/entmoot/roster/roster.go":               "validating immutable legacy rosters during conversion",
 		"src/pkg/entmoot/transport/libp2p/validation.go": "verifying immutable legacy messages",
 	}
 	var residues []string

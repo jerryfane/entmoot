@@ -503,10 +503,24 @@ func groupMemberPeerIDs(group *membership.Group) (map[peer.ID]struct{}, error) {
 	return out, nil
 }
 
-// Auto-attached fallback bounds. The cap that matters is on ADDRESSES, not
-// members: a multi-homed node can hold thirty of them, and a capability is
-// carried in one request frame with an 8 KiB ceiling, so bounding members
-// alone let an invite grow past the size at which it can be redeemed at all.
+// Auto-attached fallback bounds. Bounding members alone was not enough: a
+// multi-homed node can hold thirty addresses, and a capability travels in one
+// membership-sync request with an 8 KiB ceiling, so a member-only cap let an
+// invite grow past the size at which it could be redeemed at all.
+//
+// Each cap has one job. maxInviteFallbackPeers and maxInviteFallbackAddrsPeer
+// spread the budget across members, so an invite names several doors rather
+// than one multi-homed member's many - TestFallbackSpreadsAcrossMembers.
+// maxInviteAddrBytes stops one pathological address starving the rest -
+// TestAnOverlongAddressDoesNotStarveOtherMembers. maxInviteFallbackBytes and
+// maxInviteFallbackAddrs keep the minted capability inside what a joiner can
+// send, which the creation-estimate tests measure.
+//
+// These numbers are also charged into the pre-mint size estimate
+// (esp_operations.go), so moving one changes both what is attached and what
+// the estimate allows. Re-justify against the frame budget when you move one,
+// and check the named tests still describe what you intended - do not assume
+// a test will object.
 const (
 	maxInviteFallbackPeers     = 4
 	maxInviteFallbackAddrs     = 8
