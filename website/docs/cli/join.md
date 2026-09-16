@@ -55,8 +55,8 @@ Useful flags:
 
 On success, `join` emits a readiness event before exiting. The event includes
 `health` and a `next_command` the daemon builds for a follow-up check. That
-command carries `--probe`, which `doctor` currently ignores, so it verifies
-local state rather than a route:
+command carries `--probe`, so running it dials the other members and reports
+which of them answer:
 
 ```json
 {"event":"joined","group_ids":["<GROUP_ID>"],"members":3,"health":{"groups":1,"members":3,"peers":2,"local_member":true,"local_member_status":"ok","route_probe":"not_requested","quarantined_messages":0,"unknown_head_messages":0,"pending_membership_records":0},"next_command":"entmootd ... doctor -group <GROUP_ID> --probe"}

@@ -86,7 +86,7 @@ matching reference above.
 # Diagnose.
 "$ENTMOOT" env --json
 "$ENTMOOT" info
-"$ENTMOOT" doctor -group <gid> --json
+"$ENTMOOT" doctor -group <gid> --probe --json
 "$ENTMOOT" peers -group <gid> --json
 ```
 

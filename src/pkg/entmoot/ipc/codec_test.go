@@ -433,3 +433,66 @@ func TestReadAndDecodeSurfacesDecodeError(t *testing.T) {
 		t.Fatalf("payload = %#v, want nil on decode error", v)
 	}
 }
+
+// TestPeerProbeRoundTrip pins the new pair through the codec: a probe answer
+// that decodes into the wrong type, or loses the refusal fields, tells an
+// operator the opposite of what the daemon measured.
+func TestPeerProbeRoundTrip(t *testing.T) {
+	var gid entmoot.GroupID
+	gid[0] = 7
+	req := &PeerProbeReq{GroupID: gid, BudgetMS: 2500}
+	msgType, body, err := Encode(req)
+	if err != nil {
+		t.Fatalf("encode request: %v", err)
+	}
+	if msgType != MsgPeerProbeReq {
+		t.Fatalf("request type = %s, want peer_probe_req", msgType)
+	}
+	decoded, err := Decode(msgType, body)
+	if err != nil {
+		t.Fatalf("decode request: %v", err)
+	}
+	gotReq, ok := decoded.(*PeerProbeReq)
+	if !ok {
+		t.Fatalf("decoded %T, want *PeerProbeReq", decoded)
+	}
+	if gotReq.GroupID != gid || gotReq.BudgetMS != 2500 {
+		t.Fatalf("request round trip = %+v, want group %s budget 2500", gotReq, gid)
+	}
+
+	var member entmoot.MemberID
+	member[0] = 3
+	resp := &PeerProbeResp{
+		Status:  "probed",
+		GroupID: gid,
+		Peers: []PeerProbeResult{
+			{MemberID: member, PeerID: "12D3KooTest", Reachable: true, Answered: true, LatencyMS: 12, Addresses: 2},
+			{MemberID: entmoot.MemberID{4}, Answered: true, Refusal: "unauthorized", Addresses: 1},
+		},
+		Incomplete: true,
+	}
+	msgType, body, err = Encode(resp)
+	if err != nil {
+		t.Fatalf("encode response: %v", err)
+	}
+	if msgType != MsgPeerProbeResp {
+		t.Fatalf("response type = %s, want peer_probe_resp", msgType)
+	}
+	decoded, err = Decode(msgType, body)
+	if err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	gotResp, ok := decoded.(*PeerProbeResp)
+	if !ok {
+		t.Fatalf("decoded %T, want *PeerProbeResp", decoded)
+	}
+	if !gotResp.Incomplete || len(gotResp.Peers) != 2 {
+		t.Fatalf("response round trip = %+v", gotResp)
+	}
+	if !gotResp.Peers[0].Reachable || gotResp.Peers[0].LatencyMS != 12 {
+		t.Fatalf("reachable row lost its measurement: %+v", gotResp.Peers[0])
+	}
+	if gotResp.Peers[1].Reachable || !gotResp.Peers[1].Answered || gotResp.Peers[1].Refusal != "unauthorized" {
+		t.Fatalf("a refusal must survive as answered-and-refused, not as unreachable: %+v", gotResp.Peers[1])
+	}
+}
