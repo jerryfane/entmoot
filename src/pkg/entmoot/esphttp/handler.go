@@ -2398,7 +2398,14 @@ func (h *Handler) checkLiveAgentConfigWrite(w http.ResponseWriter, r *http.Reque
 		return false
 	}
 	if auth.member != nil {
-		if auth.member.MemberID == (entmoot.MemberID{}) {
+		// A member manages its OWN config and nothing else. The path member is
+		// the subject; the signature only proves who is asking. Without this
+		// comparison any member of the group could enable a live agent on a
+		// peer's node, choose its actions and topic filters, and have the
+		// peer's key sign whatever it then sent — the check read the
+		// signature, ignored the path, and returned the narrower rule's error
+		// message while allowing the wider one.
+		if auth.member.MemberID == (entmoot.MemberID{}) || auth.member.MemberID != nodeID {
 			writeError(w, http.StatusForbidden, "forbidden", "member can only manage its own live agent config")
 			return false
 		}
