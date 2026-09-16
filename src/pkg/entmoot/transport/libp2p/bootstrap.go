@@ -2,6 +2,7 @@ package libp2ptransport
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -37,6 +38,23 @@ var ErrBootstrapDenied = membership.ErrInviteDenied
 type BootstrapCapability = entmoot.BootstrapCapability
 
 // SignBootstrapCapability binds the grant to the issuing identity.
+// MaxCapabilityBytes bounds a capability that must still be redeemable. A
+// joiner sends the whole capability inside one membership-sync request, and
+// the server refuses a frame over maxSyncRequestBytes, so a capability minted
+// past this budget would be accepted by the issuer and then fail at redemption
+// with an opaque size error. Half the frame leaves room for the rest of the
+// request.
+const MaxCapabilityBytes = maxSyncRequestBytes / 2
+
+// CapabilityTooLarge reports whether c would not fit a redemption request.
+func CapabilityTooLarge(c entmoot.BootstrapCapability) (int, bool) {
+	encoded, err := json.Marshal(c)
+	if err != nil {
+		return 0, false
+	}
+	return len(encoded), len(encoded) > MaxCapabilityBytes
+}
+
 func SignBootstrapCapability(issuer *keystore.Identity, capability *BootstrapCapability) error {
 	return membership.SignInvite(issuer, capability)
 }

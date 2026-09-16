@@ -200,6 +200,11 @@ type InviteCreateReq struct {
 	MaxUses             int             `json:"max_uses,omitempty"`
 	ValidForMS          int64           `json:"valid_for_ms,omitempty"`
 	ValidUntilMS        int64           `json:"valid_until_ms,omitempty"`
+	// NoFallbackPeers suppresses the other-member addresses the daemon would
+	// otherwise attach so the invite outlives this node's uptime. Set it when
+	// the invite will be shared widely and disclosing members' addresses is
+	// not wanted; the CLI exposes the same choice as -no-fallback-peers.
+	NoFallbackPeers bool `json:"no_fallback_peers,omitempty"`
 }
 
 type InviteCreateResp struct {

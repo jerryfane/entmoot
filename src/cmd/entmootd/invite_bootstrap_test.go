@@ -144,7 +144,10 @@ func TestFallbackPeersAreBoundedAndRoutable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	addresses, peerIDs := addKnownMemberPeers(root, gid, members, selfBinding.PeerID, nil, nil, map[peer.ID]struct{}{})
+	addresses, peerIDs, private := addKnownMemberPeers(root, gid, members, selfBinding.PeerID, nil, nil, map[peer.ID]struct{}{})
+	if private != 0 {
+		t.Fatalf("reported %d private-only fallbacks, want 0: every member here has a routable address", private)
+	}
 
 	if len(peerIDs) > maxInviteFallbackPeers {
 		t.Fatalf("attached %d peers, want at most %d", len(peerIDs), maxInviteFallbackPeers)
@@ -171,4 +174,77 @@ func mustMultiaddr(t *testing.T, value string) multiaddr.Multiaddr {
 		t.Fatalf("NewMultiaddr(%q): %v", value, err)
 	}
 	return addr
+}
+
+// TestPrivateOnlyMemberStillGetsOneFallbackSlot covers the case the routability
+// filter got wrong on its own: on a LAN or an overlay network a member's
+// private address is exactly the door that works, and dropping it left the
+// fallback empty while the operator believed members were attached — so the
+// invite quietly went back to depending on the issuer's uptime.
+func TestPrivateOnlyMemberStillGetsOneFallbackSlot(t *testing.T) {
+	root := t.TempDir()
+	founder, founderInfo := mustDaemonIdentity(t)
+	var gid entmoot.GroupID
+	if _, err := rand.Read(gid[:]); err != nil {
+		t.Fatal(err)
+	}
+	policy := membership.DefaultPolicy()
+	policy.JoinRule = membership.JoinRuleOpen
+	mustCreateGroup(t, root, gid, founder, policy)
+	group, err := membership.Open(root, gid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer group.Close()
+
+	identity, info := mustDaemonIdentity(t)
+	if _, err := group.SignRecord(identity, membership.Record{Kind: membership.KindJoin}); err != nil {
+		t.Fatalf("join: %v", err)
+	}
+	binding, err := libp2ptransport.BindingFromPublicKey(info.EntmootPubKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	members := map[peer.ID]struct{}{binding.PeerID: {}}
+	// Reachable only on a LAN address, plus a loopback that must never be
+	// attached because it names the newcomer's own machine.
+	if err := persistGroupPeer(root, gid, peer.AddrInfo{ID: binding.PeerID, Addrs: []multiaddr.Multiaddr{
+		mustMultiaddr(t, "/ip4/127.0.0.1/tcp/1004"),
+		mustMultiaddr(t, "/ip4/192.168.1.40/tcp/1004"),
+	}}); err != nil {
+		t.Fatalf("persistGroupPeer: %v", err)
+	}
+
+	selfBinding, err := libp2ptransport.BindingFromPublicKey(founderInfo.EntmootPubKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	addresses, peerIDs, private := addKnownMemberPeers(root, gid, members, selfBinding.PeerID, nil, nil, map[peer.ID]struct{}{})
+	if len(peerIDs) != 1 || len(addresses) != 1 {
+		t.Fatalf("attached %d peers / %d addresses, want 1 and 1: a private-only member must still be reachable", len(peerIDs), len(addresses))
+	}
+	if !strings.HasPrefix(addresses[0], "/ip4/192.168.1.40/") {
+		t.Fatalf("attached %q, want the LAN address", addresses[0])
+	}
+	if private != 1 {
+		t.Fatalf("reported %d private-only fallbacks, want 1 so the operator is told", private)
+	}
+}
+
+// TestAnInviteTooLargeToRedeemIsRefused pins the mint-time guard. A capability
+// travels inside one membership-sync request; past the frame limit the mint
+// would succeed and every redemption fail with a size error naming no cause.
+func TestAnInviteTooLargeToRedeemIsRefused(t *testing.T) {
+	capability := entmoot.BootstrapCapability{GroupID: entmoot.GroupID{1}}
+	if _, tooLarge := libp2ptransport.CapabilityTooLarge(capability); tooLarge {
+		t.Fatal("an empty capability is reported as too large")
+	}
+	for i := 0; i < 200; i++ {
+		capability.AllowedMultiaddrs = append(capability.AllowedMultiaddrs,
+			fmt.Sprintf("/ip4/37.27.59.%d/tcp/1004/p2p/12D3KooWGu8QgDWWsThK4JqbwXDBAQmTr9NXsomethinglong%d", i%250, i))
+	}
+	size, tooLarge := libp2ptransport.CapabilityTooLarge(capability)
+	if !tooLarge {
+		t.Fatalf("a %d-byte capability is not reported as too large (limit %d)", size, libp2ptransport.MaxCapabilityBytes)
+	}
 }

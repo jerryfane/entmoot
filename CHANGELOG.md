@@ -21,8 +21,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   capability travels in one request frame with an 8 KiB ceiling: bounding
   members alone produced invites too large to redeem. Private, loopback and
   carrier-NAT addresses are skipped, so an invite — an open bearer link
-  especially — does not enumerate a member's internal network.
-  `-no-fallback-peers` attaches none.
+  especially — does not enumerate a member's internal network. A member known
+  only on a private address still gets one slot, because on a LAN or an overlay
+  that address is the door that works; `invite create` says so on stderr when
+  it attaches one. Loopback is never attached: it names the newcomer's own
+  machine. `-no-fallback-peers`, and `no_fallback_peers` on the IPC path,
+  attach none.
+
+  `invite create` also refuses to mint a capability larger than a joiner can
+  send. The whole capability travels in one membership-sync request, so past
+  that budget the mint used to succeed and every redemption fail with a size
+  error naming no cause; both mint paths now measure the signed capability and
+  refuse.
 
   A non-member's address is still refused, and a removed or banned member stops
   being serveable the moment its removal projects — enforced where it matters,
@@ -167,11 +177,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   checkpoints, replacing the linear founder/admin-signed roster chain.** A
   joiner signs its own admission, redeeming an invite that authorises it, so
   no founder or admin has to sign anything when the invite is used. The
-  ISSUING node does still have to be reachable then: an invite may only name
-  its issuer's own peer id as a bootstrap address (invite.go), and a peer
-  serves a pre-membership redemption only if it is named there (the transport
-  checks the capability's allowed peer ids), so the issuer is the only peer
-  that can serve one. Records (`join`, `leave`, `rekey`, `remove`, `unban`,
+  invite names the members that may serve its redemption, and a peer serves one
+  only if it is named there and is still a member itself — so an invite does not
+  depend on the issuer being up, which is the change recorded at the top of this
+  section. Records (`join`, `leave`, `rekey`, `remove`, `unban`,
   `policy`, `revoke_invite`) merge by one deterministic total order —
   timestamp, then kind, then the founder's record before a delegated admin's,
   then record id — with joins applied before rekeys, authority records, and

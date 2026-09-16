@@ -190,8 +190,12 @@ func cmdInviteCreate(gf *globalFlags, args []string) int {
 		}
 	}
 	if !*noFallback {
-		allowedAddresses, allowedPeerIDs = addKnownMemberPeers(s.dataDir, gid, memberPeers,
+		var privateFallbacks int
+		allowedAddresses, allowedPeerIDs, privateFallbacks = addKnownMemberPeers(s.dataDir, gid, memberPeers,
 			localBinding.PeerID, allowedAddresses, allowedPeerIDs, seen)
+		if privateFallbacks > 0 {
+			fmt.Fprintf(os.Stderr, "invite create: %d fallback peer(s) are known only on a private address; the invite carries it, which works on the same network and not beyond it\n", privateFallbacks)
+		}
 	}
 
 	// Relay hints default to whatever this node itself relays through, since
@@ -237,6 +241,13 @@ func cmdInviteCreate(gf *globalFlags, args []string) int {
 	if err := libp2ptransport.SignBootstrapCapability(s.identity, &capability); err != nil {
 		slog.Error("invite create: sign", slog.String("err", err.Error()))
 		return exitTransport
+	}
+	// Refuse here rather than let the mint succeed and the redemption fail
+	// with a size error the joiner cannot act on.
+	if size, tooLarge := libp2ptransport.CapabilityTooLarge(capability); tooLarge {
+		fmt.Fprintf(os.Stderr, "invite create: the invite is %d bytes, over the %d-byte limit a joiner can send; name fewer -bootstrap addresses or pass -no-fallback-peers\n",
+			size, libp2ptransport.MaxCapabilityBytes)
+		return exitInvalidArgument
 	}
 	admission, err := libp2ptransport.OpenInviteLedger(s.dataDir)
 	if err != nil {
@@ -528,13 +539,20 @@ func routableInviteAddress(addr multiaddr.Multiaddr) bool {
 // invite: fewer addresses just means the newcomer has fewer doors to try, and
 // the operator can always name peers explicitly, or pass -no-fallback-peers to
 // attach none.
+//
+// Routable addresses are preferred, but a member reachable ONLY on a private
+// address still gets one slot: on a LAN or an overlay network that private
+// address is exactly the door that works, and silently attaching nothing there
+// would leave the invite depending on the issuer's uptime while the operator
+// believed otherwise. It reports how many of each kind it attached so the
+// caller can say so.
 func addKnownMemberPeers(dataDir string, groupID entmoot.GroupID, memberPeers map[peer.ID]struct{}, self peer.ID,
-	addresses []string, peerIDs []string, seen map[peer.ID]struct{}) ([]string, []string) {
+	addresses []string, peerIDs []string, seen map[peer.ID]struct{}) ([]string, []string, int) {
 	cached, err := loadGroupPeers(dataDir, groupID)
 	if err != nil {
-		return addresses, peerIDs
+		return addresses, peerIDs, 0
 	}
-	peers, addrs := 0, 0
+	peers, addrs, private := 0, 0, 0
 	for _, info := range cached {
 		if peers >= maxInviteFallbackPeers || addrs >= maxInviteFallbackAddrs {
 			break
@@ -548,24 +566,50 @@ func addKnownMemberPeers(dataDir string, groupID entmoot.GroupID, memberPeers ma
 		if _, ok := seen[info.ID]; ok {
 			continue
 		}
-		kept := 0
+		routable, fallback := make([]string, 0, maxInviteFallbackAddrsPeer), ""
 		for _, addr := range info.Addrs {
-			if kept >= maxInviteFallbackAddrsPeer || addrs >= maxInviteFallbackAddrs {
-				break
-			}
-			if !routableInviteAddress(addr) {
+			if routableInviteAddress(addr) {
+				if len(routable) < maxInviteFallbackAddrsPeer {
+					routable = append(routable, addr.String()+"/p2p/"+info.ID.String())
+				}
 				continue
 			}
-			addresses = append(addresses, addr.String()+"/p2p/"+info.ID.String())
-			kept++
-			addrs++
+			if fallback == "" && !multiaddrIsLoopback(addr) {
+				fallback = addr.String() + "/p2p/" + info.ID.String()
+			}
 		}
-		if kept == 0 {
-			continue
+		chosen := routable
+		if len(chosen) == 0 {
+			if fallback == "" {
+				continue
+			}
+			chosen = []string{fallback}
+			private++
+		}
+		for _, addr := range chosen {
+			if addrs >= maxInviteFallbackAddrs {
+				break
+			}
+			addresses = append(addresses, addr)
+			addrs++
 		}
 		seen[info.ID] = struct{}{}
 		peerIDs = append(peerIDs, info.ID.String())
 		peers++
 	}
-	return addresses, peerIDs
+	return addresses, peerIDs, private
+}
+
+// multiaddrIsLoopback reports a literal loopback address, which is the one
+// class never worth attaching: it names the newcomer's own machine, not a
+// member.
+func multiaddrIsLoopback(addr multiaddr.Multiaddr) bool {
+	for _, code := range []int{multiaddr.P_IP4, multiaddr.P_IP6} {
+		if value, err := addr.ValueForProtocol(code); err == nil {
+			if ip := net.ParseIP(value); ip != nil {
+				return ip.IsLoopback() || ip.IsUnspecified()
+			}
+		}
+	}
+	return false
 }

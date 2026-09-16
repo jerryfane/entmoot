@@ -146,7 +146,8 @@ entmootd roster admin grant -group <GROUP_ID> -member <MEMBER_ID>
 ```
 
 A delegated admin may add and remove ordinary members and issue invites from
-its own node (`-bootstrap` must name that node). It cannot remove the founder,
+its own node (`-bootstrap` may name that node or any current member). It
+cannot remove the founder,
 remove another admin, or change who is an admin. Revoking delegation, or
 removing the member, ends the authority immediately.
 

@@ -1368,7 +1368,7 @@ func (s *ipcServer) handleInviteCreate(_ context.Context, c net.Conn, req *ipc.I
 	}
 	founder.MemberID = &founderBinding.MemberID
 	founder.PeerID = founderBinding.PeerID.String()
-	// This node serves the redemption, so the invite must name this node's
+	// Whichever member the invite names serves the redemption, so the invite
 	// addresses and, when it is not the founder, this node as the issuer.
 	localBinding, err := libp2ptransport.BindingFromPublicKey(s.identity.PublicKey)
 	if err != nil || localBinding.PeerID != s.runtime.host.ID() {
@@ -1439,8 +1439,10 @@ func (s *ipcServer) handleInviteCreate(_ context.Context, c net.Conn, req *ipc.I
 		allowedPeerIDs = append(allowedPeerIDs, localBinding.PeerID.String())
 		seenPeers[localBinding.PeerID] = struct{}{}
 	}
-	allowedAddresses, allowedPeerIDs = addKnownMemberPeers(s.dataDir, gid, memberPeers,
-		localBinding.PeerID, allowedAddresses, allowedPeerIDs, seenPeers)
+	if !req.NoFallbackPeers {
+		allowedAddresses, allowedPeerIDs, _ = addKnownMemberPeers(s.dataDir, gid, memberPeers,
+			localBinding.PeerID, allowedAddresses, allowedPeerIDs, seenPeers)
+	}
 	now := time.Now()
 	expires := now.Add(24 * time.Hour)
 	if req.ValidForMS > 0 {
@@ -1474,6 +1476,12 @@ func (s *ipcServer) handleInviteCreate(_ context.Context, c net.Conn, req *ipc.I
 	}
 	if err := libp2ptransport.SignBootstrapCapability(s.identity, &capability); err != nil {
 		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInternal, GroupID: &gid, Message: err.Error()})
+		return
+	}
+	// The signature is part of what the joiner must send, so measure after it.
+	if size, tooLarge := libp2ptransport.CapabilityTooLarge(capability); tooLarge {
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInvalidArgument, GroupID: &gid,
+			Message: fmt.Sprintf("invite is %d bytes, over the %d-byte limit a joiner can send", size, libp2ptransport.MaxCapabilityBytes)})
 		return
 	}
 	if err := s.runtime.invites.RecordIssuedInvite(capability); err != nil {
