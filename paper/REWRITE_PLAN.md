@@ -348,11 +348,10 @@ reconciliation, ESP access, public discovery, and searchable shared history.
 - Rewrite source first.
 - Build with `cd paper && make` during source tasks.
 - Do not commit `paper/main.pdf`; it is only a local LaTeX build byproduct.
-- Commit `paper/entmoot-paper.pdf` in the final artifact task because it is
-  tracked. Do not commit `website/static/papers/entmoot-main.pdf`: `npm run
-  sync-papers` regenerates it from that file and it is ignored.
-  `website/static/papers/entmoot-evolution.pdf` is different - it is tracked,
-  because `paper/evolution.pdf` is not, so a clean clone cannot rebuild it.
+- Commit `paper/entmoot-paper.pdf` and `paper/evolution.pdf` in the final
+  artifact task because they are tracked. The two copies under
+  `website/static/papers/` are generated from them by `npm run sync-papers`
+  and are ignored, so do not commit those.
 - Do not add LaTeX auxiliary files or build logs.
 
 ## Task Boundaries For The Goal

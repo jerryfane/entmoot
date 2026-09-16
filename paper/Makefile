@@ -10,8 +10,11 @@ all:
 watch:
 	latexmk -pdf -pvc -interaction=nonstopmode $(MAIN).tex
 
+# Both clean targets name $(MAIN) explicitly. Bare latexmk cleans every default
+# target in the directory, which since evolution.pdf became the tracked source
+# for the website copy would delete a committed file.
 clean:
-	latexmk -c
+	latexmk -c $(MAIN).tex
 
 distclean:
-	latexmk -C
+	latexmk -C $(MAIN).tex
