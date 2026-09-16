@@ -366,7 +366,7 @@ func (r *groupRuntime) AddCapability(ctx context.Context, capability entmoot.Boo
 		// against the membership each now holds.
 		_ = r.host.Network().ClosePeer(info.ID)
 		if err := r.host.Connect(ctx, *info); err != nil {
-			return nil, false, fmt.Errorf("reconnect enrolled group peer: %w", err)
+			return nil, false, fmt.Errorf("reconnect joined group peer: %w", err)
 		}
 		return session, added, nil
 	}

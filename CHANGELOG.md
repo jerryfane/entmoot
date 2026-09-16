@@ -427,7 +427,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   checkpoint.
 
   The enrollment protocol this bullet originally described — its typed
-  rejection codes, its applicant queue, its retry against a moved head — was
+  rejection codes and its separate protocol — was
   deleted later in this same unreleased cycle, before any release carried it,
   and is recorded under Changed above. A joiner now signs its own join record
   and pushes it over the membership sync protocol; a refusal is projected from
@@ -438,8 +438,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   millisecond both apply because the records merge as a set.
 - **Removal stays a removal.** Because an invite is no longer tied to one exact
   head, `roster remove` and the IPC member-remove path now revoke every invite
-  bound to the removed member and report how many; enrollment separately
-  refuses any applicant removed after the invite's checkpoint. Open bearer
+  bound to the removed member and report how many. Revocation is the whole
+  mechanism: a plainly removed identity that redeems a fresh invite is admitted
+  again, by design, and only a BAN refuses it ("this identity is banned from
+  the group"). Open bearer
   invites name no target, so they cannot be attributed: both paths list the
   remaining open nonces so an operator can revoke them.
 
