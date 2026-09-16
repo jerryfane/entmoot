@@ -1441,8 +1441,17 @@ func (s *ipcServer) handleInviteCreate(_ context.Context, c net.Conn, req *ipc.I
 		seenPeers[localBinding.PeerID] = struct{}{}
 	}
 	if !req.NoFallbackPeers {
-		allowedAddresses, allowedPeerIDs, _ = addKnownMemberPeers(s.dataDir, gid, memberPeers,
+		var privateFallbacks int
+		allowedAddresses, allowedPeerIDs, privateFallbacks = addKnownMemberPeers(s.dataDir, gid, memberPeers,
 			localBinding.PeerID, allowedAddresses, allowedPeerIDs, seenPeers)
+		if privateFallbacks > 0 {
+			// The CLI prints this; over IPC the operator is elsewhere, so it
+			// goes to the daemon log rather than being dropped. An invite that
+			// carries a member's LAN address should not do so silently.
+			slog.Warn("invite create: attached a private fallback address",
+				slog.String("group_id", gid.String()),
+				slog.Int("private_fallback_peers", privateFallbacks))
+		}
 	}
 	now := time.Now()
 	expires := now.Add(24 * time.Hour)
@@ -1544,6 +1553,7 @@ func (s *ipcServer) handleInviteAuthorityCheck(ctx context.Context, c net.Conn, 
 		RosterHead:    sess.group.Canonical().ID,
 		Members:       len(sess.group.MemberIDs()),
 		MemberPeerIDs: peerIDs,
+		LocalPeerID:   s.peerID,
 	})
 }
 

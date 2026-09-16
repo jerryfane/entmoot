@@ -534,7 +534,7 @@ func (e espOperationExecutor) createOpenInvite(ctx context.Context, req esphttp.
 	// returns is the thing that gets shared, and no capability exists yet, so
 	// a malformed, non-member or over-long list would otherwise produce a link
 	// that fails for every joiner with an error the joiner cannot act on.
-	if err := validateOpenInviteBootstrap(payload.BootstrapMultiaddrs, authority.MemberPeerIDs, payload.NoFallbackPeers); err != nil {
+	if err := validateOpenInviteBootstrap(payload.BootstrapMultiaddrs, authority.MemberPeerIDs, authority.LocalPeerID, payload.NoFallbackPeers); err != nil {
 		return nil, err
 	}
 	token, tokenHash, err := esphttp.NewOpenInviteToken()
@@ -1489,7 +1489,7 @@ func operationIPCError(frame *ipc.ErrorFrame) error {
 // addresses the daemon attaches when the opt-out is off. Measuring the bare
 // list accepted 26 addresses that the mint then refused, which is the failure
 // this check exists to prevent, moved one step earlier.
-func validateOpenInviteBootstrap(addresses, memberPeerIDs []string, noFallback bool) error {
+func validateOpenInviteBootstrap(addresses, memberPeerIDs []string, localPeerID string, noFallback bool) error {
 	peerIDs := make([]string, 0, len(addresses))
 	for _, raw := range addresses {
 		address, err := multiaddr.NewMultiaddr(raw)
@@ -1504,7 +1504,10 @@ func validateOpenInviteBootstrap(addresses, memberPeerIDs []string, noFallback b
 		}
 		// Membership can change before redemption, but an address naming
 		// nobody today is knowable now.
-		if len(memberPeerIDs) > 0 && !slices.Contains(memberPeerIDs, info.ID.String()) {
+		// The mint accepts the issuing node's own address even when it is not a
+		// member — a founder may issue after standing down — so creation must
+		// not be stricter than the thing it pre-empts.
+		if len(memberPeerIDs) > 0 && info.ID.String() != localPeerID && !slices.Contains(memberPeerIDs, info.ID.String()) {
 			return &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request",
 				Message: fmt.Sprintf("bootstrap multiaddr %q does not name a member of this group", raw)}
 		}
@@ -1535,21 +1538,17 @@ func openInviteCapabilityTooLarge(addresses, peerIDs []string, noFallback bool) 
 		TargetPeerID:      node.PeerID,
 		Signature:         signature[:],
 	}
+	// Relay hints come from this node's configuration, so they cost bytes the
+	// caller never named. Both they and the fallback slots are sized at the
+	// width attachment enforces, which is what makes this an upper bound: the
+	// previous version sized them from the addresses the OPERATOR named and
+	// undershot by a factor of two against a peer cache full of webtransport
+	// addresses.
+	// Both sets are bounded in BYTES by attachment, so one string of that
+	// size models the worst case exactly.
+	probe.Relays = append(probe.Relays, strings.Repeat("r", maxInviteFallbackBytes))
 	if !noFallback {
-		// Worst case: every fallback slot filled with an address as long as
-		// the longest the operator named, so the estimate cannot undershoot.
-		longest := 0
-		for _, addr := range addresses {
-			if len(addr) > longest {
-				longest = len(addr)
-			}
-		}
-		if longest == 0 {
-			longest = 64
-		}
-		for i := 0; i < maxInviteFallbackAddrs; i++ {
-			probe.AllowedMultiaddrs = append(probe.AllowedMultiaddrs, strings.Repeat("a", longest))
-		}
+		probe.AllowedMultiaddrs = append(probe.AllowedMultiaddrs, strings.Repeat("a", maxInviteFallbackBytes))
 		for i := 0; i < maxInviteFallbackPeers; i++ {
 			probe.AllowedPeerIDs = append(probe.AllowedPeerIDs, node.PeerID)
 		}

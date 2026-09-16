@@ -14,13 +14,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   newcomer only when the capability names it, so the issuer had to be running
   for its own invite to work — the one thing self-signed admission was meant to
   remove. A bootstrap address may now name any CURRENT member. The issuer also
-  attaches known addresses of up to four other members — at most two each and
-  eight in total — so an ordinary `invite create` survives its author going
-  down without the operator naming anybody. The cap is on ADDRESSES as well as
+  attaches known addresses of up to four other members — at most two each,
+  eight in total, and 1 KiB in total, each address at most 256 bytes — so an
+  ordinary `invite create` survives its author going down without the operator
+  naming anybody. Relay hints are bounded the same way. The cap is on ADDRESSES as well as
   members because a multi-homed host holds dozens, and a capability travels in
   one request frame with an 8 KiB ceiling: bounding members alone produced
-  invites too large to redeem, and both mint paths now refuse a capability over
-  that budget rather than let every redemption fail.
+  invites too large to redeem. Every mint path refuses a capability over the
+  budget, and the budget itself is pinned by a test that puts a capability of
+  that size into a real read request and a real push: counts alone were not
+  enough, because eight full-width addresses plus eight relay hints consumed
+  the whole allowance before the operator named anything.
 
   Routable addresses are preferred. A member known only on a non-routable one —
   a LAN, a ULA, a link-local or a carrier-NAT address — still gets a single

@@ -39,12 +39,19 @@ type BootstrapCapability = entmoot.BootstrapCapability
 
 // SignBootstrapCapability binds the grant to the issuing identity.
 // MaxCapabilityBytes bounds a capability that must still be redeemable. A
-// joiner sends the whole capability inside one membership-sync request, and
-// the server refuses a frame over maxSyncRequestBytes, so a capability minted
-// past this budget would be accepted by the issuer and then fail at redemption
-// with an opaque size error. Half the frame leaves room for the rest of the
-// request.
-const MaxCapabilityBytes = maxSyncRequestBytes / 2
+// joiner sends the whole capability inside one membership-sync request, which
+// the server refuses over maxSyncRequestBytes, so a capability minted past
+// this budget is accepted by its issuer and then fails at every redemption.
+//
+// The reserve is for the rest of that request: the joiner's own signed join
+// record, the cursor fields, the request id. Half the frame was the first
+// guess and it was wrong in the expensive direction — it made a worst-case
+// estimate refuse a single address. TestJoinRequestFitsTheFrame pins that a
+// capability at this budget plus a real join record still fits.
+const (
+	capabilityRequestReserve = 3 << 10
+	MaxCapabilityBytes       = maxSyncRequestBytes - capabilityRequestReserve
+)
 
 // CapabilityTooLarge reports whether c would not fit a redemption request.
 func CapabilityTooLarge(c entmoot.BootstrapCapability) (int, bool) {

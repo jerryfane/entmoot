@@ -504,14 +504,25 @@ const (
 	maxInviteFallbackPeers     = 4
 	maxInviteFallbackAddrs     = 8
 	maxInviteFallbackAddrsPeer = 2
+	// maxInviteAddrBytes bounds ONE attached address, fallback or relay, and
+	// maxInviteFallbackBytes bounds the fallback set TOGETHER. Counts alone
+	// were not enough twice over: peer caches hold long forms — a
+	// quic-v1/webtransport address with two certhashes runs past 190 bytes —
+	// so eight slots at full width plus eight relay hints consumed the whole
+	// capability budget before the operator named anything. Bounding bytes is
+	// what makes the minted size predictable to a caller that must estimate
+	// it before the capability exists.
+	maxInviteAddrBytes     = 256
+	maxInviteFallbackBytes = 1 << 10
 )
 
-// routableInviteAddress reports whether an address is worth putting in an
-// invite that may travel outside this host. Loopback and private ranges are
-// skipped: they cannot help a newcomer elsewhere, and an invite — especially
-// an open bearer invite whose link gets shared — should not enumerate a
-// member's internal network. Keeping them would also spend the byte budget on
-// addresses that never work.
+// routableInviteAddress reports whether an address is reachable from outside
+// this host. It is a PREFERENCE, not a filter: the caller attaches routable
+// addresses first and gives a member known only on a non-routable address a
+// single slot, because on a LAN or an overlay that address is the one that
+// works. What the predicate buys is that the byte budget goes to addresses
+// likely to work, and that an invite carries one of a member's internal
+// addresses rather than its whole network.
 func routableInviteAddress(addr multiaddr.Multiaddr) bool {
 	value, err := addr.ValueForProtocol(multiaddr.P_IP4)
 	if err != nil {
@@ -552,9 +563,9 @@ func addKnownMemberPeers(dataDir string, groupID entmoot.GroupID, memberPeers ma
 	if err != nil {
 		return addresses, peerIDs, 0
 	}
-	peers, addrs, private := 0, 0, 0
+	peers, addrs, bytes, private := 0, 0, 0, 0
 	for _, info := range cached {
-		if peers >= maxInviteFallbackPeers || addrs >= maxInviteFallbackAddrs {
+		if peers >= maxInviteFallbackPeers || addrs >= maxInviteFallbackAddrs || bytes >= maxInviteFallbackBytes {
 			break
 		}
 		if info.ID == self {
@@ -568,14 +579,20 @@ func addKnownMemberPeers(dataDir string, groupID entmoot.GroupID, memberPeers ma
 		}
 		routable, fallback := make([]string, 0, maxInviteFallbackAddrsPeer), ""
 		for _, addr := range info.Addrs {
+			full := addr.String() + "/p2p/" + info.ID.String()
+			// The width bound is what makes the minted size predictable to a
+			// caller estimating it before the capability exists.
+			if len(full) > maxInviteAddrBytes {
+				continue
+			}
 			if routableInviteAddress(addr) {
 				if len(routable) < maxInviteFallbackAddrsPeer {
-					routable = append(routable, addr.String()+"/p2p/"+info.ID.String())
+					routable = append(routable, full)
 				}
 				continue
 			}
 			if fallback == "" && !multiaddrIsLoopback(addr) {
-				fallback = addr.String() + "/p2p/" + info.ID.String()
+				fallback = full
 			}
 		}
 		chosen := routable
@@ -587,11 +604,12 @@ func addKnownMemberPeers(dataDir string, groupID entmoot.GroupID, memberPeers ma
 			private++
 		}
 		for _, addr := range chosen {
-			if addrs >= maxInviteFallbackAddrs {
+			if addrs >= maxInviteFallbackAddrs || bytes+len(addr) > maxInviteFallbackBytes {
 				break
 			}
 			addresses = append(addresses, addr)
 			addrs++
+			bytes += len(addr)
 		}
 		seen[info.ID] = struct{}{}
 		peerIDs = append(peerIDs, info.ID.String())

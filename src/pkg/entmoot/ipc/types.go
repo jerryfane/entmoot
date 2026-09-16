@@ -230,6 +230,11 @@ type InviteAuthorityCheckResp struct {
 	// invite — needs it to refuse an address naming nobody, rather than
 	// handing out a link every redemption will reject.
 	MemberPeerIDs []string `json:"member_peer_ids,omitempty"`
+	// LocalPeerID is this daemon's own transport peer id. The mint accepts it
+	// as a bootstrap peer even when this node is not a member — a founder may
+	// issue after standing down — so a caller validating a list early needs it
+	// to avoid being stricter than the mint.
+	LocalPeerID string `json:"local_peer_id,omitempty"`
 }
 
 type MemberRemoveReq struct {
