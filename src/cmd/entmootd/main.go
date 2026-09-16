@@ -53,7 +53,7 @@ func run() int {
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "Agent subcommands:")
 		fmt.Fprintln(os.Stderr, "  join [--serve] <bootstrap-capability> [capability...]")
-		fmt.Fprintln(os.Stderr, "                          Enroll using target-bound capabilities or open-invite descriptors.")
+		fmt.Fprintln(os.Stderr, "                          Join using target-bound capabilities or open-invite descriptors.")
 		fmt.Fprintln(os.Stderr, "  serve [-group GID...]")
 		fmt.Fprintln(os.Stderr, "                          Restart joined groups from persistent local state.")
 		fmt.Fprintln(os.Stderr, "  publish -topic T (-content S|-file PATH| -file -) [-group GID]")

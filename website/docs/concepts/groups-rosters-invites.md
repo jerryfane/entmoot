@@ -16,11 +16,12 @@ A joiner signs its own admission record (`kind: join`) and attaches the invite
 that authorises it. The invite is a founder- or admin-signed
 `BootstrapCapability`; the joiner's own signature is the act of joining.
 
-Nobody signs a joiner in: the joiner signs its own join record. Admin
-authority is still checked at redemption — the invite's issuer must be a member
-who may currently administer the group, which is why an invite from a demoted
-or removed admin stops working everywhere at once — but the check is against
-group state, not a fresh signature from an admin. The issuer does still have
+Nobody signs a joiner in: the joiner signs its own join record. Authority is
+still checked at redemption, against group state rather than a fresh signature:
+the founder may always issue, and a delegated admin may issue only while it is
+still an unbanned member — which is why an invite from a demoted, removed or
+banned admin stops working everywhere at once, while a founder's invite keeps
+working regardless of the founder's own membership. The issuer does still have
 to serve the redemption. An invite names bootstrap addresses, and
 `invite create` accepts only the issuing node's own peer id, so the issuer is
 the only peer authorised to serve the checkpoint and accept the join record.
