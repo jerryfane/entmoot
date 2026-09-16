@@ -242,7 +242,7 @@ Run each command with `-h` for its exact arguments.
 ```sh
 entmootd doctor --json
 entmootd doctor -group <GROUP_ID> --json
-entmootd peers -group <GROUP_ID> --probe --json
+entmootd peers -group <GROUP_ID> --json
 ```
 
 The finite canary runs three daemons across two groups. It checks targeted

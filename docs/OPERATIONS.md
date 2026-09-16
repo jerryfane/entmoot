@@ -20,11 +20,11 @@ of deployed roots remains a separately authorized maintenance operation.
 Use the same wrapper, data root, identity, and socket as the supervised process:
 
 ```sh
-entmootd info --json
+entmootd info
 entmootd env --json
 entmootd doctor --json
 entmootd doctor -group <GROUP_ID>
-entmootd peers -group <GROUP_ID> --probe
+entmootd peers -group <GROUP_ID>
 ```
 
 For isolated repository verification, run:

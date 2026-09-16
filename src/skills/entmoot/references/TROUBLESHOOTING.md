@@ -14,8 +14,9 @@ below Entmoot.
 
 `doctor` reports daemon state, group membership, each member's peer id derived
 from its key, message counts and the group's Merkle root, and suggests joining
-when this node is not a member. It opens no connections: there is no
-connectivity, synchronization or probe result in the report, and `--probe`
+when this node is not a member. It performs no network I/O: apart from asking the
+local control socket whether a daemon is running, it dials nobody, so there is
+no connectivity, synchronization or probe result in the report and `--probe`
 changes nothing.
 
 ## Common Exit Codes

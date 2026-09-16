@@ -81,7 +81,8 @@ entmootd query --limit 1000 | wc -l
 
 Compare those outputs across peers. `doctor` should show the same current
 membership on each, with one row per member; it reports no transport,
-synchronization or probe result, because it opens no connections. `roster status` should show the same `checkpoint` and
+synchronization or probe result, because it performs no network I/O beyond
+asking the local control socket whether a daemon is running. `roster status` should show the same `checkpoint` and
 `sequence` on every peer once a checkpoint has been signed, and the same member
 list.
 

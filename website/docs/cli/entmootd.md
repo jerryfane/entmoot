@@ -68,7 +68,7 @@ Useful inspection commands:
 ```sh
 entmootd env [--json]
 entmootd doctor [-group GID] [--json]
-entmootd peers -group <GROUP_ID> [--probe]
+entmootd peers -group <GROUP_ID> [--json]
 ```
 
 `env` is read-only. It reports the binary, identity, data root, control socket,
