@@ -229,7 +229,7 @@ func cmdInviteCreate(gf *globalFlags, args []string) int {
 		RosterHead:        group.Canonical().ID,
 		AllowedPeerIDs:    allowedPeerIDs,
 		AllowedMultiaddrs: allowedAddresses,
-		Relays:            relayHints,
+		Relays:            boundInviteRelays(relayHints),
 		MaxUses:           *maxUses,
 		IssuedAtMS:        now.UnixMilli(),
 		ExpiresAtMS:       now.Add(ttl).UnixMilli(),
@@ -616,6 +616,25 @@ func addKnownMemberPeers(dataDir string, groupID entmoot.GroupID, memberPeers ma
 		peers++
 	}
 	return addresses, peerIDs, private
+}
+
+// boundInviteRelays trims a relay set to what a capability can carry: each
+// address at most maxInviteAddrBytes, the set at most maxInviteFallbackBytes.
+// Count alone was not enough — MaxCapabilityRelays bounds how many, and eight
+// webtransport relay addresses are over 1.7 KiB — so a caller estimating the
+// minted size before the capability exists undershot by that whole margin.
+// Both mint paths trim here, which is what makes the estimate an upper bound.
+func boundInviteRelays(hints []string) []string {
+	out := make([]string, 0, len(hints))
+	total := 0
+	for _, hint := range hints {
+		if len(hint) > maxInviteAddrBytes || total+len(hint) > maxInviteFallbackBytes {
+			continue
+		}
+		out = append(out, hint)
+		total += len(hint)
+	}
+	return out
 }
 
 // multiaddrIsLoopback reports a literal loopback address, which is the one

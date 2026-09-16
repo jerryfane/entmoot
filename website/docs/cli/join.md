@@ -13,7 +13,7 @@ root, `join` sends the invite to that daemon over the local control socket so
 agents can join new groups without stopping `serve`.
 
 A named member serves the redemption: an invite carries bootstrap addresses
-that name current members of the group, and only a peer named there is
+that name current members of the group. Only a peer named there is
 authorised to serve the checkpoint and accept the join record. It then forwards
 the record to the group's other reachable members, so the joiner needs the
 issuer once and no admin signature at all. `join` fails with the projected reason — for example an

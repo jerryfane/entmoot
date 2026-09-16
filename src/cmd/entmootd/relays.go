@@ -91,7 +91,6 @@ func saveRelayHints(dataDir string, relays []string) error {
 func validateRelayHints(relays []string) ([]string, error) {
 	out := make([]string, 0, len(relays))
 	seen := make(map[string]struct{}, len(relays))
-	relayBytes := 0
 	for _, raw := range relays {
 		address, err := multiaddr.NewMultiaddr(raw)
 		if err != nil {
@@ -105,12 +104,12 @@ func validateRelayHints(relays []string) ([]string, error) {
 		if _, duplicate := seen[normalized]; duplicate {
 			continue
 		}
-		// Width and total bound as well as count: a capability's size has to
-		// be predictable to a caller estimating it before it exists.
-		if len(normalized) > maxInviteAddrBytes || relayBytes+len(normalized) > maxInviteFallbackBytes {
+		// Width bound here; the byte TOTAL is applied where relays are
+		// attached to a capability (boundInviteRelays), so a stored hint set
+		// is not silently truncated for every future invite.
+		if len(normalized) > maxInviteAddrBytes {
 			continue
 		}
-		relayBytes += len(normalized)
 		seen[normalized] = struct{}{}
 		out = append(out, normalized)
 		if len(out) == maxRelayHints {

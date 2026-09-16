@@ -196,7 +196,8 @@ start a runner.
 
 `invite create` accepts one or more libp2p bootstrap multiaddrs naming this
 node or any current member, and either a target Ed25519 public key or `-open`.
-It also attaches a bounded set of other members' known addresses unless
+It also attaches a set of other members' known addresses — bounded in count
+and in bytes, at most 4 members, 8 addresses and 1 KiB — unless
 `-no-fallback-peers` is given, so an invite outlives its issuer's uptime:
 routable addresses first, and one slot for a member known only on a LAN, ULA,
 link-local or carrier-NAT address, since on that network it is the address

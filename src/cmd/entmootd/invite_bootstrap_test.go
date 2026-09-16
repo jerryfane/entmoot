@@ -161,7 +161,7 @@ func TestFallbackPeersAreBoundedAndRoutable(t *testing.T) {
 	for _, addr := range addresses {
 		for _, leak := range []string{"/ip4/172.", "/ip4/10.", "/ip4/192.168.", "/ip4/127.", "/ip4/100.106."} {
 			if strings.HasPrefix(addr, leak) {
-				t.Fatalf("attached a non-routable address %q: an invite should not enumerate a member's internal network", addr)
+				t.Fatalf("attached a non-routable address %q while this member has a routable one: routable addresses come first", addr)
 			}
 		}
 	}

@@ -23,8 +23,11 @@ still an unbanned member — which is why an invite from a demoted, removed or
 banned admin stops working everywhere at once, while a founder's invite keeps
 working regardless of the founder's own membership. An invite names bootstrap addresses, and
 `invite create` accepts any current member's address — the issuing node's own,
-any you name, and up to four more it already knows — and only a peer the invite
-names may serve the checkpoint and accept the join record. So a newcomer can
+any you name, and up to four more it already knows, bounded in bytes as well
+as count — and only a peer the invite
+names may serve the checkpoint and accept the join record — and only while it
+is still a member itself, or is the invite's own issuer, whose authority is
+checked on every read. So a newcomer can
 join while the issuer is offline, as long as one named member is reachable.
 Naming other members is safe because the newcomer pins the founder's key from
 the invite and verifies the membership it is served against that key: a named

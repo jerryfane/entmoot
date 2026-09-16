@@ -111,6 +111,42 @@ func TestOpenInviteSizeEstimateCoversTheMintedCapability(t *testing.T) {
 	}
 }
 
+// TestAttachmentHonoursTheBytePremiseTheEstimateRelies On is the property the
+// creation-time estimate is built on: whatever the daemon attaches without
+// being asked — fallback member addresses and relay hints — never exceeds the
+// byte bounds the estimate models. The previous version of this test built its
+// own worst case from the same constants the estimate uses, so it asserted the
+// premise against itself and passed while the real mint, whose relays come
+// from relayHints() with no byte bound, signed capabilities creation had
+// accepted.
+func TestAttachmentHonoursTheBytePremiseTheEstimateReliesOn(t *testing.T) {
+	// A webtransport address with two certhashes, the shape a real peer cache
+	// holds: each under the per-address bound, the set far over the total.
+	long := "/ip4/203.0.113.7/udp/4001/quic-v1/webtransport/certhash/" +
+		strings.Repeat("u", 64) + "/certhash/" + strings.Repeat("v", 64) +
+		"/p2p/12D3KooWGu8QgDWWsThK4JqbwXDBAQmTr9NXsomethinglongenough"
+	if len(long) > maxInviteAddrBytes {
+		t.Fatalf("fixture address is %d bytes, over the per-address bound; pick a shorter one", len(long))
+	}
+
+	var hints []string
+	for i := 0; i < 16; i++ {
+		hints = append(hints, long)
+	}
+	bounded := boundInviteRelays(hints)
+	total := 0
+	for _, hint := range bounded {
+		total += len(hint)
+	}
+	if total > maxInviteFallbackBytes {
+		t.Fatalf("relay hints attach %d bytes, over the %d the estimate models: %d hints of %d bytes each",
+			total, maxInviteFallbackBytes, len(bounded), len(long))
+	}
+	if len(bounded) == 0 {
+		t.Fatal("no relay hint survived, so the bound is a refusal rather than a trim")
+	}
+}
+
 // TestCreationEstimateIsAnUpperBoundOnTheMint pins the property the estimate
 // needs and twice did not have: whatever passes creation must pass the mint.
 // Sizing the fallback slots from the operator's own short addresses let a

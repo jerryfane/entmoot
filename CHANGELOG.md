@@ -185,7 +185,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   joiner signs its own admission, redeeming an invite that authorises it, so
   no founder or admin has to sign anything when the invite is used. The
   invite names the members that may serve its redemption, and a peer serves one
-  only if it is named there and is still a member itself — so an invite does not
+  only if it is named there and is either still a member or the invite's own
+  signing authority — so an invite does not
   depend on the issuer being up, which is the change recorded at the top of this
   section. Records (`join`, `leave`, `rekey`, `remove`, `unban`,
   `policy`, `revoke_invite`) merge by one deterministic total order —
