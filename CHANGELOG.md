@@ -132,8 +132,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Group membership is now a set of self-signed records with signed
   checkpoints, replacing the linear founder/admin-signed roster chain.** A
   joiner signs its own admission, redeeming an invite that authorises it, so
-  admitting a member no longer requires the founder or a delegated admin to be
-  online and writing. Records (`join`, `leave`, `rekey`, `remove`, `unban`,
+  no founder or admin has to sign anything when the invite is used. The
+  ISSUING node does still have to be reachable then: an invite may only name
+  its issuer's own peer id as a bootstrap address (invite.go), and a peer
+  serves a pre-membership redemption only if it is named there (the transport
+  checks the capability's allowed peer ids), so the issuer is the only peer
+  that can serve one. Records (`join`, `leave`, `rekey`, `remove`, `unban`,
   `policy`, `revoke_invite`) merge by one deterministic total order —
   timestamp, then kind, then the founder's record before a delegated admin's,
   then record id — with joins applied before rekeys, authority records, and
