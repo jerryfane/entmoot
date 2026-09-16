@@ -29,7 +29,7 @@ Core rules:
 - Start read-only. Do not restart services, containers, agents, Pilot, or
   Entmoot until a task explicitly authorizes a fix.
 - Use SSH multiplexing for remote checks. Credentials are in
-  `/Users/jerryfane/Desktop/repo/entmoot/temp/vps-ssh.txt`; never print or
+  the operator's local SSH credential file (path not recorded here); never print or
   commit them.
 - Treat host-level and container-level runtimes separately. Hermes/OpenClaw,
   Entmoot, and Pilot may live inside containers.
@@ -72,7 +72,7 @@ Before starting:
 
 Task 1: Read-only Mars Hub conversation monitor
 1. Open SSH multiplex sessions for the candidate peers from
-   `temp/vps-ssh.txt`: VPS, Deimos, and the host that maps to Hermes.
+   the operator's local SSH credential file: VPS, Deimos, and the host that maps to Hermes.
 2. Discover the actual Entmoot/Pilot namespace for each peer:
    - host install vs container install;
    - Entmoot binary/wrapper path;
