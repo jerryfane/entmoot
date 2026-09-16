@@ -63,7 +63,7 @@ fi
 echo
 echo "== recent libp2p and reconciliation lines =="
 if [[ -f "$entmoot_log" ]]; then
-  tail -300 "$entmoot_log" | grep -E 'libp2p|reconcile|history|enroll|roster|message ingested' | tail -80 || true
+  tail -300 "$entmoot_log" | grep -E 'libp2p|reconcile|history|membership|roster|message ingested' | tail -80 || true
 else
   echo "log file not found: $entmoot_log"
 fi
