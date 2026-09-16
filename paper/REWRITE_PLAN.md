@@ -12,11 +12,9 @@ Current baseline:
 - `paper/evolution.tex` intentionally covers the April-May shakedown through
   `v1.5.35`.
 - `CHANGELOG.md` shows the current mainline release is `v1.5.81`.
-- `paper/entmoot-paper.pdf` is the tracked canonical paper artifact. The
-  website copy at `website/static/papers/entmoot-main.pdf` is generated from it
-  by `npm run sync-papers` and is ignored, so it is never committed.
-  `website/static/papers/entmoot-evolution.pdf` is still tracked, because its
-  source `paper/evolution.pdf` is not.
+- `paper/entmoot-paper.pdf` and `paper/evolution.pdf` are the tracked paper
+  artifacts. Both `website/static/papers/` copies are generated from them by
+  `npm run sync-papers` and are ignored, so they are never committed.
 
 ## Rewrite Thesis
 
@@ -352,6 +350,14 @@ reconciliation, ESP access, public discovery, and searchable shared history.
   artifact task because they are tracked. The two copies under
   `website/static/papers/` are generated from them by `npm run sync-papers`
   and are ignored, so do not commit those.
+- `cd paper && make` builds the main paper only. `paper/evolution.pdf` is
+  rebuilt explicitly with `make evolution`, because it is tracked and a
+  default rebuild would leave a modified binary in the tree.
+- Known state: the committed `paper/evolution.pdf` was built 2026-05-03 and is
+  one paragraph behind `evolution.tex`, which gained the `entmootd env` and
+  container-wrapper sentences in 1f40cb1 on 2026-05-07. A clean rebuild does
+  contain them. Republishing is deliberately deferred, because the same bytes
+  are on arXiv and served by the website; do it as its own artifact commit.
 - Do not add LaTeX auxiliary files or build logs.
 
 ## Task Boundaries For The Goal
