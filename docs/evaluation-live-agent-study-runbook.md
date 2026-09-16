@@ -341,7 +341,7 @@ Before running any evaluation command:
 - Confirm the worktree does not contain raw artifacts intended for publication.
 - Confirm the command is running inside the runtime that owns the node identity.
 - Confirm `entmootd env --json` works for that runtime.
-- Confirm `entmootd doctor -group "$GROUP_ID" --probe --json` can run without
+- Confirm `entmootd doctor -group "$GROUP_ID" --json` can run without
   exposing secrets in the terminal log you intend to save.
 - Confirm live replies are disabled unless this step explicitly requires them
   and owner consent has been recorded.
@@ -350,7 +350,7 @@ For Hermes:
 
 - Run commands in the Hermes container-local runtime.
 - Do not use host-level Entmoot state if it is separate from the container.
-- Preserve the container's Pilot socket and data root.
+- Preserve the container's control socket and data root.
 
 Example container invocation:
 
@@ -365,7 +365,7 @@ docker exec -e EVAL_RUN_ID="$EVAL_RUN_ID" <hermes-container> \
 For Deimos/OpenClaw:
 
 - Run commands in the OpenClaw container-local runtime, not host-level state.
-- Confirm `entmootd env --json` points at the container data root and Pilot
+- Confirm `entmootd env --json` points at the container data root and control
   socket before joining or exporting evidence.
 
 Example container invocation:

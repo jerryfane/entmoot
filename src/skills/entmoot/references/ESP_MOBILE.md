@@ -11,7 +11,7 @@ not consensus state.
 - Member summaries can include `live` with enabled/status/mode/topics/actions,
   lease, and timestamps.
 - Live config API:
-  `PUT /v1/groups/<group_id>/live-agents/<node_id>`.
+  `PUT /v1/groups/<group_id>/live-agents/<member_id_b64>`.
 - Capability API: `GET /v1/capabilities` returns an empty object `{}`. Use
   `/v1/status` or `/v1/session` for auth mode and service state.
 - Bearer/admin devices can manage configs. A member signature can manage only

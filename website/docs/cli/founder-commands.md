@@ -148,9 +148,11 @@ entmootd invite list -group <GROUP_ID>
 entmootd invite revoke -group <GROUP_ID> -nonce <BASE64_NONCE>
 ```
 
-An invite is worth its issuer's current standing in the group. Removing or
-demoting the issuer invalidates its outstanding invites on every node at once,
-with no revocation step. `invite revoke` writes a signed `revoke_invite`
+A delegated admin's invite is worth that admin's current standing in the
+group: removing or demoting it invalidates its outstanding invites on every
+node at once, with no revocation step. A founder's invites are not covered by
+that - they keep working after the founder removes itself, so revoking one
+takes an explicit `invite revoke`. `invite revoke` writes a signed `revoke_invite`
 record, which is what makes other nodes refuse it, and also marks the local
 issuance ledger; it therefore takes the writer lease and needs the daemon
 stopped. `-open` mints a bearer invite: whoever holds it can join until it

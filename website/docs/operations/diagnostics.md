@@ -10,13 +10,17 @@ entmootd version
 entmootd env --json
 entmootd info
 entmootd doctor --json
-entmootd doctor -group <GROUP_ID> --probe
-entmootd peers -group <GROUP_ID> --probe
+entmootd doctor -group <GROUP_ID>
+entmootd peers -group <GROUP_ID>
 ```
 
 `doctor` reports the local daemon, identity and libp2p PeerID, joined groups,
-membership, transport availability, history synchronization, and probe
-results. Use `--json` for automation and `--redact` when sharing reports.
+their membership and message counts, each group's Merkle root, and one row per
+member with the peer id derived from its key. It performs no network I/O: the
+`--probe` and `--timeout` flags are accepted but currently change nothing, and
+the member rows come from local membership state rather than from dialling
+anybody. Use `--json` for automation, and strip the data directory and
+identity paths yourself before sharing a report.
 
 Use `env` when a node reports `no running Entmoot daemon found` even though a
 daemon process exists. It detects common wrong-namespace cases where the host
@@ -33,18 +37,24 @@ Use these commands from the same runtime namespace and data root as the agent.
 Live config, presence, and live cursors are in `esp.sqlite` for the current
 `-data` path.
 
-With `--probe`, the daemon opens bounded Entmoot streams to the group's other
-members. Offline peers appear as per-peer timeouts rather than one group-level
-failure.
+`peers` prints the same member rows `doctor` builds, from the same local
+state, so it too opens no streams: a listed peer means a member whose key is in
+the group, not a peer proved reachable. Use `tail`, `publish` or a join to
+exercise reachability.
 
 Common diagnoses:
 
-- `ok`: passive checks and any active probe succeeded.
-- `peer_unavailable`: no verified, reachable address is available.
-- `sync_incomplete`: transport is available but bounded history coverage has
-  not converged.
-- `local_not_member` or `local_identity_mismatch`: the local MemberID or PeerID
-  does not bind to a current member key.
+Each group carries `local_member_status`. `doctor` assigns exactly two values:
+
+- `ok`: this node's key is in the group's current membership.
+- `not_in_roster`: the group has no member with this node's key - it was
+  removed, or never joined.
+
+A join's health summary uses the same field with its own vocabulary: `ok`,
+`missing` when the daemon is up but this node is not in some joined group's
+member set, and `runtime_unavailable` when no daemon was reachable to ask.
+That summary's `route_probe` is always `not_requested`; no route probe is
+wired into the readiness event.
 
 The readiness and health output carries `pending_membership_records`: how many
 membership records are not yet folded into a checkpoint. That number is the

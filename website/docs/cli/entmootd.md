@@ -20,7 +20,7 @@ typing these paths by hand:
 
 ```sh
 /data/.entmoot/entmoot env
-/data/.entmoot/entmoot doctor --probe
+/data/.entmoot/entmoot doctor
 ```
 
 The wrapper reads `/data/.entmoot/runtime.env` and keeps identity, data-root,
@@ -67,8 +67,8 @@ Useful inspection commands:
 
 ```sh
 entmootd env [--json]
-entmootd doctor [--json] [--probe]
-entmootd peers -group <GROUP_ID> [--probe]
+entmootd doctor [-group GID] [--json]
+entmootd peers -group <GROUP_ID> [--json]
 ```
 
 `env` is read-only. It reports the binary, identity, data root, control socket,

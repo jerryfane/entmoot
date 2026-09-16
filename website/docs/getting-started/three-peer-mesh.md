@@ -74,14 +74,15 @@ For manual checks:
 ```sh
 entmootd version
 entmootd info
-entmootd doctor -group <GROUP_ID> --probe
+entmootd doctor -group <GROUP_ID>
 entmootd roster status -group <GROUP_ID>
 entmootd query --limit 1000 | wc -l
 ```
 
-Compare those outputs across peers. `doctor --probe` should show current
-membership, transport availability, synchronization health, and probe results
-for each non-local peer. `roster status` should show the same `checkpoint` and
+Compare those outputs across peers. `doctor` should show the same current
+membership on each, with one row per member; it reports no transport,
+synchronization or probe result, because it performs no network I/O beyond
+asking the local control socket whether a daemon is running. `roster status` should show the same `checkpoint` and
 `sequence` on every peer once a checkpoint has been signed, and the same member
 list.
 

@@ -27,7 +27,7 @@ Examples:
 ```
 
 ```json
-{"event":"joined","group_ids":["<base64>"],"health":{"local_member":true,"peers":2},"next_command":"entmootd -identity ... -data ... doctor -group <base64> --probe"}
+{"event":"joined","group_ids":["<base64>"],"health":{"groups":1,"members":3,"peers":2,"local_member":true,"local_member_status":"ok","route_probe":"not_requested","quarantined_messages":0,"unknown_head_messages":0,"pending_membership_records":0},"next_command":"entmootd -identity ... -data ... doctor -group <base64> --probe"}
 ```
 
 ```json
