@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `entmootd doctor` now has the `-redact` flag its documentation already
+  promised. The redaction helper, its unit test and the docs all existed while
+  nothing called it, so a report an operator shared to ask for help carried the
+  data directory, the identity path and `/proc/<pid>` paths anyway. Redaction
+  runs before both the JSON and the human output.
+
 ### Changed
 
 - **An invite no longer needs its issuer online.** `invite create` accepted

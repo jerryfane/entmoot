@@ -45,6 +45,9 @@ type updateResult struct {
 	Warnings        []string `json:"warnings,omitempty"`
 }
 
+// updateSemver is the numeric triple parseUpdateReleaseVersion splits out of
+// a release tag. Precedence lives on updateReleaseVersion, which knows about
+// prerelease identifiers; this type deliberately carries no comparison.
 type updateSemver struct {
 	major int
 	minor int
@@ -651,20 +654,6 @@ func compareUpdatePrereleaseIdentifier(a, b string) int {
 		}
 		return 0
 	}
-}
-
-func (v updateSemver) NewerThan(other updateSemver) bool {
-	if v.major != other.major {
-		return v.major > other.major
-	}
-	if v.minor != other.minor {
-		return v.minor > other.minor
-	}
-	return v.patch > other.patch
-}
-
-func (v updateSemver) String() string {
-	return fmt.Sprintf("v%d.%d.%d", v.major, v.minor, v.patch)
 }
 
 func restartEntmootAfterUpdate(entmootdPath string) updateRestartResult {

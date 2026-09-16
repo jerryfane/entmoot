@@ -18,12 +18,8 @@ func TestParseUpdateSemver(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseUpdateSemver: %v", err)
 	}
-	if got.String() != "v1.2.3" {
-		t.Fatalf("version = %s, want v1.2.3", got.String())
-	}
-	newer, _ := parseUpdateSemver("v1.2.4")
-	if !newer.NewerThan(got) {
-		t.Fatalf("v1.2.4 should be newer than %s", got.String())
+	if got.major != 1 || got.minor != 2 || got.patch != 3 {
+		t.Fatalf("parsed %d.%d.%d, want 1.2.3: the prerelease suffix belongs to the caller", got.major, got.minor, got.patch)
 	}
 }
 

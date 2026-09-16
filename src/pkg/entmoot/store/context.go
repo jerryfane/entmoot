@@ -44,14 +44,6 @@ func NormalizeMessageContextOptions(opts MessageContextOptions) MessageContextOp
 	return opts
 }
 
-// DefaultMessageContextOptions returns the recommended default context window.
-func DefaultMessageContextOptions() MessageContextOptions {
-	return MessageContextOptions{
-		Before: DefaultMessageContextBefore,
-		After:  DefaultMessageContextAfter,
-	}
-}
-
 // MessageContextResult is the storage-level conversation window around a
 // target message. Messages are ordered oldest-to-newest by the same stable
 // recency tuple used by history pagination.
