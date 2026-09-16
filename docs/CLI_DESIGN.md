@@ -218,9 +218,10 @@ since that is the anchor the joiner pins.
 (open/spent/expired/revoked). `invite revoke` withdraws an invite before it
 expires, blocking every remaining use; revoking a nonce this data root never
 recorded also blocks it, so a leaked invite file is recoverable. `roster
-remove` revokes the invites bound to the removed member, reports the count, and
-lists the group's remaining open nonces, which name nobody and therefore cannot
-be revoked automatically.
+remove` needs no revocation step for the invites the removed member issued:
+each carries its issuer's authority, which the removal takes away. It lists the
+group's remaining open nonces, which name nobody and therefore cannot be
+revoked automatically.
 
 Two authorised signers may write at the same time without consequence.
 Membership is a set of signed records merged in one deterministic order, so

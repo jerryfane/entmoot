@@ -43,7 +43,7 @@ const defaultJoinTimeout = 90 * time.Second
 func cmdJoin(gf *globalFlags, args []string) int {
 	fs := flag.NewFlagSet("join", flag.ContinueOnError)
 	serveAfterJoin := fs.Bool("serve", false, "after joining, keep running as the Entmoot daemon")
-	timeout := fs.Duration("timeout", defaultJoinTimeout, "deadline for the whole join")
+	timeout := fs.Duration("timeout", defaultJoinTimeout, "deadline per capability redeemed")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return exitOK

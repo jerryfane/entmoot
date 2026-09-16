@@ -383,8 +383,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `roster add`, which does not exist (running it exits 5), claimed roster order
   is "monotonic and fork-checked" after membership v3 removed fork detection,
   advertised a memory message store deleted earlier in this unreleased cycle, and called
-  a join an "enrollment" — there has been no separate enrollment step since the
-  libp2p cutover.
+  a join an "enrollment" — a separate enrollment protocol did exist, from the
+  libp2p cutover until membership v3 deleted it earlier in this same cycle, so
+  the word is stale rather than never-true.
 
 - **Roster-ahead messages are held, not lost.** A publisher whose roster moved
   first names a head the receiver has not synchronized, and live validation
@@ -436,14 +437,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   "this identity is banned from the group", "the invite issuer may no longer
   administer this group" — and two joiners redeeming one invite in the same
   millisecond both apply because the records merge as a set.
-- **Removal stays a removal.** Because an invite is no longer tied to one exact
-  head, `roster remove` and the IPC member-remove path now revoke every invite
-  bound to the removed member and report how many. Revocation is the whole
-  mechanism: a plainly removed identity that redeems a fresh invite is admitted
-  again, by design, and only a BAN refuses it ("this identity is banned from
-  the group"). Open bearer
-  invites name no target, so they cannot be attributed: both paths list the
-  remaining open nonces so an operator can revoke them.
+- **Removal stays a removal.** Removal alone voids the invites the removed
+  member issued: an invite carries its issuer's current authority, and the
+  removal takes that authority away, so there is no revocation step and no
+  count to report. What `roster remove` and the IPC member-remove path do
+  report is the group's remaining OPEN bearer invites, from this node's ledger
+  and from the ESP store — those name no target, so removing a member says
+  nothing about them and anyone holding one can still join. A plainly removed
+  identity that redeems a fresh invite is admitted again, by design; only a ban
+  refuses it ("this identity is banned from the group").
 
 ### Changed
 
