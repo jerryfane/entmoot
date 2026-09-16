@@ -29,11 +29,14 @@ Useful global flags:
 Without `-group`, every locally joined group with a membership store is
 served. A group that still holds only the pre-checkpoint roster chain is NOT
 served: on start the daemon tries to adopt a founder-signed checkpoint 0 for
-it and warns `membership adopt: group awaits checkpoint 0 from its founder`
-when no peer offers one (or `membership adopt: no checkpoint yet` when the
-chain itself cannot be read). If no other group qualifies, `serve` then exits
-3 with `serve: no joined groups found`. Adoption is retried on every start and
-on the maintenance tick, so the group begins being served as soon as a peer
+it. When the attempt errors — a recorded peer that cannot be dialled, or a
+chain that cannot be read — it warns `membership adopt: no checkpoint yet`
+with the reason in `err`. When it completes without one, which includes having
+no peer recorded to ask, it warns `membership adopt: group awaits checkpoint 0
+from its founder` and names the `membership upgrade` command in `hint`. If no other group qualifies, `serve` then exits 3 with
+`serve: no joined groups found; run entmootd join <invite> once`. Adoption is
+retried at start and then by a dedicated one-minute ticker, not by the
+group maintenance loop, so the group begins being served as soon as a peer
 supplies checkpoint 0. A directory with neither store is skipped with the
 warning `serve: skipping group with no membership state`, and naming it with
 `-group` is an error instead. Run
