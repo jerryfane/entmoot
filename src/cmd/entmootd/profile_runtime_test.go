@@ -761,3 +761,64 @@ func TestBoundaryWalkCoversEveryRowExactlyOnce(t *testing.T) {
 		t.Fatalf("walk saw %d distinct messages, stored %d", len(seen), len(stored))
 	}
 }
+
+// TestReconcileCrossesAFullyTiedPageBoundary drives the runtime's own cursor
+// construction, which the walk test above cannot: that one rebuilds the
+// page-to-cursor rule inside the test, so only the comparator is under test.
+// Here reconciliation itself must page through more same-timestamp rows than
+// one page holds, which is the only way a wrong field in the PageBoundary it
+// builds becomes visible - zero the author or the message id and members stop
+// getting their names.
+func TestReconcileCrossesAFullyTiedPageBoundary(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	root := t.TempDir()
+	founder, _ := mustDaemonIdentity(t)
+	var gid entmoot.GroupID
+	if _, err := rand.Read(gid[:]); err != nil {
+		t.Fatal(err)
+	}
+	policy := membership.DefaultPolicy()
+	policy.JoinRule = membership.JoinRuleOpen
+	mustCreateGroup(t, root, gid, founder, policy)
+	state, err := esphttp.OpenSQLiteStateStore(root)
+	if err != nil {
+		t.Fatalf("OpenSQLiteStateStore: %v", err)
+	}
+	defer state.Close()
+	runtime, session, host := startTestRuntimeWithProfiles(t, ctx, root, founder, gid, state)
+	defer host.Close()
+	defer runtime.Close()
+
+	// One more member than a page holds, every profile at the SAME timestamp,
+	// so the whole order is decided by the tiebreaks and the walk must cross a
+	// boundary that ties on time.
+	members := profileReconcilePageSize + 40
+	tie := time.Now().Add(-time.Hour).UnixMilli()
+	want := make(map[entmoot.MemberID]string, members)
+	for i := 0; i < members; i++ {
+		member, memberInfo := mustDaemonIdentity(t)
+		if _, err := session.group.SignRecord(member, membership.Record{Kind: membership.KindJoin}); err != nil {
+			t.Fatalf("join %d: %v", i, err)
+		}
+		name := fmt.Sprintf("member-%d", i)
+		mustStoreProfileAt(t, ctx, runtime, session, member, memberInfo, gid,
+			profile.Profile{DisplayName: name, IssuedAtMS: tie}, tie)
+		want[*memberInfo.MemberID] = name + "#" + memberInfo.MemberID.String()
+	}
+
+	runtime.reconcileProfilesFromHistory(ctx, session)
+
+	missing := 0
+	var example entmoot.MemberID
+	for memberID, name := range want {
+		if got := mustDisplayName(t, ctx, state, root, gid, memberID); got != name {
+			missing++
+			example = memberID
+		}
+	}
+	if missing != 0 {
+		t.Fatalf("%d of %d members have no reconciled name (for example %s): the walk lost rows crossing a tied page boundary",
+			missing, len(want), example)
+	}
+}
