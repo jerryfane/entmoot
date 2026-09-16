@@ -53,7 +53,8 @@ func TestDaemonMintWithNoNamedAddressesStaysRedeemable(t *testing.T) {
 	}
 	defer host.Close()
 	if len(host.Addrs()) <= maxInviteFallbackAddrs {
-		t.Skipf("host reports %d addresses, not enough to exercise the bound", len(host.Addrs()))
+		t.Fatalf("host reports %d addresses with %d listeners, want more than the %d an invite carries: "+
+			"the fixture must outgrow the bound or it proves nothing", len(host.Addrs()), len(listen), maxInviteFallbackAddrs)
 	}
 	messages, err := store.OpenSQLite(root)
 	if err != nil {

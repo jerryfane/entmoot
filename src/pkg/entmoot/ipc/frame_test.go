@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"sync"
 	"testing"
@@ -214,8 +215,18 @@ func TestMsgTypeString(t *testing.T) {
 	if got := MsgType(0xFF).String(); got != "unknown(0xff)" {
 		t.Errorf("0xFF String() = %q", got)
 	}
-	// An unused byte in the ipc namespace must also be reported as unknown.
-	if got := MsgType(0x27).String(); got != "unknown(0x27)" {
-		t.Errorf("0x27 String() = %q", got)
+	// Every byte with no constant must report as unknown. The old check named
+	// one free byte out of 237, so it could not see a stray label on any
+	// other; deriving the set from the table above covers all of them, and
+	// couples this test to the table deliberately - a new MsgType has to be
+	// added here too.
+	for b := 0; b <= 0xFF; b++ {
+		if _, assigned := cases[MsgType(b)]; assigned {
+			continue
+		}
+		want := fmt.Sprintf("unknown(0x%02x)", b)
+		if got := MsgType(b).String(); got != want {
+			t.Errorf("MsgType(0x%02x).String() = %q, want %q", b, got, want)
+		}
 	}
 }

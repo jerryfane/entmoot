@@ -14,6 +14,7 @@ import (
 	"entmoot/pkg/entmoot/membership"
 	"entmoot/pkg/entmoot/profile"
 	"entmoot/pkg/entmoot/signing"
+	"entmoot/pkg/entmoot/store"
 )
 
 // TestPublishedProfileBecomesADisplayName is the whole point of the feature:
@@ -602,5 +603,201 @@ func TestReconciliationFindsARetractionADeeperPageAway(t *testing.T) {
 
 	if got := mustDisplayName(t, ctx, state, root, gid, *founderInfo.MemberID); got != "member-"+founderInfo.MemberID.String() {
 		t.Fatalf("display name = %q, want the fallback: the withdrawal has the newest issue time in the window", got)
+	}
+}
+
+// TestPageBoundaryComparatorAgreesWithTheStore pins each tiebreak separately.
+// profileMessageNewer exists to name the oldest row of a page in the SAME
+// order the store pages on, so the boundary it builds can neither skip nor
+// repeat a row. If the two orders disagree on either tiebreak, rows are lost
+// silently - which is why this asserts agreement rather than re-implementing
+// the comparison.
+func TestPageBoundaryComparatorAgreesWithTheStore(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	root := t.TempDir()
+	founder, _ := mustDaemonIdentity(t)
+	var gid entmoot.GroupID
+	if _, err := rand.Read(gid[:]); err != nil {
+		t.Fatal(err)
+	}
+	policy := membership.DefaultPolicy()
+	policy.JoinRule = membership.JoinRuleOpen
+	mustCreateGroup(t, root, gid, founder, policy)
+	state, err := esphttp.OpenSQLiteStateStore(root)
+	if err != nil {
+		t.Fatalf("OpenSQLiteStateStore: %v", err)
+	}
+	defer state.Close()
+	runtime, session, host := startTestRuntimeWithProfiles(t, ctx, root, founder, gid, state)
+	defer host.Close()
+	defer runtime.Close()
+
+	// One timestamp, many authors: with the timestamp equal for every row, the
+	// author and message-id comparisons decide the whole order. Random keys
+	// and content hashes make author order and id order differ.
+	// Some rows share an author so the message-id tiebreak decides between
+	// them, and the rest have distinct authors so the author comparison
+	// decides: both are exercised by one page.
+	const authors = 12
+	const perAuthor = 2
+	const rows = authors * perAuthor
+	tie := time.Now().UnixMilli()
+	for i := 0; i < authors; i++ {
+		author, authorInfo := mustDaemonIdentity(t)
+		if _, err := session.group.SignRecord(author, membership.Record{Kind: membership.KindJoin}); err != nil {
+			t.Fatalf("join %d: %v", i, err)
+		}
+		for j := 0; j < perAuthor; j++ {
+			mustStoreProfileAt(t, ctx, runtime, session, author, authorInfo, gid,
+				profile.Profile{DisplayName: fmt.Sprintf("member-%d-%d", i, j), IssuedAtMS: tie}, tie)
+		}
+	}
+
+	page, err := runtime.store.LatestByTopicBefore(ctx, gid, profile.Topic, rows, nil)
+	if err != nil {
+		t.Fatalf("LatestByTopicBefore: %v", err)
+	}
+	if len(page) != rows {
+		t.Fatalf("page holds %d rows, want %d: the fixture must fit one page for the order to be readable", len(page), rows)
+	}
+
+	// The store returns a page in its paging order, ties ascending, so its
+	// first row is the one every other row outranks.
+	oldest := page[0]
+	for i, message := range page[1:] {
+		if !profileMessageNewer(message, oldest) {
+			t.Fatalf("row %d does not outrank the store's first row, so the boundary would not be the page's oldest: "+
+				"author %s id %s vs author %s id %s",
+				i+1, profileMessageAuthor(message), message.ID, profileMessageAuthor(oldest), oldest.ID)
+		}
+	}
+}
+
+// TestBoundaryWalkCoversEveryRowExactlyOnce covers the other half of the
+// boundary contract. The comparator test proves the boundary names the page's
+// oldest row; this proves that using it as a cursor neither skips nor repeats
+// a row, which is the property reconciliation depends on and the one a wrong
+// boundary field breaks silently. It pages with a small limit so several pages
+// are needed, and every timestamp is shared so the tiebreaks carry the order.
+func TestBoundaryWalkCoversEveryRowExactlyOnce(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	root := t.TempDir()
+	founder, _ := mustDaemonIdentity(t)
+	var gid entmoot.GroupID
+	if _, err := rand.Read(gid[:]); err != nil {
+		t.Fatal(err)
+	}
+	policy := membership.DefaultPolicy()
+	policy.JoinRule = membership.JoinRuleOpen
+	mustCreateGroup(t, root, gid, founder, policy)
+	state, err := esphttp.OpenSQLiteStateStore(root)
+	if err != nil {
+		t.Fatalf("OpenSQLiteStateStore: %v", err)
+	}
+	defer state.Close()
+	runtime, session, host := startTestRuntimeWithProfiles(t, ctx, root, founder, gid, state)
+	defer host.Close()
+	defer runtime.Close()
+
+	const authors = 9
+	const perAuthor = 3
+	const pageLimit = 4
+	base := time.Now().UnixMilli()
+	stored := make(map[entmoot.MessageID]struct{}, authors*perAuthor)
+	for i := 0; i < authors; i++ {
+		author, authorInfo := mustDaemonIdentity(t)
+		if _, err := session.group.SignRecord(author, membership.Record{Kind: membership.KindJoin}); err != nil {
+			t.Fatalf("join %d: %v", i, err)
+		}
+		for j := 0; j < perAuthor; j++ {
+			// Two timestamps only, and the first two rows of each author share
+			// one, so every field of the cursor carries part of the order: the
+			// timestamp, the author between members, and the message id
+			// between two rows of the same member at the same instant.
+			stamp := base
+			if j == perAuthor-1 {
+				stamp = base + 1
+			}
+			message := mustStoreProfileAt(t, ctx, runtime, session, author, authorInfo, gid,
+				profile.Profile{DisplayName: fmt.Sprintf("member-%d-%d", i, j), IssuedAtMS: base}, stamp)
+			stored[message.ID] = struct{}{}
+		}
+	}
+
+	seen := make(map[entmoot.MessageID]int, len(stored))
+	var boundary *store.PageBoundary
+	for page := 0; page < len(stored)+2; page++ {
+		messages, err := runtime.store.LatestByTopicBefore(ctx, gid, profile.Topic, pageLimit, boundary)
+		if err != nil {
+			t.Fatalf("page %d: %v", page, err)
+		}
+		if len(messages) == 0 {
+			break
+		}
+		for _, message := range messages {
+			seen[message.ID]++
+		}
+		if len(messages) < pageLimit {
+			break
+		}
+		// The runtime's own rule, called rather than re-implemented: a test
+		// that rebuilt this could not see a wrong field inside it.
+		boundary = nextProfileBoundary(messages)
+	}
+
+	for id := range stored {
+		switch seen[id] {
+		case 1:
+		case 0:
+			t.Fatalf("message %s was skipped by the boundary walk: a member's name can be lost this way", id)
+		default:
+			t.Fatalf("message %s was served %d times: the boundary did not advance past it", id, seen[id])
+		}
+	}
+	if len(seen) != len(stored) {
+		t.Fatalf("walk saw %d distinct messages, stored %d", len(seen), len(stored))
+	}
+}
+
+// TestNextProfileBoundaryScansAPageInTopologicalOrder covers the min-scan. A
+// page does not arrive sorted: store.LatestByTopicBefore queries newest-first
+// and then returns order.Topological, so a parent is placed before its child
+// even when the child sorts below it. messages[0] is therefore the minimum of
+// the topological frontier, not of the page, and taking it as the cursor
+// re-serves every row between the two - which is why the scan exists.
+func TestNextProfileBoundaryScansAPageInTopologicalOrder(t *testing.T) {
+	author := entmoot.MemberID{9}
+	same := int64(1_700_000_000_000)
+	newer := entmoot.Message{
+		ID:        entmoot.MessageID{0xF0},
+		Timestamp: same,
+		Author:    entmoot.NodeInfo{MemberID: &author},
+	}
+	older := entmoot.Message{
+		ID:        entmoot.MessageID{0x0F},
+		Timestamp: same,
+		Author:    entmoot.NodeInfo{MemberID: &author},
+		Parents:   []entmoot.MessageID{newer.ID},
+	}
+	// The order a topological page puts them in: the parent first, though it
+	// is the larger of the two under the paging key.
+	page := []entmoot.Message{newer, older}
+
+	boundary := nextProfileBoundary(page)
+	if boundary == nil {
+		t.Fatal("no boundary for a non-empty page")
+	}
+	if boundary.MessageID != older.ID {
+		t.Fatalf("cursor names %s, want the page's smallest row %s: taking the first row re-serves everything between them",
+			boundary.MessageID, older.ID)
+	}
+	if boundary.AuthorMemberID != author || boundary.TimestampMS != same {
+		t.Fatalf("cursor = {%d, %s, %s}, want the smallest row's own three fields",
+			boundary.TimestampMS, boundary.AuthorMemberID, boundary.MessageID)
+	}
+	if nextProfileBoundary(nil) != nil {
+		t.Fatal("an empty page must produce no cursor, or the walk restarts from the newest row")
 	}
 }

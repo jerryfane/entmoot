@@ -1069,11 +1069,7 @@ func (r *groupRuntime) reconcileProfilesFromHistory(ctx context.Context, session
 		if len(messages) == 0 {
 			break
 		}
-		oldest := messages[0]
 		for _, message := range messages {
-			if profileMessageNewer(oldest, message) {
-				oldest = message
-			}
 			if message.Author.MemberID == nil {
 				continue
 			}
@@ -1093,11 +1089,7 @@ func (r *groupRuntime) reconcileProfilesFromHistory(ctx context.Context, session
 			// The topic is exhausted; there is nothing older to page to.
 			break
 		}
-		boundary = &store.PageBoundary{
-			TimestampMS:    oldest.Timestamp,
-			AuthorMemberID: profileMessageAuthor(oldest),
-			MessageID:      oldest.ID,
-		}
+		boundary = nextProfileBoundary(messages)
 	}
 	for _, rec := range best {
 		// The store still arbitrates against whatever it already holds; this
@@ -1111,6 +1103,29 @@ func (r *groupRuntime) reconcileProfilesFromHistory(ctx context.Context, session
 		r.logger.Debug("member profile reconciliation found no claim for some members",
 			slog.String("group_id", session.groupID.String()),
 			slog.Int("members_without_profile", len(wanted)-len(best)))
+	}
+}
+
+// nextProfileBoundary turns a page into the cursor for the page after it. The
+// cursor must name the page's OLDEST row in the store's own order, or the next
+// query skips rows (a member loses its published name) or repeats them. It is
+// a named function so a test can exercise the rule the runtime actually uses
+// rather than re-implement it - a test that rebuilt this literal could not see
+// a wrong field in it.
+func nextProfileBoundary(messages []entmoot.Message) *store.PageBoundary {
+	if len(messages) == 0 {
+		return nil
+	}
+	oldest := messages[0]
+	for _, message := range messages {
+		if profileMessageNewer(oldest, message) {
+			oldest = message
+		}
+	}
+	return &store.PageBoundary{
+		TimestampMS:    oldest.Timestamp,
+		AuthorMemberID: profileMessageAuthor(oldest),
+		MessageID:      oldest.ID,
 	}
 }
 
