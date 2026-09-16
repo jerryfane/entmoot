@@ -128,10 +128,10 @@ func cmdInviteCreate(gf *globalFlags, args []string) int {
 		return exitTransport
 	}
 	founder.MemberID = &founderBinding.MemberID
-	// The founder or any delegated admin may invite. Whichever member the
-	// bootstrap addresses name is what serves the checkpoint a joiner reads —
-	// not necessarily this node, which is what lets an invite outlive its
-	// issuer's uptime.
+	// The founder or any delegated admin may invite. Whichever named peer is
+	// entitled to serve — a current member, or this node as the capability's
+	// own issuer — serves the checkpoint a joiner reads; not necessarily this
+	// node, which is what lets an invite outlive its issuer's uptime.
 	localMemberID := mustMemberID(s.identity.PublicKey)
 	if !group.CanAdminister(localMemberID) {
 		fmt.Fprintln(os.Stderr, "invite create: local identity is neither the group founder nor a delegated admin")
@@ -683,14 +683,21 @@ func boundInviteAddresses(addresses []string) []string {
 			break
 		}
 		for _, addr := range addresses {
-			if len(out) >= maxInviteFallbackAddrs || total+len(addr) > maxInviteFallbackBytes {
+			if len(out) >= maxInviteFallbackAddrs {
 				return out
 			}
+			// Filter BEFORE budgeting. Checking the budget first let an
+			// address that would be skipped anyway — wrong tier, or over the
+			// width bound — end the whole scan by its length, dropping
+			// shorter addresses after it that still fitted.
 			if len(addr) > maxInviteAddrBytes {
 				continue
 			}
 			parsed, err := multiaddr.NewMultiaddr(addr)
 			if err != nil || tierOf(parsed) != tier {
+				continue
+			}
+			if total+len(addr) > maxInviteFallbackBytes {
 				continue
 			}
 			out = append(out, addr)

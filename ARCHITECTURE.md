@@ -130,8 +130,11 @@ A joiner signs its own admission record and hands it to the peer it read the
 checkpoint from; that peer applies it under the same rules and forwards it once.
 No admin has to SIGN anybody in, and there is no separate enrollment
 authority to ask. The issuer does not have to be reachable either: an invite
-names current members as bootstrap peers, and any peer the capability names may
-serve the pre-membership read. The issuer's authority is still evaluated, by
+names current members as bootstrap peers, and a peer serves the pre-membership
+read only if the capability names it AND it is entitled to serve: a current,
+unbanned member, or the capability's own signing authority, whose right to
+administer is checked on every read and which may therefore serve after
+leaving the group. The issuer's authority is still evaluated, by
 whichever peer serves, against its own view of the group.
 
 Hints are not authority. A hinted PeerID must bind to the expected member key.

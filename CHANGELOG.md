@@ -33,8 +33,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a LAN, a ULA, a link-local or a carrier-NAT address — still gets a single
   slot, because on that network it is the door that works; at most four such
   addresses can reach one invite, `invite create` reports on stderr when it
-  attaches any, and loopback is never attached because it names the joiner's
-  own machine. `-no-fallback-peers` attaches none, and `no_fallback_peers` does
+  attaches any, and loopback is never attached to the fallback set, because it names
+  the joiner's own machine rather than a member — the one exception being a
+  node whose own addresses are all loopback, where the alternative is an
+  invite naming nothing at all. `-no-fallback-peers` attaches none, and `no_fallback_peers` does
   the same on the IPC path, on the ESP invite-create operation, and on an ESP
   open invite, where it is stored with the token because the capability is
   minted only at redemption.

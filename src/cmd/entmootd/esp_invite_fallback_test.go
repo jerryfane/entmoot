@@ -278,3 +278,53 @@ func TestTheDaemonsOwnAddressFillIsBounded(t *testing.T) {
 		t.Fatalf("a loopback-only host filled %d addresses, want 1 as a last resort", len(loopbackOnly))
 	}
 }
+
+// TestFillDoesNotStopOnASkippableAddress is the reviewer's counterexample. The
+// budget check ran before the tier and width filters, so an address that could
+// not be attached anyway ended the whole scan by its length, dropping shorter
+// usable addresses behind it.
+func TestFillDoesNotStopOnASkippableAddress(t *testing.T) {
+	_, info := mustDaemonIdentity(t)
+	binding, err := libp2ptransport.BindingFromPublicKey(info.EntmootPubKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	suffix := "/p2p/" + binding.PeerID.String()
+	pad := func(base string, want int) string {
+		addr := base + suffix
+		if len(addr) >= want {
+			return addr
+		}
+		return "/dnsaddr/" + strings.Repeat("a", want-len(suffix)-len("/dnsaddr//tcp/1")) + "/tcp/1" + suffix
+	}
+
+	var own []string
+	for i := 0; i < 4; i++ {
+		own = append(own, pad(fmt.Sprintf("/ip4/203.0.113.%d/tcp/1004", 10+i), 232))
+	}
+	// A loopback address long enough that, counted against the budget, it
+	// would have terminated the scan.
+	own = append(own, pad("/ip4/127.0.0.1/tcp/1004", 190))
+	// A short routable one that still fits.
+	short := "/ip4/203.0.113.99/tcp/1004" + suffix
+	own = append(own, short)
+
+	bounded := boundInviteAddresses(own)
+	found := false
+	for _, addr := range bounded {
+		if addr == short {
+			found = true
+		}
+		if strings.HasPrefix(addr, "/ip4/127.") {
+			t.Fatalf("attached loopback %q while routable addresses existed", addr)
+		}
+	}
+	if !found {
+		total := 0
+		for _, addr := range bounded {
+			total += len(addr)
+		}
+		t.Fatalf("dropped a %d-byte routable address that fits: attached %d addresses / %d bytes of %d",
+			len(short), len(bounded), total, maxInviteFallbackBytes)
+	}
+}

@@ -201,7 +201,7 @@ and in bytes, at most 4 members, 8 addresses and 1 KiB — unless
 `-no-fallback-peers` is given, so an invite outlives its issuer's uptime:
 routable addresses first, and one slot for a member known only on a LAN, ULA,
 link-local or carrier-NAT address, since on that network it is the address
-that works. Loopback is never attached. With a target,
+that works. Loopback is not attached to the fallback set; the daemon uses its own loopback address only when it has no other. With a target,
 the MemberID and PeerID are derived from that key and only that identity may
 redeem the invite. With `-open` the invite is a bearer credential: any holder
 may redeem it while uses remain, which is how a small team joins from one link.
