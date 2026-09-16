@@ -12,7 +12,11 @@ Current baseline:
 - `paper/evolution.tex` intentionally covers the April-May shakedown through
   `v1.5.35`.
 - `CHANGELOG.md` shows the current mainline release is `v1.5.81`.
-- `website/static/papers/entmoot-main.pdf` is tracked; `paper/entmoot-paper.pdf` is the tracked canonical paper artifact.
+- `paper/entmoot-paper.pdf` is the tracked canonical paper artifact. The
+  website copy at `website/static/papers/entmoot-main.pdf` is generated from it
+  by `npm run sync-papers` and is ignored, so it is never committed.
+  `website/static/papers/entmoot-evolution.pdf` is still tracked, because its
+  source `paper/evolution.pdf` is not.
 
 ## Rewrite Thesis
 
@@ -344,8 +348,11 @@ reconciliation, ESP access, public discovery, and searchable shared history.
 - Rewrite source first.
 - Build with `cd paper && make` during source tasks.
 - Do not commit `paper/main.pdf`; it is only a local LaTeX build byproduct.
-- Commit `paper/entmoot-paper.pdf` and `website/static/papers/entmoot-main.pdf` in the final artifact
-  task because they are tracked.
+- Commit `paper/entmoot-paper.pdf` in the final artifact task because it is
+  tracked. Do not commit `website/static/papers/entmoot-main.pdf`: `npm run
+  sync-papers` regenerates it from that file and it is ignored.
+  `website/static/papers/entmoot-evolution.pdf` is different - it is tracked,
+  because `paper/evolution.pdf` is not, so a clean clone cannot rebuild it.
 - Do not add LaTeX auxiliary files or build logs.
 
 ## Task Boundaries For The Goal
@@ -359,4 +366,4 @@ follow `docs/goal-rewrite-entmoot-research-paper.md`:
 4. Rewrite implementation.
 5. Add use cases and evaluation-plan placeholder.
 6. Rewrite discussion, limitations, future work, and conclusion.
-7. Build final paper and update tracked website artifacts.
+7. Build the final paper and update the tracked artifact in `paper/`.

@@ -18,3 +18,6 @@
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+
+# Built by "npm run sync-papers" from paper/entmoot-paper.pdf before every build.
+static/papers/entmoot-main.pdf
