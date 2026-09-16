@@ -1574,11 +1574,11 @@ func (s *ipcServer) handleMemberRemove(ctx context.Context, c net.Conn, req *ipc
 	//
 	// Invites issued by whoever is still an admin are unaffected, and an
 	// operator may want to see them, so they are reported.
-	var revocationError string
+	var ledgerError string
 	var nonces []string
 	live, err := s.runtime.invites.LiveOpenInvites(gid)
 	if err != nil {
-		revocationError = "read open invites: " + err.Error()
+		ledgerError = "read open invites: " + err.Error()
 		slog.Error("member_remove: read open invites", slog.String("err", err.Error()))
 	} else {
 		nonces = make([]string, 0, len(live))
@@ -1620,7 +1620,7 @@ func (s *ipcServer) handleMemberRemove(ctx context.Context, c net.Conn, req *ipc
 		OutstandingOpenInvites:    nonces,
 		OutstandingESPOpenInvites: espOpen,
 		ESPOpenInvitesError:       espError,
-		InviteLedgerError:         revocationError,
+		InviteLedgerError:         ledgerError,
 	})
 }
 

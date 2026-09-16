@@ -418,3 +418,45 @@ func TestStoredWinnerDoesNotDependOnWhenItWasIngested(t *testing.T) {
 		t.Fatalf("stored winner = %q, want the longer-lived claim", nodeA)
 	}
 }
+
+// TestTwoSourcesWithTheSameNameResolveDeterministically covers the pair the
+// clauses above cannot separate. A member may hold more than one row — the
+// upsert key is (member_id, source_key) — and two rows can agree on
+// confidence, issue time, expiry and hostname while being different rows.
+// Before the source-key clause the comparator was false in both directions for
+// such a pair, and the selection loop ranges a Go map, so the served name
+// depended on iteration order.
+func TestTwoSourcesWithTheSameNameResolveDeterministically(t *testing.T) {
+	ctx := context.Background()
+	gid := testGroupID(9)
+	memberID := testMemberID(41)
+	at := time.Now().UnixMilli()
+
+	records := map[string]NodeProfileRecord{}
+	for _, pubkey := range []string{"cHVia2V5LWE=", "cHVia2V5LWI="} {
+		rec := MemberProfileRecord(gid, memberID, pubkey, "same-name", at, at+3_600_000)
+		rec.Confidence = NodeProfileConfidenceMemberProfile
+		records[nodeProfileSourceKey(rec)] = rec
+	}
+	if len(records) != 2 {
+		t.Fatalf("fixture built %d rows, want 2 distinct source keys", len(records))
+	}
+
+	// Ranging a map 200 times exposes order dependence: Go randomises it.
+	var first string
+	for i := 0; i < 200; i++ {
+		best, ok := bestNodeProfile(records, at, nil, "")
+		if !ok {
+			t.Fatal("no record selected")
+		}
+		key := nodeProfileSourceKey(best)
+		if i == 0 {
+			first = key
+			continue
+		}
+		if key != first {
+			t.Fatalf("selection changed between iterations: %q then %q — map order is deciding", first, key)
+		}
+	}
+	_ = ctx
+}

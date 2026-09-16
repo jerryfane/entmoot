@@ -1007,8 +1007,8 @@ func (r *groupRuntime) storeMemberProfile(ctx context.Context, groupID entmoot.G
 // store's paging key.
 //
 // The bound is on messages, so a member CAN be crowded out: 4096 profile
-// messages outranking another member's newest claim leave that member at the
-// member-id fallback until it republishes. Earlier shapes were far worse — 256
+// messages outranking another member's newest claim leave that member
+// unreconciled until it republishes. Earlier shapes were far worse — 256
 // messages, then 271 — but the limit is a window, not an absence of one.
 //
 // Nor is being crowded out a clean miss. Every claim INSIDE the window is

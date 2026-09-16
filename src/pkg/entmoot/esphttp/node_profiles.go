@@ -242,9 +242,9 @@ func shouldReplaceNodeProfile(existing, incoming NodeProfileRecord) bool {
 	// whether a record is expired RIGHT NOW made the stored winner depend on
 	// when the loser arrived, so two nodes holding the same two claims could
 	// disagree until the nearer expiry passed. Comparing the expiries decides
-	// the same cases without consulting any clock. Hostname order settles the
-	// rest; every clause is a total order, so the winner is the maximum of a
-	// total order and arrival cannot change it.
+	// the same cases without consulting any clock. Hostname, then source key,
+	// settle the rest; every clause is a total order over distinct rows, so
+	// the winner is the maximum of a total order and arrival cannot change it.
 	if isWithdrawalRecord(incoming) != isWithdrawalRecord(existing) {
 		return isWithdrawalRecord(incoming)
 	}
@@ -255,7 +255,17 @@ func shouldReplaceNodeProfile(existing, incoming NodeProfileRecord) bool {
 	if incomingRank, existingRank := nodeProfileExpiryRank(incoming), nodeProfileExpiryRank(existing); incomingRank != existingRank {
 		return incomingRank > existingRank
 	}
-	return incoming.Hostname < existing.Hostname
+	if incoming.Hostname != existing.Hostname {
+		return incoming.Hostname < existing.Hostname
+	}
+	// Two rows for one member can agree on everything above and still be
+	// different rows, because the upsert key is (member_id, source_key): a
+	// member signature and, say, a pilot observation coexist. Without this
+	// last clause the relation is false in both directions for such a pair,
+	// and bestNodeProfile picks while ranging a Go map — so the served name
+	// would depend on iteration order, which is exactly the arrival-order
+	// dependence the clauses above exist to remove.
+	return nodeProfileSourceKey(incoming) < nodeProfileSourceKey(existing)
 }
 func cloneNodeProfileRecord(rec NodeProfileRecord) NodeProfileRecord {
 	if rec.SourceGroupID != nil {
