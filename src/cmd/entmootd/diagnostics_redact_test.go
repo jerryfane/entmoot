@@ -46,4 +46,16 @@ func TestDoctorRedactFlagOmitsLocalPaths(t *testing.T) {
 	if strings.Contains(redacted, `"runtime"`) {
 		t.Fatalf("doctor -redact leaked the runtime report: %s", redacted)
 	}
+
+	// Redaction happens before the output branch, so the human path must be
+	// covered too - that is the one an operator pastes into a chat.
+	code, human, stderr := captureCommandOutput(t, func() int {
+		return cmdDoctor(gf, []string{"-redact"})
+	})
+	if code != exitOK {
+		t.Fatalf("doctor -redact exit %d, stderr %q", code, stderr)
+	}
+	if strings.Contains(human, dir) {
+		t.Fatalf("human doctor -redact leaked the data dir: %s", human)
+	}
 }

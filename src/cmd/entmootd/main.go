@@ -60,7 +60,7 @@ func run() int {
 		fmt.Fprintln(os.Stderr, "                          Author and gossip a message via the control socket.")
 		fmt.Fprintln(os.Stderr, "  profile <set|clear|show> [-name NAME] [-group GID] [-ttl DUR]")
 		fmt.Fprintln(os.Stderr, "                          Publish this node's display name, or list observed names.")
-		fmt.Fprintln(os.Stderr, "  doctor [-group GID] [--probe] [--json]")
+		fmt.Fprintln(os.Stderr, "  doctor [-group GID] [--probe] [--json] [--redact]")
 		fmt.Fprintln(os.Stderr, "                          Diagnose local libp2p identity, groups, and peer bindings.")
 		fmt.Fprintln(os.Stderr, "  peers -group GID [--probe] [--json]")
 		fmt.Fprintln(os.Stderr, "                          Print a compact peer health table for one group.")

@@ -63,19 +63,12 @@ type RosterLog struct {
 	// persist commits one validated entry before the in-memory projection
 	// advances. Persistent logs store entries and projections transactionally.
 	persist func(entmoot.RosterEntry) error
-	// replace atomically swaps the whole persisted chain. Only fork repair
-	// uses it; in-memory logs leave it nil.
-	replace func([]entmoot.RosterEntry) error
-	// storedChain reads the committed chain back from the store. Repair uses
-	// it to resolve an ambiguous write failure, where the store may or may not
-	// have landed the new chain. In-memory logs leave it nil.
-	storedChain func() ([]entmoot.RosterEntry, error)
 	// claimWriter acquires the persistent writer lease. In-memory logs leave it
 	// nil. Persistent logs acquire lazily for offline mutation; daemons call
 	// ClaimWriter during startup.
 	claimWriter func() error
 
-	// logger is used for subscribe-drop warnings.
+	// logger carries the policy_change warning, its one remaining use.
 	logger *slog.Logger
 
 	// closeOnce guards persistent handle and writer-lease teardown.

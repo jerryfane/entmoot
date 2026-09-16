@@ -508,14 +508,20 @@ func groupMemberPeerIDs(group *membership.Group) (map[peer.ID]struct{}, error) {
 // membership-sync request with an 8 KiB ceiling, so a member-only cap let an
 // invite grow past the size at which it could be redeemed at all.
 //
-// Of the five, maxInviteFallbackBytes and maxInviteFallbackPeers are what keep
-// a minted invite redeemable - raising either one fails the size tests. The
-// three count/width caps below bound the SHAPE of what is attached, and their
+// maxInviteFallbackBytes is the only one a size test pins: raise it and
+// TestOpenInviteSizeEstimateCoversTheMintedCapability fails, because the
+// estimate charges the byte budget once while the mint attaches per address.
+// The peer and count caps are charged into that same estimate
+// (esp_operations.go), so the estimate grows with them and a modest raise
+// changes nothing a size test can see - only a raise large enough to push the
+// estimate past a joiner's frame is caught.
+//
+// What the remaining caps buy is the SHAPE of what gets attached, and those
 // failures are the ones a user notices: without maxInviteFallbackAddrsPeer one
 // multi-homed member spends the whole budget and the invite names one door
 // instead of four; without maxInviteAddrBytes a single long address starves
-// the rest. maxInviteFallbackAddrs is the remaining belt-and-braces count, and
-// lowering it is what the tests catch.
+// the rest. Both have tests that fail on exactly that. Lowering any count cap
+// is caught too, because too few doors is also a defect.
 const (
 	maxInviteFallbackPeers     = 4
 	maxInviteFallbackAddrs     = 8
