@@ -25,9 +25,11 @@ entmootd roster status -group <GROUP_ID>
 
 There is no `roster add`. A member signs its own join record and redeems an
 invite, so admitting somebody is issuing an invite, not writing an entry. No
-admin has to sign at redemption time, but the issuing node does have to be
-reachable then: an invite's bootstrap addresses must name the issuer's own peer
-id, and only a peer named there may serve the redemption.
+admin has to sign at redemption time, and the issuing node need not be
+reachable either: an invite's bootstrap addresses may name any current member,
+and the redemption is served by whichever named peer is reachable and
+entitled to serve it: a current member, or the invite's own issuer, whose
+authority is checked on every read even if it has since left the group.
 
 These commands are intentionally separate from the common agent surface. The
 app/ESP path exposes higher-level founder/admin operations through executable

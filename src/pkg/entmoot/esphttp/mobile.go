@@ -123,9 +123,13 @@ type OpenInviteRecord struct {
 	UseCount            int             `json:"use_count"`
 	Revoked             bool            `json:"revoked"`
 	BootstrapMultiaddrs []string        `json:"bootstrap_multiaddrs,omitempty"`
-	CreatedAtMS         int64           `json:"created_at_ms"`
-	UpdatedAtMS         int64           `json:"updated_at_ms"`
-	ExpiresAtMS         int64           `json:"expires_at_ms"`
+	// NoFallbackPeers declines the other-member addresses the daemon attaches
+	// when the capability is minted at redemption. It is stored because an open
+	// invite is created long before any capability exists.
+	NoFallbackPeers bool  `json:"no_fallback_peers,omitempty"`
+	CreatedAtMS     int64 `json:"created_at_ms"`
+	UpdatedAtMS     int64 `json:"updated_at_ms"`
+	ExpiresAtMS     int64 `json:"expires_at_ms"`
 }
 
 type OpenInviteSummary struct {
@@ -695,6 +699,7 @@ CREATE TABLE IF NOT EXISTS esp_open_invites (
   use_count     INTEGER NOT NULL DEFAULT 0,
   revoked       INTEGER NOT NULL DEFAULT 0,
   bootstrap_multiaddrs BLOB,
+  no_fallback_peers INTEGER NOT NULL DEFAULT 0,
   created_at_ms INTEGER NOT NULL,
   updated_at_ms INTEGER NOT NULL,
   expires_at_ms INTEGER NOT NULL
@@ -1118,9 +1123,9 @@ func (s *SQLiteStateStore) CreateOpenInvite(ctx context.Context, rec OpenInviteR
 		return OpenInviteRecord{}, err
 	}
 	_, err = s.db.ExecContext(ctx, `
-INSERT INTO esp_open_invites (token_hash, group_id, device_id, max_uses, use_count, revoked, bootstrap_multiaddrs, created_at_ms, updated_at_ms, expires_at_ms)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		rec.TokenHash, rec.GroupID[:], rec.DeviceID, rec.MaxUses, rec.UseCount, boolInt(rec.Revoked), bootstrapMultiaddrs, rec.CreatedAtMS, rec.UpdatedAtMS, rec.ExpiresAtMS)
+INSERT INTO esp_open_invites (token_hash, group_id, device_id, max_uses, use_count, revoked, bootstrap_multiaddrs, no_fallback_peers, created_at_ms, updated_at_ms, expires_at_ms)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		rec.TokenHash, rec.GroupID[:], rec.DeviceID, rec.MaxUses, rec.UseCount, boolInt(rec.Revoked), bootstrapMultiaddrs, boolInt(rec.NoFallbackPeers), rec.CreatedAtMS, rec.UpdatedAtMS, rec.ExpiresAtMS)
 	if err != nil {
 		return OpenInviteRecord{}, fmt.Errorf("esphttp: create open invite: %w", err)
 	}
@@ -1128,7 +1133,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 }
 
 func (s *SQLiteStateStore) GetOpenInviteByTokenHash(ctx context.Context, tokenHash string) (OpenInviteRecord, bool, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT token_hash, group_id, device_id, max_uses, use_count, revoked, bootstrap_multiaddrs, created_at_ms, updated_at_ms, expires_at_ms FROM esp_open_invites WHERE token_hash = ?`, tokenHash)
+	row := s.db.QueryRowContext(ctx, `SELECT token_hash, group_id, device_id, max_uses, use_count, revoked, bootstrap_multiaddrs, no_fallback_peers, created_at_ms, updated_at_ms, expires_at_ms FROM esp_open_invites WHERE token_hash = ?`, tokenHash)
 	rec, err := scanOpenInviteRecord(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return OpenInviteRecord{}, false, nil
@@ -1140,7 +1145,7 @@ func (s *SQLiteStateStore) GetOpenInviteByTokenHash(ctx context.Context, tokenHa
 }
 
 func (s *SQLiteStateStore) ListOpenInvitesByGroup(ctx context.Context, groupID entmoot.GroupID) ([]OpenInviteRecord, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT token_hash, group_id, device_id, max_uses, use_count, revoked, bootstrap_multiaddrs, created_at_ms, updated_at_ms, expires_at_ms FROM esp_open_invites WHERE group_id = ? ORDER BY created_at_ms DESC`, groupID[:])
+	rows, err := s.db.QueryContext(ctx, `SELECT token_hash, group_id, device_id, max_uses, use_count, revoked, bootstrap_multiaddrs, no_fallback_peers, created_at_ms, updated_at_ms, expires_at_ms FROM esp_open_invites WHERE group_id = ? ORDER BY created_at_ms DESC`, groupID[:])
 	if err != nil {
 		return nil, fmt.Errorf("esphttp: list open invites: %w", err)
 	}
@@ -1194,7 +1199,7 @@ func (s *SQLiteStateStore) RedeemOpenInvite(ctx context.Context, tokenHash strin
 	}
 	defer tx.Rollback()
 
-	row := tx.QueryRowContext(ctx, `SELECT token_hash, group_id, device_id, max_uses, use_count, revoked, bootstrap_multiaddrs, created_at_ms, updated_at_ms, expires_at_ms FROM esp_open_invites WHERE token_hash = ?`, tokenHash)
+	row := tx.QueryRowContext(ctx, `SELECT token_hash, group_id, device_id, max_uses, use_count, revoked, bootstrap_multiaddrs, no_fallback_peers, created_at_ms, updated_at_ms, expires_at_ms FROM esp_open_invites WHERE token_hash = ?`, tokenHash)
 	rec, err := scanOpenInviteRecord(row)
 	if err != nil {
 		return OpenInviteRecord{}, OpenInviteRedemption{}, false, err
@@ -1236,7 +1241,7 @@ WHERE token_hash = ?
 		tokenHash, redemption.RedeemerKey, redemption.MemberID[:], redemption.PeerID, redemption.EntmootPubKey, nowMS); err != nil {
 		return OpenInviteRecord{}, OpenInviteRedemption{}, false, err
 	}
-	row = tx.QueryRowContext(ctx, `SELECT token_hash, group_id, device_id, max_uses, use_count, revoked, bootstrap_multiaddrs, created_at_ms, updated_at_ms, expires_at_ms FROM esp_open_invites WHERE token_hash = ?`, tokenHash)
+	row = tx.QueryRowContext(ctx, `SELECT token_hash, group_id, device_id, max_uses, use_count, revoked, bootstrap_multiaddrs, no_fallback_peers, created_at_ms, updated_at_ms, expires_at_ms FROM esp_open_invites WHERE token_hash = ?`, tokenHash)
 	rec, err = scanOpenInviteRecord(row)
 	if err != nil {
 		return OpenInviteRecord{}, OpenInviteRedemption{}, false, err
@@ -1388,6 +1393,11 @@ func migrateSQLiteState(db *sql.DB) error {
 			return fmt.Errorf("esphttp: migrate state schema add bootstrap_peers: %w", err)
 		}
 	}
+	if !openInviteCols["no_fallback_peers"] {
+		if _, err := db.Exec(`ALTER TABLE esp_open_invites ADD COLUMN no_fallback_peers INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return fmt.Errorf("esphttp: migrate state schema add no_fallback_peers: %w", err)
+		}
+	}
 	redemptionCols, err := tableColumns(db, "esp_open_invite_redemptions")
 	if err != nil {
 		return err
@@ -1501,9 +1511,11 @@ func scanOpenInviteRecord(row openInviteScanner) (OpenInviteRecord, error) {
 	var groupBytes []byte
 	var revoked int
 	var bootstrapMultiaddrs []byte
-	if err := row.Scan(&rec.TokenHash, &groupBytes, &rec.DeviceID, &rec.MaxUses, &rec.UseCount, &revoked, &bootstrapMultiaddrs, &rec.CreatedAtMS, &rec.UpdatedAtMS, &rec.ExpiresAtMS); err != nil {
+	var noFallback int
+	if err := row.Scan(&rec.TokenHash, &groupBytes, &rec.DeviceID, &rec.MaxUses, &rec.UseCount, &revoked, &bootstrapMultiaddrs, &noFallback, &rec.CreatedAtMS, &rec.UpdatedAtMS, &rec.ExpiresAtMS); err != nil {
 		return OpenInviteRecord{}, err
 	}
+	rec.NoFallbackPeers = noFallback != 0
 	if len(groupBytes) == len(rec.GroupID) {
 		copy(rec.GroupID[:], groupBytes)
 	}

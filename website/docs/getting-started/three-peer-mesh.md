@@ -45,28 +45,21 @@ and pushes it. The peer that accepts the record forwards it to the group's
 other reachable members, so C learns about B without either of them being
 named in the other's invite.
 
-No admin signs a join, but the issuing node must be reachable when its invite
-is used: `invite create` refuses any `-bootstrap` that does not end in the
-issuing node's own peer id, so an invite cannot point a newcomer at a different
-member. To admit C while A is stopped, B has to issue the invite itself, which
-means A must delegate admin authority to B first — `invite create` exits 2 for
-a member that is neither founder nor delegated admin. `roster admin grant`
-takes the group's writer lease, so it runs with A's daemon stopped;
-`invite create` does not, and works with B's daemon running:
+No admin signs a join, and the issuer need not be running either: an invite
+may name any current member as a bootstrap peer, and whichever named peer is
+reachable and still entitled to serve — a current member, or the invite's own
+issuer — serves the redemption. To admit C while A is stopped, A mints C's
+invite ahead of time pointing at B:
 
 ```sh
-# on A, daemon stopped
-entmootd roster admin grant -group <GROUP_ID> -member <B_MEMBER_ID>
-```
-
-Restart A long enough for B to sync the policy record (`entmootd roster status
--group <GROUP_ID>` on B lists B under `admins`), then stop A and issue from B:
-
-```sh
-# on B
+# on A, while A still runs
 entmootd invite create -group <GROUP_ID> -target-pubkey <C_PUBKEY_B64> \
   -bootstrap /ip4/<B_IP>/tcp/1004/p2p/<B_PEER_ID> -valid-for 24h > invite-c.json
 ```
+
+Then stop A. C joins through B, and the invite is still A's — B serves the
+checkpoint and accepts C's self-signed join record, then forwards it. B does
+not need admin authority to do that; serving a redemption is not issuing one.
 
 ## Verifying
 

@@ -7,7 +7,9 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
+	"net"
 	"os"
 	"time"
 
@@ -45,7 +47,7 @@ func cmdInvite(gf *globalFlags, args []string) int {
 // cmdInviteCreate emits a bootstrap capability. It is bound to one target
 // identity unless -open is given, which mints a bearer invite any holder may
 // redeem while uses remain. Bootstrap addresses must be full multiaddrs
-// ending in /p2p/<founder-peer-id>.
+// ending in /p2p/<peer-id>, naming this node or another current member.
 func cmdInviteCreate(gf *globalFlags, args []string) int {
 	fs := flag.NewFlagSet("invite create", flag.ContinueOnError)
 	groupStr := fs.String("group", "", "base64 group id (required)")
@@ -54,7 +56,8 @@ func cmdInviteCreate(gf *globalFlags, args []string) int {
 	maxUses := fs.Int("max-uses", 1, "how many distinct identities may join with this invite")
 	validFor := fs.String("valid-for", "24h", "capability TTL (time.ParseDuration or <N>d)")
 	var bootstrap stringListFlag
-	fs.Var(&bootstrap, "bootstrap", "issuing node's libp2p multiaddr ending in /p2p/<peer-id>; repeatable")
+	fs.Var(&bootstrap, "bootstrap", "libp2p multiaddr of this node or another current member, ending in /p2p/<peer-id>; repeatable")
+	noFallback := fs.Bool("no-fallback-peers", false, "do not attach other members' known addresses as fallback bootstrap peers")
 	var relays stringListFlag
 	fs.Var(&relays, "relay", "controlled-relay multiaddr the joiner should adopt, ending in /p2p/<relay-peer-id>; repeatable; defaults to this data root's own relays")
 	if err := fs.Parse(args); err != nil {
@@ -125,9 +128,10 @@ func cmdInviteCreate(gf *globalFlags, args []string) int {
 		return exitTransport
 	}
 	founder.MemberID = &founderBinding.MemberID
-	// The founder or any delegated admin may invite. The issuer's own host is
-	// what serves the checkpoint a joiner reads, so the bootstrap addresses
-	// must name it.
+	// The founder or any delegated admin may invite. Whichever named peer is
+	// entitled to serve — a current member, or this node as the capability's
+	// own issuer — serves the checkpoint a joiner reads; not necessarily this
+	// node, which is what lets an invite outlive its issuer's uptime.
 	localMemberID := mustMemberID(s.identity.PublicKey)
 	if !group.CanAdminister(localMemberID) {
 		fmt.Fprintln(os.Stderr, "invite create: local identity is neither the group founder nor a delegated admin")
@@ -150,6 +154,18 @@ func cmdInviteCreate(gf *globalFlags, args []string) int {
 		info.PeerID = localBinding.PeerID.String()
 		issuer = &info
 	}
+	// A bootstrap address may name ANY current member, not only the issuer.
+	// The newcomer pins the founder's key from this capability and verifies
+	// the checkpoint it is served against that key, so a named peer cannot
+	// forge membership — it can only serve or fail. Restricting the list to
+	// the issuer meant the issuer had to be running for its own invite to be
+	// usable, which is the one thing self-signed admission was supposed to
+	// remove.
+	memberPeers, err := groupMemberPeerIDs(group)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "invite create: read group members: %v\n", err)
+		return exitTransport
+	}
 	allowedPeerIDs := make([]string, 0, len(bootstrap))
 	allowedAddresses := make([]string, 0, len(bootstrap))
 	seen := make(map[peer.ID]struct{})
@@ -160,8 +176,12 @@ func cmdInviteCreate(gf *globalFlags, args []string) int {
 			return exitInvalidArgument
 		}
 		info, err := peer.AddrInfoFromP2pAddr(address)
-		if err != nil || info.ID != localBinding.PeerID {
-			fmt.Fprintf(os.Stderr, "invite create: bootstrap must end in the issuing node's peer id %s\n", localBinding.PeerID)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "invite create: -bootstrap must end in /p2p/<peer-id>: %s\n", raw)
+			return exitInvalidArgument
+		}
+		if _, ok := memberPeers[info.ID]; !ok && info.ID != localBinding.PeerID {
+			fmt.Fprintf(os.Stderr, "invite create: bootstrap peer %s is not a member of this group; name this node or another member\n", info.ID)
 			return exitInvalidArgument
 		}
 		allowedAddresses = append(allowedAddresses, address.String())
@@ -170,6 +190,15 @@ func cmdInviteCreate(gf *globalFlags, args []string) int {
 			allowedPeerIDs = append(allowedPeerIDs, info.ID.String())
 		}
 	}
+	if !*noFallback {
+		var privateFallbacks int
+		allowedAddresses, allowedPeerIDs, privateFallbacks = addKnownMemberPeers(s.dataDir, gid, memberPeers,
+			localBinding.PeerID, allowedAddresses, allowedPeerIDs, seen)
+		if privateFallbacks > 0 {
+			fmt.Fprintf(os.Stderr, "invite create: %d fallback peer(s) are known only on a private address; the invite carries it, which works on the same network and not beyond it\n", privateFallbacks)
+		}
+	}
+
 	// Relay hints default to whatever this node itself relays through, since
 	// that is the set already known to accept it.
 	relayHints := []string(relays)
@@ -190,6 +219,12 @@ func cmdInviteCreate(gf *globalFlags, args []string) int {
 		fmt.Fprintln(os.Stderr, "invite create: every -relay must be a multiaddr ending in /p2p/<relay-peer-id>")
 		return exitInvalidArgument
 	}
+	// An invite carries a bounded number of relay BYTES. The trim happens in
+	// resolveInviteRelayHints so that it cannot be left out by a call site —
+	// the size check depends on the bound holding — and it reports what it
+	// dropped, because losing a relay an operator named without a word is how
+	// a joiner ends up unable to reach the group by the intended path.
+	relayHints = resolveInviteRelayHints(relayHints, os.Stderr)
 	now := time.Now()
 	capability := entmoot.BootstrapCapability{
 		GroupID:           gid,
@@ -213,6 +248,13 @@ func cmdInviteCreate(gf *globalFlags, args []string) int {
 	if err := libp2ptransport.SignBootstrapCapability(s.identity, &capability); err != nil {
 		slog.Error("invite create: sign", slog.String("err", err.Error()))
 		return exitTransport
+	}
+	// Refuse here rather than let the mint succeed and the redemption fail
+	// with a size error the joiner cannot act on.
+	if size, tooLarge := libp2ptransport.CapabilityTooLarge(capability); tooLarge {
+		fmt.Fprintf(os.Stderr, "invite create: the invite is %d bytes, over the %d-byte limit a joiner can send; name fewer -bootstrap addresses or pass -no-fallback-peers\n",
+			size, libp2ptransport.MaxCapabilityBytes)
+		return exitInvalidArgument
 	}
 	admission, err := libp2ptransport.OpenInviteLedger(s.dataDir)
 	if err != nil {
@@ -440,4 +482,263 @@ func mustMemberID(publicKey []byte) entmoot.MemberID {
 		panic(err)
 	}
 	return memberID
+}
+
+// groupMemberPeerIDs maps the group's current members to their transport peer
+// ids. Both are derived from the same Ed25519 key, so membership is what makes
+// a peer id serveable: no separate list has to be maintained.
+func groupMemberPeerIDs(group *membership.Group) (map[peer.ID]struct{}, error) {
+	out := make(map[peer.ID]struct{})
+	for _, memberID := range group.MemberIDs() {
+		info, ok := group.MemberInfoByID(memberID)
+		if !ok || len(info.EntmootPubKey) == 0 {
+			continue
+		}
+		binding, err := libp2ptransport.BindingFromPublicKey(info.EntmootPubKey)
+		if err != nil {
+			return nil, err
+		}
+		out[binding.PeerID] = struct{}{}
+	}
+	return out, nil
+}
+
+// Auto-attached fallback bounds. The cap that matters is on ADDRESSES, not
+// members: a multi-homed node can hold thirty of them, and a capability is
+// carried in one request frame with an 8 KiB ceiling, so bounding members
+// alone let an invite grow past the size at which it can be redeemed at all.
+const (
+	maxInviteFallbackPeers     = 4
+	maxInviteFallbackAddrs     = 8
+	maxInviteFallbackAddrsPeer = 2
+	// maxInviteAddrBytes bounds ONE attached address, fallback or relay, and
+	// maxInviteFallbackBytes bounds the fallback set TOGETHER. Counts alone
+	// were not enough twice over: peer caches hold long forms — a
+	// quic-v1/webtransport address with two certhashes runs past 190 bytes —
+	// so eight slots at full width plus eight relay hints consumed the whole
+	// capability budget before the operator named anything. Bounding bytes is
+	// what makes the minted size predictable to a caller that must estimate
+	// it before the capability exists.
+	maxInviteAddrBytes     = 256
+	maxInviteFallbackBytes = 1 << 10
+	// maxPeerIDBytes bounds a base58 libp2p peer id string; ed25519 identity
+	// peer ids are 52 characters, and this leaves room for other key types.
+	maxPeerIDBytes = 64
+	// maxInviteCapabilityOverhead charges every field of a capability that is
+	// not an address or a peer id: both identities, the checkpoint id, nonce,
+	// signature, timestamps, target fields and the JSON structure itself.
+	// TestCapabilityOverheadIsBounded measures a capability built the way the
+	// mint builds one and fails if this stops being an upper bound, so the
+	// number is checked against the encoder rather than argued for.
+	maxInviteCapabilityOverhead = 1536
+)
+
+// routableInviteAddress reports whether an address is reachable from outside
+// this host. It is a PREFERENCE, not a filter: the caller attaches routable
+// addresses first and gives a member known only on a non-routable address a
+// single slot, because on a LAN or an overlay that address is the one that
+// works. What the predicate buys is that the byte budget goes to addresses
+// likely to work, and that an invite carries one of a member's internal
+// addresses rather than its whole network.
+func routableInviteAddress(addr multiaddr.Multiaddr) bool {
+	value, err := addr.ValueForProtocol(multiaddr.P_IP4)
+	if err != nil {
+		if value, err = addr.ValueForProtocol(multiaddr.P_IP6); err != nil {
+			// A DNS or relay address carries no literal to judge; keep it.
+			return true
+		}
+	}
+	ip := net.ParseIP(value)
+	if ip == nil {
+		return false
+	}
+	if ip.IsLoopback() || ip.IsUnspecified() || ip.IsLinkLocalUnicast() || ip.IsPrivate() {
+		return false
+	}
+	// 100.64.0.0/10, carrier-grade NAT: reachable only inside one provider.
+	if ip4 := ip.To4(); ip4 != nil && ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127 {
+		return false
+	}
+	return true
+}
+
+// addKnownMemberPeers appends addresses of OTHER current members this node has
+// seen, so an invite keeps working when the issuer is down. It never fails the
+// invite: fewer addresses just means the newcomer has fewer doors to try, and
+// the operator can always name peers explicitly, or pass -no-fallback-peers to
+// attach none.
+//
+// Routable addresses are preferred, but a member reachable ONLY on a private
+// address still gets one slot: on a LAN or an overlay network that private
+// address is exactly the door that works, and silently attaching nothing there
+// would leave the invite depending on the issuer's uptime while the operator
+// believed otherwise. It reports how many of each kind it attached so the
+// caller can say so.
+func addKnownMemberPeers(dataDir string, groupID entmoot.GroupID, memberPeers map[peer.ID]struct{}, self peer.ID,
+	addresses []string, peerIDs []string, seen map[peer.ID]struct{}) ([]string, []string, int) {
+	cached, err := loadGroupPeers(dataDir, groupID)
+	if err != nil {
+		return addresses, peerIDs, 0
+	}
+	peers, addrs, bytes, private := 0, 0, 0, 0
+	for _, info := range cached {
+		if peers >= maxInviteFallbackPeers || addrs >= maxInviteFallbackAddrs || bytes >= maxInviteFallbackBytes {
+			break
+		}
+		if info.ID == self {
+			continue
+		}
+		if _, ok := memberPeers[info.ID]; !ok {
+			continue
+		}
+		if _, ok := seen[info.ID]; ok {
+			continue
+		}
+		routable, fallback := make([]string, 0, maxInviteFallbackAddrsPeer), ""
+		for _, addr := range info.Addrs {
+			full := addr.String() + "/p2p/" + info.ID.String()
+			// The width bound is what makes the minted size predictable to a
+			// caller estimating it before the capability exists.
+			if len(full) > maxInviteAddrBytes {
+				continue
+			}
+			if routableInviteAddress(addr) {
+				if len(routable) < maxInviteFallbackAddrsPeer {
+					routable = append(routable, full)
+				}
+				continue
+			}
+			if fallback == "" && !multiaddrIsLoopback(addr) {
+				fallback = full
+			}
+		}
+		chosen := routable
+		if len(chosen) == 0 {
+			if fallback == "" {
+				continue
+			}
+			chosen = []string{fallback}
+			private++
+		}
+		for _, addr := range chosen {
+			if addrs >= maxInviteFallbackAddrs || bytes+len(addr) > maxInviteFallbackBytes {
+				break
+			}
+			addresses = append(addresses, addr)
+			addrs++
+			bytes += len(addr)
+		}
+		seen[info.ID] = struct{}{}
+		peerIDs = append(peerIDs, info.ID.String())
+		peers++
+	}
+	return addresses, peerIDs, private
+}
+
+// resolveInviteRelayHints bounds a relay set for an invite and reports any
+// trim to w. Every CLI mint goes through it, so the bound is not a call-site
+// decision: a revert there used to leave the whole suite green while the
+// capability-size check quietly stopped being an upper bound.
+func resolveInviteRelayHints(hints []string, w io.Writer) []string {
+	bounded := boundInviteRelays(hints)
+	if len(bounded) != len(hints) && w != nil {
+		fmt.Fprintf(w, "invite create: carrying %d of %d relay hints; the rest do not fit the invite's %d-byte relay budget\n",
+			len(bounded), len(hints), maxInviteFallbackBytes)
+	}
+	return bounded
+}
+
+// boundInviteAddresses trims any address set the daemon attaches on its own
+// initiative — its own host addresses when a request names none, and the
+// fallback members — to what a capability can carry: each address at most
+// maxInviteAddrBytes, the set at most maxInviteFallbackAddrs entries and
+// maxInviteFallbackBytes in total, routable ones first.
+//
+// Anything the daemon fills in without being asked has to be bounded here,
+// because the size check a caller runs before the capability exists can only
+// model sets whose ceiling is enforced.
+func boundInviteAddresses(addresses []string) []string {
+	const (
+		tierRoutable = iota
+		tierPrivate
+		tierLoopback
+	)
+	tierOf := func(addr multiaddr.Multiaddr) int {
+		switch {
+		case multiaddrIsLoopback(addr):
+			return tierLoopback
+		case routableInviteAddress(addr):
+			return tierRoutable
+		default:
+			return tierPrivate
+		}
+	}
+	out := make([]string, 0, len(addresses))
+	total := 0
+	// Routable first, then private, and loopback only if nothing else exists
+	// — a daemon on a development machine may have no other address, and
+	// attaching nothing there would make its invites unusable.
+	for _, tier := range []int{tierRoutable, tierPrivate, tierLoopback} {
+		if tier == tierLoopback && len(out) > 0 {
+			break
+		}
+		for _, addr := range addresses {
+			if len(out) >= maxInviteFallbackAddrs {
+				return out
+			}
+			// Filter BEFORE budgeting. Checking the budget first let an
+			// address that would be skipped anyway — wrong tier, or over the
+			// width bound — end the whole scan by its length, dropping
+			// shorter addresses after it that still fitted.
+			if len(addr) > maxInviteAddrBytes {
+				continue
+			}
+			parsed, err := multiaddr.NewMultiaddr(addr)
+			if err != nil || tierOf(parsed) != tier {
+				continue
+			}
+			if total+len(addr) > maxInviteFallbackBytes {
+				continue
+			}
+			out = append(out, addr)
+			total += len(addr)
+		}
+	}
+	return out
+}
+
+// boundInviteRelays trims a relay set to what a capability can carry: each
+// address at most maxInviteAddrBytes, the set at most maxInviteFallbackBytes.
+// Count alone was not enough — MaxCapabilityRelays bounds how many, and eight
+// webtransport relay addresses are over 1.7 KiB — so a caller estimating the
+// minted size before the capability exists undershot by that whole margin.
+// Both mint paths trim here, which is what makes the estimate an upper bound.
+func boundInviteRelays(hints []string) []string {
+	out := make([]string, 0, len(hints))
+	total := 0
+	for _, hint := range hints {
+		if len(hint) > maxInviteAddrBytes || total+len(hint) > maxInviteFallbackBytes {
+			continue
+		}
+		out = append(out, hint)
+		total += len(hint)
+	}
+	return out
+}
+
+// multiaddrIsLoopback reports a literal loopback or unspecified address. Its
+// two callers treat that differently and both are right: the fallback set
+// never attaches one, because it would name the newcomer's own machine rather
+// than the member it claims to describe, while the daemon's own-address fill
+// uses one as a last resort, because a development host may have nothing else
+// and an invite naming nothing cannot be redeemed at all.
+func multiaddrIsLoopback(addr multiaddr.Multiaddr) bool {
+	for _, code := range []int{multiaddr.P_IP4, multiaddr.P_IP6} {
+		if value, err := addr.ValueForProtocol(code); err == nil {
+			if ip := net.ParseIP(value); ip != nil {
+				return ip.IsLoopback() || ip.IsUnspecified()
+			}
+		}
+	}
+	return false
 }

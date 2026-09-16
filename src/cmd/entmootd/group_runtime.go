@@ -216,6 +216,11 @@ func (r *groupRuntime) peerRecordsForGroup(groupID entmoot.GroupID) (*libp2ptran
 
 // relayHints renders this node's controlled relays as full multiaddrs, so an
 // invite can hand them to a joiner that has no other way to find a relay.
+// relayHints returns the relay set an invite may carry, already bounded in
+// count and bytes. The bound lives HERE, at the producer, because it used to
+// live at each mint site and one of them could then be reverted without any
+// test noticing — the capability-size estimate depends on this bound holding,
+// so the bound must not be something a call site can forget.
 func (r *groupRuntime) relayHints() []string {
 	out := make([]string, 0, len(r.controlledRelays))
 	for _, relay := range r.controlledRelays {
@@ -223,11 +228,11 @@ func (r *groupRuntime) relayHints() []string {
 		for _, address := range relay.Addrs {
 			out = append(out, address.Encapsulate(suffix).String())
 			if len(out) == libp2ptransport.MaxCapabilityRelays {
-				return out
+				return boundInviteRelays(out)
 			}
 		}
 	}
-	return out
+	return boundInviteRelays(out)
 }
 
 func (r *groupRuntime) AddLocalGroup(ctx context.Context, groupID entmoot.GroupID) (*groupSession, bool, error) {

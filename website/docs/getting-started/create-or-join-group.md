@@ -12,9 +12,10 @@ entmootd invite create -group <GROUP_ID> -target-pubkey <MEMBER_ED25519_PUBLIC_K
 
 Issuing the invite is the whole admission step. There is no command that writes
 somebody into a group: the joiner signs its own join record and redeems the
-invite, so nobody signs on its behalf. The issuing node does have to be
-reachable when the invite is used, because an invite may only name the
-issuer's own peer id as a bootstrap address.
+invite, so nobody signs on its behalf. An invite may name any current member's
+address as a bootstrap peer, including the issuer's own, so it still works
+while the issuer is offline — as long as one named peer is reachable and still
+entitled to serve, meaning a current member or the invite's own issuer.
 
 New groups default to `visibility=private`, `join_mode=invite_only`, and the
 `standard` policy preset. A public moot is created explicitly:

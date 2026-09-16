@@ -200,6 +200,11 @@ type InviteCreateReq struct {
 	MaxUses             int             `json:"max_uses,omitempty"`
 	ValidForMS          int64           `json:"valid_for_ms,omitempty"`
 	ValidUntilMS        int64           `json:"valid_until_ms,omitempty"`
+	// NoFallbackPeers suppresses the other-member addresses the daemon would
+	// otherwise attach so the invite outlives this node's uptime. Set it when
+	// the invite will be shared widely and disclosing members' addresses is
+	// not wanted; the CLI exposes the same choice as -no-fallback-peers.
+	NoFallbackPeers bool `json:"no_fallback_peers,omitempty"`
 }
 
 type InviteCreateResp struct {
@@ -219,6 +224,17 @@ type InviteAuthorityCheckResp struct {
 	GroupID    entmoot.GroupID       `json:"group_id"`
 	RosterHead entmoot.RosterEntryID `json:"roster_head"`
 	Members    int                   `json:"members"`
+	// MemberPeerIDs are the transport peer ids of the group's current members,
+	// which is the set an invite's bootstrap addresses may name. A caller that
+	// stores a bootstrap list before any capability exists — an ESP open
+	// invite — needs it to refuse an address naming nobody, rather than
+	// handing out a link every redemption will reject.
+	MemberPeerIDs []string `json:"member_peer_ids,omitempty"`
+	// LocalPeerID is this daemon's own transport peer id. The mint accepts it
+	// as a bootstrap peer even when this node is not a member — a founder may
+	// issue after standing down — so a caller validating a list early needs it
+	// to avoid being stricter than the mint.
+	LocalPeerID string `json:"local_peer_id,omitempty"`
 }
 
 type MemberRemoveReq struct {

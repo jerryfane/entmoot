@@ -129,9 +129,13 @@ checkpoint before installing any group state.
 A joiner signs its own admission record and hands it to the peer it read the
 checkpoint from; that peer applies it under the same rules and forwards it once.
 No admin has to SIGN anybody in, and there is no separate enrollment
-authority to ask. The invite's issuer does have to be reachable, because an
-invite may name only its issuer's peer id as a bootstrap address and a peer
-serves a pre-membership read only if the capability names it.
+authority to ask. The issuer does not have to be reachable either: an invite
+names current members as bootstrap peers, and a peer serves the pre-membership
+read only if the capability names it AND it is entitled to serve: a current,
+unbanned member, or the capability's own signing authority, whose right to
+administer is checked on every read and which may therefore serve after
+leaving the group. The issuer's authority is still evaluated, by
+whichever peer serves, against its own view of the group.
 
 Hints are not authority. A hinted PeerID must bind to the expected member key.
 An invite is worth exactly its issuer's current authority: demote or remove the
