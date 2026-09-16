@@ -57,7 +57,7 @@ On success, `join` emits a readiness event before exiting. The event includes
 `health` and `next_command` so operators can immediately run a route check:
 
 ```json
-{"event":"joined","group_ids":["<GROUP_ID>"],"members":3,"health":{"local_member":true,"peers":2,"route_probe":"not_run"},"next_command":"entmootd ... doctor -group <GROUP_ID> --probe"}
+{"event":"joined","group_ids":["<GROUP_ID>"],"members":3,"health":{"local_member":true,"peers":2,"route_probe":"not_requested"},"next_command":"entmootd ... doctor -group <GROUP_ID> --probe"}
 ```
 
 After joining, signed bootstrap hints and membership-bound PeerIDs seed the

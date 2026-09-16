@@ -16,7 +16,7 @@ Prefer `-file -` for generated text so shell quoting cannot corrupt content.
 ```sh
 "$ENTMOOT" query -group <gid> \
   [-topic "chat/#"] \
-  [-author <node-id>] \
+  [-author <member-id-b64>] \
   [-since <rfc3339-or-unix-ms>] \
   [-until <rfc3339-or-unix-ms>] \
   [-limit <n>] \

@@ -84,7 +84,7 @@ outstanding and `entmootd invite revoke -group <GROUP_ID> -nonce <NONCE>`
 withdraws it. Removing a member takes away the authority it held: invites a removed
 delegated admin issued stop admitting anybody, and the member stops being able
 to serve a redemption. It does not bar the identity from coming back - a later
-join re-admits it, and `roster ban` is what refuses one. Open invites name
+join with a fresh invite re-admits it, and `roster ban` is what refuses one. Open invites name
 nobody, so `roster remove` lists the remaining open nonces for you to revoke.
 
 Transfer `invite.json` to the joining node, then join and keep serving:

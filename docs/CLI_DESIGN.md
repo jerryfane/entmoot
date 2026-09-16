@@ -247,8 +247,9 @@ matches before adopting.
 
 Join validates the complete capability before network use, fetches membership state
 only from an allowed serving peer, binds the fetched founder and its own
-resulting membership, and persists consumption per applicant. Invalid, expired,
-replayed, revoked, exhausted, wrong-target or wrong-founder capabilities
+resulting membership. Consumption is counted per invite nonce in the group's
+projected state, not per applicant in a local ledger. Invalid, expired,
+revoked, exhausted, wrong-target or wrong-founder capabilities
 install no partial group state. An invite names the checkpoint its issuer held; later joins do not
 invalidate outstanding invites, while an applicant banned after that checkpoint
 is refused. A refused join reports why — invite revoked, exhausted, expired, banned

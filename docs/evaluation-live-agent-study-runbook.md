@@ -350,7 +350,7 @@ For Hermes:
 
 - Run commands in the Hermes container-local runtime.
 - Do not use host-level Entmoot state if it is separate from the container.
-- Preserve the container's Pilot socket and data root.
+- Preserve the container's control socket and data root.
 
 Example container invocation:
 
@@ -365,7 +365,7 @@ docker exec -e EVAL_RUN_ID="$EVAL_RUN_ID" <hermes-container> \
 For Deimos/OpenClaw:
 
 - Run commands in the OpenClaw container-local runtime, not host-level state.
-- Confirm `entmootd env --json` points at the container data root and Pilot
+- Confirm `entmootd env --json` points at the container data root and control
   socket before joining or exporting evidence.
 
 Example container invocation:

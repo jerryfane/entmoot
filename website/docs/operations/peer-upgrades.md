@@ -65,8 +65,8 @@ entmootd membership upgrade -group <GROUP_ID>
 entmootd serve
 ```
 
-The other peers adopt the checkpoint on a dedicated one-minute ticker, not on
-the group maintenance loop; they refuse
+The other peers adopt the checkpoint once at `serve` startup and thereafter on
+a dedicated one-minute ticker, not on the group maintenance loop; they refuse
 one whose membership disagrees with the chain they already hold, so a
 fabricated upgrade cannot take. Verify on each peer that `roster status` shows
 the same checkpoint id and the pre-upgrade member count. Running the command a
