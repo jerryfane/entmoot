@@ -138,8 +138,10 @@ leaving the group. The issuer's authority is still evaluated, by
 whichever peer serves, against its own view of the group.
 
 Hints are not authority. A hinted PeerID must bind to the expected member key.
-An invite is worth exactly its issuer's current authority: demote or remove the
-issuer and its outstanding invites stop working everywhere. Use limits and
+A delegated admin's invite is worth exactly that admin's current authority:
+demote or remove the issuer and its outstanding invites stop working
+everywhere. The founder is exempt - its invites survive its own removal,
+because the joiner pins the founder key rather than the founder's membership. Use limits and
 revocations are projected from the group's signed state, not counted per node,
 so every node reaches the same answer offline and across restarts.
 

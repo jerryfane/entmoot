@@ -341,7 +341,7 @@ Before running any evaluation command:
 - Confirm the worktree does not contain raw artifacts intended for publication.
 - Confirm the command is running inside the runtime that owns the node identity.
 - Confirm `entmootd env --json` works for that runtime.
-- Confirm `entmootd doctor -group "$GROUP_ID" --probe --json` can run without
+- Confirm `entmootd doctor -group "$GROUP_ID" --json` can run without
   exposing secrets in the terminal log you intend to save.
 - Confirm live replies are disabled unless this step explicitly requires them
   and owner consent has been recorded.

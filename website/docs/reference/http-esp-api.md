@@ -21,10 +21,10 @@ PUT  /v1/groups/{group_id}/policy
 DELETE /v1/groups/{group_id}/policy
 POST /v1/groups/{group_id}/public-moot/publish
 GET  /v1/groups/{group_id}/members
-DELETE /v1/groups/{group_id}/members/{node_id}
+DELETE /v1/groups/{group_id}/members/{member_id}
 GET  /v1/groups/{group_id}/live-agents
-PUT  /v1/groups/{group_id}/live-agents/{node_id}
-DELETE /v1/groups/{group_id}/live-agents/{node_id}
+PUT  /v1/groups/{group_id}/live-agents/{member_id}
+DELETE /v1/groups/{group_id}/live-agents/{member_id}
 POST /v1/groups/{group_id}/invites
 POST /v1/groups/{group_id}/open-invites
 POST /v1/invites/accept
@@ -202,10 +202,10 @@ Live-agent config routes:
 
 - `GET /v1/groups/{group_id}/live-agents` returns `configs`, `presence`, and
   merged `members` live state for that group.
-- `PUT /v1/groups/{group_id}/live-agents/{node_id}` upserts config:
+- `PUT /v1/groups/{group_id}/live-agents/{member_id}` upserts config:
   `enabled`, `mode`, `topic_filters`, `allowed_actions`,
   `max_actions_per_scan`, and `max_action_bytes`.
-- `DELETE /v1/groups/{group_id}/live-agents/{node_id}` disables the config and
+- `DELETE /v1/groups/{group_id}/live-agents/{member_id}` disables the config and
   marks presence offline.
 
 Bearer/admin devices can read and manage live-agent configs. A member-signed
@@ -215,7 +215,7 @@ match the CLI: mode `reply_on_mention`, topics `#`, and `0` for
 
 Admin invite and member-management routes:
 
-- `DELETE /v1/groups/{group_id}/members/{node_id}` creates a
+- `DELETE /v1/groups/{group_id}/members/{member_id}` creates a
   `member_remove` sign request. Completion signs a `remove` membership record
   through the running daemon and propagates it to the group's other members.
 - `POST /v1/groups/{group_id}/invites` creates an `invite_create` sign request

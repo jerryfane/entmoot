@@ -103,7 +103,7 @@ reconciliation without needing the original invite file.
 After joining, run:
 
 ```sh
-entmootd doctor -group <GROUP_ID> --probe
+entmootd doctor -group <GROUP_ID>
 ```
 
 The readiness event also includes a `next_command` with the correct global

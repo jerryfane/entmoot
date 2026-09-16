@@ -86,8 +86,8 @@ matching reference above.
 # Diagnose.
 "$ENTMOOT" env --json
 "$ENTMOOT" info
-"$ENTMOOT" doctor -group <gid> --probe --json
-"$ENTMOOT" peers -group <gid> --probe --json
+"$ENTMOOT" doctor -group <gid> --json
+"$ENTMOOT" peers -group <gid> --json
 ```
 
 Prefer `-file -` for generated message text so shell quoting cannot corrupt

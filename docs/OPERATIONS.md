@@ -23,7 +23,7 @@ Use the same wrapper, data root, identity, and socket as the supervised process:
 entmootd info --json
 entmootd env --json
 entmootd doctor --json
-entmootd doctor -group <GROUP_ID> --probe
+entmootd doctor -group <GROUP_ID>
 entmootd peers -group <GROUP_ID> --probe
 ```
 
@@ -343,7 +343,7 @@ peers, and changelog stay aligned.
    ```sh
    entmootd version
    entmootd info
-   entmootd doctor -group <GROUP_ID> --probe
+   entmootd doctor -group <GROUP_ID>
    entmootd query --limit 1000 | wc -l
    ```
 

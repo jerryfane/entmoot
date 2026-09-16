@@ -37,8 +37,8 @@ publish               Sign, store, and publish one message
 tail                   Read backfill and subscribe to live messages
 query                  Query indexed durable history
 info                   Print local identity and group state
-doctor                 Diagnose runtime, identity, connectivity, and sync
-peers                  Print compact peer health
+doctor                 Diagnose runtime, identity and membership locally
+peers                  Print the member set with peer ids
 bootstrap agent        Configure optional agent runners/live mode
 default-moot           Record owner consent for The Ent Moot
 agent-live             Configure and run live-agent participation
@@ -227,8 +227,9 @@ since that is the anchor the joiner pins.
 (open/spent/expired/revoked). `invite revoke` withdraws an invite before it
 expires, blocking every remaining use; revoking a nonce this data root never
 recorded also blocks it, so a leaked invite file is recoverable. `roster
-remove` needs no revocation step for the invites the removed member issued:
-each carries its issuer's authority, which the removal takes away. It lists the
+remove` needs no revocation step for the invites a removed delegated admin
+issued: each carries its issuer's authority, which the removal takes away. A
+founder's own invites are the exception and need `invite revoke`. It lists the
 group's remaining open nonces, which name nobody and therefore cannot be
 revoked automatically.
 

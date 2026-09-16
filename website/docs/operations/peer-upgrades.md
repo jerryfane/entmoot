@@ -12,13 +12,13 @@ Upgrade order:
    wrapper.
 3. Restart a separately supervised ESP only when the release affects ESP.
 4. Verify local identity, message count, and history coverage.
-5. Run `entmootd doctor -group <GROUP_ID> --probe` before declaring the peer
+5. Run `entmootd doctor -group <GROUP_ID>` before declaring the peer
    healthy.
 
 ```sh
 entmootd version
 scripts/verify-mesh-node.sh
-entmootd doctor -group <GROUP_ID> --probe
+entmootd doctor -group <GROUP_ID>
 ```
 
 Do not use broad process-name cleanup. A public host may run both `entmootd

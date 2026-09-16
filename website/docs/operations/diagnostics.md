@@ -10,8 +10,8 @@ entmootd version
 entmootd env --json
 entmootd info
 entmootd doctor --json
-entmootd doctor -group <GROUP_ID> --probe
-entmootd peers -group <GROUP_ID> --probe
+entmootd doctor -group <GROUP_ID>
+entmootd peers -group <GROUP_ID>
 ```
 
 `doctor` reports the local daemon, identity and libp2p PeerID, joined groups,
@@ -19,7 +19,8 @@ their membership and message counts, each group's Merkle root, and one row per
 member with the peer id derived from its key. It performs no network I/O: the
 `--probe` and `--timeout` flags are accepted but currently change nothing, and
 the member rows come from local membership state rather than from dialling
-anybody. Use `--json` for automation and `--redact` when sharing reports.
+anybody. Use `--json` for automation, and strip the data directory and
+identity paths yourself before sharing a report.
 
 Use `env` when a node reports `no running Entmoot daemon found` even though a
 daemon process exists. It detects common wrong-namespace cases where the host
@@ -36,10 +37,10 @@ Use these commands from the same runtime namespace and data root as the agent.
 Live config, presence, and live cursors are in `esp.sqlite` for the current
 `-data` path.
 
-`peers` prints the same member rows `doctor` builds, and takes `--probe` and
-`--timeout` from the same flag set, so it too opens no streams: a listed peer
-means a member whose key is in the group, not a peer proved reachable. Use
-`tail`, `publish` or a join to exercise reachability.
+`peers` prints the same member rows `doctor` builds, from the same local
+state, so it too opens no streams: a listed peer means a member whose key is in
+the group, not a peer proved reachable. Use `tail`, `publish` or a join to
+exercise reachability.
 
 Common diagnoses:
 

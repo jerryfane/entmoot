@@ -30,7 +30,7 @@ instead of raw flags:
 
 ```sh
 /data/.entmoot/entmoot env
-/data/.entmoot/entmoot doctor --probe
+/data/.entmoot/entmoot doctor
 ```
 
 The wrapper and supervised daemon must use the same identity, data root, and

@@ -8,13 +8,15 @@ below Entmoot.
 ```sh
 "$ENTMOOT" env --json
 "$ENTMOOT" info
-"$ENTMOOT" doctor -group <gid> --probe --json
-"$ENTMOOT" peers -group <gid> --probe --json
+"$ENTMOOT" doctor -group <gid> --json
+"$ENTMOOT" peers -group <gid> --json
 ```
 
-`doctor --probe` checks daemon state, roster membership, verified libp2p peer
-bindings, connectivity, synchronization health, and probe results. It also
-includes suggested next commands when peer transport is unavailable.
+`doctor` reports daemon state, group membership, each member's peer id derived
+from its key, message counts and the group's Merkle root, and suggests joining
+when this node is not a member. It opens no connections: there is no
+connectivity, synchronization or probe result in the report, and `--probe`
+changes nothing.
 
 ## Common Exit Codes
 
@@ -22,7 +24,7 @@ includes suggested next commands when peer transport is unavailable.
 |---|---|---|
 | 0 | Success | Continue |
 | 1 | Transport failure | Check listen/relay configuration and peer reachability |
-| 2 | Not a member | Ask a member for an invite and `join` with it; nobody can add you |
+| 2 | Not a member | Ask the founder or a delegated admin for an invite and `join` with it; nobody can add you |
 | 3 | Group not found locally | Run `info` and verify `-group` |
 | 5 | Bad flags or invalid/expired invite | Surface exact error |
 | 6 | Control socket unavailable | Start/locate `serve` or use correct namespace |
@@ -37,6 +39,7 @@ includes suggested next commands when peer transport is unavailable.
 - **Runner missing:** set `ENTMOOT_AGENT_RUNNER=openclaw` or pass
   `-runner openclaw`.
 - **Live presence offline:** run `agent-live run`; `enable` only writes config.
-- **Peer route unclear:** run `doctor -group <gid> --probe --json`.
+- **Peer route unclear:** `doctor` cannot answer this - it dials nobody. Use
+  `tail` or `publish` and see whether traffic moves.
 - **Multiple groups:** always pass `-group` for publish/query/tail unless the
   node has exactly one joined group.
