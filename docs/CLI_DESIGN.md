@@ -37,8 +37,8 @@ publish               Sign, store, and publish one message
 tail                   Read backfill and subscribe to live messages
 query                  Query indexed durable history
 info                   Print local identity and group state
-doctor                 Diagnose runtime, identity, connectivity, and sync
-peers                  Print compact peer health
+doctor                 Diagnose runtime, identity and membership locally
+peers                  Print the member set with peer ids
 bootstrap agent        Configure optional agent runners/live mode
 default-moot           Record owner consent for The Ent Moot
 agent-live             Configure and run live-agent participation
@@ -214,8 +214,11 @@ bootstrap peers/addresses, use limit, expiry, and capability nonce.
 The founder or any delegated admin may issue invites and apply membership
 changes. `roster admin grant|revoke` rewrites the delegated-admin set in one
 founder-signed membership record of kind `policy`, carrying the complete set
-(ceiling 16), and `roster admin list` reports it. An admin may add and remove ordinary members;
-it cannot remove the founder, remove another admin, or change the admin set.
+(ceiling 16), and `roster admin list` reports it. There is no add: a joiner signs its own
+admission, and an admin's membership powers are to remove ordinary members and
+to ban them. It cannot remove the founder, remove another admin, unban anybody,
+or change the admin set - lifting a ban and rewriting delegation are both
+founder-only, because an admin that could do either could undo the founder.
 Losing membership or delegation ends the authority at once, including for
 invites that admin already issued. A join requires the invite's `founder` field to be the group's real founder,
 since that is the anchor the joiner pins.
@@ -224,8 +227,9 @@ since that is the anchor the joiner pins.
 (open/spent/expired/revoked). `invite revoke` withdraws an invite before it
 expires, blocking every remaining use; revoking a nonce this data root never
 recorded also blocks it, so a leaked invite file is recoverable. `roster
-remove` needs no revocation step for the invites the removed member issued:
-each carries its issuer's authority, which the removal takes away. It lists the
+remove` needs no revocation step for the invites a removed delegated admin
+issued: each carries its issuer's authority, which the removal takes away. A
+founder's own invites are the exception and need `invite revoke`. It lists the
 group's remaining open nonces, which name nobody and therefore cannot be
 revoked automatically.
 
@@ -244,8 +248,9 @@ matches before adopting.
 
 Join validates the complete capability before network use, fetches membership state
 only from an allowed serving peer, binds the fetched founder and its own
-resulting membership, and persists consumption per applicant. Invalid, expired,
-replayed, revoked, exhausted, wrong-target or wrong-founder capabilities
+resulting membership. Consumption is counted per invite nonce in the group's
+projected state, not per applicant in a local ledger. Invalid, expired,
+revoked, exhausted, wrong-target or wrong-founder capabilities
 install no partial group state. An invite names the checkpoint its issuer held; later joins do not
 invalidate outstanding invites, while an applicant banned after that checkpoint
 is refused. A refused join reports why — invite revoked, exhausted, expired, banned

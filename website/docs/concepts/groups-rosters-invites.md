@@ -178,11 +178,14 @@ verifies the full-width MemberID and libp2p PeerID from that key, so one
 identity binds across application and transport layers, and the join record
 that redeems the invite must carry that same key.
 
-### Invite authority is the issuer's current standing
+### A delegated admin's invite is worth its issuer's current standing
 
-An invite is worth exactly its issuer's current authority in the group. Remove
-or demote the issuer and its outstanding invites stop working everywhere at
-once, with no revocation step and no per-node bookkeeping.
+A delegated admin's invite is worth exactly that admin's current authority:
+remove or demote the issuer and its outstanding invites stop working everywhere
+at once, with no revocation step and no per-node bookkeeping. The founder is
+exempt - its invites keep admitting joiners even after it removes itself,
+because the anchor a joiner pins is the founder key, not the founder's
+membership. Revoking a founder's invite takes `invite revoke`.
 
 Use limits (`max_uses`) and revocations (`revoke_invite` records) are projected
 from the group's own signed state, so every node reaches the same answer

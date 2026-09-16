@@ -81,9 +81,11 @@ entmootd invite create \
 An open invite is a bearer credential: any holder may redeem it while uses
 remain, so treat the file as a secret. `entmootd invite list` shows what is
 outstanding and `entmootd invite revoke -group <GROUP_ID> -nonce <NONCE>`
-withdraws it. Removing a member revokes the invites bound to that member and
-refuses any later attempt by that identity, but open invites name nobody:
-`roster remove` lists the remaining open nonces so you can revoke them.
+withdraws it. Removing a member takes away the authority it held: invites a removed
+delegated admin issued stop admitting anybody, and the member stops being able
+to serve a redemption. It does not bar the identity from coming back - a later
+join with a fresh invite re-admits it, and `roster ban` is what refuses one. Open invites name
+nobody, so `roster remove` lists the remaining open nonces for you to revoke.
 
 Transfer `invite.json` to the joining node, then join and keep serving:
 
@@ -91,7 +93,8 @@ Transfer `invite.json` to the joining node, then join and keep serving:
 entmootd join --serve invite.json
 ```
 
-Capabilities are target-bound, signed, expiry-checked, and single-use. Open-invite
+Capabilities are target-bound, signed and expiry-checked, and `-max-uses`
+caps how many distinct identities may redeem one (default 1, ceiling 64). Open-invite
 groups use `-join-mode open_invite`; the ESP bridge issues and redeems the public
 join descriptor without introducing another transport identity.
 
@@ -126,8 +129,8 @@ publish              Sign and publish a message
 tail                  Read backfill and subscribe to live messages
 query                 Query durable local history
 info                  Show local identity and group state
-doctor                Validate identity, membership, and connectivity
-peers                 Show group peer health
+doctor                Validate identity and membership from local state
+peers                 List the group's members and their peer ids
 group create          Create a founder-owned group
 invite create         Create a join capability (targeted or open)
 invite list           Show issued invites, uses spent, and state
@@ -145,8 +148,9 @@ A founder can delegate admission without handing over the group:
 entmootd roster admin grant -group <GROUP_ID> -member <MEMBER_ID>
 ```
 
-A delegated admin may add and remove ordinary members and issue invites from
-its own node (`-bootstrap` may name that node or any current member). It
+No command writes somebody into a group: a joiner signs its own admission
+against an invite. A delegated admin may remove ordinary members, ban them, and
+issue invites from its own node (`-bootstrap` may name that node or any current member). It
 cannot remove the founder,
 remove another admin, or change who is an admin. Revoking delegation, or
 removing the member, ends the authority immediately.
@@ -237,8 +241,8 @@ Run each command with `-h` for its exact arguments.
 
 ```sh
 entmootd doctor --json
-entmootd doctor -group <GROUP_ID> --probe --json
-entmootd peers -group <GROUP_ID> --probe --json
+entmootd doctor -group <GROUP_ID> --json
+entmootd peers -group <GROUP_ID> --json
 ```
 
 The finite canary runs three daemons across two groups. It checks targeted
@@ -279,7 +283,9 @@ go test ./...
 - Membership records merge in one deterministic order, so concurrent writers
   cannot fork the member set.
 - Removed or unknown members cannot publish or subscribe to a group topic.
-- Invitation expiry, target binding, and replay state are checked before a join is accepted.
+- Invitation expiry, target binding, revocation, and the issuer's authority at
+  that moment are checked before a join is accepted. Use limits are counted in
+  the group's projected state, not in a local replay ledger.
 - History synchronization revalidates message signatures and current membership.
 - Open-invite and ESP requests use the same operational identity checks.
 
