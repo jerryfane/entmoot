@@ -88,7 +88,11 @@ func TestRefusalWithAnIneffectiveRecordIsNotAnEviction(t *testing.T) {
 		t.Fatalf("a stranger's removal should store and be ignored, got %v", err)
 	}
 	if !applied {
-		t.Skip("the store refused the record outright, so there is nothing to spoof")
+		// Not a reason to skip: this test exists because a record that STORES
+		// and does nothing was once read as proof of removal. If the store
+		// stops holding it, the spoof this guards against is unreachable and
+		// the guard needs rewriting rather than quietly passing.
+		t.Fatal("the store refused the ineffective record outright; this test no longer exercises the spoof it guards")
 	}
 	if !client.IsMemberID(p.clientMemberID) {
 		t.Fatal("a stranger's removal took effect")

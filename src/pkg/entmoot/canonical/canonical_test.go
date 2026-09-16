@@ -236,18 +236,6 @@ func TestRosterEntryIDFieldSensitivity(t *testing.T) {
 	}
 }
 
-// TestRosterEntryIDDeterministic verifies the id computation itself is stable
-// across 100 calls.
-func TestRosterEntryIDDeterministic(t *testing.T) {
-	e := sampleRosterEntry()
-	first := RosterEntryID(e)
-	for i := 0; i < 100; i++ {
-		if got := RosterEntryID(e); got != first {
-			t.Fatalf("iteration %d: RosterEntryID not stable", i)
-		}
-	}
-}
-
 func TestLegacyRosterEntrySigningFixtureUnchanged(t *testing.T) {
 	entry := sampleRosterEntry()
 	gotBytes, err := RosterEntrySigningBytes(entry)

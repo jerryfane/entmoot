@@ -604,3 +604,146 @@ func TestReconciliationFindsARetractionADeeperPageAway(t *testing.T) {
 		t.Fatalf("display name = %q, want the fallback: the withdrawal has the newest issue time in the window", got)
 	}
 }
+
+// TestReconciliationPagesThroughATimestampTie pins the page boundary's
+// tiebreaks. Every message in the flood below carries the same timestamp, so
+// the author and message-id comparisons are the only thing that identifies the
+// oldest row in a page. Get them wrong and the boundary stops advancing: the
+// next page re-serves rows already seen, the window never reaches the quiet
+// member, and its name is silently lost. The existing flood test cannot see
+// this, because it publishes with time.Now() and never produces a tie.
+func TestReconciliationPagesThroughATimestampTie(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	root := t.TempDir()
+	founder, _ := mustDaemonIdentity(t)
+	var gid entmoot.GroupID
+	if _, err := rand.Read(gid[:]); err != nil {
+		t.Fatal(err)
+	}
+	policy := membership.DefaultPolicy()
+	policy.JoinRule = membership.JoinRuleOpen
+	mustCreateGroup(t, root, gid, founder, policy)
+
+	state, err := esphttp.OpenSQLiteStateStore(root)
+	if err != nil {
+		t.Fatalf("OpenSQLiteStateStore: %v", err)
+	}
+	defer state.Close()
+	runtime, session, host := startTestRuntimeWithProfiles(t, ctx, root, founder, gid, state)
+	defer host.Close()
+	defer runtime.Close()
+
+	quiet, quietInfo := mustDaemonIdentity(t)
+	if _, err := session.group.SignRecord(quiet, membership.Record{Kind: membership.KindJoin}); err != nil {
+		t.Fatalf("join: %v", err)
+	}
+	quietAt := time.Now().Add(-48 * time.Hour).UnixMilli()
+	mustStoreProfileAt(t, ctx, runtime, session, quiet, quietInfo, gid,
+		profile.Profile{DisplayName: "quiet-node", IssuedAtMS: quietAt}, quietAt)
+
+	// Three members flood the topic at ONE timestamp, so ties are broken by
+	// author for messages from different members and by message id within a
+	// member. Deep enough that a boundary which fails to advance cannot reach
+	// the quiet member inside maxProfileReconcilePages.
+	tie := time.Now().UnixMilli()
+	for i := 0; i < 3; i++ {
+		loud, loudInfo := mustDaemonIdentity(t)
+		if _, err := session.group.SignRecord(loud, membership.Record{Kind: membership.KindJoin}); err != nil {
+			t.Fatalf("join loud %d: %v", i, err)
+		}
+		for j := 0; j < profileReconcilePageSize; j++ {
+			mustStoreProfileAt(t, ctx, runtime, session, loud, loudInfo, gid,
+				profile.Profile{DisplayName: fmt.Sprintf("loud-%d-%d", i, j), IssuedAtMS: tie}, tie)
+		}
+	}
+
+	if err := esphttp.WithdrawMemberProfileNodeProfile(ctx, state, gid, *quietInfo.MemberID,
+		encodeBase64(quietInfo.EntmootPubKey), quietAt-1); err != nil {
+		t.Fatalf("reset: %v", err)
+	}
+	runtime.reconcileProfilesFromHistory(ctx, session)
+
+	if got := mustDisplayName(t, ctx, state, root, gid, *quietInfo.MemberID); got != "quiet-node#"+quietInfo.MemberID.String() {
+		t.Fatalf("quiet member's name = %q, want it recovered: the boundary stopped advancing through the tie", got)
+	}
+}
+
+// TestPageBoundaryComparatorAgreesWithTheStore pins each tiebreak separately.
+// profileMessageNewer exists to name the oldest row of a page in the SAME
+// order the store pages on, so the boundary it builds can neither skip nor
+// repeat a row. If the two orders disagree on either tiebreak, rows are lost
+// silently - which is why this asserts agreement rather than re-implementing
+// the comparison.
+func TestPageBoundaryComparatorAgreesWithTheStore(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	root := t.TempDir()
+	founder, _ := mustDaemonIdentity(t)
+	var gid entmoot.GroupID
+	if _, err := rand.Read(gid[:]); err != nil {
+		t.Fatal(err)
+	}
+	policy := membership.DefaultPolicy()
+	policy.JoinRule = membership.JoinRuleOpen
+	mustCreateGroup(t, root, gid, founder, policy)
+	state, err := esphttp.OpenSQLiteStateStore(root)
+	if err != nil {
+		t.Fatalf("OpenSQLiteStateStore: %v", err)
+	}
+	defer state.Close()
+	runtime, session, host := startTestRuntimeWithProfiles(t, ctx, root, founder, gid, state)
+	defer host.Close()
+	defer runtime.Close()
+
+	// One timestamp, many authors: with the timestamp equal for every row, the
+	// author and message-id comparisons decide the whole order. Random keys
+	// and content hashes make author order and id order differ.
+	// Some rows share an author so the message-id tiebreak decides between
+	// them, and the rest have distinct authors so the author comparison
+	// decides: both are exercised by one page.
+	const authors = 12
+	const perAuthor = 2
+	const rows = authors * perAuthor
+	tie := time.Now().UnixMilli()
+	for i := 0; i < authors; i++ {
+		author, authorInfo := mustDaemonIdentity(t)
+		if _, err := session.group.SignRecord(author, membership.Record{Kind: membership.KindJoin}); err != nil {
+			t.Fatalf("join %d: %v", i, err)
+		}
+		for j := 0; j < perAuthor; j++ {
+			mustStoreProfileAt(t, ctx, runtime, session, author, authorInfo, gid,
+				profile.Profile{DisplayName: fmt.Sprintf("member-%d-%d", i, j), IssuedAtMS: tie}, tie)
+		}
+	}
+
+	page, err := runtime.store.LatestByTopicBefore(ctx, gid, profile.Topic, rows, nil)
+	if err != nil {
+		t.Fatalf("LatestByTopicBefore: %v", err)
+	}
+	if len(page) != rows {
+		t.Fatalf("page holds %d rows, want %d: the fixture must fit one page for the order to be readable", len(page), rows)
+	}
+
+	// The store returns a page in its paging order, ties ascending, so its
+	// first row is the one every other row outranks.
+	oldest := page[0]
+	for i, message := range page[1:] {
+		if !profileMessageNewer(message, oldest) {
+			t.Fatalf("row %d does not outrank the store's first row, so the boundary would not be the page's oldest: "+
+				"author %s id %s vs author %s id %s",
+				i+1, profileMessageAuthor(message), message.ID, profileMessageAuthor(oldest), oldest.ID)
+		}
+	}
+
+	// And the walk the runtime actually performs must arrive at that same row.
+	found := page[0]
+	for _, message := range page {
+		if profileMessageNewer(found, message) {
+			found = message
+		}
+	}
+	if found.ID != oldest.ID {
+		t.Fatalf("the runtime's scan picked %s as the page's oldest row, the store's order says %s", found.ID, oldest.ID)
+	}
+}
