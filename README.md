@@ -8,10 +8,12 @@ catch-up, targeted invitations, open invitations, and an ESP HTTP bridge.
 
 The operational runtime uses one Ed25519 key for both identities:
 
-- `MemberID`: SHA-256 of the raw Ed25519 public key.
+- `MemberID`: SHA-256 over the domain string `entmoot/member/v2\0` followed by
+  the raw Ed25519 public key. The domain separator is part of the hash, so a
+  plain SHA-256 of the key does not reproduce it.
 - libp2p `PeerID`: derived from the same public key.
 
-Every operational roster entry carries both values and the public key. Legacy node
+Every operational membership record carries both values and the public key. Legacy node
 identifiers exist only in immutable imported records and founder-signed conversion
 mappings. They are not accepted as live transport identities.
 
@@ -83,7 +85,7 @@ withdraws it. Removing a member revokes the invites bound to that member and
 refuses any later attempt by that identity, but open invites name nobody:
 `roster remove` lists the remaining open nonces so you can revoke them.
 
-Transfer `invite.json` to the joining node, then enroll and keep serving:
+Transfer `invite.json` to the joining node, then join and keep serving:
 
 ```sh
 entmootd join --serve invite.json
@@ -107,29 +109,30 @@ entmootd query -group <GROUP_ID> -topic 'alerts/#' -limit 100
 subscription open for new messages. Closing standard input does not stop a tail;
 use SIGINT or SIGTERM.
 
-Messages are author-signed and carry the roster checkpoint the author was
-admitted under; current membership at that checkpoint is the only publishing
-authority, so a group keeps working when the founder is offline. Live delivery
-uses a per-group GossipSub topic; offline nodes recover missing history from
-current roster keepers after restart.
+Messages are author-signed and name the membership checkpoint the author held.
+Current membership is the only publishing authority, so a group keeps working
+when the founder is offline; the named checkpoint is a synchronisation token,
+and a receiver that does not know it holds the message and retries rather than
+rejecting it. Live delivery uses a per-group GossipSub topic; offline nodes
+recover missing history from current keepers after restart.
 
 ## Runtime commands
 
 ```text
-join                 Enroll with targeted capabilities or open-invite descriptors
+join                 Join with targeted capabilities or open-invite descriptors
 serve                Restart groups from persistent state
 relay serve           Run a bounded, allowlisted Circuit Relay v2 service
 publish              Sign and publish a message
 tail                  Read backfill and subscribe to live messages
 query                 Query durable local history
 info                  Show local identity and group state
-doctor                Validate identity, roster, and connectivity
+doctor                Validate identity, membership, and connectivity
 peers                 Show group peer health
 group create          Create a founder-owned group
-invite create         Create an enrollment capability (targeted or open)
+invite create         Create a join capability (targeted or open)
 invite list           Show issued invites, uses spent, and state
 invite revoke         Withdraw an outstanding invite before it expires
-roster add/remove     Apply membership changes as founder or delegated admin
+roster remove|ban     Remove or ban a member (founder or delegated admin)
 roster admin          Grant, revoke, or list delegated admins (founder only)
 esp serve             Run the local ESP mailbox HTTP API
 esp device            Manage ESP device authorization
@@ -189,7 +192,8 @@ ready; relay-only application peers pass one of them to `-controlled-relay`.
 
 ## Persistence and conversion
 
-The SQLite store contains signed messages, roster state, invitation consumption,
+The SQLite store contains signed messages, membership records and checkpoints,
+invitation consumption,
 mailbox cursors, and conversion checkpoints. Startup conversion is transactional,
 idempotent, and hash-bound to its source files. Before conversion it copies and
 verifies every regular file in the data root, including identity and runtime
@@ -237,7 +241,7 @@ entmootd peers -group <GROUP_ID> --probe --json
 ```
 
 The finite canary runs three daemons across two groups. It checks targeted
-enrollment, fanout, group isolation, historical and live subscriptions, offline
+joins, fanout, group isolation, historical and live subscriptions, offline
 catch-up, and a full restart. Each daemon start also runs 24 simultaneous `info`
 commands while an operational SQLite database is locked:
 
@@ -268,12 +272,14 @@ go test ./...
 
 ## Security model
 
-- Ed25519 signs identities, roster entries, capabilities, and messages.
+- Ed25519 signs identities, membership records, checkpoints, capabilities, and
+  messages.
 - MemberID and PeerID must resolve to the same public key.
-- Founder-signed roster order is monotonic and fork-checked.
+- Membership records merge in one deterministic order, so concurrent writers
+  cannot fork the member set.
 - Removed or unknown members cannot publish or subscribe to a group topic.
-- Invitation expiry, target binding, and replay state are checked before enrollment.
-- History synchronization revalidates message signatures and current roster policy.
+- Invitation expiry, target binding, and replay state are checked before a join is accepted.
+- History synchronization revalidates message signatures and current membership.
 - Open-invite and ESP requests use the same operational identity checks.
 
 ## Repository layout
@@ -281,9 +287,9 @@ go test ./...
 ```text
 src/cmd/entmootd/                  CLI, daemon, IPC, ESP, and runtime wiring
 src/pkg/entmoot/                   protocol types and identity validation
-src/pkg/entmoot/roster/            signed membership log
-src/pkg/entmoot/store/             memory and SQLite message stores
-src/pkg/entmoot/transport/libp2p/  enrollment, GossipSub, and history sync
+src/pkg/entmoot/roster/            legacy linear roster chain, read-only
+src/pkg/entmoot/store/             SQLite message store, search, and paging
+src/pkg/entmoot/transport/libp2p/  membership sync, GossipSub, and history sync
 src/pkg/entmoot/conversion/        durable legacy-data conversion
 scripts/canary-libp2p.sh           isolated end-to-end runtime canary
 install.sh                         release/source installer

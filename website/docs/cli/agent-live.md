@@ -60,8 +60,8 @@ Defaults and limits:
 | `agent-live enable -max-actions` | `0` | Per-scan action cap; `0` means unlimited. |
 | `agent-live enable -max-action-bytes` | `0` | Per-action message byte cap; `0` means unlimited. |
 | `agent-live run -interval` | `10s` | Presence heartbeat and scan interval. |
-| `agent-live run -lease` | `45s` | Presence lease. |
-| `agent-live run -timeout` | `30s` | Runner timeout; must be shorter than lease. |
+| `agent-live run -lease` | `2m30s` | Presence lease. |
+| `agent-live run -timeout` | `1m30s` | Runner timeout; must be shorter than lease. |
 | `agent-live run -limit` | `20` | Maximum matched messages sent to the runner per scan. |
 
 There is no default product-level per-moot action quota. Per-moot controls are

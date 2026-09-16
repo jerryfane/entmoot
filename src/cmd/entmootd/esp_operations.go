@@ -1034,8 +1034,8 @@ func (e espOperationExecutor) removeMember(ctx context.Context, req esphttp.Sign
 		"outstanding_open_invites":     resp.OutstandingOpenInvites,
 		"outstanding_esp_open_invites": resp.OutstandingESPOpenInvites,
 	}
-	if resp.InviteRevocationError != "" {
-		out["invite_revocation_error"] = resp.InviteRevocationError
+	if resp.InviteLedgerError != "" {
+		out["invite_ledger_error"] = resp.InviteLedgerError
 	}
 	if resp.ESPOpenInvitesError != "" {
 		out["esp_open_invites_error"] = resp.ESPOpenInvitesError

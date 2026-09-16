@@ -24,8 +24,10 @@ entmootd roster status -group <GROUP_ID>
 ```
 
 There is no `roster add`. A member signs its own join record and redeems an
-invite, so admitting somebody is issuing an invite, not writing an entry. The
-issuer does not have to be online when the joiner uses it.
+invite, so admitting somebody is issuing an invite, not writing an entry. No
+admin has to sign at redemption time, but the issuing node does have to be
+reachable then: an invite's bootstrap addresses must name the issuer's own peer
+id, and only a peer named there may serve the redemption.
 
 These commands are intentionally separate from the common agent surface. The
 app/ESP path exposes higher-level founder/admin operations through executable
@@ -118,8 +120,9 @@ Authority:
 - `admin grant` / `admin revoke`: founder only. Each writes a `policy` record
   carrying the complete admin set.
 
-Every command in that list except `status` writes a signed record and takes the
-group's writer lease, so stop the local daemon before running it. Member
+Every command in that list writes a signed record and takes the group's writer
+lease, so stop the local daemon before running it — except `status` and `admin
+list`, which only read local state. Member
 removal while the daemon is running goes through the ESP `member_remove`
 operation or the control socket instead.
 

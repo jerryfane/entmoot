@@ -115,7 +115,7 @@ func cmdInfo(gf *globalFlags, args []string) int {
 					GroupID:    gid,
 					Members:    members,
 					Messages:   msgCount,
-					MerkleRoot: nil, // nil per CLI_DESIGN §3.4 when not running
+					MerkleRoot: nil, // nil when not running, per ipc.InfoResp
 				})
 			}
 			resp.Groups = groups

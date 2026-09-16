@@ -43,7 +43,7 @@ const defaultJoinTimeout = 90 * time.Second
 func cmdJoin(gf *globalFlags, args []string) int {
 	fs := flag.NewFlagSet("join", flag.ContinueOnError)
 	serveAfterJoin := fs.Bool("serve", false, "after joining, keep running as the Entmoot daemon")
-	timeout := fs.Duration("timeout", defaultJoinTimeout, "enrollment deadline")
+	timeout := fs.Duration("timeout", defaultJoinTimeout, "deadline per capability redeemed")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return exitOK
@@ -60,7 +60,7 @@ func cmdJoin(gf *globalFlags, args []string) int {
 	}
 	sockPath := controlSocketPath(gf.data)
 	if controlSocketAlive(sockPath, 200*time.Millisecond) {
-		fmt.Fprintln(os.Stderr, "join: stop the running daemon before enrolling a new group")
+		fmt.Fprintln(os.Stderr, "join: stop the running daemon before joining a new group")
 		return exitControlUnavail
 	}
 	// A brand-new node has no way to find a relay, so adopt the ones the
@@ -93,11 +93,11 @@ func cmdJoin(gf *globalFlags, args []string) int {
 				if err != nil {
 					return code, err
 				}
-				enrollCtx, cancel := context.WithTimeout(ctx, *timeout)
-				_, _, err = runtime.AddCapability(enrollCtx, *capability)
+				joinCtx, cancel := context.WithTimeout(ctx, *timeout)
+				_, _, err = runtime.AddCapability(joinCtx, *capability)
 				cancel()
 				if err != nil {
-					return exitTransport, fmt.Errorf("enroll group %s: %w", capability.GroupID.String(), err)
+					return exitTransport, fmt.Errorf("join group %s: %w", capability.GroupID.String(), err)
 				}
 				if err := persistJoinGroupMetadata(ctx, loadCtx.metadataStore, capability.GroupID, input.groupMetadata); err != nil {
 					return exitTransport, fmt.Errorf("persist group metadata %s: %w", capability.GroupID.String(), err)
@@ -122,7 +122,8 @@ func loadJoinInputs(args []string) ([]joinInput, int) {
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "join: invite %s: %v\n", inviteArg, err)
 			// A local-parse failure (bad file, bad JSON, expired ValidUntil)
-			// is INVALID_ARGUMENT per CLI_DESIGN §3.1. A network-fetch
+			// is INVALID_ARGUMENT, registered in CLI_DESIGN §5.4 and mapped to an
+			// exit code by §6. A network-fetch
 			// failure is a transport error (exit 1).
 			if errors.Is(err, errFetchFailed) {
 				return nil, exitTransport
@@ -356,6 +357,7 @@ func runGroupDaemon(gf *globalFlags, opts groupDaemonOptions) int {
 		Host:             libp2pHost,
 		Binding:          binding,
 		Logger:           slog.Default(),
+		Profiles:         espState,
 		Mode:             hostConfig.Mode,
 		ControlledRelays: hostConfig.ControlledRelays,
 	})
@@ -1366,7 +1368,7 @@ func (s *ipcServer) handleInviteCreate(_ context.Context, c net.Conn, req *ipc.I
 	}
 	founder.MemberID = &founderBinding.MemberID
 	founder.PeerID = founderBinding.PeerID.String()
-	// This node serves the enrollment, so the invite must name this node's
+	// This node serves the redemption, so the invite must name this node's
 	// addresses and, when it is not the founder, this node as the issuer.
 	localBinding, err := libp2ptransport.BindingFromPublicKey(s.identity.PublicKey)
 	if err != nil || localBinding.PeerID != s.runtime.host.ID() {
@@ -1572,11 +1574,11 @@ func (s *ipcServer) handleMemberRemove(ctx context.Context, c net.Conn, req *ipc
 	//
 	// Invites issued by whoever is still an admin are unaffected, and an
 	// operator may want to see them, so they are reported.
-	var revocationError string
+	var ledgerError string
 	var nonces []string
 	live, err := s.runtime.invites.LiveOpenInvites(gid)
 	if err != nil {
-		revocationError = "read open invites: " + err.Error()
+		ledgerError = "read open invites: " + err.Error()
 		slog.Error("member_remove: read open invites", slog.String("err", err.Error()))
 	} else {
 		nonces = make([]string, 0, len(live))
@@ -1618,7 +1620,7 @@ func (s *ipcServer) handleMemberRemove(ctx context.Context, c net.Conn, req *ipc
 		OutstandingOpenInvites:    nonces,
 		OutstandingESPOpenInvites: espOpen,
 		ESPOpenInvitesError:       espError,
-		InviteRevocationError:     revocationError,
+		InviteLedgerError:         ledgerError,
 	})
 }
 

@@ -418,6 +418,3 @@ func encodedJSONSize(value any) int {
 	}
 	return len(payload)
 }
-
-// MaxRosterSyncEntries reports the per-round pull ceiling. Callers that have to
-// chain several pulls, such as fork repair, use it to size their own bounds.

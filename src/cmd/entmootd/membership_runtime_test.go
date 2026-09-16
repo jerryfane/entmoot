@@ -14,6 +14,7 @@ import (
 	multiaddr "github.com/multiformats/go-multiaddr"
 
 	"entmoot/pkg/entmoot"
+	"entmoot/pkg/entmoot/esphttp"
 	"entmoot/pkg/entmoot/keystore"
 	"entmoot/pkg/entmoot/membership"
 	"entmoot/pkg/entmoot/signing"
@@ -183,6 +184,37 @@ func TestBannedNodeLearnsItsRemovalOverMembershipSync(t *testing.T) {
 	if !founderSession.group.IsMemberID(*founderInfo.MemberID) {
 		t.Fatal("the founder lost its own membership")
 	}
+}
+
+// startTestRuntimeWithProfiles is startTestRuntime plus the ESP state store
+// the daemon passes in serve, so observed member profiles are recorded.
+func startTestRuntimeWithProfiles(t *testing.T, ctx context.Context, root string, identity *keystore.Identity, gid entmoot.GroupID, profiles esphttp.StateStore) (*groupRuntime, *groupSession, host.Host) {
+	t.Helper()
+	host, binding, err := libp2ptransport.NewHost(ctx, identity, libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"))
+	if err != nil {
+		t.Fatalf("NewHost: %v", err)
+	}
+	messages, err := store.OpenSQLite(root)
+	if err != nil {
+		host.Close()
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	t.Cleanup(func() { _ = messages.Close() })
+	runtime, err := newGroupRuntime(groupRuntimeConfig{
+		Identity: identity, DataDir: root, Store: messages, Notify: newNotifyingStore(messages, nil),
+		Host: host, Binding: binding, Mode: libp2ptransport.DirectConnectivity, Profiles: profiles,
+	})
+	if err != nil {
+		host.Close()
+		t.Fatalf("newGroupRuntime: %v", err)
+	}
+	session, _, err := runtime.AddLocalGroup(ctx, gid)
+	if err != nil {
+		runtime.Close()
+		host.Close()
+		t.Fatalf("AddLocalGroup: %v", err)
+	}
+	return runtime, session, host
 }
 
 // startTestRuntime brings up a daemon group runtime over a real libp2p host,

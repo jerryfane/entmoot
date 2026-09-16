@@ -64,9 +64,11 @@ func VerifyBootstrapCapability(capability BootstrapCapability, remotePeer peer.I
 	return nil
 }
 
-// AuthorizedIssuer requires the identity that signed a capability to be a
-// member who may currently administer the group, with the key the group
-// records for it. The signing authority travels in the capability, so binding
+// AuthorizedIssuer requires the identity that signed a capability to be able
+// to administer the group right now, with the key the group records for it:
+// the founder always, a delegated admin only while it is still an unbanned
+// member. The founder is not required to be a member — it may have removed
+// itself and can still issue. The signing authority travels in the capability, so binding
 // it to membership state is what makes the signature mean anything.
 func AuthorizedIssuer(group *membership.Group, issuer entmoot.NodeInfo) error {
 	if group == nil {

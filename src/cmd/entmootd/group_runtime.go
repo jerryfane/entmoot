@@ -19,14 +19,25 @@ import (
 
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/conversion"
+	"entmoot/pkg/entmoot/esphttp"
 	"entmoot/pkg/entmoot/keystore"
 	"entmoot/pkg/entmoot/membership"
 	"entmoot/pkg/entmoot/merkle"
 	entpolicy "entmoot/pkg/entmoot/policy"
+	"entmoot/pkg/entmoot/profile"
 	"entmoot/pkg/entmoot/ratelimit"
 	"entmoot/pkg/entmoot/store"
 	libp2ptransport "entmoot/pkg/entmoot/transport/libp2p"
 )
+
+// maxProfileLifetimeMS bounds how long one published name stays current
+// without being republished. The author's own expiry is honoured when it is
+// shorter; a longer or missing one is clamped to this, so a single message
+// cannot keep a name alive indefinitely.
+const maxProfileLifetime = 90 * 24 * time.Hour
+
+// maxProfileLifetimeMS is the same bound in the unit the records carry.
+const maxProfileLifetimeMS = int64(maxProfileLifetime / time.Millisecond)
 
 var (
 	errLocalGroupNotMember        = errors.New("local identity is not a current group member")
@@ -41,6 +52,9 @@ type groupRuntimeConfig struct {
 	Host     host.Host
 	Binding  libp2ptransport.Binding
 	Logger   *slog.Logger
+	// Profiles records member display names observed from the group. Optional:
+	// a runtime without it simply does not learn names.
+	Profiles esphttp.StateStore
 	// Mode and ControlledRelays mirror the host's connectivity profile so
 	// forwarded member addresses are filtered exactly as dial hints are.
 	Mode             libp2ptransport.ConnectivityMode
@@ -61,6 +75,7 @@ type groupRuntime struct {
 	invites          *libp2ptransport.InviteLedger
 	liveRouter       *libp2ptransport.LiveRouter
 	policyEnforcers  map[entmoot.GroupID]*groupPolicyEnforcer
+	profiles         esphttp.StateStore
 
 	mu       sync.RWMutex
 	sessions map[entmoot.GroupID]*groupSession
@@ -124,6 +139,7 @@ func newGroupRuntime(cfg groupRuntimeConfig) (*groupRuntime, error) {
 		mode:             cfg.Mode,
 		controlledRelays: cfg.ControlledRelays,
 		policyStore:      policyStore,
+		profiles:         cfg.Profiles,
 		invites:          invites,
 		liveRouter:       liveRouter,
 		sessions:         make(map[entmoot.GroupID]*groupSession),
@@ -267,6 +283,13 @@ func (r *groupRuntime) AddLocalGroup(ctx context.Context, groupID entmoot.GroupI
 		Authorize: func(message entmoot.Message) error {
 			return r.enforceGroupPolicy(context.Background(), groupID, message)
 		},
+		// A profile arrives as an ordinary message, so validation has already
+		// established the author is a current member and the signature holds.
+		// OnIngest fires for locally published messages too, so a node records
+		// its own name by the same path as everyone else's.
+		OnIngest: func(message entmoot.Message) {
+			r.observeMemberProfile(sessionCtx, groupID, message)
+		},
 	})
 	if err != nil {
 		cancel()
@@ -343,7 +366,7 @@ func (r *groupRuntime) AddCapability(ctx context.Context, capability entmoot.Boo
 		// against the membership each now holds.
 		_ = r.host.Network().ClosePeer(info.ID)
 		if err := r.host.Connect(ctx, *info); err != nil {
-			return nil, false, fmt.Errorf("reconnect enrolled group peer: %w", err)
+			return nil, false, fmt.Errorf("reconnect joined group peer: %w", err)
 		}
 		return session, added, nil
 	}
@@ -748,6 +771,13 @@ retry:
 		slog.Int("unknown_heads", summary.UnknownHeads),
 		slog.Int("converged_hints", summary.ConvergedHints),
 		slog.String("last_error", lastErr))
+	// History insertion writes straight to the store, so it never passes
+	// through the live OnIngest hook: a name whose only copy arrived by
+	// catch-up would otherwise never be learned. Re-observing from the store
+	// is safe to repeat, because ordering is by the author's issue time.
+	if summary.Inserted > 0 {
+		r.reconcileProfilesFromHistory(ctx, session)
+	}
 }
 
 // keepersFor lists members with at least one known address, combining
@@ -887,4 +917,218 @@ func groupHasLocalIdentityPubKey(group *membership.Group, publicKey []byte) bool
 	}
 	member, ok := group.MemberInfoByID(memberID)
 	return ok && bytes.Equal(member.EntmootPubKey, publicKey)
+}
+
+// memberProfileRecordFor turns a message on the reserved profile topic into
+// the record it would be stored as, or reports false when the message carries
+// no usable claim.
+//
+// It is called for every ingested message, so it must be cheap for the common
+// case: the topic check runs before anything is decoded. A malformed payload
+// on the reserved topic is logged once and dropped — a name is a display hint,
+// so a bad one must never affect delivery of the message that carried it.
+func (r *groupRuntime) memberProfileRecordFor(groupID entmoot.GroupID, message entmoot.Message) (esphttp.NodeProfileRecord, bool) {
+	if !profile.HasTopic(message.Topics) || message.Author.MemberID == nil {
+		return esphttp.NodeProfileRecord{}, false
+	}
+	parsed, err := profile.Decode(message.Content)
+	if err != nil {
+		if !errors.Is(err, profile.ErrNotProfile) {
+			r.logger.Warn("member profile ignored",
+				slog.String("group_id", groupID.String()),
+				slog.String("member_id", message.Author.MemberID.String()),
+				slog.String("err", err.Error()))
+		}
+		return esphttp.NodeProfileRecord{}, false
+	}
+	// Order by the author's own issue time, and refuse a profile dated further
+	// ahead than the clock bound. Receipt time was the wrong answer: it does
+	// stop a future-dated message pinning a name, but it makes an old message
+	// arriving late — from history catch-up, or a peer re-gossiping — beat the
+	// newer profile already recorded, so two nodes end up disagreeing about a
+	// member's name depending on what arrived when. The author's clock ordered
+	// and bounded gives both: a crafted future date is rejected outright, and
+	// a replay of an old profile loses to the newer one on every node.
+	if err := profile.CheckClock(parsed, time.Now()); err != nil {
+		r.logger.Warn("member profile refused",
+			slog.String("group_id", groupID.String()),
+			slog.String("member_id", message.Author.MemberID.String()),
+			slog.String("err", err.Error()))
+		return esphttp.NodeProfileRecord{}, false
+	}
+	observedAt := parsed.IssuedAtMS
+	expiresAt := parsed.ExpiresAtMS
+	if parsed.DisplayName != "" {
+		// Bound how long one message can keep a name alive: the expiry is the
+		// author's claim too.
+		maxExpiry := observedAt + maxProfileLifetimeMS
+		if expiresAt <= 0 || expiresAt > maxExpiry {
+			expiresAt = maxExpiry
+		}
+	}
+	// An empty name withdraws the published one; MemberProfileRecord turns it
+	// into a tombstone at the same issue time, so a profile issued earlier
+	// cannot undo it.
+	rec := esphttp.MemberProfileRecord(groupID, *message.Author.MemberID,
+		encodeBase64(message.Author.EntmootPubKey), parsed.DisplayName, observedAt, expiresAt)
+	if _, ok := esphttp.NormalizeNodeProfileHostname(rec.Hostname); !ok {
+		return esphttp.NodeProfileRecord{}, false
+	}
+	return rec, true
+}
+
+// observeMemberProfile records a member's self-chosen display name.
+func (r *groupRuntime) observeMemberProfile(ctx context.Context, groupID entmoot.GroupID, message entmoot.Message) {
+	if r.profiles == nil {
+		return
+	}
+	rec, ok := r.memberProfileRecordFor(groupID, message)
+	if !ok {
+		return
+	}
+	r.storeMemberProfile(ctx, groupID, rec)
+}
+
+// storeMemberProfile writes one claim. The store decides whether it wins.
+func (r *groupRuntime) storeMemberProfile(ctx context.Context, groupID entmoot.GroupID, rec esphttp.NodeProfileRecord) {
+	if r.profiles == nil {
+		return
+	}
+	if _, _, err := r.profiles.UpsertNodeProfile(ctx, rec); err != nil {
+		r.logger.Warn("member profile not recorded",
+			slog.String("group_id", groupID.String()),
+			slog.String("member_id", rec.MemberID.String()),
+			slog.String("err", err.Error()))
+	}
+}
+
+// profileReconcilePageSize and maxProfileReconcilePages bound the window one
+// catch-up considers: the newest 4096 messages on the profile topic by the
+// store's paging key.
+//
+// The bound is on messages, so a member CAN be crowded out: 4096 profile
+// messages outranking another member's newest claim leave that member
+// unreconciled until it republishes. Earlier shapes were far worse — 256
+// messages, then 271 — but the limit is a window, not an absence of one.
+//
+// Nor is being crowded out a clean miss. Every claim INSIDE the window is
+// ranked correctly, but the walk only writes for members it finds, so a member
+// pushed entirely out of the window keeps whatever the store already holds —
+// a name from live ingest that its own newer claim was meant to replace. And
+// when a member's paging keys do not track its issue times — a clock step, or
+// a crafted profile, which this walk cannot rule out — the boundary can fall
+// between two of its claims, and the older one is then the only one read: a
+// node that never saw the newer records a superseded name, or a name whose
+// retraction sits just outside the window.
+// Widening the window shifts that boundary without removing it; removing it
+// needs an index on issue time, which the message store does not have.
+const (
+	profileReconcilePageSize = 256
+	maxProfileReconcilePages = 16
+)
+
+// reconcileProfilesFromHistory records the names of members whose profiles
+// arrived by history sync, which writes straight to the store and never runs
+// the live ingest hook.
+//
+// It ranks every claim in the window with the store's own comparison and
+// writes the winner once per member. Two earlier shapes were wrong for the
+// same underlying reason — the walk cannot use the message key to decide
+// anything about profiles, because the store orders records by the author's
+// issue time and the two only coincide while a member's message timestamps
+// track its payload. Selecting "the newest message per member" adopted
+// superseded names; stopping a member as soon as any of its messages appeared
+// in a page skipped a retraction that sat one page deeper with a newer issue
+// time. The message key is used for exactly one thing here: paging.
+func (r *groupRuntime) reconcileProfilesFromHistory(ctx context.Context, session *groupSession) {
+	if r.profiles == nil {
+		return
+	}
+	wanted := make(map[entmoot.MemberID]struct{})
+	for _, memberID := range session.group.MemberIDs() {
+		wanted[memberID] = struct{}{}
+	}
+	if len(wanted) == 0 {
+		return
+	}
+	best := make(map[entmoot.MemberID]esphttp.NodeProfileRecord, len(wanted))
+	var boundary *store.PageBoundary
+	for page := 0; page < maxProfileReconcilePages; page++ {
+		messages, err := r.store.LatestByTopicBefore(ctx, session.groupID, profile.Topic, profileReconcilePageSize, boundary)
+		if err != nil {
+			r.logger.Warn("member profiles not reconciled from history",
+				slog.String("group_id", session.groupID.String()),
+				slog.String("err", err.Error()))
+			return
+		}
+		if len(messages) == 0 {
+			break
+		}
+		oldest := messages[0]
+		for _, message := range messages {
+			if profileMessageNewer(oldest, message) {
+				oldest = message
+			}
+			if message.Author.MemberID == nil {
+				continue
+			}
+			if _, ok := wanted[*message.Author.MemberID]; !ok {
+				continue
+			}
+			rec, ok := r.memberProfileRecordFor(session.groupID, message)
+			if !ok {
+				continue
+			}
+			held, seen := best[rec.MemberID]
+			if !seen || esphttp.BetterMemberProfileRecord(rec, held) {
+				best[rec.MemberID] = rec
+			}
+		}
+		if len(messages) < profileReconcilePageSize {
+			// The topic is exhausted; there is nothing older to page to.
+			break
+		}
+		boundary = &store.PageBoundary{
+			TimestampMS:    oldest.Timestamp,
+			AuthorMemberID: profileMessageAuthor(oldest),
+			MessageID:      oldest.ID,
+		}
+	}
+	for _, rec := range best {
+		// The store still arbitrates against whatever it already holds; this
+		// only avoids one write per message in the window.
+		r.storeMemberProfile(ctx, session.groupID, rec)
+	}
+	if len(best) < len(wanted) {
+		// Not an error: the remaining members may simply never have published
+		// a name. It is logged because the alternative reading — a topic so
+		// busy that the window ran out before reaching them — is worth seeing.
+		r.logger.Debug("member profile reconciliation found no claim for some members",
+			slog.String("group_id", session.groupID.String()),
+			slog.Int("members_without_profile", len(wanted)-len(best)))
+	}
+}
+
+// profileMessageNewer reports whether a outranks b under the store's paging
+// key: timestamp, then author member id, then message id. It is the same
+// comparison LatestByTopicBefore pages on, so the boundary it produces cannot
+// skip or repeat a row.
+func profileMessageNewer(a, b entmoot.Message) bool {
+	if a.Timestamp != b.Timestamp {
+		return a.Timestamp > b.Timestamp
+	}
+	left, right := profileMessageAuthor(a), profileMessageAuthor(b)
+	if left != right {
+		return bytes.Compare(left[:], right[:]) > 0
+	}
+	return bytes.Compare(a.ID[:], b.ID[:]) > 0
+}
+
+// profileMessageAuthor is the member id a page boundary needs, zero when the
+// message predates member ids.
+func profileMessageAuthor(message entmoot.Message) entmoot.MemberID {
+	if message.Author.MemberID == nil {
+		return entmoot.MemberID{}
+	}
+	return *message.Author.MemberID
 }

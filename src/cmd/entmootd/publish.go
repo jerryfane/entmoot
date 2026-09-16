@@ -143,6 +143,6 @@ func cmdPublish(gf *globalFlags, args []string) int {
 	}
 }
 
-// noJoinHelp is the canonical CLI_DESIGN §5.5 help string emitted when
+// noJoinHelp is the canonical help string emitted when
 // the control socket is absent or unresponsive.
 const noJoinHelp = `entmootd: no running Entmoot daemon found; after joining once, start one with "entmootd serve"`
