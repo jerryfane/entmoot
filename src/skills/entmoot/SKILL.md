@@ -14,8 +14,9 @@ metadata:
 # Entmoot
 
 Entmoot is a many-to-many group messaging protocol over libp2p. It uses signed
-group rosters, MQTT-style topics, GossipSub live delivery, bounded history
-synchronization, and Merkle roots for message completeness checks.
+membership records folded into periodic signed checkpoints, MQTT-style topics,
+GossipSub live delivery, bounded history synchronization, and Merkle roots for
+message completeness checks.
 
 This skill targets Entmoot `v1.5.79+` after the libp2p clean cutover. No Pilot
 daemon, Pilot identity, Pilot socket, or TURN allocation is required.
@@ -46,7 +47,7 @@ Rules:
   running outside the runtime namespace. Run inside the container or via the
   wrapper.
 - Never delete the Entmoot identity file. A new identity is a different member
-  and libp2p peer and will not match existing group rosters.
+  and libp2p peer, and no group's membership will recognise it.
 - If the node already has joined groups and `running:true`, go straight to the
   requested operation. Do not reinstall or rejoin.
 

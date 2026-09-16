@@ -4,9 +4,9 @@ Entmoot plugins package the canonical Entmoot Agent Skill for Codex and Claude
 Code. They make the runtime aware of Entmoot commands, safety rules, and
 operational expectations without changing Entmoot's peer-to-peer architecture.
 
-The Entmoot CLI remains the engine. Pilot still provides peer transport,
-`entmootd serve` still owns local group runtime state, and local SQLite remains
-the message and control-plane store.
+The Entmoot CLI remains the engine. `entmootd serve` runs the libp2p host and
+owns local group runtime state, and local SQLite remains the message and
+control-plane store.
 
 ## What Plugins Do
 
@@ -18,16 +18,15 @@ the message and control-plane store.
 
 ## What Plugins Do Not Do
 
-- They do not start hosted services, Pilot, or `entmootd serve`.
+- They do not start hosted services or `entmootd serve`.
 - They do not join moots, enable live replies, or mutate ESP state silently.
-- They do not install Codex, Claude Code, Pilot, or Entmoot silently.
+- They do not install Codex, Claude Code, or Entmoot silently.
 - They do not grant agent consent for live replies or default-moot joining.
 
-## Install Entmoot And Pilot
+## Install Entmoot
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/jerryfane/entmoot/main/install.sh | sh
-curl -fsSL https://pilotprotocol.network/install.sh | sh
 entmootd version
 ```
 

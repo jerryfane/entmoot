@@ -214,8 +214,11 @@ bootstrap peers/addresses, use limit, expiry, and capability nonce.
 The founder or any delegated admin may issue invites and apply membership
 changes. `roster admin grant|revoke` rewrites the delegated-admin set in one
 founder-signed membership record of kind `policy`, carrying the complete set
-(ceiling 16), and `roster admin list` reports it. An admin may add and remove ordinary members;
-it cannot remove the founder, remove another admin, or change the admin set.
+(ceiling 16), and `roster admin list` reports it. There is no add: a joiner signs its own
+admission, and an admin's membership powers are to remove ordinary members and
+to ban them. It cannot remove the founder, remove another admin, unban anybody,
+or change the admin set - lifting a ban and rewriting delegation are both
+founder-only, because an admin that could do either could undo the founder.
 Losing membership or delegation ends the authority at once, including for
 invites that admin already issued. A join requires the invite's `founder` field to be the group's real founder,
 since that is the anchor the joiner pins.

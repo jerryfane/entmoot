@@ -45,8 +45,9 @@ where the Pilot protocol or old fixture no longer exists.
 
 ## Synchronization Snapshots
 
-Roster/history pagination keeps at most four active snapshots per peer and 32
-globally. Active tokens retain their original 30-second lifetime; continuation
+History pagination keeps at most four active snapshots per peer and 32
+globally. Membership answers carry no snapshot at all - they are a bounded
+record set, so there is nothing to hold open. Active tokens retain their original 30-second lifetime; continuation
 requests do not extend it, and abandoned slots are reclaimed at expiry.
 Quota pressure returns `resource_exhausted` without evicting active sessions.
 
@@ -93,7 +94,7 @@ NAT egress addresses. Relay-only mode is not anonymity from the relay operator.*
 
 Application hosts enforce hard admission limits of 64 total connections, eight
 connections per peer, and 64 streams per peer. Frame caps remain 8 KiB for sync
-requests, 512 KiB for roster responses, 128 KiB for history lists, and 384 KiB
+requests, 4 MiB for a membership answer, 128 KiB for history lists, and 384 KiB
 for history bodies. Relay circuit duration, byte budgets, and admission policy
 remain operator-controlled; restrictive relay policies can interrupt transfers
 or reject frames. These failures are reported rather than bypassed with direct

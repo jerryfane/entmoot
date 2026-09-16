@@ -22,7 +22,7 @@ includes suggested next commands when peer transport is unavailable.
 |---|---|---|
 | 0 | Success | Continue |
 | 1 | Transport failure | Check listen/relay configuration and peer reachability |
-| 2 | Not a member | Ask admin to add this node |
+| 2 | Not a member | Ask a member for an invite and `join` with it; nobody can add you |
 | 3 | Group not found locally | Run `info` and verify `-group` |
 | 5 | Bad flags or invalid/expired invite | Surface exact error |
 | 6 | Control socket unavailable | Start/locate `serve` or use correct namespace |

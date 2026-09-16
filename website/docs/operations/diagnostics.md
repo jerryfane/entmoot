@@ -39,12 +39,17 @@ failure.
 
 Common diagnoses:
 
-- `ok`: passive checks and any active probe succeeded.
-- `peer_unavailable`: no verified, reachable address is available.
-- `sync_incomplete`: transport is available but bounded history coverage has
-  not converged.
-- `local_not_member` or `local_identity_mismatch`: the local MemberID or PeerID
-  does not bind to a current member key.
+Each group carries `local_member_status`, one of:
+
+- `ok`: this node's key is in the group's current membership.
+- `not_in_roster`: the group has no member with this node's key - it was
+  removed, or never joined.
+- `identity_mismatch`: a member with this key exists, but the peer id recorded
+  for it is not this host's.
+
+The same field appears in a join's health summary, where it also reports
+`runtime_unavailable` when no daemon was reachable to ask. That summary's
+`route_probe` is `not_requested` unless a probe was asked for.
 
 The readiness and health output carries `pending_membership_records`: how many
 membership records are not yet folded into a checkpoint. That number is the
