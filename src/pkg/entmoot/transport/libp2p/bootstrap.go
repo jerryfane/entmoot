@@ -2,6 +2,7 @@ package libp2ptransport
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -37,6 +38,30 @@ var ErrBootstrapDenied = membership.ErrInviteDenied
 type BootstrapCapability = entmoot.BootstrapCapability
 
 // SignBootstrapCapability binds the grant to the issuing identity.
+// MaxCapabilityBytes bounds a capability that must still be redeemable. A
+// joiner sends the whole capability inside one membership-sync request, which
+// the server refuses over maxSyncRequestBytes, so a capability minted past
+// this budget is accepted by its issuer and then fails at every redemption.
+//
+// The reserve is for the rest of that request: the joiner's own signed join
+// record, the cursor fields, the request id. Half the frame was the first
+// guess and it was wrong in the expensive direction — it made a worst-case
+// estimate refuse a single address. TestJoinRequestFitsTheFrame pins that a
+// capability at this budget plus a real join record still fits.
+const (
+	capabilityRequestReserve = 3 << 10
+	MaxCapabilityBytes       = maxSyncRequestBytes - capabilityRequestReserve
+)
+
+// CapabilityTooLarge reports whether c would not fit a redemption request.
+func CapabilityTooLarge(c entmoot.BootstrapCapability) (int, bool) {
+	encoded, err := json.Marshal(c)
+	if err != nil {
+		return 0, false
+	}
+	return len(encoded), len(encoded) > MaxCapabilityBytes
+}
+
 func SignBootstrapCapability(issuer *keystore.Identity, capability *BootstrapCapability) error {
 	return membership.SignInvite(issuer, capability)
 }

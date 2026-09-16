@@ -194,8 +194,14 @@ start a runner.
 
 ## 9. Invite and Bootstrap Contract
 
-`invite create` accepts one or more libp2p bootstrap multiaddrs naming the
-issuing node, and either a target Ed25519 public key or `-open`. With a target,
+`invite create` accepts one or more libp2p bootstrap multiaddrs naming this
+node or any current member, and either a target Ed25519 public key or `-open`.
+It also attaches a set of other members' known addresses — bounded in count
+and in bytes, at most 4 members, 8 addresses and 1 KiB — unless
+`-no-fallback-peers` is given, so an invite outlives its issuer's uptime:
+routable addresses first, and one slot for a member known only on a LAN, ULA,
+link-local or carrier-NAT address, since on that network it is the address
+that works. Loopback is not attached to the fallback set; the daemon uses its own loopback address only when it has no other. With a target,
 the MemberID and PeerID are derived from that key and only that identity may
 redeem the invite. With `-open` the invite is a bearer credential: any holder
 may redeem it while uses remain, which is how a small team joins from one link.

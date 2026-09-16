@@ -104,6 +104,12 @@ func validateRelayHints(relays []string) ([]string, error) {
 		if _, duplicate := seen[normalized]; duplicate {
 			continue
 		}
+		// Width bound here; the byte TOTAL is applied where relays are
+		// attached to a capability (boundInviteRelays), so a stored hint set
+		// is not silently truncated for every future invite.
+		if len(normalized) > maxInviteAddrBytes {
+			continue
+		}
 		seen[normalized] = struct{}{}
 		out = append(out, normalized)
 		if len(out) == maxRelayHints {

@@ -262,6 +262,16 @@ func (s *SyncServer) authorize(stream network.Stream, groupID entmoot.GroupID, c
 	if !allowedServer {
 		return ErrBootstrapDenied
 	}
+	// Being named is not enough: this node must ALSO be able to serve the
+	// group right now. An invite is minted against the membership of the
+	// moment and then lives for its whole TTL, so a node removed or banned
+	// afterwards would otherwise remain a working admission channel for every
+	// invite that named it. The issuer itself is exempt because its authority
+	// was just checked above, and a founder may issue while not being a
+	// member.
+	if err := s.servingAuthority(group, capability); err != nil {
+		return err
+	}
 	if err := VerifyBootstrapCapability(*capability, remote, s.now()); err != nil {
 		return err
 	}
@@ -269,6 +279,41 @@ func (s *SyncServer) authorize(stream network.Stream, groupID entmoot.GroupID, c
 	// so it is answered from the checkpoint and records this node holds. Every
 	// node therefore gives the same answer without being told.
 	return group.CheckInvite(*capability, s.now().UnixMilli())
+}
+
+// servingAuthority reports whether this node may serve a pre-membership read
+// for capability. A current, unbanned member may; so may the capability's own
+// signing authority, whose right to administer the group was checked before
+// this and which need not be a member when it is the founder.
+//
+// The comparison is on peer ids because that is what this node knows about
+// itself: a member's peer id and its member id come from the same Ed25519
+// key, so membership is what makes a peer id serveable.
+func (s *SyncServer) servingAuthority(group *membership.Group, capability *entmoot.BootstrapCapability) error {
+	self := s.Host.ID()
+	for _, memberID := range group.MemberIDs() {
+		info, ok := group.MemberInfoByID(memberID)
+		if !ok || len(info.EntmootPubKey) == 0 {
+			continue
+		}
+		binding, err := BindingFromPublicKey(info.EntmootPubKey)
+		if err != nil || binding.PeerID != self {
+			continue
+		}
+		if group.IsBanned(memberID) {
+			return fmt.Errorf("%w: this node is banned from the group", ErrBootstrapDenied)
+		}
+		return nil
+	}
+	// Not a member. The issuer is still allowed: AuthorizedIssuer has just
+	// established that it may administer the group, and a founder may issue
+	// after removing itself.
+	if authority := capability.SigningAuthority(); len(authority.EntmootPubKey) > 0 {
+		if binding, err := BindingFromPublicKey(authority.EntmootPubKey); err == nil && binding.PeerID == self {
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: this node is no longer a member of the group", ErrBootstrapDenied)
 }
 
 func (s *SyncServer) handleHistory(stream network.Stream) {

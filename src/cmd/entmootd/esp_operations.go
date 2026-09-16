@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -30,6 +31,8 @@ import (
 	"entmoot/pkg/entmoot/publicmoot"
 	"entmoot/pkg/entmoot/store"
 	libp2ptransport "entmoot/pkg/entmoot/transport/libp2p"
+	libpeer "github.com/libp2p/go-libp2p/core/peer"
+	"github.com/multiformats/go-multiaddr"
 )
 
 type espOperationExecutor struct {
@@ -104,6 +107,9 @@ type inviteCreatePayload struct {
 	ValidUntilMS        int64                `json:"valid_until_ms,omitempty"`
 	BootstrapMultiaddrs []string             `json:"bootstrap_multiaddrs,omitempty"`
 	Target              *inviteTargetPayload `json:"target,omitempty"`
+	// NoFallbackPeers declines the other-member addresses the daemon would
+	// attach so the invite outlives this node's uptime.
+	NoFallbackPeers bool `json:"no_fallback_peers,omitempty"`
 }
 
 type openInviteCreatePayload struct {
@@ -111,6 +117,10 @@ type openInviteCreatePayload struct {
 	ValidUntilMS        int64    `json:"valid_until_ms,omitempty"`
 	MaxUses             *int     `json:"max_uses"`
 	BootstrapMultiaddrs []string `json:"bootstrap_multiaddrs,omitempty"`
+	// NoFallbackPeers is carried to redemption, when the capability is
+	// actually minted, so a widely shared link can decline to disclose other
+	// members' addresses.
+	NoFallbackPeers bool `json:"no_fallback_peers,omitempty"`
 }
 
 type openInviteAcceptPayload struct {
@@ -233,6 +243,7 @@ func (e espOperationExecutor) RedeemOpenInvite(ctx context.Context, token string
 		GroupID:             rec.GroupID,
 		TargetPublicKey:     append([]byte(nil), payload.EntmootPubKey...),
 		BootstrapMultiaddrs: append([]string(nil), rec.BootstrapMultiaddrs...),
+		NoFallbackPeers:     rec.NoFallbackPeers,
 	})
 	if err != nil {
 		if (!resp.sent || resp.rejected) && !alreadyRedeemed {
@@ -462,6 +473,7 @@ func (e espOperationExecutor) createInvite(ctx context.Context, req esphttp.Sign
 		TargetPublicKey:     target.EntmootPubKey,
 		BootstrapMultiaddrs: append([]string(nil), payload.BootstrapMultiaddrs...),
 		ValidUntilMS:        payload.ValidUntilMS,
+		NoFallbackPeers:     payload.NoFallbackPeers,
 	}
 	if payload.ValidFor != "" {
 		ttl, err := parseDurationDays(payload.ValidFor)
@@ -514,7 +526,15 @@ func (e espOperationExecutor) createOpenInvite(ctx context.Context, req esphttp.
 	if expires <= now {
 		return nil, &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request", Message: "open invite expiry must be in the future"}
 	}
-	if _, err := e.checkInviteAuthorityOverIPC(ctx, &ipc.InviteAuthorityCheckReq{GroupID: req.GroupID}); err != nil {
+	authority, err := e.checkInviteAuthorityOverIPC(ctx, &ipc.InviteAuthorityCheckReq{GroupID: req.GroupID})
+	if err != nil {
+		return nil, err
+	}
+	// Validate the addresses here, not at redemption. The token this call
+	// returns is the thing that gets shared, and no capability exists yet, so
+	// a malformed, non-member or over-long list would otherwise produce a link
+	// that fails for every joiner with an error the joiner cannot act on.
+	if err := validateOpenInviteBootstrap(payload.BootstrapMultiaddrs, authority.MemberPeerIDs, authority.LocalPeerID, payload.NoFallbackPeers); err != nil {
 		return nil, err
 	}
 	token, tokenHash, err := esphttp.NewOpenInviteToken()
@@ -527,6 +547,7 @@ func (e espOperationExecutor) createOpenInvite(ctx context.Context, req esphttp.
 		DeviceID:            req.DeviceID,
 		MaxUses:             maxUses,
 		BootstrapMultiaddrs: append([]string(nil), payload.BootstrapMultiaddrs...),
+		NoFallbackPeers:     payload.NoFallbackPeers,
 		CreatedAtMS:         now,
 		ExpiresAtMS:         expires,
 	})
@@ -1455,4 +1476,87 @@ func operationIPCError(frame *ipc.ErrorFrame) error {
 		status, code = http.StatusInternalServerError, "internal"
 	}
 	return &esphttp.OperationError{HTTPStatus: status, Code: code, Message: frame.Message}
+}
+
+// validateOpenInviteBootstrap rejects a bootstrap list that cannot produce a
+// redeemable capability: a malformed multiaddr, an address naming no current
+// member, or so many addresses that the minted capability would not fit the
+// request a joiner sends.
+//
+// The size check must model what the MINT will sign, not just the list: a
+// capability also carries founder and issuer identities, the checkpoint id, a
+// nonce, a signature, target fields and relay hints, plus the fallback member
+// addresses the daemon attaches when the opt-out is off. Measuring the bare
+// list accepted 26 addresses that the mint then refused, which is the failure
+// this check exists to prevent, moved one step earlier.
+func validateOpenInviteBootstrap(addresses, memberPeerIDs []string, localPeerID string, noFallback bool) error {
+	peerIDs := make([]string, 0, len(addresses))
+	for _, raw := range addresses {
+		address, err := multiaddr.NewMultiaddr(raw)
+		if err != nil {
+			return &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request",
+				Message: fmt.Sprintf("invalid bootstrap multiaddr %q", raw)}
+		}
+		info, err := libpeer.AddrInfoFromP2pAddr(address)
+		if err != nil {
+			return &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request",
+				Message: fmt.Sprintf("bootstrap multiaddr %q must end in /p2p/<peer-id>", raw)}
+		}
+		// Membership can change before redemption, but an address naming
+		// nobody today is knowable now.
+		// The mint accepts the issuing node's own address even when it is not a
+		// member — a founder may issue after standing down — so creation must
+		// not be stricter than the thing it pre-empts.
+		if len(memberPeerIDs) > 0 && info.ID.String() != localPeerID && !slices.Contains(memberPeerIDs, info.ID.String()) {
+			return &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request",
+				Message: fmt.Sprintf("bootstrap multiaddr %q does not name a member of this group", raw)}
+		}
+		peerIDs = append(peerIDs, info.ID.String())
+	}
+	if size, tooLarge := openInviteCapabilityTooLarge(addresses, peerIDs, noFallback); tooLarge {
+		// The figure is an upper bound, not a prediction: everything the
+		// caller did not name is charged at its ceiling, so say so rather
+		// than report it as the size the invite will have. Name the remedy
+		// too — declining the fallback peers buys most of the allowance back.
+		return &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "bad_request",
+			Message: fmt.Sprintf("this list could mint an invite of up to %d bytes, over the %d a joiner can send; name fewer addresses, or set no_fallback_peers to stop the daemon attaching others", size, libp2ptransport.MaxCapabilityBytes)}
+	}
+	return nil
+}
+
+// openInviteCapabilityTooLarge reports whether a bootstrap list would mint a
+// capability too large to redeem.
+//
+// It does NOT model the JSON. Three attempts at that undercounted in turn: the
+// fallback slots, then the relay bytes, then the nonce, the timestamps and the
+// per-element array overhead. The size of a document is a fact about the
+// encoder, not something to reason about in prose, so the arithmetic here is
+// deliberately coarse and one-directional: everything the caller did not name
+// is charged at its enforced ceiling, and the fixed fields are charged at
+// maxInviteCapabilityOverhead, a constant TestCapabilityOverheadIsBounded
+// measures against a capability built the way the mint builds one.
+func openInviteCapabilityTooLarge(addresses, peerIDs []string, noFallback bool) (int, bool) {
+	// Each array element costs its own quotes and comma on the wire.
+	const perElement = 4
+	size := maxInviteCapabilityOverhead
+	for _, addr := range addresses {
+		size += len(addr) + perElement
+	}
+	for _, id := range peerIDs {
+		size += len(id) + perElement
+	}
+	// Relay hints come from this node's configuration, not the caller.
+	size += maxInviteFallbackBytes + libp2ptransport.MaxCapabilityRelays*perElement
+	if len(addresses) == 0 {
+		// A request naming nothing is filled with this node's own addresses,
+		// and that happens whether or not the caller declined the fallback
+		// members: no_fallback_peers gates addKnownMemberPeers only.
+		size += maxInviteFallbackBytes + maxInviteFallbackAddrs*perElement
+		size += maxPeerIDBytes + perElement
+	}
+	if !noFallback {
+		size += maxInviteFallbackBytes + maxInviteFallbackAddrs*perElement
+		size += maxInviteFallbackPeers * (maxPeerIDBytes + perElement)
+	}
+	return size, size > libp2ptransport.MaxCapabilityBytes
 }

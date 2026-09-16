@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **An invite no longer needs its issuer online.** `invite create` accepted
+  only the issuing node's own address as a bootstrap peer, and a peer serves a
+  newcomer only when the capability names it, so the issuer had to be running
+  for its own invite to work — the one thing self-signed admission was meant to
+  remove. A bootstrap address may now name any CURRENT member. The issuer also
+  attaches known addresses of up to four other members — at most two each,
+  eight in total, and 1 KiB in total, each address at most 256 bytes — so an
+  ordinary `invite create` survives its author going down without the operator
+  naming anybody. Relay hints are bounded the same way. The cap is on ADDRESSES as well as
+  members because a multi-homed host holds dozens, and a capability travels in
+  one request frame with an 8 KiB ceiling: bounding members alone produced
+  invites too large to redeem. Every mint path refuses a capability over the
+  budget, the budget is pinned by a test that puts a capability of that size
+  into a real read request, and the creation-time check charges everything the
+  caller did not name at its enforced ceiling rather than modelling the JSON:
+  three attempts at modelling it undercounted in turn, on the fallback slots,
+  then the relay bytes, then the nonce and timestamps. The fixed-field
+  allowance is measured by a test against a capability built the way the mint
+  builds one.
+
+  Routable addresses are preferred. A member known only on a non-routable one —
+  a LAN, a ULA, a link-local or a carrier-NAT address — still gets a single
+  slot, because on that network it is the door that works; at most four such
+  addresses can reach one invite, `invite create` reports on stderr when it
+  attaches any, and loopback is never attached to the fallback set, because it names
+  the joiner's own machine rather than a member — the one exception being a
+  node whose own addresses are all loopback, where the alternative is an
+  invite naming nothing at all. `-no-fallback-peers` attaches none, and `no_fallback_peers` does
+  the same on the IPC path, on the ESP invite-create operation, and on an ESP
+  open invite, where it is stored with the token because the capability is
+  minted only at redemption.
+
+  An ESP open invite is checked at CREATION instead, because the token is what
+  gets shared and no capability exists yet: a malformed multiaddr or a list too
+  long to redeem is refused there rather than producing a link that fails for
+  every joiner.
+
+  A non-member's address is still refused, and a removed or banned member stops
+  being serveable the moment its removal projects — enforced where it matters,
+  at the serving node: being named by an invite is not sufficient, because an
+  invite is minted against the membership of one moment and then lives for its
+  whole TTL. The issuer itself is exempt, since its authority is checked on
+  every read and a founder may issue after removing itself. Naming another member is safe
+  because the newcomer pins the founder's key from the invite and verifies the
+  membership it is served against that key: a named peer can serve or fail, not
+  forge. The serving peer evaluates the issuer's authority against its own view
+  of the group, so a demoted issuer's invite fails wherever it is presented.
+
+  Proved on three daemons: the founder mints an invite naming a plain member,
+  the founder is stopped, and the newcomer joins through that member in under a
+  second, with both live nodes converging on three members and one checkpoint.
+  The same command on the previous build exits 5.
+
+
 ### Removed
 
 - **Five one-off files are removed from the repository root.**
@@ -133,11 +189,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   checkpoints, replacing the linear founder/admin-signed roster chain.** A
   joiner signs its own admission, redeeming an invite that authorises it, so
   no founder or admin has to sign anything when the invite is used. The
-  ISSUING node does still have to be reachable then: an invite may only name
-  its issuer's own peer id as a bootstrap address (invite.go), and a peer
-  serves a pre-membership redemption only if it is named there (the transport
-  checks the capability's allowed peer ids), so the issuer is the only peer
-  that can serve one. Records (`join`, `leave`, `rekey`, `remove`, `unban`,
+  invite names the members that may serve its redemption, and a peer serves one
+  only if it is named there and is either still a member or the invite's own
+  signing authority — so an invite does not
+  depend on the issuer being up, which is the change recorded at the top of this
+  section. Records (`join`, `leave`, `rekey`, `remove`, `unban`,
   `policy`, `revoke_invite`) merge by one deterministic total order —
   timestamp, then kind, then the founder's record before a delegated admin's,
   then record id — with joins applied before rekeys, authority records, and

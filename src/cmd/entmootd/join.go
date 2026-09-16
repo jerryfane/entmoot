@@ -19,6 +19,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -1368,7 +1369,8 @@ func (s *ipcServer) handleInviteCreate(_ context.Context, c net.Conn, req *ipc.I
 	}
 	founder.MemberID = &founderBinding.MemberID
 	founder.PeerID = founderBinding.PeerID.String()
-	// This node serves the redemption, so the invite must name this node's
+	// Whichever named peer is entitled to serve does so — a current member, or
+	// this node as the capability's own issuer. So the invite carries those
 	// addresses and, when it is not the founder, this node as the issuer.
 	localBinding, err := libp2ptransport.BindingFromPublicKey(s.identity.PublicKey)
 	if err != nil || localBinding.PeerID != s.runtime.host.ID() {
@@ -1399,12 +1401,28 @@ func (s *ipcServer) handleInviteCreate(_ context.Context, c net.Conn, req *ipc.I
 		targetPeerID = targetBinding.PeerID.String()
 	}
 	if len(req.BootstrapMultiaddrs) == 0 {
-		req.BootstrapMultiaddrs = make([]string, 0, len(s.runtime.host.Addrs()))
+		// A request that names nothing gets this node's own addresses — and a
+		// libp2p host on a multi-homed machine reports dozens, so this fill
+		// has to obey the same bounds as everything else the daemon attaches
+		// without being asked. It did not, which is how an ESP open invite
+		// created with no address list (the group_create open-invite mode
+		// never supplies one) minted a capability too large to redeem.
+		own := make([]string, 0, len(s.runtime.host.Addrs()))
 		for _, address := range s.runtime.host.Addrs() {
-			req.BootstrapMultiaddrs = append(req.BootstrapMultiaddrs, address.Encapsulate(multiaddr.StringCast("/p2p/"+localBinding.PeerID.String())).String())
+			own = append(own, address.Encapsulate(multiaddr.StringCast("/p2p/"+localBinding.PeerID.String())).String())
 		}
+		req.BootstrapMultiaddrs = boundInviteAddresses(own)
+	}
+	// Any current member may be named as a bootstrap peer, so an invite stays
+	// usable while its issuer is down. See the comment in cmdInviteCreate.
+	memberPeers, err := groupMemberPeerIDs(session.group)
+	if err != nil {
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInternal, GroupID: &gid, Message: "read group members"})
+		return
 	}
 	allowedAddresses := make([]string, 0, len(req.BootstrapMultiaddrs))
+	allowedPeerIDs := make([]string, 0, len(req.BootstrapMultiaddrs)+1)
+	seenPeers := make(map[libpeer.ID]struct{})
 	for _, raw := range req.BootstrapMultiaddrs {
 		address, err := multiaddr.NewMultiaddr(raw)
 		if err != nil {
@@ -1412,11 +1430,36 @@ func (s *ipcServer) handleInviteCreate(_ context.Context, c net.Conn, req *ipc.I
 			return
 		}
 		info, err := libpeer.AddrInfoFromP2pAddr(address)
-		if err != nil || info.ID != localBinding.PeerID {
-			_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInvalidArgument, GroupID: &gid, Message: "bootstrap address does not name the issuing host"})
+		if err != nil {
+			_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInvalidArgument, GroupID: &gid, Message: "bootstrap address must end in /p2p/<peer-id>"})
+			return
+		}
+		if _, ok := memberPeers[info.ID]; !ok && info.ID != localBinding.PeerID {
+			_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInvalidArgument, GroupID: &gid, Message: "bootstrap address does not name a member of this group"})
 			return
 		}
 		allowedAddresses = append(allowedAddresses, address.String())
+		if _, ok := seenPeers[info.ID]; !ok {
+			seenPeers[info.ID] = struct{}{}
+			allowedPeerIDs = append(allowedPeerIDs, info.ID.String())
+		}
+	}
+	if len(allowedPeerIDs) == 0 {
+		allowedPeerIDs = append(allowedPeerIDs, localBinding.PeerID.String())
+		seenPeers[localBinding.PeerID] = struct{}{}
+	}
+	if !req.NoFallbackPeers {
+		var privateFallbacks int
+		allowedAddresses, allowedPeerIDs, privateFallbacks = addKnownMemberPeers(s.dataDir, gid, memberPeers,
+			localBinding.PeerID, allowedAddresses, allowedPeerIDs, seenPeers)
+		if privateFallbacks > 0 {
+			// The CLI prints this; over IPC the operator is elsewhere, so it
+			// goes to the daemon log rather than being dropped. An invite that
+			// carries a member's LAN address should not do so silently.
+			slog.Warn("invite create: attached a private fallback address",
+				slog.String("group_id", gid.String()),
+				slog.Int("private_fallback_peers", privateFallbacks))
+		}
 	}
 	now := time.Now()
 	expires := now.Add(24 * time.Hour)
@@ -1438,7 +1481,7 @@ func (s *ipcServer) handleInviteCreate(_ context.Context, c net.Conn, req *ipc.I
 		Founder:           founder,
 		Issuer:            issuer,
 		RosterHead:        session.group.Canonical().ID,
-		AllowedPeerIDs:    []string{localBinding.PeerID.String()},
+		AllowedPeerIDs:    allowedPeerIDs,
 		AllowedMultiaddrs: allowedAddresses,
 		Relays:            s.runtime.relayHints(),
 		MaxUses:           req.MaxUses,
@@ -1451,6 +1494,12 @@ func (s *ipcServer) handleInviteCreate(_ context.Context, c net.Conn, req *ipc.I
 	}
 	if err := libp2ptransport.SignBootstrapCapability(s.identity, &capability); err != nil {
 		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInternal, GroupID: &gid, Message: err.Error()})
+		return
+	}
+	// The signature is part of what the joiner must send, so measure after it.
+	if size, tooLarge := libp2ptransport.CapabilityTooLarge(capability); tooLarge {
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInvalidArgument, GroupID: &gid,
+			Message: fmt.Sprintf("invite is %d bytes, over the %d-byte limit a joiner can send", size, libp2ptransport.MaxCapabilityBytes)})
 		return
 	}
 	if err := s.runtime.invites.RecordIssuedInvite(capability); err != nil {
@@ -1498,11 +1547,21 @@ func (s *ipcServer) handleInviteAuthorityCheck(ctx context.Context, c net.Conn, 
 		})
 		return
 	}
+	memberPeers, peersErr := groupMemberPeerIDs(sess.group)
+	peerIDs := make([]string, 0, len(memberPeers))
+	if peersErr == nil {
+		for id := range memberPeers {
+			peerIDs = append(peerIDs, id.String())
+		}
+		sort.Strings(peerIDs)
+	}
 	_ = ipc.EncodeAndWrite(c, &ipc.InviteAuthorityCheckResp{
-		Status:     "ok",
-		GroupID:    gid,
-		RosterHead: sess.group.Canonical().ID,
-		Members:    len(sess.group.MemberIDs()),
+		Status:        "ok",
+		GroupID:       gid,
+		RosterHead:    sess.group.Canonical().ID,
+		Members:       len(sess.group.MemberIDs()),
+		MemberPeerIDs: peerIDs,
+		LocalPeerID:   s.peerID,
 	})
 }
 
