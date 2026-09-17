@@ -2300,6 +2300,13 @@ func TestReachableMemberInfosDropsSomebodyTheAdoptedBranchBanned(t *testing.T) {
 			t.Fatal("a banned identity is still named as reachable")
 		}
 	}
+	// And in the repair-only list, which is what fills the reserved sync
+	// slots: a banned identity would be dialed and gossiped to FIRST.
+	for _, info := range f.group.RewoundMemberInfos() {
+		if id, err := entmoot.ResolvedMemberID(info); err == nil && id == f.memberID(joiner) {
+			t.Fatal("a banned identity is still named for the reserved repair slots")
+		}
+	}
 }
 
 // rewind returns the head of a founder-signed branch that forks from base and

@@ -1044,37 +1044,6 @@ func (g *Group) settleCanonicalLocked() error {
 	if best.ID == g.canonicalID {
 		return nil
 	}
-	// Moving backwards in time un-covers records this node may already have
-	// deleted, so remember the membership being left behind: those members
-	// are the peers that can serve the records back. See the KNOWN GAP above
-	// and ReachableMemberInfos.
-	//
-	// Merged, never replaced. The membership a second rewind leaves behind is
-	// the branch the first one adopted, which by construction does not hold
-	// what the first one lost - so overwriting would throw away the peers
-	// that can still repair it. rewoundFrom keeps the highest bound this node
-	// has moved back from, and the hint is dropped once the chain has reached
-	// that point again, because then nothing is uncovered any more.
-	//
-	// The backwards test is belt and braces for correctness - the expiry
-	// below would erase a forward capture on the same call - but it is not
-	// pointless: without it every ordinary checkpoint would copy the whole
-	// member set only to throw it away.
-	if outgoing, ok := g.checkpoints[g.canonicalID]; ok && best.Timestamp < outgoing.Timestamp {
-		if g.rewoundMembers == nil {
-			g.rewoundMembers = make(map[entmoot.MemberID]entmoot.NodeInfo, len(g.membersAt[outgoing.ID]))
-		}
-		for id, info := range g.membersAt[outgoing.ID] {
-			g.rewoundMembers[id] = cloneNodeInfo(info)
-		}
-		if outgoing.Timestamp > g.rewoundFrom {
-			g.rewoundFrom = outgoing.Timestamp
-		}
-	}
-	if g.rewoundFrom > 0 && best.Timestamp >= g.rewoundFrom {
-		g.rewoundMembers, g.rewoundFrom = nil, 0
-	}
-
 	ctx := context.Background()
 	tx, err := g.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -1139,6 +1108,37 @@ func (g *Group) settleCanonicalLocked() error {
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("membership: commit canonical update: %w", err)
+	}
+
+	// Moving backwards in time un-covers records this node may already have
+	// deleted, so remember the membership being left behind: those members
+	// are the peers that can serve the records back. See the KNOWN GAP above
+	// and ReachableMemberInfos.
+	//
+	// Merged, never replaced. The membership a second rewind leaves behind is
+	// the branch the first one adopted, which by construction does not hold
+	// what the first one lost - so overwriting would throw away the peers
+	// that can still repair it. rewoundFrom keeps the highest bound this node
+	// has moved back from, and the hint is dropped once the chain has reached
+	// that point again, because then nothing is uncovered any more.
+	//
+	// The backwards test is belt and braces for correctness - the expiry
+	// below would erase a forward capture on the same call - but it is not
+	// pointless: without it every ordinary checkpoint would copy the whole
+	// member set only to throw it away.
+	if outgoing, ok := g.checkpoints[g.canonicalID]; ok && best.Timestamp < outgoing.Timestamp {
+		if g.rewoundMembers == nil {
+			g.rewoundMembers = make(map[entmoot.MemberID]entmoot.NodeInfo, len(g.membersAt[outgoing.ID]))
+		}
+		for id, info := range g.membersAt[outgoing.ID] {
+			g.rewoundMembers[id] = cloneNodeInfo(info)
+		}
+		if outgoing.Timestamp > g.rewoundFrom {
+			g.rewoundFrom = outgoing.Timestamp
+		}
+	}
+	if g.rewoundFrom > 0 && best.Timestamp >= g.rewoundFrom {
+		g.rewoundMembers, g.rewoundFrom = nil, 0
 	}
 
 	g.canonicalID = best.ID
