@@ -604,13 +604,30 @@ func (g *Group) ReachableMemberInfos() []entmoot.NodeInfo {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 	canonical := g.checkpoints[g.canonicalID]
+	// Every identity this node holds a departure for: banned, removed, or
+	// left. A rewind can put such an identity back in a post-canonical
+	// checkpoint's member set, and this list is used to dial peers and to
+	// push membership records, so it must not resurrect somebody the group
+	// evicted just because the branch that evicted them lost the walk.
+	evicted := make(map[entmoot.MemberID]struct{}, len(g.state.Banned))
+	for id := range g.state.Banned {
+		evicted[id] = struct{}{}
+	}
+	for _, rec := range g.records {
+		switch rec.Kind {
+		case KindRemove, KindLeave:
+			if id, err := rec.SubjectMemberID(); err == nil {
+				evicted[id] = struct{}{}
+			}
+		}
+	}
 	out := make([]entmoot.NodeInfo, 0, len(g.state.Members))
 	seen := make(map[entmoot.MemberID]struct{}, len(g.state.Members))
 	add := func(id entmoot.MemberID, info entmoot.NodeInfo) {
 		if _, already := seen[id]; already {
 			return
 		}
-		if _, banned := g.state.Banned[id]; banned {
+		if _, gone := evicted[id]; gone {
 			return
 		}
 		seen[id] = struct{}{}

@@ -791,3 +791,51 @@ func TestServerServesRecordsACallerOwnBoundStillNeeds(t *testing.T) {
 		t.Fatalf("a caller in step with us was served %d records it must refuse", len(response.Records))
 	}
 }
+
+// The gate on the generous answer. A caller naming a checkpoint we do not
+// hold gets the whole retained window, because its bound cannot be read from
+// the request - but only if it also claims a sequence at or beyond ours,
+// which is what a rewound node has. A joiner sends no checkpoint at all and a
+// lagging node names one we have retired; both must get the ordinary answer,
+// or any admitted caller could ask for the window and the removal records in
+// it by naming an id nobody holds.
+func TestUnknownCheckpointBelowOurSequenceGetsTheOrdinaryAnswer(t *testing.T) {
+	joiner := mustIdentity(t)
+	p := newMembershipSyncPair(t, joiner)
+	if _, signed, err := p.group.SignCheckpoint(p.founder, true); err != nil || !signed {
+		t.Fatalf("checkpoint: signed=%t err=%v", signed, err)
+	}
+	canonical := p.group.Canonical()
+	if len(p.group.Pending()) != 0 {
+		t.Fatalf("server reports %d pending records, so every answer would carry them", len(p.group.Pending()))
+	}
+	if len(p.group.PendingFor(membership.Checkpoint{})) == 0 {
+		t.Fatal("the server holds no retained window, so there is nothing to withhold")
+	}
+
+	unknown := entmoot.RosterEntryID{0x9e, 0x9e}
+	ask := func(sequence uint64) int {
+		t.Helper()
+		response, err := RequestMembership(p.ctx, p.clientHost, p.remote, MembershipSyncRequest{
+			Version:        1,
+			RequestID:      fmt.Sprintf("unknown-%d", sequence),
+			GroupID:        p.groupID,
+			HaveSequence:   sequence,
+			HaveCheckpoint: unknown,
+			Limit:          maxMembershipRecords,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return len(response.Records)
+	}
+	if got := ask(canonical.Sequence - 1); got != 0 {
+		t.Fatalf("a caller below our sequence naming an unknown checkpoint was served %d records", got)
+	}
+	if got := ask(0); got != 0 {
+		t.Fatalf("a caller naming no checkpoint at all was served %d records", got)
+	}
+	if got := ask(canonical.Sequence); got == 0 {
+		t.Fatal("a caller at our sequence naming a branch we do not hold was served nothing, so a rewound node cannot recover")
+	}
+}

@@ -1955,32 +1955,78 @@ func TestReachableMemberInfosKeepsMembersTheProjectionLost(t *testing.T) {
 	}
 }
 
-// The other half of that list: it must not name identities the group evicted.
-// It is used to dial peers and to push membership records, so an ex-member
-// that appears in an old retained checkpoint would keep being talked to -
-// a checkpoint older than the canonical one is not evidence of a rewind.
+// The other half of that list: it must not name identities the group evicted,
+// even when a rewind puts them back in a post-canonical checkpoint's member
+// set. The list dials peers and pushes membership records, so resurrecting
+// somebody the group removed would keep talking to them.
 func TestReachableMemberInfosExcludesEvictedIdentities(t *testing.T) {
 	f := newFixture(t, DefaultPolicy())
 	removed, banned := mustIdentity(t), mustIdentity(t)
 	f.join(removed)
 	f.join(banned)
 	f.tick(10)
+	if _, signed, err := f.group.SignCheckpoint(f.founder, true); err != nil || !signed {
+		t.Fatalf("base checkpoint: signed=%t err=%v", signed, err)
+	}
+	base := f.group.Canonical()
+	named := func(cp Checkpoint, want entmoot.MemberID) bool {
+		for _, info := range cp.Members {
+			if id, err := entmoot.ResolvedMemberID(info); err == nil && id == want {
+				return true
+			}
+		}
+		return false
+	}
+	for _, id := range []entmoot.MemberID{f.memberID(removed), f.memberID(banned)} {
+		if !named(base, id) {
+			t.Fatalf("the base checkpoint does not name %s, so this proves nothing", id.String())
+		}
+	}
+
+	// Both leave the group, and a checkpoint folds the departures in.
+	f.tick(10)
 	f.apply(f.sign(f.founder, Record{Kind: KindRemove, Subject: f.info(removed)}))
 	f.apply(f.sign(f.founder, Record{Kind: KindRemove, Subject: f.info(banned), Banned: true}))
 	f.tick(10)
-	for i := 0; i < 2; i++ {
-		f.tick(1_000)
-		if _, signed, err := f.group.SignCheckpoint(f.founder, true); err != nil || !signed {
-			t.Fatalf("checkpoint %d: signed=%t err=%v", i, signed, err)
-		}
+	if _, signed, err := f.group.SignCheckpoint(f.founder, true); err != nil || !signed {
+		t.Fatalf("eviction checkpoint: signed=%t err=%v", signed, err)
 	}
+	head := f.group.Canonical()
 	if f.group.IsMemberID(f.memberID(removed)) || f.group.IsMemberID(f.memberID(banned)) {
 		t.Fatal("the fixture left an evicted identity in the projection")
 	}
-	// The checkpoints that named them are still retained, which is the whole
-	// hazard: retention keeps every founder-signed checkpoint.
-	if len(f.group.CheckpointsSince(0)) < 2 {
-		t.Fatal("the fixture retained no earlier checkpoint, so this proves nothing")
+
+	// Now a rewind that drops the canonical checkpoint BELOW the base, which
+	// still names both of them and is still retained: a branch forking from
+	// the checkpoint before the base, reaching further while dated earlier.
+	fork, ok := f.group.CheckpointByID(base.Previous)
+	if !ok {
+		t.Fatal("the checkpoint before the base was retired, so the branch has nowhere to fork")
+	}
+	previous := fork
+	for sequence := fork.Sequence + 1; sequence <= head.Sequence+1; sequence++ {
+		body := previous
+		body.ID = entmoot.RosterEntryID{}
+		body.Sequence = sequence
+		body.Previous = previous.ID
+		body.Timestamp = previous.Timestamp + 1
+		body.Covered = 0
+		body.Members = []entmoot.NodeInfo{f.info(f.founder)}
+		body.Signature = nil
+		signed, err := SignCheckpoint(f.founder, f.info(f.founder), body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.group.ApplyCheckpoint(signed); err != nil {
+			t.Fatalf("branch at sequence %d: %v", sequence, err)
+		}
+		previous = signed
+	}
+	if got := f.group.Canonical().Timestamp; got >= base.Timestamp {
+		t.Fatalf("the fixture did not rewind past the base: canonical ts %d, base ts %d", got, base.Timestamp)
+	}
+	if _, retained := f.group.CheckpointByID(base.ID); !retained {
+		t.Fatal("the checkpoint naming both identities was not retained, so the hazard is not present")
 	}
 
 	for _, info := range f.group.ReachableMemberInfos() {
@@ -1989,10 +2035,10 @@ func TestReachableMemberInfosExcludesEvictedIdentities(t *testing.T) {
 			continue
 		}
 		if id == f.memberID(removed) {
-			t.Fatal("a removed member is still named as reachable")
+			t.Fatal("a removed member is named as reachable after a rewind")
 		}
 		if id == f.memberID(banned) {
-			t.Fatal("a banned identity is still named as reachable")
+			t.Fatal("a banned identity is named as reachable after a rewind")
 		}
 	}
 }
