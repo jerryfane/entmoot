@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.82] - 2026-09-17
+
 ### Added
 
 - `entmootd doctor --probe` and `peers --probe` now do what they always
