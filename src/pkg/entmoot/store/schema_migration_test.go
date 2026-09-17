@@ -24,7 +24,7 @@ func TestOpenDropsTheRetiredRangeIndex(t *testing.T) {
 	if err := s.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	path := filepath.Join(root, "groups", encodeGroupDirName(gid), "messages.sqlite")
+	path := filepath.Join(root, "groups", gid.DirName(), "messages.sqlite")
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		t.Fatalf("open raw: %v", err)
@@ -81,7 +81,7 @@ func TestOpenSucceedsWhileAnotherWriterHoldsTheLock(t *testing.T) {
 	if err := s.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	path := filepath.Join(root, "groups", encodeGroupDirName(gid), "messages.sqlite")
+	path := filepath.Join(root, "groups", gid.DirName(), "messages.sqlite")
 
 	legacy, err := sql.Open("sqlite", path)
 	if err != nil {

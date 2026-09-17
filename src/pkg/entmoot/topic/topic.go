@@ -27,8 +27,6 @@ package topic
 import (
 	"errors"
 	"strings"
-
-	entmoot "entmoot/pkg/entmoot"
 )
 
 const (
@@ -135,16 +133,4 @@ func Match(pattern, topic string) bool {
 	}
 	// All pattern segments consumed; topic must be exhausted for a match.
 	return len(patSegs) == len(topSegs)
-}
-
-// MatchAny reports whether topic matches any of the patterns in filter.
-// An empty filter never matches. Invalid patterns inside the filter are
-// skipped (per Match's lenient contract); they cannot cause a match.
-func MatchAny(filter entmoot.Filter, topic string) bool {
-	for _, p := range filter {
-		if Match(p, topic) {
-			return true
-		}
-	}
-	return false
 }

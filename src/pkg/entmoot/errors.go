@@ -33,7 +33,3 @@ var ErrNotMember = errors.New("entmoot: author not a group member")
 // ErrRosterHeadUnknown means message verification needs an authenticated
 // roster update before it can decide historical authorization.
 var ErrRosterHeadUnknown = errors.New("entmoot: roster head unknown")
-
-// ErrInviteExpired is returned by gossip.Join when the invite's ValidUntil
-// timestamp is in the past relative to the local clock.
-var ErrInviteExpired = errors.New("entmoot: invite has expired")

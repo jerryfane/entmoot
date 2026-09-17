@@ -92,8 +92,9 @@ func TestAllow_ByteBurstAcceptsFourMiBRejectsFiveMiB(t *testing.T) {
 		t.Fatalf("4 MiB payload: unexpected rate-limit: %v", err)
 	}
 
-	// Reset peer so the next call is independent of remaining msg tokens.
-	lim.Reset(peer)
+	// A different peer, so the next call is independent of the msg tokens the
+	// first one spent.
+	peer = testMemberID(8)
 
 	// 5 MiB exceeds the 4 MiB burst in a single call; must reject.
 	if err := lim.Allow(peer, 5<<20); !errors.Is(err, entmoot.ErrRateLimited) {
@@ -211,33 +212,6 @@ func TestAllow_ConcurrentSamePeerIsRaceSafe(t *testing.T) {
 	}
 }
 
-func TestReset_RestoresFullBurst(t *testing.T) {
-	fk := clock.NewFake(anchor)
-	lim := ratelimit.New(testLimits(), fk)
-	peer := testMemberID(5)
-
-	// Drain the msg burst.
-	for i := 0; i < 200; i++ {
-		if err := lim.Allow(peer, 0); err != nil {
-			t.Fatalf("drain %d: %v", i, err)
-		}
-	}
-	if err := lim.Allow(peer, 0); !errors.Is(err, entmoot.ErrRateLimited) {
-		t.Fatalf("expected ErrRateLimited after drain, got %v", err)
-	}
-
-	// Reset: next Allow should get full burst again without advancing time.
-	lim.Reset(peer)
-	for i := 0; i < 200; i++ {
-		if err := lim.Allow(peer, 0); err != nil {
-			t.Fatalf("post-reset %d: %v", i, err)
-		}
-	}
-	if err := lim.Allow(peer, 0); !errors.Is(err, entmoot.ErrRateLimited) {
-		t.Fatalf("expected ErrRateLimited post-reset-drain, got %v", err)
-	}
-}
-
 func TestAllow_UnlimitedWhenRateZero(t *testing.T) {
 	fk := clock.NewFake(anchor)
 	// Both rates zero -> both buckets disabled.
@@ -297,58 +271,6 @@ func TestAllow_UnknownPeerStartsWithFullBurst(t *testing.T) {
 	}
 }
 
-// TestAllowTopic_UnconfiguredTopicDelegatesToGlobal asserts that a
-// topic with no explicit TopicLimit entry falls back to the global
-// per-peer bucket; the topic-level bucket is a no-op.
-func TestAllowTopic_UnconfiguredTopicDelegatesToGlobal(t *testing.T) {
-	fk := clock.NewFake(anchor)
-	lim := ratelimit.New(ratelimit.Limits{
-		MsgRate:  1,
-		MsgBurst: 3,
-	}, fk)
-	peer := testMemberID(7)
-
-	// Burst of 3 — from the global bucket — then reject.
-	for i := 0; i < 3; i++ {
-		if err := lim.AllowTopic(peer, "chat/messages", 0); err != nil {
-			t.Fatalf("iter %d: %v", i, err)
-		}
-	}
-	if err := lim.AllowTopic(peer, "chat/messages", 0); !errors.Is(err, entmoot.ErrRateLimited) {
-		t.Fatalf("expected ErrRateLimited from global bucket, got %v", err)
-	}
-}
-
-// TestAllowTopic_GlobalRejectCancelsTopicReservation asserts the
-// reverse: when the global per-peer bucket rejects, the per-(peer,
-// topic) bucket must not be charged.
-func TestAllowTopic_GlobalRejectCancelsTopicReservation(t *testing.T) {
-	fk := clock.NewFake(anchor)
-	// Tight global bucket, loose topic bucket so we can isolate the
-	// cancel-on-global-reject path.
-	lim := ratelimit.New(ratelimit.Limits{
-		MsgRate:  1,
-		MsgBurst: 1,
-		TopicLimits: map[string]ratelimit.TopicLimit{
-			"t": {MsgRate: 1000, MsgBurst: 1000},
-		},
-	}, fk)
-	peer := testMemberID(11)
-
-	if err := lim.AllowTopic(peer, "t", 0); err != nil {
-		t.Fatalf("first: %v", err)
-	}
-	if err := lim.AllowTopic(peer, "t", 0); !errors.Is(err, entmoot.ErrRateLimited) {
-		t.Fatalf("second (global bucket empty): expected ErrRateLimited, got %v", err)
-	}
-	// 999 topic tokens should still be available; assert that a single
-	// clock advance (restoring 1 global token) lets the next call through.
-	fk.Advance(1 * time.Second)
-	if err := lim.AllowTopic(peer, "t", 0); err != nil {
-		t.Fatalf("post-refill: topic bucket appears to have been charged anyway: %v", err)
-	}
-}
-
 func TestNew_NilClockUsesSystem(t *testing.T) {
 	// Smoke test: a nil clock should not panic and should still apply
 	// limits. We can't usefully assert timing without racing real time,
@@ -366,29 +288,6 @@ func TestNew_NilClockUsesSystem(t *testing.T) {
 	}
 	if err := lim.Allow(peer, 0); !errors.Is(err, entmoot.ErrRateLimited) {
 		t.Fatalf("third: expected ErrRateLimited, got %v", err)
-	}
-}
-
-func TestAllowTopicOnlyDoesNotDoubleChargeGlobalBucket(t *testing.T) {
-	fk := clock.NewFake(anchor)
-	lim := ratelimit.New(ratelimit.Limits{
-		MsgRate:    1,
-		MsgBurst:   1,
-		BytesRate:  1024,
-		BytesBurst: 1024,
-		TopicLimits: map[string]ratelimit.TopicLimit{
-			"system": {MsgRate: 1, MsgBurst: 1},
-		},
-	}, fk)
-	peer := testMemberID(7)
-	if err := lim.AllowTopicOnly(peer, "system"); err != nil {
-		t.Fatalf("AllowTopicOnly: %v", err)
-	}
-	if err := lim.Allow(peer, 1); err != nil {
-		t.Fatalf("global bucket was charged by AllowTopicOnly: %v", err)
-	}
-	if err := lim.AllowTopicOnly(peer, "system"); !errors.Is(err, entmoot.ErrRateLimited) {
-		t.Fatalf("second AllowTopicOnly = %v, want ErrRateLimited", err)
 	}
 }
 

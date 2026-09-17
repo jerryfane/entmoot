@@ -59,6 +59,14 @@ func (g GroupID) String() string {
 	return base64.StdEncoding.EncodeToString(g[:])
 }
 
+// DirName is the group id as a filesystem-safe name: the same base64 without
+// padding or "/". Every on-disk layout - message stores, membership, the
+// legacy chain - keys its per-group directory by this, so the encoding lives
+// here rather than being restated beside each store.
+func (g GroupID) DirName() string {
+	return base64.RawURLEncoding.EncodeToString(g[:])
+}
+
 // MarshalJSON encodes the group id as a base64 JSON string.
 func (g GroupID) MarshalJSON() ([]byte, error) {
 	return json.Marshal(g.String())
@@ -193,11 +201,6 @@ type RosterEntry struct {
 	// Signature is the Ed25519 signature over canonical.RosterEntrySigningBytes.
 	Signature []byte `json:"signature,omitempty"`
 }
-
-// Filter is a set of MQTT-style topic patterns. A message matches a filter
-// if any pattern matches its topics (match semantics live in the topic
-// package, added in phase A1).
-type Filter []string
 
 // BootstrapCapability is an issuer-signed, expiring grant for a bounded set of
 // bootstrap endpoints. Target fields bind it to one fresh identity; leaving

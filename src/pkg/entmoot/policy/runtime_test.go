@@ -22,7 +22,4 @@ func TestContentLimitsFromPolicy(t *testing.T) {
 	if limits.BytesBurst != 128*1024 {
 		t.Fatalf("BytesBurst = %d, want 128KiB", limits.BytesBurst)
 	}
-	if len(limits.TopicLimits) != 0 {
-		t.Fatalf("TopicLimits = %+v, want none for content limiter", limits.TopicLimits)
-	}
 }

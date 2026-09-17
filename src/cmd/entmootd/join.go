@@ -129,11 +129,6 @@ func loadJoinInputs(args []string) ([]joinInput, int) {
 			if errors.Is(err, errFetchFailed) {
 				return nil, exitTransport
 			}
-			if errors.Is(err, entmoot.ErrInviteExpired) ||
-				errors.Is(err, entmoot.ErrSigInvalid) ||
-				errors.Is(err, errInviteMalformed) {
-				return nil, exitInvalidArgument
-			}
 			return nil, exitInvalidArgument
 		}
 		inputs = append(inputs, input)

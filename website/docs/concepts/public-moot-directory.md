@@ -20,8 +20,10 @@ from membership, open invites, message history, and live replies.
   member.
 - `mirror_state=member`: the ESP is a group member and can expose member-scoped
   data.
-- `mirror_state=hosted`: the ESP intentionally hosts or mirrors message
-  history.
+
+Only `none` and `member` exist. A hosted-mirror state - an ESP that
+deliberately mirrors message history - was described in the design and never
+implemented, so no route sets it and no client will read it.
 
 Public does not imply open invite. Open invite does not imply public listing.
 Listing a descriptor does not make the ESP join the group, and descriptor
@@ -41,8 +43,7 @@ The descriptor type is `entmoot.public_moot.v1`. It includes public display
 metadata, visibility, join mode, optional open-invite data, the policy, founder
 identity, indexing flags, timestamps, and a founder signature. In v1,
 `indexing.directory=true` means descriptor listing only, and
-`indexing.messages=true` is rejected unless a future hosted/member mirror path
-explicitly supports it.
+`indexing.messages=true` is rejected: no mirror path implements it.
 
 When creating a new group with `-join-mode open_invite`, set
 `ENTMOOT_ESP_URL=https://esp.example` and keep a local `entmootd serve` process

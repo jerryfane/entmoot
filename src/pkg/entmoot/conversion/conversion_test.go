@@ -158,20 +158,15 @@ func TestRunConvertsLegacyRootWithoutChangingSignedBytes(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	convertedRoster, err := roster.OpenJSONL(root, gid)
+	// The converted chain is still an authentic legacy log, which is what a
+	// node reads when it mints checkpoint 0. Nothing appends to it: the live
+	// membership layer took over at conversion.
+	converted, err := roster.ValidateLegacyJSONL(filepath.Join(groupDir, "roster.jsonl"), gid)
 	if err != nil {
-		t.Fatalf("open converted roster: %v", err)
+		t.Fatalf("the converted roster no longer validates: %v", err)
 	}
-	defer convertedRoster.Close()
-	if err := convertedRoster.ClaimWriter(); err != nil {
-		t.Fatal(err)
-	}
-	next, err := convertedRoster.SignEntry(founder, "policy_change", entmoot.NodeInfo{}, json.RawMessage(`{"post_conversion":true}`), cp.UpgradeEntry.Timestamp+1)
-	if err != nil {
-		t.Fatalf("sign after conversion: %v", err)
-	}
-	if err := convertedRoster.Apply(next); err != nil {
-		t.Fatalf("append after conversion: %v", err)
+	if len(converted) == 0 {
+		t.Fatal("the converted roster is empty")
 	}
 }
 

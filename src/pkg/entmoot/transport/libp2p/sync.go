@@ -45,7 +45,6 @@ type SyncErrorCode string
 const (
 	SyncMalformed           SyncErrorCode = "malformed"
 	SyncUnauthorized        SyncErrorCode = "unauthorized"
-	SyncBootstrapDenied     SyncErrorCode = "bootstrap_denied"
 	SyncSnapshotExpired     SyncErrorCode = "snapshot_expired"
 	SyncCoverageUnavailable SyncErrorCode = "coverage_unavailable"
 	SyncResourceExhausted   SyncErrorCode = "resource_exhausted"

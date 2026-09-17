@@ -14,7 +14,7 @@
 // history paths in cmd/entmootd turn a refusal into an error to the caller.
 //
 // A Limiter tracks one pair of buckets per peer, keyed by MemberID. Buckets
-// are created lazily on first contact. Call Reset on disconnect to drop state.
+// are created lazily on first contact and live for the process.
 //
 // Clock injection: golang.org/x/time/rate consults time.Now internally only
 // through its Allow / Reserve shorthands. The *At / *N variants accept an
@@ -47,22 +47,6 @@ type Limits struct {
 	BytesRate rate.Limit
 	// BytesBurst is the burst capacity of the byte bucket.
 	BytesBurst int
-	// TopicLimits is a map from topic -> quota. Unspecified topics fall
-	// through to the per-peer global limit with no additional constraint.
-	// Topic-scoped buckets are applied on top of the global per-peer
-	// bucket by AllowTopic — both must pass for the call to succeed.
-	// (v1.2.0)
-	TopicLimits map[string]TopicLimit
-}
-
-// TopicLimit is an optional per-(member, topic) quota applied in addition to
-// the global per-member limit.
-type TopicLimit struct {
-	// MsgRate is the refill rate, in messages/second, for the (peer,
-	// topic) bucket. Zero means "no topic-specific bucket".
-	MsgRate rate.Limit
-	// MsgBurst is the burst capacity of the (peer, topic) bucket.
-	MsgBurst int
 }
 
 // peerLimiter holds the pair of buckets for a single peer. A nil bucket
@@ -73,12 +57,6 @@ type peerLimiter struct {
 	bytes *rate.Limiter
 }
 
-// topicPeerKey identifies a single per-(peer, topic) bucket. (v1.2.0)
-type topicPeerKey struct {
-	peer  entmoot.MemberID
-	topic string
-}
-
 // Limiter tracks per-peer token buckets. The zero value is not usable;
 // construct one with New. Limiter is safe for concurrent use by multiple
 // goroutines.
@@ -86,9 +64,8 @@ type Limiter struct {
 	limits Limits
 	clk    clock.Clock
 
-	mu         sync.Mutex
-	peers      map[entmoot.MemberID]*peerLimiter
-	topicPeers map[topicPeerKey]*rate.Limiter
+	mu    sync.Mutex
+	peers map[entmoot.MemberID]*peerLimiter
 }
 
 // New returns a Limiter that applies the given Limits to every peer.
@@ -100,10 +77,9 @@ func New(limits Limits, clk clock.Clock) *Limiter {
 		clk = clock.System{}
 	}
 	return &Limiter{
-		limits:     limits,
-		clk:        clk,
-		peers:      make(map[entmoot.MemberID]*peerLimiter),
-		topicPeers: make(map[topicPeerKey]*rate.Limiter),
+		limits: limits,
+		clk:    clk,
+		peers:  make(map[entmoot.MemberID]*peerLimiter),
 	}
 }
 
@@ -175,123 +151,5 @@ func (l *Limiter) Allow(peer entmoot.MemberID, nbytes int) error {
 		}
 	}
 
-	return nil
-}
-
-// Reset discards the per-peer bucket state for peer. The next Allow call
-// for that peer will allocate a fresh pair of buckets with full burst.
-// Per-(peer, topic) buckets created via AllowTopic are also dropped so
-// the next AllowTopic call re-allocates a fresh bucket. Call on
-// disconnect.
-func (l *Limiter) Reset(peer entmoot.MemberID) {
-	l.mu.Lock()
-	delete(l.peers, peer)
-	for k := range l.topicPeers {
-		if k.peer == peer {
-			delete(l.topicPeers, k)
-		}
-	}
-	l.mu.Unlock()
-}
-
-// topicBucketFor returns the *rate.Limiter for (peer, topic), creating
-// it on first sight from l.limits.TopicLimits[topic]. Returns nil if
-// the topic has no configured limit (or its rate is zero), meaning
-// the topic-specific bucket is disabled and only the global per-peer
-// bucket applies. Caller must hold l.mu.
-func (l *Limiter) topicBucketFor(peer entmoot.MemberID, topic string) *rate.Limiter {
-	key := topicPeerKey{peer: peer, topic: topic}
-	if b, ok := l.topicPeers[key]; ok {
-		return b
-	}
-	tl, ok := l.limits.TopicLimits[topic]
-	if !ok || tl.MsgRate <= 0 || tl.MsgBurst <= 0 {
-		return nil
-	}
-	b := rate.NewLimiter(tl.MsgRate, tl.MsgBurst)
-	l.topicPeers[key] = b
-	return b
-}
-
-// AllowTopic enforces the global member quota and any configured topic quota.
-// Rejected reservations are canceled so either bucket can recover normally.
-func (l *Limiter) AllowTopic(peer entmoot.MemberID, topic string, nbytes int) error {
-	now := l.clk.Now()
-
-	l.mu.Lock()
-	pl := l.bucketFor(peer)
-	tb := l.topicBucketFor(peer, topic)
-	l.mu.Unlock()
-
-	// Topic bucket: reserve 1 token first, so a topic-level reject doesn't
-	// consume anything from the global per-peer bucket.
-	var topicRes *rate.Reservation
-	if tb != nil {
-		topicRes = tb.ReserveN(now, 1)
-		if !topicRes.OK() {
-			return entmoot.ErrRateLimited
-		}
-		if topicRes.DelayFrom(now) > 0 {
-			topicRes.CancelAt(now)
-			return entmoot.ErrRateLimited
-		}
-	}
-
-	// Global per-peer message bucket.
-	var msgRes *rate.Reservation
-	if pl.msg != nil {
-		msgRes = pl.msg.ReserveN(now, 1)
-		if !msgRes.OK() {
-			if topicRes != nil {
-				topicRes.CancelAt(now)
-			}
-			return entmoot.ErrRateLimited
-		}
-		if msgRes.DelayFrom(now) > 0 {
-			msgRes.CancelAt(now)
-			if topicRes != nil {
-				topicRes.CancelAt(now)
-			}
-			return entmoot.ErrRateLimited
-		}
-	}
-
-	// Global per-peer byte bucket.
-	if pl.bytes != nil && nbytes > 0 {
-		byteRes := pl.bytes.ReserveN(now, nbytes)
-		if !byteRes.OK() || byteRes.DelayFrom(now) > 0 {
-			if byteRes.OK() {
-				byteRes.CancelAt(now)
-			}
-			if msgRes != nil {
-				msgRes.CancelAt(now)
-			}
-			if topicRes != nil {
-				topicRes.CancelAt(now)
-			}
-			return entmoot.ErrRateLimited
-		}
-	}
-	return nil
-}
-
-// AllowTopicOnly charges only the optional per-(peer, topic) message bucket.
-// Use it when the caller already charged the frame to the global peer buckets.
-func (l *Limiter) AllowTopicOnly(peer entmoot.MemberID, topic string) error {
-	now := l.clk.Now()
-	l.mu.Lock()
-	tb := l.topicBucketFor(peer, topic)
-	l.mu.Unlock()
-	if tb == nil {
-		return nil
-	}
-	res := tb.ReserveN(now, 1)
-	if !res.OK() {
-		return entmoot.ErrRateLimited
-	}
-	if res.DelayFrom(now) > 0 {
-		res.CancelAt(now)
-		return entmoot.ErrRateLimited
-	}
 	return nil
 }
