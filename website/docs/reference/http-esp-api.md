@@ -59,12 +59,31 @@ Authentication modes:
 - `device`: Ed25519 device signatures.
 - `dual`: either mode during rollout.
 
-There is a fourth, narrow scheme: a member signature over the same fields
-(`X-Entmoot-Member-ID`, `-Pubkey`, `-Signature`) authenticates `GET
-/v1/session` alone, and the response echoes that member's id, peer id and
-public key. It is accepted even in `bearer` mode, without the token. It used
-to authenticate the live-agent config routes as well; those were deleted in
+There is a fourth, narrow scheme: a member signature authenticates `GET
+/v1/session` alone, even in `bearer` mode and without the token, and the
+response echoes that member's id, peer id and public key. It used to
+authenticate the live-agent config routes as well; those were deleted in
 1.5.85, leaving this one route. No in-tree client sends these headers.
+
+It requires six headers: `X-Entmoot-Member-ID`, `X-Entmoot-Peer-ID` (not
+`-Member-Peer-ID`), `X-Entmoot-Member-Pubkey`, `X-Entmoot-Timestamp-Ms`,
+`X-Entmoot-Nonce` and `X-Entmoot-Member-Signature`. The member id and the peer
+id must both derive from the supplied public key. The signing input is its
+own, not the device one: the lines
+
+```text
+ENTMOOT-ESP-MEMBER-AUTH-V2
+<METHOD uppercased>
+<path with raw query>
+<member id>
+<peer id>
+<base64 public key>
+<timestamp ms>
+<nonce>
+<base64 sha256 of the body>
+```
+
+joined with `\n`.
 
 Device-authenticated requests sign method, path with query, timestamp, nonce,
 and body hash.

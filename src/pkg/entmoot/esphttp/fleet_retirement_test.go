@@ -55,7 +55,7 @@ func TestOpenRetiresFleetTables(t *testing.T) {
 // writer holding it must not stall the ESP start, so the attempt is bounded and
 // gives up, leaving the tables for a later open.
 //
-// This calls retireFleetTables directly rather than going through
+// This calls retireRemovedFeatureTables directly rather than going through
 // OpenSQLiteStateStore, because that path already waits the full busy_timeout
 // for an unrelated reason: deleteExpiredIdempotency runs at open and writes
 // (mobile.go, "_, _ = store.deleteExpiredIdempotency"). Measuring the whole

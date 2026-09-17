@@ -1651,13 +1651,11 @@ func retireRemovedFeatureTables(db *sql.DB, dbPath string) {
 				slog.String("path", dbPath), slog.String("err", err.Error()))
 		}
 	}()
-	for _, tables := range [][]string{RetiredTables} {
-		for _, table := range tables {
-			if _, err := db.Exec(`DROP TABLE IF EXISTS ` + table); err != nil {
-				slog.Debug("esphttp: retire removed-feature table deferred to a later open",
-					slog.String("path", dbPath), slog.String("table", table), slog.String("err", err.Error()))
-				return
-			}
+	for _, table := range RetiredTables {
+		if _, err := db.Exec(`DROP TABLE IF EXISTS ` + table); err != nil {
+			slog.Debug("esphttp: retire removed-feature table deferred to a later open",
+				slog.String("path", dbPath), slog.String("table", table), slog.String("err", err.Error()))
+			return
 		}
 	}
 }
