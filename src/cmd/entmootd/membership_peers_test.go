@@ -149,18 +149,16 @@ func TestMembershipPeersReachesTheMembersARewindDropped(t *testing.T) {
 			}
 		}
 	}
-	if dropped == 0 {
-		t.Fatalf("no member the rewind dropped is among the %d peers this node will pull from", len(peers))
-	}
 
 	// And the reservation has a ceiling, which is the half the constant
 	// exists for: repair peers must not take the whole fan-out, or a long
 	// rewind would stop this node syncing with the members it still has.
-	// Literal numbers on purpose: this is the only guard on the reservation's
-	// ceiling, and an assertion written in terms of maxRewoundSyncPeers moves
-	// with the constant it is supposed to pin. Eight slots, at most three of
-	// them reserved for repair, so at least five remain for the members this
-	// node still has - or a long rewind would stop ordinary sync.
+	// Exact, and with literal numbers on purpose: this is the only guard on
+	// the reservation in either direction, and an assertion written in terms
+	// of maxRewoundSyncPeers moves with the constant it is supposed to pin.
+	// Eight slots, three of them for repair - fewer and a rewind that dropped
+	// several members would repair them a tick at a time, more and a long
+	// rewind would stop this node syncing with the members it still has.
 	if dropped != 3 {
 		t.Fatalf("%d of %d peers are members the rewind dropped, want exactly the 3 reserved slots", dropped, len(peers))
 	}
