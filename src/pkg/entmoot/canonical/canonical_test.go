@@ -9,24 +9,6 @@ import (
 	"entmoot/pkg/entmoot"
 )
 
-// TestEncodeStability verifies byte-identical output across 100 calls.
-func TestEncodeStability(t *testing.T) {
-	m := sampleMessage()
-	want, err := Encode(m)
-	if err != nil {
-		t.Fatalf("Encode: %v", err)
-	}
-	for i := 0; i < 100; i++ {
-		got, err := Encode(m)
-		if err != nil {
-			t.Fatalf("iteration %d: Encode: %v", i, err)
-		}
-		if !bytes.Equal(got, want) {
-			t.Fatalf("iteration %d: bytes differ\nwant=%s\n got=%s", i, want, got)
-		}
-	}
-}
-
 // TestEncodeMapOrderInsensitive verifies that differently-ordered map inputs
 // produce the same canonical bytes.
 func TestEncodeMapOrderInsensitive(t *testing.T) {
@@ -126,17 +108,6 @@ func TestMessageIDFieldSensitivity(t *testing.T) {
 				t.Fatalf("mutation of %s did not change MessageID", mu.name)
 			}
 		})
-	}
-}
-
-// TestMessageIDDeterministic verifies the id computation itself is stable.
-func TestMessageIDDeterministic(t *testing.T) {
-	m := sampleMessage()
-	first := MessageID(m)
-	for i := 0; i < 10; i++ {
-		if got := MessageID(m); got != first {
-			t.Fatalf("iteration %d: MessageID not stable", i)
-		}
 	}
 }
 

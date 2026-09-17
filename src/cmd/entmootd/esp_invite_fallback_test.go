@@ -1,38 +1,25 @@
 package main
 
 import (
+	"context"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"net"
+	"slices"
 	"strings"
 	"testing"
 
 	entmoot "entmoot/pkg/entmoot"
+	"entmoot/pkg/entmoot/ipc"
+	"entmoot/pkg/entmoot/membership"
+	"entmoot/pkg/entmoot/store"
 	libp2ptransport "entmoot/pkg/entmoot/transport/libp2p"
 
+	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/multiformats/go-multiaddr"
 )
-
-// TestESPInvitePayloadsCarryTheFallbackOptOut pins that the escape hatch is
-// reachable from the ESP, which is the only shipped IPC client. The flag
-// existed on the IPC request while nothing set it, so the documented opt-out
-// could not be exercised by any caller.
-func TestESPInvitePayloadsCarryTheFallbackOptOut(t *testing.T) {
-	var targeted inviteCreatePayload
-	if err := json.Unmarshal([]byte(`{"no_fallback_peers":true}`), &targeted); err != nil {
-		t.Fatalf("unmarshal targeted: %v", err)
-	}
-	if !targeted.NoFallbackPeers {
-		t.Fatal("invite_create ignores no_fallback_peers")
-	}
-	var open openInviteCreatePayload
-	if err := json.Unmarshal([]byte(`{"max_uses":1,"no_fallback_peers":true}`), &open); err != nil {
-		t.Fatalf("unmarshal open: %v", err)
-	}
-	if !open.NoFallbackPeers {
-		t.Fatal("open_invite_create ignores no_fallback_peers")
-	}
-}
 
 // TestOpenInviteBootstrapIsValidatedAtCreation pins where the check belongs.
 // The token an open invite returns is what gets shared, and the capability is
@@ -44,7 +31,7 @@ func TestOpenInviteBootstrapIsValidatedAtCreation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	good := "/ip4/37.27.59.89/tcp/1004/p2p/" + binding.PeerID.String()
+	good := "/ip4/203.0.113.1/tcp/1004/p2p/" + binding.PeerID.String()
 	members := []string{binding.PeerID.String()}
 	if err := validateOpenInviteBootstrap([]string{good}, members, "", false); err != nil {
 		t.Fatalf("a well-formed address was refused: %v", err)
@@ -52,7 +39,7 @@ func TestOpenInviteBootstrapIsValidatedAtCreation(t *testing.T) {
 	if err := validateOpenInviteBootstrap([]string{"not-a-multiaddr"}, members, "", false); err == nil {
 		t.Fatal("a malformed multiaddr was accepted")
 	}
-	if err := validateOpenInviteBootstrap([]string{"/ip4/37.27.59.89/tcp/1004"}, members, "", false); err == nil {
+	if err := validateOpenInviteBootstrap([]string{"/ip4/203.0.113.1/tcp/1004"}, members, "", false); err == nil {
 		t.Fatal("an address with no /p2p/ component was accepted")
 	}
 
@@ -81,10 +68,10 @@ func TestOpenInviteBootstrapRefusesANonMember(t *testing.T) {
 		t.Fatal(err)
 	}
 	members := []string{member.PeerID.String()}
-	if err := validateOpenInviteBootstrap([]string{"/ip4/37.27.59.89/tcp/1004/p2p/" + member.PeerID.String()}, members, "", false); err != nil {
+	if err := validateOpenInviteBootstrap([]string{"/ip4/203.0.113.1/tcp/1004/p2p/" + member.PeerID.String()}, members, "", false); err != nil {
 		t.Fatalf("a member's address was refused: %v", err)
 	}
-	if err := validateOpenInviteBootstrap([]string{"/ip4/37.27.59.89/tcp/1004/p2p/" + stranger.PeerID.String()}, members, "", false); err == nil {
+	if err := validateOpenInviteBootstrap([]string{"/ip4/203.0.113.1/tcp/1004/p2p/" + stranger.PeerID.String()}, members, "", false); err == nil {
 		t.Fatal("an address naming no member was accepted")
 	}
 }
@@ -326,5 +313,129 @@ func TestFillDoesNotStopOnASkippableAddress(t *testing.T) {
 		}
 		t.Fatalf("dropped a %d-byte routable address that fits: attached %d addresses / %d bytes of %d",
 			len(short), len(bounded), total, maxInviteFallbackBytes)
+	}
+}
+
+// TestFallbackOptOutSuppressesOtherMembersAddresses drives the real mint over
+// IPC with another member's addresses in the peer cache. The opt-out is a
+// privacy control: with it set, an invite must not disclose where the other
+// members live. Nothing exercised the wiring - flipping
+// `if !req.NoFallbackPeers` to `if true` left the whole suite green - so the
+// documented escape hatch could have stopped working silently.
+func TestFallbackOptOutSuppressesOtherMembersAddresses(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	root := t.TempDir()
+	founder, founderInfo := mustDaemonIdentity(t)
+	var gid entmoot.GroupID
+	if _, err := rand.Read(gid[:]); err != nil {
+		t.Fatal(err)
+	}
+	mustCreateGroup(t, root, gid, founder, membership.DefaultPolicy())
+
+	// A second member, and the address cache the daemon would have built from
+	// talking to it.
+	other, otherInfo := mustDaemonIdentity(t)
+	group := mustOpenGroup(t, root, gid)
+	mustJoinWithInvite(t, group, other, mustDaemonInvite(t, group, founder, otherInfo, 1))
+	mustCloseGroup(t, group)
+	otherBinding, err := libp2ptransport.BindingFromPublicKey(otherInfo.EntmootPubKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const otherAddress = "/ip4/203.0.113.7/tcp/4001"
+	if err := persistGroupPeer(root, gid, peer.AddrInfo{
+		ID:    otherBinding.PeerID,
+		Addrs: []multiaddr.Multiaddr{mustMultiaddr(t, otherAddress)},
+	}); err != nil {
+		t.Fatalf("persistGroupPeer: %v", err)
+	}
+
+	host, binding0, err := libp2ptransport.NewHost(ctx, founder, libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"))
+	if err != nil {
+		t.Fatalf("NewHost: %v", err)
+	}
+	defer host.Close()
+	messages, err := store.OpenSQLite(root)
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	defer messages.Close()
+	runtime, err := newGroupRuntime(groupRuntimeConfig{
+		Identity: founder, DataDir: root, Store: messages, Notify: newNotifyingStore(messages, nil),
+		Host: host, Binding: binding0, Mode: libp2ptransport.DirectConnectivity,
+	})
+	if err != nil {
+		t.Fatalf("newGroupRuntime: %v", err)
+	}
+	defer runtime.Close()
+	if _, _, err := runtime.AddLocalGroup(ctx, gid); err != nil {
+		t.Fatalf("AddLocalGroup: %v", err)
+	}
+	binding, err := libp2ptransport.BindingFromPublicKey(founderInfo.EntmootPubKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &ipcServer{
+		memberID: binding.MemberID,
+		peerID:   binding.PeerID.String(),
+		identity: founder,
+		dataDir:  root,
+		runtime:  runtime,
+	}
+
+	mint := func(noFallback bool) entmoot.BootstrapCapability {
+		t.Helper()
+		client, daemon := net.Pipe()
+		defer client.Close()
+		go func() {
+			defer daemon.Close()
+			server.handleInviteCreate(ctx, daemon, &ipc.InviteCreateReq{
+				GroupID: gid, MaxUses: 1, TargetPublicKey: otherInfo.EntmootPubKey, NoFallbackPeers: noFallback,
+			})
+		}()
+		_, decoded, err := ipc.ReadAndDecode(client)
+		if err != nil {
+			t.Fatalf("read response: %v", err)
+		}
+		if frame, ok := decoded.(*ipc.ErrorFrame); ok {
+			t.Fatalf("mint refused (no_fallback_peers=%t): %s: %s", noFallback, frame.Code, frame.Message)
+		}
+		resp, ok := decoded.(*ipc.InviteCreateResp)
+		if !ok {
+			t.Fatalf("response is %T, want an invite", decoded)
+		}
+		return resp.Capability
+	}
+
+	discloses := func(capability entmoot.BootstrapCapability) bool {
+		for _, address := range capability.AllowedMultiaddrs {
+			if strings.HasPrefix(address, otherAddress) {
+				return true
+			}
+		}
+		return false
+	}
+
+	// The default is the useful one: a joiner that cannot reach the issuer
+	// still has a member to bootstrap from.
+	attached := mint(false)
+	if !discloses(attached) {
+		t.Fatalf("by default the mint attached no cached member address: %v", attached.AllowedMultiaddrs)
+	}
+	if !slices.Contains(attached.AllowedPeerIDs, otherBinding.PeerID.String()) {
+		t.Fatalf("the member's peer id was not authorised alongside its address: %v", attached.AllowedPeerIDs)
+	}
+
+	withheld := mint(true)
+	if discloses(withheld) {
+		t.Fatalf("no_fallback_peers still disclosed another member's address: %v", withheld.AllowedMultiaddrs)
+	}
+	if slices.Contains(withheld.AllowedPeerIDs, otherBinding.PeerID.String()) {
+		t.Fatalf("no_fallback_peers still authorised another member's peer id: %v", withheld.AllowedPeerIDs)
+	}
+	// The issuer's own address survives the opt-out, or the invite is dead.
+	if len(withheld.AllowedMultiaddrs) == 0 {
+		t.Fatal("the opt-out left an invite with no address at all")
 	}
 }

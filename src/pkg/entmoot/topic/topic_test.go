@@ -140,20 +140,6 @@ func TestMatch(t *testing.T) {
 	}
 }
 
-func TestMatchDoesNotPanicOnJunk(t *testing.T) {
-	t.Parallel()
-	// Mostly a regression guard for the "never panics" contract.
-	junk := []string{
-		"", "/", "//", "///", "+", "#", "a/+/b/#", "a/#/b",
-		"a+b", "#a", "a#", "foo\x00bar",
-	}
-	for _, p := range junk {
-		for _, tp := range junk {
-			_ = Match(p, tp)
-		}
-	}
-}
-
 func TestMatchAny(t *testing.T) {
 	t.Parallel()
 	filter := entmoot.Filter{

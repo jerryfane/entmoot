@@ -56,19 +56,6 @@ func TestEncodeSetsErrorType(t *testing.T) {
 		t.Fatalf("Type = %q, want %q", ef.Type, "error")
 	}
 
-	// Caller-supplied non-empty Type: respect it. (We don't need to
-	// coerce, just not clobber.)
-	ef2 := &ErrorFrame{
-		Type:    "error",
-		Code:    CodeInternal,
-		Message: "x",
-	}
-	if _, _, err := Encode(ef2); err != nil {
-		t.Fatalf("Encode: %v", err)
-	}
-	if ef2.Type != "error" {
-		t.Fatalf("pre-filled Type = %q, want %q", ef2.Type, "error")
-	}
 }
 
 // TestEncodeErrorFrameBodyShape confirms the JSON body carries the

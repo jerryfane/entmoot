@@ -25,8 +25,13 @@ func TestOperationalTreeHasNoPilotDependency(t *testing.T) {
 		"src/pkg/entmoot/roster/roster.go":               "validating immutable legacy rosters during conversion",
 		"src/pkg/entmoot/transport/libp2p/validation.go": "verifying immutable legacy messages",
 	}
+	// Only the trees this repository ships. The walk used to start at the
+	// checkout and skip a deny-list, so it also read whatever else was lying
+	// there: an untracked scratch file containing "autopilot" turned this test
+	// red, naming a file no release contains.
+	owned := []string{"src", "scripts", ".github", "install.sh"}
 	var residues []string
-	err = filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+	walk := func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
@@ -36,10 +41,6 @@ func TestOperationalTreeHasNoPilotDependency(t *testing.T) {
 		}
 		rel = filepath.ToSlash(rel)
 		if entry.IsDir() {
-			switch rel {
-			case ".git", "artifacts", "docs", "paper", "repos", "website":
-				return filepath.SkipDir
-			}
 			return nil
 		}
 		if _, ok := allowed[rel]; ok {
@@ -60,9 +61,11 @@ func TestOperationalTreeHasNoPilotDependency(t *testing.T) {
 			}
 		}
 		return scanner.Err()
-	})
-	if err != nil {
-		t.Fatal(err)
+	}
+	for _, tree := range owned {
+		if err := filepath.WalkDir(filepath.Join(root, tree), walk); err != nil {
+			t.Fatalf("walk %s: %v", tree, err)
+		}
 	}
 	if len(residues) != 0 {
 		t.Fatalf("operational Pilot residues outside explicit legacy allowlist: %s", strings.Join(residues, ", "))

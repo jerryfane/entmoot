@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -827,5 +828,149 @@ func TestNormalizeGroupMetadataMergesDisplayFields(t *testing.T) {
 	tags, ok := got["tags"].([]any)
 	if !ok || len(tags) != 2 || tags[0] != "infra" || tags[1] != "ios" {
 		t.Fatalf("tags = %#v, want [infra ios]", got["tags"])
+	}
+}
+
+// serveESPInviteIPC fakes the daemon for the invite path: it answers the
+// authority check the open-invite creation needs and captures the mint request
+// the ESP sends, which is where the fallback opt-out has to arrive.
+func serveESPInviteIPC(t *testing.T, sock string, inviteReqCh chan<- *ipc.InviteCreateReq, memberPeerIDs []string) func() {
+	t.Helper()
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatalf("listen unix: %v", err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer ln.Close()
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			_, payload, err := ipc.ReadAndDecode(conn)
+			if err != nil {
+				_ = conn.Close()
+				continue
+			}
+			switch v := payload.(type) {
+			case *ipc.InviteAuthorityCheckReq:
+				_ = ipc.EncodeAndWrite(conn, &ipc.InviteAuthorityCheckResp{
+					Status: "ok", GroupID: v.GroupID, MemberPeerIDs: memberPeerIDs,
+				})
+			case *ipc.InviteCreateReq:
+				if inviteReqCh != nil {
+					req := *v
+					inviteReqCh <- &req
+				}
+				_ = ipc.EncodeAndWrite(conn, &ipc.InviteCreateResp{
+					Status: "created", GroupID: v.GroupID,
+					Capability: entmoot.BootstrapCapability{GroupID: v.GroupID},
+				})
+			default:
+				_ = ipc.EncodeAndWrite(conn, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInvalidArgument, Message: "unexpected request"})
+			}
+			_ = conn.Close()
+		}
+	}()
+	return func() {
+		_ = ln.Close()
+		<-done
+	}
+}
+
+// TestESPCarriesTheFallbackOptOutToTheMint follows the privacy opt-out across
+// the two hops the ESP owns: a direct invite_create, and an open invite where
+// the choice is made at creation and has to survive in the store until some
+// stranger redeems the link. Zeroing it at either hop left the suite green,
+// so the flag could have stopped travelling without anything noticing.
+func TestESPCarriesTheFallbackOptOutToTheMint(t *testing.T) {
+	ctx := context.Background()
+	gid := testESPGroupID(21)
+	sock := testUnixSocketPath(t)
+	inviteReqCh := make(chan *ipc.InviteCreateReq, 2)
+	stop := serveESPInviteIPC(t, sock, inviteReqCh, nil)
+	defer stop()
+	joiner, err := keystore.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := testESPNodeInfo(t, joiner.PublicKey)
+	exec := espOperationExecutor{
+		dataDir:    t.TempDir(),
+		socketPath: sock,
+		stateStore: esphttp.NewMemoryStateStore(),
+	}
+
+	minted := func() *ipc.InviteCreateReq {
+		t.Helper()
+		select {
+		case req := <-inviteReqCh:
+			return req
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for the mint request")
+			return nil
+		}
+	}
+
+	// Hop one: the targeted invite_create payload.
+	for _, noFallback := range []bool{true, false} {
+		payload, err := json.Marshal(map[string]any{
+			"target": map[string]any{
+				"member_id":      target.MemberID.String(),
+				"peer_id":        target.PeerID,
+				"entmoot_pubkey": base64.StdEncoding.EncodeToString(target.EntmootPubKey),
+			},
+			"no_fallback_peers": noFallback,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := exec.ExecuteSignRequest(ctx, esphttp.SignRequest{
+			Kind: "invite_create", GroupID: gid, Payload: payload,
+		}, nil); err != nil {
+			t.Fatalf("invite_create(no_fallback_peers=%t): %v", noFallback, err)
+		}
+		if got := minted().NoFallbackPeers; got != noFallback {
+			t.Fatalf("invite_create sent no_fallback_peers=%t, want %t", got, noFallback)
+		}
+	}
+
+	// Hop two: the choice is made when the link is created and read back at
+	// redemption, which is a different process run days later.
+	createdRaw, err := exec.ExecuteSignRequest(ctx, esphttp.SignRequest{
+		Kind: "open_invite_create", GroupID: gid, DeviceID: "device-1",
+		Payload: json.RawMessage(`{"max_uses":1,"valid_for":"1d","no_fallback_peers":true}`),
+	}, nil)
+	if err != nil {
+		t.Fatalf("open_invite_create: %v", err)
+	}
+	var created struct {
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal(createdRaw, &created); err != nil {
+		t.Fatalf("created payload: %v", err)
+	}
+	stored, ok, err := exec.stateStore.GetOpenInviteByTokenHash(ctx, esphttp.HashOpenInviteToken(created.Token))
+	if err != nil || !ok {
+		t.Fatalf("stored open invite: ok=%t err=%v", ok, err)
+	}
+	if !stored.NoFallbackPeers {
+		t.Fatal("the open invite was stored without the opt-out, so redemption cannot honour it")
+	}
+	redeemPayload, err := json.Marshal(map[string]any{
+		"member_id":      target.MemberID.String(),
+		"peer_id":        target.PeerID,
+		"entmoot_pubkey": target.EntmootPubKey,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := exec.RedeemOpenInvite(ctx, created.Token, redeemPayload); err != nil {
+		t.Fatalf("open_invite_redeem: %v", err)
+	}
+	if !minted().NoFallbackPeers {
+		t.Fatal("redemption minted an invite that attaches other members' addresses, against the stored choice")
 	}
 }
