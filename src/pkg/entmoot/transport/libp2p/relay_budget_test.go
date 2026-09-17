@@ -79,3 +79,39 @@ func TestRelayServiceDoesNotSpendTheGroupConnectionBudget(t *testing.T) {
 			got, group+len(allowed), group, len(allowed))
 	}
 }
+
+// A repeated -relay-allow-peer must not buy extra inbound connections: the ACL
+// deduplicates the allowlist, so the budget has to as well.
+func TestRelayBudgetCountsDistinctAllowedPeers(t *testing.T) {
+	identity, err := keystore.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := keystore.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding, err := BindingFromPublicKey(client.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repeated := []peer.ID{binding.PeerID, binding.PeerID, binding.PeerID, binding.PeerID, binding.PeerID}
+
+	h, _, err := NewConfiguredHost(context.Background(), identity, HostConfig{
+		ListenAddrs: []string{"/ip4/127.0.0.1/tcp/0"},
+		RelayService: &RelayServerConfig{
+			AllowedPeers: repeated, ReservationTTL: time.Hour, CircuitDuration: time.Minute,
+			CircuitBytes: 1 << 20, MaxReservations: 8, MaxCircuitsPerPeer: 2,
+			MaxReservationsPerIP: 2, MaxReservationsPerASN: 2,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+
+	if got := systemConnLimit(t, h); got != maxHostConnections+1 {
+		t.Fatalf("%d entries for one distinct peer admit %d connections, want %d",
+			len(repeated), got, maxHostConnections+1)
+	}
+}
