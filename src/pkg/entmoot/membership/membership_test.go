@@ -1145,6 +1145,62 @@ func TestCheckpointSignerCannotAuthoriseItself(t *testing.T) {
 	}
 }
 
+// The rule the one above does not reach: an ordinary member is a member of
+// the previous checkpoint and its key matches the group's record for it, so
+// every check after the authority check passes. Only CanAdminister stands
+// between a plain member and rewriting membership for every quiet node, and
+// removing it left the whole suite green.
+func TestAnOrdinaryMemberMayNotSignACheckpoint(t *testing.T) {
+	f := newFixture(t, DefaultPolicy())
+	member := mustIdentity(t)
+	memberID := f.memberID(member)
+	f.join(member)
+	f.tick(10)
+	if _, signed, err := f.group.SignCheckpoint(f.founder, true); err != nil || !signed {
+		t.Fatalf("base checkpoint: signed=%t err=%v", signed, err)
+	}
+	base := f.group.Canonical()
+	if base.Policy.HasAdmin(memberID) {
+		t.Fatal("the fixture made the member an admin, so this proves nothing")
+	}
+
+	// The member signs its own checkpoint and evicts everybody else. It does
+	// not claim admin rights, so nothing about the body looks forged.
+	evicting := base
+	evicting.ID = entmoot.RosterEntryID{}
+	evicting.Sequence = base.Sequence + 1
+	evicting.Previous = base.ID
+	evicting.Timestamp = base.Timestamp + 1
+	evicting.Covered = 1
+	evicting.Members = []entmoot.NodeInfo{f.info(f.founder), f.info(member)}
+	sortCheckpointMembers(&evicting)
+	evicting.Policy = base.Policy.Clone()
+	evicting.Signature = nil
+	signedByMember, err := SignCheckpoint(member, f.info(member), evicting)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A quiet node holds the base checkpoint and none of the records behind
+	// the next one, so the authority rule is all it has.
+	quiet, err := Adopt(t.TempDir(), base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer quiet.Close()
+	if _, err := quiet.ApplyCheckpoint(signedByMember); !errors.Is(err, ErrNotAuthorised) {
+		t.Fatalf("a non-admin member's checkpoint was accepted: %v", err)
+	}
+	if got := quiet.Canonical().Sequence; got != base.Sequence {
+		t.Fatalf("the quiet node advanced to sequence %d", got)
+	}
+	// The group that holds the records refuses it too: authority does not
+	// depend on what a node happens to have.
+	if _, err := f.group.ApplyCheckpoint(signedByMember); !errors.Is(err, ErrNotAuthorised) {
+		t.Fatalf("the founder's own node accepted it: %v", err)
+	}
+}
+
 // sortCheckpointMembers puts a hand-built member list in the order a real
 // checkpoint carries, so the signature covers a well-formed body.
 func sortCheckpointMembers(cp *Checkpoint) {

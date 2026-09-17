@@ -2,7 +2,9 @@ package entmoot_test
 
 import (
 	"bufio"
+	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -25,44 +27,62 @@ func TestOperationalTreeHasNoPilotDependency(t *testing.T) {
 		"src/pkg/entmoot/roster/roster.go":               "validating immutable legacy rosters during conversion",
 		"src/pkg/entmoot/transport/libp2p/validation.go": "verifying immutable legacy messages",
 	}
+	// Every file the repository SHIPS, and nothing else. Walking the checkout
+	// also read whatever was lying there untracked: a scratch file containing
+	// "autopilot" turned this test red while naming a file no release
+	// contains. Asking git for the tracked set keeps the release manifest and
+	// the shell scripts in scope - narrowing to a few directories silently
+	// dropped .goreleaser.yaml - without letting local mess decide.
+	tracked, err := exec.Command("git", "-C", root, "ls-files", "-z").Output()
+	if err != nil {
+		t.Fatalf("git ls-files in %s: %v (this guard needs the checkout)", root, err)
+	}
+	// Prose and generated web assets are not the operational tree.
+	skipped := []string{"docs/", "paper/", "website/"}
 	var residues []string
-	err = filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		rel, err := filepath.Rel(root, path)
-		if err != nil {
-			return err
-		}
-		rel = filepath.ToSlash(rel)
-		if entry.IsDir() {
-			switch rel {
-			case ".git", "artifacts", "docs", "paper", "repos", "website":
-				return filepath.SkipDir
-			}
-			return nil
+	for _, rel := range strings.Split(strings.TrimRight(string(tracked), "\x00"), "\x00") {
+		if rel == "" {
+			continue
 		}
 		if _, ok := allowed[rel]; ok {
-			return nil
+			continue
 		}
 		if !inventoryFile(rel) {
-			return nil
+			continue
 		}
-		file, err := os.Open(path)
+		prose := false
+		for _, prefix := range skipped {
+			if strings.HasPrefix(rel, prefix) {
+				prose = true
+			}
+		}
+		if prose {
+			continue
+		}
+		file, err := os.Open(filepath.Join(root, rel))
+		if errors.Is(err, os.ErrNotExist) {
+			// The index can name a file the working tree does not have: a
+			// deletion staged mid-refactor, or a sparse checkout. There is
+			// nothing to scan, and failing here would blame this guard for an
+			// unrelated state.
+			continue
+		}
 		if err != nil {
-			return err
+			t.Fatalf("open %s: %v", rel, err)
 		}
-		defer file.Close()
 		scanner := bufio.NewScanner(file)
 		for line := 1; scanner.Scan(); line++ {
 			if strings.Contains(strings.ToLower(scanner.Text()), "pilot") {
 				residues = append(residues, rel+":"+itoa(line))
 			}
 		}
-		return scanner.Err()
-	})
-	if err != nil {
-		t.Fatal(err)
+		scanErr := scanner.Err()
+		if err := file.Close(); err != nil {
+			t.Fatalf("close %s: %v", rel, err)
+		}
+		if scanErr != nil {
+			t.Fatalf("scan %s: %v", rel, scanErr)
+		}
 	}
 	if len(residues) != 0 {
 		t.Fatalf("operational Pilot residues outside explicit legacy allowlist: %s", strings.Join(residues, ", "))
