@@ -65,10 +65,13 @@ type Group struct {
 	// it is deliberately not persisted, because a rewind that happened in a
 	// previous process has already had its chance to heal.
 	rewoundMembers map[entmoot.MemberID]entmoot.NodeInfo
-	legacy         *LegacyChain
-	now            func() time.Time
-	logger         *slog.Logger
-	closeOnce      sync.Once
+	// rewoundFrom is the highest coverage bound this node has moved back
+	// from, so the hint above can be dropped once the chain reaches it again.
+	rewoundFrom int64
+	legacy      *LegacyChain
+	now         func() time.Time
+	logger      *slog.Logger
+	closeOnce   sync.Once
 }
 
 // Open loads a group's membership store. A group that still has only the
@@ -644,6 +647,35 @@ func (g *Group) ReachableMemberInfos() []entmoot.NodeInfo {
 	return out
 }
 
+// RewoundMemberInfos is the second half of ReachableMemberInfos on its own:
+// the members a rewind dropped, excluding any the current projection already
+// holds or the adopted branch bans. It is empty in the ordinary case.
+//
+// A caller that can only reach a few peers needs this separately, because the
+// current membership comes first in the combined list and a group with more
+// addressable members than the caller's fan-out would never get to the part
+// that repairs anything.
+func (g *Group) RewoundMemberInfos() []entmoot.NodeInfo {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	ids := make([]entmoot.MemberID, 0, len(g.rewoundMembers))
+	for id := range g.rewoundMembers {
+		if _, banned := g.state.Banned[id]; banned {
+			continue
+		}
+		if _, member := g.state.Members[id]; member {
+			continue
+		}
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return bytes.Compare(ids[i][:], ids[j][:]) < 0 })
+	out := make([]entmoot.NodeInfo, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, cloneNodeInfo(g.rewoundMembers[id]))
+	}
+	return out
+}
+
 // MemberAt answers whether a member was in the group at a cited checkpoint,
 // which is what verifying an old message needs. known is false when the id
 // means nothing to this node, so the caller can hold the message rather than
@@ -1016,11 +1048,31 @@ func (g *Group) settleCanonicalLocked() error {
 	// deleted, so remember the membership being left behind: those members
 	// are the peers that can serve the records back. See the KNOWN GAP above
 	// and ReachableMemberInfos.
+	//
+	// Merged, never replaced. The membership a second rewind leaves behind is
+	// the branch the first one adopted, which by construction does not hold
+	// what the first one lost - so overwriting would throw away the peers
+	// that can still repair it. rewoundFrom keeps the highest bound this node
+	// has moved back from, and the hint is dropped once the chain has reached
+	// that point again, because then nothing is uncovered any more.
+	//
+	// The backwards test is belt and braces for correctness - the expiry
+	// below would erase a forward capture on the same call - but it is not
+	// pointless: without it every ordinary checkpoint would copy the whole
+	// member set only to throw it away.
 	if outgoing, ok := g.checkpoints[g.canonicalID]; ok && best.Timestamp < outgoing.Timestamp {
-		g.rewoundMembers = make(map[entmoot.MemberID]entmoot.NodeInfo, len(g.membersAt[outgoing.ID]))
+		if g.rewoundMembers == nil {
+			g.rewoundMembers = make(map[entmoot.MemberID]entmoot.NodeInfo, len(g.membersAt[outgoing.ID]))
+		}
 		for id, info := range g.membersAt[outgoing.ID] {
 			g.rewoundMembers[id] = cloneNodeInfo(info)
 		}
+		if outgoing.Timestamp > g.rewoundFrom {
+			g.rewoundFrom = outgoing.Timestamp
+		}
+	}
+	if g.rewoundFrom > 0 && best.Timestamp >= g.rewoundFrom {
+		g.rewoundMembers, g.rewoundFrom = nil, 0
 	}
 
 	ctx := context.Background()

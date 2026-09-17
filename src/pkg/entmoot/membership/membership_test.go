@@ -2301,3 +2301,194 @@ func TestReachableMemberInfosDropsSomebodyTheAdoptedBranchBanned(t *testing.T) {
 		}
 	}
 }
+
+// rewind returns the head of a founder-signed branch that forks from base and
+// reaches one sequence past head, which is the shape the KNOWN GAP describes:
+// further reach, earlier dates, so it wins the walk and pulls the coverage
+// bound backwards.
+func (f *fixture) rewind(t *testing.T, base, head Checkpoint, members ...entmoot.NodeInfo) Checkpoint {
+	t.Helper()
+	return f.rewindWith(t, base, head.Sequence+1, 1, members...)
+}
+
+// rewindWith is the same, with control over how far the branch reaches and how
+// widely its timestamps are spaced, so a test can build a second branch that
+// reaches further than the first while staying dated below it.
+func (f *fixture) rewindWith(t *testing.T, base Checkpoint, through uint64, step int64, members ...entmoot.NodeInfo) Checkpoint {
+	t.Helper()
+	previous := base
+	for sequence := base.Sequence + 1; sequence <= through; sequence++ {
+		body := previous
+		body.ID = entmoot.RosterEntryID{}
+		body.Sequence = sequence
+		body.Previous = previous.ID
+		body.Timestamp = previous.Timestamp + step
+		body.Covered = 0
+		body.Members = append([]entmoot.NodeInfo(nil), members...)
+		sortCheckpointMembers(&body)
+		body.Signature = nil
+		signed, err := SignCheckpoint(f.founder, f.info(f.founder), body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.group.ApplyCheckpoint(signed); err != nil {
+			t.Fatalf("branch at sequence %d: %v", sequence, err)
+		}
+		previous = signed
+	}
+	return previous
+}
+
+// A second rewind before the first has healed must not throw the first away.
+// The membership rewind two leaves behind is the branch rewind one adopted,
+// which by construction does not hold what rewind one lost, so replacing the
+// hint loses that member for good while a peer still has its record.
+func TestRewoundMembersSurviveASecondRewind(t *testing.T) {
+	f := newFixture(t, DefaultPolicy())
+	first := mustIdentity(t)
+	if _, signed, err := f.group.SignCheckpoint(f.founder, true); err != nil || !signed {
+		t.Fatalf("base checkpoint: signed=%t err=%v", signed, err)
+	}
+	base := f.group.Canonical()
+	f.tick(1_000)
+	f.join(first)
+	f.tick(1_000)
+	if _, signed, err := f.group.SignCheckpoint(f.founder, true); err != nil || !signed {
+		t.Fatalf("folding checkpoint: signed=%t err=%v", signed, err)
+	}
+	f.tick(1_000)
+	if _, signed, err := f.group.SignCheckpoint(f.founder, true); err != nil || !signed {
+		t.Fatalf("retiring checkpoint: signed=%t err=%v", signed, err)
+	}
+	head := f.group.Canonical()
+
+	// Rewind one: widely spaced dates, so a later branch can still reach
+	// further while staying below it. It drops the first joiner.
+	branch := f.rewindWith(t, base, head.Sequence+1, 100, f.info(f.founder))
+	if f.group.IsMemberID(f.memberID(first)) {
+		t.Fatal("the first rewind did not drop the joiner")
+	}
+	if f.group.Canonical().ID != branch.ID {
+		t.Fatal("the first branch did not win the walk")
+	}
+
+	// Rewind two: from the same base, one sequence further, dated below
+	// branch one - so the coverage bound moves backwards a second time.
+	second := f.rewindWith(t, base, branch.Sequence+1, 1, f.info(f.founder))
+	if f.group.Canonical().ID != second.ID {
+		t.Fatalf("the second branch did not win: canonical %s", f.group.Canonical().ID)
+	}
+	if second.Timestamp >= branch.Timestamp {
+		t.Fatalf("the second branch is not a rewind: ts %d against %d", second.Timestamp, branch.Timestamp)
+	}
+
+	var found bool
+	for _, info := range f.group.RewoundMemberInfos() {
+		if id, err := entmoot.ResolvedMemberID(info); err == nil && id == f.memberID(first) {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("the second rewind discarded the member the first one lost")
+	}
+}
+
+// And the hint is not kept for ever: once the chain has reached the bound it
+// was pulled back from, nothing is uncovered and the node has no reason to
+// keep dialing an identity the group may since have removed.
+func TestRewoundMembersAreDroppedOnceTheChainCatchesUp(t *testing.T) {
+	f := newFixture(t, DefaultPolicy())
+	joiner := mustIdentity(t)
+	if _, signed, err := f.group.SignCheckpoint(f.founder, true); err != nil || !signed {
+		t.Fatalf("base checkpoint: signed=%t err=%v", signed, err)
+	}
+	base := f.group.Canonical()
+	f.tick(1_000)
+	f.join(joiner)
+	f.tick(1_000)
+	if _, signed, err := f.group.SignCheckpoint(f.founder, true); err != nil || !signed {
+		t.Fatalf("folding checkpoint: signed=%t err=%v", signed, err)
+	}
+	f.tick(1_000)
+	if _, signed, err := f.group.SignCheckpoint(f.founder, true); err != nil || !signed {
+		t.Fatalf("retiring checkpoint: signed=%t err=%v", signed, err)
+	}
+	head := f.group.Canonical()
+	branch := f.rewind(t, base, head, f.info(f.founder))
+	if len(f.group.RewoundMemberInfos()) == 0 {
+		t.Fatal("the rewind recorded nothing, so there is nothing to drop")
+	}
+
+	// The chain now advances past the bound it was pulled back from.
+	f.tick(10)
+	f.join(mustIdentity(t))
+	f.tick(10)
+	body := branch
+	body.ID = entmoot.RosterEntryID{}
+	body.Sequence = branch.Sequence + 1
+	body.Previous = branch.ID
+	body.Timestamp = head.Timestamp + 1
+	body.Covered = 0
+	body.Signature = nil
+	ahead, err := SignCheckpoint(f.founder, f.info(f.founder), body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.group.ApplyCheckpoint(ahead); err != nil {
+		t.Fatalf("the catching-up checkpoint was refused: %v", err)
+	}
+	if got := f.group.Canonical().Timestamp; got < head.Timestamp {
+		t.Fatalf("the chain did not catch up: canonical ts %d, rewound from %d", got, head.Timestamp)
+	}
+	if got := f.group.RewoundMemberInfos(); len(got) != 0 {
+		t.Fatalf("the hint survived the chain catching up: %d entries", len(got))
+	}
+}
+
+// Once the repair has worked, the member is a current member again and the
+// hint has no business naming it: the peer slots reserved for repair are
+// scarce, and a caller with a small fan-out would spend them on peers the
+// ordinary list already covers.
+func TestRewoundMembersDropAMemberOnceItIsBack(t *testing.T) {
+	f := newFixture(t, DefaultPolicy())
+	joiner := mustIdentity(t)
+	if _, signed, err := f.group.SignCheckpoint(f.founder, true); err != nil || !signed {
+		t.Fatalf("base checkpoint: signed=%t err=%v", signed, err)
+	}
+	base := f.group.Canonical()
+	f.tick(1_000)
+	joinRecord := f.group.Pending()
+	capability := f.invite(f.founder, joiner, 1)
+	joinRecord = append(joinRecord, f.sign(joiner, Record{Kind: KindJoin, Invite: &capability}))
+	f.apply(joinRecord[len(joinRecord)-1])
+	f.tick(1_000)
+	if _, signed, err := f.group.SignCheckpoint(f.founder, true); err != nil || !signed {
+		t.Fatalf("folding checkpoint: signed=%t err=%v", signed, err)
+	}
+	f.tick(1_000)
+	if _, signed, err := f.group.SignCheckpoint(f.founder, true); err != nil || !signed {
+		t.Fatalf("retiring checkpoint: signed=%t err=%v", signed, err)
+	}
+	head := f.group.Canonical()
+	f.rewind(t, base, head, f.info(f.founder))
+	if f.group.IsMemberID(f.memberID(joiner)) {
+		t.Fatal("the rewind did not drop the joiner")
+	}
+	if len(f.group.RewoundMemberInfos()) == 0 {
+		t.Fatal("the rewind recorded nothing")
+	}
+
+	// The repair: a peer serves the record back, and the bound no longer
+	// covers it, so it applies.
+	if applied, err := f.group.Apply(joinRecord[len(joinRecord)-1]); err != nil || !applied {
+		t.Fatalf("the record could not be pulled back: applied=%v err=%v", applied, err)
+	}
+	if !f.group.IsMemberID(f.memberID(joiner)) {
+		t.Fatal("the repair did not restore the member")
+	}
+	for _, info := range f.group.RewoundMemberInfos() {
+		if id, err := entmoot.ResolvedMemberID(info); err == nil && id == f.memberID(joiner) {
+			t.Fatal("the hint still names a member that is back in the group")
+		}
+	}
+}
