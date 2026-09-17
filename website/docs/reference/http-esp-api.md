@@ -59,6 +59,13 @@ Authentication modes:
 - `device`: Ed25519 device signatures.
 - `dual`: either mode during rollout.
 
+There is a fourth, narrow scheme: a member signature over the same fields
+(`X-Entmoot-Member-ID`, `-Pubkey`, `-Signature`) authenticates `GET
+/v1/session` alone, and the response echoes that member's id, peer id and
+public key. It is accepted even in `bearer` mode, without the token. It used
+to authenticate the live-agent config routes as well; those were deleted in
+1.5.85, leaving this one route. No in-tree client sends these headers.
+
 Device-authenticated requests sign method, path with query, timestamp, nonce,
 and body hash.
 

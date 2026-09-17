@@ -121,6 +121,6 @@ func LoadJSONFile(path string) (Policy, error) {
 
 // Summary returns the stable one-line policy summary used by status commands.
 func Summary(p Policy) string {
-	return fmt.Sprintf("message_rate=%s burst=%d max_message_bytes=%d live_rate=%s live_burst=%d retention_days=%d",
-		p.MessageRatePerAuthor, p.MessageBurstPerAuthor, p.MaxMessageBytes, p.LiveTriggerRate, p.LiveTriggerBurst, p.RetentionDays)
+	return fmt.Sprintf("message_rate=%s burst=%d max_message_bytes=%d retention_days=%d",
+		p.MessageRatePerAuthor, p.MessageBurstPerAuthor, p.MaxMessageBytes, p.RetentionDays)
 }

@@ -783,7 +783,7 @@ func OpenSQLiteStateStore(dataDir string) (*SQLiteStateStore, error) {
 		_ = db.Close()
 		return nil, err
 	}
-	retireFleetTables(db, dbPath)
+	retireRemovedFeatureTables(db, dbPath)
 	store := &SQLiteStateStore{db: db}
 	cleanupCtx, cleanupCancel := context.WithCancel(context.Background())
 	store.cleanupCancel = cleanupCancel
@@ -1605,16 +1605,18 @@ func deviceIDForRequest(auth authContext) string {
 	return strings.TrimSpace(auth.device.ID)
 }
 
-// RetiredFleetTables are the tables of the removed Fleet/tasks/agent-commands
-// feature. They are dropped rather than left in place so an upgraded node stops
-// carrying rows nothing can read, and so a later reader cannot mistake stale
-// fleet state for something live.
+// RetiredTables are the tables of features this daemon no longer has: the
+// Fleet/tasks/agent-commands feature, and agent-live's per-node config,
+// presence lease and scan cursor. They are dropped rather than left in place
+// so an upgraded node stops carrying rows nothing can read, and so a later
+// reader cannot mistake stale state for something live.
 //
-// Exported because the legacy-root conversion has to drop them too, and for the
-// same reason it drops esp_open_invite_challenges: it rewrites identities table
-// by table, and a table whose rows can no longer be keyed or scoped must be
-// gone before that walk rather than fail it.
-var RetiredFleetTables = []string{
+// Exported because the legacy-root conversion has to drop them too, and for
+// the same reason it drops esp_open_invite_challenges: it rewrites identities
+// table by table, and a table whose rows can no longer be keyed or scoped must
+// be gone before that walk rather than fail it. agent-live's cursor table
+// carries last_seen_author_node_id, which is exactly such a column.
+var RetiredTables = []string{
 	"esp_fleet_command_results",
 	"esp_fleet_commands",
 	"esp_fleet_task_submissions",
@@ -1624,21 +1626,12 @@ var RetiredFleetTables = []string{
 	"esp_fleet_members",
 	"esp_fleets",
 	"esp_agent_commands",
-}
-
-// retiredLiveAgentTables are the tables of the removed agent-live feature: a
-// per-node config, a presence lease and a scan cursor, all written by a poller
-// that no longer exists. They are dropped for the same reason the fleet tables
-// are, and unexported because nothing outside this package ever keyed a row in
-// them: the daemon reached them through this store.
-var retiredLiveAgentTables = []string{
 	"esp_live_agent_cursors",
 	"esp_live_agent_presence",
 	"esp_live_agent_configs",
 }
 
-// retireFleetTables drops the removed features' tables, best-effort: the
-// Fleet/tasks/agent-commands tables and the agent-live tables.
+// retireRemovedFeatureTables drops the removed features' tables, best-effort.
 //
 // DROP TABLE needs a write transaction while the schema block above needs
 // none, so this runs outside it and never fails the open: this fleet runs
@@ -1646,7 +1639,7 @@ var retiredLiveAgentTables = []string{
 // holding the lock must not stop the ESP starting. busy_timeout is lowered for
 // the attempt and restored afterwards so a contended open is not stalled for
 // the path's full 5s; whatever is left is retired on a later open.
-func retireFleetTables(db *sql.DB, dbPath string) {
+func retireRemovedFeatureTables(db *sql.DB, dbPath string) {
 	if _, err := db.Exec(`PRAGMA busy_timeout = 200`); err != nil {
 		slog.Debug("esphttp: retire removed-feature tables deferred: set busy_timeout",
 			slog.String("path", dbPath), slog.String("err", err.Error()))
@@ -1658,7 +1651,7 @@ func retireFleetTables(db *sql.DB, dbPath string) {
 				slog.String("path", dbPath), slog.String("err", err.Error()))
 		}
 	}()
-	for _, tables := range [][]string{RetiredFleetTables, retiredLiveAgentTables} {
+	for _, tables := range [][]string{RetiredTables} {
 		for _, table := range tables {
 			if _, err := db.Exec(`DROP TABLE IF EXISTS ` + table); err != nil {
 				slog.Debug("esphttp: retire removed-feature table deferred to a later open",

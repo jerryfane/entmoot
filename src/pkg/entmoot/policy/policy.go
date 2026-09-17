@@ -32,8 +32,12 @@ type Policy struct {
 	ByteRatePerAuthor     string `json:"byte_rate_per_author"`
 	ByteBurstPerAuthor    int64  `json:"byte_burst_per_author"`
 	MaxMessageBytes       int64  `json:"max_message_bytes"`
-	// The four live_* limits are a frozen wire remnant: since 1.5.85 nothing
-	// enforces them, because the live-agent feature they bounded is gone.
+	// The four live_* limits are a frozen wire remnant. Since 1.5.85 nothing
+	// reads them, enforces them or requires them: the live-agent feature they
+	// bounded is gone, Validate ignores them and a policy file may omit them.
+	// The presets still fill them so a newly signed descriptor keeps the shape
+	// existing ones have.
+	//
 	// They cannot simply be deleted. A public-moot descriptor embeds this
 	// struct, is Ed25519-signed over its bytes, and publicmoot.Parse decodes
 	// with DisallowUnknownFields - so removing the fields makes every
@@ -74,18 +78,6 @@ func (p Policy) Validate() error {
 	}
 	if p.ByteBurstPerAuthor < p.MaxMessageBytes {
 		return errors.New("byte_burst_per_author must be greater than or equal to max_message_bytes")
-	}
-	if _, err := ParseMessageRate(p.LiveTriggerRate); err != nil {
-		return fmt.Errorf("live_trigger_rate: %w", err)
-	}
-	if p.LiveTriggerBurst <= 0 {
-		return errors.New("live_trigger_burst must be positive")
-	}
-	if p.LiveMaxActionsPerScan < 0 {
-		return errors.New("live_max_actions_per_scan must be non-negative")
-	}
-	if p.LiveMaxActionBytes < 0 {
-		return errors.New("live_max_action_bytes must be non-negative")
 	}
 	if p.RetentionDays <= 0 {
 		return errors.New("retention_days must be positive")

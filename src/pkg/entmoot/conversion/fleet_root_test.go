@@ -3,6 +3,7 @@ package conversion
 import (
 	"database/sql"
 	"encoding/base64"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -13,8 +14,12 @@ import (
 )
 
 // TestRunConvertsRootCarryingRetiredFleetTables pins the upgrade path for a
-// pre-libp2p root that still holds the removed feature's tables: conversion
-// must not abort on rows it can no longer scope or key.
+// pre-libp2p root that still holds removed features' tables - Fleet and
+// agent-live: conversion must not abort on rows it can no longer scope or key.
+// agent-live's cursor carries node_id and last_seen_author_node_id, which the
+// identity walk rewrites, and this row is dated between the removal of one
+// holder of that legacy node id and the arrival of the next - so the walk can
+// resolve it to nobody and fails closed, taking the whole conversion with it.
 func TestRunConvertsRootCarryingRetiredFleetTables(t *testing.T) {
 	root := t.TempDir()
 	founder, err := keystore.Generate()
@@ -81,6 +86,13 @@ CREATE TABLE esp_fleet_activity(
   actor_node_id INTEGER NOT NULL,
   actor_pubkey TEXT NOT NULL,
   created_at_ms INTEGER NOT NULL
+);
+CREATE TABLE esp_live_agent_cursors(
+  group_id BLOB NOT NULL,
+  node_id INTEGER NOT NULL,
+  last_seen_author_node_id INTEGER,
+  updated_at_ms INTEGER NOT NULL,
+  PRIMARY KEY(group_id, node_id)
 );`); err != nil {
 		db.Close()
 		t.Fatal(err)
@@ -95,11 +107,30 @@ CREATE TABLE esp_fleet_activity(
 		db.Close()
 		t.Fatal(err)
 	}
+	if _, err := db.Exec(`INSERT INTO esp_live_agent_cursors VALUES(?,133053,133053,1700000003500)`, gid[:]); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
 
 	if err := Run(root, founder); err != nil {
-		t.Fatalf("Run on a root carrying retired fleet tables: %v", err)
+		t.Fatalf("Run on a root carrying retired tables: %v", err)
+	}
+
+	converted, err := sql.Open("sqlite", "file:"+espPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer converted.Close()
+	for _, table := range []string{"esp_fleets", "esp_fleet_activity", "esp_live_agent_cursors"} {
+		var name string
+		err := converted.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&name)
+		if err == nil {
+			t.Fatalf("%s survived conversion", table)
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			t.Fatal(err)
+		}
 	}
 }

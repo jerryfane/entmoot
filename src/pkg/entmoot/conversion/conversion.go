@@ -1319,13 +1319,15 @@ func migrateESP(path string, mappings *legacyIdentityResolver) error {
 	if _, err = tx.Exec(`DROP TABLE IF EXISTS esp_open_invite_challenges`); err != nil {
 		return err
 	}
-	// The removed Fleet feature's tables go before the identity walk below.
-	// They are dropped on ESP open too, but conversion runs first on a legacy
-	// root (setup() converts before anything opens the ESP store), and the walk
-	// would otherwise try to rewrite rows it can no longer key or scope: a
-	// reassigned legacy node id in a fleet row would fail closed and abort the
-	// whole conversion, leaving the daemon unable to start.
-	for _, table := range esphttp.RetiredFleetTables {
+	// The removed features' tables go before the identity walk below: Fleet,
+	// and agent-live's config/presence/cursor. They are dropped on ESP open
+	// too, but conversion runs first on a legacy root (setup() converts before
+	// anything opens the ESP store), and the walk would otherwise try to
+	// rewrite rows it can no longer key or scope: a reassigned legacy node id
+	// in one of those rows would fail closed and abort the whole conversion,
+	// leaving the daemon unable to start. agent-live's cursor table carries
+	// last_seen_author_node_id, so it is exactly such a table.
+	for _, table := range esphttp.RetiredTables {
 		if _, err = tx.Exec(`DROP TABLE IF EXISTS ` + table); err != nil {
 			return err
 		}
