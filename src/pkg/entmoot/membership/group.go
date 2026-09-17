@@ -889,9 +889,19 @@ func sameMembership(left, right State) bool {
 }
 
 // settleCanonicalLocked picks the canonical checkpoint and retires what it
-// covers. Two admins may sign a checkpoint for the same sequence; the earlier
-// one wins, ties broken by id, so every node picks the same one without
-// negotiating.
+// covers. Two admins may sign a checkpoint for the same sequence; the LATER
+// one wins, the founder's signature breaks a tie at one timestamp, and the id
+// breaks the rest - see checkpointBeats - so every node picks the same one
+// without negotiating.
+//
+// KNOWN GAP: the walk ranks branches by how far they reach BEFORE that rule
+// runs, so a longer branch dated earlier than the current canonical still
+// wins, and retirement here has already deleted the records behind the loser.
+// A member admitted on the losing branch is then lost, exactly as it was
+// before checkpoints were ordered by timestamp - one sequence further out.
+// Closing it means either making selection monotone in the bound or making
+// retirement recoverable (re-pulling the uncovered window from peers), which
+// is a protocol decision rather than a local fix.
 func (g *Group) settleCanonicalLocked() error {
 	// Walk forward from this node's anchor, not from the current canonical
 	// checkpoint: a better sibling can arrive after a worse one was already
@@ -1064,17 +1074,34 @@ func (g *Group) onChainLocked(cp, head Checkpoint) bool {
 }
 
 // checkpointBeats decides between two checkpoints at the same sequence. Every
-// node applies the same rule, so no negotiation is needed.
+// node applies the same rule - a total order over (timestamp, signer, id) - so
+// no negotiation is needed and arrival order cannot matter.
 //
-// A founder-signed checkpoint wins first, before any timestamp comparison: it
-// is the only kind a node holding no group state can adopt, so preferring it
-// keeps a group joinable. Then the earlier timestamp, then the lower id.
+// The LATER timestamp wins. A checkpoint's timestamp is the coverage bound
+// (see coveredBy), while retirement is irreversible: settleCanonicalLocked
+// deletes the records behind the previous checkpoint. So a rule that let a
+// sibling dated behind the current canonical win the sequence lost the
+// membership those deleted records carried - a member that had properly
+// joined vanished, with no adversary involved. At ONE SEQUENCE the bound now
+// cannot move backwards. It is not monotone in general: the walk ranks
+// branches by reach first, and settleCanonicalLocked documents that gap.
+//
+// A founder-signed checkpoint wins the tie at one timestamp, because it is
+// the only kind a node holding no group state can adopt, and retention keeps
+// every founder-signed checkpoint the chain reaches, so a joiner can still
+// anchor. Demoting it below the bound has a cost, and it is deliberate: a
+// checkpoint signer can now date a checkpoint 1ms later than the honest one
+// and have it win, which excludes a record from nodes that have not received
+// it. Nodes that hold the record refuse such a checkpoint outright, so this
+// is visible divergence rather than a silent rewrite, and only authority
+// holders can sign at all - but the old ordering had no such lever, and lost
+// members without one.
 func checkpointBeats(candidate, current Checkpoint) bool {
+	if candidate.Timestamp != current.Timestamp {
+		return candidate.Timestamp > current.Timestamp
+	}
 	if left, right := founderSigned(candidate), founderSigned(current); left != right {
 		return left
-	}
-	if candidate.Timestamp != current.Timestamp {
-		return candidate.Timestamp < current.Timestamp
 	}
 	return bytes.Compare(candidate.ID[:], current.ID[:]) < 0
 }

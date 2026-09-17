@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Competing checkpoints at one sequence no longer lose a member. A
+  checkpoint's timestamp is the coverage bound, and retirement is
+  irreversible: the records behind the previous checkpoint are deleted. The
+  sibling rule preferred the EARLIER timestamp, so a checkpoint dated behind
+  one whose records were already deleted won its sequence and the membership
+  those records carried went with them - a member that had properly joined
+  vanished, with no adversary involved. Siblings are now ordered by timestamp
+  first; a founder-signed checkpoint wins the tie at one timestamp, which is
+  what keeps a group joinable. Two things this does NOT do: the bound is not
+  monotone in general, because a longer branch dated earlier still wins on
+  reach, so the same loss remains reachable one sequence further out; and a
+  checkpoint signer can now date a checkpoint just after an honest one to win
+  it, which excludes a record from nodes that have not yet received it, though
+  nodes holding the record refuse such a checkpoint outright.
+
 - A membership checkpoint that folds nothing in now covers what it succeeds.
   Retirement drops the records behind the previous checkpoint, but the
   projection read a zero fold count as covering nothing at all, so a node that
