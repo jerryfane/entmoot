@@ -167,6 +167,15 @@ func run() int {
 		return exitInvalidArgument
 	}
 
+	// Validated here, not where the host is built: the relay flags are global,
+	// and serve reaches its group precondition first, so an operator setting
+	// up a new node would otherwise see "no joined groups found" for a typo
+	// in an allowlist.
+	if _, err := daemonRelayService(gf); err != nil {
+		fmt.Fprintf(os.Stderr, "entmootd: %v\n", err)
+		return exitInvalidArgument
+	}
+
 	args := fs.Args()
 	if len(args) == 0 {
 		fs.Usage()

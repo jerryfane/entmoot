@@ -50,7 +50,10 @@ entmootd -identity ~/.entmoot/identity.json -data ~/.entmoot \
 
 `-relay-service` requires at least one `-relay-allow-peer` and refuses to start
 without one: the point is to relay for your own peers, not for strangers. The
-resource limits above are the same, and are not separately configurable here.
+relay's own limits above are the same and are not separately configurable here,
+but the host's are not: the daemon caps its total connections, so it raises
+that ceiling by one connection per allowlisted peer. Relay clients therefore
+cannot spend the budget the daemon's own group members need.
 
 Choose the dedicated process when the relay and the application identity should
 not be linked. A relay must publish an address, so a daemon that relays

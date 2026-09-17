@@ -9,6 +9,25 @@ import (
 	relayv2client "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/client"
 )
 
+// An invalid relay service must be refused before the host exists, so a caller
+// gets an error rather than a daemon quietly running with no relay.
+func TestConfiguredHostRefusesAnInvalidRelayService(t *testing.T) {
+	allowed := []peer.ID{"12D3KooWPXb5rMPAHKYBc5Cwx9dbDhjm2Dsqwt8gFkGe6kGNCDSp"}
+	for name, service := range map[string]RelayServerConfig{
+		"no allowed peers":   {ReservationTTL: time.Hour, CircuitDuration: time.Minute, CircuitBytes: 1 << 20, MaxReservations: 8, MaxCircuitsPerPeer: 2, MaxReservationsPerIP: 2, MaxReservationsPerASN: 2},
+		"unbounded circuits": {AllowedPeers: allowed, ReservationTTL: time.Hour, CircuitDuration: time.Minute, CircuitBytes: 1 << 20, MaxReservations: 8, MaxCircuitsPerPeer: 0, MaxReservationsPerIP: 2, MaxReservationsPerASN: 2},
+	} {
+		h, _, err := NewConfiguredHost(context.Background(), mustIdentity(t), HostConfig{
+			ListenAddrs:  []string{"/ip4/127.0.0.1/tcp/0"},
+			RelayService: &service,
+		})
+		if err == nil {
+			_ = h.Close()
+			t.Fatalf("%s: a host was built for an invalid relay service", name)
+		}
+	}
+}
+
 // One process that both talks to a group and relays for its members: a
 // relay-only peer takes a reservation on a daemon host that was started with
 // a relay service, which is the whole point of the flag.

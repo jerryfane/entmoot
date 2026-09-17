@@ -39,6 +39,16 @@ const (
 	maxPeerStreams     = 64
 )
 
+// relayConnectionBudget is how many connections a relay service can add to
+// its host. Each allowlisted peer holds at most one reservation
+// (MaxReservationsPerPeer is 1) and libp2p keeps one connection per peer, so
+// the allowlist bounds relay clients; the reservation cap bounds them further
+// when it is lower, but non-reserving circuit sources are only bounded by the
+// ACL, so the allowlist is the number that has to be covered.
+func relayConnectionBudget(cfg RelayServerConfig) int {
+	return len(cfg.AllowedPeers)
+}
+
 type HostConfig struct {
 	Mode             ConnectivityMode
 	ListenAddrs      []string
@@ -67,13 +77,30 @@ func NewConfiguredHost(ctx context.Context, identity *keystore.Identity, cfg Hos
 	if cfg.Mode == RelayOnlyConnectivity && cfg.RelayService != nil {
 		return nil, Binding{}, errors.New("libp2p: relay-only mode cannot also run a relay service")
 	}
-	manager, err := connmgr.NewConnManager(maxHostConnections*3/4, maxHostConnections)
+	// Validate the relay service before anything needs closing, and size the
+	// host budget around it. A relay client holds a connection for as long as
+	// its reservation or circuit lives, and the ACL is what bounds how many
+	// there can be: at most one per allowlisted peer. Taking that out of the
+	// group's budget would let relay load crowd out this daemon's own group
+	// peers - which are not Protect()ed - so the relay's share is added on
+	// top instead, and the advertised reservation cap stays reachable.
+	var serviceOptions []libp2p.Option
+	var err error
+	hostConns := maxHostConnections
+	if cfg.RelayService != nil {
+		serviceOptions, err = RelayServiceOptions(*cfg.RelayService)
+		if err != nil {
+			return nil, Binding{}, err
+		}
+		hostConns += relayConnectionBudget(*cfg.RelayService)
+	}
+	manager, err := connmgr.NewConnManager(hostConns*3/4, hostConns)
 	if err != nil {
 		return nil, Binding{}, err
 	}
 	limits := rcmgr.PartialLimitConfig{
 		System: rcmgr.ResourceLimits{
-			Conns: maxHostConnections, ConnsInbound: maxHostConnections, ConnsOutbound: maxHostConnections,
+			Conns: rcmgr.LimitVal(hostConns), ConnsInbound: rcmgr.LimitVal(hostConns), ConnsOutbound: rcmgr.LimitVal(hostConns),
 		},
 		PeerDefault: rcmgr.ResourceLimits{
 			Conns: maxPeerConnections, ConnsInbound: maxPeerConnections, ConnsOutbound: maxPeerConnections,
@@ -98,14 +125,7 @@ func NewConfiguredHost(ctx context.Context, identity *keystore.Identity, cfg Hos
 		// peer, so the protocol is enabled even without local relays. Relay
 		// rendezvous itself stays opt-in through ControlledRelays.
 		options = append(options, libp2p.EnableRelay(), libp2p.EnableHolePunching())
-		if cfg.RelayService != nil {
-			service, serviceErr := RelayServiceOptions(*cfg.RelayService)
-			if serviceErr != nil {
-				_ = manager.Close()
-				return nil, Binding{}, serviceErr
-			}
-			options = append(options, service...)
-		}
+		options = append(options, serviceOptions...)
 		if len(cfg.ControlledRelays) > 0 {
 			// libp2p only folds relay addresses into Addrs() once AutoNAT
 			// reports no reachable address. Members must be able to publish a

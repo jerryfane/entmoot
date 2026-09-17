@@ -291,6 +291,12 @@ func daemonRelayService(gf *globalFlags) (*libp2ptransport.RelayServerConfig, er
 	if len(gf.relayAllowPeers) == 0 {
 		return nil, errors.New("-relay-service requires at least one -relay-allow-peer")
 	}
+	// The transport refuses this pairing too, but that refusal surfaces as a
+	// transport failure. Flag misuse has to read as flag misuse, or a
+	// supervisor retries a configuration error as if it were a network fault.
+	if gf.connectivity == "relay-only" {
+		return nil, errors.New("-relay-service cannot be used with -connectivity relay-only")
+	}
 	allowed := make([]libpeer.ID, 0, len(gf.relayAllowPeers))
 	for _, raw := range gf.relayAllowPeers {
 		id, err := libpeer.Decode(raw)
