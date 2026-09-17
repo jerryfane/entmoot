@@ -85,21 +85,35 @@ ENTMOOT-ESP-MEMBER-AUTH-V2
 
 joined with `\n`. Every base64 here is standard padded encoding - the member
 id, the public key, the body hash and the signature header. Decoding is
-`StdEncoding` with no URL-safe or unpadded fallback, so a key or signature
-encoded URL-safely is refused whenever its bytes actually differ, which for a
-random 32-byte key is most of the time but not always: the two alphabets
-differ only at values 62 and 63. Fields are checked in header order and the
-first bad one names itself: `invalid member id`, `invalid peer id`, `invalid
-member public key`, `invalid nonce`, then `invalid signature` - which is also
-what a wrongly encoded body hash produces, because it only changes the bytes
-that were signed.
+`StdEncoding` with no URL-safe or unpadded fallback, so URL-safe encoding is
+refused whenever the encoded text differs, which for a random 32-byte value is
+usually but not always: the alphabets differ only at values 62 and 63.
 
-The timestamp must be within five minutes of the ESP's clock either way. The
-nonce is single-use for that same five minutes, scoped to the member id and
-peer id, so the same nonce from a different member is accepted; a replay
-answers `replayed nonce`. A nonce is consumed only after the signature
-verifies, so a request rejected as `invalid signature` may be retried with the
-same nonce.
+Checks run in this order, and the first failure answers `401` with its own
+message:
+
+| # | Check | Message |
+|---|---|---|
+| 1 | member id header decodes and is non-zero | `invalid member id` |
+| 2 | peer id header decodes | `invalid peer id` |
+| 3 | public key header decodes to 32 bytes | `invalid member public key` |
+| 4 | member id derives from that key | `member id does not match public key` |
+| 5 | peer id derives from that key | `peer id does not match public key` |
+| 6 | timestamp header parses | `invalid request timestamp` |
+| 7 | timestamp within five minutes either way | `request timestamp outside allowed window` |
+| 8 | nonce non-empty, at most 256 bytes | `invalid nonce` |
+| 9 | signature decodes and verifies | `invalid signature` |
+| 10 | nonce not already used | `replayed nonce` |
+
+A wrongly encoded body-hash line reaches step 9, because it only changes the
+bytes that were signed.
+
+The nonce cache is keyed by member id and the peer id header's exact text, so
+the same nonce from a different member is accepted - and so is the same nonce
+re-sent under a different spelling of one peer identity, since base58btc and
+CIDv1 both decode to the same peer but form different keys. Entries last the
+same five minutes. A nonce is consumed only after the signature verifies, so a
+request rejected at step 9 may be retried with the same nonce.
 
 Device-authenticated requests sign method, path with query, timestamp, nonce,
 and body hash.
