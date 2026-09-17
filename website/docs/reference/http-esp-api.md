@@ -90,13 +90,22 @@ refused whenever the encoded text differs, which for a random 32-byte value is
 usually but not always: the alphabets differ only at values 62 and 63.
 
 Checks run in this order, and the first failure answers `401` with its own
-message - when the request carries no other credential. A valid token
-alongside (in `bearer` or `dual` mode) wins whichever row failed: the request
-answers `200` and simply omits the `member` echo, with no `401` and no
-diagnostic. A wrong token does not win, so the row message stands. A device
-header is checked first and displaces the row message entirely, even when the
-member signature is valid: an unknown device answers `401 unknown device` and
-a disabled one `403 device_disabled`. Send one credential at a time.
+message - when the request carries no other credential. What another
+credential does depends on the mode:
+
+- `bearer`: a valid token wins whichever row failed, so the request answers
+  `200` and simply omits the `member` echo, with no `401` and no diagnostic. A
+  wrong token does not win, so the row message stands. A device header is never
+  consulted.
+- `device`: the device header is checked first and displaces the member result
+  entirely, even when the member signature is valid - an unknown device answers
+  `401 unknown device`, a disabled one `403 device_disabled`.
+- `dual`: a valid member signature is tried first and wins, so a device header
+  alongside it changes nothing. Once a member row has failed, a valid token
+  wins; failing that, a device header is checked and its message replaces the
+  row's.
+
+Send one credential at a time.
 
 | # | Check | Message |
 |---|---|---|
