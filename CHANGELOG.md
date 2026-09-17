@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.83] - 2026-09-17
+
 ### Fixed
 
 - The ESP state-schema migration no longer dies when another process migrates
