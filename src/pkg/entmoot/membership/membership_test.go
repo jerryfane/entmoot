@@ -1954,3 +1954,45 @@ func TestReachableMemberInfosKeepsMembersTheProjectionLost(t *testing.T) {
 		t.Fatal("the lost member is not reachable, so this node cannot ask the peer that holds its record")
 	}
 }
+
+// The other half of that list: it must not name identities the group evicted.
+// It is used to dial peers and to push membership records, so an ex-member
+// that appears in an old retained checkpoint would keep being talked to -
+// a checkpoint older than the canonical one is not evidence of a rewind.
+func TestReachableMemberInfosExcludesEvictedIdentities(t *testing.T) {
+	f := newFixture(t, DefaultPolicy())
+	removed, banned := mustIdentity(t), mustIdentity(t)
+	f.join(removed)
+	f.join(banned)
+	f.tick(10)
+	f.apply(f.sign(f.founder, Record{Kind: KindRemove, Subject: f.info(removed)}))
+	f.apply(f.sign(f.founder, Record{Kind: KindRemove, Subject: f.info(banned), Banned: true}))
+	f.tick(10)
+	for i := 0; i < 2; i++ {
+		f.tick(1_000)
+		if _, signed, err := f.group.SignCheckpoint(f.founder, true); err != nil || !signed {
+			t.Fatalf("checkpoint %d: signed=%t err=%v", i, signed, err)
+		}
+	}
+	if f.group.IsMemberID(f.memberID(removed)) || f.group.IsMemberID(f.memberID(banned)) {
+		t.Fatal("the fixture left an evicted identity in the projection")
+	}
+	// The checkpoints that named them are still retained, which is the whole
+	// hazard: retention keeps every founder-signed checkpoint.
+	if len(f.group.CheckpointsSince(0)) < 2 {
+		t.Fatal("the fixture retained no earlier checkpoint, so this proves nothing")
+	}
+
+	for _, info := range f.group.ReachableMemberInfos() {
+		id, err := entmoot.ResolvedMemberID(info)
+		if err != nil {
+			continue
+		}
+		if id == f.memberID(removed) {
+			t.Fatal("a removed member is still named as reachable")
+		}
+		if id == f.memberID(banned) {
+			t.Fatal("a banned identity is still named as reachable")
+		}
+	}
+}

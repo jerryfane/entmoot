@@ -582,23 +582,35 @@ func (g *Group) MemberIDs() []entmoot.MemberID {
 	return g.state.MemberIDs()
 }
 
-// ReachableMemberInfos is everyone this node has recently seen as a member:
-// the current projection first, then members of the checkpoints it still
-// retains, deduplicated, each with the newest record this node holds for it.
+// ReachableMemberInfos is who this node may talk to about membership: the
+// current projection, plus the members of any retained checkpoint dated AFTER
+// the canonical one. Deduplicated, current projection first, and each entry
+// carries the NodeInfo the source recorded. Banned identities are excluded.
 //
-// It exists because the current projection is the wrong list to ask when the
-// projection itself is what went wrong. If this node's coverage bound moves
-// backwards - a branch that reaches further while dated earlier wins, see the
-// KNOWN GAP on settleCanonicalLocked - the members it just lost are exactly
-// the peers holding the records that would restore them, and asking only the
-// survivors can never get them back.
+// The second half exists because the current projection is the wrong list to
+// ask when the projection itself is what went wrong. If this node's coverage
+// bound moves backwards - a branch that reaches further while dated earlier
+// wins, see the KNOWN GAP on settleCanonicalLocked - the members it lost are
+// exactly the peers holding the records that would restore them, and asking
+// only the survivors can never get them back.
+//
+// The "dated after the canonical one" bound is what keeps that from becoming
+// "everyone ever seen". A checkpoint older than the canonical one is not
+// evidence of a rewind; the identities it names and the current one does not
+// are the ones a signed record removed, and this list is used to dial peers
+// and to push membership records, so naming them would keep talking to
+// members the group has evicted.
 func (g *Group) ReachableMemberInfos() []entmoot.NodeInfo {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
+	canonical := g.checkpoints[g.canonicalID]
 	out := make([]entmoot.NodeInfo, 0, len(g.state.Members))
 	seen := make(map[entmoot.MemberID]struct{}, len(g.state.Members))
 	add := func(id entmoot.MemberID, info entmoot.NodeInfo) {
 		if _, already := seen[id]; already {
+			return
+		}
+		if _, banned := g.state.Banned[id]; banned {
 			return
 		}
 		seen[id] = struct{}{}
@@ -610,16 +622,29 @@ func (g *Group) ReachableMemberInfos() []entmoot.NodeInfo {
 	for _, id := range g.state.MemberIDs() {
 		add(id, g.state.Members[id])
 	}
-	// Retained checkpoints, newest sequence first, so a member the newest one
-	// dropped is still tried before one only an old checkpoint knew.
-	retained := make([]Checkpoint, 0, len(g.checkpoints))
+	// Newest sequence first, so a member the rewind dropped most recently is
+	// tried before one an older branch knew, and the order is stable for a
+	// caller that truncates the list.
+	rewound := make([]Checkpoint, 0, len(g.checkpoints))
 	for _, cp := range g.checkpoints {
-		retained = append(retained, cp)
+		if cp.Timestamp > canonical.Timestamp {
+			rewound = append(rewound, cp)
+		}
 	}
-	sort.Slice(retained, func(i, j int) bool { return retained[i].Sequence > retained[j].Sequence })
-	for _, cp := range retained {
-		for id, info := range g.membersAt[cp.ID] {
-			add(id, info)
+	sort.Slice(rewound, func(i, j int) bool {
+		if rewound[i].Sequence != rewound[j].Sequence {
+			return rewound[i].Sequence > rewound[j].Sequence
+		}
+		return bytes.Compare(rewound[i].ID[:], rewound[j].ID[:]) < 0
+	})
+	for _, cp := range rewound {
+		ids := make([]entmoot.MemberID, 0, len(g.membersAt[cp.ID]))
+		for id := range g.membersAt[cp.ID] {
+			ids = append(ids, id)
+		}
+		sort.Slice(ids, func(i, j int) bool { return bytes.Compare(ids[i][:], ids[j][:]) < 0 })
+		for _, id := range ids {
+			add(id, g.membersAt[cp.ID][id])
 		}
 	}
 	return out
@@ -973,9 +998,13 @@ func sameMembership(left, right State) bool {
 // wins, and retirement here has already deleted the records behind the loser.
 // A member admitted on the losing branch is then lost, exactly as it was
 // before checkpoints were ordered by timestamp - one sequence further out.
-// Closing it means either making selection monotone in the bound or making
-// retirement recoverable (re-pulling the uncovered window from peers), which
-// is a protocol decision rather than a local fix.
+// Selection is not the place to close it: ranking branches by timestamp turns
+// a recoverable loss into a permanent one, and a retirement watermark is
+// path-dependent, so two nodes fed the same checkpoints in different orders
+// pick different canonicals. What the group does instead is repair: the
+// records a dropped bound un-covers can be pulled back from a peer that still
+// holds them (see PendingFor and ReachableMemberInfos), which works until
+// every peer has folded one more checkpoint past the window.
 func (g *Group) settleCanonicalLocked() error {
 	// Walk forward from this node's anchor, not from the current canonical
 	// checkpoint: a better sibling can arrive after a worse one was already

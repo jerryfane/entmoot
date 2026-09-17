@@ -665,13 +665,16 @@ func TestSyncBootstrapAuthorityAndMembership(t *testing.T) {
 	check("fresh_invite_after_removal", &second, "")
 }
 
-// A pull that lowers this node's coverage bound re-reads the peer's window in
-// the same call. The walk can move canonical to a branch that reaches further
+// A node whose coverage bound has dropped gets the records back on an
+// ordinary pull. The walk can move canonical to a branch that reaches further
 // while dated earlier (see membership.settleCanonicalLocked), which un-covers
-// records this node had already retired - and those records are exactly what
-// the peer serving the branch may still hold. Continuing past the cursor
-// leaves the member lost until some later tick, and a node holding no record
-// cannot refuse the branch extension that makes the loss permanent.
+// records this node had already retired - and a peer that has folded those
+// records in still holds them for a checkpoint of lag. It answers against the
+// caller's bound rather than its own, so the caller can have them.
+//
+// The repair is not guaranteed: it depends on some peer still holding the
+// window, and once every peer has folded one more checkpoint past it, the
+// records are gone everywhere and the loss is permanent.
 func TestPullRecoversRecordsWhenTheBoundDrops(t *testing.T) {
 	joiner := mustIdentity(t)
 	p := newMembershipSyncPair(t, joiner)
@@ -738,4 +741,53 @@ func sortNodeInfos(members []entmoot.NodeInfo) {
 		right, _ := entmoot.ResolvedMemberID(members[j])
 		return bytes.Compare(left[:], right[:]) < 0
 	})
+}
+
+// The other arm of the same rule, measured at the server: a caller whose
+// checkpoint we DO hold and which is older than ours is behind rather than
+// rewound, and the records it still needs are the ones our own bound calls
+// covered. We keep them for a checkpoint of lag precisely so it can catch up,
+// and answering from our own bound would serve it nothing.
+func TestServerServesRecordsACallerOwnBoundStillNeeds(t *testing.T) {
+	joiner := mustIdentity(t)
+	p := newMembershipSyncPair(t, joiner)
+
+	if _, signed, err := p.group.SignCheckpoint(p.founder, true); err != nil || !signed {
+		t.Fatalf("checkpoint: signed=%t err=%v", signed, err)
+	}
+	if len(p.group.Pending()) != 0 {
+		t.Fatalf("server reports %d pending records, so its own bound would have served them", len(p.group.Pending()))
+	}
+
+	response, err := RequestMembership(p.ctx, p.clientHost, p.remote, MembershipSyncRequest{
+		Version:        1,
+		RequestID:      "behind-caller",
+		GroupID:        p.groupID,
+		HaveSequence:   p.root.Sequence,
+		HaveCheckpoint: p.root.ID,
+		Limit:          maxMembershipRecords,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Records) == 0 {
+		t.Fatal("the server served no record to a caller sitting on an older checkpoint it holds")
+	}
+	// And the same request from a caller already on our bound gets none, so
+	// the steady state is unchanged.
+	current := p.group.Canonical()
+	response, err = RequestMembership(p.ctx, p.clientHost, p.remote, MembershipSyncRequest{
+		Version:        1,
+		RequestID:      "in-step-caller",
+		GroupID:        p.groupID,
+		HaveSequence:   current.Sequence,
+		HaveCheckpoint: current.ID,
+		Limit:          maxMembershipRecords,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Records) != 0 {
+		t.Fatalf("a caller in step with us was served %d records it must refuse", len(response.Records))
+	}
 }
