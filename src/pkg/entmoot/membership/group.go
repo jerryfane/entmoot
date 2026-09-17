@@ -1064,17 +1064,30 @@ func (g *Group) onChainLocked(cp, head Checkpoint) bool {
 }
 
 // checkpointBeats decides between two checkpoints at the same sequence. Every
-// node applies the same rule, so no negotiation is needed.
+// node applies the same rule - a total order over (timestamp, signer, id) - so
+// no negotiation is needed and arrival order cannot matter.
 //
-// A founder-signed checkpoint wins first, before any timestamp comparison: it
-// is the only kind a node holding no group state can adopt, so preferring it
-// keeps a group joinable. Then the earlier timestamp, then the lower id.
+// The LATER timestamp wins, and that ordering is load-bearing rather than
+// arbitrary. A checkpoint's timestamp is the coverage bound (see coveredBy),
+// while retirement is irreversible: settleCanonicalLocked deletes the records
+// behind the previous checkpoint. The invariant those two facts demand is that
+// what a node has retired stays inside what its canonical checkpoint covers,
+// and that holds only while the bound never moves backwards. It used to:
+// preferring the earlier timestamp let a chain dated behind one whose records
+// were already deleted win the sequence, and the membership those records
+// carried was gone - a member that had properly joined simply vanished.
+//
+// A founder-signed checkpoint then wins the tie at one timestamp, because it
+// is the only kind a node holding no group state can adopt. It no longer wins
+// ahead of the bound: a joiner anchors on any founder-signed checkpoint the
+// chain still reaches, and retention keeps every one of those, so preferring
+// one that covers less is not needed to keep a group joinable.
 func checkpointBeats(candidate, current Checkpoint) bool {
+	if candidate.Timestamp != current.Timestamp {
+		return candidate.Timestamp > current.Timestamp
+	}
 	if left, right := founderSigned(candidate), founderSigned(current); left != right {
 		return left
-	}
-	if candidate.Timestamp != current.Timestamp {
-		return candidate.Timestamp < current.Timestamp
 	}
 	return bytes.Compare(candidate.ID[:], current.ID[:]) < 0
 }

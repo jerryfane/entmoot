@@ -578,25 +578,49 @@ func TestConcurrentCheckpointsSettleOnOneCanonical(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Apply the later one first: the earlier must still win, or two nodes that
-	// received them in different orders would disagree.
-	if _, err := f.group.ApplyCheckpoint(lateSigned); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.group.ApplyCheckpoint(earlySigned); err != nil {
-		t.Fatal(err)
-	}
-	if got := f.group.Canonical().ID; got != earlySigned.ID {
-		t.Fatalf("canonical checkpoint is %s, want the earlier %s", got, earlySigned.ID)
-	}
-	if !f.group.IsMemberID(f.memberID(third)) {
-		t.Fatal("settling lost the member the checkpoints folded in")
+	// The later one wins its sequence - the coverage bound may not move
+	// backwards - and it wins whichever order the two arrive in, or two nodes
+	// that received them in different orders would disagree.
+	for _, order := range [][]Checkpoint{{lateSigned, earlySigned}, {earlySigned, lateSigned}} {
+		group := mustAdoptedCopy(t, base, f.group.Pending())
+		for _, cp := range order {
+			if _, err := group.ApplyCheckpoint(cp); err != nil {
+				t.Fatalf("apply %s: %v", cp.ID, err)
+			}
+		}
+		if got := group.Canonical().ID; got != lateSigned.ID {
+			t.Fatalf("canonical checkpoint is %s, want the later %s", got, lateSigned.ID)
+		}
+		if !group.IsMemberID(f.memberID(third)) {
+			t.Fatal("settling lost the member the checkpoints folded in")
+		}
+		if err := group.Close(); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
-// A founder-signed checkpoint wins its sequence even when an admin signed one
-// earlier: it is the only kind a node holding no group state can adopt, so
+// mustAdoptedCopy is a second node holding the same base checkpoint and the
+// same records, so a test can replay checkpoints in either arrival order.
+func mustAdoptedCopy(t *testing.T, base Checkpoint, records []Record) *Group {
+	t.Helper()
+	group, err := Adopt(t.TempDir(), base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, rec := range records {
+		if _, err := group.Apply(rec); err != nil {
+			t.Fatalf("seed record: %v", err)
+		}
+	}
+	return group
+}
+
+// A founder-signed checkpoint wins its sequence against an admin's at the same
+// timestamp: it is the only kind a node holding no group state can adopt, so
 // preferring it is what keeps a group joinable while admins keep checkpointing.
+// It wins the tie only - the coverage bound decides first, because moving that
+// backwards loses members.
 func TestFounderSignedCheckpointWinsItsSequence(t *testing.T) {
 	f := newFixture(t, DefaultPolicy())
 	admin := mustIdentity(t)
@@ -616,7 +640,7 @@ func TestFounderSignedCheckpointWinsItsSequence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	founderBody := state.Checkpoint(f.groupID, base.Sequence+1, base.ID, 1, f.clockMS+50)
+	founderBody := state.Checkpoint(f.groupID, base.Sequence+1, base.ID, 1, f.clockMS)
 	founderSignedCP, err := SignCheckpoint(f.founder, f.info(f.founder), founderBody)
 	if err != nil {
 		t.Fatal(err)
@@ -1697,5 +1721,164 @@ func TestFounderIssuesAfterLeavingWhileADemotedAdminCannot(t *testing.T) {
 	f.apply(f.sign(f.founder, Record{Kind: KindRemove, Subject: f.info(admin)}))
 	if f.group.CanAdminister(f.memberID(admin)) {
 		t.Fatal("a removed admin kept the authority to issue invites")
+	}
+}
+
+// Retirement is irreversible, so the coverage bound may not move backwards.
+// A second chain dated behind one whose records were already deleted used to
+// win the sequence - the sibling rule preferred the earlier timestamp - and
+// the membership those records carried went with them: a member that had
+// properly joined simply vanished, on every node, deterministically.
+func TestALaterChainDoesNotLoseAMemberToAnEarlierSibling(t *testing.T) {
+	f := newFixture(t, DefaultPolicy())
+	joiner := mustIdentity(t)
+
+	if _, signed, err := f.group.SignCheckpoint(f.founder, true); err != nil || !signed {
+		t.Fatalf("base checkpoint: signed=%t err=%v", signed, err)
+	}
+	base := f.group.Canonical()
+	f.tick(1_000)
+	f.join(joiner)
+	f.tick(1_000)
+	if _, signed, err := f.group.SignCheckpoint(f.founder, true); err != nil || !signed {
+		t.Fatalf("folding checkpoint: signed=%t err=%v", signed, err)
+	}
+	f.tick(1_000)
+	if _, signed, err := f.group.SignCheckpoint(f.founder, true); err != nil || !signed {
+		t.Fatalf("retiring checkpoint: signed=%t err=%v", signed, err)
+	}
+	head := f.group.Canonical()
+	if !f.group.IsMemberID(f.memberID(joiner)) || len(f.group.Pending()) != 0 {
+		t.Fatalf("fixture did not retire the join: member=%v pending=%d",
+			f.group.IsMemberID(f.memberID(joiner)), len(f.group.Pending()))
+	}
+
+	// The other chain: two founder-signed siblings dated earlier, carrying the
+	// membership as it stood before the join. Both are valid on their own.
+	previous := base
+	for sequence := base.Sequence + 1; sequence <= head.Sequence; sequence++ {
+		body := previous
+		body.ID = entmoot.RosterEntryID{}
+		body.Sequence = sequence
+		body.Previous = previous.ID
+		body.Timestamp = previous.Timestamp + 1
+		body.Covered = 0
+		body.Members = []entmoot.NodeInfo{f.info(f.founder)}
+		body.Signature = nil
+		signed, err := SignCheckpoint(f.founder, f.info(f.founder), body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.group.ApplyCheckpoint(signed); err != nil {
+			t.Fatalf("sibling at sequence %d was refused: %v", sequence, err)
+		}
+		previous = signed
+	}
+
+	if got := f.group.Canonical().Timestamp; got < head.Timestamp {
+		t.Fatalf("canonical moved back in time, from %d to %d", head.Timestamp, got)
+	}
+	if !f.group.IsMemberID(f.memberID(joiner)) {
+		t.Fatal("the group forgot a member it admitted")
+	}
+}
+
+// The same rule against the strongest possible sibling: one the FOUNDER
+// signed, dated earlier than the admin-signed chain the group is on. Founder
+// preference is a tie-break, not a licence to move the coverage bound back -
+// preferring it first lost the member the admins' chain had folded in.
+func TestAnEarlierFounderSiblingDoesNotRewindAnAdminChain(t *testing.T) {
+	f := newFixture(t, DefaultPolicy())
+	admin := mustIdentity(t)
+	f.join(admin)
+	f.grantAdmin(f.memberID(admin))
+	f.tick(10)
+	if _, signed, err := f.group.SignCheckpoint(f.founder, true); err != nil || !signed {
+		t.Fatalf("base checkpoint: signed=%t err=%v", signed, err)
+	}
+	base := f.group.Canonical()
+
+	// The admin folds a joiner in and then retires the record behind it.
+	joiner := mustIdentity(t)
+	f.tick(1_000)
+	f.join(joiner)
+	f.tick(1_000)
+	if _, signed, err := f.group.SignCheckpoint(admin, true); err != nil || !signed {
+		t.Fatalf("admin checkpoint: signed=%t err=%v", signed, err)
+	}
+	f.tick(1_000)
+	if _, signed, err := f.group.SignCheckpoint(admin, true); err != nil || !signed {
+		t.Fatalf("second admin checkpoint: signed=%t err=%v", signed, err)
+	}
+	head := f.group.Canonical()
+	if len(f.group.Pending()) != 0 || !f.group.IsMemberID(f.memberID(joiner)) {
+		t.Fatalf("fixture did not retire the join: pending=%d member=%v",
+			len(f.group.Pending()), f.group.IsMemberID(f.memberID(joiner)))
+	}
+
+	// The founder's own chain for the same sequences, dated earlier and
+	// without the joiner.
+	previous := base
+	for sequence := base.Sequence + 1; sequence <= head.Sequence; sequence++ {
+		body := previous
+		body.ID = entmoot.RosterEntryID{}
+		body.Sequence = sequence
+		body.Previous = previous.ID
+		body.Timestamp = previous.Timestamp + 1
+		body.Covered = 0
+		body.Members = []entmoot.NodeInfo{f.info(f.founder), f.info(admin)}
+		sortCheckpointMembers(&body)
+		body.Signature = nil
+		signed, err := SignCheckpoint(f.founder, f.info(f.founder), body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.group.ApplyCheckpoint(signed); err != nil {
+			t.Fatalf("founder sibling at sequence %d was refused: %v", sequence, err)
+		}
+		previous = signed
+	}
+
+	if got := f.group.Canonical().Timestamp; got < head.Timestamp {
+		t.Fatalf("an earlier founder-signed chain pulled the bound back, from %d to %d", head.Timestamp, got)
+	}
+	if !f.group.IsMemberID(f.memberID(joiner)) {
+		t.Fatal("the group forgot a member the admin chain admitted")
+	}
+}
+
+// The tie-break itself, in both id orders. The behavioural test above cannot
+// pin it: at one timestamp the loser is decided by id, and whether the
+// founder's id happens to sort first depends on a freshly generated key, so
+// dropping the signer clause passed or failed by luck.
+func TestFounderSignsTheTieWhicheverIDSortsFirst(t *testing.T) {
+	f := newFixture(t, DefaultPolicy())
+	admin := mustIdentity(t)
+	founderInfo, adminInfo := f.info(f.founder), f.info(admin)
+
+	for _, order := range []string{"founder id first", "admin id first"} {
+		founderCP := Checkpoint{Sequence: 4, Timestamp: 5_000, Founder: founderInfo, Signer: founderInfo}
+		adminCP := Checkpoint{Sequence: 4, Timestamp: 5_000, Founder: founderInfo, Signer: adminInfo}
+		if order == "founder id first" {
+			founderCP.ID = entmoot.RosterEntryID{0x01}
+			adminCP.ID = entmoot.RosterEntryID{0x02}
+		} else {
+			founderCP.ID = entmoot.RosterEntryID{0x02}
+			adminCP.ID = entmoot.RosterEntryID{0x01}
+		}
+		if !checkpointBeats(founderCP, adminCP) {
+			t.Fatalf("%s: the admin's checkpoint beat the founder's at one timestamp", order)
+		}
+		if checkpointBeats(adminCP, founderCP) {
+			t.Fatalf("%s: the comparison is not antisymmetric", order)
+		}
+	}
+
+	// And the bound still decides ahead of the signer: an admin's later
+	// checkpoint beats the founder's earlier one.
+	later := Checkpoint{ID: entmoot.RosterEntryID{0x09}, Sequence: 4, Timestamp: 6_000, Founder: founderInfo, Signer: adminInfo}
+	earlier := Checkpoint{ID: entmoot.RosterEntryID{0x01}, Sequence: 4, Timestamp: 5_000, Founder: founderInfo, Signer: founderInfo}
+	if !checkpointBeats(later, earlier) {
+		t.Fatal("an earlier founder-signed checkpoint beat a later one, which moves the coverage bound back")
 	}
 }
