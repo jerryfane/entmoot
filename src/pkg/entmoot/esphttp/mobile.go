@@ -1360,6 +1360,38 @@ ON CONFLICT(device_id) DO UPDATE SET
 	return nil
 }
 
+// addStateColumn adds one column if it is missing, and treats "that column
+// already exists" as success.
+//
+// The check-then-ALTER it replaces was a race, and the race is real: the ESP
+// bridge and the daemon both open the same esp.sqlite, so a simultaneous
+// restart had them both read PRAGMA table_info, both decide the column was
+// missing, and the loser die on "duplicate column name". Observed in
+// production on 2026-09-17: the ESP exited 1 while the daemon started in the
+// same second, and only Restart=always brought it back. SQLite has no
+// ALTER TABLE ... ADD COLUMN IF NOT EXISTS, so the duplicate error IS the
+// idempotency check.
+func addStateColumn(db *sql.DB, table, column, stmt string) error {
+	if _, err := db.Exec(stmt); err != nil {
+		if isDuplicateColumn(err, column) {
+			return nil
+		}
+		return fmt.Errorf("esphttp: migrate state schema add %s.%s: %w", table, column, err)
+	}
+	return nil
+}
+
+// isDuplicateColumn reports the one error that means another writer already
+// added this column. It is matched narrowly - on the column name as well as
+// the phrase - so a different schema failure is never swallowed.
+func isDuplicateColumn(err error, column string) bool {
+	if err == nil {
+		return false
+	}
+	text := strings.ToLower(err.Error())
+	return strings.Contains(text, "duplicate column name") && strings.Contains(text, strings.ToLower(column))
+}
+
 func migrateSQLiteState(db *sql.DB) error {
 	signRequestCols, err := tableColumns(db, "sign_requests")
 	if err != nil {
@@ -1379,8 +1411,8 @@ func migrateSQLiteState(db *sql.DB) error {
 		if signRequestCols[stmt.name] {
 			continue
 		}
-		if _, err := db.Exec(stmt.sql); err != nil {
-			return fmt.Errorf("esphttp: migrate state schema add %s: %w", stmt.name, err)
+		if err := addStateColumn(db, "sign_requests", stmt.name, stmt.sql); err != nil {
+			return err
 		}
 	}
 
@@ -1389,13 +1421,15 @@ func migrateSQLiteState(db *sql.DB) error {
 		return err
 	}
 	if !openInviteCols["bootstrap_peers"] {
-		if _, err := db.Exec(`ALTER TABLE esp_open_invites ADD COLUMN bootstrap_peers BLOB`); err != nil {
-			return fmt.Errorf("esphttp: migrate state schema add bootstrap_peers: %w", err)
+		if err := addStateColumn(db, "esp_open_invites", "bootstrap_peers",
+			`ALTER TABLE esp_open_invites ADD COLUMN bootstrap_peers BLOB`); err != nil {
+			return err
 		}
 	}
 	if !openInviteCols["no_fallback_peers"] {
-		if _, err := db.Exec(`ALTER TABLE esp_open_invites ADD COLUMN no_fallback_peers INTEGER NOT NULL DEFAULT 0`); err != nil {
-			return fmt.Errorf("esphttp: migrate state schema add no_fallback_peers: %w", err)
+		if err := addStateColumn(db, "esp_open_invites", "no_fallback_peers",
+			`ALTER TABLE esp_open_invites ADD COLUMN no_fallback_peers INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return err
 		}
 	}
 	redemptionCols, err := tableColumns(db, "esp_open_invite_redemptions")
@@ -1403,8 +1437,9 @@ func migrateSQLiteState(db *sql.DB) error {
 		return err
 	}
 	if !redemptionCols["result"] {
-		if _, err := db.Exec(`ALTER TABLE esp_open_invite_redemptions ADD COLUMN result BLOB`); err != nil {
-			return fmt.Errorf("esphttp: migrate state schema add result: %w", err)
+		if err := addStateColumn(db, "esp_open_invite_redemptions", "result",
+			`ALTER TABLE esp_open_invite_redemptions ADD COLUMN result BLOB`); err != nil {
+			return err
 		}
 	}
 	liveConfigCols, err := tableColumns(db, "esp_live_agent_configs")
@@ -1421,8 +1456,8 @@ func migrateSQLiteState(db *sql.DB) error {
 		if liveConfigCols[stmt.name] {
 			continue
 		}
-		if _, err := db.Exec(stmt.sql); err != nil {
-			return fmt.Errorf("esphttp: migrate state schema add live config %s: %w", stmt.name, err)
+		if err := addStateColumn(db, "esp_live_agent_configs", stmt.name, stmt.sql); err != nil {
+			return err
 		}
 	}
 	liveCursorCols, err := tableColumns(db, "esp_live_agent_cursors")
@@ -1441,8 +1476,8 @@ func migrateSQLiteState(db *sql.DB) error {
 		if liveCursorCols[stmt.name] {
 			continue
 		}
-		if _, err := db.Exec(stmt.sql); err != nil {
-			return fmt.Errorf("esphttp: migrate state schema add live cursor %s: %w", stmt.name, err)
+		if err := addStateColumn(db, "esp_live_agent_cursors", stmt.name, stmt.sql); err != nil {
+			return err
 		}
 	}
 	return nil

@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The ESP state-schema migration no longer dies when another process migrates
+  the same database first. It checked each column with `PRAGMA table_info` and
+  then issued `ALTER TABLE ... ADD COLUMN`, which is a race: the ESP bridge and
+  the daemon both open `esp.sqlite`, so a simultaneous restart had both read
+  the same schema, both decide a column was missing, and the loser exit on
+  `duplicate column name`. It happened in production on 2026-09-17 during the
+  v1.5.82 deploy - the ESP went down and only `Restart=always` brought it back
+  five seconds later. SQLite has no `ADD COLUMN IF NOT EXISTS`, so the
+  duplicate error is now the idempotency check, matched on the column name as
+  well as the phrase so no other schema failure is swallowed.
+
+
 ## [1.5.82] - 2026-09-17
 
 ### Added
