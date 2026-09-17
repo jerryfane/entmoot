@@ -556,7 +556,7 @@ func TestRefusalTextIsBounded(t *testing.T) {
 // connection and never writes, so the probe can only end at the deadline it
 // handed out, and the elapsed time IS the deadline. Without the floor a peer
 // gets a sub-millisecond deadline and is called unreachable for arithmetic
-// reasons rather than network ones - and because `doctor -probe-timeout`
+// reasons rather than network ones - and because `doctor -timeout`
 // reaches probePeers unfiltered, the caller was able to ask for exactly that.
 func TestProbeGivesEachPeerTheFloor(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())

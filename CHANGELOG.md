@@ -12,10 +12,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A probe budget below one peer-slice no longer defeats the floor it is
   measured against. `probePeers` clamped its per-peer slice and its
   remaining-time budget to `minProbeSlice` but not the incoming budget, so
-  `doctor -probe-timeout 1ms` - an operator value forwarded unfiltered -
+  `doctor -timeout 1ms` - an operator value forwarded unfiltered -
   refused every peer with "not attempted: probe budget spent" instead of
-  probing any of them. The budget is now clamped at entry too. This also
-  removes a 1-in-130 test flake whose window was the 1ms the caller asked for.
+  probing any of them. The budget is now clamped at entry too, so `probePeers`
+  cannot return before one slice has passed however starved the machine is.
+  That also closes a rare flake in `TestProbeGivesEachPeerTheFloor` whose
+  window was the 1ms the caller asked for: 4 failures in 520 runs under heavy
+  oversubscription before the clamp, 0 in 520 after. An idle machine does not
+  reproduce it.
 
 ### Removed
 
@@ -31,10 +35,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Member-signature authentication now has a round-trip test: a correctly signed
   `GET /v1/session` returning the member echo, plus the replay, clock-window
   and impersonation refusals. It had none.
-- The profile total-order sweep builds two state stores instead of 264. The
-  132 record pairs are isolated by member id, not by database, so the
-  per-pair store bought nothing: the `esphttp` package now tests in 20s
-  instead of 48s.
+- The profile total-order sweep builds six state stores instead of 264 - two
+  shared ones, plus a fresh pair for the first case so the cold-store path
+  stays covered. The 132 record pairs are isolated by member id, not by
+  database, so the per-pair store bought nothing: the `esphttp` package now
+  tests in 20s instead of 48s.
 - One serveability predicate, spelled two ways: `membershipExists` and
   `groupMembershipExists` are gone in favour of `membership.Exists`, which
   eight call sites already used.

@@ -84,9 +84,14 @@ func memberSessionUnauthorizedMessage(t *testing.T, handler http.Handler, req *h
 
 // TestMemberSignedSessionRoundTrip is the only exercise of a *successful*
 // member-signed request: the scheme the iPhone app authenticates with. It
-// proves the signing input the client must reproduce, the identity the server
-// echoes back, and the three refusals that stop a captured request from being
-// replayed, back-dated, or reused under someone else's member id.
+// proves the identity the server echoes back and the three refusals that stop
+// a captured request from being replayed, back-dated, or reused under someone
+// else's member id.
+//
+// It does NOT pin the signing input: it signs with the same
+// MemberSigningInput the server verifies with, so a change to the canonical
+// layout keeps this green while invalidating every deployed client's
+// signature. TestMemberSigningInputIsFrozen is what defends that.
 func TestMemberSignedSessionRoundTrip(t *testing.T) {
 	now := time.UnixMilli(1_700_000_000_000)
 	handler := testMobileHandlerFull(t, testGroupID(21), nil, nil, func() time.Time { return now }, nil, NewMemoryStateStore(), nil)
@@ -157,4 +162,49 @@ func TestMemberSignedSessionRoundTrip(t *testing.T) {
 			t.Errorf("impersonation message = %q, want %q", msg, "member id does not match public key")
 		}
 	})
+}
+
+// A golden vector over MemberSigningInput. The round-trip test above signs
+// with the same function the server verifies with, so it stays green if the
+// canonical layout changes - field order, the version prefix, the body-hash
+// encoding - while every signature a deployed iPhone client produces becomes
+// invalid. These bytes were produced by this code and must not move without a
+// client release: the fixed key, timestamp and nonce make the expected
+// signature exact.
+func TestMemberSigningInputIsFrozen(t *testing.T) {
+	const (
+		wantMemberID  = "mpPB7OcXItIdNQKxrg2PnaqGlxnA4b3OrePAjZUQuYo="
+		wantPeerID    = "12D3KooWRawPbxPtP1eZaJpumGnyWX2DcUyd3RQnydr3eAto4Az7"
+		wantPubKey    = "6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw="
+		wantSignature = "ceBe+/ezCHpmAN99yODSEIZ8GcAakPgdmENAcLy6G3vhR+WDPUHAlrAC0qMSQykdu8619XHjy8VM7uV+fQcjBQ=="
+		wantInput     = "ENTMOOT-ESP-MEMBER-AUTH-V2\n" +
+			"GET\n" +
+			"/v1/session\n" +
+			wantMemberID + "\n" +
+			wantPeerID + "\n" +
+			wantPubKey + "\n" +
+			"1700000000000\n" +
+			"golden-nonce\n" +
+			"47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU="
+	)
+
+	signer := newTestMemberSigner(t, 0x07)
+	if got := signer.memberID.String(); got != wantMemberID {
+		t.Fatalf("member id = %q, want %q (the vector's key changed)", got, wantMemberID)
+	}
+	if signer.peerID != wantPeerID {
+		t.Fatalf("peer id = %q, want %q", signer.peerID, wantPeerID)
+	}
+	if got := base64.StdEncoding.EncodeToString(signer.pub); got != wantPubKey {
+		t.Fatalf("public key = %q, want %q", got, wantPubKey)
+	}
+
+	got := MemberSigningInput("GET", "/v1/session", signer.memberID, signer.peerID, signer.pub, 1700000000000, "golden-nonce", nil)
+	if got != wantInput {
+		t.Fatalf("signing input changed:\n got %q\nwant %q", got, wantInput)
+	}
+	gotSignature := base64.StdEncoding.EncodeToString(ed25519.Sign(signer.priv, []byte(got)))
+	if gotSignature != wantSignature {
+		t.Fatalf("signature = %q, want %q", gotSignature, wantSignature)
+	}
 }

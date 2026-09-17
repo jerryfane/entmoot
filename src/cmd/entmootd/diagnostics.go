@@ -87,7 +87,7 @@ func cmdDoctor(gf *globalFlags, args []string) int {
 	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
 	groupStr := fs.String("group", "", "base64 group id (optional; defaults to all groups)")
 	probe := fs.Bool("probe", false, "ask the running daemon to dial each other member and report which answer")
-	timeout := fs.Duration("timeout", defaultProbeBudget, "budget for the whole probe, not per peer")
+	timeout := fs.Duration("timeout", defaultProbeBudget, "budget for the whole probe, not per peer; raised to one peer-slice if smaller")
 	jsonOutput := fs.Bool("json", false, "print JSON")
 	redact := fs.Bool("redact", false, "omit local runtime paths and the data directory, for sharing a report")
 	if err := fs.Parse(args); err != nil {

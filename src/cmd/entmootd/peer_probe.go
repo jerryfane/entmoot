@@ -68,7 +68,7 @@ func (r *groupRuntime) probePeers(ctx context.Context, groupID entmoot.GroupID, 
 	if budget < minProbeSlice {
 		// The floor binds the budget, not only the slices carved out of it.
 		// Clamping the slice alone left the incoming budget free to defeat
-		// it: `doctor -probe-timeout 1ms` (join.go passes the operator's
+		// it: `doctor -timeout 1ms` (join.go passes the operator's
 		// value straight through) set a deadline that was already spent by
 		// the time the workers ran, so every member was refused with
 		// arithmetic - "not attempted: probe budget spent" - without one
