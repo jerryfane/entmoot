@@ -21,10 +21,10 @@ const AdminPolicyType = "admins/v1"
 // founder believed the set had changed.
 const adminPolicyFamily = "admins/"
 
-// MaxAdmins bounds the delegated-admin set. Roster changes stay strictly
+// maxAdmins bounds the delegated-admin set. Roster changes stay strictly
 // linear, so every admin is a concurrent writer competing for the same head;
 // a small ceiling keeps that contention survivable.
-const MaxAdmins = 16
+const maxAdmins = 16
 
 // AdminPolicy is the payload of a founder-signed "policy_change" entry. It
 // replaces the delegated-admin set wholesale: the entry states the complete
@@ -42,9 +42,9 @@ type policyDiscriminator struct {
 	Type string `json:"type"`
 }
 
-// IsAdminPolicy reports whether a policy_change payload is an admin-set change
+// isAdminPolicy reports whether a policy_change payload is an admin-set change
 // rather than some other policy this build does not interpret.
-func IsAdminPolicy(payload []byte) bool {
+func isAdminPolicy(payload []byte) bool {
 	var probe policyDiscriminator
 	if err := json.Unmarshal(payload, &probe); err != nil {
 		return false
@@ -52,11 +52,11 @@ func IsAdminPolicy(payload []byte) bool {
 	return probe.Type == AdminPolicyType
 }
 
-// IsUnknownAdminPolicy reports whether a payload claims to change the admin
+// isUnknownAdminPolicy reports whether a payload claims to change the admin
 // set in a version this build does not implement. Such an entry must not be
 // accepted: peers would disagree about who can sign next, and the node that
 // cannot read it would keep honouring admins the payload may have removed.
-func IsUnknownAdminPolicy(payload []byte) bool {
+func isUnknownAdminPolicy(payload []byte) bool {
 	var probe policyDiscriminator
 	if err := json.Unmarshal(payload, &probe); err != nil {
 		return false
@@ -64,10 +64,10 @@ func IsUnknownAdminPolicy(payload []byte) bool {
 	return strings.HasPrefix(probe.Type, adminPolicyFamily) && probe.Type != AdminPolicyType
 }
 
-// ParseAdminPolicy decodes an admin-set policy_change payload. Unknown fields
+// parseAdminPolicy decodes an admin-set policy_change payload. Unknown fields
 // and unknown types are refused: a payload that claims to set admins but that
 // this build cannot read must not be mistaken for "no admins".
-func ParseAdminPolicy(payload []byte) (AdminPolicy, error) {
+func parseAdminPolicy(payload []byte) (AdminPolicy, error) {
 	if len(payload) == 0 {
 		return AdminPolicy{}, fmt.Errorf("roster: empty policy payload")
 	}
@@ -80,8 +80,8 @@ func ParseAdminPolicy(payload []byte) (AdminPolicy, error) {
 	if policy.Type != AdminPolicyType {
 		return AdminPolicy{}, fmt.Errorf("roster: unsupported admin policy type %q", policy.Type)
 	}
-	if len(policy.Admins) > MaxAdmins {
-		return AdminPolicy{}, fmt.Errorf("roster: %d admins exceeds the ceiling of %d", len(policy.Admins), MaxAdmins)
+	if len(policy.Admins) > maxAdmins {
+		return AdminPolicy{}, fmt.Errorf("roster: %d admins exceeds the ceiling of %d", len(policy.Admins), maxAdmins)
 	}
 	for _, admin := range policy.Admins {
 		if admin == (entmoot.MemberID{}) {

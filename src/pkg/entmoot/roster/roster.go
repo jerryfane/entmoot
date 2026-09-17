@@ -4,9 +4,10 @@
 // projected against a checkpoint, with no head to contend for. This package is
 // what remains of the linear chain that preceded it, and it exists for one
 // purpose - deciding whether a legacy log found on disk is authentic before
-// pkg/entmoot/conversion adopts it. Nothing here appends, signs or persists;
-// the exported surface is ValidateEntries, ValidateLegacyJSONL and
-// CurrentEntryVersion.
+// pkg/entmoot/conversion adopts it. Nothing here appends, signs or persists.
+// The exported surface is ValidateEntries, ValidateLegacyJSONL and
+// CurrentEntryVersion, plus the admin-policy payload a legacy policy_change
+// carried (AdminPolicy and AdminPolicyType, which conversion fixtures build).
 //
 // The rules it enforces are the ones the chain was written under: entries come
 // from the founder or from a delegated admin named by a founder-signed
@@ -69,16 +70,18 @@ func newChain(groupID entmoot.GroupID) *chain {
 	}
 }
 
-// validate performs every non-genesis acceptance check. Entry 1 never reaches
-// it: both callers route the first entry to validateGenesis, so the log is
-// non-empty here by construction.
+// validate performs every non-genesis acceptance check. Both callers route the
+// first entry to validateGenesis, so no current input reaches it with an empty
+// log - but it refuses one rather than relying on that, because the checks
+// below read the head entry and a future caller that skipped genesis would
+// otherwise fail by panic instead of by ErrRosterReject.
 func (r *chain) validate(entry entmoot.RosterEntry) error {
+	if len(r.entries) == 0 {
+		return fmt.Errorf("%w: validate on an empty log; the genesis entry comes first", entmoot.ErrRosterReject)
+	}
 	founder := r.founder
 	head := r.head
-	var headTimestamp int64
-	if len(r.entries) > 0 {
-		headTimestamp = r.entries[len(r.entries)-1].Timestamp
-	}
+	headTimestamp := r.entries[len(r.entries)-1].Timestamp
 
 	switch entry.Op {
 	case "add", "remove", "policy_change":
@@ -128,15 +131,15 @@ func (r *chain) validate(entry entmoot.RosterEntry) error {
 		if len(entry.Policy) == 0 || !json.Valid(entry.Policy) {
 			return fmt.Errorf("%w: policy_change payload is not valid JSON", entmoot.ErrRosterReject)
 		}
-		if IsUnknownAdminPolicy(entry.Policy) {
+		if isUnknownAdminPolicy(entry.Policy) {
 			// It says it changes the admin set, in a version this build cannot
 			// read. Accepting it would leave the current admins standing here
 			// while a newer peer applied the change: the two nodes would then
 			// disagree about who may sign. Refuse and let the operator see it.
 			return fmt.Errorf("%w: policy_change names an admin policy version this build cannot apply", entmoot.ErrRosterReject)
 		}
-		if IsAdminPolicy(entry.Policy) {
-			if _, err := ParseAdminPolicy(entry.Policy); err != nil {
+		if isAdminPolicy(entry.Policy) {
+			if _, err := parseAdminPolicy(entry.Policy); err != nil {
 				return fmt.Errorf("%w: %v", entmoot.ErrRosterReject, err)
 			}
 		}
@@ -281,10 +284,10 @@ func (r *chain) apply(entry entmoot.RosterEntry) {
 		// delegated authority the bytes do not state would be the unsafe
 		// reading.
 		if len(stored.Policy) > 0 && json.Valid(stored.Policy) &&
-			!IsAdminPolicy(stored.Policy) && !IsUnknownAdminPolicy(stored.Policy) {
+			!isAdminPolicy(stored.Policy) && !isUnknownAdminPolicy(stored.Policy) {
 			break
 		}
-		policy, err := ParseAdminPolicy(stored.Policy)
+		policy, err := parseAdminPolicy(stored.Policy)
 		if err != nil {
 			r.logger.Warn("roster: unreadable policy_change; clearing delegated admins",
 				slog.String("entry_id", stored.ID.String()),
@@ -299,11 +302,11 @@ func (r *chain) apply(entry entmoot.RosterEntry) {
 	}
 }
 
-// adminInfo resolves a delegated admin's current member record.
-//
-// Delegation alone is enough to look up here: apply drops a removed member
-// from r.admins in the same step it drops it from the projection (see the
-// "remove" case), so a delegated id is always a current member.
+// adminInfo resolves a delegated admin's current member record. Both halves
+// are load-bearing: apply drops a removed member from r.admins with the
+// projection, but r.admins is filled wholesale from a policy payload that is
+// never required to name members, so a founder can delegate an id that was
+// never added - and the membership lookup is what refuses it.
 func (r *chain) adminInfo(memberID entmoot.MemberID) (entmoot.NodeInfo, bool) {
 	if _, delegated := r.admins[memberID]; !delegated {
 		return entmoot.NodeInfo{}, false

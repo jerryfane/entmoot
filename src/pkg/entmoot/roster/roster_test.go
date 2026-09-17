@@ -197,6 +197,61 @@ func TestValidateEntriesRefusesAnInauthenticChain(t *testing.T) {
 			l.op(founderKey, "add", strangerInfo, nil, 2_000)
 			l.op(strangerKey, "policy_change", entmoot.NodeInfo{}, adminPolicy(t, *strangerInfo.MemberID), 3_000)
 		},
+		"an admin removing the founder": func(l *legacyLog) {
+			l.genesis(founderKey, founderInfo, 1_000)
+			l.op(founderKey, "add", strangerInfo, nil, 2_000)
+			l.op(founderKey, "policy_change", entmoot.NodeInfo{}, adminPolicy(t, *strangerInfo.MemberID), 3_000)
+			l.op(strangerKey, "remove", founderInfo, nil, 4_000)
+		},
+		"an admin changing the admin set": func(l *legacyLog) {
+			l.genesis(founderKey, founderInfo, 1_000)
+			l.op(founderKey, "add", strangerInfo, nil, 2_000)
+			l.op(founderKey, "policy_change", entmoot.NodeInfo{}, adminPolicy(t, *strangerInfo.MemberID), 3_000)
+			l.op(strangerKey, "policy_change", entmoot.NodeInfo{}, adminPolicy(t, *memberInfo.MemberID), 4_000)
+		},
+		"a sequence that skips a place in the chain": func(l *legacyLog) {
+			l.genesis(founderKey, founderInfo, 1_000)
+			entry := l.op(founderKey, "add", memberInfo, nil, 2_000)
+			entry.Sequence = 7
+			entry.Signature = nil
+			sigInput, err := canonical.RosterEntrySigningBytes(entry)
+			if err != nil {
+				t.Fatal(err)
+			}
+			entry.Signature = founderKey.Sign(sigInput)
+			entry.ID = canonical.RosterEntryID(entry)
+			l.entries[len(l.entries)-1] = entry
+		},
+		"a version 0 genesis whose actor is not its subject": func(l *legacyLog) {
+			// A legacy genesis is self-signed by definition: the founder
+			// admits itself, so actor and subject are one node.
+			entry := entmoot.RosterEntry{
+				Op: "add", Subject: legacyNode(founderInfo, 7), Actor: 9, Timestamp: 1_000,
+			}
+			sigInput, err := canonical.RosterEntrySigningBytes(entry)
+			if err != nil {
+				t.Fatal(err)
+			}
+			entry.Signature = founderKey.Sign(sigInput)
+			entry.ID = canonical.RosterEntryID(entry)
+			l.entries = append(l.entries, entry)
+		},
+		"a version 0 entry carrying a version 2 member id": func(l *legacyLog) {
+			// Actor matches the subject's Pilot node id, so the genesis shape
+			// is right and the member id is the only version-2 field present.
+			subject := legacyNode(founderInfo, 7)
+			subject.MemberID = founderInfo.MemberID
+			entry := entmoot.RosterEntry{
+				Op: "add", Subject: subject, Actor: 7, Timestamp: 1_000,
+			}
+			sigInput, err := canonical.RosterEntrySigningBytes(entry)
+			if err != nil {
+				t.Fatal(err)
+			}
+			entry.Signature = founderKey.Sign(sigInput)
+			entry.ID = canonical.RosterEntryID(entry)
+			l.entries = append(l.entries, entry)
+		},
 		"an admin policy nobody can decode": func(l *legacyLog) {
 			l.genesis(founderKey, founderInfo, 1_000)
 			l.op(founderKey, "policy_change", entmoot.NodeInfo{}, []byte(`{"type":"admins/v1","admins":"not-a-list"}`), 2_000)
@@ -306,4 +361,25 @@ func TestValidateLegacyJSONLReadsTheFileItIsGiven(t *testing.T) {
 	if len(after) != len(before)-1 {
 		t.Fatalf("the validator rewrote the source it was given: %d bytes, want %d", len(after), len(before)-1)
 	}
+}
+
+// A guard with no current caller, pinned because the next caller is what it
+// exists for: validate is only ever reached after a genesis entry today, and
+// reaching it without one used to be refused - then, briefly, panicked.
+func TestValidateOnAnEmptyLogIsRefusedNotAPanic(t *testing.T) {
+	log := newLegacyLog(t)
+	founder, founderInfo := newIdentity(t)
+	_, memberInfo := newIdentity(t)
+	entry := log.sign(founder, entmoot.RosterEntry{
+		Op: "add", Subject: memberInfo, ActorMemberID: founderInfo.MemberID, Timestamp: 2_000,
+	})
+	if err := newChain(log.groupID).validate(entry); !errors.Is(err, entmoot.ErrRosterReject) {
+		t.Fatalf("validate on an empty log returned %v, want a rejection", err)
+	}
+}
+
+// legacyNode shapes a version 0 subject: a Pilot node id and a key, with no
+// member id, which is what the pre-cutover format carried.
+func legacyNode(info entmoot.NodeInfo, nodeID entmoot.NodeID) entmoot.NodeInfo {
+	return entmoot.NodeInfo{PilotNodeID: nodeID, EntmootPubKey: info.EntmootPubKey}
 }
