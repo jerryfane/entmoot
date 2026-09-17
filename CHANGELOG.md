@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A node whose coverage bound moves backwards now recovers the membership it
+  lost, instead of keeping the loss for ever. Retirement deletes records, so
+  when a branch that reaches further while dated earlier wins the walk, the
+  members those records carried disappear - and the peers that still hold
+  them were exactly the ones the node stopped asking, because the pull list
+  came from the current projection. Two changes make the repair happen on an
+  ordinary sync round: the pull list is now everyone recently seen as a
+  member, including members of the checkpoints this node still retains, and a
+  peer serves the records the CALLER's checkpoint has not folded in rather
+  than the ones its own has - it holds them for a checkpoint of lag anyway,
+  and a caller refuses whatever its own checkpoint already accounts for.
+  Holding the record again also restores the node's ability to refuse the
+  branch extension that would otherwise make the loss permanent.
+
 - Competing checkpoints at one sequence no longer lose a member. A
   checkpoint's timestamp is the coverage bound, and retirement is
   irreversible: the records behind the previous checkpoint are deleted. The

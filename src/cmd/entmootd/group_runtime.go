@@ -656,23 +656,12 @@ func (r *groupRuntime) membershipPeers(session *groupSession) []peer.AddrInfo {
 		}
 		return nil
 	}
-	memberIDs := session.group.MemberIDs()
-	ordered := make([]entmoot.MemberID, 0, len(memberIDs)+1)
-	if founder := session.group.Founder(); founder.MemberID != nil {
-		ordered = append(ordered, *founder.MemberID)
-	}
-	for _, memberID := range memberIDs {
-		if len(ordered) > 0 && memberID == ordered[0] {
-			continue
-		}
-		ordered = append(ordered, memberID)
-	}
-	out := make([]peer.AddrInfo, 0, len(ordered))
-	for _, memberID := range ordered {
-		info, found := session.group.MemberInfoByID(memberID)
-		if !found {
-			continue
-		}
+	// Everyone recently seen as a member, not just the current projection:
+	// when this node's coverage bound moves backwards, the members it lost are
+	// the peers holding the records that restore them, and a list drawn from
+	// the survivors can never ask for them back.
+	out := make([]peer.AddrInfo, 0, maxMembershipSyncPeers)
+	for _, info := range session.group.ReachableMemberInfos() {
 		binding, err := libp2ptransport.BindingFromPublicKey(info.EntmootPubKey)
 		if err != nil || binding.PeerID == r.host.ID() {
 			continue

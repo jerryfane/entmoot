@@ -1889,3 +1889,68 @@ func TestFounderSignsTheTieWhicheverIDSortsFirst(t *testing.T) {
 		t.Fatal("an earlier founder-signed checkpoint beat a later one, which moves the coverage bound back")
 	}
 }
+
+// Who to ask for records when the projection itself is what went wrong. If
+// this node's coverage bound moves backwards, the members it just lost are
+// the peers holding the records that restore them, so a list drawn from the
+// current projection alone can never ask for them back.
+func TestReachableMemberInfosKeepsMembersTheProjectionLost(t *testing.T) {
+	f := newFixture(t, DefaultPolicy())
+	joiner := mustIdentity(t)
+	joinerID := f.memberID(joiner)
+	if _, signed, err := f.group.SignCheckpoint(f.founder, true); err != nil || !signed {
+		t.Fatalf("base checkpoint: signed=%t err=%v", signed, err)
+	}
+	base := f.group.Canonical()
+	f.tick(1_000)
+	f.join(joiner)
+	f.tick(1_000)
+	if _, signed, err := f.group.SignCheckpoint(f.founder, true); err != nil || !signed {
+		t.Fatalf("folding checkpoint: signed=%t err=%v", signed, err)
+	}
+	f.tick(1_000)
+	if _, signed, err := f.group.SignCheckpoint(f.founder, true); err != nil || !signed {
+		t.Fatalf("retiring checkpoint: signed=%t err=%v", signed, err)
+	}
+	head := f.group.Canonical()
+	if !f.group.IsMemberID(joinerID) || len(f.group.Pending()) != 0 {
+		t.Fatalf("fixture did not retire the join: member=%v pending=%d",
+			f.group.IsMemberID(joinerID), len(f.group.Pending()))
+	}
+
+	// A branch forking from the base that reaches one sequence further while
+	// dated earlier, and without the joiner: it wins, and the record that
+	// would restore the joiner is already deleted.
+	previous := base
+	for sequence := base.Sequence + 1; sequence <= head.Sequence+1; sequence++ {
+		body := previous
+		body.ID = entmoot.RosterEntryID{}
+		body.Sequence = sequence
+		body.Previous = previous.ID
+		body.Timestamp = previous.Timestamp + 1
+		body.Covered = 0
+		body.Members = []entmoot.NodeInfo{f.info(f.founder)}
+		body.Signature = nil
+		signed, err := SignCheckpoint(f.founder, f.info(f.founder), body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.group.ApplyCheckpoint(signed); err != nil {
+			t.Fatalf("branch at sequence %d: %v", sequence, err)
+		}
+		previous = signed
+	}
+	if f.group.IsMemberID(joinerID) {
+		t.Fatal("the fixture did not drop the joiner, so this proves nothing")
+	}
+
+	var found bool
+	for _, info := range f.group.ReachableMemberInfos() {
+		if id, err := entmoot.ResolvedMemberID(info); err == nil && id == joinerID {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("the lost member is not reachable, so this node cannot ask the peer that holds its record")
+	}
+}

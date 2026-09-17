@@ -368,6 +368,37 @@ func (g *Group) Pending() []Record {
 	return out
 }
 
+// PendingFor returns the records this node holds that BASE has not folded in,
+// which is what a peer arriving at base still needs.
+//
+// Pending answers the same question against this node's own canonical
+// checkpoint, and that is the wrong bound to use for somebody else: the
+// records are kept for one checkpoint of lag, so a peer whose own coverage
+// bound is lower than ours - it is behind, or its bound moved backwards when
+// a branch that reaches further while dated earlier won its walk - needs
+// exactly the records we call covered and still hold. Serving them is safe in
+// both directions: the receiver refuses anything its own checkpoint already
+// accounts for, and a peer in step with us gets the same set Pending would
+// have returned.
+func (g *Group) PendingFor(base Checkpoint) []Record {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	out := make([]Record, 0, len(g.records))
+	for _, rec := range g.records {
+		if coveredBy(base, rec) {
+			continue
+		}
+		out = append(out, cloneRecord(rec))
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Timestamp != out[j].Timestamp {
+			return out[i].Timestamp < out[j].Timestamp
+		}
+		return bytes.Compare(out[i].ID[:], out[j].ID[:]) < 0
+	})
+	return out
+}
+
 // EffectivePendingCount is how many retained records changed the state, which
 // is what the checkpoint cadence counts.
 func (g *Group) EffectivePendingCount() int {
@@ -549,6 +580,49 @@ func (g *Group) MemberIDs() []entmoot.MemberID {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 	return g.state.MemberIDs()
+}
+
+// ReachableMemberInfos is everyone this node has recently seen as a member:
+// the current projection first, then members of the checkpoints it still
+// retains, deduplicated, each with the newest record this node holds for it.
+//
+// It exists because the current projection is the wrong list to ask when the
+// projection itself is what went wrong. If this node's coverage bound moves
+// backwards - a branch that reaches further while dated earlier wins, see the
+// KNOWN GAP on settleCanonicalLocked - the members it just lost are exactly
+// the peers holding the records that would restore them, and asking only the
+// survivors can never get them back.
+func (g *Group) ReachableMemberInfos() []entmoot.NodeInfo {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	out := make([]entmoot.NodeInfo, 0, len(g.state.Members))
+	seen := make(map[entmoot.MemberID]struct{}, len(g.state.Members))
+	add := func(id entmoot.MemberID, info entmoot.NodeInfo) {
+		if _, already := seen[id]; already {
+			return
+		}
+		seen[id] = struct{}{}
+		out = append(out, cloneNodeInfo(info))
+	}
+	if founder, err := entmoot.ResolvedMemberID(g.state.Founder); err == nil {
+		add(founder, g.state.Founder)
+	}
+	for _, id := range g.state.MemberIDs() {
+		add(id, g.state.Members[id])
+	}
+	// Retained checkpoints, newest sequence first, so a member the newest one
+	// dropped is still tried before one only an old checkpoint knew.
+	retained := make([]Checkpoint, 0, len(g.checkpoints))
+	for _, cp := range g.checkpoints {
+		retained = append(retained, cp)
+	}
+	sort.Slice(retained, func(i, j int) bool { return retained[i].Sequence > retained[j].Sequence })
+	for _, cp := range retained {
+		for id, info := range g.membersAt[cp.ID] {
+			add(id, info)
+		}
+	}
+	return out
 }
 
 // MemberAt answers whether a member was in the group at a cited checkpoint,

@@ -148,8 +148,29 @@ func (s *SyncServer) handleMembership(stream network.Stream) {
 		response.Checkpoints = checkpoints
 	}
 
+	// Against the CALLER's bound, not ours. A caller whose bound is lower
+	// than ours - behind, or rewound by a branch that reaches further while
+	// dated earlier - needs the records we still hold and call covered, and
+	// they are the only copy it can get. When we do not know the checkpoint
+	// it names we fall back to our own bound, which is what this served
+	// before.
+	base := canonical
+	if caller, known := group.CheckpointByID(request.HaveCheckpoint); known {
+		if caller.Timestamp < canonical.Timestamp {
+			base = caller
+		}
+	} else {
+		// A checkpoint we do not hold: the caller is on a branch of its own,
+		// or has none yet. We cannot read its bound - the request carries no
+		// timestamp and adding a field would break every current peer, which
+		// refuses unknown fields - so serve the whole window we still hold and
+		// let the caller refuse what its own checkpoint covers. The window is
+		// one checkpoint of lag, so this is bounded, and it is the only way a
+		// node whose bound moved backwards can get those records back.
+		base = membership.Checkpoint{}
+	}
 	limit := boundedLimit(request.Limit, maxMembershipRecords, maxMembershipRecords)
-	for _, record := range group.Pending() {
+	for _, record := range group.PendingFor(base) {
 		if !afterCursor(record, request.AfterTimestamp, request.AfterID) {
 			continue
 		}

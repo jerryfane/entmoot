@@ -1,10 +1,12 @@
 package libp2ptransport
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"slices"
+	"sort"
 	"testing"
 	"time"
 
@@ -661,4 +663,79 @@ func TestSyncBootstrapAuthorityAndMembership(t *testing.T) {
 	// invite outranks the removal notice because it authorises the read.
 	second := mustInvite(t, group, founder, target.PublicKey, 0, []string{serverHost.ID().String()})
 	check("fresh_invite_after_removal", &second, "")
+}
+
+// A pull that lowers this node's coverage bound re-reads the peer's window in
+// the same call. The walk can move canonical to a branch that reaches further
+// while dated earlier (see membership.settleCanonicalLocked), which un-covers
+// records this node had already retired - and those records are exactly what
+// the peer serving the branch may still hold. Continuing past the cursor
+// leaves the member lost until some later tick, and a node holding no record
+// cannot refuse the branch extension that makes the loss permanent.
+func TestPullRecoversRecordsWhenTheBoundDrops(t *testing.T) {
+	joiner := mustIdentity(t)
+	p := newMembershipSyncPair(t, joiner)
+	joinerID := *mustNode(t, joiner).MemberID
+
+	// The server folds every record in and retires them, so its own answer
+	// carries checkpoints plus the records behind them.
+	if _, signed, err := p.group.SignCheckpoint(p.founder, true); err != nil || !signed {
+		t.Fatalf("first checkpoint: signed=%t err=%v", signed, err)
+	}
+	client := p.adoptClient(t)
+	if _, _, _, err := FetchMembership(p.ctx, p.clientHost, p.remote, client, p.clientMemberID); err != nil {
+		t.Fatal(err)
+	}
+	if !client.IsMemberID(joinerID) {
+		t.Fatal("the client did not learn the joiner, so the rest proves nothing")
+	}
+
+	// Now the client adopts a branch of its own that reaches further while
+	// dated earlier: canonical moves back and the joiner disappears.
+	base := client.Canonical()
+	previous := p.root
+	for sequence := p.root.Sequence + 1; sequence <= base.Sequence+1; sequence++ {
+		body := previous
+		body.ID = entmoot.RosterEntryID{}
+		body.Sequence = sequence
+		body.Previous = previous.ID
+		body.Timestamp = previous.Timestamp + 1
+		body.Covered = 0
+		body.Members = []entmoot.NodeInfo{mustNode(t, p.founder), mustNode(t, p.member)}
+		sortNodeInfos(body.Members)
+		body.Signature = nil
+		signed, err := membership.SignCheckpoint(p.founder, mustNode(t, p.founder), body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := client.ApplyCheckpoint(signed); err != nil {
+			t.Fatalf("sibling branch at sequence %d: %v", sequence, err)
+		}
+		previous = signed
+	}
+	dropped := client.Canonical()
+	if dropped.Timestamp >= base.Timestamp || client.IsMemberID(joinerID) {
+		t.Fatalf("fixture did not drop the bound: ts %d -> %d, member=%v",
+			base.Timestamp, dropped.Timestamp, client.IsMemberID(joinerID))
+	}
+
+	// One ordinary pull from the peer that still holds the window restores it.
+	if _, records, _, err := FetchMembership(p.ctx, p.clientHost, p.remote, client, p.clientMemberID); err != nil {
+		t.Fatal(err)
+	} else if records == 0 {
+		t.Fatal("the peer served no record, so it withheld the window it still holds")
+	}
+	if !client.IsMemberID(joinerID) {
+		t.Fatal("the pull left the member lost, so a node whose bound dropped cannot recover")
+	}
+}
+
+// sortNodeInfos puts a hand-built member list in the order a real checkpoint
+// carries, so the signature covers a well-formed body.
+func sortNodeInfos(members []entmoot.NodeInfo) {
+	sort.Slice(members, func(i, j int) bool {
+		left, _ := entmoot.ResolvedMemberID(members[i])
+		right, _ := entmoot.ResolvedMemberID(members[j])
+		return bytes.Compare(left[:], right[:]) < 0
+	})
 }
