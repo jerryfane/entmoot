@@ -253,6 +253,11 @@ func daemonHostConfig(gf *globalFlags) (libp2ptransport.HostConfig, error) {
 		return libp2ptransport.HostConfig{}, err
 	}
 	config.ControlledRelays = relays
+	service, err := daemonRelayService(gf)
+	if err != nil {
+		return libp2ptransport.HostConfig{}, err
+	}
+	config.RelayService = service
 	switch gf.connectivity {
 	case "", "direct":
 		config.ListenAddrs = []string{fmt.Sprintf("/ip4/0.0.0.0/tcp/%d", gf.listenPort)}
@@ -265,6 +270,51 @@ func daemonHostConfig(gf *globalFlags) (libp2ptransport.HostConfig, error) {
 		return libp2ptransport.HostConfig{}, fmt.Errorf("unsupported connectivity profile %q", gf.connectivity)
 	}
 	return config, nil
+}
+
+// daemonRelayService reads -relay-service and its allowlist. The caps match
+// `relay serve`'s defaults, because the service is the same one: this only
+// decides whether it runs on the daemon's host instead of its own.
+//
+// Two things it deliberately does not do. It does not invent an allowlist -
+// an open relay is a service for strangers, and the flag exists so an
+// operator can relay for their OWN peers. And it does not touch the announced
+// address list, so the addresses this daemon puts in its invites stay its own
+// (see RelayServiceOptions).
+func daemonRelayService(gf *globalFlags) (*libp2ptransport.RelayServerConfig, error) {
+	if !gf.relayService {
+		if len(gf.relayAllowPeers) > 0 {
+			return nil, errors.New("-relay-allow-peer requires -relay-service")
+		}
+		return nil, nil
+	}
+	if len(gf.relayAllowPeers) == 0 {
+		return nil, errors.New("-relay-service requires at least one -relay-allow-peer")
+	}
+	// The transport refuses this pairing too, but that refusal surfaces as a
+	// transport failure. Flag misuse has to read as flag misuse, or a
+	// supervisor retries a configuration error as if it were a network fault.
+	if gf.connectivity == "relay-only" {
+		return nil, errors.New("-relay-service cannot be used with -connectivity relay-only")
+	}
+	allowed := make([]libpeer.ID, 0, len(gf.relayAllowPeers))
+	for _, raw := range gf.relayAllowPeers {
+		id, err := libpeer.Decode(raw)
+		if err != nil {
+			return nil, fmt.Errorf("relay allow peer %q: %w", raw, err)
+		}
+		allowed = append(allowed, id)
+	}
+	return &libp2ptransport.RelayServerConfig{
+		AllowedPeers:          allowed,
+		ReservationTTL:        time.Hour,
+		CircuitDuration:       15 * time.Minute,
+		CircuitBytes:          64 << 20,
+		MaxReservations:       128,
+		MaxCircuitsPerPeer:    16,
+		MaxReservationsPerIP:  8,
+		MaxReservationsPerASN: 32,
+	}, nil
 }
 
 // parseControlledRelays resolves repeatable -controlled-relay multiaddrs. In the

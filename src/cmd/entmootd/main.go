@@ -37,6 +37,8 @@ type globalFlags struct {
 	logLevel         string
 	connectivity     string
 	controlledRelays stringListFlag
+	relayService     bool
+	relayAllowPeers  stringListFlag
 }
 
 func main() {
@@ -129,6 +131,8 @@ func run() int {
 	fs.StringVar(&gf.logLevel, "log-level", "info", "slog level: debug|info|warn|error")
 	fs.StringVar(&gf.connectivity, "connectivity", "direct", "connectivity profile: direct|relay-only")
 	fs.Var(&gf.controlledRelays, "controlled-relay", "controlled Circuit Relay v2 multiaddr ending in /p2p/<peer-id>; repeatable")
+	fs.BoolVar(&gf.relayService, "relay-service", false, "also relay for -relay-allow-peer members from this daemon (publicly reachable hosts only)")
+	fs.Var(&gf.relayAllowPeers, "relay-allow-peer", "peer id allowed to reserve on this daemon's relay service; repeatable, required with -relay-service")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -159,6 +163,15 @@ func run() int {
 	if v, err := expandHome(gf.data); err == nil {
 		gf.data = v
 	} else {
+		fmt.Fprintf(os.Stderr, "entmootd: %v\n", err)
+		return exitInvalidArgument
+	}
+
+	// Validated here, not where the host is built: the relay flags are global,
+	// and serve reaches its group precondition first, so an operator setting
+	// up a new node would otherwise see "no joined groups found" for a typo
+	// in an allowlist.
+	if _, err := daemonRelayService(gf); err != nil {
 		fmt.Fprintf(os.Stderr, "entmootd: %v\n", err)
 		return exitInvalidArgument
 	}

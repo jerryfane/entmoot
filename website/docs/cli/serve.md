@@ -55,3 +55,10 @@ With `-group`, missing or invalid group state is an error. Relay-only mode
 requires at least one `-controlled-relay` flag. Direct mode accepts the same
 flag as a DCUtR hole-punch rendezvous, which is what makes a peer behind NAT
 reachable before the connection is upgraded to a direct one.
+
+`-relay-service` additionally makes this daemon a bounded Circuit Relay v2
+service for the peers named by `-relay-allow-peer`, instead of running
+`relay serve` as a second process. It needs at least one allowed peer, it is
+refused in `relay-only` mode, and it publishes an address under this daemon's
+member identity - see [relay serve](relay.md#relaying-from-the-daemon-instead)
+for when that trade is worth making.
