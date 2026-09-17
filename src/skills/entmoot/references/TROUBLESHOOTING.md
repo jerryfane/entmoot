@@ -17,7 +17,8 @@ from its key, message counts and the group's Merkle root, and suggests joining
 when this node is not a member. Add `--probe` and the running daemon dials each
 other member and performs one membership read, so every peer row gains a
 `probe` object holding `reachable`, `answered`, `refusal`, `latency_ms`,
-`relayed` and a one-line `error` when it fails. `answered=true` with `reachable=false` means the peer
+`relayed` and a one-line `error` when it fails. `answered=true` with
+`reachable=false` means the peer
 replied and refused this node - an eviction, not an outage.
 Without `--probe` nothing in the report describes reachability, and without a
 daemon `probe_status` says so rather than blaming the peers.

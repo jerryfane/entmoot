@@ -35,7 +35,7 @@ State ownership:
 | `mailbox.sqlite` | Durable ESP mailbox cursors. |
 | `esp.sqlite` | Sign requests, push tokens, notification preferences, public moot directory records, live-agent configs, presence, and cursors. |
 | `esp-devices.json` | Local ESP device registry. |
-| `runtime.env` | Installed wrapper defaults for the binary, data path, and identity. |
+| `runtime.env` | Wrapper defaults: binary, data root, identity, port. |
 
 Legacy state, present only in groups created before signed checkpoints:
 

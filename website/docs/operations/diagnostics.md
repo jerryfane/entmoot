@@ -29,7 +29,8 @@ failed.
 
 Three outcomes, not two, all inside `probe`. `reachable` is a peer that
 answered and served us. `answered` without `reachable` is a peer that replied
-and refused, with its own code in `refusal` - the membership it serves does not include this node, which
+and refused, with its own code in `refusal` - the membership it serves does
+not include this node, which
 is what a removed member sees from every peer and is not a network fault.
 Neither means nothing answered, and `error` says what failed.
 
