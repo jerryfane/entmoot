@@ -11,6 +11,8 @@ Important flags:
 -log-level info
 -connectivity direct
 -controlled-relay <CIRCUIT_RELAY_MULTIADDR>
+-relay-service
+-relay-allow-peer <PEER_ID>
 ```
 
 Precedence is intentionally simple:

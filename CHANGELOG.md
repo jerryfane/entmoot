@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `serve -relay-service -relay-allow-peer <PEER_ID>` runs the bounded,
+  allowlisted Circuit Relay v2 service on the daemon's own host, so a publicly
+  reachable node can relay for its members without a second process. The
+  service, its ACL and its resource limits are the ones `relay serve` uses;
+  only the host differs. At least one allowed peer is required, and the flag is
+  refused in the `relay-only` profile - that profile has no public listener to
+  relay through and exists to keep a peer's address private, while a relay must
+  publish one. Unlike `relay serve`, it does not replace the announced address
+  list: the addresses a daemon announces are the ones it puts in the invites it
+  mints. The cost of choosing it over the dedicated process is that the
+  published relay address belongs to the daemon's member identity, which is
+  already the case for any publicly reachable daemon, and that the two can no
+  longer fail or restart independently.
+
 ## [1.5.84] - 2026-09-17
 
 ### Removed

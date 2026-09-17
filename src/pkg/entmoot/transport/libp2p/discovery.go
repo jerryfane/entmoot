@@ -43,6 +43,15 @@ type HostConfig struct {
 	Mode             ConnectivityMode
 	ListenAddrs      []string
 	ControlledRelays []peer.AddrInfo
+	// RelayService, when set, also makes this host a bounded allowlisted
+	// Circuit Relay v2 service for the peers it names - one process that both
+	// talks to a group and relays for its members.
+	//
+	// It is refused in relay-only mode. A relay-only host has no public
+	// listener to relay through, and it is the one profile where sharing the
+	// identity matters: relay-only exists so a peer's address stays private,
+	// while a relay has to publish one.
+	RelayService *RelayServerConfig
 }
 
 // NewConfiguredHost applies the selected address/privacy profile. Relay-only
@@ -54,6 +63,9 @@ func NewConfiguredHost(ctx context.Context, identity *keystore.Identity, cfg Hos
 	}
 	if cfg.Mode == RelayOnlyConnectivity && len(cfg.ControlledRelays) == 0 {
 		return nil, Binding{}, errors.New("libp2p: relay-only mode requires a controlled relay")
+	}
+	if cfg.Mode == RelayOnlyConnectivity && cfg.RelayService != nil {
+		return nil, Binding{}, errors.New("libp2p: relay-only mode cannot also run a relay service")
 	}
 	manager, err := connmgr.NewConnManager(maxHostConnections*3/4, maxHostConnections)
 	if err != nil {
@@ -86,6 +98,14 @@ func NewConfiguredHost(ctx context.Context, identity *keystore.Identity, cfg Hos
 		// peer, so the protocol is enabled even without local relays. Relay
 		// rendezvous itself stays opt-in through ControlledRelays.
 		options = append(options, libp2p.EnableRelay(), libp2p.EnableHolePunching())
+		if cfg.RelayService != nil {
+			service, serviceErr := RelayServiceOptions(*cfg.RelayService)
+			if serviceErr != nil {
+				_ = manager.Close()
+				return nil, Binding{}, serviceErr
+			}
+			options = append(options, service...)
+		}
 		if len(cfg.ControlledRelays) > 0 {
 			// libp2p only folds relay addresses into Addrs() once AutoNAT
 			// reports no reachable address. Members must be able to publish a
