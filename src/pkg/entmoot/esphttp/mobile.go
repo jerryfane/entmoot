@@ -1372,6 +1372,13 @@ ON CONFLICT(device_id) DO UPDATE SET
 // ALTER TABLE ... ADD COLUMN IF NOT EXISTS, so the duplicate error IS the
 // idempotency check.
 func addStateColumn(db *sql.DB, table, column, stmt string) error {
+	// The duplicate error is only safe to ignore for an ADD COLUMN. A failed
+	// RENAME COLUMN reports the same text ("after rename: duplicate column
+	// name: x"), so routing one through here would silently skip it while
+	// reporting success. Refuse anything else rather than trust the caller.
+	if !strings.Contains(strings.ToLower(stmt), "add column") {
+		return fmt.Errorf("esphttp: migrate state schema %s.%s: addStateColumn takes an ADD COLUMN statement, got %q", table, column, stmt)
+	}
 	if _, err := db.Exec(stmt); err != nil {
 		if isDuplicateColumn(err, column) {
 			return nil
@@ -1388,8 +1395,24 @@ func isDuplicateColumn(err error, column string) bool {
 	if err == nil {
 		return false
 	}
+	// Anchored on the name SQLite reports, not merely containing it: this
+	// schema has result, publish_result and operation_result, and an
+	// unanchored match would read a duplicate report for operation_result as
+	// one for result.
 	text := strings.ToLower(err.Error())
-	return strings.Contains(text, "duplicate column name") && strings.Contains(text, strings.ToLower(column))
+	marker := "duplicate column name: " + strings.ToLower(column)
+	index := strings.Index(text, marker)
+	if index < 0 {
+		return false
+	}
+	rest := text[index+len(marker):]
+	if rest == "" {
+		return true
+	}
+	// SQLite follows the name with " (1)"; anything that continues the
+	// identifier means a different, longer column.
+	next := rest[0]
+	return !(next == '_' || next == '-' || (next >= 'a' && next <= 'z') || (next >= '0' && next <= '9'))
 }
 
 func migrateSQLiteState(db *sql.DB) error {

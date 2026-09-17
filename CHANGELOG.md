@@ -13,13 +13,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the same database first. It checked each column with `PRAGMA table_info` and
   then issued `ALTER TABLE ... ADD COLUMN`, which is a race: the ESP bridge and
   the daemon both open `esp.sqlite`, so a simultaneous restart had both read
-  the same schema, both decide a column was missing, and the loser exit on
+  the same schema, both decided a column was missing, and the loser exited on
   `duplicate column name`. It happened in production on 2026-09-17 during the
-  v1.5.82 deploy - the ESP went down and only `Restart=always` brought it back
+  v1.5.82 deploy: the ESP went down and only `Restart=always` brought it back
   five seconds later. SQLite has no `ADD COLUMN IF NOT EXISTS`, so the
-  duplicate error is now the idempotency check, matched on the column name as
-  well as the phrase so no other schema failure is swallowed.
-
+  duplicate error is now the idempotency check, anchored on the reported
+  column name - this schema holds `result`, `publish_result` and
+  `operation_result`, so a looser match would read one as another - and the
+  helper refuses any statement that is not an `ADD COLUMN`, because a failed
+  `RENAME COLUMN` reports the same text.
 
 ## [1.5.82] - 2026-09-17
 
