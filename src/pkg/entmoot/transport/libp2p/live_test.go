@@ -338,7 +338,7 @@ func legacyEntry(t *testing.T, signer *keystore.Identity, previous []entmoot.Ros
 // membership finds it when the group is opened.
 func writeLegacyChain(t *testing.T, root string, groupID entmoot.GroupID, entries []entmoot.RosterEntry) {
 	t.Helper()
-	dir := filepath.Join(root, "groups", membership.GroupDirName(groupID))
+	dir := filepath.Join(root, "groups", groupID.DirName())
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}

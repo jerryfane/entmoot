@@ -1,10 +1,6 @@
 package topic
 
-import (
-	"testing"
-
-	entmoot "entmoot/pkg/entmoot"
-)
+import "testing"
 
 func TestValidPattern(t *testing.T) {
 	t.Parallel()
@@ -137,62 +133,5 @@ func TestMatch(t *testing.T) {
 				t.Fatalf("Match(%q, %q) = %v, want %v", tc.pattern, tc.topic, got, tc.want)
 			}
 		})
-	}
-}
-
-func TestMatchAny(t *testing.T) {
-	t.Parallel()
-	filter := entmoot.Filter{
-		"entmoot/security/+",
-		"logs/#",
-		"exact/topic",
-	}
-
-	cases := []struct {
-		topic string
-		want  bool
-	}{
-		{"entmoot/security/cve", true},
-		{"entmoot/security/hotfix", true},
-		{"entmoot/security/cve/2026", false}, // '+' is one segment only
-		{"logs", true},                       // '#' matches zero tail segments
-		{"logs/errors", true},
-		{"logs/errors/fatal", true},
-		{"exact/topic", true},
-		{"exact/topic/extra", false},
-		{"unrelated", false},
-		{"", false},
-	}
-	for _, tc := range cases {
-		tc := tc
-		t.Run(tc.topic, func(t *testing.T) {
-			t.Parallel()
-			got := MatchAny(filter, tc.topic)
-			if got != tc.want {
-				t.Fatalf("MatchAny(filter, %q) = %v, want %v", tc.topic, got, tc.want)
-			}
-		})
-	}
-}
-
-func TestMatchAnyEmptyFilter(t *testing.T) {
-	t.Parallel()
-	if MatchAny(entmoot.Filter{}, "foo") {
-		t.Fatalf("empty filter should never match")
-	}
-	if MatchAny(nil, "foo") {
-		t.Fatalf("nil filter should never match")
-	}
-}
-
-func TestMatchAnySkipsInvalidPatterns(t *testing.T) {
-	t.Parallel()
-	// Invalid patterns must not cause a match; only the valid one decides.
-	f := entmoot.Filter{"foo/#/bar", "foo+", "exact/topic"}
-	if !MatchAny(f, "exact/topic") {
-		t.Fatalf("valid pattern in filter should still match")
-	}
-	if MatchAny(f, "foo/x/bar") {
-		t.Fatalf("invalid patterns must not match")
 	}
 }

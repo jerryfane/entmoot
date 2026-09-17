@@ -3,7 +3,6 @@ package store
 import (
 	"context"
 	"database/sql"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1473,7 +1472,7 @@ func (s *SQLite) dbForExisting(groupID entmoot.GroupID) (*sql.DB, bool, error) {
 		return db, true, nil
 	}
 
-	dbPath := filepath.Join(s.groupsDir, encodeGroupDirName(groupID), "messages.sqlite")
+	dbPath := filepath.Join(s.groupsDir, groupID.DirName(), "messages.sqlite")
 	if _, err := os.Stat(dbPath); errors.Is(err, os.ErrNotExist) {
 		return nil, false, nil
 	} else if err != nil {
@@ -1490,7 +1489,7 @@ func (s *SQLite) dbForExisting(groupID entmoot.GroupID) (*sql.DB, bool, error) {
 
 // openGroupDB opens or creates the messages.sqlite for groupID.
 func openGroupDB(groupsDir string, groupID entmoot.GroupID) (*sql.DB, error) {
-	dir := filepath.Join(groupsDir, encodeGroupDirName(groupID))
+	dir := filepath.Join(groupsDir, groupID.DirName())
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("store: mkdir group %q: %w", dir, err)
 	}
@@ -1668,6 +1667,3 @@ func decodeMessage(canonBytes []byte) (entmoot.Message, error) {
 
 // encodeGroupDirName names a group's on-disk directory. Raw-url base64 keeps
 // the 32-byte id in one path-safe segment with no padding character.
-func encodeGroupDirName(gid entmoot.GroupID) string {
-	return base64.RawURLEncoding.EncodeToString(gid[:])
-}

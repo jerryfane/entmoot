@@ -47,7 +47,7 @@ func TestSQLiteReadMissAndPutMismatchDoNotCreateGroups(t *testing.T) {
 	}
 
 	for _, gid := range []entmoot.GroupID{trustedGroup, foreignGroup} {
-		groupDir := filepath.Join(root, "groups", encodeGroupDirName(gid))
+		groupDir := filepath.Join(root, "groups", gid.DirName())
 		if _, err := os.Stat(groupDir); !os.IsNotExist(err) {
 			t.Fatalf("group directory %q exists after read miss or rejected Put: %v", groupDir, err)
 		}
@@ -74,7 +74,7 @@ func TestSQLiteWALMode(t *testing.T) {
 	}
 
 	// Locate the database file under <root>/groups/<b64>/messages.sqlite.
-	dbPath := filepath.Join(root, "groups", encodeGroupDirName(gid), "messages.sqlite")
+	dbPath := filepath.Join(root, "groups", gid.DirName(), "messages.sqlite")
 	if _, err := os.Stat(dbPath); err != nil {
 		t.Fatalf("db file missing: %v", err)
 	}
@@ -351,7 +351,7 @@ func TestSQLiteLatestUsesBoundedIndexOrder(t *testing.T) {
 		}
 	}
 
-	dbPath := filepath.Join(root, "groups", encodeGroupDirName(gid), "messages.sqlite")
+	dbPath := filepath.Join(root, "groups", gid.DirName(), "messages.sqlite")
 	side, err := sql.Open("sqlite", "file:"+dbPath)
 	if err != nil {
 		t.Fatalf("sql.Open side: %v", err)
@@ -416,7 +416,7 @@ func TestSQLiteFilePermissions(t *testing.T) {
 		t.Fatalf("Put: %v", err)
 	}
 
-	dbPath := filepath.Join(root, "groups", encodeGroupDirName(gid), "messages.sqlite")
+	dbPath := filepath.Join(root, "groups", gid.DirName(), "messages.sqlite")
 	info, err := os.Stat(dbPath)
 	if err != nil {
 		t.Fatalf("stat: %v", err)

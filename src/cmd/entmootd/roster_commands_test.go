@@ -536,7 +536,7 @@ func signLegacyEntry(t *testing.T, signer *keystore.Identity, gid entmoot.GroupI
 // behind, which is what membership.LoadLegacyChain reads.
 func writeLegacyRosterDB(t *testing.T, dataDir string, gid entmoot.GroupID, entries []entmoot.RosterEntry) {
 	t.Helper()
-	dir := filepath.Join(dataDir, "groups", membership.GroupDirName(gid))
+	dir := filepath.Join(dataDir, "groups", gid.DirName())
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}

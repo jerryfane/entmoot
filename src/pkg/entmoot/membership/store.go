@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -108,18 +107,12 @@ func (l *writerLease) close() error {
 	return nil
 }
 
-// GroupDirName is the on-disk directory name for a group, shared with the
-// legacy roster layout so both stores live side by side during migration.
-func GroupDirName(groupID entmoot.GroupID) string {
-	return base64.RawURLEncoding.EncodeToString(groupID[:])
-}
-
 func groupDir(root string, groupID entmoot.GroupID) (string, error) {
 	absRoot, err := filepath.Abs(root)
 	if err != nil {
 		return "", fmt.Errorf("membership: resolve root %q: %w", root, err)
 	}
-	return filepath.Join(absRoot, "groups", GroupDirName(groupID)), nil
+	return filepath.Join(absRoot, "groups", groupID.DirName()), nil
 }
 
 // Exists reports whether groupID has a committed membership store.

@@ -24,7 +24,6 @@ const (
 
 	PublicMootMirrorNone   = "none"
 	PublicMootMirrorMember = "member"
-	PublicMootMirrorHosted = "hosted"
 )
 
 var (
