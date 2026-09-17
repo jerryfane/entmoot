@@ -17,7 +17,6 @@ import (
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/conversion"
 	"entmoot/pkg/entmoot/keystore"
-	"entmoot/pkg/entmoot/membership"
 )
 
 // withBackgroundTimeout is the standard control-socket deadline for one-shot
@@ -205,14 +204,6 @@ func parseTopicList(s string) []string {
 // membership/store.go (both use <dataRoot>/groups/<base64url(gid)>/).
 func groupsDir(dataRoot string) string {
 	return filepath.Join(dataRoot, "groups")
-}
-
-// groupMembershipExists reports whether a group can be served: it needs a
-// checkpoint. A directory holding only the pre-checkpoint chain is not
-// serveable until `membership upgrade` mints checkpoint 0, and saying so is
-// better than starting a session that cannot answer anything.
-func groupMembershipExists(dataRoot string, gid entmoot.GroupID) bool {
-	return membership.Exists(dataRoot, gid)
 }
 
 // controlSocketPath returns the canonical control-socket path under the

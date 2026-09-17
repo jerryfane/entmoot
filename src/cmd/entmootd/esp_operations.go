@@ -1371,8 +1371,10 @@ func groupIDForCreateRequest(req esphttp.SignRequest) (entmoot.GroupID, error) {
 	return gid, nil
 }
 
+// groupDirPath is the per-group directory every store keys by. The encoding
+// lives on GroupID.DirName so it is stated once, not per store.
 func groupDirPath(dataDir string, gid entmoot.GroupID) string {
-	return filepath.Join(groupsDir(dataDir), base64.RawURLEncoding.EncodeToString(gid[:]))
+	return filepath.Join(groupsDir(dataDir), gid.DirName())
 }
 
 func (e espOperationExecutor) grantDeviceGroupIfNeeded(ctx context.Context, deviceID string, gid entmoot.GroupID) error {

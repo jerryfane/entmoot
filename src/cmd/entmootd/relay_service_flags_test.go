@@ -35,10 +35,24 @@ func TestRelayServiceFlagsRequireEachOther(t *testing.T) {
 	if len(on.AllowedPeers) != 1 || on.AllowedPeers[0].String() != peerID {
 		t.Fatalf("allowlist = %v", on.AllowedPeers)
 	}
-	// The caps are the ones `relay serve` uses, because it is the same service.
-	if on.MaxReservations != 128 || on.MaxCircuitsPerPeer != 16 ||
-		on.MaxReservationsPerIP != 8 || on.MaxReservationsPerASN != 32 || on.CircuitBytes != 64<<20 {
-		t.Fatalf("caps = %+v", *on)
+	// The contract is "the same caps `relay serve` uses", which is what the
+	// docs promise an operator, so assert that relationship instead of
+	// restating the numbers: parse `relay serve`'s flag set with nothing but
+	// the required -allow-peer and compare its defaults field by field.
+	// Restating 128/16/8/32 here would pass after someone raised one side
+	// alone, which is the only way this can actually break.
+	serveDefaults, _, ok := parseRelayServeConfig([]string{"-allow-peer", peerID})
+	if !ok {
+		t.Fatal("relay serve rejected its own defaults")
+	}
+	if on.ReservationTTL != serveDefaults.reservationTTL ||
+		on.CircuitDuration != serveDefaults.circuitDuration ||
+		on.CircuitBytes != int64(serveDefaults.circuitBytes) ||
+		on.MaxReservations != int(serveDefaults.maxReservations) ||
+		on.MaxCircuitsPerPeer != int(serveDefaults.maxCircuitsPerPeer) ||
+		on.MaxReservationsPerIP != int(serveDefaults.maxReservationsPerIP) ||
+		on.MaxReservationsPerASN != int(serveDefaults.maxReservationsPerASN) {
+		t.Fatalf("daemon-hosted caps = %+v, `relay serve` defaults = %+v", *on, serveDefaults)
 	}
 }
 

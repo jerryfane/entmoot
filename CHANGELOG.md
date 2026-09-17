@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A probe budget below one peer-slice no longer defeats the floor it is
+  measured against. `probePeers` clamped its per-peer slice and its
+  remaining-time budget to `minProbeSlice` but not the incoming budget, so
+  `doctor -timeout 1ms` - an operator value forwarded unfiltered -
+  refused every peer with "not attempted: probe budget spent" instead of
+  probing any of them. The budget is now clamped at entry too, so every peer
+  gets at least one slice of deadline to answer in. A refused dial still
+  returns as fast as the refusal arrives - the clamp buys each attempt its
+  slice, not a minimum call duration.
+  That also closes a rare flake in `TestProbeGivesEachPeerTheFloor` whose
+  window was the 1ms the caller asked for: 4 failures in 520 runs under heavy
+  oversubscription before the clamp, 0 in 520 after. An idle machine does not
+  reproduce it.
+
+### Removed
+
+- `MemberAuth` no longer carries `Method`, `Path`, `TimestampMS`, `Nonce` and
+  `Signature`. All five are auth inputs already spent by the time the struct
+  exists - the timestamp is range-checked, the nonce is burned into the replay
+  cache, the signature is verified - and nothing read them. Keeping spent
+  credentials invites a reader to trust one. They were `json:"-"`, so
+  `GET /v1/session` is unchanged.
+
+### Changed
+
+- Member-signature authentication now has a round-trip test: a correctly signed
+  `GET /v1/session` returning the member echo, plus the replay, clock-window
+  and impersonation refusals. It had none.
+- The profile total-order sweep builds six state stores instead of 264 - two
+  shared ones, plus a fresh pair for the first case so the cold-store path
+  stays covered. The 132 record pairs are isolated by member id, not by
+  database, so the per-pair store bought nothing: the `esphttp` package now
+  tests in 20s instead of 48s.
+- One serveability predicate, spelled two ways: `membershipExists` and
+  `groupMembershipExists` are gone in favour of `membership.Exists`, which
+  eight call sites already used.
+- Three production sites restated the group directory encoding by hand; they
+  call `GroupID.DirName()` now, which exists to be the single spelling.
+
 ## [1.5.85] - 2026-09-17
 
 ### Removed

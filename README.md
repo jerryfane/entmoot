@@ -163,6 +163,9 @@ Global runtime flags:
 -listen-port PORT     libp2p TCP listen port; default 1004
 -connectivity MODE    direct (default) or relay-only
 -controlled-relay MA  Approved relay multiaddr ending in /p2p/<peer-id>; repeatable
+-relay-service        Also relay for -relay-allow-peer members from this daemon
+-relay-allow-peer ID  Peer id allowed to reserve on this daemon's relay service;
+                      repeatable, required with -relay-service
 -allow-new-identity   Permit first-time identity creation
 -log-level LEVEL      debug, info, warn, or error
 ```
@@ -193,6 +196,22 @@ entmootd relay serve \
 At least one `-allow-peer` is required. Both circuit endpoints must be
 allowlisted. The command emits its full `/p2p/<relay-peer-id>` multiaddrs when
 ready; relay-only application peers pass one of them to `-controlled-relay`.
+
+A daemon on a publicly reachable host can serve that rendezvous itself with
+`-relay-service`, instead of running a second process:
+
+```sh
+entmootd -relay-service -relay-allow-peer <APPLICATION_PEER_ID> serve
+```
+
+At least one `-relay-allow-peer` is required, and `-relay-allow-peer` without
+`-relay-service` is refused. The pair is also refused with `-connectivity
+relay-only`: a relay has to publish an address, which is the one thing
+relay-only exists to avoid. The relay's own limits are the same fixed ones
+`relay serve` uses and are not separately configurable here; the host's
+admission ceiling is not shared with them, it rises by one connection per
+distinct allowlisted peer, so relay clients cannot spend the budget this
+daemon's own group peers need.
 
 
 ## Persistence and conversion

@@ -28,9 +28,11 @@ const (
 	maxProbeBudget     = 60 * time.Second
 	// minProbeSlice is the least time worth giving one peer: below this a
 	// healthy peer on a slow path would be reported unreachable for
-	// arithmetic reasons. TestProbeGivesEachPeerTheFloor pins both uses of it
-	// against a listener that accepts and never writes, where the elapsed
-	// time is the deadline that was handed out.
+	// arithmetic reasons. It is a floor on all three of the budget, the
+	// per-peer slice and the remaining-time clamp, so no caller can ask for
+	// an answer cheaper than one honest attempt.
+	// TestProbeGivesEachPeerTheFloor pins it against a listener that accepts
+	// and never writes, where the elapsed time is the deadline handed out.
 	minProbeSlice = 500 * time.Millisecond
 	// maxProbeParallel bounds concurrent dials so a large group does not open
 	// a connection per member at once.
@@ -62,6 +64,18 @@ func (r *groupRuntime) probePeers(ctx context.Context, groupID entmoot.GroupID, 
 	}
 	if budget <= 0 {
 		budget = defaultProbeBudget
+	}
+	if budget < minProbeSlice {
+		// The floor binds the budget, not only the slices carved out of it.
+		// Clamping the slice alone left the incoming budget free to defeat
+		// it: `doctor -timeout 1ms` (join.go passes the operator's
+		// value straight through) set a deadline that was already spent by
+		// the time the workers ran, so every member was refused with
+		// arithmetic - "not attempted: probe budget spent" - without one
+		// dial being made. One peer's worth of time is the least a probe can
+		// honestly cost, so a smaller request buys a slower answer, not a
+		// false one.
+		budget = minProbeSlice
 	}
 	if budget > maxProbeBudget {
 		budget = maxProbeBudget

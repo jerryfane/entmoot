@@ -20,11 +20,20 @@ file for restart.
 -listen-port PORT     Direct libp2p TCP port; default 1004
 -connectivity MODE    direct (default) or relay-only
 -controlled-relay MA  Approved Circuit Relay v2 multiaddr; repeatable
+-relay-service        Also run a bounded allowlisted relay service on this host
+-relay-allow-peer ID  Peer id allowed to reserve on that service; repeatable,
+                      required with -relay-service
 -log-level LEVEL      debug, info, warn, or error
 ```
 
 Global flags precede the subcommand. Identity creation fails closed unless
 `-allow-new-identity` is present. An existing identity is never overwritten.
+
+`-relay-service` requires at least one `-relay-allow-peer`, refuses
+`-relay-allow-peer` without it, and is refused together with `-connectivity
+relay-only`. Its relay limits are fixed; the host's admission ceiling rises by
+one connection per distinct allowlisted peer rather than being shared with
+them.
 
 ## 3. Commands
 

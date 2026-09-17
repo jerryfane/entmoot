@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,8 +27,7 @@ type persistedPeer struct {
 }
 
 func groupPeersPath(dataDir string, groupID entmoot.GroupID) string {
-	name := base64.RawURLEncoding.EncodeToString(groupID[:])
-	return filepath.Join(dataDir, "groups", name, groupPeersFileName)
+	return filepath.Join(groupDirPath(dataDir, groupID), groupPeersFileName)
 }
 
 func loadGroupPeers(dataDir string, groupID entmoot.GroupID) ([]peer.AddrInfo, error) {
