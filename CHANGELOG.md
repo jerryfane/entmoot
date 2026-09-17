@@ -18,7 +18,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   twice on the other, and a joiner with a use left over was admitted by one
   and refused by the other. `roster checkpoint` on a quiet group mints exactly
   this checkpoint. The store and the projection now share one predicate
-  instead of restating it, which is what the code already claimed.
+  instead of restating it, which is what the code already claimed. A
+  checkpoint is also required to be dated after its predecessor: retirement
+  drops records through the previous checkpoint while coverage bounds at the
+  canonical one, so a backdated successive checkpoint from a peer retired
+  records it did not cover - the same asymmetry from the other side. Only the
+  local signer advanced the timestamp; nothing checked an arriving one.
 
 ## [1.5.83] - 2026-09-17
 

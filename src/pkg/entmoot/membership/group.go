@@ -672,6 +672,16 @@ func (g *Group) ApplyCheckpoint(cp Checkpoint) (bool, error) {
 	if cp.Sequence != previous.Sequence+1 {
 		return false, fmt.Errorf("%w: checkpoint %d does not follow %d", entmoot.ErrRosterReject, cp.Sequence, previous.Sequence)
 	}
+	// A checkpoint's timestamp must advance. Retirement drops records through
+	// the PREVIOUS checkpoint's timestamp while coverage bounds at the
+	// canonical one, so a backdated successor would retire records it does not
+	// cover - the same asymmetry coveredBy exists to close, re-entered from
+	// the other side. SignCheckpoint always advances (see below); nothing
+	// checked it on a checkpoint arriving from a peer.
+	if cp.Timestamp <= previous.Timestamp {
+		return false, fmt.Errorf("%w: checkpoint %d is dated %d, not after its predecessor at %d",
+			entmoot.ErrRosterReject, cp.Sequence, cp.Timestamp, previous.Timestamp)
+	}
 	if err := g.verifyCheckpointAuthorityLocked(cp, previous); err != nil {
 		return false, err
 	}

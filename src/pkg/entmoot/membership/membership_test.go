@@ -1324,6 +1324,66 @@ func TestCheckpointFarAheadOfTheLocalClockIsRefused(t *testing.T) {
 	}
 }
 
+// The same asymmetry from the other side. Retirement drops records through
+// the PREVIOUS checkpoint's timestamp while coverage bounds at the canonical
+// one, so a successor dated behind its predecessor would retire records it
+// does not cover, and a peer one checkpoint behind would replay them.
+// SignCheckpoint always advances the timestamp; nothing checked it on a
+// checkpoint arriving from a peer.
+func TestABackdatedCheckpointIsRefused(t *testing.T) {
+	f := newFixture(t, DefaultPolicy())
+	f.join(mustIdentity(t))
+	f.tick(10)
+	if _, signed, err := f.group.SignCheckpoint(f.founder, true); err != nil || !signed {
+		t.Fatalf("base checkpoint: signed=%t err=%v", signed, err)
+	}
+	base := f.group.Canonical()
+
+	backdated := base
+	backdated.ID = entmoot.RosterEntryID{}
+	backdated.Sequence = base.Sequence + 1
+	backdated.Previous = base.ID
+	backdated.Timestamp = base.Timestamp - 1
+	backdated.Covered = 0
+	backdated.Signature = nil
+	signedBackdate, err := SignCheckpoint(f.founder, f.info(f.founder), backdated)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.group.ApplyCheckpoint(signedBackdate); !errors.Is(err, entmoot.ErrRosterReject) {
+		t.Fatalf("a checkpoint dated before its predecessor was accepted: %v", err)
+	}
+	if got := f.group.Canonical().ID; got != base.ID {
+		t.Fatalf("canonical moved to a backdated checkpoint (%s)", got)
+	}
+
+	// A checkpoint at exactly the predecessor's timestamp is refused too: it
+	// would advance the sequence while covering nothing new.
+	level := backdated
+	level.Timestamp = base.Timestamp
+	level.ID = entmoot.RosterEntryID{}
+	level.Signature = nil
+	signedLevel, err := SignCheckpoint(f.founder, f.info(f.founder), level)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.group.ApplyCheckpoint(signedLevel); !errors.Is(err, entmoot.ErrRosterReject) {
+		t.Fatalf("a checkpoint at its predecessor's timestamp was accepted: %v", err)
+	}
+
+	// The founder's own cadence still lands, so the rule does not stall the
+	// group it protects.
+	f.tick(10)
+	f.join(mustIdentity(t))
+	f.tick(10)
+	if _, signed, err := f.group.SignCheckpoint(f.founder, true); err != nil || !signed {
+		t.Fatalf("the next legitimate checkpoint was refused: signed=%t err=%v", signed, err)
+	}
+	if got := f.group.Canonical().Sequence; got != base.Sequence+1 {
+		t.Fatalf("canonical sequence = %d, want %d", got, base.Sequence+1)
+	}
+}
+
 // LegacyHead is signed into checkpoint 0 to bind an upgrade to the chain it
 // replaces. A checkpoint naming a chain this node does not hold, or naming a
 // different head, is refused rather than believed.

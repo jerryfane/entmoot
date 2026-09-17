@@ -102,9 +102,13 @@ func Project(base Checkpoint, records []Record) (State, []Record) {
 // Older than the timestamp is covered whatever the fold count, which is what
 // Checkpoint.Timestamp promises: a checkpoint that folded nothing in still
 // succeeds one that did, and its predecessor's records are retired behind it.
-// At the timestamp itself the fold count decides, and that is the genesis
-// case: checkpoint 0 carries its own signing time rather than a record's, so
-// a record minted in the same millisecond is not inside it.
+// At the timestamp itself the fold count decides. The case that needs it is
+// genesis: checkpoint 0 carries its own signing time rather than a record's,
+// so a record minted in the same millisecond is not inside it. The clause
+// also fires at a later checkpoint whose whole fold was ineffective, and
+// there it is harmless: Covered==0 means the fold changed no state, so the
+// state such a record is re-judged against is the one it was already judged
+// against, and it stays ineffective.
 func coveredBy(base Checkpoint, rec Record) bool {
 	if rec.Timestamp < base.Timestamp {
 		return true
