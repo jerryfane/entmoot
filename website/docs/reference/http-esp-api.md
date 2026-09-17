@@ -90,10 +90,11 @@ refused whenever the encoded text differs, which for a random 32-byte value is
 usually but not always: the alphabets differ only at values 62 and 63.
 
 Checks run in this order, and the first failure answers `401` with its own
-message. That is the token-less case this section describes: in `bearer` mode
-a request carrying both a valid token and a broken member signature falls
-through to the token, answers `200`, and simply omits the `member` echo - no
-`401` and no diagnostic. Send one credential at a time.
+message. That holds whenever no valid token accompanies the request, including
+one carrying a wrong token. In `bearer` or `dual` mode a request that carries
+a valid token as well falls through to it whichever row failed, answers `200`,
+and simply omits the `member` echo - no `401` and no diagnostic. Send one
+credential at a time.
 
 | # | Check | Message |
 |---|---|---|
