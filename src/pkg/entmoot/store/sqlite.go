@@ -1664,6 +1664,3 @@ func decodeMessage(canonBytes []byte) (entmoot.Message, error) {
 	}
 	return msg, nil
 }
-
-// encodeGroupDirName names a group's on-disk directory. Raw-url base64 keeps
-// the 32-byte id in one path-safe segment with no padding character.

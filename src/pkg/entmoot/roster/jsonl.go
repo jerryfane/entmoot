@@ -8,48 +8,10 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"sync"
 
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/canonical"
-
-	_ "modernc.org/sqlite"
 )
-
-const (
-	rosterFileName     = "roster.jsonl"
-	rosterDBFileName   = "roster.sqlite"
-	rosterLockFileName = "roster.writer.lock"
-)
-
-var ErrWriterActive = errors.New("roster: writer already active")
-
-const rosterSchema = `
-CREATE TABLE IF NOT EXISTS roster_meta (
-  group_id        BLOB PRIMARY KEY,
-  version         INTEGER NOT NULL,
-  head_id         BLOB NOT NULL,
-  import_complete INTEGER NOT NULL CHECK (import_complete = 1)
-);
-CREATE TABLE IF NOT EXISTS roster_entries (
-  entry_id        BLOB PRIMARY KEY,
-  group_id        BLOB NOT NULL,
-  sequence        INTEGER NOT NULL,
-  parent_id       BLOB,
-  canonical_bytes BLOB NOT NULL,
-  op              TEXT NOT NULL,
-  timestamp_ms    INTEGER NOT NULL,
-  UNIQUE (group_id, sequence)
-);
-CREATE INDEX IF NOT EXISTS idx_roster_entries_group_sequence
-  ON roster_entries(group_id, sequence);
-`
-
-type writerLease struct {
-	mu   sync.Mutex
-	path string
-	file *os.File
-}
 
 func readAndValidateLegacy(path string, groupID entmoot.GroupID) ([]entmoot.RosterEntry, error) {
 	f, err := os.Open(path)

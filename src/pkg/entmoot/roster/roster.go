@@ -16,7 +16,6 @@
 package roster
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -70,20 +69,15 @@ func newChain(groupID entmoot.GroupID) *chain {
 	}
 }
 
-// validate performs every non-genesis acceptance check. r.mu must be
-// held for writing so validation and projection update share one critical
-// section.
+// validate performs every non-genesis acceptance check. Entry 1 never reaches
+// it: both callers route the first entry to validateGenesis, so the log is
+// non-empty here by construction.
 func (r *chain) validate(entry entmoot.RosterEntry) error {
 	founder := r.founder
 	head := r.head
 	var headTimestamp int64
 	if len(r.entries) > 0 {
 		headTimestamp = r.entries[len(r.entries)-1].Timestamp
-	}
-	empty := len(r.entries) == 0
-
-	if empty {
-		return fmt.Errorf("%w: Apply on empty log; call Genesis first", entmoot.ErrRosterReject)
 	}
 
 	switch entry.Op {
@@ -104,12 +98,12 @@ func (r *chain) validate(entry entmoot.RosterEntry) error {
 	// legacy entries and founder-only operations, or a delegated admin.
 	signerKey := founder.EntmootPubKey
 	if entry.Version != 0 && *entry.ActorMemberID != founderMemberID {
-		actor, isAdmin := r.adminInfoLocked(*entry.ActorMemberID)
+		actor, isAdmin := r.adminInfo(*entry.ActorMemberID)
 		if !isAdmin {
 			return fmt.Errorf("%w: actor %s is not the founder or a delegated admin",
 				entmoot.ErrRosterReject, entry.ActorMemberID.String())
 		}
-		if err := r.validateAdminOpLocked(entry); err != nil {
+		if err := r.validateAdminOp(entry); err != nil {
 			return err
 		}
 		signerKey = actor.EntmootPubKey
@@ -145,17 +139,6 @@ func (r *chain) validate(entry entmoot.RosterEntry) error {
 			if _, err := ParseAdminPolicy(entry.Policy); err != nil {
 				return fmt.Errorf("%w: %v", entmoot.ErrRosterReject, err)
 			}
-		}
-	}
-
-	// A member id is derived from its key, so re-adding one under a different
-	// key is an identity substitution. r.members is keyed by legacy Pilot node
-	// id and is empty for version-2 groups, so this has to consult the
-	// full-width projection.
-	if entry.Op == "add" && entry.Subject.MemberID != nil {
-		if existing, ok := r.membersByID[*entry.Subject.MemberID]; ok &&
-			!bytes.Equal(existing.EntmootPubKey, entry.Subject.EntmootPubKey) {
-			return fmt.Errorf("%w: member id is already bound to another public key", entmoot.ErrRosterReject)
 		}
 	}
 
@@ -252,8 +235,7 @@ func validateEntryFormat(entry entmoot.RosterEntry, groupID entmoot.GroupID, seq
 	return nil
 }
 
-// apply updates in-memory state for entry. Must be called with r.mu
-// held for writing. Does NOT emit events (callers do that after unlocking).
+// apply updates the projection for an accepted entry.
 func (r *chain) apply(entry entmoot.RosterEntry) {
 	stored := cloneEntry(entry)
 	r.byID[stored.ID] = len(r.entries)
@@ -317,24 +299,24 @@ func (r *chain) apply(entry entmoot.RosterEntry) {
 	}
 }
 
-// adminInfoLocked resolves a delegated admin's current member record. An admin
-// that is no longer a member has no authority. r.mu must be held.
-func (r *chain) adminInfoLocked(memberID entmoot.MemberID) (entmoot.NodeInfo, bool) {
+// adminInfo resolves a delegated admin's current member record.
+//
+// Delegation alone is enough to look up here: apply drops a removed member
+// from r.admins in the same step it drops it from the projection (see the
+// "remove" case), so a delegated id is always a current member.
+func (r *chain) adminInfo(memberID entmoot.MemberID) (entmoot.NodeInfo, bool) {
 	if _, delegated := r.admins[memberID]; !delegated {
 		return entmoot.NodeInfo{}, false
 	}
 	info, member := r.membersByID[memberID]
-	if !member {
-		return entmoot.NodeInfo{}, false
-	}
-	return info, true
+	return info, member
 }
 
-// validateAdminOpLocked enforces what a delegated admin may do. Admins exist
+// validateAdminOp enforces what a delegated admin may do. Admins exist
 // so members can be invited and evicted without the founder present; changing
 // who holds that authority stays with the founder, and an admin cannot remove
-// another admin or the founder. r.mu must be held.
-func (r *chain) validateAdminOpLocked(entry entmoot.RosterEntry) error {
+// another admin or the founder.
+func (r *chain) validateAdminOp(entry entmoot.RosterEntry) error {
 	switch entry.Op {
 	case "add":
 		return nil

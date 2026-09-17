@@ -14,7 +14,7 @@
 // history paths in cmd/entmootd turn a refusal into an error to the caller.
 //
 // A Limiter tracks one pair of buckets per peer, keyed by MemberID. Buckets
-// are created lazily on first contact. Call Reset on disconnect to drop state.
+// are created lazily on first contact and live for the process.
 //
 // Clock injection: golang.org/x/time/rate consults time.Now internally only
 // through its Allow / Reserve shorthands. The *At / *N variants accept an
@@ -57,12 +57,6 @@ type peerLimiter struct {
 	bytes *rate.Limiter
 }
 
-// topicPeerKey identifies a single per-(peer, topic) bucket. (v1.2.0)
-type topicPeerKey struct {
-	peer  entmoot.MemberID
-	topic string
-}
-
 // Limiter tracks per-peer token buckets. The zero value is not usable;
 // construct one with New. Limiter is safe for concurrent use by multiple
 // goroutines.
@@ -70,9 +64,8 @@ type Limiter struct {
 	limits Limits
 	clk    clock.Clock
 
-	mu         sync.Mutex
-	peers      map[entmoot.MemberID]*peerLimiter
-	topicPeers map[topicPeerKey]*rate.Limiter
+	mu    sync.Mutex
+	peers map[entmoot.MemberID]*peerLimiter
 }
 
 // New returns a Limiter that applies the given Limits to every peer.
@@ -84,10 +77,9 @@ func New(limits Limits, clk clock.Clock) *Limiter {
 		clk = clock.System{}
 	}
 	return &Limiter{
-		limits:     limits,
-		clk:        clk,
-		peers:      make(map[entmoot.MemberID]*peerLimiter),
-		topicPeers: make(map[topicPeerKey]*rate.Limiter),
+		limits: limits,
+		clk:    clk,
+		peers:  make(map[entmoot.MemberID]*peerLimiter),
 	}
 }
 
