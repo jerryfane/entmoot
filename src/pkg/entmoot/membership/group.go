@@ -58,10 +58,17 @@ type Group struct {
 	records     map[entmoot.RosterEntryID]Record
 	state       State
 	effective   int
-	legacy      *LegacyChain
-	now         func() time.Time
-	logger      *slog.Logger
-	closeOnce   sync.Once
+	// rewoundMembers is the membership of the canonical checkpoint this node
+	// last moved BACKWARDS from, kept so the records that membership rests on
+	// can be pulled back from the peers that hold them. It is a local hint
+	// about who to talk to, not group state: nothing is decided from it, and
+	// it is deliberately not persisted, because a rewind that happened in a
+	// previous process has already had its chance to heal.
+	rewoundMembers map[entmoot.MemberID]entmoot.NodeInfo
+	legacy         *LegacyChain
+	now            func() time.Time
+	logger         *slog.Logger
+	closeOnce      sync.Once
 }
 
 // Open loads a group's membership store. A group that still has only the
@@ -583,9 +590,9 @@ func (g *Group) MemberIDs() []entmoot.MemberID {
 }
 
 // ReachableMemberInfos is who this node may talk to about membership: every
-// current member, plus the members of the NEWEST retained checkpoint dated
-// after the canonical one. Current members come first, deduplicated, each
-// entry carrying the NodeInfo its source recorded.
+// current member, plus the membership of the canonical checkpoint it last
+// moved BACKWARDS from. Current members come first, deduplicated, each entry
+// carrying the NodeInfo its source recorded.
 //
 // The second half exists because the current projection is the wrong list to
 // ask when the projection itself is what went wrong. If this node's coverage
@@ -594,25 +601,20 @@ func (g *Group) MemberIDs() []entmoot.MemberID {
 // exactly the peers holding the records that would restore them, and asking
 // only the survivors can never get them back.
 //
-// Two bounds keep that from becoming "everyone ever seen", and both matter
-// because this list is used to dial peers and to push membership records:
-//
-//   - Only checkpoints dated AFTER the canonical one. An older checkpoint is
-//     not evidence of a rewind, and the identities it names that the current
-//     projection does not are the ones a record evicted.
-//   - Of those, only the newest by timestamp. An identity an older rewound
-//     checkpoint named and the newest one does
-//     not is one that was evicted between the two: the newest checkpoint on
-//     the branch we moved away from is the best evidence this node has of the
-//     membership it lost. Asking held records instead does not work - both
-//     the removal records and the projection's ban set are erased by ordinary
-//     retirement one checkpoint later, so the exposure would come back.
+// It is what the rewind actually dropped, recorded when it happened, rather
+// than anything inferred from the checkpoints still on disk. Inference does
+// not work here: a retained checkpoint dated after the canonical one can be a
+// losing sibling that predates an eviction, so reading those would name
+// identities the group has removed, while reading only the newest of them
+// misses the very member a rewind dropped whenever a later-dated sibling is
+// also retained. Identities banned by the group as it stands now are
+// excluded, because the branch this node has adopted may have banned somebody
+// the branch it left had not.
 func (g *Group) ReachableMemberInfos() []entmoot.NodeInfo {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
-	canonical := g.checkpoints[g.canonicalID]
-	out := make([]entmoot.NodeInfo, 0, len(g.state.Members))
-	seen := make(map[entmoot.MemberID]struct{}, len(g.state.Members))
+	out := make([]entmoot.NodeInfo, 0, len(g.state.Members)+len(g.rewoundMembers))
+	seen := make(map[entmoot.MemberID]struct{}, len(g.state.Members)+len(g.rewoundMembers))
 	add := func(id entmoot.MemberID, info entmoot.NodeInfo) {
 		if _, already := seen[id]; already {
 			return
@@ -628,31 +630,16 @@ func (g *Group) ReachableMemberInfos() []entmoot.NodeInfo {
 	for _, id := range g.state.MemberIDs() {
 		add(id, g.state.Members[id])
 	}
-
-	var newest Checkpoint
-	var found bool
-	for _, cp := range g.checkpoints {
-		if cp.Timestamp <= canonical.Timestamp {
+	ids := make([]entmoot.MemberID, 0, len(g.rewoundMembers))
+	for id := range g.rewoundMembers {
+		if _, banned := g.state.Banned[id]; banned {
 			continue
 		}
-		if !found || cp.Timestamp > newest.Timestamp ||
-			(cp.Timestamp == newest.Timestamp && bytes.Compare(cp.ID[:], newest.ID[:]) < 0) {
-			newest, found = cp, true
-		}
-	}
-	if !found {
-		return out
-	}
-	// No ban filter here: a checkpoint's own member set and ban list cannot
-	// disagree - being banned means having been removed - so the member set
-	// of the newest rewound checkpoint already excludes them.
-	ids := make([]entmoot.MemberID, 0, len(g.membersAt[newest.ID]))
-	for id := range g.membersAt[newest.ID] {
 		ids = append(ids, id)
 	}
 	sort.Slice(ids, func(i, j int) bool { return bytes.Compare(ids[i][:], ids[j][:]) < 0 })
 	for _, id := range ids {
-		add(id, g.membersAt[newest.ID][id])
+		add(id, g.rewoundMembers[id])
 	}
 	return out
 }
@@ -1024,6 +1011,16 @@ func (g *Group) settleCanonicalLocked() error {
 	best = g.furthestFromLocked(best)
 	if best.ID == g.canonicalID {
 		return nil
+	}
+	// Moving backwards in time un-covers records this node may already have
+	// deleted, so remember the membership being left behind: those members
+	// are the peers that can serve the records back. See the KNOWN GAP above
+	// and ReachableMemberInfos.
+	if outgoing, ok := g.checkpoints[g.canonicalID]; ok && best.Timestamp < outgoing.Timestamp {
+		g.rewoundMembers = make(map[entmoot.MemberID]entmoot.NodeInfo, len(g.membersAt[outgoing.ID]))
+		for id, info := range g.membersAt[outgoing.ID] {
+			g.rewoundMembers[id] = cloneNodeInfo(info)
+		}
 	}
 
 	ctx := context.Background()
