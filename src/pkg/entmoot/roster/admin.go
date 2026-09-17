@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"sort"
 	"strings"
 
 	"entmoot/pkg/entmoot"
@@ -63,31 +62,6 @@ func IsUnknownAdminPolicy(payload []byte) bool {
 		return false
 	}
 	return strings.HasPrefix(probe.Type, adminPolicyFamily) && probe.Type != AdminPolicyType
-}
-
-// MarshalAdminPolicy encodes a complete admin set for a policy_change entry.
-// The set is sorted and deduplicated so the same intent always produces the
-// same signed bytes.
-func MarshalAdminPolicy(admins []entmoot.MemberID) ([]byte, error) {
-	if len(admins) > MaxAdmins {
-		return nil, fmt.Errorf("roster: %d admins exceeds the ceiling of %d", len(admins), MaxAdmins)
-	}
-	sorted := make([]entmoot.MemberID, 0, len(admins))
-	seen := make(map[entmoot.MemberID]struct{}, len(admins))
-	for _, admin := range admins {
-		if admin == (entmoot.MemberID{}) {
-			return nil, fmt.Errorf("roster: admin set contains the zero member id")
-		}
-		if _, duplicate := seen[admin]; duplicate {
-			continue
-		}
-		seen[admin] = struct{}{}
-		sorted = append(sorted, admin)
-	}
-	sort.Slice(sorted, func(i, j int) bool {
-		return bytes.Compare(sorted[i][:], sorted[j][:]) < 0
-	})
-	return json.Marshal(AdminPolicy{Type: AdminPolicyType, Admins: sorted})
 }
 
 // ParseAdminPolicy decodes an admin-set policy_change payload. Unknown fields

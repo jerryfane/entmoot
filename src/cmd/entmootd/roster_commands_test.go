@@ -1,12 +1,16 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"entmoot/pkg/entmoot"
+	"entmoot/pkg/entmoot/canonical"
 	"entmoot/pkg/entmoot/keystore"
 	"entmoot/pkg/entmoot/membership"
 	"entmoot/pkg/entmoot/roster"
@@ -482,37 +486,91 @@ func TestMembershipUpgradeMintsCheckpointZeroFromTheChain(t *testing.T) {
 
 // seedLegacyChain writes the pre-checkpoint chain a group had before this
 // release: a founder genesis, one added member, and that member delegated as
-// an admin.
+// an admin. It writes the on-disk artifact directly - the roster package
+// validates legacy logs and no longer appends to them, which is the whole
+// point of the upgrade this test drives.
 func seedLegacyChain(t *testing.T, dataDir string, gid entmoot.GroupID, founder *keystore.Identity, founderInfo, memberInfo entmoot.NodeInfo) {
 	t.Helper()
-	chain, err := roster.OpenJSONL(dataDir, gid)
+	policy, err := json.Marshal(roster.AdminPolicy{Type: roster.AdminPolicyType, Admins: []entmoot.MemberID{*memberInfo.MemberID}})
 	if err != nil {
-		t.Fatalf("roster.OpenJSONL: %v", err)
+		t.Fatalf("admin policy: %v", err)
 	}
-	defer func() {
-		if err := chain.Close(); err != nil {
-			t.Fatalf("roster close: %v", err)
+	entries := []entmoot.RosterEntry{
+		signLegacyEntry(t, founder, gid, 1, entmoot.RosterEntryID{}, "add", founderInfo, founderInfo.MemberID, nil, 1_700_000_000_000),
+	}
+	entries = append(entries,
+		signLegacyEntry(t, founder, gid, 2, entries[0].ID, "add", memberInfo, founderInfo.MemberID, nil, 1_700_000_001_000))
+	entries = append(entries,
+		signLegacyEntry(t, founder, gid, 3, entries[1].ID, "policy_change", entmoot.NodeInfo{}, founderInfo.MemberID, policy, 1_700_000_002_000))
+
+	if err := roster.ValidateEntries(gid, entries); err != nil {
+		t.Fatalf("the seeded chain is not a valid legacy log: %v", err)
+	}
+	writeLegacyRosterDB(t, dataDir, gid, entries)
+}
+
+// signLegacyEntry mints one entry of the linear chain exactly as the retired
+// writer did, so the fixture is authentic by construction.
+func signLegacyEntry(t *testing.T, signer *keystore.Identity, gid entmoot.GroupID, sequence uint64,
+	parent entmoot.RosterEntryID, op string, subject entmoot.NodeInfo, actor *entmoot.MemberID,
+	policy []byte, timestamp int64) entmoot.RosterEntry {
+	t.Helper()
+	groupID := gid
+	entry := entmoot.RosterEntry{
+		Op: op, Subject: subject, Policy: policy, ActorMemberID: actor, Timestamp: timestamp,
+		Version: roster.CurrentEntryVersion, GroupID: &groupID, Sequence: sequence,
+	}
+	if parent != (entmoot.RosterEntryID{}) {
+		entry.Parents = []entmoot.RosterEntryID{parent}
+	}
+	sigInput, err := canonical.RosterEntrySigningBytes(entry)
+	if err != nil {
+		t.Fatalf("canonical signing bytes: %v", err)
+	}
+	entry.Signature = signer.Sign(sigInput)
+	entry.ID = canonical.RosterEntryID(entry)
+	return entry
+}
+
+// writeLegacyRosterDB lays down the roster.sqlite a pre-checkpoint node left
+// behind, which is what membership.LoadLegacyChain reads.
+func writeLegacyRosterDB(t *testing.T, dataDir string, gid entmoot.GroupID, entries []entmoot.RosterEntry) {
+	t.Helper()
+	dir := filepath.Join(dataDir, "groups", membership.GroupDirName(gid))
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", "file:"+filepath.Join(dir, "roster.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS roster_entries (
+  entry_id        BLOB PRIMARY KEY,
+  group_id        BLOB NOT NULL,
+  sequence        INTEGER NOT NULL,
+  parent_id       BLOB,
+  canonical_bytes BLOB NOT NULL,
+  op              TEXT NOT NULL,
+  timestamp_ms    INTEGER NOT NULL,
+  UNIQUE (group_id, sequence)
+);`); err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		encoded, err := canonical.Encode(entry)
+		if err != nil {
+			t.Fatal(err)
 		}
-	}()
-	if err := chain.Genesis(founder, founderInfo, 1_700_000_000_000); err != nil {
-		t.Fatalf("Genesis: %v", err)
-	}
-	add, err := chain.SignEntry(founder, "add", memberInfo, nil, 1_700_000_001_000)
-	if err != nil {
-		t.Fatalf("SignEntry add: %v", err)
-	}
-	if err := chain.Apply(add); err != nil {
-		t.Fatalf("Apply add: %v", err)
-	}
-	policy, err := roster.MarshalAdminPolicy([]entmoot.MemberID{*memberInfo.MemberID})
-	if err != nil {
-		t.Fatalf("MarshalAdminPolicy: %v", err)
-	}
-	grant, err := chain.SignEntry(founder, "policy_change", entmoot.NodeInfo{}, policy, 1_700_000_002_000)
-	if err != nil {
-		t.Fatalf("SignEntry policy_change: %v", err)
-	}
-	if err := chain.Apply(grant); err != nil {
-		t.Fatalf("Apply policy_change: %v", err)
+		var parent []byte
+		if len(entry.Parents) == 1 {
+			parent = entry.Parents[0][:]
+		}
+		if _, err := db.Exec(
+			`INSERT INTO roster_entries (entry_id, group_id, sequence, parent_id, canonical_bytes, op, timestamp_ms)
+			 VALUES (?, ?, ?, ?, ?, ?, ?);`,
+			entry.ID[:], gid[:], entry.Sequence, parent, encoded, entry.Op, entry.Timestamp); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
