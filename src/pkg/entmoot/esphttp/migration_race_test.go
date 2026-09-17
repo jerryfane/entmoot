@@ -115,6 +115,25 @@ func TestDuplicateColumnIsMatchedNarrowly(t *testing.T) {
 	if isDuplicateColumn(nil, "no_fallback_peers") {
 		t.Fatal("no error must not read as a duplicate")
 	}
+	// Boundary cases that defeated a byte-classifier: a multi-byte name and
+	// one containing "$", which SQLite accepts in an identifier.
+	if isDuplicateColumn(errors.New("SQL logic error: duplicate column name: caf\u00e9 (1)"), "caf") {
+		t.Fatal("a multi-byte sibling name was accepted as a shorter one")
+	}
+	if !isDuplicateColumn(errors.New("SQL logic error: duplicate column name: caf\u00e9 (1)"), "caf\u00e9") {
+		t.Fatal("a multi-byte name was rejected for itself")
+	}
+	if isDuplicateColumn(errors.New("SQL logic error: duplicate column name: a$b (1)"), "a") {
+		t.Fatal("a name continuing with $ was accepted as a shorter one")
+	}
+	if !isDuplicateColumn(errors.New("SQL logic error: duplicate column name: a$b (1)"), "a$b") {
+		t.Fatal("a name containing $ was rejected for itself")
+	}
+	// A quoted identifier must fail closed: the duplicate is re-raised rather
+	// than swallowed.
+	if isDuplicateColumn(errors.New(`SQL logic error: duplicate column name: "two words" (1)`), `"two words"`) {
+		t.Fatal("a quoted identifier matched; it must fail closed so the error surfaces")
+	}
 }
 
 // TestAddStateColumnIsIdempotentAndOnlyAdds pins the helper deterministically,

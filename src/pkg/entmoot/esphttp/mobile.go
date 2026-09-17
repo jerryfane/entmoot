@@ -1395,24 +1395,26 @@ func isDuplicateColumn(err error, column string) bool {
 	if err == nil {
 		return false
 	}
-	// Anchored on the name SQLite reports, not merely containing it: this
-	// schema has result, publish_result and operation_result, and an
-	// unanchored match would read a duplicate report for operation_result as
-	// one for result.
+	// Compare the name SQLite reported, exactly. Anything looser has bitten
+	// twice: plain containment read a duplicate report for operation_result as
+	// one for result, and classifying the following BYTE was ASCII-only, so a
+	// multi-byte or "$" continuation read as a boundary and revived the same
+	// false match. SQLite reports a bare identifier, which cannot contain a
+	// space, so the token up to the next space IS the name.
+	const phrase = "duplicate column name: "
 	text := strings.ToLower(err.Error())
-	marker := "duplicate column name: " + strings.ToLower(column)
-	index := strings.Index(text, marker)
+	index := strings.Index(text, phrase)
 	if index < 0 {
 		return false
 	}
-	rest := text[index+len(marker):]
-	if rest == "" {
-		return true
+	reported := text[index+len(phrase):]
+	if end := strings.IndexByte(reported, ' '); end >= 0 {
+		reported = reported[:end]
 	}
-	// SQLite follows the name with " (1)"; anything that continues the
-	// identifier means a different, longer column.
-	next := rest[0]
-	return !(next == '_' || next == '-' || (next >= 'a' && next <= 'z') || (next >= '0' && next <= '9'))
+	// A quoted identifier, which may contain spaces, therefore fails to match
+	// and the duplicate is re-raised: the migration errors loudly instead of
+	// skipping work silently, which is the safe direction.
+	return reported == strings.ToLower(column)
 }
 
 func migrateSQLiteState(db *sql.DB) error {
