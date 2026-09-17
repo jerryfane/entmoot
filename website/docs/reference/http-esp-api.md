@@ -90,7 +90,10 @@ refused whenever the encoded text differs, which for a random 32-byte value is
 usually but not always: the alphabets differ only at values 62 and 63.
 
 Checks run in this order, and the first failure answers `401` with its own
-message:
+message. That is the token-less case this section describes: in `bearer` mode
+a request carrying both a valid token and a broken member signature falls
+through to the token, answers `200`, and simply omits the `member` echo - no
+`401` and no diagnostic. Send one credential at a time.
 
 | # | Check | Message |
 |---|---|---|
@@ -108,12 +111,18 @@ message:
 A wrongly encoded body-hash line reaches step 9, because it only changes the
 bytes that were signed.
 
-The nonce cache is keyed by member id and the peer id header's exact text, so
-the same nonce from a different member is accepted - and so is the same nonce
-re-sent under a different spelling of one peer identity, since base58btc and
-CIDv1 both decode to the same peer but form different keys. Entries last the
-same five minutes. A nonce is consumed only after the signature verifies, so a
-request rejected at step 9 may be retried with the same nonce.
+The nonce cache is keyed by member id and the peer id header's text after
+trimming, not by the decoded peer identity. So the same nonce is accepted from
+a different member, and also under a different spelling of one peer identity -
+base58btc and CIDv1 decode to the same peer but form different keys, while
+surrounding whitespace does not, because it is trimmed. Only the key holder
+can use that: the peer id text is the signing input's fifth line, so a
+captured request cannot be replayed under the other spelling by rewriting the
+header - the signature stops matching.
+
+Entries last the same five minutes. A nonce is consumed only after the
+signature verifies, so a request rejected at step 9 may be retried with the
+same nonce.
 
 Device-authenticated requests sign method, path with query, timestamp, nonce,
 and body hash.
