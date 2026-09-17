@@ -13,7 +13,16 @@ Common global flags:
 -log-level info
 -connectivity direct
 -controlled-relay <CIRCUIT_RELAY_MULTIADDR>
+-relay-service
+-relay-allow-peer <PEER_ID>
+-allow-new-identity
 ```
+
+`-allow-new-identity` is required the first time a node creates its identity;
+without it a missing identity file is an error rather than a new key.
+`-relay-service` turns this daemon into a bounded allowlisted relay for the
+peers named by `-relay-allow-peer`; it needs at least one such peer and is
+refused with `-connectivity relay-only`. See [Relay](./relay).
 
 Container/OpenClaw-style agents should use the installed wrapper instead of
 typing these paths by hand:
@@ -49,6 +58,7 @@ entmootd group policy checkpoint-every -group <GROUP_ID> -records <N>
 entmootd roster status|checkpoint|remove|ban|unban|leave -group <GROUP_ID> [flags]
 entmootd roster admin list|grant|revoke -group <GROUP_ID> [flags]
 entmootd membership upgrade -group <GROUP_ID>
+entmootd membership adopt -group <GROUP_ID> -peer <MULTIADDR>
 entmootd group public descriptor|publish -group <GROUP_ID> [flags]
 ```
 
@@ -57,6 +67,10 @@ Everything under `roster` except `status` and `admin list`, the two membership
 upgrade` write a signed record and take the group's writer lease, so stop the
 local daemon before running them. `roster status`, `roster admin list` and
 `group policy status` only read local state.
+`membership adopt` signs nothing - it fetches the founder's checkpoint 0 from
+one named peer for a node the automatic path cannot reach - but it brings up
+its own libp2p host on the configured listen port, so the local daemon has to
+be stopped for it too. It is a no-op once the group holds a checkpoint.
 See [Founder Commands](./founder-commands).
 
 Public listing, open invites, ESP membership, and message-history indexing are

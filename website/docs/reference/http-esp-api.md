@@ -24,7 +24,9 @@ POST /v1/groups/{group_id}/public-moot/publish
 GET  /v1/groups/{group_id}/members
 DELETE /v1/groups/{group_id}/members/{member_id}
 POST /v1/groups/{group_id}/invites
+GET  /v1/groups/{group_id}/open-invites
 POST /v1/groups/{group_id}/open-invites
+POST /v1/groups/{group_id}/open-invites/{invite}/revoke
 POST /v1/invites/accept
 POST /v1/open-invites/accept
 POST /v1/open-invites/{token}/challenge
@@ -34,6 +36,9 @@ GET  /v1/groups/{group_id}/search
 GET  /v1/groups/{group_id}/message-context
 GET  /v1/groups/{group_id}/messages
 POST /v1/groups/{group_id}/messages
+GET  /v1/groups/{group_id}/mailbox
+GET  /v1/groups/{group_id}/topics
+GET  /v1/groups/{group_id}/diagnostics
 GET  /v1/mailbox/pull
 POST /v1/mailbox/ack
 GET  /v1/mailbox/cursor
@@ -52,6 +57,9 @@ POST /v1/notifications/test
 `GET /v1/capabilities` is unauthenticated and answers `200 {}`. It carries no
 fields yet: it exists as a reachability check behind the public reverse proxy,
 so a probe can tell "the ESP is serving" from "the proxy is up".
+
+`GET /v1/groups/{group_id}/mailbox` is an alias: it is served by the same
+handler as `GET /v1/groups/{group_id}/messages` and takes the same parameters.
 
 Authentication modes:
 
@@ -263,6 +271,15 @@ Example public directory entry shape:
   "status_updated_at_ms": 1777740058738
 }
 ```
+
+The four `live_*` values in that policy are a frozen wire remnant, not a
+working limit: the live-agent feature they bounded was removed in 1.5.85, and
+nothing now reads or enforces them - policy validation ignores them, and a
+descriptor that omits them still validates. They are still emitted because a
+descriptor is Ed25519-signed over its bytes and the policy presets keep filling
+them, so a newly signed descriptor keeps the shape published ones already have.
+Retiring the keys is a re-sign-and-republish job for every existing
+descriptor, not a field deletion.
 
 `visibility=public` and `join_mode=open_invite` are independent values.
 Operators may set a listed descriptor to `pending`, `delisted`, or `blocked`

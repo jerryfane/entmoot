@@ -66,7 +66,7 @@ func cmdServe(gf *globalFlags, args []string) int {
 			runtime.adoptPendingGroups(ctx, selectedGroups)
 			runtime.retryPendingAdoptions(ctx, selectedGroups)
 			for _, gid := range selectedGroups {
-				if !membershipExists(gf.data, gid) {
+				if !membership.Exists(gf.data, gid) {
 					continue
 				}
 				if _, _, err := runtime.AddLocalGroup(ctx, gid); err != nil {
@@ -92,6 +92,16 @@ func cmdServe(gf *globalFlags, args []string) int {
 	})
 }
 
+// selectServeGroupIDs resolves which groups this daemon will serve, from
+// -group if given and from the data root otherwise.
+//
+// Serveability is membership.Exists: a group needs a checkpoint. A directory
+// holding only the pre-checkpoint chain is not serveable until `membership
+// upgrade` mints checkpoint 0, so such a group is named as missing (when the
+// operator asked for it) or skipped with a warning (when it was found by
+// scan), which is better than starting a session that cannot answer anything.
+// membership.LegacyExists still admits it to the list: adoption runs in the
+// background and the group becomes serveable without a restart.
 func selectServeGroupIDs(dataRoot string, selected []string, logger *slog.Logger) ([]entmoot.GroupID, error) {
 	declinedDefaultMoot, hasDeclinedDefaultMoot := defaultMootDeclinedGroupID(dataRoot)
 	if len(selected) > 0 {
@@ -112,7 +122,7 @@ func selectServeGroupIDs(dataRoot string, selected []string, logger *slog.Logger
 			if _, ok := seen[gid]; ok {
 				continue
 			}
-			if !membershipExists(dataRoot, gid) && !membership.LegacyExists(dataRoot, gid) {
+			if !membership.Exists(dataRoot, gid) && !membership.LegacyExists(dataRoot, gid) {
 				return nil, fmt.Errorf("%w: %s", errServeGroupMissing, gid.String())
 			}
 			seen[gid] = struct{}{}
@@ -137,7 +147,7 @@ func selectServeGroupIDs(dataRoot string, selected []string, logger *slog.Logger
 			}
 			continue
 		}
-		if !membershipExists(dataRoot, gid) && !membership.LegacyExists(dataRoot, gid) {
+		if !membership.Exists(dataRoot, gid) && !membership.LegacyExists(dataRoot, gid) {
 			if logger != nil {
 				logger.Warn("serve: skipping group with no membership state",
 					slog.String("group_id", gid.String()))
@@ -150,8 +160,4 @@ func selectServeGroupIDs(dataRoot string, selected []string, logger *slog.Logger
 		return nil, errServeNoGroups
 	}
 	return out, nil
-}
-
-func membershipExists(dataRoot string, gid entmoot.GroupID) bool {
-	return groupMembershipExists(dataRoot, gid)
 }

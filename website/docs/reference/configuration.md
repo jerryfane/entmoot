@@ -22,6 +22,31 @@ Precedence is intentionally simple:
 3. Installed wrapper defaults from `runtime.env`.
 4. Built-in defaults.
 
+The environment variables that exist:
+
+| Variable | Read by | Effect |
+| --- | --- | --- |
+| `ENTMOOT_ESP_TOKEN` | `esp serve` | Bearer token when `-token` is not given. |
+| `ENTMOOT_APNS_TEAM_ID` | `esp serve` | Apple Developer Team ID; default for `-apns-team-id`. |
+| `ENTMOOT_APNS_KEY_ID` | `esp serve` | APNs key id; default for `-apns-key-id`. |
+| `ENTMOOT_APNS_TOPIC` | `esp serve` | APNs topic/bundle id; default for `-apns-topic`. |
+| `ENTMOOT_APNS_KEY` | `esp serve` | Path to the APNs `.p8` key; default for `-apns-key`. |
+| `ENTMOOT_APNS_SANDBOX` | `esp serve` | `1`, `true` or `yes` sends APNs requests to the sandbox endpoint. Unlike the others it cannot be turned off by the flag: either source enables it. |
+| `ENTMOOT_ESP_URL` | `group create -join-mode open_invite`, ESP group create | Issuer URL used to build the redeemable open-invite link. Required unless the request carries `issuer_url`. |
+| `ENTMOOT_DEFAULT_MOOT_DESCRIPTOR_URL` | `default-moot`, `bootstrap agent` | Overrides the well-known descriptor URL for The Ent Moot. |
+| `ENTMOOT_DEFAULT_MOOT_DESCRIPTOR_PUBKEY` | `default-moot`, `bootstrap agent` | Overrides the pinned base64 Ed25519 key the descriptor signature is checked against. Use it only with a matching test descriptor. |
+| `ENTMOOT_HOME` | `install.sh` | Installation directory; defaults to `$HOME/.entmoot`. |
+| `ENTMOOT_RUNTIME_ENV` | installed wrapper | Explicit path to the `runtime.env` the wrapper sources instead of `<installation>/runtime.env`. |
+| `ENTMOOT_BIN`, `ENTMOOT_DATA`, `ENTMOOT_IDENTITY`, `ENTMOOT_LISTEN_PORT` | installed wrapper | The values the wrapper passes as `-identity`, `-data` and `-listen-port`. The installer writes all four into `runtime.env`, and `ENTMOOT_LISTEN_PORT` is also read at install time to choose the port written there. |
+
+One exception to the precedence above: the wrapper sources `runtime.env` with
+plain assignments, so for those four names the file overrides a value exported
+in the calling environment. Point `ENTMOOT_RUNTIME_ENV` at another file to
+change them, or call the binary directly with flags.
+
+The daemon reads no environment for identity, data root, connectivity or
+relays; those are flags only.
+
 Long-lived services must be restarted after changing startup environment such
 as identity, data root, connectivity profile, or controlled relays.
 `entmootd env --json` is the first check for the effective binary, identity,
@@ -64,6 +89,13 @@ ESP-specific flags:
 ```sh
 -addr 127.0.0.1:8087
 -auth-mode bearer|device|dual
+-token <BEARER_TOKEN>
 -device-keys ~/.entmoot/esp-devices.json
 -allow-non-loopback
+-apns-team-id <TEAM_ID>
+-apns-key-id <KEY_ID>
+-apns-topic <BUNDLE_ID>
+-apns-key <PATH_TO_P8>
+-apns-sandbox
+-bonjour-name <INSTANCE_NAME>
 ```

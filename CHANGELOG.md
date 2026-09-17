@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A probe budget below one peer-slice no longer defeats the floor it is
+  measured against. `probePeers` clamped its per-peer slice and its
+  remaining-time budget to `minProbeSlice` but not the incoming budget, so
+  `doctor -probe-timeout 1ms` - an operator value forwarded unfiltered -
+  refused every peer with "not attempted: probe budget spent" instead of
+  probing any of them. The budget is now clamped at entry too. This also
+  removes a 1-in-130 test flake whose window was the 1ms the caller asked for.
+
+### Removed
+
+- `MemberAuth` no longer carries `Method`, `Path`, `TimestampMS`, `Nonce` and
+  `Signature`. All five are auth inputs already spent by the time the struct
+  exists - the timestamp is range-checked, the nonce is burned into the replay
+  cache, the signature is verified - and nothing read them. Keeping spent
+  credentials invites a reader to trust one. They were `json:"-"`, so
+  `GET /v1/session` is unchanged.
+
+### Changed
+
+- Member-signature authentication now has a round-trip test: a correctly signed
+  `GET /v1/session` returning the member echo, plus the replay, clock-window
+  and impersonation refusals. It had none.
+- The profile total-order sweep builds two state stores instead of 264. The
+  132 record pairs are isolated by member id, not by database, so the
+  per-pair store bought nothing: the `esphttp` package now tests in 20s
+  instead of 48s.
+- One serveability predicate, spelled two ways: `membershipExists` and
+  `groupMembershipExists` are gone in favour of `membership.Exists`, which
+  eight call sites already used.
+- Three production sites restated the group directory encoding by hand; they
+  call `GroupID.DirName()` now, which exists to be the single spelling.
+
 ## [1.5.85] - 2026-09-17
 
 ### Removed

@@ -556,7 +556,8 @@ func TestRefusalTextIsBounded(t *testing.T) {
 // connection and never writes, so the probe can only end at the deadline it
 // handed out, and the elapsed time IS the deadline. Without the floor a peer
 // gets a sub-millisecond deadline and is called unreachable for arithmetic
-// reasons rather than network ones.
+// reasons rather than network ones - and because `doctor -probe-timeout`
+// reaches probePeers unfiltered, the caller was able to ask for exactly that.
 func TestProbeGivesEachPeerTheFloor(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -618,7 +619,8 @@ func TestProbeGivesEachPeerTheFloor(t *testing.T) {
 		}
 	}
 
-	// A millisecond of budget across four peers. Both floors must lift it.
+	// A millisecond of budget across four peers. All three floors must lift
+	// it: the budget, the per-peer slice, and the remaining-time clamp.
 	started := time.Now()
 	results, _, err := runtime.probePeers(ctx, gid, time.Millisecond)
 	if err != nil {
@@ -633,10 +635,15 @@ func TestProbeGivesEachPeerTheFloor(t *testing.T) {
 			t.Fatalf("a listener that never writes was reported as answering: %+v", result)
 		}
 	}
-	// Half the floor, to leave room for scheduling without accepting a probe
-	// that gave up in microseconds.
-	if elapsed < minProbeSlice/2 {
-		t.Fatalf("the probe gave up after %s; with a %s floor it must wait about that long before calling a peer unreachable",
+	// The whole floor, not half of it. Once the budget itself is clamped the
+	// property is exact rather than best-effort: the earliest a worker can
+	// finish is one floor after it starts, and a worker that is descheduled
+	// past the deadline and reports "not attempted" can only do so once the
+	// floor has already passed. So probePeers cannot return sooner than
+	// minProbeSlice however starved the machine is - which is the point of
+	// calling it a floor, and what a half-floor assertion could not say.
+	if elapsed < minProbeSlice {
+		t.Fatalf("the probe gave up after %s; a %s floor on the budget means it must wait at least that long before calling a peer unreachable",
 			elapsed, minProbeSlice)
 	}
 }

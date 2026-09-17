@@ -92,13 +92,28 @@ connections and addresses for approved relays remain permitted.
 **The relay operator sees connecting clients' IP addresses, including their
 NAT egress addresses. Relay-only mode is not anonymity from the relay operator.**
 
+A publicly reachable daemon can host the relay service itself with
+`-relay-service` and one `-relay-allow-peer` per client, instead of running the
+dedicated `relay serve` process. The daemon refuses `-relay-service` without at
+least one allowed peer, refuses `-relay-allow-peer` without `-relay-service`,
+and refuses the pair together with `-connectivity relay-only`, where publishing
+a relay address would defeat the profile. The relay's own limits match `relay
+serve`'s defaults and are not configurable on the daemon. The flag does not
+replace the addresses the daemon announces; it adds a relay under the same
+member identity, so every peer that reserves a slot learns that this member
+lives at this address. Choose the dedicated process when the relay and the
+application identity should not be linked, or when the two must fail and
+restart independently.
+
 Application hosts enforce hard admission limits of 64 total connections, eight
-connections per peer, and 64 streams per peer. Frame caps remain 8 KiB for sync
-requests, 4 MiB for a membership answer, 128 KiB for history lists, and 384 KiB
-for history bodies. Relay circuit duration, byte budgets, and admission policy
-remain operator-controlled; restrictive relay policies can interrupt transfers
-or reject frames. These failures are reported rather than bypassed with direct
-dials or raised application limits.
+connections per peer, and 64 streams per peer; a host running `-relay-service`
+raises only its total by one connection per distinct allowlisted peer, so relay
+clients cannot crowd out the daemon's own group peers. Frame caps remain 8 KiB
+for sync requests, 4 MiB for a membership answer, 128 KiB for history lists,
+and 384 KiB for history bodies. Relay circuit duration, byte budgets, and
+admission policy remain operator-controlled; restrictive relay policies can
+interrupt transfers or reject frames. These failures are reported rather than
+bypassed with direct dials or raised application limits.
 
 ## Social Surface
 

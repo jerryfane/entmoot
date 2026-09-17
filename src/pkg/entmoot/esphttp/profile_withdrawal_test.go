@@ -330,11 +330,20 @@ func TestProfileReplacementIsATotalOrderInEveryStore(t *testing.T) {
 	}
 
 	stores := []struct {
-		name string
-		make func() StateStore
+		name   string
+		make   func() StateStore
+		shared StateStore
 	}{
 		{name: "memory", make: func() StateStore { return NewMemoryStateStore() }},
 		{name: "sqlite", make: func() StateStore { return mustOpenTestStateStore(t) }},
+	}
+	// One store per backend carries the whole sweep: profiles are keyed by
+	// member id and next() hands every pair a fresh id, so no two pairs can
+	// interact. Building a database per pair cost 264 schema creations and
+	// bought nothing. The first pair still runs against freshly made stores so
+	// the "first write into an empty store" path keeps its coverage.
+	for i := range stores {
+		stores[i].shared = stores[i].make()
 	}
 
 	member := uint32(100)
@@ -352,8 +361,12 @@ func TestProfileReplacementIsATotalOrderInEveryStore(t *testing.T) {
 			pairs++
 			results := make(map[string][2]string, len(stores))
 			for _, s := range stores {
-				forward := outcome(s.make(), next(), a, b)
-				reverse := outcome(s.make(), next(), b, a)
+				forwardStore, reverseStore := s.shared, s.shared
+				if pairs == 1 {
+					forwardStore, reverseStore = s.make(), s.make()
+				}
+				forward := outcome(forwardStore, next(), a, b)
+				reverse := outcome(reverseStore, next(), b, a)
 				results[s.name] = [2]string{forward, reverse}
 				if forward != reverse {
 					orderDependent++

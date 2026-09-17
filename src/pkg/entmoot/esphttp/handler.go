@@ -1944,11 +1944,6 @@ type MemberAuth struct {
 	MemberID      entmoot.MemberID `json:"member_id"`
 	PeerID        string           `json:"peer_id"`
 	EntmootPubKey []byte           `json:"entmoot_pubkey"`
-	Method        string           `json:"-"`
-	Path          string           `json:"-"`
-	TimestampMS   int64            `json:"-"`
-	Nonce         string           `json:"-"`
-	Signature     string           `json:"-"`
 }
 
 func (h *Handler) authorize(w http.ResponseWriter, r *http.Request) (authContext, bool) {
@@ -2159,7 +2154,7 @@ func (h *Handler) memberAuthFromRequest(r *http.Request, body []byte) (authConte
 	if !h.nonceCache.use(nonceKey, nonce, now.Add(deviceAuthSkew)) {
 		return authContext{}, "replayed nonce", false
 	}
-	return authContext{member: &MemberAuth{MemberID: memberID, PeerID: peerIDRaw, EntmootPubKey: append([]byte(nil), pub...), Method: r.Method, Path: r.URL.RequestURI(), TimestampMS: tsMillis, Nonce: nonce, Signature: strings.TrimSpace(r.Header.Get(memberSignatureHeader))}}, "", true
+	return authContext{member: &MemberAuth{MemberID: memberID, PeerID: peerIDRaw, EntmootPubKey: append([]byte(nil), pub...)}}, "", true
 }
 
 // DeviceSigningInput returns the canonical bytes a device signs for one ESP

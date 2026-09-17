@@ -3,11 +3,9 @@ package main
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"log/slog"
-	"path/filepath"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -277,7 +275,7 @@ func (r *groupRuntime) AddLocalGroup(ctx context.Context, groupID entmoot.GroupI
 	if legacy := group.Legacy(); legacy != nil {
 		legacyEntries = legacy.Entries()
 	}
-	legacyHistory, err := conversion.LoadLegacyHistoryTree(filepath.Join(r.dataDir, "groups", base64.RawURLEncoding.EncodeToString(groupID[:])), groupID, legacyEntries)
+	legacyHistory, err := conversion.LoadLegacyHistoryTree(groupDirPath(r.dataDir, groupID), groupID, legacyEntries)
 	if err != nil {
 		_ = group.Close()
 		return nil, false, fmt.Errorf("load legacy history commitment: %w", err)
