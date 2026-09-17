@@ -83,11 +83,23 @@ ENTMOOT-ESP-MEMBER-AUTH-V2
 <base64 sha256 of the body>
 ```
 
-joined with `\n`. Every base64 here is standard padded encoding, including the
-member id, the public key, the body hash and the signature header itself;
-URL-safe base64 is refused with `invalid member public key`. The timestamp
-must be within five minutes of the ESP's clock either way, and the nonce is
-single-use for that window - a replay answers `replayed nonce`.
+joined with `\n`. Every base64 here is standard padded encoding - the member
+id, the public key, the body hash and the signature header. Decoding is
+`StdEncoding` with no URL-safe or unpadded fallback, so a key or signature
+encoded URL-safely is refused whenever its bytes actually differ, which for a
+random 32-byte key is most of the time but not always: the two alphabets
+differ only at values 62 and 63. Fields are checked in header order and the
+first bad one names itself: `invalid member id`, `invalid peer id`, `invalid
+member public key`, `invalid nonce`, then `invalid signature` - which is also
+what a wrongly encoded body hash produces, because it only changes the bytes
+that were signed.
+
+The timestamp must be within five minutes of the ESP's clock either way. The
+nonce is single-use for that same five minutes, scoped to the member id and
+peer id, so the same nonce from a different member is accepted; a replay
+answers `replayed nonce`. A nonce is consumed only after the signature
+verifies, so a request rejected as `invalid signature` may be retried with the
+same nonce.
 
 Device-authenticated requests sign method, path with query, timestamp, nonce,
 and body hash.
