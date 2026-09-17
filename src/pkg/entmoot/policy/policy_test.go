@@ -102,22 +102,6 @@ func TestPolicyValidateRejectsMalformedValues(t *testing.T) {
 			},
 		},
 		{
-			name:   "bad live trigger rate",
-			mutate: func(p *Policy) { p.LiveTriggerRate = "6/day" },
-		},
-		{
-			name:   "zero live trigger burst",
-			mutate: func(p *Policy) { p.LiveTriggerBurst = 0 },
-		},
-		{
-			name:   "negative live max actions",
-			mutate: func(p *Policy) { p.LiveMaxActionsPerScan = -1 },
-		},
-		{
-			name:   "negative live max action bytes",
-			mutate: func(p *Policy) { p.LiveMaxActionBytes = -1 },
-		},
-		{
 			name:   "zero retention",
 			mutate: func(p *Policy) { p.RetentionDays = 0 },
 		},
@@ -238,10 +222,28 @@ func TestLoadJSONFileRejectsUnknownFieldsAndTrailingData(t *testing.T) {
 
 func TestPolicySummary(t *testing.T) {
 	got := Summary(TheEntMootDefault())
-	for _, want := range []string{"message_rate=6/min", "burst=12", "max_message_bytes=8192", "live_rate=6/min", "retention_days=30"} {
+	for _, want := range []string{"message_rate=6/min", "burst=12", "max_message_bytes=8192", "retention_days=30"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("Summary = %q, missing %q", got, want)
 		}
+	}
+	// The live limits are enforced by nothing, so status output stops
+	// advertising them as if they were a working limit.
+	if strings.Contains(got, "live_") {
+		t.Fatalf("Summary = %q, still reports a live limit", got)
+	}
+}
+
+// A policy file written for a build without the live-agent feature omits the
+// live_* keys entirely. They are optional input now, not required.
+func TestPolicyValidateAcceptsAPolicyWithoutLiveLimits(t *testing.T) {
+	p := Standard()
+	p.LiveTriggerRate = ""
+	p.LiveTriggerBurst = 0
+	p.LiveMaxActionsPerScan = 0
+	p.LiveMaxActionBytes = 0
+	if err := p.Validate(); err != nil {
+		t.Fatalf("a policy with no live limits was rejected: %v", err)
 	}
 }
 

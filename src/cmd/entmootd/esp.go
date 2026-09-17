@@ -206,7 +206,7 @@ func runESPServe(gf *globalFlags, cfg espServeConfig) int {
 		},
 		Notifier:    notifier,
 		State:       resources.espState,
-		Groups:      localGroupCatalog{dataDir: gf.data, metadata: metadataStore, state: resources.espState},
+		Groups:      localGroupCatalog{dataDir: gf.data, metadata: metadataStore},
 		Diagnostics: espDiagnosticsProvider{flags: *gf},
 		GroupExists: espGroupExists(gf.data),
 		Logger:      slog.Default(),
@@ -328,11 +328,12 @@ func (p controlSocketSignedPublisher) PublishSigned(ctx context.Context, msg ent
 	}
 	switch v := payload.(type) {
 	case *ipc.SignedPublishResp:
+		authorMemberID, _ := entmoot.ResolvedMemberID(msg.Author)
 		return esphttp.PublishResult{
 			Status:         v.Status,
 			MessageID:      v.MessageID,
 			GroupID:        v.GroupID,
-			AuthorMemberID: liveMessageAuthorMemberID(msg),
+			AuthorMemberID: authorMemberID,
 			TimestampMS:    v.TimestampMS,
 		}, nil
 	case *ipc.ErrorFrame:

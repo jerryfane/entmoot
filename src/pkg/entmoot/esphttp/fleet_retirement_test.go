@@ -16,7 +16,7 @@ func TestOpenRetiresFleetTables(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open legacy: %v", err)
 	}
-	for _, table := range RetiredFleetTables {
+	for _, table := range RetiredTables {
 		if _, err := legacy.Exec(`CREATE TABLE ` + table + ` (id TEXT PRIMARY KEY, note TEXT)`); err != nil {
 			t.Fatalf("create %s: %v", table, err)
 		}
@@ -39,7 +39,7 @@ func TestOpenRetiresFleetTables(t *testing.T) {
 		t.Fatalf("open probe: %v", err)
 	}
 	defer probe.Close()
-	for _, table := range RetiredFleetTables {
+	for _, table := range RetiredTables {
 		var n int
 		if err := probe.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&n); err != nil {
 			t.Fatalf("count %s: %v", table, err)
@@ -55,7 +55,7 @@ func TestOpenRetiresFleetTables(t *testing.T) {
 // writer holding it must not stall the ESP start, so the attempt is bounded and
 // gives up, leaving the tables for a later open.
 //
-// This calls retireFleetTables directly rather than going through
+// This calls retireRemovedFeatureTables directly rather than going through
 // OpenSQLiteStateStore, because that path already waits the full busy_timeout
 // for an unrelated reason: deleteExpiredIdempotency runs at open and writes
 // (mobile.go, "_, _ = store.deleteExpiredIdempotency"). Measuring the whole
@@ -101,7 +101,7 @@ func TestRetireFleetTablesIsBoundedUnderAContendedLock(t *testing.T) {
 	}
 	defer target.Close()
 	started := time.Now()
-	retireFleetTables(target, path)
+	retireRemovedFeatureTables(target, path)
 	waited := time.Since(started)
 	if waited > 2*time.Second {
 		_ = tx.Rollback()
@@ -131,7 +131,7 @@ func TestRetireFleetTablesIsBoundedUnderAContendedLock(t *testing.T) {
 	}
 
 	// Uncontended, a later call finishes the job.
-	retireFleetTables(target, path)
+	retireRemovedFeatureTables(target, path)
 	if err := target.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='table' AND name='esp_fleets'`).Scan(&n); err != nil {
 		t.Fatalf("count after retry: %v", err)
 	}

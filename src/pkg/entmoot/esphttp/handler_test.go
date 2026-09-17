@@ -378,19 +378,6 @@ func TestHandlerMobileGroupsAndSignRequests(t *testing.T) {
 	}
 }
 
-func TestLiveAgentConfigReadHonorsBearerBeforeMember(t *testing.T) {
-	gid := testGroupID(9)
-	req := httptest.NewRequest(http.MethodGet, "/v1/groups/"+gid.String()+"/live-agents", nil)
-	req = req.WithContext(context.WithValue(req.Context(), authContextKey{}, authContext{
-		bearer: true,
-		member: &MemberAuth{MemberID: testMemberID(45499), EntmootPubKey: []byte("not-a-group-member")},
-	}))
-	rec := httptest.NewRecorder()
-	if !(&Handler{}).checkLiveAgentConfigRead(rec, req, gid) {
-		t.Fatalf("checkLiveAgentConfigRead = false, status=%d body=%s", rec.Code, rec.Body.String())
-	}
-}
-
 func TestHandlerOpenInviteListAndRevoke(t *testing.T) {
 	gid := testGroupID(1)
 	_, priv, err := ed25519.GenerateKey(rand.Reader)

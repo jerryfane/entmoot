@@ -48,16 +48,6 @@ daemon process exists. It detects common wrong-namespace cases where the host
 shell sees a different `/data` than the Docker/OpenClaw process that owns
 `/data/.entmoot/control.sock`.
 
-Live-agent inspection:
-
-```sh
-entmootd agent-live status -group <GROUP_ID> --json
-```
-
-Use these commands from the same runtime namespace and data root as the agent.
-Live config, presence, and live cursors are in `esp.sqlite` for the current
-`-data` path.
-
 `peers` prints the same member rows `doctor` builds and takes the same
 `--probe` and `--timeout`. Without `--probe` a listed peer means a member whose
 key is in the group, not a peer proved reachable.

@@ -729,7 +729,7 @@ func TestGroupCreateOpenInviteIssuerURLForUsesEnvFallback(t *testing.T) {
 	}
 }
 
-func TestLocalGroupCatalogListMembersIncludesLiveAgentState(t *testing.T) {
+func TestLocalGroupCatalogListMembersProjectsIdentityAndCurrentHostname(t *testing.T) {
 	ctx := context.Background()
 	dataDir := t.TempDir()
 	gid := testESPGroupID(41)
@@ -741,44 +741,22 @@ func TestLocalGroupCatalogListMembersIncludesLiveAgentState(t *testing.T) {
 	createTestGroup(t, dataDir, gid, id, info)
 	state := esphttp.NewMemoryStateStore()
 	now := time.Now().UnixMilli()
-	if _, err := state.UpsertLiveAgentConfig(ctx, esphttp.LiveAgentConfig{
-		GroupID:        gid,
-		MemberID:       *info.MemberID,
-		Enabled:        true,
-		Mode:           esphttp.LiveModeOperator,
-		TopicFilters:   []string{"chat"},
-		AllowedActions: []string{"reply", "message.summarize"},
-		UpdatedAtMS:    now,
-	}); err != nil {
-		t.Fatalf("UpsertLiveAgentConfig: %v", err)
-	}
-	if _, err := state.UpsertLiveAgentPresence(ctx, esphttp.LiveAgentPresence{
-		GroupID:      gid,
-		MemberID:     *info.MemberID,
-		Status:       esphttp.LiveStatusOnline,
-		Mode:         esphttp.LiveModeOperator,
-		TopicFilters: []string{"chat"},
-		LastSeenAtMS: now,
-		LeaseUntilMS: time.Now().Add(time.Minute).UnixMilli(),
-		UpdatedAtMS:  now,
-	}); err != nil {
-		t.Fatalf("UpsertLiveAgentPresence: %v", err)
-	}
-	catalog := localGroupCatalog{dataDir: dataDir, state: state}
+	catalog := localGroupCatalog{dataDir: dataDir}
 	members, err := catalog.ListMembers(ctx, gid)
 	if err != nil {
 		t.Fatalf("ListMembers: %v", err)
 	}
-	if len(members) != 1 || members[0].MemberID != *info.MemberID || members[0].PeerID != info.PeerID || members[0].Live == nil {
-		t.Fatalf("members = %+v, want live state", members)
+	if len(members) != 1 || members[0].MemberID != *info.MemberID || members[0].PeerID != info.PeerID {
+		t.Fatalf("members = %+v, want the one group member", members)
 	}
-	if members[0].Live.Status != esphttp.LiveStatusOnline || members[0].Live.Mode != esphttp.LiveModeOperator {
-		t.Fatalf("live state = %+v, want online operator", members[0].Live)
+	staleKey, err := keystore.Generate()
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
 	}
 	otherGroup := testESPGroupID(42)
 	for _, profile := range []esphttp.NodeProfileRecord{
 		{MemberID: *info.MemberID, EntmootPubKey: encodeBase64(info.EntmootPubKey), Hostname: "current", Source: esphttp.NodeProfileSourceMemberProfile, SourceGroupID: &gid, ObservedAtMS: now},
-		{MemberID: *info.MemberID, EntmootPubKey: encodeBase64(testAgentLiveAuthor(99).EntmootPubKey), Hostname: "stale-key", Source: esphttp.NodeProfileSourceMemberProfile, SourceGroupID: &gid, ObservedAtMS: now + 1},
+		{MemberID: *info.MemberID, EntmootPubKey: encodeBase64(staleKey.PublicKey), Hostname: "stale-key", Source: esphttp.NodeProfileSourceMemberProfile, SourceGroupID: &gid, ObservedAtMS: now + 1},
 		{MemberID: *info.MemberID, EntmootPubKey: encodeBase64(info.EntmootPubKey), Hostname: "other-room", Source: esphttp.NodeProfileSourceMemberProfile, SourceGroupID: &otherGroup, ObservedAtMS: now + 2},
 	} {
 		if _, _, err := state.UpsertNodeProfile(ctx, profile); err != nil {
@@ -803,7 +781,7 @@ func TestLocalGroupCatalogListMembersIncludesLiveAgentState(t *testing.T) {
 	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
 		t.Fatal(err)
 	}
-	if len(result.Members) != 1 || result.Members[0].MemberID != *info.MemberID || result.Members[0].PeerID != info.PeerID || result.Members[0].GlobalHostname != "current" || result.Members[0].Live == nil || result.Members[0].Live.Status != esphttp.LiveStatusOnline {
+	if len(result.Members) != 1 || result.Members[0].MemberID != *info.MemberID || result.Members[0].PeerID != info.PeerID || result.Members[0].GlobalHostname != "current" {
 		t.Fatalf("HTTP member projection lost identity or trusted stale profiles: %+v", result.Members)
 	}
 }

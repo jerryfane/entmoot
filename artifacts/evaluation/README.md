@@ -18,4 +18,6 @@ Tracked files in this directory are policy files only:
 - `.gitignore` keeps raw output out of git by default.
 - `README.md` documents the artifact policy.
 
-Use `docs/evaluation-live-agent-study-runbook.md` for the full study procedure.
+The live-agent study runbook this pointed at was deleted with the
+`agent-live` feature in 1.5.85. The `scripts/eval/*` tooling here does not
+depend on that feature and still runs.

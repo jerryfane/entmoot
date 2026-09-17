@@ -33,7 +33,7 @@ State ownership:
 | other group SQLite files | Messages, Merkle state, profiles, and gossip state. |
 | `bootstrap-admission.db` | Local record of the invites this node issued, used by `invite list`. Not an authority: invite use limits and revocations are projected from the group's signed state. |
 | `mailbox.sqlite` | Durable ESP mailbox cursors. |
-| `esp.sqlite` | Sign requests, push tokens, notification preferences, public moot directory records, live-agent configs, presence, and cursors. |
+| `esp.sqlite` | Sign requests, push tokens, notification preferences, and public moot directory records. |
 | `esp-devices.json` | Local ESP device registry. |
 | `runtime.env` | Wrapper defaults: binary, data root, identity, port. |
 
@@ -65,6 +65,6 @@ It reads `runtime.env` and keeps the binary, identity and data root inside the
 same runtime namespace. Connectivity is not among them - the wrapper execs
 only `-identity`, `-data` and `-listen-port`.
 
-When diagnosing live agents, the data root matters as much as the binary. A
+When diagnosing ESP state, the data root matters as much as the binary. A
 container agent that writes `/data/.entmoot/esp.sqlite` will not appear in a
 host command reading `~/.entmoot/esp.sqlite`.

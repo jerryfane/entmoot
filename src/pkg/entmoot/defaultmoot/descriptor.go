@@ -68,9 +68,16 @@ type OpenInviteDescriptor struct {
 	Link      string `json:"link,omitempty"`
 }
 
-// RecommendedLiveConfig describes the safe default live-agent settings for the
-// public moot. Later CLI tasks consume this; this package only validates and
-// transports it.
+// RecommendedLiveConfig is a frozen wire remnant, like policy's live_* limits.
+// It described the safe default live-agent settings for the public moot;
+// since 1.5.85 nothing consumes it, because the live-agent feature is gone.
+//
+// It stays because the descriptor is Ed25519-signed over its bytes and Parse
+// rejects unknown fields, so dropping the field makes the published descriptor
+// unparseable and the signature means the key cannot be stripped without the
+// signer re-issuing it. Validate still pins its values: an already-signed
+// descriptor has them, and accepting other values would only mean admitting
+// data nothing checks. Retiring it needs a re-signed descriptor.
 type RecommendedLiveConfig struct {
 	Mode           string   `json:"mode"`
 	AllowedActions []string `json:"allowed_actions"`

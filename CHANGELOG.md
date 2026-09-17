@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- `agent-live` is deleted: the subcommand, its polling runtime, the OpenClaw
+  runner adapter and selectors, the `default-moot live on|off` consent path,
+  the `live-agents` ESP HTTP routes, the `live` field on mobile member
+  summaries, and the `esp_live_agent_configs`/`_presence`/`_cursors` tables
+  (dropped on open, like the retired Fleet tables). It was a 2,532-line bot
+  living outside the daemon: it opened the daemon's SQLite behind its back
+  every 10 seconds, re-scanned a 10-minute message window, and shelled out to
+  a runner binary, duplicating a push path the daemon already owns
+  (`notifyingStore` + `ipc tail_subscribe`). Its presence "lease" was
+  decorative and its cursor a blind last-write-wins upsert, so two runners
+  answered every message twice. Entmoot stays a message pipe; a bot belongs
+  outside it, reading the push path.
+- Member-signature authentication (`X-Entmoot-Member-*`) now reaches only
+  `GET /v1/session`. The live-agent config routes were the only others that
+  accepted it.
+- The four `live_*` limits in a group policy survive as a wire remnant and are
+  enforced by nothing. They cannot be deleted in code: a public-moot
+  descriptor embeds the policy, is signed over its bytes, and is parsed with
+  unknown fields rejected, so removing them breaks every descriptor already
+  signed and published. Retiring them needs a re-signed descriptor.
+
 ### Added
 
 - `serve -relay-service -relay-allow-peer <PEER_ID>` runs the bounded,

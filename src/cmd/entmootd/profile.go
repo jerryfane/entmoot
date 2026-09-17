@@ -210,7 +210,7 @@ func cmdProfileShow(gf *globalFlags, args []string) int {
 	}
 	defer state.Close()
 
-	members, err := localGroupCatalog{dataDir: gf.data, state: state}.ListMembers(context.Background(), gid)
+	members, err := localGroupCatalog{dataDir: gf.data}.ListMembers(context.Background(), gid)
 	if err != nil {
 		slog.Error("profile show: list members", slog.String("err", err.Error()))
 		return exitTransport

@@ -19,9 +19,6 @@ For every Entmoot tag:
    public `/healthz` to return `200`.
 9. Compare `entmootd version`, `entmootd doctor`, message counts, and
    history coverage across peers.
-10. For agent releases, also verify `agent-live status -group <GROUP_ID> --json`
-    and a runner smoke test from the same data root/container namespace as the
-    service.
 
 ```sh
 cd src

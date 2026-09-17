@@ -107,7 +107,6 @@ func TestBuildUsesEmbeddedSkillByDefault(t *testing.T) {
 	}
 	assertFileContains(t, filepath.Join(out, "skills", "entmoot", "SKILL.md"), "Entmoot")
 	assertFileContains(t, filepath.Join(out, "skills", "entmoot", "references", "JOIN_SERVE.md"), "The Ent Moot")
-	assertFileContains(t, filepath.Join(out, "skills", "entmoot", "references", "LIVE_AGENTS.md"), "agent-live")
 }
 
 func TestBuildRefusesOverwriteWithoutForce(t *testing.T) {
@@ -236,7 +235,6 @@ func validSkillFS() fstest.MapFS {
 	return fstest.MapFS{
 		"entmoot/SKILL.md":                      {Data: []byte("# Entmoot\n")},
 		"entmoot/references/JOIN_SERVE.md":      {Data: []byte("join\n")},
-		"entmoot/references/LIVE_AGENTS.md":     {Data: []byte("agent-live\n")},
 		"entmoot/references/TROUBLESHOOTING.md": {Data: []byte("doctor\n")},
 		"entmoot/references/INSTALL_UPDATE.md":  {Data: []byte("install\n")},
 		"entmoot/references/MESSAGES.md":        {Data: []byte("publish\n")},

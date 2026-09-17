@@ -40,7 +40,6 @@ const sidebars: SidebarsConfig = {
         'cli/tail-query-info-version',
         'cli/bootstrap-agent',
         'cli/default-moot',
-        'cli/agent-live',
         'cli/mailbox',
         'cli/esp-serve',
         'cli/esp-device-sign-request',

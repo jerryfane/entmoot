@@ -43,7 +43,6 @@ type MemberSummary struct {
 	Hostname       string           `json:"hostname,omitempty"`
 	GlobalHostname string           `json:"global_hostname,omitempty"`
 	DisplayName    string           `json:"display_name"`
-	Live           *LiveAgentState  `json:"live,omitempty"`
 }
 
 // GroupCatalog reads local group/roster state for mobile API requests.
@@ -201,15 +200,6 @@ type StateStore interface {
 	RedeemOpenInvite(context.Context, string, OpenInviteRedemption, int64) (OpenInviteRecord, OpenInviteRedemption, bool, error)
 	CompleteOpenInviteRedemption(context.Context, string, string, json.RawMessage, int64) error
 	ReleaseOpenInviteRedemption(context.Context, string, string, int64) error
-	UpsertLiveAgentConfig(context.Context, LiveAgentConfig) (LiveAgentConfig, error)
-	GetLiveAgentConfig(context.Context, entmoot.GroupID, entmoot.MemberID) (LiveAgentConfig, bool, error)
-	ListLiveAgentConfigs(context.Context, entmoot.GroupID) ([]LiveAgentConfig, error)
-	ListLiveAgentConfigsForMember(context.Context, entmoot.MemberID) ([]LiveAgentConfig, error)
-	DeleteLiveAgentConfig(context.Context, entmoot.GroupID, entmoot.MemberID, int64) error
-	UpsertLiveAgentPresence(context.Context, LiveAgentPresence) (LiveAgentPresence, error)
-	ListLiveAgentPresence(context.Context, entmoot.GroupID) ([]LiveAgentPresence, error)
-	GetLiveAgentCursor(context.Context, entmoot.GroupID, entmoot.MemberID) (LiveAgentCursor, bool, error)
-	UpsertLiveAgentCursor(context.Context, LiveAgentCursor) (LiveAgentCursor, error)
 	UpsertPublicMoot(context.Context, PublicMootRecord, int64) (PublicMootRecord, bool, error)
 	ListPublicMoots(context.Context, PublicMootListFilter) ([]PublicMootRecord, error)
 	GetPublicMoot(context.Context, entmoot.GroupID) (PublicMootRecord, bool, error)
@@ -255,35 +245,29 @@ func OpenInviteUseLimitReached(rec OpenInviteRecord) bool {
 
 // MemoryStateStore is useful for tests and dev-mode ESP handlers.
 type MemoryStateStore struct {
-	mu                sync.Mutex
-	requests          map[string]SignRequest
-	devices           map[string]DeviceState
-	idem              map[string]IdempotencyRecord
-	groups            map[entmoot.GroupID]json.RawMessage
-	invites           map[string]OpenInviteRecord
-	redeems           map[string]map[string]OpenInviteRedemption
-	liveAgentConfigs  map[entmoot.GroupID]map[entmoot.MemberID]LiveAgentConfig
-	liveAgentPresence map[entmoot.GroupID]map[entmoot.MemberID]LiveAgentPresence
-	liveAgentCursors  map[entmoot.GroupID]map[entmoot.MemberID]LiveAgentCursor
-	publicMoots       map[entmoot.GroupID]PublicMootRecord
-	nodeProfiles      map[entmoot.MemberID]map[string]NodeProfileRecord
-	clock             func() time.Time
+	mu           sync.Mutex
+	requests     map[string]SignRequest
+	devices      map[string]DeviceState
+	idem         map[string]IdempotencyRecord
+	groups       map[entmoot.GroupID]json.RawMessage
+	invites      map[string]OpenInviteRecord
+	redeems      map[string]map[string]OpenInviteRedemption
+	publicMoots  map[entmoot.GroupID]PublicMootRecord
+	nodeProfiles map[entmoot.MemberID]map[string]NodeProfileRecord
+	clock        func() time.Time
 }
 
 func NewMemoryStateStore() *MemoryStateStore {
 	return &MemoryStateStore{
-		requests:          make(map[string]SignRequest),
-		devices:           make(map[string]DeviceState),
-		idem:              make(map[string]IdempotencyRecord),
-		groups:            make(map[entmoot.GroupID]json.RawMessage),
-		invites:           make(map[string]OpenInviteRecord),
-		redeems:           make(map[string]map[string]OpenInviteRedemption),
-		liveAgentConfigs:  make(map[entmoot.GroupID]map[entmoot.MemberID]LiveAgentConfig),
-		liveAgentPresence: make(map[entmoot.GroupID]map[entmoot.MemberID]LiveAgentPresence),
-		liveAgentCursors:  make(map[entmoot.GroupID]map[entmoot.MemberID]LiveAgentCursor),
-		publicMoots:       make(map[entmoot.GroupID]PublicMootRecord),
-		nodeProfiles:      make(map[entmoot.MemberID]map[string]NodeProfileRecord),
-		clock:             time.Now,
+		requests:     make(map[string]SignRequest),
+		devices:      make(map[string]DeviceState),
+		idem:         make(map[string]IdempotencyRecord),
+		groups:       make(map[entmoot.GroupID]json.RawMessage),
+		invites:      make(map[string]OpenInviteRecord),
+		redeems:      make(map[string]map[string]OpenInviteRedemption),
+		publicMoots:  make(map[entmoot.GroupID]PublicMootRecord),
+		nodeProfiles: make(map[entmoot.MemberID]map[string]NodeProfileRecord),
+		clock:        time.Now,
 	}
 }
 
@@ -765,49 +749,6 @@ CREATE INDEX IF NOT EXISTS idx_node_profile_sources_node
 CREATE INDEX IF NOT EXISTS idx_node_profile_sources_expires
   ON esp_node_profile_sources(expires_at_ms);
 
-CREATE TABLE IF NOT EXISTS esp_live_agent_configs (
-  group_id BLOB NOT NULL,
-  member_id BLOB NOT NULL,
-  enabled INTEGER NOT NULL,
-  mode TEXT NOT NULL,
-  topic_filters BLOB NOT NULL,
-  allowed_actions BLOB NOT NULL,
-  max_actions_per_scan INTEGER NOT NULL DEFAULT 0,
-  max_action_bytes INTEGER NOT NULL DEFAULT 0,
-  updated_at_ms INTEGER NOT NULL,
-  PRIMARY KEY(group_id, member_id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_live_agent_configs_group
-  ON esp_live_agent_configs(group_id, enabled, member_id);
-
-CREATE TABLE IF NOT EXISTS esp_live_agent_presence (
-  group_id BLOB NOT NULL,
-  member_id BLOB NOT NULL,
-  status TEXT NOT NULL,
-  mode TEXT NOT NULL,
-  topic_filters BLOB NOT NULL,
-  last_seen_at_ms INTEGER NOT NULL,
-  lease_until_ms INTEGER NOT NULL,
-  updated_at_ms INTEGER NOT NULL,
-  PRIMARY KEY(group_id, member_id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_live_agent_presence_group
-  ON esp_live_agent_presence(group_id, lease_until_ms, member_id);
-
-CREATE TABLE IF NOT EXISTS esp_live_agent_cursors (
-  group_id BLOB NOT NULL,
-  member_id BLOB NOT NULL,
-  scan_floor_at_ms INTEGER NOT NULL DEFAULT 0,
-  last_seen_at_ms INTEGER NOT NULL,
-  last_seen_author_member_id BLOB,
-  last_seen_message_id BLOB NOT NULL DEFAULT x'',
-  seen_message_ids BLOB NOT NULL DEFAULT '[]',
-  updated_at_ms INTEGER NOT NULL,
-  PRIMARY KEY(group_id, member_id)
-);
-
 `
 
 func OpenSQLiteStateStore(dataDir string) (*SQLiteStateStore, error) {
@@ -842,7 +783,7 @@ func OpenSQLiteStateStore(dataDir string) (*SQLiteStateStore, error) {
 		_ = db.Close()
 		return nil, err
 	}
-	retireFleetTables(db, dbPath)
+	retireRemovedFeatureTables(db, dbPath)
 	store := &SQLiteStateStore{db: db}
 	cleanupCtx, cleanupCancel := context.WithCancel(context.Background())
 	store.cleanupCancel = cleanupCancel
@@ -1467,44 +1408,6 @@ func migrateSQLiteState(db *sql.DB) error {
 			return err
 		}
 	}
-	liveConfigCols, err := tableColumns(db, "esp_live_agent_configs")
-	if err != nil {
-		return err
-	}
-	for _, stmt := range []struct {
-		name string
-		sql  string
-	}{
-		{"max_actions_per_scan", `ALTER TABLE esp_live_agent_configs ADD COLUMN max_actions_per_scan INTEGER NOT NULL DEFAULT 0`},
-		{"max_action_bytes", `ALTER TABLE esp_live_agent_configs ADD COLUMN max_action_bytes INTEGER NOT NULL DEFAULT 0`},
-	} {
-		if liveConfigCols[stmt.name] {
-			continue
-		}
-		if err := addStateColumn(db, "esp_live_agent_configs", stmt.name, stmt.sql); err != nil {
-			return err
-		}
-	}
-	liveCursorCols, err := tableColumns(db, "esp_live_agent_cursors")
-	if err != nil {
-		return err
-	}
-	for _, stmt := range []struct {
-		name string
-		sql  string
-	}{
-		{"scan_floor_at_ms", `ALTER TABLE esp_live_agent_cursors ADD COLUMN scan_floor_at_ms INTEGER NOT NULL DEFAULT 0`},
-		{"last_seen_author_member_id", `ALTER TABLE esp_live_agent_cursors ADD COLUMN last_seen_author_member_id BLOB`},
-		{"last_seen_message_id", `ALTER TABLE esp_live_agent_cursors ADD COLUMN last_seen_message_id BLOB NOT NULL DEFAULT x''`},
-		{"seen_message_ids", `ALTER TABLE esp_live_agent_cursors ADD COLUMN seen_message_ids BLOB NOT NULL DEFAULT '[]'`},
-	} {
-		if liveCursorCols[stmt.name] {
-			continue
-		}
-		if err := addStateColumn(db, "esp_live_agent_cursors", stmt.name, stmt.sql); err != nil {
-			return err
-		}
-	}
 	return nil
 }
 
@@ -1702,16 +1605,18 @@ func deviceIDForRequest(auth authContext) string {
 	return strings.TrimSpace(auth.device.ID)
 }
 
-// RetiredFleetTables are the tables of the removed Fleet/tasks/agent-commands
-// feature. They are dropped rather than left in place so an upgraded node stops
-// carrying rows nothing can read, and so a later reader cannot mistake stale
-// fleet state for something live.
+// RetiredTables are the tables of features this daemon no longer has: the
+// Fleet/tasks/agent-commands feature, and agent-live's per-node config,
+// presence lease and scan cursor. They are dropped rather than left in place
+// so an upgraded node stops carrying rows nothing can read, and so a later
+// reader cannot mistake stale state for something live.
 //
-// Exported because the legacy-root conversion has to drop them too, and for the
-// same reason it drops esp_open_invite_challenges: it rewrites identities table
-// by table, and a table whose rows can no longer be keyed or scoped must be
-// gone before that walk rather than fail it.
-var RetiredFleetTables = []string{
+// Exported because the legacy-root conversion has to drop them too, and for
+// the same reason it drops esp_open_invite_challenges: it rewrites identities
+// table by table, and a table whose rows can no longer be keyed or scoped must
+// be gone before that walk rather than fail it. agent-live's cursor table
+// carries last_seen_author_node_id, which is exactly such a column.
+var RetiredTables = []string{
 	"esp_fleet_command_results",
 	"esp_fleet_commands",
 	"esp_fleet_task_submissions",
@@ -1721,9 +1626,12 @@ var RetiredFleetTables = []string{
 	"esp_fleet_members",
 	"esp_fleets",
 	"esp_agent_commands",
+	"esp_live_agent_cursors",
+	"esp_live_agent_presence",
+	"esp_live_agent_configs",
 }
 
-// retireFleetTables drops the removed feature's tables, best-effort.
+// retireRemovedFeatureTables drops the removed features' tables, best-effort.
 //
 // DROP TABLE needs a write transaction while the schema block above needs
 // none, so this runs outside it and never fails the open: this fleet runs
@@ -1731,21 +1639,21 @@ var RetiredFleetTables = []string{
 // holding the lock must not stop the ESP starting. busy_timeout is lowered for
 // the attempt and restored afterwards so a contended open is not stalled for
 // the path's full 5s; whatever is left is retired on a later open.
-func retireFleetTables(db *sql.DB, dbPath string) {
+func retireRemovedFeatureTables(db *sql.DB, dbPath string) {
 	if _, err := db.Exec(`PRAGMA busy_timeout = 200`); err != nil {
-		slog.Debug("esphttp: retire fleet tables deferred: set busy_timeout",
+		slog.Debug("esphttp: retire removed-feature tables deferred: set busy_timeout",
 			slog.String("path", dbPath), slog.String("err", err.Error()))
 		return
 	}
 	defer func() {
 		if _, err := db.Exec(`PRAGMA busy_timeout = 5000`); err != nil {
-			slog.Warn("esphttp: restore busy_timeout after fleet retirement",
+			slog.Warn("esphttp: restore busy_timeout after table retirement",
 				slog.String("path", dbPath), slog.String("err", err.Error()))
 		}
 	}()
-	for _, table := range RetiredFleetTables {
+	for _, table := range RetiredTables {
 		if _, err := db.Exec(`DROP TABLE IF EXISTS ` + table); err != nil {
-			slog.Debug("esphttp: retire fleet table deferred to a later open",
+			slog.Debug("esphttp: retire removed-feature table deferred to a later open",
 				slog.String("path", dbPath), slog.String("table", table), slog.String("err", err.Error()))
 			return
 		}

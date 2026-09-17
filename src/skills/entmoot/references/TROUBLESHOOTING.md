@@ -41,9 +41,6 @@ daemon `probe_status` says so rather than blaming the peers.
 - **Peer transport unavailable:** check `-connectivity`, the direct listener, and every configured `-controlled-relay`.
 - **Not a member:** send `"$ENTMOOT" info` to the group founder/admin.
 - **Invite expired:** request a new invite.
-- **Runner missing:** set `ENTMOOT_AGENT_RUNNER=openclaw` or pass
-  `-runner openclaw`.
-- **Live presence offline:** run `agent-live run`; `enable` only writes config.
 - **Peer route unclear:** run `doctor -group <gid> --probe --json`. Read
   `reachable` per peer, and `answered` before blaming the network: an
   answered-but-refused row means membership, not routing. `probe_status` says

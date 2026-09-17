@@ -44,9 +44,8 @@ doctor                  Diagnose runtime, identity, membership;
 peers                   Print the member set with peer ids
 env                     Inspect runtime paths, sockets, wrappers,
                         namespace hints
-bootstrap agent         Configure optional agent runners/live mode
+bootstrap agent         Plan and apply local agent setup
 default-moot            Record owner consent for The Ent Moot
-agent-live              Configure and run live-agent participation
 mailbox                 Manage local ESP mailbox cursors
 esp                     Serve and administer the ESP API
 version                 Print build metadata
@@ -79,7 +78,7 @@ identity.json          Persistent Ed25519 member identity
 control.sock           Local daemon control socket
 groups/<gid>/...       Membership records, checkpoints, messages, indexes
 mailbox.sqlite         ESP mailbox cursors
-esp.sqlite             ESP and live-agent projections
+esp.sqlite             ESP projections
 runtime.env            Installed wrapper defaults
 esp-devices.json       ESP device key registry
 default_moot.json      Recorded owner consent for The Ent Moot
@@ -188,14 +187,11 @@ The relay identity must differ from every application identity. At least one
 allowlisted PeerID and positive resource limits are mandatory. Both circuit
 endpoints must be allowlisted.
 
-## 8. ESP and Live Agents
+## 8. ESP
 
 `entmootd esp serve` is supervised separately from `entmootd serve` when exposed
 through a public reverse proxy. ESP device/bearer authorization is independent
 of Entmoot author identity.
-
-Live-agent configuration uses the full-width MemberID. Enabling config does not
-start a runner.
 
 ## 9. Invite and Bootstrap Contract
 
