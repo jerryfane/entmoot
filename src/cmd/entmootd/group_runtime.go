@@ -541,6 +541,11 @@ const (
 	// pulls from. Membership changes are rare and a pull is idempotent, so a
 	// handful of peers converges without turning every tick into a fan-out.
 	maxMembershipSyncPeers = 8
+	// maxRewoundSyncPeers reserves part of that fan-out for the members a
+	// rewind dropped. Without a reservation a group with eight addressable
+	// members never reaches them, because current members come first; with
+	// the whole budget they could crowd out ordinary sync.
+	maxRewoundSyncPeers = 3
 	// membershipSyncInterval is how often a session pulls membership. It is
 	// slower than the old roster tick because a pull now carries a set
 	// difference rather than a chain, and because a pushed record arrives
@@ -656,36 +661,37 @@ func (r *groupRuntime) membershipPeers(session *groupSession) []peer.AddrInfo {
 		}
 		return nil
 	}
-	memberIDs := session.group.MemberIDs()
-	ordered := make([]entmoot.MemberID, 0, len(memberIDs)+1)
-	if founder := session.group.Founder(); founder.MemberID != nil {
-		ordered = append(ordered, *founder.MemberID)
-	}
-	for _, memberID := range memberIDs {
-		if len(ordered) > 0 && memberID == ordered[0] {
-			continue
-		}
-		ordered = append(ordered, memberID)
-	}
-	out := make([]peer.AddrInfo, 0, len(ordered))
-	for _, memberID := range ordered {
-		info, found := session.group.MemberInfoByID(memberID)
-		if !found {
-			continue
-		}
-		binding, err := libp2ptransport.BindingFromPublicKey(info.EntmootPubKey)
-		if err != nil || binding.PeerID == r.host.ID() {
-			continue
-		}
-		addrs := addrsFor(binding.PeerID)
-		if len(addrs) == 0 {
-			continue
-		}
-		out = append(out, peer.AddrInfo{ID: binding.PeerID, Addrs: addrs})
-		if len(out) == maxMembershipSyncPeers {
-			break
+	out := make([]peer.AddrInfo, 0, maxMembershipSyncPeers)
+	seen := make(map[peer.ID]struct{}, maxMembershipSyncPeers)
+	take := func(infos []entmoot.NodeInfo, room int) {
+		for _, info := range infos {
+			if room == 0 || len(out) == maxMembershipSyncPeers {
+				return
+			}
+			binding, err := libp2ptransport.BindingFromPublicKey(info.EntmootPubKey)
+			if err != nil || binding.PeerID == r.host.ID() {
+				continue
+			}
+			if _, already := seen[binding.PeerID]; already {
+				continue
+			}
+			addrs := addrsFor(binding.PeerID)
+			if len(addrs) == 0 {
+				continue
+			}
+			seen[binding.PeerID] = struct{}{}
+			out = append(out, peer.AddrInfo{ID: binding.PeerID, Addrs: addrs})
+			room--
 		}
 	}
+	// The members a rewind dropped go first, and they are the reason this is
+	// not simply the current projection: they hold the records that restore
+	// what this node lost, and asking only the survivors can never get them
+	// back. There are none in the ordinary case. They are bounded so a long
+	// rewind cannot crowd out ordinary sync, and they go first so a group
+	// with more addressable members than this fan-out still reaches them.
+	take(session.group.RewoundMemberInfos(), maxRewoundSyncPeers)
+	take(session.group.ReachableMemberInfos(), maxMembershipSyncPeers)
 	return out
 }
 

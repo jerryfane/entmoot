@@ -148,8 +148,30 @@ func (s *SyncServer) handleMembership(stream network.Stream) {
 		response.Checkpoints = checkpoints
 	}
 
+	// Against the CALLER's bound where we can read it, because a caller whose
+	// bound is lower than ours - behind, or rewound by a branch that reaches
+	// further while dated earlier - needs the records we still hold and call
+	// covered, and we are the only copy it can get.
+	base := canonical
+	if caller, known := group.CheckpointByID(request.HaveCheckpoint); known {
+		if caller.Timestamp < canonical.Timestamp {
+			base = caller
+		}
+	} else if request.HaveSequence >= canonical.Sequence {
+		// A checkpoint we do not hold, at or beyond our own sequence: that is
+		// the rewound caller, on a branch of its own. Its bound is unreadable
+		// here - the request carries no timestamp and a new field would be
+		// refused by every current peer - so serve the whole window we hold
+		// and let it refuse what its own checkpoint covers.
+		//
+		// The sequence test is what keeps this narrow. A joiner sends no
+		// checkpoint at all, and a node far behind names one we have retired;
+		// both are below our sequence and get the ordinary answer, so neither
+		// pulls the retained window nor the removal records inside it.
+		base = membership.Checkpoint{}
+	}
 	limit := boundedLimit(request.Limit, maxMembershipRecords, maxMembershipRecords)
-	for _, record := range group.Pending() {
+	for _, record := range group.PendingFor(base) {
 		if !afterCursor(record, request.AfterTimestamp, request.AfterID) {
 			continue
 		}

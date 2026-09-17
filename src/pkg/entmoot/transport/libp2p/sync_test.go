@@ -1,10 +1,12 @@
 package libp2ptransport
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"slices"
+	"sort"
 	"testing"
 	"time"
 
@@ -661,4 +663,179 @@ func TestSyncBootstrapAuthorityAndMembership(t *testing.T) {
 	// invite outranks the removal notice because it authorises the read.
 	second := mustInvite(t, group, founder, target.PublicKey, 0, []string{serverHost.ID().String()})
 	check("fresh_invite_after_removal", &second, "")
+}
+
+// A node whose coverage bound has dropped gets the records back on an
+// ordinary pull. The walk can move canonical to a branch that reaches further
+// while dated earlier (see membership.settleCanonicalLocked), which un-covers
+// records this node had already retired - and a peer that has folded those
+// records in still holds them for a checkpoint of lag. It answers against the
+// caller's bound rather than its own, so the caller can have them.
+//
+// The repair is not guaranteed: it depends on some peer still holding the
+// window, and once every peer has folded one more checkpoint past it, the
+// records are gone everywhere and the loss is permanent.
+func TestPullRecoversRecordsWhenTheBoundDrops(t *testing.T) {
+	joiner := mustIdentity(t)
+	p := newMembershipSyncPair(t, joiner)
+	joinerID := *mustNode(t, joiner).MemberID
+
+	// The server folds every record in and retires them, so its own answer
+	// carries checkpoints plus the records behind them.
+	if _, signed, err := p.group.SignCheckpoint(p.founder, true); err != nil || !signed {
+		t.Fatalf("first checkpoint: signed=%t err=%v", signed, err)
+	}
+	client := p.adoptClient(t)
+	if _, _, _, err := FetchMembership(p.ctx, p.clientHost, p.remote, client, p.clientMemberID); err != nil {
+		t.Fatal(err)
+	}
+	if !client.IsMemberID(joinerID) {
+		t.Fatal("the client did not learn the joiner, so the rest proves nothing")
+	}
+
+	// Now the client adopts a branch of its own that reaches further while
+	// dated earlier: canonical moves back and the joiner disappears.
+	base := client.Canonical()
+	previous := p.root
+	for sequence := p.root.Sequence + 1; sequence <= base.Sequence+1; sequence++ {
+		body := previous
+		body.ID = entmoot.RosterEntryID{}
+		body.Sequence = sequence
+		body.Previous = previous.ID
+		body.Timestamp = previous.Timestamp + 1
+		body.Covered = 0
+		body.Members = []entmoot.NodeInfo{mustNode(t, p.founder), mustNode(t, p.member)}
+		sortNodeInfos(body.Members)
+		body.Signature = nil
+		signed, err := membership.SignCheckpoint(p.founder, mustNode(t, p.founder), body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := client.ApplyCheckpoint(signed); err != nil {
+			t.Fatalf("sibling branch at sequence %d: %v", sequence, err)
+		}
+		previous = signed
+	}
+	dropped := client.Canonical()
+	if dropped.Timestamp >= base.Timestamp || client.IsMemberID(joinerID) {
+		t.Fatalf("fixture did not drop the bound: ts %d -> %d, member=%v",
+			base.Timestamp, dropped.Timestamp, client.IsMemberID(joinerID))
+	}
+
+	// One ordinary pull from the peer that still holds the window restores it.
+	if _, records, _, err := FetchMembership(p.ctx, p.clientHost, p.remote, client, p.clientMemberID); err != nil {
+		t.Fatal(err)
+	} else if records == 0 {
+		t.Fatal("the peer served no record, so it withheld the window it still holds")
+	}
+	if !client.IsMemberID(joinerID) {
+		t.Fatal("the pull left the member lost, so a node whose bound dropped cannot recover")
+	}
+}
+
+// sortNodeInfos puts a hand-built member list in the order a real checkpoint
+// carries, so the signature covers a well-formed body.
+func sortNodeInfos(members []entmoot.NodeInfo) {
+	sort.Slice(members, func(i, j int) bool {
+		left, _ := entmoot.ResolvedMemberID(members[i])
+		right, _ := entmoot.ResolvedMemberID(members[j])
+		return bytes.Compare(left[:], right[:]) < 0
+	})
+}
+
+// The other arm of the same rule, measured at the server: a caller whose
+// checkpoint we DO hold and which is older than ours is behind rather than
+// rewound, and the records it still needs are the ones our own bound calls
+// covered. We keep them for a checkpoint of lag precisely so it can catch up,
+// and answering from our own bound would serve it nothing.
+func TestServerServesRecordsACallerOwnBoundStillNeeds(t *testing.T) {
+	joiner := mustIdentity(t)
+	p := newMembershipSyncPair(t, joiner)
+
+	if _, signed, err := p.group.SignCheckpoint(p.founder, true); err != nil || !signed {
+		t.Fatalf("checkpoint: signed=%t err=%v", signed, err)
+	}
+	if len(p.group.Pending()) != 0 {
+		t.Fatalf("server reports %d pending records, so its own bound would have served them", len(p.group.Pending()))
+	}
+
+	response, err := RequestMembership(p.ctx, p.clientHost, p.remote, MembershipSyncRequest{
+		Version:        1,
+		RequestID:      "behind-caller",
+		GroupID:        p.groupID,
+		HaveSequence:   p.root.Sequence,
+		HaveCheckpoint: p.root.ID,
+		Limit:          maxMembershipRecords,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Records) == 0 {
+		t.Fatal("the server served no record to a caller sitting on an older checkpoint it holds")
+	}
+	// And the same request from a caller already on our bound gets none, so
+	// the steady state is unchanged.
+	current := p.group.Canonical()
+	response, err = RequestMembership(p.ctx, p.clientHost, p.remote, MembershipSyncRequest{
+		Version:        1,
+		RequestID:      "in-step-caller",
+		GroupID:        p.groupID,
+		HaveSequence:   current.Sequence,
+		HaveCheckpoint: current.ID,
+		Limit:          maxMembershipRecords,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Records) != 0 {
+		t.Fatalf("a caller in step with us was served %d records it must refuse", len(response.Records))
+	}
+}
+
+// The gate on the generous answer. A caller naming a checkpoint we do not
+// hold gets the whole retained window, because its bound cannot be read from
+// the request - but only if it also claims a sequence at or beyond ours,
+// which is what a rewound node has. A joiner sends no checkpoint at all and a
+// lagging node names one we have retired; both must get the ordinary answer,
+// or any admitted caller could ask for the window and the removal records in
+// it by naming an id nobody holds.
+func TestUnknownCheckpointBelowOurSequenceGetsTheOrdinaryAnswer(t *testing.T) {
+	joiner := mustIdentity(t)
+	p := newMembershipSyncPair(t, joiner)
+	if _, signed, err := p.group.SignCheckpoint(p.founder, true); err != nil || !signed {
+		t.Fatalf("checkpoint: signed=%t err=%v", signed, err)
+	}
+	canonical := p.group.Canonical()
+	if len(p.group.Pending()) != 0 {
+		t.Fatalf("server reports %d pending records, so every answer would carry them", len(p.group.Pending()))
+	}
+	if len(p.group.PendingFor(membership.Checkpoint{})) == 0 {
+		t.Fatal("the server holds no retained window, so there is nothing to withhold")
+	}
+
+	unknown := entmoot.RosterEntryID{0x9e, 0x9e}
+	ask := func(sequence uint64) int {
+		t.Helper()
+		response, err := RequestMembership(p.ctx, p.clientHost, p.remote, MembershipSyncRequest{
+			Version:        1,
+			RequestID:      fmt.Sprintf("unknown-%d", sequence),
+			GroupID:        p.groupID,
+			HaveSequence:   sequence,
+			HaveCheckpoint: unknown,
+			Limit:          maxMembershipRecords,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return len(response.Records)
+	}
+	if got := ask(canonical.Sequence - 1); got != 0 {
+		t.Fatalf("a caller below our sequence naming an unknown checkpoint was served %d records", got)
+	}
+	if got := ask(0); got != 0 {
+		t.Fatalf("a caller naming no checkpoint at all was served %d records", got)
+	}
+	if got := ask(canonical.Sequence); got == 0 {
+		t.Fatal("a caller at our sequence naming a branch we do not hold was served nothing, so a rewound node cannot recover")
+	}
 }
