@@ -1956,9 +1956,14 @@ func TestReachableMemberInfosKeepsMembersTheProjectionLost(t *testing.T) {
 }
 
 // The other half of that list: it must not name identities the group evicted,
-// even when a rewind puts them back in a post-canonical checkpoint's member
-// set. The list dials peers and pushes membership records, so resurrecting
-// somebody the group removed would keep talking to them.
+// even when a rewind drops the canonical checkpoint below one that still
+// named them. The list dials peers and pushes membership records, so
+// resurrecting somebody the group removed would keep talking to them.
+//
+// The departure records are deliberately retired before the rewind here: an
+// earlier version of this filter read held records and the projection's ban
+// set, and both are erased one checkpoint after the eviction, so the exposure
+// came back in the steady state.
 func TestReachableMemberInfosExcludesEvictedIdentities(t *testing.T) {
 	f := newFixture(t, DefaultPolicy())
 	removed, banned := mustIdentity(t), mustIdentity(t)
@@ -1983,7 +1988,8 @@ func TestReachableMemberInfosExcludesEvictedIdentities(t *testing.T) {
 		}
 	}
 
-	// Both leave the group, and a checkpoint folds the departures in.
+	// Both leave, a checkpoint folds the departures in, and a further
+	// checkpoint retires the records that said so.
 	f.tick(10)
 	f.apply(f.sign(f.founder, Record{Kind: KindRemove, Subject: f.info(removed)}))
 	f.apply(f.sign(f.founder, Record{Kind: KindRemove, Subject: f.info(banned), Banned: true}))
@@ -1991,14 +1997,21 @@ func TestReachableMemberInfosExcludesEvictedIdentities(t *testing.T) {
 	if _, signed, err := f.group.SignCheckpoint(f.founder, true); err != nil || !signed {
 		t.Fatalf("eviction checkpoint: signed=%t err=%v", signed, err)
 	}
+	f.tick(1_000)
+	if _, signed, err := f.group.SignCheckpoint(f.founder, true); err != nil || !signed {
+		t.Fatalf("lag checkpoint: signed=%t err=%v", signed, err)
+	}
 	head := f.group.Canonical()
+	if len(f.group.Pending()) != 0 {
+		t.Fatalf("the fixture still holds %d records, so the filter could read them", len(f.group.Pending()))
+	}
 	if f.group.IsMemberID(f.memberID(removed)) || f.group.IsMemberID(f.memberID(banned)) {
 		t.Fatal("the fixture left an evicted identity in the projection")
 	}
 
-	// Now a rewind that drops the canonical checkpoint BELOW the base, which
-	// still names both of them and is still retained: a branch forking from
-	// the checkpoint before the base, reaching further while dated earlier.
+	// A branch forking below the base reaches further while dated earlier, so
+	// the canonical checkpoint drops below the base - which still names both
+	// evicted identities and is still retained.
 	fork, ok := f.group.CheckpointByID(base.Previous)
 	if !ok {
 		t.Fatal("the checkpoint before the base was retired, so the branch has nowhere to fork")
@@ -2012,6 +2025,7 @@ func TestReachableMemberInfosExcludesEvictedIdentities(t *testing.T) {
 		body.Timestamp = previous.Timestamp + 1
 		body.Covered = 0
 		body.Members = []entmoot.NodeInfo{f.info(f.founder)}
+		body.Banned = nil
 		body.Signature = nil
 		signed, err := SignCheckpoint(f.founder, f.info(f.founder), body)
 		if err != nil {
@@ -2041,4 +2055,31 @@ func TestReachableMemberInfosExcludesEvictedIdentities(t *testing.T) {
 			t.Fatal("a banned identity is named as reachable after a rewind")
 		}
 	}
+}
+
+// And it must still name a member that left and came back. Filtering on
+// departures alone dropped such a member from the sync peer list while it was
+// a current member, so this node stopped pulling from it and stopped pushing
+// records to it.
+func TestReachableMemberInfosKeepsARejoinedMember(t *testing.T) {
+	f := newFixture(t, DefaultPolicy())
+	returner := mustIdentity(t)
+	f.join(returner)
+	f.tick(10)
+	f.apply(f.sign(returner, Record{Kind: KindLeave}))
+	f.tick(10)
+	f.join(returner)
+	if !f.group.IsMemberID(f.memberID(returner)) {
+		t.Fatal("the fixture did not readmit the member")
+	}
+	if len(f.group.Pending()) == 0 {
+		t.Fatal("the fixture holds no records, so a departure-reading filter would see nothing")
+	}
+
+	for _, info := range f.group.ReachableMemberInfos() {
+		if id, err := entmoot.ResolvedMemberID(info); err == nil && id == f.memberID(returner) {
+			return
+		}
+	}
+	t.Fatal("a member that left and rejoined is not reachable, so this node will not sync with it")
 }
