@@ -1025,9 +1025,9 @@ func sameMembership(left, right State) bool {
 // A member admitted on the losing branch is then lost, exactly as it was
 // before checkpoints were ordered by timestamp - one sequence further out.
 // The same class has a second shape this repair does not reach: a FORWARD
-// switch to a later-dated sibling chain at equal reach can drop a member this
-// node had already folded in, and nothing captures that because the bound
-// moves forwards rather than backwards. Read the capture below as covering
+// switch - to a sibling chain at equal reach, or to any chain that reaches
+// further - can drop a member this node had already folded in, and nothing
+// captures that, because the bound moves forwards rather than backwards. Read the capture below as covering
 // the rewind, not every membership-dropping switch.
 //
 // Selection is not the place to close it: ranking branches by timestamp turns

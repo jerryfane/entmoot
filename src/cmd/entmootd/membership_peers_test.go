@@ -99,9 +99,6 @@ func TestMembershipPeersReachesTheMembersARewindDropped(t *testing.T) {
 	if _, signed, err := session.group.SignCheckpoint(founder, true); err != nil || !signed {
 		t.Fatalf("crowd checkpoint: signed=%t err=%v", signed, err)
 	}
-	if _, signed, err := session.group.SignCheckpoint(founder, true); err != nil || !signed {
-		t.Fatalf("lag checkpoint: signed=%t err=%v", signed, err)
-	}
 	head := session.group.Canonical()
 	if got := len(runtime.membershipPeers(session)); got != maxMembershipSyncPeers {
 		t.Fatalf("the fixture has %d addressable peers, want the fan-out full at %d", got, maxMembershipSyncPeers)
@@ -164,10 +161,10 @@ func TestMembershipPeersReachesTheMembersARewindDropped(t *testing.T) {
 	// with the constant it is supposed to pin. Eight slots, at most three of
 	// them reserved for repair, so at least five remain for the members this
 	// node still has - or a long rewind would stop ordinary sync.
-	if dropped > 3 {
-		t.Fatalf("%d of %d peers are members the rewind dropped, want at most 3", dropped, len(peers))
+	if dropped != 3 {
+		t.Fatalf("%d of %d peers are members the rewind dropped, want exactly the 3 reserved slots", dropped, len(peers))
 	}
-	if len(peers)-dropped < 5 {
-		t.Fatalf("only %d of %d peers are current members, want at least 5", len(peers)-dropped, len(peers))
+	if len(peers)-dropped != 5 {
+		t.Fatalf("%d of %d peers are current members, want the remaining 5", len(peers)-dropped, len(peers))
 	}
 }
