@@ -14,8 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   remaining-time budget to `minProbeSlice` but not the incoming budget, so
   `doctor -timeout 1ms` - an operator value forwarded unfiltered -
   refused every peer with "not attempted: probe budget spent" instead of
-  probing any of them. The budget is now clamped at entry too, so `probePeers`
-  cannot return before one slice has passed however starved the machine is.
+  probing any of them. The budget is now clamped at entry too, so every peer
+  gets at least one slice of deadline to answer in. A refused dial still
+  returns as fast as the refusal arrives - the clamp buys each attempt its
+  slice, not a minimum call duration.
   That also closes a rare flake in `TestProbeGivesEachPeerTheFloor` whose
   window was the 1ms the caller asked for: 4 failures in 520 runs under heavy
   oversubscription before the clamp, 0 in 520 after. An idle machine does not

@@ -40,12 +40,15 @@ read:
 | `ENTMOOT_RUNTIME_ENV` | installed wrapper | Explicit path to the `runtime.env` the wrapper sources instead of `<installation>/runtime.env`. |
 | `ENTMOOT_BIN`, `ENTMOOT_DATA`, `ENTMOOT_IDENTITY`, `ENTMOOT_LISTEN_PORT` | installed wrapper | The values the wrapper passes as `-identity`, `-data` and `-listen-port`. The installer writes all four into `runtime.env`, and `ENTMOOT_LISTEN_PORT` is also read at install time to choose the port written there. |
 
-The operator scripts in `scripts/` read their own set, documented where they
-are used: `ENTMOOT_LOG` (`verify-mesh-node.sh`, see
-[file layout and backups](../operations/file-layout-backups.md)),
+The operator scripts in `scripts/` read their own set. Each script's `--help`
+is the authority; only some appear in these docs. `ENTMOOT_LOG`
+(`verify-mesh-node.sh`, also in
+[file layout and backups](../operations/file-layout-backups.md));
 `ENTMOOT_INSTALL_DIR`, `ENTMOOT_SERVE_SERVICE`, `ENTMOOT_SERVE_RESTART_CMD`
-and `ENTMOOT_SERVE_STOP_TIMEOUT` (`update-entmoot-peer.sh`, see
-[peer upgrades](../operations/peer-upgrades.md)).
+and `ENTMOOT_SERVE_STOP_TIMEOUT` (`update-entmoot-peer.sh`, each the
+equivalent of a flag it accepts, and `ENTMOOT_SERVE_RESTART_CMD` is also in
+[peer upgrades](../operations/peer-upgrades.md)); `ENTMOOT_AGENT_WRAPPER`
+(`verify-agent-runtime.sh` and `scripts/eval/lib.sh`).
 
 One exception to the precedence above: the wrapper sources `runtime.env` with
 plain assignments, so for those four names the file overrides a value exported
