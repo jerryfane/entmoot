@@ -578,9 +578,9 @@ func TestConcurrentCheckpointsSettleOnOneCanonical(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// The later one wins its sequence - the coverage bound may not move
-	// backwards - and it wins whichever order the two arrive in, or two nodes
-	// that received them in different orders would disagree.
+	// The later one wins its sequence - at one sequence the coverage bound may
+	// not move backwards - and it wins whichever order the two arrive in, or
+	// two nodes that received them in different orders would disagree.
 	for _, order := range [][]Checkpoint{{lateSigned, earlySigned}, {earlySigned, lateSigned}} {
 		group := mustAdoptedCopy(t, base, f.group.Pending())
 		for _, cp := range order {
@@ -1724,11 +1724,17 @@ func TestFounderIssuesAfterLeavingWhileADemotedAdminCannot(t *testing.T) {
 	}
 }
 
-// Retirement is irreversible, so the coverage bound may not move backwards.
-// A second chain dated behind one whose records were already deleted used to
-// win the sequence - the sibling rule preferred the earlier timestamp - and
-// the membership those records carried went with them: a member that had
-// properly joined simply vanished, on every node, deterministically.
+// Retirement is irreversible, so the coverage bound may not move backwards AT
+// ONE SEQUENCE. A second chain dated behind one whose records were already
+// deleted used to win the sequence - the sibling rule preferred the earlier
+// timestamp - and the membership those records carried went with them: a
+// member that had properly joined simply vanished, on every node,
+// deterministically.
+//
+// This pins that sequence only. A branch that reaches FURTHER while dated
+// earlier still wins, because the walk ranks reach before this rule; see the
+// KNOWN GAP on settleCanonicalLocked, and do not read this test as the
+// general invariant.
 func TestALaterChainDoesNotLoseAMemberToAnEarlierSibling(t *testing.T) {
 	f := newFixture(t, DefaultPolicy())
 	joiner := mustIdentity(t)
@@ -1785,8 +1791,9 @@ func TestALaterChainDoesNotLoseAMemberToAnEarlierSibling(t *testing.T) {
 
 // The same rule against the strongest possible sibling: one the FOUNDER
 // signed, dated earlier than the admin-signed chain the group is on. Founder
-// preference is a tie-break, not a licence to move the coverage bound back -
-// preferring it first lost the member the admins' chain had folded in.
+// preference is a tie-break, not a licence to move the coverage bound back at
+// this sequence - preferring it first lost the member the admins' chain had
+// folded in.
 func TestAnEarlierFounderSiblingDoesNotRewindAnAdminChain(t *testing.T) {
 	f := newFixture(t, DefaultPolicy())
 	admin := mustIdentity(t)
