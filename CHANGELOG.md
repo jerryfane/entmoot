@@ -14,17 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   remaining-time budget to `minProbeSlice` but not the incoming budget, so
   `doctor -timeout 1ms` - an operator value forwarded unfiltered -
   refused every peer with "not attempted: probe budget spent" instead of
-  probing any of them. The budget is now clamped at entry too, so the first
-  wave of peers - `maxProbeParallel`, currently eight - gets a full slice of
-  deadline each. Two limits remain, both pre-existing and now stated in the
-  code: a refused dial returns as fast as the refusal arrives, and in a group
-  larger than one wave a sub-slice budget still expires while the first wave
-  runs, so later peers are reported "not attempted". Ask for a budget that
-  covers the group if you want every member dialled.
-  That also closes a rare flake in `TestProbeGivesEachPeerTheFloor` whose
-  window was the 1ms the caller asked for: 4 failures in 520 runs under heavy
-  oversubscription before the clamp, 0 in 520 after. An idle machine does not
-  reproduce it.
+  probing any of them. The budget is now clamped at entry, so each attempt
+  gets a slice to answer in. What a probe timeout does and does not guarantee
+  - the 500ms floor, the eight-wide dial waves, and why a refusal returns
+  sooner than the budget - is documented in one place now, under
+  [diagnostics](website/docs/operations/diagnostics.md).
 
 ### Removed
 

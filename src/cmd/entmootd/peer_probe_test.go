@@ -636,12 +636,12 @@ func TestProbeGivesEachPeerTheFloor(t *testing.T) {
 		}
 	}
 	// The whole floor, not half of it. Once the budget itself is clamped the
-	// property is exact rather than best-effort: the earliest a worker can
-	// finish is one floor after it starts, and a worker that is descheduled
-	// past the deadline and reports "not attempted" can only do so once the
-	// floor has already passed. So probePeers cannot return sooner than
-	// minProbeSlice however starved the machine is - which is the point of
-	// calling it a floor, and what a half-floor assertion could not say.
+	// property is exact rather than best-effort for THIS fixture: the peers
+	// accept and never write, so no attempt can end early, the earliest a
+	// worker can finish is one floor after it starts, and a worker descheduled
+	// past the deadline can only report "not attempted" once the floor has
+	// passed. Against peers that refuse fast, probePeers returns in
+	// milliseconds - the floor bounds each attempt, not the call.
 	if elapsed < minProbeSlice {
 		t.Fatalf("the probe gave up after %s; a %s floor on the budget means it must wait at least that long before calling a peer unreachable",
 			elapsed, minProbeSlice)

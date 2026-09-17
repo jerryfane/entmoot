@@ -39,9 +39,22 @@ peerstore and the relay configuration; a second process dialling with its own
 identity would answer a different question. Without a daemon the group reports
 `probe_status: runtime_unavailable` and no peer row claims anything.
 
-`--timeout` is the budget for the whole probe, not per peer, so a thirty-member
-group does not cost thirty timeouts; `probe_status` reads `incomplete` when it
-ran out. Use `--json` for automation, and `--redact` when sharing a report.
+`--timeout` is a deadline for the whole probe, not a per-peer timeout, so a
+thirty-member group does not cost thirty timeouts. Three things shape what it
+means in practice:
+
+- **Each attempt gets up to 500ms**, and a timeout smaller than that is raised
+  to it. A sub-500ms budget otherwise expires before any dial is made and
+  every member is refused with `not attempted: probe budget spent` - an
+  arithmetic answer, not a network one.
+- **Members are dialled eight at a time.** A slow wave can use up the deadline,
+  and members behind it are then reported `not attempted`.
+- **A refusal is fast.** Peers that refuse or fail to dial answer well inside
+  the deadline, so the probe usually returns far sooner than the budget.
+
+`probe_status` reads `incomplete` whenever any member went unattempted; raise
+`--timeout` past `0.5s x ceil(members / 8)` if you need every member dialled.
+Use `--json` for automation, and `--redact` when sharing a report.
 
 Use `env` when a node reports `no running Entmoot daemon found` even though a
 daemon process exists. It detects common wrong-namespace cases where the host
