@@ -7,7 +7,8 @@
 // pkg/entmoot/conversion adopts it. Nothing here appends, signs or persists.
 // The exported surface is ValidateEntries, ValidateLegacyJSONL and
 // CurrentEntryVersion, plus the admin-policy payload a legacy policy_change
-// carried (AdminPolicy and AdminPolicyType, which conversion fixtures build).
+// carried: AdminPolicy and AdminPolicyType, which the daemon's legacy-chain
+// test fixture builds (cmd/entmootd/roster_commands_test.go).
 //
 // The rules it enforces are the ones the chain was written under: entries come
 // from the founder or from a delegated admin named by a founder-signed

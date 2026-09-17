@@ -363,16 +363,22 @@ func TestValidateLegacyJSONLReadsTheFileItIsGiven(t *testing.T) {
 	}
 }
 
-// A guard with no current caller, pinned because the next caller is what it
-// exists for: validate is only ever reached after a genesis entry today, and
-// reaching it without one used to be refused - then, briefly, panicked.
+// A guard with no current caller, pinned with the input that actually
+// panicked: a version 0 entry whose actor matches its subject's Pilot node id
+// passes the legacy actor check and then reads the head entry, which on an
+// empty chain indexed position -1.
 func TestValidateOnAnEmptyLogIsRefusedNotAPanic(t *testing.T) {
 	log := newLegacyLog(t)
 	founder, founderInfo := newIdentity(t)
-	_, memberInfo := newIdentity(t)
-	entry := log.sign(founder, entmoot.RosterEntry{
-		Op: "add", Subject: memberInfo, ActorMemberID: founderInfo.MemberID, Timestamp: 2_000,
-	})
+	entry := entmoot.RosterEntry{
+		Op: "add", Subject: legacyNode(founderInfo, 0), Actor: 0, Timestamp: 1_000,
+	}
+	sigInput, err := canonical.RosterEntrySigningBytes(entry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry.Signature = founder.Sign(sigInput)
+	entry.ID = canonical.RosterEntryID(entry)
 	if err := newChain(log.groupID).validate(entry); !errors.Is(err, entmoot.ErrRosterReject) {
 		t.Fatalf("validate on an empty log returned %v, want a rejection", err)
 	}
