@@ -62,7 +62,7 @@ entmootd join invite-a.json invite-b.json
 ```
 
 On `/data`-backed agents, use `/data/.entmoot/entmoot join ...` so the join
-uses the agent's persistent identity, data root, and connectivity profile.
+uses the agent's persistent identity, data root, and listen port.
 
 Open-invite links are redeemed automatically during `join`; a raw token is not
 enough because the issuer URL is part of the proof flow.

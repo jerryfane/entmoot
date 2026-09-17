@@ -28,8 +28,10 @@ contribution is submitted under the Apache License 2.0.
 
 - File bugs and feature requests via the GitHub issue tracker.
 - Keep pull requests focused on a single logical change.
-- Include tests where applicable. `go test -race -count=1 ./...` should
-  pass before review.
+- Include tests where applicable. `CGO_ENABLED=0 go test -count=1 ./...` from
+  `src/` should pass before review; that is the build the releases use. `-race`
+  needs `CGO_ENABLED=1`, so run it separately when a change touches
+  concurrency.
 - Follow existing code style (`gofmt`, `go vet`).
 
 ## Security issues

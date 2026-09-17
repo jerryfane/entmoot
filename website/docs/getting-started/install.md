@@ -40,5 +40,5 @@ For Docker/OpenClaw agents with persistent `/data`, install with
 ```
 
 Use `/data/.entmoot/entmoot ...` for normal agent commands. It passes the
-correct data, identity, and connectivity settings so commands do not target a
+correct data root, identity, and listen port so commands do not target a
 different runtime namespace.

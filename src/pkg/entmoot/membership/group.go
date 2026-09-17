@@ -930,9 +930,10 @@ func (g *Group) settleCanonicalLocked() error {
 			return err
 		}
 	}
-	// What this node keeps is the chain from its newest founder-signed
-	// checkpoint up to the canonical one, plus one sequence of lag for
-	// siblings. Two reasons, and both are load-bearing:
+	// What this node keeps is the chain from its OLDEST founder-signed
+	// checkpoint still on the canonical chain up to the canonical one, plus
+	// one sequence of lag for siblings. Two reasons, and both are
+	// load-bearing:
 	//
 	//   - The chain must stay CONTIGUOUS. The forward walk steps by Previous,
 	//     so a hole in the middle freezes the canonical checkpoint for ever

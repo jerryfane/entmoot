@@ -41,8 +41,9 @@ fi
 Rules:
 
 - In OpenClaw/Docker containers, prefer `/data/.entmoot/entmoot`. It loads
-  `/data/.entmoot/runtime.env` and passes the correct identity, data-root, and
-  connectivity flags.
+  `/data/.entmoot/runtime.env` and passes the correct identity, data root and
+  listen port. It does not pass a connectivity profile: `-connectivity`
+  defaults to `direct`, so pass it explicitly when that is wrong.
 - If `env` reports a daemon under `/proc/<pid>/root/...`, commands are probably
   running outside the runtime namespace. Run inside the container or via the
   wrapper.

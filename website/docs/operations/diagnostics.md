@@ -23,12 +23,14 @@ from local state and say nothing about whether a peer answers.
 membership read for the group, which is the question behind "why will this
 group not converge": it proves the peer is up, speaks the protocol, and serves
 this group to this node. A connection alone would not. Each peer row then
-carries `reachable`, `answered`, `latency_ms`, `relayed`, how many addresses
-were tried, and a one-line reason when it failed.
+carries a `probe` object holding `reachable`, `answered`, `latency_ms`,
+`relayed`, how many addresses were tried, and a one-line reason when it
+failed.
 
-Three outcomes, not two. `reachable` is a peer that answered and served us.
-`answered` without `reachable` is a peer that replied and refused, with its own
-code in `refusal` - the membership it serves does not include this node, which
+Three outcomes, not two, all inside `probe`. `reachable` is a peer that
+answered and served us. `answered` without `reachable` is a peer that replied
+and refused, with its own code in `refusal` - the membership it serves does
+not include this node, which
 is what a removed member sees from every peer and is not a network fault.
 Neither means nothing answered, and `error` says what failed.
 

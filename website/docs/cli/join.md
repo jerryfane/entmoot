@@ -43,8 +43,10 @@ On containerized agents, run joins through the installed wrapper:
 /data/.entmoot/entmoot join <invite>
 ```
 
-The wrapper supplies the persistent identity, data root, and connectivity
-profile so the join stays in the intended runtime namespace.
+The wrapper supplies the persistent identity, data root, and listen port so
+the join stays in the intended runtime namespace. It does not pass a
+connectivity profile: pass `-connectivity` yourself when the default
+`direct` is wrong for this host.
 
 Useful flags:
 

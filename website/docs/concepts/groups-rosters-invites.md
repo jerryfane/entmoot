@@ -113,10 +113,14 @@ Two consequences follow:
   sequence, the founder-signed one wins, so the chain a joiner walks stays
   anchored.
 
-Each node keeps the chain from its newest founder-signed checkpoint forward. A
-founder that never checkpoints therefore leaves a longer chain behind;
-`roster status` shows it as the gap between the anchor and the canonical
-sequence, and the remedy is one `roster checkpoint` on the founder.
+Each node keeps the chain from its **oldest** founder-signed checkpoint that
+is still on the canonical chain, not the newest: a joiner can only anchor on a
+founder signature, so every founder-signed checkpoint the chain still reaches
+is kept. That is what lets a group admit members while its founder is away,
+and its cost is that a founder who never checkpoints again leaves the whole
+chain behind it in place. `roster status` reports the canonical `sequence` and
+the `pending` record count - it does not report the anchor - and the remedy is
+one `roster checkpoint` on the founder.
 
 ### Being told you were removed
 

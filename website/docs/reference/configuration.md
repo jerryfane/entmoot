@@ -33,9 +33,12 @@ instead of raw flags:
 /data/.entmoot/entmoot doctor
 ```
 
-The wrapper and supervised daemon must use the same identity, data root, and
-connectivity profile. Relay-only mode requires at least one full Circuit Relay
-v2 multiaddr ending in `/p2p/<peer-id>`.
+The wrapper and supervised daemon must use the same identity and data root.
+The wrapper does not pass a connectivity profile - it execs only `-identity`,
+`-data` and `-listen-port` - so a relay-only daemon does not make a wrapper
+call relay-only: pass `-connectivity relay-only` on the call too. Relay-only
+mode requires at least one full Circuit Relay v2 multiaddr ending in
+`/p2p/<peer-id>`.
 
 Live-agent runner settings:
 

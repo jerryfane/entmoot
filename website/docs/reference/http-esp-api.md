@@ -6,6 +6,7 @@ ESP HTTP routes:
 
 ```text
 GET  /healthz
+GET  /v1/capabilities
 GET  /v1/session
 GET  /v1/status
 GET  /v1/public-moots
@@ -50,6 +51,10 @@ GET  /v1/notifications/preferences
 PATCH /v1/notifications/preferences
 POST /v1/notifications/test
 ```
+
+`GET /v1/capabilities` is unauthenticated and answers `200 {}`. It carries no
+fields yet: it exists as a reachability check behind the public reverse proxy,
+so a probe can tell "the ESP is serving" from "the proxy is up".
 
 Authentication modes:
 
