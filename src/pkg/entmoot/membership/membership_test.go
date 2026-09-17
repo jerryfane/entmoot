@@ -1207,6 +1207,86 @@ func TestRecordsAtTheCheckpointTimestampAreNotReplayed(t *testing.T) {
 	}
 }
 
+// The sibling case of the one above, on the other half of the same rule. A
+// checkpoint that folds nothing in - what `roster checkpoint` mints on a quiet
+// group - still succeeds one that did, and retirement drops the records behind
+// its predecessor. The projection treated a zero fold count as covering
+// nothing at all, so a node that still held those records replayed them while
+// a node that had retired them did not: the same checkpoint, two invite-use
+// counts, and an invite exhausted for one of them.
+func TestCheckpointThatFoldsNothingStillCoversWhatItSucceeds(t *testing.T) {
+	f := newFixture(t, DefaultPolicy())
+	invite := f.invite(f.founder, nil, 2)
+	first := mustIdentity(t)
+	joined := f.joinWith(first, invite)
+	left := f.sign(first, Record{Kind: KindLeave})
+	f.apply(left)
+
+	if _, signed, err := f.group.SignCheckpoint(f.founder, true); err != nil || !signed {
+		t.Fatalf("first checkpoint: signed=%t err=%v", signed, err)
+	}
+	f.tick(1_000)
+	quiet, signed, err := f.group.SignCheckpoint(f.founder, true)
+	if err != nil || !signed {
+		t.Fatalf("second checkpoint: signed=%t err=%v", signed, err)
+	}
+	if quiet.Covered != 0 {
+		t.Fatalf("second checkpoint folded %d records in, want the quiet case", quiet.Covered)
+	}
+
+	// One node retired the two records when the quiet checkpoint landed; a
+	// peer a checkpoint behind still holds them and re-delivers them.
+	held := []Record{joined, left}
+	retired, _ := Project(quiet, nil)
+	holding, effective := Project(quiet, held)
+	if len(effective) != 0 {
+		t.Fatalf("the quiet checkpoint left %d of its predecessor's records effective", len(effective))
+	}
+	if retired.InviteUses[invite.Nonce] != holding.InviteUses[invite.Nonce] {
+		t.Fatalf("invite counted %d times after retirement and %d times while the records are held",
+			retired.InviteUses[invite.Nonce], holding.InviteUses[invite.Nonce])
+	}
+	if _, back := holding.Members[f.memberID(first)]; back {
+		t.Fatal("replaying the retired records re-admitted a member who had left")
+	}
+
+	// The store refuses what the projection skips, which is the invariant the
+	// two halves of the rule exist to keep.
+	for _, rec := range held {
+		if _, err := f.group.Apply(rec); !errors.Is(err, ErrStale) {
+			t.Fatalf("the store accepted a record the projection skips: %v", err)
+		}
+	}
+
+	// The invite's second use still belongs to somebody who has not used it.
+	second := mustIdentity(t)
+	f.tick(10)
+	if _, err := f.group.Apply(f.sign(second, Record{Kind: KindJoin, Invite: &invite})); err != nil {
+		t.Fatalf("the invite's second use was denied: %v", err)
+	}
+}
+
+// The other side of the fold-count clause: checkpoint 0 carries its own
+// signing time, not a record's, so it covers nothing at that instant. A first
+// join minted in the same millisecond the group was created has to land, or a
+// group cannot be used until its creation millisecond has passed.
+func TestGenesisDoesNotCoverItsOwnMillisecond(t *testing.T) {
+	f := newFixture(t, DefaultPolicy())
+	genesis := f.group.Canonical()
+	if genesis.Covered != 0 {
+		t.Fatalf("genesis folded %d records in", genesis.Covered)
+	}
+	joiner := mustIdentity(t)
+	invite := f.invite(f.founder, joiner, 1)
+	rec := f.sign(joiner, Record{Kind: KindJoin, Invite: &invite, Timestamp: genesis.Timestamp})
+	if _, err := f.group.Apply(rec); err != nil {
+		t.Fatalf("a join minted in the group's creation millisecond was refused: %v", err)
+	}
+	if !f.group.IsMemberID(f.memberID(joiner)) {
+		t.Fatal("the joiner is not a member")
+	}
+}
+
 // A checkpoint dated far in the future would make every legitimate record
 // stale and freeze the node until that date arrived, so it is refused.
 func TestCheckpointFarAheadOfTheLocalClockIsRefused(t *testing.T) {

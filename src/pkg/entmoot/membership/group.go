@@ -624,10 +624,9 @@ func (g *Group) Apply(rec Record) (bool, error) {
 	if err := g.verifyRecordClockLocked(rec); err != nil {
 		return false, err
 	}
-	if rec.Timestamp < g.checkpoints[g.canonicalID].Timestamp {
-		return false, ErrStale
-	}
-	if rec.Timestamp == g.checkpoints[g.canonicalID].Timestamp && g.recordCoveredLocked(rec) {
+	// The same predicate the projection skips on, not a restatement of it:
+	// see coveredBy.
+	if g.recordCoveredLocked(rec) {
 		return false, ErrStale
 	}
 	ctx := context.Background()

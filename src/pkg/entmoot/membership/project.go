@@ -92,17 +92,24 @@ func Project(base Checkpoint, records []Record) (State, []Record) {
 	return state, effective
 }
 
-// coveredBy reports whether a base already accounts for a record. The bound is
-// inclusive, and must stay identical to the one Group.Apply uses: a record the
-// projection replays but the store refuses (or the reverse) would make two
-// nodes holding the same data disagree. Invite-use counting is the one
-// non-idempotent effect, so a replay there is not merely wasteful.
+// coveredBy reports whether a base already accounts for a record. It is the
+// ONE staleness rule: Group.Apply refuses exactly what this skips, because a
+// record the projection replays but the store refuses (or the reverse) makes
+// two nodes holding different subsets of the retired records disagree.
+// Invite-use counting is the non-idempotent effect, so a replay there is not
+// merely wasteful - it can exhaust an invite that still had uses left.
 //
-// A base that folded nothing in covers nothing, whatever its timestamp: that
-// is the genesis case, where the checkpoint's timestamp is its own signing
-// time rather than a record's.
+// Older than the timestamp is covered whatever the fold count, which is what
+// Checkpoint.Timestamp promises: a checkpoint that folded nothing in still
+// succeeds one that did, and its predecessor's records are retired behind it.
+// At the timestamp itself the fold count decides, and that is the genesis
+// case: checkpoint 0 carries its own signing time rather than a record's, so
+// a record minted in the same millisecond is not inside it.
 func coveredBy(base Checkpoint, rec Record) bool {
-	return base.Covered > 0 && rec.Timestamp <= base.Timestamp
+	if rec.Timestamp < base.Timestamp {
+		return true
+	}
+	return rec.Timestamp == base.Timestamp && base.Covered > 0
 }
 
 func actorIs(rec Record, id entmoot.MemberID) bool {

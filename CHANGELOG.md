@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A membership checkpoint that folds nothing in now covers what it succeeds.
+  Retirement drops the records behind the previous checkpoint, but the
+  projection read a zero fold count as covering nothing at all, so a node that
+  still held those records replayed them on top of the newer checkpoint while
+  a node that had retired them did not. Invite-use counting is the one
+  non-idempotent effect: the same invite was counted once on one node and
+  twice on the other, and a joiner with a use left over was admitted by one
+  and refused by the other. `roster checkpoint` on a quiet group mints exactly
+  this checkpoint. The store and the projection now share one predicate
+  instead of restating it, which is what the code already claimed.
+
 ## [1.5.83] - 2026-09-17
 
 ### Fixed
