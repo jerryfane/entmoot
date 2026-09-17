@@ -2,6 +2,7 @@ package entmoot_test
 
 import (
 	"bufio"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -59,6 +60,13 @@ func TestOperationalTreeHasNoPilotDependency(t *testing.T) {
 			continue
 		}
 		file, err := os.Open(filepath.Join(root, rel))
+		if errors.Is(err, os.ErrNotExist) {
+			// The index can name a file the working tree does not have: a
+			// deletion staged mid-refactor, or a sparse checkout. There is
+			// nothing to scan, and failing here would blame this guard for an
+			// unrelated state.
+			continue
+		}
 		if err != nil {
 			t.Fatalf("open %s: %v", rel, err)
 		}
