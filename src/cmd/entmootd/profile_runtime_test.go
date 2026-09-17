@@ -142,7 +142,7 @@ func TestProfileOnAnUnrelatedTopicIsIgnored(t *testing.T) {
 
 func mustDisplayName(t *testing.T, ctx context.Context, state esphttp.StateStore, root string, gid entmoot.GroupID, memberID entmoot.MemberID) string {
 	t.Helper()
-	members, err := localGroupCatalog{dataDir: root, state: state}.ListMembers(ctx, gid)
+	members, err := localGroupCatalog{dataDir: root}.ListMembers(ctx, gid)
 	if err != nil {
 		t.Fatalf("ListMembers: %v", err)
 	}

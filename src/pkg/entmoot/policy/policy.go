@@ -32,6 +32,14 @@ type Policy struct {
 	ByteRatePerAuthor     string `json:"byte_rate_per_author"`
 	ByteBurstPerAuthor    int64  `json:"byte_burst_per_author"`
 	MaxMessageBytes       int64  `json:"max_message_bytes"`
+	// The four live_* limits are a frozen wire remnant: since 1.5.85 nothing
+	// enforces them, because the live-agent feature they bounded is gone.
+	// They cannot simply be deleted. A public-moot descriptor embeds this
+	// struct, is Ed25519-signed over its bytes, and publicmoot.Parse decodes
+	// with DisallowUnknownFields - so removing the fields makes every
+	// descriptor already published or stored fail to parse, and the signature
+	// means the keys cannot be stripped without the signer re-issuing it.
+	// Retiring them is a re-sign-and-republish job, not a code change.
 	LiveTriggerRate       string `json:"live_trigger_rate"`
 	LiveTriggerBurst      int    `json:"live_trigger_burst"`
 	LiveMaxActionsPerScan int    `json:"live_max_actions_per_scan"`

@@ -37,7 +37,6 @@ func TestConcurrentOpenSurvivesSchemaMigration(t *testing.T) {
 		`ALTER TABLE esp_open_invites DROP COLUMN no_fallback_peers`,
 		`ALTER TABLE esp_open_invites DROP COLUMN bootstrap_peers`,
 		`ALTER TABLE esp_open_invite_redemptions DROP COLUMN result`,
-		`ALTER TABLE esp_live_agent_cursors DROP COLUMN seen_message_ids`,
 	} {
 		if _, err := db.Exec(stmt); err != nil {
 			t.Fatalf("age the schema (%s): %v", stmt, err)

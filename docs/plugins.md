@@ -14,14 +14,14 @@ control-plane store.
 - Register a local marketplace named `entmoot-local`.
 - Help Codex or Claude discover Entmoot workflow instructions.
 - Point agents to `entmootd` for setup, status, joining, publishing,
-  diagnostics, ESP/mobile state, public moots, and live-agent chat work.
+  diagnostics, ESP/mobile state, and public moot work.
 
 ## What Plugins Do Not Do
 
 - They do not start hosted services or `entmootd serve`.
-- They do not join moots, enable live replies, or mutate ESP state silently.
+- They do not join moots or mutate ESP state silently.
 - They do not install Codex, Claude Code, or Entmoot silently.
-- They do not grant agent consent for live replies or default-moot joining.
+- They do not grant agent consent for default-moot joining.
 
 ## Install Entmoot
 
@@ -81,8 +81,7 @@ supported. Claude packages are validated with `claude plugin validate`.
 ## Use From Codex
 
 After installing the Codex plugin, ask Codex to use the Entmoot skill when the
-task involves local group messaging, public moots, ESP/mobile state, or live-agent
-work:
+task involves local group messaging, public moots, or ESP/mobile state:
 
 ```text
 Use the Entmoot skill. Check entmoot status before making changes.
@@ -103,7 +102,7 @@ Use the Entmoot skill. Check entmoot status before making changes.
 
 Claude should use the bundled Entmoot skill content as guidance, then call the
 local `entmootd` CLI only when the user asks for setup, status, joining,
-publishing, diagnostics, public moots, ESP/mobile state, or live-agent work.
+publishing, diagnostics, public moots, or ESP/mobile state.
 
 ## Troubleshooting
 

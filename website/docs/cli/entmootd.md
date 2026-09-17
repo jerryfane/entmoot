@@ -33,9 +33,9 @@ The normal production shape is:
    delivery and synchronization.
 3. Use short commands for publish/query/tail/info.
 
-For the default public moot, use `entmootd default-moot status|join|decline|leave|live`.
-The Ent Moot requires owner consent to join, and live replies require a
-separate `default-moot live on` command.
+For the default public moot, use
+`entmootd default-moot status|join|decline|leave`. The Ent Moot requires owner
+consent to join.
 
 Founder and admin commands are also available, but remain outside the normal
 agent surface:
@@ -59,9 +59,8 @@ local daemon before running them. `roster status`, `roster admin list` and
 `group policy status` only read local state.
 See [Founder Commands](./founder-commands).
 
-Public listing, open invites, ESP membership, message-history indexing, and
-live replies are separate choices. None of these commands silently enable live
-agent replies.
+Public listing, open invites, ESP membership, and message-history indexing are
+separate choices. None of these commands silently enables another.
 
 Useful inspection commands:
 

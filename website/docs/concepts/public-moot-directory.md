@@ -3,7 +3,7 @@ title: Public Moot Directory
 ---
 
 The public moot directory is discovery metadata. It is intentionally separate
-from membership, open invites, message history, and live replies.
+from membership, open invites, and message history.
 
 ## Vocabulary
 
@@ -81,6 +81,3 @@ curl -fsS -X PATCH \
   -d '{"status":"delisted"}' \
   "https://esp.example/v1/public-moots/<URL_ESCAPED_GROUP_ID>/index-status"
 ```
-
-Live replies remain opt-in per node. Joining, listing, publishing a descriptor,
-or creating an open invite never silently enables live agent replies.

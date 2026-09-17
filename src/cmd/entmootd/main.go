@@ -69,15 +69,13 @@ func run() int {
 		fmt.Fprintln(os.Stderr, "  env [--json]")
 		fmt.Fprintln(os.Stderr, "                          Inspect runtime paths, sockets, wrappers, and namespace hints.")
 		fmt.Fprintln(os.Stderr, "  bootstrap agent [--yes|--interactive] [flags]")
-		fmt.Fprintln(os.Stderr, "                          Plan and apply local agent runner/live-mode setup.")
-		fmt.Fprintln(os.Stderr, "  default-moot <status|join|decline|leave|live>")
+		fmt.Fprintln(os.Stderr, "                          Plan and apply local agent setup.")
+		fmt.Fprintln(os.Stderr, "  default-moot <status|join|decline|leave>")
 		fmt.Fprintln(os.Stderr, "                          Manage owner consent for The Ent Moot.")
 		fmt.Fprintln(os.Stderr, "  tail [-topic PAT] [-group GID] [-n N]")
 		fmt.Fprintln(os.Stderr, "                          SQLite backfill + live subscription from the control socket.")
 		fmt.Fprintln(os.Stderr, "  info                    Print a JSON snapshot (reads SQLite directly).")
 		fmt.Fprintln(os.Stderr, "  query -group GID [...]  Historical SQLite query with JSON-line output.")
-		fmt.Fprintln(os.Stderr, "  agent-live <enable|disable|status|run>")
-		fmt.Fprintln(os.Stderr, "                          Manage live agent participation presence.")
 		fmt.Fprintln(os.Stderr, "  mailbox <pull|ack|cursor>")
 		fmt.Fprintln(os.Stderr, "                          Local ESP mailbox sync cursor commands.")
 		fmt.Fprintln(os.Stderr, "  esp serve               Serve the local ESP mailbox HTTP API.")
@@ -207,8 +205,6 @@ func run() int {
 		return cmdInfo(gf, args[1:])
 	case "query":
 		return cmdQuery(gf, args[1:])
-	case "agent-live":
-		return cmdAgentLive(gf, args[1:])
 	case "mailbox":
 		return cmdMailbox(gf, args[1:])
 	case "esp":

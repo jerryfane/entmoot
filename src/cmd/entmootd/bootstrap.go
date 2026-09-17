@@ -9,53 +9,22 @@ import (
 	"os"
 	"strconv"
 	"strings"
-
-	"entmoot/pkg/entmoot"
-	"entmoot/pkg/entmoot/esphttp"
 )
 
-const bootstrapLiveModeOff = "off"
-
 type bootstrapAgentOptions struct {
-	yes               bool
-	interactive       bool
-	dryRun            bool
-	json              bool
-	runner            string
-	runnerCommand     string
-	liveMode          string
-	group             string
-	node              string
-	topics            repeatedStringFlag
-	actions           repeatedStringFlag
-	maxActionsPerScan int
-	maxActionBytes    int
-	defaultMoot       string
+	yes         bool
+	interactive bool
+	dryRun      bool
+	json        bool
+	defaultMoot string
 }
 
 type bootstrapAgentReport struct {
-	DryRun            bool                       `json:"dry_run"`
-	Applied           bool                       `json:"applied"`
-	Runner            string                     `json:"runner"`
-	RunnerCommand     string                     `json:"runner_command,omitempty"`
-	Live              bootstrapAgentLiveReport   `json:"live"`
-	DefaultMoot       bootstrapDefaultMootReport `json:"default_moot"`
-	Commands          []string                   `json:"commands,omitempty"`
-	Warnings          []string                   `json:"warnings,omitempty"`
-	Runtime           runtimeReport              `json:"runtime"`
-	AppliedLiveConfig *esphttp.LiveAgentConfig   `json:"applied_live_config,omitempty"`
-}
-
-type bootstrapAgentLiveReport struct {
-	Enabled           bool     `json:"enabled"`
-	Group             string   `json:"group,omitempty"`
-	GroupID           string   `json:"group_id,omitempty"`
-	MemberID          string   `json:"member_id,omitempty"`
-	Mode              string   `json:"mode,omitempty"`
-	TopicFilters      []string `json:"topic_filters,omitempty"`
-	AllowedActions    []string `json:"allowed_actions,omitempty"`
-	MaxActionsPerScan int      `json:"max_actions_per_scan,omitempty"`
-	MaxActionBytes    int      `json:"max_action_bytes,omitempty"`
+	DryRun      bool                       `json:"dry_run"`
+	Applied     bool                       `json:"applied"`
+	DefaultMoot bootstrapDefaultMootReport `json:"default_moot"`
+	Commands    []string                   `json:"commands,omitempty"`
+	Runtime     runtimeReport              `json:"runtime"`
 }
 
 type bootstrapDefaultMootReport struct {
@@ -83,24 +52,12 @@ func cmdBootstrap(gf *globalFlags, args []string) int {
 }
 
 func cmdBootstrapAgent(gf *globalFlags, args []string) int {
-	cfg := bootstrapAgentOptions{
-		runner:   agentRunnerNone,
-		liveMode: bootstrapLiveModeOff,
-	}
+	var cfg bootstrapAgentOptions
 	fs := flag.NewFlagSet("bootstrap agent", flag.ContinueOnError)
 	fs.BoolVar(&cfg.yes, "yes", false, "use unattended safe defaults and never prompt")
 	fs.BoolVar(&cfg.interactive, "interactive", false, "ask owner-driven setup questions on a TTY")
 	fs.BoolVar(&cfg.dryRun, "dry-run", false, "print the setup plan without applying local config")
 	fs.BoolVar(&cfg.json, "json", false, "print JSON summary")
-	fs.StringVar(&cfg.runner, "runner", cfg.runner, "agent runtime: none, custom, or openclaw")
-	fs.StringVar(&cfg.runnerCommand, "runner-command", "", "custom agent runner command")
-	fs.StringVar(&cfg.liveMode, "live-mode", cfg.liveMode, "live mode: off, listen, reply_on_mention, converse, operator")
-	fs.StringVar(&cfg.group, "group", "", "base64 moot group id for live mode")
-	fs.StringVar(&cfg.node, "member", "", "base64 local member id for live mode")
-	fs.Var(&cfg.topics, "topic", "live topic filter; may be repeated")
-	fs.Var(&cfg.actions, "action", "operator action; may be repeated")
-	fs.IntVar(&cfg.maxActionsPerScan, "max-actions", 0, "optional maximum live actions per scan; 0 means unlimited")
-	fs.IntVar(&cfg.maxActionBytes, "max-action-bytes", 0, "optional maximum bytes per live action message; 0 means unlimited")
 	fs.StringVar(&cfg.defaultMoot, "default-moot", "skip", "The Ent Moot owner choice: skip, join, or decline")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -125,36 +82,7 @@ func cmdBootstrapAgent(gf *globalFlags, args []string) int {
 		return exitInvalidArgument
 	}
 	cfg.defaultMoot = normalizeBootstrapDefaultMootChoice(cfg.defaultMoot)
-	report, gid, nodeID, err := buildBootstrapAgentReport(gf, cfg)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "bootstrap agent: %v\n", err)
-		return exitInvalidArgument
-	}
-	if !cfg.dryRun && report.Live.Enabled {
-		state, err := esphttp.OpenSQLiteStateStore(gf.data)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "bootstrap agent: %v\n", err)
-			return exitTransport
-		}
-		defer state.Close()
-		rec, err := enableAgentLiveConfig(context.Background(), state, enableAgentLiveConfigOptions{
-			groupID:           gid,
-			nodeID:            nodeID,
-			mode:              report.Live.Mode,
-			topics:            report.Live.TopicFilters,
-			actions:           report.Live.AllowedActions,
-			maxActionsPerScan: report.Live.MaxActionsPerScan,
-			maxActionBytes:    report.Live.MaxActionBytes,
-		})
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "bootstrap agent: %v\n", err)
-			return exitInvalidArgument
-		}
-		report.Applied = true
-		report.AppliedLiveConfig = &rec
-	} else {
-		report.Applied = false
-	}
+	report := buildBootstrapAgentReport(gf, cfg)
 	if !cfg.dryRun && cfg.defaultMoot == defaultMootConsentDeclined {
 		declinedState, err := defaultMootDeclinedLocalState(context.Background(), gf.data)
 		if err != nil {
@@ -174,89 +102,21 @@ func cmdBootstrapAgent(gf *globalFlags, args []string) int {
 	return exitOK
 }
 
-func buildBootstrapAgentReport(gf *globalFlags, cfg bootstrapAgentOptions) (bootstrapAgentReport, entmoot.GroupID, entmoot.MemberID, error) {
-	var gid entmoot.GroupID
-	var nodeID entmoot.MemberID
-	runner := normalizeAgentRunnerKind(cfg.runner)
-	if runner == "" {
-		return bootstrapAgentReport{}, gid, nodeID, fmt.Errorf("invalid --runner; use none, custom, or openclaw")
-	}
-	if err := validateAgentRunner(runner, cfg.runnerCommand); err != nil {
-		return bootstrapAgentReport{}, gid, nodeID, err
-	}
-	liveMode := strings.TrimSpace(strings.ToLower(cfg.liveMode))
-	if liveMode == "" {
-		liveMode = bootstrapLiveModeOff
-	}
-	if liveMode != bootstrapLiveModeOff {
-		liveMode = esphttp.NormalizeLiveMode(liveMode)
-		if liveMode == "" {
-			return bootstrapAgentReport{}, gid, nodeID, fmt.Errorf("invalid --live-mode; use off, listen, reply_on_mention, converse, or operator")
-		}
-		var err error
-		gid, nodeID, err = parseBootstrapLiveTarget(cfg.group, cfg.node)
-		if err != nil {
-			return bootstrapAgentReport{}, gid, nodeID, err
-		}
-	}
-	if cfg.maxActionsPerScan < 0 || cfg.maxActionBytes < 0 {
-		return bootstrapAgentReport{}, gid, nodeID, fmt.Errorf("--max-actions and --max-action-bytes must be non-negative")
-	}
-	if unknown := esphttp.UnknownLiveActions([]string(cfg.actions)); len(unknown) > 0 {
-		return bootstrapAgentReport{}, gid, nodeID, fmt.Errorf("unknown --action value(s): %s", strings.Join(unknown, ", "))
-	}
-	runnerCommand := agentRunnerCommand(runner, cfg.runnerCommand)
+func buildBootstrapAgentReport(gf *globalFlags, cfg bootstrapAgentOptions) bootstrapAgentReport {
 	runtime := collectRuntimeReport(gf, gf.data)
 	report := bootstrapAgentReport{
-		DryRun:        cfg.dryRun,
-		Runner:        runner,
-		RunnerCommand: runnerCommand,
-		Runtime:       runtime,
-		DefaultMoot:   buildBootstrapDefaultMootReport(gf, runtime, cfg.defaultMoot),
-	}
-	if liveMode != bootstrapLiveModeOff {
-		topics := esphttp.NormalizeLiveTopicFilters([]string(cfg.topics))
-		if len(topics) == 0 {
-			topics = []string{"#"}
-		}
-		rawActions := []string(cfg.actions)
-		actions := esphttp.NormalizeLiveActions(rawActions)
-		if len(rawActions) > 0 && len(actions) == 0 {
-			return bootstrapAgentReport{}, gid, nodeID, fmt.Errorf("live action list cannot be empty")
-		}
-		if liveMode == esphttp.LiveModeOperator && len(actions) == 0 && len(rawActions) == 0 {
-			actions = esphttp.DefaultLiveActions()
-		}
-		report.Live = bootstrapAgentLiveReport{
-			Enabled:           true,
-			Group:             cfg.group,
-			GroupID:           gid.String(),
-			MemberID:          nodeID.String(),
-			Mode:              liveMode,
-			TopicFilters:      topics,
-			AllowedActions:    actions,
-			MaxActionsPerScan: cfg.maxActionsPerScan,
-			MaxActionBytes:    cfg.maxActionBytes,
-		}
-		if agentLiveModeRunsAdapter(liveMode) && runner == agentRunnerNone {
-			report.Warnings = append(report.Warnings, "live mode can match events, but no runner is configured; use --runner custom --runner-command PATH or --runner openclaw")
-		}
+		DryRun:      cfg.dryRun,
+		Runtime:     runtime,
+		DefaultMoot: buildBootstrapDefaultMootReport(gf, runtime, cfg.defaultMoot),
 	}
 	report.Commands = bootstrapAgentCommands(gf, report)
-	return report, gid, nodeID, nil
+	return report
 }
 
 func bootstrapAgentCommands(gf *globalFlags, report bootstrapAgentReport) []string {
 	var out []string
 	out = append(out, report.DefaultMoot.Commands...)
 	out = append(out, entmootCommand(gf, report.Runtime, "serve"))
-	if report.Live.Enabled {
-		parts := []string{"agent-live", "run", "-group", report.Live.Group, "-member", report.Live.MemberID}
-		if report.Runner != agentRunnerNone {
-			parts = append(parts, "-runner", report.RunnerCommand)
-		}
-		out = append(out, entmootCommand(gf, report.Runtime, parts...))
-	}
 	return out
 }
 
@@ -310,19 +170,18 @@ func entmootCommand(gf *globalFlags, report runtimeReport, args ...string) strin
 	return shellCommand(parts...)
 }
 
-func parseBootstrapLiveTarget(rawGroup, rawMember string) (entmoot.GroupID, entmoot.MemberID, error) {
-	if strings.TrimSpace(rawGroup) == "" {
-		return entmoot.GroupID{}, entmoot.MemberID{}, fmt.Errorf("--group is required when --live-mode is not off")
+// shellCommand renders a copy-pasteable command line for the bootstrap
+// report: empty parts are dropped so an unset flag does not print as a bare
+// dangling name, and every part is quoted for a POSIX shell.
+func shellCommand(parts ...string) string {
+	quoted := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if strings.TrimSpace(part) == "" {
+			continue
+		}
+		quoted = append(quoted, shellQuoteArg(part))
 	}
-	gid, err := decodeGroupID(rawGroup)
-	if err != nil {
-		return entmoot.GroupID{}, entmoot.MemberID{}, err
-	}
-	memberID, ok := parseAgentLiveMember("bootstrap agent", rawMember)
-	if !ok {
-		return entmoot.GroupID{}, entmoot.MemberID{}, fmt.Errorf("--member must be a base64 32-byte member id")
-	}
-	return gid, memberID, nil
+	return strings.Join(quoted, " ")
 }
 
 func printBootstrapAgentReport(report bootstrapAgentReport) {
@@ -332,22 +191,6 @@ func printBootstrapAgentReport(report bootstrapAgentReport) {
 		fmt.Println("bootstrap agent: applied")
 	} else {
 		fmt.Println("bootstrap agent: ready")
-	}
-	fmt.Printf("runner: %s\n", report.Runner)
-	if report.RunnerCommand != "" {
-		fmt.Printf("runner_command: %s\n", report.RunnerCommand)
-	}
-	if report.Live.Enabled {
-		fmt.Printf("live: enabled mode=%s group=%s member=%s\n", report.Live.Mode, report.Live.Group, report.Live.MemberID)
-		fmt.Printf("live_topics: %s\n", strings.Join(report.Live.TopicFilters, ","))
-		if len(report.Live.AllowedActions) > 0 {
-			fmt.Printf("live_actions: %s\n", strings.Join(report.Live.AllowedActions, ","))
-		}
-	} else {
-		fmt.Println("live: disabled")
-	}
-	for _, warning := range report.Warnings {
-		fmt.Printf("warning: %s\n", warning)
 	}
 	fmt.Printf("default_moot: %s\n", report.DefaultMoot.Choice)
 	for _, warning := range report.DefaultMoot.Warnings {
@@ -363,18 +206,7 @@ func promptBootstrapAgentOptions(cfg bootstrapAgentOptions) (bootstrapAgentOptio
 		return cfg, fmt.Errorf("--interactive requires a terminal; pass flags or use --yes for defaults")
 	}
 	reader := bufio.NewReader(os.Stdin)
-	var err error
-	cfg.runner, err = promptChoice(reader, "runner [none/custom/openclaw]", cfg.runner, map[string]bool{agentRunnerNone: true, agentRunnerCustom: true, agentRunnerOpenClaw: true})
-	if err != nil {
-		return cfg, err
-	}
-	if cfg.runner == agentRunnerCustom {
-		cfg.runnerCommand, err = promptString(reader, "custom runner command", cfg.runnerCommand)
-		if err != nil {
-			return cfg, err
-		}
-	}
-	cfg.defaultMoot, err = promptChoice(reader, "The Ent Moot [skip/join/decline]", cfg.defaultMoot, map[string]bool{
+	choice, err := promptChoice(reader, "The Ent Moot [skip/join/decline]", cfg.defaultMoot, map[string]bool{
 		"skip":                     true,
 		"join":                     true,
 		"decline":                  true,
@@ -383,38 +215,7 @@ func promptBootstrapAgentOptions(cfg bootstrapAgentOptions) (bootstrapAgentOptio
 	if err != nil {
 		return cfg, err
 	}
-	cfg.liveMode, err = promptChoice(reader, "live mode [off/listen/reply_on_mention/converse/operator]", cfg.liveMode, map[string]bool{
-		bootstrapLiveModeOff:           true,
-		esphttp.LiveModeListen:         true,
-		esphttp.LiveModeReplyOnMention: true,
-		esphttp.LiveModeConverse:       true,
-		esphttp.LiveModeOperator:       true,
-	})
-	if err != nil {
-		return cfg, err
-	}
-	if cfg.liveMode != bootstrapLiveModeOff {
-		cfg.group, err = promptString(reader, "live group id", cfg.group)
-		if err != nil {
-			return cfg, err
-		}
-		cfg.node, err = promptString(reader, "live member id", cfg.node)
-		if err != nil {
-			return cfg, err
-		}
-		rawTopics, err := promptString(reader, "live topics comma-separated", strings.Join(cfg.topics, ","))
-		if err != nil {
-			return cfg, err
-		}
-		cfg.topics = repeatedStringFlag(parseTopicList(rawTopics))
-		if cfg.liveMode == esphttp.LiveModeOperator {
-			rawActions, err := promptString(reader, "operator actions comma-separated; blank means all", strings.Join(cfg.actions, ","))
-			if err != nil {
-				return cfg, err
-			}
-			cfg.actions = repeatedStringFlag(parseTopicList(rawActions))
-		}
-	}
+	cfg.defaultMoot = choice
 	return cfg, nil
 }
 

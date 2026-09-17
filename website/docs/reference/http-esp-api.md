@@ -23,9 +23,6 @@ DELETE /v1/groups/{group_id}/policy
 POST /v1/groups/{group_id}/public-moot/publish
 GET  /v1/groups/{group_id}/members
 DELETE /v1/groups/{group_id}/members/{member_id}
-GET  /v1/groups/{group_id}/live-agents
-PUT  /v1/groups/{group_id}/live-agents/{member_id}
-DELETE /v1/groups/{group_id}/live-agents/{member_id}
 POST /v1/groups/{group_id}/invites
 POST /v1/groups/{group_id}/open-invites
 POST /v1/invites/accept
@@ -194,29 +191,13 @@ Example public directory entry shape:
 Operators may set a listed descriptor to `pending`, `delisted`, or `blocked`
 for Entmoot-operated surfaces without changing group membership.
 
-Member list responses include `display_name` and may include profile and live
-state. A member profile is signed with the same Entmoot key that derives the
+Member list responses include `display_name` and may include a profile. A
+member profile is signed with the same Entmoot key that derives the
 full-width MemberID and libp2p PeerID. ESP exposes it only after the profile
 author still matches current membership. ESP-local profile observations are
 display hints, not identity authority. `display_name` is stable for clients and
 falls back to a short presentation of the MemberID when no approved name is
-available. `live` is ESP-local state with `enabled`, `status`, `mode`, topic
-filters, allowed actions, lease, and timestamps.
-
-Live-agent config routes:
-
-- `GET /v1/groups/{group_id}/live-agents` returns `configs`, `presence`, and
-  merged `members` live state for that group.
-- `PUT /v1/groups/{group_id}/live-agents/{member_id}` upserts config:
-  `enabled`, `mode`, `topic_filters`, `allowed_actions`,
-  `max_actions_per_scan`, and `max_action_bytes`.
-- `DELETE /v1/groups/{group_id}/live-agents/{member_id}` disables the config and
-  marks presence offline.
-
-Bearer/admin devices can read and manage live-agent configs. A member-signed
-request can manage only that member node's own live-agent config. Defaults
-match the CLI: mode `reply_on_mention`, topics `#`, and `0` for
-`max_actions_per_scan` or `max_action_bytes` means unlimited.
+available.
 
 Admin invite and member-management routes:
 
@@ -316,9 +297,9 @@ oldest-to-newest, includes the target once, and returns `has_more_older` plus
 history endpoint.
 
 Mailbox cursors are stored in `mailbox.sqlite`. Mobile service state such as
-sign requests, push tokens, notification preferences, public moot directory
-records, live-agent configs, live presence, and live cursors is stored in
-`esp.sqlite`. Push routes are provider-neutral wakeup plumbing; APNs delivery
-belongs behind the ESP service boundary. APNs is configured on `esp serve` with
-Team ID, Key ID, bundle topic, `.p8` key path, and optional sandbox mode. Push
-payloads are background wakeups only; message content stays in mailbox sync.
+sign requests, push tokens, notification preferences, and public moot directory
+records is stored in `esp.sqlite`. Push routes are provider-neutral wakeup
+plumbing; APNs delivery belongs behind the ESP service boundary. APNs is
+configured on `esp serve` with Team ID, Key ID, bundle topic, `.p8` key path,
+and optional sandbox mode. Push payloads are background wakeups only; message
+content stays in mailbox sync.

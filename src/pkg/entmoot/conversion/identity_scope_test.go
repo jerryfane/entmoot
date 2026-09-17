@@ -16,10 +16,13 @@ import (
 // TestRunResolvesLegacyNodeIDByIntervalAndGroup covers the two resolution
 // branches that have no signing key to fall back on.
 //
-// esp_live_agent_cursors is the vehicle because it survives the Fleet removal
-// and has the shape that forces both branches: a group_id column, a timestamp
-// column, and no pubkey column. So a row can only be resolved by asking which
-// key held that legacy node id in that group at that moment.
+// The ESP identity walk is generic: it rewrites every table in esp.sqlite that
+// carries a legacy node-id column, whatever that table is. legacy_group_scoped_rows
+// is written by this test rather than borrowed from today's schema because no
+// surviving table has the shape that forces both branches: a group_id column, a
+// timestamp column the walk recognises (updated_at_ms here; last_seen_at_ms is
+// deliberately not one), and no pubkey column. So a row can only be resolved by
+// asking which key held that legacy node id in that group at that moment.
 //
 // Two groups reuse legacy node id 133053. In the first it was one key and then
 // another; in the second it was a third key the whole time. A row must resolve
@@ -101,7 +104,7 @@ func TestRunResolvesLegacyNodeIDByIntervalAndGroup(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := db.Exec(`
-CREATE TABLE esp_live_agent_cursors(
+CREATE TABLE legacy_group_scoped_rows(
   group_id BLOB NOT NULL,
   node_id INTEGER NOT NULL,
   last_seen_at_ms INTEGER NOT NULL,
@@ -119,7 +122,7 @@ CREATE TABLE esp_live_agent_cursors(
 		{gid: gidA, at: 1_700_000_004_500},
 		{gid: gidB, at: 1_700_000_002_500},
 	} {
-		if _, err := db.Exec(`INSERT INTO esp_live_agent_cursors VALUES(?,?,?,?)`,
+		if _, err := db.Exec(`INSERT INTO legacy_group_scoped_rows VALUES(?,?,?,?)`,
 			row.gid[:], int64(reused), row.at, row.at); err != nil {
 			db.Close()
 			t.Fatal(err)
@@ -153,7 +156,7 @@ CREATE TABLE esp_live_agent_cursors(
 		{name: "unrelated holder in group B", gid: gidB, at: 1_700_000_002_500, member: otherMember},
 	} {
 		var member []byte
-		if err := converted.QueryRow(`SELECT member_id FROM esp_live_agent_cursors WHERE group_id=? AND updated_at_ms=?`,
+		if err := converted.QueryRow(`SELECT member_id FROM legacy_group_scoped_rows WHERE group_id=? AND updated_at_ms=?`,
 			want.gid[:], want.at).Scan(&member); err != nil {
 			t.Fatalf("%s: %v", want.name, err)
 		}
