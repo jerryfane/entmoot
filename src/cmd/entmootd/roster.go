@@ -435,14 +435,14 @@ func cmdRosterCheckpoint(gf *globalFlags, args []string) int {
 		return code
 	}
 	defer ctx.close()
-	checkpoint, signed, err := ctx.group.SignCheckpoint(ctx.setup.identity, true)
+	// Forced, so it signs even with nothing pending: a founder-signed
+	// checkpoint is worth minting for its signature alone, since that is the
+	// only one a joiner holding no group state can check. SignCheckpoint
+	// therefore never reports "not signed" here.
+	checkpoint, _, err := ctx.group.SignCheckpoint(ctx.setup.identity, true)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "roster checkpoint: %v\n", err)
 		return exitInvalidArgument
-	}
-	if !signed {
-		fmt.Fprintln(os.Stderr, "roster checkpoint: nothing to fold in")
-		return exitOK
 	}
 	data, err := json.Marshal(map[string]any{
 		"status":     "signed",

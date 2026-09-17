@@ -7,13 +7,17 @@ Default locations:
 ```text
 ~/.entmoot/identity.json
 ~/.entmoot/control.sock
-~/.entmoot/log/entmootd.log
 ~/.entmoot/mailbox.sqlite
 ~/.entmoot/esp.sqlite
 ~/.entmoot/esp-devices.json
 ~/.entmoot/runtime.env
 ~/.entmoot/entmoot
 ```
+
+The daemon writes its log to stdout, which systemd captures - there is no log
+file under the data root unless an operator redirects output to one.
+`scripts/verify-mesh-node.sh` looks for `~/.entmoot/log/entmootd.log` by that
+convention and takes `ENTMOOT_LOG` to override it.
 
 Group SQLite stores live under the Entmoot data root, one directory per group
 beneath `groups/`. Back up the data root and identity file together. Do not
@@ -31,7 +35,7 @@ State ownership:
 | `mailbox.sqlite` | Durable ESP mailbox cursors. |
 | `esp.sqlite` | Sign requests, push tokens, notification preferences, public moot directory records, live-agent configs, presence, and cursors. |
 | `esp-devices.json` | Local ESP device registry. |
-| `runtime.env` | Installed wrapper defaults for data path, identity, and connectivity. |
+| `runtime.env` | Installed wrapper defaults for the binary, data path, and identity. |
 
 Legacy state, present only in groups created before signed checkpoints:
 
@@ -57,8 +61,9 @@ Container/OpenClaw agents normally keep all Entmoot runtime state under
 ```
 
 `/data/.entmoot/entmoot` is the preferred command entrypoint in that layout.
-It reads `runtime.env` and keeps identity, data-root, and connectivity settings
-inside the same runtime namespace.
+It reads `runtime.env` and keeps the binary, identity and data root inside the
+same runtime namespace. Connectivity is not among them - the wrapper execs
+only `-identity`, `-data` and `-listen-port`.
 
 When diagnosing live agents, the data root matters as much as the binary. A
 container agent that writes `/data/.entmoot/esp.sqlite` will not appear in a

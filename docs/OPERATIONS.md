@@ -213,7 +213,7 @@ peers, and changelog stay aligned.
    container or service manager for host
    restarts, crashes, upgrades, and fatal config or storage errors. In `/data`
    agent installs, the generated live-run command uses the existing Entmoot
-   wrapper so it shares the configured identity, data root, and connectivity
+   wrapper so it shares the configured identity, data root, and listen port
    profile with `serve`.
 
    Live-agent config is scoped by `group_id + member_id` and is stored in the

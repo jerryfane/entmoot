@@ -112,8 +112,9 @@ Authority:
 - `leave`: any member, about itself. No admin is involved.
 - `checkpoint`: the founder, or a delegated admin the **current canonical
   checkpoint already names**. It signs a checkpoint now instead of waiting for
-  the cadence, and retires the records it folds in. It prints `nothing to fold
-  in` when there is nothing pending. An admin granted authority since that
+  the cadence, and retires the records it folds in. It signs even when nothing
+  is pending: a founder-signed checkpoint is worth minting for its signature
+  alone, because that is the only one a joiner can check. An admin granted authority since that
   checkpoint is refused until the next one carries its grant, because a
   checkpoint is judged by the one before it — see
   [who may sign a checkpoint](../concepts/groups-rosters-invites.md#who-may-sign-one).

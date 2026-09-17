@@ -15,7 +15,7 @@ Use `join` once with a signed invite; use `serve` for service managers and
 restarts. Expired or missing invite files do not affect `serve`.
 
 For `/data`-backed agents, run commands through `/data/.entmoot/entmoot` so the
-identity, data root, and connectivity profile match the supervised daemon.
+identity, data root, and listen port match the supervised daemon.
 
 Useful global flags:
 

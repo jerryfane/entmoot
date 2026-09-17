@@ -294,7 +294,8 @@ go test ./...
 ```text
 src/cmd/entmootd/                  CLI, daemon, IPC, ESP, and runtime wiring
 src/pkg/entmoot/                   protocol types and identity validation
-src/pkg/entmoot/roster/            legacy linear roster chain, read-only
+src/pkg/entmoot/membership/        signed records, checkpoints, and projection
+src/pkg/entmoot/roster/            validator for the legacy linear chain
 src/pkg/entmoot/store/             SQLite message store, search, and paging
 src/pkg/entmoot/transport/libp2p/  membership sync, GossipSub, and history sync
 src/pkg/entmoot/conversion/        durable legacy-data conversion

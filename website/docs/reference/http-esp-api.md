@@ -6,6 +6,7 @@ ESP HTTP routes:
 
 ```text
 GET  /healthz
+GET  /v1/capabilities
 GET  /v1/session
 GET  /v1/status
 GET  /v1/public-moots
@@ -95,6 +96,9 @@ as forward-compatible app data.
 
 Group policy routes:
 
+- `GET /v1/capabilities` answers `200 {}`. It carries no fields yet: it exists
+  as an unauthenticated reachability check behind the public reverse proxy, so
+  a probe can tell "the ESP is serving" from "the proxy is up".
 - `GET /v1/groups/{group_id}/policy` returns the stored/effective policy report
   for the group.
 - `PUT /v1/groups/{group_id}/policy` creates a `group_policy_update` sign

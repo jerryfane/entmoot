@@ -24,7 +24,7 @@ typing these paths by hand:
 ```
 
 The wrapper reads `/data/.entmoot/runtime.env` and keeps identity, data-root,
-and connectivity settings inside the same runtime namespace.
+and listen port inside the same runtime namespace.
 
 The normal production shape is:
 

@@ -51,9 +51,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   claimed. The running daemon dials every other member of the group and
   performs one membership read: that proves the peer is up, speaks the
   protocol and serves this group to this node, where a connection alone would
-  not. Each peer row gains `reachable`, `answered`, `refusal`, `latency_ms`,
-  `relayed` and how many addresses were tried, with a one-line reason on
-  failure. Three outcomes, not two: `answered` without `reachable` is a peer
+  not. Each peer row gains a `probe` object holding `reachable`, `answered`,
+  `refusal`, `latency_ms`, `relayed` and how many addresses were tried, with a
+  one-line reason on failure. Three outcomes, not two: `answered` without `reachable` is a peer
   that replied and refused this node, which is what a removed member sees from
   every peer and must not read as a network fault. A multi-homed member's dial
   error is summarised rather than pasted, and the peer's own refusal text is
