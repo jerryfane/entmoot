@@ -1207,6 +1207,86 @@ func TestRecordsAtTheCheckpointTimestampAreNotReplayed(t *testing.T) {
 	}
 }
 
+// The sibling case of the one above, on the other half of the same rule. A
+// checkpoint that folds nothing in - what `roster checkpoint` mints on a quiet
+// group - still succeeds one that did, and retirement drops the records behind
+// its predecessor. The projection treated a zero fold count as covering
+// nothing at all, so a node that still held those records replayed them while
+// a node that had retired them did not: the same checkpoint, two invite-use
+// counts, and an invite exhausted for one of them.
+func TestCheckpointThatFoldsNothingStillCoversWhatItSucceeds(t *testing.T) {
+	f := newFixture(t, DefaultPolicy())
+	invite := f.invite(f.founder, nil, 2)
+	first := mustIdentity(t)
+	joined := f.joinWith(first, invite)
+	left := f.sign(first, Record{Kind: KindLeave})
+	f.apply(left)
+
+	if _, signed, err := f.group.SignCheckpoint(f.founder, true); err != nil || !signed {
+		t.Fatalf("first checkpoint: signed=%t err=%v", signed, err)
+	}
+	f.tick(1_000)
+	quiet, signed, err := f.group.SignCheckpoint(f.founder, true)
+	if err != nil || !signed {
+		t.Fatalf("second checkpoint: signed=%t err=%v", signed, err)
+	}
+	if quiet.Covered != 0 {
+		t.Fatalf("second checkpoint folded %d records in, want the quiet case", quiet.Covered)
+	}
+
+	// One node retired the two records when the quiet checkpoint landed; a
+	// peer a checkpoint behind still holds them and re-delivers them.
+	held := []Record{joined, left}
+	retired, _ := Project(quiet, nil)
+	holding, effective := Project(quiet, held)
+	if len(effective) != 0 {
+		t.Fatalf("the quiet checkpoint left %d of its predecessor's records effective", len(effective))
+	}
+	if retired.InviteUses[invite.Nonce] != holding.InviteUses[invite.Nonce] {
+		t.Fatalf("invite counted %d times after retirement and %d times while the records are held",
+			retired.InviteUses[invite.Nonce], holding.InviteUses[invite.Nonce])
+	}
+	if _, back := holding.Members[f.memberID(first)]; back {
+		t.Fatal("replaying the retired records re-admitted a member who had left")
+	}
+
+	// The store refuses what the projection skips, which is the invariant the
+	// two halves of the rule exist to keep.
+	for _, rec := range held {
+		if _, err := f.group.Apply(rec); !errors.Is(err, ErrStale) {
+			t.Fatalf("the store accepted a record the projection skips: %v", err)
+		}
+	}
+
+	// The invite's second use still belongs to somebody who has not used it.
+	second := mustIdentity(t)
+	f.tick(10)
+	if _, err := f.group.Apply(f.sign(second, Record{Kind: KindJoin, Invite: &invite})); err != nil {
+		t.Fatalf("the invite's second use was denied: %v", err)
+	}
+}
+
+// The other side of the fold-count clause: checkpoint 0 carries its own
+// signing time, not a record's, so it covers nothing at that instant. A first
+// join minted in the same millisecond the group was created has to land, or a
+// group cannot be used until its creation millisecond has passed.
+func TestGenesisDoesNotCoverItsOwnMillisecond(t *testing.T) {
+	f := newFixture(t, DefaultPolicy())
+	genesis := f.group.Canonical()
+	if genesis.Covered != 0 {
+		t.Fatalf("genesis folded %d records in", genesis.Covered)
+	}
+	joiner := mustIdentity(t)
+	invite := f.invite(f.founder, joiner, 1)
+	rec := f.sign(joiner, Record{Kind: KindJoin, Invite: &invite, Timestamp: genesis.Timestamp})
+	if _, err := f.group.Apply(rec); err != nil {
+		t.Fatalf("a join minted in the group's creation millisecond was refused: %v", err)
+	}
+	if !f.group.IsMemberID(f.memberID(joiner)) {
+		t.Fatal("the joiner is not a member")
+	}
+}
+
 // A checkpoint dated far in the future would make every legitimate record
 // stale and freeze the node until that date arrived, so it is refused.
 func TestCheckpointFarAheadOfTheLocalClockIsRefused(t *testing.T) {
@@ -1241,6 +1321,66 @@ func TestCheckpointFarAheadOfTheLocalClockIsRefused(t *testing.T) {
 	f.join(late)
 	if !f.group.IsMemberID(f.memberID(late)) {
 		t.Fatal("a legitimate join was refused after the future-dated checkpoint")
+	}
+}
+
+// The same asymmetry from the other side. Retirement drops records through
+// the PREVIOUS checkpoint's timestamp while coverage bounds at the canonical
+// one, so a successor dated behind its predecessor would retire records it
+// does not cover, and a peer one checkpoint behind would replay them.
+// SignCheckpoint always advances the timestamp; nothing checked it on a
+// checkpoint arriving from a peer.
+func TestABackdatedCheckpointIsRefused(t *testing.T) {
+	f := newFixture(t, DefaultPolicy())
+	f.join(mustIdentity(t))
+	f.tick(10)
+	if _, signed, err := f.group.SignCheckpoint(f.founder, true); err != nil || !signed {
+		t.Fatalf("base checkpoint: signed=%t err=%v", signed, err)
+	}
+	base := f.group.Canonical()
+
+	backdated := base
+	backdated.ID = entmoot.RosterEntryID{}
+	backdated.Sequence = base.Sequence + 1
+	backdated.Previous = base.ID
+	backdated.Timestamp = base.Timestamp - 1
+	backdated.Covered = 0
+	backdated.Signature = nil
+	signedBackdate, err := SignCheckpoint(f.founder, f.info(f.founder), backdated)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.group.ApplyCheckpoint(signedBackdate); !errors.Is(err, entmoot.ErrRosterReject) {
+		t.Fatalf("a checkpoint dated before its predecessor was accepted: %v", err)
+	}
+	if got := f.group.Canonical().ID; got != base.ID {
+		t.Fatalf("canonical moved to a backdated checkpoint (%s)", got)
+	}
+
+	// A checkpoint at exactly the predecessor's timestamp is refused too: it
+	// would advance the sequence while covering nothing new.
+	level := backdated
+	level.Timestamp = base.Timestamp
+	level.ID = entmoot.RosterEntryID{}
+	level.Signature = nil
+	signedLevel, err := SignCheckpoint(f.founder, f.info(f.founder), level)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.group.ApplyCheckpoint(signedLevel); !errors.Is(err, entmoot.ErrRosterReject) {
+		t.Fatalf("a checkpoint at its predecessor's timestamp was accepted: %v", err)
+	}
+
+	// The founder's own cadence still lands, so the rule does not stall the
+	// group it protects.
+	f.tick(10)
+	f.join(mustIdentity(t))
+	f.tick(10)
+	if _, signed, err := f.group.SignCheckpoint(f.founder, true); err != nil || !signed {
+		t.Fatalf("the next legitimate checkpoint was refused: signed=%t err=%v", signed, err)
+	}
+	if got := f.group.Canonical().Sequence; got != base.Sequence+1 {
+		t.Fatalf("canonical sequence = %d, want %d", got, base.Sequence+1)
 	}
 }
 
