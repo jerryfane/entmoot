@@ -45,8 +45,15 @@ const (
 // the allowlist bounds relay clients; the reservation cap bounds them further
 // when it is lower, but non-reserving circuit sources are only bounded by the
 // ACL, so the allowlist is the number that has to be covered.
+//
+// Distinct peers, because that is what the ACL enforces: a repeated
+// -relay-allow-peer must not buy the relay extra inbound connections.
 func relayConnectionBudget(cfg RelayServerConfig) int {
-	return len(cfg.AllowedPeers)
+	distinct := make(map[peer.ID]struct{}, len(cfg.AllowedPeers))
+	for _, id := range cfg.AllowedPeers {
+		distinct[id] = struct{}{}
+	}
+	return len(distinct)
 }
 
 type HostConfig struct {
