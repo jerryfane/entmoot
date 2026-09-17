@@ -83,7 +83,11 @@ ENTMOOT-ESP-MEMBER-AUTH-V2
 <base64 sha256 of the body>
 ```
 
-joined with `\n`.
+joined with `\n`. Every base64 here is standard padded encoding, including the
+member id, the public key, the body hash and the signature header itself;
+URL-safe base64 is refused with `invalid member public key`. The timestamp
+must be within five minutes of the ESP's clock either way, and the nonce is
+single-use for that window - a replay answers `replayed nonce`.
 
 Device-authenticated requests sign method, path with query, timestamp, nonce,
 and body hash.
