@@ -150,9 +150,6 @@ func TestMembershipPeersReachesTheMembersARewindDropped(t *testing.T) {
 		}
 	}
 
-	// And the reservation has a ceiling, which is the half the constant
-	// exists for: repair peers must not take the whole fan-out, or a long
-	// rewind would stop this node syncing with the members it still has.
 	// Exact, and with literal numbers on purpose: this is the only guard on
 	// the reservation in either direction, and an assertion written in terms
 	// of maxRewoundSyncPeers moves with the constant it is supposed to pin.
