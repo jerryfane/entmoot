@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.85] - 2026-09-17
+
 ### Removed
 
 - `agent-live` is deleted: the subcommand, its polling runtime, the OpenClaw
