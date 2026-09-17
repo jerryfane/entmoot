@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.84] - 2026-09-17
+
+### Removed
+
+- `pkg/entmoot/roster` is now only what conversion needs: a validator for the
+  legacy linear chain. Its package doc described a live append-only membership
+  log, which `pkg/entmoot/membership` replaced; the persistence half -
+  writer lease, SQLite schema, migrate, import, load, persist - duplicated
+  what `pkg/entmoot/conversion` already owns, and the mutation and query API
+  had no production caller. 1501 non-test lines become 629, and the exported
+  surface is `ValidateEntries`, `ValidateLegacyJSONL`, `CurrentEntryVersion`
+  and the admin-policy payload a legacy `policy_change` carried.
+- The per-(peer, topic) rate limit: `Limits.TopicLimits`, `TopicLimit`,
+  `AllowTopic`, `AllowTopicOnly` and `Limiter.Reset`. It was complete and had
+  no production caller. The per-peer message and byte buckets are unchanged.
+- Four declarations nothing ever produced: `entmoot.ErrInviteExpired`, whose
+  doc named a package deleted with the Pilot cutover; the
+  `bootstrap_denied` sync error code, never written to a stream;
+  `esphttp.PublicMootMirrorHosted`, a mirror state no route assigns - only
+  `none` and `member` are ever produced; and `entmoot.Filter` together with
+  `topic.MatchAny`, which was test-only.
+
 ### Fixed
 
 - A node whose coverage bound moves backwards now recovers the membership it
