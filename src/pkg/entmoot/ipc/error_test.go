@@ -41,8 +41,7 @@ func TestExitCodeUnknown(t *testing.T) {
 }
 
 // TestEncodeSetsErrorType verifies that Encode populates
-// ErrorFrame.Type = "error" when the caller leaves it empty, and does
-// not clobber a caller-supplied value.
+// ErrorFrame.Type = "error" when the caller leaves it empty.
 func TestEncodeSetsErrorType(t *testing.T) {
 	// Empty Type: Encode must fill it in.
 	ef := &ErrorFrame{
@@ -55,7 +54,6 @@ func TestEncodeSetsErrorType(t *testing.T) {
 	if ef.Type != "error" {
 		t.Fatalf("Type = %q, want %q", ef.Type, "error")
 	}
-
 }
 
 // TestEncodeErrorFrameBodyShape confirms the JSON body carries the

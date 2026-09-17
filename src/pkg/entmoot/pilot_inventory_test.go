@@ -3,6 +3,7 @@ package entmoot_test
 import (
 	"bufio"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -25,46 +26,54 @@ func TestOperationalTreeHasNoPilotDependency(t *testing.T) {
 		"src/pkg/entmoot/roster/roster.go":               "validating immutable legacy rosters during conversion",
 		"src/pkg/entmoot/transport/libp2p/validation.go": "verifying immutable legacy messages",
 	}
-	// Only the trees this repository ships. The walk used to start at the
-	// checkout and skip a deny-list, so it also read whatever else was lying
-	// there: an untracked scratch file containing "autopilot" turned this test
-	// red, naming a file no release contains.
-	owned := []string{"src", "scripts", ".github", "install.sh"}
+	// Every file the repository SHIPS, and nothing else. Walking the checkout
+	// also read whatever was lying there untracked: a scratch file containing
+	// "autopilot" turned this test red while naming a file no release
+	// contains. Asking git for the tracked set keeps the release manifest and
+	// the shell scripts in scope - narrowing to a few directories silently
+	// dropped .goreleaser.yaml - without letting local mess decide.
+	tracked, err := exec.Command("git", "-C", root, "ls-files", "-z").Output()
+	if err != nil {
+		t.Fatalf("git ls-files in %s: %v (this guard needs the checkout)", root, err)
+	}
+	// Prose and generated web assets are not the operational tree.
+	skipped := []string{"docs/", "paper/", "website/"}
 	var residues []string
-	walk := func(path string, entry os.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		rel, err := filepath.Rel(root, path)
-		if err != nil {
-			return err
-		}
-		rel = filepath.ToSlash(rel)
-		if entry.IsDir() {
-			return nil
+	for _, rel := range strings.Split(strings.TrimRight(string(tracked), "\x00"), "\x00") {
+		if rel == "" {
+			continue
 		}
 		if _, ok := allowed[rel]; ok {
-			return nil
+			continue
 		}
 		if !inventoryFile(rel) {
-			return nil
+			continue
 		}
-		file, err := os.Open(path)
+		prose := false
+		for _, prefix := range skipped {
+			if strings.HasPrefix(rel, prefix) {
+				prose = true
+			}
+		}
+		if prose {
+			continue
+		}
+		file, err := os.Open(filepath.Join(root, rel))
 		if err != nil {
-			return err
+			t.Fatalf("open %s: %v", rel, err)
 		}
-		defer file.Close()
 		scanner := bufio.NewScanner(file)
 		for line := 1; scanner.Scan(); line++ {
 			if strings.Contains(strings.ToLower(scanner.Text()), "pilot") {
 				residues = append(residues, rel+":"+itoa(line))
 			}
 		}
-		return scanner.Err()
-	}
-	for _, tree := range owned {
-		if err := filepath.WalkDir(filepath.Join(root, tree), walk); err != nil {
-			t.Fatalf("walk %s: %v", tree, err)
+		scanErr := scanner.Err()
+		if err := file.Close(); err != nil {
+			t.Fatalf("close %s: %v", rel, err)
+		}
+		if scanErr != nil {
+			t.Fatalf("scan %s: %v", rel, scanErr)
 		}
 	}
 	if len(residues) != 0 {
