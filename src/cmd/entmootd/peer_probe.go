@@ -75,6 +75,13 @@ func (r *groupRuntime) probePeers(ctx context.Context, groupID entmoot.GroupID, 
 		// dial being made. One peer's worth of time is the least a probe can
 		// honestly cost, so a smaller request buys a slower answer, not a
 		// false one.
+		//
+		// This floors the FIRST wave only. Workers are gated at
+		// maxProbeParallel, so in a larger group the clamped deadline can
+		// still pass while that wave runs and later peers get the
+		// "not attempted" branch below. Flooring the budget by the number of
+		// waves would make a one-member typo cost seconds on a big group, so
+		// the budget a caller asks for still bounds the whole probe.
 		budget = minProbeSlice
 	}
 	if budget > maxProbeBudget {
