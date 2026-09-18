@@ -22,10 +22,10 @@ from local state and say nothing about whether a peer answers.
 `--probe` asks the running daemon to dial every other member and perform one
 membership read for the group, which is the question behind "why will this
 group not converge": it proves the peer is up, speaks the protocol, and serves
-this group to this node. A connection alone would not. Each peer row then
-carries a `probe` object holding `reachable`, `answered`, `latency_ms`,
+this group to this node. A connection alone would not. Each dialled peer's row
+then carries a `probe` object holding `reachable`, `answered`, `latency_ms`,
 `relayed`, how many addresses were tried, and a one-line reason when it
-failed.
+failed. This node's own row has no `probe` object: it is not dialled.
 
 Three outcomes, not two, all inside `probe`. `reachable` is a peer that
 answered and served us. `answered` without `reachable` is a peer that replied
