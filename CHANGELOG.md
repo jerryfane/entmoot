@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.86] - 2026-09-18
+
 ### Fixed
 
 - A probe budget below one peer-slice no longer defeats the floor it is
