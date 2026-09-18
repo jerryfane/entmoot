@@ -30,6 +30,15 @@ const (
 	// DefaultDescriptorPubKeyBase64 is the pinned Ed25519 public key for the
 	// official descriptor signer. The matching private key is intentionally
 	// not tracked in Git.
+	//
+	// Deprecated: the signer is rotating away from this key. The descriptor it
+	// signed states its issuer the retired pre-v2 way - a numeric transport
+	// node id and no member id - which today's validator refuses, so that
+	// descriptor cannot verify and cannot be corrected without a new
+	// signature over the corrected bytes.
+	// It stays in DefaultDescriptorPubKeysBase64 for one release so a client
+	// that upgrades before the document is re-signed keeps working, and is
+	// removed after. Use DefaultDescriptorPubKeysBase64.
 	DefaultDescriptorPubKeyBase64 = "UsIV+iaJEljYZSdiW+h9NoA+qkBNhsZTAAEJPweJrz8="
 
 	EnvDescriptorURL    = "ENTMOOT_DEFAULT_MOOT_DESCRIPTOR_URL"
@@ -37,6 +46,25 @@ const (
 
 	defaultDescriptorMaxBytes = 1 << 20
 )
+
+// DefaultDescriptorPubKeysBase64 is the set of Ed25519 public keys a descriptor
+// may be signed by, newest first. Matching private keys are intentionally not
+// tracked in Git.
+//
+// The set exists for the rotation in progress. The outgoing key signed a
+// descriptor that states its issuer the retired pre-v2 way, which the current
+// validator refuses, and the issuer sits inside the signed bytes - so the fix
+// needs a new signature. Trusting both keys for one release means the
+// re-signed document can be published without breaking clients that upgrade
+// before the swap. Drop the outgoing key once the published descriptor is
+// signed by the new one.
+var DefaultDescriptorPubKeysBase64 = []string{
+	// Incoming: signs the descriptor whose issuer carries a member id and a
+	// peer id, both derived from the issuer key.
+	"emV7di8Th8e1v+B2AQW7D6znInpfeIAMkQQWUd/59hE=",
+	// Outgoing, accepted during the rotation window only.
+	DefaultDescriptorPubKeyBase64,
+}
 
 var (
 	ErrInvalidDescriptor     = errors.New("defaultmoot: invalid descriptor")
@@ -86,9 +114,25 @@ type RecommendedLiveConfig struct {
 }
 
 // Config is the resolved fetch-and-verify configuration.
+//
+// PinnedPublicKeys is a set because rotating the signer key is otherwise a
+// flag day: the descriptor lives at one URL, so the moment it is re-signed,
+// every client pinned to only the previous key rejects it. A release that
+// trusts the outgoing key and the incoming one lets the document be swapped
+// without breaking the clients that already upgraded, and the outgoing key is
+// dropped in a later release once they have.
 type Config struct {
-	URL             string
-	PinnedPublicKey ed25519.PublicKey
+	URL              string
+	PinnedPublicKeys []ed25519.PublicKey
+}
+
+// PinnedPublicKey returns the first pinned key, for callers that only need one
+// to display or log. Verification must use the whole set.
+func (c Config) PinnedPublicKey() ed25519.PublicKey {
+	if len(c.PinnedPublicKeys) == 0 {
+		return nil
+	}
+	return c.PinnedPublicKeys[0]
 }
 
 // LoadConfigFromEnv resolves the descriptor URL and pinned key from defaults
@@ -112,13 +156,26 @@ func ConfigFromEnv(lookup func(string) string) (Config, error) {
 	}
 	pubRaw := strings.TrimSpace(lookup(EnvDescriptorPubKey))
 	if pubRaw == "" {
-		pubRaw = DefaultDescriptorPubKeyBase64
+		pubRaw = strings.Join(DefaultDescriptorPubKeysBase64, ",")
 	}
-	pub, err := DecodePublicKey(pubRaw)
-	if err != nil {
-		return Config{}, err
+	// Comma-separated so an operator can pin a rotation window explicitly, and
+	// so the override is a set like the default rather than narrowing to one.
+	var keys []ed25519.PublicKey
+	for _, field := range strings.Split(pubRaw, ",") {
+		field = strings.TrimSpace(field)
+		if field == "" {
+			continue
+		}
+		pub, err := DecodePublicKey(field)
+		if err != nil {
+			return Config{}, err
+		}
+		keys = append(keys, pub)
 	}
-	return Config{URL: descriptorURL, PinnedPublicKey: pub}, nil
+	if len(keys) == 0 {
+		return Config{}, fmt.Errorf("%w: descriptor public key is required", ErrInvalidDescriptor)
+	}
+	return Config{URL: descriptorURL, PinnedPublicKeys: keys}, nil
 }
 
 // DecodePublicKey parses a base64-encoded Ed25519 public key.
@@ -154,7 +211,7 @@ func FetchAndVerify(ctx context.Context, client *http.Client, cfg Config) (Descr
 	if err != nil {
 		return Descriptor{}, err
 	}
-	if err := Verify(desc, cfg.PinnedPublicKey); err != nil {
+	if err := VerifyAny(desc, cfg.PinnedPublicKeys); err != nil {
 		return Descriptor{}, err
 	}
 	return desc, nil
@@ -207,23 +264,37 @@ func Parse(raw []byte) (Descriptor, error) {
 
 // Verify validates desc and verifies its Ed25519 signature against pinnedKey.
 func Verify(desc Descriptor, pinnedKey ed25519.PublicKey) error {
+	return VerifyAny(desc, []ed25519.PublicKey{pinnedKey})
+}
+
+// VerifyAny validates desc and verifies its signature against the first pinned
+// key the descriptor names. A descriptor signed by a key outside the set is
+// refused, so widening the set is the only way to admit a new signer - the
+// document cannot nominate its own authority.
+func VerifyAny(desc Descriptor, pinnedKeys []ed25519.PublicKey) error {
 	if err := Validate(desc); err != nil {
 		return err
 	}
-	if len(pinnedKey) != ed25519.PublicKeySize {
-		return fmt.Errorf("%w: pinned public key length %d", ErrDescriptorSignature, len(pinnedKey))
+	if len(pinnedKeys) == 0 {
+		return fmt.Errorf("%w: no pinned public key", ErrDescriptorSignature)
 	}
-	if !bytes.Equal(desc.DescriptorSignerPubKey, pinnedKey) {
-		return fmt.Errorf("%w: descriptor signer does not match pinned public key", ErrDescriptorSignature)
+	for _, pinnedKey := range pinnedKeys {
+		if len(pinnedKey) != ed25519.PublicKeySize {
+			return fmt.Errorf("%w: pinned public key length %d", ErrDescriptorSignature, len(pinnedKey))
+		}
+		if !bytes.Equal(desc.DescriptorSignerPubKey, pinnedKey) {
+			continue
+		}
+		signingBytes, err := SigningBytes(desc)
+		if err != nil {
+			return err
+		}
+		if !keystore.Verify(pinnedKey, signingBytes, desc.Signature) {
+			return fmt.Errorf("%w: Ed25519 verification failed", ErrDescriptorSignature)
+		}
+		return nil
 	}
-	signingBytes, err := SigningBytes(desc)
-	if err != nil {
-		return err
-	}
-	if !keystore.Verify(pinnedKey, signingBytes, desc.Signature) {
-		return fmt.Errorf("%w: Ed25519 verification failed", ErrDescriptorSignature)
-	}
-	return nil
+	return fmt.Errorf("%w: descriptor signer does not match any pinned public key", ErrDescriptorSignature)
 }
 
 // Sign signs desc with priv and returns a copy with DescriptorSignerPubKey and

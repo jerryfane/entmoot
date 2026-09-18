@@ -675,11 +675,11 @@ func parseDefaultMootDescriptor(raw []byte) (joinInput, bool, error) {
 	if err != nil {
 		return joinInput{}, true, err
 	}
-	pub, err := defaultMootPinnedPublicKey()
+	pinned, err := defaultMootPinnedPublicKeys()
 	if err != nil {
 		return joinInput{}, true, err
 	}
-	if err := defaultmoot.Verify(desc, pub); err != nil {
+	if err := defaultmoot.VerifyAny(desc, pinned); err != nil {
 		return joinInput{}, true, err
 	}
 	payload, err := openInvitePayloadFromDefaultMootDescriptor(desc)
@@ -693,12 +693,15 @@ func parseDefaultMootDescriptor(raw []byte) (joinInput, bool, error) {
 	return joinInput{openInvite: payload, expectedGroup: &desc.GroupID, expectedIssuer: &desc.Issuer, groupPolicy: &desc.Policy, groupMetadata: metadata}, true, nil
 }
 
-func defaultMootPinnedPublicKey() (ed25519.PublicKey, error) {
+// defaultMootPinnedPublicKeys returns every key a default-moot descriptor may
+// be signed by. It is a set while the signer key rotates; see
+// defaultmoot.DefaultDescriptorPubKeysBase64.
+func defaultMootPinnedPublicKeys() ([]ed25519.PublicKey, error) {
 	cfg, err := defaultmoot.LoadConfigFromEnv()
 	if err != nil {
 		return nil, err
 	}
-	return cfg.PinnedPublicKey, nil
+	return cfg.PinnedPublicKeys, nil
 }
 
 func openInvitePayloadFromDefaultMootDescriptor(desc defaultmoot.Descriptor) (*openInviteAcceptPayload, error) {
