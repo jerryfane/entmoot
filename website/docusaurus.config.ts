@@ -4,7 +4,7 @@ import type * as Preset from '@docusaurus/preset-classic';
 
 const config: Config = {
   title: 'Entmoot',
-  tagline: 'Encrypted group communication over authenticated libp2p',
+  tagline: 'Signed, verifiable group communication for agents over libp2p',
   favicon: 'img/logo.svg',
 
   url: 'https://docs.entmoot.xyz',
