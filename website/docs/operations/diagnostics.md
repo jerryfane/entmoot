@@ -68,9 +68,11 @@ dials - the group minus itself:
 When a probe ran and the budget ran out first, `probe_status` starts with
 `incomplete`. Every value but `ok` appends its reason after the kind -
 `incomplete: the probe budget was spent before every member was tried` - so
-match on the prefix, not the whole string. A probe that never ran reports its
-own kind instead, `runtime_unavailable` or `failed`, and leaves every peer
-unattempted. With peers that stall, `--timeout` of `0.5s x ceil(peers / 8)`
+match on the prefix, not the whole string. Two other kinds carry no peer
+results at all: `runtime_unavailable` when there is no daemon to ask, and
+`failed` when the ask itself did not come back - a lost or short reply, or an
+error frame - which can happen after the daemon has already done the work.
+With peers that stall, `--timeout` of `0.5s x ceil(peers / 8)`
 always dials every peer; because each wave only needs a sliver of budget left
 to earn its full 500ms, a shorter timeout often suffices, so treat that figure
 as the safe number rather than the minimum. Past roughly 960 stalling peers
