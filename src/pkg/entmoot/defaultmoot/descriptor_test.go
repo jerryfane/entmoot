@@ -82,8 +82,8 @@ func TestConfigFromEnvOverrides(t *testing.T) {
 	if cfg.URL != "http://127.0.0.1/descriptor.json" {
 		t.Fatalf("URL = %q", cfg.URL)
 	}
-	if string(cfg.PinnedPublicKey) != string(pub) {
-		t.Fatalf("PinnedPublicKey mismatch")
+	if len(cfg.PinnedPublicKeys) != 1 || string(cfg.PinnedPublicKeys[0]) != string(pub) {
+		t.Fatalf("PinnedPublicKeys = %v, want just the override", cfg.PinnedPublicKeys)
 	}
 }
 
@@ -95,8 +95,13 @@ func TestConfigFromEnvUsesCompiledPinnedKey(t *testing.T) {
 	if cfg.URL != DefaultDescriptorURL {
 		t.Fatalf("URL = %q, want %q", cfg.URL, DefaultDescriptorURL)
 	}
-	if len(cfg.PinnedPublicKey) != ed25519.PublicKeySize {
-		t.Fatalf("PinnedPublicKey length = %d, want %d", len(cfg.PinnedPublicKey), ed25519.PublicKeySize)
+	if len(cfg.PinnedPublicKeys) != len(DefaultDescriptorPubKeysBase64) {
+		t.Fatalf("pinned %d keys, want %d", len(cfg.PinnedPublicKeys), len(DefaultDescriptorPubKeysBase64))
+	}
+	for i, key := range cfg.PinnedPublicKeys {
+		if len(key) != ed25519.PublicKeySize {
+			t.Fatalf("pinned key %d length = %d, want %d", i, len(key), ed25519.PublicKeySize)
+		}
 	}
 }
 
@@ -258,4 +263,64 @@ func testGroupID(fill byte) entmoot.GroupID {
 		gid[i] = fill
 	}
 	return gid
+}
+
+// The rotation window is the whole point of the key set: a descriptor signed by
+// either the incoming or the outgoing key verifies, one signed by neither does
+// not, and a descriptor cannot nominate its own signer.
+func TestVerifyAnyAcceptsEitherPinnedKeyAndNoOther(t *testing.T) {
+	incomingPub, incomingPriv := testDescriptorKey(t)
+	outgoingPub, outgoingPriv := testDescriptorKey(t)
+	_, strangerPriv := testDescriptorKey(t)
+	pinned := []ed25519.PublicKey{incomingPub, outgoingPub}
+
+	for name, priv := range map[string]ed25519.PrivateKey{
+		"incoming": incomingPriv,
+		"outgoing": outgoingPriv,
+	} {
+		if err := VerifyAny(testSignedDescriptor(t, priv), pinned); err != nil {
+			t.Fatalf("%s key was pinned but rejected: %v", name, err)
+		}
+	}
+
+	strange := testSignedDescriptor(t, strangerPriv)
+	if err := VerifyAny(strange, pinned); err == nil {
+		t.Fatal("a descriptor signed by an unpinned key was accepted")
+	}
+
+	// A forged signer field must not admit the document either: the signature
+	// then fails against the key it names.
+	forged := strange
+	forged.DescriptorSignerPubKey = append([]byte(nil), incomingPub...)
+	if err := VerifyAny(forged, pinned); err == nil {
+		t.Fatal("a descriptor naming a pinned key it did not sign with was accepted")
+	}
+
+	if err := VerifyAny(strange, nil); err == nil {
+		t.Fatal("an empty pinned set accepted a descriptor")
+	}
+}
+
+// A malformed pinned key must not decide the verdict by its position: a library
+// caller assembling a set by hand can include a short key, and order is not a
+// security boundary.
+func TestVerifyAnyIgnoresMalformedPinnedKeysRegardlessOfOrder(t *testing.T) {
+	pub, priv := testDescriptorKey(t)
+	desc := testSignedDescriptor(t, priv)
+	junk := ed25519.PublicKey([]byte("too short"))
+
+	for _, tc := range []struct {
+		name string
+		keys []ed25519.PublicKey
+	}{
+		{"malformed first", []ed25519.PublicKey{junk, pub}},
+		{"malformed last", []ed25519.PublicKey{pub, junk}},
+	} {
+		if err := VerifyAny(desc, tc.keys); err != nil {
+			t.Fatalf("%s: VerifyAny = %v, want nil", tc.name, err)
+		}
+	}
+	if err := VerifyAny(desc, []ed25519.PublicKey{junk}); !errors.Is(err, ErrDescriptorSignature) {
+		t.Fatalf("all-malformed set: VerifyAny = %v, want ErrDescriptorSignature", err)
+	}
 }

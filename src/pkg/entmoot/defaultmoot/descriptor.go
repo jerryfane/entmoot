@@ -27,16 +27,27 @@ const (
 	Name           = "The Ent Moot"
 
 	DefaultDescriptorURL = "https://entmoot.xyz/.well-known/the-ent-moot.json"
-	// DefaultDescriptorPubKeyBase64 is the pinned Ed25519 public key for the
-	// official descriptor signer. The matching private key is intentionally
-	// not tracked in Git.
-	DefaultDescriptorPubKeyBase64 = "UsIV+iaJEljYZSdiW+h9NoA+qkBNhsZTAAEJPweJrz8="
-
-	EnvDescriptorURL    = "ENTMOOT_DEFAULT_MOOT_DESCRIPTOR_URL"
-	EnvDescriptorPubKey = "ENTMOOT_DEFAULT_MOOT_DESCRIPTOR_PUBKEY"
+	EnvDescriptorURL     = "ENTMOOT_DEFAULT_MOOT_DESCRIPTOR_URL"
+	EnvDescriptorPubKey  = "ENTMOOT_DEFAULT_MOOT_DESCRIPTOR_PUBKEY"
 
 	defaultDescriptorMaxBytes = 1 << 20
 )
+
+// DefaultDescriptorPubKeysBase64 is the set of Ed25519 public keys a descriptor
+// may be signed by, newest first. Matching private keys are intentionally not
+// tracked in Git.
+//
+// A set rather than one key so the official signer can rotate without a flag
+// day: publishing a re-signed document and upgrading clients can then happen
+// in either order, because both keys verify during the overlap. Today the set
+// holds one key, the signer of the live document. The previous signer
+// (UsIV+iaJEljYZSdiW+h9NoA+qkBNhsZTAAEJPweJrz8=) is deliberately absent: the
+// only document it ever signed states its issuer the retired pre-v2 way, which
+// Validate refuses, so nothing it signed can verify and keeping it would widen
+// the trust anchor for no reachable case.
+var DefaultDescriptorPubKeysBase64 = []string{
+	"emV7di8Th8e1v+B2AQW7D6znInpfeIAMkQQWUd/59hE=",
+}
 
 var (
 	ErrInvalidDescriptor     = errors.New("defaultmoot: invalid descriptor")
@@ -86,9 +97,16 @@ type RecommendedLiveConfig struct {
 }
 
 // Config is the resolved fetch-and-verify configuration.
+//
+// PinnedPublicKeys is a set because rotating the signer key is otherwise a
+// flag day: the descriptor lives at one URL, so the moment it is re-signed,
+// every client pinned to only the previous key rejects it. A release that
+// trusts the outgoing key and the incoming one lets the document be swapped
+// without breaking the clients that already upgraded, and the outgoing key is
+// dropped in a later release once they have.
 type Config struct {
-	URL             string
-	PinnedPublicKey ed25519.PublicKey
+	URL              string
+	PinnedPublicKeys []ed25519.PublicKey
 }
 
 // LoadConfigFromEnv resolves the descriptor URL and pinned key from defaults
@@ -112,13 +130,26 @@ func ConfigFromEnv(lookup func(string) string) (Config, error) {
 	}
 	pubRaw := strings.TrimSpace(lookup(EnvDescriptorPubKey))
 	if pubRaw == "" {
-		pubRaw = DefaultDescriptorPubKeyBase64
+		pubRaw = strings.Join(DefaultDescriptorPubKeysBase64, ",")
 	}
-	pub, err := DecodePublicKey(pubRaw)
-	if err != nil {
-		return Config{}, err
+	// Comma-separated so an operator can pin a rotation window explicitly, and
+	// so the override is a set like the default rather than narrowing to one.
+	var keys []ed25519.PublicKey
+	for _, field := range strings.Split(pubRaw, ",") {
+		field = strings.TrimSpace(field)
+		if field == "" {
+			continue
+		}
+		pub, err := DecodePublicKey(field)
+		if err != nil {
+			return Config{}, err
+		}
+		keys = append(keys, pub)
 	}
-	return Config{URL: descriptorURL, PinnedPublicKey: pub}, nil
+	if len(keys) == 0 {
+		return Config{}, fmt.Errorf("%w: descriptor public key is required", ErrInvalidDescriptor)
+	}
+	return Config{URL: descriptorURL, PinnedPublicKeys: keys}, nil
 }
 
 // DecodePublicKey parses a base64-encoded Ed25519 public key.
@@ -154,7 +185,7 @@ func FetchAndVerify(ctx context.Context, client *http.Client, cfg Config) (Descr
 	if err != nil {
 		return Descriptor{}, err
 	}
-	if err := Verify(desc, cfg.PinnedPublicKey); err != nil {
+	if err := VerifyAny(desc, cfg.PinnedPublicKeys); err != nil {
 		return Descriptor{}, err
 	}
 	return desc, nil
@@ -207,23 +238,45 @@ func Parse(raw []byte) (Descriptor, error) {
 
 // Verify validates desc and verifies its Ed25519 signature against pinnedKey.
 func Verify(desc Descriptor, pinnedKey ed25519.PublicKey) error {
+	return VerifyAny(desc, []ed25519.PublicKey{pinnedKey})
+}
+
+// VerifyAny validates desc and verifies its signature against the first pinned
+// key the descriptor names. A descriptor signed by a key outside the set is
+// refused, so widening the set is the only way to admit a new signer - the
+// document cannot nominate its own authority.
+func VerifyAny(desc Descriptor, pinnedKeys []ed25519.PublicKey) error {
 	if err := Validate(desc); err != nil {
 		return err
 	}
-	if len(pinnedKey) != ed25519.PublicKeySize {
-		return fmt.Errorf("%w: pinned public key length %d", ErrDescriptorSignature, len(pinnedKey))
+	if len(pinnedKeys) == 0 {
+		return fmt.Errorf("%w: no pinned public key", ErrDescriptorSignature)
 	}
-	if !bytes.Equal(desc.DescriptorSignerPubKey, pinnedKey) {
-		return fmt.Errorf("%w: descriptor signer does not match pinned public key", ErrDescriptorSignature)
+	// A malformed entry is skipped rather than fatal: aborting here would let
+	// one bad key at position i veto a good key at i+1, making the verdict
+	// depend on set order. An all-malformed set still fails, below.
+	usable := 0
+	for _, pinnedKey := range pinnedKeys {
+		if len(pinnedKey) != ed25519.PublicKeySize {
+			continue
+		}
+		usable++
+		if !bytes.Equal(desc.DescriptorSignerPubKey, pinnedKey) {
+			continue
+		}
+		signingBytes, err := SigningBytes(desc)
+		if err != nil {
+			return err
+		}
+		if !keystore.Verify(pinnedKey, signingBytes, desc.Signature) {
+			return fmt.Errorf("%w: Ed25519 verification failed", ErrDescriptorSignature)
+		}
+		return nil
 	}
-	signingBytes, err := SigningBytes(desc)
-	if err != nil {
-		return err
+	if usable == 0 {
+		return fmt.Errorf("%w: no usable pinned public key", ErrDescriptorSignature)
 	}
-	if !keystore.Verify(pinnedKey, signingBytes, desc.Signature) {
-		return fmt.Errorf("%w: Ed25519 verification failed", ErrDescriptorSignature)
-	}
-	return nil
+	return fmt.Errorf("%w: descriptor signer does not match any pinned public key", ErrDescriptorSignature)
 }
 
 // Sign signs desc with priv and returns a copy with DescriptorSignerPubKey and

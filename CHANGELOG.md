@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The Ent Moot's published descriptor could not be verified, so `default-moot
+  join` failed for everyone: it was signed before Membership v3 and states its
+  issuer the retired pre-v2 way - a numeric transport node id, no member id -
+  which `Validate` refuses. The document has been re-signed with the issuer's
+  member id and peer id derived from the same unchanged public key, and the
+  retired node id is gone.
+
+### Changed
+
+- The official descriptor signer is pinned as a *set* of keys rather than one,
+  so a future signer rotation is not a flag day: publishing a re-signed
+  document and upgrading clients may happen in either order while both keys are
+  trusted. `ENTMOOT_DEFAULT_MOOT_DESCRIPTOR_PUBKEY` now accepts a
+  comma-separated list. The set currently holds the one key that signed the
+  live document; the previous signer is not retained, because the only document
+  it signed cannot verify under the current validator.
+
 ## [1.5.86] - 2026-09-18
 
 ### Fixed
