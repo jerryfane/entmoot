@@ -53,9 +53,11 @@ type doctorGroupReport struct {
 	Peers             []doctorPeerReport `json:"peers"`
 	Error             string             `json:"error,omitempty"`
 	Suggestion        string             `json:"suggestion,omitempty"`
-	// ProbeStatus is empty without -probe. With it: "ok", "incomplete" when
-	// the budget ran out before every member was tried, or the reason no
-	// probe ran at all - a probe needs the daemon, which owns the host.
+	// ProbeStatus is empty without -probe. With it, one of four kinds: "ok",
+	// or "incomplete", "runtime_unavailable" or "failed" followed by ": " and
+	// the reason - the budget ran out before every member was tried, a probe
+	// needs the daemon that owns the host, or the probe itself errored. Only
+	// "ok" is bare, so a consumer matches the kind as a prefix.
 	ProbeStatus string `json:"probe_status,omitempty"`
 }
 

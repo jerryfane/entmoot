@@ -38,7 +38,8 @@ what failed - including the one error that is not a network fault at all,
 The probe runs in the daemon, because the daemon owns the libp2p host, the
 peerstore and the relay configuration; a second process dialling with its own
 identity would answer a different question. Without a daemon the group reports
-`probe_status: runtime_unavailable` and no peer row claims anything.
+`probe_status` starting with `runtime_unavailable` and no peer row claims
+anything.
 
 `--timeout` is the budget for the whole probe, not a per-peer timeout, so a
 group of any size costs one timeout, not one per member. It is divided,
@@ -64,7 +65,10 @@ dials - the group minus itself:
   exists to find.
 - **`--timeout` above 60s is clamped to 60s.**
 
-`probe_status` reads `incomplete` whenever any peer went unattempted. With
+`probe_status` starts with `incomplete` whenever any peer went unattempted.
+Every value but `ok` appends its reason after the kind - `incomplete: the
+probe budget was spent before every member was tried` - so match on the
+prefix, not the whole string. With
 peers that stall, `--timeout` of `0.5s x ceil(peers / 8)` always dials every
 peer; because each wave only needs a sliver of budget left to earn its full
 500ms, a shorter timeout often suffices, so treat that figure as the safe
