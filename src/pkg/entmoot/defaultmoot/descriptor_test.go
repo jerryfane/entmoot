@@ -300,3 +300,27 @@ func TestVerifyAnyAcceptsEitherPinnedKeyAndNoOther(t *testing.T) {
 		t.Fatal("an empty pinned set accepted a descriptor")
 	}
 }
+
+// A malformed pinned key must not decide the verdict by its position: a library
+// caller assembling a set by hand can include a short key, and order is not a
+// security boundary.
+func TestVerifyAnyIgnoresMalformedPinnedKeysRegardlessOfOrder(t *testing.T) {
+	pub, priv := testDescriptorKey(t)
+	desc := testSignedDescriptor(t, priv)
+	junk := ed25519.PublicKey([]byte("too short"))
+
+	for _, tc := range []struct {
+		name string
+		keys []ed25519.PublicKey
+	}{
+		{"malformed first", []ed25519.PublicKey{junk, pub}},
+		{"malformed last", []ed25519.PublicKey{pub, junk}},
+	} {
+		if err := VerifyAny(desc, tc.keys); err != nil {
+			t.Fatalf("%s: VerifyAny = %v, want nil", tc.name, err)
+		}
+	}
+	if err := VerifyAny(desc, []ed25519.PublicKey{junk}); !errors.Is(err, ErrDescriptorSignature) {
+		t.Fatalf("all-malformed set: VerifyAny = %v, want ErrDescriptorSignature", err)
+	}
+}

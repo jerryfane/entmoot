@@ -35,7 +35,7 @@ read:
 | `ENTMOOT_APNS_SANDBOX` | `esp serve` | `1`, `true` or `yes` sends APNs requests to the sandbox endpoint. Unlike the others it cannot be turned off by the flag: either source enables it. |
 | `ENTMOOT_ESP_URL` | `group create -join-mode open_invite`, ESP group create | Issuer URL used to build the redeemable open-invite link. Required unless the request carries `issuer_url`. |
 | `ENTMOOT_DEFAULT_MOOT_DESCRIPTOR_URL` | `default-moot`, `bootstrap agent` | Overrides the well-known descriptor URL for The Ent Moot. |
-| `ENTMOOT_DEFAULT_MOOT_DESCRIPTOR_PUBKEY` | `default-moot`, `bootstrap agent` | Overrides the pinned base64 Ed25519 key the descriptor signature is checked against. Use it only with a matching test descriptor. |
+| `ENTMOOT_DEFAULT_MOOT_DESCRIPTOR_PUBKEY` | `default-moot`, `bootstrap agent` | Overrides the pinned base64 Ed25519 keys the descriptor signature is checked against. A comma-separated list is accepted, so a signer rotation can be trusted from both sides at once; empty entries are skipped and a list with no key at all is an error. Setting this replaces the compiled set rather than adding to it, so use it only with a matching test descriptor. |
 | `ENTMOOT_HOME` | `install.sh` | Installation directory; defaults to `$HOME/.entmoot`. |
 | `ENTMOOT_RUNTIME_ENV` | installed wrapper | Explicit path to the `runtime.env` the wrapper sources instead of `<installation>/runtime.env`. |
 | `ENTMOOT_BIN`, `ENTMOOT_DATA`, `ENTMOOT_IDENTITY`, `ENTMOOT_LISTEN_PORT` | installed wrapper | The values the wrapper passes as `-identity`, `-data` and `-listen-port`. The installer writes all four into `runtime.env`, and `ENTMOOT_LISTEN_PORT` is also read at install time to choose the port written there. |

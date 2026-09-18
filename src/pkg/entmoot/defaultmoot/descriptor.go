@@ -27,22 +27,8 @@ const (
 	Name           = "The Ent Moot"
 
 	DefaultDescriptorURL = "https://entmoot.xyz/.well-known/the-ent-moot.json"
-	// DefaultDescriptorPubKeyBase64 is the pinned Ed25519 public key for the
-	// official descriptor signer. The matching private key is intentionally
-	// not tracked in Git.
-	//
-	// Deprecated: the signer is rotating away from this key. The descriptor it
-	// signed states its issuer the retired pre-v2 way - a numeric transport
-	// node id and no member id - which today's validator refuses, so that
-	// descriptor cannot verify and cannot be corrected without a new
-	// signature over the corrected bytes.
-	// It stays in DefaultDescriptorPubKeysBase64 for one release so a client
-	// that upgrades before the document is re-signed keeps working, and is
-	// removed after. Use DefaultDescriptorPubKeysBase64.
-	DefaultDescriptorPubKeyBase64 = "UsIV+iaJEljYZSdiW+h9NoA+qkBNhsZTAAEJPweJrz8="
-
-	EnvDescriptorURL    = "ENTMOOT_DEFAULT_MOOT_DESCRIPTOR_URL"
-	EnvDescriptorPubKey = "ENTMOOT_DEFAULT_MOOT_DESCRIPTOR_PUBKEY"
+	EnvDescriptorURL     = "ENTMOOT_DEFAULT_MOOT_DESCRIPTOR_URL"
+	EnvDescriptorPubKey  = "ENTMOOT_DEFAULT_MOOT_DESCRIPTOR_PUBKEY"
 
 	defaultDescriptorMaxBytes = 1 << 20
 )
@@ -51,19 +37,16 @@ const (
 // may be signed by, newest first. Matching private keys are intentionally not
 // tracked in Git.
 //
-// The set exists for the rotation in progress. The outgoing key signed a
-// descriptor that states its issuer the retired pre-v2 way, which the current
-// validator refuses, and the issuer sits inside the signed bytes - so the fix
-// needs a new signature. Trusting both keys for one release means the
-// re-signed document can be published without breaking clients that upgrade
-// before the swap. Drop the outgoing key once the published descriptor is
-// signed by the new one.
+// A set rather than one key so the official signer can rotate without a flag
+// day: publishing a re-signed document and upgrading clients can then happen
+// in either order, because both keys verify during the overlap. Today the set
+// holds one key, the signer of the live document. The previous signer
+// (UsIV+iaJEljYZSdiW+h9NoA+qkBNhsZTAAEJPweJrz8=) is deliberately absent: the
+// only document it ever signed states its issuer the retired pre-v2 way, which
+// Validate refuses, so nothing it signed can verify and keeping it would widen
+// the trust anchor for no reachable case.
 var DefaultDescriptorPubKeysBase64 = []string{
-	// Incoming: signs the descriptor whose issuer carries a member id and a
-	// peer id, both derived from the issuer key.
 	"emV7di8Th8e1v+B2AQW7D6znInpfeIAMkQQWUd/59hE=",
-	// Outgoing, accepted during the rotation window only.
-	DefaultDescriptorPubKeyBase64,
 }
 
 var (
@@ -124,15 +107,6 @@ type RecommendedLiveConfig struct {
 type Config struct {
 	URL              string
 	PinnedPublicKeys []ed25519.PublicKey
-}
-
-// PinnedPublicKey returns the first pinned key, for callers that only need one
-// to display or log. Verification must use the whole set.
-func (c Config) PinnedPublicKey() ed25519.PublicKey {
-	if len(c.PinnedPublicKeys) == 0 {
-		return nil
-	}
-	return c.PinnedPublicKeys[0]
 }
 
 // LoadConfigFromEnv resolves the descriptor URL and pinned key from defaults
@@ -278,10 +252,15 @@ func VerifyAny(desc Descriptor, pinnedKeys []ed25519.PublicKey) error {
 	if len(pinnedKeys) == 0 {
 		return fmt.Errorf("%w: no pinned public key", ErrDescriptorSignature)
 	}
+	// A malformed entry is skipped rather than fatal: aborting here would let
+	// one bad key at position i veto a good key at i+1, making the verdict
+	// depend on set order. An all-malformed set still fails, below.
+	usable := 0
 	for _, pinnedKey := range pinnedKeys {
 		if len(pinnedKey) != ed25519.PublicKeySize {
-			return fmt.Errorf("%w: pinned public key length %d", ErrDescriptorSignature, len(pinnedKey))
+			continue
 		}
+		usable++
 		if !bytes.Equal(desc.DescriptorSignerPubKey, pinnedKey) {
 			continue
 		}
@@ -293,6 +272,9 @@ func VerifyAny(desc Descriptor, pinnedKeys []ed25519.PublicKey) error {
 			return fmt.Errorf("%w: Ed25519 verification failed", ErrDescriptorSignature)
 		}
 		return nil
+	}
+	if usable == 0 {
+		return fmt.Errorf("%w: no usable pinned public key", ErrDescriptorSignature)
 	}
 	return fmt.Errorf("%w: descriptor signer does not match any pinned public key", ErrDescriptorSignature)
 }
