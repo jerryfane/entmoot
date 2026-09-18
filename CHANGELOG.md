@@ -36,11 +36,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Member-signature authentication now has a round-trip test: a correctly signed
   `GET /v1/session` returning the member echo, plus the replay, clock-window
   and impersonation refusals. It had none.
-- The profile total-order sweep builds six state stores instead of 264 - two
-  shared ones, plus a fresh pair for the first case so the cold-store path
-  stays covered. The 132 record pairs are isolated by member id, not by
-  database, so the per-pair store bought nothing: the `esphttp` package now
-  tests in 20s instead of 48s.
+- The profile total-order sweep builds six state stores instead of 528 - one
+  shared per backend, plus a fresh pair for the first case so the cold-store
+  path keeps its coverage. It ran 132 pairs in both directions against two
+  backends, building a store each time, 264 of them SQLite. The pairs are
+  isolated by member id, not by database, so the per-pair store bought
+  nothing: the `esphttp` package now tests in 20s instead of 48s.
 - One serveability predicate, spelled two ways: `membershipExists` and
   `groupMembershipExists` are gone in favour of `membership.Exists`, which
   eight call sites already used.
