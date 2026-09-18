@@ -7,7 +7,7 @@ Most CLI commands emit one JSON object per line or one JSON envelope.
 Examples:
 
 ```json
-{"version":"v1.5.79","commit":"<sha>","date":"2026-09-13T08:01:45Z"}
+{"version":"v1.5.86","commit":"<sha>","date":"2026-09-18T05:23:26Z"}
 ```
 
 ```json

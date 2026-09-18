@@ -2,13 +2,28 @@
 title: Groups, Membership, and Invites
 ---
 
-Group membership is a signed checkpoint plus a set of signed membership
-records. Projecting the records onto the checkpoint yields the membership: who
-can author messages, and which libp2p PeerIDs may participate in group
-protocols.
+Group membership is a merge-able set of self-signed records on top of one
+admin-signed checkpoint. Projecting the records onto the checkpoint yields the
+membership: who can author messages, and which libp2p PeerIDs may participate
+in group protocols.
 
-Membership is not a chain. There is no head to append to, no fork to detect,
-and no repair command.
+Three properties are the whole model:
+
+- **A member joins by signing itself in.** The joiner signs its own `join`
+  record and attaches the invite that authorises it. No admin has to be online:
+  any member the invite names can serve the checkpoint and take the record.
+- **Membership is a set, not a chain.** Records merge by one deterministic
+  order, so two nodes holding the same records project the same membership
+  whatever order those records arrived in. There is no head to append to, no
+  fork to detect, and no repair command.
+- **Checkpoints retire history.** Every `checkpoint_every` effective records
+  (default 64) an admin signs a checkpoint carrying the whole member set, which
+  replaces the records before it. A new member downloads one checkpoint instead
+  of replaying the group's past, and storage follows group size, not group age.
+
+A group created before checkpoints existed still holds a linear roster chain.
+`entmootd membership upgrade` mints checkpoint 0 from it; the chain then stays
+read-only, kept only to verify version-0 messages that cite it.
 
 ## Joining is self-signed
 
@@ -16,23 +31,23 @@ A joiner signs its own admission record (`kind: join`) and attaches the invite
 that authorises it. The invite is a founder- or admin-signed
 `BootstrapCapability`; the joiner's own signature is the act of joining.
 
-Nobody signs a joiner in: the joiner signs its own join record. Authority is
-still checked at redemption, against group state rather than a fresh signature:
-the founder may always issue, and a delegated admin may issue only while it is
-still an unbanned member — which is why an invite from a demoted, removed or
-banned admin stops working everywhere at once, while a founder's invite keeps
-working regardless of the founder's own membership. An invite names bootstrap addresses, and
-`invite create` accepts any current member's address — the issuing node's own,
-any you name, and up to four more it already knows, bounded in bytes as well
-as count — and only a peer the invite
-names may serve the checkpoint and accept the join record — and only while it
-is still a member itself, or is the invite's own issuer, whose authority is
-checked on every read. So a newcomer can
-join while the issuer is offline, as long as one named member is reachable.
-Naming other members is safe because the newcomer pins the founder's key from
-the invite and verifies the membership it is served against that key: a named
-peer can serve or fail, not forge. Once the record is accepted, the serving
-peer forwards it to the group's other reachable members.
+Authority is still checked at redemption, against group state rather than a
+fresh signature: the founder may always issue, and a delegated admin may issue
+only while it is still an unbanned member — which is why an invite from a
+demoted, removed or banned admin stops working everywhere at once, while a
+founder's invite keeps working regardless of the founder's own membership.
+
+An invite names bootstrap addresses, and `invite create` accepts any current
+member's address: the issuing node's own, any you name, and up to four more it
+already knows, bounded in bytes as well as in count. Only a peer the invite
+names may serve the checkpoint and accept the join record, and only while it is
+still a member itself — or is the invite's own issuer, whose authority is
+checked on every read. So a newcomer can join while the issuer is offline, as
+long as one named member is reachable. Naming other members is safe because the
+newcomer pins the founder's key from the invite and verifies the membership it
+is served against that key: a named peer can serve or fail, not forge. Once the
+record is accepted, the serving peer forwards it to the group's other reachable
+members.
 
 ## Membership is a set
 
@@ -80,6 +95,14 @@ records it folds in.
 A checkpoint replaces the records it covers. Records older than the canonical
 checkpoint's timestamp are refused as stale, so a change that was discarded
 cannot come back later on a slow link.
+
+Two consequences matter operationally:
+
+- A new member downloads one checkpoint instead of replaying a group's whole
+  history. Storage follows group size, not group age.
+- A membership lookup against a cited checkpoint is constant time. Measured on
+  the implementation: 330ns at 1k members and 172ns at 100k members, against
+  3.5ms and 316ms for walking the equivalent pre-checkpoint chain.
 
 Signing one is the daemon's job, not an operator's. Every maintenance round,
 each node that may sign checks whether the group has reached its cadence
@@ -146,25 +169,18 @@ commitment over the member set, and is not implemented.
 
 ### What a checkpoint may not claim
 
-- A RECORD more than five minutes ahead of the reading node's clock is refused
+- A checkpoint timestamp more than five minutes ahead of the reading node's
+  clock is refused. The timestamp decides which records the checkpoint covers,
+  so one dated next year would make every legitimate record stale and freeze
+  the node.
+- A record more than five minutes ahead of the reading node's clock is refused
   too. Records merge in timestamp order, so an unbounded timestamp is
   authority: a member could date one years ahead and win every contest about
   itself until that date — re-admitting itself over a removal, or keeping a
   membership it had left — while holding no authority at all.
-- A checkpoint timestamp more than five minutes ahead of the reading node's
-  clock is refused. The timestamp decides which records the checkpoint covers, so one
-  dated next year would make every legitimate record stale and freeze the node.
 - A checkpoint that says it replaces a linear roster chain must name the head
   of the chain that node holds. One claiming an upgrade where there is no chain
   is refused rather than installed.
-
-Two consequences matter operationally:
-
-- A new member downloads one checkpoint instead of replaying a group's whole
-  history. Storage follows group size, not group age.
-- A membership lookup against a cited checkpoint is constant time. Measured on
-  the implementation: 330ns at 1k members and 172ns at 100k members, against
-  3.5ms and 316ms for walking the equivalent pre-checkpoint chain.
 
 ## Invites
 
