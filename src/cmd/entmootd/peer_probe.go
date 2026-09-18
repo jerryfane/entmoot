@@ -81,7 +81,8 @@ func (r *groupRuntime) probePeers(ctx context.Context, groupID entmoot.GroupID, 
 		// still pass while that wave runs and later peers get the
 		// "not attempted" branch below. Flooring the budget by the number of
 		// waves would make a one-member typo cost seconds on a big group, so
-		// the budget a caller asks for still bounds the whole probe.
+		// a caller's budget is not raised past one slice - which means it is
+		// a deadline the probe may overshoot by up to a slice, not a bound.
 		budget = minProbeSlice
 	}
 	if budget > maxProbeBudget {
