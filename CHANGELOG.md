@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.87] - 2026-09-18
+
 ### Fixed
 
 - The Ent Moot's published descriptor could not be verified, so `default-moot
