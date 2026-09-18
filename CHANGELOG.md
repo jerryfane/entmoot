@@ -201,9 +201,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The probe lives in the daemon because the daemon owns the libp2p host, the
   peerstore and the relay configuration; a second process dialling with its
   own identity would answer a different question. Without a daemon the group
-  reports `probe_status: runtime_unavailable` and no peer row claims anything.
+  reports a `probe_status` starting with `runtime_unavailable` and no peer row
+  claims anything.
   `--timeout` is the budget for the whole probe, not per peer, and
-  `probe_status` reads `incomplete` if it runs out. New IPC frames
+  `probe_status` starts with `incomplete` if it runs out. New IPC frames
   `peer_probe_req`/`peer_probe_resp` (0x25/0x26) carry it.
 
 ### Fixed
