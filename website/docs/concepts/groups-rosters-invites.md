@@ -2,10 +2,12 @@
 title: Groups, Membership, and Invites
 ---
 
-Group membership is a merge-able set of self-signed records on top of one
-admin-signed checkpoint. Projecting the records onto the checkpoint yields the
-membership: who can author messages, and which libp2p PeerIDs may participate
-in group protocols.
+Group membership is a merge-able set of signed records on top of one signed
+checkpoint. A member signs its own `join`, `leave` and `rekey`; a `remove`,
+`unban`, `policy` or `revoke_invite` comes from the founder or a delegated
+admin. The first checkpoint is founder-signed, and any admin may sign a later
+one. Projecting the records onto the checkpoint yields the membership: who can
+author messages, and which libp2p PeerIDs may participate in group protocols.
 
 Three properties are the whole model:
 
