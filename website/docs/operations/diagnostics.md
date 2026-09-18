@@ -41,19 +41,21 @@ identity would answer a different question. Without a daemon the group reports
 
 `--timeout` is the budget for the whole probe, not a per-peer timeout, so a
 thirty-member group does not cost thirty timeouts. It is divided, floored and
-clamped:
+clamped. Throughout, "peers" means the members this node dials - the group
+minus itself:
 
-- **Each attempt gets `max(timeout / members, 500ms)`.** The division is why a
+- **Each attempt gets `max(timeout / peers, 500ms)`.** The division is why a
   large group is not thirty timeouts; the 500ms floor is why a small one is
   not a sub-millisecond deadline that reports a healthy peer unreachable for
-  arithmetic reasons. So `--timeout 5s` is 2.5s per attempt across two
-  members and 500ms each across thirty. A timeout below 500ms is raised to it.
-- **Members are dialled eight at a time.** Slow waves consume the budget, and
-  a member whose turn comes after it is gone is reported
+  arithmetic reasons. So in a three-member group, where this node dials two
+  peers, `--timeout 5s` is 2.5s per attempt; across thirty peers it is 500ms
+  each. A timeout below 500ms is raised to it.
+- **Peers are dialled eight at a time.** Slow waves consume the budget, and a
+  peer whose turn comes after it is gone is reported
   `not attempted: probe budget spent`.
 - **The probe may run up to 500ms past the timeout.** A wave that starts just
   before the budget expires still gets the floor rather than a doomed
-  fraction of it. After that overshoot, remaining members go unattempted.
+  fraction of it. After that overshoot, remaining peers go unattempted.
 - **A refusal is fast; a stalled handshake is not.** A peer that refuses
   answers in milliseconds, so most probes return well inside the budget. A
   peer that accepts the connection and then stalls - a NAT black hole, a
@@ -61,9 +63,9 @@ clamped:
   exists to find.
 - **`--timeout` above 60s is clamped to 60s.**
 
-`probe_status` reads `incomplete` whenever any member went unattempted. With
-peers that stall, dialling every member needs `--timeout` of at least
-`0.5s x ceil(members / 8)`; past roughly 960 members the 60s ceiling makes
+`probe_status` reads `incomplete` whenever any peer went unattempted. With
+peers that stall, dialling every peer needs `--timeout` of at least
+`0.5s x ceil(peers / 8)`; past roughly 960 stalling peers the 60s ceiling makes
 `incomplete` unavoidable in one run. Use `--json` for automation, and
 `--redact` when sharing a report.
 
