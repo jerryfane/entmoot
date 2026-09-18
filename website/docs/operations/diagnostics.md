@@ -32,9 +32,8 @@ answered and served us. `answered` without `reachable` is a peer that replied
 and refused, with its own code in `refusal` - the membership it serves does
 not include this node, which is what a removed member sees from every peer
 and is not a network fault. Neither means nothing answered, and `error` says
-what failed. One `error` is not a network fault either:
-`not attempted: probe budget spent` means the probe ran out of time before
-reaching that member, so raise `--timeout` rather than suspect the path.
+what failed - including the one error that is not a network fault at all,
+`not attempted: probe budget spent`, explained with the budget below.
 
 The probe runs in the daemon, because the daemon owns the libp2p host, the
 peerstore and the relay configuration; a second process dialling with its own

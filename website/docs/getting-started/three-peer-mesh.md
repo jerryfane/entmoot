@@ -87,11 +87,11 @@ four different reasons, and the row says which: `no address known for this
 member` while addresses are still propagating, `answered=true` with a
 `refusal` when the peer serves a membership that does not include this node,
 a dial error when nothing answered, and `not attempted: probe budget spent`
-when the probe ran out of time before reaching that member - which also sets
-`probe_status` to `incomplete`, and means raise `--timeout` rather than
-suspect the network. `roster status` should show the same
-`checkpoint` and `sequence` on every peer once a checkpoint has been signed,
-and the same member list.
+when the probe ran out of time before reaching that member - which also makes
+`probe_status` start with `incomplete` (the full value names the reason, so
+match on the prefix), and means raise `--timeout` rather than suspect the
+network. `roster status` should show the same `checkpoint` and `sequence` on
+every peer once a checkpoint has been signed, and the same member list.
 
 `pending` in `roster status` (also `pending_membership_records` in health
 output) is the number of records not yet folded into a checkpoint. Peers may
