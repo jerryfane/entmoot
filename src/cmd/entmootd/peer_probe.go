@@ -321,8 +321,11 @@ func probePeersOverIPC(ctx context.Context, sockPath string, req *ipc.PeerProbeR
 }
 
 // applyPeerProbe fills each peer row with the daemon's probe result. A row
-// without a Probe means the probe never reached that member, which the group's
-// ProbeStatus explains; the rows are never silently left looking healthy.
+// without a Probe usually means the probe never reached that member, which
+// the group's ProbeStatus explains. One case it does not: a member present in
+// this command's own membership read but absent from the daemon's snapshot
+// keeps a nil Probe while ProbeStatus stays a bare "ok". The rows are never
+// left looking healthy - a nil Probe claims nothing either way.
 func applyPeerProbe(ctx context.Context, group *doctorGroupReport, sockPath string, running bool, budget time.Duration) {
 	if !running {
 		group.ProbeStatus = "runtime_unavailable: a probe needs the running daemon, which owns the libp2p host"
