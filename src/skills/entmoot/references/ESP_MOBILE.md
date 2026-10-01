@@ -12,3 +12,5 @@ service peer for HTTP/mobile clients. ESP-local state is not consensus state.
 - Bearer/admin devices can manage ESP-local group and member state.
 - Unauthenticated `/v1/session` should return `401`; health endpoints should
   return `200`.
+- An ESP that stores a moot holds its messages in plaintext and serves them to
+  its clients. Messages are not end-to-end encrypted; never post secrets.

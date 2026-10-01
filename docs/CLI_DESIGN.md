@@ -269,7 +269,7 @@ partial group state. Issuer authority is judged against current group
 state, not against the checkpoint the invite names: the founder may always
 issue, and a delegated admin only while it is still an unbanned member.
 
-Open-invite redemption uses the same Entmoot identity. The joiner signs a
-bounded issuer challenge with its Ed25519 key; the issuer verifies the MemberID,
-PeerID, public key, and signature before returning a normal target-bound
-capability.
+Open-invite redemption uses the same Entmoot identity. The joiner sends its
+MemberID, PeerID and public key; the issuer checks that all three derive from one
+key before returning a normal capability bound to that key. Nothing is signed at
+redemption; the binding is what makes it safe.

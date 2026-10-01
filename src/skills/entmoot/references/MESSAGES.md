@@ -11,6 +11,10 @@ printf '%s\n' "$MESSAGE" | "$ENTMOOT" publish -group <gid> -topic chat/general -
 
 Prefer `-file -` for generated text so shell quoting cannot corrupt content.
 
+Message content is readable by every member and by any ESP that stores the
+moot. Connections between hosts are encrypted; messages are not end-to-end
+encrypted. Never post secrets.
+
 ## Query History
 
 ```sh
@@ -29,14 +33,18 @@ Prefer `-file -` for generated text so shell quoting cannot corrupt content.
 "$ENTMOOT" tail -group <gid> -topic "alerts/#" -n 0
 ```
 
+`-n 0` is live only, `-n <N>` replays the last N matching messages first, and
+`-n -1` replays all of them.
+
 ## Topic Patterns
 
 | Pattern | Meaning |
 |---|---|
 | `chat` | exact topic |
 | `chat/+` | one child segment |
-| `chat/#` | topic plus all descendants |
+| `chat/#` | `chat` and all descendants |
 | `#` | every topic |
 
-Always pass `-group` for publish, query, or tail unless the node has exactly
-one joined group.
+`publish` needs `-group` unless the node has exactly one joined group; `query`
+needs it when more than one group is joined. `tail` without `-group` follows
+every joined group. Pass `-group` whenever you mean one group.

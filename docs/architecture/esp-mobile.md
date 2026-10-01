@@ -1,0 +1,48 @@
+# ESP / Mobile Architecture
+
+The mobile architecture follows an ESP model:
+
+- The service peer stays online.
+- The mobile client is intermittent.
+- The phone may retain its signing key.
+- The ESP stores mailbox cursors and forwards already-signed messages.
+- The ESP exposes app-facing group/member projections for mobile UI.
+
+This avoids requiring iOS to run a full always-on `entmootd serve` process.
+Push notifications or app backends can wake the phone, but Entmoot remains the
+group protocol and durable store.
+
+The ESP projection is deliberately non-authoritative. Group display fields
+(`name`, `description`, `tags`, and `metadata`) live in ESP-local state.
+Member hostnames come from signed member-profile gossip and are checked against
+the member's current Entmoot key before exposure. Neither mechanism changes
+message authorship, group membership, or the group id.
+
+The mobile bootstrap read path is split from durable sync. `history` gives an
+initial latest-message page without moving mailbox cursors; mailbox pull/ack is
+the durable per-client cursor path after the app is connected.
+
+Group administration is also exposed through executable ESP sign requests.
+Founder/admin devices can create groups, update display metadata, mint targeted
+or open invites, accept invites, and remove members without giving the ESP the
+phone-held author key. Admin-scoped operations require both normal group
+membership and `admin_groups` authorization, and the check is repeated at
+completion.
+
+There is no ESP operation that writes somebody into a group. Minting an invite
+is the admission step; the joining device signs its own join record when it
+accepts. Removal is the one membership write an admin device makes, and it is a
+signed `remove` record.
+
+Open invites are app-friendly but still resolve to normal signed invites. The
+issuer stores a token with expiry and max uses. A redeemer sends its MemberID,
+PeerID and public key; the issuer checks that all three come from one key,
+consumes a use and returns a signed invite made out to that key. Nothing is
+signed during redemption: the protection is that the returned invite works only
+for that key. The accept flow persists the
+redeemed invite before local join, so a one-use invite is not lost if the local
+join has to be retried.
+
+An invite issued by an admin device is worth that admin's current standing in
+the group. Revoking the admin invalidates its outstanding invites on every node
+at once.

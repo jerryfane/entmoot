@@ -204,7 +204,7 @@ func parseTimeBound(s string) (int64, error) {
 
 // emitMessageJSON prints one JSON object representing m to stdout with
 // a trailing newline. Schema matches the JSON shapes in
-// website/docs/reference/json-formats.md.
+// docs/reference/json-formats.md.
 func emitMessageJSON(m entmoot.Message) error {
 	data, err := json.Marshal(messageJSON(m))
 	if err != nil {

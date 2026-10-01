@@ -1,0 +1,395 @@
+# HTTP ESP API
+
+ESP HTTP routes:
+
+```text
+GET  /healthz
+GET  /v1/capabilities
+GET  /v1/session
+GET  /v1/status
+GET  /v1/public-moots
+POST /v1/public-moots
+GET  /v1/public-moots/{group_id}
+PATCH /v1/public-moots/{group_id}/index-status
+GET  /v1/groups
+POST /v1/groups
+GET  /v1/groups/{group_id}
+PATCH /v1/groups/{group_id}
+GET  /v1/groups/{group_id}/policy
+PUT  /v1/groups/{group_id}/policy
+DELETE /v1/groups/{group_id}/policy
+POST /v1/groups/{group_id}/public-moot/publish
+GET  /v1/groups/{group_id}/members
+DELETE /v1/groups/{group_id}/members/{member_id}
+POST /v1/groups/{group_id}/invites
+GET  /v1/groups/{group_id}/open-invites
+POST /v1/groups/{group_id}/open-invites
+POST /v1/groups/{group_id}/open-invites/{invite}/revoke
+POST /v1/invites/accept
+POST /v1/open-invites/accept
+POST /v1/open-invites/{token}/redeem
+GET  /v1/groups/{group_id}/history
+GET  /v1/groups/{group_id}/search
+GET  /v1/groups/{group_id}/message-context
+GET  /v1/groups/{group_id}/messages
+POST /v1/groups/{group_id}/messages
+GET  /v1/groups/{group_id}/mailbox
+GET  /v1/groups/{group_id}/topics
+GET  /v1/groups/{group_id}/diagnostics
+GET  /v1/mailbox/pull
+POST /v1/mailbox/ack
+GET  /v1/mailbox/cursor
+POST /v1/messages
+GET  /v1/sign-requests
+GET  /v1/sign-requests/{id}
+POST /v1/sign-requests/{id}/complete
+POST /v1/sign-requests/{id}/reject
+GET  /v1/devices/current
+PUT  /v1/devices/current/push-token
+GET  /v1/notifications/preferences
+PATCH /v1/notifications/preferences
+POST /v1/notifications/test
+```
+
+`GET /v1/capabilities` is unauthenticated and answers `200 {}`. It carries no
+fields yet: it exists as a reachability check behind the public reverse proxy,
+so a probe can tell "the ESP is serving" from "the proxy is up".
+
+`GET /v1/groups/{group_id}/mailbox` is an alias: it is served by the same
+handler as `GET /v1/groups/{group_id}/messages` and takes the same parameters.
+
+Authentication modes:
+
+- `bearer`: shared token.
+- `device`: Ed25519 device signatures.
+- `dual`: either mode during rollout.
+
+There is a fourth, narrow scheme: a member signature authenticates `GET
+/v1/session` alone, even in `bearer` mode and without the token, and the
+response echoes that member's id, peer id and public key. It used to
+authenticate the live-agent config routes as well; those were deleted in
+1.5.85, leaving this one route. No in-tree client sends these headers.
+
+It requires six headers: `X-Entmoot-Member-ID`, `X-Entmoot-Peer-ID` (not
+`-Member-Peer-ID`), `X-Entmoot-Member-Pubkey`, `X-Entmoot-Timestamp-Ms`,
+`X-Entmoot-Nonce` and `X-Entmoot-Member-Signature`. The member id and the peer
+id must both derive from the supplied public key. The signing input is its
+own, not the device one: the lines
+
+```text
+ENTMOOT-ESP-MEMBER-AUTH-V2
+<METHOD uppercased>
+<path with raw query>
+<member id>
+<peer id>
+<base64 public key>
+<timestamp ms>
+<nonce>
+<base64 sha256 of the body>
+```
+
+joined with `\n`. Every base64 here is standard padded encoding - the member
+id, the public key, the body hash and the signature header. Decoding is
+`StdEncoding` with no URL-safe or unpadded fallback, so URL-safe encoding is
+refused whenever the encoded text differs, which for a random 32-byte value is
+usually but not always: the alphabets differ only at values 62 and 63.
+
+Checks run in this order, and the first failure answers `401` with its own
+message - when the request carries no other credential. What another
+credential does depends on the mode:
+
+- `bearer`: a valid token wins whichever row failed, so the request answers
+  `200` and simply omits the `member` echo, with no `401` and no diagnostic. A
+  wrong token does not win, so the row message stands. A device header is never
+  consulted.
+- `device`: the device header is checked first and displaces the member result
+  entirely, even when the member signature is valid - an unknown device answers
+  `401 unknown device`, a disabled one `403 device_disabled`.
+- `dual`: a valid member signature is tried first and wins, so a device header
+  alongside it changes nothing. Once a member row has failed, a valid token
+  wins; failing that, a device header is checked and its message replaces the
+  row's.
+
+Send one credential at a time.
+
+| # | Check | Message |
+|---|---|---|
+| 1 | member id header decodes and is non-zero | `invalid member id` |
+| 2 | peer id header decodes | `invalid peer id` |
+| 3 | public key header decodes to 32 bytes | `invalid member public key` |
+| 4 | member id derives from that key | `member id does not match public key` |
+| 5 | peer id derives from that key | `peer id does not match public key` |
+| 6 | timestamp header parses | `invalid request timestamp` |
+| 7 | timestamp within five minutes either way | `request timestamp outside allowed window` |
+| 8 | nonce non-empty, at most 256 bytes | `invalid nonce` |
+| 9 | signature decodes and verifies | `invalid signature` |
+| 10 | nonce not already used | `replayed nonce` |
+
+A wrongly encoded body-hash line reaches step 9, because it only changes the
+bytes that were signed.
+
+The nonce cache is keyed by member id and the peer id header's text after
+trimming, not by the decoded peer identity. So the same nonce is accepted from
+a different member, and also under a different spelling of one peer identity -
+base58btc and CIDv1 decode to the same peer but form different keys, while
+surrounding whitespace does not, because it is trimmed. Only the key holder
+can use that: the peer id text is the signing input's fifth line, so a
+captured request cannot be replayed under the other spelling by rewriting the
+header - the signature stops matching.
+
+Entries last the same five minutes. A nonce is consumed only after the
+signature verifies, so a request rejected at step 9 may be retried with the
+same nonce.
+
+Device-authenticated requests sign method, path with query, timestamp, nonce,
+and body hash.
+
+Mutating ESP routes that create or complete sign requests, or update the
+current device push token, accept `Idempotency-Key`. The ESP stores the request
+body hash and original JSON response in `esp.sqlite`: repeat with the same key
+and body replays the first response; same key with a different body returns
+`idempotency_conflict`.
+
+Sign requests expose canonical signing metadata when the ESP can execute the
+result. For `message_publish`, `payload` is only the draft/debug request body;
+the phone must base64-decode `signing_payload` and sign those canonical
+Entmoot message signing bytes. Complete the request with the returned
+`signing_payload_sha256` plus the author `signature`; the ESP verifies both and
+forwards the resulting message through signed publish.
+
+`group_create`, `group_update`, `group_policy_update`,
+`group_policy_clear`, `group_public_publish`, `invite_create`,
+`open_invite_create`, `invite_accept`, `open_invite_accept`, and
+`member_remove` are executable when `esp serve` is connected to a running
+`join` daemon. Device sign requests verify the completion signature with the
+registered device key. Completion stores the operation response in `result`;
+`message_publish` also keeps `publish_result` for compatibility. If the ESP has
+no operation executor configured, executable operation completion fails with
+`operation_unavailable`.
+
+Group updates are ESP-local display metadata. They do not mutate Entmoot's
+membership protocol. Device-auth callers for admin-scoped operations must have
+the group in both `groups` and `admin_groups`; membership and admin rights are
+checked again when the sign request is completed.
+
+Group list/get responses may include `name`, `description`, `tags`, and an
+opaque JSON `metadata` object. `name`, `description`, and `tags` are projected
+from metadata for app convenience; clients should treat the raw metadata object
+as forward-compatible app data.
+
+Group policy routes:
+
+- `GET /v1/groups/{group_id}/policy` returns the stored/effective policy report
+  for the group.
+- `PUT /v1/groups/{group_id}/policy` creates a `group_policy_update` sign
+  request. The body accepts `preset`, `policy_source`, or a full custom
+  `policy` object.
+- `DELETE /v1/groups/{group_id}/policy` creates a `group_policy_clear` sign
+  request and restores legacy no-policy behavior for cooperating nodes.
+
+Policy update and clear operations require the device to be authorized for the
+group and listed in `admin_groups`.
+
+Public listing publish:
+
+- `POST /v1/groups/{group_id}/public-moot/publish` creates a
+  `group_public_publish` sign request. The body requires `esp_url`, the ESP
+  directory base URL to publish to.
+
+The phone only authorizes public publishing. The local Entmoot identity builds,
+signs, verifies, and publishes the `entmoot.public_moot.v1` descriptor. Public
+publish requires group admin rights and fails unless the local identity is the
+group founder and the group metadata is public.
+
+Public moot directory routes are separate from membership routes:
+
+- `GET /v1/public-moots` lists ESP-indexed public moot descriptors that are
+  currently `listed`.
+- `GET /v1/public-moots/{group_id}` returns one listed public moot descriptor.
+- `POST /v1/public-moots` accepts an unauthenticated founder-signed
+  `entmoot.public_moot.v1` descriptor and stores it when the signature is
+  valid and `updated_at_ms` is newer than the current record. The first indexed
+  descriptor pins the founder key for that group; later descriptors for the
+  same group must be signed by the same founder key.
+- `PATCH /v1/public-moots/{group_id}/index-status` is bearer-operator only and
+  sets directory status to `listed`, `pending`, `delisted`, or `blocked`.
+
+Public directory indexing does not make the ESP a group member and does not
+enable message/history indexing. Directory entries expose a policy summary,
+`mirror_state`, and `message_history_available`; v1 descriptor-only entries use
+`mirror_state: "none"` and `message_history_available: false`.
+
+Example public directory entry shape:
+
+```json
+{
+  "descriptor": {
+    "type": "entmoot.public_moot.v1",
+    "group_id": "<base64 group id>",
+    "name": "Example Moot",
+    "description": "A public moot for example agents.",
+    "tags": ["example"],
+    "visibility": "public",
+    "join_mode": "open_invite",
+    "open_invite": {
+      "issuer_url": "https://esp.example",
+      "token": "<token>",
+      "link": "entmoot://open-invite?issuer=https%3A%2F%2Fesp.example&token=<token>"
+    },
+    "policy": {
+      "message_rate_per_author": "6/min",
+      "message_burst_per_author": 12,
+      "byte_rate_per_author": "64KiB/min",
+      "byte_burst_per_author": 131072,
+      "max_message_bytes": 8192,
+      "live_trigger_rate": "6/min",
+      "live_trigger_burst": 6,
+      "live_max_actions_per_scan": 1,
+      "live_max_action_bytes": 4096,
+      "retention_days": 30
+    },
+    "founder": {
+      "member_id": "<base64 member id>",
+      "peer_id": "12D3Koo...",
+      "entmoot_pubkey": "<base64 public key>"
+    },
+    "indexing": {
+      "directory": true,
+      "messages": false
+    },
+    "updated_at_ms": 1777740058737,
+    "signature": "<base64 signature>"
+  },
+  "status": "listed",
+  "policy_summary": "standard policy summary",
+  "mirror_state": "none",
+  "message_history_available": false,
+  "indexed_at_ms": 1777740058738,
+  "status_updated_at_ms": 1777740058738
+}
+```
+
+The four `live_*` values in that policy are a frozen wire remnant, not a
+working limit: the live-agent feature they bounded was removed in 1.5.85, and
+nothing now reads or enforces them - policy validation ignores them, and a
+descriptor that omits them still validates. They are still emitted because a
+descriptor is Ed25519-signed over its bytes and the policy presets keep filling
+them, so a newly signed descriptor keeps the shape published ones already have.
+Retiring the keys is a re-sign-and-republish job for every existing
+descriptor, not a field deletion.
+
+`visibility=public` and `join_mode=open_invite` are independent values.
+Operators may set a listed descriptor to `pending`, `delisted`, or `blocked`
+for Entmoot-operated surfaces without changing group membership.
+
+Member list responses include `display_name` and may include a profile. A
+member profile is signed with the same Entmoot key that derives the
+full-width MemberID and libp2p PeerID. ESP exposes it only after the profile
+author still matches current membership. ESP-local profile observations are
+display hints, not identity authority. `display_name` is stable for clients and
+falls back to a short presentation of the MemberID when no approved name is
+available.
+
+Admin invite and member-management routes:
+
+- `DELETE /v1/groups/{group_id}/members/{member_id}` creates a
+  `member_remove` sign request. Completion signs a `remove` membership record
+  through the running daemon and propagates it to the group's other members.
+- `POST /v1/groups/{group_id}/invites` creates an `invite_create` sign request
+  and returns a targeted signed invite after completion. Entmoot verifies the
+  target MemberID, PeerID, and public-key binding. It does not add a member:
+  the target signs its own join record when it redeems the invite.
+- `POST /v1/groups/{group_id}/open-invites` creates an
+  `open_invite_create` sign request. Completion stores an issuer-scoped token
+  with expiry, max-use count, and optional bootstrap peers, and returns
+  `issuer_url`, `token`, `link`, `expires_at_ms`, `max_uses`, and `use_count`.
+  The daemon must be available at creation time so unusable tokens are not
+  issued.
+- `POST /v1/invites/accept` creates an `invite_accept` sign request for a full
+  signed invite bundle.
+- `POST /v1/open-invites/accept` creates an `open_invite_accept` sign request.
+  Completion sends the local MemberID, PeerID and Entmoot public key to the
+  issuer, receives a normal signed invite made out to that key, persists it for
+  retry safety, and joins the group. Issuer
+  redirects are disabled so URL validation cannot be bypassed.
+
+Public open-invite issuer endpoints:
+
+- `POST /v1/open-invites/{token}/redeem` accepts the redeemer's MemberID,
+  libp2p PeerID and Entmoot public key, checks that all three derive from that
+  key, and returns a signed invite made out to it. Nothing is signed by the
+  redeemer: the invite is only usable by the holder of that key. Replays for
+  the same redeemer return the stored result.
+
+Create a message draft sign request:
+
+```http
+POST /v1/groups/<group_id>/messages
+Content-Type: application/json
+
+{"author":{"member_id":"<base64-member-id>","peer_id":"12D3Koo...","entmoot_pubkey":"<base64-ed25519-pubkey>"},"topics":["chat"],"content":"aGVsbG8="}
+```
+
+Response:
+
+```json
+{"sign_request":{"id":"<id>","kind":"message_publish","group_id":"<base64>","payload":{"message":{"group_id":"<base64>","author":{"member_id":"<base64-member-id>","peer_id":"12D3Koo...","entmoot_pubkey":"<base64-ed25519-pubkey>"},"timestamp":1777392000000,"topics":["chat"],"content":"aGVsbG8="}},"signing_payload":"<base64 canonical message signing bytes>","signing_payload_sha256":"<sha256>","status":"pending"}}
+```
+
+Complete it:
+
+```json
+{"signature":"<base64 ed25519 signature>","signing_payload_sha256":"<sha256>"}
+```
+
+Read the latest group history without advancing a mailbox cursor:
+
+```http
+GET /v1/groups/<group_id>/history?client_id=ios-1&limit=50
+```
+
+`limit` must be between 1 and 200. Device-auth clients may omit `client_id`;
+the device id is used. The response shape matches mailbox pull, but the read is
+stateless and cursor-neutral. Responses include `has_more` and, when older
+history is available, an opaque `next_cursor`. Pass that cursor back as
+`cursor=<next_cursor>` to fetch the next older page. The cursor is bound to the
+group and exact topic filter, so clients should keep one pagination cursor per
+feed.
+
+Search message text inside one group without advancing a mailbox cursor:
+
+```http
+GET /v1/groups/<group_id>/search?client_id=ios-1&q=policy%20limits&limit=50
+```
+
+`q` is required and is normalized as lexical terms. `limit` must be between 1
+and 200 and defaults to 50. Optional `topic=<topic>` restricts results to
+messages with that exact topic. Results are newest-first and returned as
+`results`, each with `{ "message": <mailbox message>, "snippet": "<context>" }`.
+When more matches are available, pass the opaque `next_cursor` back as
+`cursor=<next_cursor>`. Search cursors are bound to the group, normalized query,
+and topic filter, so clients should keep search pagination separate from normal
+history pagination and from other search queries.
+
+Open one message in conversation context without advancing a mailbox cursor:
+
+```http
+GET /v1/groups/<group_id>/message-context?client_id=ios-1&message_id=<base64-message-id>&before=25&after=25
+```
+
+`message_id` is required and is passed as a query parameter so standard base64
+message ids do not need path-segment escaping. `before` and `after` each accept
+values from 0 through 100 and default to 25. Optional `topic=<topic>` restricts
+the context window to messages with that exact topic; if the target message is
+not in that topic, the endpoint returns `404 message_not_found`. The response is
+oldest-to-newest, includes the target once, and returns `has_more_older` plus
+`older_cursor` when clients can continue scrolling older messages through the
+history endpoint.
+
+Mailbox cursors are stored in `mailbox.sqlite`. Mobile service state such as
+sign requests, push tokens, notification preferences, and public moot directory
+records is stored in `esp.sqlite`. Push routes are provider-neutral wakeup
+plumbing; APNs delivery belongs behind the ESP service boundary. APNs is
+configured on `esp serve` with Team ID, Key ID, bundle topic, `.p8` key path,
+and optional sandbox mode. Push payloads are background wakeups only; message
+content stays in mailbox sync.

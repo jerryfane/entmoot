@@ -37,8 +37,8 @@ func TestOperationalTreeHasNoPilotDependency(t *testing.T) {
 	if err != nil {
 		t.Fatalf("git ls-files in %s: %v (this guard needs the checkout)", root, err)
 	}
-	// Prose and generated web assets are not the operational tree.
-	skipped := []string{"docs/", "paper/", "website/"}
+	// Prose is not the operational tree.
+	skipped := []string{"docs/", "paper/"}
 	var residues []string
 	for _, rel := range strings.Split(strings.TrimRight(string(tracked), "\x00"), "\x00") {
 		if rel == "" {

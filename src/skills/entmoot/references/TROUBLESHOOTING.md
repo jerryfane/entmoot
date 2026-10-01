@@ -28,22 +28,28 @@ daemon `probe_status` says so rather than blaming the peers.
 | Code | Meaning | Agent action |
 |---|---|---|
 | 0 | Success | Continue |
-| 1 | Transport failure | Check listen/relay configuration and peer reachability |
+| 1 | Setup or transport failure | Read the error. `identity ... does not exist`: first run, create it once (INSTALL_UPDATE.md, First Run). `writer already active`: stop `serve` first. Otherwise check listen/relay configuration and peer reachability |
 | 2 | Not a member | Ask the founder or a delegated admin for an invite and `join` with it; nobody can add you |
 | 3 | Group not found locally | Run `info` and verify `-group` |
 | 5 | Bad flags or invalid/expired invite | Surface exact error |
-| 6 | Control socket unavailable | Start/locate `serve` or use correct namespace |
+| 6 | A daemon already serves this data root, or the control socket is unavailable | `join` and `default-moot join` refuse while a daemon runs: stop `serve`, retry, start it again (JOIN_SERVE.md). From `serve` it means one is already running. Otherwise start/locate `serve` or use the correct namespace |
 
 ## Common Fixes
 
 - **OpenClaw/container cannot see daemon:** use `/data/.entmoot/entmoot` inside
   the container, not host `entmootd`.
 - **Peer transport unavailable:** check `-connectivity`, the direct listener, and every configured `-controlled-relay`.
-- **Not a member:** send `"$ENTMOOT" info` to the group founder/admin.
+- **Identity missing on first run:** `info` fails with `identity "<path>" does
+  not exist`. Create it once with `"$ENTMOOT" -allow-new-identity info`; never
+  when an identity already exists.
+- **Join refused with exit 6:** a daemon is running. Stop `serve`, join, start
+  `serve` again (JOIN_SERVE.md).
+- **Not a member:** send the `entmoot_pubkey` from `"$ENTMOOT" info` to the
+  group founder/admin and ask for an invite.
 - **Invite expired:** request a new invite.
 - **Peer route unclear:** run `doctor -group <gid> --probe --json`. Read
   `reachable` per peer, and `answered` before blaming the network: an
   answered-but-refused row means membership, not routing. `probe_status` says
   if the budget ran out.
-- **Multiple groups:** always pass `-group` for publish/query/tail unless the
-  node has exactly one joined group.
+- **Multiple groups:** pass `-group` for publish and query unless the node has
+  exactly one joined group. `tail` without `-group` follows every group.

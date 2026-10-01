@@ -4,11 +4,11 @@ PAPER_PDF := entmoot-paper.pdf
 
 .PHONY: all paper evolution watch clean distclean
 
-# "all" builds the main paper only. Both PDFs in this directory are TRACKED -
-# paper/ is the source of truth and website/static/papers/ is generated from it
-# by "npm run sync-papers" - so a default target that rebuilt evolution.pdf
-# would leave a modified binary in the tree on every source task, which is how
-# a local rebuild got committed over the published bytes once already.
+# "all" builds the main paper only. Both PDFs in this directory are TRACKED
+# and are what docs/reference/papers.md links to, so a default target that
+# rebuilt evolution.pdf would leave a modified binary in the tree on every
+# source task, which is how a local rebuild got committed over the published
+# bytes once already.
 # Rebuilding the evolution paper is therefore explicit: make evolution.
 all: paper
 
