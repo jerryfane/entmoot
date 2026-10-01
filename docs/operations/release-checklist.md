@@ -7,7 +7,7 @@ For every Entmoot tag:
 3. Commit implementation and release bookkeeping.
 4. Tag and push.
 5. Verify the GitHub release archives.
-6. Check docs parity for new CLI/API/config behavior. README, website CLI
+6. Check docs parity for new CLI/API/config behavior. README, `docs/cli`
    pages, reference docs, operations docs, and `src/skills/entmoot/SKILL.md`
    should match the changelog entry.
 7. Update peers when the release is meant to deploy. Use service-scoped
