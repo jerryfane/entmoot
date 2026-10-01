@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The Docusaurus site (`website/`, docs.entmoot.xyz) is retired. Its pages are
+  now plain markdown under [docs/](docs/README.md); internal deployment notes
+  are grouped at the end of that index.
+
+### Fixed
+
+- The docs described a challenge-signing step in open-invite redemption that
+  does not exist. Redemption sends the joiner's MemberID, PeerID and public key
+  unsigned; the safeguard is that the returned invite works only for that key.
+- Getting-started pages now create the identity first
+  (`entmootd -allow-new-identity info`), so `group create` no longer fails on a
+  new install.
+- `join` and `serve` pages put global flags (`-connectivity`,
+  `-controlled-relay`, `-listen-port`) before the subcommand, and say `join`
+  refuses to run while a daemon serves the same data root.
+- The `-open` invite example includes the required `-bootstrap`.
+- README: `-identity` defaults to `~/.entmoot/identity.json` even when `-data`
+  points elsewhere, and message content is not end-to-end encrypted.
+
 ## [1.5.87] - 2026-09-18
 
 ### Fixed
@@ -41,7 +62,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   gets a slice to answer in. What a probe timeout does and does not guarantee
   - the 500ms floor, the eight-wide dial waves, and why a refusal returns
   sooner than the budget - is documented in one place now, under
-  [diagnostics](website/docs/operations/diagnostics.md).
+  [diagnostics](docs/operations/diagnostics.md).
 
 ### Removed
 

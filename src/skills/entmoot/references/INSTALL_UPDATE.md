@@ -14,8 +14,8 @@ else
   ENTMOOT=entmootd
 fi
 
-"$ENTMOOT" env --json 2>/dev/null || true
-INFO_JSON=$("$ENTMOOT" info 2>/dev/null || true)
+"$ENTMOOT" env --json
+INFO_JSON=$("$ENTMOOT" info) || INFO_JSON=""
 printf '%s\n' "$INFO_JSON"
 
 if command -v jq >/dev/null 2>&1 && [ -n "$INFO_JSON" ]; then
@@ -37,8 +37,34 @@ if command -v jq >/dev/null 2>&1 && [ -n "$INFO_JSON" ]; then
 fi
 ```
 
-If the node already has joined groups and `running:true`, go directly to the
-requested operation. Do not reinstall or rejoin.
+If `info` printed nothing, read its error before anything else. A missing
+identity means a first run: see [First Run](#first-run). Other errors: see
+[TROUBLESHOOTING.md](TROUBLESHOOTING.md).
+
+If the node already has joined groups and `running:true`, go directly to
+publish, query, tail or diagnostics. Do not reinstall or rejoin. Joining
+another group needs `serve` stopped first: see
+[JOIN_SERVE.md](JOIN_SERVE.md#join-and-serve).
+
+## First Run
+
+The installer does not create an identity, and no command creates one unless
+`-allow-new-identity` is passed. When
+`info` fails with `identity "<path>" does not exist; pass -allow-new-identity
+to create it`, check that `<path>` is the expected file
+(`/data/.entmoot/identity.json` in containers, `~/.entmoot/identity.json`
+otherwise) and create it once:
+
+```sh
+"$ENTMOOT" -allow-new-identity info
+```
+
+`-allow-new-identity` is a global flag and goes before the subcommand. Never
+pass it when an identity already exists, and never replace or delete an
+identity: a new one is a different member that no group recognises. If the error
+is `data root "<path>" does not exist`, the data root is wrong or missing: use
+the installer's `entmoot` wrapper (it passes the installed paths), or create
+the directory only if it is the intended data root.
 
 ## Install Or Update
 
@@ -52,6 +78,8 @@ fi
 
 "$ENTMOOT" version
 ```
+
+On a fresh install, continue with [First Run](#first-run).
 
 Use the release updater when `entmootd version` is older than the required
 release, reports `dev`, or when the newest release is needed:
@@ -67,7 +95,19 @@ fi
 "$ENTMOOT" update --restart --install-dir "$ENTMOOT_UPDATE_INSTALL_DIR"
 ```
 
-Pin a known release only when that exact version is required:
+`--restart` only works on Linux, and it only sends SIGTERM to `entmootd`
+processes running from the install directory. It does not start anything. A
+`serve` launched with `nohup`/`setsid` stays stopped; relaunch it the way it was
+started ([JOIN_SERVE.md](JOIN_SERVE.md#join-and-serve)) unless a supervisor
+(systemd, container restart policy) restarts it. Then confirm:
+
+```sh
+"$ENTMOOT" version
+"$ENTMOOT" env --json   # control_socket_reachable must be true
+```
+
+Pin a known release only when that exact version is required (relaunch `serve`
+afterwards in the same way):
 
 ```sh
 "$ENTMOOT" update --restart --tag <release-tag> --install-dir "$ENTMOOT_UPDATE_INSTALL_DIR"
