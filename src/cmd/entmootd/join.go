@@ -260,8 +260,15 @@ func daemonHostConfig(gf *globalFlags) (libp2ptransport.HostConfig, error) {
 	config.RelayService = service
 	switch gf.connectivity {
 	case "", "direct":
-		config.ListenAddrs = []string{fmt.Sprintf("/ip4/0.0.0.0/tcp/%d", gf.listenPort)}
+		config.ListenAddrs = gf.p2pListen
+		if len(config.ListenAddrs) == 0 {
+			config.ListenAddrs = []string{fmt.Sprintf("/ip4/0.0.0.0/tcp/%d", gf.listenPort)}
+		}
+		config.AnnounceAddrs = gf.p2pAnnounce
 	case "relay-only":
+		if len(gf.p2pListen) != 0 || len(gf.p2pAnnounce) != 0 {
+			return libp2ptransport.HostConfig{}, errors.New("-p2p-listen and -p2p-announce cannot be used with relay-only connectivity")
+		}
 		config.Mode = libp2ptransport.RelayOnlyConnectivity
 		if len(config.ControlledRelays) == 0 {
 			return libp2ptransport.HostConfig{}, errors.New("relay-only connectivity requires at least one -controlled-relay")

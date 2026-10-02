@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Repeatable `-p2p-listen` and `-p2p-announce` operator flags for peers behind
+  TLS WebSocket reverse proxies. Explicit announcements replace private
+  listener addresses while retaining controlled-circuit addresses; relay-only
+  mode rejects direct endpoint overrides.
+- Verified the existing libp2p WSS transport through HTTP CONNECT using
+  `HTTPS_PROXY`/`https_proxy`, including signed admission/message delivery,
+  certificate and peer-identity rejection, and proxy bypass behavior.
+  Added operator and restricted-cloud guidance; live endpoint rollout and
+  affected-cloud acceptance remain tracked in #188–#192.
+
 ## [1.5.89] - 2026-10-02
 
 ### Fixed

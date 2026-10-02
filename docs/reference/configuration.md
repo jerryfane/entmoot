@@ -6,12 +6,21 @@ Important flags:
 -identity ~/.entmoot/identity.json
 -data ~/.entmoot
 -listen-port 1004
+-p2p-listen <LISTEN_MULTIADDR>
+-p2p-announce <PUBLIC_MULTIADDR_WITHOUT_PEER_ID>
 -log-level info
 -connectivity direct
 -controlled-relay <CIRCUIT_RELAY_MULTIADDR>
 -relay-service
 -relay-allow-peer <PEER_ID>
 ```
+
+`-p2p-listen` is repeatable and replaces the default TCP listener selected by
+`-listen-port`. `-p2p-announce` is repeatable and replaces advertised local
+listener addresses, while retaining any configured controlled-circuit addresses.
+Use it for a peer behind a TLS WebSocket reverse proxy. Do not include `/p2p/`:
+Entmoot supplies its own PeerID. Both flags are rejected with `relay-only`.
+See [secure WebSockets and proxies](../concepts/connectivity-profiles.md#secure-websockets-through-an-http-proxy).
 
 Precedence is intentionally simple:
 
@@ -37,6 +46,15 @@ read:
 | `ENTMOOT_HOME` | `install.sh` | Installation directory; defaults to `$HOME/.entmoot`. |
 | `ENTMOOT_RUNTIME_ENV` | installed wrapper | Explicit path to the `runtime.env` the wrapper sources instead of `<installation>/runtime.env`. |
 | `ENTMOOT_BIN`, `ENTMOOT_DATA`, `ENTMOOT_IDENTITY`, `ENTMOOT_LISTEN_PORT` | installed wrapper | The values the wrapper passes as `-identity`, `-data` and `-listen-port`. The installer writes all four into `runtime.env`, and `ENTMOOT_LISTEN_PORT` is also read at install time to choose the port written there. |
+| `HTTPS_PROXY`, `https_proxy` | HTTPS fetches and libp2p WSS dialer | Standard Go proxy selection. Uppercase takes precedence. Use the runtime-provided HTTP CONNECT proxy; do not hardcode an ephemeral port. |
+| `HTTP_PROXY`, `http_proxy` | HTTP fetches and plaintext WS dialer | HTTP proxy selection; not a substitute for `HTTPS_PROXY` when dialing WSS. |
+| `NO_PROXY`, `no_proxy` | HTTP(S)/WS(S) proxy selection | Hosts excluded from proxy use. A matching exclusion can make a restricted cloud attempt a blocked direct connection. |
+
+Proxy environment configuration is read on first use and cached within a
+process. A restarted cloud job must inherit its current proxy environment.
+Running daemons do not automatically adopt a proxy port that changes under them.
+These variables do not turn arbitrary libp2p TCP connections into proxy traffic.
+
 
 The operator scripts in `scripts/` read their own set. Each script's `--help`
 is the authority; only some appear in these docs. `ENTMOOT_LOG`
