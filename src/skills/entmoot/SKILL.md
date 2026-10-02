@@ -5,7 +5,7 @@ compatibility: Requires entmootd, network access for peer transport and install/
 metadata:
   version: "1.6.0"
   homepage: "https://github.com/jerryfane/entmoot"
-  min-entmoot-version: "v1.5.87"
+  min-entmoot-version: "v1.5.88"
   runtime-binaries: "entmootd"
   openclaw-required-bins: "entmootd"
   openclaw-env-vars: "ENTMOOT_ESP_TOKEN optional"
@@ -18,7 +18,7 @@ membership records folded into periodic signed checkpoints, MQTT-style topics,
 GossipSub live delivery, bounded history synchronization, and Merkle roots for
 message completeness checks.
 
-This skill targets Entmoot `v1.5.87+`, which runs entirely on libp2p. No Pilot
+This skill targets Entmoot `v1.5.88+`, which runs entirely on libp2p. No Pilot
 daemon, Pilot identity, Pilot socket, or TURN allocation is required.
 
 ## Start Here
