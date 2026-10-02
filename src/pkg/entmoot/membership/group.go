@@ -137,10 +137,22 @@ func Create(root string, founder *keystore.Identity, founderInfo entmoot.NodeInf
 	return Adopt(root, signed)
 }
 
-// Adopt writes a first checkpoint into a fresh store. Joining a group and
-// upgrading a legacy one both start here: the checkpoint is the group's whole
-// starting state, so there is nothing else to install.
+// Adopt installs a founder checkpoint for a locally created or converted group.
+// A conversion claim must match the legacy roster held on this node.
 func Adopt(root string, cp Checkpoint) (*Group, error) {
+	return adopt(root, cp, false)
+}
+
+// AdoptForJoin installs an invite-verified founder checkpoint on a fresh node.
+// Its LegacyHead describes the founder's conversion, not a local roster this
+// newcomer must possess. It grants no authority to verify legacy messages.
+// Callers must bind the checkpoint's founder and group to the verified invite.
+// Existing local legacy artifacts require the conversion path, never this one.
+func AdoptForJoin(root string, cp Checkpoint) (*Group, error) {
+	return adopt(root, cp, true)
+}
+
+func adopt(root string, cp Checkpoint, joining bool) (*Group, error) {
 	if err := VerifyCheckpoint(cp); err != nil {
 		return nil, err
 	}
@@ -176,6 +188,16 @@ func Adopt(root string, cp Checkpoint) (*Group, error) {
 	defer func() {
 		_ = lease.close()
 	}()
+	if joining {
+		for _, name := range []string{legacyDBName, legacyJSONLName} {
+			if _, err := os.Stat(filepath.Join(dir, name)); !errors.Is(err, os.ErrNotExist) {
+				if err != nil {
+					return nil, fmt.Errorf("membership: inspect local legacy store: %w", err)
+				}
+				return nil, fmt.Errorf("%w: joining cannot replace a local legacy store", ErrNotAuthorised)
+			}
+		}
+	}
 	if Exists(root, cp.GroupID) {
 		return nil, fmt.Errorf("%w: group %s", ErrExists, cp.GroupID.String())
 	}
@@ -208,17 +230,14 @@ func Adopt(root string, cp Checkpoint) (*Group, error) {
 		_ = db.Close()
 		return nil, err
 	}
-	// The same binding every later checkpoint gets: a root that claims to
-	// replace a roster chain must name the chain this node holds, and one that
-	// claims an upgrade where there is no chain is refused. Checking it only
-	// on later checkpoints would leave the adopted root — the one a joiner
-	// trusts most — unchecked.
-	group.mu.RLock()
-	legacyErr := group.verifyLegacyAnchorLocked(cp)
-	group.mu.RUnlock()
-	if legacyErr != nil {
-		_ = group.Close()
-		return nil, legacyErr
+	if !joining {
+		group.mu.RLock()
+		legacyErr := group.verifyLegacyAnchorLocked(cp)
+		group.mu.RUnlock()
+		if legacyErr != nil {
+			_ = group.Close()
+			return nil, legacyErr
+		}
 	}
 	return group, nil
 }

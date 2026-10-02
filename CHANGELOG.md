@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.89] - 2026-10-02
+
+### Fixed
+
+- A fresh peer can now join a migrated group such as The Ent Moot without
+  possessing the founder's old roster. Remote admission verifies the
+  invite-pinned founder and founder-signed checkpoint; its legacy anchor does
+  not grant legacy-message verification authority. Local conversion still
+  requires a matching roster, and joining refuses to replace local legacy
+  artifacts. This fixes the admission error uncovered after the v1.5.88 ESP
+  redemption repair.
+
 ## [1.5.88] - 2026-10-02
 
 ### Changed
