@@ -164,8 +164,8 @@ func joinGroupReqOverIPC(ctx context.Context, sockPath string, req *ipc.JoinGrou
 	req.TimeoutMS = timeout.Milliseconds()
 	dialCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
 	defer cancel()
-	var dialer net.Dialer
-	conn, err := dialer.DialContext(dialCtx, "unix", sockPath)
+
+	conn, err := ipc.DialContext(dialCtx, sockPath)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -362,15 +362,20 @@ func runGroupDaemon(gf *globalFlags, opts groupDaemonOptions) int {
 		fmt.Fprintf(os.Stderr, "%s: another entmoot daemon is already running at %s\n", opts.command, sockPath)
 		return exitControlUnavail
 	}
-	// Stale socket left behind by a previous crash: unlink so we can
-	// bind. If a process is listening we'd have taken the branch above.
-	if _, err := os.Stat(sockPath); err == nil {
-		if err := os.Remove(sockPath); err != nil {
-			fmt.Fprintf(os.Stderr, "%s: remove stale socket: %v\n", opts.command, err)
+	// Reserve the endpoint before initializing group state. Join-only operations
+	// need no listener, including in runtimes that forbid Unix sockets.
+	var listener *ipc.Listener
+	if !opts.exitAfterLoad {
+		listener, err = ipc.Listen(sockPath, gf.controlTransport)
+		if err != nil {
+			slog.Error(opts.command+": listen control endpoint", slog.String("err", err.Error()))
+			if errors.Is(err, ipc.ErrControlActive) {
+				return exitControlUnavail
+			}
 			return exitTransport
 		}
+		defer listener.Close()
 	}
-
 	rootCtx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	hostConfig, err := daemonHostConfig(gf)
@@ -453,25 +458,6 @@ func runGroupDaemon(gf *globalFlags, opts groupDaemonOptions) int {
 		return exitOK
 	}
 
-	// Bind the control socket with 0600 permissions. net.Listen uses
-	// the process umask, so explicitly chmod afterwards.
-	listener, err := net.Listen("unix", sockPath)
-	if err != nil {
-		slog.Error(opts.command+": listen control socket", slog.String("err", err.Error()))
-		runtime.Close()
-		return exitTransport
-	}
-	if err := os.Chmod(sockPath, 0o600); err != nil {
-		slog.Warn(opts.command+": chmod control socket", slog.String("err", err.Error()))
-	}
-	// Ensure the socket file is removed on every return path, even
-	// panics / Close errors.
-	removeSocket := func() {
-		if err := os.Remove(sockPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-			slog.Warn(opts.command+": remove control socket", slog.String("err", err.Error()))
-		}
-	}
-
 	// Start the shared libp2p transport and local IPC loop independently.
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -500,7 +486,7 @@ func runGroupDaemon(gf *globalFlags, opts groupDaemonOptions) int {
 		defer wg.Done()
 		go func() {
 			<-rootCtx.Done()
-			_ = listener.Close()
+			_ = listener.StopAccepting()
 		}()
 		srv.acceptLoop(rootCtx, listener)
 	}()
@@ -518,9 +504,7 @@ func runGroupDaemon(gf *globalFlags, opts groupDaemonOptions) int {
 	runtime.Close()
 	wg.Wait()
 
-	// WAL checkpoint + DB close is handled by rawStore.Close in the
-	// deferred teardown above. Remove the control socket last.
-	removeSocket()
+	// Deferred store and endpoint cleanup retain ownership until shutdown.
 	slog.Info("entmootd shutting down")
 	return exitOK
 }

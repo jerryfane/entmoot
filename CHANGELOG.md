@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Opt-in `-control-transport tcp` for runtimes that forbid Unix sockets.
+  Loopback-only TLS control authenticates both sides using owner-private
+  endpoint credentials, while Unix remains the default. All CLI and local ESP
+  control clients use the shared endpoint dialer; exclusive ownership survives
+  startup/shutdown, and control credentials rotate without changing identity.
+
 - Repeatable `-p2p-listen` and `-p2p-announce` operator flags for peers behind
   TLS WebSocket reverse proxies. Explicit announcements replace private
   listener addresses while retaining controlled-circuit addresses; relay-only

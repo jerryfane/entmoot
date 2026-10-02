@@ -1,6 +1,6 @@
 // Package ipc implements the Entmoot local control-socket protocol used by
 // cmd/entmootd's join process to serve client commands (publish, tail, info)
-// over a Unix-domain socket.
+// over a Unix-domain socket or an authenticated loopback TLS connection.
 //
 // Framing (CLI_DESIGN §5.2):
 //
