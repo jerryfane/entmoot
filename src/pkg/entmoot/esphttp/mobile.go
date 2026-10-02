@@ -1418,11 +1418,11 @@ func migrateSQLiteState(db *sql.DB) error {
 	return nil
 }
 
-// Pilot redemption results contain retired capabilities and must never be replayed
-// as libp2p invites. Preserve them in an archive; invite usage counts stay intact.
+// Pre-libp2p redemption results have no canonical identity binding and cannot be
+// replayed as current invites. Archive them without changing invite usage counts.
 func migrateLegacyOpenInviteRedemptions(db *sql.DB) error {
 	cols, err := tableColumns(db, "esp_open_invite_redemptions")
-	if err != nil || !cols["pilot_node_id"] {
+	if err != nil || (cols["member_id"] && cols["peer_id"]) {
 		return err
 	}
 	ctx := context.Background()
@@ -1436,11 +1436,11 @@ func migrateLegacyOpenInviteRedemptions(db *sql.DB) error {
 		return fmt.Errorf("esphttp: begin legacy redemption migration: %w", err)
 	}
 	defer conn.ExecContext(ctx, "ROLLBACK")
-	var legacyColumns int
-	if err := conn.QueryRowContext(ctx, `SELECT count(*) FROM pragma_table_info('esp_open_invite_redemptions') WHERE name = 'pilot_node_id'`).Scan(&legacyColumns); err != nil {
+	var identityColumns int
+	if err := conn.QueryRowContext(ctx, `SELECT count(*) FROM pragma_table_info('esp_open_invite_redemptions') WHERE name IN ('member_id', 'peer_id')`).Scan(&identityColumns); err != nil {
 		return err
 	}
-	if legacyColumns != 0 {
+	if identityColumns != 2 {
 		if _, err := conn.ExecContext(ctx, `ALTER TABLE esp_open_invite_redemptions RENAME TO esp_legacy_open_invite_redemptions`); err != nil {
 			return fmt.Errorf("esphttp: archive legacy redemptions: %w", err)
 		}
