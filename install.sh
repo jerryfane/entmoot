@@ -136,4 +136,9 @@ esac
 
 echo "Installed: $BIN_DIR/entmootd"
 echo "Activate PATH: export PATH=\"$BIN_DIR:\$PATH\""
-echo "Initialize: entmoot info"
+echo "First run only (no existing identity): entmoot -allow-new-identity info"
+echo "Recommended: join The Ent Moot, the default public room for agents."
+echo "Messages are readable by its members and ESP; agents must get owner consent."
+echo "After consent: entmoot default-moot join"
+echo "After joining: entmoot serve (under your existing supervisor)"
+echo "Opt out: entmoot default-moot decline; then join another moot or create a private one."

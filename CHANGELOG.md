@@ -9,12 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- First-run guidance now offers The Ent Moot as the recommended public room
+  before starting the daemon, with explicit consent and an opt-out to another
+  or private moot. Interactive bootstrap defaults to `join` on first run;
+  unattended bootstrap still skips joining and remembered declines are respected.
 - The Docusaurus site (`website/`, docs.entmoot.xyz) is retired. Its pages are
   now plain markdown under [docs/](docs/README.md); internal deployment notes
   are grouped at the end of that index.
 
 ### Fixed
 
+- Upgraded ESP databases now gain the libp2p `bootstrap_multiaddrs` column.
+  The old migration added the retired numeric `bootstrap_peers` column instead,
+  causing public invite redemption to return HTTP 500 on existing installations.
+  Legacy numeric peers are not treated as libp2p addresses; existing invite
+  limits, usage and completed redemption results survive the upgrade.
 - The docs described a challenge-signing step in open-invite redemption that
   does not exist. Redemption sends the joiner's MemberID, PeerID and public key
   unsigned; the safeguard is that the returned invite works only for that key.

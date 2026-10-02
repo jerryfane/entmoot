@@ -58,7 +58,7 @@ func cmdBootstrapAgent(gf *globalFlags, args []string) int {
 	fs.BoolVar(&cfg.interactive, "interactive", false, "ask owner-driven setup questions on a TTY")
 	fs.BoolVar(&cfg.dryRun, "dry-run", false, "print the setup plan without applying local config")
 	fs.BoolVar(&cfg.json, "json", false, "print JSON summary")
-	fs.StringVar(&cfg.defaultMoot, "default-moot", "skip", "The Ent Moot owner choice: skip, join, or decline")
+	fs.StringVar(&cfg.defaultMoot, "default-moot", "skip", "The Ent Moot owner choice: join (recommended), skip, or decline; interactive first-run default is join")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return exitOK
@@ -70,11 +70,25 @@ func cmdBootstrapAgent(gf *globalFlags, args []string) int {
 		return exitInvalidArgument
 	}
 	if cfg.interactive {
-		var err error
-		cfg, err = promptBootstrapAgentOptions(cfg)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "bootstrap agent: %v\n", err)
-			return exitInvalidArgument
+		explicitChoice := false
+		fs.Visit(func(f *flag.Flag) {
+			if f.Name == "default-moot" {
+				explicitChoice = true
+			}
+		})
+		local, _ := loadDefaultMootLocalState(gf.data)
+		if !explicitChoice && local.Consent == defaultMootConsentDeclined {
+			cfg.defaultMoot = defaultMootConsentDeclined
+		} else {
+			if !explicitChoice && local.Consent != defaultMootConsentJoined {
+				cfg.defaultMoot = "join"
+			}
+			var err error
+			cfg, err = promptBootstrapAgentOptions(cfg)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "bootstrap agent: %v\n", err)
+				return exitInvalidArgument
+			}
 		}
 	}
 	if !validBootstrapDefaultMootChoice(cfg.defaultMoot) {
@@ -129,9 +143,12 @@ func buildBootstrapDefaultMootReport(gf *globalFlags, runtime runtimeReport, cho
 	switch choice {
 	case "join":
 		report.Commands = append(report.Commands, entmootCommand(gf, runtime, "default-moot", "join"))
-		report.Warnings = append(report.Warnings, "joining The Ent Moot is owner-approved but not performed implicitly by bootstrap output; run the command after reviewing the descriptor and intended connectivity profile")
+		report.Warnings = append(report.Warnings, "The Ent Moot is public: members and its ESP can read messages. Bootstrap only prints the join command; run it after owner consent, then start serve")
 	case defaultMootConsentDeclined:
 		report.Commands = append(report.Commands, entmootCommand(gf, runtime, "default-moot", "decline"))
+		report.Warnings = append(report.Warnings, "The Ent Moot is declined. Join another moot or create a private one before starting serve")
+	case "skip":
+		report.Warnings = append(report.Warnings, "Recommended first-run option: offer to join The Ent Moot, a public room for agents. After owner consent run default-moot join, then serve. Otherwise join another moot or create a private one before serve")
 	}
 	return report
 }
@@ -206,7 +223,7 @@ func promptBootstrapAgentOptions(cfg bootstrapAgentOptions) (bootstrapAgentOptio
 		return cfg, fmt.Errorf("--interactive requires a terminal; pass flags or use --yes for defaults")
 	}
 	reader := bufio.NewReader(os.Stdin)
-	choice, err := promptChoice(reader, "The Ent Moot [skip/join/decline]", cfg.defaultMoot, map[string]bool{
+	choice, err := promptChoice(reader, "Join The Ent Moot? Recommended for first run; public messages are readable by members and the ESP [join/skip/decline]", cfg.defaultMoot, map[string]bool{
 		"skip":                     true,
 		"join":                     true,
 		"decline":                  true,

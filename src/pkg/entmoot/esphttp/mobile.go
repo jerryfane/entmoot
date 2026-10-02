@@ -1386,9 +1386,9 @@ func migrateSQLiteState(db *sql.DB) error {
 	if err != nil {
 		return err
 	}
-	if !openInviteCols["bootstrap_peers"] {
-		if err := addStateColumn(db, "esp_open_invites", "bootstrap_peers",
-			`ALTER TABLE esp_open_invites ADD COLUMN bootstrap_peers BLOB`); err != nil {
+	if !openInviteCols["bootstrap_multiaddrs"] {
+		if err := addStateColumn(db, "esp_open_invites", "bootstrap_multiaddrs",
+			`ALTER TABLE esp_open_invites ADD COLUMN bootstrap_multiaddrs BLOB`); err != nil {
 			return err
 		}
 	}

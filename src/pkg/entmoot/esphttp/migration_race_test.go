@@ -35,7 +35,7 @@ func TestConcurrentOpenSurvivesSchemaMigration(t *testing.T) {
 	}
 	for _, stmt := range []string{
 		`ALTER TABLE esp_open_invites DROP COLUMN no_fallback_peers`,
-		`ALTER TABLE esp_open_invites DROP COLUMN bootstrap_peers`,
+		`ALTER TABLE esp_open_invites DROP COLUMN bootstrap_multiaddrs`,
 		`ALTER TABLE esp_open_invite_redemptions DROP COLUMN result`,
 	} {
 		if _, err := db.Exec(stmt); err != nil {
@@ -82,7 +82,7 @@ func TestConcurrentOpenSurvivesSchemaMigration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("inspect schema: %v", err)
 	}
-	for _, want := range []string{"no_fallback_peers", "bootstrap_peers"} {
+	for _, want := range []string{"no_fallback_peers", "bootstrap_multiaddrs"} {
 		if !cols[want] {
 			t.Fatalf("column %s is missing after the race: the migration was skipped, not completed", want)
 		}
