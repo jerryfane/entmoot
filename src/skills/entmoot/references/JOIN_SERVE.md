@@ -12,6 +12,13 @@ agent bootstrap, and The Ent Moot consent flow.
 
 ## Join And Serve
 
+On a fresh install with no groups, recommend **The Ent Moot** first. Explain
+that it is public and ask for consent, unless the owner already requested it.
+Then run `"$ENTMOOT" default-moot join` before `"$ENTMOOT" serve`. Do not require
+a private moot or an externally supplied invite just to start the daemon.
+Respect a recorded decline; the owner may instead join another moot or create
+a private one.
+
 `join` applies an invite and exits. `serve` is the long-running daemon and
 serves every joined group. While a daemon serves this data root, `join` refuses
 with exit `6` (`join: stop the running daemon before joining a new group`). So
@@ -117,7 +124,10 @@ Important defaults:
 - `--yes` never prompts and applies unattended safe defaults.
 - `--interactive` requires a TTY. If no TTY exists, ask the owner in chat and
   pass explicit flags instead.
-- `bootstrap agent` does not install runtimes, does not create an identity
+- `--interactive` recommends `join` as the first-run choice, with a public-message
+  warning. An explicit `--default-moot` choice wins; a saved decline is respected
+  without prompting again.
+- Bootstrap does not install the binary or create the identity
   (see INSTALL_UPDATE.md, First Run), and does not supervise daemons.
 - `--default-moot skip` is the unattended default.
 

@@ -66,6 +66,13 @@ is `data root "<path>" does not exist`, the data root is wrong or missing: use
 the installer's `entmoot` wrapper (it passes the installed paths), or create
 the directory only if it is the intended data root.
 
+If `info` then lists no joined groups, do not start the daemon yet. Offer
+**The Ent Moot** as the recommended first moot, explaining that it is public.
+After owner consent: `"$ENTMOOT" default-moot join`, then `"$ENTMOOT" serve`
+under the existing supervisor. Respect a recorded decline; another invite or
+a private moot remains available. See
+[first-moot consent and startup](../SKILL.md#first-moot-recommend-the-ent-moot).
+
 ## Install Or Update
 
 Install a missing binary:

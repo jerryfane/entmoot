@@ -626,6 +626,19 @@ type SQLiteStateStore struct {
 	cleanupWG     sync.WaitGroup
 }
 
+const sqliteOpenInviteRedemptionsSchema = `
+CREATE TABLE IF NOT EXISTS esp_open_invite_redemptions (
+  token_hash      TEXT NOT NULL,
+  redeemer_key    TEXT NOT NULL,
+  member_id       BLOB NOT NULL,
+  peer_id         TEXT NOT NULL,
+  entmoot_pubkey  TEXT NOT NULL,
+  result          BLOB,
+  redeemed_at_ms  INTEGER NOT NULL,
+  PRIMARY KEY(token_hash, redeemer_key)
+);
+`
+
 const sqliteStateSchema = `
 CREATE TABLE IF NOT EXISTS sign_requests (
   id            TEXT PRIMARY KEY,
@@ -689,16 +702,7 @@ CREATE TABLE IF NOT EXISTS esp_open_invites (
   expires_at_ms INTEGER NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS esp_open_invite_redemptions (
-  token_hash      TEXT NOT NULL,
-  redeemer_key    TEXT NOT NULL,
-  member_id       BLOB NOT NULL,
-  peer_id         TEXT NOT NULL,
-  entmoot_pubkey  TEXT NOT NULL,
-  result          BLOB,
-  redeemed_at_ms  INTEGER NOT NULL,
-  PRIMARY KEY(token_hash, redeemer_key)
-);
+` + sqliteOpenInviteRedemptionsSchema + `
 
 CREATE TABLE IF NOT EXISTS esp_public_moots (
   group_id             BLOB PRIMARY KEY,
@@ -1386,9 +1390,9 @@ func migrateSQLiteState(db *sql.DB) error {
 	if err != nil {
 		return err
 	}
-	if !openInviteCols["bootstrap_peers"] {
-		if err := addStateColumn(db, "esp_open_invites", "bootstrap_peers",
-			`ALTER TABLE esp_open_invites ADD COLUMN bootstrap_peers BLOB`); err != nil {
+	if !openInviteCols["bootstrap_multiaddrs"] {
+		if err := addStateColumn(db, "esp_open_invites", "bootstrap_multiaddrs",
+			`ALTER TABLE esp_open_invites ADD COLUMN bootstrap_multiaddrs BLOB`); err != nil {
 			return err
 		}
 	}
@@ -1397,6 +1401,9 @@ func migrateSQLiteState(db *sql.DB) error {
 			`ALTER TABLE esp_open_invites ADD COLUMN no_fallback_peers INTEGER NOT NULL DEFAULT 0`); err != nil {
 			return err
 		}
+	}
+	if err := migrateLegacyOpenInviteRedemptions(db); err != nil {
+		return err
 	}
 	redemptionCols, err := tableColumns(db, "esp_open_invite_redemptions")
 	if err != nil {
@@ -1407,6 +1414,42 @@ func migrateSQLiteState(db *sql.DB) error {
 			`ALTER TABLE esp_open_invite_redemptions ADD COLUMN result BLOB`); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// Pre-libp2p redemption results have no canonical identity binding and cannot be
+// replayed as current invites. Archive them without changing invite usage counts.
+func migrateLegacyOpenInviteRedemptions(db *sql.DB) error {
+	cols, err := tableColumns(db, "esp_open_invite_redemptions")
+	if err != nil || (cols["member_id"] && cols["peer_id"]) {
+		return err
+	}
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	// Serialize the schema check and rename across daemon/ESP startup processes.
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return fmt.Errorf("esphttp: begin legacy redemption migration: %w", err)
+	}
+	defer conn.ExecContext(ctx, "ROLLBACK")
+	var identityColumns int
+	if err := conn.QueryRowContext(ctx, `SELECT count(*) FROM pragma_table_info('esp_open_invite_redemptions') WHERE name IN ('member_id', 'peer_id')`).Scan(&identityColumns); err != nil {
+		return err
+	}
+	if identityColumns != 2 {
+		if _, err := conn.ExecContext(ctx, `ALTER TABLE esp_open_invite_redemptions RENAME TO esp_legacy_open_invite_redemptions`); err != nil {
+			return fmt.Errorf("esphttp: archive legacy redemptions: %w", err)
+		}
+		if _, err := conn.ExecContext(ctx, sqliteOpenInviteRedemptionsSchema); err != nil {
+			return fmt.Errorf("esphttp: create libp2p redemptions: %w", err)
+		}
+	}
+	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+		return fmt.Errorf("esphttp: commit legacy redemption migration: %w", err)
 	}
 	return nil
 }
