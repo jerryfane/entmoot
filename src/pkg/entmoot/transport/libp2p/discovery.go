@@ -57,8 +57,11 @@ func relayConnectionBudget(cfg RelayServerConfig) int {
 }
 
 type HostConfig struct {
-	Mode             ConnectivityMode
-	ListenAddrs      []string
+	Mode        ConnectivityMode
+	ListenAddrs []string
+	// AnnounceAddrs replaces local listener addresses for a peer behind a
+	// reverse proxy. Controlled circuit addresses are still included.
+	AnnounceAddrs    []string
 	ControlledRelays []peer.AddrInfo
 	// RelayService, when set, also makes this host a bounded allowlisted
 	// Circuit Relay v2 service for the peers it names - one process that both
@@ -83,6 +86,20 @@ func NewConfiguredHost(ctx context.Context, identity *keystore.Identity, cfg Hos
 	}
 	if cfg.Mode == RelayOnlyConnectivity && cfg.RelayService != nil {
 		return nil, Binding{}, errors.New("libp2p: relay-only mode cannot also run a relay service")
+	}
+	if cfg.Mode == RelayOnlyConnectivity && len(cfg.AnnounceAddrs) != 0 {
+		return nil, Binding{}, errors.New("libp2p: relay-only mode cannot announce direct addresses")
+	}
+	announced := make([]multiaddr.Multiaddr, 0, len(cfg.AnnounceAddrs))
+	for _, raw := range cfg.AnnounceAddrs {
+		addr, err := multiaddr.NewMultiaddr(raw)
+		if err != nil {
+			return nil, Binding{}, fmt.Errorf("libp2p: invalid announce address: %w", err)
+		}
+		if _, err := addr.ValueForProtocol(multiaddr.P_P2P); err == nil {
+			return nil, Binding{}, errors.New("libp2p: announce address must omit /p2p; the host supplies its own peer id")
+		}
+		announced = append(announced, addr)
 	}
 	// Validate the relay service before anything needs closing, and size the
 	// host budget around it. A relay client holds a connection for as long as
@@ -139,8 +156,16 @@ func NewConfiguredHost(ctx context.Context, identity *keystore.Identity, cfg Hos
 			// circuit address as soon as the reservation exists, so mirror the
 			// reservation manager's addresses unconditionally.
 			relayAddrs = &advertisedRelayAddrs{}
+		}
+		if len(announced) > 0 || relayAddrs != nil {
 			options = append(options, libp2p.AddrsFactory(func(addresses []multiaddr.Multiaddr) []multiaddr.Multiaddr {
-				return multiaddr.Unique(append(slices.Clone(addresses), relayAddrs.snapshot()...))
+				if len(announced) > 0 {
+					addresses = announced
+				}
+				if relayAddrs != nil {
+					return multiaddr.Unique(append(slices.Clone(addresses), relayAddrs.snapshot()...))
+				}
+				return slices.Clone(addresses)
 			}))
 		}
 	case RelayOnlyConnectivity:

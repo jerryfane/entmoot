@@ -34,6 +34,8 @@ type globalFlags struct {
 	data             string
 	allowNewIdentity bool
 	listenPort       uint
+	p2pListen        stringListFlag
+	p2pAnnounce      stringListFlag
 	logLevel         string
 	connectivity     string
 	controlledRelays stringListFlag
@@ -126,6 +128,8 @@ func run() int {
 	fs.BoolVar(&gf.allowNewIdentity, "allow-new-identity", false,
 		"allow first-time Entmoot identity creation when the identity file is absent")
 	fs.UintVar(&gf.listenPort, "listen-port", 1004, "Entmoot listen port")
+	fs.Var(&gf.p2pListen, "p2p-listen", "libp2p listen multiaddr; repeatable, replaces the default TCP listener")
+	fs.Var(&gf.p2pAnnounce, "p2p-announce", "externally reachable libp2p multiaddr without /p2p; repeatable, replaces advertised listener addresses")
 	fs.StringVar(&gf.logLevel, "log-level", "info", "slog level: debug|info|warn|error")
 	fs.StringVar(&gf.connectivity, "connectivity", "direct", "connectivity profile: direct|relay-only")
 	fs.Var(&gf.controlledRelays, "controlled-relay", "controlled Circuit Relay v2 multiaddr ending in /p2p/<peer-id>; repeatable")
