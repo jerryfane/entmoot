@@ -406,7 +406,7 @@ func JoinGroup(ctx context.Context, h host.Host, remote peer.AddrInfo, root stri
 		!bytes.Equal(anchor.Founder.EntmootPubKey, capability.Founder.EntmootPubKey) {
 		return nil, errors.New("libp2p: served checkpoint names a different founder than the invite")
 	}
-	group, err := membership.Adopt(root, anchor)
+	group, err := membership.AdoptForJoin(root, anchor)
 	if err != nil {
 		return nil, err
 	}

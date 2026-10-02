@@ -22,6 +22,14 @@ total order derived from their contents, so two nodes holding the same records
 reach the same membership. A checkpoint refuses records older than itself,
 which is what stops a discarded change from being replayed back in.
 
+A fresh joiner trusts the founder key pinned by its verified invite and checks
+the served checkpoint's founder signature. A migrated group's legacy anchor
+describes history on the founder's node; the joiner need not possess that old
+roster and gains no authority to verify legacy messages from the anchor alone.
+This remote-admission path refuses to replace local legacy artifacts. Local
+conversion remains separate and requires the checkpoint to name the roster
+chain actually held on disk.
+
 Bearer (`-open`) invites are bearer credentials: whoever holds the link can
 join until it expires, is revoked, or runs out of uses.
 
