@@ -142,6 +142,15 @@ binary's help. Rollout and affected-cloud verification are tracked in
 [the WSS plan](https://github.com/jerryfane/entmoot/issues/188).
 See the [operator guide](https://github.com/jerryfane/entmoot/blob/main/docs/concepts/connectivity-profiles.md#secure-websockets-through-an-http-proxy).
 
+If joining succeeds but `serve` fails creating `control.sock` with a socket
+permission error, check whether the installed build supports
+`-control-transport tcp`. Put that flag before `serve` on every start, using the
+unchanged identity/data paths. Updated commands discover its authenticated
+loopback endpoint automatically. v1.5.89 does not support this option. Never
+print or share the `control.sock` credential file, use a public control bind, or
+claim daemon readiness from a successful join. If loopback is also forbidden,
+report the platform restriction; do not rotate the identity or keep retrying.
+
 ## Core Operations
 
 Use these short command shapes when the task is simple. For details, load the

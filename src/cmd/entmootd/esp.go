@@ -306,8 +306,8 @@ func (p controlSocketSignedPublisher) PublishSigned(ctx context.Context, msg ent
 	}
 	dialCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
 	defer cancel()
-	var dialer net.Dialer
-	conn, err := dialer.DialContext(dialCtx, "unix", p.socketPath)
+
+	conn, err := ipc.DialContext(dialCtx, p.socketPath)
 	if err != nil {
 		return esphttp.PublishResult{}, &esphttp.PublishError{
 			HTTPStatus: http.StatusServiceUnavailable,

@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net"
 	"time"
 
 	"entmoot/pkg/entmoot"
@@ -42,7 +41,7 @@ func publishIPCMessage(ctx context.Context, gf *globalFlags, groupID entmoot.Gro
 func publishIPCMessageToSocket(ctx context.Context, socketPath string, groupID entmoot.GroupID, topics []string, content []byte) error {
 	dialCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
 	defer cancel()
-	conn, err := (&net.Dialer{}).DialContext(dialCtx, "unix", socketPath)
+	conn, err := ipc.DialContext(dialCtx, socketPath)
 	if err != nil {
 		return err
 	}

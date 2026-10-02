@@ -99,7 +99,7 @@ func cmdTail(gf *globalFlags, args []string) int {
 		return exitControlUnavail
 	}
 
-	conn, err := net.DialTimeout("unix", sockPath, 500*time.Millisecond)
+	conn, err := ipc.DialTimeout(sockPath, 500*time.Millisecond)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, runtimeNoDaemonHelp(gf, gf.data))
 		return exitControlUnavail
