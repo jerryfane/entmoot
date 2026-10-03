@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- History synchronization now includes outbound-only members with an existing
+  direct connection even when they advertise no dialable addresses. Messages
+  missed before that connection formed can be recovered from the member's
+  store without republishing, with membership and signature checks unchanged.
+  This fixes the locally reproduced recovery gap tracked in #199; actual-cloud
+  post-restart delivery remains under verification in #192.
+
 ### Added
 
 - Opt-in `-control-transport tcp` for runtimes that forbid Unix sockets.

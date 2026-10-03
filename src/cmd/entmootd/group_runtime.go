@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	multiaddr "github.com/multiformats/go-multiaddr"
 
@@ -816,9 +817,15 @@ func (r *groupRuntime) keepersFor(session *groupSession) ([]peer.AddrInfo, error
 	}
 	keepers := make([]peer.AddrInfo, 0, len(byID))
 	for _, keeper := range byID {
-		if len(keeper.Addrs) > 0 {
-			keepers = append(keepers, keeper)
+		if len(keeper.Addrs) == 0 {
+			// Outbound-only members can serve history over an existing
+			// connection without advertising an address we could dial.
+			state := r.host.Network().Connectedness(keeper.ID)
+			if state != network.Connected {
+				continue
+			}
 		}
+		keepers = append(keepers, keeper)
 	}
 	sort.Slice(keepers, func(i, j int) bool { return keepers[i].ID.String() < keepers[j].ID.String() })
 	return keepers, nil
