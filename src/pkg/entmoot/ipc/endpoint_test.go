@@ -2,6 +2,7 @@ package ipc
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -21,6 +22,13 @@ import (
 // authenticated the connection. The counter detects unauthorized dispatch.
 func serveControlFixture(t *testing.T, l *Listener) *atomic.Int32 {
 	t.Helper()
+	return serveControlFixtureWithDeadline(t, l, time.Second)
+}
+
+// firstFrame is the application read deadline set before the first request,
+// which also caps authentication (cmd/entmootd uses 10s).
+func serveControlFixtureWithDeadline(t *testing.T, l *Listener, firstFrame time.Duration) *atomic.Int32 {
+	t.Helper()
 	var dispatched atomic.Int32
 	done := make(chan struct{})
 	go func() {
@@ -36,7 +44,7 @@ func serveControlFixture(t *testing.T, l *Listener) *atomic.Int32 {
 			go func() {
 				defer wg.Done()
 				defer c.Close()
-				_ = c.SetReadDeadline(time.Now().Add(time.Second))
+				_ = c.SetReadDeadline(time.Now().Add(firstFrame))
 				var request [1]byte
 				if _, err := io.ReadFull(c, request[:]); err != nil {
 					return
@@ -306,6 +314,78 @@ func TestTCPControlHandshakeHonorsCancellation(t *testing.T) {
 	}
 	if c := <-accepted; c != nil {
 		c.Close()
+	}
+}
+
+// Local users who cannot read the endpoint file can still connect to the
+// loopback port. Stalled clients, whether silent or holding a finished TLS
+// handshake without the credential, must not lock out the authorized owner:
+// beyond the pending-authentication capacity, the oldest ones make way.
+func TestTCPControlStalledClientsCannotExhaustAuthentication(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "control.sock")
+	l, err := Listen(path, "tcp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertStalledClientsEvictedOldestFirst(t, l, path)
+}
+
+func assertStalledClientsEvictedOldestFirst(t *testing.T, l *Listener, path string) {
+	t.Helper()
+	// As in cmd/entmootd, stalled authentication lasts the full authenticationTimeout.
+	dispatch := serveControlFixtureWithDeadline(t, l, 10*time.Second)
+	endpoint, err := readEndpoint(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stalled []net.Conn
+	defer func() {
+		for _, c := range stalled {
+			c.Close()
+		}
+	}()
+	dial := func(handshake bool) {
+		t.Helper()
+		var c net.Conn
+		var err error
+		if handshake {
+			// The attacker lacks the private certificate, so it skips verification.
+			dialer := tls.Dialer{NetDialer: &net.Dialer{Timeout: time.Second}, Config: &tls.Config{MinVersion: tls.VersionTLS13, InsecureSkipVerify: true}}
+			c, err = dialer.Dial("tcp4", endpoint.Address)
+		} else {
+			c, err = net.DialTimeout("tcp4", endpoint.Address, time.Second)
+		}
+		if err != nil {
+			t.Fatalf("stalled connection %d: %v", len(stalled), err)
+		}
+		stalled = append(stalled, c)
+	}
+	for i := range maxPendingAuthentications {
+		dial(i%2 == 1)
+	}
+	const extra = 8
+	for range extra {
+		dial(false)
+	}
+	// Each connection beyond capacity closes the oldest pending one, well before
+	// its authenticationTimeout would have.
+	for i, c := range stalled[:extra] {
+		_ = c.SetReadDeadline(time.Now().Add(authenticationTimeout / 2))
+		var b [1]byte
+		if _, err := c.Read(b[:]); err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Fatalf("oldest pending connection %d was not evicted: %v", i, err)
+		}
+	}
+	// Eviction of stalled[extra-1] proves the newest was admitted, not refused.
+	newest := stalled[len(stalled)-1]
+	_ = newest.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+	var b [1]byte
+	if _, err := newest.Read(b[:]); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("newest pending connection was closed instead of the oldest: %v", err)
+	}
+	requestControl(t, path)
+	if dispatch.Load() != 1 {
+		t.Fatalf("dispatched %d requests, want only the authorized one", dispatch.Load())
 	}
 }
 

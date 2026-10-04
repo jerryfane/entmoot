@@ -154,3 +154,17 @@ func TestListenAutoServesTCPWhenUnixSocketsForbidden(t *testing.T) {
 		}
 	})
 }
+
+// The TCP endpoint chosen by the "auto" fallback is the one a restricted cloud
+// gets without flags, so it must evict stalled clients like explicit "tcp".
+func TestListenAutoFallbackEvictsStalledClients(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "control.sock")
+	l, err := listenWithoutUnixSockets(t, path, "auto", unix.EPERM)
+	if err != nil {
+		t.Fatalf("auto transport: %v", err)
+	}
+	if l.UnixDenied() == nil {
+		t.Fatal("auto transport did not fall back to tcp")
+	}
+	assertStalledClientsEvictedOldestFirst(t, l, path)
+}

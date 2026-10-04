@@ -34,6 +34,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   store without republishing, with membership and signature checks unchanged.
   This fixes the locally reproduced recovery gap tracked in #199; actual-cloud
   post-restart delivery remains under verification in #192.
+- Stalled local connections to TCP control (`-control-transport tcp` or the
+  `auto` fallback) no longer lock out the daemon's own CLI and ESP clients.
+  The listener bounds unauthenticated connections and closes the oldest when
+  full instead of refusing new ones, so `info` keeps reporting the running
+  daemon while stalled raw or credential-less TLS connections are held open
+  (#197). TLS 1.3 pinning, the owner-private credential and its constant-time
+  check are unchanged. A local process opening connections faster than a
+  loopback handshake can still delay control; keep Unix sockets available
+  wherever the runtime permits them.
 
 ### Added
 
