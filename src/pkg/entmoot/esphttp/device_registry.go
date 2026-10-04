@@ -30,6 +30,10 @@ type DeviceRecord struct {
 	PeerID        string           `json:"peer_id,omitempty"`
 	EntmootPubKey string           `json:"entmoot_pubkey,omitempty"`
 	Disabled      bool             `json:"disabled"`
+	// SelfEnrolled is omitted for operator devices, so registry files written
+	// before member connect existed load unchanged and operator entries never
+	// gain the key.
+	SelfEnrolled bool `json:"self_enrolled,omitempty"`
 }
 
 // LoadDeviceRegistryOrEmpty reads path, returning an empty registry when the
@@ -152,6 +156,7 @@ func DeviceRegistryDocumentFromRegistry(reg *DeviceRegistry) DeviceRegistryDocum
 			PeerID:        d.PeerID,
 			EntmootPubKey: base64.StdEncoding.EncodeToString(d.EntmootPubKey),
 			Disabled:      d.Disabled,
+			SelfEnrolled:  d.SelfEnrolled,
 		})
 	}
 	return DeviceRegistryDocument{Devices: devices}
@@ -225,6 +230,7 @@ func DeviceFromRecord(in DeviceRecord) (Device, error) {
 		PeerID:        in.PeerID,
 		EntmootPubKey: append([]byte(nil), entmootPub...),
 		Disabled:      in.Disabled,
+		SelfEnrolled:  in.SelfEnrolled,
 	}, nil
 }
 

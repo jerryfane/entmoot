@@ -26,7 +26,7 @@ import (
 
 func cmdESP(gf *globalFlags, args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "esp: expected serve, device, or sign-request")
+		fmt.Fprintln(os.Stderr, "esp: expected serve, device, sign-request, connect, history, or publish")
 		return exitInvalidArgument
 	}
 	switch args[0] {
@@ -36,6 +36,12 @@ func cmdESP(gf *globalFlags, args []string) int {
 		return cmdESPDevice(gf, args[1:])
 	case "sign-request":
 		return cmdESPSignRequest(gf, args[1:])
+	case "connect":
+		return cmdESPConnect(gf, args[1:])
+	case "history":
+		return cmdESPHistory(gf, args[1:])
+	case "publish":
+		return cmdESPPublish(gf, args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "esp: unknown subcommand %q\n", args[0])
 		return exitInvalidArgument
@@ -54,6 +60,9 @@ type espServeConfig struct {
 	apnsKeyPath      string
 	apnsSandbox      bool
 	bonjourName      string
+	// allowMemberConnect enables POST /v1/devices/connect, letting a current
+	// group member enroll its own device without operator approval.
+	allowMemberConnect bool
 }
 
 func cmdESPServe(gf *globalFlags, args []string) int {
@@ -82,6 +91,7 @@ func parseESPServeConfig(args []string) (espServeConfig, int, bool) {
 	fs.StringVar(&cfg.apnsKeyPath, "apns-key", "", "Apple APNs .p8 key path (defaults to ENTMOOT_APNS_KEY)")
 	fs.BoolVar(&cfg.apnsSandbox, "apns-sandbox", false, "send APNs requests to the sandbox endpoint")
 	fs.StringVar(&cfg.bonjourName, "bonjour-name", "", "advertise ESP over Bonjour/mDNS with this instance name")
+	fs.BoolVar(&cfg.allowMemberConnect, "allow-member-connect", false, "let current group members enroll their own devices via POST /v1/devices/connect (requires -auth-mode device or dual)")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return cfg, exitOK, false
@@ -118,6 +128,9 @@ func validateESPServeConfig(cfg espServeConfig) error {
 	}
 	if (mode == esphttp.AuthModeBearer || mode == esphttp.AuthModeDual) && cfg.token == "" {
 		return errors.New("-token or ENTMOOT_ESP_TOKEN is required")
+	}
+	if cfg.allowMemberConnect && mode != esphttp.AuthModeDevice && mode != esphttp.AuthModeDual {
+		return errors.New("-allow-member-connect requires -auth-mode device or dual")
 	}
 	if !cfg.allowNonLoopback && !addrIsLoopback(cfg.addr) {
 		return fmt.Errorf("-addr %s is not loopback; pass -allow-non-loopback only behind TLS/auth infrastructure", cfg.addr)
@@ -171,7 +184,13 @@ func runESPServe(gf *globalFlags, cfg espServeConfig) int {
 			slog.Error("esp serve: device registry path", slog.String("err", err.Error()))
 			return exitInvalidArgument
 		}
-		devices, err = esphttp.LoadDeviceRegistry(path)
+		if cfg.allowMemberConnect {
+			// A connect-only ESP may start before any operator device
+			// exists; the first connect creates the file.
+			devices, err = esphttp.LoadDeviceRegistryOrEmpty(path)
+		} else {
+			devices, err = esphttp.LoadDeviceRegistry(path)
+		}
 		if err != nil {
 			slog.Error("esp serve: load device registry", slog.String("err", err.Error()))
 			return exitInvalidArgument
@@ -210,6 +229,13 @@ func runESPServe(gf *globalFlags, cfg espServeConfig) int {
 		Diagnostics: espDiagnosticsProvider{flags: *gf},
 		GroupExists: espGroupExists(gf.data),
 		Logger:      slog.Default(),
+		// The roster is wired whenever devices are, so self-enrolled devices
+		// already in the registry stay re-checked even with connect off.
+		MemberRoster: &esphttp.MembershipRoster{Root: gf.data},
+		MemberConnect: esphttp.MemberConnectConfig{
+			Enabled:      cfg.allowMemberConnect,
+			RegistryPath: deviceRegistryPath,
+		},
 	})
 	if err != nil {
 		slog.Error("esp serve: create handler", slog.String("err", err.Error()))
