@@ -57,6 +57,16 @@ CREATE TABLE IF NOT EXISTS membership_records (
 );
 CREATE INDEX IF NOT EXISTS idx_membership_records_ts
   ON membership_records(group_id, timestamp_ms);
+CREATE TABLE IF NOT EXISTS membership_history (
+  record_id         BLOB PRIMARY KEY,
+  group_id          BLOB NOT NULL,
+  kind              TEXT NOT NULL,
+  subject_member_id BLOB,
+  timestamp_ms      INTEGER NOT NULL,
+  canonical_bytes   BLOB NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_membership_history_ts
+  ON membership_history(group_id, timestamp_ms);
 `
 
 // writerLease is the single-writer guard: one process at a time may mutate a
@@ -191,6 +201,7 @@ func openStoreDB(path string) (*sql.DB, error) {
 type storedState struct {
 	checkpoints []Checkpoint
 	records     []Record
+	history     []Record
 	canonicalID entmoot.RosterEntryID
 	present     bool
 }
@@ -241,28 +252,41 @@ func loadStore(ctx context.Context, db *sql.DB, groupID entmoot.GroupID) (stored
 		return out, fmt.Errorf("membership: iterate checkpoints: %w", err)
 	}
 
-	recordRows, err := db.QueryContext(ctx,
-		`SELECT canonical_bytes FROM membership_records WHERE group_id = ? ORDER BY timestamp_ms;`, groupID[:])
-	if err != nil {
-		return out, fmt.Errorf("membership: read records: %w", err)
+	if out.records, err = loadRecords(ctx, db, groupID, "membership_records"); err != nil {
+		return out, err
 	}
-	defer recordRows.Close()
-	for recordRows.Next() {
+	if out.history, err = loadRecords(ctx, db, groupID, "membership_history"); err != nil {
+		return out, err
+	}
+	return out, nil
+}
+
+// loadRecords reads one record table: the live records, or the history of
+// retired ones. table is one of those two constant names, never input.
+func loadRecords(ctx context.Context, db *sql.DB, groupID entmoot.GroupID, table string) ([]Record, error) {
+	rows, err := db.QueryContext(ctx,
+		`SELECT canonical_bytes FROM `+table+` WHERE group_id = ? ORDER BY timestamp_ms;`, groupID[:])
+	if err != nil {
+		return nil, fmt.Errorf("membership: read %s: %w", table, err)
+	}
+	defer rows.Close()
+	var out []Record
+	for rows.Next() {
 		var raw []byte
-		if err := recordRows.Scan(&raw); err != nil {
-			return out, fmt.Errorf("membership: scan record: %w", err)
+		if err := rows.Scan(&raw); err != nil {
+			return nil, fmt.Errorf("membership: scan %s: %w", table, err)
 		}
 		var rec Record
 		if err := json.Unmarshal(raw, &rec); err != nil {
-			return out, fmt.Errorf("membership: decode record: %w", err)
+			return nil, fmt.Errorf("membership: decode %s: %w", table, err)
 		}
 		if err := verifyStoredBytes(rec, raw); err != nil {
-			return out, fmt.Errorf("membership: record %s: %w", rec.ID, err)
+			return nil, fmt.Errorf("membership: %s %s: %w", table, rec.ID, err)
 		}
-		out.records = append(out.records, rec)
+		out = append(out, rec)
 	}
-	if err := recordRows.Err(); err != nil {
-		return out, fmt.Errorf("membership: iterate records: %w", err)
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("membership: iterate %s: %w", table, err)
 	}
 	return out, nil
 }
@@ -344,10 +368,18 @@ func setCanonicalTx(ctx context.Context, tx *sql.Tx, groupID entmoot.GroupID, id
 	return nil
 }
 
-// deleteRecordsThroughTx retires records a checkpoint covers, inclusive of its
-// own timestamp: a checkpoint accounts for every record up to and including the
-// newest one it folded in.
-func deleteRecordsThroughTx(ctx context.Context, tx *sql.Tx, groupID entmoot.GroupID, timestamp int64) error {
+// retireRecordsThroughTx moves the records a checkpoint covers, inclusive of
+// its own timestamp, out of the live set and into history: a checkpoint
+// accounts for every record up to and including the newest one it folded in.
+func retireRecordsThroughTx(ctx context.Context, tx *sql.Tx, groupID entmoot.GroupID, timestamp int64) error {
+	if _, err := tx.ExecContext(ctx, `
+		INSERT OR IGNORE INTO membership_history
+		  (record_id, group_id, kind, subject_member_id, timestamp_ms, canonical_bytes)
+		SELECT record_id, group_id, kind, subject_member_id, timestamp_ms, canonical_bytes
+		FROM membership_records WHERE group_id = ? AND timestamp_ms <= ?;`, groupID[:], timestamp,
+	); err != nil {
+		return fmt.Errorf("membership: keep retired records: %w", err)
+	}
 	if _, err := tx.ExecContext(ctx,
 		`DELETE FROM membership_records WHERE group_id = ? AND timestamp_ms <= ?;`, groupID[:], timestamp,
 	); err != nil {
