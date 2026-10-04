@@ -145,6 +145,100 @@ func TestGroupRuntimeServesConvertedLegacyHistory(t *testing.T) {
 	t.Log("authenticated daemon member received 1 unchanged legacy message and 1 verified conversion proof")
 }
 
+func TestGroupRuntimeRecoversHistoryFromConnectedMemberWithoutAddresses(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	root := t.TempDir()
+	founder, _ := mustDaemonIdentity(t)
+	member, memberInfo := mustDaemonIdentity(t)
+	groupID := entmoot.GroupID{0x71}
+	mustCreateGroup(t, root, groupID, founder, membership.DefaultPolicy())
+	group := mustOpenGroup(t, root, groupID)
+	mustJoinWithInvite(t, group, member, mustDaemonInvite(t, group, founder, memberInfo, 1))
+	mustCloseGroup(t, group)
+
+	receiver, binding, err := libp2ptransport.NewHost(ctx, founder, libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer receiver.Close()
+	sender, _, err := libp2ptransport.NewHost(ctx, member, libp2p.NoListenAddrs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sender.Close()
+	messages, err := store.OpenSQLite(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer messages.Close()
+	source, err := store.OpenSQLite(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	runtime, err := newGroupRuntime(groupRuntimeConfig{
+		Identity: founder, DataDir: root, Store: messages, Notify: newNotifyingStore(messages, nil),
+		Host: receiver, Binding: binding, Mode: libp2ptransport.DirectConnectivity,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+	session, _, err := runtime.AddLocalGroup(ctx, groupID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A publication made before connectivity exists survives in the sender's
+	// store. Do not broadcast it here: only authenticated history can recover it.
+	message := mustSignedMessage(t, ctx, groupID, memberInfo, member, session.group.Canonical().ID)
+	if _, err := source.Put(ctx, groupID, message); err != nil {
+		t.Fatal(err)
+	}
+	history := &libp2ptransport.SyncServer{
+		Host: sender, Store: source,
+		Group: func(id entmoot.GroupID) (*membership.Group, bool) {
+			return session.group, id == groupID
+		},
+	}
+	if err := history.Install(); err != nil {
+		t.Fatal(err)
+	}
+	if err := sender.Connect(ctx, peer.AddrInfo{ID: receiver.ID(), Addrs: receiver.Addrs()}); err != nil {
+		t.Fatal(err)
+	}
+	if addresses := receiver.Peerstore().Addrs(sender.ID()); len(addresses) != 0 {
+		t.Fatalf("outbound-only fixture unexpectedly advertises addresses: %v", addresses)
+	}
+	// Exercise the maintenance path directly, without waiting for its minute
+	// ticker. The initial background pass may still own the catch-up lock.
+	for {
+		runtime.catchUp(ctx, session)
+		found, err := messages.Has(ctx, groupID, message.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if found {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal("connected member's stored message was not recovered")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	recovered, err := messages.Range(ctx, groupID, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recovered) != 1 || recovered[0].ID != message.ID || !bytes.Equal(recovered[0].Signature, message.Signature) {
+		t.Fatalf("recovered history differs from the original signed message: %+v", recovered)
+	}
+	if err := libp2ptransport.VerifyHistoricalMessageWithProof(session.group, recovered[0], time.Now(), nil); err != nil {
+		t.Fatalf("recovered member message failed verification: %v", err)
+	}
+}
+
 func seedRuntimeLegacyMessage(t *testing.T, path string, message entmoot.Message, encoded []byte) {
 	t.Helper()
 	db, err := sql.Open("sqlite", path)
