@@ -783,6 +783,7 @@ retry:
 		slog.Int("missing_bodies", summary.MissingBodies),
 		slog.Int("pruned_locally", summary.PrunedLocally),
 		slog.Int("unknown_heads", summary.UnknownHeads),
+		slog.Int("unauthorized_authors", summary.UnauthorizedAuthors),
 		slog.Int("converged_hints", summary.ConvergedHints),
 		slog.String("last_error", lastErr))
 	// History insertion writes straight to the store, so it never passes
