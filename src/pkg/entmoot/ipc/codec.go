@@ -38,6 +38,8 @@ func Encode(v any) (MsgType, []byte, error) {
 		t = MsgJoinGroupResp
 	case *InviteCreateReq:
 		t = MsgInviteCreateReq
+	case *InviteRefreshReq:
+		t = MsgInviteRefreshReq
 	case *InviteCreateResp:
 		t = MsgInviteCreateResp
 	case *InviteAuthorityCheckReq:
@@ -106,6 +108,8 @@ func Decode(t MsgType, body []byte) (any, error) {
 		return decodeAs[JoinGroupResp](t, body)
 	case MsgInviteCreateReq:
 		return decodeAs[InviteCreateReq](t, body)
+	case MsgInviteRefreshReq:
+		return decodeAs[InviteRefreshReq](t, body)
 	case MsgInviteCreateResp:
 		return decodeAs[InviteCreateResp](t, body)
 	case MsgInviteAuthorityCheckReq:

@@ -75,6 +75,12 @@ const (
 	MsgPeerProbeReq MsgType = 0x25
 	// MsgPeerProbeResp returns one result per member probed.
 	MsgPeerProbeResp MsgType = 0x26
+	// MsgInviteRefreshReq offers the daemon a capability it issued to a
+	// target and asks for a replacement if that one has gone stale. It is a
+	// type of its own, not a field on MsgInviteCreateReq, so a daemon that
+	// predates it drops the request instead of minting without checking. The
+	// answer is a MsgInviteCreateResp carrying RefreshStatus.
+	MsgInviteRefreshReq MsgType = 0x27
 	// MsgError carries a structured error frame. 0x1F is kept stable so
 	// existing logs and clients can continue spotting error frames.
 	MsgError MsgType = 0x1F
@@ -124,6 +130,8 @@ func (t MsgType) String() string {
 		return "peer_probe_req"
 	case MsgPeerProbeResp:
 		return "peer_probe_resp"
+	case MsgInviteRefreshReq:
+		return "invite_refresh_req"
 	case MsgError:
 		return "error"
 	default:
@@ -215,13 +223,18 @@ type InviteCreateReq struct {
 	// the invite will be shared widely and disclosing members' addresses is
 	// not wanted; the CLI exposes the same choice as -no-fallback-peers.
 	NoFallbackPeers bool `json:"no_fallback_peers,omitempty"`
-	// Refresh is a capability already issued to the same target, offered for
-	// replacement. The daemon hands it back unchanged, with status
-	// "unchanged", unless it has expired or would now carry different
-	// addresses, peers or relays, and it never replaces one whose nonce the
-	// group has seen used or revoked, or one held by a current, removed or
-	// banned member. Only a targeted request may carry it.
-	Refresh *entmoot.BootstrapCapability `json:"refresh,omitempty"`
+}
+
+// InviteRefreshReq asks for a replacement of Refresh, a capability already
+// issued to the request's target, carrying the same choices an invite_create
+// for it would. The daemon hands Refresh back unchanged unless it has expired
+// or would now carry different addresses, peers or relays, and never replaces
+// one whose nonce the group has seen used or revoked, or one held by a
+// current, removed or banned member. Replacing a capability that has not
+// expired revokes it first.
+type InviteRefreshReq struct {
+	InviteCreateReq
+	Refresh entmoot.BootstrapCapability `json:"refresh"`
 }
 
 type InviteCreateResp struct {
@@ -230,6 +243,9 @@ type InviteCreateResp struct {
 	Capability entmoot.BootstrapCapability `json:"capability"`
 	RosterHead entmoot.RosterEntryID       `json:"roster_head"`
 	Members    int                         `json:"members"`
+	// RefreshStatus answers an InviteRefreshReq: "unchanged" with the offered
+	// capability, or "replaced" with a new one. It is empty for invite_create.
+	RefreshStatus string `json:"refresh_status,omitempty"`
 }
 
 type InviteAuthorityCheckReq struct {

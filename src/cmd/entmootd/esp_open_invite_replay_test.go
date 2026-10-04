@@ -3,16 +3,19 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/esphttp"
+	"entmoot/pkg/entmoot/ipc"
 	"entmoot/pkg/entmoot/keystore"
 	"entmoot/pkg/entmoot/mailbox/mailboxtest"
 	"entmoot/pkg/entmoot/membership"
@@ -237,6 +240,14 @@ func TestOpenInviteReplayReplacesOnlyAStaleUnusedCapability(t *testing.T) {
 	if err := session.group.CheckInvite(again.Capability, time.Now().UnixMilli()); err != nil {
 		t.Fatalf("group refuses the replacement: %v", err)
 	}
+	// The replaced capability had not expired, so it was revoked before the
+	// replacement left: the holder never carries two that admit it.
+	if err := session.group.CheckInvite(first.Capability, time.Now().UnixMilli()); err == nil {
+		t.Fatal("the replaced capability still admits alongside its replacement")
+	}
+	if !session.group.IsInviteRevoked(first.Capability.Nonce) {
+		t.Fatal("the replaced capability was not revoked in the roster")
+	}
 	if again.UseCount != 1 || useCount(link) != 1 {
 		t.Fatalf("replacement spent a use: response %d, stored %d, want 1", again.UseCount, useCount(link))
 	}
@@ -250,6 +261,27 @@ func TestOpenInviteReplayReplacesOnlyAStaleUnusedCapability(t *testing.T) {
 	}
 	if got := ledgerRows(); got != rows+1 {
 		t.Fatalf("replays after the replacement minted: ledger rows %d, want %d", got, rows+1)
+	}
+
+	// Joining with the replacement and being removed leaves nothing to rejoin
+	// with: the replay hands back the spent capability, not a new one.
+	mustJoinWithInvite(t, session.group, stuck, again.Capability)
+	if err := applyRosterRemove(founder, session.group, mustDaemonNodeInfo(t, stuck)); err != nil {
+		t.Fatalf("remove stuck member: %v", err)
+	}
+	if err := host.Network().Listen(multiaddr.StringCast("/ip4/127.0.0.1/tcp/0/ws")); err != nil {
+		t.Fatalf("listen on a second WebSocket: %v", err)
+	}
+	if _, body := redeemed(redeem("link", stuck)); !bytes.Equal(body, againBody) {
+		t.Fatalf("a removed member's replay after an address change returned different bytes:\n%s\nwant\n%s", body, againBody)
+	}
+	for _, capability := range []entmoot.BootstrapCapability{first.Capability, again.Capability} {
+		if err := session.group.CheckInvite(capability, time.Now().UnixMilli()); err == nil {
+			t.Fatal("a removed member still holds a capability that admits it")
+		}
+	}
+	if got := ledgerRows(); got != rows+1 {
+		t.Fatalf("a removed member's replay minted: ledger rows %d, want %d", got, rows+1)
 	}
 
 	// A stored capability that has expired is replaced even when the
@@ -318,4 +350,99 @@ func TestOpenInviteReplayReplacesOnlyAStaleUnusedCapability(t *testing.T) {
 	redeemed(redeem("short", stuck))
 	time.Sleep(time.Until(expiresAt) + 10*time.Millisecond)
 	refused(redeem("short", stuck), "open_invite_expired")
+}
+
+// TestOpenInviteReplayKeepsStoredBytesUnlessTheDaemonChecked covers an ESP
+// upgraded ahead of its daemon. The fake daemons here know only the frames a
+// daemon from before invite_refresh knows. One hangs up on any other frame, as
+// that daemon's decoder does. The other reads every request as an
+// invite_create and mints, the way lenient JSON decoding treats a field it
+// does not know. Neither answer says the stored capability was checked, so
+// the replay must return the stored bytes and store nothing. Taking any new
+// nonce would let every replay mint again.
+func TestOpenInviteReplayKeepsStoredBytesUnlessTheDaemonChecked(t *testing.T) {
+	for _, daemon := range []struct {
+		name            string
+		mintsAnyRequest bool
+	}{
+		{"hangs up on an unknown frame", false},
+		{"mints for any request", true},
+	} {
+		t.Run(daemon.name, func(t *testing.T) {
+			ctx := context.Background()
+			gid := testESPGroupID(33)
+			sock := testUnixSocketPath(t)
+			ln, err := net.Listen("unix", sock)
+			if err != nil {
+				t.Fatalf("listen unix: %v", err)
+			}
+			var requests atomic.Int32
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				for {
+					conn, err := ln.Accept()
+					if err != nil {
+						return
+					}
+					requests.Add(1)
+					msgType, body, err := ipc.ReadFrame(conn)
+					var req ipc.InviteCreateReq
+					if err == nil && (msgType == ipc.MsgInviteCreateReq || daemon.mintsAnyRequest) && json.Unmarshal(body, &req) == nil {
+						capability := entmoot.BootstrapCapability{GroupID: req.GroupID, TargetPublicKey: req.TargetPublicKey}
+						_, _ = rand.Read(capability.Nonce[:])
+						_ = ipc.EncodeAndWrite(conn, &ipc.InviteCreateResp{Status: "created", GroupID: req.GroupID, Capability: capability})
+					}
+					_ = conn.Close()
+				}
+			}()
+			defer func() {
+				_ = ln.Close()
+				<-done
+			}()
+			state, err := esphttp.OpenSQLiteStateStore(t.TempDir())
+			if err != nil {
+				t.Fatalf("OpenSQLiteStateStore: %v", err)
+			}
+			defer state.Close()
+			exec := espOperationExecutor{dataDir: t.TempDir(), socketPath: sock, timeout: 5 * time.Second, stateStore: state}
+			hash := esphttp.HashOpenInviteToken("link")
+			if _, err := state.CreateOpenInvite(ctx, esphttp.OpenInviteRecord{
+				TokenHash: hash, GroupID: gid, DeviceID: "device-1", MaxUses: 1, ExpiresAtMS: time.Now().Add(time.Hour).UnixMilli(),
+			}); err != nil {
+				t.Fatalf("CreateOpenInvite: %v", err)
+			}
+			joiner, err := keystore.Generate()
+			if err != nil {
+				t.Fatal(err)
+			}
+			info := mustDaemonNodeInfo(t, joiner)
+			payload, err := json.Marshal(map[string]any{
+				"member_id": info.MemberID.String(), "peer_id": info.PeerID, "entmoot_pubkey": info.EntmootPubKey,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			first, err := exec.RedeemOpenInvite(ctx, "link", payload)
+			if err != nil {
+				t.Fatalf("first redemption: %v", err)
+			}
+			for range 3 {
+				again, err := exec.RedeemOpenInvite(ctx, "link", payload)
+				if err != nil {
+					t.Fatalf("repeat redemption: %v", err)
+				}
+				if !bytes.Equal(again, first) {
+					t.Fatalf("repeat took an unchecked answer:\n%s\nwant the stored\n%s", again, first)
+				}
+			}
+			stored, ok, err := state.GetOpenInviteRedemption(ctx, hash, info.MemberID.String())
+			if err != nil || !ok || !bytes.Equal(stored.Result, first) {
+				t.Fatalf("stored result changed: ok=%t err=%v\n%s", ok, err, stored.Result)
+			}
+			if got := requests.Load(); got != 4 {
+				t.Fatalf("daemon saw %d requests, want 4: the first mint and one per replay", got)
+			}
+		})
+	}
 }

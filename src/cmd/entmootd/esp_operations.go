@@ -258,24 +258,24 @@ func (e espOperationExecutor) RedeemOpenInvite(ctx context.Context, token string
 // they were then, and the capability's own expiry, so a link redeemed before
 // the node announced its WebSocket address kept handing a TCP-only, soon
 // expired grant to the one identity entitled to it. The daemon is offered the
-// stored capability and mints a replacement only when that one is stale and
-// was never used to get in (see keepIssuedInvite); anything else, including a
-// daemon that cannot be reached, replays the stored bytes as before. A
-// replacement is stored, so later replays return it without minting again.
+// stored capability and replaces it only when that one is stale and never got
+// anyone in (see keepIssuedInvite), revoking it first if it still admits. Only
+// an answer that says "replaced" is taken; anything else, including a daemon
+// that predates invite_refresh or cannot be reached, replays the stored bytes
+// as before. A replacement is stored, so later replays return it.
 func (e espOperationExecutor) replayOpenInviteRedemption(ctx context.Context, tokenHash string, redemption esphttp.OpenInviteRedemption, stored json.RawMessage, mint *ipc.InviteCreateReq) (json.RawMessage, error) {
 	replay := append(json.RawMessage(nil), stored...)
 	var previous openInviteRedeemResponse
 	if err := json.Unmarshal(stored, &previous); err != nil {
 		return replay, nil
 	}
-	mint.Refresh = &previous.Capability
-	resp, err := e.createInviteOverIPC(ctx, mint)
+	resp, err := e.refreshInviteOverIPC(ctx, &ipc.InviteRefreshReq{InviteCreateReq: *mint, Refresh: previous.Capability})
 	if err != nil {
 		slog.Warn("open invite redeem: kept the stored capability; the daemon could not check it",
 			slog.String("err", err.Error()))
 		return replay, nil
 	}
-	if resp.Capability.Nonce == previous.Capability.Nonce {
+	if resp.RefreshStatus != "replaced" || resp.Capability.Nonce == previous.Capability.Nonce {
 		return replay, nil
 	}
 	// The store refuses a revoked or expired invite inside its transaction,
@@ -284,7 +284,7 @@ func (e espOperationExecutor) replayOpenInviteRedemption(ctx context.Context, to
 	if err != nil {
 		return nil, openInviteStoreError(err)
 	}
-	return e.completeOpenInviteRedemption(ctx, tokenHash, redemption.RedeemerKey, rec, resp.InviteCreateResp)
+	return e.completeOpenInviteRedemption(ctx, tokenHash, redemption.RedeemerKey, rec, resp)
 }
 
 func (e espOperationExecutor) completeOpenInviteRedemption(ctx context.Context, tokenHash string, redeemerKey string, rec esphttp.OpenInviteRecord, resp *ipc.InviteCreateResp) (json.RawMessage, error) {
@@ -1161,7 +1161,19 @@ type memberRemoveIPCResult struct {
 	rejected bool
 }
 
-func (e espOperationExecutor) createInviteOverIPC(ctx context.Context, req *ipc.InviteCreateReq) (*inviteCreateIPCResult, error) {
+// refreshInviteOverIPC sends an invite_refresh. A daemon that predates it
+// cannot decode the frame and hangs up, which comes back as an error.
+func (e espOperationExecutor) refreshInviteOverIPC(ctx context.Context, req *ipc.InviteRefreshReq) (*ipc.InviteCreateResp, error) {
+	result, err := e.createInviteOverIPC(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	return result.InviteCreateResp, nil
+}
+
+// createInviteOverIPC sends an invite_create or invite_refresh request; both
+// are answered with an InviteCreateResp.
+func (e espOperationExecutor) createInviteOverIPC(ctx context.Context, req any) (*inviteCreateIPCResult, error) {
 	timeout := e.timeout
 	if timeout <= 0 {
 		timeout = 30 * time.Second

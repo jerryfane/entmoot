@@ -200,6 +200,7 @@ func TestMsgTypeString(t *testing.T) {
 		MsgGroupDeactivateResp:      "group_deactivate_resp",
 		MsgPeerProbeReq:             "peer_probe_req",
 		MsgPeerProbeResp:            "peer_probe_resp",
+		MsgInviteRefreshReq:         "invite_refresh_req",
 		MsgTailSubscribe:            "tail_subscribe",
 		MsgTailEvent:                "tail_event",
 		MsgInfoReq:                  "info_req",
