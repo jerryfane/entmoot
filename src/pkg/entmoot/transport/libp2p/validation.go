@@ -176,6 +176,15 @@ func VerifyHistoricalMessageWithProof(group *membership.Group, message entmoot.M
 		if message.Author.MemberID == nil || message.RosterHead == nil {
 			return fmt.Errorf("%w: incomplete historical member checkpoint", entmoot.ErrNotMember)
 		}
+		// Authenticity first, membership second. The shape check above binds
+		// the claimed member id and peer id to the carried key, so this proves
+		// the named identity signed these exact bytes. Only then is a head or
+		// membership failure a disagreement about roster history, which a
+		// caller may skip and retry; a forgery is reported as one whatever it
+		// claims, so it cannot pass itself off as a membership gap.
+		if err := signing.VerifyMessage(message, message.Author); err != nil {
+			return fmt.Errorf("%w: historical author signature: %v", entmoot.ErrSigInvalid, err)
+		}
 		author, active, known := group.MemberAt(*message.Author.MemberID, *message.RosterHead, message.Timestamp)
 		if !known {
 			return fmt.Errorf("%w: historical head %s", entmoot.ErrRosterHeadUnknown, message.RosterHead)

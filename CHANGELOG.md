@@ -24,7 +24,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retired before this release are gone, so messages that depend on them stay
   unverifiable on that node. History catch-up now skips and counts
   (`unauthorized_authors`) a message whose author it cannot place instead of
-  abandoning the keeper; forged signatures still fail the keeper.
+  abandoning the keeper. Historical validation checks the author signature
+  before membership, so a forged message fails the keeper whatever author or
+  checkpoint it claims.
 
 - History synchronization now includes outbound-only members with an existing
   direct connection even when they advertise no dialable addresses. Messages
