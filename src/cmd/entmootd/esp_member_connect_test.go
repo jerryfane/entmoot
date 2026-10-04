@@ -33,6 +33,7 @@ type memberConnectFixture struct {
 	t            *testing.T
 	dataDir      string
 	registryPath string
+	memberPath   string
 	gid          entmoot.GroupID
 	otherGID     entmoot.GroupID
 	unservedGID  entmoot.GroupID
@@ -63,6 +64,7 @@ func newMemberConnectFixture(t *testing.T, opts memberConnectOptions) *memberCon
 		publisher:   &recordingSignedPublisher{},
 	}
 	f.registryPath = filepath.Join(f.dataDir, "esp-devices.json")
+	f.memberPath = filepath.Join(f.dataDir, espMemberDevicesFile)
 	f.founder, _ = mustDaemonIdentity(t)
 	f.member, _ = mustDaemonIdentity(t)
 	f.outsider, _ = mustDaemonIdentity(t)
@@ -98,16 +100,17 @@ func newMemberConnectFixture(t *testing.T, opts memberConnectOptions) *memberCon
 		t.Fatal(err)
 	}
 	handler, err := esphttp.NewHandler(esphttp.Config{
-		AuthMode:     esphttp.AuthModeDevice,
-		Devices:      f.registry,
-		Service:      mailboxtest.New(t, st, nil),
-		Publisher:    f.publisher,
-		Groups:       localGroupCatalog{dataDir: f.dataDir},
-		GroupExists:  espGroupExists(f.dataDir),
-		MemberRoster: &esphttp.MembershipRoster{Root: f.dataDir},
+		AuthMode:      esphttp.AuthModeDevice,
+		Devices:       f.registry,
+		Service:       mailboxtest.New(t, st, nil),
+		Publisher:     f.publisher,
+		Groups:        localGroupCatalog{dataDir: f.dataDir},
+		GroupExists:   espGroupExists(f.dataDir),
+		MemberRoster:  &esphttp.MembershipRoster{Root: f.dataDir},
+		MemberDevices: mustEmptyMemberRegistry(t),
 		MemberConnect: esphttp.MemberConnectConfig{
 			Enabled:             !opts.disabled,
-			RegistryPath:        f.registryPath,
+			RegistryPath:        f.memberPath,
 			MaxDevicesPerMember: opts.maxDevicesPerMember,
 		},
 	})
@@ -199,22 +202,52 @@ func (f *memberConnectFixture) history(deviceID string, priv ed25519.PrivateKey,
 	return f.signed(deviceID, priv, http.MethodGet, espGroupPath(gid, "history"), nil)
 }
 
+func mustEmptyMemberRegistry(t *testing.T) *esphttp.DeviceRegistry {
+	t.Helper()
+	reg, err := esphttp.NewDeviceRegistry(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return reg
+}
+
+// registryFile returns both registry files, so a refusal that touched
+// either one is caught.
 func (f *memberConnectFixture) registryFile() []byte {
 	f.t.Helper()
-	data, err := os.ReadFile(f.registryPath)
+	operator, err := os.ReadFile(f.registryPath)
 	if err != nil {
 		f.t.Fatal(err)
 	}
-	return data
+	member, err := os.ReadFile(f.memberPath)
+	if err != nil && !os.IsNotExist(err) {
+		f.t.Fatal(err)
+	}
+	return append(append(operator, 0), member...)
 }
 
-func (f *memberConnectFixture) registryDevice(id string) (esphttp.Device, bool) {
+func (f *memberConnectFixture) operatorDevices() []esphttp.Device {
 	f.t.Helper()
 	reg, err := esphttp.LoadDeviceRegistry(f.registryPath)
 	if err != nil {
-		f.t.Fatalf("reload registry file: %v", err)
+		f.t.Fatalf("reload operator registry: %v", err)
 	}
-	for _, d := range reg.Snapshot() {
+	return reg.Snapshot()
+}
+
+func (f *memberConnectFixture) memberDevices() []esphttp.Device {
+	f.t.Helper()
+	reg, err := esphttp.LoadMemberDeviceRegistryOrEmpty(f.memberPath)
+	if err != nil {
+		f.t.Fatalf("reload member registry: %v", err)
+	}
+	return reg.Snapshot()
+}
+
+// registryDevice finds id in either file as a fresh process would load it.
+func (f *memberConnectFixture) registryDevice(id string) (esphttp.Device, bool) {
+	f.t.Helper()
+	for _, d := range append(f.operatorDevices(), f.memberDevices()...) {
 		if d.ID == id {
 			return d, true
 		}
@@ -314,6 +347,20 @@ func TestESPMemberConnectRejectsInvalidRequests(t *testing.T) {
 			r.TimestampMS = time.Now().Add(-10 * time.Minute).UnixMilli()
 			r.Signature = base64.StdEncoding.EncodeToString(f.member.Sign([]byte(esphttp.MemberConnectSigningInput(*r))))
 		}, http.StatusUnauthorized, "stale"},
+		// Dated beyond the 30s future window, it would outlive its nonce.
+		{"future timestamp", func(r *esphttp.MemberConnectRequest) {
+			r.TimestampMS = time.Now().Add(2 * time.Minute).UnixMilli()
+			r.Signature = base64.StdEncoding.EncodeToString(f.member.Sign([]byte(esphttp.MemberConnectSigningInput(*r))))
+		}, http.StatusUnauthorized, "future_timestamp"},
+		{"device proof missing", func(r *esphttp.MemberConnectRequest) {
+			r.DeviceSignature = ""
+		}, http.StatusUnauthorized, "bad_device_signature"},
+		{"device proof by another key", func(r *esphttp.MemberConnectRequest) {
+			r.DeviceSignature = base64.StdEncoding.EncodeToString(ed25519.Sign(newDeviceKey(t), []byte(esphttp.MemberConnectDeviceSigningInput(*r))))
+		}, http.StatusUnauthorized, "bad_device_signature"},
+		{"member signature reused as device proof", func(r *esphttp.MemberConnectRequest) {
+			r.DeviceSignature = r.Signature
+		}, http.StatusUnauthorized, "bad_device_signature"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -427,8 +474,8 @@ func TestESPMemberConnectReconnectReplacesGroups(t *testing.T) {
 	if same.Changed {
 		t.Fatalf("identical reconnect reported a change: %+v", same)
 	}
-	if reg, _ := esphttp.LoadDeviceRegistry(f.registryPath); len(reg.Snapshot()) != 2 {
-		t.Fatalf("registry holds %d devices, want operator + one member device", len(reg.Snapshot()))
+	if got := f.memberDevices(); len(got) != 1 {
+		t.Fatalf("member registry holds %d devices, want one", len(got))
 	}
 }
 
@@ -445,8 +492,8 @@ func TestESPMemberConnectCapsDevicesPerMember(t *testing.T) {
 	if _, ok := f.registryDevice(legacyOperatorDeviceID); !ok {
 		t.Fatal("cap enforcement evicted the operator device")
 	}
-	if reg, _ := esphttp.LoadDeviceRegistry(f.registryPath); len(reg.Snapshot()) != 4 {
-		t.Fatalf("registry holds %d devices, want operator + 2 member + 1 founder", len(reg.Snapshot()))
+	if got := len(f.memberDevices()); got != 3 || len(f.operatorDevices()) != 1 {
+		t.Fatalf("member registry holds %d devices, want 2 member + 1 founder beside the operator", got)
 	}
 }
 
@@ -460,13 +507,25 @@ func TestESPMemberConnectConcurrentWritersKeepEveryChange(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			req, err := buildESPConnectRequest(f.member, newDeviceKey(t), []entmoot.GroupID{f.gid}, "", time.Now())
-			if err != nil {
-				errs <- err
+			devicePriv := newDeviceKey(t)
+			// Only a few connects run roster checks at once; the rest get
+			// 429 busy and retry, as a client would. Every retry is a fresh
+			// request (new nonce) for the same device key.
+			for {
+				req, err := buildESPConnectRequest(f.member, devicePriv, []entmoot.GroupID{f.gid}, "", time.Now())
+				if err != nil {
+					errs <- err
+					return
+				}
+				rec := f.postConnect(req)
+				if rec.Code == http.StatusTooManyRequests {
+					time.Sleep(5 * time.Millisecond)
+					continue
+				}
+				if rec.Code != http.StatusOK {
+					errs <- fmt.Errorf("connect status %d: %s", rec.Code, rec.Body.String())
+				}
 				return
-			}
-			if rec := f.postConnect(req); rec.Code != http.StatusOK {
-				errs <- fmt.Errorf("connect status %d: %s", rec.Code, rec.Body.String())
 			}
 		}()
 	}
@@ -482,12 +541,8 @@ func TestESPMemberConnectConcurrentWritersKeepEveryChange(t *testing.T) {
 	for err := range errs {
 		t.Fatal(err)
 	}
-	reg, err := esphttp.LoadDeviceRegistry(f.registryPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := len(reg.Snapshot()); got != connects+1 {
-		t.Fatalf("registry file holds %d devices, want %d", got, connects+1)
+	if got := len(f.memberDevices()); got != connects {
+		t.Fatalf("member registry file holds %d devices, want %d", got, connects)
 	}
 	operator, _ := f.registryDevice(legacyOperatorDeviceID)
 	if len(operator.Groups) != 2 {
@@ -540,18 +595,42 @@ func TestESPLegacyRegistryAndOperatorDeviceUnchanged(t *testing.T) {
 	if _, ok := f.registryDevice("ops-tablet"); !ok {
 		t.Fatal("connect dropped a device the operator added to the file while the ESP ran")
 	}
-	var doc struct {
-		Devices []map[string]any `json:"devices"`
+}
+
+// A pre-member-connect binary loads only esp-devices.json with the operator
+// loader. After members connect, that loader must see no member device in
+// either file, so a rollback (or an old binary pointed at the member file)
+// fails closed instead of serving member devices as operator devices.
+func TestESPMemberDevicesInvisibleToOperatorLoader(t *testing.T) {
+	f := newMemberConnectFixture(t, memberConnectOptions{})
+	devicePriv := newDeviceKey(t)
+	resp := f.mustConnect(f.member, devicePriv, f.gid)
+	for _, path := range []string{f.registryPath, f.memberPath} {
+		reg, err := esphttp.LoadDeviceRegistry(path)
+		if err != nil {
+			t.Fatalf("operator loader on %s: %v", path, err)
+		}
+		for _, d := range reg.Snapshot() {
+			if d.ID != legacyOperatorDeviceID {
+				t.Fatalf("operator loader on %s sees device %q", path, d.ID)
+			}
+		}
 	}
-	if err := json.Unmarshal(f.registryFile(), &doc); err != nil {
+	if strings.Contains(string(f.registryFile()[:bytes.IndexByte(f.registryFile(), 0)]), resp.DeviceID) {
+		t.Fatal("member device written to the operator registry file")
+	}
+	// The current binary loads it from the member file as self-enrolled.
+	if d, ok := f.registryDevice(resp.DeviceID); !ok || !d.SelfEnrolled {
+		t.Fatalf("member device reloaded = %+v (found %v), want self-enrolled", d, ok)
+	}
+	// Operator-side writes cannot carry a member device into the operator file.
+	member := f.memberDevices()
+	reg, err := esphttp.NewDeviceRegistry(append(f.operatorDevices(), member...))
+	if err != nil {
 		t.Fatal(err)
 	}
-	for _, d := range doc.Devices {
-		_, marked := d["self_enrolled"]
-		id, _ := d["id"].(string)
-		if strings.HasPrefix(id, "member-") != marked {
-			t.Fatalf("device %s self_enrolled key present=%v; only member devices may carry it", id, marked)
-		}
+	if err := esphttp.SaveDeviceRegistry(f.registryPath, reg); err == nil {
+		t.Fatal("SaveDeviceRegistry accepted a self-enrolled device")
 	}
 }
 

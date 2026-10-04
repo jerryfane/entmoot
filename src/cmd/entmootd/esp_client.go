@@ -28,8 +28,11 @@ import (
 const (
 	espDeviceKeyFile    = "esp-device.key"
 	espClientConfigFile = "esp-client.json"
-	espClientTimeout    = 30 * time.Second
-	maxESPResponseBytes = 32 << 20
+	// espMemberDevicesFile is the ESP-side registry of self-enrolled member
+	// devices, kept apart from the operator registry esp-devices.json.
+	espMemberDevicesFile = "esp-member-devices.json"
+	espClientTimeout     = 30 * time.Second
+	maxESPResponseBytes  = 32 << 20
 )
 
 // espClientConfig is what `esp connect` leaves behind for `esp history` and
@@ -251,6 +254,7 @@ func buildESPConnectRequest(identity *keystore.Identity, devicePriv ed25519.Priv
 		Nonce:           nonce,
 	}
 	req.Signature = base64.StdEncoding.EncodeToString(identity.Sign([]byte(esphttp.MemberConnectSigningInput(req))))
+	req.DeviceSignature = base64.StdEncoding.EncodeToString(ed25519.Sign(devicePriv, []byte(esphttp.MemberConnectDeviceSigningInput(req))))
 	return req, nil
 }
 

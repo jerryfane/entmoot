@@ -57,10 +57,14 @@ type Config struct {
 	Diagnostics DiagnosticsProvider
 	GroupExists GroupExistsFunc
 	Logger      *slog.Logger
+	// MemberDevices holds self-enrolled member devices, loaded from their
+	// own file (LoadMemberDeviceRegistryOrEmpty), never from the operator
+	// registry: an older binary that reads only the operator file then sees
+	// no member devices instead of mistaking them for operator devices.
+	MemberDevices *DeviceRegistry
 	// MemberRoster is the authoritative roster self-enrolled devices are
-	// re-checked against on every group request. It is needed whenever the
-	// registry may hold self-enrolled devices, even with MemberConnect off;
-	// without it those devices are refused.
+	// re-checked against on every group request. It is required whenever
+	// MemberDevices is set, even with MemberConnect off.
 	MemberRoster MemberRoster
 	// MemberConnect enables POST /v1/devices/connect, through which a current
 	// group member enrolls its own read/publish device without operator
@@ -213,14 +217,31 @@ func (r *DeviceRegistry) Replace(next *DeviceRegistry) {
 // copy-on-write cycles would start from the same snapshot and the later save
 // would drop the earlier change.
 func (r *DeviceRegistry) Update(path string, mutate func(current *DeviceRegistry) (*DeviceRegistry, bool, error)) (bool, error) {
+	var load func() (*DeviceRegistry, error)
+	var save func(*DeviceRegistry) error
+	if path != "" {
+		load = func() (*DeviceRegistry, error) { return LoadDeviceRegistryOrEmpty(path) }
+		save = func(next *DeviceRegistry) error { return SaveDeviceRegistry(path, next) }
+	}
+	return r.update(load, save, mutate)
+}
+
+// UpdateMemberDevices is Update for the member device registry. The running
+// ESP is the only writer of that file (operator CLI commands never touch
+// it), so the cycle starts from memory and needs no cross-process reload.
+func (r *DeviceRegistry) UpdateMemberDevices(path string, mutate func(current *DeviceRegistry) (*DeviceRegistry, bool, error)) (bool, error) {
+	return r.update(nil, func(next *DeviceRegistry) error { return SaveMemberDeviceRegistry(path, next) }, mutate)
+}
+
+func (r *DeviceRegistry) update(load func() (*DeviceRegistry, error), save func(*DeviceRegistry) error, mutate func(current *DeviceRegistry) (*DeviceRegistry, bool, error)) (bool, error) {
 	if r == nil {
 		return false, errors.New("esphttp: device registry is not configured")
 	}
 	r.updateMu.Lock()
 	defer r.updateMu.Unlock()
 	current := r
-	if path != "" {
-		onDisk, err := LoadDeviceRegistryOrEmpty(path)
+	if load != nil {
+		onDisk, err := load()
 		if err != nil {
 			return false, err
 		}
@@ -230,8 +251,8 @@ func (r *DeviceRegistry) Update(path string, mutate func(current *DeviceRegistry
 	if err != nil || !changed {
 		return false, err
 	}
-	if path != "" {
-		if err := SaveDeviceRegistry(path, next); err != nil {
+	if save != nil {
+		if err := save(next); err != nil {
 			return false, err
 		}
 	}
@@ -476,6 +497,11 @@ type Handler struct {
 	logger                *slog.Logger
 	memberRoster          MemberRoster
 	memberConnect         MemberConnectConfig
+	memberDevices         *DeviceRegistry
+	connectNonces         *nonceCache
+	// connectSlots bounds concurrent connect roster checks so refused
+	// connects cannot queue ahead of member-device reads.
+	connectSlots chan struct{}
 }
 
 // NewHandler returns an HTTP handler for the ESP mailbox API.
@@ -504,7 +530,7 @@ func NewHandler(cfg Config) (*Handler, error) {
 			return nil, errors.New("esphttp: member connect requires device or dual auth mode")
 		}
 		if strings.TrimSpace(memberConnect.RegistryPath) == "" {
-			return nil, errors.New("esphttp: member connect requires a device registry path")
+			return nil, errors.New("esphttp: member connect requires a member device registry path")
 		}
 		if cfg.MemberRoster == nil {
 			return nil, errors.New("esphttp: member connect requires a member roster")
@@ -517,6 +543,20 @@ func NewHandler(cfg Config) (*Handler, error) {
 		}
 		if memberConnect.MaxDevices <= 0 {
 			memberConnect.MaxDevices = DefaultMaxSelfEnrolledDevices
+		}
+	}
+	memberDevices := cfg.MemberDevices
+	if memberDevices == nil && memberConnect.Enabled {
+		memberDevices, _ = NewDeviceRegistry(nil)
+	}
+	if memberDevices != nil {
+		if cfg.MemberRoster == nil {
+			return nil, errors.New("esphttp: member devices require a member roster")
+		}
+		for _, d := range memberDevices.Snapshot() {
+			if !d.SelfEnrolled {
+				return nil, fmt.Errorf("esphttp: member device registry entry %q is not self-enrolled", d.ID)
+			}
 		}
 	}
 	state := cfg.State
@@ -554,6 +594,9 @@ func NewHandler(cfg Config) (*Handler, error) {
 		logger:                logger,
 		memberRoster:          cfg.MemberRoster,
 		memberConnect:         memberConnect,
+		memberDevices:         memberDevices,
+		connectNonces:         newNonceCache(clock),
+		connectSlots:          make(chan struct{}, maxConcurrentConnects),
 	}, nil
 }
 
@@ -2168,6 +2211,12 @@ func (h *Handler) authorizedDevice(w http.ResponseWriter, r *http.Request, body 
 	}
 	device, ok := h.devices.lookup(deviceID)
 	if !ok {
+		// Member devices come only from the member registry and are always
+		// self-enrolled, whatever their in-memory flag says.
+		device, ok = h.memberDevices.lookup(deviceID)
+		device.SelfEnrolled = true
+	}
+	if !ok {
 		writeError(w, http.StatusUnauthorized, "unauthorized", "unknown device")
 		return authContext{}, false
 	}
@@ -2954,6 +3003,14 @@ func newNonceCache(clock func() time.Time) *nonceCache {
 }
 
 func (c *nonceCache) use(deviceID, nonce string, expires time.Time) bool {
+	fresh, _ := c.useBounded(deviceID, nonce, expires, 0)
+	return fresh
+}
+
+// useBounded records nonce like use, but when max > 0 and the cache already
+// holds max live entries it records nothing and reports full, so an
+// unauthenticated route cannot grow the cache without bound.
+func (c *nonceCache) useBounded(scope, nonce string, expires time.Time, max int) (fresh, full bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	now := c.clock()
@@ -2962,12 +3019,15 @@ func (c *nonceCache) use(deviceID, nonce string, expires time.Time) bool {
 			delete(c.seen, key)
 		}
 	}
-	key := deviceID + "\x00" + nonce
+	key := scope + "\x00" + nonce
 	if exp, ok := c.seen[key]; ok && exp.After(now) {
-		return false
+		return false, false
+	}
+	if max > 0 && len(c.seen) >= max {
+		return false, true
 	}
 	c.seen[key] = expires
-	return true
+	return true, false
 }
 
 type errorEnvelope struct {

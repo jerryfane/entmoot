@@ -172,8 +172,9 @@ func runESPServe(gf *globalFlags, cfg espServeConfig) int {
 		return exitTransport
 	}
 
-	var devices *esphttp.DeviceRegistry
+	var devices, memberDevices *esphttp.DeviceRegistry
 	deviceRegistryPath := ""
+	memberRegistryPath := ""
 	if cfg.authMode == string(esphttp.AuthModeDevice) || cfg.authMode == string(esphttp.AuthModeDual) {
 		path := cfg.deviceKeysPath
 		if path == "" {
@@ -196,6 +197,15 @@ func runESPServe(gf *globalFlags, cfg espServeConfig) int {
 			return exitInvalidArgument
 		}
 		deviceRegistryPath = path
+		// Member devices live in their own file next to the operator
+		// registry. Older binaries never read it, so a rollback drops member
+		// access instead of promoting member devices to operator devices.
+		memberRegistryPath = filepath.Join(filepath.Dir(path), espMemberDevicesFile)
+		memberDevices, err = esphttp.LoadMemberDeviceRegistryOrEmpty(memberRegistryPath)
+		if err != nil {
+			slog.Error("esp serve: load member device registry", slog.String("err", err.Error()))
+			return exitInvalidArgument
+		}
 	}
 	notifier, err := buildESPNotifier(cfg)
 	if err != nil {
@@ -229,12 +239,12 @@ func runESPServe(gf *globalFlags, cfg espServeConfig) int {
 		Diagnostics: espDiagnosticsProvider{flags: *gf},
 		GroupExists: espGroupExists(gf.data),
 		Logger:      slog.Default(),
-		// The roster is wired whenever devices are, so self-enrolled devices
-		// already in the registry stay re-checked even with connect off.
-		MemberRoster: &esphttp.MembershipRoster{Root: gf.data},
+		// Member devices are always roster-checked, even with connect off.
+		MemberDevices: memberDevices,
+		MemberRoster:  &esphttp.MembershipRoster{Root: gf.data},
 		MemberConnect: esphttp.MemberConnectConfig{
 			Enabled:      cfg.allowMemberConnect,
-			RegistryPath: deviceRegistryPath,
+			RegistryPath: memberRegistryPath,
 		},
 	})
 	if err != nil {

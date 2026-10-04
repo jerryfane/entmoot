@@ -33,6 +33,10 @@ const (
 	// is used for nothing else, so a connect signature can never be replayed
 	// as a message, record, sign-request approval, or HTTP request signature.
 	memberConnectVersion = "ENTMOOT-ESP-MEMBER-CONNECT-V1"
+	// memberConnectDeviceVersion is the domain of the device key's proof of
+	// possession over the same fields. It differs from the member domain so
+	// neither signature can stand in for the other.
+	memberConnectDeviceVersion = "ENTMOOT-ESP-MEMBER-CONNECT-DEVICE-V1"
 	// selfEnrolledDeviceIDDomain separates the device-id hash from every
 	// other hash of a device public key.
 	selfEnrolledDeviceIDDomain = "entmoot.esp.member-device-id.v1\x00"
@@ -41,6 +45,19 @@ const (
 	maxMemberConnectBodyBytes = 64 << 10
 	maxConnectNonceBytes      = 128
 	maxConnectClientIDBytes   = 64
+	// connectFutureSkew is how far ahead of the ESP clock a connect may be
+	// dated. It is much tighter than the past window so a request signed
+	// with a fast clock cannot outlive its remembered nonce.
+	connectFutureSkew = 30 * time.Second
+	// connectNonceTTL covers the whole window a connect timestamp is
+	// accepted in, past and future.
+	connectNonceTTL = deviceAuthSkew + connectFutureSkew
+	// maxConnectNonces bounds the connect replay cache. When full, connects
+	// are refused (503) rather than accepted without replay protection.
+	maxConnectNonces = 16384
+	// maxConcurrentConnects bounds connects doing roster lookups at once;
+	// excess connects get 429 instead of queueing behind member reads.
+	maxConcurrentConnects = 2
 
 	// DefaultMaxDevicesPerMember caps self-enrolled devices one member may
 	// hold on an ESP. Reaching it rejects new keys; nothing is evicted.
@@ -63,8 +80,9 @@ type MemberConnectConfig struct {
 	// Enabled turns on POST /v1/devices/connect. When false the route
 	// answers 404 exactly like any unknown path.
 	Enabled bool
-	// RegistryPath is the device registry file every successful connect is
-	// persisted to before it takes effect. Required when Enabled.
+	// RegistryPath is the member device registry file
+	// (esp-member-devices.json) every successful connect is persisted to
+	// before it takes effect. Required when Enabled.
 	RegistryPath string
 	// MaxDevicesPerMember, MaxGroupsPerRequest, and MaxDevices default to
 	// the package Default* values when zero.
@@ -83,6 +101,9 @@ type MemberConnectRequest struct {
 	TimestampMS     int64             `json:"timestamp_ms"`
 	Nonce           string            `json:"nonce"`
 	Signature       string            `json:"signature"`
+	// DeviceSignature proves the caller holds the device private key: the
+	// device key signs the same fields under the device domain.
+	DeviceSignature string `json:"device_signature"`
 }
 
 // MemberConnectResponse is the success body of POST /v1/devices/connect.
@@ -97,15 +118,25 @@ type MemberConnectResponse struct {
 }
 
 // MemberConnectSigningInput returns the bytes the member's Entmoot identity
-// signs for a connect request. Every request field except the signature is
-// bound, one per line, under a domain no other Entmoot signature uses.
+// signs for a connect request. Every request field except the two signatures
+// is bound, one per line, under a domain no other Entmoot signature uses.
 func MemberConnectSigningInput(req MemberConnectRequest) string {
+	return memberConnectPayload(memberConnectVersion, req)
+}
+
+// MemberConnectDeviceSigningInput returns the bytes the device private key
+// signs to prove possession: the same fields under the device domain.
+func MemberConnectDeviceSigningInput(req MemberConnectRequest) string {
+	return memberConnectPayload(memberConnectDeviceVersion, req)
+}
+
+func memberConnectPayload(domain string, req MemberConnectRequest) string {
 	groups := make([]string, 0, len(req.GroupIDs))
 	for _, gid := range req.GroupIDs {
 		groups = append(groups, gid.String())
 	}
 	return strings.Join([]string{
-		memberConnectVersion,
+		domain,
 		strings.TrimSpace(req.DevicePublicKey),
 		req.MemberID.String(),
 		strings.TrimSpace(req.EntmootPubKey),
@@ -220,8 +251,12 @@ func (h *Handler) handleMemberConnect(w http.ResponseWriter, r *http.Request) {
 	}
 	now := h.clock()
 	ts := time.UnixMilli(req.TimestampMS)
-	if ts.Before(now.Add(-deviceAuthSkew)) || ts.After(now.Add(deviceAuthSkew)) {
-		writeError(w, http.StatusUnauthorized, "stale", "timestamp_ms outside allowed window")
+	if ts.Before(now.Add(-deviceAuthSkew)) {
+		writeError(w, http.StatusUnauthorized, "stale", "timestamp_ms is older than the allowed window")
+		return
+	}
+	if ts.After(now.Add(connectFutureSkew)) {
+		writeError(w, http.StatusUnauthorized, "future_timestamp", "timestamp_ms is too far in the future; check the client clock")
 		return
 	}
 	entmootPub, err := base64.StdEncoding.DecodeString(strings.TrimSpace(req.EntmootPubKey))
@@ -244,10 +279,20 @@ func (h *Handler) handleMemberConnect(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "bad_signature", "signature does not verify against entmoot_pubkey")
 		return
 	}
-	// The nonce is spent only after the signature verifies, so unsigned
-	// traffic cannot grow the cache or burn a member's nonces.
-	if !h.nonceCache.use("connect:"+memberID.String(), req.Nonce, now.Add(deviceAuthSkew)) {
-		writeError(w, http.StatusUnauthorized, "replay", "nonce already used")
+	deviceSig, err := base64.StdEncoding.DecodeString(strings.TrimSpace(req.DeviceSignature))
+	if err != nil || len(deviceSig) != ed25519.SignatureSize || !ed25519.Verify(ed25519.PublicKey(devicePub), []byte(MemberConnectDeviceSigningInput(req)), deviceSig) {
+		writeError(w, http.StatusUnauthorized, "bad_device_signature", "device_signature does not prove possession of device_public_key")
+		return
+	}
+	// Everything above is CPU-only. The roster lookups below open the
+	// membership store, so only a few connects may run them at once; the
+	// rest are refused instead of queueing ahead of member-device reads.
+	select {
+	case h.connectSlots <- struct{}{}:
+		defer func() { <-h.connectSlots }()
+	default:
+		w.Header().Set("Retry-After", "1")
+		writeError(w, http.StatusTooManyRequests, "busy", "too many concurrent connect requests; retry shortly")
 		return
 	}
 	for _, gid := range req.GroupIDs {
@@ -261,6 +306,8 @@ func (h *Handler) handleMemberConnect(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, "unknown_group", "group "+gid.String()+" is not served by this ESP")
 			return
 		}
+	}
+	for _, gid := range req.GroupIDs {
 		info, active, err := h.memberRoster.ActiveMember(r.Context(), gid, memberID)
 		if err != nil {
 			h.logger.Error("esphttp: member connect roster lookup", slog.String("group_id", gid.String()), slog.String("err", err.Error()))
@@ -272,11 +319,23 @@ func (h *Handler) handleMemberConnect(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// The nonce is recorded only for members, so callers outside every
+	// served group cannot grow the cache; it is kept for the whole accepted
+	// timestamp window, past and future, and the cache is capped.
+	fresh, full := h.connectNonces.useBounded("connect:"+memberID.String(), req.Nonce, now.Add(connectNonceTTL), maxConnectNonces)
+	if full {
+		writeError(w, http.StatusServiceUnavailable, "busy", "connect replay cache is full; retry later")
+		return
+	}
+	if !fresh {
+		writeError(w, http.StatusUnauthorized, "replay", "nonce already used")
+		return
+	}
 	deviceID := SelfEnrolledDeviceID(devicePub)
 	clientID := SelfEnrolledClientID(deviceID, req.ClientID)
 	created := false
-	changed, err := h.devices.Update(h.memberConnect.RegistryPath, func(current *DeviceRegistry) (*DeviceRegistry, bool, error) {
-		devices, isNew, changed, err := h.enrollMemberDevice(current.Snapshot(), deviceID, devicePub, memberID, peerID, entmootPub, req.GroupIDs, clientID)
+	changed, err := h.memberDevices.UpdateMemberDevices(h.memberConnect.RegistryPath, func(current *DeviceRegistry) (*DeviceRegistry, bool, error) {
+		devices, isNew, changed, err := h.enrollMemberDevice(current.Snapshot(), h.devices.Snapshot(), deviceID, devicePub, memberID, peerID, entmootPub, req.GroupIDs, clientID)
 		if err != nil || !changed {
 			return nil, false, err
 		}
@@ -314,13 +373,21 @@ func (h *Handler) handleMemberConnect(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// enrollMemberDevice applies one connect to a registry snapshot. It never
-// touches an operator device: a colliding id or reused key is refused, and
-// the per-member cap refuses a new key rather than evicting anything.
-func (h *Handler) enrollMemberDevice(devices []Device, deviceID string, devicePub ed25519.PublicKey, memberID entmoot.MemberID, peerID string, entmootPub []byte, groups []entmoot.GroupID, clientID string) ([]Device, bool, bool, error) {
+// enrollMemberDevice applies one connect to a member registry snapshot. It
+// never touches an operator device: an id or key an operator device already
+// uses is refused, and the per-member cap refuses a new key rather than
+// evicting anything.
+func (h *Handler) enrollMemberDevice(devices, operators []Device, deviceID string, devicePub ed25519.PublicKey, memberID entmoot.MemberID, peerID string, entmootPub []byte, groups []entmoot.GroupID, clientID string) ([]Device, bool, bool, error) {
+	for _, d := range operators {
+		if d.ID == deviceID {
+			return nil, false, false, &OperationError{HTTPStatus: http.StatusConflict, Code: "device_id_conflict", Message: "device id is held by an operator device"}
+		}
+		if bytes.Equal(d.PublicKey, devicePub) {
+			return nil, false, false, &OperationError{HTTPStatus: http.StatusConflict, Code: "device_key_conflict", Message: "device key is already registered to another device"}
+		}
+	}
 	idx := -1
 	memberDevices := 0
-	selfEnrolled := 0
 	for i, d := range devices {
 		if d.ID == deviceID {
 			idx = i
@@ -329,17 +396,14 @@ func (h *Handler) enrollMemberDevice(devices []Device, deviceID string, devicePu
 		if bytes.Equal(d.PublicKey, devicePub) {
 			return nil, false, false, &OperationError{HTTPStatus: http.StatusConflict, Code: "device_key_conflict", Message: "device key is already registered to another device"}
 		}
-		if d.SelfEnrolled {
-			selfEnrolled++
-			if d.MemberID == memberID {
-				memberDevices++
-			}
+		if d.MemberID == memberID {
+			memberDevices++
 		}
 	}
 	if idx >= 0 {
 		existing := devices[idx]
-		if !existing.SelfEnrolled || !bytes.Equal(existing.PublicKey, devicePub) {
-			return nil, false, false, &OperationError{HTTPStatus: http.StatusConflict, Code: "device_id_conflict", Message: "device id is held by an operator device"}
+		if !bytes.Equal(existing.PublicKey, devicePub) {
+			return nil, false, false, &OperationError{HTTPStatus: http.StatusConflict, Code: "device_id_conflict", Message: "device id is held by another device"}
 		}
 		if existing.MemberID != memberID {
 			return nil, false, false, &OperationError{HTTPStatus: http.StatusForbidden, Code: "device_bound_to_other_member", Message: "device key is bound to another member"}
@@ -358,7 +422,7 @@ func (h *Handler) enrollMemberDevice(devices []Device, deviceID string, devicePu
 	if memberDevices >= h.memberConnect.MaxDevicesPerMember {
 		return nil, false, false, &OperationError{HTTPStatus: http.StatusForbidden, Code: "device_limit", Message: fmt.Sprintf("member already has %d self-enrolled devices", memberDevices)}
 	}
-	if selfEnrolled >= h.memberConnect.MaxDevices {
+	if len(devices) >= h.memberConnect.MaxDevices {
 		return nil, false, false, &OperationError{HTTPStatus: http.StatusServiceUnavailable, Code: "registry_full", Message: "ESP self-enrolled device limit reached"}
 	}
 	devices = append(devices, Device{

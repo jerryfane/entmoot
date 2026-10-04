@@ -21,18 +21,28 @@ An ESP started with `entmootd esp serve -auth-mode device -allow-member-connect`
 (off by default) accepts `POST /v1/devices/connect` without device auth. The
 body names a new Ed25519 device key, the requested `group_ids` (at most 16),
 an optional `client_id`, the member's `member_id` and `entmoot_pubkey`,
-`timestamp_ms` (within 5 minutes), a single-use `nonce`, and a `signature` by
-the member's Entmoot identity over `ENTMOOT-ESP-MEMBER-CONNECT-V1` plus every
-field. The ESP grants the device only if every group is one it serves and the
+`timestamp_ms` (at most 5 minutes old and 30 seconds ahead of the ESP clock),
+and a single-use `nonce`. It carries two signatures over every field: a
+`signature` by the member's Entmoot identity (domain
+`ENTMOOT-ESP-MEMBER-CONNECT-V1`), and a `device_signature` by the device key
+(domain `ENTMOOT-ESP-MEMBER-CONNECT-DEVICE-V1`) that proves the caller holds
+it. The ESP grants the device only if every group is one it serves and the
 member is currently in it (not removed or banned); otherwise nothing changes.
-Error codes: `stale`, `bad_signature`, `member_mismatch`, `replay`,
-`unknown_group`, `not_member`, `device_limit`, `device_id_conflict`,
+Error codes: `stale`, `future_timestamp`, `bad_signature`,
+`bad_device_signature`, `member_mismatch`, `replay`, `unknown_group`,
+`not_member`, `busy` (429/503, retry), `device_limit`, `device_id_conflict`,
 `device_key_conflict`, `device_bound_to_other_member`.
 
 - The device id is `member-<hash of the device key>` and its mailbox client
   id is the device id, or `<device id>:<client_id>`. It is saved to
-  `esp-devices.json` with `"self_enrolled": true` and works straight away,
-  without an ESP restart. Operator devices are unchanged.
+  `esp-member-devices.json`, next to `esp-devices.json`, and works straight
+  away, without an ESP restart. Only the running ESP writes that file;
+  `entmootd esp device` commands never touch it, and operator devices in
+  `esp-devices.json` are unchanged.
+- Binaries without member connect never read `esp-member-devices.json`.
+  Rolling back simply drops member devices; they are never treated as
+  operator devices. To remove every member device, stop the ESP and delete
+  the file.
 - Connecting again with the same key replaces its group set. A key stays bound
   to the member that first connected it. Each member can have up to 4
   self-enrolled devices; when that is reached, new keys are refused and no
