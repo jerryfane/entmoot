@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"strings"
-	"sync"
 
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/esphttp"
@@ -19,10 +18,12 @@ type deviceGroupAuthorizer interface {
 	BindDeviceIdentity(context.Context, string, entmoot.MemberID, string, []byte) (bool, error)
 }
 
+// fileBackedDeviceGroupAuthorizer persists operator-approved grants. Every
+// write goes through DeviceRegistry.Update, the same serialized cycle member
+// self-enrollment uses, so neither writer can drop the other's change.
 type fileBackedDeviceGroupAuthorizer struct {
 	path     string
 	registry *esphttp.DeviceRegistry
-	mu       sync.Mutex
 }
 
 func (a *fileBackedDeviceGroupAuthorizer) GrantDeviceGroup(_ context.Context, deviceID string, gid entmoot.GroupID) (bool, error) {
@@ -47,8 +48,6 @@ func (a *fileBackedDeviceGroupAuthorizer) DeviceAllowsGroup(_ context.Context, d
 	if a == nil || a.registry == nil {
 		return false, fmt.Errorf("esp device group authorizer is not configured")
 	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
 	deviceID = strings.TrimSpace(deviceID)
 	if deviceID == "" {
 		return false, fmt.Errorf("esp device id is required")
@@ -71,67 +70,31 @@ func (a *fileBackedDeviceGroupAuthorizer) BindDeviceIdentity(_ context.Context, 
 	if a == nil || a.registry == nil {
 		return false, fmt.Errorf("esp device group authorizer is not configured")
 	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	next, changed, err := a.registry.WithDeviceIdentity(deviceID, memberID, peerID, entmootPubKey)
-	if err != nil || !changed {
-		return false, err
-	}
-	if err := esphttp.SaveDeviceRegistry(a.path, next); err != nil {
-		return false, err
-	}
-	a.registry.Replace(next)
-	return true, nil
+	return a.registry.Update(a.path, func(current *esphttp.DeviceRegistry) (*esphttp.DeviceRegistry, bool, error) {
+		return current.WithDeviceIdentity(deviceID, memberID, peerID, entmootPubKey)
+	})
 }
 
 func (a *fileBackedDeviceGroupAuthorizer) update(deviceID string, gid entmoot.GroupID, grant bool) (bool, error) {
 	if a == nil || a.registry == nil {
 		return false, fmt.Errorf("esp device group authorizer is not configured")
 	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	var (
-		next    *esphttp.DeviceRegistry
-		changed bool
-		err     error
-	)
-	if grant {
-		next, changed, err = a.registry.WithGroupGranted(deviceID, gid)
-	} else {
-		next, changed, err = a.registry.WithGroupRevoked(deviceID, gid)
-	}
-	if err != nil || !changed {
-		return false, err
-	}
-	if err := esphttp.SaveDeviceRegistry(a.path, next); err != nil {
-		return false, err
-	}
-	a.registry.Replace(next)
-	return true, nil
+	return a.registry.Update(a.path, func(current *esphttp.DeviceRegistry) (*esphttp.DeviceRegistry, bool, error) {
+		if grant {
+			return current.WithGroupGranted(deviceID, gid)
+		}
+		return current.WithGroupRevoked(deviceID, gid)
+	})
 }
 
 func (a *fileBackedDeviceGroupAuthorizer) updateAdmin(deviceID string, gid entmoot.GroupID, grant bool) (bool, error) {
 	if a == nil || a.registry == nil {
 		return false, fmt.Errorf("esp device group authorizer is not configured")
 	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	var (
-		next    *esphttp.DeviceRegistry
-		changed bool
-		err     error
-	)
-	if grant {
-		next, changed, err = a.registry.WithAdminGroupGranted(deviceID, gid)
-	} else {
-		next, changed, err = a.registry.WithAdminGroupRevoked(deviceID, gid)
-	}
-	if err != nil || !changed {
-		return false, err
-	}
-	if err := esphttp.SaveDeviceRegistry(a.path, next); err != nil {
-		return false, err
-	}
-	a.registry.Replace(next)
-	return true, nil
+	return a.registry.Update(a.path, func(current *esphttp.DeviceRegistry) (*esphttp.DeviceRegistry, bool, error) {
+		if grant {
+			return current.WithAdminGroupGranted(deviceID, gid)
+		}
+		return current.WithAdminGroupRevoked(deviceID, gid)
+	})
 }

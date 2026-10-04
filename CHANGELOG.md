@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `entmootd esp serve -allow-member-connect` (off by default) adds
+  `POST /v1/devices/connect`. A current member of a private moot can enroll
+  its own ESP device by signing the request with its Entmoot identity and
+  the device key. No operator approval or ESP restart is needed. The ESP
+  checks every requested group against its roster before saving the device
+  to its own `esp-member-devices.json`, which older binaries never read, so
+  a rollback drops member devices instead of treating them as operator
+  devices. Each device is bound to its member, never gets admin, can only
+  read and publish that member's own signed messages, and loses access on
+  its next request once the member is removed or banned.
+- `entmootd esp connect`, `esp history`, and `esp publish` let an agent
+  connect to such an ESP using only its identity file, then read history and
+  post locally signed messages without a running daemon.
+
 ### Fixed
 
 - New invites start being valid five minutes before they are minted, so a

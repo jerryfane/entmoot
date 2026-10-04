@@ -57,6 +57,19 @@ type Config struct {
 	Diagnostics DiagnosticsProvider
 	GroupExists GroupExistsFunc
 	Logger      *slog.Logger
+	// MemberDevices holds self-enrolled member devices, loaded from their
+	// own file (LoadMemberDeviceRegistryOrEmpty), never from the operator
+	// registry: an older binary that reads only the operator file then sees
+	// no member devices instead of mistaking them for operator devices.
+	MemberDevices *DeviceRegistry
+	// MemberRoster is the authoritative roster self-enrolled devices are
+	// re-checked against on every group request. It is required whenever
+	// MemberDevices is set, even with MemberConnect off.
+	MemberRoster MemberRoster
+	// MemberConnect enables POST /v1/devices/connect, through which a current
+	// group member enrolls its own read/publish device without operator
+	// approval. The zero value keeps the endpoint disabled.
+	MemberConnect MemberConnectConfig
 }
 
 // AuthMode selects how ESP v1 HTTP requests authenticate.
@@ -96,6 +109,11 @@ type Device struct {
 	PeerID        string
 	EntmootPubKey []byte
 	Disabled      bool
+	// SelfEnrolled marks a device a member created through
+	// /v1/devices/connect. Such a device is bound to that member, never holds
+	// admin groups, is limited to read and own-author publish routes, and is
+	// re-checked against the live roster on every group request.
+	SelfEnrolled bool
 }
 
 // DeviceRegistry is the in-memory authorization projection loaded by ESP
@@ -104,6 +122,9 @@ type DeviceRegistry struct {
 	mu      sync.RWMutex
 	Devices []Device
 	byID    map[string]Device
+	// updateMu serializes read-modify-write cycles (Update) so concurrent
+	// writers cannot drop each other's changes.
+	updateMu sync.Mutex
 }
 
 // NewDeviceRegistry validates and indexes devices.
@@ -128,6 +149,12 @@ func NewDeviceRegistry(devices []Device) (*DeviceRegistry, error) {
 		}
 		if d.MemberID != (entmoot.MemberID{}) && (d.PeerID == "" || len(d.EntmootPubKey) != ed25519.PublicKeySize) {
 			return nil, fmt.Errorf("esphttp: device %q has incomplete member identity", d.ID)
+		}
+		if d.SelfEnrolled && d.MemberID == (entmoot.MemberID{}) {
+			return nil, fmt.Errorf("esphttp: self-enrolled device %q has no bound member", d.ID)
+		}
+		if d.SelfEnrolled && len(d.AdminGroups) > 0 {
+			return nil, fmt.Errorf("esphttp: self-enrolled device %q cannot hold admin groups", d.ID)
 		}
 		if _, exists := reg.byID[d.ID]; exists {
 			return nil, fmt.Errorf("esphttp: duplicate device id %q", d.ID)
@@ -178,6 +205,59 @@ func (r *DeviceRegistry) Replace(next *DeviceRegistry) {
 	defer r.mu.Unlock()
 	r.Devices = nextDevices
 	r.byID = nextByID
+}
+
+// Update runs one serialized read-modify-write cycle. With a path, the cycle
+// starts from the file, not the in-memory copy: an operator who edited
+// esp-devices.json with `entmootd esp device` while the ESP runs keeps that
+// edit instead of having the next write replace it. mutate returns a
+// validated replacement; when it reports a change the replacement is written
+// to path first and only then swapped in, so memory never runs ahead of the
+// file. Every in-process writer must go through Update: two unserialized
+// copy-on-write cycles would start from the same snapshot and the later save
+// would drop the earlier change.
+func (r *DeviceRegistry) Update(path string, mutate func(current *DeviceRegistry) (*DeviceRegistry, bool, error)) (bool, error) {
+	var load func() (*DeviceRegistry, error)
+	var save func(*DeviceRegistry) error
+	if path != "" {
+		load = func() (*DeviceRegistry, error) { return LoadDeviceRegistryOrEmpty(path) }
+		save = func(next *DeviceRegistry) error { return SaveDeviceRegistry(path, next) }
+	}
+	return r.update(load, save, mutate)
+}
+
+// UpdateMemberDevices is Update for the member device registry. The running
+// ESP is the only writer of that file (operator CLI commands never touch
+// it), so the cycle starts from memory and needs no cross-process reload.
+func (r *DeviceRegistry) UpdateMemberDevices(path string, mutate func(current *DeviceRegistry) (*DeviceRegistry, bool, error)) (bool, error) {
+	return r.update(nil, func(next *DeviceRegistry) error { return SaveMemberDeviceRegistry(path, next) }, mutate)
+}
+
+func (r *DeviceRegistry) update(load func() (*DeviceRegistry, error), save func(*DeviceRegistry) error, mutate func(current *DeviceRegistry) (*DeviceRegistry, bool, error)) (bool, error) {
+	if r == nil {
+		return false, errors.New("esphttp: device registry is not configured")
+	}
+	r.updateMu.Lock()
+	defer r.updateMu.Unlock()
+	current := r
+	if load != nil {
+		onDisk, err := load()
+		if err != nil {
+			return false, err
+		}
+		current = onDisk
+	}
+	next, changed, err := mutate(current)
+	if err != nil || !changed {
+		return false, err
+	}
+	if save != nil {
+		if err := save(next); err != nil {
+			return false, err
+		}
+	}
+	r.Replace(next)
+	return true, nil
 }
 
 // WithGroupGranted returns a validated registry copy with gid granted to
@@ -236,6 +316,9 @@ func (r *DeviceRegistry) WithDeviceIdentity(deviceID string, memberID entmoot.Me
 		found = true
 		if devices[i].MemberID == memberID && devices[i].PeerID == peerID && bytes.Equal(devices[i].EntmootPubKey, entmootPubKey) {
 			break
+		}
+		if devices[i].SelfEnrolled {
+			return nil, false, fmt.Errorf("esphttp: self-enrolled device %q is bound to another member", deviceID)
 		}
 		devices[i].MemberID = memberID
 		devices[i].PeerID = peerID
@@ -412,6 +495,13 @@ type Handler struct {
 	groupExists           GroupExistsFunc
 	groupExistsConfigured bool
 	logger                *slog.Logger
+	memberRoster          MemberRoster
+	memberConnect         MemberConnectConfig
+	memberDevices         *DeviceRegistry
+	connectNonces         *nonceCache
+	// connectSlots bounds concurrent connect roster checks so refused
+	// connects cannot queue ahead of member-device reads.
+	connectSlots chan struct{}
 }
 
 // NewHandler returns an HTTP handler for the ESP mailbox API.
@@ -433,6 +523,41 @@ func NewHandler(cfg Config) (*Handler, error) {
 	}
 	if cfg.Service == nil {
 		return nil, errors.New("esphttp: mailbox service is required")
+	}
+	memberConnect := cfg.MemberConnect
+	if memberConnect.Enabled {
+		if authMode != AuthModeDevice && authMode != AuthModeDual {
+			return nil, errors.New("esphttp: member connect requires device or dual auth mode")
+		}
+		if strings.TrimSpace(memberConnect.RegistryPath) == "" {
+			return nil, errors.New("esphttp: member connect requires a member device registry path")
+		}
+		if cfg.MemberRoster == nil {
+			return nil, errors.New("esphttp: member connect requires a member roster")
+		}
+		if memberConnect.MaxDevicesPerMember <= 0 {
+			memberConnect.MaxDevicesPerMember = DefaultMaxDevicesPerMember
+		}
+		if memberConnect.MaxGroupsPerRequest <= 0 {
+			memberConnect.MaxGroupsPerRequest = DefaultMaxConnectGroups
+		}
+		if memberConnect.MaxDevices <= 0 {
+			memberConnect.MaxDevices = DefaultMaxSelfEnrolledDevices
+		}
+	}
+	memberDevices := cfg.MemberDevices
+	if memberDevices == nil && memberConnect.Enabled {
+		memberDevices, _ = NewDeviceRegistry(nil)
+	}
+	if memberDevices != nil {
+		if cfg.MemberRoster == nil {
+			return nil, errors.New("esphttp: member devices require a member roster")
+		}
+		for _, d := range memberDevices.Snapshot() {
+			if !d.SelfEnrolled {
+				return nil, fmt.Errorf("esphttp: member device registry entry %q is not self-enrolled", d.ID)
+			}
+		}
 	}
 	state := cfg.State
 	if state == nil {
@@ -467,6 +592,11 @@ func NewHandler(cfg Config) (*Handler, error) {
 		groupExists:           groupExists,
 		groupExistsConfigured: groupExistsConfigured,
 		logger:                logger,
+		memberRoster:          cfg.MemberRoster,
+		memberConnect:         memberConnect,
+		memberDevices:         memberDevices,
+		connectNonces:         newNonceCache(clock),
+		connectSlots:          make(chan struct{}, maxConcurrentConnects),
 	}, nil
 }
 
@@ -490,6 +620,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if h.handleCapabilities(w, r) {
+		return
+	}
+	if r.URL.Path == MemberConnectPath {
+		// Authenticated by the member's identity signature in the body, not
+		// by a device credential; answers 404 unless enabled.
+		h.handleMemberConnect(w, r)
 		return
 	}
 	auth, ok := h.authorize(w, r)
@@ -618,9 +754,21 @@ func (h *Handler) handleListGroups(w http.ResponseWriter, r *http.Request) {
 	if auth.device != nil {
 		filtered := groups[:0]
 		for _, g := range groups {
-			if deviceAllowsGroup(*auth.device, g.GroupID) {
-				filtered = append(filtered, g)
+			if !deviceAllowsGroup(*auth.device, g.GroupID) {
+				continue
 			}
+			if auth.device.SelfEnrolled {
+				active, err := h.selfEnrolledMemberActive(r.Context(), *auth.device, g.GroupID)
+				if err != nil {
+					h.logger.Error("esphttp: self-enrolled roster check", slog.String("device_id", auth.device.ID), slog.String("err", err.Error()))
+					writeError(w, http.StatusServiceUnavailable, "roster_unavailable", "group roster lookup failed")
+					return
+				}
+				if !active {
+					continue
+				}
+			}
+			filtered = append(filtered, g)
 		}
 		groups = filtered
 	}
@@ -1312,6 +1460,10 @@ func (h *Handler) handleGroupMessagePublish(w http.ResponseWriter, r *http.Reque
 	if !ok {
 		return
 	}
+	selfEnrolled := authFromContext(r).device
+	if selfEnrolled != nil && !selfEnrolled.SelfEnrolled {
+		selfEnrolled = nil
+	}
 	if msgRaw, hasMessage := raw["message"]; hasMessage {
 		if h.publisher == nil {
 			writeError(w, http.StatusServiceUnavailable, "join_unavailable", "no running join publisher configured")
@@ -1326,8 +1478,15 @@ func (h *Handler) handleGroupMessagePublish(w http.ResponseWriter, r *http.Reque
 			writeError(w, http.StatusBadRequest, "bad_request", "message.group_id does not match URL group_id")
 			return
 		}
+		if selfEnrolled != nil && !checkSelfEnrolledPublish(w, *selfEnrolled, msg) {
+			return
+		}
 		result, err := h.publisher.PublishSigned(r.Context(), msg)
 		h.writePublishResult(w, r, result, err)
+		return
+	}
+	if selfEnrolled != nil {
+		writeError(w, http.StatusForbidden, "self_enrolled_forbidden", "self-enrolled devices publish only messages they already signed")
 		return
 	}
 	var draft messagePublishDraft
@@ -2052,6 +2211,12 @@ func (h *Handler) authorizedDevice(w http.ResponseWriter, r *http.Request, body 
 	}
 	device, ok := h.devices.lookup(deviceID)
 	if !ok {
+		// Member devices come only from the member registry and are always
+		// self-enrolled, whatever their in-memory flag says.
+		device, ok = h.memberDevices.lookup(deviceID)
+		device.SelfEnrolled = true
+	}
+	if !ok {
 		writeError(w, http.StatusUnauthorized, "unauthorized", "unknown device")
 		return authContext{}, false
 	}
@@ -2088,6 +2253,10 @@ func (h *Handler) authorizedDevice(w http.ResponseWriter, r *http.Request, body 
 	}
 	if !h.nonceCache.use(device.ID, nonce, now.Add(deviceAuthSkew)) {
 		writeError(w, http.StatusUnauthorized, "unauthorized", "replayed nonce")
+		return authContext{}, false
+	}
+	if device.SelfEnrolled && !selfEnrolledRouteAllowed(r) {
+		writeError(w, http.StatusForbidden, "self_enrolled_forbidden", "self-enrolled devices may only read their groups and publish their own signed messages")
 		return authContext{}, false
 	}
 	return authContext{device: &device}, true
@@ -2192,6 +2361,9 @@ func (h *Handler) checkDeviceGroup(w http.ResponseWriter, r *http.Request, group
 		return true
 	}
 	if auth.device != nil && deviceAllowsGroup(*auth.device, groupID) {
+		if auth.device.SelfEnrolled {
+			return h.checkSelfEnrolledMember(w, r, *auth.device, groupID)
+		}
 		return true
 	}
 	writeError(w, http.StatusForbidden, "forbidden", "device is not authorized for group")
@@ -2747,6 +2919,9 @@ func deviceView(device Device) map[string]any {
 		"peer_id":      device.PeerID,
 		"disabled":     device.Disabled,
 	}
+	if device.SelfEnrolled {
+		out["self_enrolled"] = true
+	}
 	if len(device.EntmootPubKey) > 0 {
 		out["entmoot_pubkey"] = base64.StdEncoding.EncodeToString(device.EntmootPubKey)
 	}
@@ -2828,6 +3003,14 @@ func newNonceCache(clock func() time.Time) *nonceCache {
 }
 
 func (c *nonceCache) use(deviceID, nonce string, expires time.Time) bool {
+	fresh, _ := c.useBounded(deviceID, nonce, expires, 0)
+	return fresh
+}
+
+// useBounded records nonce like use, but when max > 0 and the cache already
+// holds max live entries it records nothing and reports full, so an
+// unauthenticated route cannot grow the cache without bound.
+func (c *nonceCache) useBounded(scope, nonce string, expires time.Time, max int) (fresh, full bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	now := c.clock()
@@ -2836,12 +3019,15 @@ func (c *nonceCache) use(deviceID, nonce string, expires time.Time) bool {
 			delete(c.seen, key)
 		}
 	}
-	key := deviceID + "\x00" + nonce
+	key := scope + "\x00" + nonce
 	if exp, ok := c.seen[key]; ok && exp.After(now) {
-		return false
+		return false, false
+	}
+	if max > 0 && len(c.seen) >= max {
+		return false, true
 	}
 	c.seen[key] = expires
-	return true
+	return true, false
 }
 
 type errorEnvelope struct {
