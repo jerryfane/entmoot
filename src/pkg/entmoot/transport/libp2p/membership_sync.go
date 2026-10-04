@@ -5,11 +5,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/p2p/net/swarm"
 
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/keystore"
@@ -373,6 +375,94 @@ func FetchMembership(ctx context.Context, h host.Host, remote peer.AddrInfo, gro
 	return checkpoints, records, false, firstErr
 }
 
+// joinRoundInterval paces repeat rounds over the join candidates that timed
+// out. It equals libp2p's first per-address dial backoff (swarm.BackoffBase),
+// so the next round normally dials afresh rather than meeting "dial backoff".
+const joinRoundInterval = 5 * time.Second
+
+// JoinGroupVia joins through the first candidate that admits this node. Every
+// candidate gets one attempt, in order, before any is tried again, so a stalled
+// address costs one libp2p dial (15s, whatever ctx allows) and never the
+// budget the later addresses need. While ctx has a deadline left, candidates
+// whose connection timed out - at any phase: proxy CONNECT, TLS, WebSocket
+// upgrade, security handshake or muxer - or met the backoff such a failure
+// leaves, get further rounds. serve recovers from such a stall on its next
+// membership round; a join would otherwise fail its whole -timeout on one
+// stalled connection. Only the connection is retried: a candidate that
+// refused, presented the wrong identity, failed validation or answered the
+// join is not asked again, and a context without a deadline gets one round.
+// It returns the candidate that admitted the join.
+func JoinGroupVia(ctx context.Context, h host.Host, candidates []peer.AddrInfo, root string, identity *keystore.Identity, capability entmoot.BootstrapCapability, applicant entmoot.NodeInfo) (*membership.Group, peer.AddrInfo, error) {
+	if len(candidates) == 0 {
+		return nil, peer.AddrInfo{}, errors.New("libp2p: no join candidates")
+	}
+	pending := candidates
+	var first, last error
+	for round := 1; ; round++ {
+		var stalled []peer.AddrInfo
+		for _, remote := range pending {
+			group, err := JoinGroup(ctx, h, remote, root, identity, capability, applicant)
+			if err == nil {
+				return group, remote, nil
+			}
+			if first == nil {
+				first = err
+			}
+			last = err
+			if joinConnectTimedOut(err) {
+				stalled = append(stalled, remote)
+			}
+		}
+		_, bounded := ctx.Deadline()
+		if len(stalled) == 0 || !bounded || ctx.Err() != nil {
+			return nil, peer.AddrInfo{}, joinRoundsError(round, first, last)
+		}
+		timer := time.NewTimer(joinRoundInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, peer.AddrInfo{}, joinRoundsError(round, first, last)
+		case <-timer.C:
+		}
+		pending = stalled
+	}
+}
+
+// joinConnectError marks a join that never got a connection, so nothing was
+// sent and trying the same candidate again is safe.
+type joinConnectError struct {
+	remote peer.ID
+	err    error
+}
+
+func (e *joinConnectError) Error() string {
+	return fmt.Sprintf("libp2p: connect %s: %v", e.remote, e.err)
+}
+
+func (e *joinConnectError) Unwrap() error { return e.err }
+
+// joinConnectTimedOut reports a join connection that ran out of time, or was
+// refused only because an earlier one did.
+func joinConnectTimedOut(err error) bool {
+	var connectErr *joinConnectError
+	if !errors.As(err, &connectErr) {
+		return false
+	}
+	return errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, os.ErrDeadlineExceeded) ||
+		errors.Is(err, swarm.ErrDialBackoff)
+}
+
+// joinRoundsError returns a single round's last error unchanged, as a join
+// always did, and otherwise keeps the first failure too: later ones are often
+// just the backoff it caused.
+func joinRoundsError(rounds int, first, last error) error {
+	if rounds == 1 {
+		return last
+	}
+	return fmt.Errorf("libp2p: join failed after %d rounds; first: %w; last: %w", rounds, first, last)
+}
+
 // JoinGroup is how a non-member gets in. It reads the group's checkpoint with
 // the invite, signs its own join record, and hands that record to the peer it
 // read from, which is an ordinary membership exchange: there is no enrollment
@@ -384,6 +474,9 @@ func JoinGroup(ctx context.Context, h host.Host, remote peer.AddrInfo, root stri
 		GroupID:    capability.GroupID,
 		Capability: &capability,
 		Limit:      maxMembershipRecords,
+	}
+	if err := h.Connect(ctx, remote); err != nil {
+		return nil, &joinConnectError{remote: remote.ID, err: err}
 	}
 	response, err := RequestMembership(ctx, h, remote, request)
 	if err != nil {

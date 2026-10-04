@@ -327,6 +327,7 @@ func (r *groupRuntime) AddCapability(ctx context.Context, capability entmoot.Boo
 		return nil, false, errors.New("bootstrap capability is for a different local identity")
 	}
 	var lastErr error
+	var candidates []peer.AddrInfo
 	for _, raw := range capability.AllowedMultiaddrs {
 		address, err := multiaddr.NewMultiaddr(raw)
 		if err != nil {
@@ -342,42 +343,45 @@ func (r *groupRuntime) AddCapability(ctx context.Context, capability entmoot.Boo
 			lastErr = errors.New("bootstrap address peer is not authorized by capability")
 			continue
 		}
-		applicant := entmoot.NodeInfo{
-			EntmootPubKey: append([]byte(nil), r.identity.PublicKey...),
-			MemberID:      &r.binding.MemberID,
-			PeerID:        r.binding.PeerID.String(),
-		}
-		// The join is this node's own signed record: the peer applies it under
-		// the same rules, so nothing here depends on the peer being willing to
-		// write on our behalf.
-		group, err := libp2ptransport.JoinGroup(ctx, r.host, *info, r.dataDir, r.identity, capability, applicant)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		if err := group.Close(); err != nil {
-			return nil, false, err
-		}
-		if err := persistGroupPeer(r.dataDir, capability.GroupID, *info); err != nil {
-			return nil, false, err
-		}
-		session, added, err := r.AddLocalGroup(ctx, capability.GroupID)
-		if err != nil {
-			return nil, false, err
-		}
-		// The join happens before the joining host owns its GossipSub topic.
-		// Reconnect after topic setup so both peers exchange subscriptions
-		// against the membership each now holds.
-		_ = r.host.Network().ClosePeer(info.ID)
-		if err := r.host.Connect(ctx, *info); err != nil {
-			return nil, false, fmt.Errorf("reconnect joined group peer: %w", err)
-		}
-		return session, added, nil
+		candidates = append(candidates, *info)
 	}
-	if lastErr == nil {
-		lastErr = errors.New("bootstrap capability contains no usable address")
+	if len(candidates) == 0 {
+		if lastErr == nil {
+			lastErr = errors.New("bootstrap capability contains no usable address")
+		}
+		return nil, false, lastErr
 	}
-	return nil, false, lastErr
+	applicant := entmoot.NodeInfo{
+		EntmootPubKey: append([]byte(nil), r.identity.PublicKey...),
+		MemberID:      &r.binding.MemberID,
+		PeerID:        r.binding.PeerID.String(),
+	}
+	// The join is this node's own signed record: the peer applies it under
+	// the same rules, so nothing here depends on the peer being willing to
+	// write on our behalf. Every address gets its turn before a stalled one is
+	// dialled again, so one stalled address cannot spend the whole budget.
+	group, info, err := libp2ptransport.JoinGroupVia(ctx, r.host, candidates, r.dataDir, r.identity, capability, applicant)
+	if err != nil {
+		return nil, false, err
+	}
+	if err := group.Close(); err != nil {
+		return nil, false, err
+	}
+	if err := persistGroupPeer(r.dataDir, capability.GroupID, info); err != nil {
+		return nil, false, err
+	}
+	session, added, err := r.AddLocalGroup(ctx, capability.GroupID)
+	if err != nil {
+		return nil, false, err
+	}
+	// The join happens before the joining host owns its GossipSub topic.
+	// Reconnect after topic setup so both peers exchange subscriptions
+	// against the membership each now holds.
+	_ = r.host.Network().ClosePeer(info.ID)
+	if err := r.host.Connect(ctx, info); err != nil {
+		return nil, false, fmt.Errorf("reconnect joined group peer: %w", err)
+	}
+	return session, added, nil
 }
 
 func stringMember(values []string, wanted string) bool {
