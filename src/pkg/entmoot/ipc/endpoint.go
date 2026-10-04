@@ -1,6 +1,7 @@
 package ipc
 
 import (
+	"container/list"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -28,6 +29,13 @@ import (
 const endpointVersion = "entmoot.control.tls.v1"
 const authenticationTimeout = 5 * time.Second
 
+// maxPendingAuthentications bounds TCP control connections that have not yet
+// presented the credential. At capacity the oldest one is closed, so local
+// clients that connect and stall cannot lock out a client that authenticates
+// promptly; a loopback attacker must instead open connections faster than one
+// local TLS handshake completes. This limits, not eliminates, local DoS.
+const maxPendingAuthentications = 256
+
 // ErrControlActive means another daemon owns this data root's control endpoint.
 var ErrControlActive = errors.New("control endpoint is already owned by a daemon")
 
@@ -52,7 +60,8 @@ type Listener struct {
 	stopErr   error
 	tlsConfig *tls.Config
 	token     [32]byte
-	slots     chan struct{}
+	pendingMu sync.Mutex
+	pending   list.List // raw connections awaiting authentication, oldest first
 }
 
 // Listen creates either the default Unix socket or an explicitly selected,
@@ -128,7 +137,6 @@ func Listen(path, transport string) (*Listener, error) {
 			return nil, err
 		}
 		l.tlsConfig = &tls.Config{MinVersion: tls.VersionTLS13, Certificates: []tls.Certificate{cert}}
-		l.slots = make(chan struct{}, 32)
 		l.Listener, err = net.Listen("tcp4", "127.0.0.1:0")
 		if err != nil {
 			return nil, err
@@ -160,21 +168,29 @@ func Listen(path, transport string) (*Listener, error) {
 }
 
 func (l *Listener) Accept() (net.Conn, error) {
-	for {
-		c, err := l.Listener.Accept()
-		if err != nil {
-			return nil, err
-		}
-		if l.tlsConfig == nil {
-			return c, nil
-		}
-		select {
-		case l.slots <- struct{}{}:
-			return &authenticatedConn{Conn: tls.Server(c, l.tlsConfig), token: l.token, release: func() { <-l.slots }}, nil
-		default:
-			c.Close()
-		}
+	c, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
 	}
+	if l.tlsConfig == nil {
+		return c, nil
+	}
+	l.pendingMu.Lock()
+	var evicted net.Conn
+	if l.pending.Len() >= maxPendingAuthentications {
+		evicted = l.pending.Remove(l.pending.Front()).(net.Conn)
+	}
+	e := l.pending.PushBack(c)
+	l.pendingMu.Unlock()
+	if evicted != nil {
+		// Its handshake or credential read fails and its handler returns.
+		evicted.Close()
+	}
+	return &authenticatedConn{Conn: tls.Server(c, l.tlsConfig), token: l.token, release: func() {
+		l.pendingMu.Lock()
+		l.pending.Remove(e) // no-op once evicted or already released
+		l.pendingMu.Unlock()
+	}}, nil
 }
 
 // StopAccepting stops new connections without releasing endpoint ownership.
@@ -205,7 +221,6 @@ type authenticatedConn struct {
 	*tls.Conn
 	token         [32]byte
 	once          sync.Once
-	releaseOnce   sync.Once
 	release       func()
 	err           error
 	deadlineMu    sync.Mutex
@@ -213,10 +228,9 @@ type authenticatedConn struct {
 	writeDeadline time.Time
 }
 
-func (c *authenticatedConn) releaseSlot() { c.releaseOnce.Do(c.release) }
 func (c *authenticatedConn) authenticate() error {
 	c.once.Do(func() {
-		defer c.releaseSlot()
+		defer c.release()
 		c.deadlineMu.Lock()
 		deadline := time.Now().Add(authenticationTimeout)
 		if !c.readDeadline.IsZero() && c.readDeadline.Before(deadline) {
@@ -255,7 +269,7 @@ func (c *authenticatedConn) Write(p []byte) (int, error) {
 	}
 	return c.Conn.Write(p)
 }
-func (c *authenticatedConn) Close() error { c.releaseSlot(); return c.Conn.Close() }
+func (c *authenticatedConn) Close() error { c.release(); return c.Conn.Close() }
 func (c *authenticatedConn) SetDeadline(t time.Time) error {
 	c.deadlineMu.Lock()
 	defer c.deadlineMu.Unlock()

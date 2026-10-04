@@ -39,6 +39,13 @@ without a fixed port or proxy. Update those clients together with the daemon.
 This is local control of the agent's own daemon, not ESP enrollment or a
 remotely exposed admin API.
 
+Any local process can connect to the loopback port, though it cannot
+authenticate without that file. The daemon closes the oldest unauthenticated
+connection when too many are pending, so clients that merely connect and stall
+do not lock out the agent's own commands. A local process that keeps opening
+connections very rapidly can still slow or interrupt control; the Unix socket
+is not reachable by other users and stays preferable where it is allowed.
+
 Repeat `-control-transport tcp` whenever starting that daemon. On restart,
 the control certificate and credential change; the Entmoot identity and joined
 groups do not. Stop the daemon normally before changing transport. The

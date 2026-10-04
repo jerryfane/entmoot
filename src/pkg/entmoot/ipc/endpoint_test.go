@@ -2,6 +2,7 @@ package ipc
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -306,6 +307,46 @@ func TestTCPControlHandshakeHonorsCancellation(t *testing.T) {
 	}
 	if c := <-accepted; c != nil {
 		c.Close()
+	}
+}
+
+// Local users who cannot read the endpoint file can still connect to the
+// loopback port. Stalled clients, whether silent or holding a finished TLS
+// handshake without the credential, must not lock out the authorized owner.
+func TestTCPControlStalledClientsCannotExhaustAuthentication(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "control.sock")
+	l, err := Listen(path, "tcp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatch := serveControlFixture(t, l)
+	endpoint, err := readEndpoint(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stalled []net.Conn
+	defer func() {
+		for _, c := range stalled {
+			c.Close()
+		}
+	}()
+	for range 20 {
+		// The attacker lacks the private certificate, so it skips verification.
+		dialer := tls.Dialer{NetDialer: &net.Dialer{Timeout: time.Second}, Config: &tls.Config{MinVersion: tls.VersionTLS13, InsecureSkipVerify: true}}
+		if c, err := dialer.Dial("tcp4", endpoint.Address); err == nil {
+			stalled = append(stalled, c)
+		}
+	}
+	for range 20 {
+		c, err := net.DialTimeout("tcp4", endpoint.Address, time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		stalled = append(stalled, c)
+	}
+	requestControl(t, path)
+	if dispatch.Load() != 1 {
+		t.Fatalf("dispatched %d requests, want only the authorized one", dispatch.Load())
 	}
 }
 
