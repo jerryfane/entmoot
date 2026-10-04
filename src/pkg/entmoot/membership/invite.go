@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/keystore"
@@ -133,6 +134,17 @@ func VerifyInviteSignature(capability entmoot.BootstrapCapability) error {
 	}
 	return nil
 }
+
+// InviteClockSkew is how far before the moment of minting an invite's validity
+// starts. A joiner checks validity against its own clock, and so does every
+// node projecting the join record the joiner stamps. An invite dated exactly at
+// minting is therefore "not yet valid" on any machine whose clock is even a
+// moment behind the issuer's, which is the normal case when a service mints and
+// hands it over at once. The expiry still counts from the real minting time.
+const InviteClockSkew = 5 * time.Minute
+
+// InviteIssuedAtMS is the IssuedAtMS to sign into an invite minted at now.
+func InviteIssuedAtMS(now time.Time) int64 { return now.Add(-InviteClockSkew).UnixMilli() }
 
 // InviteValidAt reports whether the invite's validity window contains the
 // given time in unix milliseconds. An invite with no expiry never ages out;
