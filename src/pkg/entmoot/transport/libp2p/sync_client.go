@@ -102,13 +102,20 @@ type KeeperProgress struct {
 	// UnknownHeads counts historical messages skipped because their roster
 	// checkpoint is not on this node's chain yet. They are retried on a later
 	// pass, after roster synchronization, rather than failing the keeper.
-	UnknownHeads     int
-	ConvergedHint    bool
-	CoverageFloorMS  int64
-	TransferredBytes int
-	BudgetExhausted  bool
-	Continuation     *HistorySyncRequest
-	Err              error
+	UnknownHeads int
+	// UnauthorizedAuthors counts historical messages skipped because this
+	// node's membership history cannot show their author was a member at the
+	// roster position they cite. Honest nodes can disagree here, since a node
+	// that never held the records behind a checkpoint cannot place a member
+	// inside its window, so one such message does not fail the keeper; it is
+	// never stored, and the pass does not claim convergence.
+	UnauthorizedAuthors int
+	ConvergedHint       bool
+	CoverageFloorMS     int64
+	TransferredBytes    int
+	BudgetExhausted     bool
+	Continuation        *HistorySyncRequest
+	Err                 error
 }
 
 // HistorySyncState retains one bounded page per keeper across interrupted and
@@ -128,6 +135,10 @@ type keeperSyncState struct {
 	// their roster checkpoint is not on our chain. They are a real gap, so a
 	// pass that skipped any of them has not converged.
 	unknownHeads int
+	// unauthorized counts messages this pass skipped because their author
+	// could not be shown to be a member where they claim. They are not stored
+	// either, so a pass that skipped any has not converged.
+	unauthorized int
 	// batch shrinks when a keeper refuses a body page, so a peer running an
 	// older server that cannot truncate still makes progress.
 	batch int
@@ -142,14 +153,16 @@ const (
 )
 
 type SyncSummary struct {
-	Availability   KeeperAvailability
-	Eligible       int
-	Available      int
-	Inserted       int
-	MissingBodies  int
-	PrunedLocally  int
-	UnknownHeads   int
-	ConvergedHints int
+	Availability  KeeperAvailability
+	Eligible      int
+	Available     int
+	Inserted      int
+	MissingBodies int
+	PrunedLocally int
+	UnknownHeads  int
+	// UnauthorizedAuthors totals KeeperProgress.UnauthorizedAuthors.
+	UnauthorizedAuthors int
+	ConvergedHints      int
 }
 
 func SummarizeKeeperProgress(progress []KeeperProgress) SyncSummary {
@@ -162,6 +175,7 @@ func SummarizeKeeperProgress(progress []KeeperProgress) SyncSummary {
 		summary.MissingBodies += item.MissingBodies
 		summary.PrunedLocally += item.PrunedLocally
 		summary.UnknownHeads += item.UnknownHeads
+		summary.UnauthorizedAuthors += item.UnauthorizedAuthors
 		if item.ConvergedHint {
 			summary.ConvergedHints++
 		}
@@ -266,6 +280,7 @@ func syncFromKeeper(ctx context.Context, h host.Host, groupID entmoot.GroupID, k
 						cursor.request.AfterID = nil
 						cursor.missingBodies = 0
 						cursor.unknownHeads = 0
+						cursor.unauthorized = 0
 					}
 				}
 				return err
@@ -350,12 +365,24 @@ func syncFromKeeper(ctx context.Context, h host.Host, groupID entmoot.GroupID, k
 						// A head this node has not synchronized yet is a
 						// synchronization gap, not a bad message: skip it,
 						// report it, and let the next pass retry once roster
-						// sync has caught up. Anything else is still fatal for
-						// this keeper, because a keeper serving invalid
-						// history is not a keeper.
+						// sync has caught up.
 						if errors.Is(err, entmoot.ErrRosterHeadUnknown) {
 							progress.UnknownHeads++
 							cursor.unknownHeads++
+							continue
+						}
+						// An author this node cannot place in the group is
+						// judged against membership history that differs
+						// between honest nodes, so skip it rather than drop
+						// every other message this keeper serves. Nothing is
+						// accepted on weaker grounds: it is not stored. A bad
+						// signature, a malformed message or anything else is
+						// wrong everywhere, and still fails the keeper,
+						// because a keeper serving forged history is not a
+						// keeper.
+						if errors.Is(err, entmoot.ErrNotMember) && !errors.Is(err, entmoot.ErrSigInvalid) {
+							progress.UnauthorizedAuthors++
+							cursor.unauthorized++
 							continue
 						}
 						return fmt.Errorf("libp2p: invalid historical message: %w", err)
@@ -398,7 +425,7 @@ func syncFromKeeper(ctx context.Context, h host.Host, groupID entmoot.GroupID, k
 		}
 		cursor.page = nil
 		if !listed.HasMore {
-			progress.ConvergedHint = cursor.missingBodies == 0 && cursor.unknownHeads == 0
+			progress.ConvergedHint = cursor.missingBodies == 0 && cursor.unknownHeads == 0 && cursor.unauthorized == 0
 			return nil
 		}
 		cursor.request.SnapshotToken = listed.SnapshotToken

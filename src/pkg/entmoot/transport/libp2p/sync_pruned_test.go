@@ -1,10 +1,14 @@
 package libp2ptransport
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/libp2p/go-libp2p/core/peer"
 
@@ -301,5 +305,81 @@ func TestUnknownRosterHeadIsAGapNotConvergence(t *testing.T) {
 	}
 	if !retry.ConvergedHint {
 		t.Fatal("a complete pass did not report convergence")
+	}
+}
+
+// Whether a historical author was a member where it claims depends on the
+// membership history a node holds, which honest nodes need not share. So a
+// genuinely signed message this node cannot place is skipped, counted, never
+// stored, and the pass does not claim convergence. A forgery is wrong
+// everywhere: whatever author and head it claims, the keeper serving it fails.
+// Both run through the production validator.
+func TestUnauthorizedHistoricalAuthorIsSkippedNotFatal(t *testing.T) {
+	f := newSnapshotLifecycleFixture(t)
+	group := f.groups[0]
+	head := f.head(group)
+	validate := func(message entmoot.Message, proof *merkle.Proof) error {
+		return VerifyHistoricalMessageWithProof(f.membership[group], message, time.Now(), proof)
+	}
+	keepers := []peer.AddrInfo{f.remote}
+	stranger := mustIdentity(t)
+	serve := func(message entmoot.Message) {
+		t.Helper()
+		if _, err := f.store.Put(f.ctx, group, message); err != nil {
+			t.Fatal(err)
+		}
+	}
+	forge := func(message entmoot.Message) entmoot.Message {
+		message.Signature = bytes.Clone(message.Signature)
+		message.Signature[0] ^= 0xff
+		return message
+	}
+	openLocal := func() *store.SQLite {
+		t.Helper()
+		local, err := store.OpenSQLite(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = local.Close() })
+		return local
+	}
+
+	unplaceable := signAtHead(t, stranger, group, head, 10_005, "signed by a nonmember")
+	if err := validate(unplaceable, nil); !errors.Is(err, entmoot.ErrNotMember) {
+		t.Fatalf("genuine nonmember message: got %v, want ErrNotMember", err)
+	}
+	serve(unplaceable)
+	local := openLocal()
+	item := SyncFromKeepers(f.ctx, f.client, group, keepers, local, validate, new(HistorySyncState))[0]
+	if item.Err != nil {
+		t.Fatalf("a genuinely signed, unplaceable author failed the keeper: %v", item.Err)
+	}
+	if item.UnauthorizedAuthors != 1 || item.Inserted != len(f.ids[group]) {
+		t.Fatalf("unauthorized=%d inserted=%d of %d member messages", item.UnauthorizedAuthors, item.Inserted, len(f.ids[group]))
+	}
+	if item.ConvergedHint {
+		t.Fatal("a pass that skipped a message claimed convergence")
+	}
+	if summary := SummarizeKeeperProgress([]KeeperProgress{item}); summary.UnauthorizedAuthors != 1 {
+		t.Fatalf("summary unauthorized authors = %d, want 1", summary.UnauthorizedAuthors)
+	}
+	if present, err := local.Has(context.Background(), group, unplaceable.ID); err != nil || present {
+		t.Fatalf("an unauthorized message was stored: present=%t err=%v", present, err)
+	}
+
+	// A forgery naming a nonmember at a known head must not pass itself off
+	// as a membership gap, and neither may one naming a head nobody holds.
+	forgedUnknownHead := forge(signAtHead(t, stranger, group, entmoot.RosterEntryID{0xde, 0xad}, 10_006, "forged, fabricated head"))
+	if err := validate(forgedUnknownHead, nil); !errors.Is(err, entmoot.ErrSigInvalid) {
+		t.Fatalf("forged message at a fabricated head: got %v, want ErrSigInvalid", err)
+	}
+	forged := forge(signAtHead(t, stranger, group, head, 10_007, "forged by a nonmember"))
+	if err := validate(forged, nil); !errors.Is(err, entmoot.ErrSigInvalid) {
+		t.Fatalf("forged nonmember message: got %v, want ErrSigInvalid", err)
+	}
+	serve(forged)
+	failed := SyncFromKeepers(f.ctx, f.client, group, keepers, openLocal(), validate, new(HistorySyncState))[0]
+	if failed.Err == nil || !errors.Is(failed.Err, entmoot.ErrSigInvalid) || !strings.Contains(failed.Err.Error(), "invalid historical message") {
+		t.Fatalf("a keeper serving a forged nonmember message was not failed: %v", failed.Err)
 	}
 }
