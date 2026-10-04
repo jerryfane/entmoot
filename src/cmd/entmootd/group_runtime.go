@@ -423,7 +423,7 @@ func (r *groupRuntime) enforceGroupPolicy(ctx context.Context, groupID entmoot.G
 		return nil
 	}
 	if int64(len(message.Content)) > policy.MaxMessageBytes {
-		return fmt.Errorf("group policy: content is %d bytes, maximum is %d", len(message.Content), policy.MaxMessageBytes)
+		return fmt.Errorf("group policy: content is %d bytes, maximum is %d: %w", len(message.Content), policy.MaxMessageBytes, entmoot.ErrOversized)
 	}
 	limits, err := entpolicy.ContentLimits(*policy)
 	if err != nil {
@@ -784,6 +784,7 @@ retry:
 		slog.Int("pruned_locally", summary.PrunedLocally),
 		slog.Int("unknown_heads", summary.UnknownHeads),
 		slog.Int("unauthorized_authors", summary.UnauthorizedAuthors),
+		slog.Int("rate_limited", summary.RateLimited),
 		slog.Int("converged_hints", summary.ConvergedHints),
 		slog.String("last_error", lastErr))
 	// History insertion writes straight to the store, so it never passes

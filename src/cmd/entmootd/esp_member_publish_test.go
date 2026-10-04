@@ -3,12 +3,16 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 
 	"entmoot/pkg/entmoot"
@@ -16,6 +20,7 @@ import (
 	"entmoot/pkg/entmoot/ipc"
 	"entmoot/pkg/entmoot/keystore"
 	"entmoot/pkg/entmoot/membership"
+	entpolicy "entmoot/pkg/entmoot/policy"
 	"entmoot/pkg/entmoot/signing"
 	"entmoot/pkg/entmoot/store"
 	libp2ptransport "entmoot/pkg/entmoot/transport/libp2p"
@@ -129,6 +134,109 @@ func publishResultJSON(t *testing.T, result esphttp.PublishResult) map[string]an
 	return out
 }
 
+// espHistoryMoot is a founder running the ESP plus member C's own daemon,
+// which learns other members' ESP posts only through history catch-up.
+type espHistoryMoot struct {
+	node     *espPublishNode
+	cRuntime *groupRuntime
+	cSession *groupSession
+	cHost    host.Host
+}
+
+// startESPHistoryMoot enrolls memberC and every author in a new group and
+// starts both daemons. A non-nil policy is configured on both nodes before
+// they start. C is not connected to the founder until catchUp.
+func startESPHistoryMoot(t *testing.T, ctx context.Context, gid entmoot.GroupID, policy *entpolicy.Policy, memberC *keystore.Identity, authors ...*keystore.Identity) *espHistoryMoot {
+	t.Helper()
+	founder, _ := mustDaemonIdentity(t)
+	founderRoot := t.TempDir()
+	memberCRoot := t.TempDir()
+	mustCreateGroup(t, founderRoot, gid, founder, membership.DefaultPolicy())
+	group := mustOpenGroup(t, founderRoot, gid)
+	var joins []membership.Record
+	for _, member := range append([]*keystore.Identity{memberC}, authors...) {
+		joins = append(joins, mustJoinWithInvite(t, group, member, mustDaemonInvite(t, group, founder, mustDaemonNodeInfo(t, member), 1)))
+	}
+	checkpoint := group.Canonical()
+	mustCloseGroup(t, group)
+	cGroup, err := membership.Adopt(memberCRoot, checkpoint)
+	if err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	for _, join := range joins {
+		if _, err := cGroup.Apply(join); err != nil {
+			t.Fatalf("apply join on member C: %v", err)
+		}
+	}
+	mustCloseGroup(t, cGroup)
+	if policy != nil {
+		for _, root := range []string{founderRoot, memberCRoot} {
+			mustPutGroupPolicy(t, ctx, root, gid, *policy)
+		}
+	}
+
+	node := startESPPublishNode(t, ctx, founderRoot, gid, founder)
+	cRuntime, cSession, cHost := startTestRuntime(t, ctx, memberCRoot, memberC, gid)
+	t.Cleanup(func() { _ = cHost.Close() })
+	t.Cleanup(cRuntime.Close)
+	return &espHistoryMoot{node: node, cRuntime: cRuntime, cSession: cSession, cHost: cHost}
+}
+
+func mustPutGroupPolicy(t *testing.T, ctx context.Context, root string, gid entmoot.GroupID, policy entpolicy.Policy) {
+	t.Helper()
+	policies, err := entpolicy.OpenFileStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := policies.Put(ctx, gid, policy); err != nil {
+		t.Fatalf("put group policy: %v", err)
+	}
+}
+
+// catchUp runs one maintenance catch-up on C against the founder.
+func (m *espHistoryMoot) catchUp(t *testing.T, ctx context.Context) {
+	t.Helper()
+	founderHost := m.node.runtime.host
+	if m.cHost.Network().Connectedness(founderHost.ID()) != network.Connected {
+		if err := m.cHost.Connect(ctx, peer.AddrInfo{ID: founderHost.ID(), Addrs: founderHost.Addrs()}); err != nil {
+			t.Fatalf("connect C to founder: %v", err)
+		}
+	}
+	m.cRuntime.catchUp(ctx, m.cSession)
+}
+
+func (m *espHistoryMoot) cHas(t *testing.T, ctx context.Context, id entmoot.MessageID) bool {
+	t.Helper()
+	found, err := m.cRuntime.store.Has(ctx, m.node.gid, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return found
+}
+
+type espPublishOutput struct {
+	Status         string            `json:"status"`
+	Delivery       string            `json:"delivery"`
+	MessageID      entmoot.MessageID `json:"message_id"`
+	AuthorMemberID entmoot.MemberID  `json:"author_member_id"`
+}
+
+// espPublishCLI runs `entmootd esp publish` and decodes its output.
+func espPublishCLI(t *testing.T, flags *globalFlags, gid entmoot.GroupID, content string) espPublishOutput {
+	t.Helper()
+	code, stdout, stderr := captureCommandOutput(t, func() int {
+		return cmdESPPublish(flags, []string{"-group", gid.String(), "-topic", "general", "-content", content})
+	})
+	if code != exitOK {
+		t.Fatalf("esp publish %q exit = %d stdout=%s stderr=%s", content, code, stdout, stderr)
+	}
+	var out espPublishOutput
+	if err := json.Unmarshal([]byte(stdout), &out); err != nil {
+		t.Fatalf("decode publish output %q: %v", stdout, err)
+	}
+	return out
+}
+
 // A member that is not the ESP's daemon publishes through `entmootd esp
 // publish`. The daemon cannot gossip a message another member authored, so it
 // stores it, and a third member's daemon fetches it by history catch-up.
@@ -136,51 +244,14 @@ func TestESPMemberPublishReachesMembersThroughHistory(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	gid := daemonTestGroupID(0x5e)
-	founder, _ := mustDaemonIdentity(t)
 	memberB, memberBInfo := mustDaemonIdentity(t)
-	memberC, memberCInfo := mustDaemonIdentity(t)
-
-	founderRoot := t.TempDir()
-	memberCRoot := t.TempDir()
-	mustCreateGroup(t, founderRoot, gid, founder, membership.DefaultPolicy())
-	group := mustOpenGroup(t, founderRoot, gid)
-	joinB := mustJoinWithInvite(t, group, memberB, mustDaemonInvite(t, group, founder, memberBInfo, 1))
-	joinC := mustJoinWithInvite(t, group, memberC, mustDaemonInvite(t, group, founder, memberCInfo, 1))
-	checkpoint := group.Canonical()
-	mustCloseGroup(t, group)
-	cGroup, err := membership.Adopt(memberCRoot, checkpoint)
-	if err != nil {
-		t.Fatalf("Adopt: %v", err)
-	}
-	for _, join := range []membership.Record{joinB, joinC} {
-		if _, err := cGroup.Apply(join); err != nil {
-			t.Fatalf("apply join on member C: %v", err)
-		}
-	}
-	mustCloseGroup(t, cGroup)
-
-	node := startESPPublishNode(t, ctx, founderRoot, gid, founder)
-	cRuntime, cSession, cHost := startTestRuntime(t, ctx, memberCRoot, memberC, gid)
-	defer cHost.Close()
-	defer cRuntime.Close()
+	memberC, _ := mustDaemonIdentity(t)
+	moot := startESPHistoryMoot(t, ctx, gid, nil, memberC, memberB)
+	node := moot.node
 
 	// B has no daemon in this group at all: only its identity and the ESP.
 	flagsB := node.connectESPMember(t, memberB)
-	code, stdout, stderr := captureCommandOutput(t, func() int {
-		return cmdESPPublish(flagsB, []string{"-group", gid.String(), "-topic", "general", "-content", "posted from B's device"})
-	})
-	if code != exitOK {
-		t.Fatalf("esp publish exit = %d stdout=%s stderr=%s", code, stdout, stderr)
-	}
-	var published struct {
-		Status         string            `json:"status"`
-		Delivery       string            `json:"delivery"`
-		MessageID      entmoot.MessageID `json:"message_id"`
-		AuthorMemberID entmoot.MemberID  `json:"author_member_id"`
-	}
-	if err := json.Unmarshal([]byte(stdout), &published); err != nil {
-		t.Fatalf("decode publish output %q: %v", stdout, err)
-	}
+	published := espPublishCLI(t, flagsB, gid, "posted from B's device")
 	if published.Status != "accepted" || published.Delivery != string(libp2ptransport.DeliveryPendingHistory) {
 		t.Fatalf("publish = %+v, want accepted for history delivery", published)
 	}
@@ -192,7 +263,7 @@ func TestESPMemberPublishReachesMembersThroughHistory(t *testing.T) {
 	}
 
 	// The ESP's own history serves it back to B.
-	code, stdout, stderr = captureCommandOutput(t, func() int {
+	code, stdout, stderr := captureCommandOutput(t, func() int {
 		return cmdESPHistory(flagsB, []string{"-group", gid.String()})
 	})
 	if code != exitOK {
@@ -216,26 +287,15 @@ func TestESPMemberPublishReachesMembersThroughHistory(t *testing.T) {
 	}
 
 	// C catches up from the founder, the only keeper holding the message.
-	founderHost := node.runtime.host
-	if err := cHost.Connect(ctx, peer.AddrInfo{ID: founderHost.ID(), Addrs: founderHost.Addrs()}); err != nil {
-		t.Fatalf("connect C to founder: %v", err)
-	}
-	for {
-		cRuntime.catchUp(ctx, cSession)
-		found, err := cRuntime.store.Has(ctx, gid, published.MessageID)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if found {
-			break
-		}
+	for !moot.cHas(t, ctx, published.MessageID) {
+		moot.catchUp(t, ctx)
 		select {
 		case <-ctx.Done():
 			t.Fatal("member C never fetched B's message through history catch-up")
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
-	received, err := cRuntime.store.Get(ctx, gid, published.MessageID)
+	received, err := moot.cRuntime.store.Get(ctx, gid, published.MessageID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -244,6 +304,141 @@ func TestESPMemberPublishReachesMembersThroughHistory(t *testing.T) {
 	}
 	if err := signing.VerifyMessage(received, memberBInfo); err != nil {
 		t.Fatalf("C's copy does not verify under B's key: %v", err)
+	}
+}
+
+// The ESP admits a member's posts at the policy rate, so over a catch-up
+// interval it can hold more of them than one burst. C's catch-up spends the
+// same per-author budget, and must not let the excess stall the pass: other
+// members' later posts arrive in the same pass, and the excess on the next.
+func TestESPMemberBurstDoesNotHoldBackOthersHistory(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	gid := daemonTestGroupID(0x4e)
+	policy := entpolicy.Standard()
+	policy.MessageRatePerAuthor = "60/min"
+	policy.MessageBurstPerAuthor = 3
+	memberB, _ := mustDaemonIdentity(t)
+	memberC, _ := mustDaemonIdentity(t)
+	memberD, _ := mustDaemonIdentity(t)
+	moot := startESPHistoryMoot(t, ctx, gid, &policy, memberC, memberB, memberD)
+	flagsB := moot.node.connectESPMember(t, memberB)
+	flagsD := moot.node.connectESPMember(t, memberD)
+
+	// The ESP admits B's whole burst, then one more per refill.
+	var fromB []entmoot.MessageID
+	for i := range 5 {
+		if i >= policy.MessageBurstPerAuthor {
+			time.Sleep(1100 * time.Millisecond)
+		}
+		fromB = append(fromB, espPublishCLI(t, flagsB, gid, fmt.Sprintf("B %d", i)).MessageID)
+	}
+	fromD := espPublishCLI(t, flagsD, gid, "D after B's burst").MessageID
+
+	heldBackByB := true
+	for {
+		moot.catchUp(t, ctx)
+		received := 0
+		for _, id := range fromB {
+			if moot.cHas(t, ctx, id) {
+				received++
+			}
+		}
+		dReceived := moot.cHas(t, ctx, fromD)
+		if dReceived && received < len(fromB) {
+			heldBackByB = false
+		}
+		if dReceived && received == len(fromB) {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("C received %d of B's %d posts, D's: %t", received, len(fromB), dReceived)
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+	if heldBackByB {
+		t.Fatal("D's post reached C only after every post B made over the limit")
+	}
+}
+
+// Rejections the submitter caused come back as client errors, and a stored
+// message submitted again is acknowledged without spending its author's
+// rate budget.
+func TestESPSignedPublishReplaysAndClientErrors(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	gid := daemonTestGroupID(0x3e)
+	policy := entpolicy.Standard()
+	policy.MessageRatePerAuthor = "1/h"
+	policy.MessageBurstPerAuthor = 3
+	memberB, _ := mustDaemonIdentity(t)
+	memberC, _ := mustDaemonIdentity(t)
+	node := startESPHistoryMoot(t, ctx, gid, &policy, memberC, memberB).node
+	head := node.session.group.Canonical().ID
+	sign := func(head entmoot.RosterEntryID, content string, at time.Time) entmoot.Message {
+		t.Helper()
+		message, err := buildESPSignedMessage(ctx, memberB, gid, head, []string{"general"}, []byte(content), at)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return message
+	}
+
+	// B's device resubmits one message, as a phone does after a lost reply.
+	clientB, err := openESPClient(node.connectESPMember(t, memberB))
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := sign(head, "first", time.Now())
+	body, err := json.Marshal(map[string]entmoot.Message{"message": first})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for attempt, want := range []libp2ptransport.DeliveryState{
+		libp2ptransport.DeliveryPendingHistory,
+		libp2ptransport.DeliveryAlreadyStored,
+		libp2ptransport.DeliveryAlreadyStored,
+		libp2ptransport.DeliveryAlreadyStored,
+		libp2ptransport.DeliveryAlreadyStored,
+	} {
+		var out espPublishOutput
+		if err := clientB.do(ctx, http.MethodPost, espGroupPath(gid, "messages"), body, &out); err != nil {
+			t.Fatalf("submission %d: %v", attempt, err)
+		}
+		if out.Delivery != string(want) || out.MessageID != first.ID {
+			t.Fatalf("submission %d = %+v, want delivery %s", attempt, out, want)
+		}
+	}
+	// Resubmissions spent nothing: the rest of B's burst is still there.
+	for i := 1; i < policy.MessageBurstPerAuthor; i++ {
+		if _, err := node.publisher.PublishSigned(ctx, sign(head, fmt.Sprintf("fresh %d", i), time.Now())); err != nil {
+			t.Fatalf("fresh message %d after resubmissions: %v", i, err)
+		}
+	}
+
+	var unknownHead entmoot.RosterEntryID
+	unknownHead[0] = 0xee
+	refusals := []struct {
+		name    string
+		message entmoot.Message
+		status  int
+		code    string
+	}{
+		{"over the rate budget", sign(head, "one too many", time.Now()), http.StatusTooManyRequests, "rate_limited"},
+		{"dated past the clock skew", sign(head, "from the future", time.Now().Add(10*time.Minute)), http.StatusBadRequest, "bad_request"},
+		{"over the policy size", sign(head, strings.Repeat("x", int(policy.MaxMessageBytes)+1), time.Now()), http.StatusBadRequest, "bad_request"},
+		{"citing an unknown roster head", sign(unknownHead, "from a roster you lack", time.Now()), http.StatusConflict, "roster_head_unknown"},
+	}
+	for _, refusal := range refusals {
+		_, err := node.publisher.PublishSigned(ctx, refusal.message)
+		pubErr, ok := err.(*esphttp.PublishError)
+		if !ok || pubErr.HTTPStatus != refusal.status || pubErr.Code != refusal.code {
+			t.Fatalf("%s: error = %v (%#v), want %d %s", refusal.name, err, err, refusal.status, refusal.code)
+		}
+		if node.stored(t, ctx, refusal.message.ID) {
+			t.Fatalf("%s: the daemon stored a refused message", refusal.name)
+		}
 	}
 }
 

@@ -400,6 +400,14 @@ func publishHTTPError(frame *ipc.ErrorFrame) error {
 	case ipc.CodeGroupNotFound:
 		status = http.StatusNotFound
 		code = "group_not_found"
+	case ipc.CodeRateLimited:
+		status = http.StatusTooManyRequests
+		code = "rate_limited"
+	case ipc.CodeConflict:
+		// The only conflict signed publish reports is a roster head the
+		// daemon has not synchronized yet; it can succeed on retry.
+		status = http.StatusConflict
+		code = "roster_head_unknown"
 	case ipc.CodeInternal:
 		status = http.StatusInternalServerError
 	}

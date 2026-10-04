@@ -110,12 +110,20 @@ type KeeperProgress struct {
 	// inside its window, so one such message does not fail the keeper; it is
 	// never stored, and the pass does not claim convergence.
 	UnauthorizedAuthors int
-	ConvergedHint       bool
-	CoverageFloorMS     int64
-	TransferredBytes    int
-	BudgetExhausted     bool
-	Continuation        *HistorySyncRequest
-	Err                 error
+	// RateLimited counts historical messages skipped because their author is
+	// over this node's per-author policy budget. The validator spends the
+	// same budget live messages do, so a burst the keeper admitted over a
+	// minute can exceed it in one pass. That is the author's pace, not the
+	// keeper's fault: the message is not stored, the pass continues with the
+	// rest of the keeper's history, and a later pass fetches it once the
+	// budget refills.
+	RateLimited      int
+	ConvergedHint    bool
+	CoverageFloorMS  int64
+	TransferredBytes int
+	BudgetExhausted  bool
+	Continuation     *HistorySyncRequest
+	Err              error
 }
 
 // HistorySyncState retains one bounded page per keeper across interrupted and
@@ -139,6 +147,9 @@ type keeperSyncState struct {
 	// could not be shown to be a member where they claim. They are not stored
 	// either, so a pass that skipped any has not converged.
 	unauthorized int
+	// rateLimited counts messages this pass skipped while their author was
+	// over budget; they are still missing, so the pass has not converged.
+	rateLimited int
 	// batch shrinks when a keeper refuses a body page, so a peer running an
 	// older server that cannot truncate still makes progress.
 	batch int
@@ -162,7 +173,9 @@ type SyncSummary struct {
 	UnknownHeads  int
 	// UnauthorizedAuthors totals KeeperProgress.UnauthorizedAuthors.
 	UnauthorizedAuthors int
-	ConvergedHints      int
+	// RateLimited totals KeeperProgress.RateLimited.
+	RateLimited    int
+	ConvergedHints int
 }
 
 func SummarizeKeeperProgress(progress []KeeperProgress) SyncSummary {
@@ -176,6 +189,7 @@ func SummarizeKeeperProgress(progress []KeeperProgress) SyncSummary {
 		summary.PrunedLocally += item.PrunedLocally
 		summary.UnknownHeads += item.UnknownHeads
 		summary.UnauthorizedAuthors += item.UnauthorizedAuthors
+		summary.RateLimited += item.RateLimited
 		if item.ConvergedHint {
 			summary.ConvergedHints++
 		}
@@ -281,6 +295,7 @@ func syncFromKeeper(ctx context.Context, h host.Host, groupID entmoot.GroupID, k
 						cursor.missingBodies = 0
 						cursor.unknownHeads = 0
 						cursor.unauthorized = 0
+						cursor.rateLimited = 0
 					}
 				}
 				return err
@@ -385,6 +400,11 @@ func syncFromKeeper(ctx context.Context, h host.Host, groupID entmoot.GroupID, k
 							cursor.unauthorized++
 							continue
 						}
+						if errors.Is(err, entmoot.ErrRateLimited) {
+							progress.RateLimited++
+							cursor.rateLimited++
+							continue
+						}
 						return fmt.Errorf("libp2p: invalid historical message: %w", err)
 					}
 				}
@@ -425,7 +445,7 @@ func syncFromKeeper(ctx context.Context, h host.Host, groupID entmoot.GroupID, k
 		}
 		cursor.page = nil
 		if !listed.HasMore {
-			progress.ConvergedHint = cursor.missingBodies == 0 && cursor.unknownHeads == 0 && cursor.unauthorized == 0
+			progress.ConvergedHint = cursor.missingBodies == 0 && cursor.unknownHeads == 0 && cursor.unauthorized == 0 && cursor.rateLimited == 0
 			return nil
 		}
 		cursor.request.SnapshotToken = listed.SnapshotToken

@@ -1258,12 +1258,22 @@ func (s *ipcServer) publishLocalMessage(ctx context.Context, gid entmoot.GroupID
 	}, nil
 }
 
+// publishErrorCode separates what the submitter got wrong from failures of
+// this node, so the ESP can answer with a client status rather than a 500.
 func publishErrorCode(err error) ipc.ErrorCode {
 	switch {
 	case errors.Is(err, entmoot.ErrNotMember):
 		return ipc.CodeNotMember
-	case errors.Is(err, entmoot.ErrSigInvalid):
+	case errors.Is(err, entmoot.ErrSigInvalid),
+		errors.Is(err, libp2ptransport.ErrInvalidMessage),
+		errors.Is(err, entmoot.ErrOversized):
 		return ipc.CodeInvalidArgument
+	case errors.Is(err, entmoot.ErrRateLimited):
+		return ipc.CodeRateLimited
+	case errors.Is(err, entmoot.ErrRosterHeadUnknown):
+		// The message cites a roster this node has not synchronized: valid
+		// perhaps, but in conflict with local state until roster sync.
+		return ipc.CodeConflict
 	default:
 		return ipc.CodeInternal
 	}

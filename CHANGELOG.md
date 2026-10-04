@@ -32,9 +32,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   receiving member would (signature, current membership, membership at the
   cited roster head, group policy, size and clock limits), stores it without
   gossiping it, and the other members fetch it on their next history
-  catch-up, at most about a minute later. The response's new `delivery`
-  field says `pending_history` for these and `published` for messages the
-  daemon authored, which are still gossiped live.
+  catch-up, usually within about a minute. The response's new `delivery`
+  field says `pending_history` for these, `published` for messages the
+  daemon authored (still gossiped live), and `already_stored` when the
+  message was already held, as on a retry.
+- Resubmitting a stored message to the ESP no longer counts against its
+  author's rate limit, so retries or replays cannot use up a member's budget.
+- Signed publish rejections the submitter caused are client errors instead of
+  `500 internal_error`: a malformed message, a timestamp past the clock skew,
+  or content over the group's size limit give `400 bad_request`; an author
+  over the group's rate limit gives `429 rate_limited`; a roster head the
+  daemon has not synchronized gives `409 roster_head_unknown`, which can be
+  retried.
+- History catch-up no longer gives up on a keeper when one author's messages
+  exceed this node's per-author rate limit. Those messages are skipped and
+  fetched on a later pass, once the budget refills, and the rest of the
+  keeper's history, including other members' messages, still arrives in the
+  same pass.
 - New invites start being valid five minutes before they are minted, so a
   joiner whose clock is slightly behind the issuer's no longer gets "invite is
   not yet valid" when it redeems an invite and joins straight away. Expiry

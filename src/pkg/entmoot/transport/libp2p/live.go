@@ -327,7 +327,17 @@ func (g *LiveGroup) StoreForHistory(ctx context.Context, message entmoot.Message
 
 // authorizeAndStore applies group policy to a verified message, stores it,
 // and reports a first insertion to OnIngest the way a received message is.
+// A message already held is reported before policy runs, so resubmitting
+// one, whether a client retry or someone replaying it, never spends its
+// author's rate budget.
 func (g *LiveGroup) authorizeAndStore(ctx context.Context, message entmoot.Message) (bool, error) {
+	held, err := g.cfg.Store.Has(ctx, g.cfg.GroupID, message.ID)
+	if err != nil {
+		return false, err
+	}
+	if held {
+		return false, nil
+	}
 	if g.cfg.Authorize != nil {
 		if err := g.cfg.Authorize(message); err != nil {
 			return false, err
