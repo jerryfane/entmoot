@@ -327,6 +327,11 @@ func TestTCPControlStalledClientsCannotExhaustAuthentication(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	assertStalledClientsEvictedOldestFirst(t, l, path)
+}
+
+func assertStalledClientsEvictedOldestFirst(t *testing.T, l *Listener, path string) {
+	t.Helper()
 	// As in cmd/entmootd, stalled authentication lasts the full authenticationTimeout.
 	dispatch := serveControlFixtureWithDeadline(t, l, 10*time.Second)
 	endpoint, err := readEndpoint(path)
