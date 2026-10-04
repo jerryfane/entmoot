@@ -375,60 +375,92 @@ func FetchMembership(ctx context.Context, h host.Host, remote peer.AddrInfo, gro
 	return checkpoints, records, false, firstErr
 }
 
-// joinConnectRetryInterval paces repeat connection attempts during a join. It
-// equals libp2p's first per-address dial backoff (swarm.BackoffBase), so the
-// next attempt is normally a fresh dial rather than an instant "dial backoff".
-const joinConnectRetryInterval = 5 * time.Second
+// joinRoundInterval paces repeat rounds over the join candidates that timed
+// out. It equals libp2p's first per-address dial backoff (swarm.BackoffBase),
+// so the next round normally dials afresh rather than meeting "dial backoff".
+const joinRoundInterval = 5 * time.Second
 
-// connectForJoin opens the connection a join needs within the caller's
-// deadline. libp2p bounds every address attempt - for WSS that is proxy
-// CONNECT, TLS, HTTP upgrade, security handshake and muxer together - by its
-// own 15s dial timeout, whatever ctx allows. One stalled attempt would then
-// fail a join that was given 90s, while serve recovers from the same stall on
-// its next membership round. Only attempts that timed out (and the backoff
-// they leave behind) are tried again: a refused proxy, an untrusted
-// certificate or the wrong peer identity still fails at once, and a context
-// without a deadline gets exactly one attempt. Admission is not retried here;
-// this only establishes the authenticated connection the join then uses.
-func connectForJoin(ctx context.Context, h host.Host, remote peer.AddrInfo) error {
-	var first error
-	for attempt := 1; ; attempt++ {
-		err := h.Connect(ctx, remote)
-		if err == nil {
-			return nil
-		}
-		if first == nil {
-			first = err
+// JoinGroupVia joins through the first candidate that admits this node. Every
+// candidate gets one attempt, in order, before any is tried again, so a stalled
+// address costs one libp2p dial (15s, whatever ctx allows) and never the
+// budget the later addresses need. While ctx has a deadline left, candidates
+// whose connection timed out - at any phase: proxy CONNECT, TLS, WebSocket
+// upgrade, security handshake or muxer - or met the backoff such a failure
+// leaves, get further rounds. serve recovers from such a stall on its next
+// membership round; a join would otherwise fail its whole -timeout on one
+// stalled connection. Only the connection is retried: a candidate that
+// refused, presented the wrong identity, failed validation or answered the
+// join is not asked again, and a context without a deadline gets one round.
+// It returns the candidate that admitted the join.
+func JoinGroupVia(ctx context.Context, h host.Host, candidates []peer.AddrInfo, root string, identity *keystore.Identity, capability entmoot.BootstrapCapability, applicant entmoot.NodeInfo) (*membership.Group, peer.AddrInfo, error) {
+	if len(candidates) == 0 {
+		return nil, peer.AddrInfo{}, errors.New("libp2p: no join candidates")
+	}
+	pending := candidates
+	var first, last error
+	for round := 1; ; round++ {
+		var stalled []peer.AddrInfo
+		for _, remote := range pending {
+			group, err := JoinGroup(ctx, h, remote, root, identity, capability, applicant)
+			if err == nil {
+				return group, remote, nil
+			}
+			if first == nil {
+				first = err
+			}
+			last = err
+			if joinConnectTimedOut(err) {
+				stalled = append(stalled, remote)
+			}
 		}
 		_, bounded := ctx.Deadline()
-		if !bounded || ctx.Err() != nil || !retryableJoinDialError(err) {
-			return joinConnectError(remote.ID, attempt, first, err)
+		if len(stalled) == 0 || !bounded || ctx.Err() != nil {
+			return nil, peer.AddrInfo{}, joinRoundsError(round, first, last)
 		}
-		timer := time.NewTimer(joinConnectRetryInterval)
+		timer := time.NewTimer(joinRoundInterval)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return joinConnectError(remote.ID, attempt, first, err)
+			return nil, peer.AddrInfo{}, joinRoundsError(round, first, last)
 		case <-timer.C:
 		}
+		pending = stalled
 	}
 }
 
-// retryableJoinDialError reports a dial that ran out of time, at any phase,
-// or was refused only because an earlier one did.
-func retryableJoinDialError(err error) bool {
+// joinConnectError marks a join that never got a connection, so nothing was
+// sent and trying the same candidate again is safe.
+type joinConnectError struct {
+	remote peer.ID
+	err    error
+}
+
+func (e *joinConnectError) Error() string {
+	return fmt.Sprintf("libp2p: connect %s: %v", e.remote, e.err)
+}
+
+func (e *joinConnectError) Unwrap() error { return e.err }
+
+// joinConnectTimedOut reports a join connection that ran out of time, or was
+// refused only because an earlier one did.
+func joinConnectTimedOut(err error) bool {
+	var connectErr *joinConnectError
+	if !errors.As(err, &connectErr) {
+		return false
+	}
 	return errors.Is(err, context.DeadlineExceeded) ||
 		errors.Is(err, os.ErrDeadlineExceeded) ||
 		errors.Is(err, swarm.ErrDialBackoff)
 }
 
-// joinConnectError keeps the first failure: later ones are often just the
-// backoff it caused.
-func joinConnectError(remote peer.ID, attempts int, first, last error) error {
-	if attempts == 1 {
-		return fmt.Errorf("libp2p: connect %s: %w", remote, last)
+// joinRoundsError returns a single round's last error unchanged, as a join
+// always did, and otherwise keeps the first failure too: later ones are often
+// just the backoff it caused.
+func joinRoundsError(rounds int, first, last error) error {
+	if rounds == 1 {
+		return last
 	}
-	return fmt.Errorf("libp2p: connect %s: %d attempts failed; first: %w; last: %w", remote, attempts, first, last)
+	return fmt.Errorf("libp2p: join failed after %d rounds; first: %w; last: %w", rounds, first, last)
 }
 
 // JoinGroup is how a non-member gets in. It reads the group's checkpoint with
@@ -443,8 +475,8 @@ func JoinGroup(ctx context.Context, h host.Host, remote peer.AddrInfo, root stri
 		Capability: &capability,
 		Limit:      maxMembershipRecords,
 	}
-	if err := connectForJoin(ctx, h, remote); err != nil {
-		return nil, err
+	if err := h.Connect(ctx, remote); err != nil {
+		return nil, &joinConnectError{remote: remote.ID, err: err}
 	}
 	response, err := RequestMembership(ctx, h, remote, request)
 	if err != nil {

@@ -297,7 +297,7 @@ func runWSSProxyClient(t *testing.T, fixture string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	group, err := JoinGroup(ctx, h, peer.AddrInfo{ID: remote, Addrs: []ma.Multiaddr{address}}, dir, identity, f.Invite, mustNode(t, identity))
+	group, _, err := JoinGroupVia(ctx, h, []peer.AddrInfo{{ID: remote, Addrs: []ma.Multiaddr{address}}}, dir, identity, f.Invite, mustNode(t, identity))
 	if !wssProxyJoinSucceeds(f.Mode) {
 		if err == nil {
 			group.Close()

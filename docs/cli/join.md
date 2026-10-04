@@ -62,10 +62,11 @@ entmootd join -timeout 2m <invite>
 ```
 
 `-timeout` (default 90s) bounds each invite. libp2p gives up on a single
-connection attempt after 15s; when an attempt times out, for example a WSS
-connection stalled behind an HTTPS proxy, `join` opens a fresh one every 5s
+connection attempt after 15s. `join` tries every address in the invite once,
+in order; if a connection timed out, for example a WSS connection stalled
+behind an HTTPS proxy, it dials the addresses that timed out again every 5s
 until `-timeout` runs out. A refused proxy, an untrusted certificate or the
-wrong peer identity fails at once.
+wrong peer identity is not retried.
 
 On success, `join` emits a readiness event before exiting. The event includes
 `health` and a `next_command` the daemon builds for a follow-up check. That

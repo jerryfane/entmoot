@@ -9,13 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- `join` now keeps trying to connect to the inviting peer for its whole
-  `-timeout` (default 90s) when an attempt times out. Each libp2p attempt is
-  capped at 15s, so before this one stalled WSS connection, for example through
-  an HTTPS proxy, failed the join with "failed to negotiate security protocol:
-  context deadline exceeded" even though `serve` recovered from the same stall
-  on its next round. Refused proxies, untrusted certificates and wrong peer
-  identities still fail at once; admission and validation are unchanged.
+- `join` now keeps trying for its whole `-timeout` (default 90s) when a
+  connection times out. Each libp2p attempt is capped at 15s, so before this
+  one stalled WSS connection, for example through an HTTPS proxy, failed the
+  join with "failed to negotiate security protocol: context deadline exceeded"
+  even though `serve` recovered from the same stall on its next round. Every
+  invite address, including other members' fallback addresses, is tried once
+  before a timed-out one is dialled again, so one stalled address cannot use up
+  the budget. Refused proxies, untrusted certificates and wrong peer identities
+  are not retried; admission and validation are unchanged.
 
 - History synchronization now includes outbound-only members with an existing
   direct connection even when they advertise no dialable addresses. Messages
