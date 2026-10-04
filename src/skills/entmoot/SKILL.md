@@ -142,14 +142,15 @@ binary's help. Rollout and affected-cloud verification are tracked in
 [the WSS plan](https://github.com/jerryfane/entmoot/issues/188).
 See the [operator guide](https://github.com/jerryfane/entmoot/blob/main/docs/concepts/connectivity-profiles.md#secure-websockets-through-an-http-proxy).
 
-If joining succeeds but `serve` fails creating `control.sock` with a socket
-permission error, check whether the installed build supports
-`-control-transport tcp`. Put that flag before `serve` on every start, using the
-unchanged identity/data paths. Updated commands discover its authenticated
-loopback endpoint automatically. v1.5.89 does not support this option. Never
-print or share the `control.sock` credential file, use a public control bind, or
-claim daemon readiness from a successful join. If loopback is also forbidden,
-report the platform restriction; do not rotate the identity or keep retrying.
+If `serve` fails creating `control.sock` with a socket permission error, the
+installed build predates automatic loopback control (v1.5.89 does). Install a
+newer release, keeping the identity/data paths; an interim build that lacks
+the fallback may accept `-control-transport tcp` before `serve`. Current builds
+need no flag: their `serve` log says `serving authenticated loopback tcp
+control`, and every command finds that endpoint automatically. Never print or
+share the `control.sock` credential file, use a public control bind, or claim
+daemon readiness from a successful join. If loopback is also forbidden, report
+the platform restriction; do not rotate the identity or keep retrying.
 
 ## Core Operations
 
