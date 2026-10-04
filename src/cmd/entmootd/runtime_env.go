@@ -42,6 +42,7 @@ type runtimeReport struct {
 	AgentWrapper           string               `json:"agent_wrapper,omitempty"`
 	RunningDaemon          *runtimeDaemonReport `json:"running_daemon,omitempty"`
 	NamespaceWarning       string               `json:"namespace_warning,omitempty"`
+	StorageWarning         string               `json:"storage_warning,omitempty"`
 	Suggestions            []string             `json:"suggestions,omitempty"`
 	Recommended            map[string]string    `json:"recommended,omitempty"`
 	Platform               map[string]string    `json:"platform,omitempty"`
@@ -144,6 +145,7 @@ func collectRuntimeReport(gf *globalFlags, dataDir string) runtimeReport {
 			"goos":   runtime.GOOS,
 			"goarch": runtime.GOARCH,
 		},
+		StorageWarning: dataStorageWarning(dataDir),
 	}
 	if fileExists(agentEntmootWrapper) {
 		report.AgentWrapper = agentEntmootWrapper
@@ -199,6 +201,9 @@ func printRuntimeReport(report runtimeReport) {
 	}
 	if report.NamespaceWarning != "" {
 		fmt.Printf("warning: %s\n", report.NamespaceWarning)
+	}
+	if report.StorageWarning != "" {
+		fmt.Printf("warning: %s\n", report.StorageWarning)
 	}
 	for _, suggestion := range report.Suggestions {
 		fmt.Printf("suggestion: %s\n", suggestion)

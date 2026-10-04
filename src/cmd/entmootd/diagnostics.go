@@ -283,6 +283,9 @@ func printDoctorHuman(report *doctorReport) {
 	if report.Runtime != nil && report.Runtime.NamespaceWarning != "" {
 		fmt.Printf("runtime: warning %s\n", report.Runtime.NamespaceWarning)
 	}
+	if report.Runtime != nil && report.Runtime.StorageWarning != "" {
+		fmt.Printf("runtime: warning %s\n", report.Runtime.StorageWarning)
+	}
 	if report.Entmoot.Running {
 		fmt.Printf("running member=%s peer=%s data=%s\n", report.Entmoot.MemberID.String(), report.Entmoot.PeerID, report.Entmoot.DataDir)
 	} else {

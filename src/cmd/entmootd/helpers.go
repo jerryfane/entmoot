@@ -97,6 +97,9 @@ func setup(gf *globalFlags) (*setupResult, error) {
 	slog.Info("entmootd: using runtime paths",
 		slog.String("data", dataDir),
 		slog.String("identity", identityPath))
+	if warning := dataStorageWarning(dataDir); warning != "" {
+		slog.Warn("entmootd: data directory is not durable", slog.String("detail", warning))
+	}
 	return &setupResult{identity: id, dataDir: dataDir}, nil
 }
 
