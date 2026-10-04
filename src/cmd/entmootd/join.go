@@ -375,6 +375,10 @@ func runGroupDaemon(gf *globalFlags, opts groupDaemonOptions) int {
 			return exitTransport
 		}
 		defer listener.Close()
+		if denied := listener.UnixDenied(); denied != nil {
+			slog.Info(opts.command+": unix control socket forbidden; serving authenticated loopback tcp control",
+				slog.String("endpoint_file", sockPath), slog.String("unix_err", denied.Error()))
+		}
 	}
 	rootCtx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
