@@ -318,8 +318,10 @@ Public open-invite issuer endpoints:
 - `POST /v1/open-invites/{token}/redeem` accepts the redeemer's MemberID,
   libp2p PeerID and Entmoot public key, checks that all three derive from that
   key, and returns a signed invite made out to it. Nothing is signed by the
-  redeemer: the invite is only usable by the holder of that key. Replays for
-  the same redeemer return the stored result.
+  redeemer: the invite is only usable by the holder of that key. A replay by
+  the same redeemer is signed again from the issuer's current addresses and
+  roster without using up another use; revoked or expired invites still refuse
+  it.
 
 Create a message draft sign request:
 

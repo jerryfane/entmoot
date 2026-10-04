@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Redeeming an ESP open invite again with the same identity now returns a
+  freshly signed capability built from the daemon's current addresses, relays
+  and roster head, instead of replaying the one stored at the first
+  redemption. Identities that redeemed a link before the node announced its
+  WSS address kept receiving a TCP-only capability (one that had also expired
+  a day after it was issued), so restricted clouds could never join with it.
+  The repeat redemption still does not count as a use, keeps the identity
+  binding, and is still refused once the invite is revoked or expired; a
+  different identity is still refused when the invite is exhausted. The
+  stored result is replaced with the new capability.
+
 - `join` now keeps trying for its whole `-timeout` (default 90s) when a
   connection times out. Each libp2p attempt is capped at 15s, so before this
   one stalled WSS connection, for example through an HTTPS proxy, failed the

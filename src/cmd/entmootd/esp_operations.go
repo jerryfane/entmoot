@@ -216,17 +216,21 @@ func (e espOperationExecutor) RedeemOpenInvite(ctx context.Context, token string
 	if rec.ExpiresAtMS > 0 && rec.ExpiresAtMS <= now {
 		return nil, openInviteStoreError(esphttp.ErrOpenInviteExpired)
 	}
-	existing, ok, err := e.stateStore.GetOpenInviteRedemption(ctx, tokenHash, redeemerKey)
+	_, redeemed, err := e.stateStore.GetOpenInviteRedemption(ctx, tokenHash, redeemerKey)
 	if err != nil {
 		return nil, err
 	}
-	if ok && len(existing.Result) > 0 {
-		return append(json.RawMessage(nil), existing.Result...), nil
-	}
-	if !ok && esphttp.OpenInviteUseLimitReached(rec) {
+	if !redeemed && esphttp.OpenInviteUseLimitReached(rec) {
 		return nil, openInviteStoreError(esphttp.ErrOpenInviteExhausted)
 	}
-	rec, redemption, alreadyRedeemed, err := e.stateStore.RedeemOpenInvite(ctx, tokenHash, esphttp.OpenInviteRedemption{
+	// A redeemer that already holds a use is minted a new capability rather
+	// than handed the bytes stored at its first redemption. Those bytes froze
+	// the daemon's addresses, relays and roster head as they were then, and the
+	// capability's own expiry (a day by default), so a link redeemed before the
+	// node announced its WebSocket address kept replaying a TCP-only grant,
+	// soon expired, to the one identity entitled to it. The store does not
+	// count a repeat use, so minting again costs the invite nothing.
+	rec, _, alreadyRedeemed, err := e.stateStore.RedeemOpenInvite(ctx, tokenHash, esphttp.OpenInviteRedemption{
 		RedeemerKey:   redeemerKey,
 		MemberID:      binding.MemberID,
 		PeerID:        binding.PeerID.String(),
@@ -234,9 +238,6 @@ func (e espOperationExecutor) RedeemOpenInvite(ctx context.Context, token string
 	}, now)
 	if err != nil {
 		return nil, openInviteStoreError(err)
-	}
-	if alreadyRedeemed && len(redemption.Result) > 0 {
-		return append(json.RawMessage(nil), redemption.Result...), nil
 	}
 	resp, err := e.createInviteOverIPC(ctx, &ipc.InviteCreateReq{
 		GroupID:             rec.GroupID,

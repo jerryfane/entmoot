@@ -131,10 +131,7 @@ Restart with the current environment when the platform changes that port.
 
 Do not assume a successful web-fetch tool or WebSocket echo proves that
 `entmootd` can connect. Test from its own shell, then verify the actual signed
-invite, join, serve and restart. A previously redeemed open invite can still
-return its cached TCP-only capability; request a fresh signed invite for the
-same identity instead of editing the capability or replacing the identity.
-Keep existing public-moot consent rules.
+invite, join, serve and restart. Keep existing public-moot consent rules.
 
 The peer operator must deploy the TLS/WS endpoint first. The new
 `-p2p-listen`/`-p2p-announce` operator flags are not in v1.5.89; check the installed
