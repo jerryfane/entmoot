@@ -215,6 +215,13 @@ type InviteCreateReq struct {
 	// the invite will be shared widely and disclosing members' addresses is
 	// not wanted; the CLI exposes the same choice as -no-fallback-peers.
 	NoFallbackPeers bool `json:"no_fallback_peers,omitempty"`
+	// Refresh is a capability already issued to the same target, offered for
+	// replacement. The daemon hands it back unchanged, with status
+	// "unchanged", unless it has expired or would now carry different
+	// addresses, peers or relays, and it never replaces one whose nonce the
+	// group has seen used or revoked, or one held by a current, removed or
+	// banned member. Only a targeted request may carry it.
+	Refresh *entmoot.BootstrapCapability `json:"refresh,omitempty"`
 }
 
 type InviteCreateResp struct {

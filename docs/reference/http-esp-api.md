@@ -319,9 +319,12 @@ Public open-invite issuer endpoints:
   libp2p PeerID and Entmoot public key, checks that all three derive from that
   key, and returns a signed invite made out to it. Nothing is signed by the
   redeemer: the invite is only usable by the holder of that key. A replay by
-  the same redeemer is signed again from the issuer's current addresses and
-  roster without using up another use; revoked or expired invites still refuse
-  it.
+  the same redeemer returns the stored result, and does not use up another
+  use. The exception is a stored invite that has expired or names different
+  addresses, peers or relays than the issuer would issue now, and that never
+  got anyone in (its nonce unused and unrevoked, its holder never a member,
+  removed or banned): that one is replaced once and the replacement stored.
+  Revoked or expired open invites refuse replays.
 
 Create a message draft sign request:
 

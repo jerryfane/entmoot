@@ -3,52 +3,98 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
 	"encoding/json"
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"slices"
-	"sync"
+	"strings"
 	"testing"
 	"time"
 
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/esphttp"
-	"entmoot/pkg/entmoot/ipc"
 	"entmoot/pkg/entmoot/keystore"
 	"entmoot/pkg/entmoot/mailbox/mailboxtest"
 	"entmoot/pkg/entmoot/membership"
+	"entmoot/pkg/entmoot/store"
 	"entmoot/pkg/entmoot/store/storetest"
 	libp2ptransport "entmoot/pkg/entmoot/transport/libp2p"
+
+	"github.com/libp2p/go-libp2p"
+	"github.com/multiformats/go-multiaddr"
 )
 
-// TestOpenInviteRepeatRedemptionMintsFromCurrentAddresses covers an identity
-// that redeemed an open invite before the node announced its WSS address. The
-// ESP used to replay the capability stored at the first redemption, so that
-// identity was handed a TCP-only grant forever and a restricted cloud could
-// never join with it. A repeat redemption must be minted again from what the
-// daemon announces now, without spending another use, and the invite's
-// revocation, expiry and use limit must still hold.
-func TestOpenInviteRepeatRedemptionMintsFromCurrentAddresses(t *testing.T) {
-	ctx := context.Background()
+// TestOpenInviteReplayReplacesOnlyAStaleUnusedCapability drives repeat
+// redemptions of ESP open invites through the HTTP handler, the executor and
+// the real daemon mint. Replaying the stored result forever left an identity
+// that redeemed before the node announced its WebSocket address holding a
+// TCP-only grant no restricted cloud could use. Minting on every replay fixed
+// that but let anyone holding a token and a public key sign without bound, and
+// let a removed member mint its way back in through an exhausted link. A
+// replay may be minted again only once per change, and only for a capability
+// that never got anyone in.
+func TestOpenInviteReplayReplacesOnlyAStaleUnusedCapability(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	root := t.TempDir()
 	founder, founderInfo := mustDaemonIdentity(t)
-	gid := testESPGroupID(31)
+	gid := testESPGroupID(32)
 	mustCreateGroup(t, root, gid, founder, membership.DefaultPolicy())
-	group := mustOpenGroup(t, root, gid)
-	daemon := &mintingInviteDaemon{
-		identity:   founder,
-		founder:    group.Founder(),
-		rosterHead: group.Canonical().ID,
+
+	host, hostBinding, err := libp2ptransport.NewHost(ctx, founder, libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"))
+	if err != nil {
+		t.Fatalf("NewHost: %v", err)
 	}
-	mustCloseGroup(t, group)
-	tcp := "/ip4/203.0.113.10/tcp/1004/p2p/" + founderInfo.PeerID
-	wss := "/dns4/moot.example/tcp/443/tls/sni/moot.example/ws/p2p/" + founderInfo.PeerID
-	daemon.announce(tcp)
+	defer host.Close()
+	messages, err := store.OpenSQLite(root)
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	defer messages.Close()
+	runtime, err := newGroupRuntime(groupRuntimeConfig{
+		Identity: founder, DataDir: root, Store: messages, Notify: newNotifyingStore(messages, nil),
+		Host: host, Binding: hostBinding, Mode: libp2ptransport.DirectConnectivity,
+	})
+	if err != nil {
+		t.Fatalf("newGroupRuntime: %v", err)
+	}
+	defer runtime.Close()
+	if _, _, err := runtime.AddLocalGroup(ctx, gid); err != nil {
+		t.Fatalf("AddLocalGroup: %v", err)
+	}
+	session, ok := runtime.Get(gid)
+	if !ok {
+		t.Fatal("group session missing")
+	}
+	founderBinding, err := libp2ptransport.BindingFromPublicKey(founderInfo.EntmootPubKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &ipcServer{
+		memberID: founderBinding.MemberID, peerID: founderBinding.PeerID.String(),
+		identity: founder, dataDir: root, runtime: runtime,
+	}
 	sock := testUnixSocketPath(t)
-	stop := daemon.serve(t, sock)
-	defer stop()
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatalf("listen unix: %v", err)
+	}
+	served := make(chan struct{})
+	go func() {
+		defer close(served)
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			server.handleConn(ctx, conn)
+			_ = conn.Close()
+		}
+	}()
+	defer func() {
+		_ = ln.Close()
+		<-served
+	}()
 
 	state, err := esphttp.OpenSQLiteStateStore(t.TempDir())
 	if err != nil {
@@ -93,7 +139,7 @@ func TestOpenInviteRepeatRedemptionMintsFromCurrentAddresses(t *testing.T) {
 		UseCount   int                         `json:"use_count"`
 		Capability entmoot.BootstrapCapability `json:"capability"`
 	}
-	redeemed := func(response *httptest.ResponseRecorder) redemption {
+	redeemed := func(response *httptest.ResponseRecorder) (redemption, []byte) {
 		t.Helper()
 		if response.Code != http.StatusOK {
 			t.Fatalf("redeem: %d %s", response.Code, response.Body.String())
@@ -102,7 +148,7 @@ func TestOpenInviteRepeatRedemptionMintsFromCurrentAddresses(t *testing.T) {
 		if err := json.Unmarshal(response.Body.Bytes(), &got); err != nil {
 			t.Fatalf("redeem response: %v", err)
 		}
-		return got
+		return got, response.Body.Bytes()
 	}
 	refused := func(response *httptest.ResponseRecorder, code string) {
 		t.Helper()
@@ -123,144 +169,153 @@ func TestOpenInviteRepeatRedemptionMintsFromCurrentAddresses(t *testing.T) {
 		}
 		return rec.UseCount
 	}
+	ledgerRows := func() int {
+		t.Helper()
+		records, err := runtime.invites.ListInvites(&gid)
+		if err != nil {
+			t.Fatalf("ListInvites: %v", err)
+		}
+		return len(records)
+	}
+	hasWebSocket := func(capability entmoot.BootstrapCapability) bool {
+		for _, address := range capability.AllowedMultiaddrs {
+			if strings.Contains(address, "/ws/") {
+				return true
+			}
+		}
+		return false
+	}
+	generate := func() *keystore.Identity {
+		t.Helper()
+		identity, err := keystore.Generate()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return identity
+	}
 
-	joiner, err := keystore.Generate()
-	if err != nil {
-		t.Fatal(err)
-	}
-	joinerBinding, err := libp2ptransport.BindingFromPublicKey(joiner.PublicKey)
-	if err != nil {
-		t.Fatal(err)
-	}
+	// Two identities redeem while the node listens on TCP only: one never
+	// joins, the other joins with its capability and is then removed.
+	stuck, removed := generate(), generate()
 	link := createInvite("link", time.Now().Add(time.Hour))
-	first := redeemed(redeem("link", joiner))
-	if slices.Contains(first.Capability.AllowedMultiaddrs, wss) {
-		t.Fatalf("first capability already carries the WSS address: %v", first.Capability.AllowedMultiaddrs)
+	used := createInvite("used", time.Now().Add(time.Hour))
+	first, firstBody := redeemed(redeem("link", stuck))
+	if hasWebSocket(first.Capability) {
+		t.Fatalf("first capability already carries a WebSocket address: %v", first.Capability.AllowedMultiaddrs)
+	}
+	removedGrant, removedBody := redeemed(redeem("used", removed))
+	mustJoinWithInvite(t, session.group, removed, removedGrant.Capability)
+	if err := applyRosterRemove(founder, session.group, mustDaemonNodeInfo(t, removed)); err != nil {
+		t.Fatalf("remove member: %v", err)
+	}
+	rows := ledgerRows()
+
+	// Nothing changed: the stored bytes come back and nothing is minted.
+	if _, body := redeemed(redeem("link", stuck)); !bytes.Equal(body, firstBody) {
+		t.Fatalf("an unchanged replay returned different bytes:\n%s\nwant\n%s", body, firstBody)
+	}
+	if got := ledgerRows(); got != rows {
+		t.Fatalf("an unchanged replay minted: ledger rows %d, want %d", got, rows)
 	}
 
-	daemon.announce(tcp, wss)
-	again := redeemed(redeem("link", joiner))
-	if !slices.Contains(again.Capability.AllowedMultiaddrs, wss) {
-		t.Fatalf("repeat redemption replayed the old addresses %v, want the announced WSS address", again.Capability.AllowedMultiaddrs)
+	if err := host.Network().Listen(multiaddr.StringCast("/ip4/127.0.0.1/tcp/0/ws")); err != nil {
+		t.Fatalf("listen on WebSocket: %v", err)
 	}
-	if err := libp2ptransport.VerifyBootstrapCapability(again.Capability, joinerBinding.PeerID, time.Now()); err != nil {
-		t.Fatalf("repeat capability does not verify for its redeemer: %v", err)
+
+	// The stuck identity gets one replacement carrying the new address.
+	again, againBody := redeemed(redeem("link", stuck))
+	if !hasWebSocket(again.Capability) || again.Capability.Nonce == first.Capability.Nonce {
+		t.Fatalf("stale replay was not replaced: %v", again.Capability.AllowedMultiaddrs)
 	}
-	if again.Capability.TargetMemberID != joinerBinding.MemberID || !bytes.Equal(again.Capability.TargetPublicKey, joiner.PublicKey) {
-		t.Fatal("repeat capability is not bound to the redeeming identity")
+	stuckBinding, err := libp2ptransport.BindingFromPublicKey(stuck.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := libp2ptransport.VerifyBootstrapCapability(again.Capability, stuckBinding.PeerID, time.Now()); err != nil {
+		t.Fatalf("replacement does not verify for its redeemer: %v", err)
+	}
+	if err := session.group.CheckInvite(again.Capability, time.Now().UnixMilli()); err != nil {
+		t.Fatalf("group refuses the replacement: %v", err)
 	}
 	if again.UseCount != 1 || useCount(link) != 1 {
-		t.Fatalf("repeat redemption spent a use: response %d, stored %d, want 1", again.UseCount, useCount(link))
+		t.Fatalf("replacement spent a use: response %d, stored %d, want 1", again.UseCount, useCount(link))
 	}
-	stored, ok, err := state.GetOpenInviteRedemption(ctx, link, joinerBinding.MemberID.String())
+	if got := ledgerRows(); got != rows+1 {
+		t.Fatalf("replacement left %d ledger rows, want %d", got, rows+1)
+	}
+	for range 3 {
+		if _, body := redeemed(redeem("link", stuck)); !bytes.Equal(body, againBody) {
+			t.Fatalf("a replay after the replacement returned different bytes:\n%s\nwant\n%s", body, againBody)
+		}
+	}
+	if got := ledgerRows(); got != rows+1 {
+		t.Fatalf("replays after the replacement minted: ledger rows %d, want %d", got, rows+1)
+	}
+
+	// A stored capability that has expired is replaced even when the
+	// addresses have not moved, and the replacement is kept.
+	aged := generate()
+	agedLink := createInvite("aged", time.Now().Add(time.Hour))
+	agedFirst, _ := redeemed(redeem("aged", aged))
+	agedBinding, err := libp2ptransport.BindingFromPublicKey(aged.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, ok, err := state.GetOpenInviteRedemption(ctx, agedLink, agedBinding.MemberID.String())
 	if err != nil || !ok {
 		t.Fatalf("GetOpenInviteRedemption: ok=%t err=%v", ok, err)
 	}
-	var storedResult redemption
-	if err := json.Unmarshal(stored.Result, &storedResult); err != nil || storedResult.Capability.Nonce != again.Capability.Nonce {
-		t.Fatalf("stored result is not the capability just returned (err %v)", err)
+	var aging map[string]any
+	if err := json.Unmarshal(stored.Result, &aging); err != nil {
+		t.Fatal(err)
 	}
-
-	stranger, err := keystore.Generate()
+	stale := agedFirst.Capability
+	stale.IssuedAtMS = time.Now().Add(-2 * time.Hour).UnixMilli()
+	stale.ExpiresAtMS = time.Now().Add(-time.Hour).UnixMilli()
+	aging["capability"] = stale
+	agingResult, err := json.Marshal(aging)
 	if err != nil {
 		t.Fatal(err)
 	}
-	refused(redeem("link", stranger), "open_invite_exhausted")
+	if err := state.CompleteOpenInviteRedemption(ctx, agedLink, agedBinding.MemberID.String(), agingResult, time.Now().UnixMilli()); err != nil {
+		t.Fatalf("age the stored capability: %v", err)
+	}
+	renewed, renewedBody := redeemed(redeem("aged", aged))
+	if renewed.Capability.Nonce == stale.Nonce || renewed.Capability.ExpiresAtMS <= time.Now().UnixMilli() {
+		t.Fatal("an expired stored capability was replayed")
+	}
+	if _, body := redeemed(redeem("aged", aged)); !bytes.Equal(body, renewedBody) {
+		t.Fatal("a replay after the renewal returned different bytes")
+	}
+	rows += 2 // the aged identity's first redemption and its one renewal
+
+	// The removed member's capability got it in once; it gets the same bytes
+	// back, not a fresh nonce to rejoin through an exhausted link.
+	if _, body := redeemed(redeem("used", removed)); !bytes.Equal(body, removedBody) {
+		t.Fatalf("a removed member's replay returned different bytes:\n%s\nwant\n%s", body, removedBody)
+	}
+	if err := session.group.CheckInvite(removedGrant.Capability, time.Now().UnixMilli()); err == nil {
+		t.Fatal("the removed member's spent capability still admits")
+	}
+	if got := ledgerRows(); got != rows+1 {
+		t.Fatalf("the removed member's replay minted: ledger rows %d, want %d", got, rows+1)
+	}
+	if useCount(used) != 1 {
+		t.Fatalf("the removed member's replay changed the use count to %d", useCount(used))
+	}
+
+	// The existing refusals hold.
+	refused(redeem("link", generate()), "open_invite_exhausted")
 	if useCount(link) != 1 {
 		t.Fatalf("refused stranger changed the use count to %d", useCount(link))
 	}
-
 	if _, _, err := state.RevokeOpenInvite(ctx, link, time.Now().UnixMilli()); err != nil {
 		t.Fatalf("RevokeOpenInvite: %v", err)
 	}
-	refused(redeem("link", joiner), "open_invite_revoked")
-
+	refused(redeem("link", stuck), "open_invite_revoked")
 	expiresAt := time.Now().Add(time.Second)
 	createInvite("short", expiresAt)
-	redeemed(redeem("short", joiner))
+	redeemed(redeem("short", stuck))
 	time.Sleep(time.Until(expiresAt) + 10*time.Millisecond)
-	refused(redeem("short", joiner), "open_invite_expired")
-}
-
-// mintingInviteDaemon answers invite_create the way the daemon does: a
-// capability signed by the founder, carrying whatever addresses the node
-// announces at the moment of the request.
-type mintingInviteDaemon struct {
-	identity   *keystore.Identity
-	founder    entmoot.NodeInfo
-	rosterHead entmoot.RosterEntryID
-
-	mu    sync.Mutex
-	addrs []string
-}
-
-func (d *mintingInviteDaemon) announce(addrs ...string) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	d.addrs = addrs
-}
-
-func (d *mintingInviteDaemon) mint(req *ipc.InviteCreateReq) (entmoot.BootstrapCapability, error) {
-	d.mu.Lock()
-	addrs := append([]string(nil), d.addrs...)
-	d.mu.Unlock()
-	member, err := entmoot.MemberIDFromPublicKey(req.TargetPublicKey)
-	if err != nil {
-		return entmoot.BootstrapCapability{}, err
-	}
-	peer, err := entmoot.PeerIDFromPublicKey(req.TargetPublicKey)
-	if err != nil {
-		return entmoot.BootstrapCapability{}, err
-	}
-	now := time.Now()
-	capability := entmoot.BootstrapCapability{
-		GroupID:           req.GroupID,
-		TargetPublicKey:   append([]byte(nil), req.TargetPublicKey...),
-		TargetMemberID:    member,
-		TargetPeerID:      peer,
-		Founder:           d.founder,
-		RosterHead:        d.rosterHead,
-		AllowedPeerIDs:    []string{d.founder.PeerID},
-		AllowedMultiaddrs: addrs,
-		IssuedAtMS:        now.UnixMilli(),
-		ExpiresAtMS:       now.Add(24 * time.Hour).UnixMilli(),
-	}
-	if _, err := rand.Read(capability.Nonce[:]); err != nil {
-		return entmoot.BootstrapCapability{}, err
-	}
-	err = libp2ptransport.SignBootstrapCapability(d.identity, &capability)
-	return capability, err
-}
-
-func (d *mintingInviteDaemon) serve(t *testing.T, sock string) func() {
-	t.Helper()
-	ln, err := net.Listen("unix", sock)
-	if err != nil {
-		t.Fatalf("listen unix: %v", err)
-	}
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			_, payload, err := ipc.ReadAndDecode(conn)
-			if req, ok := payload.(*ipc.InviteCreateReq); err == nil && ok {
-				if capability, err := d.mint(req); err == nil {
-					_ = ipc.EncodeAndWrite(conn, &ipc.InviteCreateResp{Status: "created", GroupID: req.GroupID, Capability: capability})
-				} else {
-					_ = ipc.EncodeAndWrite(conn, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInternal, Message: err.Error()})
-				}
-			} else {
-				_ = ipc.EncodeAndWrite(conn, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInvalidArgument, Message: "unexpected request"})
-			}
-			_ = conn.Close()
-		}
-	}()
-	return func() {
-		_ = ln.Close()
-		<-done
-	}
+	refused(redeem("short", stuck), "open_invite_expired")
 }

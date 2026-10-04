@@ -19,6 +19,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -1507,6 +1508,17 @@ func (s *ipcServer) handleInviteCreate(_ context.Context, c net.Conn, req *ipc.I
 		}
 	}
 	now := time.Now()
+	relays := s.runtime.relayHints()
+	if req.Refresh != nil {
+		if len(req.TargetPublicKey) == 0 || req.Refresh.GroupID != gid || !bytes.Equal(req.Refresh.TargetPublicKey, req.TargetPublicKey) {
+			_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInvalidArgument, GroupID: &gid, Message: "refresh must be a capability for the same group and target"})
+			return
+		}
+		if keepIssuedInvite(session.group, *req.Refresh, targetMemberID, allowedAddresses, allowedPeerIDs, relays, now.UnixMilli()) {
+			_ = ipc.EncodeAndWrite(c, &ipc.InviteCreateResp{Status: "unchanged", GroupID: gid, Capability: *req.Refresh, RosterHead: session.group.Canonical().ID, Members: len(session.group.MemberIDs())})
+			return
+		}
+	}
 	expires := now.Add(24 * time.Hour)
 	if req.ValidForMS > 0 {
 		expires = now.Add(time.Duration(req.ValidForMS) * time.Millisecond)
@@ -1528,7 +1540,7 @@ func (s *ipcServer) handleInviteCreate(_ context.Context, c net.Conn, req *ipc.I
 		RosterHead:        session.group.Canonical().ID,
 		AllowedPeerIDs:    allowedPeerIDs,
 		AllowedMultiaddrs: allowedAddresses,
-		Relays:            s.runtime.relayHints(),
+		Relays:            relays,
 		MaxUses:           req.MaxUses,
 		IssuedAtMS:        now.UnixMilli(),
 		ExpiresAtMS:       expires.UnixMilli(),
@@ -1552,6 +1564,33 @@ func (s *ipcServer) handleInviteCreate(_ context.Context, c net.Conn, req *ipc.I
 		return
 	}
 	_ = ipc.EncodeAndWrite(c, &ipc.InviteCreateResp{Status: "created", GroupID: gid, Capability: capability, RosterHead: session.group.Canonical().ID, Members: len(session.group.MemberIDs())})
+}
+
+// keepIssuedInvite decides whether a capability already issued to target is
+// handed back as is instead of being replaced. A replacement is a new nonce,
+// and a new nonce is a fresh admission, so one is minted only for a target
+// that never got in: the old nonce unused and unrevoked, the target not a
+// member now and never removed or banned. Even then the old capability stands
+// while it is unexpired and names the same addresses, peers and relays a new
+// one would, so a caller replaying it mints at most once per change.
+func keepIssuedInvite(group *membership.Group, issued entmoot.BootstrapCapability, target entmoot.MemberID, addresses, peerIDs, relays []string, nowMS int64) bool {
+	if group.InviteUses(issued.Nonce) > 0 || group.IsInviteRevoked(issued.Nonce) ||
+		group.IsMemberID(target) || group.IsBanned(target) {
+		return true
+	}
+	if _, removed := group.RemovalProof(target); removed {
+		return true
+	}
+	if membership.InviteValidAt(issued, nowMS) != nil {
+		return false
+	}
+	return sameStringSet(issued.AllowedMultiaddrs, addresses) &&
+		sameStringSet(issued.AllowedPeerIDs, peerIDs) &&
+		sameStringSet(issued.Relays, relays)
+}
+
+func sameStringSet(left, right []string) bool {
+	return slices.Equal(slices.Sorted(slices.Values(left)), slices.Sorted(slices.Values(right)))
 }
 
 func (s *ipcServer) handleInviteAuthorityCheck(ctx context.Context, c net.Conn, req *ipc.InviteAuthorityCheckReq) {
