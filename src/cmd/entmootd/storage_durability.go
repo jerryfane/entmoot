@@ -23,9 +23,7 @@ func dataStorageWarning(dataDir string) string {
 	if err != nil {
 		return ""
 	}
-	if resolved, err := filepath.EvalSymlinks(path); err == nil {
-		path = resolved
-	}
+	path = resolveExistingPrefix(path)
 	mount, ok := mountContaining(filepath.Join(procRoot, "self", "mountinfo"), path)
 	if !ok {
 		return ""
@@ -39,6 +37,24 @@ func dataStorageWarning(dataDir string) string {
 		}
 	}
 	return ""
+}
+
+// resolveExistingPrefix resolves symlinks in the longest existing ancestor of
+// path and appends the not-yet-created remainder, so a data directory that
+// will be created behind a symlink is classified by the mount it will land on.
+func resolveExistingPrefix(path string) string {
+	existing, suffix := path, ""
+	for {
+		if resolved, err := filepath.EvalSymlinks(existing); err == nil {
+			return filepath.Join(resolved, suffix)
+		}
+		parent := filepath.Dir(existing)
+		if parent == existing {
+			return path
+		}
+		suffix = filepath.Join(filepath.Base(existing), suffix)
+		existing = parent
+	}
 }
 
 type mountEntry struct {
@@ -82,7 +98,7 @@ func parseMountinfoLine(line string) (mountEntry, bool) {
 			break
 		}
 	}
-	if separator < 0 || separator+3 > len(fields) {
+	if separator < 0 || separator+3 >= len(fields) {
 		return mountEntry{}, false
 	}
 	point := unescapeMountField(fields[4])

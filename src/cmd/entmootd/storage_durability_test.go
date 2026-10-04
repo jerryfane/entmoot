@@ -60,3 +60,34 @@ func TestRuntimeReportWarnsDataDirOnVolatileStorage(t *testing.T) {
 		}
 	}
 }
+
+func TestDataStorageWarningResolvesSymlinkedUncreatedDataDir(t *testing.T) {
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	shm := filepath.Join(root, "shm")
+	if err := os.Mkdir(shm, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "link")
+	if err := os.Symlink(shm, link); err != nil {
+		t.Fatal(err)
+	}
+	withMountinfo(t, "22 1 0:20 / / rw,relatime - ext4 /dev/vda1 rw\n43 22 0:44 / "+shm+" rw,nosuid - tmpfs tmpfs rw\n")
+	dataDir := filepath.Join(link, "entmoot-not-created", "nested")
+	if got := dataStorageWarning(dataDir); !strings.Contains(got, "memory-backed tmpfs mounted at "+shm) {
+		t.Fatalf("dataStorageWarning(%q) = %q, want tmpfs warning for %s", dataDir, got, shm)
+	}
+}
+
+func TestMountinfoWithoutSuperOptionsIsRejected(t *testing.T) {
+	malformed := "22 1 0:20 / / rw - ext4 /dev/vda"
+	if entry, ok := parseMountinfoLine(malformed); ok {
+		t.Fatalf("parseMountinfoLine(%q) = %+v, want rejection", malformed, entry)
+	}
+	withMountinfo(t, malformed+"\n43 22 0:44 / /run rw,nosuid - tmpfs tmpfs rw\n")
+	if got := dataStorageWarning("/run/entmoot"); !strings.Contains(got, "memory-backed tmpfs") {
+		t.Fatalf("dataStorageWarning after malformed line = %q, want tmpfs warning", got)
+	}
+}
