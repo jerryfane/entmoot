@@ -275,7 +275,9 @@ member. A ban is not, until it is lifted.
 Removed members are excluded from future membership projection, diagnostics
 onboarding, and auto-approval. Live messages are authorised against current
 membership; historical messages are authorised against membership at the
-checkpoint the message cites.
+roster position the message commits to — its cited checkpoint plus the signed
+records up to its timestamp — so a departed member's earlier messages stay
+valid while anything it dates at or after its leave or removal does not.
 
 ## Limits
 
