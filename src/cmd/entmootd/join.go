@@ -1093,8 +1093,11 @@ func (s *ipcServer) handleConn(ctx context.Context, c net.Conn) {
 }
 
 // handleSignedPublish accepts a message whose author already signed it. This
-// is the ESP/mobile write path: the daemon owns durable storage and gossip
-// fanout, but does not hold the author's signing key.
+// is the ESP/mobile write path: the daemon owns durable storage, but does not
+// hold the author's signing key. Live gossip binds each envelope's sender to
+// its author, so only a message this node authored is gossiped; another
+// member's message is verified, stored, and reaches the group through history
+// catch-up from this node.
 func (s *ipcServer) handleSignedPublish(ctx context.Context, c net.Conn, req *ipc.SignedPublishReq) {
 	msg := req.Message
 	gid := msg.GroupID
@@ -1108,7 +1111,12 @@ func (s *ipcServer) handleSignedPublish(ctx context.Context, c net.Conn, req *ip
 		})
 		return
 	}
-	if _, err := sess.live.Publish(ctx, msg); err != nil {
+	deliver := sess.live.StoreForHistory
+	if messageAuthorMemberID(msg) == s.memberID {
+		deliver = sess.live.Publish
+	}
+	delivery, err := deliver(ctx, msg)
+	if err != nil {
 		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
 			Type:    "error",
 			Code:    publishErrorCode(err),
@@ -1119,6 +1127,7 @@ func (s *ipcServer) handleSignedPublish(ctx context.Context, c net.Conn, req *ip
 	}
 	_ = ipc.EncodeAndWrite(c, &ipc.SignedPublishResp{
 		Status:         "accepted",
+		Delivery:       string(delivery),
 		MessageID:      msg.ID,
 		GroupID:        gid,
 		AuthorMemberID: messageAuthorMemberID(msg),

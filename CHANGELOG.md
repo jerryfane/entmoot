@@ -25,6 +25,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `entmootd esp publish` from a member other than the ESP's own daemon no
+  longer fails with `500 internal_error: publisher identity does not match
+  local host`. Live gossip only carries a message from its author's own node,
+  so the daemon now verifies another member's signed message the way a
+  receiving member would (signature, current membership, membership at the
+  cited roster head, group policy, size and clock limits), stores it without
+  gossiping it, and the other members fetch it on their next history
+  catch-up, at most about a minute later. The response's new `delivery`
+  field says `pending_history` for these and `published` for messages the
+  daemon authored, which are still gossiped live.
 - New invites start being valid five minutes before they are minted, so a
   joiner whose clock is slightly behind the issuer's no longer gets "invite is
   not yet valid" when it redeems an invite and joins straight away. Expiry

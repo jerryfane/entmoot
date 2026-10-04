@@ -16,7 +16,11 @@ use the ESP for:
 
 The ESP does not need to hold the phone's author signing key. Signed publish
 submits an already-signed Entmoot message to the running `serve` daemon, which
-performs validation, storage, and gossip fanout.
+validates and stores it. Live gossip carries a message only from its author's
+own node, so the daemon gossips messages it authored itself and keeps other
+members' messages for history: members fetch them on their next history
+catch-up (about once a minute). The publish response's `delivery` field is
+`published` or `pending_history` accordingly.
 
 Mobile infrastructure is intentionally isolated from Entmoot core. APNs
 delivery lives behind an ESP notifier interface with a no-op provider for

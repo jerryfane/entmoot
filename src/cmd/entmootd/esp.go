@@ -367,6 +367,7 @@ func (p controlSocketSignedPublisher) PublishSigned(ctx context.Context, msg ent
 		authorMemberID, _ := entmoot.ResolvedMemberID(msg.Author)
 		return esphttp.PublishResult{
 			Status:         v.Status,
+			Delivery:       v.Delivery,
 			MessageID:      v.MessageID,
 			GroupID:        v.GroupID,
 			AuthorMemberID: authorMemberID,
