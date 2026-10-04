@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"net"
 	"testing"
+	"time"
 
 	entmoot "entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/ipc"
@@ -120,5 +121,11 @@ func TestDaemonMintWithNoNamedAddressesStaysRedeemable(t *testing.T) {
 	if size, tooLarge := libp2ptransport.CapabilityTooLarge(resp.Capability); tooLarge {
 		t.Fatalf("the minted capability is %d bytes, over the %d a joiner can send: the daemon's own address fill is unbounded",
 			size, libp2ptransport.MaxCapabilityBytes)
+	}
+	// A joiner's clock is usually a little behind the minting host's. The
+	// invite must already be valid there, or a fresh redemption fails with
+	// "invite is not yet valid" on the joiner's first attempt.
+	if err := membership.InviteValidAt(resp.Capability, time.Now().Add(-2*time.Minute).UnixMilli()); err != nil {
+		t.Fatalf("an invite minted now is refused by a joiner whose clock is two minutes behind: %v", err)
 	}
 }

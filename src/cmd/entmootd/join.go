@@ -1530,7 +1530,7 @@ func (s *ipcServer) handleInviteCreate(_ context.Context, c net.Conn, req *ipc.I
 		AllowedMultiaddrs: allowedAddresses,
 		Relays:            s.runtime.relayHints(),
 		MaxUses:           req.MaxUses,
-		IssuedAtMS:        now.UnixMilli(),
+		IssuedAtMS:        membership.InviteIssuedAtMS(now),
 		ExpiresAtMS:       expires.UnixMilli(),
 	}
 	if _, err := rand.Read(capability.Nonce[:]); err != nil {
