@@ -1,6 +1,7 @@
 package libp2ptransport
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -38,7 +39,7 @@ func TestWSSJoinThroughEnvironmentProxy(t *testing.T) {
 		runWSSProxyClient(t, fixture)
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 	founder := mustIdentity(t)
 	h, _, err := NewConfiguredHost(ctx, founder, HostConfig{ListenAddrs: []string{"/ip4/127.0.0.1/tcp/0/ws"}})
@@ -70,14 +71,24 @@ func TestWSSJoinThroughEnvironmentProxy(t *testing.T) {
 		t.Fatal("WS TCP listener missing")
 	}
 	target, _ := url.Parse("http://127.0.0.1:" + port)
-	tlsServer := httptest.NewTLSServer(httputil.NewSingleHostReverseProxy(target))
+	direct := httputil.NewSingleHostReverseProxy(target)
+	stalled := httputil.NewSingleHostReverseProxy(&url.URL{Scheme: "http", Host: stallingRelay(t, target.Host)})
+	var stallMode atomic.Bool
+	tlsServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if stallMode.Load() {
+			stalled.ServeHTTP(w, r)
+			return
+		}
+		direct.ServeHTTP(w, r)
+	}))
 	defer tlsServer.Close()
 	certFile := filepath.Join(t.TempDir(), "root.pem")
 	if err := os.WriteFile(certFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: tlsServer.Certificate().Raw}), 0600); err != nil {
 		t.Fatal(err)
 	}
-	for _, mode := range []string{"HTTPS_PROXY", "https_proxy", "no_proxy", "untrusted_tls", "wrong_peer", "proxy_refused"} {
+	for _, mode := range []string{"HTTPS_PROXY", "https_proxy", "no_proxy", "untrusted_tls", "wrong_peer", "proxy_refused", "stalled_first_handshake"} {
 		t.Run(mode, func(t *testing.T) {
+			stallMode.Store(mode == "stalled_first_handshake")
 			var tunnels atomic.Int32
 			proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.Method != http.MethodConnect || r.Host != "example.com:443" {
@@ -157,9 +168,14 @@ func TestWSSJoinThroughEnvironmentProxy(t *testing.T) {
 			if err != nil {
 				t.Fatalf("client: %v\n%s", err, output)
 			}
-			if mode == "HTTPS_PROXY" || mode == "https_proxy" {
+			if wssProxyJoinSucceeds(mode) {
 				if tunnels.Load() == 0 {
 					t.Fatal("join did not traverse CONNECT proxy")
+				}
+				// The first tunnel stalled until the libp2p dial gave up; only a
+				// second connection inside the join's own deadline can have joined.
+				if mode == "stalled_first_handshake" && tunnels.Load() < 2 {
+					t.Fatalf("join used %d tunnel(s); want a fresh one after the stall", tunnels.Load())
 				}
 				select {
 				case m := <-received:
@@ -177,6 +193,68 @@ func TestWSSJoinThroughEnvironmentProxy(t *testing.T) {
 			}
 		})
 	}
+}
+
+func wssProxyJoinSucceeds(mode string) bool {
+	return mode == "HTTPS_PROXY" || mode == "https_proxy" || mode == "stalled_first_handshake"
+}
+
+// stallingRelay forwards TCP to target. Its first connection delivers the
+// founder's WebSocket upgrade response and then withholds every later founder
+// byte until the client gives up, which is what the actual cloud's failed
+// official join looked like: the client got its 101 and failed in "negotiate
+// security protocol" exactly at libp2p's 15s per-dial timeout, while the
+// ingress logged the founder's reply flight on an upgrade that never completed.
+// Later connections are relayed untouched.
+func stallingRelay(t *testing.T, target string) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	var accepted atomic.Int32
+	go func() {
+		for {
+			client, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			stall := accepted.Add(1) == 1
+			go func() {
+				defer client.Close()
+				server, err := net.Dial("tcp", target)
+				if err != nil {
+					return
+				}
+				defer server.Close()
+				clientDone := make(chan struct{})
+				go func() {
+					_, _ = io.Copy(server, client)
+					_ = server.Close()
+					close(clientDone)
+				}()
+				if !stall {
+					_, _ = io.Copy(client, server)
+					return
+				}
+				reader := bufio.NewReader(server)
+				var header []byte
+				for !bytes.HasSuffix(header, []byte("\r\n\r\n")) {
+					b, err := reader.ReadByte()
+					if err != nil {
+						return
+					}
+					header = append(header, b)
+				}
+				if _, err := client.Write(header); err != nil {
+					return
+				}
+				<-clientDone
+			}()
+		}
+	}()
+	return listener.Addr().String()
 }
 
 type wssProxyFixture struct {
@@ -199,7 +277,12 @@ func runWSSProxyClient(t *testing.T, fixture string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	// A stalled first connection needs the join's own budget, not one dial's.
+	timeout := 8 * time.Second
+	if f.Mode == "stalled_first_handshake" {
+		timeout = 45 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	h, binding, err := NewConfiguredHost(ctx, identity, HostConfig{ListenAddrs: []string{"/ip4/127.0.0.1/tcp/0"}})
 	if err != nil {
@@ -214,8 +297,8 @@ func runWSSProxyClient(t *testing.T, fixture string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	group, err := JoinGroup(ctx, h, peer.AddrInfo{ID: remote, Addrs: []ma.Multiaddr{address}}, dir, identity, f.Invite, mustNode(t, identity))
-	if f.Mode != "HTTPS_PROXY" && f.Mode != "https_proxy" {
+	group, _, err := JoinGroupVia(ctx, h, []peer.AddrInfo{{ID: remote, Addrs: []ma.Multiaddr{address}}}, dir, identity, f.Invite, mustNode(t, identity))
+	if !wssProxyJoinSucceeds(f.Mode) {
 		if err == nil {
 			group.Close()
 			t.Fatal("unsafe connection unexpectedly admitted")
