@@ -5,11 +5,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/p2p/net/swarm"
 
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/keystore"
@@ -373,6 +375,62 @@ func FetchMembership(ctx context.Context, h host.Host, remote peer.AddrInfo, gro
 	return checkpoints, records, false, firstErr
 }
 
+// joinConnectRetryInterval paces repeat connection attempts during a join. It
+// equals libp2p's first per-address dial backoff (swarm.BackoffBase), so the
+// next attempt is normally a fresh dial rather than an instant "dial backoff".
+const joinConnectRetryInterval = 5 * time.Second
+
+// connectForJoin opens the connection a join needs within the caller's
+// deadline. libp2p bounds every address attempt - for WSS that is proxy
+// CONNECT, TLS, HTTP upgrade, security handshake and muxer together - by its
+// own 15s dial timeout, whatever ctx allows. One stalled attempt would then
+// fail a join that was given 90s, while serve recovers from the same stall on
+// its next membership round. Only attempts that timed out (and the backoff
+// they leave behind) are tried again: a refused proxy, an untrusted
+// certificate or the wrong peer identity still fails at once, and a context
+// without a deadline gets exactly one attempt. Admission is not retried here;
+// this only establishes the authenticated connection the join then uses.
+func connectForJoin(ctx context.Context, h host.Host, remote peer.AddrInfo) error {
+	var first error
+	for attempt := 1; ; attempt++ {
+		err := h.Connect(ctx, remote)
+		if err == nil {
+			return nil
+		}
+		if first == nil {
+			first = err
+		}
+		_, bounded := ctx.Deadline()
+		if !bounded || ctx.Err() != nil || !retryableJoinDialError(err) {
+			return joinConnectError(remote.ID, attempt, first, err)
+		}
+		timer := time.NewTimer(joinConnectRetryInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return joinConnectError(remote.ID, attempt, first, err)
+		case <-timer.C:
+		}
+	}
+}
+
+// retryableJoinDialError reports a dial that ran out of time, at any phase,
+// or was refused only because an earlier one did.
+func retryableJoinDialError(err error) bool {
+	return errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, os.ErrDeadlineExceeded) ||
+		errors.Is(err, swarm.ErrDialBackoff)
+}
+
+// joinConnectError keeps the first failure: later ones are often just the
+// backoff it caused.
+func joinConnectError(remote peer.ID, attempts int, first, last error) error {
+	if attempts == 1 {
+		return fmt.Errorf("libp2p: connect %s: %w", remote, last)
+	}
+	return fmt.Errorf("libp2p: connect %s: %d attempts failed; first: %w; last: %w", remote, attempts, first, last)
+}
+
 // JoinGroup is how a non-member gets in. It reads the group's checkpoint with
 // the invite, signs its own join record, and hands that record to the peer it
 // read from, which is an ordinary membership exchange: there is no enrollment
@@ -384,6 +442,9 @@ func JoinGroup(ctx context.Context, h host.Host, remote peer.AddrInfo, root stri
 		GroupID:    capability.GroupID,
 		Capability: &capability,
 		Limit:      maxMembershipRecords,
+	}
+	if err := connectForJoin(ctx, h, remote); err != nil {
+		return nil, err
 	}
 	response, err := RequestMembership(ctx, h, remote, request)
 	if err != nil {
