@@ -359,7 +359,7 @@ func isRuntimeDaemonSubcommand(arg string) bool {
 
 func runtimeGlobalFlagTakesValue(name string) bool {
 	switch name {
-	case "identity", "data", "listen-port", "log-level", "connectivity", "controlled-relay":
+	case "identity", "data", "listen-port", "log-level", "connectivity", "controlled-relay", "control-transport":
 		return true
 	default:
 		return false

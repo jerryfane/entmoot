@@ -6,7 +6,6 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"net"
 	"sort"
 	"strings"
 	"sync"
@@ -293,7 +292,7 @@ func probeRequestID() string {
 // holds the libp2p host. A second process dialling with a fresh identity
 // would answer a different question.
 func probePeersOverIPC(ctx context.Context, sockPath string, req *ipc.PeerProbeReq, budget time.Duration) (*ipc.PeerProbeResp, error) {
-	conn, err := net.DialTimeout("unix", sockPath, 2*time.Second)
+	conn, err := ipc.DialTimeout(sockPath, 2*time.Second)
 	if err != nil {
 		return nil, err
 	}

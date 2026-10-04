@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -1131,8 +1130,8 @@ func (e espOperationExecutor) createInviteOverIPC(ctx context.Context, req *ipc.
 	}
 	dialCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
 	defer cancel()
-	var dialer net.Dialer
-	conn, err := dialer.DialContext(dialCtx, "unix", e.socketPath)
+
+	conn, err := ipc.DialContext(dialCtx, e.socketPath)
 	if err != nil {
 		return &inviteCreateIPCResult{}, joinUnavailableError(err)
 	}
@@ -1172,8 +1171,8 @@ func (e espOperationExecutor) checkInviteAuthorityOverIPC(ctx context.Context, r
 	}
 	dialCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
 	defer cancel()
-	var dialer net.Dialer
-	conn, err := dialer.DialContext(dialCtx, "unix", e.socketPath)
+
+	conn, err := ipc.DialContext(dialCtx, e.socketPath)
 	if err != nil {
 		return nil, joinUnavailableError(err)
 	}
@@ -1205,8 +1204,8 @@ func (e espOperationExecutor) deactivateGroupOverIPC(ctx context.Context, req *i
 	}
 	dialCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
 	defer cancel()
-	var dialer net.Dialer
-	conn, err := dialer.DialContext(dialCtx, "unix", e.socketPath)
+
+	conn, err := ipc.DialContext(dialCtx, e.socketPath)
 	if err != nil {
 		return nil, joinUnavailableError(err)
 	}
@@ -1238,8 +1237,8 @@ func (e espOperationExecutor) removeMemberOverIPC(ctx context.Context, req *ipc.
 	}
 	dialCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
 	defer cancel()
-	var dialer net.Dialer
-	conn, err := dialer.DialContext(dialCtx, "unix", e.socketPath)
+
+	conn, err := ipc.DialContext(dialCtx, e.socketPath)
 	if err != nil {
 		return &memberRemoveIPCResult{}, joinUnavailableError(err)
 	}
@@ -1421,8 +1420,8 @@ func (e espOperationExecutor) joinGroupRequest(ctx context.Context, request *ipc
 	}
 	dialCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
 	defer cancel()
-	var dialer net.Dialer
-	conn, err := dialer.DialContext(dialCtx, "unix", e.socketPath)
+
+	conn, err := ipc.DialContext(dialCtx, e.socketPath)
 	if err != nil {
 		return nil, joinUnavailableError(err)
 	}

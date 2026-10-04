@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -16,6 +15,7 @@ import (
 
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/conversion"
+	"entmoot/pkg/entmoot/ipc"
 	"entmoot/pkg/entmoot/keystore"
 )
 
@@ -269,7 +269,7 @@ func resolveGroupID(dataRoot string, gid *entmoot.GroupID, logger *slog.Logger) 
 // controlSocketAlive probes path with a short dial timeout. Returns true
 // if an accepted connection can be opened within timeout.
 func controlSocketAlive(path string, timeout time.Duration) bool {
-	conn, err := net.DialTimeout("unix", path, timeout)
+	conn, err := ipc.DialTimeout(path, timeout)
 	if err != nil {
 		return false
 	}

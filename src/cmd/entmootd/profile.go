@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"context"
-	"net"
 
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/esphttp"
@@ -119,7 +118,7 @@ func cmdProfileSet(gf *globalFlags, args []string, clear bool) int {
 		fmt.Fprintln(os.Stderr, runtimeNoDaemonHelp(gf, gf.data))
 		return exitControlUnavail
 	}
-	conn, err := net.DialTimeout("unix", sockPath, 500*time.Millisecond)
+	conn, err := ipc.DialTimeout(sockPath, 500*time.Millisecond)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, runtimeNoDaemonHelp(gf, gf.data))
 		return exitControlUnavail

@@ -7,7 +7,6 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
-	"net"
 	"os"
 	"time"
 
@@ -140,7 +139,7 @@ func infoOverIPC(sockPath string) (*ipc.InfoResp, error) {
 func infoOverIPCContext(ctx context.Context, sockPath string) (*ipc.InfoResp, error) {
 	dialCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
 	defer cancel()
-	conn, err := (&net.Dialer{}).DialContext(dialCtx, "unix", sockPath)
+	conn, err := ipc.DialContext(dialCtx, sockPath)
 	if err != nil {
 		return nil, fmt.Errorf("dial control socket: %w", err)
 	}

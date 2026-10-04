@@ -36,6 +36,7 @@ type globalFlags struct {
 	listenPort       uint
 	p2pListen        stringListFlag
 	p2pAnnounce      stringListFlag
+	controlTransport string
 	logLevel         string
 	connectivity     string
 	controlledRelays stringListFlag
@@ -130,6 +131,7 @@ func run() int {
 	fs.UintVar(&gf.listenPort, "listen-port", 1004, "Entmoot listen port")
 	fs.Var(&gf.p2pListen, "p2p-listen", "libp2p listen multiaddr; repeatable, replaces the default TCP listener")
 	fs.Var(&gf.p2pAnnounce, "p2p-announce", "externally reachable libp2p multiaddr without /p2p; repeatable, replaces advertised listener addresses")
+	fs.StringVar(&gf.controlTransport, "control-transport", "unix", "local control transport: unix or authenticated loopback tcp")
 	fs.StringVar(&gf.logLevel, "log-level", "info", "slog level: debug|info|warn|error")
 	fs.StringVar(&gf.connectivity, "connectivity", "direct", "connectivity profile: direct|relay-only")
 	fs.Var(&gf.controlledRelays, "controlled-relay", "controlled Circuit Relay v2 multiaddr ending in /p2p/<peer-id>; repeatable")
@@ -166,6 +168,11 @@ func run() int {
 		gf.data = v
 	} else {
 		fmt.Fprintf(os.Stderr, "entmootd: %v\n", err)
+		return exitInvalidArgument
+	}
+
+	if gf.controlTransport != "unix" && gf.controlTransport != "tcp" {
+		fmt.Fprintln(os.Stderr, "entmootd: -control-transport must be unix or tcp")
 		return exitInvalidArgument
 	}
 

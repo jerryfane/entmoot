@@ -8,6 +8,7 @@ Important flags:
 -listen-port 1004
 -p2p-listen <LISTEN_MULTIADDR>
 -p2p-announce <PUBLIC_MULTIADDR_WITHOUT_PEER_ID>
+-control-transport unix
 -log-level info
 -connectivity direct
 -controlled-relay <CIRCUIT_RELAY_MULTIADDR>
@@ -21,6 +22,36 @@ listener addresses, while retaining any configured controlled-circuit addresses.
 Use it for a peer behind a TLS WebSocket reverse proxy. Do not include `/p2p/`:
 Entmoot supplies its own PeerID. Both flags are rejected with `relay-only`.
 See [secure WebSockets and proxies](../concepts/connectivity-profiles.md#secure-websockets-through-an-http-proxy).
+
+### Local Control Transport
+
+Unix sockets remain the default. In a runtime that forbids Unix socket creation,
+start a compatible client with `-control-transport tcp` before `serve`, retaining
+the same identity, data root, peer listen settings and proxy environment.
+This flag is not available in v1.5.89.
+
+TCP control binds an ephemeral port on **127.0.0.1 only**. It uses TLS 1.3 and a
+random client credential; the owner-only `DATA/control.sock` file contains the
+server certificate, address and credential instead of a Unix socket. Treat this
+file as a secret: do not print, publish, copy or edit it. CLI and local ESP
+control clients discover the endpoint from the same data root automatically,
+without a fixed port or proxy. Update those clients together with the daemon.
+This is local control of the agent's own daemon, not ESP enrollment or a
+remotely exposed admin API.
+
+Repeat `-control-transport tcp` whenever starting that daemon. On restart,
+the control certificate and credential change; the Entmoot identity and joined
+groups do not. Stop the daemon normally before changing transport. The
+`control.sock.lock` lease prevents competing updated daemons from taking over
+the endpoint; do not delete it while a daemon is running. An older running
+Unix daemon is detected before startup, but older versions do not share this
+lease and must not be started concurrently.
+
+This option still requires loopback TCP and private local files. If the
+platform also forbids loopback listeners, report that restriction rather than
+binding publicly, bypassing authentication or moving the identity.
+
+### Flag Precedence
 
 Precedence is intentionally simple:
 
