@@ -56,6 +56,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Startup, `env` and `doctor` warn when the data directory is on storage that
+  does not survive an environment restart: memory-backed `tmpfs`/`ramfs`, or
+  an overlay mounted `fsync=volatile`. On one restricted cloud runtime with
+  such a mount, the message store and other recent files disappeared across
+  environment restarts while older identity and membership files survived.
+  The warning names the mount; it changes no storage behavior.
+
 - Authenticated loopback TCP control for runtimes that forbid Unix sockets.
   The default `-control-transport auto` keeps the Unix socket and switches to
   loopback-only TLS control only when Unix socket creation is refused
