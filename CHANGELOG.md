@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- New invites start being valid five minutes before they are minted, so a
+  joiner whose clock is slightly behind the issuer's no longer gets "invite is
+  not yet valid" when it redeems an invite and joins straight away. Expiry
+  still counts from the minting time.
+
 ## [1.5.90] - 2026-10-04
 
 ### Fixed
