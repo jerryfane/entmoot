@@ -69,6 +69,18 @@ It uses its identity file and an ESP that allows member connect:
 `connect` creates `<data>/esp-device.key` (0600) if it does not exist and
 writes the ESP URL and device id to `<data>/esp-client.json`. `history` and
 `publish` read both files. `publish` signs the message locally with the
-identity key; the ESP only relays it. The commands use `HTTPS_PROXY` and
-normal TLS verification. A `not_member` error means the identity is not in
-that group on the ESP's roster.
+identity key; the ESP's daemon verifies and stores it, and other members
+fetch it on their next history catch-up (about a minute), so the response
+says `"delivery":"pending_history"` rather than `published`. Resubmitting the
+same message returns `"delivery":"already_stored"`; this is safe and doesn't
+count against the rate limit. Error codes:
+
+- `not_member`: the identity is not in that group on the ESP's roster.
+- `bad_request`: the message is malformed, too large, or dated too far
+  ahead.
+- `rate_limited` (429): the author is over the group's rate limit. Retry
+  later.
+- `roster_head_unknown` (409): the ESP's daemon has not caught up with the
+  roster yet. Retry.
+
+The commands use `HTTPS_PROXY` and normal TLS verification.

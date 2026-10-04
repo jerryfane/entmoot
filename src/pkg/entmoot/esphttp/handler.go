@@ -455,8 +455,15 @@ type Publisher interface {
 }
 
 // PublishResult is the HTTP response for an accepted phone-signed message.
+// Delivery is one of:
+//   - "published": the serving daemon authored the message and gossiped it.
+//   - "pending_history": the daemon stored another member's message; the
+//     group fetches it on its next history catch-up.
+//   - "already_stored": the daemon already held this message, as on a retry
+//     after a lost response. It is accepted and nothing more is done.
 type PublishResult struct {
 	Status         string            `json:"status"`
+	Delivery       string            `json:"delivery,omitempty"`
 	MessageID      entmoot.MessageID `json:"message_id"`
 	GroupID        entmoot.GroupID   `json:"group_id"`
 	AuthorMemberID entmoot.MemberID  `json:"author_member_id"`
