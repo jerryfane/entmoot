@@ -57,8 +57,13 @@ type Group struct {
 	membersAt   map[entmoot.RosterEntryID]map[entmoot.MemberID]entmoot.NodeInfo
 	canonicalID entmoot.RosterEntryID
 	records     map[entmoot.RosterEntryID]Record
-	state       State
-	effective   int
+	// history holds the records checkpoints have retired. Nothing projects
+	// or serves them: they exist so MemberAt can still place a member inside
+	// a window a checkpoint closed, which is what verifying a departed
+	// member's old messages needs.
+	history   map[entmoot.RosterEntryID]Record
+	state     State
+	effective int
 	// rewoundMembers is the membership of the canonical checkpoint this node
 	// last moved BACKWARDS from, kept so the records that membership rests on
 	// can be pulled back from the peers that hold them. It is a local hint
@@ -260,6 +265,7 @@ func newGroup(dir string, groupID entmoot.GroupID, db *sql.DB) (*Group, error) {
 		membersAt:   make(map[entmoot.RosterEntryID]map[entmoot.MemberID]entmoot.NodeInfo, len(stored.checkpoints)),
 		canonicalID: stored.canonicalID,
 		records:     make(map[entmoot.RosterEntryID]Record, len(stored.records)),
+		history:     make(map[entmoot.RosterEntryID]Record, len(stored.history)),
 		now:         time.Now,
 		logger:      slog.Default(),
 	}
@@ -277,6 +283,12 @@ func newGroup(dir string, groupID entmoot.GroupID, db *sql.DB) (*Group, error) {
 			return nil, fmt.Errorf("membership: stored record %s: %w", rec.ID, err)
 		}
 		g.records[rec.ID] = rec
+	}
+	for _, rec := range stored.history {
+		if err := VerifyRecord(rec); err != nil {
+			return nil, fmt.Errorf("membership: stored history record %s: %w", rec.ID, err)
+		}
+		g.history[rec.ID] = rec
 	}
 	// A legacy chain may still be present for verifying messages that cite it.
 	if legacy, err := LoadLegacyChain(filepath.Dir(filepath.Dir(dir)), groupID); err == nil {
@@ -706,13 +718,17 @@ func (g *Group) RewoundMemberInfos() []entmoot.NodeInfo {
 // already precedes.
 //
 // The position is read from the newest checkpoint on the canonical chain from
-// the cited one that is not later than atMS, plus the held records after it
-// up to atMS, ordered exactly as the projection orders them. A message dated
-// before the checkpoint it cites is judged at that checkpoint, the earliest
-// position consistent with having cited it. A window whose records a
-// checkpoint has since retired falls back to the checkpoint that closes it: a
-// member that checkpoint names was admitted inside the window, unless a held
-// record about that member says when, in which case the record decides.
+// the cited one that is not later than atMS, plus the records after it up to
+// atMS, ordered exactly as the projection orders them. A message dated before
+// the checkpoint it cites is judged at that checkpoint, the earliest position
+// consistent with having cited it. Records a later checkpoint retired are
+// still consulted, from the history settleCanonicalLocked moves them into.
+//
+// A checkpoint proves membership at its own position only, never across the
+// window before it. So when a later checkpoint closes the window and the
+// member's standing moves inside it, the records this node holds must
+// reproduce that checkpoint before they can place the member; a node missing
+// some of them answers not a member rather than guess.
 //
 // known is false when the id means nothing to this node, so the caller can
 // hold the message rather than reject it.
@@ -731,32 +747,28 @@ func (g *Group) MemberAt(id entmoot.MemberID, checkpoint entmoot.RosterEntryID, 
 		at = i
 	}
 	base := path[at]
-	var window []Record
-	mentioned := false
-	for _, rec := range g.records {
-		if rec.Timestamp > atMS || coveredBy(base, rec) {
-			continue
+	window := g.windowLocked(base, atMS)
+	moved := slices.ContainsFunc(window, func(rec Record) bool { return recordMoves(rec, id) })
+	if at+1 < len(path) && atMS >= base.Timestamp {
+		next := path[at+1]
+		_, inBase := g.membersAt[base.ID][id]
+		_, inNext := g.membersAt[next.ID][id]
+		if (moved || inBase != inNext) && !g.windowCompleteLocked(base, next) {
+			return entmoot.NodeInfo{}, false, true
 		}
-		window = append(window, rec)
-		mentioned = mentioned || recordNames(rec, id)
 	}
-	// Only a record naming the member can change whether it is one, so the
-	// checkpoint alone answers unless such a record falls in the window.
+	// Only a record that moves the member can change whether it is one, so
+	// the checkpoint alone answers unless such a record falls in the window.
 	members := g.membersAt[base.ID]
-	if mentioned {
+	if moved {
 		state, _ := Project(base, window)
 		members = state.Members
 	}
-	if member, present := members[id]; present {
-		return cloneNodeInfo(member), true, true
+	member, present := members[id]
+	if !present {
+		return entmoot.NodeInfo{}, false, true
 	}
-	if at+1 < len(path) && atMS >= base.Timestamp {
-		next := path[at+1]
-		if member, present := g.membersAt[next.ID][id]; present && !g.namedInWindowLocked(id, base, next) {
-			return cloneNodeInfo(member), true, true
-		}
-	}
-	return entmoot.NodeInfo{}, false, true
+	return cloneNodeInfo(member), true, true
 }
 
 // chainFromLocked returns the canonical chain from a retained checkpoint to the
@@ -773,25 +785,39 @@ func (g *Group) chainFromLocked(from entmoot.RosterEntryID) []Checkpoint {
 	return []Checkpoint{g.checkpoints[from]}
 }
 
-// namedInWindowLocked reports whether this node holds a record naming id that
-// next folded in after base, so the window's own records place the member.
-func (g *Group) namedInWindowLocked(id entmoot.MemberID, base, next Checkpoint) bool {
-	for _, rec := range g.records {
-		if !coveredBy(base, rec) && rec.Timestamp <= next.Timestamp && recordNames(rec, id) {
-			return true
+// windowLocked returns every record this node holds, live or retired, that base
+// does not account for and that is dated no later than throughMS.
+func (g *Group) windowLocked(base Checkpoint, throughMS int64) []Record {
+	var window []Record
+	for _, held := range []map[entmoot.RosterEntryID]Record{g.records, g.history} {
+		for _, rec := range held {
+			if rec.Timestamp <= throughMS && !coveredBy(base, rec) {
+				window = append(window, rec)
+			}
 		}
 	}
-	return false
+	return window
 }
 
-// recordNames reports whether a record is about id, as its signer or subject:
-// the only records that can admit, move or remove that member.
-func recordNames(rec Record, id entmoot.MemberID) bool {
-	if actorIs(rec, id) {
+// windowCompleteLocked reports whether the records this node holds for the
+// window next closes reproduce next: the same membership from the same number
+// of effective records. Only then do they say where inside the window a member
+// joined or left; a node missing a leave would otherwise place the member in
+// the group past it.
+func (g *Group) windowCompleteLocked(base, next Checkpoint) bool {
+	state, effective := Project(base, g.windowLocked(base, next.Timestamp))
+	return uint64(len(effective)) == next.Covered && sameMembership(state, stateFrom(next))
+}
+
+// recordMoves reports whether a record can change id's own standing: as the
+// subject it admits, removes, bans or rekeys onto, or as the actor that joins,
+// leaves or rekeys away. An authority record changes its subject, not its
+// signer.
+func recordMoves(rec Record, id entmoot.MemberID) bool {
+	if subject, err := rec.SubjectMemberID(); err == nil && subject == id {
 		return true
 	}
-	subject, err := rec.SubjectMemberID()
-	return err == nil && subject == id
+	return !rec.IsAuthority() && actorIs(rec, id)
 }
 
 // Legacy exposes the linear chain this group upgraded from, when one is still
@@ -1155,6 +1181,11 @@ func (g *Group) settleCanonicalLocked() error {
 	// Retire with one checkpoint of lag: records covered by the newest
 	// checkpoint stay until the following one lands, so a node that has to
 	// re-verify the newest checkpoint still holds the records behind it.
+	// Retired records move to history rather than vanish: they no longer
+	// change membership, but they are the only account of who was a member
+	// part-way through the window they sat in. History lives as long as the
+	// chain does, and the chain is kept from its oldest founder-signed
+	// checkpoint, so in practice neither is trimmed.
 	var retireBefore int64
 	for _, cp := range g.checkpoints {
 		if cp.ID == best.Previous {
@@ -1162,7 +1193,7 @@ func (g *Group) settleCanonicalLocked() error {
 		}
 	}
 	if retireBefore > 0 {
-		if err := deleteRecordsThroughTx(ctx, tx, g.groupID, retireBefore); err != nil {
+		if err := retireRecordsThroughTx(ctx, tx, g.groupID, retireBefore); err != nil {
 			_ = tx.Rollback()
 			return err
 		}
@@ -1248,6 +1279,7 @@ func (g *Group) settleCanonicalLocked() error {
 	if retireBefore > 0 {
 		for id, rec := range g.records {
 			if rec.Timestamp <= retireBefore {
+				g.history[id] = rec
 				delete(g.records, id)
 			}
 		}

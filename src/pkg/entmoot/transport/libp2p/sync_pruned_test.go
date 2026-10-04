@@ -3,6 +3,7 @@ package libp2ptransport
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -301,5 +302,65 @@ func TestUnknownRosterHeadIsAGapNotConvergence(t *testing.T) {
 	}
 	if !retry.ConvergedHint {
 		t.Fatal("a complete pass did not report convergence")
+	}
+}
+
+// Whether a historical author was a member where it claims depends on the
+// membership history a node holds, which honest nodes need not share. One
+// message this node cannot authorize must not throw away everything else a
+// keeper serves: it is skipped, counted, never stored, and the pass does not
+// claim convergence. A forged signature is wrong everywhere and still fails
+// the keeper.
+func TestUnauthorizedHistoricalAuthorIsSkippedNotFatal(t *testing.T) {
+	f := newSnapshotLifecycleFixture(t)
+	group := f.groups[0]
+	for sequence := 5; sequence <= 6; sequence++ {
+		f.addMessage(t, group, sequence)
+	}
+	local, err := store.OpenSQLite(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer local.Close()
+	unauthorized := f.ids[group][0]
+	validate := func(message entmoot.Message, _ *merkle.Proof) error {
+		if message.ID == unauthorized {
+			return fmt.Errorf("%w: historical author at its cited roster position", entmoot.ErrNotMember)
+		}
+		return signing.VerifyMessage(message, message.Author)
+	}
+	keepers := []peer.AddrInfo{f.remote}
+
+	item := SyncFromKeepers(f.ctx, f.client, group, keepers, local, validate, new(HistorySyncState))[0]
+	if item.Err != nil {
+		t.Fatalf("one unauthorized author failed the keeper: %v", item.Err)
+	}
+	if item.UnauthorizedAuthors != 1 || item.Inserted != len(f.ids[group])-1 {
+		t.Fatalf("unauthorized=%d inserted=%d of %d", item.UnauthorizedAuthors, item.Inserted, len(f.ids[group]))
+	}
+	if item.ConvergedHint {
+		t.Fatal("a pass that skipped a message claimed convergence")
+	}
+	if summary := SummarizeKeeperProgress([]KeeperProgress{item}); summary.UnauthorizedAuthors != 1 {
+		t.Fatalf("summary unauthorized authors = %d, want 1", summary.UnauthorizedAuthors)
+	}
+	if present, err := local.Has(context.Background(), group, unauthorized); err != nil || present {
+		t.Fatalf("an unauthorized message was stored: present=%t err=%v", present, err)
+	}
+
+	forgedLocal, err := store.OpenSQLite(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer forgedLocal.Close()
+	forged := func(message entmoot.Message, _ *merkle.Proof) error {
+		if message.ID == unauthorized {
+			return fmt.Errorf("%w: message %s", entmoot.ErrSigInvalid, message.ID)
+		}
+		return nil
+	}
+	failed := SyncFromKeepers(f.ctx, f.client, group, keepers, forgedLocal, forged, new(HistorySyncState))[0]
+	if failed.Err == nil || !strings.Contains(failed.Err.Error(), "invalid historical message") {
+		t.Fatalf("a forged signature did not fail the keeper: %v", failed.Err)
 	}
 }

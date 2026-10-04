@@ -2,7 +2,9 @@ package libp2ptransport
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -136,7 +138,7 @@ func TestHistoricalMessageOutsideMembershipIntervalRejected(t *testing.T) {
 
 // A member that joined after a checkpoint and is still in verifies at that
 // checkpoint after the next one lands and the join record is retired: the
-// checkpoint that closes the window is the signed evidence of the join.
+// retired join, kept in membership history, still says when it was admitted.
 func TestHistoricalMessageFromJoinerVerifiesAfterRecordsRetire(t *testing.T) {
 	founder, member := mustIdentity(t), mustIdentity(t)
 	groupID, group := mustOpenGroup(t, founder)
@@ -171,8 +173,8 @@ func TestHistoricalMessageFromJoinerVerifiesAfterRecordsRetire(t *testing.T) {
 	if err := VerifyHistoricalMessage(group, posted, time.UnixMilli(clockMS)); err != nil {
 		t.Fatalf("joiner's history rejected after records retired: %v", err)
 	}
-	// The closing checkpoint places the join inside its window and no
-	// earlier: a message dated before the cited checkpoint is before it.
+	// A message dated before the cited checkpoint is judged at it, where
+	// the member was not yet in.
 	requireNotMember(t, VerifyHistoricalMessage(group,
 		signAtHead(t, member, groupID, head, headMS-1, "dated before the cited checkpoint"), time.UnixMilli(clockMS)),
 		"message dated before the window the join is known to fall in")
@@ -222,4 +224,182 @@ func TestHistoricalMessageFromCheckpointMemberAfterLeaveRejected(t *testing.T) {
 		t.Fatalf("history from before the leave rejected after retirement: %v", err)
 	}
 	requireNotMember(t, VerifyHistoricalMessage(group, after, time.UnixMilli(clockMS)), "post-leave message citing the member's checkpoint, leave retired")
+}
+
+// retiringGroup is an open group rooted in a directory the test can reopen,
+// on a clock the test advances, so a scenario can drive checkpoints through
+// the production retirement path and then read membership back from disk.
+type retiringGroup struct {
+	t       *testing.T
+	dir     string
+	groupID entmoot.GroupID
+	founder *keystore.Identity
+	group   *membership.Group
+	clockMS int64
+}
+
+func newRetiringGroup(t *testing.T) *retiringGroup {
+	t.Helper()
+	r := &retiringGroup{t: t, dir: t.TempDir(), groupID: mustGroupID(t), founder: mustIdentity(t)}
+	policy := membership.DefaultPolicy()
+	policy.JoinRule = membership.JoinRuleOpen
+	r.clockMS = time.Now().UnixMilli()
+	group, err := membership.Create(r.dir, r.founder, mustNode(t, r.founder), r.groupID, policy, r.clockMS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.adopt(group)
+	return r
+}
+
+func (r *retiringGroup) adopt(group *membership.Group) {
+	r.group = group
+	r.group.SetNow(func() time.Time { return time.UnixMilli(r.clockMS) })
+	r.t.Cleanup(func() { _ = group.Close() })
+}
+
+func (r *retiringGroup) tick() int64 {
+	r.clockMS += 1_000
+	return r.clockMS
+}
+
+func (r *retiringGroup) record(identity *keystore.Identity, kind membership.Kind) membership.Record {
+	r.t.Helper()
+	r.tick()
+	rec, err := r.group.SignRecord(identity, membership.Record{Kind: kind})
+	if err != nil {
+		r.t.Fatal(err)
+	}
+	return rec
+}
+
+// checkpoints signs n founder checkpoints; two or more retire every record
+// before the first of them, through settleCanonicalLocked.
+func (r *retiringGroup) checkpoints(n int) {
+	r.t.Helper()
+	for range n {
+		r.tick()
+		if _, _, err := r.group.SignCheckpoint(r.founder, true); err != nil {
+			r.t.Fatal(err)
+		}
+	}
+}
+
+func (r *retiringGroup) reopen() {
+	r.t.Helper()
+	if err := r.group.Close(); err != nil {
+		r.t.Fatal(err)
+	}
+	group, err := membership.Open(r.dir, r.groupID)
+	if err != nil {
+		r.t.Fatal(err)
+	}
+	r.adopt(group)
+}
+
+func (r *retiringGroup) verify(message entmoot.Message) error {
+	return VerifyHistoricalMessage(r.group, message, time.UnixMilli(r.clockMS))
+}
+
+// Issue #198's lifecycle run to completion: a member joins, posts and leaves
+// between two checkpoints, so no checkpoint ever names it, and then later
+// checkpoints retire its join and leave. Its message must still verify, from
+// memory and after a restart, and nothing dated outside its membership may.
+func TestHistoricalMessageFromDepartedJoinerVerifiesAfterRetirement(t *testing.T) {
+	r := newRetiringGroup(t)
+	head := r.group.Canonical().ID
+	member := mustIdentity(t)
+	join := r.record(member, membership.KindJoin)
+	posted := signAtHead(t, member, r.groupID, head, r.tick(), "posted while a member")
+	leave := r.record(member, membership.KindLeave)
+	afterLeave := signAtHead(t, member, r.groupID, head, leave.Timestamp+1, "dated after leaving")
+	// A checkpoint is dated at the newest record it folds in, so a later
+	// record keeps afterLeave inside the window C0 opens rather than at the
+	// next checkpoint, which no longer names the member.
+	r.record(mustIdentity(t), membership.KindJoin)
+	beforeJoin := signAtHead(t, member, r.groupID, head, join.Timestamp-1, "dated before joining")
+
+	r.checkpoints(3)
+	if r.group.HasRecord(join.ID) || r.group.HasRecord(leave.ID) || !r.group.HasCheckpoint(head) {
+		t.Fatal("fixture: want the join and leave retired and the cited checkpoint held")
+	}
+	for _, phase := range []string{"in memory", "after reopening"} {
+		if phase == "after reopening" {
+			r.reopen()
+		}
+		if err := r.verify(posted); err != nil {
+			t.Fatalf("%s: departed joiner's history rejected after retirement: %v", phase, err)
+		}
+		requireNotMember(t, r.verify(afterLeave), phase+": message dated after a retired leave")
+		requireNotMember(t, r.verify(beforeJoin), phase+": message dated before a retired join")
+	}
+}
+
+// A checkpoint proves membership at its own position only. A member a later
+// checkpoint names was not a member throughout the window before it, so a
+// message dated before its join stays rejected once the join is retired.
+func TestHistoricalMessageDatedBeforeRetiredJoinRejected(t *testing.T) {
+	r := newRetiringGroup(t)
+	head := r.group.Canonical().ID
+	member := mustIdentity(t)
+	early := signAtHead(t, member, r.groupID, head, r.tick(), "dated before admission")
+	join := r.record(member, membership.KindJoin)
+	requireNotMember(t, r.verify(early), "message dated before a held join")
+
+	r.checkpoints(2)
+	if r.group.HasRecord(join.ID) || !r.group.HasCheckpoint(head) {
+		t.Fatal("fixture: want the join retired and the cited checkpoint held")
+	}
+	requireNotMember(t, r.verify(early), "message dated before a retired join")
+	r.reopen()
+	requireNotMember(t, r.verify(early), "message dated before a retired join, after reopening")
+}
+
+// A node whose history lacks part of a window - a store retired before history
+// was kept, or one that lost a row - must not guess. Holding the join but not
+// the leave would place the member in the group past its leave; the window no
+// longer reproduces the checkpoint that closes it, so the node refuses to place
+// the member at all.
+func TestHistoricalMessageWithIncompleteRetiredWindowRejected(t *testing.T) {
+	r := newRetiringGroup(t)
+	head := r.group.Canonical().ID
+	member := mustIdentity(t)
+	r.record(member, membership.KindJoin)
+	posted := signAtHead(t, member, r.groupID, head, r.tick(), "posted while a member")
+	leave := r.record(member, membership.KindLeave)
+	afterLeave := signAtHead(t, member, r.groupID, head, leave.Timestamp+1, "dated after leaving")
+	// A checkpoint is dated at the newest record it folds in, so a later
+	// record keeps afterLeave inside the window C0 opens rather than at the
+	// next checkpoint, which no longer names the member.
+	r.record(mustIdentity(t), membership.KindJoin)
+	r.checkpoints(3)
+	if err := r.verify(posted); err != nil {
+		t.Fatalf("fixture: complete history rejected: %v", err)
+	}
+
+	if err := r.group.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", filepath.Join(r.dir, "groups", r.groupID.DirName(), "membership.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := db.Exec(`DELETE FROM membership_history WHERE record_id = ?;`, leave.ID[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := result.RowsAffected(); n != 1 {
+		t.Fatalf("fixture: removed %d history rows, want the retired leave", n)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	group, err := membership.Open(r.dir, r.groupID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.adopt(group)
+
+	requireNotMember(t, r.verify(afterLeave), "message dated after a leave this node no longer holds")
+	requireNotMember(t, r.verify(posted), "message in a window this node cannot reconstruct")
 }

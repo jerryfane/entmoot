@@ -14,9 +14,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `author not a group member` on a departed member's messages (#198). A
   historical message is authorised at the roster position it commits to: its
   cited checkpoint plus signed membership records up to its timestamp.
-  Messages dated at or after the author's leave or removal, or citing a
-  checkpoint that no longer names it, are rejected; signature checks and live
-  authorisation are unchanged.
+  Messages dated at or after the author's leave or removal, or before its
+  join, or citing a checkpoint that no longer names it, are rejected;
+  signature checks and live authorisation are unchanged. Membership records a
+  checkpoint retires now move to a local `membership_history` table instead of
+  being deleted, so this still holds after later checkpoints retire the join
+  and leave; a node whose history cannot reproduce the checkpoint closing a
+  window refuses to place a member inside it rather than guess. Records
+  retired before this release are gone, so messages that depend on them stay
+  unverifiable on that node. History catch-up now skips and counts
+  (`unauthorized_authors`) a message whose author it cannot place instead of
+  abandoning the keeper; forged signatures still fail the keeper.
 
 - History synchronization now includes outbound-only members with an existing
   direct connection even when they advertise no dialable addresses. Messages
