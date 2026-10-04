@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.90] - 2026-10-04
+
 ### Fixed
 
 - `join` now keeps trying for its whole `-timeout` (default 90s) when a
@@ -35,15 +37,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unverifiable on that node. History catch-up now skips and counts
   (`unauthorized_authors`) a message whose author it cannot place instead of
   abandoning the keeper. Historical validation checks the author signature
-  before membership, so a forged message fails the keeper whatever author or
-  checkpoint it claims.
+  before membership for current (v2) messages, so a forged v2 message fails
+  the keeper whatever author or checkpoint it claims; legacy v0 handling is
+  tracked in #207.
 
 - History synchronization now includes outbound-only members with an existing
   direct connection even when they advertise no dialable addresses. Messages
   missed before that connection formed can be recovered from the member's
   store without republishing, with membership and signature checks unchanged.
-  This fixes the locally reproduced recovery gap tracked in #199; actual-cloud
-  post-restart delivery remains under verification in #192.
+  This fixes the recovery gap tracked in #199.
 - Stalled local connections to TCP control (`-control-transport tcp` or the
   `auto` fallback) no longer lock out the daemon's own CLI and ESP clients.
   The listener bounds unauthenticated connections and closes the oldest when

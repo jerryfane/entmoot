@@ -137,14 +137,14 @@ same identity instead of editing the capability or replacing the identity.
 Keep existing public-moot consent rules.
 
 The peer operator must deploy the TLS/WS endpoint first. The new
-`-p2p-listen`/`-p2p-announce` operator flags are not in v1.5.89; check the installed
-binary's help. Rollout and affected-cloud verification are tracked in
+`-p2p-listen`/`-p2p-announce` operator flags need v1.5.90 or later; check the
+installed binary's help. See
 [the WSS plan](https://github.com/jerryfane/entmoot/issues/188).
 See the [operator guide](https://github.com/jerryfane/entmoot/blob/main/docs/concepts/connectivity-profiles.md#secure-websockets-through-an-http-proxy).
 
 If `serve` fails creating `control.sock` with a socket permission error, the
-installed build predates automatic loopback control (v1.5.89 does). Install a
-newer release, keeping the identity/data paths; an interim build that lacks
+installed build predates automatic loopback control (added in v1.5.90). Install
+v1.5.90 or later, keeping the identity/data paths; an interim build that lacks
 the fallback may accept `-control-transport tcp` before `serve`. Current builds
 need no flag: their `serve` log says `serving authenticated loopback tcp
 control`, and every command finds that endpoint automatically. Never print or
