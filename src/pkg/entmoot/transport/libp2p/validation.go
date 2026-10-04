@@ -123,8 +123,11 @@ func VerifyLiveMessage(group *membership.Group, message entmoot.Message, now tim
 	return VerifyLiveAuthor(group, message, now)
 }
 
-// VerifyHistoricalMessage accepts version-2 messages at a known roster
-// checkpoint. Version-0 messages require VerifyHistoricalMessageWithProof.
+// VerifyHistoricalMessage accepts a version-2 message whose author was a member
+// at the roster position it commits to: its cited checkpoint and timestamp, read
+// from signed membership history (see membership.Group.MemberAt), so a member
+// that later left keeps its history and cannot author past its own departure.
+// Version-0 messages require VerifyHistoricalMessageWithProof.
 func VerifyHistoricalMessage(group *membership.Group, message entmoot.Message, now time.Time) error {
 	return VerifyHistoricalMessageWithProof(group, message, now, nil)
 }
@@ -173,12 +176,12 @@ func VerifyHistoricalMessageWithProof(group *membership.Group, message entmoot.M
 		if message.Author.MemberID == nil || message.RosterHead == nil {
 			return fmt.Errorf("%w: incomplete historical member checkpoint", entmoot.ErrNotMember)
 		}
-		author, active, known := group.MemberAt(*message.Author.MemberID, *message.RosterHead)
+		author, active, known := group.MemberAt(*message.Author.MemberID, *message.RosterHead, message.Timestamp)
 		if !known {
 			return fmt.Errorf("%w: historical head %s", entmoot.ErrRosterHeadUnknown, message.RosterHead)
 		}
 		if !active {
-			return fmt.Errorf("%w: historical author %s", entmoot.ErrNotMember, message.Author.MemberID.String())
+			return fmt.Errorf("%w: historical author %s at its cited roster position", entmoot.ErrNotMember, message.Author.MemberID.String())
 		}
 		if err := verifyOperationalAuthor(message.Author, author); err != nil {
 			return err

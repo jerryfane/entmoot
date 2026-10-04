@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Historical messages from members who joined after a checkpoint and later
+  left verify again, so history synchronization no longer aborts with
+  `author not a group member` on a departed member's messages (#198). A
+  historical message is authorised at the roster position it commits to: its
+  cited checkpoint plus signed membership records up to its timestamp.
+  Messages dated at or after the author's leave or removal, or citing a
+  checkpoint that no longer names it, are rejected; signature checks and live
+  authorisation are unchanged.
+
 - History synchronization now includes outbound-only members with an existing
   direct connection even when they advertise no dialable addresses. Messages
   missed before that connection formed can be recovered from the member's
