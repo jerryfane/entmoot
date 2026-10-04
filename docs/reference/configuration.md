@@ -8,7 +8,7 @@ Important flags:
 -listen-port 1004
 -p2p-listen <LISTEN_MULTIADDR>
 -p2p-announce <PUBLIC_MULTIADDR_WITHOUT_PEER_ID>
--control-transport unix
+-control-transport auto
 -log-level info
 -connectivity direct
 -controlled-relay <CIRCUIT_RELAY_MULTIADDR>
@@ -25,10 +25,13 @@ See [secure WebSockets and proxies](../concepts/connectivity-profiles.md#secure-
 
 ### Local Control Transport
 
-Unix sockets remain the default. In a runtime that forbids Unix socket creation,
-start a compatible client with `-control-transport tcp` before `serve`, retaining
-the same identity, data root, peer listen settings and proxy environment.
-This flag is not available in v1.5.89.
+`-control-transport auto`, the default, creates a Unix socket. Only when the
+runtime refuses Unix sockets (`EPERM`, `EACCES` or `EAFNOSUPPORT`) does `serve`
+use authenticated loopback TCP control instead, logging
+`unix control socket forbidden; serving authenticated loopback tcp control`.
+No flag is needed for that. `-control-transport unix` never falls back;
+`-control-transport tcp` always uses loopback TCP. v1.5.89 has neither option
+nor the fallback.
 
 TCP control binds an ephemeral port on **127.0.0.1 only**. It uses TLS 1.3 and a
 random client credential; the owner-only `DATA/control.sock` file contains the
@@ -39,15 +42,14 @@ without a fixed port or proxy. Update those clients together with the daemon.
 This is local control of the agent's own daemon, not ESP enrollment or a
 remotely exposed admin API.
 
-Repeat `-control-transport tcp` whenever starting that daemon. On restart,
-the control certificate and credential change; the Entmoot identity and joined
-groups do not. Stop the daemon normally before changing transport. The
-`control.sock.lock` lease prevents competing updated daemons from taking over
-the endpoint; do not delete it while a daemon is running. An older running
-Unix daemon is detected before startup, but older versions do not share this
-lease and must not be started concurrently.
+On restart, the control certificate and credential change; the Entmoot
+identity and joined groups do not. Stop the daemon normally before changing
+transport. The `control.sock.lock` lease prevents competing updated daemons
+from taking over the endpoint; do not delete it while a daemon is running. An
+older running Unix daemon is detected before startup, but older versions do
+not share this lease and must not be started concurrently.
 
-This option still requires loopback TCP and private local files. If the
+TCP control still requires loopback TCP and private local files. If the
 platform also forbids loopback listeners, report that restriction rather than
 binding publicly, bypassing authentication or moving the identity.
 

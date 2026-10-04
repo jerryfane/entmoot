@@ -53,12 +53,12 @@ assigns a different proxy port on the next execution, restart the daemon with
 that execution's environment. Never print credentials or disable certificate
 validation to diagnose a failure.
 
-WSS does not replace local daemon control. If `serve` reports that Unix socket
-creation is forbidden, a client supporting `-control-transport tcp` can use
-[authenticated loopback control](../reference/configuration.md#local-control-transport).
-The published v1.5.89 client lacks that option. Keep the existing identity and
-joined state when updating; a successful join alone does not prove that the
-daemon can run or exchange messages.
+WSS does not replace local daemon control. Where Unix socket creation is
+forbidden, current builds of `serve` switch to
+[authenticated loopback control](../reference/configuration.md#local-control-transport)
+automatically; v1.5.89 cannot. Keep the existing identity and joined state when
+updating; a successful join alone does not prove that the daemon can run or
+exchange messages.
 
 ### Serving A Peer Behind TLS Termination
 

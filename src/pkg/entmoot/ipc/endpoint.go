@@ -43,28 +43,32 @@ type controlEndpoint struct {
 // Listener owns both a control endpoint and its exclusive file lease.
 type Listener struct {
 	net.Listener
-	lock      *os.File
-	path      string
-	file      os.FileInfo
-	once      sync.Once
-	closeErr  error
-	stopOnce  sync.Once
-	stopErr   error
-	tlsConfig *tls.Config
-	token     [32]byte
-	slots     chan struct{}
+	lock       *os.File
+	path       string
+	file       os.FileInfo
+	once       sync.Once
+	closeErr   error
+	stopOnce   sync.Once
+	stopErr    error
+	tlsConfig  *tls.Config
+	token      [32]byte
+	slots      chan struct{}
+	unixDenied error
 }
 
-// Listen creates either the default Unix socket or an explicitly selected,
-// mutually authenticated loopback TLS endpoint. The file lease spans startup,
-// service and cleanup, so a slow or stalled daemon cannot lose its endpoint to
-// a competing process. The lock file is never unlinked (avoiding inode races).
+// Listen creates the control endpoint for transport "unix", "tcp" or "auto"
+// (the empty string means "unix"). "unix" is strictly a Unix socket; "tcp" is a
+// mutually authenticated loopback TLS endpoint; "auto" creates the Unix socket
+// unless the runtime forbids creating one, then serves the authenticated TCP
+// endpoint instead. The file lease spans startup, service and cleanup, so a
+// slow or stalled daemon cannot lose its endpoint to a competing process. The
+// lock file is never unlinked (avoiding inode races).
 func Listen(path, transport string) (*Listener, error) {
 	if transport == "" {
 		transport = "unix"
 	}
-	if transport != "unix" && transport != "tcp" {
-		return nil, errors.New("control transport must be unix or tcp")
+	if transport != "unix" && transport != "tcp" && transport != "auto" {
+		return nil, errors.New("control transport must be auto, unix or tcp")
 	}
 	lock, err := os.OpenFile(path+".lock", os.O_CREATE|os.O_RDWR|unix.O_NOFOLLOW, 0600)
 	if err != nil {
@@ -106,57 +110,84 @@ func Listen(path, transport string) (*Listener, error) {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
-	if transport == "unix" {
-		l.Listener, err = net.Listen("unix", path)
-		if err != nil {
-			return nil, err
-		}
-		l.Listener.(*net.UnixListener).SetUnlinkOnClose(false)
-		l.file, err = os.Lstat(path)
-		if err != nil {
-			return nil, err
-		}
-		if err = os.Chmod(path, 0600); err != nil {
-			return nil, err
-		}
+	if transport == "tcp" {
+		err = l.listenTCP()
 	} else {
-		cert, certPEM, err := newControlCertificate()
-		if err != nil {
-			return nil, err
-		}
-		if _, err = rand.Read(l.token[:]); err != nil {
-			return nil, err
-		}
-		l.tlsConfig = &tls.Config{MinVersion: tls.VersionTLS13, Certificates: []tls.Certificate{cert}}
-		l.slots = make(chan struct{}, 32)
-		l.Listener, err = net.Listen("tcp4", "127.0.0.1:0")
-		if err != nil {
-			return nil, err
-		}
-		endpoint := controlEndpoint{Version: endpointVersion, Address: l.Addr().String(), Certificate: string(certPEM), Token: base64.StdEncoding.EncodeToString(l.token[:])}
-		tmp, err := os.CreateTemp(filepath.Dir(path), ".control-endpoint-*")
-		if err != nil {
-			return nil, err
-		}
-		defer os.Remove(tmp.Name())
-		err = json.NewEncoder(tmp).Encode(endpoint)
-		closeErr := tmp.Close()
-		if err != nil {
-			return nil, err
-		}
-		if closeErr != nil {
-			return nil, closeErr
-		}
-		if err = os.Rename(tmp.Name(), path); err != nil {
-			return nil, err
-		}
-		l.file, err = os.Lstat(path)
-		if err != nil {
-			return nil, err
-		}
+		err = l.listenUnix(transport == "auto")
+	}
+	if err != nil {
+		return nil, err
 	}
 	ok = true
 	return l, nil
+}
+
+// UnixDenied returns the Unix socket creation error that made an "auto"
+// listener serve authenticated loopback TCP instead, or nil.
+func (l *Listener) UnixDenied() error { return l.unixDenied }
+
+// unixSocketForbidden matches runtimes that refuse Unix sockets outright:
+// seccomp or LSM denial (EPERM, EACCES) and a disabled address family
+// (EAFNOSUPPORT, e.g. systemd RestrictAddressFamilies). Other failures, such
+// as an over-long path, stay fatal so "auto" never hides a misconfiguration.
+func unixSocketForbidden(err error) bool {
+	return errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES) || errors.Is(err, unix.EAFNOSUPPORT)
+}
+
+func (l *Listener) listenUnix(fallbackToTCP bool) error {
+	ln, err := net.Listen("unix", l.path)
+	if err != nil {
+		if fallbackToTCP && unixSocketForbidden(err) {
+			l.unixDenied = err
+			if err := l.listenTCP(); err != nil {
+				return fmt.Errorf("unix control socket forbidden (%v); authenticated loopback tcp control: %w", l.unixDenied, err)
+			}
+			return nil
+		}
+		return err
+	}
+	l.Listener = ln
+	ln.(*net.UnixListener).SetUnlinkOnClose(false)
+	if l.file, err = os.Lstat(l.path); err != nil {
+		return err
+	}
+	return os.Chmod(l.path, 0600)
+}
+
+func (l *Listener) listenTCP() error {
+	cert, certPEM, err := newControlCertificate()
+	if err != nil {
+		return err
+	}
+	if _, err = rand.Read(l.token[:]); err != nil {
+		return err
+	}
+	l.tlsConfig = &tls.Config{MinVersion: tls.VersionTLS13, Certificates: []tls.Certificate{cert}}
+	l.slots = make(chan struct{}, 32)
+	l.Listener, err = net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		return err
+	}
+	endpoint := controlEndpoint{Version: endpointVersion, Address: l.Addr().String(), Certificate: string(certPEM), Token: base64.StdEncoding.EncodeToString(l.token[:])}
+	tmp, err := os.CreateTemp(filepath.Dir(l.path), ".control-endpoint-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+	err = json.NewEncoder(tmp).Encode(endpoint)
+	closeErr := tmp.Close()
+	if err != nil {
+		return err
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	// Rename also replaces any socket file left by a failed Unix listen.
+	if err = os.Rename(tmp.Name(), l.path); err != nil {
+		return err
+	}
+	l.file, err = os.Lstat(l.path)
+	return err
 }
 
 func (l *Listener) Accept() (net.Conn, error) {

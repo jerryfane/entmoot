@@ -131,7 +131,7 @@ func run() int {
 	fs.UintVar(&gf.listenPort, "listen-port", 1004, "Entmoot listen port")
 	fs.Var(&gf.p2pListen, "p2p-listen", "libp2p listen multiaddr; repeatable, replaces the default TCP listener")
 	fs.Var(&gf.p2pAnnounce, "p2p-announce", "externally reachable libp2p multiaddr without /p2p; repeatable, replaces advertised listener addresses")
-	fs.StringVar(&gf.controlTransport, "control-transport", "unix", "local control transport: unix or authenticated loopback tcp")
+	fs.StringVar(&gf.controlTransport, "control-transport", "auto", "local control transport: auto (Unix socket, or authenticated loopback tcp where Unix sockets are forbidden), unix or tcp")
 	fs.StringVar(&gf.logLevel, "log-level", "info", "slog level: debug|info|warn|error")
 	fs.StringVar(&gf.connectivity, "connectivity", "direct", "connectivity profile: direct|relay-only")
 	fs.Var(&gf.controlledRelays, "controlled-relay", "controlled Circuit Relay v2 multiaddr ending in /p2p/<peer-id>; repeatable")
@@ -171,8 +171,8 @@ func run() int {
 		return exitInvalidArgument
 	}
 
-	if gf.controlTransport != "unix" && gf.controlTransport != "tcp" {
-		fmt.Fprintln(os.Stderr, "entmootd: -control-transport must be unix or tcp")
+	if gf.controlTransport != "auto" && gf.controlTransport != "unix" && gf.controlTransport != "tcp" {
+		fmt.Fprintln(os.Stderr, "entmootd: -control-transport must be auto, unix or tcp")
 		return exitInvalidArgument
 	}
 
