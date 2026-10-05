@@ -49,14 +49,15 @@ daemon `probe_status` says so rather than blaming the peers.
 - **Invite expired:** request a new invite.
 - **Join refused as stale (`record predates the current checkpoint`):** the
   group checkpointed while the join was in flight, often right after an invite
-  revoke or admin removal. Run the same `join` again; it re-signs above the
-  checkpoint and succeeds unless that invite was the one revoked.
+  revoke or admin removal was sealed. Run the same `join` again; it re-signs
+  above the checkpoint and succeeds unless that invite was the one revoked.
 - **Revoked invite or removed admin still seems to work on one node:** a
-  revoke, admin demotion or admin removal takes effect on each node once it
-  has the checkpoint signed with it, which it pulls on its next membership
-  round. If the command warned that it could not checkpoint, run
-  `roster checkpoint -group <gid>` on the founder (daemon stopped) or let the
-  founder's `serve` seal it on its next round.
+  revoke, admin demotion or admin removal is final against backdated joins
+  once the founder's daemon has sealed it with a checkpoint (one to two
+  membership rounds after that daemon has the record) and the node has
+  pulled that checkpoint. Make sure the founder's `serve` is running. Only if
+  it cannot run, use `roster checkpoint -group <gid>` on the founder, right
+  after it last synchronized with the other members.
 - **Peer route unclear:** run `doctor -group <gid> --probe --json`. Read
   `reachable` per peer, and `answered` before blaming the network: an
   answered-but-refused row means membership, not routing. `probe_status` says

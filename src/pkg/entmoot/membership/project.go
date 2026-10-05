@@ -49,10 +49,10 @@ func Project(base Checkpoint, records []Record) (State, []Record) {
 	return state, effective
 }
 
-// project is Project that also reports whether any effective record took
-// authority away (see applyJudged). That is what decides a checkpoint is due
-// before the cadence is.
-func project(base Checkpoint, records []Record) (State, []Record, bool) {
+// project is Project that also returns the timestamp of the newest effective
+// record that took authority away (see applyJudged), or 0 when none did. That
+// is the point a seal has to cover (see Group.SealDue).
+func project(base Checkpoint, records []Record) (State, []Record, int64) {
 	state := stateFrom(base)
 
 	// Deduplicate, and drop anything this base already accounts for. A record
@@ -92,15 +92,17 @@ func project(base Checkpoint, records []Record) (State, []Record, bool) {
 	})
 
 	effective := make([]Record, 0, len(ordered))
-	reduced := false
+	var reducedAt int64
 	for _, rec := range ordered {
-		applied, cut := applyJudged(&state, rec)
+		applied, reduced := applyJudged(&state, rec)
 		if applied {
 			effective = append(effective, rec)
-			reduced = reduced || cut
+			if reduced {
+				reducedAt = rec.Timestamp
+			}
 		}
 	}
-	return state, effective, reduced
+	return state, effective, reducedAt
 }
 
 // applyJudged applies one record and also reports whether it took authority
@@ -111,8 +113,8 @@ func project(base Checkpoint, records []Record) (State, []Record, bool) {
 // is by the signer's own timestamp and nothing bounds it from below except a
 // checkpoint, so a holder of a revoked invite, or of an invite from an admin
 // since demoted, can sign a join dated before the change and every node will
-// admit it. A checkpoint dated after the change refuses every such record as
-// stale, which is why these changes are sealed at once instead of waiting for
+// admit it. A checkpoint dated at or after the change refuses every such
+// record as stale, which is why these changes are sealed soon rather than at
 // the cadence.
 func applyJudged(state *State, rec Record) (applied, reduced bool) {
 	switch rec.Kind {

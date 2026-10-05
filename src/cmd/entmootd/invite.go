@@ -439,15 +439,13 @@ func cmdInviteRevoke(gf *globalFlags, args []string) int {
 	defer admission.Close()
 	// A local ledger row stops this node from advertising the invite. What
 	// stops every other node honouring it is a signed record, so sign one:
-	// without it a revoked invite still works anywhere it is presented. The
-	// checkpoint signed with it is what makes the revocation final against
-	// a join dated before it, which nothing else bounds.
+	// without it a revoked invite still works anywhere it is presented.
 	ctx, code, ok := setupAdminRoster(gf, "invite revoke", gid)
 	if !ok {
 		return code
 	}
 	defer ctx.close()
-	record, sealed, err := ctx.group.SignRecordAndCheckpoint(ctx.setup.identity, membership.Record{
+	record, err := ctx.group.SignRecord(ctx.setup.identity, membership.Record{
 		Kind:        membership.KindRevokeInvite,
 		InviteNonce: nonce,
 	})
@@ -455,7 +453,6 @@ func cmdInviteRevoke(gf *globalFlags, args []string) int {
 		fmt.Fprintf(os.Stderr, "invite revoke: %v\n", err)
 		return exitInvalidArgument
 	}
-	warnUnsealed("invite revoke", gid, sealed)
 	noted, err := admission.MarkRevoked(gid, nonce)
 	if err != nil {
 		slog.Error("invite revoke: ledger", slog.String("err", err.Error()))
@@ -466,11 +463,10 @@ func cmdInviteRevoke(gf *globalFlags, args []string) int {
 		status = "revoked_not_issued_here"
 	}
 	encoded, err := json.Marshal(map[string]any{
-		"status":     status,
-		"record_id":  record.ID,
-		"group_id":   gid.String(),
-		"nonce":      base64.StdEncoding.EncodeToString(nonce[:]),
-		"checkpoint": ctx.group.Canonical().ID,
+		"status":    status,
+		"record_id": record.ID,
+		"group_id":  gid.String(),
+		"nonce":     base64.StdEncoding.EncodeToString(nonce[:]),
 	})
 	if err != nil {
 		slog.Error("invite revoke: marshal", slog.String("err", err.Error()))

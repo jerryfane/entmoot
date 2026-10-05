@@ -1723,8 +1723,7 @@ func (s *ipcServer) handleMemberRemove(ctx context.Context, c net.Conn, req *ipc
 		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeConflict, GroupID: &gid, Message: "target identity does not match current roster"})
 		return
 	}
-	record, sealed, err := applyRosterRemove(s.identity, sess.group, existing)
-	if err != nil {
+	if err := applyRosterRemove(s.identity, sess.group, existing); err != nil {
 		unlock()
 		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInternal, GroupID: &gid, Message: err.Error()})
 		return
@@ -1732,7 +1731,6 @@ func (s *ipcServer) handleMemberRemove(ctx context.Context, c net.Conn, req *ipc
 	head := sess.group.Canonical().ID
 	members := len(sess.group.MemberIDs())
 	unlock()
-	s.runtime.publishMembershipChange(gid, record, sealed)
 	// A removed member's outstanding invites stop working by rule: an invite
 	// is worth exactly its issuer's current authority, which every node
 	// projects from the same records. There is nothing to revoke and so

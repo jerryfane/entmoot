@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -94,6 +95,25 @@ type groupSession struct {
 	// want of a roster checkpoint, kept so status output can show the gap.
 	unknownHeads atomic.Int64
 	peerRecords  *libp2ptransport.PeerRecordCache
+	seal         sealState
+}
+
+// sealState is the sealer's progress on sealing authority changes (see
+// sealAuthorityChanges). Maintenance rounds can overlap, so it is locked.
+type sealState struct {
+	mu sync.Mutex
+	// armed is the timestamp of the newest authority change this node held at
+	// the end of an earlier round, or 0. It is sealed through only after a
+	// later round has pulled from the reachable members.
+	armed int64
+	// last is when this node last sealed, for minSealInterval.
+	last time.Time
+}
+
+func (s *sealState) isArmed() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.armed != 0
 }
 
 type groupPolicyEnforcer struct {
@@ -201,24 +221,6 @@ func (r *groupRuntime) gossipMembershipRecord(groupID entmoot.GroupID, record me
 			}
 		}
 	}()
-}
-
-// publishMembershipChange gets a change this node signed out to the group's
-// reachable members now rather than on their next pull, and logs the
-// checkpoint that sealed it, if one did. Only records travel by push: the
-// checkpoint reaches each member on its next membership round, which asks the
-// founder first. An admin node that receives the record before the checkpoint
-// seals it itself on its own next round (see membership SignCheckpoint).
-func (r *groupRuntime) publishMembershipChange(groupID entmoot.GroupID, record membership.Record, sealed membership.AutoCheckpoint) {
-	if sealed.Signed {
-		r.logger.Info("membership checkpoint signed",
-			slog.String("group_id", groupID.String()),
-			slog.String("record_kind", string(record.Kind)),
-			slog.Uint64("sequence", sealed.Checkpoint.Sequence),
-			slog.Uint64("covered", sealed.Checkpoint.Covered),
-			slog.Int("members", len(sealed.Checkpoint.Members)))
-	}
-	r.gossipMembershipRecord(groupID, record)
 }
 
 func (r *groupRuntime) peerRecordsForGroup(groupID entmoot.GroupID) (*libp2ptransport.PeerRecordCache, bool) {
@@ -572,6 +574,12 @@ const (
 	// difference rather than a chain, and because a pushed record arrives
 	// immediately instead of waiting for the next round.
 	membershipSyncInterval = 15 * time.Second
+	// minSealInterval bounds how often the sealer signs a checkpoint for
+	// authority changes alone. Every one is founder-signed and so retained for
+	// good (it is what a joiner holding no group state can anchor on), so an
+	// admin revoking in a loop must not be able to make the founder sign one
+	// per change.
+	minSealInterval = time.Minute
 )
 
 // syncMembership pulls membership from reachable members. There is no backoff,
@@ -583,15 +591,30 @@ const (
 // changes nothing. That is the whole reason this is short: with a set there is
 // no "wrong chain" to detect, adopt or roll back.
 func (r *groupRuntime) syncMembership(ctx context.Context, session *groupSession) {
-	peers := r.membershipPeers(session)
+	// A round that is to seal an authority change pulls from every member it
+	// can address, not the usual handful: the seal makes everything dated
+	// before the change stale, so it may only vouch for what all the members
+	// it can reach hold.
+	limit := maxMembershipSyncPeers
+	if session.seal.isArmed() {
+		limit = math.MaxInt
+	}
+	peers := r.membershipPeersUpTo(session, limit)
 	if len(peers) == 0 {
 		// Nobody to pull from, which is not a reason to skip the cadence: a
 		// group whose only online node is the founder still accumulates the
-		// records the founder signs, and still has to retire them.
+		// records the founder signs, and still has to retire them. A seal is
+		// different: it would vouch for records other members may hold, so it
+		// waits for a round that reaches one, unless there is nobody else.
+		r.sealAuthorityChanges(session, r.onlyLocalMember(session))
 		r.signCheckpointIfDue(session)
 		return
 	}
 	progressed := false
+	// reached counts the members this round pulled everything from. A member
+	// that could not be pulled from is treated as unreachable; one that had
+	// more than one exchange carries leaves the round short.
+	reached, short := 0, false
 	for _, remote := range peers {
 		syncCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		checkpoints, records, complete, err := libp2ptransport.FetchMembership(syncCtx, r.host, remote, session.group, r.binding.MemberID)
@@ -615,6 +638,13 @@ func (r *groupRuntime) syncMembership(ctx context.Context, session *groupSession
 				slog.String("peer_id", remote.ID.String()),
 				slog.String("err", err.Error()))
 		}
+		if err == nil {
+			if complete {
+				reached++
+			} else {
+				short = true
+			}
+		}
 		if checkpoints > 0 || records > 0 {
 			progressed = true
 			r.logger.Info("libp2p membership synchronized",
@@ -637,19 +667,81 @@ func (r *groupRuntime) syncMembership(ctx context.Context, session *groupSession
 		// Messages held for a checkpoint we have now learned can be accepted.
 		r.drainHeldMessages(ctx, session)
 	}
+	r.sealAuthorityChanges(session, reached > 0 && !short)
 	// Every round, not only when a pull brought something back: records this
 	// node signed itself count towards the cadence too, so a founder admitting
 	// members while nothing arrives from anybody else must still checkpoint.
 	r.signCheckpointIfDue(session)
 }
 
-// signCheckpointIfDue folds pending records into a checkpoint once one is due,
-// if this node may sign one. Any admin may: a group whose founder is offline
-// still retires history. One is due at the group's cadence, and as soon as the
-// pending records take authority away - a revoked invite, a demoted or removed
-// admin - so such a change signed by a node that could not seal it itself, or
-// received from a peer ahead of its checkpoint, is sealed within one round by
-// whichever admin holds it.
+// onlyLocalMember reports whether this node is the group's only member, so
+// no other node can hold a record it lacks.
+func (r *groupRuntime) onlyLocalMember(session *groupSession) bool {
+	for _, id := range session.group.MemberIDs() {
+		if id != r.binding.MemberID {
+			return false
+		}
+	}
+	return true
+}
+
+// sealAuthorityChanges makes a revoked invite, a demoted or removed admin, or
+// a closed group final against joins dated before the change (see
+// membership.Group.SealDue), by signing a checkpoint dated at the change.
+//
+// Signing one is safe only on a view the other members agree with: the
+// checkpoint makes every record dated before it stale, so a record a member
+// holds and this node does not is lost for good, and that member refuses the
+// checkpoint and every one after it. So:
+//   - only the founder's daemon seals. Every checkpoint lists the founder and
+//     the founder may always sign one, so it is always able to, and with one
+//     signer no two nodes cut sibling checkpoints over different records.
+//     Admins, including one that signed the change or received it first,
+//     never seal; while the founder's daemon is down a change waits for it,
+//     or for the cadence;
+//   - it seals only a change it already held at the end of an earlier round,
+//     and only once a later round has pulled from every member it could
+//     reach (synced), which gives records dated before the change a full
+//     round to reach somebody and be pulled; a round that reached nobody
+//     defers the seal to the next one;
+//   - the checkpoint folds only what is dated up to the change, so records
+//     signed since stay out of what it vouches for;
+//   - one seal per minSealInterval, however many changes arrive.
+//
+// The cadence checkpoint is separate and unchanged.
+func (r *groupRuntime) sealAuthorityChanges(session *groupSession, synced bool) {
+	seal := &session.seal
+	seal.mu.Lock()
+	defer seal.mu.Unlock()
+	founder := session.group.Founder()
+	if founder.MemberID == nil || *founder.MemberID != r.binding.MemberID ||
+		!bytes.Equal(founder.EntmootPubKey, r.identity.PublicKey) {
+		return
+	}
+	if seal.armed != 0 && synced && time.Since(seal.last) >= minSealInterval {
+		checkpoint, signed, err := session.group.SealThrough(r.identity, seal.armed)
+		switch {
+		case err != nil:
+			r.logger.Warn("membership seal",
+				slog.String("group_id", session.groupID.String()),
+				slog.String("err", err.Error()))
+		case signed:
+			seal.last = time.Now()
+			r.logger.Info("membership authority change sealed",
+				slog.String("group_id", session.groupID.String()),
+				slog.Uint64("sequence", checkpoint.Sequence),
+				slog.Int64("through", checkpoint.Timestamp),
+				slog.Uint64("covered", checkpoint.Covered),
+				slog.Int("members", len(checkpoint.Members)))
+		}
+	}
+	// Whatever is due now waits for the next synced round.
+	seal.armed, _ = session.group.SealDue()
+}
+
+// signCheckpointIfDue folds pending records into a checkpoint once the group's
+// cadence is reached, if this node may sign one. Any admin may: a group whose
+// founder is offline still retires history.
 func (r *groupRuntime) signCheckpointIfDue(session *groupSession) {
 	if !session.group.CanAdminister(r.binding.MemberID) {
 		return
@@ -674,6 +766,11 @@ func (r *groupRuntime) signCheckpointIfDue(session *groupSession) {
 // current member except this node, founder first because it is the most likely
 // to be reachable.
 func (r *groupRuntime) membershipPeers(session *groupSession) []peer.AddrInfo {
+	return r.membershipPeersUpTo(session, maxMembershipSyncPeers)
+}
+
+// membershipPeersUpTo is membershipPeers with the fan-out given by limit.
+func (r *groupRuntime) membershipPeersUpTo(session *groupSession, limit int) []peer.AddrInfo {
 	cached, _ := loadGroupPeers(r.dataDir, session.groupID)
 	addrsFor := func(id peer.ID) []multiaddr.Multiaddr {
 		if addrs := r.host.Peerstore().Addrs(id); len(addrs) > 0 {
@@ -686,11 +783,11 @@ func (r *groupRuntime) membershipPeers(session *groupSession) []peer.AddrInfo {
 		}
 		return nil
 	}
-	out := make([]peer.AddrInfo, 0, maxMembershipSyncPeers)
-	seen := make(map[peer.ID]struct{}, maxMembershipSyncPeers)
+	out := make([]peer.AddrInfo, 0, min(limit, maxMembershipSyncPeers))
+	seen := make(map[peer.ID]struct{}, min(limit, maxMembershipSyncPeers))
 	take := func(infos []entmoot.NodeInfo, room int) {
 		for _, info := range infos {
-			if room == 0 || len(out) == maxMembershipSyncPeers {
+			if room == 0 || len(out) == limit {
 				return
 			}
 			binding, err := libp2ptransport.BindingFromPublicKey(info.EntmootPubKey)
@@ -716,7 +813,7 @@ func (r *groupRuntime) membershipPeers(session *groupSession) []peer.AddrInfo {
 	// rewind cannot crowd out ordinary sync, and they go first so a group
 	// with more addressable members than this fan-out still reaches them.
 	take(session.group.RewoundMemberInfos(), maxRewoundSyncPeers)
-	take(session.group.ReachableMemberInfos(), maxMembershipSyncPeers)
+	take(session.group.ReachableMemberInfos(), limit)
 	return out
 }
 

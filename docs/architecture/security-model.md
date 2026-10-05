@@ -26,11 +26,14 @@ Records are ordered by their signer's timestamp, which nothing else bounds
 from below, so a revocation or a demotion is final only against joins dated
 after it until a checkpoint covers it. Every change that takes authority away
 (invite revocation, admin demotion, removal or departure, closing an open
-group) is therefore checkpointed as it is signed, and a node refuses a join
-dated before it once that checkpoint has reached it. Until then - one
-membership round for a serving node - that node can still admit such a join.
-Invite expiry has no such checkpoint: a join dated inside an expired invite's
-validity window is admitted until a later checkpoint covers the window.
+group) is therefore sealed by the founder's daemon with a checkpoint dated at
+the change, once a membership round has pulled what the reachable members
+hold, and a node refuses a join dated before the change once that checkpoint
+has reached it. Until then - about one to two membership rounds on the
+founder, and one more for the other nodes, longer while the founder's daemon
+is down - a node can still admit such a join. Invite expiry has no such
+checkpoint: a join dated inside an expired invite's validity window is
+admitted until a later checkpoint covers the window.
 
 A fresh joiner trusts the founder key pinned by its verified invite and checks
 the served checkpoint's founder signature. A migrated group's legacy anchor

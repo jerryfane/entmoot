@@ -2572,11 +2572,11 @@ func authorityLosses() []authorityLoss {
 
 // Records are ordered by their signer's timestamp and nothing bounds it from
 // below but a checkpoint, so a join dated before a change that takes authority
-// away is judged as if the change had not happened yet. The maintenance round
-// must therefore checkpoint such a change at once, not at the cadence: then
-// the signer and every peer that adopts the checkpoint through the ordinary
-// Apply paths refuse the backdated join as stale.
-func TestRoundSealsAuthorityLossAgainstBackdatedJoins(t *testing.T) {
+// away is judged as if the change had not happened yet. Each such change is
+// due for a seal, and the seal - a checkpoint folding the records up to the
+// change and nothing later - makes the signer and every peer that adopts it
+// through the ordinary Apply paths refuse the backdated join as stale.
+func TestSealMakesAuthorityLossFinalAgainstBackdatedJoins(t *testing.T) {
 	for _, tc := range authorityLosses() {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newFixture(t, tc.policy())
@@ -2584,10 +2584,25 @@ func TestRoundSealsAuthorityLossAgainstBackdatedJoins(t *testing.T) {
 			joiner := mustIdentity(t)
 			backdated, change := tc.setup(f, joiner)
 			change()
+			through, due := f.group.SealDue()
+			if !due {
+				t.Fatal("the change is not due for a seal")
+			}
+			f.tick(10)
+			later := f.join(mustIdentity(t))
 
-			sealed, signed, err := f.group.SignCheckpoint(f.founder, false)
+			sealed, signed, err := f.group.SealThrough(f.founder, through)
 			if err != nil || !signed {
-				t.Fatalf("the round did not checkpoint the change: signed=%t err=%v", signed, err)
+				t.Fatalf("seal: signed=%t err=%v", signed, err)
+			}
+			if sealed.Timestamp != through {
+				t.Fatalf("the seal is dated %d, want the change at %d", sealed.Timestamp, through)
+			}
+			if pending := f.group.Pending(); len(pending) != 1 || pending[0].ID != later.ID {
+				t.Fatalf("the seal folded records signed after the change: %d still pending", len(pending))
+			}
+			if _, due := f.group.SealDue(); due {
+				t.Fatal("the change is still due after its seal")
 			}
 			if _, err := f.group.Apply(backdated); !errors.Is(err, ErrStale) {
 				t.Fatalf("signer applied a join dated before the change: %v (member=%t)", err, f.group.IsMemberID(f.memberID(joiner)))
@@ -2607,10 +2622,10 @@ func TestRoundSealsAuthorityLossAgainstBackdatedJoins(t *testing.T) {
 				}
 			}
 			if _, err := peer.ApplyCheckpoint(sealed); err != nil {
-				t.Fatalf("peer refused the checkpoint: %v", err)
+				t.Fatalf("peer refused the seal: %v", err)
 			}
 			if peer.Canonical().ID != sealed.ID {
-				t.Fatal("peer did not adopt the checkpoint as canonical")
+				t.Fatal("peer did not adopt the seal as canonical")
 			}
 			if _, err := peer.Apply(backdated); !errors.Is(err, ErrStale) {
 				t.Fatalf("peer applied a join dated before the change after syncing: %v", err)
@@ -2619,11 +2634,11 @@ func TestRoundSealsAuthorityLossAgainstBackdatedJoins(t *testing.T) {
 	}
 }
 
-// Only changes that take authority away are sealed before the cadence. Joins,
-// removing an ordinary member, lifting a ban, a policy change that leaves the
-// admins and the join rule alone, and a revoke that changed nothing leave
-// history to the cadence, as before.
-func TestRoundLeavesOtherChangesToTheCadence(t *testing.T) {
+// Only changes that take authority away are due for a seal. Joins, removing
+// an ordinary member, lifting a ban, a policy change that leaves the admins
+// and the join rule alone, and a revoke that changed nothing leave history to
+// the cadence, and the cadence itself is unchanged.
+func TestOnlyAuthorityLossIsDueForASeal(t *testing.T) {
 	f := newFixture(t, DefaultPolicy())
 	member := mustIdentity(t)
 	f.join(member)
@@ -2631,9 +2646,6 @@ func TestRoundLeavesOtherChangesToTheCadence(t *testing.T) {
 	f.join(admin)
 	f.grantAdmin(f.memberID(admin))
 	f.tick(10)
-	if _, signed, err := f.group.SignCheckpoint(f.founder, true); err != nil || !signed {
-		t.Fatalf("base checkpoint: signed=%t err=%v", signed, err)
-	}
 	capability := f.invite(f.founder, nil, 2)
 	f.tick(10)
 	if _, err := f.group.SignRecord(f.founder, Record{Kind: KindRevokeInvite, InviteNonce: capability.Nonce}); err != nil {
@@ -2662,17 +2674,23 @@ func TestRoundLeavesOtherChangesToTheCadence(t *testing.T) {
 	if _, err := f.group.SignRecord(f.founder, Record{Kind: KindPolicy, Policy: &policy}); err != nil {
 		t.Fatal(err)
 	}
+	if through, due := f.group.SealDue(); due {
+		t.Fatalf("changes that take no authority away are due for a seal through %d", through)
+	}
+	if _, signed, err := f.group.SealThrough(f.founder, f.clockMS); err != nil || signed {
+		t.Fatalf("sealed changes that take no authority away: signed=%t err=%v", signed, err)
+	}
 	if _, signed, err := f.group.SignCheckpoint(f.founder, false); err != nil || signed {
-		t.Fatalf("the round checkpointed changes that take no authority away: signed=%t err=%v", signed, err)
+		t.Fatalf("the cadence checkpointed early: signed=%t err=%v", signed, err)
 	}
 	if f.group.Canonical().ID != base.ID {
 		t.Fatal("the canonical checkpoint moved")
 	}
 }
 
-// However many authority changes a round brings, one checkpoint seals them
-// all, and the next round has nothing left to seal.
-func TestRoundSealsABurstOfAuthorityLossOnce(t *testing.T) {
+// However many authority changes are pending, one seal through the newest
+// covers them all.
+func TestOneSealCoversABurstOfAuthorityLoss(t *testing.T) {
 	f := newFixture(t, DefaultPolicy())
 	admin := mustIdentity(t)
 	f.join(admin)
@@ -2685,23 +2703,27 @@ func TestRoundSealsABurstOfAuthorityLossOnce(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	f.grantAdmin()
+	demotion := f.grantAdmin()
 
-	sealed, signed, err := f.group.SignCheckpoint(f.founder, false)
+	through, due := f.group.SealDue()
+	if !due || through != demotion.Timestamp {
+		t.Fatalf("due=%t through %d, want the newest change at %d", due, through, demotion.Timestamp)
+	}
+	sealed, signed, err := f.group.SealThrough(f.founder, through)
 	if err != nil || !signed {
-		t.Fatalf("the round did not checkpoint the burst: signed=%t err=%v", signed, err)
+		t.Fatalf("seal: signed=%t err=%v", signed, err)
 	}
 	if sealed.Sequence != base.Sequence+1 || len(f.group.Pending()) != 0 {
 		t.Fatalf("burst sealed at sequence %d with %d records left, want %d with none",
 			sealed.Sequence, len(f.group.Pending()), base.Sequence+1)
 	}
-	if _, signed, err := f.group.SignCheckpoint(f.founder, false); err != nil || signed {
-		t.Fatalf("the next round checkpointed again: signed=%t err=%v", signed, err)
+	if _, due := f.group.SealDue(); due {
+		t.Fatal("the burst is still due after one seal")
 	}
 }
 
 // A legitimate join signed concurrently with a revoke can arrive after the
-// checkpoint and be refused as stale. Re-running the join adopts the current
+// seal and be refused as stale. Re-running the join adopts the current
 // checkpoint and signs above it, which succeeds unless its own invite was the
 // revoked one.
 func TestJoinRacingARevokeSucceedsWhenRerun(t *testing.T) {
@@ -2711,14 +2733,15 @@ func TestJoinRacingARevokeSucceedsWhenRerun(t *testing.T) {
 	revokedInvite := f.invite(f.founder, holder, 1)
 	raced := f.sign(honest, Record{Kind: KindJoin, Invite: &honestInvite})
 	f.tick(10)
-	if _, err := f.group.SignRecord(f.founder, Record{Kind: KindRevokeInvite, InviteNonce: revokedInvite.Nonce}); err != nil {
+	revoke, err := f.group.SignRecord(f.founder, Record{Kind: KindRevokeInvite, InviteNonce: revokedInvite.Nonce})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, signed, err := f.group.SignCheckpoint(f.founder, false); err != nil || !signed {
-		t.Fatalf("revoke not checkpointed: signed=%t err=%v", signed, err)
+	if _, signed, err := f.group.SealThrough(f.founder, revoke.Timestamp); err != nil || !signed {
+		t.Fatalf("seal: signed=%t err=%v", signed, err)
 	}
 	if _, err := f.group.Apply(raced); !errors.Is(err, ErrStale) {
-		t.Fatalf("a join dated before the checkpoint was applied: %v", err)
+		t.Fatalf("a join dated before the seal was applied: %v", err)
 	}
 
 	rejoin := func(identity *keystore.Identity, capability entmoot.BootstrapCapability) bool {
