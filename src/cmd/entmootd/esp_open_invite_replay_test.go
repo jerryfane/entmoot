@@ -1434,6 +1434,48 @@ func TestReinviteMintedWhileTheWorkerIsBusySurvives(t *testing.T) {
 	f.cannotRejoinButReinviteWorks(removed, removedSpare)
 }
 
+// TestReinviteAfterARemovalSeenWithoutInvitesSurvivesARestart: a node with
+// no live invite in the group does no work for removals - no projection, no
+// ledger write - but keeps them noticed. Minting the re-invite starts a pass
+// that records when the removal arrived while the process still knows, so the
+// re-invite outlives a restart, after which the group has forgotten.
+func TestReinviteAfterARemovalSeenWithoutInvitesSurvivesARestart(t *testing.T) {
+	f := startReplayFixture(t, 69, true)
+	group := f.session.group
+	target := generateIdentity(t)
+	info := mustDaemonNodeInfo(t, target)
+	mustJoinWithInvite(t, group, target, mustDaemonInvite(t, group, f.founder, info, 1))
+	f.session.reconciler.wait()
+	time.Sleep(5 * time.Millisecond)
+	f.applyAndSettle(f.signAs(f.admin, membership.Record{Kind: membership.KindRemove, Subject: info, Timestamp: time.Now().UnixMilli()}))
+	noticed, all := group.TakeNoticed()
+	if !all && !slices.Contains(noticed, *info.MemberID) {
+		t.Fatal("a pass with no live invite consumed the removal it had noticed")
+	}
+	group.Renotice(noticed, all)
+
+	time.Sleep(20 * time.Millisecond)
+	reinvite := f.inviteTargeted(target)
+	f.session.reconciler.wait()
+	if !f.runtime.RemoveGroup(f.gid) {
+		t.Fatal("RemoveGroup found no session")
+	}
+	time.Sleep(20 * time.Millisecond)
+	session, _, err := f.runtime.AddLocalGroup(f.ctx, f.gid)
+	if err != nil {
+		t.Fatalf("reopen the group: %v", err)
+	}
+	f.session = session
+	f.session.reconciler.signal()
+	f.session.reconciler.wait()
+	if f.session.group.IsInviteRevoked(reinvite.Nonce) || !f.admits(reinvite) {
+		t.Fatal("after a restart the re-invite minted once the removal had arrived was revoked")
+	}
+	if !f.joinNow(target, reinvite) {
+		t.Fatal("the removed member could not come back with its re-invite")
+	}
+}
+
 // TestInvitesOfARemovalQueuedAtShutdownAreRevoked: a removal applied just
 // before the group is removed, as at shutdown, is reconciled before the group
 // is closed, and a signal after that is a harmless no-op.

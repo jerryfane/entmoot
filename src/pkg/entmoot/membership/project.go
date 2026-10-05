@@ -53,41 +53,27 @@ func Project(base Checkpoint, records []Record) (State, []Record) {
 // record that took authority away (see applyJudged), or 0 when none did. That
 // is the point a seal has to cover (see Group.SealDue).
 func project(base Checkpoint, records []Record) (State, []Record, int64) {
-	return projectTracking(base, records, nil)
-}
-
-// membershipEndings is what projectTracking notes about how memberships
-// ended, for Group.RemovedAt.
-type membershipEndings struct {
-	// endedBy is, for each member the records took out of the group - by a
-	// removal, a ban, a leave or a rekey - the effective record that ended
-	// its latest membership, kept if it was readmitted since.
-	endedBy map[entmoot.MemberID]Record
-	// removedAfter is, for each id that was not a member when it was named,
-	// the earliest removal or ban of it since it last was one, that its
-	// signer had the authority for at that point in the order: the removal
-	// that would have ended the membership had a leave or rekey, perhaps
-	// dated earlier by the member itself, not ended it first. Readmission
-	// clears it. A removal that ended the membership is in endedBy instead.
-	removedAfter map[entmoot.MemberID]Record
-}
-
-func newMembershipEndings() membershipEndings {
-	return membershipEndings{
-		endedBy:      make(map[entmoot.MemberID]Record),
-		removedAfter: make(map[entmoot.MemberID]Record),
-	}
-}
-
-// projectTracking is project that, when endings is not nil, also fills it
-// (see membershipEndings). Tracking is off on the hot path (reproject) and
-// asked for only by Group.RemovedAt.
-func projectTracking(base Checkpoint, records []Record, endings *membershipEndings) (State, []Record, int64) {
 	state := stateFrom(base)
+	ordered := orderForProjection(base, records)
+	effective := make([]Record, 0, len(ordered))
+	var reducedAt int64
+	for _, rec := range ordered {
+		applied, reduced := applyJudged(&state, rec)
+		if applied {
+			effective = append(effective, rec)
+			if reduced {
+				reducedAt = rec.Timestamp
+			}
+		}
+	}
+	return state, effective, reducedAt
+}
 
-	// Deduplicate, and drop anything this base already accounts for. A record
-	// at or before the checkpoint's timestamp is inside it; applying it again
-	// is exactly what would let a discarded change come back.
+// orderForProjection deduplicates records, drops anything base already
+// accounts for, and sorts the rest into the order they are projected in. A
+// record at or before the checkpoint's timestamp is inside it; applying it
+// again is exactly what would let a discarded change come back.
+func orderForProjection(base Checkpoint, records []Record) []Record {
 	seen := make(map[entmoot.RosterEntryID]struct{}, len(records))
 	ordered := make([]Record, 0, len(records))
 	for _, rec := range records {
@@ -100,7 +86,6 @@ func projectTracking(base Checkpoint, records []Record, endings *membershipEndin
 		seen[rec.ID] = struct{}{}
 		ordered = append(ordered, rec)
 	}
-
 	founderID, founderErr := entmoot.ResolvedMemberID(base.Founder)
 	sort.Slice(ordered, func(i, j int) bool {
 		left, right := ordered[i], ordered[j]
@@ -120,44 +105,122 @@ func projectTracking(base Checkpoint, records []Record, endings *membershipEndin
 		}
 		return bytes.Compare(left.ID[:], right.ID[:]) < 0
 	})
+	return ordered
+}
 
-	effective := make([]Record, 0, len(ordered))
-	var reducedAt int64
+// chainCheckpoint is a checkpoint on the canonical chain with the index of
+// the members it lists.
+type chainCheckpoint struct {
+	Checkpoint
+	members map[entmoot.MemberID]entmoot.NodeInfo
+}
+
+// endingNote is a record trackEndings noted, with the Sequence of the
+// checkpoint whose segment it was applied in.
+type endingNote struct {
+	Record
+	segment uint64
+}
+
+// membershipEndings is what trackEndings notes about how memberships ended,
+// for Group.RemovedAt. Every note carries the sequence of the checkpoint its
+// record was projected from, so the one pass answers for a projection begun
+// at any checkpoint on the chain: a note made from checkpoint k or a later
+// one is a note a projection from checkpoint k makes too.
+type membershipEndings struct {
+	// ended is, for each member the records took out of the group - by a
+	// removal, a ban, a leave or a rekey - the effective record that ended
+	// its latest membership, kept if it was readmitted since.
+	ended map[entmoot.MemberID]endingNote
+	// removedAfter lists, oldest first, for each id while it is not a member,
+	// the removals or bans of it whose signer could remove it at that point
+	// in the order: the removals that would have ended the membership had a
+	// leave or rekey, perhaps dated earlier by the member itself, not ended
+	// it first. Readmission - a join or a rekey onto the id - clears the list.
+	// A removal that ended the membership is in ended instead.
+	removedAfter map[entmoot.MemberID][]endingNote
+	// from is the sequence of the checkpoint the pass began at: notes say
+	// nothing about what happened before it.
+	from uint64
+}
+
+// endedBy reports the record that ended id's latest membership, if a
+// projection from the checkpoint with sequence from would have met it.
+func (e *membershipEndings) endedBy(id entmoot.MemberID, from uint64) (Record, bool) {
+	note, ok := e.ended[id]
+	if !ok || note.segment < from {
+		return Record{}, false
+	}
+	return note.Record, true
+}
+
+// removedSince reports the earliest removal of id since it was last a member
+// that a projection from the checkpoint with sequence from would have met.
+func (e *membershipEndings) removedSince(id entmoot.MemberID, from uint64) (Record, bool) {
+	for _, note := range e.removedAfter[id] {
+		if note.segment >= from {
+			return note.Record, true
+		}
+	}
+	return Record{}, false
+}
+
+// trackEndings projects records along chain, oldest checkpoint first, the
+// way the group projects its window from the canonical checkpoint: the
+// records a checkpoint does not cover and the next one does are projected
+// from that checkpoint's own state, and those the newest does not cover from
+// it. Every record is sorted and applied once, so how memberships ended since
+// any checkpoint on the chain costs one projection in all, not one for each
+// checkpoint asked about. Where a checkpoint's state is what projecting the
+// records before it gives - as for every checkpoint this node signed - this
+// is exactly a projection from any earlier checkpoint over every record after
+// it; where a checkpoint signed elsewhere folded records this node does not
+// hold, the records after it are read from what that checkpoint says, as the
+// group itself reads them.
+func trackEndings(chain []chainCheckpoint, records []Record) *membershipEndings {
+	endings := &membershipEndings{
+		ended:        make(map[entmoot.MemberID]endingNote),
+		removedAfter: make(map[entmoot.MemberID][]endingNote),
+	}
+	if len(chain) == 0 {
+		return endings
+	}
+	endings.from = chain[0].Sequence
+	ordered := orderForProjection(chain[0].Checkpoint, records)
+	at := 0
+	state := stateFrom(chain[0].Checkpoint)
 	for _, rec := range ordered {
-		var involved []entmoot.MemberID
-		if endings != nil {
-			involved = membersIn(state, rec)
-			if subject, ok := authorizedRemovalOfNonMember(state, rec); ok {
-				if _, earlier := endings.removedAfter[subject]; !earlier {
-					endings.removedAfter[subject] = rec
-				}
+		next := at
+		for next+1 < len(chain) && !coveredBy(chain[next+1].Checkpoint, rec) {
+			next++
+		}
+		if next != at {
+			at = next
+			state = stateFrom(chain[at].Checkpoint)
+		}
+		segment := chain[at].Sequence
+		involved := membersIn(state, rec)
+		if subject, ok := authorizedRemovalOfNonMember(state, rec); ok {
+			endings.removedAfter[subject] = append(endings.removedAfter[subject], endingNote{Record: rec, segment: segment})
+		}
+		if applied, _ := applyJudged(&state, rec); !applied {
+			continue
+		}
+		for _, id := range involved {
+			if _, still := state.Members[id]; !still {
+				endings.ended[id] = endingNote{Record: rec, segment: segment}
 			}
 		}
-		applied, reduced := applyJudged(&state, rec)
-		if applied {
-			effective = append(effective, rec)
-			if reduced {
-				reducedAt = rec.Timestamp
-			}
-			if endings == nil {
-				continue
-			}
-			for _, id := range involved {
-				if _, still := state.Members[id]; !still {
-					endings.endedBy[id] = rec
-				}
-			}
-			// Readmitted - a join, or a rekey onto this id - starts afresh.
-			if rec.Kind == KindJoin || rec.Kind == KindRekey {
-				for _, id := range recordMemberIDs(rec) {
-					if _, member := state.Members[id]; member {
-						delete(endings.removedAfter, id)
-					}
+		// Readmitted - a join, or a rekey onto this id - starts afresh.
+		if rec.Kind == KindJoin || rec.Kind == KindRekey {
+			for _, id := range recordMemberIDs(rec) {
+				if _, member := state.Members[id]; member {
+					delete(endings.removedAfter, id)
 				}
 			}
 		}
 	}
-	return state, effective, reducedAt
+	return endings
 }
 
 // authorizedRemovalOfNonMember reports the subject of rec if rec is a removal

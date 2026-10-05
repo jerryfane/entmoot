@@ -951,13 +951,42 @@ type removedMemberInvite struct {
 // gets round to it, so a busy worker cannot move it past a re-invite; the
 // ledger keeps the earliest time each removal was ever given, which is what
 // covers a restart. A removal the group has no time for - one it loaded when
-// it opened - is given the time of this pass. Every pass records every
-// removal, whether or not this node has invites for that member yet. A ledger
-// row from before minted_at_ms existed has only its issue date, set minutes
-// early, and is compared with the removal's timestamp alone.
+// it opened - is given the time of this pass. A ledger row from before
+// minted_at_ms existed has only its issue date, set minutes early, and is
+// compared with the removal's timestamp alone.
+//
+// Only the targets of live invites are asked about, with the members the group
+// noticed going out or being named by a removal since the last pass (see
+// membership.Group.TakeNoticed): those are recorded in the ledger whether or
+// not this node has invites for them yet, so a re-invite minted later is
+// judged by when the removal arrived even across a restart. Every member is
+// asked about only after the group was opened or its canonical checkpoint
+// moved. A node with no live invite in the group asks nothing and keeps the
+// notices for the first pass that has one: minting an invite starts a pass.
 func (r *groupRuntime) invitesOfRemovedMembers(group *membership.Group) []removedMemberInvite {
 	gid := group.GroupID()
-	removals := group.RemovedAt(nil, r.binding.MemberID)
+	live, err := r.invites.LiveTargetedInvites(gid)
+	if err != nil {
+		r.logger.Warn("list issued invites", slog.String("group_id", gid.String()), slog.String("err", err.Error()))
+		return nil
+	}
+	targets := make([]entmoot.MemberID, 0, len(live))
+	for _, record := range live {
+		if !group.IsInviteRevoked(record.Nonce) &&
+			(record.MaxUses == 0 || group.InviteUses(record.Nonce) < record.MaxUses) {
+			targets = append(targets, *record.TargetMemberID)
+		}
+	}
+	if len(targets) == 0 {
+		return nil
+	}
+	noticed, all := group.TakeNoticed()
+	var removals map[entmoot.MemberID]membership.Removal
+	if all {
+		removals = group.RemovedAt(nil, r.binding.MemberID)
+	} else {
+		removals = group.RemovedAt(append(noticed, targets...), r.binding.MemberID)
+	}
 	if len(removals) == 0 {
 		return nil
 	}
@@ -974,12 +1003,8 @@ func (r *groupRuntime) invitesOfRemovedMembers(group *membership.Group) []remove
 	}
 	seen, err := r.invites.RemovalsSeenAt(gid, learned)
 	if err != nil {
+		group.Renotice(noticed, all)
 		r.logger.Warn("record removals", slog.String("group_id", gid.String()), slog.String("err", err.Error()))
-		return nil
-	}
-	live, err := r.invites.LiveTargetedInvites(gid)
-	if err != nil {
-		r.logger.Warn("list issued invites", slog.String("group_id", gid.String()), slog.String("err", err.Error()))
 		return nil
 	}
 	var out []removedMemberInvite

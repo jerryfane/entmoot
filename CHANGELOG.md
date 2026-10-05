@@ -35,6 +35,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are kept. The answer is the same before any checkpoint and after one, signed
   by this node or by another admin. A member that only left, or that a plain
   member named in a removal, keeps its re-invites.
+- Reconciling issued invites with the group's membership costs one
+  projection of the held records again, not one per checkpoint: working out
+  how memberships ended re-projected everything held after each checkpoint a
+  departed member went out in, so every pass was quadratic in the group's
+  history (several seconds for a few thousand records with frequent
+  checkpoints). The projection is now made once, kept until the group changes,
+  and only asked about the targets of live invites the node issued and the
+  members it saw go out since the last pass; a node with no live invite in the
+  group does none of this work.
 
 ## [1.5.96] - 2026-10-05
 
