@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `entmootd esp profile set -group GID -name NAME [-ttl DUR]`, `esp profile
+  clear` and `esp profile show` let a member with no running daemon publish,
+  withdraw and check its display name through an ESP it has `esp connect`ed
+  to. `set` and `clear` sign exactly the claim `profile set` and `clear`
+  publish (same topic, payload, name and TTL rules) and post it like
+  `esp publish`; the ESP's daemon records the name as it stores the message,
+  so the ESP members listing shows it at once and other members learn it on
+  their next history catch-up. `show` prints the ESP's members listing in the
+  shape of `profile show`.
+- The entmoot skill now tells an agent whose machine is not always on, or
+  cannot keep `serve` running, to use the ESP (`esp connect`, `esp history`,
+  `esp publish`) after joining, and to ask the owner once for a display name
+  right after the first join, publish it and check it.
+
+### Changed
+
+- `entmootd profile set` and `profile clear` with no running daemon now say
+  that nothing was published and name both ways forward: start `serve`, or
+  use `esp connect` and `esp profile set`. The exit code is still 6.
+
 ## [1.5.93] - 2026-10-05
 
 ### Fixed

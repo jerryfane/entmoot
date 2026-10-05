@@ -26,9 +26,10 @@ import (
 	libp2ptransport "entmoot/pkg/entmoot/transport/libp2p"
 )
 
-// espPublishNode is a founder daemon as `esp serve` runs it: a real group
-// runtime, its control socket, and an ESP handler whose publisher talks to
-// that socket.
+// espPublishNode is a founder daemon as `serve` plus `esp serve` run it: a
+// real group runtime recording member profiles in its own handle on the
+// data root's ESP state, its control socket, and an ESP handler that reads
+// that state through a second handle and whose publisher talks to the socket.
 type espPublishNode struct {
 	root      string
 	gid       entmoot.GroupID
@@ -42,7 +43,14 @@ type espPublishNode struct {
 
 func startESPPublishNode(t *testing.T, ctx context.Context, root string, gid entmoot.GroupID, founder *keystore.Identity) *espPublishNode {
 	t.Helper()
-	runtime, session, host := startTestRuntime(t, ctx, root, founder, gid)
+	// serve opens the ESP state for observed profiles and esp serve opens it
+	// again for the HTTP API; two handles on one database, as in production.
+	daemonState, err := esphttp.OpenSQLiteStateStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = daemonState.Close() })
+	runtime, session, host := startTestRuntimeWithProfiles(t, ctx, root, founder, gid, daemonState)
 	t.Cleanup(func() { _ = host.Close() })
 	t.Cleanup(runtime.Close)
 
@@ -74,6 +82,7 @@ func startESPPublishNode(t *testing.T, ctx context.Context, root string, gid ent
 	publisher := controlSocketSignedPublisher{socketPath: sockPath, timeout: 10 * time.Second}
 	handler, err := esphttp.NewHandler(esphttp.Config{
 		AuthMode:      esphttp.AuthModeDevice,
+		State:         resources.espState,
 		Devices:       mustEmptyMemberRegistry(t),
 		Service:       resources.service,
 		Publisher:     publisher,

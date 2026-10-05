@@ -26,7 +26,7 @@ import (
 
 func cmdESP(gf *globalFlags, args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "esp: expected serve, device, sign-request, connect, history, or publish")
+		fmt.Fprintln(os.Stderr, "esp: expected serve, device, sign-request, connect, history, publish, or profile")
 		return exitInvalidArgument
 	}
 	switch args[0] {
@@ -42,6 +42,8 @@ func cmdESP(gf *globalFlags, args []string) int {
 		return cmdESPHistory(gf, args[1:])
 	case "publish":
 		return cmdESPPublish(gf, args[1:])
+	case "profile":
+		return cmdESPProfile(gf, args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "esp: unknown subcommand %q\n", args[0])
 		return exitInvalidArgument
