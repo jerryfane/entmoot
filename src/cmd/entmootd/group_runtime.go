@@ -943,27 +943,36 @@ type removedMemberInvite struct {
 // that a removal has since taken out (see reconcileIssuedInvites).
 //
 // The cutoff is the later of the removal's own timestamp, by the remover's
-// clock, and when this node first saw that removal, by its own: so an invite
+// clock, and when this node learned of that removal, by its own: so an invite
 // minted here before this node knew of the removal is caught even when the
-// remover's clock runs behind, and a re-invite minted after it never is. Every
-// pass notes when it first sees each removal in the group - whether or not
-// this node has invites for that member yet - and passes run as soon as a
-// record is applied, so that is when the removal arrived. A ledger row from
-// before minted_at_ms existed has only its issue date, set minutes early, and
-// is compared with the removal's timestamp alone: the first-seen time noted
-// for a removal this node held before upgrading is the upgrade, not when it
-// arrived.
+// remover's clock runs behind, and a re-invite minted after it never is. The
+// group notes that time as the record or checkpoint that makes the removal
+// take effect is applied (membership.Removal.SeenAt), not when this worker
+// gets round to it, so a busy worker cannot move it past a re-invite; the
+// ledger keeps the earliest time each removal was ever given, which is what
+// covers a restart. A removal the group has no time for - one it loaded when
+// it opened - is given the time of this pass. Every pass records every
+// removal, whether or not this node has invites for that member yet. A ledger
+// row from before minted_at_ms existed has only its issue date, set minutes
+// early, and is compared with the removal's timestamp alone.
 func (r *groupRuntime) invitesOfRemovedMembers(group *membership.Group) []removedMemberInvite {
 	gid := group.GroupID()
-	removals := group.RemovedAt(nil)
+	removals := group.RemovedAt(nil, r.binding.MemberID)
 	if len(removals) == 0 {
 		return nil
 	}
-	entries := make([]entmoot.RosterEntryID, 0, len(removals))
+	now := time.Now().UnixMilli()
+	learned := make(map[entmoot.RosterEntryID]int64, len(removals))
 	for _, removal := range removals {
-		entries = append(entries, removal.Entry)
+		at := removal.SeenAt
+		if at == 0 {
+			at = now
+		}
+		if earlier, ok := learned[removal.Entry]; !ok || at < earlier {
+			learned[removal.Entry] = at
+		}
 	}
-	seen, err := r.invites.RemovalsSeenAt(gid, entries, time.Now().UnixMilli())
+	seen, err := r.invites.RemovalsSeenAt(gid, learned)
 	if err != nil {
 		r.logger.Warn("record removals", slog.String("group_id", gid.String()), slog.String("err", err.Error()))
 		return nil

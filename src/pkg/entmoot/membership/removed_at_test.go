@@ -27,9 +27,9 @@ func TestRemovedAtIsCheapForNeverMembersAndDoesNotHoldTheLock(t *testing.T) {
 			removed = append(removed, id)
 		}
 	}
-	group.RemovedAt(ids)
+	group.RemovedAt(ids, entmoot.MemberID{})
 	start := time.Now()
-	none := group.RemovedAt(ids)
+	none := group.RemovedAt(ids, entmoot.MemberID{})
 	took := time.Since(start)
 	t.Logf("RemovedAt over %d never-member ids and %d records: %v", len(ids), len(records), took)
 	if took > 100*time.Millisecond && !raceEnabled {
@@ -40,7 +40,7 @@ func TestRemovedAtIsCheapForNeverMembersAndDoesNotHoldTheLock(t *testing.T) {
 	}
 
 	ids = append(ids, removed...)
-	got := group.RemovedAt(ids)
+	got := group.RemovedAt(ids, entmoot.MemberID{})
 	if len(got) != len(removed) {
 		t.Fatalf("RemovedAt reported %d removals, want the %d removed members", len(got), len(removed))
 	}
@@ -57,8 +57,8 @@ func TestRemovedAtIsCheapForNeverMembersAndDoesNotHoldTheLock(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for !stop.Load() {
-			group.RemovedAt(nil)
-			group.RemovedAt(ids)
+			group.RemovedAt(nil, entmoot.MemberID{})
+			group.RemovedAt(ids, entmoot.MemberID{})
 		}
 	}()
 	var worst time.Duration

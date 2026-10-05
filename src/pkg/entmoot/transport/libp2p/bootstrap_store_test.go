@@ -77,8 +77,8 @@ func TestConcurrentOpensMigrateTheInviteLedgerOnce(t *testing.T) {
 	}
 }
 
-// When this node first saw a removal is set once and never moved.
-func TestRemovalsSeenAtKeepsTheFirstSighting(t *testing.T) {
+// When this node first learned of a removal only ever moves earlier.
+func TestRemovalsSeenAtKeepsTheEarliestSighting(t *testing.T) {
 	ledger, err := OpenInviteLedger(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -86,12 +86,16 @@ func TestRemovalsSeenAtKeepsTheFirstSighting(t *testing.T) {
 	defer ledger.Close()
 	gid := entmoot.GroupID{2}
 	a, b := entmoot.RosterEntryID{1}, entmoot.RosterEntryID{2}
-	first, err := ledger.RemovalsSeenAt(gid, []entmoot.RosterEntryID{a}, 100)
+	first, err := ledger.RemovalsSeenAt(gid, map[entmoot.RosterEntryID]int64{a: 100})
 	if err != nil || first[a] != 100 {
 		t.Fatalf("first sighting = %v, %v", first, err)
 	}
-	again, err := ledger.RemovalsSeenAt(gid, []entmoot.RosterEntryID{a, b}, 200)
+	again, err := ledger.RemovalsSeenAt(gid, map[entmoot.RosterEntryID]int64{a: 200, b: 200})
 	if err != nil || again[a] != 100 || again[b] != 200 {
-		t.Fatalf("second sighting = %v, %v; want a kept at 100, b at 200", again, err)
+		t.Fatalf("later sighting = %v, %v; want a kept at 100, b at 200", again, err)
+	}
+	earlier, err := ledger.RemovalsSeenAt(gid, map[entmoot.RosterEntryID]int64{b: 150})
+	if err != nil || earlier[b] != 150 {
+		t.Fatalf("earlier sighting = %v, %v; want b moved to 150", earlier, err)
 	}
 }

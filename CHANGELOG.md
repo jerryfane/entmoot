@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The daemon no longer revokes invites it should keep when it reconciles its
+  issued invites with the group's membership. A member that left of its own
+  accord and was re-invited lost the re-invite as soon as the founder's
+  daemon signed a checkpoint folding the leave in, because a member that went
+  out inside a checkpoint was always taken to be removed. A checkpoint the
+  node signed itself folded exactly the records it holds, so those records now
+  decide whether a leave, a rekey or a removal ended the membership; only a
+  checkpoint signed elsewhere is still read that way. And when the node learned
+  of a removal is now noted the moment it applies the record or checkpoint that
+  makes the removal take effect, not when the invite worker next gets round to
+  it, so a re-invite minted after the removal arrived is no longer revoked
+  because the worker was still busy with an earlier pass. The ledger keeps the
+  earliest time it was ever given for each removal.
+
 ## [1.5.96] - 2026-10-05
 
 ### Fixed

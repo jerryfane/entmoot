@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -76,7 +77,14 @@ type Group struct {
 	rewoundFrom int64
 	legacy      *LegacyChain
 	now         func() time.Time
-	logger      *slog.Logger
+	// removalAppliedAt is when, by this node's clock, it applied each removal
+	// record it has applied since it opened the group, and departedAt when
+	// each member last went out of its projected membership. Together they
+	// say when this node learned of a removal (see Removal.SeenAt). Neither
+	// is persisted: a group opened afresh knows neither for what it loaded.
+	removalAppliedAt map[entmoot.RosterEntryID]int64
+	departedAt       map[entmoot.MemberID]int64
+	logger           *slog.Logger
 	// onChanged, if set, is called after Apply or ApplyCheckpoint stores
 	// something (see SetChangeHook).
 	onChanged func()
@@ -350,6 +358,12 @@ type Removal struct {
 	// Entry is the removal record's id, or that checkpoint's: what ended the
 	// membership, so a caller can tell one removal from another.
 	Entry entmoot.RosterEntryID
+	// SeenAt is when this node learned of the removal, by its own clock: the
+	// later of applying the removal record and the member going out of the
+	// projected membership - the apply that made the removal take effect,
+	// which may be a later grant or a checkpoint. Zero when this node has not
+	// seen either happen since it opened the group.
+	SeenAt int64
 }
 
 // RemovedAt reports, for each of ids that is not a member now and whose
@@ -366,16 +380,18 @@ type Removal struct {
 // node holds - and missing from the first later one is reported as removed by
 // a removal of it this node holds from between the two, or else by that later
 // checkpoint. Without the records a member that left of its own accord inside
-// a checkpoint cannot be told from a removed one, so it is reported too.
+// a checkpoint signed elsewhere cannot be told from a removed one, so it is
+// reported too. A checkpoint self - the member this node signs as - signed
+// folded exactly the records this node holds, so for it those records say
+// whether a leave, a rekey or a removal ended the membership.
 //
 // The group's lock is held only to copy what the answer needs; the work runs
 // outside it, in one pass over the held records whatever the number of ids,
 // and an id this node never saw as a member costs no more than a lookup.
-func (g *Group) RemovedAt(ids []entmoot.MemberID) map[entmoot.MemberID]Removal {
+func (g *Group) RemovedAt(ids []entmoot.MemberID, self entmoot.MemberID) map[entmoot.MemberID]Removal {
 	type checkpointView struct {
-		id        entmoot.RosterEntryID
-		timestamp int64
-		members   map[entmoot.MemberID]entmoot.NodeInfo
+		Checkpoint
+		members map[entmoot.MemberID]entmoot.NodeInfo
 	}
 	all := ids == nil
 	wanted := make(map[entmoot.MemberID]struct{}, len(ids))
@@ -409,8 +425,10 @@ func (g *Group) RemovedAt(ids []entmoot.MemberID) map[entmoot.MemberID]Removal {
 	// never changed once stored, so sharing it outside the lock is safe.
 	var chain []checkpointView
 	for cp, ok := g.checkpoints[g.canonicalID]; ok && len(chain) <= len(g.checkpoints); cp, ok = g.checkpoints[cp.Previous] {
-		chain = append(chain, checkpointView{id: cp.ID, timestamp: cp.Timestamp, members: g.membersAt[cp.ID]})
+		chain = append(chain, checkpointView{Checkpoint: cp, members: g.membersAt[cp.ID]})
 	}
+	appliedAt := maps.Clone(g.removalAppliedAt)
+	departedAt := maps.Clone(g.departedAt)
 	g.mu.RUnlock()
 	// Every non-member a held record or a checkpoint names.
 	want := func(id entmoot.MemberID) bool {
@@ -462,8 +480,8 @@ func (g *Group) RemovedAt(ids []entmoot.MemberID) map[entmoot.MemberID]Removal {
 	}
 	for _, cp := range chain {
 		for id := range wanted {
-			if _, in := cp.members[id]; in && cp.timestamp > lastSeen[id] {
-				lastSeen[id] = cp.timestamp
+			if _, in := cp.members[id]; in && cp.Timestamp > lastSeen[id] {
+				lastSeen[id] = cp.Timestamp
 			}
 		}
 	}
@@ -479,32 +497,71 @@ func (g *Group) RemovedAt(ids []entmoot.MemberID) map[entmoot.MemberID]Removal {
 
 	endedBy := make(map[entmoot.MemberID]Record)
 	projectTracking(base, window, endedBy)
+	// signedHere caches, per checkpoint this node signed, what ended each
+	// membership inside it (see below).
+	signedHere := make(map[entmoot.RosterEntryID]map[entmoot.MemberID]Record)
 	removed := make(map[entmoot.MemberID]Removal)
 	for id := range wanted {
+		seen := func(removal Removal) Removal {
+			removal.SeenAt = max(appliedAt[removal.Entry], departedAt[id])
+			return removal
+		}
 		if ending, ok := endedBy[id]; ok {
 			if ending.Kind == KindRemove {
-				removed[id] = Removal{At: ending.Timestamp, Entry: ending.ID}
+				removed[id] = seen(Removal{At: ending.Timestamp, Entry: ending.ID})
 			}
 			continue
 		}
 		// The first checkpoint after the member was last known in that no
-		// longer lists it.
-		var out *checkpointView
+		// longer lists it, and the one before that.
+		var out, previous *checkpointView
 		for k := range chain {
-			if chain[k].timestamp <= lastSeen[id] {
+			if chain[k].Timestamp <= lastSeen[id] {
 				break
 			}
 			if _, in := chain[k].members[id]; !in {
 				out = &chain[k]
+				previous = nil
+				if k+1 < len(chain) {
+					previous = &chain[k+1]
+				}
 			}
 		}
 		if out == nil {
 			continue
 		}
-		removal := Removal{At: out.timestamp, Entry: out.id}
+		// A checkpoint this node signed folded exactly the records it held,
+		// so those records say how the membership ended inside it: a leave or
+		// a rekey is no removal. A checkpoint signed elsewhere may have folded
+		// a removal this node never held - one dated before a leave it does
+		// hold, which made that leave count for nothing there - and the
+		// checkpoint does not say which, so there a departure is a removal.
+		if signer, err := entmoot.ResolvedMemberID(out.Signer); err == nil && signer == self && previous != nil {
+			endings, ok := signedHere[out.ID]
+			if !ok {
+				var folded []Record
+				for _, records := range [][]Record{window, covered} {
+					for _, rec := range records {
+						if rec.Timestamp <= out.Timestamp && !coveredBy(previous.Checkpoint, rec) {
+							folded = append(folded, rec)
+						}
+					}
+				}
+				endings = make(map[entmoot.MemberID]Record)
+				projectTracking(previous.Checkpoint, folded, endings)
+				signedHere[out.ID] = endings
+			}
+			if ending, ok := endings[id]; ok {
+				if ending.Kind == KindRemove {
+					removed[id] = seen(Removal{At: ending.Timestamp, Entry: ending.ID})
+				}
+				continue
+			}
+		}
+		removal := Removal{At: out.Timestamp, Entry: out.ID}
 		var removedAt int64
 		for _, rec := range held[id] {
-			if rec.Kind != KindRemove || rec.Timestamp <= lastSeen[id] || rec.Timestamp > out.timestamp || rec.Timestamp <= removedAt {
+			if rec.Kind != KindRemove || rec.Timestamp <= lastSeen[id] || rec.Timestamp > out.Timestamp || rec.Timestamp <= removedAt {
 				continue
 			}
 			if subject, err := rec.SubjectMemberID(); err == nil && subject == id {
@@ -512,7 +569,7 @@ func (g *Group) RemovedAt(ids []entmoot.MemberID) map[entmoot.MemberID]Removal {
 				removal = Removal{At: rec.Timestamp, Entry: rec.ID}
 			}
 		}
-		removed[id] = removal
+		removed[id] = seen(removal)
 	}
 	return removed
 }
@@ -524,6 +581,17 @@ func (g *Group) reproject() {
 		records = append(records, rec)
 	}
 	state, effective := Project(base, records)
+	// Note when members go out, for Removal.SeenAt. The group's first
+	// projection has no members before it, so loading notes nothing.
+	now := g.now().UnixMilli()
+	for id := range g.state.Members {
+		if _, still := state.Members[id]; !still {
+			if g.departedAt == nil {
+				g.departedAt = make(map[entmoot.MemberID]int64)
+			}
+			g.departedAt[id] = now
+		}
+	}
 	g.state = state
 	g.effective = len(effective)
 }
@@ -1133,6 +1201,12 @@ func (g *Group) apply(rec Record) (bool, error) {
 		return false, fmt.Errorf("membership: commit record: %w", err)
 	}
 	g.records[rec.ID] = cloneRecord(rec)
+	if rec.Kind == KindRemove {
+		if g.removalAppliedAt == nil {
+			g.removalAppliedAt = make(map[entmoot.RosterEntryID]int64)
+		}
+		g.removalAppliedAt[rec.ID] = g.now().UnixMilli()
+	}
 	g.reproject()
 	return true, nil
 }

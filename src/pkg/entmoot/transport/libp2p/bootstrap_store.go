@@ -300,11 +300,11 @@ func addInviteLedgerColumn(db *sql.DB, name, definition string) error {
 	return nil
 }
 
-// RemovalsSeenAt returns when this node first saw each of the removals with
-// the given entry ids, by its own clock, recording now for those it had not
-// seen before. A removal's own timestamp is the remover's clock; this is the
-// local one, for comparing with when this node minted an invite.
-func (l *InviteLedger) RemovalsSeenAt(groupID entmoot.GroupID, entries []entmoot.RosterEntryID, now int64) (map[entmoot.RosterEntryID]int64, error) {
+// RemovalsSeenAt records, for each removal entry, when this node learned of
+// it by its own clock, keeping the earliest time it has ever been given, and
+// returns the times kept. A removal's own timestamp is the remover's clock;
+// this is the local one, for comparing with when this node minted an invite.
+func (l *InviteLedger) RemovalsSeenAt(groupID entmoot.GroupID, seenAt map[entmoot.RosterEntryID]int64) (map[entmoot.RosterEntryID]int64, error) {
 	if l == nil || l.db == nil {
 		return nil, errors.New("libp2p: invite ledger is not open")
 	}
@@ -313,23 +313,24 @@ func (l *InviteLedger) RemovalsSeenAt(groupID entmoot.GroupID, entries []entmoot
 		return nil, fmt.Errorf("libp2p: record removals: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	seen := make(map[entmoot.RosterEntryID]int64, len(entries))
-	for _, entry := range entries {
-		if _, err := tx.Exec(`INSERT OR IGNORE INTO removals_seen (group_id, entry_id, seen_at_ms) VALUES (?, ?, ?)`,
-			groupID[:], entry[:], now); err != nil {
+	kept := make(map[entmoot.RosterEntryID]int64, len(seenAt))
+	for entry, at := range seenAt {
+		if _, err := tx.Exec(`INSERT INTO removals_seen (group_id, entry_id, seen_at_ms) VALUES (?, ?, ?)
+			ON CONFLICT (group_id, entry_id) DO UPDATE SET seen_at_ms = MIN(seen_at_ms, excluded.seen_at_ms)`,
+			groupID[:], entry[:], at); err != nil {
 			return nil, fmt.Errorf("libp2p: record removal: %w", err)
 		}
-		var at int64
+		var first int64
 		if err := tx.QueryRow(`SELECT seen_at_ms FROM removals_seen WHERE group_id=? AND entry_id=?`,
-			groupID[:], entry[:]).Scan(&at); err != nil {
+			groupID[:], entry[:]).Scan(&first); err != nil {
 			return nil, fmt.Errorf("libp2p: read removal: %w", err)
 		}
-		seen[entry] = at
+		kept[entry] = first
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("libp2p: record removals: %w", err)
 	}
-	return seen, nil
+	return kept, nil
 }
 
 // MarkRevoked notes locally that an invite was withdrawn. It reports whether a
