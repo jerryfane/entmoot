@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.91] - 2026-10-04
+
 ### Added
 
 - `entmootd esp serve -allow-member-connect` (off by default) adds
