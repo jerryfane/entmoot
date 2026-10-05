@@ -23,7 +23,27 @@ const (
 	MaxMessageFutureSkew     = 2 * time.Minute
 )
 
+// ErrInvalidMessage marks a message that is wrong on its own terms: an
+// unsupported version, a structural cap exceeded, a timestamp beyond the
+// future skew. It is the sender's fault and reads the same on every node,
+// unlike membership or roster-head failures. Errors keep their own text.
+var ErrInvalidMessage = errors.New("libp2p: invalid message")
+
+type invalidMessageError struct{ err error }
+
+func (e invalidMessageError) Error() string   { return e.err.Error() }
+func (e invalidMessageError) Unwrap() []error { return []error{ErrInvalidMessage, e.err} }
+
+// ValidateMessageShape checks the bounds a message must meet before any
+// membership is consulted. Failures match ErrInvalidMessage.
 func ValidateMessageShape(message entmoot.Message, now time.Time) error {
+	if err := validateMessageShape(message, now); err != nil {
+		return invalidMessageError{err: err}
+	}
+	return nil
+}
+
+func validateMessageShape(message entmoot.Message, now time.Time) error {
 	switch message.Version {
 	case 0:
 		if message.RosterHead != nil {

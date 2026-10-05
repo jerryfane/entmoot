@@ -45,6 +45,14 @@ func kindRank(kind Kind) int {
 // join rule, already true — are ignored rather than rejected, because a peer is
 // entitled to send us records we cannot use.
 func Project(base Checkpoint, records []Record) (State, []Record) {
+	state, effective, _ := project(base, records)
+	return state, effective
+}
+
+// project is Project that also returns the timestamp of the newest effective
+// record that took authority away (see applyJudged), or 0 when none did. That
+// is the point a seal has to cover (see Group.SealDue).
+func project(base Checkpoint, records []Record) (State, []Record, int64) {
 	state := stateFrom(base)
 
 	// Deduplicate, and drop anything this base already accounts for. A record
@@ -84,12 +92,55 @@ func Project(base Checkpoint, records []Record) (State, []Record) {
 	})
 
 	effective := make([]Record, 0, len(ordered))
+	var reducedAt int64
 	for _, rec := range ordered {
-		if applyRecord(&state, rec) {
+		applied, reduced := applyJudged(&state, rec)
+		if applied {
 			effective = append(effective, rec)
+			if reduced {
+				reducedAt = rec.Timestamp
+			}
 		}
 	}
-	return state, effective
+	return state, effective, reducedAt
+}
+
+// applyJudged applies one record and also reports whether it took authority
+// away: it revoked an invite, closed an open group, or left somebody who could
+// administer unable to - a demotion, a removal or ban, a departure, a rekey.
+//
+// Those are the changes a join can slip past by being dated before them. Order
+// is by the signer's own timestamp and nothing bounds it from below except a
+// checkpoint, so a holder of a revoked invite, or of an invite from an admin
+// since demoted, can sign a join dated before the change and every node will
+// admit it. A checkpoint dated at or after the change refuses every such
+// record as stale, which is why these changes are sealed soon rather than at
+// the cadence.
+func applyJudged(state *State, rec Record) (applied, reduced bool) {
+	switch rec.Kind {
+	case KindJoin, KindUnban:
+		return applyRecord(state, rec), false
+	}
+	revoked := len(state.RevokedInvites)
+	open := state.Policy.JoinRule == JoinRuleOpen
+	var holders []entmoot.MemberID
+	for _, admin := range state.Policy.Admins {
+		if state.CanAdminister(admin) {
+			holders = append(holders, admin)
+		}
+	}
+	if !applyRecord(state, rec) {
+		return false, false
+	}
+	if len(state.RevokedInvites) > revoked || (open && state.Policy.JoinRule != JoinRuleOpen) {
+		return true, true
+	}
+	for _, admin := range holders {
+		if !state.CanAdminister(admin) {
+			return true, true
+		}
+	}
+	return true, false
 }
 
 // coveredBy reports whether a base already accounts for a record. It is the

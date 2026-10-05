@@ -34,6 +34,9 @@ type globalFlags struct {
 	data             string
 	allowNewIdentity bool
 	listenPort       uint
+	// listenPortSet records an explicit -listen-port. Only the default port
+	// may fall back when it cannot be bound (see directListenAddr).
+	listenPortSet    bool
 	p2pListen        stringListFlag
 	p2pAnnounce      stringListFlag
 	controlTransport string
@@ -64,7 +67,7 @@ func run() int {
 		fmt.Fprintln(os.Stderr, "  publish -topic T (-content S|-file PATH| -file -) [-group GID]")
 		fmt.Fprintln(os.Stderr, "                          Author and gossip a message via the control socket.")
 		fmt.Fprintln(os.Stderr, "  profile <set|clear|show> [-name NAME] [-group GID] [-ttl DUR]")
-		fmt.Fprintln(os.Stderr, "                          Publish this node's display name, or list observed names.")
+		fmt.Fprintln(os.Stderr, "                          Publish this node's display name (needs serve), or list observed names.")
 		fmt.Fprintln(os.Stderr, "  doctor [-group GID] [--probe] [--json] [--redact]")
 		fmt.Fprintln(os.Stderr, "                          Diagnose local libp2p identity, groups, and peer bindings.")
 		fmt.Fprintln(os.Stderr, "  peers -group GID [--probe] [--json]")
@@ -84,6 +87,14 @@ func run() int {
 		fmt.Fprintln(os.Stderr, "  esp serve               Serve the local ESP mailbox HTTP API.")
 		fmt.Fprintln(os.Stderr, "  esp device <cmd>        Manage the local ESP device registry.")
 		fmt.Fprintln(os.Stderr, "  esp sign-request        Sign one ESP device-auth HTTP request.")
+		fmt.Fprintln(os.Stderr, "  esp connect -esp URL -group GID [-group ...] [-client ID]")
+		fmt.Fprintln(os.Stderr, "                          Enroll this agent's own device with a member-connect ESP.")
+		fmt.Fprintln(os.Stderr, "  esp history -group GID [-limit N] [-cursor C] [-topic T]")
+		fmt.Fprintln(os.Stderr, "                          Read group history through the connected ESP.")
+		fmt.Fprintln(os.Stderr, "  esp publish -group GID -topic T -content TEXT")
+		fmt.Fprintln(os.Stderr, "                          Sign locally and publish through the connected ESP.")
+		fmt.Fprintln(os.Stderr, "  esp profile <set|clear|show> -group GID [-name NAME] [-ttl DUR]")
+		fmt.Fprintln(os.Stderr, "                          Publish or list display names through the connected ESP; no daemon needed.")
 		fmt.Fprintln(os.Stderr, "  version                 Print build metadata as JSON.")
 		fmt.Fprintln(os.Stderr, "  update [--check] [--restart] [--json]")
 		fmt.Fprintln(os.Stderr, "                          Update entmootd from the latest GitHub Release.")
@@ -128,7 +139,8 @@ func run() int {
 	fs.StringVar(&gf.data, "data", defaultEntmootDataDir, "Entmoot data root")
 	fs.BoolVar(&gf.allowNewIdentity, "allow-new-identity", false,
 		"allow first-time Entmoot identity creation when the identity file is absent")
-	fs.UintVar(&gf.listenPort, "listen-port", 1004, "Entmoot listen port")
+	fs.UintVar(&gf.listenPort, "listen-port", defaultListenPort,
+		"Entmoot listen port; if not given and the default cannot be bound (privileged or in use), an OS-assigned port is used")
 	fs.Var(&gf.p2pListen, "p2p-listen", "libp2p listen multiaddr; repeatable, replaces the default TCP listener")
 	fs.Var(&gf.p2pAnnounce, "p2p-announce", "externally reachable libp2p multiaddr without /p2p; repeatable, replaces advertised listener addresses")
 	fs.StringVar(&gf.controlTransport, "control-transport", "auto", "local control transport: auto (Unix socket, or authenticated loopback tcp where Unix sockets are forbidden), unix or tcp")
@@ -144,6 +156,11 @@ func run() int {
 		}
 		return exitInvalidArgument
 	}
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "listen-port" {
+			gf.listenPortSet = true
+		}
+	})
 
 	level, err := parseLogLevel(gf.logLevel)
 	if err != nil {

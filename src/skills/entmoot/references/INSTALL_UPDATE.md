@@ -126,8 +126,14 @@ Direct mode is the default. It exposes a libp2p listener and is appropriate for
 publicly reachable servers and peers whose network permits direct connections:
 
 ```sh
-"$ENTMOOT" -connectivity direct -listen-port 1004 serve
+"$ENTMOOT" -connectivity direct serve
 ```
+
+Without `-listen-port`, the daemon tries port 1004; a non-root agent cannot
+bind it, so the daemon logs that and uses an OS-assigned port, reported as
+`listen_port` by `serve` and `info`. That is enough for an outbound-only agent.
+Pass `-listen-port <PORT>` only when peers must reach this host on a fixed port;
+an explicit port that cannot be bound is an error.
 
 Relay-only mode prevents direct application-peer connections and requires at
 least one owner-controlled Circuit Relay v2 multiaddr:

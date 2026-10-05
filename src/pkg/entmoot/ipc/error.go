@@ -36,6 +36,9 @@ const (
 	// CodeUnavailable is returned when a required local dependency is not
 	// available for the requested operation.
 	CodeUnavailable ErrorCode = "UNAVAILABLE"
+	// CodeRateLimited is returned when a message is refused because its
+	// author is over the group's per-author rate budget. Retry later.
+	CodeRateLimited ErrorCode = "RATE_LIMITED"
 )
 
 // ErrorFrame is the JSON body of a MsgError frame.
@@ -68,6 +71,7 @@ type ErrorFrame struct {
 //	CodeInvalidArgument -> 5
 //	CodeConflict        -> 5
 //	CodeUnavailable     -> 1
+//	CodeRateLimited     -> 1
 //	(unknown)           -> 1
 func ExitCode(c ErrorCode) int {
 	switch c {
@@ -83,7 +87,7 @@ func ExitCode(c ErrorCode) int {
 		return 5
 	case CodeConflict:
 		return 5
-	case CodeUnavailable:
+	case CodeUnavailable, CodeRateLimited:
 		return 1
 	default:
 		return 1

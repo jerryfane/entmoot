@@ -91,7 +91,8 @@ running owner or an exclusive offline maintenance boundary.
 ### Direct
 
 Direct mode is the default. The daemon listens on
-`/ip4/0.0.0.0/tcp/<listen-port>` and learns addresses from signed
+`/ip4/0.0.0.0/tcp/<listen-port>` (when the default port 1004 is not given
+explicitly and cannot be bound, an OS-assigned port instead) and learns addresses from signed
 bootstrap/static hints and gossiped signed peer records. There is no LAN
 discovery in either mode. It is suitable for publicly reachable hosts or
 networks that permit direct connections.

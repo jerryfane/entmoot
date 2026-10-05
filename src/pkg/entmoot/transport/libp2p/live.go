@@ -27,12 +27,17 @@ const (
 	maxPubSubEnvelopeBytes = 384 << 10
 )
 
+// DeliveryState reports how an accepted message reaches the other members.
 type DeliveryState string
 
 const (
-	DeliveryPublished      DeliveryState = "published"
+	// DeliveryPublished: stored here and gossiped live.
+	DeliveryPublished DeliveryState = "published"
+	// DeliveryPendingHistory: stored here, not gossiped; other members fetch
+	// it on their next history catch-up from this node.
 	DeliveryPendingHistory DeliveryState = "pending_history"
-	DeliveryAlreadyStored  DeliveryState = "already_stored"
+	// DeliveryAlreadyStored: this node already held the message.
+	DeliveryAlreadyStored DeliveryState = "already_stored"
 )
 
 type LiveConfig struct {
@@ -259,20 +264,12 @@ func (g *LiveGroup) Publish(ctx context.Context, message entmoot.Message) (Deliv
 	if err := VerifyLiveMessage(g.cfg.Group, message, g.now()); err != nil {
 		return "", err
 	}
-	if g.cfg.Authorize != nil {
-		if err := g.cfg.Authorize(message); err != nil {
-			return "", err
-		}
-	}
-	inserted, err := g.cfg.Store.Put(ctx, g.cfg.GroupID, message)
+	inserted, err := g.authorizeAndStore(ctx, message)
 	if err != nil {
 		return "", err
 	}
 	if !inserted {
 		return DeliveryAlreadyStored, nil
-	}
-	if g.cfg.OnIngest != nil {
-		g.cfg.OnIngest(message)
 	}
 	payload, err := json.Marshal(message)
 	if err != nil {
@@ -285,6 +282,75 @@ func (g *LiveGroup) Publish(ctx context.Context, message entmoot.Message) (Deliv
 		return DeliveryPendingHistory, err
 	}
 	return DeliveryPublished, nil
+}
+
+// StoreForHistory accepts a message another member signed and handed to this
+// node out of band, as an ESP does for a member's device. The live protocol
+// binds every envelope's sender to its author, so this node cannot gossip
+// someone else's message; it stores it instead, and other members fetch it
+// from this node's history like any message they missed live.
+//
+// The message is held to both standards a receiver applies: the live one
+// (the author is a member now and signed these bytes) and the historical one
+// (the author was a member at the roster position the message cites), so no
+// member catching up from here can be handed a message it would refuse.
+func (g *LiveGroup) StoreForHistory(ctx context.Context, message entmoot.Message) (DeliveryState, error) {
+	if message.GroupID != g.cfg.GroupID {
+		return "", errors.New("libp2p: store group mismatch")
+	}
+	local, err := hostBinding(g.cfg.Host)
+	if err != nil {
+		return "", err
+	}
+	if !g.cfg.Group.IsMemberID(local.MemberID) {
+		return "", fmt.Errorf("%w: local node %s cannot keep history for the group", entmoot.ErrNotMember, local.MemberID.String())
+	}
+	if binding, err := BindingFromPublicKey(message.Author.EntmootPubKey); err == nil && binding.PeerID == g.cfg.Host.ID() {
+		return "", errors.New("libp2p: a message this host authored is published live")
+	}
+	now := g.now()
+	if err := VerifyLiveMessage(g.cfg.Group, message, now); err != nil {
+		return "", err
+	}
+	if err := VerifyHistoricalMessage(g.cfg.Group, message, now); err != nil {
+		return "", err
+	}
+	inserted, err := g.authorizeAndStore(ctx, message)
+	if err != nil {
+		return "", err
+	}
+	if !inserted {
+		return DeliveryAlreadyStored, nil
+	}
+	return DeliveryPendingHistory, nil
+}
+
+// authorizeAndStore applies group policy to a verified message, stores it,
+// and reports a first insertion to OnIngest the way a received message is.
+// A message already held is reported before policy runs, so resubmitting
+// one, whether a client retry or someone replaying it, never spends its
+// author's rate budget.
+func (g *LiveGroup) authorizeAndStore(ctx context.Context, message entmoot.Message) (bool, error) {
+	held, err := g.cfg.Store.Has(ctx, g.cfg.GroupID, message.ID)
+	if err != nil {
+		return false, err
+	}
+	if held {
+		return false, nil
+	}
+	if g.cfg.Authorize != nil {
+		if err := g.cfg.Authorize(message); err != nil {
+			return false, err
+		}
+	}
+	inserted, err := g.cfg.Store.Put(ctx, g.cfg.GroupID, message)
+	if err != nil {
+		return false, err
+	}
+	if inserted && g.cfg.OnIngest != nil {
+		g.cfg.OnIngest(message)
+	}
+	return inserted, nil
 }
 
 func (g *LiveGroup) Close() error {

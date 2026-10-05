@@ -186,7 +186,8 @@ Global runtime flags:
 -data PATH            Data root; default ~/.entmoot
 -identity PATH        Ed25519 identity file; default ~/.entmoot/identity.json,
                       also when -data points elsewhere: pass it for a second node
--listen-port PORT     libp2p TCP listen port; default 1004
+-listen-port PORT     libp2p TCP listen port; default 1004, or an OS-assigned
+                      port when 1004 cannot be bound and the flag is not given
 -connectivity MODE    direct (default) or relay-only
 -controlled-relay MA  Approved relay multiaddr ending in /p2p/<peer-id>; repeatable
 -relay-service        Also relay for -relay-allow-peer members from this daemon

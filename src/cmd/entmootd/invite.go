@@ -238,7 +238,7 @@ func cmdInviteCreate(gf *globalFlags, args []string) int {
 		AllowedMultiaddrs: allowedAddresses,
 		Relays:            relayHints,
 		MaxUses:           *maxUses,
-		IssuedAtMS:        now.UnixMilli(),
+		IssuedAtMS:        membership.InviteIssuedAtMS(now),
 		ExpiresAtMS:       now.Add(ttl).UnixMilli(),
 	}
 	if _, err := rand.Read(capability.Nonce[:]); err != nil {

@@ -32,6 +32,16 @@ type DeviceRecord struct {
 	Disabled      bool             `json:"disabled"`
 }
 
+// MemberDeviceRegistryDocument is the JSON stored in esp-member-devices.json.
+// Its devices live under "member_devices", not "devices": a loader that only
+// knows the operator format reads this file as an empty registry, so a
+// rollback or misconfigured -device-keys fails closed instead of treating
+// member devices as operator devices.
+type MemberDeviceRegistryDocument struct {
+	Version       int            `json:"version"`
+	MemberDevices []DeviceRecord `json:"member_devices"`
+}
+
 // LoadDeviceRegistryOrEmpty reads path, returning an empty registry when the
 // file does not exist.
 func LoadDeviceRegistryOrEmpty(path string) (*DeviceRegistry, error) {
@@ -81,7 +91,16 @@ func SaveDeviceRegistry(path string, reg *DeviceRegistry) error {
 	if err != nil {
 		return err
 	}
-	doc := DeviceRegistryDocumentFromRegistry(validated)
+	for _, d := range validated.Snapshot() {
+		if d.SelfEnrolled {
+			return fmt.Errorf("esphttp: self-enrolled device %q belongs in the member device registry", d.ID)
+		}
+	}
+	return writeRegistryJSON(path, DeviceRegistryDocumentFromRegistry(validated))
+}
+
+// writeRegistryJSON atomically replaces path with doc as indented 0600 JSON.
+func writeRegistryJSON(path string, doc any) error {
 	data, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {
 		return fmt.Errorf("esphttp: marshal device registry %s: %w", path, err)
@@ -226,6 +245,54 @@ func DeviceFromRecord(in DeviceRecord) (Device, error) {
 		EntmootPubKey: append([]byte(nil), entmootPub...),
 		Disabled:      in.Disabled,
 	}, nil
+}
+
+// LoadMemberDeviceRegistryOrEmpty reads the member device registry, returning
+// an empty registry when the file does not exist. Every entry is loaded as a
+// self-enrolled device and must be bound to a member and hold no admin group.
+func LoadMemberDeviceRegistryOrEmpty(path string) (*DeviceRegistry, error) {
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return NewDeviceRegistry(nil)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("esphttp: read member device registry %s: %w", path, err)
+	}
+	var doc MemberDeviceRegistryDocument
+	if err := json.Unmarshal(data, &doc); err != nil {
+		return nil, fmt.Errorf("esphttp: parse member device registry %s: %w", path, err)
+	}
+	if doc.Version != 1 {
+		return nil, fmt.Errorf("esphttp: member device registry %s version %d, want 1", path, doc.Version)
+	}
+	devices := make([]Device, 0, len(doc.MemberDevices))
+	for _, in := range doc.MemberDevices {
+		device, err := DeviceFromRecord(in)
+		if err != nil {
+			return nil, err
+		}
+		device.SelfEnrolled = true
+		devices = append(devices, device)
+	}
+	return NewDeviceRegistry(devices)
+}
+
+// SaveMemberDeviceRegistry atomically writes the member device registry. It
+// refuses operator devices, which belong in esp-devices.json.
+func SaveMemberDeviceRegistry(path string, reg *DeviceRegistry) error {
+	validated, err := NewDeviceRegistry(reg.Snapshot())
+	if err != nil {
+		return err
+	}
+	for _, d := range validated.Snapshot() {
+		if !d.SelfEnrolled {
+			return fmt.Errorf("esphttp: operator device %q does not belong in the member device registry", d.ID)
+		}
+	}
+	return writeRegistryJSON(path, MemberDeviceRegistryDocument{
+		Version:       1,
+		MemberDevices: DeviceRegistryDocumentFromRegistry(validated).Devices,
+	})
 }
 
 func syncDir(dir string) {

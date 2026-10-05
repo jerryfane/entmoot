@@ -12,8 +12,10 @@ entmootd profile show [-group GID]
 `set` publishes the name into the group as an ordinary signed message on the
 reserved topic `entmoot/profile/1`. It needs the daemon running, for the same
 reason `publish` does: the daemon holds the identity, the store and the
-GossipSub topic. Every member that receives the message records the name, and
-ESP member listings show it.
+GossipSub topic. With no daemon it publishes nothing and exits with code 6
+(control unavailable), naming the two ways forward: start `serve`, or use
+`esp profile set` below. Every member that receives the message records the
+name, and ESP member listings show it.
 
 `clear` publishes an empty name, withdrawing it. `show` prints the names this
 node has observed for the group's members and works with the daemon stopped.
@@ -22,6 +24,28 @@ A name expires after 30 days unless `-ttl` says otherwise. Republishing before
 then extends it. There is no "never expires": `-ttl 0`, or any value above the
 90-day maximum a node will honour, publishes 90 days. Expiry is why a node that leaves
 for good eventually stops being displayed.
+
+## Without a daemon: through the ESP
+
+A member whose machine is not always on (a sandbox, a cloud job) sets its name
+through an ESP that allows member connect, after `esp connect` once for the
+group (see [ESP_MOBILE.md](../../src/skills/entmoot/references/ESP_MOBILE.md)):
+
+```sh
+entmootd esp profile set -group GID -name pi-burj [-ttl 720h]
+entmootd esp profile clear -group GID
+entmootd esp profile show -group GID
+```
+
+`esp profile set` and `clear` build exactly the claim `profile set` and
+`clear` publish, with the same name and `-ttl` rules, sign it locally with the
+identity key and post it like `esp publish`. The ESP's daemon records the name
+at once, so the ESP members listing (what the website shows) has it straight
+away; other members' daemons pick it up on their next history catch-up, about
+a minute. The output is the ESP's publish response (`"delivery":
+"pending_history"`) plus `display_name`, `expires_at_ms` and `ttl`. `-group`
+is required. `esp profile show` prints the names the ESP lists for the group's
+members, in the same shape as `profile show`.
 
 ## What a name cannot do
 

@@ -5,13 +5,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
+	"slices"
+	"syscall"
 	"time"
 
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/p2p/net/swarm"
+	multiaddr "github.com/multiformats/go-multiaddr"
 
 	"entmoot/pkg/entmoot"
 	"entmoot/pkg/entmoot/keystore"
@@ -398,6 +402,7 @@ func JoinGroupVia(ctx context.Context, h host.Host, candidates []peer.AddrInfo, 
 	}
 	pending := candidates
 	var first, last error
+	unreachable := true
 	for round := 1; ; round++ {
 		var stalled []peer.AddrInfo
 		for _, remote := range pending {
@@ -409,19 +414,20 @@ func JoinGroupVia(ctx context.Context, h host.Host, candidates []peer.AddrInfo, 
 				first = err
 			}
 			last = err
+			unreachable = unreachable && joinUnreachable(err, remote)
 			if joinConnectTimedOut(err) {
 				stalled = append(stalled, remote)
 			}
 		}
 		_, bounded := ctx.Deadline()
 		if len(stalled) == 0 || !bounded || ctx.Err() != nil {
-			return nil, peer.AddrInfo{}, joinRoundsError(round, first, last)
+			return nil, peer.AddrInfo{}, withNoProxyHint(joinRoundsError(round, first, last), unreachable)
 		}
 		timer := time.NewTimer(joinRoundInterval)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return nil, peer.AddrInfo{}, joinRoundsError(round, first, last)
+			return nil, peer.AddrInfo{}, withNoProxyHint(joinRoundsError(round, first, last), unreachable)
 		case <-timer.C:
 		}
 		pending = stalled
@@ -461,6 +467,57 @@ func joinRoundsError(rounds int, first, last error) error {
 		return last
 	}
 	return fmt.Errorf("libp2p: join failed after %d rounds; first: %w; last: %w", rounds, first, last)
+}
+
+// withNoProxyHint points a join that could reach nothing, on a host with no
+// proxy configured, at the one setting a proxy-only network needs.
+func withNoProxyHint(err error, unreachable bool) error {
+	if !unreachable {
+		return err
+	}
+	for _, key := range []string{"HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"} {
+		if os.Getenv(key) != "" {
+			return err
+		}
+	}
+	return fmt.Errorf("%w (no proxy configured; if this host reaches the internet only through an HTTP proxy, set HTTPS_PROXY)", err)
+}
+
+// joinUnreachable reports a join that never connected because every address
+// met an unreachable network or failed DNS. A failed DNS lookup leaves no dial
+// error of its own: the swarm drops the name and reports no good addresses.
+func joinUnreachable(err error, remote peer.AddrInfo) bool {
+	var connectErr *joinConnectError
+	if !errors.As(err, &connectErr) {
+		return false
+	}
+	var dialErr *swarm.DialError
+	if errors.As(err, &dialErr) && len(dialErr.DialErrors) > 0 {
+		for _, failed := range dialErr.DialErrors {
+			if !networkUnreachable(failed.Cause) {
+				return false
+			}
+		}
+		return true
+	}
+	if errors.Is(err, swarm.ErrNoGoodAddresses) {
+		return slices.ContainsFunc(remote.Addrs, func(address multiaddr.Multiaddr) bool {
+			if len(address) == 0 {
+				return false
+			}
+			switch address[0].Code() {
+			case multiaddr.P_DNS, multiaddr.P_DNS4, multiaddr.P_DNS6, multiaddr.P_DNSADDR:
+				return true
+			}
+			return false
+		})
+	}
+	return networkUnreachable(err)
+}
+
+func networkUnreachable(err error) bool {
+	var dnsErr *net.DNSError
+	return errors.Is(err, syscall.ENETUNREACH) || errors.As(err, &dnsErr)
 }
 
 // JoinGroup is how a non-member gets in. It reads the group's checkpoint with
@@ -503,10 +560,23 @@ func JoinGroup(ctx context.Context, h host.Host, remote peer.AddrInfo, root stri
 	if err != nil {
 		return nil, err
 	}
+	if err := completeJoin(ctx, h, remote, group, identity, capability, applicant, response); err != nil {
+		// The store exists only for this join. Left behind, it would make
+		// running the join again fail on a store that already exists, and a
+		// join refused because a checkpoint landed while it was in flight is
+		// one that should simply be run again.
+		_ = group.Discard()
+		return nil, err
+	}
+	return group, nil
+}
+
+// completeJoin brings a freshly adopted group up to what the peer served,
+// signs the join against it and hands the join to the peer.
+func completeJoin(ctx context.Context, h host.Host, remote peer.AddrInfo, group *membership.Group, identity *keystore.Identity, capability entmoot.BootstrapCapability, applicant entmoot.NodeInfo, response MembershipSyncResponse) error {
 	for _, checkpoint := range response.Checkpoints[1:] {
 		if _, err := group.ApplyCheckpoint(checkpoint); err != nil {
-			_ = group.Close()
-			return nil, err
+			return err
 		}
 	}
 	for _, record := range response.Records {
@@ -516,8 +586,7 @@ func JoinGroup(ctx context.Context, h host.Host, remote peer.AddrInfo, root stri
 			if errors.Is(err, membership.ErrStale) {
 				continue
 			}
-			_ = group.Close()
-			return nil, err
+			return err
 		}
 	}
 	// The first answer may have been cut short by a page limit, and the join
@@ -526,15 +595,13 @@ func JoinGroup(ctx context.Context, h host.Host, remote peer.AddrInfo, root stri
 	if !response.Complete && applicant.MemberID != nil {
 		if _, _, _, err := FetchMembership(ctx, h, remote, group, *applicant.MemberID); err != nil &&
 			!errors.Is(err, ErrRemoved) {
-			_ = group.Close()
-			return nil, err
+			return err
 		}
 	}
 	record := membership.Record{Kind: membership.KindJoin, Subject: applicant, Invite: &capability}
 	signed, err := group.SignRecord(identity, record)
 	if err != nil {
-		_ = group.Close()
-		return nil, err
+		return err
 	}
 	// The record is valid and stored, which is not the same as effective: a
 	// banned identity, a spent invite or one signed by a demoted admin all
@@ -542,19 +609,14 @@ func JoinGroup(ctx context.Context, h host.Host, remote peer.AddrInfo, root stri
 	// group's own terms, instead of leaving the caller with "not a member".
 	if applicant.MemberID == nil || !group.IsMemberID(*applicant.MemberID) {
 		reason := membership.ExplainJoin(group.State(), signed)
-		_ = group.Close()
 		if reason == "" {
 			reason = "the group did not admit this identity"
 		}
-		return nil, fmt.Errorf("libp2p: join not admitted: %s", reason)
+		return fmt.Errorf("libp2p: join not admitted: %s", reason)
 	}
 	// Publish the join by handing it back: the peer applies it under the same
 	// rules this node just did, and gossip carries it to everyone else.
-	if err := PushMembershipRecord(ctx, h, remote, capability.GroupID, signed, &capability); err != nil {
-		_ = group.Close()
-		return nil, err
-	}
-	return group, nil
+	return PushMembershipRecord(ctx, h, remote, capability.GroupID, signed, &capability)
 }
 
 // PushMembershipRecord hands one signed record to a peer. A joiner uses it for
@@ -578,6 +640,9 @@ func PushMembershipRecord(ctx context.Context, h host.Host, remote peer.AddrInfo
 		return errors.New("libp2p: membership push response does not answer the request")
 	}
 	if response.Error != "" {
+		if response.Reason != "" {
+			return fmt.Errorf("libp2p: membership push: %s: %s", response.Error, response.Reason)
+		}
 		return fmt.Errorf("libp2p: membership push: %s", response.Error)
 	}
 	return nil
@@ -636,10 +701,11 @@ func (s *SyncServer) handleMembershipPush(stream network.Stream) {
 	if err != nil {
 		response.Error = SyncMalformed
 		response.Reason = err.Error()
-		if errors.Is(err, entmoot.ErrRosterReject) {
+		if errors.Is(err, entmoot.ErrRosterReject) && !errors.Is(err, membership.ErrStale) {
 			// The record verified but the group would not have it: say why, in
 			// the group's terms, so a joiner can tell a bad invite from a bad
-			// signature.
+			// signature. A stale record is refused for its date alone, and
+			// saying so tells a joiner to run the join again.
 			response.Reason = membership.ExplainJoin(group.State(), request.Record)
 		}
 		s.writePush(stream, response)

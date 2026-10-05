@@ -2499,3 +2499,268 @@ func TestRewoundMembersDropAMemberOnceItIsBack(t *testing.T) {
 		}
 	}
 }
+
+// authorityLoss is one change that takes authority away, set up so that a
+// join dated inside the window before it would be admitted: change signs the
+// change, and backdated is a join that only the change's own position in the
+// order makes ineffective.
+type authorityLoss struct {
+	name   string
+	policy func() Policy
+	setup  func(f *fixture, joiner *keystore.Identity) (backdated Record, change func())
+}
+
+func authorityLosses() []authorityLoss {
+	// viaAdmin admits an admin, has it issue the joiner an invite, and dates
+	// the joiner's join while the admin still holds its authority.
+	viaAdmin := func(change func(f *fixture, admin *keystore.Identity)) func(*fixture, *keystore.Identity) (Record, func()) {
+		return func(f *fixture, joiner *keystore.Identity) (Record, func()) {
+			admin := mustIdentity(f.t)
+			f.join(admin)
+			f.grantAdmin(f.memberID(admin))
+			f.tick(10)
+			capability := f.invite(admin, joiner, 1)
+			backdated := f.sign(joiner, Record{Kind: KindJoin, Invite: &capability})
+			f.tick(10)
+			return backdated, func() { change(f, admin) }
+		}
+	}
+	signAs := func(f *fixture, identity *keystore.Identity, rec Record) {
+		f.t.Helper()
+		if _, err := f.group.SignRecord(identity, rec); err != nil {
+			f.t.Fatal(err)
+		}
+	}
+	return []authorityLoss{
+		{name: "revoke invite", policy: DefaultPolicy, setup: func(f *fixture, joiner *keystore.Identity) (Record, func()) {
+			capability := f.invite(f.founder, joiner, 1)
+			backdated := f.sign(joiner, Record{Kind: KindJoin, Invite: &capability})
+			f.tick(10)
+			return backdated, func() {
+				signAs(f, f.founder, Record{Kind: KindRevokeInvite, InviteNonce: capability.Nonce})
+			}
+		}},
+		{name: "demote admin", policy: DefaultPolicy, setup: viaAdmin(func(f *fixture, _ *keystore.Identity) {
+			policy := f.group.Policy()
+			policy.Admins = nil
+			signAs(f, f.founder, Record{Kind: KindPolicy, Policy: &policy})
+		})},
+		{name: "remove admin", policy: DefaultPolicy, setup: viaAdmin(func(f *fixture, admin *keystore.Identity) {
+			signAs(f, f.founder, Record{Kind: KindRemove, Subject: f.info(admin)})
+		})},
+		{name: "ban admin", policy: DefaultPolicy, setup: viaAdmin(func(f *fixture, admin *keystore.Identity) {
+			signAs(f, f.founder, Record{Kind: KindRemove, Subject: f.info(admin), Banned: true})
+		})},
+		{name: "admin leaves", policy: DefaultPolicy, setup: viaAdmin(func(f *fixture, admin *keystore.Identity) {
+			signAs(f, admin, Record{Kind: KindLeave})
+		})},
+		{name: "close open group", policy: func() Policy {
+			policy := DefaultPolicy()
+			policy.JoinRule = JoinRuleOpen
+			return policy
+		}, setup: func(f *fixture, joiner *keystore.Identity) (Record, func()) {
+			backdated := f.sign(joiner, Record{Kind: KindJoin})
+			f.tick(10)
+			return backdated, func() {
+				policy := f.group.Policy()
+				policy.JoinRule = JoinRuleInvite
+				signAs(f, f.founder, Record{Kind: KindPolicy, Policy: &policy})
+			}
+		}},
+	}
+}
+
+// Records are ordered by their signer's timestamp and nothing bounds it from
+// below but a checkpoint, so a join dated before a change that takes authority
+// away is judged as if the change had not happened yet. Each such change is
+// due for a seal, and the seal - a checkpoint folding the records up to the
+// change and nothing later - makes the signer and every peer that adopts it
+// through the ordinary Apply paths refuse the backdated join as stale.
+func TestSealMakesAuthorityLossFinalAgainstBackdatedJoins(t *testing.T) {
+	for _, tc := range authorityLosses() {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t, tc.policy())
+			genesis := f.group.Canonical()
+			joiner := mustIdentity(t)
+			backdated, change := tc.setup(f, joiner)
+			change()
+			through, due := f.group.SealDue()
+			if !due {
+				t.Fatal("the change is not due for a seal")
+			}
+			f.tick(10)
+			later := f.join(mustIdentity(t))
+
+			sealed, signed, err := f.group.SealThrough(f.founder, through)
+			if err != nil || !signed {
+				t.Fatalf("seal: signed=%t err=%v", signed, err)
+			}
+			if sealed.Timestamp != through {
+				t.Fatalf("the seal is dated %d, want the change at %d", sealed.Timestamp, through)
+			}
+			if pending := f.group.Pending(); len(pending) != 1 || pending[0].ID != later.ID {
+				t.Fatalf("the seal folded records signed after the change: %d still pending", len(pending))
+			}
+			if _, due := f.group.SealDue(); due {
+				t.Fatal("the change is still due after its seal")
+			}
+			if _, err := f.group.Apply(backdated); !errors.Is(err, ErrStale) {
+				t.Fatalf("signer applied a join dated before the change: %v (member=%t)", err, f.group.IsMemberID(f.memberID(joiner)))
+			}
+
+			// A peer that held the records but not the checkpoint adopts it
+			// through the same Apply paths every version has, and then
+			// refuses the backdated join too.
+			peer, err := Adopt(t.TempDir(), genesis)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = peer.Close() })
+			for _, record := range f.group.PendingFor(genesis) {
+				if _, err := peer.Apply(record); err != nil {
+					t.Fatalf("peer refused the %s record: %v", record.Kind, err)
+				}
+			}
+			if _, err := peer.ApplyCheckpoint(sealed); err != nil {
+				t.Fatalf("peer refused the seal: %v", err)
+			}
+			if peer.Canonical().ID != sealed.ID {
+				t.Fatal("peer did not adopt the seal as canonical")
+			}
+			if _, err := peer.Apply(backdated); !errors.Is(err, ErrStale) {
+				t.Fatalf("peer applied a join dated before the change after syncing: %v", err)
+			}
+		})
+	}
+}
+
+// Only changes that take authority away are due for a seal. Joins, removing
+// an ordinary member, lifting a ban, a policy change that leaves the admins
+// and the join rule alone, and a revoke that changed nothing leave history to
+// the cadence, and the cadence itself is unchanged.
+func TestOnlyAuthorityLossIsDueForASeal(t *testing.T) {
+	f := newFixture(t, DefaultPolicy())
+	member := mustIdentity(t)
+	f.join(member)
+	admin := mustIdentity(t)
+	f.join(admin)
+	f.grantAdmin(f.memberID(admin))
+	f.tick(10)
+	capability := f.invite(f.founder, nil, 2)
+	f.tick(10)
+	if _, err := f.group.SignRecord(f.founder, Record{Kind: KindRevokeInvite, InviteNonce: capability.Nonce}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := f.group.SignCheckpoint(f.founder, true); err != nil {
+		t.Fatal(err)
+	}
+	base := f.group.Canonical()
+
+	f.tick(10)
+	f.join(mustIdentity(t))
+	steps := []Record{
+		{Kind: KindRemove, Subject: f.info(member), Banned: true},
+		{Kind: KindUnban, Subject: f.info(member)},
+		{Kind: KindRevokeInvite, InviteNonce: capability.Nonce},
+	}
+	for _, rec := range steps {
+		f.tick(10)
+		if _, err := f.group.SignRecord(f.founder, rec); err != nil {
+			t.Fatal(err)
+		}
+	}
+	policy := f.group.Policy()
+	policy.CheckpointEvery = 100
+	if _, err := f.group.SignRecord(f.founder, Record{Kind: KindPolicy, Policy: &policy}); err != nil {
+		t.Fatal(err)
+	}
+	if through, due := f.group.SealDue(); due {
+		t.Fatalf("changes that take no authority away are due for a seal through %d", through)
+	}
+	if _, signed, err := f.group.SealThrough(f.founder, f.clockMS); err != nil || signed {
+		t.Fatalf("sealed changes that take no authority away: signed=%t err=%v", signed, err)
+	}
+	if _, signed, err := f.group.SignCheckpoint(f.founder, false); err != nil || signed {
+		t.Fatalf("the cadence checkpointed early: signed=%t err=%v", signed, err)
+	}
+	if f.group.Canonical().ID != base.ID {
+		t.Fatal("the canonical checkpoint moved")
+	}
+}
+
+// However many authority changes are pending, one seal through the newest
+// covers them all.
+func TestOneSealCoversABurstOfAuthorityLoss(t *testing.T) {
+	f := newFixture(t, DefaultPolicy())
+	admin := mustIdentity(t)
+	f.join(admin)
+	f.grantAdmin(f.memberID(admin))
+	base := f.group.Canonical()
+	for range 5 {
+		capability := f.invite(f.founder, nil, 1)
+		f.tick(10)
+		if _, err := f.group.SignRecord(f.founder, Record{Kind: KindRevokeInvite, InviteNonce: capability.Nonce}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	demotion := f.grantAdmin()
+
+	through, due := f.group.SealDue()
+	if !due || through != demotion.Timestamp {
+		t.Fatalf("due=%t through %d, want the newest change at %d", due, through, demotion.Timestamp)
+	}
+	sealed, signed, err := f.group.SealThrough(f.founder, through)
+	if err != nil || !signed {
+		t.Fatalf("seal: signed=%t err=%v", signed, err)
+	}
+	if sealed.Sequence != base.Sequence+1 || len(f.group.Pending()) != 0 {
+		t.Fatalf("burst sealed at sequence %d with %d records left, want %d with none",
+			sealed.Sequence, len(f.group.Pending()), base.Sequence+1)
+	}
+	if _, due := f.group.SealDue(); due {
+		t.Fatal("the burst is still due after one seal")
+	}
+}
+
+// A legitimate join signed concurrently with a revoke can arrive after the
+// seal and be refused as stale. Re-running the join adopts the current
+// checkpoint and signs above it, which succeeds unless its own invite was the
+// revoked one.
+func TestJoinRacingARevokeSucceedsWhenRerun(t *testing.T) {
+	f := newFixture(t, DefaultPolicy())
+	honest, holder := mustIdentity(t), mustIdentity(t)
+	honestInvite := f.invite(f.founder, honest, 1)
+	revokedInvite := f.invite(f.founder, holder, 1)
+	raced := f.sign(honest, Record{Kind: KindJoin, Invite: &honestInvite})
+	f.tick(10)
+	revoke, err := f.group.SignRecord(f.founder, Record{Kind: KindRevokeInvite, InviteNonce: revokedInvite.Nonce})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, signed, err := f.group.SealThrough(f.founder, revoke.Timestamp); err != nil || !signed {
+		t.Fatalf("seal: signed=%t err=%v", signed, err)
+	}
+	if _, err := f.group.Apply(raced); !errors.Is(err, ErrStale) {
+		t.Fatalf("a join dated before the seal was applied: %v", err)
+	}
+
+	rejoin := func(identity *keystore.Identity, capability entmoot.BootstrapCapability) bool {
+		t.Helper()
+		joiner := adoptServedSet(t, f.group)
+		joiner.SetNow(func() time.Time { return time.UnixMilli(f.clockMS) })
+		signed, err := joiner.SignRecord(identity, Record{Kind: KindJoin, Invite: &capability})
+		if err != nil {
+			t.Fatalf("re-signed join: %v", err)
+		}
+		if _, err := f.group.Apply(signed); err != nil {
+			t.Fatalf("the founder refused the re-signed join: %v", err)
+		}
+		return f.group.IsMemberID(f.memberID(identity))
+	}
+	if !rejoin(honest, honestInvite) {
+		t.Fatal("re-running the honest join did not admit it")
+	}
+	if rejoin(holder, revokedInvite) {
+		t.Fatal("re-running a join with the revoked invite admitted it")
+	}
+}

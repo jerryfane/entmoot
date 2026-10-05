@@ -263,7 +263,7 @@ func daemonHostConfig(gf *globalFlags) (libp2ptransport.HostConfig, error) {
 	case "", "direct":
 		config.ListenAddrs = gf.p2pListen
 		if len(config.ListenAddrs) == 0 {
-			config.ListenAddrs = []string{fmt.Sprintf("/ip4/0.0.0.0/tcp/%d", gf.listenPort)}
+			config.ListenAddrs = []string{directListenAddr(gf)}
 		}
 		config.AnnounceAddrs = gf.p2pAnnounce
 	case "relay-only":
@@ -393,6 +393,7 @@ func runGroupDaemon(gf *globalFlags, opts groupDaemonOptions) int {
 		slog.Error(opts.command+": libp2p host", slog.String("err", err.Error()))
 		return exitTransport
 	}
+	listenPort := reportedListenPort(gf, libp2pHost)
 	rawStore, err := store.OpenSQLite(s.dataDir)
 	if err != nil {
 		slog.Error(opts.command+": open store", slog.String("err", err.Error()))
@@ -455,7 +456,7 @@ func runGroupDaemon(gf *globalFlags, opts groupDaemonOptions) int {
 	if opts.exitAfterLoad {
 		groups := runtime.ActiveGroupIDs()
 		members := groupRuntimeMemberCount(runtime, groups)
-		joinedEvent := groupDaemonEvent(opts.event, gf, groups, members, buildJoinHealthSummary(rootCtx, runtime, rawStore, s.identity.PublicKey), sockPath)
+		joinedEvent := groupDaemonEvent(opts.event, gf, listenPort, groups, members, buildJoinHealthSummary(rootCtx, runtime, rawStore, s.identity.PublicKey), sockPath)
 		if data, err := json.Marshal(joinedEvent); err == nil {
 			fmt.Println(string(data))
 		}
@@ -480,7 +481,7 @@ func runGroupDaemon(gf *globalFlags, opts groupDaemonOptions) int {
 		identityPath:      gf.identity,
 		dataDir:           s.dataDir,
 		controlSocketPath: sockPath,
-		listenPort:        uint16(gf.listenPort),
+		listenPort:        listenPort,
 		runtime:           runtime,
 		store:             rawStore,
 		notify:            notifyStore,
@@ -499,7 +500,7 @@ func runGroupDaemon(gf *globalFlags, opts groupDaemonOptions) int {
 	// Emit the one-line "joined" event on stdout.
 	groups := runtime.ActiveGroupIDs()
 	members := groupRuntimeMemberCount(runtime, groups)
-	joinedEvent := groupDaemonEvent(opts.event, gf, groups, members, buildJoinHealthSummary(rootCtx, runtime, rawStore, s.identity.PublicKey), sockPath)
+	joinedEvent := groupDaemonEvent(opts.event, gf, listenPort, groups, members, buildJoinHealthSummary(rootCtx, runtime, rawStore, s.identity.PublicKey), sockPath)
 	if data, err := json.Marshal(joinedEvent); err == nil {
 		fmt.Println(string(data))
 	}
@@ -524,14 +525,16 @@ func groupRuntimeMemberCount(runtime *groupRuntime, groups []entmoot.GroupID) in
 	return members
 }
 
-func groupDaemonEvent(event string, gf *globalFlags, groups []entmoot.GroupID, members int, health joinHealthSummary, sockPath string) map[string]any {
+// groupDaemonEvent is the one-line join/serve event. listenPort is the port
+// the host bound, not necessarily -listen-port (see directListenAddr).
+func groupDaemonEvent(event string, gf *globalFlags, listenPort uint16, groups []entmoot.GroupID, members int, health joinHealthSummary, sockPath string) map[string]any {
 	return map[string]any{
 		"event":          event,
 		"group_id":       groups[0],
 		"group_ids":      groups,
 		"members":        members,
 		"health":         health,
-		"listen_port":    gf.listenPort,
+		"listen_port":    listenPort,
 		"control_socket": sockPath,
 		"next_command":   doctorNextCommand(gf, groups[0]),
 	}
@@ -1097,8 +1100,11 @@ func (s *ipcServer) handleConn(ctx context.Context, c net.Conn) {
 }
 
 // handleSignedPublish accepts a message whose author already signed it. This
-// is the ESP/mobile write path: the daemon owns durable storage and gossip
-// fanout, but does not hold the author's signing key.
+// is the ESP/mobile write path: the daemon owns durable storage, but does not
+// hold the author's signing key. Live gossip binds each envelope's sender to
+// its author, so only a message this node authored is gossiped; another
+// member's message is verified, stored, and reaches the group through history
+// catch-up from this node.
 func (s *ipcServer) handleSignedPublish(ctx context.Context, c net.Conn, req *ipc.SignedPublishReq) {
 	msg := req.Message
 	gid := msg.GroupID
@@ -1112,7 +1118,12 @@ func (s *ipcServer) handleSignedPublish(ctx context.Context, c net.Conn, req *ip
 		})
 		return
 	}
-	if _, err := sess.live.Publish(ctx, msg); err != nil {
+	deliver := sess.live.StoreForHistory
+	if messageAuthorMemberID(msg) == s.memberID {
+		deliver = sess.live.Publish
+	}
+	delivery, err := deliver(ctx, msg)
+	if err != nil {
 		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{
 			Type:    "error",
 			Code:    publishErrorCode(err),
@@ -1123,6 +1134,7 @@ func (s *ipcServer) handleSignedPublish(ctx context.Context, c net.Conn, req *ip
 	}
 	_ = ipc.EncodeAndWrite(c, &ipc.SignedPublishResp{
 		Status:         "accepted",
+		Delivery:       string(delivery),
 		MessageID:      msg.ID,
 		GroupID:        gid,
 		AuthorMemberID: messageAuthorMemberID(msg),
@@ -1253,12 +1265,22 @@ func (s *ipcServer) publishLocalMessage(ctx context.Context, gid entmoot.GroupID
 	}, nil
 }
 
+// publishErrorCode separates what the submitter got wrong from failures of
+// this node, so the ESP can answer with a client status rather than a 500.
 func publishErrorCode(err error) ipc.ErrorCode {
 	switch {
 	case errors.Is(err, entmoot.ErrNotMember):
 		return ipc.CodeNotMember
-	case errors.Is(err, entmoot.ErrSigInvalid):
+	case errors.Is(err, entmoot.ErrSigInvalid),
+		errors.Is(err, libp2ptransport.ErrInvalidMessage),
+		errors.Is(err, entmoot.ErrOversized):
 		return ipc.CodeInvalidArgument
+	case errors.Is(err, entmoot.ErrRateLimited):
+		return ipc.CodeRateLimited
+	case errors.Is(err, entmoot.ErrRosterHeadUnknown):
+		// The message cites a roster this node has not synchronized: valid
+		// perhaps, but in conflict with local state until roster sync.
+		return ipc.CodeConflict
 	default:
 		return ipc.CodeInternal
 	}
@@ -1364,13 +1386,13 @@ func (s *ipcServer) joinReadinessEvent(ctx context.Context) json.RawMessage {
 		return nil
 	}
 	gf := &globalFlags{
-		identity:   s.identityPath,
-		data:       s.dataDir,
-		listenPort: uint(s.listenPort),
+		identity: s.identityPath,
+		data:     s.dataDir,
 	}
 	event := groupDaemonEvent(
 		"joined",
 		gf,
+		s.listenPort,
 		groups,
 		groupRuntimeMemberCount(s.runtime, groups),
 		buildJoinHealthSummary(ctx, s.runtime, s.store, s.identity.PublicKey),
@@ -1558,7 +1580,7 @@ func (s *ipcServer) issueInvite(c net.Conn, req *ipc.InviteCreateReq, refresh *e
 		AllowedMultiaddrs: allowedAddresses,
 		Relays:            relays,
 		MaxUses:           req.MaxUses,
-		IssuedAtMS:        now.UnixMilli(),
+		IssuedAtMS:        membership.InviteIssuedAtMS(now),
 		ExpiresAtMS:       expires.UnixMilli(),
 	}
 	if _, err := rand.Read(capability.Nonce[:]); err != nil {

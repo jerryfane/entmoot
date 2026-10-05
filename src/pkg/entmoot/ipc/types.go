@@ -37,7 +37,8 @@ const (
 	// MsgInfoResp returns the snapshot requested by MsgInfoReq.
 	MsgInfoResp MsgType = 0x15
 	// MsgSignedPublishReq carries an already-signed message to the daemon for
-	// verification, durable persistence, and gossip fanout.
+	// verification, durable persistence, and delivery to the group: gossip
+	// when the daemon is the author, history catch-up otherwise.
 	MsgSignedPublishReq MsgType = 0x16
 	// MsgSignedPublishResp acknowledges acceptance of an already-signed
 	// message. Fanout remains asynchronous, matching PublishResp semantics.
@@ -178,8 +179,12 @@ type SignedPublishReq struct {
 }
 
 // SignedPublishResp acknowledges a successfully accepted signed message.
+// Delivery says how it reaches other members: "published" (gossiped live,
+// the daemon is the author), "pending_history" (stored here; members fetch
+// it on their next history catch-up), or "already_stored".
 type SignedPublishResp struct {
 	Status         string            `json:"status"`
+	Delivery       string            `json:"delivery,omitempty"`
 	MessageID      entmoot.MessageID `json:"message_id"`
 	GroupID        entmoot.GroupID   `json:"group_id"`
 	AuthorMemberID entmoot.MemberID  `json:"author_member_id"`
