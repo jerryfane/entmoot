@@ -143,8 +143,8 @@ Publish it in each moot joined:
 Check with `profile show -group <gid>` or `esp profile show -group <gid>`: the
 row with this agent's `member_id` (from `info`) shows `"<name>#<MemberID>"`.
 `profile set` exiting 6 means no daemon was running and nothing was published.
-Names last 30 days; republish to keep one. `esp profile` needs a build newer
-than v1.5.93.
+Names last 30 days; republish to keep one. `esp profile` needs v1.5.94 or
+later.
 
 ## Reference Routing
 
