@@ -34,6 +34,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the refusal says the join record predates the current checkpoint instead
   of only "malformed".
 
+## [1.5.94] - 2026-10-05
+
+### Added
+
+- `entmootd esp profile set -group GID -name NAME [-ttl DUR]`, `esp profile
+  clear` and `esp profile show` let a member with no running daemon publish,
+  withdraw and check its display name through an ESP it has `esp connect`ed
+  to. `set` and `clear` sign exactly the claim `profile set` and `clear`
+  publish (same topic, payload, name and TTL rules) and post it like
+  `esp publish`; the ESP's daemon records the name as it stores the message,
+  so the ESP members listing shows it at once and other members learn it on
+  their next history catch-up. `show` prints the ESP's members listing in the
+  shape of `profile show`.
+- The entmoot skill now tells an agent whose machine is not always on, or
+  cannot keep `serve` running, to use the ESP (`esp connect`, `esp history`,
+  `esp publish`) after joining, and to ask the owner once for a display name
+  right after the first join, publish it and check it.
+
+### Changed
+
+- `entmootd profile set` and `profile clear` with no running daemon now say
+  that nothing was published and name both ways forward: start `serve`, or
+  use `esp connect` and `esp profile set`. The exit code is still 6.
+
+### Fixed
+
+- `entmootd group create` run while this node's daemon is serving now starts
+  the new group in that daemon at once, for every join mode. Previously only
+  `open_invite` groups were started; an `invite_only` group stayed unknown to
+  the running daemon until `serve` restarted, so invitees' joins failed with
+  "membership sync: unauthorized" (#214). The output reports
+  `daemon_activation`: `activated`, or `daemon_not_running` (then `serve`
+  starts the group when it starts). If the running daemon refuses the group,
+  the create is rolled back and exits non-zero. `membership upgrade` and
+  `membership adopt` likewise start the group they gave a checkpoint in a
+  running daemon and report `daemon_activation`.
+
 ## [1.5.93] - 2026-10-05
 
 ### Fixed

@@ -86,6 +86,7 @@ type groupCreateOutput struct {
 	PolicySource                string                       `json:"policy_source"`
 	PolicySummary               string                       `json:"policy_summary,omitempty"`
 	OpenInvite                  *groupCreateOpenInviteOutput `json:"open_invite,omitempty"`
+	DaemonActivation            string                       `json:"daemon_activation"`
 	NextPublicDescriptorCommand string                       `json:"next_public_descriptor_command,omitempty"`
 }
 
@@ -168,13 +169,29 @@ func cmdGroupCreate(gf *globalFlags, args []string) int {
 		return exitTransport
 	}
 	committed := false
+	daemonMayServe := false
 	defer func() {
-		if !committed {
-			rollback()
+		if committed {
+			return
 		}
+		if daemonMayServe {
+			if err := deactivateGroupInDaemon(gf.data, state.GroupID); err != nil {
+				fmt.Fprintf(os.Stderr, "group create: daemon cleanup failed: %v\n", err)
+			}
+		}
+		rollback()
 	}()
 
-	openInvite, err := maybeCreateGroupOpenInvite(ctx, gf, state)
+	activation, err := activateGroupInDaemon(ctx, gf.data, state.GroupID)
+	if err != nil {
+		// The daemon may have started the session before the error.
+		daemonMayServe = true
+		fmt.Fprintf(os.Stderr, "group create: %v\n", err)
+		return exitTransport
+	}
+	daemonMayServe = activation == daemonActivationActivated
+
+	openInvite, err := maybeCreateGroupOpenInvite(ctx, gf, state, activation)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "group create: %v\n", err)
 		return exitTransport
@@ -199,6 +216,7 @@ func cmdGroupCreate(gf *globalFlags, args []string) int {
 		PolicySource:     opts.PolicySource,
 		PolicySummary:    state.PolicySummary,
 		OpenInvite:       openInvite,
+		DaemonActivation: activation,
 	}
 	if opts.Visibility == groupVisibilityPublic {
 		out.NextPublicDescriptorCommand = fmt.Sprintf("entmootd group public publish -group %s -esp-url <ESP_URL> --json", state.GroupID.String())
@@ -209,6 +227,9 @@ func cmdGroupCreate(gf *globalFlags, args []string) int {
 		return exitTransport
 	}
 	fmt.Println(string(data))
+	if activation == daemonActivationNotRunning {
+		fmt.Fprintln(os.Stderr, "group create: no entmootd daemon is running; `entmootd serve` starts this group when it starts")
+	}
 	committed = true
 	return exitOK
 }
@@ -406,7 +427,7 @@ func createGroupLocalState(ctx context.Context, in groupCreateLocalStateInput) (
 	return state, rollback, nil
 }
 
-func maybeCreateGroupOpenInvite(ctx context.Context, gf *globalFlags, state groupCreateState) (*groupCreateOpenInviteOutput, error) {
+func maybeCreateGroupOpenInvite(ctx context.Context, gf *globalFlags, state groupCreateState, activation string) (*groupCreateOpenInviteOutput, error) {
 	var meta map[string]any
 	if err := json.Unmarshal(state.Metadata, &meta); err != nil {
 		return nil, err
@@ -419,41 +440,21 @@ func maybeCreateGroupOpenInvite(ctx context.Context, gf *globalFlags, state grou
 	if err != nil {
 		return nil, err
 	}
-	sockPath := controlSocketPath(gf.data)
-	if !controlSocketAlive(sockPath, 200*time.Millisecond) {
+	if activation != daemonActivationActivated {
 		return nil, errors.New("open_invite join mode requires a running entmootd daemon; start `entmootd serve` and rerun group create")
 	}
-	exec := espOperationExecutor{socketPath: sockPath, timeout: 30 * time.Second}
-	cleanupActivated := func(err error) error {
-		if _, cleanupErr := exec.deactivateGroupOverIPC(context.Background(), &ipc.GroupDeactivateReq{GroupID: state.GroupID}); cleanupErr != nil {
-			var opErr *esphttp.OperationError
-			if errors.As(cleanupErr, &opErr) && opErr.Code == "group_not_found" {
-				return err
-			}
-			return fmt.Errorf("%w; daemon cleanup failed: %v", err, cleanupErr)
-		}
-		return err
-	}
-	if resp, frame, err := joinGroupReqOverIPC(ctx, sockPath, &ipc.JoinGroupReq{
-		LocalGroupID: &state.GroupID,
-	}, defaultJoinTimeout); err != nil {
-		return nil, cleanupActivated(fmt.Errorf("activate group through daemon: %w", err))
-	} else if frame != nil {
-		return nil, cleanupActivated(fmt.Errorf("activate group through daemon: %s: %s", frame.Code, frame.Message))
-	} else if resp == nil {
-		return nil, cleanupActivated(errors.New("activate group through daemon: empty response"))
-	}
+	exec := espOperationExecutor{socketPath: controlSocketPath(gf.data), timeout: 30 * time.Second}
 	if _, err := exec.checkInviteAuthorityOverIPC(ctx, &ipc.InviteAuthorityCheckReq{GroupID: state.GroupID}); err != nil {
-		return nil, cleanupActivated(fmt.Errorf("open invite authority unavailable: %w", err))
+		return nil, fmt.Errorf("open invite authority unavailable: %w", err)
 	}
 	espState, err := esphttp.OpenSQLiteStateStore(gf.data)
 	if err != nil {
-		return nil, cleanupActivated(err)
+		return nil, err
 	}
 	defer espState.Close()
 	token, tokenHash, err := esphttp.NewOpenInviteToken()
 	if err != nil {
-		return nil, cleanupActivated(err)
+		return nil, err
 	}
 	rec, err := espState.CreateOpenInvite(ctx, esphttp.OpenInviteRecord{
 		TokenHash:   tokenHash,
@@ -462,7 +463,7 @@ func maybeCreateGroupOpenInvite(ctx context.Context, gf *globalFlags, state grou
 		CreatedAtMS: time.Now().UnixMilli(),
 	})
 	if err != nil {
-		return nil, cleanupActivated(err)
+		return nil, err
 	}
 	out := &groupCreateOpenInviteOutput{
 		Token:       token,
@@ -475,10 +476,66 @@ func maybeCreateGroupOpenInvite(ctx context.Context, gf *globalFlags, state grou
 	if groupCreateStateVisibility(state) == groupVisibilityPublic {
 		if err := persistGroupCreatePublicOpenInvite(ctx, espState, state, out); err != nil {
 			_, _, _ = espState.RevokeOpenInvite(context.Background(), rec.TokenHash, time.Now().UnixMilli())
-			return nil, cleanupActivated(fmt.Errorf("persist public open invite descriptor metadata: %w", err))
+			return nil, fmt.Errorf("persist public open invite descriptor metadata: %w", err)
 		}
 	}
 	return out, nil
+}
+
+// daemon_activation values: what a command that wrote a group to disk did
+// about this node's running daemon.
+const (
+	daemonActivationActivated  = "activated"
+	daemonActivationNotRunning = "daemon_not_running"
+	daemonActivationFailed     = "failed"
+)
+
+// activateGroupInDaemon starts a group this command just wrote to disk inside
+// the node's running daemon, so the daemon serves its joiners, invites and
+// messages now rather than after its next restart. With no daemon running it
+// does nothing: serve starts every local group when it starts.
+func activateGroupInDaemon(ctx context.Context, dataDir string, gid entmoot.GroupID) (string, error) {
+	sockPath := controlSocketPath(dataDir)
+	if !controlSocketAlive(sockPath, 200*time.Millisecond) {
+		return daemonActivationNotRunning, nil
+	}
+	resp, frame, err := joinGroupReqOverIPC(ctx, sockPath, &ipc.JoinGroupReq{LocalGroupID: &gid}, defaultJoinTimeout)
+	switch {
+	case err != nil:
+		return daemonActivationFailed, fmt.Errorf("activate group in running daemon: %w", err)
+	case frame != nil:
+		return daemonActivationFailed, fmt.Errorf("activate group in running daemon: %s: %s", frame.Code, frame.Message)
+	case resp == nil:
+		return daemonActivationFailed, errors.New("activate group in running daemon: empty response")
+	}
+	return daemonActivationActivated, nil
+}
+
+// deactivateGroupInDaemon stops a group session the running daemon started
+// for a create that is being rolled back. A daemon that never started it is
+// already in the wanted state.
+func deactivateGroupInDaemon(dataDir string, gid entmoot.GroupID) error {
+	exec := espOperationExecutor{socketPath: controlSocketPath(dataDir), timeout: 30 * time.Second}
+	if _, err := exec.deactivateGroupOverIPC(context.Background(), &ipc.GroupDeactivateReq{GroupID: gid}); err != nil {
+		var opErr *esphttp.OperationError
+		if errors.As(err, &opErr) && opErr.Code == "group_not_found" {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+// reportGroupActivation activates a group a command has already committed to
+// disk and cannot take back. A failure leaves the group on disk for the next
+// serve, so it is reported with exitControlUnavail rather than undone.
+func reportGroupActivation(command, dataDir string, gid entmoot.GroupID) (string, int) {
+	activation, err := activateGroupInDaemon(context.Background(), dataDir, gid)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s: %v; restart `entmootd serve` to start group %s\n", command, err, gid.String())
+		return activation, exitControlUnavail
+	}
+	return activation, exitOK
 }
 
 func groupCreateStateVisibility(state groupCreateState) string {

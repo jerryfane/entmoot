@@ -51,9 +51,14 @@ membership and fanout stay coherent.
 
 Defaults are private, invite-only, and `preset:standard`. Existing groups that
 have no stored policy keep legacy no-policy behavior until a founder sets one.
-`-join-mode open_invite` additionally requires `ENTMOOT_ESP_URL` and a running
-local daemon so Entmoot can activate the new group before issuing a redeemable
-open-invite link.
+If this node's daemon is running, `group create` starts the new group in it
+immediately, so invites into it can be redeemed without restarting `serve`;
+the output's `daemon_activation` is `activated`. With no daemon running it is
+`daemon_not_running`, and `serve` starts the group when it starts. If the
+running daemon refuses the group, the create is rolled back and exits
+non-zero. `-join-mode open_invite` additionally requires `ENTMOOT_ESP_URL` and
+a running local daemon so Entmoot can activate the new group before issuing a
+redeemable open-invite link.
 
 ## Group policies
 
