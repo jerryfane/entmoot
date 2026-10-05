@@ -341,124 +341,180 @@ func (g *Group) changed() {
 	}
 }
 
+// Removal is when, and by which signed entry, a member's latest membership
+// was ended by a removal or ban (see RemovedAt).
+type Removal struct {
+	// At is the removal record's timestamp or, for a removal this node only
+	// knows from a checkpoint, that checkpoint's.
+	At int64
+	// Entry is the removal record's id, or that checkpoint's: what ended the
+	// membership, so a caller can tell one removal from another.
+	Entry entmoot.RosterEntryID
+}
+
 // RemovedAt reports, for each of ids that is not a member now and whose
-// latest membership a removal or ban ended, when that removal is dated. A
-// member that was never in the group, that left or rekeyed, or that has been
-// readmitted since is left out.
+// latest membership a removal or ban ended, that removal. A member that was
+// never in the group, that left or rekeyed, or that has been readmitted since
+// is left out. A nil ids asks about every member this node knows of that is
+// not a member now.
 //
 // What ended a membership is read from the records the canonical checkpoint
 // does not cover, projected in their own order, so the answer does not depend
 // on the order they arrived in. A membership that ended inside a checkpoint,
-// whose records this node does not hold, falls back to the checkpoints: a
+// whose records this node does not project, falls back to the checkpoints: a
 // member listed by one checkpoint on the canonical chain - or with a join this
-// node holds - and missing from the first later one is reported dated at that
-// later checkpoint, or at a removal of it this node holds from between the two.
-// Without the records a member that left of its own accord inside a
-// checkpoint cannot be told from a removed one unless its leave is held.
-func (g *Group) RemovedAt(ids []entmoot.MemberID) map[entmoot.MemberID]int64 {
+// node holds - and missing from the first later one is reported as removed by
+// a removal of it this node holds from between the two, or else by that later
+// checkpoint. Without the records a member that left of its own accord inside
+// a checkpoint cannot be told from a removed one, so it is reported too.
+//
+// The group's lock is held only to copy what the answer needs; the work runs
+// outside it, in one pass over the held records whatever the number of ids,
+// and an id this node never saw as a member costs no more than a lookup.
+func (g *Group) RemovedAt(ids []entmoot.MemberID) map[entmoot.MemberID]Removal {
+	type checkpointView struct {
+		id        entmoot.RosterEntryID
+		timestamp int64
+		members   map[entmoot.MemberID]entmoot.NodeInfo
+	}
+	all := ids == nil
+	wanted := make(map[entmoot.MemberID]struct{}, len(ids))
+	var current map[entmoot.MemberID]struct{}
 	g.mu.RLock()
-	defer g.mu.RUnlock()
-	removed := make(map[entmoot.MemberID]int64)
-	var endedBy map[entmoot.MemberID]Record
+	if all {
+		current = make(map[entmoot.MemberID]struct{}, len(g.state.Members))
+		for id := range g.state.Members {
+			current[id] = struct{}{}
+		}
+	}
 	for _, id := range ids {
-		if _, member := g.state.Members[id]; member {
-			continue
+		if _, member := g.state.Members[id]; !member {
+			wanted[id] = struct{}{}
 		}
-		if _, done := removed[id]; done {
-			continue
+	}
+	if !all && len(wanted) == 0 {
+		g.mu.RUnlock()
+		return nil
+	}
+	base := g.checkpoints[g.canonicalID]
+	window := make([]Record, 0, len(g.records))
+	for _, rec := range g.records {
+		window = append(window, rec)
+	}
+	covered := make([]Record, 0, len(g.history))
+	for _, rec := range g.history {
+		covered = append(covered, rec)
+	}
+	// The canonical chain, newest first. A checkpoint's member index is
+	// never changed once stored, so sharing it outside the lock is safe.
+	var chain []checkpointView
+	for cp, ok := g.checkpoints[g.canonicalID]; ok && len(chain) <= len(g.checkpoints); cp, ok = g.checkpoints[cp.Previous] {
+		chain = append(chain, checkpointView{id: cp.ID, timestamp: cp.Timestamp, members: g.membersAt[cp.ID]})
+	}
+	g.mu.RUnlock()
+	// Every non-member a held record or a checkpoint names.
+	want := func(id entmoot.MemberID) bool {
+		if _, ok := wanted[id]; ok {
+			return true
 		}
-		if endedBy == nil {
-			endedBy = make(map[entmoot.MemberID]Record)
-			records := make([]Record, 0, len(g.records))
-			for _, rec := range g.records {
-				records = append(records, rec)
+		if !all {
+			return false
+		}
+		if _, member := current[id]; member {
+			return false
+		}
+		wanted[id] = struct{}{}
+		return true
+	}
+	if all {
+		for _, cp := range chain {
+			for id := range cp.members {
+				want(id)
 			}
-			projectTracking(g.checkpoints[g.canonicalID], records, endedBy)
 		}
-		if ending, held := endedBy[id]; held {
+	}
+
+	// One pass over every held record, resolving each one's member ids once:
+	// the records naming a wanted id, and the last moment each was known in.
+	held := make(map[entmoot.MemberID][]Record)
+	lastSeen := make(map[entmoot.MemberID]int64)
+	for _, records := range [][]Record{window, covered} {
+		for _, rec := range records {
+			var involved [2]entmoot.MemberID
+			n := 0
+			if subject, err := rec.SubjectMemberID(); err == nil && want(subject) {
+				involved[n] = subject
+				n++
+			}
+			if actor, err := entmoot.ResolvedMemberID(rec.Actor); err == nil {
+				if want(actor) && (n == 0 || involved[0] != actor) {
+					involved[n] = actor
+					n++
+				}
+			}
+			for _, id := range involved[:n] {
+				held[id] = append(held[id], rec)
+				if rec.Kind == KindJoin && rec.Timestamp > lastSeen[id] {
+					lastSeen[id] = rec.Timestamp
+				}
+			}
+		}
+	}
+	for _, cp := range chain {
+		for id := range wanted {
+			if _, in := cp.members[id]; in && cp.timestamp > lastSeen[id] {
+				lastSeen[id] = cp.timestamp
+			}
+		}
+	}
+	// Never a member, as far as this node knows: nothing to report.
+	for id := range wanted {
+		if _, seen := lastSeen[id]; !seen {
+			delete(wanted, id)
+		}
+	}
+	if len(wanted) == 0 {
+		return nil
+	}
+
+	endedBy := make(map[entmoot.MemberID]Record)
+	projectTracking(base, window, endedBy)
+	removed := make(map[entmoot.MemberID]Removal)
+	for id := range wanted {
+		if ending, ok := endedBy[id]; ok {
 			if ending.Kind == KindRemove {
-				removed[id] = ending.Timestamp
+				removed[id] = Removal{At: ending.Timestamp, Entry: ending.ID}
 			}
 			continue
 		}
-		if at, ok := g.removedInsideCheckpointLocked(id); ok {
-			removed[id] = at
+		// The first checkpoint after the member was last known in that no
+		// longer lists it.
+		var out *checkpointView
+		for k := range chain {
+			if chain[k].timestamp <= lastSeen[id] {
+				break
+			}
+			if _, in := chain[k].members[id]; !in {
+				out = &chain[k]
+			}
 		}
+		if out == nil {
+			continue
+		}
+		removal := Removal{At: out.timestamp, Entry: out.id}
+		var removedAt int64
+		for _, rec := range held[id] {
+			if rec.Kind != KindRemove || rec.Timestamp <= lastSeen[id] || rec.Timestamp > out.timestamp || rec.Timestamp <= removedAt {
+				continue
+			}
+			if subject, err := rec.SubjectMemberID(); err == nil && subject == id {
+				removedAt = rec.Timestamp
+				removal = Removal{At: rec.Timestamp, Entry: rec.ID}
+			}
+		}
+		removed[id] = removal
 	}
 	return removed
-}
-
-// removedInsideCheckpointLocked is RemovedAt's fallback for a member whose
-// membership ended inside a checkpoint (see RemovedAt).
-func (g *Group) removedInsideCheckpointLocked(id entmoot.MemberID) (int64, bool) {
-	// The canonical chain, newest first.
-	var chain []Checkpoint
-	for cp, ok := g.checkpoints[g.canonicalID]; ok && len(chain) <= len(g.checkpoints); cp, ok = g.checkpoints[cp.Previous] {
-		chain = append(chain, cp)
-	}
-	// The last moment this node knows id was in the group.
-	var lastSeen int64
-	seen := false
-	for _, cp := range chain {
-		if _, in := g.membersAt[cp.ID][id]; in && (!seen || cp.Timestamp > lastSeen) {
-			lastSeen, seen = cp.Timestamp, true
-		}
-	}
-	var held []Record
-	for _, records := range []map[entmoot.RosterEntryID]Record{g.records, g.history} {
-		for _, rec := range records {
-			subject, err := rec.SubjectMemberID()
-			actor, actorErr := entmoot.ResolvedMemberID(rec.Actor)
-			if (err == nil && subject == id) || (actorErr == nil && actor == id) {
-				held = append(held, rec)
-			}
-		}
-	}
-	for _, rec := range held {
-		if rec.Kind == KindJoin && (!seen || rec.Timestamp > lastSeen) {
-			lastSeen, seen = rec.Timestamp, true
-		}
-	}
-	if !seen {
-		return 0, false
-	}
-	// The first checkpoint after that which no longer lists it.
-	var out *Checkpoint
-	for i := range chain {
-		cp := chain[i]
-		if cp.Timestamp <= lastSeen {
-			break
-		}
-		if _, in := g.membersAt[cp.ID][id]; !in {
-			out = &chain[i]
-		}
-	}
-	if out == nil {
-		return 0, false
-	}
-	at, left := out.Timestamp, false
-	var removedAt int64
-	for _, rec := range held {
-		if rec.Timestamp <= lastSeen || rec.Timestamp > out.Timestamp {
-			continue
-		}
-		switch rec.Kind {
-		case KindRemove:
-			if subject, err := rec.SubjectMemberID(); err == nil && subject == id && rec.Timestamp > removedAt {
-				removedAt = rec.Timestamp
-			}
-		case KindLeave, KindRekey:
-			left = true
-		}
-	}
-	switch {
-	case removedAt != 0:
-		return removedAt, true
-	case left:
-		return 0, false
-	default:
-		return at, true
-	}
 }
 
 func (g *Group) reproject() {

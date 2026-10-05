@@ -331,9 +331,10 @@ Public open-invite issuer endpoints:
   way back in, the issuer keeps its invites in line with the group's
   membership whenever it applies a record or checkpoint: it revokes every
   other invite in a replacement chain once one of them has been used, and
-  every invite it minted to somebody no longer a member, no later than the
-  removal or ban that ended its latest membership. Re-invites minted after the
-  removal, readmitted members and members that left are never touched. A
+  every invite it minted to somebody no longer a member before it had the
+  removal or ban that ended its latest membership (or before that removal's
+  own date, if later). Re-invites minted once it had the removal, readmitted
+  members and members that left are never touched. A
   removal signed on the issuing node revokes them before it, so they cannot
   readmit the member. A removal signed on another admin's node is followed by
   the revocations once the issuer holds it, so a join with one of those

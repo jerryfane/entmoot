@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/url"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -90,6 +91,16 @@ func initInviteLedgerSchema(db *sql.DB) error {
 	// Reconciling a removal looks up the invites issued to one member.
 	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS bootstrap_invites_target
 		ON bootstrap_invites (group_id, target_member_id) WHERE target_member_id IS NOT NULL`); err != nil {
+		return fmt.Errorf("libp2p: initialize invite ledger: %w", err)
+	}
+	// When this node first saw each removal it reconciled invites against.
+	if _, err := db.Exec(`
+		CREATE TABLE IF NOT EXISTS removals_seen (
+			group_id BLOB NOT NULL,
+			entry_id BLOB NOT NULL,
+			seen_at_ms INTEGER NOT NULL,
+			PRIMARY KEY (group_id, entry_id)
+		);`); err != nil {
 		return fmt.Errorf("libp2p: initialize invite ledger: %w", err)
 	}
 	// An invite reissued in place of another is linked to it, so the holder
@@ -279,9 +290,46 @@ func addInviteLedgerColumn(db *sql.DB, name, definition string) error {
 		return err
 	}
 	if _, err := db.Exec(`ALTER TABLE bootstrap_invites ADD COLUMN ` + name + ` ` + definition); err != nil {
+		// Another process opening the same ledger may have added it between
+		// the check and the ALTER; that is success, not a failed migration.
+		if strings.Contains(err.Error(), "duplicate column name") {
+			return nil
+		}
 		return fmt.Errorf("libp2p: add invite ledger column %s: %w", name, err)
 	}
 	return nil
+}
+
+// RemovalsSeenAt returns when this node first saw each of the removals with
+// the given entry ids, by its own clock, recording now for those it had not
+// seen before. A removal's own timestamp is the remover's clock; this is the
+// local one, for comparing with when this node minted an invite.
+func (l *InviteLedger) RemovalsSeenAt(groupID entmoot.GroupID, entries []entmoot.RosterEntryID, now int64) (map[entmoot.RosterEntryID]int64, error) {
+	if l == nil || l.db == nil {
+		return nil, errors.New("libp2p: invite ledger is not open")
+	}
+	tx, err := l.db.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("libp2p: record removals: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	seen := make(map[entmoot.RosterEntryID]int64, len(entries))
+	for _, entry := range entries {
+		if _, err := tx.Exec(`INSERT OR IGNORE INTO removals_seen (group_id, entry_id, seen_at_ms) VALUES (?, ?, ?)`,
+			groupID[:], entry[:], now); err != nil {
+			return nil, fmt.Errorf("libp2p: record removal: %w", err)
+		}
+		var at int64
+		if err := tx.QueryRow(`SELECT seen_at_ms FROM removals_seen WHERE group_id=? AND entry_id=?`,
+			groupID[:], entry[:]).Scan(&at); err != nil {
+			return nil, fmt.Errorf("libp2p: read removal: %w", err)
+		}
+		seen[entry] = at
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("libp2p: record removals: %w", err)
+	}
+	return seen, nil
 }
 
 // MarkRevoked notes locally that an invite was withdrawn. It reports whether a

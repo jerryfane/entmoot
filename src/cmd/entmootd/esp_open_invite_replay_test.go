@@ -890,46 +890,101 @@ func TestRemovalThatChangesNothingRevokesNothing(t *testing.T) {
 // TestIssuerRevokesInvitesOfAMemberRemovedInsideACheckpoint: an issuer that
 // lagged receives a removal only folded inside a checkpoint another admin
 // signed, never the record. Adopting that checkpoint takes the member out all
-// the same, so the issuer must revoke the live invites it issued to it.
+// the same, so the issuer must revoke the live invites it issued to it. In the
+// second case the issuer also holds the member's leave, signed after the
+// removal and so of no effect where the removal is held; without the removal
+// the issuer cannot tell, and the checkpoint fallback used to let that leave
+// excuse the member.
 func TestIssuerRevokesInvitesOfAMemberRemovedInsideACheckpoint(t *testing.T) {
-	f := startReplayFixture(t, 41, true)
-	group := f.session.group
-	target := generateIdentity(t)
-	targetInfo := mustDaemonNodeInfo(t, target)
-	f.createInvite("link", time.Now().Add(time.Hour))
-	first, _ := f.redeemed("link", target)
-	mustJoinWithInvite(t, group, target, first.Capability)
-	spare := f.inviteTargeted(target)
-	// Two checkpoints, so the join is behind the window the next one covers
-	// and the issuer holds no record of its own to check that one against.
-	for range 2 {
-		if _, signed, err := group.SignCheckpoint(f.founder, true); err != nil || !signed {
-			t.Fatalf("checkpoint: signed=%t err=%v", signed, err)
-		}
-	}
-	adminGroup, err := membership.Adopt(t.TempDir(), group.Canonical())
-	if err != nil {
-		t.Fatalf("admin adopts: %v", err)
-	}
-	defer mustCloseGroup(t, adminGroup)
-	time.Sleep(5 * time.Millisecond)
-	if _, err := adminGroup.SignRecord(f.admin, membership.Record{Kind: membership.KindRemove, Subject: targetInfo}); err != nil {
-		t.Fatalf("admin removes: %v", err)
-	}
-	folded, signed, err := adminGroup.SignCheckpoint(f.admin, true)
-	if err != nil || !signed {
-		t.Fatalf("admin checkpoint: signed=%t err=%v", signed, err)
-	}
+	for _, tc := range []struct {
+		name      string
+		seed      byte
+		heldLeave bool
+	}{
+		{"removal only", 41, false},
+		{"with a later leave held", 48, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := startReplayFixture(t, tc.seed, true)
+			group := f.session.group
+			target := generateIdentity(t)
+			targetInfo := mustDaemonNodeInfo(t, target)
+			f.createInvite("link", time.Now().Add(time.Hour))
+			first, _ := f.redeemed("link", target)
+			mustJoinWithInvite(t, group, target, first.Capability)
+			spare := f.inviteTargeted(target)
+			// Two checkpoints, so the join is behind the window the next one
+			// covers and the issuer holds no record of its own to check that
+			// one against.
+			for range 2 {
+				if _, signed, err := group.SignCheckpoint(f.founder, true); err != nil || !signed {
+					t.Fatalf("checkpoint: signed=%t err=%v", signed, err)
+				}
+			}
+			adminGroup, err := membership.Adopt(t.TempDir(), group.Canonical())
+			if err != nil {
+				t.Fatalf("admin adopts: %v", err)
+			}
+			defer mustCloseGroup(t, adminGroup)
+			time.Sleep(5 * time.Millisecond)
+			if _, err := adminGroup.SignRecord(f.admin, membership.Record{Kind: membership.KindRemove, Subject: targetInfo}); err != nil {
+				t.Fatalf("admin removes: %v", err)
+			}
+			if tc.heldLeave {
+				time.Sleep(5 * time.Millisecond)
+				leave := f.signAs(target, membership.Record{Kind: membership.KindLeave, Subject: targetInfo, Timestamp: time.Now().UnixMilli()})
+				if _, err := adminGroup.Apply(leave); err != nil {
+					t.Fatalf("admin applies the leave: %v", err)
+				}
+				// The issuer gets the leave first: it takes the member out
+				// there, and by itself revokes nothing.
+				f.applyAndSettle(leave)
+				if group.IsInviteRevoked(spare.Nonce) {
+					t.Fatal("precondition: a leave alone revokes nothing")
+				}
+			}
+			time.Sleep(5 * time.Millisecond)
+			folded, signed, err := adminGroup.SignCheckpoint(f.admin, true)
+			if err != nil || !signed {
+				t.Fatalf("admin checkpoint: signed=%t err=%v", signed, err)
+			}
 
-	if _, err := group.ApplyCheckpoint(folded); err != nil {
-		t.Fatalf("issuer adopts the admin's checkpoint: %v", err)
+			if _, err := group.ApplyCheckpoint(folded); err != nil {
+				t.Fatalf("issuer adopts the admin's checkpoint: %v", err)
+			}
+			f.session.reconciler.wait()
+			if group.Canonical().ID != folded.ID || group.IsMemberID(*targetInfo.MemberID) {
+				t.Fatal("precondition: the issuer adopted the checkpoint that removes the target")
+			}
+			if !group.IsInviteRevoked(spare.Nonce) {
+				t.Fatal("a removal folded inside a checkpoint left the removed member's invite live")
+			}
+			f.cannotRejoinButReinviteWorks(target, spare)
+		})
 	}
-	f.session.reconciler.wait()
-	if group.Canonical().ID != folded.ID || group.IsMemberID(*targetInfo.MemberID) {
-		t.Fatal("precondition: the issuer adopted the checkpoint that removes the target")
+}
+
+// TestRemovalByAnAdminWhoseClockIsBehindRevokes: the removing admin's clock is
+// a second behind this node's, so its removal is dated before an invite this
+// node minted to the member a moment before the removal arrived. Judged by
+// the removal's date alone, that invite looked like a re-invite and stayed
+// live. It was minted before this node knew of the removal, so it goes; one
+// minted once this node had the removal stays.
+func TestRemovalByAnAdminWhoseClockIsBehindRevokes(t *testing.T) {
+	f := startReplayFixture(t, 49, true)
+	target := generateIdentity(t)
+	info := mustDaemonNodeInfo(t, target)
+	mustJoinWithInvite(t, f.session.group, target, f.inviteTargeted(target))
+	time.Sleep(1200 * time.Millisecond)
+	spare := f.inviteTargeted(target)
+	time.Sleep(50 * time.Millisecond)
+	behind := time.Now().Add(-time.Second).UnixMilli()
+	f.removeAs(f.admin, target, behind)
+	if f.session.group.IsMemberID(*info.MemberID) {
+		t.Fatal("precondition: the admin removed the target")
 	}
-	if !group.IsInviteRevoked(spare.Nonce) {
-		t.Fatal("a removal folded inside a checkpoint left the removed member's invite live")
+	if !f.session.group.IsInviteRevoked(spare.Nonce) {
+		t.Fatal("an invite minted before this node had the removal stayed live because the remover's clock is behind")
 	}
 	f.cannotRejoinButReinviteWorks(target, spare)
 }
@@ -1106,7 +1161,9 @@ func TestLeaveBeforeAnEarlierRemovalRevokes(t *testing.T) {
 // TestRevocationsDoNotDependOnArrivalOrder applies one set of records - the
 // founder's grant making a member admin, that admin's removal of another
 // member, and the removed member's later leave - in every order, each on a
-// fresh node, and checks every order ends with the same invites revoked.
+// fresh node, and checks every order ends with the same invites revoked: the
+// one minted before the removal, and the one minted after the removal's date
+// but before this node had it, while one minted once it had it stays live.
 func TestRevocationsDoNotDependOnArrivalOrder(t *testing.T) {
 	orders := [][3]int{{0, 1, 2}, {0, 2, 1}, {1, 0, 2}, {1, 2, 0}, {2, 0, 1}, {2, 1, 0}}
 	for i, order := range orders {
@@ -1129,15 +1186,20 @@ func TestRevocationsDoNotDependOnArrivalOrder(t *testing.T) {
 				f.signAs(target, membership.Record{Kind: membership.KindLeave, Subject: info, Timestamp: start + 20}),
 			}
 			time.Sleep(40 * time.Millisecond)
-			post := f.inviteTargeted(target)
+			unaware := f.inviteTargeted(target)
 			for _, k := range order {
 				f.applyAndSettle(records[k])
 			}
-			got := [3]bool{group.IsMemberID(*info.MemberID), group.IsInviteRevoked(pre.Nonce), group.IsInviteRevoked(post.Nonce)}
-			if want := [3]bool{false, true, false}; got != want {
-				t.Fatalf("member, pre-removal invite revoked, post-removal invite revoked = %v, want %v", got, want)
+			time.Sleep(5 * time.Millisecond)
+			known := f.inviteTargeted(target)
+			f.session.reconciler.signal()
+			f.session.reconciler.wait()
+			got := [4]bool{group.IsMemberID(*info.MemberID), group.IsInviteRevoked(pre.Nonce),
+				group.IsInviteRevoked(unaware.Nonce), group.IsInviteRevoked(known.Nonce)}
+			if want := [4]bool{false, true, true, false}; got != want {
+				t.Fatalf("member; revoked: minted before the removal, before this node had it, after = %v, want %v", got, want)
 			}
-			if at := group.RemovedAt([]entmoot.MemberID{*info.MemberID}); at[*info.MemberID] != start+10 {
+			if at := group.RemovedAt([]entmoot.MemberID{*info.MemberID}); at[*info.MemberID].At != start+10 {
 				t.Fatalf("removed at %v, want %d", at, start+10)
 			}
 			f.cannotRejoinButReinviteWorks(target, pre)

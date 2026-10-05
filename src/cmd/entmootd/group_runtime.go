@@ -899,93 +899,125 @@ func (r *groupRuntime) reconcileInvites(session *groupSession) {
 //     out, but a join with it dated before that revocation is accepted until
 //     the founder seals it.
 //
-// It runs only where this node may revoke, under lockESPInviteRoster.
+// It runs only where this node may revoke, and holds lockESPInviteRoster only
+// while it signs.
 func (r *groupRuntime) reconcileIssuedInvites(session *groupSession) {
 	group := session.group
 	if r.invites == nil || r.identity == nil || !group.CanAdminister(r.binding.MemberID) {
 		return
 	}
+	// Working out what to revoke reads the group and the ledger and holds
+	// neither lock; only signing the revocations does.
+	removed := r.invitesOfRemovedMembers(group)
+	chains := r.unusedRestOfUsedChains(group)
+	if len(removed) == 0 && len(chains) == 0 {
+		return
+	}
 	gid := session.groupID
 	unlock := lockESPInviteRoster(gid)
 	defer unlock()
-	r.revokeInvitesOfRemovedMembers(group)
-	r.retireUsedReplacementChains(group)
+	var nonces [][32]byte
+	for _, candidate := range removed {
+		// Readmitted while the pass was working: its invites stand.
+		if !group.IsMemberID(candidate.target) {
+			nonces = append(nonces, candidate.nonce)
+		}
+	}
+	nonces = append(nonces, chains...)
+	revoked, err := revokeIssuedInvites(r.identity, group, r.invites, nonces)
+	if err != nil {
+		r.logger.Warn("revoke issued invites", slog.String("group_id", gid.String()), slog.String("err", err.Error()))
+	}
+	if len(revoked) > 0 {
+		r.logger.Info("revoked issued invites that no longer admit anybody",
+			slog.String("group_id", gid.String()), slog.Int("revoked", len(revoked)))
+	}
 }
 
-func (r *groupRuntime) revokeInvitesOfRemovedMembers(group *membership.Group) {
+type removedMemberInvite struct {
+	target entmoot.MemberID
+	nonce  [32]byte
+}
+
+// invitesOfRemovedMembers lists the live invites this node minted to members
+// that a removal has since taken out (see reconcileIssuedInvites).
+//
+// The cutoff is the later of the removal's own timestamp, by the remover's
+// clock, and when this node first saw that removal, by its own: so an invite
+// minted here before this node knew of the removal is caught even when the
+// remover's clock runs behind, and a re-invite minted after it never is. Every
+// pass notes when it first sees each removal in the group - whether or not
+// this node has invites for that member yet - and passes run as soon as a
+// record is applied, so that is when the removal arrived. A ledger row from
+// before minted_at_ms existed has only its issue date, set minutes early, and
+// is compared with the removal's timestamp alone: the first-seen time noted
+// for a removal this node held before upgrading is the upgrade, not when it
+// arrived.
+func (r *groupRuntime) invitesOfRemovedMembers(group *membership.Group) []removedMemberInvite {
 	gid := group.GroupID()
+	removals := group.RemovedAt(nil)
+	if len(removals) == 0 {
+		return nil
+	}
+	entries := make([]entmoot.RosterEntryID, 0, len(removals))
+	for _, removal := range removals {
+		entries = append(entries, removal.Entry)
+	}
+	seen, err := r.invites.RemovalsSeenAt(gid, entries, time.Now().UnixMilli())
+	if err != nil {
+		r.logger.Warn("record removals", slog.String("group_id", gid.String()), slog.String("err", err.Error()))
+		return nil
+	}
 	live, err := r.invites.LiveTargetedInvites(gid)
 	if err != nil {
 		r.logger.Warn("list issued invites", slog.String("group_id", gid.String()), slog.String("err", err.Error()))
-		return
+		return nil
 	}
-	var targets []entmoot.MemberID
-	candidates := live[:0]
+	var out []removedMemberInvite
 	for _, record := range live {
-		if group.IsMemberID(*record.TargetMemberID) || group.IsInviteRevoked(record.Nonce) ||
+		removal, removed := removals[*record.TargetMemberID]
+		if !removed || group.IsInviteRevoked(record.Nonce) ||
 			(record.MaxUses > 0 && group.InviteUses(record.Nonce) >= record.MaxUses) {
 			continue
 		}
-		candidates = append(candidates, record)
-		targets = append(targets, *record.TargetMemberID)
-	}
-	if len(candidates) == 0 {
-		return
-	}
-	removedAt := group.RemovedAt(targets)
-	var nonces [][32]byte
-	for _, record := range candidates {
-		// An invite's own date is set minutes early (InviteIssuedAtMS), so it
-		// is judged by when this node minted it; a ledger row older than that
-		// column falls back to the earlier date, which errs towards revoking.
-		minted := record.MintedAtMS
+		cutoff, minted := removal.At, record.MintedAtMS
 		if minted == 0 {
 			minted = record.IssuedAtMS
+		} else {
+			cutoff = max(cutoff, seen[removal.Entry])
 		}
-		if at, removed := removedAt[*record.TargetMemberID]; removed && minted <= at {
-			nonces = append(nonces, record.Nonce)
+		if minted <= cutoff {
+			out = append(out, removedMemberInvite{target: *record.TargetMemberID, nonce: record.Nonce})
 		}
 	}
-	revoked, err := revokeIssuedInvites(r.identity, group, r.invites, nonces)
-	if err != nil {
-		r.logger.Warn("revoke removed members' invites", slog.String("group_id", gid.String()), slog.String("err", err.Error()))
-	}
-	if len(revoked) > 0 {
-		r.logger.Info("revoked removed members' invites", slog.String("group_id", gid.String()), slog.Int("revoked", len(revoked)))
-	}
+	return out
 }
 
-func (r *groupRuntime) retireUsedReplacementChains(group *membership.Group) {
+// unusedRestOfUsedChains lists the unused capabilities of every replacement
+// chain one of whose capabilities has been used (see reconcileIssuedInvites).
+func (r *groupRuntime) unusedRestOfUsedChains(group *membership.Group) [][32]byte {
 	gid := group.GroupID()
 	chains, err := r.invites.ReplacementChains(gid)
 	if err != nil {
 		r.logger.Warn("invite replacement chains", slog.String("group_id", gid.String()), slog.String("err", err.Error()))
-		return
+		return nil
 	}
+	var out [][32]byte
 	for _, chain := range chains {
 		used := false
 		var unused [][32]byte
 		for _, nonce := range chain {
 			if group.InviteUses(nonce) > 0 {
 				used = true
-			} else {
+			} else if !group.IsInviteRevoked(nonce) {
 				unused = append(unused, nonce)
 			}
 		}
-		if !used {
-			continue
-		}
-		revoked, err := revokeIssuedInvites(r.identity, group, r.invites, unused)
-		if err != nil {
-			r.logger.Warn("revoke the rest of a used invite replacement chain",
-				slog.String("group_id", gid.String()), slog.String("err", err.Error()))
-			continue
-		}
-		if len(revoked) > 0 {
-			r.logger.Info("revoked the rest of a used invite replacement chain",
-				slog.String("group_id", gid.String()), slog.Int("revoked", len(revoked)))
+		if used {
+			out = append(out, unused...)
 		}
 	}
+	return out
 }
 
 // memberPull is the outcome of pulling membership from one member.

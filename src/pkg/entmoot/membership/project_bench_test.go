@@ -10,7 +10,17 @@ import (
 
 // benchmarkRecords builds a window of about n records over a fresh group:
 // joins, then removals and leaves of some of the members.
-func benchmarkRecords(b *testing.B, n int) (Checkpoint, []Record) {
+func benchmarkRecords(b testing.TB, n int) (Checkpoint, []Record) {
+	b.Helper()
+	group, records := benchmarkGroup(b, n)
+	base := group.Canonical()
+	_ = group.Close()
+	return base, records
+}
+
+// benchmarkGroup is benchmarkRecords with the group left open and holding the
+// records, as if it had applied them.
+func benchmarkGroup(b testing.TB, n int) (*Group, []Record) {
 	b.Helper()
 	founder, err := keystore.Generate()
 	if err != nil {
@@ -25,8 +35,7 @@ func benchmarkRecords(b *testing.B, n int) (Checkpoint, []Record) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	base := group.Canonical()
-	_ = group.Close()
+	b.Cleanup(func() { _ = group.Close() })
 	clock := int64(1_000)
 	sign := func(identity *keystore.Identity, rec Record) Record {
 		info, err := identityInfo(identity)
@@ -80,7 +89,36 @@ func benchmarkRecords(b *testing.B, n int) (Checkpoint, []Record) {
 			records = append(records, sign(member, Record{Kind: KindLeave}))
 		}
 	}
-	return base, records
+	group.mu.Lock()
+	for _, rec := range records {
+		group.records[rec.ID] = rec
+	}
+	group.reproject()
+	group.mu.Unlock()
+	return group, records
+}
+
+// neverMembers makes n member ids nobody in the group has ever had.
+func neverMembers(b testing.TB, n int) []entmoot.MemberID {
+	ids := make([]entmoot.MemberID, n)
+	for i := range ids {
+		if _, err := rand.Read(ids[i][:]); err != nil {
+			b.Fatal(err)
+		}
+	}
+	return ids
+}
+
+// BenchmarkRemovedAtNeverMembers is the reconciler's question about invites
+// minted to identities that never joined - which an unlimited open invite
+// lets anybody mint - over a 2000-record window.
+func BenchmarkRemovedAtNeverMembers(b *testing.B) {
+	group, _ := benchmarkGroup(b, 2000)
+	ids := neverMembers(b, 1000)
+	b.ResetTimer()
+	for range b.N {
+		group.RemovedAt(ids)
+	}
 }
 
 // BenchmarkProject500 is the projection every Apply runs (reproject).

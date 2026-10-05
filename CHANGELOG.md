@@ -31,19 +31,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   maintenance round, a per-group worker revokes every live invite it issued to
   somebody who is not a member and whose latest membership a removal or ban
   ended - in the group's own order, so the order records arrive in does not
-  matter - if the invite was minted no later than that removal; and every
-  unused capability in a replacement chain once one in it has been used.
-  Re-invites minted after a removal, a member readmitted since, and a member
-  that left or rekeyed are never touched, so a repeated or ineffective
-  removal signs nothing. A removal signed on the issuing node (`member_remove`,
+  matter - if the invite was minted before this node had that removal (or
+  before the removal's own date, whichever is later, so a remover whose clock
+  runs behind changes nothing); and every unused capability in a replacement
+  chain once one in it has been used. Re-invites minted once the node had the
+  removal, a member readmitted since, and a member that left or rekeyed are
+  never touched, so a repeated or ineffective removal signs nothing. The work
+  runs outside the group's lock and the invite lock except to sign, and costs
+  next to nothing for invites minted to identities that never joined. A removal signed on the issuing node (`member_remove`,
   `roster remove`, `roster ban`, which list them as `revoked_invites`) revokes
   them first, so they cannot readmit the member. A removal signed by another
   admin's node is followed by these revocations once the issuing node holds
   it, which leaves a window: a join with such an invite dated between the
   removal and the revocation is accepted until the founder seals the
-  revocation. A member that left of its own accord inside a checkpoint the
-  node adopts without the records cannot be told from a removed one, and has
-  its invites revoked too. The daemon links each replacement to the
+  revocation. A member that went out inside a checkpoint the node adopts
+  without projecting the records - even one whose leave the node holds,
+  since the removal it lacks may have come first - is treated as removed,
+  and its invites minted before then are revoked too. The daemon links each replacement to the
   capability it replaced, so a redeemer whose answer was lost is handed that
   replacement on its next try rather than being left with a revoked one, and
   the daemon signs at most once per change.
