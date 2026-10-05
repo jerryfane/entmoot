@@ -21,7 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   makes the removal take effect, not when the invite worker next gets round to
   it, so a re-invite minted after the removal arrived is no longer revoked
   because the worker was still busy with an earlier pass. The ledger keeps the
-  earliest time it was ever given for each removal.
+  earliest time it was ever given for each removal, recorded on every pass
+  whether or not the node has any invite in the group, so a re-invite minted
+  after a restart is judged by when the removal arrived; a removal with no
+  recorded time is judged by its own timestamp, never by when a pass ran.
 - A member's own leave no longer shields the invites issued to it from a
   removal that follows. When a member left - perhaps with a leave it dated
   just before a removal it saw coming - and an admin on another node then
@@ -43,7 +46,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   checkpoints). The projection is now made once, kept until the group changes,
   and only asked about the targets of live invites the node issued and the
   members it saw go out since the last pass; a node with no live invite in the
-  group does none of this work.
+  group asks only about those members, to record when it saw them go.
 
 ## [1.5.96] - 2026-10-05
 

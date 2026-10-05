@@ -98,4 +98,12 @@ func TestRemovalsSeenAtKeepsTheEarliestSighting(t *testing.T) {
 	if err != nil || earlier[b] != 150 {
 		t.Fatalf("earlier sighting = %v, %v; want b moved to 150", earlier, err)
 	}
+	c := entmoot.RosterEntryID{3}
+	looked, err := ledger.RemovalsSeenAt(gid, map[entmoot.RosterEntryID]int64{a: 0, c: 0})
+	if err != nil || looked[a] != 100 || len(looked) != 1 {
+		t.Fatalf("lookup = %v, %v; want a at 100 and nothing for c", looked, err)
+	}
+	if after, err := ledger.RemovalsSeenAt(gid, map[entmoot.RosterEntryID]int64{c: 0}); err != nil || len(after) != 0 {
+		t.Fatalf("a zero time recorded c: %v, %v", after, err)
+	}
 }

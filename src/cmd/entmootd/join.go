@@ -1628,9 +1628,9 @@ func (s *ipcServer) issueInvite(c net.Conn, req *ipc.InviteCreateReq, refresh *e
 			_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInternal, GroupID: &gid, Message: "record replacement invite: " + err.Error()})
 			return
 		}
-		// A live invite lets the reconciler record the removals it noticed
-		// (see invitesOfRemovedMembers); a pass now does so while this
-		// process still knows when it saw them.
+		// A new live invite is one the reconciler has to judge (see
+		// invitesOfRemovedMembers), and the first one in a group also starts
+		// the full sweep a pass without invites leaves for later.
 		session.reconciler.signal()
 		s.handOutReplacement(c, session.group, chain, capability, targetMemberID)
 		return

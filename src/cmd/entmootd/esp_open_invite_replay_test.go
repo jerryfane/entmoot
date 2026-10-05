@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -1434,45 +1436,85 @@ func TestReinviteMintedWhileTheWorkerIsBusySurvives(t *testing.T) {
 	f.cannotRejoinButReinviteWorks(removed, removedSpare)
 }
 
-// TestReinviteAfterARemovalSeenWithoutInvitesSurvivesARestart: a node with
-// no live invite in the group does no work for removals - no projection, no
-// ledger write - but keeps them noticed. Minting the re-invite starts a pass
-// that records when the removal arrived while the process still knows, so the
-// re-invite outlives a restart, after which the group has forgotten.
-func TestReinviteAfterARemovalSeenWithoutInvitesSurvivesARestart(t *testing.T) {
-	f := startReplayFixture(t, 69, true)
-	group := f.session.group
-	target := generateIdentity(t)
-	info := mustDaemonNodeInfo(t, target)
-	mustJoinWithInvite(t, group, target, mustDaemonInvite(t, group, f.founder, info, 1))
-	f.session.reconciler.wait()
-	time.Sleep(5 * time.Millisecond)
-	f.applyAndSettle(f.signAs(f.admin, membership.Record{Kind: membership.KindRemove, Subject: info, Timestamp: time.Now().UnixMilli()}))
-	noticed, all := group.TakeNoticed()
-	if !all && !slices.Contains(noticed, *info.MemberID) {
-		t.Fatal("a pass with no live invite consumed the removal it had noticed")
-	}
-	group.Renotice(noticed, all)
+// TestReinviteAfterARemovalSurvivesARestart: a member is removed by another
+// admin, the node restarts - forgetting when it applied the removal - and only
+// then re-invites the member. Minting starts a pass, and that pass ran after
+// the mint; a node that had no live invite when the removal arrived had not
+// recorded when it saw it, so the pass took its own time for that and revoked
+// the re-invite at once. Every pass now records the times of the removals it
+// noticed, invites or not, and a removal with no recorded time is judged by
+// its own timestamp, never by a pass's: the re-invite admits, and an invite
+// minted before the removal is still revoked.
+func TestReinviteAfterARemovalSurvivesARestart(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		seed byte
+		// spare mints an invite to the member before its removal.
+		spare bool
+		// forget drops what the ledger recorded about removals before the
+		// restart, as when the process stopped before a pass recorded it.
+		forget bool
+	}{
+		{"no invite when the removal arrived", 69, false, false},
+		{"an invite minted before the removal", 70, true, false},
+		{"no time recorded before the restart", 71, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := startReplayFixture(t, tc.seed, true)
+			group := f.session.group
+			target := generateIdentity(t)
+			info := mustDaemonNodeInfo(t, target)
+			mustJoinWithInvite(t, group, target, mustDaemonInvite(t, group, f.founder, info, 1))
+			var spare entmoot.BootstrapCapability
+			if tc.spare {
+				spare = f.inviteTargeted(target)
+			}
+			f.session.reconciler.wait()
+			time.Sleep(5 * time.Millisecond)
+			f.applyAndSettle(f.signAs(f.admin, membership.Record{Kind: membership.KindRemove, Subject: info, Timestamp: time.Now().UnixMilli()}))
+			if tc.spare && !group.IsInviteRevoked(spare.Nonce) {
+				t.Fatal("precondition: the invite minted before the removal is revoked")
+			}
+			f.session.reconciler.wait()
+			db, err := sql.Open("sqlite", filepath.Join(f.runtime.dataDir, "bootstrap-admission.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			var recorded int
+			if err := db.QueryRow(`SELECT COUNT(*) FROM removals_seen`).Scan(&recorded); err != nil || recorded == 0 {
+				t.Fatalf("the pass did not record when the removal arrived: %d rows, %v", recorded, err)
+			}
+			if tc.forget {
+				if _, err := db.Exec(`DELETE FROM removals_seen`); err != nil {
+					t.Fatalf("forget recorded removals: %v", err)
+				}
+			}
 
-	time.Sleep(20 * time.Millisecond)
-	reinvite := f.inviteTargeted(target)
-	f.session.reconciler.wait()
-	if !f.runtime.RemoveGroup(f.gid) {
-		t.Fatal("RemoveGroup found no session")
-	}
-	time.Sleep(20 * time.Millisecond)
-	session, _, err := f.runtime.AddLocalGroup(f.ctx, f.gid)
-	if err != nil {
-		t.Fatalf("reopen the group: %v", err)
-	}
-	f.session = session
-	f.session.reconciler.signal()
-	f.session.reconciler.wait()
-	if f.session.group.IsInviteRevoked(reinvite.Nonce) || !f.admits(reinvite) {
-		t.Fatal("after a restart the re-invite minted once the removal had arrived was revoked")
-	}
-	if !f.joinNow(target, reinvite) {
-		t.Fatal("the removed member could not come back with its re-invite")
+			if !f.runtime.RemoveGroup(f.gid) {
+				t.Fatal("RemoveGroup found no session")
+			}
+			session, _, err := f.runtime.AddLocalGroup(f.ctx, f.gid)
+			if err != nil {
+				t.Fatalf("reopen the group: %v", err)
+			}
+			f.session = session
+			f.session.reconciler.wait()
+			time.Sleep(20 * time.Millisecond)
+			reinvite := f.inviteTargeted(target)
+			f.session.reconciler.wait()
+			if f.session.group.IsInviteRevoked(reinvite.Nonce) || !f.admits(reinvite) {
+				t.Fatal("a re-invite minted after a restart, long after the removal arrived, was revoked")
+			}
+			if tc.spare {
+				if !f.session.group.IsInviteRevoked(spare.Nonce) || f.admits(spare) || f.joinNow(target, spare) {
+					t.Fatal("the invite minted before the removal readmits the member after a restart")
+				}
+			}
+			if !f.joinNow(target, reinvite) {
+				t.Fatal("the removed member could not come back with its re-invite")
+			}
+		})
 	}
 }
 

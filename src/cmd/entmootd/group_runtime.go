@@ -948,21 +948,23 @@ type removedMemberInvite struct {
 // remover's clock runs behind, and a re-invite minted after it never is. The
 // group notes that time as the record or checkpoint that makes the removal
 // take effect is applied (membership.Removal.SeenAt), not when this worker
-// gets round to it, so a busy worker cannot move it past a re-invite; the
-// ledger keeps the earliest time each removal was ever given, which is what
-// covers a restart. A removal the group has no time for - one it loaded when
-// it opened - is given the time of this pass. A ledger row from before
-// minted_at_ms existed has only its issue date, set minutes early, and is
-// compared with the removal's timestamp alone.
+// gets round to it, so a busy worker cannot move it past a re-invite. Every
+// pass writes the times of the removals the group noticed since the last one
+// (membership.Group.TakeNoticed) to the ledger, which keeps the earliest time
+// each removal was ever given - whether or not this node has any invite in
+// the group, so a re-invite minted after a restart is still judged by when
+// the removal arrived. A removal with no time anywhere - loaded when the
+// group opened, before any pass recorded it - is judged by its own timestamp
+// alone, never by the time of a pass: a pass can run after a re-invite it
+// would then revoke. A ledger row from before minted_at_ms existed has only
+// its issue date, set minutes early, and is also compared with the removal's
+// timestamp alone.
 //
-// Only the targets of live invites are asked about, with the members the group
-// noticed going out or being named by a removal since the last pass (see
-// membership.Group.TakeNoticed): those are recorded in the ledger whether or
-// not this node has invites for them yet, so a re-invite minted later is
-// judged by when the removal arrived even across a restart. Every member is
-// asked about only after the group was opened or its canonical checkpoint
-// moved. A node with no live invite in the group asks nothing and keeps the
-// notices for the first pass that has one: minting an invite starts a pass.
+// Only the targets of live invites are asked about beyond the noticed
+// members, and every member only after the group was opened or its canonical
+// checkpoint moved. A node with no live invite in the group asks only about
+// the members it noticed - none on most passes - and leaves the full sweep to
+// the first pass that has one.
 func (r *groupRuntime) invitesOfRemovedMembers(group *membership.Group) []removedMemberInvite {
 	gid := group.GroupID()
 	live, err := r.invites.LiveTargetedInvites(gid)
@@ -977,33 +979,32 @@ func (r *groupRuntime) invitesOfRemovedMembers(group *membership.Group) []remove
 			targets = append(targets, *record.TargetMemberID)
 		}
 	}
-	if len(targets) == 0 {
-		return nil
-	}
 	noticed, all := group.TakeNoticed()
+	sweep := all && len(targets) > 0
+	if all && !sweep {
+		// Nothing to revoke yet: keep the sweep for the first pass that has
+		// an invite, which mints start.
+		group.Renotice(nil, true)
+	}
 	var removals map[entmoot.MemberID]membership.Removal
-	if all {
+	switch {
+	case sweep:
 		removals = group.RemovedAt(nil, r.binding.MemberID)
-	} else {
+	case len(noticed)+len(targets) > 0:
 		removals = group.RemovedAt(append(noticed, targets...), r.binding.MemberID)
 	}
 	if len(removals) == 0 {
 		return nil
 	}
-	now := time.Now().UnixMilli()
 	learned := make(map[entmoot.RosterEntryID]int64, len(removals))
 	for _, removal := range removals {
-		at := removal.SeenAt
-		if at == 0 {
-			at = now
-		}
-		if earlier, ok := learned[removal.Entry]; !ok || at < earlier {
-			learned[removal.Entry] = at
+		if earlier, ok := learned[removal.Entry]; !ok || earlier == 0 || (removal.SeenAt != 0 && removal.SeenAt < earlier) {
+			learned[removal.Entry] = removal.SeenAt
 		}
 	}
 	seen, err := r.invites.RemovalsSeenAt(gid, learned)
 	if err != nil {
-		group.Renotice(noticed, all)
+		group.Renotice(noticed, sweep)
 		r.logger.Warn("record removals", slog.String("group_id", gid.String()), slog.String("err", err.Error()))
 		return nil
 	}

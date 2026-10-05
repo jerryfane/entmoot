@@ -304,6 +304,8 @@ func addInviteLedgerColumn(db *sql.DB, name, definition string) error {
 // it by its own clock, keeping the earliest time it has ever been given, and
 // returns the times kept. A removal's own timestamp is the remover's clock;
 // this is the local one, for comparing with when this node minted an invite.
+// A zero time records nothing and only looks the entry up; an entry with no
+// time kept is left out of the result.
 func (l *InviteLedger) RemovalsSeenAt(groupID entmoot.GroupID, seenAt map[entmoot.RosterEntryID]int64) (map[entmoot.RosterEntryID]int64, error) {
 	if l == nil || l.db == nil {
 		return nil, errors.New("libp2p: invite ledger is not open")
@@ -315,14 +317,20 @@ func (l *InviteLedger) RemovalsSeenAt(groupID entmoot.GroupID, seenAt map[entmoo
 	defer func() { _ = tx.Rollback() }()
 	kept := make(map[entmoot.RosterEntryID]int64, len(seenAt))
 	for entry, at := range seenAt {
-		if _, err := tx.Exec(`INSERT INTO removals_seen (group_id, entry_id, seen_at_ms) VALUES (?, ?, ?)
-			ON CONFLICT (group_id, entry_id) DO UPDATE SET seen_at_ms = MIN(seen_at_ms, excluded.seen_at_ms)`,
-			groupID[:], entry[:], at); err != nil {
-			return nil, fmt.Errorf("libp2p: record removal: %w", err)
+		if at != 0 {
+			if _, err := tx.Exec(`INSERT INTO removals_seen (group_id, entry_id, seen_at_ms) VALUES (?, ?, ?)
+				ON CONFLICT (group_id, entry_id) DO UPDATE SET seen_at_ms = MIN(seen_at_ms, excluded.seen_at_ms)`,
+				groupID[:], entry[:], at); err != nil {
+				return nil, fmt.Errorf("libp2p: record removal: %w", err)
+			}
 		}
 		var first int64
-		if err := tx.QueryRow(`SELECT seen_at_ms FROM removals_seen WHERE group_id=? AND entry_id=?`,
-			groupID[:], entry[:]).Scan(&first); err != nil {
+		err := tx.QueryRow(`SELECT seen_at_ms FROM removals_seen WHERE group_id=? AND entry_id=?`,
+			groupID[:], entry[:]).Scan(&first)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		if err != nil {
 			return nil, fmt.Errorf("libp2p: read removal: %w", err)
 		}
 		kept[entry] = first
