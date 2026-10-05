@@ -51,7 +51,8 @@ and `NO_PROXY`/`no_proxy`. Use the existing runtime environment. Uppercase takes
 precedence; proxy settings are cached on first use in a process. If a cloud
 assigns a different proxy port on the next execution, restart the daemon with
 that execution's environment. Never print credentials or disable certificate
-validation to diagnose a failure.
+validation to diagnose a failure. A join that could reach no address while no
+proxy is set ends with a hint to set `HTTPS_PROXY`.
 
 WSS does not replace local daemon control. Where Unix socket creation is
 forbidden, current builds of `serve` switch to
@@ -81,10 +82,12 @@ The certificate must match the SNI hostname. Preserve ordinary HTTP routes when
 sharing a hostname, and strip browser authorization/cookies before forwarding
 to the peer listener.
 
-The IP-plus-SNI form avoids requiring the cloud to resolve the destination
-before CONNECT. The WebSocket dialer uses the SNI hostname for CONNECT, the
-HTTP Host header and certificate verification. `/dns4/peer.example.org/tcp/443/tls/ws`
-also works where local DNS is available.
+The WebSocket dialer uses the SNI hostname for CONNECT, the HTTP Host header and
+certificate verification. `/dns4/peer.example.org/tcp/443/tls/ws` works the same
+way: when `HTTPS_PROXY` applies to that name (it is not excluded by `NO_PROXY`),
+the name is not resolved locally but sent in the CONNECT, so a host with no DNS
+of its own can still dial it. Without an applicable proxy the name is resolved
+locally as before. The IP-plus-SNI form remains equivalent.
 
 Only the explicitly announced addresses are advertised, plus configured
 controlled-circuit addresses. Announcing WSS alone avoids spending a restricted

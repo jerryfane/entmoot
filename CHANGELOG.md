@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A WSS peer address given by name (`/dns4/<host>/tcp/443/tls/ws`) can now be
+  dialled from a host whose only egress is an HTTP proxy and which has no DNS
+  of its own. When `HTTPS_PROXY` applies to the name (honouring `NO_PROXY`),
+  the name is no longer resolved locally before dialling; it is sent in the
+  proxy CONNECT and the proxy resolves it. Previously such joins failed with
+  "no good addresses". Without an applicable proxy, names resolve locally as
+  before; peer-identity verification is unchanged.
+- A join that reaches no address because the network is unreachable or DNS
+  fails, on a host with no `HTTPS_PROXY`/`https_proxy`/`ALL_PROXY` set, now
+  ends its error with a hint to set `HTTPS_PROXY` if the host reaches the
+  internet only through an HTTP proxy.
+
 ## [1.5.92] - 2026-10-05
 
 ### Fixed

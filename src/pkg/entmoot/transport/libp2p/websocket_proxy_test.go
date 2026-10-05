@@ -4,9 +4,15 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
 	"io"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -33,7 +39,9 @@ import (
 // ProxyFromEnvironment and system certificate roots are process-cached. Each
 // client runs in a fresh process, just as a cloud job with a new proxy port does.
 // The public destination is TEST-NET, never a routable peer: CONNECT is the only
-// successful path to the TLS reverse proxy and the real libp2p WS listener.
+// successful path to the TLS reverse proxy and the real libp2p WS listener. The
+// dns_name modes dial a /dns4 name under .invalid, which no resolver knows, so
+// only a proxy that resolves the name itself can reach the listener.
 func TestWSSJoinThroughEnvironmentProxy(t *testing.T) {
 	if fixture := os.Getenv("ENTMOOT_WSS_TEST_FIXTURE"); fixture != "" {
 		runWSSProxyClient(t, fixture)
@@ -74,24 +82,26 @@ func TestWSSJoinThroughEnvironmentProxy(t *testing.T) {
 	direct := httputil.NewSingleHostReverseProxy(target)
 	stalled := httputil.NewSingleHostReverseProxy(&url.URL{Scheme: "http", Host: stallingRelay(t, target.Host)})
 	var stallMode atomic.Bool
-	tlsServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	tlsServer := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if stallMode.Load() {
 			stalled.ServeHTTP(w, r)
 			return
 		}
 		direct.ServeHTTP(w, r)
 	}))
+	tlsServer.TLS = &tls.Config{Certificates: []tls.Certificate{wssProxyTestCertificate(t)}}
+	tlsServer.StartTLS()
 	defer tlsServer.Close()
 	certFile := filepath.Join(t.TempDir(), "root.pem")
 	if err := os.WriteFile(certFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: tlsServer.Certificate().Raw}), 0600); err != nil {
 		t.Fatal(err)
 	}
-	for _, mode := range []string{"HTTPS_PROXY", "https_proxy", "no_proxy", "untrusted_tls", "wrong_peer", "proxy_refused", "stalled_first_handshake"} {
+	for _, mode := range []string{"HTTPS_PROXY", "https_proxy", "no_proxy", "untrusted_tls", "wrong_peer", "proxy_refused", "stalled_first_handshake", "dns_name", "dns_name_no_proxy", "dns_name_unproxied"} {
 		t.Run(mode, func(t *testing.T) {
 			stallMode.Store(mode == "stalled_first_handshake")
 			var tunnels atomic.Int32
 			proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.Method != http.MethodConnect || r.Host != "example.com:443" {
+				if r.Method != http.MethodConnect || r.Host != wssProxyTestConnectHost(mode) {
 					http.Error(w, "unexpected CONNECT destination", 400)
 					return
 				}
@@ -153,16 +163,22 @@ func TestWSSJoinThroughEnvironmentProxy(t *testing.T) {
 				}
 				command.Env = append(command.Env, entry)
 			}
-			proxyKey := "HTTPS_PROXY"
-			if mode == "https_proxy" {
-				proxyKey = mode
+			switch mode {
+			case "https_proxy":
+				command.Env = append(command.Env, "https_proxy="+proxy.URL)
+			case "dns_name_unproxied":
+			default:
+				command.Env = append(command.Env, "HTTPS_PROXY="+proxy.URL)
 			}
-			command.Env = append(command.Env, "ENTMOOT_WSS_TEST_FIXTURE="+fixture, proxyKey+"="+proxy.URL, "SSL_CERT_DIR="+dir)
+			command.Env = append(command.Env, "ENTMOOT_WSS_TEST_FIXTURE="+fixture, "SSL_CERT_DIR="+dir)
 			if mode != "untrusted_tls" {
 				command.Env = append(command.Env, "SSL_CERT_FILE="+certFile)
 			}
-			if mode == "no_proxy" {
+			switch mode {
+			case "no_proxy":
 				command.Env = append(command.Env, "NO_PROXY=example.com")
+			case "dns_name_no_proxy":
+				command.Env = append(command.Env, "NO_PROXY="+wssProxyTestName)
 			}
 			output, err := command.CombinedOutput()
 			if err != nil {
@@ -188,15 +204,60 @@ func TestWSSJoinThroughEnvironmentProxy(t *testing.T) {
 				case <-ctx.Done():
 					t.Fatal("signed message never reached remote group")
 				}
-			} else if mode == "no_proxy" && tunnels.Load() != 0 {
-				t.Fatal("NO_PROXY was ignored")
+			} else if tunnels.Load() != 0 && (mode == "no_proxy" || mode == "dns_name_no_proxy" || mode == "dns_name_unproxied") {
+				t.Fatal("dial used the proxy it was told not to use")
 			}
 		})
 	}
 }
 
 func wssProxyJoinSucceeds(mode string) bool {
-	return mode == "HTTPS_PROXY" || mode == "https_proxy" || mode == "stalled_first_handshake"
+	return mode == "HTTPS_PROXY" || mode == "https_proxy" || mode == "stalled_first_handshake" || mode == "dns_name"
+}
+
+// wssProxyTestName is the founder's public name in the dns_name modes. RFC 6761
+// reserves .invalid, so a local lookup always fails.
+const wssProxyTestName = "entmoot-founder.invalid"
+
+// wssProxyTestAddress is the founder address the client process dials.
+func wssProxyTestAddress(mode string) string {
+	if strings.HasPrefix(mode, "dns_name") {
+		return "/dns4/" + wssProxyTestName + "/tcp/443/tls/ws"
+	}
+	return "/ip4/192.0.2.1/tcp/443/tls/sni/example.com/ws"
+}
+
+// wssProxyTestConnectHost is the only CONNECT target the test proxy tunnels.
+func wssProxyTestConnectHost(mode string) string {
+	if strings.HasPrefix(mode, "dns_name") {
+		return wssProxyTestName + ":443"
+	}
+	return "example.com:443"
+}
+
+// wssProxyTestCertificate is a self-signed server certificate for both public
+// names; clients trust it through SSL_CERT_FILE.
+func wssProxyTestCertificate(t *testing.T) tls.Certificate {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		DNSNames:              []string{"example.com", wssProxyTestName},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
 }
 
 // stallingRelay forwards TCP to target. Its first connection delivers the
@@ -293,7 +354,7 @@ func runWSSProxyClient(t *testing.T, fixture string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	address, err := ma.NewMultiaddr("/ip4/192.0.2.1/tcp/443/tls/sni/example.com/ws")
+	address, err := ma.NewMultiaddr(wssProxyTestAddress(f.Mode))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -302,6 +363,10 @@ func runWSSProxyClient(t *testing.T, fixture string) {
 		if err == nil {
 			group.Close()
 			t.Fatal("unsafe connection unexpectedly admitted")
+		}
+		// Only a host with no proxy at all, that reached nothing, gets the hint.
+		if hinted := strings.Contains(err.Error(), "set HTTPS_PROXY"); hinted != (f.Mode == "dns_name_unproxied") {
+			t.Fatalf("proxy hint %v in %s join error: %v", hinted, f.Mode, err)
 		}
 		if membership.Exists(dir, f.Invite.GroupID) {
 			t.Fatal("failed transport wrote membership")
