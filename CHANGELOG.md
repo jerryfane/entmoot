@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.95] - 2026-10-05
+
 ### Fixed
 
 - A revoked invite, or an invite from an admin since demoted or removed, can
