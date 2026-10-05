@@ -56,12 +56,33 @@ func project(base Checkpoint, records []Record) (State, []Record, int64) {
 	return projectTracking(base, records, nil)
 }
 
-// projectTracking is project that, when endedBy is not nil, also fills it:
-// for each member the records took out of the group - by a removal, a ban, a
-// leave or a rekey - the effective record that ended its latest membership,
-// kept if it was readmitted since. Tracking is off on the hot path (reproject)
-// and asked for only by Group.RemovedAt.
-func projectTracking(base Checkpoint, records []Record, endedBy map[entmoot.MemberID]Record) (State, []Record, int64) {
+// membershipEndings is what projectTracking notes about how memberships
+// ended, for Group.RemovedAt.
+type membershipEndings struct {
+	// endedBy is, for each member the records took out of the group - by a
+	// removal, a ban, a leave or a rekey - the effective record that ended
+	// its latest membership, kept if it was readmitted since.
+	endedBy map[entmoot.MemberID]Record
+	// removedAfter is, for each id that was not a member when it was named,
+	// the earliest removal or ban of it since it last was one, that its
+	// signer had the authority for at that point in the order: the removal
+	// that would have ended the membership had a leave or rekey, perhaps
+	// dated earlier by the member itself, not ended it first. Readmission
+	// clears it. A removal that ended the membership is in endedBy instead.
+	removedAfter map[entmoot.MemberID]Record
+}
+
+func newMembershipEndings() membershipEndings {
+	return membershipEndings{
+		endedBy:      make(map[entmoot.MemberID]Record),
+		removedAfter: make(map[entmoot.MemberID]Record),
+	}
+}
+
+// projectTracking is project that, when endings is not nil, also fills it
+// (see membershipEndings). Tracking is off on the hot path (reproject) and
+// asked for only by Group.RemovedAt.
+func projectTracking(base Checkpoint, records []Record, endings *membershipEndings) (State, []Record, int64) {
 	state := stateFrom(base)
 
 	// Deduplicate, and drop anything this base already accounts for. A record
@@ -104,8 +125,13 @@ func projectTracking(base Checkpoint, records []Record, endedBy map[entmoot.Memb
 	var reducedAt int64
 	for _, rec := range ordered {
 		var involved []entmoot.MemberID
-		if endedBy != nil {
+		if endings != nil {
 			involved = membersIn(state, rec)
+			if subject, ok := authorizedRemovalOfNonMember(state, rec); ok {
+				if _, earlier := endings.removedAfter[subject]; !earlier {
+					endings.removedAfter[subject] = rec
+				}
+			}
 		}
 		applied, reduced := applyJudged(&state, rec)
 		if applied {
@@ -113,14 +139,60 @@ func projectTracking(base Checkpoint, records []Record, endedBy map[entmoot.Memb
 			if reduced {
 				reducedAt = rec.Timestamp
 			}
+			if endings == nil {
+				continue
+			}
 			for _, id := range involved {
 				if _, still := state.Members[id]; !still {
-					endedBy[id] = rec
+					endings.endedBy[id] = rec
+				}
+			}
+			// Readmitted - a join, or a rekey onto this id - starts afresh.
+			if rec.Kind == KindJoin || rec.Kind == KindRekey {
+				for _, id := range recordMemberIDs(rec) {
+					if _, member := state.Members[id]; member {
+						delete(endings.removedAfter, id)
+					}
 				}
 			}
 		}
 	}
 	return state, effective, reducedAt
+}
+
+// authorizedRemovalOfNonMember reports the subject of rec if rec is a removal
+// or ban of somebody not a member in state, signed by an actor that state lets
+// remove that subject: the founder, or an admin removing neither the founder
+// nor a peer admin. The projection ignores such a removal (or applies only its
+// ban), but it shows the group meant the subject out.
+func authorizedRemovalOfNonMember(state State, rec Record) (entmoot.MemberID, bool) {
+	if rec.Kind != KindRemove {
+		return entmoot.MemberID{}, false
+	}
+	subject, err := rec.SubjectMemberID()
+	if err != nil {
+		return entmoot.MemberID{}, false
+	}
+	if _, member := state.Members[subject]; member {
+		return entmoot.MemberID{}, false
+	}
+	actor, err := entmoot.ResolvedMemberID(rec.Actor)
+	if err != nil || !(state.IsFounder(actor) || state.CanAdminister(actor)) || !state.MayRemove(actor, subject) {
+		return entmoot.MemberID{}, false
+	}
+	return subject, true
+}
+
+// recordMemberIDs lists the record's actor and subject ids.
+func recordMemberIDs(rec Record) []entmoot.MemberID {
+	var ids []entmoot.MemberID
+	if actor, err := entmoot.ResolvedMemberID(rec.Actor); err == nil {
+		ids = append(ids, actor)
+	}
+	if subject, err := rec.SubjectMemberID(); err == nil {
+		ids = append(ids, subject)
+	}
+	return ids
 }
 
 // membersIn lists the record's actor and subject that are members in state:

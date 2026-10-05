@@ -333,8 +333,10 @@ Public open-invite issuer endpoints:
   other invite in a replacement chain once one of them has been used, and
   every invite it minted to somebody no longer a member before it had the
   removal or ban that ended its latest membership (or before that removal's
-  own date, if later). Re-invites minted once it had the removal, readmitted
-  members and members that left are never touched. A
+  own date, if later). A member that left or rekeyed and that an admin then
+  removed or banned counts as removed by that removal. Re-invites minted once
+  it had the removal, readmitted members and members that only left are never
+  touched. A
   removal signed on the issuing node revokes them before it, so they cannot
   readmit the member. A removal signed on another admin's node is followed by
   the revocations once the issuer holds it, so a join with one of those

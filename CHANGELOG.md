@@ -22,6 +22,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it, so a re-invite minted after the removal arrived is no longer revoked
   because the worker was still busy with an earlier pass. The ledger keeps the
   earliest time it was ever given for each removal.
+- A member's own leave no longer shields the invites issued to it from a
+  removal that follows. When a member left - perhaps with a leave it dated
+  just before a removal it saw coming - and an admin on another node then
+  removed it, the leave reaching the issuing node first, the removal changed
+  nothing in the projection, and once a checkpoint folded both, the invites
+  the node had minted to the member before the removal were never revoked: it
+  could rejoin with them for as long as they lived. A removal or ban whose
+  signer could remove the member, signed after its leave or rekey and before
+  any readmission, now counts as the member's removal for its invites, the
+  earliest such one deciding; invites minted after the node saw that removal
+  are kept. The answer is the same before any checkpoint and after one, signed
+  by this node or by another admin. A member that only left, or that a plain
+  member named in a removal, keeps its re-invites.
 
 ## [1.5.96] - 2026-10-05
 

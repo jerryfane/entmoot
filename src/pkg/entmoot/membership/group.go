@@ -385,6 +385,15 @@ type Removal struct {
 // folded exactly the records this node holds, so for it those records say
 // whether a leave, a rekey or a removal ended the membership.
 //
+// A membership a leave or rekey ended still counts as removed if the group
+// then removed or banned the member - by a signer with the authority to,
+// before any readmission - and that earliest such removal is reported: the
+// member signs its own leave and may date it before a removal it sees coming.
+// A membership a removal ended is reported by that removal alone; a later
+// removal of somebody already removed changes nothing. The same holds whether
+// the records are in the window, inside a checkpoint this node signed, or
+// held from inside one signed elsewhere.
+//
 // The group's lock is held only to copy what the answer needs; the work runs
 // outside it, in one pass over the held records whatever the number of ids,
 // and an id this node never saw as a member costs no more than a lookup.
@@ -495,21 +504,45 @@ func (g *Group) RemovedAt(ids []entmoot.MemberID, self entmoot.MemberID) map[ent
 		return nil
 	}
 
-	endedBy := make(map[entmoot.MemberID]Record)
-	projectTracking(base, window, endedBy)
-	// signedHere caches, per checkpoint this node signed, what ended each
-	// membership inside it (see below).
-	signedHere := make(map[entmoot.RosterEntryID]map[entmoot.MemberID]Record)
+	inWindow := newMembershipEndings()
+	projectTracking(base, window, &inWindow)
+	// since caches, per checkpoint on the chain, how memberships ended in a
+	// projection from it over every record held after it (see below).
+	since := make(map[entmoot.RosterEntryID]*membershipEndings)
+	endingsSince := func(from Checkpoint) *membershipEndings {
+		if endings, ok := since[from.ID]; ok {
+			return endings
+		}
+		endings := newMembershipEndings()
+		held := make([]Record, 0, len(window)+len(covered))
+		held = append(append(held, window...), covered...)
+		projectTracking(from, held, &endings)
+		since[from.ID] = &endings
+		return &endings
+	}
 	removed := make(map[entmoot.MemberID]Removal)
 	for id := range wanted {
-		seen := func(removal Removal) Removal {
-			removal.SeenAt = max(appliedAt[removal.Entry], departedAt[id])
-			return removal
+		seen := func(rec Record) Removal {
+			return Removal{At: rec.Timestamp, Entry: rec.ID, SeenAt: max(appliedAt[rec.ID], departedAt[id])}
 		}
-		if ending, ok := endedBy[id]; ok {
-			if ending.Kind == KindRemove {
-				removed[id] = seen(Removal{At: ending.Timestamp, Entry: ending.ID})
+		// endedBy decides with the records that ended the membership: a
+		// removal is the removal; a leave or a rekey is none, unless the
+		// group removed the member after it (removedAfter) - a member that
+		// signs its own leave, dated before a removal it expects, must not
+		// keep the invites issued to it before that removal.
+		decide := func(endings *membershipEndings) bool {
+			ending, ok := endings.endedBy[id]
+			if !ok {
+				return false
 			}
+			if ending.Kind == KindRemove {
+				removed[id] = seen(ending)
+			} else if after, ok := endings.removedAfter[id]; ok {
+				removed[id] = seen(after)
+			}
+			return true
+		}
+		if decide(&inWindow) {
 			continue
 		}
 		// The first checkpoint after the member was last known in that no
@@ -531,45 +564,53 @@ func (g *Group) RemovedAt(ids []entmoot.MemberID, self entmoot.MemberID) map[ent
 			continue
 		}
 		// A checkpoint this node signed folded exactly the records it held,
-		// so those records say how the membership ended inside it: a leave or
-		// a rekey is no removal. A checkpoint signed elsewhere may have folded
-		// a removal this node never held - one dated before a leave it does
-		// hold, which made that leave count for nothing there - and the
-		// checkpoint does not say which, so there a departure is a removal.
+		// so those records say how the membership ended inside it. Every
+		// record held after the previous checkpoint is projected - those the
+		// checkpoint folded and those since - so a removal after a leave is
+		// found wherever it sits.
 		if signer, err := entmoot.ResolvedMemberID(out.Signer); err == nil && signer == self && previous != nil {
-			endings, ok := signedHere[out.ID]
-			if !ok {
-				var folded []Record
-				for _, records := range [][]Record{window, covered} {
-					for _, rec := range records {
-						if rec.Timestamp <= out.Timestamp && !coveredBy(previous.Checkpoint, rec) {
-							folded = append(folded, rec)
-						}
-					}
-				}
-				endings = make(map[entmoot.MemberID]Record)
-				projectTracking(previous.Checkpoint, folded, endings)
-				signedHere[out.ID] = endings
-			}
-			if ending, ok := endings[id]; ok {
-				if ending.Kind == KindRemove {
-					removed[id] = seen(Removal{At: ending.Timestamp, Entry: ending.ID})
-				}
+			if decide(endingsSince(previous.Checkpoint)) {
 				continue
 			}
 		}
-		removal := Removal{At: out.Timestamp, Entry: out.ID}
-		var removedAt int64
+		// A checkpoint signed elsewhere may have folded a removal this node
+		// never held - one dated before a leave it does hold, which made that
+		// leave count for nothing there - and does not say which, so a
+		// departure inside it is a removal: by a removal of the member this
+		// node holds from inside it if there is one, or else by the
+		// checkpoint. Where this node holds the member's own leave or rekey
+		// from inside it and no removal, and the group removed the member
+		// after the checkpoint, that removal is the one: the same answer as
+		// where this node signed the checkpoint itself.
+		var removal *Record
+		ownEnding := false
 		for _, rec := range held[id] {
-			if rec.Kind != KindRemove || rec.Timestamp <= lastSeen[id] || rec.Timestamp > out.Timestamp || rec.Timestamp <= removedAt {
+			if rec.Timestamp <= lastSeen[id] || rec.Timestamp > out.Timestamp {
 				continue
 			}
-			if subject, err := rec.SubjectMemberID(); err == nil && subject == id {
-				removedAt = rec.Timestamp
-				removal = Removal{At: rec.Timestamp, Entry: rec.ID}
+			switch rec.Kind {
+			case KindRemove:
+				if subject, err := rec.SubjectMemberID(); err == nil && subject == id && (removal == nil || rec.Timestamp > removal.Timestamp) {
+					removal = &rec
+				}
+			case KindLeave, KindRekey:
+				if actor, err := entmoot.ResolvedMemberID(rec.Actor); err == nil && actor == id {
+					ownEnding = true
+				}
 			}
 		}
-		removed[id] = seen(removal)
+		switch {
+		case removal != nil:
+			removed[id] = seen(*removal)
+		case ownEnding:
+			if after, ok := endingsSince(out.Checkpoint).removedAfter[id]; ok {
+				removed[id] = seen(after)
+				continue
+			}
+			fallthrough
+		default:
+			removed[id] = Removal{At: out.Timestamp, Entry: out.ID, SeenAt: max(appliedAt[out.ID], departedAt[id])}
+		}
 	}
 	return removed
 }
