@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.93] - 2026-10-05
+
 ### Fixed
 
 - A WSS peer address given by name (`/dns4/<host>/tcp/443/tls/ws`) can now be
