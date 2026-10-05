@@ -45,32 +45,23 @@ func kindRank(kind Kind) int {
 // join rule, already true — are ignored rather than rejected, because a peer is
 // entitled to send us records we cannot use.
 func Project(base Checkpoint, records []Record) (State, []Record) {
-	projected := projectFull(base, records)
-	return projected.state, projected.effective
+	state, effective, _ := project(base, records)
+	return state, effective
 }
 
 // project is Project that also returns the timestamp of the newest effective
 // record that took authority away (see applyJudged), or 0 when none did. That
 // is the point a seal has to cover (see Group.SealDue).
 func project(base Checkpoint, records []Record) (State, []Record, int64) {
-	projected := projectFull(base, records)
-	return projected.state, projected.effective, projected.reducedAt
+	return projectTracking(base, records, nil)
 }
 
-// projection is everything one pass of the projection works out.
-type projection struct {
-	state     State
-	effective []Record
-	reducedAt int64
-	// endedBy maps each member the projected records took out of the group -
-	// by a removal, a ban, a leave or a rekey - to the effective record that
-	// ended its latest membership, whether or not it has been readmitted
-	// since. A member the base checkpoint already left out, and nothing since
-	// admitted, is not in it.
-	endedBy map[entmoot.MemberID]Record
-}
-
-func projectFull(base Checkpoint, records []Record) projection {
+// projectTracking is project that, when endedBy is not nil, also fills it:
+// for each member the records took out of the group - by a removal, a ban, a
+// leave or a rekey - the effective record that ended its latest membership,
+// kept if it was readmitted since. Tracking is off on the hot path (reproject)
+// and asked for only by Group.RemovedAt.
+func projectTracking(base Checkpoint, records []Record, endedBy map[entmoot.MemberID]Record) (State, []Record, int64) {
 	state := stateFrom(base)
 
 	// Deduplicate, and drop anything this base already accounts for. A record
@@ -110,40 +101,44 @@ func projectFull(base Checkpoint, records []Record) projection {
 	})
 
 	effective := make([]Record, 0, len(ordered))
-	endedBy := make(map[entmoot.MemberID]Record)
 	var reducedAt int64
 	for _, rec := range ordered {
-		// Only the record's own actor and subject can leave by it: a removal
-		// takes its subject out, a leave or rekey its actor.
-		var involved [2]entmoot.MemberID
-		var present [2]bool
-		var known [2]bool
-		if actor, err := entmoot.ResolvedMemberID(rec.Actor); err == nil {
-			involved[0], known[0] = actor, true
-			_, present[0] = state.Members[actor]
-		}
-		if subject, err := rec.SubjectMemberID(); err == nil {
-			involved[1], known[1] = subject, true
-			_, present[1] = state.Members[subject]
+		var involved []entmoot.MemberID
+		if endedBy != nil {
+			involved = membersIn(state, rec)
 		}
 		applied, reduced := applyJudged(&state, rec)
-		if !applied {
-			continue
-		}
-		effective = append(effective, rec)
-		if reduced {
-			reducedAt = rec.Timestamp
-		}
-		for i := range involved {
-			if !known[i] || !present[i] {
-				continue
+		if applied {
+			effective = append(effective, rec)
+			if reduced {
+				reducedAt = rec.Timestamp
 			}
-			if _, still := state.Members[involved[i]]; !still {
-				endedBy[involved[i]] = rec
+			for _, id := range involved {
+				if _, still := state.Members[id]; !still {
+					endedBy[id] = rec
+				}
 			}
 		}
 	}
-	return projection{state: state, effective: effective, reducedAt: reducedAt, endedBy: endedBy}
+	return state, effective, reducedAt
+}
+
+// membersIn lists the record's actor and subject that are members in state:
+// the only members a record can take out - a removal its subject, a leave or
+// a rekey its actor.
+func membersIn(state State, rec Record) []entmoot.MemberID {
+	var in []entmoot.MemberID
+	if actor, err := entmoot.ResolvedMemberID(rec.Actor); err == nil {
+		if _, member := state.Members[actor]; member {
+			in = append(in, actor)
+		}
+	}
+	if subject, err := rec.SubjectMemberID(); err == nil {
+		if _, member := state.Members[subject]; member {
+			in = append(in, subject)
+		}
+	}
+	return in
 }
 
 // applyJudged applies one record and also reports whether it took authority

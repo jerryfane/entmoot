@@ -105,9 +105,9 @@ type groupSession struct {
 	// members: the first member the previous round ran out of time before
 	// asking, so every member is asked within a few rounds however many hang.
 	pullOffset atomic.Int64
-	// departures carries members the group's records and checkpoints took
-	// out to processDepartures, which revokes the invites issued to them.
-	departures *departureQueue
+	// reconciler wakes reconcileInvites, the session's worker that keeps the
+	// invites this node issued in line with the group's membership.
+	reconciler *inviteReconciler
 }
 
 // sealState is the sealer's progress on sealing authority changes (see
@@ -339,8 +339,8 @@ func (r *groupRuntime) AddLocalGroup(ctx context.Context, groupID entmoot.GroupI
 		return nil, false, err
 	}
 	group.SetLogger(r.logger)
-	departures := newDepartureQueue()
-	group.SetDepartureHook(departures.push)
+	reconciler := newInviteReconciler()
+	group.SetChangeHook(reconciler.signal)
 	if err := r.validateLocalMembership(group); err != nil {
 		_ = group.Close()
 		return nil, false, err
@@ -375,7 +375,7 @@ func (r *groupRuntime) AddLocalGroup(ctx context.Context, groupID entmoot.GroupI
 	}
 	session := &groupSession{
 		groupID: groupID, group: group, live: live, legacyHistory: legacyHistory, cancel: cancel,
-		peerRecords: libp2ptransport.NewPeerRecordCache(), departures: departures,
+		peerRecords: libp2ptransport.NewPeerRecordCache(), reconciler: reconciler,
 	}
 	r.mu.Lock()
 	if r.closed {
@@ -387,7 +387,7 @@ func (r *groupRuntime) AddLocalGroup(ctx context.Context, groupID entmoot.GroupI
 	}
 	r.sessions[groupID] = session
 	r.mu.Unlock()
-	go r.processDepartures(session)
+	go r.reconcileInvites(session)
 	go r.maintainGroup(sessionCtx, session)
 	return session, true, nil
 }
@@ -541,7 +541,7 @@ func (r *groupRuntime) RemoveGroup(groupID entmoot.GroupID) bool {
 	if ok {
 		session.cancel()
 		_ = session.live.Close()
-		session.departures.close()
+		session.reconciler.close()
 		_ = session.group.Close()
 	}
 	return ok
@@ -664,7 +664,9 @@ const (
 // changes nothing. That is the whole reason this is short: with a set there is
 // no "wrong chain" to detect, adopt or roll back.
 func (r *groupRuntime) syncMembership(ctx context.Context, session *groupSession) {
-	r.retireUsedReplacementChains(session)
+	// The backstop for anything the change hook could not wake: every
+	// round, the invites this node issued are reconciled once more.
+	session.reconciler.signal()
 	// A round that is to seal an authority change pulls from every member it
 	// can address, not the usual handful: the seal makes everything dated
 	// before the change stale, so it may only vouch for what all the members
@@ -783,96 +785,40 @@ func (r *groupRuntime) syncMembership(ctx context.Context, session *groupSession
 	r.signCheckpointIfDue(session)
 }
 
-// retireUsedReplacementChains revokes, for every ESP replacement chain this
-// node issued in the group, each capability still unrevoked in a chain one of
-// whose capabilities has been used to join. Every capability in a chain is
-// made out to the same target, so once one has admitted it the others are
-// only a way back in after a removal. The capability a refresh replaces is
-// revoked when the replacement is handed out, but a join with it dated before
-// that revocation is accepted until the founder seals it. This revokes the
-// rest of the chain on the round after such a join reaches this node; a
-// removal of its holder revokes them once this node has applied it, on the
-// session's departure worker (see revokeInvitesOfDeparted), without waiting for
-// a round. Neither is final before the seal. It runs
-// only where this node may revoke.
-func (r *groupRuntime) retireUsedReplacementChains(session *groupSession) {
-	if r.invites == nil || r.identity == nil || !session.group.CanAdminister(r.binding.MemberID) {
-		return
-	}
-	chains, err := r.invites.ReplacementChains(session.groupID)
-	if err != nil {
-		r.logger.Warn("invite replacement chains", slog.String("group_id", session.groupID.String()), slog.String("err", err.Error()))
-		return
-	}
-	unlock := lockESPInviteRoster(session.groupID)
-	defer unlock()
-	for _, chain := range chains {
-		used := false
-		var unused [][32]byte
-		for _, nonce := range chain {
-			if session.group.InviteUses(nonce) > 0 {
-				used = true
-			} else {
-				unused = append(unused, nonce)
-			}
-		}
-		if !used {
-			continue
-		}
-		revoked, err := revokeIssuedInvites(r.identity, session.group, r.invites, unused)
-		if err != nil {
-			r.logger.Warn("revoke the rest of a used invite replacement chain",
-				slog.String("group_id", session.groupID.String()), slog.String("err", err.Error()))
-			continue
-		}
-		if len(revoked) > 0 {
-			r.logger.Info("revoked the rest of a used invite replacement chain",
-				slog.String("group_id", session.groupID.String()), slog.Int("revoked", len(revoked)))
-		}
-	}
+// inviteReconciler wakes a session's invite worker, reconcileInvites,
+// whenever the group may have changed: a record or checkpoint was applied, or
+// a maintenance round came round. Signals coalesce - the worker looks at the
+// group as it is, not at what changed - so signal never blocks, a burst of
+// records costs one pass, and the order records arrived in cannot matter.
+// Nothing is done on the signalling goroutine, which may be a pull, a push,
+// or a caller holding lockESPInviteRoster while it signs a revocation.
+type inviteReconciler struct {
+	mu        sync.Mutex
+	settled   *sync.Cond
+	requested uint64
+	completed uint64
+	closed    bool
+	wake      chan struct{}
+	done      chan struct{}
 }
 
-// departureQueue carries departures (see membership.Group.SetDepartureHook)
-// from the goroutine that applied a record or checkpoint to the session's own
-// worker, processDepartures. Acting on them inline is not safe: the applying
-// goroutine may be a pull, a push, or a caller that holds lockESPInviteRoster
-// while it signs a revocation, and revoking takes that lock. push never
-// blocks, and pending departures are kept one per member, so the queue holds
-// at most as many entries as the group has had members.
-type departureQueue struct {
-	mu      sync.Mutex
-	idle    *sync.Cond
-	pending map[entmoot.MemberID]membership.Departure
-	busy    bool
-	closed  bool
-	wake    chan struct{}
-	done    chan struct{}
-}
-
-func newDepartureQueue() *departureQueue {
-	q := &departureQueue{
-		pending: make(map[entmoot.MemberID]membership.Departure),
-		wake:    make(chan struct{}, 1),
-		done:    make(chan struct{}),
-	}
-	q.idle = sync.NewCond(&q.mu)
+func newInviteReconciler() *inviteReconciler {
+	q := &inviteReconciler{wake: make(chan struct{}, 1), done: make(chan struct{})}
+	q.settled = sync.NewCond(&q.mu)
 	return q
 }
 
-// push queues departed. A member already waiting keeps its latest removal,
-// which covers every invite the earlier one would.
-func (q *departureQueue) push(departed []membership.Departure) {
+// signal asks for a pass. It is a no-op on a nil or closed reconciler.
+func (q *inviteReconciler) signal() {
+	if q == nil {
+		return
+	}
 	q.mu.Lock()
 	if q.closed {
 		q.mu.Unlock()
 		return
 	}
-	for _, departure := range departed {
-		if waiting, ok := q.pending[departure.Member]; ok && waiting.At >= departure.At {
-			continue
-		}
-		q.pending[departure.Member] = departure
-	}
+	q.requested++
 	q.mu.Unlock()
 	select {
 	case q.wake <- struct{}{}:
@@ -880,50 +826,18 @@ func (q *departureQueue) push(departed []membership.Departure) {
 	}
 }
 
-// take waits for queued departures and hands them all over. It reports false
-// once the queue is closed and nothing is left.
-func (q *departureQueue) take() ([]membership.Departure, bool) {
-	for {
-		q.mu.Lock()
-		if len(q.pending) > 0 {
-			batch := make([]membership.Departure, 0, len(q.pending))
-			for _, departure := range q.pending {
-				batch = append(batch, departure)
-			}
-			clear(q.pending)
-			q.busy = true
-			q.mu.Unlock()
-			return batch, true
-		}
-		closed := q.closed
-		q.mu.Unlock()
-		if closed {
-			return nil, false
-		}
-		<-q.wake
-	}
-}
-
-// processed marks the batch take handed over as done.
-func (q *departureQueue) processed() {
-	q.mu.Lock()
-	q.busy = false
-	q.idle.Broadcast()
-	q.mu.Unlock()
-}
-
-// wait blocks until every departure pushed so far has been processed.
-func (q *departureQueue) wait() {
+// wait blocks until a pass has started after every signal so far, and ended.
+func (q *inviteReconciler) wait() {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	for len(q.pending) > 0 || q.busy {
-		q.idle.Wait()
+	for q.completed < q.requested {
+		q.settled.Wait()
 	}
 }
 
-// close stops accepting departures and waits for the worker to process those
-// already queued, so a group is not closed under it.
-func (q *departureQueue) close() {
+// close stops accepting signals and waits for the worker to finish the pass
+// still owed, so the group is not closed under it.
+func (q *inviteReconciler) close() {
 	q.mu.Lock()
 	q.closed = true
 	q.mu.Unlock()
@@ -934,62 +848,142 @@ func (q *departureQueue) close() {
 	<-q.done
 }
 
-// processDepartures is the session's departure worker; it runs until the
-// queue is closed, then processes what is left and returns.
-func (r *groupRuntime) processDepartures(session *groupSession) {
-	queue := session.departures
-	defer close(queue.done)
+// reconcileInvites is the session's invite worker. It runs a pass whenever
+// one is owed, until the reconciler is closed and nothing is owed.
+func (r *groupRuntime) reconcileInvites(session *groupSession) {
+	q := session.reconciler
+	defer close(q.done)
 	for {
-		batch, ok := queue.take()
-		if !ok {
+		q.mu.Lock()
+		if q.completed < q.requested {
+			target := q.requested
+			q.mu.Unlock()
+			r.reconcileIssuedInvites(session)
+			q.mu.Lock()
+			q.completed = target
+			q.settled.Broadcast()
+			q.mu.Unlock()
+			continue
+		}
+		closed := q.closed
+		q.mu.Unlock()
+		if closed {
 			return
 		}
-		r.revokeInvitesOfDeparted(session.group, batch)
-		queue.processed()
+		<-q.wake
 	}
 }
 
-// revokeInvitesOfDeparted acts on departures from the session's queue. When
-// applying a record or checkpoint - pulled, pushed, or a seal - took a member
-// out of the group by a removal or ban signed elsewhere, it revokes every
-// capability this node issued to that member, issued no later than the
-// removal, that could still admit it: so a replacement an ESP open invite
-// handed that member is not left live until a maintenance round, and an
-// invite issued after the removal - a re-invite - is never touched. Only a
-// removal that newly ends the member's membership counts, whichever record
-// made it take effect (see SetDepartureHook): a removal of somebody already
-// gone, or one its signer had no authority for, revokes nothing, so repeating
-// it cannot be used against a re-invite.
+// reconcileIssuedInvites revokes every capability this node issued that the
+// group's current membership says should no longer admit anybody, and does
+// nothing else: a pass over a group with nothing to revoke signs nothing, so
+// passes may repeat freely. It looks only at the group as it stands, never at
+// what just changed, so every order the same records arrive in ends with the
+// same capabilities revoked.
 //
-// A removal signed here needs nothing: every local path revokes before it
-// signs (see revokeInvitesForRemoval). This cannot close the window between a
-// removal signed elsewhere and these revocations, which carry this node's
-// later timestamps: a join with such a capability dated inside it is
-// accepted, as for any revoked invite, until the founder seals them.
-func (r *groupRuntime) revokeInvitesOfDeparted(group *membership.Group, departed []membership.Departure) {
+//   - A removed member: for each member this node issued live capabilities to
+//     that is not a member now and whose latest membership a removal or ban
+//     ended (Group.RemovedAt), every such capability minted no later than that
+//     removal. Re-invites issued after it are never touched, a readmitted
+//     member is a member, and a member that left or rekeyed is not removed.
+//     A removal signed here already revoked them first (revokeInvitesForRemoval);
+//     one signed elsewhere is caught here once this node holds it - but these
+//     revocations carry this node's later timestamps, so a join with such a
+//     capability dated between the removal and them is accepted, as for any
+//     revoked invite, until the founder seals them.
+//   - A used replacement chain: every capability still unrevoked in an ESP
+//     replacement chain one of whose capabilities has been used to join.
+//     Every capability in a chain is made out to the same target, so once one
+//     has admitted it the others are only a way back in after a removal. The
+//     capability a refresh replaces is revoked when the replacement is handed
+//     out, but a join with it dated before that revocation is accepted until
+//     the founder seals it.
+//
+// It runs only where this node may revoke, under lockESPInviteRoster.
+func (r *groupRuntime) reconcileIssuedInvites(session *groupSession) {
+	group := session.group
 	if r.invites == nil || r.identity == nil || !group.CanAdminister(r.binding.MemberID) {
 		return
 	}
+	gid := session.groupID
+	unlock := lockESPInviteRoster(gid)
+	defer unlock()
+	r.revokeInvitesOfRemovedMembers(group)
+	r.retireUsedReplacementChains(group)
+}
+
+func (r *groupRuntime) revokeInvitesOfRemovedMembers(group *membership.Group) {
 	gid := group.GroupID()
-	var unlock func()
-	for _, departure := range departed {
-		if departure.Actor != nil && *departure.Actor == r.binding.MemberID {
+	live, err := r.invites.LiveTargetedInvites(gid)
+	if err != nil {
+		r.logger.Warn("list issued invites", slog.String("group_id", gid.String()), slog.String("err", err.Error()))
+		return
+	}
+	var targets []entmoot.MemberID
+	candidates := live[:0]
+	for _, record := range live {
+		if group.IsMemberID(*record.TargetMemberID) || group.IsInviteRevoked(record.Nonce) ||
+			(record.MaxUses > 0 && group.InviteUses(record.Nonce) >= record.MaxUses) {
 			continue
 		}
-		if unlock == nil {
-			unlock = lockESPInviteRoster(gid)
-			defer unlock()
+		candidates = append(candidates, record)
+		targets = append(targets, *record.TargetMemberID)
+	}
+	if len(candidates) == 0 {
+		return
+	}
+	removedAt := group.RemovedAt(targets)
+	var nonces [][32]byte
+	for _, record := range candidates {
+		// An invite's own date is set minutes early (InviteIssuedAtMS), so it
+		// is judged by when this node minted it; a ledger row older than that
+		// column falls back to the earlier date, which errs towards revoking.
+		minted := record.MintedAtMS
+		if minted == 0 {
+			minted = record.IssuedAtMS
 		}
-		revoked, err := revokeInvitesTargeting(r.identity, group, r.invites, departure.Member, departure.At)
+		if at, removed := removedAt[*record.TargetMemberID]; removed && minted <= at {
+			nonces = append(nonces, record.Nonce)
+		}
+	}
+	revoked, err := revokeIssuedInvites(r.identity, group, r.invites, nonces)
+	if err != nil {
+		r.logger.Warn("revoke removed members' invites", slog.String("group_id", gid.String()), slog.String("err", err.Error()))
+	}
+	if len(revoked) > 0 {
+		r.logger.Info("revoked removed members' invites", slog.String("group_id", gid.String()), slog.Int("revoked", len(revoked)))
+	}
+}
+
+func (r *groupRuntime) retireUsedReplacementChains(group *membership.Group) {
+	gid := group.GroupID()
+	chains, err := r.invites.ReplacementChains(gid)
+	if err != nil {
+		r.logger.Warn("invite replacement chains", slog.String("group_id", gid.String()), slog.String("err", err.Error()))
+		return
+	}
+	for _, chain := range chains {
+		used := false
+		var unused [][32]byte
+		for _, nonce := range chain {
+			if group.InviteUses(nonce) > 0 {
+				used = true
+			} else {
+				unused = append(unused, nonce)
+			}
+		}
+		if !used {
+			continue
+		}
+		revoked, err := revokeIssuedInvites(r.identity, group, r.invites, unused)
 		if err != nil {
-			r.logger.Warn("revoke a removed member's invites",
+			r.logger.Warn("revoke the rest of a used invite replacement chain",
 				slog.String("group_id", gid.String()), slog.String("err", err.Error()))
 			continue
 		}
 		if len(revoked) > 0 {
-			r.logger.Info("revoked a removed member's invites",
-				slog.String("group_id", gid.String()), slog.String("member_id", departure.Member.String()),
-				slog.Int("revoked", len(revoked)))
+			r.logger.Info("revoked the rest of a used invite replacement chain",
+				slog.String("group_id", gid.String()), slog.Int("revoked", len(revoked)))
 		}
 	}
 }
@@ -1480,7 +1474,7 @@ func (r *groupRuntime) Close() {
 	for _, session := range sessions {
 		session.cancel()
 		_ = session.live.Close()
-		session.departures.close()
+		session.reconciler.close()
 		_ = session.group.Close()
 	}
 	_ = r.liveRouter.Close()

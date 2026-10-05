@@ -1647,8 +1647,7 @@ func (s *ipcServer) issueInvite(c net.Conn, req *ipc.InviteCreateReq, refresh *e
 // the seal too. A join that landed before the revocation means the target got
 // in after all; then the replacement is withheld and the refreshed capability
 // handed back, as for any target that got in. What still lands before the
-// seal is retired by retireUsedReplacementChains and by member removal (see
-// revokeInvitesTargeting).
+// seal is retired by reconcileIssuedInvites, and by member removal.
 func (s *ipcServer) handOutReplacement(c net.Conn, group *membership.Group, chain []entmoot.BootstrapCapability, replacement entmoot.BootstrapCapability, target entmoot.MemberID) {
 	gid := group.GroupID()
 	previous := make([][32]byte, 0, len(chain))
@@ -1690,48 +1689,36 @@ func revokeIssuedInvites(identity *keystore.Identity, group *membership.Group, l
 	return revoked, nil
 }
 
-// revokeInvitesTargeting revokes every capability this node issued to target
-// that could still admit it: not expired, not used up, not revoked. That
-// includes every link of an ESP replacement chain, so a removed or banned
-// member cannot come back through a replacement it was handed before it got
-// in with an older capability (which a join dated before that one's
-// revocation can do until the founder seals it). A removal signed here calls
-// it first (revokeInvitesForRemoval): a join with one of these dated after
-// the revocation is refused, and one dated before it is dated before the
-// removal too, so the removal still applies after it. A removal signed on
-// another node can only be followed by it (revokeInvitesOfDeparted), which
-// leaves a window until the founder seals. issuedBy, when not zero, spares
-// invites issued after it, so revoking for a removal dated issuedBy never
-// touches a re-invite issued since.
-func revokeInvitesTargeting(identity *keystore.Identity, group *membership.Group, ledger *libp2ptransport.InviteLedger, target entmoot.MemberID, issuedBy int64) ([][32]byte, error) {
-	gid := group.GroupID()
-	issued, err := ledger.ListInvites(&gid)
+// revokeInvitesForRemoval revokes, ahead of a remove or ban of target that
+// actor is about to sign, every capability this node issued to target that
+// could still admit it: not expired, not used up, not revoked. That includes
+// every link of an ESP replacement chain, so a removed or banned member cannot
+// come back through a replacement it was handed before it got in with an
+// older capability (which a join dated before that one's revocation can do
+// until the founder seals it). Revoking first means a join with one of these
+// dated after the revocation is refused, and one dated before it is dated
+// before the removal too, so the removal still applies after it. A removal
+// signed on another node can only be followed by such revocations
+// (reconcileIssuedInvites), which leaves a window until the founder seals.
+// A removal the projection will not honour, such as an admin removing a peer
+// admin, revokes nothing.
+func revokeInvitesForRemoval(identity *keystore.Identity, actor entmoot.MemberID, group *membership.Group, ledger *libp2ptransport.InviteLedger, target entmoot.MemberID) ([][32]byte, error) {
+	if !group.RemovalTakesEffect(actor, target) {
+		return nil, nil
+	}
+	issued, err := ledger.LiveTargetedInvites(group.GroupID())
 	if err != nil {
 		return nil, err
 	}
-	nowMS := time.Now().UnixMilli()
 	var nonces [][32]byte
 	for _, record := range issued {
-		if record.TargetMemberID == nil || *record.TargetMemberID != target ||
-			(issuedBy != 0 && record.IssuedAtMS > issuedBy) ||
-			(record.ExpiresAtMS > 0 && record.ExpiresAtMS <= nowMS) ||
+		if *record.TargetMemberID != target ||
 			(record.MaxUses > 0 && group.InviteUses(record.Nonce) >= record.MaxUses) {
 			continue
 		}
 		nonces = append(nonces, record.Nonce)
 	}
 	return revokeIssuedInvites(identity, group, ledger, nonces)
-}
-
-// revokeInvitesForRemoval is revokeInvitesTargeting ahead of a remove or ban
-// of target that actor is about to sign, but only if the projection will
-// honour that removal: one it ignores, such as an admin removing a peer
-// admin, revokes nothing.
-func revokeInvitesForRemoval(identity *keystore.Identity, actor entmoot.MemberID, group *membership.Group, ledger *libp2ptransport.InviteLedger, target entmoot.MemberID) ([][32]byte, error) {
-	if !group.RemovalTakesEffect(actor, target) {
-		return nil, nil
-	}
-	return revokeInvitesTargeting(identity, group, ledger, target, 0)
 }
 
 func encodeInviteNonces(nonces [][32]byte) []string {
@@ -1932,7 +1919,7 @@ func (s *ipcServer) handleMemberRemove(ctx context.Context, c net.Conn, req *ipc
 		return
 	}
 	// Capabilities this node issued to the member are revoked first; see
-	// revokeInvitesTargeting for why before, not after, the removal. A failure
+	// revokeInvitesForRemoval for why before, not after, the removal. A failure
 	// leaves the member in place so the removal can be retried, rather than
 	// removing it while a capability that readmits it stays live.
 	revoked, err := revokeInvitesForRemoval(s.identity, s.memberID, sess.group, s.runtime.invites, *existing.MemberID)

@@ -64,9 +64,6 @@ type Group struct {
 	history   map[entmoot.RosterEntryID]Record
 	state     State
 	effective int
-	// endedBy is, from the latest projection, the effective record that ended
-	// each member's latest membership (see projection.endedBy).
-	endedBy map[entmoot.MemberID]Record
 	// rewoundMembers is the membership of the canonical checkpoint this node
 	// last moved BACKWARDS from, kept so the records that membership rests on
 	// can be pulled back from the peers that hold them. It is a local hint
@@ -80,10 +77,10 @@ type Group struct {
 	legacy      *LegacyChain
 	now         func() time.Time
 	logger      *slog.Logger
-	// onDeparted, if set, is called with the members an Apply or
-	// ApplyCheckpoint took out of the group (see SetDepartureHook).
-	onDeparted func([]Departure)
-	closeOnce  sync.Once
+	// onChanged, if set, is called after Apply or ApplyCheckpoint stores
+	// something (see SetChangeHook).
+	onChanged func()
+	closeOnce sync.Once
 }
 
 // Open loads a group's membership store. A group that still has only the
@@ -322,102 +319,145 @@ func (g *Group) SetLogger(logger *slog.Logger) {
 	}
 }
 
-// Departure is a member that applying one record or checkpoint took out of
-// the group, by a removal or ban.
-type Departure struct {
-	Member entmoot.MemberID
-	// At is the timestamp of the removal record that took the member out.
-	// When the member went out inside a checkpoint this node adopted, it is
-	// that checkpoint's timestamp: the removal is no later.
-	At int64
-	// Actor signed the removal record; nil for a checkpoint.
-	Actor *entmoot.MemberID
-	// Banned reports the removal banned the member.
-	Banned bool
-}
-
-// SetDepartureHook sets a function called with the members that applying one
-// record (Apply, so also SignRecord) or one checkpoint (ApplyCheckpoint) took
-// out of the group by a removal or ban: members before it, not after it.
-//
-// Whatever was applied, the departure is judged by what ended the member's
-// latest membership in the new projection. It is reported only when that is
-// an effective removal or ban that did not already end it before - so a
-// removal that took effect just now, including one that only took effect
-// because a later record (an admin grant) arrived - and it is dated and
-// signed as that removal is. A member whose membership ended by a leave or a
-// rekey, or that went out because the join that readmitted it no longer holds
-// (a revocation, a policy change) while its old removal still ends the
-// interval before, is not reported; nor is anybody for a removal of somebody
-// already gone, or one its signer had no authority for. When a checkpoint
-// takes out a member whose ending record this node never held, it is
-// reported dated at the checkpoint, since without the records a member that
-// left of its own accord cannot be told from a removed one.
-//
-// The hook runs on whatever goroutine applied the record, once the group's
-// lock is released and before Apply or ApplyCheckpoint returns. That caller
-// may hold locks of its own, so the hook must not block or take them: hand
-// the departures off and act on them elsewhere.
-func (g *Group) SetDepartureHook(hook func([]Departure)) {
+// SetChangeHook sets a function called whenever Apply (so also SignRecord) or
+// ApplyCheckpoint stores something, once the group's lock is released and
+// before they return. It says only that the group may have changed - not
+// what changed, or why - so a caller acting on it must look at the group as it
+// is then (see RemovedAt), which gives the same answer whatever order the
+// records arrived in. The hook runs on whatever goroutine applied the record;
+// that caller may hold locks of its own, so it must not block or take them.
+func (g *Group) SetChangeHook(hook func()) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	g.onDeparted = hook
+	g.onChanged = hook
 }
 
-// memberSetLocked copies the current members.
-func (g *Group) memberSetLocked() map[entmoot.MemberID]struct{} {
-	members := make(map[entmoot.MemberID]struct{}, len(g.state.Members))
-	for id := range g.state.Members {
-		members[id] = struct{}{}
+func (g *Group) changed() {
+	g.mu.RLock()
+	hook := g.onChanged
+	g.mu.RUnlock()
+	if hook != nil {
+		hook()
 	}
-	return members
 }
 
-// departuresLocked reports the members of before that the current projection
-// no longer holds and whose latest membership a removal ended that had not
-// ended it in the projection before, whose endings were previous. folded is
-// the timestamp of the checkpoint just adopted, or zero for a record: with a
-// checkpoint, a member whose ending this node does not hold went out inside
-// it.
-func (g *Group) departuresLocked(before map[entmoot.MemberID]struct{}, previous map[entmoot.MemberID]Record, folded int64) []Departure {
-	var departed []Departure
-	for id := range before {
-		if _, still := g.state.Members[id]; still {
+// RemovedAt reports, for each of ids that is not a member now and whose
+// latest membership a removal or ban ended, when that removal is dated. A
+// member that was never in the group, that left or rekeyed, or that has been
+// readmitted since is left out.
+//
+// What ended a membership is read from the records the canonical checkpoint
+// does not cover, projected in their own order, so the answer does not depend
+// on the order they arrived in. A membership that ended inside a checkpoint,
+// whose records this node does not hold, falls back to the checkpoints: a
+// member listed by one checkpoint on the canonical chain - or with a join this
+// node holds - and missing from the first later one is reported dated at that
+// later checkpoint, or at a removal of it this node holds from between the two.
+// Without the records a member that left of its own accord inside a
+// checkpoint cannot be told from a removed one unless its leave is held.
+func (g *Group) RemovedAt(ids []entmoot.MemberID) map[entmoot.MemberID]int64 {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	removed := make(map[entmoot.MemberID]int64)
+	var endedBy map[entmoot.MemberID]Record
+	for _, id := range ids {
+		if _, member := g.state.Members[id]; member {
 			continue
 		}
-		_, banned := g.state.Banned[id]
-		ending, held := g.endedBy[id]
-		if !held {
-			if folded != 0 {
-				departed = append(departed, Departure{Member: id, At: folded, Banned: banned})
+		if _, done := removed[id]; done {
+			continue
+		}
+		if endedBy == nil {
+			endedBy = make(map[entmoot.MemberID]Record)
+			records := make([]Record, 0, len(g.records))
+			for _, rec := range g.records {
+				records = append(records, rec)
+			}
+			projectTracking(g.checkpoints[g.canonicalID], records, endedBy)
+		}
+		if ending, held := endedBy[id]; held {
+			if ending.Kind == KindRemove {
+				removed[id] = ending.Timestamp
 			}
 			continue
 		}
-		if ending.Kind != KindRemove {
-			continue // a leave or a rekey
+		if at, ok := g.removedInsideCheckpointLocked(id); ok {
+			removed[id] = at
 		}
-		if earlier, ok := previous[id]; ok && earlier.ID == ending.ID {
-			continue // the removal already ended it; a later readmission fell away
-		}
-		departure := Departure{Member: id, At: ending.Timestamp, Banned: banned}
-		if actor, err := entmoot.ResolvedMemberID(ending.Actor); err == nil {
-			departure.Actor = &actor
-		}
-		departed = append(departed, departure)
 	}
-	return departed
+	return removed
 }
 
-// reportDepartures hands departed to the departure hook.
-func (g *Group) reportDepartures(departed []Departure) {
-	if len(departed) == 0 {
-		return
+// removedInsideCheckpointLocked is RemovedAt's fallback for a member whose
+// membership ended inside a checkpoint (see RemovedAt).
+func (g *Group) removedInsideCheckpointLocked(id entmoot.MemberID) (int64, bool) {
+	// The canonical chain, newest first.
+	var chain []Checkpoint
+	for cp, ok := g.checkpoints[g.canonicalID]; ok && len(chain) <= len(g.checkpoints); cp, ok = g.checkpoints[cp.Previous] {
+		chain = append(chain, cp)
 	}
-	g.mu.RLock()
-	hook := g.onDeparted
-	g.mu.RUnlock()
-	if hook != nil {
-		hook(departed)
+	// The last moment this node knows id was in the group.
+	var lastSeen int64
+	seen := false
+	for _, cp := range chain {
+		if _, in := g.membersAt[cp.ID][id]; in && (!seen || cp.Timestamp > lastSeen) {
+			lastSeen, seen = cp.Timestamp, true
+		}
+	}
+	var held []Record
+	for _, records := range []map[entmoot.RosterEntryID]Record{g.records, g.history} {
+		for _, rec := range records {
+			subject, err := rec.SubjectMemberID()
+			actor, actorErr := entmoot.ResolvedMemberID(rec.Actor)
+			if (err == nil && subject == id) || (actorErr == nil && actor == id) {
+				held = append(held, rec)
+			}
+		}
+	}
+	for _, rec := range held {
+		if rec.Kind == KindJoin && (!seen || rec.Timestamp > lastSeen) {
+			lastSeen, seen = rec.Timestamp, true
+		}
+	}
+	if !seen {
+		return 0, false
+	}
+	// The first checkpoint after that which no longer lists it.
+	var out *Checkpoint
+	for i := range chain {
+		cp := chain[i]
+		if cp.Timestamp <= lastSeen {
+			break
+		}
+		if _, in := g.membersAt[cp.ID][id]; !in {
+			out = &chain[i]
+		}
+	}
+	if out == nil {
+		return 0, false
+	}
+	at, left := out.Timestamp, false
+	var removedAt int64
+	for _, rec := range held {
+		if rec.Timestamp <= lastSeen || rec.Timestamp > out.Timestamp {
+			continue
+		}
+		switch rec.Kind {
+		case KindRemove:
+			if subject, err := rec.SubjectMemberID(); err == nil && subject == id && rec.Timestamp > removedAt {
+				removedAt = rec.Timestamp
+			}
+		case KindLeave, KindRekey:
+			left = true
+		}
+	}
+	switch {
+	case removedAt != 0:
+		return removedAt, true
+	case left:
+		return 0, false
+	default:
+		return at, true
 	}
 }
 
@@ -427,10 +467,9 @@ func (g *Group) reproject() {
 	for _, rec := range g.records {
 		records = append(records, rec)
 	}
-	projected := projectFull(base, records)
-	g.state = projected.state
-	g.effective = len(projected.effective)
-	g.endedBy = projected.endedBy
+	state, effective := Project(base, records)
+	g.state = state
+	g.effective = len(effective)
 }
 
 // GroupID identifies the group.
@@ -998,15 +1037,14 @@ func (g *Group) Discard() error {
 // Apply stores one record and re-projects. Applying a record twice is a no-op,
 // so a peer may send the same record repeatedly.
 func (g *Group) Apply(rec Record) (bool, error) {
-	var departed []Departure
-	applied, err := g.apply(rec, &departed)
-	if applied && err == nil {
-		g.reportDepartures(departed)
+	applied, err := g.apply(rec)
+	if applied {
+		g.changed()
 	}
 	return applied, err
 }
 
-func (g *Group) apply(rec Record, departed *[]Departure) (bool, error) {
+func (g *Group) apply(rec Record) (bool, error) {
 	if err := VerifyRecord(rec); err != nil {
 		return false, err
 	}
@@ -1039,9 +1077,7 @@ func (g *Group) apply(rec Record, departed *[]Departure) (bool, error) {
 		return false, fmt.Errorf("membership: commit record: %w", err)
 	}
 	g.records[rec.ID] = cloneRecord(rec)
-	before, previous := g.memberSetLocked(), g.endedBy
 	g.reproject()
-	*departed = g.departuresLocked(before, previous, 0)
 	return true, nil
 }
 
@@ -1050,15 +1086,14 @@ func (g *Group) apply(rec Record, departed *[]Departure) (bool, error) {
 // records is refused rather than adopted, so a wrong or hostile checkpoint
 // cannot rewrite what this node knows.
 func (g *Group) ApplyCheckpoint(cp Checkpoint) (bool, error) {
-	var departed []Departure
-	applied, err := g.applyCheckpoint(cp, &departed)
-	if applied && err == nil {
-		g.reportDepartures(departed)
+	applied, err := g.applyCheckpoint(cp)
+	if applied {
+		g.changed()
 	}
 	return applied, err
 }
 
-func (g *Group) applyCheckpoint(cp Checkpoint, departed *[]Departure) (bool, error) {
+func (g *Group) applyCheckpoint(cp Checkpoint) (bool, error) {
 	if err := VerifyCheckpoint(cp); err != nil {
 		return false, err
 	}
@@ -1110,11 +1145,9 @@ func (g *Group) applyCheckpoint(cp Checkpoint, departed *[]Departure) (bool, err
 		return false, fmt.Errorf("membership: commit checkpoint: %w", err)
 	}
 	g.retainLocked(cp)
-	before, endings := g.memberSetLocked(), g.endedBy
 	if err := g.settleCanonicalLocked(); err != nil {
 		return true, err
 	}
-	*departed = g.departuresLocked(before, endings, g.checkpoints[g.canonicalID].Timestamp)
 	return true, nil
 }
 

@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -330,32 +331,73 @@ func (f *replayFixture) joinNow(member *keystore.Identity, capability entmoot.Bo
 
 // removeAs has signer sign member's removal, dated at, and this node apply it
 // as it applies a pulled or pushed record. It returns once the daemon has
-// acted on the departure.
+// reconciled its invites with the result.
 func (f *replayFixture) removeAs(signer, member *keystore.Identity, at int64) {
 	f.t.Helper()
-	record, err := membership.SignRecord(signer, membership.Record{
-		GroupID: f.gid, Kind: membership.KindRemove,
-		Actor: mustDaemonNodeInfo(f.t, signer), Subject: mustDaemonNodeInfo(f.t, member), Timestamp: at,
-	})
-	if err != nil {
-		f.t.Fatalf("sign removal: %v", err)
-	}
-	if _, err := f.session.group.Apply(record); err != nil {
-		f.t.Fatalf("apply removal: %v", err)
-	}
-	f.session.departures.wait()
+	f.applyAndSettle(f.signAs(signer, membership.Record{Kind: membership.KindRemove, Subject: mustDaemonNodeInfo(f.t, member), Timestamp: at}))
 }
 
-// countDepartures has the group report departures to a counter as well as
-// to the daemon, and returns the counter.
-func (f *replayFixture) countDepartures() *atomic.Int32 {
+// signAs has signer sign rec for the fixture's group, as its own node would.
+func (f *replayFixture) signAs(signer *keystore.Identity, rec membership.Record) membership.Record {
+	f.t.Helper()
+	rec.GroupID = f.gid
+	rec.Actor = mustDaemonNodeInfo(f.t, signer)
+	signed, err := membership.SignRecord(signer, rec)
+	if err != nil {
+		f.t.Fatalf("sign %s: %v", rec.Kind, err)
+	}
+	return signed
+}
+
+// applyAndSettle applies records here, in order, as pulled or pushed records
+// are, and waits for the daemon to reconcile its invites with the result.
+func (f *replayFixture) applyAndSettle(records ...membership.Record) {
+	f.t.Helper()
+	for _, rec := range records {
+		if _, err := f.session.group.Apply(rec); err != nil {
+			f.t.Fatalf("apply %s: %v", rec.Kind, err)
+		}
+	}
+	f.session.reconciler.wait()
+}
+
+// countChanges has the group count the changes it reports, still waking the
+// daemon's reconciler, and returns the counter. Every record the daemon signs
+// in response is a change too, so the count says whether it signed anything.
+func (f *replayFixture) countChanges() *atomic.Int32 {
 	var count atomic.Int32
-	queue := f.session.departures
-	f.session.group.SetDepartureHook(func(departed []membership.Departure) {
-		count.Add(int32(len(departed)))
-		queue.push(departed)
+	reconciler := f.session.reconciler
+	f.session.group.SetChangeHook(func() {
+		count.Add(1)
+		reconciler.signal()
 	})
 	return &count
+}
+
+// cannotRejoinButReinviteWorks is the outcome every removal case must end in:
+// none of the invites this node issued member before its removal readmits
+// it, and an invite issued to it now does.
+func (f *replayFixture) cannotRejoinButReinviteWorks(member *keystore.Identity, before ...entmoot.BootstrapCapability) {
+	f.t.Helper()
+	for _, capability := range before {
+		if f.admits(capability) {
+			f.t.Fatal("an invite issued before the removal still admits the removed member")
+		}
+		if f.joinNow(member, capability) {
+			f.t.Fatal("the removed member rejoined with an invite issued before its removal")
+		}
+	}
+	time.Sleep(5 * time.Millisecond)
+	reinvite := f.inviteTargeted(member)
+	f.session.reconciler.signal()
+	f.session.reconciler.wait()
+	if !f.admits(reinvite) || !f.joinNow(member, reinvite) {
+		f.t.Fatal("an invite issued after the removal does not readmit the member")
+	}
+	f.session.reconciler.wait()
+	if !f.session.group.IsMemberID(*mustDaemonNodeInfo(f.t, member).MemberID) {
+		f.t.Fatal("the readmitted member did not stay in")
+	}
 }
 
 // inviteTargeted has the daemon issue a single-use invite to member through
@@ -636,13 +678,13 @@ func TestOpenInviteRefreshSurvivesALostAnswerAndIsSealed(t *testing.T) {
 // with B through an exhausted link that member_remove reported as having
 // nothing outstanding.
 //
-// A removal signed on this node revokes B before it, so B never readmits. A
-// removal signed by another admin revokes B once this node has applied it, on
-// the session's departure worker with no maintenance round in between - but
-// that revocation is dated after
-// the removal, so a join with B dated between the two is still accepted until
-// the founder seals, as for any revoked invite. The last two cases pin that
-// residual down and show the seal closing it.
+// The join with A is a use of B's chain, so the daemon's invite worker revokes
+// B as soon as it has applied it. Any other live invite this node issued the
+// holder is revoked by a removal signed on this node before it, and by one
+// signed by another admin once this node has applied it - but that revocation
+// is dated after the removal, so a join with such an invite dated between the
+// two is still accepted until the founder seals, as for any revoked invite.
+// The last two cases pin that residual down and show the seal closing it.
 func TestOpenInviteReplacementCannotReadmitARemovedHolder(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -695,19 +737,20 @@ func TestOpenInviteReplacementCannotReadmitARemovedHolder(t *testing.T) {
 			if _, err := group.Apply(mustSignedJoinAt(t, f.gid, holder, replaced, joinAt)); err != nil || !group.IsMemberID(holderID) {
 				t.Fatalf("precondition: a join with the replaced capability dated before its revocation should land before the seal: %v", err)
 			}
-			if group.IsInviteRevoked(again.Capability.Nonce) {
-				t.Fatal("precondition: the replacement is live until the removal")
+			f.session.reconciler.wait()
+			if !group.IsInviteRevoked(again.Capability.Nonce) {
+				t.Fatal("a join with the replaced capability left its replacement live")
 			}
+			// Another invite this node issues the holder while it is in.
+			spare := f.inviteTargeted(holder)
 
 			var removedAt int64
 			if tc.elsewhere {
-				// The removal is applied before this node has run a round
-				// over the join, so only applying it can revoke B.
 				removedAt = time.Now().UnixMilli()
 				time.Sleep(10 * time.Millisecond)
 				f.removeAs(f.admin, holder, removedAt)
-				if !group.IsInviteRevoked(again.Capability.Nonce) {
-					t.Fatal("applying a removal signed elsewhere left the replacement live")
+				if !group.IsInviteRevoked(spare.Nonce) {
+					t.Fatal("applying a removal signed elsewhere left the member's invite live")
 				}
 			} else {
 				resp := f.removeMember(holder)
@@ -715,39 +758,39 @@ func TestOpenInviteReplacementCannotReadmitARemovedHolder(t *testing.T) {
 					t.Fatalf("member_remove reported outstanding invites: esp=%v open=%v (%s)",
 						resp.OutstandingESPOpenInvites, resp.OutstandingOpenInvites, resp.ESPOpenInvitesError)
 				}
-				if !group.IsInviteRevoked(again.Capability.Nonce) {
-					t.Fatal("member_remove left the replacement unrevoked")
+				if !group.IsInviteRevoked(spare.Nonce) {
+					t.Fatal("member_remove left the member's invite unrevoked")
 				}
 			}
 			if group.IsMemberID(holderID) {
 				t.Fatal("the holder is still a member after its removal")
 			}
-			if f.joinNow(holder, again.Capability) {
-				t.Fatal("the removed holder rejoined with the replacement")
+			if f.joinNow(holder, again.Capability) || f.joinNow(holder, spare) {
+				t.Fatal("the removed holder rejoined with an invite this node had issued it")
 			}
 			if f.admits(again.Capability) || f.useCount(link) != 1 {
 				t.Fatalf("the replacement still admits (use count %d)", f.useCount(link))
 			}
 
 			if tc.elsewhere {
-				// Dated after the removal and before B's revocation.
-				window := mustSignedJoinAt(t, f.gid, holder, again.Capability, removedAt+2)
+				// Dated after the removal and before the spare's revocation.
+				window := mustSignedJoinAt(t, f.gid, holder, spare, removedAt+2)
 				if tc.sealed {
 					due, ok := group.SealDue()
 					if !ok {
-						t.Fatal("B's revocation did not arm the founder's seal")
+						t.Fatal("the revocation did not arm the founder's seal")
 					}
 					if _, signed, err := group.SealThrough(f.founder, due); err != nil || !signed {
 						t.Fatalf("founder seal: signed=%t err=%v", signed, err)
 					}
 					if _, err := group.Apply(window); !errors.Is(err, membership.ErrStale) {
-						t.Fatalf("after the seal a join with the replacement dated inside the window was not refused as stale: %v (member=%t)",
+						t.Fatalf("after the seal a join with the revoked invite dated inside the window was not refused as stale: %v (member=%t)",
 							err, group.IsMemberID(holderID))
 					}
 					return
 				}
 				// The residual this PR does not close: until the founder
-				// seals, B's revocation is dated after the removal, so a join
+				// seals, the revocation is dated after the removal, so a join
 				// dated between them is accepted.
 				if _, err := group.Apply(window); err != nil || !group.IsMemberID(holderID) {
 					t.Fatalf("the documented pre-seal window changed: err=%v member=%t", err, group.IsMemberID(holderID))
@@ -803,10 +846,9 @@ func TestIneffectiveRemovalRevokesNoInvites(t *testing.T) {
 // TestRemovalThatChangesNothingRevokesNothing: once a member has been
 // removed, a later removal naming it - by a plain member, which the
 // projection ignores, or by an admin, of somebody no longer in the group -
-// takes nobody out. The issuing daemon used to judge such a record by the
-// subject's standing, already removed, and revoked the re-invite the founder
-// had issued since; a hostile member could repeat that at will and arm a seal
-// each time. Only a record that takes the member out revokes anything.
+// changes nothing, so the daemon signs nothing and the re-invite issued since
+// keeps working; a hostile member repeating such a record cannot use it
+// against the re-invite or to arm a seal.
 func TestRemovalThatChangesNothingRevokesNothing(t *testing.T) {
 	f := startReplayFixture(t, 40, true)
 	group := f.session.group
@@ -817,27 +859,32 @@ func TestRemovalThatChangesNothingRevokesNothing(t *testing.T) {
 	f.createInvite("link", time.Now().Add(time.Hour))
 	first, _ := f.redeemed("link", target)
 	mustJoinWithInvite(t, group, target, first.Capability)
+	spare := f.inviteTargeted(target)
 	f.removeMember(target)
-	if group.IsMemberID(targetID) {
-		t.Fatal("precondition: the founder removed the target")
+	f.session.reconciler.wait()
+	if group.IsMemberID(targetID) || !group.IsInviteRevoked(spare.Nonce) {
+		t.Fatal("precondition: the founder removed the target and revoked its invite")
 	}
+	time.Sleep(5 * time.Millisecond)
 	reinvite := f.inviteTargeted(target)
 	due, armed := group.SealDue()
+	changes := f.countChanges()
 
 	time.Sleep(5 * time.Millisecond)
 	f.removeAs(plain, target, time.Now().UnixMilli())
 	time.Sleep(5 * time.Millisecond)
 	f.removeAs(f.admin, target, time.Now().UnixMilli())
 
+	if n := changes.Load(); n != 2 {
+		t.Fatalf("two removals that changed nothing led to %d changes; the daemon signed %d record(s)", n, n-2)
+	}
 	if group.IsInviteRevoked(reinvite.Nonce) || !f.admits(reinvite) {
 		t.Fatal("a removal of somebody already removed revoked the re-invite issued since")
 	}
 	if gotDue, gotArmed := group.SealDue(); gotDue != due || gotArmed != armed {
 		t.Fatalf("a removal that changed nothing armed a seal: due %d/%t, was %d/%t", gotDue, gotArmed, due, armed)
 	}
-	if !f.joinNow(target, reinvite) {
-		t.Fatal("the re-invited member could not rejoin")
-	}
+	f.cannotRejoinButReinviteWorks(target, first.Capability, spare)
 }
 
 // TestIssuerRevokesInvitesOfAMemberRemovedInsideACheckpoint: an issuer that
@@ -877,32 +924,28 @@ func TestIssuerRevokesInvitesOfAMemberRemovedInsideACheckpoint(t *testing.T) {
 	if _, err := group.ApplyCheckpoint(folded); err != nil {
 		t.Fatalf("issuer adopts the admin's checkpoint: %v", err)
 	}
-	f.session.departures.wait()
+	f.session.reconciler.wait()
 	if group.Canonical().ID != folded.ID || group.IsMemberID(*targetInfo.MemberID) {
 		t.Fatal("precondition: the issuer adopted the checkpoint that removes the target")
 	}
-	if !group.IsInviteRevoked(spare.Nonce) || f.admits(spare) {
+	if !group.IsInviteRevoked(spare.Nonce) {
 		t.Fatal("a removal folded inside a checkpoint left the removed member's invite live")
 	}
-	if f.joinNow(target, spare) {
-		t.Fatal("the removed member rejoined with an invite the issuer had handed it")
-	}
+	f.cannotRejoinButReinviteWorks(target, spare)
 }
 
-// TestDepartureDuringALockedRevocationDoesNotDeadlock: a member removed by
+// TestLockedRevocationThatEndsAJoinDoesNotDeadlock: a member removed by
 // another admin rejoins with a join dated minutes ahead, with an invite this
 // node issued it after the removal. This node revokes that invite while it
 // holds lockESPInviteRoster, as a refresh or chain retirement does, and the
 // join lands between the moment SignRecord dates the revocation and the
 // moment it applies it - so the revocation comes before the join and takes
-// the member out again, on the goroutine that holds the lock. The departure
-// hook used to blame that on the old removal and take the same lock again,
-// wedging every invite and removal on the node for good. The test stands in
-// for that interleaving by applying, under the lock, a revocation this node
-// signed dated before the join it already holds. A revocation is no removal,
-// so it reports no departure, and departures are acted on by the session's
-// own worker anyway.
-func TestDepartureDuringALockedRevocationDoesNotDeadlock(t *testing.T) {
+// the member out again, on the goroutine that holds the lock. Acting on that
+// inline took the same lock again on the same goroutine and wedged every
+// invite and removal on the node. The change hook only wakes the session's
+// worker. The test stands in for that interleaving by applying, under the
+// lock, a revocation dated before a join this node already holds.
+func TestLockedRevocationThatEndsAJoinDoesNotDeadlock(t *testing.T) {
 	f := startReplayFixture(t, 42, true)
 	group := f.session.group
 	target := generateIdentity(t)
@@ -910,24 +953,20 @@ func TestDepartureDuringALockedRevocationDoesNotDeadlock(t *testing.T) {
 	f.createInvite("link", time.Now().Add(time.Hour))
 	first, _ := f.redeemed("link", target)
 	mustJoinWithInvite(t, group, target, first.Capability)
+	spare := f.inviteTargeted(target)
+	time.Sleep(5 * time.Millisecond)
 	f.removeAs(f.admin, target, time.Now().UnixMilli())
 	if group.IsMemberID(targetID) {
 		t.Fatal("precondition: the other admin removed the target")
 	}
+	time.Sleep(5 * time.Millisecond)
 	reinvite := f.inviteTargeted(target)
 	revokedAt := time.Now().UnixMilli()
 	ahead := mustSignedJoinAt(t, f.gid, target, reinvite, time.Now().Add(2*time.Minute).UnixMilli())
 	if _, err := group.Apply(ahead); err != nil || !group.IsMemberID(targetID) {
 		t.Fatalf("precondition: a join dated ahead with the re-invite should land: %v", err)
 	}
-	revocation, err := membership.SignRecord(f.founder, membership.Record{
-		GroupID: f.gid, Kind: membership.KindRevokeInvite, InviteNonce: reinvite.Nonce,
-		Actor: mustDaemonNodeInfo(t, f.founder), Timestamp: revokedAt,
-	})
-	if err != nil {
-		t.Fatalf("sign revocation: %v", err)
-	}
-	departures := f.countDepartures()
+	revocation := f.signAs(f.founder, membership.Record{Kind: membership.KindRevokeInvite, InviteNonce: reinvite.Nonce, Timestamp: revokedAt})
 
 	done := make(chan error, 1)
 	go func() {
@@ -942,25 +981,20 @@ func TestDepartureDuringALockedRevocationDoesNotDeadlock(t *testing.T) {
 			t.Fatalf("revoke: %v", err)
 		}
 	case <-time.After(10 * time.Second):
-		t.Fatal("a revocation signed under the roster lock never returned: the departure hook deadlocked on that lock")
+		t.Fatal("a revocation applied under the roster lock never returned: the change hook deadlocked on that lock")
 	}
+	f.session.reconciler.wait()
 	if group.IsMemberID(targetID) {
 		t.Fatal("precondition: the revocation dated before the join should take the member out again")
 	}
-	f.session.departures.wait()
-	if n := departures.Load(); n != 0 {
-		t.Fatalf("a revocation was reported as %d removal departure(s)", n)
-	}
-	// The roster lock is free again: another invite can be issued.
-	f.inviteTargeted(target)
+	f.cannotRejoinButReinviteWorks(target, first.Capability, spare)
 }
 
-// TestLeaveOrRekeyOfAReadmittedMemberIsNoDeparture: a member removed by
-// another admin, re-invited and readmitted, then leaves or moves to a new key.
-// Its earlier removal is still held, and the hook used to blame the departure
-// on it and revoke invites issued to the member since. Only a removal record
-// that takes a member out is a departure.
-func TestLeaveOrRekeyOfAReadmittedMemberIsNoDeparture(t *testing.T) {
+// TestLeaveOrRekeyOfAReadmittedMemberIsNoRemoval: a member removed by another
+// admin, re-invited and readmitted, then leaves or moves to a new key. Its
+// earlier removal is still held, but what ended its membership now is the
+// leave or rekey: it is not a removed member, and the daemon signs nothing.
+func TestLeaveOrRekeyOfAReadmittedMemberIsNoRemoval(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		seed byte
@@ -977,46 +1011,41 @@ func TestLeaveOrRekeyOfAReadmittedMemberIsNoDeparture(t *testing.T) {
 			f.createInvite("link", time.Now().Add(time.Hour))
 			first, _ := f.redeemed("link", member)
 			mustJoinWithInvite(t, group, member, first.Capability)
+			time.Sleep(5 * time.Millisecond)
 			f.removeAs(f.admin, member, time.Now().UnixMilli())
+			time.Sleep(5 * time.Millisecond)
 			if !f.joinNow(member, f.inviteTargeted(member)) {
 				t.Fatal("precondition: the re-invited member rejoins")
 			}
-			// Issued after the removal, but dated (InviteIssuedAtMS) before it.
 			spare := f.inviteTargeted(member)
-			departures := f.countDepartures()
+			f.session.reconciler.wait()
+			changes := f.countChanges()
 
 			time.Sleep(5 * time.Millisecond)
-			rec := membership.Record{GroupID: f.gid, Kind: tc.kind, Actor: info, Subject: info, Timestamp: time.Now().UnixMilli()}
+			rec := membership.Record{Kind: tc.kind, Subject: info, Timestamp: time.Now().UnixMilli()}
 			if tc.kind == membership.KindRekey {
 				rec.Subject = mustDaemonNodeInfo(t, generateIdentity(t))
 			}
-			signed, err := membership.SignRecord(member, rec)
-			if err != nil {
-				t.Fatalf("sign %s: %v", tc.kind, err)
+			f.applyAndSettle(f.signAs(member, rec))
+			if group.IsMemberID(*info.MemberID) {
+				t.Fatalf("precondition: the %s takes the member's identity out", tc.kind)
 			}
-			if _, err := group.Apply(signed); err != nil || group.IsMemberID(*info.MemberID) {
-				t.Fatalf("precondition: the %s takes the member's identity out: %v", tc.kind, err)
+			if _, removed := group.RemovedAt([]entmoot.MemberID{*info.MemberID})[*info.MemberID]; removed {
+				t.Fatalf("a member that ended its own membership by a %s is reported as removed", tc.kind)
 			}
-			f.session.departures.wait()
-			if n := departures.Load(); n != 0 {
-				t.Fatalf("a %s was reported as %d removal departure(s)", tc.kind, n)
-			}
-			if group.IsInviteRevoked(spare.Nonce) {
-				t.Fatalf("a %s revoked an invite issued to the member", tc.kind)
+			if n := changes.Load(); n != 1 || group.IsInviteRevoked(spare.Nonce) {
+				t.Fatalf("a %s led the daemon to sign %d record(s)", tc.kind, n-1)
 			}
 		})
 	}
 }
 
-// TestRemovalThatTakesEffectLaterIsADeparture: records arrive out of order.
-// This node receives an admin's removal of a member before the founder's
-// grant that made that admin one, so the removal is held but ineffective;
-// it takes the member out only when the grant arrives. The record applied
-// then is a policy, not a removal, and attributing departures to the applied
-// record reported nothing: the member kept the invites this node had issued
-// it and walked back in. The departure is the removal's, dated and signed as
-// it is, whatever record made it count.
-func TestRemovalThatTakesEffectLaterIsADeparture(t *testing.T) {
+// TestRemovalThatTakesEffectLaterRevokes: records arrive out of order. This
+// node receives an admin's removal of a member before the founder's grant
+// that made that admin one, so the removal is held but takes nobody out until
+// the grant arrives. The grant is a policy record, not a removal, and judging
+// by the record applied missed it: the member kept this node's invites.
+func TestRemovalThatTakesEffectLaterRevokes(t *testing.T) {
 	f := startReplayFixture(t, 46, true)
 	group := f.session.group
 	late, lateInfo := mustDaemonIdentity(t)
@@ -1026,64 +1055,109 @@ func TestRemovalThatTakesEffectLaterIsADeparture(t *testing.T) {
 	mustJoinWithInvite(t, group, target, f.inviteTargeted(target))
 	spare := f.inviteTargeted(target)
 
-	// The founder's grant, signed on another of its devices and not yet here.
 	time.Sleep(5 * time.Millisecond)
 	policy := group.Policy()
 	policy.Admins = withAdmin(policy.Admins, *lateInfo.MemberID)
-	grant, err := membership.SignRecord(f.founder, membership.Record{
-		GroupID: f.gid, Kind: membership.KindPolicy, Actor: mustDaemonNodeInfo(t, f.founder),
-		Policy: &policy, Timestamp: time.Now().UnixMilli(),
-	})
-	if err != nil {
-		t.Fatalf("sign grant: %v", err)
-	}
-	departures := f.countDepartures()
+	grant := f.signAs(f.founder, membership.Record{Kind: membership.KindPolicy, Policy: &policy, Timestamp: time.Now().UnixMilli()})
 	time.Sleep(5 * time.Millisecond)
-	removedAt := time.Now().UnixMilli()
-	f.removeAs(late, target, removedAt)
-	if !group.IsMemberID(targetID) || departures.Load() != 0 || group.IsInviteRevoked(spare.Nonce) {
+	f.removeAs(late, target, time.Now().UnixMilli())
+	if !group.IsMemberID(targetID) || group.IsInviteRevoked(spare.Nonce) {
 		t.Fatal("precondition: a removal by a member not yet admin takes nobody out")
 	}
 
-	if _, err := group.Apply(grant); err != nil {
-		t.Fatalf("apply grant: %v", err)
-	}
-	f.session.departures.wait()
+	f.applyAndSettle(grant)
 	if group.IsMemberID(targetID) {
 		t.Fatal("precondition: the grant makes the held removal take effect")
 	}
-	if n := departures.Load(); n != 1 {
-		t.Fatalf("the removal that took effect with the grant was reported as %d departure(s), want 1", n)
+	if !group.IsInviteRevoked(spare.Nonce) {
+		t.Fatal("the removal that took effect with the grant left the member's invite live")
 	}
-	if !group.IsInviteRevoked(spare.Nonce) || f.admits(spare) {
-		t.Fatal("the removed member's invite is still live")
+	f.cannotRejoinButReinviteWorks(target, spare)
+}
+
+// TestLeaveBeforeAnEarlierRemovalRevokes: a member's leave, dated after an
+// admin's removal of it, reaches this node first. The member is already gone
+// when the removal arrives, so diffing members before and after applying it
+// saw nothing. In the group's own order the removal comes first and ended the
+// membership, so the member is a removed one and loses this node's invites.
+func TestLeaveBeforeAnEarlierRemovalRevokes(t *testing.T) {
+	f := startReplayFixture(t, 47, true)
+	target := generateIdentity(t)
+	info := mustDaemonNodeInfo(t, target)
+	mustJoinWithInvite(t, f.session.group, target, f.inviteTargeted(target))
+	spare := f.inviteTargeted(target)
+	time.Sleep(5 * time.Millisecond)
+	removedAt := time.Now().UnixMilli()
+	removal := f.signAs(f.admin, membership.Record{Kind: membership.KindRemove, Subject: info, Timestamp: removedAt})
+	leave := f.signAs(target, membership.Record{Kind: membership.KindLeave, Subject: info, Timestamp: removedAt + 10})
+	time.Sleep(20 * time.Millisecond)
+
+	f.applyAndSettle(leave)
+	if f.session.group.IsInviteRevoked(spare.Nonce) {
+		t.Fatal("precondition: a leave alone revokes nothing")
 	}
-	if f.joinNow(target, spare) {
-		t.Fatal("the removed member rejoined with an invite this node had issued it")
+	f.applyAndSettle(removal)
+	if !f.session.group.IsInviteRevoked(spare.Nonce) {
+		t.Fatal("a removal that arrived after the member's later leave left its invite live")
+	}
+	f.cannotRejoinButReinviteWorks(target, spare)
+}
+
+// TestRevocationsDoNotDependOnArrivalOrder applies one set of records - the
+// founder's grant making a member admin, that admin's removal of another
+// member, and the removed member's later leave - in every order, each on a
+// fresh node, and checks every order ends with the same invites revoked.
+func TestRevocationsDoNotDependOnArrivalOrder(t *testing.T) {
+	orders := [][3]int{{0, 1, 2}, {0, 2, 1}, {1, 0, 2}, {1, 2, 0}, {2, 0, 1}, {2, 1, 0}}
+	for i, order := range orders {
+		t.Run(fmt.Sprint(order), func(t *testing.T) {
+			f := startReplayFixture(t, byte(50+i), true)
+			group := f.session.group
+			late, lateInfo := mustDaemonIdentity(t)
+			mustJoinWithInvite(t, group, late, f.inviteTargeted(late))
+			target := generateIdentity(t)
+			info := mustDaemonNodeInfo(t, target)
+			mustJoinWithInvite(t, group, target, f.inviteTargeted(target))
+			pre := f.inviteTargeted(target)
+			time.Sleep(5 * time.Millisecond)
+			start := time.Now().UnixMilli()
+			policy := group.Policy()
+			policy.Admins = withAdmin(policy.Admins, *lateInfo.MemberID)
+			records := [3]membership.Record{
+				f.signAs(f.founder, membership.Record{Kind: membership.KindPolicy, Policy: &policy, Timestamp: start}),
+				f.signAs(late, membership.Record{Kind: membership.KindRemove, Subject: info, Timestamp: start + 10}),
+				f.signAs(target, membership.Record{Kind: membership.KindLeave, Subject: info, Timestamp: start + 20}),
+			}
+			time.Sleep(40 * time.Millisecond)
+			post := f.inviteTargeted(target)
+			for _, k := range order {
+				f.applyAndSettle(records[k])
+			}
+			got := [3]bool{group.IsMemberID(*info.MemberID), group.IsInviteRevoked(pre.Nonce), group.IsInviteRevoked(post.Nonce)}
+			if want := [3]bool{false, true, false}; got != want {
+				t.Fatalf("member, pre-removal invite revoked, post-removal invite revoked = %v, want %v", got, want)
+			}
+			if at := group.RemovedAt([]entmoot.MemberID{*info.MemberID}); at[*info.MemberID] != start+10 {
+				t.Fatalf("removed at %v, want %d", at, start+10)
+			}
+			f.cannotRejoinButReinviteWorks(target, pre)
+		})
 	}
 }
 
-// TestDeparturesQueuedAtShutdownAreProcessed: departures wait in the
-// session's queue for its worker. Removing the group, as shutdown does, must
-// process what is queued before the group is closed, and a departure pushed
-// after that is dropped rather than blocking or panicking.
-func TestDeparturesQueuedAtShutdownAreProcessed(t *testing.T) {
+// TestInvitesOfARemovalQueuedAtShutdownAreRevoked: a removal applied just
+// before the group is removed, as at shutdown, is reconciled before the group
+// is closed, and a signal after that is a harmless no-op.
+func TestInvitesOfARemovalQueuedAtShutdownAreRevoked(t *testing.T) {
 	f := startReplayFixture(t, 45, true)
 	group := f.session.group
 	target := generateIdentity(t)
 	targetInfo := mustDaemonNodeInfo(t, target)
-	f.createInvite("link", time.Now().Add(time.Hour))
-	first, _ := f.redeemed("link", target)
-	mustJoinWithInvite(t, group, target, first.Capability)
+	mustJoinWithInvite(t, group, target, f.inviteTargeted(target))
 	spare := f.inviteTargeted(target)
-	removal, err := membership.SignRecord(f.admin, membership.Record{
-		GroupID: f.gid, Kind: membership.KindRemove,
-		Actor: mustDaemonNodeInfo(t, f.admin), Subject: targetInfo, Timestamp: time.Now().UnixMilli(),
-	})
-	if err != nil {
-		t.Fatalf("sign removal: %v", err)
-	}
-	queue := f.session.departures
+	time.Sleep(5 * time.Millisecond)
+	removal := f.signAs(f.admin, membership.Record{Kind: membership.KindRemove, Subject: targetInfo, Timestamp: time.Now().UnixMilli()})
+	reconciler := f.session.reconciler
 	if _, err := group.Apply(removal); err != nil {
 		t.Fatalf("apply removal: %v", err)
 	}
@@ -1096,11 +1170,11 @@ func TestDeparturesQueuedAtShutdownAreProcessed(t *testing.T) {
 	}
 	for _, record := range records {
 		if record.Nonce == spare.Nonce && record.RevokedAtMS == 0 {
-			t.Fatal("a departure queued at shutdown was dropped: the removed member's invite is still live")
+			t.Fatal("a removal applied at shutdown was not reconciled: the removed member's invite is still live")
 		}
 	}
-	queue.push([]membership.Departure{{Member: *targetInfo.MemberID, At: time.Now().UnixMilli()}})
-	queue.wait()
+	reconciler.signal()
+	reconciler.wait()
 }
 
 // TestOpenInviteReplayKeepsStoredBytesUnlessTheDaemonChecked covers an ESP

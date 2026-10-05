@@ -26,31 +26,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with the replaced capability dated before its revocation (or inside its
   window, if it had expired) is still accepted, as for any revoked invite.
   So that such a join is not easily turned into a way back in after a
-  removal, the issuing daemon also revokes every capability it issued to a
-  member when that member is removed or banned, if the removal takes effect.
-  A removal signed on the issuing node (`member_remove`, `roster remove`,
-  `roster ban`, which list them as `revoked_invites`) revokes them first, so
-  they cannot readmit the member. A removal signed by another admin's node is
-  followed by these revocations once the issuing node has applied it, whether
-  as a record or folded into a checkpoint (a session worker does it right
-  after, never on the goroutine that applied it), which leaves a window: a join with
-  such a capability dated between the removal and the revocation is accepted
-  until the founder seals the revocation. It is triggered whenever applying a
-  record or checkpoint takes a member out and what ended its membership is a
-  removal or ban that had not already ended it - including a removal that
-  only takes effect once a later record, such as the grant that made its
-  signer an admin, arrives - not a leave, a rekey, or a revocation that
-  invalidates a join, and only for invites issued no later than that removal.
-  A removal of somebody already gone, or one its signer had no authority for,
-  revokes nothing, so it cannot be used against a re-invite. A member that
-  left of its own accord inside a checkpoint the node adopts without the
-  records cannot be told from a removed one, and has its invites revoked too.
-  The issuing
-  daemon also revokes the rest of a replacement chain on the first maintenance
-  round after any capability in it has been used. The daemon links each
-  replacement to the capability it replaced, so a redeemer whose answer was
-  lost is handed that replacement on its next try rather than being left with
-  a revoked one, and the daemon signs at most once per change.
+  removal, each daemon keeps the invites it issued in line with the group's
+  membership: whenever it applies a record or checkpoint, and once per
+  maintenance round, a per-group worker revokes every live invite it issued to
+  somebody who is not a member and whose latest membership a removal or ban
+  ended - in the group's own order, so the order records arrive in does not
+  matter - if the invite was minted no later than that removal; and every
+  unused capability in a replacement chain once one in it has been used.
+  Re-invites minted after a removal, a member readmitted since, and a member
+  that left or rekeyed are never touched, so a repeated or ineffective
+  removal signs nothing. A removal signed on the issuing node (`member_remove`,
+  `roster remove`, `roster ban`, which list them as `revoked_invites`) revokes
+  them first, so they cannot readmit the member. A removal signed by another
+  admin's node is followed by these revocations once the issuing node holds
+  it, which leaves a window: a join with such an invite dated between the
+  removal and the revocation is accepted until the founder seals the
+  revocation. A member that left of its own accord inside a checkpoint the
+  node adopts without the records cannot be told from a removed one, and has
+  its invites revoked too. The daemon links each replacement to the
+  capability it replaced, so a redeemer whose answer was lost is handed that
+  replacement on its next try rather than being left with a revoked one, and
+  the daemon signs at most once per change.
   The ESP accepts a replacement only from a daemon that answers
   `refresh_status: "replaced"`. With a daemon that predates `invite_refresh`
   (for example after restarting only `entmootd esp`), it keeps returning the
