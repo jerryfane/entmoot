@@ -170,4 +170,18 @@ func TestServeWithoutUnixSocketsUsesAuthenticatedTCPControl(t *testing.T) {
 	if stdout, stderr, err := run("publish", "-topic", "unix/denied", "-content", "after restart"); err != nil || !strings.Contains(stdout, `"message_id"`) {
 		t.Fatalf("plain publish after restart: %v\n%s%s", err, stdout, stderr)
 	}
+
+	// A group created while the daemon runs is started in it over the same
+	// tcp control endpoint, and the daemon then publishes to it.
+	stdout, stderr, err := run("group", "create", "-name", "unix-denied-second", "-json")
+	var second struct {
+		GroupID          string `json:"group_id"`
+		DaemonActivation string `json:"daemon_activation"`
+	}
+	if err != nil || json.Unmarshal([]byte(stdout), &second) != nil || second.DaemonActivation != "activated" {
+		t.Fatalf("group create under the tcp-control daemon: %v %+v\n%s%s", err, second, stdout, stderr)
+	}
+	if stdout, stderr, err := run("publish", "-group", second.GroupID, "-topic", "unix/denied", "-content", "new group"); err != nil || !strings.Contains(stdout, `"message_id"`) {
+		t.Fatalf("publish to the new group: %v\n%s%s", err, stdout, stderr)
+	}
 }

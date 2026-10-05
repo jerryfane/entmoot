@@ -260,6 +260,11 @@ func cmdMembershipAdopt(gf *globalFlags, args []string) int {
 	}
 	if membership.Exists(s.dataDir, gid) {
 		fmt.Fprintf(os.Stderr, "membership adopt: group %s already holds a checkpoint\n", gid.String())
+		// A daemon that was running when it was adopted may not have started
+		// it; rerunning the command starts it.
+		if activation, _ := reportGroupActivation("membership adopt", s.dataDir, gid); activation == daemonActivationActivated {
+			fmt.Fprintf(os.Stderr, "membership adopt: running daemon serves group %s\n", gid.String())
+		}
 		return exitOK
 	}
 	if err := persistGroupPeer(s.dataDir, gid, *info); err != nil {
@@ -296,18 +301,23 @@ func cmdMembershipAdopt(gf *globalFlags, args []string) int {
 		fmt.Fprintf(os.Stderr, "membership adopt: %s served no checkpoint for this group; run `membership upgrade` on the founder first\n", info.ID.String())
 		return exitGroupNotFound
 	}
+	// The running daemon stops polling a group once it holds a checkpoint,
+	// whoever adopted it: start it there now. Release this command's host first.
+	_ = host.Close()
+	activation, code := reportGroupActivation("membership adopt", s.dataDir, gid)
 	data, err := json.Marshal(map[string]any{
-		"status":     "adopted",
-		"group_id":   gid,
-		"checkpoint": checkpoint.ID,
-		"sequence":   checkpoint.Sequence,
-		"members":    len(checkpoint.Members),
-		"peer_id":    info.ID.String(),
+		"status":            "adopted",
+		"group_id":          gid,
+		"checkpoint":        checkpoint.ID,
+		"sequence":          checkpoint.Sequence,
+		"members":           len(checkpoint.Members),
+		"peer_id":           info.ID.String(),
+		"daemon_activation": activation,
 	})
 	if err != nil {
 		slog.Error("membership adopt: marshal", slog.String("err", err.Error()))
 		return exitTransport
 	}
 	fmt.Println(string(data))
-	return exitOK
+	return code
 }

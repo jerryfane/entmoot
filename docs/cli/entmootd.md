@@ -69,6 +69,10 @@ local daemon before running them. `roster status`, `roster admin list` and
 one named peer for a node the automatic path cannot reach - but it brings up
 its own libp2p host on the configured listen port, so the local daemon has to
 be stopped for it too. It is a no-op once the group holds a checkpoint.
+Both membership commands report `daemon_activation`. When this node's daemon
+is running anyway, they start the group in it (`activated`), because the
+daemon stops polling a group once it holds a checkpoint; otherwise it is
+`daemon_not_running` and the next `serve` starts the group.
 See [Founder Commands](./founder-commands.md).
 
 Public listing, open invites, ESP membership, and message-history indexing are
