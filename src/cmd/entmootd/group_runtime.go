@@ -105,6 +105,9 @@ type groupSession struct {
 	// members: the first member the previous round ran out of time before
 	// asking, so every member is asked within a few rounds however many hang.
 	pullOffset atomic.Int64
+	// departures carries members the group's records and checkpoints took
+	// out to processDepartures, which revokes the invites issued to them.
+	departures *departureQueue
 }
 
 // sealState is the sealer's progress on sealing authority changes (see
@@ -336,7 +339,8 @@ func (r *groupRuntime) AddLocalGroup(ctx context.Context, groupID entmoot.GroupI
 		return nil, false, err
 	}
 	group.SetLogger(r.logger)
-	group.SetDepartureHook(func(departed []membership.Departure) { r.revokeInvitesOfDeparted(group, departed) })
+	departures := newDepartureQueue()
+	group.SetDepartureHook(departures.push)
 	if err := r.validateLocalMembership(group); err != nil {
 		_ = group.Close()
 		return nil, false, err
@@ -371,7 +375,7 @@ func (r *groupRuntime) AddLocalGroup(ctx context.Context, groupID entmoot.GroupI
 	}
 	session := &groupSession{
 		groupID: groupID, group: group, live: live, legacyHistory: legacyHistory, cancel: cancel,
-		peerRecords: libp2ptransport.NewPeerRecordCache(),
+		peerRecords: libp2ptransport.NewPeerRecordCache(), departures: departures,
 	}
 	r.mu.Lock()
 	if r.closed {
@@ -383,6 +387,7 @@ func (r *groupRuntime) AddLocalGroup(ctx context.Context, groupID entmoot.GroupI
 	}
 	r.sessions[groupID] = session
 	r.mu.Unlock()
+	go r.processDepartures(session)
 	go r.maintainGroup(sessionCtx, session)
 	return session, true, nil
 }
@@ -536,6 +541,7 @@ func (r *groupRuntime) RemoveGroup(groupID entmoot.GroupID) bool {
 	if ok {
 		session.cancel()
 		_ = session.live.Close()
+		session.departures.close()
 		_ = session.group.Close()
 	}
 	return ok
@@ -785,8 +791,9 @@ func (r *groupRuntime) syncMembership(ctx context.Context, session *groupSession
 // revoked when the replacement is handed out, but a join with it dated before
 // that revocation is accepted until the founder seals it. This revokes the
 // rest of the chain on the round after such a join reaches this node; a
-// removal of its holder revokes them as soon as this node applies it (see
-// revokeInvitesOfDeparted). Neither is final before the seal. It runs
+// removal of its holder revokes them once this node has applied it, on the
+// session's departure worker (see revokeInvitesOfDeparted), without waiting for
+// a round. Neither is final before the seal. It runs
 // only where this node may revoke.
 func (r *groupRuntime) retireUsedReplacementChains(session *groupSession) {
 	if r.invites == nil || r.identity == nil || !session.group.CanAdminister(r.binding.MemberID) {
@@ -825,15 +832,132 @@ func (r *groupRuntime) retireUsedReplacementChains(session *groupSession) {
 	}
 }
 
-// revokeInvitesOfDeparted is the group's departure hook. When applying a
-// record or checkpoint - pulled, pushed, or a seal - takes a member out of
-// the group by a removal or ban signed elsewhere, it revokes every capability
-// this node issued to that member, issued no later than the removal, that
-// could still admit it, before Apply returns: so a replacement an ESP open
-// invite handed that member is not left live until a maintenance round, and
-// an invite issued after the removal - a re-invite - is never touched. Only a
-// record that changed the member's standing counts: a removal of somebody
-// already gone, or one its signer had no authority for, takes nobody out and
+// departureQueue carries departures (see membership.Group.SetDepartureHook)
+// from the goroutine that applied a record or checkpoint to the session's own
+// worker, processDepartures. Acting on them inline is not safe: the applying
+// goroutine may be a pull, a push, or a caller that holds lockESPInviteRoster
+// while it signs a revocation, and revoking takes that lock. push never
+// blocks, and pending departures are kept one per member, so the queue holds
+// at most as many entries as the group has had members.
+type departureQueue struct {
+	mu      sync.Mutex
+	idle    *sync.Cond
+	pending map[entmoot.MemberID]membership.Departure
+	busy    bool
+	closed  bool
+	wake    chan struct{}
+	done    chan struct{}
+}
+
+func newDepartureQueue() *departureQueue {
+	q := &departureQueue{
+		pending: make(map[entmoot.MemberID]membership.Departure),
+		wake:    make(chan struct{}, 1),
+		done:    make(chan struct{}),
+	}
+	q.idle = sync.NewCond(&q.mu)
+	return q
+}
+
+// push queues departed. A member already waiting keeps its latest removal,
+// which covers every invite the earlier one would.
+func (q *departureQueue) push(departed []membership.Departure) {
+	q.mu.Lock()
+	if q.closed {
+		q.mu.Unlock()
+		return
+	}
+	for _, departure := range departed {
+		if waiting, ok := q.pending[departure.Member]; ok && waiting.At >= departure.At {
+			continue
+		}
+		q.pending[departure.Member] = departure
+	}
+	q.mu.Unlock()
+	select {
+	case q.wake <- struct{}{}:
+	default:
+	}
+}
+
+// take waits for queued departures and hands them all over. It reports false
+// once the queue is closed and nothing is left.
+func (q *departureQueue) take() ([]membership.Departure, bool) {
+	for {
+		q.mu.Lock()
+		if len(q.pending) > 0 {
+			batch := make([]membership.Departure, 0, len(q.pending))
+			for _, departure := range q.pending {
+				batch = append(batch, departure)
+			}
+			clear(q.pending)
+			q.busy = true
+			q.mu.Unlock()
+			return batch, true
+		}
+		closed := q.closed
+		q.mu.Unlock()
+		if closed {
+			return nil, false
+		}
+		<-q.wake
+	}
+}
+
+// processed marks the batch take handed over as done.
+func (q *departureQueue) processed() {
+	q.mu.Lock()
+	q.busy = false
+	q.idle.Broadcast()
+	q.mu.Unlock()
+}
+
+// wait blocks until every departure pushed so far has been processed.
+func (q *departureQueue) wait() {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for len(q.pending) > 0 || q.busy {
+		q.idle.Wait()
+	}
+}
+
+// close stops accepting departures and waits for the worker to process those
+// already queued, so a group is not closed under it.
+func (q *departureQueue) close() {
+	q.mu.Lock()
+	q.closed = true
+	q.mu.Unlock()
+	select {
+	case q.wake <- struct{}{}:
+	default:
+	}
+	<-q.done
+}
+
+// processDepartures is the session's departure worker; it runs until the
+// queue is closed, then processes what is left and returns.
+func (r *groupRuntime) processDepartures(session *groupSession) {
+	queue := session.departures
+	defer close(queue.done)
+	for {
+		batch, ok := queue.take()
+		if !ok {
+			return
+		}
+		r.revokeInvitesOfDeparted(session.group, batch)
+		queue.processed()
+	}
+}
+
+// revokeInvitesOfDeparted acts on departures from the session's queue. When
+// applying a record or checkpoint - pulled, pushed, or a seal - took a member
+// out of the group by a removal or ban signed elsewhere, it revokes every
+// capability this node issued to that member, issued no later than the
+// removal, that could still admit it: so a replacement an ESP open invite
+// handed that member is not left live until a maintenance round, and an
+// invite issued after the removal - a re-invite - is never touched. Only a
+// removal record that took the member out counts (see SetDepartureHook): a
+// removal of somebody already gone, or one its signer had no authority for,
 // revokes nothing, so repeating it cannot be used against a re-invite.
 //
 // A removal signed here needs nothing: every local path revokes before it
@@ -1355,6 +1479,7 @@ func (r *groupRuntime) Close() {
 	for _, session := range sessions {
 		session.cancel()
 		_ = session.live.Close()
+		session.departures.close()
 		_ = session.group.Close()
 	}
 	_ = r.liveRouter.Close()
