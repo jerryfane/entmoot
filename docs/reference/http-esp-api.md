@@ -333,8 +333,11 @@ Public open-invite issuer endpoints:
   removal or ban takes effect. A removal signed on the issuing node revokes
   them before it, so they cannot readmit the member. A removal signed on
   another admin's node is followed by the revocations when the issuer applies
-  it, so a join with one of those invites dated between the removal and the
-  revocation is accepted until the founder seals. If
+  it, as a record or folded into a checkpoint, so a join with one of those
+  invites dated between the removal and the revocation is accepted until the
+  founder seals. Only a removal that actually takes the member out revokes,
+  and only invites issued no later than it, so a re-invite is never touched.
+  If
   the answer carrying a replacement is lost, the next replay is handed that
   same replacement. Revoked or expired open invites refuse replays.
 

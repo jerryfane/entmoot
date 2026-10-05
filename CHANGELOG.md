@@ -31,9 +31,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A removal signed on the issuing node (`member_remove`, `roster remove`,
   `roster ban`, which list them as `revoked_invites`) revokes them first, so
   they cannot readmit the member. A removal signed by another admin's node is
-  followed by these revocations when the issuing node applies it, which leaves
-  a window: a join with such a capability dated between the removal and the
-  revocation is accepted until the founder seals the revocation. The issuing
+  followed by these revocations when the issuing node applies it, whether as
+  a record or folded into a checkpoint, which leaves a window: a join with
+  such a capability dated between the removal and the revocation is accepted
+  until the founder seals the revocation. Only a record or checkpoint that
+  actually takes the member out triggers this, and only for invites issued no
+  later than the removal: a removal of somebody already gone, or one its
+  signer had no authority for, revokes nothing, so it cannot be used against a
+  re-invite. A member that left of its own accord inside a checkpoint the node
+  adopts without the records cannot be told from a removed one, and has its
+  invites revoked too. The issuing
   daemon also revokes the rest of a replacement chain on the first maintenance
   round after any capability in it has been used. The daemon links each
   replacement to the capability it replaced, so a redeemer whose answer was

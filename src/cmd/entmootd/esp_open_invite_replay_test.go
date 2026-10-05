@@ -328,13 +328,13 @@ func (f *replayFixture) joinNow(member *keystore.Identity, capability entmoot.Bo
 	return f.session.group.IsMemberID(*mustDaemonNodeInfo(f.t, member).MemberID)
 }
 
-// removeElsewhere has the fixture's other admin sign member's removal, dated
-// at, and this node apply it as it applies a pulled or pushed record.
-func (f *replayFixture) removeElsewhere(member *keystore.Identity, at int64) {
+// removeAs has signer sign member's removal, dated at, and this node apply it
+// as it applies a pulled or pushed record.
+func (f *replayFixture) removeAs(signer, member *keystore.Identity, at int64) {
 	f.t.Helper()
-	record, err := membership.SignRecord(f.admin, membership.Record{
+	record, err := membership.SignRecord(signer, membership.Record{
 		GroupID: f.gid, Kind: membership.KindRemove,
-		Actor: mustDaemonNodeInfo(f.t, f.admin), Subject: mustDaemonNodeInfo(f.t, member), Timestamp: at,
+		Actor: mustDaemonNodeInfo(f.t, signer), Subject: mustDaemonNodeInfo(f.t, member), Timestamp: at,
 	})
 	if err != nil {
 		f.t.Fatalf("sign removal: %v", err)
@@ -342,6 +342,24 @@ func (f *replayFixture) removeElsewhere(member *keystore.Identity, at int64) {
 	if _, err := f.session.group.Apply(record); err != nil {
 		f.t.Fatalf("apply removal: %v", err)
 	}
+}
+
+// inviteTargeted has the daemon issue a single-use invite to member through
+// invite_create, so it is in the node's invite ledger.
+func (f *replayFixture) inviteTargeted(member *keystore.Identity) entmoot.BootstrapCapability {
+	f.t.Helper()
+	client, daemon := net.Pipe()
+	go func() {
+		defer daemon.Close()
+		f.server.handleInviteCreate(f.ctx, daemon, &ipc.InviteCreateReq{GroupID: f.gid, TargetPublicKey: member.PublicKey, MaxUses: 1})
+	}()
+	_, decoded, err := ipc.ReadAndDecode(client)
+	_ = client.Close()
+	created, ok := decoded.(*ipc.InviteCreateResp)
+	if err != nil || !ok {
+		f.t.Fatalf("invite_create: %#v %v", decoded, err)
+	}
+	return created.Capability
 }
 
 func hasWebSocket(capability entmoot.BootstrapCapability) bool {
@@ -672,7 +690,7 @@ func TestOpenInviteReplacementCannotReadmitARemovedHolder(t *testing.T) {
 				// over the join, so only applying it can revoke B.
 				removedAt = time.Now().UnixMilli()
 				time.Sleep(10 * time.Millisecond)
-				f.removeElsewhere(holder, removedAt)
+				f.removeAs(f.admin, holder, removedAt)
 				if !group.IsInviteRevoked(again.Capability.Nonce) {
 					t.Fatal("applying a removal signed elsewhere left the replacement live")
 				}
@@ -744,18 +762,7 @@ func TestIneffectiveRemovalRevokesNoInvites(t *testing.T) {
 	first, _ := f.redeemed("link", target)
 	mustJoinWithInvite(t, group, target, first.Capability)
 	// A second capability this node issued to the target, still live.
-	client, daemon := net.Pipe()
-	go func() {
-		defer daemon.Close()
-		f.server.handleInviteCreate(f.ctx, daemon, &ipc.InviteCreateReq{GroupID: f.gid, TargetPublicKey: target.PublicKey, MaxUses: 1})
-	}()
-	_, decoded, err := ipc.ReadAndDecode(client)
-	_ = client.Close()
-	created, ok := decoded.(*ipc.InviteCreateResp)
-	if err != nil || !ok {
-		t.Fatalf("invite_create: %#v %v", decoded, err)
-	}
-	spare := created.Capability
+	spare := f.inviteTargeted(target)
 	policy := group.Policy()
 	policy.Admins = withAdmin(policy.Admins, targetID)
 	if _, err := group.SignRecord(f.founder, membership.Record{Kind: membership.KindPolicy, Policy: &policy}); err != nil {
@@ -769,12 +776,100 @@ func TestIneffectiveRemovalRevokesNoInvites(t *testing.T) {
 		t.Fatalf("revoked %d invites ahead of an ineffective removal (err %v)", len(revoked), err)
 	}
 	time.Sleep(5 * time.Millisecond)
-	f.removeElsewhere(target, time.Now().UnixMilli())
+	f.removeAs(f.admin, target, time.Now().UnixMilli())
 	if !group.IsMemberID(targetID) {
 		t.Fatal("precondition: an admin cannot remove a peer admin")
 	}
 	if group.IsInviteRevoked(spare.Nonce) || !f.admits(spare) {
 		t.Fatal("applying an ineffective removal revoked the target's invite")
+	}
+}
+
+// TestRemovalThatChangesNothingRevokesNothing: once a member has been
+// removed, a later removal naming it - by a plain member, which the
+// projection ignores, or by an admin, of somebody no longer in the group -
+// takes nobody out. The issuing daemon used to judge such a record by the
+// subject's standing, already removed, and revoked the re-invite the founder
+// had issued since; a hostile member could repeat that at will and arm a seal
+// each time. Only a record that takes the member out revokes anything.
+func TestRemovalThatChangesNothingRevokesNothing(t *testing.T) {
+	f := startReplayFixture(t, 40, true)
+	group := f.session.group
+	plain, plainInfo := mustDaemonIdentity(t)
+	mustJoinWithInvite(t, group, plain, mustDaemonInvite(t, group, f.founder, plainInfo, 1))
+	target := generateIdentity(t)
+	targetID := *mustDaemonNodeInfo(t, target).MemberID
+	f.createInvite("link", time.Now().Add(time.Hour))
+	first, _ := f.redeemed("link", target)
+	mustJoinWithInvite(t, group, target, first.Capability)
+	f.removeMember(target)
+	if group.IsMemberID(targetID) {
+		t.Fatal("precondition: the founder removed the target")
+	}
+	reinvite := f.inviteTargeted(target)
+	due, armed := group.SealDue()
+
+	time.Sleep(5 * time.Millisecond)
+	f.removeAs(plain, target, time.Now().UnixMilli())
+	time.Sleep(5 * time.Millisecond)
+	f.removeAs(f.admin, target, time.Now().UnixMilli())
+
+	if group.IsInviteRevoked(reinvite.Nonce) || !f.admits(reinvite) {
+		t.Fatal("a removal of somebody already removed revoked the re-invite issued since")
+	}
+	if gotDue, gotArmed := group.SealDue(); gotDue != due || gotArmed != armed {
+		t.Fatalf("a removal that changed nothing armed a seal: due %d/%t, was %d/%t", gotDue, gotArmed, due, armed)
+	}
+	if !f.joinNow(target, reinvite) {
+		t.Fatal("the re-invited member could not rejoin")
+	}
+}
+
+// TestIssuerRevokesInvitesOfAMemberRemovedInsideACheckpoint: an issuer that
+// lagged receives a removal only folded inside a checkpoint another admin
+// signed, never the record. Adopting that checkpoint takes the member out all
+// the same, so the issuer must revoke the live invites it issued to it.
+func TestIssuerRevokesInvitesOfAMemberRemovedInsideACheckpoint(t *testing.T) {
+	f := startReplayFixture(t, 41, true)
+	group := f.session.group
+	target := generateIdentity(t)
+	targetInfo := mustDaemonNodeInfo(t, target)
+	f.createInvite("link", time.Now().Add(time.Hour))
+	first, _ := f.redeemed("link", target)
+	mustJoinWithInvite(t, group, target, first.Capability)
+	spare := f.inviteTargeted(target)
+	// Two checkpoints, so the join is behind the window the next one covers
+	// and the issuer holds no record of its own to check that one against.
+	for range 2 {
+		if _, signed, err := group.SignCheckpoint(f.founder, true); err != nil || !signed {
+			t.Fatalf("checkpoint: signed=%t err=%v", signed, err)
+		}
+	}
+	adminGroup, err := membership.Adopt(t.TempDir(), group.Canonical())
+	if err != nil {
+		t.Fatalf("admin adopts: %v", err)
+	}
+	defer mustCloseGroup(t, adminGroup)
+	time.Sleep(5 * time.Millisecond)
+	if _, err := adminGroup.SignRecord(f.admin, membership.Record{Kind: membership.KindRemove, Subject: targetInfo}); err != nil {
+		t.Fatalf("admin removes: %v", err)
+	}
+	folded, signed, err := adminGroup.SignCheckpoint(f.admin, true)
+	if err != nil || !signed {
+		t.Fatalf("admin checkpoint: signed=%t err=%v", signed, err)
+	}
+
+	if _, err := group.ApplyCheckpoint(folded); err != nil {
+		t.Fatalf("issuer adopts the admin's checkpoint: %v", err)
+	}
+	if group.Canonical().ID != folded.ID || group.IsMemberID(*targetInfo.MemberID) {
+		t.Fatal("precondition: the issuer adopted the checkpoint that removes the target")
+	}
+	if !group.IsInviteRevoked(spare.Nonce) || f.admits(spare) {
+		t.Fatal("a removal folded inside a checkpoint left the removed member's invite live")
+	}
+	if f.joinNow(target, spare) {
+		t.Fatal("the removed member rejoined with an invite the issuer had handed it")
 	}
 }
 

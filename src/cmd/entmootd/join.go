@@ -1699,9 +1699,11 @@ func revokeIssuedInvites(identity *keystore.Identity, group *membership.Group, l
 // it first (revokeInvitesForRemoval): a join with one of these dated after
 // the revocation is refused, and one dated before it is dated before the
 // removal too, so the removal still applies after it. A removal signed on
-// another node can only be followed by it (revokeInvitesOfRemovedMember),
-// which leaves a window until the founder seals.
-func revokeInvitesTargeting(identity *keystore.Identity, group *membership.Group, ledger *libp2ptransport.InviteLedger, target entmoot.MemberID) ([][32]byte, error) {
+// another node can only be followed by it (revokeInvitesOfDeparted), which
+// leaves a window until the founder seals. issuedBy, when not zero, spares
+// invites issued after it, so revoking for a removal dated issuedBy never
+// touches a re-invite issued since.
+func revokeInvitesTargeting(identity *keystore.Identity, group *membership.Group, ledger *libp2ptransport.InviteLedger, target entmoot.MemberID, issuedBy int64) ([][32]byte, error) {
 	gid := group.GroupID()
 	issued, err := ledger.ListInvites(&gid)
 	if err != nil {
@@ -1711,6 +1713,7 @@ func revokeInvitesTargeting(identity *keystore.Identity, group *membership.Group
 	var nonces [][32]byte
 	for _, record := range issued {
 		if record.TargetMemberID == nil || *record.TargetMemberID != target ||
+			(issuedBy != 0 && record.IssuedAtMS > issuedBy) ||
 			(record.ExpiresAtMS > 0 && record.ExpiresAtMS <= nowMS) ||
 			(record.MaxUses > 0 && group.InviteUses(record.Nonce) >= record.MaxUses) {
 			continue
@@ -1728,7 +1731,7 @@ func revokeInvitesForRemoval(identity *keystore.Identity, actor entmoot.MemberID
 	if !group.RemovalTakesEffect(actor, target) {
 		return nil, nil
 	}
-	return revokeInvitesTargeting(identity, group, ledger, target)
+	return revokeInvitesTargeting(identity, group, ledger, target, 0)
 }
 
 func encodeInviteNonces(nonces [][32]byte) []string {

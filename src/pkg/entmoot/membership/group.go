@@ -77,10 +77,10 @@ type Group struct {
 	legacy      *LegacyChain
 	now         func() time.Time
 	logger      *slog.Logger
-	// onApplied, if set, is called with each record Apply stores, after the
-	// group's lock is released (see SetApplyHook).
-	onApplied func(Record)
-	closeOnce sync.Once
+	// onDeparted, if set, is called with the members an Apply or
+	// ApplyCheckpoint took out of the group (see SetDepartureHook).
+	onDeparted func([]Departure)
+	closeOnce  sync.Once
 }
 
 // Open loads a group's membership store. A group that still has only the
@@ -319,15 +319,91 @@ func (g *Group) SetLogger(logger *slog.Logger) {
 	}
 }
 
-// SetApplyHook sets a function called with every record Apply stores -
-// pulled, pushed, or signed here through SignRecord - once it is stored and
-// projected and the group's lock is released, so the hook may read the group
-// and sign records of its own. It runs on the applying goroutine, before
-// Apply returns.
-func (g *Group) SetApplyHook(hook func(Record)) {
+// Departure is a member that applying one record or checkpoint took out of
+// the group, by a removal or ban.
+type Departure struct {
+	Member entmoot.MemberID
+	// At is the timestamp of the removal that took the member out. When the
+	// removal arrived folded into a checkpoint, so this node never held the
+	// record, it is that checkpoint's timestamp: the removal is no later.
+	At int64
+	// Actor signed the removal; nil when it arrived folded into a checkpoint.
+	Actor *entmoot.MemberID
+	// Banned reports the member is banned now.
+	Banned bool
+}
+
+// SetDepartureHook sets a function called with the members that applying one
+// record (Apply, so also SignRecord) or one checkpoint (ApplyCheckpoint) took
+// out of the group by a removal or ban: members before it, not after it. A
+// record that changes nothing - a removal of somebody already gone, or one
+// its signer had no authority for - reports nobody. A member that left of
+// its own accord is not reported when its leave record is held; one that left
+// inside a checkpoint this node adopts without the records cannot be told
+// from a removed one, and is reported. The hook runs once the group's lock is
+// released, so it may read the group and sign records, on the applying
+// goroutine before Apply or ApplyCheckpoint returns.
+func (g *Group) SetDepartureHook(hook func([]Departure)) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	g.onApplied = hook
+	g.onDeparted = hook
+}
+
+// memberSetLocked copies the current members.
+func (g *Group) memberSetLocked() map[entmoot.MemberID]struct{} {
+	members := make(map[entmoot.MemberID]struct{}, len(g.state.Members))
+	for id := range g.state.Members {
+		members[id] = struct{}{}
+	}
+	return members
+}
+
+// departedSinceLocked lists the members of before that are no longer members.
+func (g *Group) departedSinceLocked(before map[entmoot.MemberID]struct{}) []entmoot.MemberID {
+	var departed []entmoot.MemberID
+	for id := range before {
+		if _, still := g.state.Members[id]; !still {
+			departed = append(departed, id)
+		}
+	}
+	return departed
+}
+
+// reportDepartures hands departed to the departure hook, each with the
+// removal that took it out. folded is the timestamp of the checkpoint the
+// departures arrived in, or zero for a record.
+func (g *Group) reportDepartures(departed []entmoot.MemberID, folded int64) {
+	g.mu.RLock()
+	hook := g.onDeparted
+	g.mu.RUnlock()
+	if hook == nil || len(departed) == 0 {
+		return
+	}
+	var out []Departure
+	for _, id := range departed {
+		departure := Departure{Member: id, Banned: g.IsBanned(id)}
+		proof, held := g.RemovalProof(id)
+		for i := len(proof) - 1; held && i >= 0; i-- {
+			if subject, err := proof[i].SubjectMemberID(); proof[i].Kind == KindRemove && err == nil && subject == id {
+				departure.At = proof[i].Timestamp
+				if actor, err := entmoot.ResolvedMemberID(proof[i].Actor); err == nil {
+					departure.Actor = &actor
+				}
+				break
+			}
+		}
+		switch {
+		case departure.At != 0:
+		case folded != 0:
+			departure.At = folded
+		default:
+			continue // a leave, or a member that came back since
+		}
+		out = append(out, departure)
+	}
+	if len(out) > 0 {
+		hook(out)
+	}
 }
 
 func (g *Group) reproject() {
@@ -906,19 +982,15 @@ func (g *Group) Discard() error {
 // Apply stores one record and re-projects. Applying a record twice is a no-op,
 // so a peer may send the same record repeatedly.
 func (g *Group) Apply(rec Record) (bool, error) {
-	applied, err := g.apply(rec)
+	var departed []entmoot.MemberID
+	applied, err := g.apply(rec, &departed)
 	if applied && err == nil {
-		g.mu.RLock()
-		hook := g.onApplied
-		g.mu.RUnlock()
-		if hook != nil {
-			hook(rec)
-		}
+		g.reportDepartures(departed, 0)
 	}
 	return applied, err
 }
 
-func (g *Group) apply(rec Record) (bool, error) {
+func (g *Group) apply(rec Record, departed *[]entmoot.MemberID) (bool, error) {
 	if err := VerifyRecord(rec); err != nil {
 		return false, err
 	}
@@ -951,7 +1023,9 @@ func (g *Group) apply(rec Record) (bool, error) {
 		return false, fmt.Errorf("membership: commit record: %w", err)
 	}
 	g.records[rec.ID] = cloneRecord(rec)
+	before := g.memberSetLocked()
 	g.reproject()
+	*departed = g.departedSinceLocked(before)
 	return true, nil
 }
 
@@ -960,6 +1034,15 @@ func (g *Group) apply(rec Record) (bool, error) {
 // records is refused rather than adopted, so a wrong or hostile checkpoint
 // cannot rewrite what this node knows.
 func (g *Group) ApplyCheckpoint(cp Checkpoint) (bool, error) {
+	var departed []entmoot.MemberID
+	applied, err := g.applyCheckpoint(cp, &departed)
+	if applied && err == nil {
+		g.reportDepartures(departed, g.Canonical().Timestamp)
+	}
+	return applied, err
+}
+
+func (g *Group) applyCheckpoint(cp Checkpoint, departed *[]entmoot.MemberID) (bool, error) {
 	if err := VerifyCheckpoint(cp); err != nil {
 		return false, err
 	}
@@ -1011,9 +1094,11 @@ func (g *Group) ApplyCheckpoint(cp Checkpoint) (bool, error) {
 		return false, fmt.Errorf("membership: commit checkpoint: %w", err)
 	}
 	g.retainLocked(cp)
+	before := g.memberSetLocked()
 	if err := g.settleCanonicalLocked(); err != nil {
 		return true, err
 	}
+	*departed = g.departedSinceLocked(before)
 	return true, nil
 }
 
