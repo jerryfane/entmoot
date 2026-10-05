@@ -54,7 +54,7 @@ daemon `probe_status` says so rather than blaming the peers.
 - **Revoked invite or removed admin still seems to work on one node:** a
   revoke, admin demotion or admin removal is final against backdated joins
   once the founder's daemon has sealed it with a checkpoint (normally one to
-  two membership rounds, at most about three and a half minutes, after that
+  two membership rounds, and at most about four minutes, after that
   daemon has the record) and the node has pulled that checkpoint. Make sure
   the founder's `serve` is running and can reach at least one member: a
   founder that reaches nobody does not seal. Only if it cannot run, use

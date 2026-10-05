@@ -606,161 +606,222 @@ func TestANewerChangeWaitsItsOwnDeadline(t *testing.T) {
 	}
 }
 
-// A round asks members maxMembershipSyncPeers at a time within one pull
-// timeout for the whole round, so members that accept a pull and never
-// answer cost about one timeout per round however many there are - not one
-// each, which would stretch the seal's deadline with every hanging member.
-// Such a round reached them, so it counts towards the deadline, and it is
-// not synchronized.
-func TestHangingMembersCostOneTimeoutPerRound(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-	root := t.TempDir()
-	founder, _ := mustDaemonIdentity(t)
-	gid := daemonTestGroupID(0xa9)
-	mustCreateGroup(t, root, gid, founder, membership.DefaultPolicy())
-	group := mustOpenGroup(t, root, gid)
-	const hanging = 12
-	members := make([]*keystore.Identity, hanging)
-	for i := range members {
-		identity, info := mustDaemonIdentity(t)
-		mustJoinWithInvite(t, group, identity, mustDaemonInvite(t, group, founder, info, 1))
-		members[i] = identity
-	}
-	_, holderInfo := mustDaemonIdentity(t)
-	invite := mustDaemonInvite(t, group, founder, holderInfo, 1)
-	base := group.Canonical()
-	mustCloseGroup(t, group)
-	mustRevokeOffline(t, root, gid, founder, invite)
-
-	runtime, session, h := startTestRuntime(t, ctx, root, founder, gid)
-	defer h.Close()
-	defer runtime.Close()
-	runtime.pullTimeout = 2 * time.Second
-	release := make(chan struct{})
-	defer close(release)
-	for _, identity := range members {
-		member, _, err := libp2ptransport.NewHost(ctx, identity, libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"))
-		if err != nil {
-			t.Fatalf("NewHost: %v", err)
-		}
-		defer member.Close()
-		member.SetStreamHandler(libp2ptransport.MembershipProtocol, func(stream network.Stream) {
-			defer stream.Close()
-			<-release
-		})
-		h.Peerstore().AddAddrs(member.ID(), member.Addrs(), peerstore.PermanentAddrTTL)
-	}
-	runtime.sealAuthorityChanges(session, sealRound{})
-	if !session.seal.isArmed() {
-		t.Fatal("the revoke is not waiting to be sealed")
-	}
-	if got := len(runtime.membershipPeersUpTo(session, math.MaxInt)); got != hanging {
-		t.Fatalf("the fixture has %d addressable members, want %d", got, hanging)
-	}
-
-	started := time.Now()
-	runtime.syncMembership(ctx, session)
-	took := time.Since(started)
-	t.Logf("a round with %d hanging members and pullTimeout %s took %s", hanging, runtime.pullTimeout, took)
-	// Asked one at a time this would take hanging*pullTimeout; eight at a
-	// time with a timeout each, two timeouts.
-	if limit := runtime.pullTimeout + runtime.pullTimeout/2; took > limit {
-		t.Fatalf("a round with %d hanging members took %s, want at most %s", hanging, took, limit)
-	}
-	session.seal.mu.Lock()
-	rounds := session.seal.waiting[0].rounds
-	session.seal.mu.Unlock()
-	if rounds != 1 {
-		t.Fatalf("the round counted %d towards the deadline, want 1: it reached the hanging members", rounds)
-	}
-	if session.group.Canonical().ID != base.ID {
-		t.Fatal("a round in which every member hung was treated as synchronized")
-	}
+// hangingFixture is a founder's group in which some members accept every
+// membership pull and never answer, and optionally one honest member, asked
+// after all of them, that holds a join nobody else has - dated before a
+// revoke the founder signed offline.
+type hangingFixture struct {
+	gid        entmoot.GroupID
+	base       membership.Checkpoint
+	revoked    entmoot.BootstrapCapability
+	holder     *keystore.Identity
+	runtime    *groupRuntime
+	session    *groupSession
+	host       host.Host
+	honest     *groupRuntime
+	honestSess *groupSession
+	newcomer   entmoot.MemberID
 }
 
-// Members are pulled side by side, so a member that hangs does not use up the
-// round before an honest member is asked: the honest member's records still
-// arrive that round, even when it is the last one asked.
-func TestAHangingMemberDoesNotStarveTheOthers(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-	gid := daemonTestGroupID(0xaa)
+func newHangingFixture(t *testing.T, ctx context.Context, seed byte, hanging int, withHonest bool) *hangingFixture {
+	t.Helper()
+	f := &hangingFixture{gid: daemonTestGroupID(seed)}
 	founder, _ := mustDaemonIdentity(t)
-	const hanging = maxMembershipSyncPeers - 1
 	hangers := make([]*keystore.Identity, hanging)
-	var newest entmoot.MemberID
+	var last entmoot.MemberID
 	for i := range hangers {
 		identity, info := mustDaemonIdentity(t)
 		hangers[i] = identity
-		if bytes.Compare(info.MemberID[:], newest[:]) > 0 {
-			newest = *info.MemberID
+		if bytes.Compare(info.MemberID[:], last[:]) > 0 {
+			last = *info.MemberID
 		}
 	}
-	// Peers are asked in member-id order after the founder, so the honest
-	// member sorts last: asked one at a time, it would never be reached.
-	honest, honestInfo := mustDaemonIdentity(t)
-	for bytes.Compare(honestInfo.MemberID[:], newest[:]) <= 0 {
-		honest, honestInfo = mustDaemonIdentity(t)
-	}
-	newcomer, newcomerInfo := mustDaemonIdentity(t)
 	founderRoot, honestRoot := t.TempDir(), t.TempDir()
-	mustCreateGroup(t, founderRoot, gid, founder, membership.DefaultPolicy())
-	group := mustOpenGroup(t, founderRoot, gid)
-	base := group.Canonical()
+	mustCreateGroup(t, founderRoot, f.gid, founder, membership.DefaultPolicy())
+	group := mustOpenGroup(t, founderRoot, f.gid)
+	f.base = group.Canonical()
+	members := hangers
+	var honest *keystore.Identity
+	if withHonest {
+		// Peers are asked in member-id order, so the honest member sorts
+		// after every member that hangs.
+		var honestInfo entmoot.NodeInfo
+		honest, honestInfo = mustDaemonIdentity(t)
+		for bytes.Compare(honestInfo.MemberID[:], last[:]) <= 0 {
+			honest, honestInfo = mustDaemonIdentity(t)
+		}
+		members = append(append([]*keystore.Identity(nil), hangers...), honest)
+	}
 	var joins []membership.Record
-	for _, identity := range append(append([]*keystore.Identity(nil), hangers...), honest) {
+	for _, identity := range members {
 		info := mustDaemonNodeInfo(t, identity)
 		joins = append(joins, mustJoinWithInvite(t, group, identity, mustDaemonInvite(t, group, founder, info, 1)))
 	}
+	newcomer, newcomerInfo := mustDaemonIdentity(t)
+	f.newcomer = *newcomerInfo.MemberID
 	newcomerInvite := mustDaemonInvite(t, group, founder, newcomerInfo, 1)
+	holder, holderInfo := mustDaemonIdentity(t)
+	f.holder = holder
+	f.revoked = mustDaemonInvite(t, group, founder, holderInfo, 1)
 	mustCloseGroup(t, group)
 
-	honestGroup, err := membership.Adopt(honestRoot, base)
-	if err != nil {
-		t.Fatalf("Adopt: %v", err)
+	if withHonest {
+		honestGroup, err := membership.Adopt(honestRoot, f.base)
+		if err != nil {
+			t.Fatalf("Adopt: %v", err)
+		}
+		for _, join := range joins {
+			if _, err := honestGroup.Apply(join); err != nil {
+				t.Fatalf("seed the honest member: %v", err)
+			}
+		}
+		if _, err := honestGroup.Apply(mustSignedJoinAt(t, f.gid, newcomer, newcomerInvite, time.Now().UnixMilli())); err != nil {
+			t.Fatalf("apply the newcomer's join: %v", err)
+		}
+		mustCloseGroup(t, honestGroup)
 	}
-	for _, join := range joins {
-		if _, err := honestGroup.Apply(join); err != nil {
-			t.Fatalf("seed the honest member: %v", err)
+	time.Sleep(5 * time.Millisecond)
+	mustRevokeOffline(t, founderRoot, f.gid, founder, f.revoked)
+
+	f.runtime, f.session, f.host = startTestRuntime(t, ctx, founderRoot, founder, f.gid)
+	t.Cleanup(func() { _ = f.host.Close() })
+	t.Cleanup(f.runtime.Close)
+	// The test drives the founder's rounds itself. Stop the session's own
+	// loop, and wait out the round it starts with: no member has an address
+	// yet, so that round asks nobody and only finds the revoke.
+	f.session.cancel()
+	for deadline := time.Now().Add(5 * time.Second); !f.session.seal.isArmed(); time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the founder's first round did not find the revoke")
 		}
 	}
-	// Only the honest member holds the newcomer's join.
-	if _, err := honestGroup.Apply(mustSignedJoinAt(t, gid, newcomer, newcomerInvite, time.Now().UnixMilli())); err != nil {
-		t.Fatalf("apply the newcomer's join: %v", err)
+	f.runtime.pullTimeout = time.Second
+	f.runtime.roundTimeout = 1500 * time.Millisecond
+	if withHonest {
+		var honestHost host.Host
+		f.honest, f.honestSess, honestHost = startTestRuntime(t, ctx, honestRoot, honest, f.gid)
+		t.Cleanup(func() { _ = honestHost.Close() })
+		t.Cleanup(f.honest.Close)
+		f.host.Peerstore().AddAddrs(honestHost.ID(), honestHost.Addrs(), peerstore.PermanentAddrTTL)
+		honestHost.Peerstore().AddAddrs(f.host.ID(), f.host.Addrs(), peerstore.PermanentAddrTTL)
 	}
-	mustCloseGroup(t, honestGroup)
-
-	founderRuntime, founderSession, founderHost := startTestRuntime(t, ctx, founderRoot, founder, gid)
-	defer founderHost.Close()
-	defer founderRuntime.Close()
-	founderRuntime.pullTimeout = 2 * time.Second
-	honestRuntime, _, honestHost := startTestRuntime(t, ctx, honestRoot, honest, gid)
-	defer honestHost.Close()
-	defer honestRuntime.Close()
-	founderHost.Peerstore().AddAddrs(honestHost.ID(), honestHost.Addrs(), peerstore.PermanentAddrTTL)
 	release := make(chan struct{})
-	defer close(release)
 	for _, identity := range hangers {
 		member, _, err := libp2ptransport.NewHost(ctx, identity, libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"))
 		if err != nil {
 			t.Fatalf("NewHost: %v", err)
 		}
-		defer member.Close()
+		t.Cleanup(func() { _ = member.Close() })
 		member.SetStreamHandler(libp2ptransport.MembershipProtocol, func(stream network.Stream) {
 			defer stream.Close()
 			<-release
 		})
-		founderHost.Peerstore().AddAddrs(member.ID(), member.Addrs(), peerstore.PermanentAddrTTL)
+		f.host.Peerstore().AddAddrs(member.ID(), member.Addrs(), peerstore.PermanentAddrTTL)
 	}
-	peers := founderRuntime.membershipPeers(founderSession)
-	if len(peers) != hanging+1 || peers[len(peers)-1].ID != honestHost.ID() {
-		t.Fatalf("the honest member is not asked last among %d peers", len(peers))
+	t.Cleanup(func() { close(release) })
+	return f
+}
+
+// countRounds counts n rounds towards every waiting seal's deadline.
+func countRounds(session *groupSession, n int) {
+	session.seal.mu.Lock()
+	defer session.seal.mu.Unlock()
+	for i := range session.seal.waiting {
+		session.seal.waiting[i].rounds = max(session.seal.waiting[i].rounds, n)
+	}
+}
+
+// A round asks members maxMembershipSyncPeers at a time, each pull with its
+// own timeout, and stops starting pulls after its round timeout, so members
+// that accept a pull and never answer cost a round at most the two timeouts
+// however many there are - not one pull timeout per eight members, which
+// would stretch the seal's deadline with every hanging member. Such a round
+// reached them, so it counts towards the deadline, and it is not
+// synchronized.
+func TestHangingMembersCostOneTimeoutPerRound(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	const hanging = 4 * maxMembershipSyncPeers
+	f := newHangingFixture(t, ctx, 0xa9, hanging, false)
+	if !f.session.seal.isArmed() {
+		t.Fatal("the revoke is not waiting to be sealed")
+	}
+	if got := len(f.runtime.membershipPeersUpTo(f.session, math.MaxInt)); got != hanging {
+		t.Fatalf("the fixture has %d addressable members, want %d", got, hanging)
 	}
 
-	founderRuntime.syncMembership(ctx, founderSession)
-	if !founderSession.group.IsMemberID(*newcomerInfo.MemberID) {
-		t.Fatal("hanging members kept the round from pulling the honest member's records")
+	started := time.Now()
+	f.runtime.syncMembership(ctx, f.session)
+	took := time.Since(started)
+	t.Logf("a round with %d hanging members, pullTimeout %s and roundTimeout %s took %s", hanging, f.runtime.pullTimeout, f.runtime.roundTimeout, took)
+	// Without the round's own timeout this would take four pull timeouts.
+	if limit := f.runtime.roundTimeout + f.runtime.pullTimeout + f.runtime.pullTimeout/2; took > limit {
+		t.Fatalf("a round with %d hanging members took %s, want at most %s", hanging, took, limit)
+	}
+	f.session.seal.mu.Lock()
+	rounds := f.session.seal.waiting[0].rounds
+	f.session.seal.mu.Unlock()
+	if rounds != 1 {
+		t.Fatalf("the round counted %d towards the deadline, want 1: it reached the hanging members", rounds)
+	}
+	if f.session.group.Canonical().ID != f.base.ID {
+		t.Fatal("a round in which every member hung was treated as synchronized")
+	}
+}
+
+// More members hang than one round can get through, all asked before an
+// honest member that holds a join the founder lacks, dated before the
+// revoke. A seal forced on the deadline alone would leave that join out and
+// cut the honest member off the chain. Instead the forced seal waits until
+// every addressable member has been asked; rounds start where the previous
+// one ran out of time and a member that hangs frees its slot after its own
+// timeout, so the honest member is asked on the next round, and the seal
+// carries its join.
+func TestHangingMembersCannotKeepAnHonestMemberOutOfTheSeal(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	const hanging = 2*maxMembershipSyncPeers + 4
+	f := newHangingFixture(t, ctx, 0xaa, hanging, true)
+	peers := f.runtime.membershipPeersUpTo(f.session, math.MaxInt)
+	if len(peers) != hanging+1 {
+		t.Fatalf("the fixture has %d addressable members, want %d", len(peers), hanging+1)
+	}
+
+	// The revoke is waiting. Make it overdue at once, so that only the rule
+	// under test holds the seal back.
+	ageWaitingSeals(f.session, sealDeadline)
+	countRounds(f.session, sealDeadlineRounds)
+
+	// This round asks two waves of hanging members and runs out of time
+	// before the rest, the honest member among them.
+	f.runtime.syncMembership(ctx, f.session)
+	if f.session.group.IsMemberID(f.newcomer) {
+		t.Fatal("the fixture let the round reach the honest member; it must run out of time first")
+	}
+	if f.session.group.Canonical().ID != f.base.ID {
+		t.Fatal("forced a seal before the honest member had been asked")
+	}
+
+	f.runtime.syncMembership(ctx, f.session)
+	if !f.session.group.IsMemberID(f.newcomer) {
+		t.Fatal("the honest member was not asked on the next round")
+	}
+	sealed := f.session.group.Canonical()
+	if sealed.ID == f.base.ID {
+		t.Fatal("the seal was not forced once every member had been asked")
+	}
+	backdated := mustSignedJoinAt(t, f.gid, f.holder, f.revoked, f.base.Timestamp+1)
+	if _, err := f.session.group.Apply(backdated); !errors.Is(err, membership.ErrStale) {
+		t.Fatalf("a join dated before the revoke was not refused as stale: %v", err)
+	}
+
+	f.honest.syncMembership(ctx, f.honestSess)
+	f.honest.syncMembership(ctx, f.honestSess)
+	if got := f.honestSess.group.Canonical().ID; got != sealed.ID {
+		t.Fatalf("the honest member is on checkpoint %s, the founder sealed %s: it was cut off the chain", got, sealed.ID)
+	}
+	if !f.honestSess.group.IsMemberID(f.newcomer) {
+		t.Fatal("the honest member lost its join")
 	}
 }
 

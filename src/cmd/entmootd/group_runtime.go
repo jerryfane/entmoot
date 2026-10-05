@@ -76,9 +76,11 @@ type groupRuntime struct {
 	liveRouter       *libp2ptransport.LiveRouter
 	policyEnforcers  map[entmoot.GroupID]*groupPolicyEnforcer
 	profiles         esphttp.StateStore
-	// pullTimeout bounds one membership round's pulls (membershipPullTimeout;
-	// shortened by tests).
-	pullTimeout time.Duration
+	// pullTimeout bounds one member's pull and roundTimeout a membership
+	// round's pulls together (membershipPullTimeout and
+	// membershipRoundTimeout; shortened by tests).
+	pullTimeout  time.Duration
+	roundTimeout time.Duration
 
 	mu       sync.RWMutex
 	sessions map[entmoot.GroupID]*groupSession
@@ -99,6 +101,10 @@ type groupSession struct {
 	unknownHeads atomic.Int64
 	peerRecords  *libp2ptransport.PeerRecordCache
 	seal         sealState
+	// pullOffset is where the next membership round starts in its list of
+	// members: the first member the previous round ran out of time before
+	// asking, so every member is asked within a few rounds however many hang.
+	pullOffset atomic.Int64
 }
 
 // sealState is the sealer's progress on sealing authority changes (see
@@ -121,9 +127,14 @@ type waitingSeal struct {
 	through int64
 	// since is when a round first found it, and rounds counts the rounds
 	// since then that reached another member: past sealDeadline and
-	// sealDeadlineRounds it is sealed whether or not a round synced.
+	// sealDeadlineRounds it is sealed whether or not a round synced, once
+	// every member this node can address is in pulled.
 	since  time.Time
 	rounds int
+	// pulled holds the members asked since then, whatever they answered: a
+	// seal forced on a view that never asked a member could leave out the
+	// records only that member holds.
+	pulled map[peer.ID]struct{}
 }
 
 func (s *sealState) isArmed() bool {
@@ -145,6 +156,10 @@ type sealRound struct {
 	synced bool
 	// lagging names the members the round could not pull everything from.
 	lagging []string
+	// addressable lists every member the round could have asked, and pulled
+	// the ones it did ask, whatever they answered.
+	addressable []peer.ID
+	pulled      []peer.ID
 }
 
 type groupPolicyEnforcer struct {
@@ -194,6 +209,7 @@ func newGroupRuntime(cfg groupRuntimeConfig) (*groupRuntime, error) {
 		liveRouter:       liveRouter,
 		sessions:         make(map[entmoot.GroupID]*groupSession),
 		pullTimeout:      membershipPullTimeout,
+		roundTimeout:     membershipRoundTimeout,
 		joining:          make(map[entmoot.GroupID]chan struct{}),
 		policyEnforcers:  make(map[entmoot.GroupID]*groupPolicyEnforcer),
 	}
@@ -606,11 +622,15 @@ const (
 	// difference rather than a chain, and because a pushed record arrives
 	// immediately instead of waiting for the next round.
 	membershipSyncInterval = 15 * time.Second
-	// membershipPullTimeout bounds a membership round's pulls, all of them
-	// together: members are pulled maxMembershipSyncPeers at a time, so a
-	// round costs at most this however many members hang, and one that ran
-	// out of time before pulling a member is not a synchronized round.
-	membershipPullTimeout = 30 * time.Second
+	// membershipPullTimeout bounds one member's pull, and
+	// membershipRoundTimeout how long a round keeps starting pulls (see
+	// pullMembers). Members are pulled maxMembershipSyncPeers at a time, so a
+	// member that hangs frees its slot after membershipPullTimeout, a round
+	// lasts at most the two together however many members hang, and every
+	// member is asked within a few rounds (see pullOffset). A round that ran
+	// out of time before asking a member is not a synchronized round.
+	membershipPullTimeout  = 10 * time.Second
+	membershipRoundTimeout = 30 * time.Second
 	// minSealInterval bounds how often the sealer signs a checkpoint for
 	// authority changes alone. Every one is founder-signed and so retained for
 	// good (it is what a joiner holding no group state can anchor on), so an
@@ -657,7 +677,19 @@ func (r *groupRuntime) syncMembership(ctx context.Context, session *groupSession
 		r.signCheckpointIfDue(session)
 		return
 	}
-	pulls, removed := r.pullMembers(ctx, session, peers)
+	// Start where the previous round ran out of time, so members that hang
+	// cannot keep the ones after them from ever being asked.
+	start := int(session.pullOffset.Load() % int64(len(peers)))
+	order := append(append(make([]peer.AddrInfo, 0, len(peers)), peers[start:]...), peers[:start]...)
+	pulls, removed := r.pullMembers(ctx, session, order)
+	next := 0
+	for i, pull := range pulls {
+		if pull.skipped {
+			next = (start + i) % len(peers)
+			break
+		}
+	}
+	session.pullOffset.Store(int64(next))
 	if removed != nil {
 		// The peer served the signed record that removed us, and it has been
 		// applied. Say so once, loudly: an operator whose node has been
@@ -679,6 +711,14 @@ func (r *groupRuntime) syncMembership(ctx context.Context, session *groupSession
 	// full, for the log of a forced seal (see sealAuthorityChanges).
 	full, reached, short := 0, false, false
 	var lagging []string
+	addressable := make([]peer.ID, 0, len(pulls))
+	pulled := make([]peer.ID, 0, len(pulls))
+	for _, pull := range pulls {
+		addressable = append(addressable, pull.remote.ID)
+		if !pull.skipped {
+			pulled = append(pulled, pull.remote.ID)
+		}
+	}
 	for _, pull := range pulls {
 		remote := pull.remote
 		switch {
@@ -725,7 +765,10 @@ func (r *groupRuntime) syncMembership(ctx context.Context, session *groupSession
 		// Messages held for a checkpoint we have now learned can be accepted.
 		r.drainHeldMessages(ctx, session)
 	}
-	r.sealAuthorityChanges(session, sealRound{reached: reached, synced: full > 0 && !short, lagging: lagging})
+	r.sealAuthorityChanges(session, sealRound{
+		reached: reached, synced: full > 0 && !short, lagging: lagging,
+		addressable: addressable, pulled: pulled,
+	})
 	// Every round, not only when a pull brought something back: records this
 	// node signed itself count towards the cadence too, so a founder admitting
 	// members while nothing arrives from anybody else must still checkpoint.
@@ -746,12 +789,19 @@ type memberPull struct {
 	skipped bool
 }
 
-// pullMembers pulls from peers maxMembershipSyncPeers at a time, within one
-// pullTimeout for the whole round, in the order given. It stops asking once a
-// peer shows this node was removed, and returns that peer.
+// pullMembers pulls from peers maxMembershipSyncPeers at a time, in the order
+// given. Each pull gets pullTimeout, so a member that hangs frees its slot for
+// the next; roundTimeout stops the round starting more pulls, and the members
+// it did not start are marked skipped. A pull that started always runs to its
+// own answer or timeout, so a member counts as asked only when it was given
+// its full time, and a round lasts at most roundTimeout plus pullTimeout
+// however many members hang. It stops asking once a peer shows this node was
+// removed, and returns that peer.
 func (r *groupRuntime) pullMembers(ctx context.Context, session *groupSession, peers []peer.AddrInfo) ([]memberPull, *peer.AddrInfo) {
-	roundCtx, cancel := context.WithTimeout(ctx, r.pullTimeout)
+	pullsCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	roundCtx, roundCancel := context.WithTimeout(pullsCtx, r.roundTimeout)
+	defer roundCancel()
 	pulls := make([]memberPull, len(peers))
 	var removedMu sync.Mutex
 	var removed *peer.AddrInfo
@@ -771,7 +821,9 @@ func (r *groupRuntime) pullMembers(ctx context.Context, session *groupSession, p
 		go func(pull *memberPull) {
 			defer wg.Done()
 			defer func() { <-slots }()
-			pull.checkpoints, pull.records, pull.complete, pull.err = libp2ptransport.FetchMembership(roundCtx, r.host, pull.remote, session.group, r.binding.MemberID)
+			pullCtx, pullCancel := context.WithTimeout(pullsCtx, r.pullTimeout)
+			defer pullCancel()
+			pull.checkpoints, pull.records, pull.complete, pull.err = libp2ptransport.FetchMembership(pullCtx, r.host, pull.remote, session.group, r.binding.MemberID)
 			if errors.Is(pull.err, libp2ptransport.ErrRemoved) {
 				removedMu.Lock()
 				if removed == nil {
@@ -823,7 +875,11 @@ func (r *groupRuntime) onlyLocalMember(session *groupSession) bool {
 //     its own: a member that answers every pull as incomplete, or hangs,
 //     cannot hold the seal off. Such a seal goes only through the newest
 //     change that is overdue, so a newer one still gets its full wait, and
-//     the members that lagged are logged;
+//     the members that lagged are logged. It also needs every member this
+//     node can address to have been asked since the change was found -
+//     whatever it answered - so members that hang cannot crowd out an
+//     honest one and have the seal leave its records out (rounds start
+//     where the last one ran out of time, so each is asked within a few);
 //   - only rounds that got through to another member count towards that
 //     deadline, so a founder cut off from every member - partitioned, or
 //     holding no address for any of them - never seals its own view over
@@ -848,14 +904,21 @@ func (r *groupRuntime) sealAuthorityChanges(session *groupSession, round sealRou
 			seal.waiting[i].rounds++
 		}
 	}
+	for i := range seal.waiting {
+		for _, id := range round.pulled {
+			seal.waiting[i].pulled[id] = struct{}{}
+		}
+	}
 	if n := len(seal.waiting); n > 0 && now.Sub(seal.last) >= minSealInterval {
 		var target *waitingSeal
 		if round.synced {
 			target = &seal.waiting[n-1]
 		} else {
 			for i := range seal.waiting {
-				if seal.waiting[i].rounds >= sealDeadlineRounds && now.Sub(seal.waiting[i].since) >= sealDeadline {
-					target = &seal.waiting[i]
+				waiting := &seal.waiting[i]
+				if waiting.rounds >= sealDeadlineRounds && now.Sub(waiting.since) >= sealDeadline &&
+					askedAll(waiting.pulled, round.addressable) {
+					target = waiting
 				}
 			}
 		}
@@ -905,8 +968,18 @@ func (r *groupRuntime) sealAuthorityChanges(session *groupSession, round sealRou
 	}
 	seal.waiting = kept
 	if n := len(seal.waiting); n == 0 || due > seal.waiting[n-1].through {
-		seal.waiting = append(seal.waiting, waitingSeal{through: due, since: now})
+		seal.waiting = append(seal.waiting, waitingSeal{through: due, since: now, pulled: make(map[peer.ID]struct{})})
 	}
+}
+
+// askedAll reports whether every member in addressable is in pulled.
+func askedAll(pulled map[peer.ID]struct{}, addressable []peer.ID) bool {
+	for _, id := range addressable {
+		if _, ok := pulled[id]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // signCheckpointIfDue folds pending records into a checkpoint once the group's

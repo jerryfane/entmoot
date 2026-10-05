@@ -19,12 +19,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   admin's demotion, removal, ban or departure, and closing an open group. The
   daemon seals a change about one to two membership rounds after it receives
   it, once a round has pulled what every reachable member holds. If some
-  member keeps answering incompletely or hangs, it seals anyway at most about
-  three and a half minutes after, and logs the members that lagged; rounds
-  pull members eight at a time within 30 seconds, so hanging members cannot
-  stretch that. A founder that reaches no member at all does not seal until
-  one answers again. After that the founder refuses such a backdated join,
-  and every other node does once it has pulled the checkpoint. The commands
+  member keeps answering incompletely or hangs, it seals anyway once the
+  change has waited two minutes and every member it can address has been
+  asked since, normally at most about four minutes after, and logs the
+  members that lagged. Rounds pull members eight at a time, 10 seconds each,
+  and start no new pull after 30 seconds, and each starts with the members
+  the last one missed, so hanging members can neither stretch a round nor
+  crowd an honest member out of the seal. A founder that reaches no member
+  at all does not seal until one answers again. After that the founder
+  refuses such a backdated join, and every other node does once it has
+  pulled the checkpoint. The commands
   sign only the record. A checkpoint signed from a view that misses records
   other members hold would strand those members, so only the founder seals,
   it folds only records dated up to the change, each change waits its own

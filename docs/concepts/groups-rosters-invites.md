@@ -139,26 +139,33 @@ from every member it could reach, and folds only records dated up to the
 change. A member that cannot be dialled does not hold this up, but a round
 in which a member answered with only part of what it holds, or connected and
 then hung, does. That wait is bounded: once the change has waited two minutes
-and three rounds that got through to at least one other member, the founder
-seals on what it holds and logs which members lagged. So no member, a
-demoted admin included, can keep a change unsealed by answering slowly or
-incompletely. A round asks members eight at a time and gives up on all of
-them together after 30 seconds, so members that hang cost a round at most
-30 seconds however many there are. Rounds that reach no other member do not
-count at all: a founder cut off from every member, which may be the node
-that is behind, does not seal until a member answers again, unless it is the
-group's only member. Each change waits its own time, so a change that arrives
-while an older one is held back is not sealed early along with it. Only the
-founder seals, so no two nodes cut competing checkpoints for the same change,
-and it signs at most one seal a minute however many changes arrive.
+and three rounds that got through to at least one other member, and every
+member the founder can address has been asked at least once since it saw the
+change - whatever that member answered - the founder seals on what it holds
+and logs which members lagged. So no member, a demoted admin included, can
+keep a change unsealed by answering slowly or incompletely, and members that
+hang cannot crowd an honest member out of the seal. A round asks members
+eight at a time, gives each 10 seconds to answer, and starts no new pull
+after 30 seconds, so a round lasts at most 40 seconds however many members
+hang and asks at least 24 of them; the next round starts with the members
+the last one did not reach. Rounds that reach no other member do not count
+at all: a founder cut off from every member, which may be the node that is
+behind, does not seal until a member answers again, unless it is the
+group's only member. Each change waits its own time, so a change that
+arrives while an older one is held back is not sealed early along with it.
+Only the founder seals, so no two nodes cut competing checkpoints for the
+same change, and it signs at most one seal a minute however many changes
+arrive.
 
 A change is normally final on the founder one to two membership rounds (15
 to 30 seconds) after its daemon receives it. When members lag or hang it is
-final at most about three and a half minutes after - up to 45 seconds for the
-round that first sees it, the two-minute wait, and up to 45 seconds for the
-round that ends it - as long as the founder reaches at least one member. It
-is final on every other node once that node has pulled the checkpoint,
-normally within another round. Older peers need no upgrade: they already
+final at most about four minutes after - up to 55 seconds for the round that
+first sees it, the two-minute wait, and up to 40 seconds for the round that
+ends it - as long as the founder reaches at least one member and no more than
+about 70 members hang; each further 24 that hang can add a 40-second round,
+because every member is asked before a seal is forced. It is final on every
+other node once that node has pulled the checkpoint, normally within another
+round. Older peers need no upgrade: they already
 adopt checkpoints and refuse records older than one. While the founder's
 daemon is not running, nothing is sealed and the cadence checkpoint is the
 only bound. For an urgent case, `entmootd roster checkpoint` on the founder
