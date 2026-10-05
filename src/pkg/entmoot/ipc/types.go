@@ -76,6 +76,12 @@ const (
 	MsgPeerProbeReq MsgType = 0x25
 	// MsgPeerProbeResp returns one result per member probed.
 	MsgPeerProbeResp MsgType = 0x26
+	// MsgInviteRefreshReq offers the daemon a capability it issued to a
+	// target and asks for a replacement if that one has gone stale. It is a
+	// type of its own, not a field on MsgInviteCreateReq, so a daemon that
+	// predates it drops the request instead of minting without checking. The
+	// answer is a MsgInviteCreateResp carrying RefreshStatus.
+	MsgInviteRefreshReq MsgType = 0x27
 	// MsgError carries a structured error frame. 0x1F is kept stable so
 	// existing logs and clients can continue spotting error frames.
 	MsgError MsgType = 0x1F
@@ -125,6 +131,8 @@ func (t MsgType) String() string {
 		return "peer_probe_req"
 	case MsgPeerProbeResp:
 		return "peer_probe_resp"
+	case MsgInviteRefreshReq:
+		return "invite_refresh_req"
 	case MsgError:
 		return "error"
 	default:
@@ -222,12 +230,28 @@ type InviteCreateReq struct {
 	NoFallbackPeers bool `json:"no_fallback_peers,omitempty"`
 }
 
+// InviteRefreshReq asks for a replacement of Refresh, a capability already
+// issued to the request's target, carrying the same choices an invite_create
+// for it would. The daemon answers with the replacement it already issued for
+// Refresh, if any, and otherwise mints one only when the current capability
+// has expired or would now carry different addresses, peers or relays. It
+// never replaces for a target that got in (a used nonce; a current, removed
+// or banned member) or a capability somebody revoked, and revokes what it
+// replaces if that still admits.
+type InviteRefreshReq struct {
+	InviteCreateReq
+	Refresh entmoot.BootstrapCapability `json:"refresh"`
+}
+
 type InviteCreateResp struct {
 	Status     string                      `json:"status"`
 	GroupID    entmoot.GroupID             `json:"group_id"`
 	Capability entmoot.BootstrapCapability `json:"capability"`
 	RosterHead entmoot.RosterEntryID       `json:"roster_head"`
 	Members    int                         `json:"members"`
+	// RefreshStatus answers an InviteRefreshReq: "unchanged" with the offered
+	// capability, or "replaced" with a new one. It is empty for invite_create.
+	RefreshStatus string `json:"refresh_status,omitempty"`
 }
 
 type InviteAuthorityCheckReq struct {
@@ -320,11 +344,13 @@ type MemberRemoveResp struct {
 	ESPOpenInvitesError string `json:"esp_open_invites_error,omitempty"`
 	// InviteLedgerError reports that the removal was applied but the local
 	// invite ledger could not be read, so the outstanding list is incomplete.
-	// It is named for the ledger, not for a revocation: removal performs none,
-	// because an invite carries its issuer's authority and loses it with the
-	// removal. The CLI path reports the identical condition under the same
-	// name.
+	// The CLI path reports the identical condition under the same name.
 	InviteLedgerError string `json:"invite_ledger_error,omitempty"`
+	// RevokedInvites lists base64 nonces of capabilities this node had issued
+	// to the removed member that could still have admitted it - such as the
+	// replacements an ESP open invite hands a redeemer - revoked before the
+	// removal so it cannot rejoin with them.
+	RevokedInvites []string `json:"revoked_invites,omitempty"`
 }
 
 type GroupDeactivateReq struct {

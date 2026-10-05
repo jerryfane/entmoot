@@ -53,6 +53,15 @@ func Project(base Checkpoint, records []Record) (State, []Record) {
 // record that took authority away (see applyJudged), or 0 when none did. That
 // is the point a seal has to cover (see Group.SealDue).
 func project(base Checkpoint, records []Record) (State, []Record, int64) {
+	return projectTracking(base, records, nil)
+}
+
+// projectTracking is project that, when endedBy is not nil, also fills it:
+// for each member the records took out of the group - by a removal, a ban, a
+// leave or a rekey - the effective record that ended its latest membership,
+// kept if it was readmitted since. Tracking is off on the hot path (reproject)
+// and asked for only by Group.RemovedAt.
+func projectTracking(base Checkpoint, records []Record, endedBy map[entmoot.MemberID]Record) (State, []Record, int64) {
 	state := stateFrom(base)
 
 	// Deduplicate, and drop anything this base already accounts for. A record
@@ -94,15 +103,42 @@ func project(base Checkpoint, records []Record) (State, []Record, int64) {
 	effective := make([]Record, 0, len(ordered))
 	var reducedAt int64
 	for _, rec := range ordered {
+		var involved []entmoot.MemberID
+		if endedBy != nil {
+			involved = membersIn(state, rec)
+		}
 		applied, reduced := applyJudged(&state, rec)
 		if applied {
 			effective = append(effective, rec)
 			if reduced {
 				reducedAt = rec.Timestamp
 			}
+			for _, id := range involved {
+				if _, still := state.Members[id]; !still {
+					endedBy[id] = rec
+				}
+			}
 		}
 	}
 	return state, effective, reducedAt
+}
+
+// membersIn lists the record's actor and subject that are members in state:
+// the only members a record can take out - a removal its subject, a leave or
+// a rekey its actor.
+func membersIn(state State, rec Record) []entmoot.MemberID {
+	var in []entmoot.MemberID
+	if actor, err := entmoot.ResolvedMemberID(rec.Actor); err == nil {
+		if _, member := state.Members[actor]; member {
+			in = append(in, actor)
+		}
+	}
+	if subject, err := rec.SubjectMemberID(); err == nil {
+		if _, member := state.Members[subject]; member {
+			in = append(in, subject)
+		}
+	}
+	return in
 }
 
 // applyJudged applies one record and also reports whether it took authority
@@ -238,15 +274,8 @@ func applyAuthority(state *State, rec Record, actor entmoot.MemberID) bool {
 		if err != nil {
 			return false
 		}
-		if !isFounder {
-			// An admin may stand down, but removing the founder or a peer
-			// admin is the founder's decision.
-			if state.IsFounder(subject) {
-				return false
-			}
-			if subject != actor && state.Policy.HasAdmin(subject) {
-				return false
-			}
+		if !state.MayRemove(actor, subject) {
+			return false
 		}
 		changed := false
 		if _, member := state.Members[subject]; member {

@@ -3,10 +3,12 @@ package libp2ptransport
 import (
 	"database/sql"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -34,6 +36,11 @@ type InviteRecord struct {
 	MaxUses        int
 	IssuedAtMS     int64
 	ExpiresAtMS    int64
+	// MintedAtMS is when this node minted it, by its own clock. IssuedAtMS is
+	// dated earlier than that on purpose (membership.InviteIssuedAtMS), so it
+	// cannot say whether an invite was minted before or after some event.
+	// Zero for invites recorded before the column existed.
+	MintedAtMS int64
 	// RevokedAtMS is when the operator withdrew it here. The withdrawal that
 	// other nodes honour is a signed revoke_invite record; this column is how
 	// `invite list` shows the local decision.
@@ -78,6 +85,35 @@ func initInviteLedgerSchema(db *sql.DB) error {
 		);`); err != nil {
 		return fmt.Errorf("libp2p: initialize invite ledger: %w", err)
 	}
+	if err := addInviteLedgerColumn(db, "minted_at_ms", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	// Reconciling a removal looks up the invites issued to one member.
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS bootstrap_invites_target
+		ON bootstrap_invites (group_id, target_member_id) WHERE target_member_id IS NOT NULL`); err != nil {
+		return fmt.Errorf("libp2p: initialize invite ledger: %w", err)
+	}
+	// When this node first saw each removal it reconciled invites against.
+	if _, err := db.Exec(`
+		CREATE TABLE IF NOT EXISTS removals_seen (
+			group_id BLOB NOT NULL,
+			entry_id BLOB NOT NULL,
+			seen_at_ms INTEGER NOT NULL,
+			PRIMARY KEY (group_id, entry_id)
+		);`); err != nil {
+		return fmt.Errorf("libp2p: initialize invite ledger: %w", err)
+	}
+	// An invite reissued in place of another is linked to it, so the holder
+	// of the old one, if it never got the new one, can still be handed it.
+	if _, err := db.Exec(`
+		CREATE TABLE IF NOT EXISTS replaced_invites (
+			group_id BLOB NOT NULL,
+			nonce BLOB NOT NULL,
+			replacement BLOB NOT NULL,
+			PRIMARY KEY (group_id, nonce)
+		);`); err != nil {
+		return fmt.Errorf("libp2p: initialize invite ledger: %w", err)
+	}
 	// Redemption counting moved into the group's signed state, where every
 	// node reaches the same answer. These tables were the old local tally;
 	// keeping them would invite a reader to trust the wrong one.
@@ -94,20 +130,206 @@ func (l *InviteLedger) RecordIssuedInvite(capability BootstrapCapability) error 
 	if l == nil || l.db == nil {
 		return errors.New("libp2p: invite ledger is not open")
 	}
+	return recordIssuedInvite(l.db, capability)
+}
+
+// RecordReplacementInvite files replacement, an invite issued in place of the
+// one whose nonce is replaced, together with the link between them, so a
+// caller that only ever saw the replaced invite can still be handed the
+// replacement (see ReplacementChain).
+func (l *InviteLedger) RecordReplacementInvite(replaced [32]byte, replacement BootstrapCapability) error {
+	if l == nil || l.db == nil {
+		return errors.New("libp2p: invite ledger is not open")
+	}
+	encoded, err := json.Marshal(replacement)
+	if err != nil {
+		return fmt.Errorf("libp2p: encode replacement invite: %w", err)
+	}
+	tx, err := l.db.Begin()
+	if err != nil {
+		return fmt.Errorf("libp2p: record replacement invite: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := recordIssuedInvite(tx, replacement); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`INSERT INTO replaced_invites (group_id, nonce, replacement) VALUES (?, ?, ?)`,
+		replacement.GroupID[:], replaced[:], encoded); err != nil {
+		return fmt.Errorf("libp2p: record replacement invite: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("libp2p: record replacement invite: %w", err)
+	}
+	return nil
+}
+
+// ReplacementChain returns issued followed by each invite recorded as
+// replacing the one before it, oldest first; the last is the current one.
+func (l *InviteLedger) ReplacementChain(issued BootstrapCapability) ([]BootstrapCapability, error) {
+	if l == nil || l.db == nil {
+		return nil, errors.New("libp2p: invite ledger is not open")
+	}
+	chain := []BootstrapCapability{issued}
+	seen := map[[32]byte]struct{}{issued.Nonce: {}}
+	for {
+		head := chain[len(chain)-1]
+		var encoded []byte
+		err := l.db.QueryRow(`SELECT replacement FROM replaced_invites WHERE group_id=? AND nonce=?`,
+			head.GroupID[:], head.Nonce[:]).Scan(&encoded)
+		if errors.Is(err, sql.ErrNoRows) {
+			return chain, nil
+		}
+		if err != nil {
+			return nil, fmt.Errorf("libp2p: read replacement invite: %w", err)
+		}
+		var next BootstrapCapability
+		if err := json.Unmarshal(encoded, &next); err != nil {
+			return nil, fmt.Errorf("libp2p: decode replacement invite: %w", err)
+		}
+		if _, loop := seen[next.Nonce]; loop {
+			return nil, errors.New("libp2p: replacement invites form a loop")
+		}
+		seen[next.Nonce] = struct{}{}
+		chain = append(chain, next)
+	}
+}
+
+// ReplacementChains lists the nonces of every replacement chain recorded for
+// a group, each oldest first: an invite that was replaced, then each invite
+// issued in place of the one before it.
+func (l *InviteLedger) ReplacementChains(groupID entmoot.GroupID) ([][][32]byte, error) {
+	if l == nil || l.db == nil {
+		return nil, errors.New("libp2p: invite ledger is not open")
+	}
+	rows, err := l.db.Query(`SELECT nonce, replacement FROM replaced_invites WHERE group_id=?`, groupID[:])
+	if err != nil {
+		return nil, fmt.Errorf("libp2p: list replacement invites: %w", err)
+	}
+	defer rows.Close()
+	next := make(map[[32]byte][32]byte)
+	replacing := make(map[[32]byte]struct{})
+	for rows.Next() {
+		var raw, encoded []byte
+		if err := rows.Scan(&raw, &encoded); err != nil {
+			return nil, err
+		}
+		var replacement BootstrapCapability
+		if len(raw) != 32 {
+			return nil, fmt.Errorf("libp2p: replacement invite has a %d-byte nonce", len(raw))
+		}
+		if err := json.Unmarshal(encoded, &replacement); err != nil {
+			return nil, fmt.Errorf("libp2p: decode replacement invite: %w", err)
+		}
+		var replaced [32]byte
+		copy(replaced[:], raw)
+		next[replaced] = replacement.Nonce
+		replacing[replacement.Nonce] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	var chains [][][32]byte
+	for first := range next {
+		if _, replaces := replacing[first]; replaces {
+			continue
+		}
+		chain := [][32]byte{first}
+		seen := map[[32]byte]struct{}{first: {}}
+		for nonce, ok := next[first]; ok; nonce, ok = next[nonce] {
+			if _, loop := seen[nonce]; loop {
+				return nil, errors.New("libp2p: replacement invites form a loop")
+			}
+			seen[nonce] = struct{}{}
+			chain = append(chain, nonce)
+		}
+		chains = append(chains, chain)
+	}
+	return chains, nil
+}
+
+func recordIssuedInvite(db interface {
+	Exec(string, ...any) (sql.Result, error)
+}, capability BootstrapCapability) error {
 	var target []byte
 	if !capability.IsOpenInvite() {
 		target = capability.TargetMemberID[:]
 	}
-	_, err := l.db.Exec(`INSERT OR REPLACE INTO bootstrap_invites
-		(group_id, nonce, target_member_id, max_uses, issued_at_ms, expires_at_ms, revoked_at_ms)
-		VALUES (?, ?, ?, ?, ?, ?, COALESCE((SELECT revoked_at_ms FROM bootstrap_invites WHERE group_id=? AND nonce=?), 0))`,
+	_, err := db.Exec(`INSERT OR REPLACE INTO bootstrap_invites
+		(group_id, nonce, target_member_id, max_uses, issued_at_ms, expires_at_ms, revoked_at_ms, minted_at_ms)
+		VALUES (?, ?, ?, ?, ?, ?,
+			COALESCE((SELECT revoked_at_ms FROM bootstrap_invites WHERE group_id=? AND nonce=?), 0),
+			COALESCE((SELECT minted_at_ms FROM bootstrap_invites WHERE group_id=? AND nonce=?), ?))`,
 		capability.GroupID[:], capability.Nonce[:], target, capability.Uses(),
 		capability.IssuedAtMS, capability.ExpiresAtMS,
-		capability.GroupID[:], capability.Nonce[:])
+		capability.GroupID[:], capability.Nonce[:],
+		capability.GroupID[:], capability.Nonce[:], time.Now().UnixMilli())
 	if err != nil {
 		return fmt.Errorf("libp2p: record issued invite: %w", err)
 	}
 	return nil
+}
+
+// addInviteLedgerColumn adds a column to bootstrap_invites unless a ledger
+// written by this version already has it.
+func addInviteLedgerColumn(db *sql.DB, name, definition string) error {
+	rows, err := db.Query(`SELECT name FROM pragma_table_info('bootstrap_invites')`)
+	if err != nil {
+		return fmt.Errorf("libp2p: inspect invite ledger: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var column string
+		if err := rows.Scan(&column); err != nil {
+			return err
+		}
+		if column == name {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if _, err := db.Exec(`ALTER TABLE bootstrap_invites ADD COLUMN ` + name + ` ` + definition); err != nil {
+		// Another process opening the same ledger may have added it between
+		// the check and the ALTER; that is success, not a failed migration.
+		if strings.Contains(err.Error(), "duplicate column name") {
+			return nil
+		}
+		return fmt.Errorf("libp2p: add invite ledger column %s: %w", name, err)
+	}
+	return nil
+}
+
+// RemovalsSeenAt returns when this node first saw each of the removals with
+// the given entry ids, by its own clock, recording now for those it had not
+// seen before. A removal's own timestamp is the remover's clock; this is the
+// local one, for comparing with when this node minted an invite.
+func (l *InviteLedger) RemovalsSeenAt(groupID entmoot.GroupID, entries []entmoot.RosterEntryID, now int64) (map[entmoot.RosterEntryID]int64, error) {
+	if l == nil || l.db == nil {
+		return nil, errors.New("libp2p: invite ledger is not open")
+	}
+	tx, err := l.db.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("libp2p: record removals: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	seen := make(map[entmoot.RosterEntryID]int64, len(entries))
+	for _, entry := range entries {
+		if _, err := tx.Exec(`INSERT OR IGNORE INTO removals_seen (group_id, entry_id, seen_at_ms) VALUES (?, ?, ?)`,
+			groupID[:], entry[:], now); err != nil {
+			return nil, fmt.Errorf("libp2p: record removal: %w", err)
+		}
+		var at int64
+		if err := tx.QueryRow(`SELECT seen_at_ms FROM removals_seen WHERE group_id=? AND entry_id=?`,
+			groupID[:], entry[:]).Scan(&at); err != nil {
+			return nil, fmt.Errorf("libp2p: read removal: %w", err)
+		}
+		seen[entry] = at
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("libp2p: record removals: %w", err)
+	}
+	return seen, nil
 }
 
 // MarkRevoked notes locally that an invite was withdrawn. It reports whether a
@@ -150,12 +372,28 @@ func (l *InviteLedger) LiveOpenInvites(groupID entmoot.GroupID) ([]InviteRecord,
 	return out, nil
 }
 
+// LiveTargetedInvites lists the invites made out to a member that this node
+// issued in a group and has neither revoked locally nor seen expire.
+func (l *InviteLedger) LiveTargetedInvites(groupID entmoot.GroupID) ([]InviteRecord, error) {
+	if l == nil || l.db == nil {
+		return nil, errors.New("libp2p: invite ledger is not open")
+	}
+	rows, err := l.db.Query(`SELECT group_id, nonce, target_member_id, max_uses, issued_at_ms, expires_at_ms, revoked_at_ms, minted_at_ms
+		FROM bootstrap_invites
+		WHERE group_id=? AND target_member_id IS NOT NULL AND revoked_at_ms=0 AND (expires_at_ms=0 OR expires_at_ms>?)`,
+		groupID[:], time.Now().UnixMilli())
+	if err != nil {
+		return nil, fmt.Errorf("libp2p: list targeted invites: %w", err)
+	}
+	return scanInviteRecords(rows)
+}
+
 // ListInvites lists issued invites, for one group or all of them.
 func (l *InviteLedger) ListInvites(groupID *entmoot.GroupID) ([]InviteRecord, error) {
 	if l == nil || l.db == nil {
 		return nil, errors.New("libp2p: invite ledger is not open")
 	}
-	query := `SELECT group_id, nonce, target_member_id, max_uses, issued_at_ms, expires_at_ms, revoked_at_ms
+	query := `SELECT group_id, nonce, target_member_id, max_uses, issued_at_ms, expires_at_ms, revoked_at_ms, minted_at_ms
 		FROM bootstrap_invites`
 	args := []any{}
 	if groupID != nil {
@@ -167,12 +405,16 @@ func (l *InviteLedger) ListInvites(groupID *entmoot.GroupID) ([]InviteRecord, er
 	if err != nil {
 		return nil, fmt.Errorf("libp2p: list invites: %w", err)
 	}
+	return scanInviteRecords(rows)
+}
+
+func scanInviteRecords(rows *sql.Rows) ([]InviteRecord, error) {
 	defer rows.Close()
 	out := make([]InviteRecord, 0)
 	for rows.Next() {
 		var record InviteRecord
 		var group, nonce, target []byte
-		if err := rows.Scan(&group, &nonce, &target, &record.MaxUses, &record.IssuedAtMS, &record.ExpiresAtMS, &record.RevokedAtMS); err != nil {
+		if err := rows.Scan(&group, &nonce, &target, &record.MaxUses, &record.IssuedAtMS, &record.ExpiresAtMS, &record.RevokedAtMS, &record.MintedAtMS); err != nil {
 			return nil, err
 		}
 		if len(group) != len(record.GroupID) || len(nonce) != len(record.Nonce) {

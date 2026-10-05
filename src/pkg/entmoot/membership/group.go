@@ -77,7 +77,10 @@ type Group struct {
 	legacy      *LegacyChain
 	now         func() time.Time
 	logger      *slog.Logger
-	closeOnce   sync.Once
+	// onChanged, if set, is called after Apply or ApplyCheckpoint stores
+	// something (see SetChangeHook).
+	onChanged func()
+	closeOnce sync.Once
 }
 
 // Open loads a group's membership store. A group that still has only the
@@ -316,6 +319,204 @@ func (g *Group) SetLogger(logger *slog.Logger) {
 	}
 }
 
+// SetChangeHook sets a function called whenever Apply (so also SignRecord) or
+// ApplyCheckpoint stores something, once the group's lock is released and
+// before they return. It says only that the group may have changed - not
+// what changed, or why - so a caller acting on it must look at the group as it
+// is then (see RemovedAt), which gives the same answer whatever order the
+// records arrived in. The hook runs on whatever goroutine applied the record;
+// that caller may hold locks of its own, so it must not block or take them.
+func (g *Group) SetChangeHook(hook func()) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.onChanged = hook
+}
+
+func (g *Group) changed() {
+	g.mu.RLock()
+	hook := g.onChanged
+	g.mu.RUnlock()
+	if hook != nil {
+		hook()
+	}
+}
+
+// Removal is when, and by which signed entry, a member's latest membership
+// was ended by a removal or ban (see RemovedAt).
+type Removal struct {
+	// At is the removal record's timestamp or, for a removal this node only
+	// knows from a checkpoint, that checkpoint's.
+	At int64
+	// Entry is the removal record's id, or that checkpoint's: what ended the
+	// membership, so a caller can tell one removal from another.
+	Entry entmoot.RosterEntryID
+}
+
+// RemovedAt reports, for each of ids that is not a member now and whose
+// latest membership a removal or ban ended, that removal. A member that was
+// never in the group, that left or rekeyed, or that has been readmitted since
+// is left out. A nil ids asks about every member this node knows of that is
+// not a member now.
+//
+// What ended a membership is read from the records the canonical checkpoint
+// does not cover, projected in their own order, so the answer does not depend
+// on the order they arrived in. A membership that ended inside a checkpoint,
+// whose records this node does not project, falls back to the checkpoints: a
+// member listed by one checkpoint on the canonical chain - or with a join this
+// node holds - and missing from the first later one is reported as removed by
+// a removal of it this node holds from between the two, or else by that later
+// checkpoint. Without the records a member that left of its own accord inside
+// a checkpoint cannot be told from a removed one, so it is reported too.
+//
+// The group's lock is held only to copy what the answer needs; the work runs
+// outside it, in one pass over the held records whatever the number of ids,
+// and an id this node never saw as a member costs no more than a lookup.
+func (g *Group) RemovedAt(ids []entmoot.MemberID) map[entmoot.MemberID]Removal {
+	type checkpointView struct {
+		id        entmoot.RosterEntryID
+		timestamp int64
+		members   map[entmoot.MemberID]entmoot.NodeInfo
+	}
+	all := ids == nil
+	wanted := make(map[entmoot.MemberID]struct{}, len(ids))
+	var current map[entmoot.MemberID]struct{}
+	g.mu.RLock()
+	if all {
+		current = make(map[entmoot.MemberID]struct{}, len(g.state.Members))
+		for id := range g.state.Members {
+			current[id] = struct{}{}
+		}
+	}
+	for _, id := range ids {
+		if _, member := g.state.Members[id]; !member {
+			wanted[id] = struct{}{}
+		}
+	}
+	if !all && len(wanted) == 0 {
+		g.mu.RUnlock()
+		return nil
+	}
+	base := g.checkpoints[g.canonicalID]
+	window := make([]Record, 0, len(g.records))
+	for _, rec := range g.records {
+		window = append(window, rec)
+	}
+	covered := make([]Record, 0, len(g.history))
+	for _, rec := range g.history {
+		covered = append(covered, rec)
+	}
+	// The canonical chain, newest first. A checkpoint's member index is
+	// never changed once stored, so sharing it outside the lock is safe.
+	var chain []checkpointView
+	for cp, ok := g.checkpoints[g.canonicalID]; ok && len(chain) <= len(g.checkpoints); cp, ok = g.checkpoints[cp.Previous] {
+		chain = append(chain, checkpointView{id: cp.ID, timestamp: cp.Timestamp, members: g.membersAt[cp.ID]})
+	}
+	g.mu.RUnlock()
+	// Every non-member a held record or a checkpoint names.
+	want := func(id entmoot.MemberID) bool {
+		if _, ok := wanted[id]; ok {
+			return true
+		}
+		if !all {
+			return false
+		}
+		if _, member := current[id]; member {
+			return false
+		}
+		wanted[id] = struct{}{}
+		return true
+	}
+	if all {
+		for _, cp := range chain {
+			for id := range cp.members {
+				want(id)
+			}
+		}
+	}
+
+	// One pass over every held record, resolving each one's member ids once:
+	// the records naming a wanted id, and the last moment each was known in.
+	held := make(map[entmoot.MemberID][]Record)
+	lastSeen := make(map[entmoot.MemberID]int64)
+	for _, records := range [][]Record{window, covered} {
+		for _, rec := range records {
+			var involved [2]entmoot.MemberID
+			n := 0
+			if subject, err := rec.SubjectMemberID(); err == nil && want(subject) {
+				involved[n] = subject
+				n++
+			}
+			if actor, err := entmoot.ResolvedMemberID(rec.Actor); err == nil {
+				if want(actor) && (n == 0 || involved[0] != actor) {
+					involved[n] = actor
+					n++
+				}
+			}
+			for _, id := range involved[:n] {
+				held[id] = append(held[id], rec)
+				if rec.Kind == KindJoin && rec.Timestamp > lastSeen[id] {
+					lastSeen[id] = rec.Timestamp
+				}
+			}
+		}
+	}
+	for _, cp := range chain {
+		for id := range wanted {
+			if _, in := cp.members[id]; in && cp.timestamp > lastSeen[id] {
+				lastSeen[id] = cp.timestamp
+			}
+		}
+	}
+	// Never a member, as far as this node knows: nothing to report.
+	for id := range wanted {
+		if _, seen := lastSeen[id]; !seen {
+			delete(wanted, id)
+		}
+	}
+	if len(wanted) == 0 {
+		return nil
+	}
+
+	endedBy := make(map[entmoot.MemberID]Record)
+	projectTracking(base, window, endedBy)
+	removed := make(map[entmoot.MemberID]Removal)
+	for id := range wanted {
+		if ending, ok := endedBy[id]; ok {
+			if ending.Kind == KindRemove {
+				removed[id] = Removal{At: ending.Timestamp, Entry: ending.ID}
+			}
+			continue
+		}
+		// The first checkpoint after the member was last known in that no
+		// longer lists it.
+		var out *checkpointView
+		for k := range chain {
+			if chain[k].timestamp <= lastSeen[id] {
+				break
+			}
+			if _, in := chain[k].members[id]; !in {
+				out = &chain[k]
+			}
+		}
+		if out == nil {
+			continue
+		}
+		removal := Removal{At: out.timestamp, Entry: out.id}
+		var removedAt int64
+		for _, rec := range held[id] {
+			if rec.Kind != KindRemove || rec.Timestamp <= lastSeen[id] || rec.Timestamp > out.timestamp || rec.Timestamp <= removedAt {
+				continue
+			}
+			if subject, err := rec.SubjectMemberID(); err == nil && subject == id {
+				removedAt = rec.Timestamp
+				removal = Removal{At: rec.Timestamp, Entry: rec.ID}
+			}
+		}
+		removed[id] = removal
+	}
+	return removed
+}
+
 func (g *Group) reproject() {
 	base := g.checkpoints[g.canonicalID]
 	records := make([]Record, 0, len(g.records))
@@ -514,6 +715,16 @@ func (g *Group) CanAdminister(id entmoot.MemberID) bool {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 	return g.state.CanAdminister(id)
+}
+
+// RemovalTakesEffect reports whether a remove or ban of subject that actor
+// signs now would take effect, by the rule the projection applies: actor must
+// administer the group and, unless it is the founder, may not remove the
+// founder or another admin.
+func (g *Group) RemovalTakesEffect(actor, subject entmoot.MemberID) bool {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.state.CanAdminister(actor) && g.state.MayRemove(actor, subject)
 }
 
 // IsMemberID reports current membership.
@@ -882,6 +1093,14 @@ func (g *Group) Discard() error {
 // Apply stores one record and re-projects. Applying a record twice is a no-op,
 // so a peer may send the same record repeatedly.
 func (g *Group) Apply(rec Record) (bool, error) {
+	applied, err := g.apply(rec)
+	if applied {
+		g.changed()
+	}
+	return applied, err
+}
+
+func (g *Group) apply(rec Record) (bool, error) {
 	if err := VerifyRecord(rec); err != nil {
 		return false, err
 	}
@@ -923,6 +1142,14 @@ func (g *Group) Apply(rec Record) (bool, error) {
 // records is refused rather than adopted, so a wrong or hostile checkpoint
 // cannot rewrite what this node knows.
 func (g *Group) ApplyCheckpoint(cp Checkpoint) (bool, error) {
+	applied, err := g.applyCheckpoint(cp)
+	if applied {
+		g.changed()
+	}
+	return applied, err
+}
+
+func (g *Group) applyCheckpoint(cp Checkpoint) (bool, error) {
 	if err := VerifyCheckpoint(cp); err != nil {
 		return false, err
 	}

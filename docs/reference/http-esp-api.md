@@ -318,8 +318,30 @@ Public open-invite issuer endpoints:
 - `POST /v1/open-invites/{token}/redeem` accepts the redeemer's MemberID,
   libp2p PeerID and Entmoot public key, checks that all three derive from that
   key, and returns a signed invite made out to it. Nothing is signed by the
-  redeemer: the invite is only usable by the holder of that key. Replays for
-  the same redeemer return the stored result.
+  redeemer: the invite is only usable by the holder of that key. A replay by
+  the same redeemer returns the stored result, and does not use up another
+  use. The exception is a stored invite that has expired or names different
+  addresses, peers or relays than the issuer would issue now, and that never
+  got anyone in (its holder never a member, removed or banned, and nobody else
+  revoked it). That invite is replaced once and the replacement is stored.
+  The issuer revokes the invite it replaces, and any it replaced before, in
+  the roster. As with any revoked invite, a join with one of those dated
+  before its revocation, or inside its window if it had expired, is accepted
+  until the founder seals the revocation. To make that harder to turn into a
+  way back in, the issuer keeps its invites in line with the group's
+  membership whenever it applies a record or checkpoint: it revokes every
+  other invite in a replacement chain once one of them has been used, and
+  every invite it minted to somebody no longer a member before it had the
+  removal or ban that ended its latest membership (or before that removal's
+  own date, if later). Re-invites minted once it had the removal, readmitted
+  members and members that left are never touched. A
+  removal signed on the issuing node revokes them before it, so they cannot
+  readmit the member. A removal signed on another admin's node is followed by
+  the revocations once the issuer holds it, so a join with one of those
+  invites dated between the removal and the revocation is accepted until the
+  founder seals. If
+  the answer carrying a replacement is lost, the next replay is handed that
+  same replacement. Revoked or expired open invites refuse replays.
 
 Create a message draft sign request:
 

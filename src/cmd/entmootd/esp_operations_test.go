@@ -566,14 +566,28 @@ func testGroupCreateRequest(id string) esphttp.SignRequest {
 	}
 }
 
+// testUnixSocketPath makes a socket path under os.TempDir(), or under /tmp
+// when the temp dir is too deep for a unix socket path (about 104 bytes on
+// macOS) or cannot be written.
 func testUnixSocketPath(t *testing.T) string {
 	t.Helper()
-	dir, err := os.MkdirTemp("/tmp", "entmoot-esp-ipc-")
-	if err != nil {
-		t.Fatalf("MkdirTemp: %v", err)
+	const maxSocketPath = 100
+	var errs []error
+	for _, base := range []string{os.TempDir(), "/tmp"} {
+		if len(filepath.Join(base, "entmoot-esp-ipc-0000000000", "sock")) > maxSocketPath {
+			errs = append(errs, fmt.Errorf("%s: too deep for a unix socket", base))
+			continue
+		}
+		dir, err := os.MkdirTemp(base, "entmoot-esp-ipc-")
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		t.Cleanup(func() { _ = os.RemoveAll(dir) })
+		return filepath.Join(dir, "sock")
 	}
-	t.Cleanup(func() { _ = os.RemoveAll(dir) })
-	return filepath.Join(dir, "sock")
+	t.Fatalf("no directory for a test socket: %v", errors.Join(errs...))
+	return ""
 }
 
 func createTestGroup(t *testing.T, dataDir string, gid entmoot.GroupID, id *keystore.Identity, founder entmoot.NodeInfo) {

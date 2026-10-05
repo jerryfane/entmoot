@@ -19,6 +19,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -1071,6 +1072,9 @@ func (s *ipcServer) handleConn(ctx context.Context, c net.Conn) {
 		s.handleJoinGroup(ctx, c, v)
 	case *ipc.InviteCreateReq:
 		s.handleInviteCreate(ctx, c, v)
+	case *ipc.InviteRefreshReq:
+		refresh := v.Refresh
+		s.issueInvite(c, &v.InviteCreateReq, &refresh)
 	case *ipc.InviteAuthorityCheckReq:
 		s.handleInviteAuthorityCheck(ctx, c, v)
 	case *ipc.MemberRemoveReq:
@@ -1402,6 +1406,14 @@ func (s *ipcServer) joinReadinessEvent(ctx context.Context) json.RawMessage {
 }
 
 func (s *ipcServer) handleInviteCreate(_ context.Context, c net.Conn, req *ipc.InviteCreateReq) {
+	s.issueInvite(c, req, nil)
+}
+
+// issueInvite mints a capability for req. With refresh, a capability already
+// issued to req's target, it answers an invite_refresh instead: refresh comes
+// back unchanged, or the capability that replaces it - one issued earlier
+// whose answer was lost, or a new one when that has gone stale.
+func (s *ipcServer) issueInvite(c net.Conn, req *ipc.InviteCreateReq, refresh *entmoot.BootstrapCapability) {
 	gid := req.GroupID
 	if gid == (entmoot.GroupID{}) {
 		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInvalidArgument, GroupID: &gid, Message: "group_id is required"})
@@ -1529,6 +1541,45 @@ func (s *ipcServer) handleInviteCreate(_ context.Context, c net.Conn, req *ipc.I
 		}
 	}
 	now := time.Now()
+	relays := s.runtime.relayHints()
+	// chain is the refreshed capability followed by every replacement this
+	// node has recorded for it, oldest first; nil for a plain invite_create.
+	var chain []entmoot.BootstrapCapability
+	if refresh != nil {
+		if len(req.TargetPublicKey) == 0 || refresh.GroupID != gid || !bytes.Equal(refresh.TargetPublicKey, req.TargetPublicKey) {
+			_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInvalidArgument, GroupID: &gid, Message: "refresh must be a capability for the same group and target"})
+			return
+		}
+		if err := membership.VerifyInviteSignature(*refresh); err != nil {
+			_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInvalidArgument, GroupID: &gid, Message: "refresh: " + err.Error()})
+			return
+		}
+		// Removal takes this lock too, so a target cannot be removed between
+		// the check that it never got in and the replacement it is handed;
+		// and two refreshes of one capability cannot both replace it.
+		unlock := lockESPInviteRoster(gid)
+		defer unlock()
+		resolved, err := s.runtime.invites.ReplacementChain(*refresh)
+		if err != nil {
+			_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInternal, GroupID: &gid, Message: err.Error()})
+			return
+		}
+		chain = resolved
+		current := chain[len(chain)-1]
+		switch {
+		case issuedInviteAdmitted(session.group, chain, targetMemberID) || session.group.IsInviteRevoked(current.Nonce):
+			// The target got in, or the current capability was withdrawn by
+			// somebody else: what the caller holds stands.
+			answerInviteRefresh(c, session.group, *refresh, *refresh)
+			return
+		case issuedInviteCurrent(current, allowedAddresses, allowedPeerIDs, relays, now.UnixMilli()):
+			// Either nothing changed, or a replacement was already issued and
+			// the answer carrying it never reached the caller: hand it out
+			// again rather than leave the caller holding a revoked one.
+			s.handOutReplacement(c, session.group, chain, current, targetMemberID)
+			return
+		}
+	}
 	expires := now.Add(24 * time.Hour)
 	if req.ValidForMS > 0 {
 		expires = now.Add(time.Duration(req.ValidForMS) * time.Millisecond)
@@ -1550,7 +1601,7 @@ func (s *ipcServer) handleInviteCreate(_ context.Context, c net.Conn, req *ipc.I
 		RosterHead:        session.group.Canonical().ID,
 		AllowedPeerIDs:    allowedPeerIDs,
 		AllowedMultiaddrs: allowedAddresses,
-		Relays:            s.runtime.relayHints(),
+		Relays:            relays,
 		MaxUses:           req.MaxUses,
 		IssuedAtMS:        membership.InviteIssuedAtMS(now),
 		ExpiresAtMS:       expires.UnixMilli(),
@@ -1569,11 +1620,155 @@ func (s *ipcServer) handleInviteCreate(_ context.Context, c net.Conn, req *ipc.I
 			Message: fmt.Sprintf("invite is %d bytes, over the %d-byte limit a joiner can send", size, libp2ptransport.MaxCapabilityBytes)})
 		return
 	}
+	if chain != nil {
+		// Linked before anything is revoked, so however this request ends -
+		// the answer lost, the daemon stopped - a later refresh of any
+		// capability in the chain finds the replacement.
+		if err := s.runtime.invites.RecordReplacementInvite(chain[len(chain)-1].Nonce, capability); err != nil {
+			_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInternal, GroupID: &gid, Message: "record replacement invite: " + err.Error()})
+			return
+		}
+		s.handOutReplacement(c, session.group, chain, capability, targetMemberID)
+		return
+	}
 	if err := s.runtime.invites.RecordIssuedInvite(capability); err != nil {
 		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInternal, GroupID: &gid, Message: "record issued invite: " + err.Error()})
 		return
 	}
 	_ = ipc.EncodeAndWrite(c, &ipc.InviteCreateResp{Status: "created", GroupID: gid, Capability: capability, RosterHead: session.group.Canonical().ID, Members: len(session.group.MemberIDs())})
+}
+
+// handOutReplacement answers a refresh of chain[0] with replacement, the
+// capability that now stands in for every one in chain. Every other
+// capability in chain is revoked first, expired or not, with the same signed
+// record `invite revoke` writes - which the founder's daemon then seals like
+// any other revocation - so the holder never carries two capabilities that
+// admit it, and a join dated inside an expired one's window is made stale by
+// the seal too. A join that landed before the revocation means the target got
+// in after all; then the replacement is withheld and the refreshed capability
+// handed back, as for any target that got in. What still lands before the
+// seal is retired by reconcileIssuedInvites, and by member removal.
+func (s *ipcServer) handOutReplacement(c net.Conn, group *membership.Group, chain []entmoot.BootstrapCapability, replacement entmoot.BootstrapCapability, target entmoot.MemberID) {
+	gid := group.GroupID()
+	previous := make([][32]byte, 0, len(chain))
+	for _, issued := range chain {
+		if issued.Nonce != replacement.Nonce {
+			previous = append(previous, issued.Nonce)
+		}
+	}
+	if _, err := revokeIssuedInvites(s.identity, group, s.runtime.invites, previous); err != nil {
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInternal, GroupID: &gid, Message: "revoke replaced invite: " + err.Error()})
+		return
+	}
+	if issuedInviteAdmitted(group, chain, target) {
+		answerInviteRefresh(c, group, chain[0], chain[0])
+		return
+	}
+	answerInviteRefresh(c, group, chain[0], replacement)
+}
+
+// revokeIssuedInvites signs a revoke_invite record for each nonce the group
+// has not revoked yet and notes it in the local ledger. It returns the nonces
+// it revoked.
+func revokeIssuedInvites(identity *keystore.Identity, group *membership.Group, ledger *libp2ptransport.InviteLedger, nonces [][32]byte) ([][32]byte, error) {
+	gid := group.GroupID()
+	var revoked [][32]byte
+	for _, nonce := range nonces {
+		if group.IsInviteRevoked(nonce) {
+			continue
+		}
+		if _, err := group.SignRecord(identity, membership.Record{Kind: membership.KindRevokeInvite, InviteNonce: nonce}); err != nil {
+			return revoked, err
+		}
+		revoked = append(revoked, nonce)
+		if _, err := ledger.MarkRevoked(gid, nonce); err != nil {
+			slog.Warn("invite revoked by record but not in the local ledger",
+				slog.String("group_id", gid.String()), slog.String("err", err.Error()))
+		}
+	}
+	return revoked, nil
+}
+
+// revokeInvitesForRemoval revokes, ahead of a remove or ban of target that
+// actor is about to sign, every capability this node issued to target that
+// could still admit it: not expired, not used up, not revoked. That includes
+// every link of an ESP replacement chain, so a removed or banned member cannot
+// come back through a replacement it was handed before it got in with an
+// older capability (which a join dated before that one's revocation can do
+// until the founder seals it). Revoking first means a join with one of these
+// dated after the revocation is refused, and one dated before it is dated
+// before the removal too, so the removal still applies after it. A removal
+// signed on another node can only be followed by such revocations
+// (reconcileIssuedInvites), which leaves a window until the founder seals.
+// A removal the projection will not honour, such as an admin removing a peer
+// admin, revokes nothing.
+func revokeInvitesForRemoval(identity *keystore.Identity, actor entmoot.MemberID, group *membership.Group, ledger *libp2ptransport.InviteLedger, target entmoot.MemberID) ([][32]byte, error) {
+	if !group.RemovalTakesEffect(actor, target) {
+		return nil, nil
+	}
+	issued, err := ledger.LiveTargetedInvites(group.GroupID())
+	if err != nil {
+		return nil, err
+	}
+	var nonces [][32]byte
+	for _, record := range issued {
+		if *record.TargetMemberID != target ||
+			(record.MaxUses > 0 && group.InviteUses(record.Nonce) >= record.MaxUses) {
+			continue
+		}
+		nonces = append(nonces, record.Nonce)
+	}
+	return revokeIssuedInvites(identity, group, ledger, nonces)
+}
+
+func encodeInviteNonces(nonces [][32]byte) []string {
+	encoded := make([]string, 0, len(nonces))
+	for _, nonce := range nonces {
+		encoded = append(encoded, base64.StdEncoding.EncodeToString(nonce[:]))
+	}
+	return encoded
+}
+
+// answerInviteRefresh answers a refresh of offered with answer, saying
+// whether it is a replacement; only that answer lets the caller swap.
+func answerInviteRefresh(c net.Conn, group *membership.Group, offered, answer entmoot.BootstrapCapability) {
+	status, refreshStatus := "unchanged", "unchanged"
+	if answer.Nonce != offered.Nonce {
+		status, refreshStatus = "created", "replaced"
+	}
+	gid := group.GroupID()
+	_ = ipc.EncodeAndWrite(c, &ipc.InviteCreateResp{Status: status, RefreshStatus: refreshStatus, GroupID: gid, Capability: answer, RosterHead: group.Canonical().ID, Members: len(group.MemberIDs())})
+}
+
+// issuedInviteCurrent reports whether issued still serves its holder: it has
+// not expired and names the addresses, peers and relays a new one would.
+// Replacing only what fails this is what bounds a caller replaying a
+// capability to one new mint per change.
+func issuedInviteCurrent(issued entmoot.BootstrapCapability, addresses, peerIDs, relays []string, nowMS int64) bool {
+	return membership.InviteValidAt(issued, nowMS) == nil &&
+		sameStringSet(issued.AllowedMultiaddrs, addresses) &&
+		sameStringSet(issued.AllowedPeerIDs, peerIDs) &&
+		sameStringSet(issued.Relays, relays)
+}
+
+// issuedInviteAdmitted reports whether target got in: a capability in chain
+// has been used, or it is a member now, or was removed or banned. A new
+// nonce is a fresh admission, so such a target is never given one.
+func issuedInviteAdmitted(group *membership.Group, chain []entmoot.BootstrapCapability, target entmoot.MemberID) bool {
+	for _, issued := range chain {
+		if group.InviteUses(issued.Nonce) > 0 {
+			return true
+		}
+	}
+	if group.IsMemberID(target) || group.IsBanned(target) {
+		return true
+	}
+	_, removed := group.RemovalProof(target)
+	return removed
+}
+
+func sameStringSet(left, right []string) bool {
+	return slices.Equal(slices.Sorted(slices.Values(left)), slices.Sorted(slices.Values(right)))
 }
 
 func (s *ipcServer) handleInviteAuthorityCheck(ctx context.Context, c net.Conn, req *ipc.InviteAuthorityCheckReq) {
@@ -1723,6 +1918,16 @@ func (s *ipcServer) handleMemberRemove(ctx context.Context, c net.Conn, req *ipc
 		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeConflict, GroupID: &gid, Message: "target identity does not match current roster"})
 		return
 	}
+	// Capabilities this node issued to the member are revoked first; see
+	// revokeInvitesForRemoval for why before, not after, the removal. A failure
+	// leaves the member in place so the removal can be retried, rather than
+	// removing it while a capability that readmits it stays live.
+	revoked, err := revokeInvitesForRemoval(s.identity, s.memberID, sess.group, s.runtime.invites, *existing.MemberID)
+	if err != nil {
+		unlock()
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInternal, GroupID: &gid, Message: "revoke the member's invites: " + err.Error()})
+		return
+	}
 	if err := applyRosterRemove(s.identity, sess.group, existing); err != nil {
 		unlock()
 		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInternal, GroupID: &gid, Message: err.Error()})
@@ -1731,10 +1936,10 @@ func (s *ipcServer) handleMemberRemove(ctx context.Context, c net.Conn, req *ipc
 	head := sess.group.Canonical().ID
 	members := len(sess.group.MemberIDs())
 	unlock()
-	// A removed member's outstanding invites stop working by rule: an invite
-	// is worth exactly its issuer's current authority, which every node
-	// projects from the same records. There is nothing to revoke and so
-	// nothing that can fail to be revoked.
+	revokedNonces := encodeInviteNonces(revoked)
+	// Invites the removed member issued stop working by rule: an invite is
+	// worth exactly its issuer's current authority, which every node projects
+	// from the same records, so those need no revocation.
 	//
 	// Invites issued by whoever is still an admin are unaffected, and an
 	// operator may want to see them, so they are reported.
@@ -1785,6 +1990,7 @@ func (s *ipcServer) handleMemberRemove(ctx context.Context, c net.Conn, req *ipc
 		OutstandingESPOpenInvites: espOpen,
 		ESPOpenInvitesError:       espError,
 		InviteLedgerError:         ledgerError,
+		RevokedInvites:            revokedNonces,
 	})
 }
 
