@@ -53,11 +53,12 @@ daemon `probe_status` says so rather than blaming the peers.
   above the checkpoint and succeeds unless that invite was the one revoked.
 - **Revoked invite or removed admin still seems to work on one node:** a
   revoke, admin demotion or admin removal is final against backdated joins
-  once the founder's daemon has sealed it with a checkpoint (one to two
-  membership rounds after that daemon has the record) and the node has
-  pulled that checkpoint. Make sure the founder's `serve` is running. Only if
-  it cannot run, use `roster checkpoint -group <gid>` on the founder, right
-  after it last synchronized with the other members.
+  once the founder's daemon has sealed it with a checkpoint (normally one to
+  two membership rounds, at most about two minutes, after that daemon has the
+  record) and the node has pulled that checkpoint. Make sure the founder's
+  `serve` is running. Only if it cannot run, use `roster checkpoint -group
+  <gid>` on the founder, right after it last synchronized with the other
+  members.
 - **Peer route unclear:** run `doctor -group <gid> --probe --json`. Read
   `reachable` per peer, and `answered` before blaming the network: an
   answered-but-refused row means membership, not routing. `probe_status` says

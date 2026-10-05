@@ -134,28 +134,35 @@ The commands themselves only sign the record. A checkpoint makes every record
 dated before it stale, so one signed from a view that is missing records other
 members hold would lose those records for good and leave those members unable
 to follow the chain. The founder's daemon therefore seals a change only after a
-membership round that started after it saw the change has pulled from every
-member it could reach, and folds only records dated up to the change. If that
-round reached no other member, it waits for the next. Only the founder seals,
-so no two nodes cut competing checkpoints for the same change, and it signs at
-most one seal a minute however many changes arrive.
+membership round that started after it saw the change has pulled everything
+from every member it could reach, and folds only records dated up to the
+change. A member that cannot be dialled does not hold this up, but a round
+that reached no other member, or in which one answered with only part of what
+it holds, does. That wait is bounded: two minutes and three rounds after
+the founder first saw the change, it seals on what it holds, and logs which
+members lagged. So no member, a demoted admin included, can keep a change
+unsealed by answering slowly or incompletely. Only the founder seals, so no
+two nodes cut competing checkpoints for the same change, and it signs at most
+one seal a minute however many changes arrive.
 
-A change is final on the founder about one to two membership rounds (15 to 30
-seconds) after its daemon receives it, and on every other node once it has
-pulled that checkpoint, normally within another round. Older peers need no
-upgrade: they already adopt checkpoints and refuse records older than one.
-While the founder's daemon is not running, nothing is sealed and the cadence
-checkpoint is the only bound. For an urgent case, `entmootd roster checkpoint`
-on the founder seals at once, but run it only right after the founder's
-daemon has synchronized with the other members, for the reason above.
+A change is normally final on the founder one to two membership rounds (15
+to 30 seconds) after its daemon receives it, and at most about two minutes
+after, and on every other node once it has pulled that checkpoint, normally
+within another round. Older peers need no upgrade: they already adopt
+checkpoints and refuse records older than one. While the founder's daemon is
+not running, nothing is sealed and the cadence checkpoint is the only bound.
+For an urgent case, `entmootd roster checkpoint` on the founder seals at
+once, but run it only right after the founder's daemon has synchronized with
+the other members, for the reason above.
 
 What remains: until a node has the checkpoint, that node can still accept such
 a backdated join, and a node that does will then refuse the checkpoint as
 disagreeing with its records. A record a member received but that the founder
-could not pull before the seal (the member was unreachable, or the record
-arrived late) has the same effect. Expiry is not covered: a join dated inside an
-invite's validity window is still admitted after the invite expires, until a
-later checkpoint covers that window.
+could not pull before the seal (the member was unreachable or lagging until
+the deadline, or the record arrived late) has the same effect. Expiry is not
+covered: a join dated inside an invite's validity window is still admitted
+after the invite expires, until a later checkpoint covers that window.
+
 Several admins reaching the cadence at once each sign one; they all describe
 the same membership, and every node picks the same winner by the rule below, so
 a duplicate costs one signature and nothing else.

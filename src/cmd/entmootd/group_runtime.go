@@ -103,9 +103,14 @@ type groupSession struct {
 type sealState struct {
 	mu sync.Mutex
 	// armed is the timestamp of the newest authority change this node held at
-	// the end of an earlier round, or 0. It is sealed through only after a
-	// later round has pulled from the reachable members.
+	// the end of an earlier round, or 0. It is sealed through once a later
+	// round has pulled from the reachable members, or once it is overdue.
 	armed int64
+	// armedAt and rounds measure how long a seal has been waiting, from the
+	// round that armed it: past sealDeadline and sealDeadlineRounds it is
+	// sealed whether or not a round synced.
+	armedAt time.Time
+	rounds  int
 	// last is when this node last sealed, for minSealInterval.
 	last time.Time
 }
@@ -580,6 +585,15 @@ const (
 	// admin revoking in a loop must not be able to make the founder sign one
 	// per change.
 	minSealInterval = time.Minute
+	// sealDeadline and sealDeadlineRounds bound how long a seal waits for a
+	// round that pulled everything from every reachable member; once both
+	// have passed it is signed on what this node holds. Without a bound a
+	// single member could keep the seal off for ever by answering every
+	// pull as incomplete or not at all - and the member with most reason to
+	// is an admin keeping its own demotion unsealed while it signs backdated
+	// joins.
+	sealDeadline       = 2 * time.Minute
+	sealDeadlineRounds = 3
 )
 
 // syncMembership pulls membership from reachable members. There is no backoff,
@@ -606,15 +620,19 @@ func (r *groupRuntime) syncMembership(ctx context.Context, session *groupSession
 		// records the founder signs, and still has to retire them. A seal is
 		// different: it would vouch for records other members may hold, so it
 		// waits for a round that reaches one, unless there is nobody else.
-		r.sealAuthorityChanges(session, r.onlyLocalMember(session))
+		r.sealAuthorityChanges(session, r.onlyLocalMember(session), nil)
 		r.signCheckpointIfDue(session)
 		return
 	}
 	progressed := false
-	// reached counts the members this round pulled everything from. A member
-	// that could not be pulled from is treated as unreachable; one that had
-	// more than one exchange carries leaves the round short.
+	// reached counts the members this round pulled everything from, and
+	// short is set when one answered but had more than one exchange carries.
+	// A member that could not be pulled from at all is treated as
+	// unreachable rather than as holding the round up, or a single offline
+	// member would delay every seal. lagging names both kinds, for the log
+	// of a forced seal (see sealAuthorityChanges).
 	reached, short := 0, false
+	var lagging []string
 	for _, remote := range peers {
 		syncCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		checkpoints, records, complete, err := libp2ptransport.FetchMembership(syncCtx, r.host, remote, session.group, r.binding.MemberID)
@@ -638,12 +656,14 @@ func (r *groupRuntime) syncMembership(ctx context.Context, session *groupSession
 				slog.String("peer_id", remote.ID.String()),
 				slog.String("err", err.Error()))
 		}
-		if err == nil {
-			if complete {
-				reached++
-			} else {
-				short = true
-			}
+		switch {
+		case err == nil && complete:
+			reached++
+		case err == nil:
+			short = true
+			lagging = append(lagging, remote.ID.String())
+		default:
+			lagging = append(lagging, remote.ID.String())
 		}
 		if checkpoints > 0 || records > 0 {
 			progressed = true
@@ -667,7 +687,7 @@ func (r *groupRuntime) syncMembership(ctx context.Context, session *groupSession
 		// Messages held for a checkpoint we have now learned can be accepted.
 		r.drainHeldMessages(ctx, session)
 	}
-	r.sealAuthorityChanges(session, reached > 0 && !short)
+	r.sealAuthorityChanges(session, reached > 0 && !short, lagging)
 	// Every round, not only when a pull brought something back: records this
 	// node signed itself count towards the cadence too, so a founder admitting
 	// members while nothing arrives from anybody else must still checkpoint.
@@ -704,12 +724,16 @@ func (r *groupRuntime) onlyLocalMember(session *groupSession) bool {
 //     reach (synced), which gives records dated before the change a full
 //     round to reach somebody and be pulled; a round that reached nobody
 //     defers the seal to the next one;
+//   - but it never waits past sealDeadline and sealDeadlineRounds from the
+//     round that armed it: a member that never answers, or answers every
+//     pull as incomplete, cannot hold the seal off, and the members that
+//     lagged are logged when it is forced;
 //   - the checkpoint folds only what is dated up to the change, so records
 //     signed since stay out of what it vouches for;
 //   - one seal per minSealInterval, however many changes arrive.
 //
 // The cadence checkpoint is separate and unchanged.
-func (r *groupRuntime) sealAuthorityChanges(session *groupSession, synced bool) {
+func (r *groupRuntime) sealAuthorityChanges(session *groupSession, synced bool, lagging []string) {
 	seal := &session.seal
 	seal.mu.Lock()
 	defer seal.mu.Unlock()
@@ -718,25 +742,52 @@ func (r *groupRuntime) sealAuthorityChanges(session *groupSession, synced bool) 
 		!bytes.Equal(founder.EntmootPubKey, r.identity.PublicKey) {
 		return
 	}
-	if seal.armed != 0 && synced && time.Since(seal.last) >= minSealInterval {
-		checkpoint, signed, err := session.group.SealThrough(r.identity, seal.armed)
-		switch {
-		case err != nil:
-			r.logger.Warn("membership seal",
-				slog.String("group_id", session.groupID.String()),
-				slog.String("err", err.Error()))
-		case signed:
-			seal.last = time.Now()
-			r.logger.Info("membership authority change sealed",
-				slog.String("group_id", session.groupID.String()),
-				slog.Uint64("sequence", checkpoint.Sequence),
-				slog.Int64("through", checkpoint.Timestamp),
-				slog.Uint64("covered", checkpoint.Covered),
-				slog.Int("members", len(checkpoint.Members)))
+	now := time.Now()
+	if seal.armed != 0 {
+		seal.rounds++
+		overdue := seal.rounds >= sealDeadlineRounds && now.Sub(seal.armedAt) >= sealDeadline
+		if (synced || overdue) && now.Sub(seal.last) >= minSealInterval {
+			checkpoint, signed, err := session.group.SealThrough(r.identity, seal.armed)
+			switch {
+			case err != nil:
+				r.logger.Warn("membership seal",
+					slog.String("group_id", session.groupID.String()),
+					slog.String("err", err.Error()))
+			case signed:
+				seal.last = now
+				// Whatever is still due after this seal is a newer change,
+				// and gets its own full wait.
+				seal.armed = 0
+				attrs := []any{
+					slog.String("group_id", session.groupID.String()),
+					slog.Uint64("sequence", checkpoint.Sequence),
+					slog.Int64("through", checkpoint.Timestamp),
+					slog.Uint64("covered", checkpoint.Covered),
+					slog.Int("members", len(checkpoint.Members)),
+				}
+				if synced {
+					r.logger.Info("membership authority change sealed", attrs...)
+				} else {
+					// A member that lagged may hold a record dated before
+					// the change that this seal now leaves out; it will
+					// refuse the seal until repaired. Name it.
+					r.logger.Warn("membership authority change sealed without a fully synchronized round",
+						append(attrs,
+							slog.Duration("waited", now.Sub(seal.armedAt)),
+							slog.Any("lagging_peers", lagging))...)
+				}
+			}
 		}
 	}
-	// Whatever is due now waits for the next synced round.
-	seal.armed, _ = session.group.SealDue()
+	due, ok := session.group.SealDue()
+	switch {
+	case !ok:
+		seal.armed, seal.armedAt, seal.rounds = 0, time.Time{}, 0
+	case seal.armed == 0:
+		seal.armed, seal.armedAt, seal.rounds = due, now, 0
+	default:
+		seal.armed = due
+	}
 }
 
 // signCheckpointIfDue folds pending records into a checkpoint once the group's

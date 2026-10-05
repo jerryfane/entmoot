@@ -169,10 +169,10 @@ takes an explicit `invite revoke`. `invite revoke` writes a signed `revoke_invit
 record, which is what makes other nodes refuse it, and also marks the local
 issuance ledger; it therefore takes the writer lease and needs the daemon
 stopped. The revocation is final against a join dated before it once the
-founder's daemon has sealed it, one to two membership rounds after that
-daemon has the record, and on each other node once it has pulled that
-checkpoint. `-open` mints a bearer invite: whoever holds it can join until it
-expires, is revoked, or runs out of uses.
+founder's daemon has sealed it, normally one to two membership rounds and at
+most about two minutes after that daemon has the record, and on each other
+node once it has pulled that checkpoint. `-open` mints a bearer invite:
+whoever holds it can join until it expires, is revoked, or runs out of uses.
 
 `invite list` reads `bootstrap-admission.db`, which is only a local record of
 the invites this node issued. Invite use limits themselves are counted from the

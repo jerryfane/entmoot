@@ -28,10 +28,12 @@ after it until a checkpoint covers it. Every change that takes authority away
 (invite revocation, admin demotion, removal or departure, closing an open
 group) is therefore sealed by the founder's daemon with a checkpoint dated at
 the change, once a membership round has pulled what the reachable members
-hold, and a node refuses a join dated before the change once that checkpoint
-has reached it. Until then - about one to two membership rounds on the
-founder, and one more for the other nodes, longer while the founder's daemon
-is down - a node can still admit such a join. Invite expiry has no such
+hold or, failing that, about two minutes after it saw the change, so that no
+member can hold the seal off. A node refuses a join dated before the change
+once that checkpoint has reached it. Until then - normally one to two
+membership rounds on the founder and at most about two minutes, one more
+round for the other nodes, longer while the founder's daemon is down - a
+node can still admit such a join. Invite expiry has no such
 checkpoint: a join dated inside an expired invite's validity window is
 admitted until a later checkpoint covers the window.
 
