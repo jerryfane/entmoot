@@ -322,10 +322,12 @@ Public open-invite issuer endpoints:
   the same redeemer returns the stored result, and does not use up another
   use. The exception is a stored invite that has expired or names different
   addresses, peers or relays than the issuer would issue now, and that never
-  got anyone in (its nonce unused and unrevoked, its holder never a member,
-  removed or banned). That invite is replaced once and the replacement is
-  stored. If the replaced invite had not expired, the issuer revokes it in the
-  roster first. Revoked or expired open invites refuse replays.
+  got anyone in (its holder never a member, removed or banned, and nobody else
+  revoked it). That invite is replaced once and the replacement is stored. If
+  the replaced invite had not expired, the issuer revokes it in the roster
+  first. If the answer carrying a replacement is lost, the next replay is
+  handed that same replacement. Revoked or expired open invites refuse
+  replays.
 
 Create a message draft sign request:
 

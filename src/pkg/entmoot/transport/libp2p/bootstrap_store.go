@@ -3,6 +3,7 @@ package libp2ptransport
 import (
 	"database/sql"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -78,6 +79,17 @@ func initInviteLedgerSchema(db *sql.DB) error {
 		);`); err != nil {
 		return fmt.Errorf("libp2p: initialize invite ledger: %w", err)
 	}
+	// An invite reissued in place of another is linked to it, so the holder
+	// of the old one, if it never got the new one, can still be handed it.
+	if _, err := db.Exec(`
+		CREATE TABLE IF NOT EXISTS replaced_invites (
+			group_id BLOB NOT NULL,
+			nonce BLOB NOT NULL,
+			replacement BLOB NOT NULL,
+			PRIMARY KEY (group_id, nonce)
+		);`); err != nil {
+		return fmt.Errorf("libp2p: initialize invite ledger: %w", err)
+	}
 	// Redemption counting moved into the group's signed state, where every
 	// node reaches the same answer. These tables were the old local tally;
 	// keeping them would invite a reader to trust the wrong one.
@@ -94,11 +106,78 @@ func (l *InviteLedger) RecordIssuedInvite(capability BootstrapCapability) error 
 	if l == nil || l.db == nil {
 		return errors.New("libp2p: invite ledger is not open")
 	}
+	return recordIssuedInvite(l.db, capability)
+}
+
+// RecordReplacementInvite files replacement, an invite issued in place of the
+// one whose nonce is replaced, together with the link between them, so a
+// caller that only ever saw the replaced invite can still be handed the
+// replacement (see ReplacementChain).
+func (l *InviteLedger) RecordReplacementInvite(replaced [32]byte, replacement BootstrapCapability) error {
+	if l == nil || l.db == nil {
+		return errors.New("libp2p: invite ledger is not open")
+	}
+	encoded, err := json.Marshal(replacement)
+	if err != nil {
+		return fmt.Errorf("libp2p: encode replacement invite: %w", err)
+	}
+	tx, err := l.db.Begin()
+	if err != nil {
+		return fmt.Errorf("libp2p: record replacement invite: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := recordIssuedInvite(tx, replacement); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`INSERT INTO replaced_invites (group_id, nonce, replacement) VALUES (?, ?, ?)`,
+		replacement.GroupID[:], replaced[:], encoded); err != nil {
+		return fmt.Errorf("libp2p: record replacement invite: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("libp2p: record replacement invite: %w", err)
+	}
+	return nil
+}
+
+// ReplacementChain returns issued followed by each invite recorded as
+// replacing the one before it, oldest first; the last is the current one.
+func (l *InviteLedger) ReplacementChain(issued BootstrapCapability) ([]BootstrapCapability, error) {
+	if l == nil || l.db == nil {
+		return nil, errors.New("libp2p: invite ledger is not open")
+	}
+	chain := []BootstrapCapability{issued}
+	seen := map[[32]byte]struct{}{issued.Nonce: {}}
+	for {
+		head := chain[len(chain)-1]
+		var encoded []byte
+		err := l.db.QueryRow(`SELECT replacement FROM replaced_invites WHERE group_id=? AND nonce=?`,
+			head.GroupID[:], head.Nonce[:]).Scan(&encoded)
+		if errors.Is(err, sql.ErrNoRows) {
+			return chain, nil
+		}
+		if err != nil {
+			return nil, fmt.Errorf("libp2p: read replacement invite: %w", err)
+		}
+		var next BootstrapCapability
+		if err := json.Unmarshal(encoded, &next); err != nil {
+			return nil, fmt.Errorf("libp2p: decode replacement invite: %w", err)
+		}
+		if _, loop := seen[next.Nonce]; loop {
+			return nil, errors.New("libp2p: replacement invites form a loop")
+		}
+		seen[next.Nonce] = struct{}{}
+		chain = append(chain, next)
+	}
+}
+
+func recordIssuedInvite(db interface {
+	Exec(string, ...any) (sql.Result, error)
+}, capability BootstrapCapability) error {
 	var target []byte
 	if !capability.IsOpenInvite() {
 		target = capability.TargetMemberID[:]
 	}
-	_, err := l.db.Exec(`INSERT OR REPLACE INTO bootstrap_invites
+	_, err := db.Exec(`INSERT OR REPLACE INTO bootstrap_invites
 		(group_id, nonce, target_member_id, max_uses, issued_at_ms, expires_at_ms, revoked_at_ms)
 		VALUES (?, ?, ?, ?, ?, ?, COALESCE((SELECT revoked_at_ms FROM bootstrap_invites WHERE group_id=? AND nonce=?), 0))`,
 		capability.GroupID[:], capability.Nonce[:], target, capability.Uses(),

@@ -258,11 +258,12 @@ func (e espOperationExecutor) RedeemOpenInvite(ctx context.Context, token string
 // they were then, and the capability's own expiry, so a link redeemed before
 // the node announced its WebSocket address kept handing a TCP-only, soon
 // expired grant to the one identity entitled to it. The daemon is offered the
-// stored capability and replaces it only when that one is stale and never got
-// anyone in (see keepIssuedInvite), revoking it first if it still admits. Only
-// an answer that says "replaced" is taken; anything else, including a daemon
-// that predates invite_refresh or cannot be reached, replays the stored bytes
-// as before. A replacement is stored, so later replays return it.
+// stored capability and answers with a replacement only when it has gone stale
+// and never got anyone in, revoking the one it replaces if that still admits
+// (see issueInvite). Only an answer that says "replaced" is taken; anything
+// else, including a daemon that predates invite_refresh or cannot be reached,
+// replays the stored bytes as before. A replacement is stored, so later
+// replays return it; one whose answer was lost is handed out again.
 func (e espOperationExecutor) replayOpenInviteRedemption(ctx context.Context, tokenHash string, redemption esphttp.OpenInviteRedemption, stored json.RawMessage, mint *ipc.InviteCreateReq) (json.RawMessage, error) {
 	replay := append(json.RawMessage(nil), stored...)
 	var previous openInviteRedeemResponse

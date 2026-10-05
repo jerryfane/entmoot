@@ -232,11 +232,12 @@ type InviteCreateReq struct {
 
 // InviteRefreshReq asks for a replacement of Refresh, a capability already
 // issued to the request's target, carrying the same choices an invite_create
-// for it would. The daemon hands Refresh back unchanged unless it has expired
-// or would now carry different addresses, peers or relays, and never replaces
-// one whose nonce the group has seen used or revoked, or one held by a
-// current, removed or banned member. Replacing a capability that has not
-// expired revokes it first.
+// for it would. The daemon answers with the replacement it already issued for
+// Refresh, if any, and otherwise mints one only when the current capability
+// has expired or would now carry different addresses, peers or relays. It
+// never replaces for a target that got in (a used nonce; a current, removed
+// or banned member) or a capability somebody revoked, and revokes what it
+// replaces if that still admits.
 type InviteRefreshReq struct {
 	InviteCreateReq
 	Refresh entmoot.BootstrapCapability `json:"refresh"`
