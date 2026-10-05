@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.96] - 2026-10-05
+
 ### Fixed
 
 - Redeeming an ESP open invite again with the same identity replaces the
