@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"math"
 	"net"
 	"strings"
 	"sync"
@@ -327,16 +328,19 @@ func TestMemberRemoveOverIPCIsSealedByTheFoundersRounds(t *testing.T) {
 	}
 }
 
-// A seal vouches for what the other members hold, so a round that reached
-// none of them - every addressable member refused the dial - seals nothing
-// until the seal is overdue; then it is signed on what the founder holds.
-func TestFounderDefersTheSealWhileNoMemberAnswersUntilItIsOverdue(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+// A seal vouches for what the other members hold. A founder that reaches none
+// of them - every addressable member refuses the dial, as when the founder is
+// the one partitioned off - may be the node that is behind, so those rounds
+// count for nothing and it does not seal however long it waits. Once a member
+// answers again, even only in part, the rounds count and the deadline
+// applies as usual.
+func TestIsolatedFounderDoesNotSealUntilAMemberAnswers(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	root := t.TempDir()
 	founder, _ := mustDaemonIdentity(t)
 	member, memberInfo := mustDaemonIdentity(t)
-	_, holderInfo := mustDaemonIdentity(t)
+	holder, holderInfo := mustDaemonIdentity(t)
 	gid := daemonTestGroupID(0xa5)
 	mustCreateGroup(t, root, gid, founder, membership.DefaultPolicy())
 	group := mustOpenGroup(t, root, gid)
@@ -363,112 +367,400 @@ func TestFounderDefersTheSealWhileNoMemberAnswersUntilItIsOverdue(t *testing.T) 
 	if got := len(runtime.membershipPeers(session)); got != 1 {
 		t.Fatalf("the fixture has %d addressable members, want the departed one", got)
 	}
-	for range sealDeadlineRounds {
+	for range sealDeadlineRounds + 2 {
+		runtime.syncMembership(ctx, session)
+	}
+	ageWaitingSeals(session, 10*sealDeadline)
+	for range sealDeadlineRounds + 2 {
 		runtime.syncMembership(ctx, session)
 	}
 	if session.group.Canonical().ID != base.ID {
-		t.Fatal("the founder sealed a revoke on a round that reached no member before it was overdue")
+		t.Fatal("a founder that reached no member sealed its own view")
 	}
-	overdue(session)
+
+	// The member is back, answering every pull only in part: rounds reach it
+	// now, so the long-passed deadline applies once enough of them have.
+	back, _, err := libp2ptransport.NewHost(ctx, member, libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"))
+	if err != nil {
+		t.Fatalf("NewHost: %v", err)
+	}
+	defer back.Close()
+	answerIncomplete(back)
+	h.Peerstore().AddAddrs(back.ID(), back.Addrs(), peerstore.PermanentAddrTTL)
+	for range sealDeadlineRounds - 1 {
+		runtime.syncMembership(ctx, session)
+	}
+	if session.group.Canonical().ID != base.ID {
+		t.Fatal("the founder sealed before enough rounds reached a member")
+	}
 	runtime.syncMembership(ctx, session)
 	if session.group.Canonical().ID == base.ID {
-		t.Fatal("the founder did not seal an overdue revoke")
+		t.Fatal("the founder did not seal once rounds reached a member again")
+	}
+	backdated := mustSignedJoinAt(t, gid, holder, invite, base.Timestamp+1)
+	if _, err := session.group.Apply(backdated); !errors.Is(err, membership.ErrStale) {
+		t.Fatalf("a join dated before the revoke was not refused as stale: %v", err)
 	}
 }
 
-// overdue moves a session's armed seal back past both of its bounds, as if
-// sealDeadline had passed since the round that armed it.
-func overdue(session *groupSession) {
+// ageWaitingSeals moves every waiting seal's start back by d, as if d had
+// passed since a round first found it. Only time passes: a round that
+// reached nobody still does not count.
+func ageWaitingSeals(session *groupSession, d time.Duration) {
 	session.seal.mu.Lock()
 	defer session.seal.mu.Unlock()
-	session.seal.armedAt = session.seal.armedAt.Add(-sealDeadline)
-	session.seal.rounds = max(session.seal.rounds, sealDeadlineRounds)
+	for i := range session.seal.waiting {
+		session.seal.waiting[i].since = session.seal.waiting[i].since.Add(-d)
+	}
 }
+
+// allowSealNow lifts minSealInterval for the next round.
+func allowSealNow(session *groupSession) {
+	session.seal.mu.Lock()
+	defer session.seal.mu.Unlock()
+	session.seal.last = time.Now().Add(-minSealInterval)
+}
+
+// answerIncomplete makes a host answer every membership pull with nothing,
+// claiming there is more.
+func answerIncomplete(h host.Host) {
+	h.SetStreamHandler(libp2ptransport.MembershipProtocol, func(stream network.Stream) {
+		defer stream.Close()
+		var request libp2ptransport.MembershipSyncRequest
+		if err := json.NewDecoder(stream).Decode(&request); err != nil {
+			return
+		}
+		_ = json.NewEncoder(stream).Encode(libp2ptransport.MembershipSyncResponse{
+			Version: 1, RequestID: request.RequestID, GroupID: request.GroupID, Complete: false,
+		})
+	})
+}
+
+// sealTestGroup is a founder's group driven round by round, without a
+// network, for the rules of when a seal is signed.
+type sealTestGroup struct {
+	t        *testing.T
+	founder  *keystore.Identity
+	group    *membership.Group
+	runtime  *groupRuntime
+	session  *groupSession
+	revoked  byte
+	reached  sealRound
+	unsynced sealRound
+}
+
+func newSealTestGroup(t *testing.T, seed byte) *sealTestGroup {
+	t.Helper()
+	root := t.TempDir()
+	founder, founderInfo := mustDaemonIdentity(t)
+	gid := daemonTestGroupID(seed)
+	mustCreateGroup(t, root, gid, founder, membership.DefaultPolicy())
+	group := mustOpenGroup(t, root, gid)
+	t.Cleanup(func() { mustCloseGroup(t, group) })
+	return &sealTestGroup{
+		t: t, founder: founder, group: group,
+		runtime:  &groupRuntime{identity: founder, binding: libp2ptransport.Binding{MemberID: *founderInfo.MemberID}, logger: slog.Default()},
+		session:  &groupSession{groupID: gid, group: group},
+		reached:  sealRound{reached: true, synced: true},
+		unsynced: sealRound{reached: true, lagging: []string{"lagging-peer"}},
+	}
+}
+
+// revoke signs a revocation, an authority change, and returns its timestamp.
+func (g *sealTestGroup) revoke() int64 {
+	g.t.Helper()
+	time.Sleep(2 * time.Millisecond)
+	g.revoked++
+	var nonce [32]byte
+	nonce[0] = g.revoked
+	record, err := g.group.SignRecord(g.founder, membership.Record{Kind: membership.KindRevokeInvite, InviteNonce: nonce})
+	if err != nil {
+		g.t.Fatal(err)
+	}
+	return record.Timestamp
+}
+
+func (g *sealTestGroup) round(round sealRound) { g.runtime.sealAuthorityChanges(g.session, round) }
+func (g *sealTestGroup) sequence() uint64      { return g.group.Canonical().Sequence }
 
 // The seal waits for a synced round that starts after the change was seen,
 // so records dated before the change have a round to arrive, but not past
-// both of its bounds; and the founder signs at most one seal per
-// minSealInterval however many changes arrive.
+// both of its bounds, counting only rounds that reached another member; only
+// the founder seals; and it signs at most one seal per minSealInterval.
 func TestSealWaitsForASyncedRoundAndIsBoundedAndRateLimited(t *testing.T) {
-	root := t.TempDir()
-	founder, founderInfo := mustDaemonIdentity(t)
-	admin, adminInfo := mustDaemonIdentity(t)
-	gid := daemonTestGroupID(0xa6)
-	mustCreateGroup(t, root, gid, founder, membership.DefaultPolicy())
-	group := mustOpenGroup(t, root, gid)
-	defer mustCloseGroup(t, group)
-	founderRuntime := &groupRuntime{identity: founder, binding: libp2ptransport.Binding{MemberID: *founderInfo.MemberID}, logger: slog.Default()}
-	adminRuntime := &groupRuntime{identity: admin, binding: libp2ptransport.Binding{MemberID: *adminInfo.MemberID}, logger: slog.Default()}
-	founderSession := &groupSession{groupID: gid, group: group}
-	adminSession := &groupSession{groupID: gid, group: group}
-	revoke := func() {
-		t.Helper()
-		var nonce [32]byte
-		nonce[0] = byte(time.Now().UnixNano())
-		if _, err := group.SignRecord(founder, membership.Record{Kind: membership.KindRevokeInvite, InviteNonce: nonce}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	sequence := func() uint64 { return group.Canonical().Sequence }
-	lagging := []string{"lagging-peer"}
+	g := newSealTestGroup(t, 0xa6)
+	_, adminInfo := mustDaemonIdentity(t)
+	admin := &groupRuntime{identity: g.founder, binding: libp2ptransport.Binding{MemberID: *adminInfo.MemberID}, logger: slog.Default()}
+	adminSession := &groupSession{groupID: g.session.groupID, group: g.group}
 
-	revoke()
-	founderRuntime.sealAuthorityChanges(founderSession, true, nil)
-	if sequence() != 0 {
+	g.revoke()
+	g.round(g.reached)
+	if g.sequence() != 0 {
 		t.Fatal("sealed on the round that first saw the change")
 	}
 	for range sealDeadlineRounds + 1 {
-		founderRuntime.sealAuthorityChanges(founderSession, false, lagging)
+		g.round(g.unsynced)
 	}
-	if sequence() != 0 {
+	if g.sequence() != 0 {
 		t.Fatal("sealed on rounds that did not sync, before sealDeadline passed")
 	}
 	for range 3 {
-		adminRuntime.sealAuthorityChanges(adminSession, true, nil)
+		admin.sealAuthorityChanges(adminSession, g.reached)
 	}
-	if sequence() != 0 {
+	if g.sequence() != 0 {
 		t.Fatal("a node other than the founder sealed")
 	}
-	founderRuntime.sealAuthorityChanges(founderSession, true, nil)
-	if sequence() != 1 {
-		t.Fatalf("not sealed on the next synced round: sequence %d", sequence())
+	g.round(g.reached)
+	if g.sequence() != 1 {
+		t.Fatalf("not sealed on the next synced round: sequence %d", g.sequence())
 	}
 
-	// sealDeadline alone does not force a seal: the rounds must pass too, so
-	// a founder whose daemon was asleep still gives members a round.
-	founderSession.seal.mu.Lock()
-	founderSession.seal.last = time.Now().Add(-minSealInterval)
-	founderSession.seal.mu.Unlock()
-	time.Sleep(2 * time.Millisecond)
-	revoke()
-	founderRuntime.sealAuthorityChanges(founderSession, false, lagging)
-	founderSession.seal.mu.Lock()
-	founderSession.seal.armedAt = founderSession.seal.armedAt.Add(-sealDeadline)
-	founderSession.seal.mu.Unlock()
+	// sealDeadline alone does not force a seal: the rounds must pass too.
+	allowSealNow(g.session)
+	g.revoke()
+	g.round(g.unsynced)
+	ageWaitingSeals(g.session, sealDeadline)
 	for range sealDeadlineRounds - 1 {
-		founderRuntime.sealAuthorityChanges(founderSession, false, lagging)
+		g.round(g.unsynced)
 	}
-	if sequence() != 1 {
+	if g.sequence() != 1 {
 		t.Fatal("forced a seal before sealDeadlineRounds rounds")
 	}
-	founderRuntime.sealAuthorityChanges(founderSession, false, lagging)
-	if sequence() != 2 {
-		t.Fatalf("an overdue seal was not forced: sequence %d", sequence())
+	g.round(g.unsynced)
+	if g.sequence() != 2 {
+		t.Fatalf("an overdue seal was not forced: sequence %d", g.sequence())
 	}
 
-	time.Sleep(2 * time.Millisecond)
-	revoke()
-	founderRuntime.sealAuthorityChanges(founderSession, true, nil)
-	founderRuntime.sealAuthorityChanges(founderSession, true, nil)
-	if sequence() != 2 {
+	// Rounds that reached nobody do not count towards the deadline.
+	allowSealNow(g.session)
+	g.revoke()
+	g.round(sealRound{})
+	ageWaitingSeals(g.session, 10*sealDeadline)
+	for range 3 * sealDeadlineRounds {
+		g.round(sealRound{})
+	}
+	if g.sequence() != 2 {
+		t.Fatal("rounds that reached no member forced a seal")
+	}
+	for range sealDeadlineRounds {
+		g.round(g.unsynced)
+	}
+	if g.sequence() != 3 {
+		t.Fatalf("an overdue seal was not forced once rounds reached a member: sequence %d", g.sequence())
+	}
+
+	g.revoke()
+	g.round(g.reached)
+	g.round(g.reached)
+	if g.sequence() != 3 {
 		t.Fatal("sealed again inside minSealInterval")
 	}
-	founderSession.seal.mu.Lock()
-	founderSession.seal.last = time.Now().Add(-minSealInterval)
-	founderSession.seal.mu.Unlock()
-	founderRuntime.sealAuthorityChanges(founderSession, true, nil)
-	if sequence() != 3 {
-		t.Fatalf("not sealed once the interval passed: sequence %d", sequence())
+	allowSealNow(g.session)
+	g.round(g.reached)
+	if g.sequence() != 4 {
+		t.Fatalf("not sealed once the interval passed: sequence %d", g.sequence())
+	}
+}
+
+// Each change waits its own deadline. A change that arrives while an older
+// one is being held back is not sealed when the older one falls due: the
+// forced seal goes only through the older change, and the newer one gets a
+// full wait of its own.
+func TestANewerChangeWaitsItsOwnDeadline(t *testing.T) {
+	g := newSealTestGroup(t, 0xa8)
+	older := g.revoke()
+	g.round(g.unsynced)
+	for range sealDeadlineRounds - 2 {
+		g.round(g.unsynced)
+	}
+	ageWaitingSeals(g.session, sealDeadline)
+	// The newer change is found while the older one is still held back.
+	newer := g.revoke()
+	g.round(g.unsynced)
+	if g.sequence() != 0 {
+		t.Fatal("sealed before the older change was overdue")
+	}
+
+	g.round(g.unsynced)
+	if g.sequence() != 1 {
+		t.Fatalf("the older change was not sealed when overdue: sequence %d", g.sequence())
+	}
+	if got := g.group.Canonical().Timestamp; got != older {
+		t.Fatalf("the forced seal reaches %d, want only the older change at %d (the newer is at %d)", got, older, newer)
+	}
+	if due, ok := g.group.SealDue(); !ok || due != newer {
+		t.Fatalf("the newer change is no longer due: due=%t at %d", ok, due)
+	}
+
+	allowSealNow(g.session)
+	for range sealDeadlineRounds + 2 {
+		g.round(g.unsynced)
+	}
+	if g.sequence() != 1 {
+		t.Fatal("the newer change was forced before its own deadline")
+	}
+	ageWaitingSeals(g.session, sealDeadline)
+	g.round(g.unsynced)
+	if g.sequence() != 2 || g.group.Canonical().Timestamp != newer {
+		t.Fatalf("the newer change was not sealed at its own deadline: sequence %d", g.sequence())
+	}
+}
+
+// A round asks members maxMembershipSyncPeers at a time within one pull
+// timeout for the whole round, so members that accept a pull and never
+// answer cost about one timeout per round however many there are - not one
+// each, which would stretch the seal's deadline with every hanging member.
+// Such a round reached them, so it counts towards the deadline, and it is
+// not synchronized.
+func TestHangingMembersCostOneTimeoutPerRound(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	root := t.TempDir()
+	founder, _ := mustDaemonIdentity(t)
+	gid := daemonTestGroupID(0xa9)
+	mustCreateGroup(t, root, gid, founder, membership.DefaultPolicy())
+	group := mustOpenGroup(t, root, gid)
+	const hanging = 12
+	members := make([]*keystore.Identity, hanging)
+	for i := range members {
+		identity, info := mustDaemonIdentity(t)
+		mustJoinWithInvite(t, group, identity, mustDaemonInvite(t, group, founder, info, 1))
+		members[i] = identity
+	}
+	_, holderInfo := mustDaemonIdentity(t)
+	invite := mustDaemonInvite(t, group, founder, holderInfo, 1)
+	base := group.Canonical()
+	mustCloseGroup(t, group)
+	mustRevokeOffline(t, root, gid, founder, invite)
+
+	runtime, session, h := startTestRuntime(t, ctx, root, founder, gid)
+	defer h.Close()
+	defer runtime.Close()
+	runtime.pullTimeout = 2 * time.Second
+	release := make(chan struct{})
+	defer close(release)
+	for _, identity := range members {
+		member, _, err := libp2ptransport.NewHost(ctx, identity, libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"))
+		if err != nil {
+			t.Fatalf("NewHost: %v", err)
+		}
+		defer member.Close()
+		member.SetStreamHandler(libp2ptransport.MembershipProtocol, func(stream network.Stream) {
+			defer stream.Close()
+			<-release
+		})
+		h.Peerstore().AddAddrs(member.ID(), member.Addrs(), peerstore.PermanentAddrTTL)
+	}
+	runtime.sealAuthorityChanges(session, sealRound{})
+	if !session.seal.isArmed() {
+		t.Fatal("the revoke is not waiting to be sealed")
+	}
+	if got := len(runtime.membershipPeersUpTo(session, math.MaxInt)); got != hanging {
+		t.Fatalf("the fixture has %d addressable members, want %d", got, hanging)
+	}
+
+	started := time.Now()
+	runtime.syncMembership(ctx, session)
+	took := time.Since(started)
+	t.Logf("a round with %d hanging members and pullTimeout %s took %s", hanging, runtime.pullTimeout, took)
+	// Asked one at a time this would take hanging*pullTimeout; eight at a
+	// time with a timeout each, two timeouts.
+	if limit := runtime.pullTimeout + runtime.pullTimeout/2; took > limit {
+		t.Fatalf("a round with %d hanging members took %s, want at most %s", hanging, took, limit)
+	}
+	session.seal.mu.Lock()
+	rounds := session.seal.waiting[0].rounds
+	session.seal.mu.Unlock()
+	if rounds != 1 {
+		t.Fatalf("the round counted %d towards the deadline, want 1: it reached the hanging members", rounds)
+	}
+	if session.group.Canonical().ID != base.ID {
+		t.Fatal("a round in which every member hung was treated as synchronized")
+	}
+}
+
+// Members are pulled side by side, so a member that hangs does not use up the
+// round before an honest member is asked: the honest member's records still
+// arrive that round, even when it is the last one asked.
+func TestAHangingMemberDoesNotStarveTheOthers(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	gid := daemonTestGroupID(0xaa)
+	founder, _ := mustDaemonIdentity(t)
+	const hanging = maxMembershipSyncPeers - 1
+	hangers := make([]*keystore.Identity, hanging)
+	var newest entmoot.MemberID
+	for i := range hangers {
+		identity, info := mustDaemonIdentity(t)
+		hangers[i] = identity
+		if bytes.Compare(info.MemberID[:], newest[:]) > 0 {
+			newest = *info.MemberID
+		}
+	}
+	// Peers are asked in member-id order after the founder, so the honest
+	// member sorts last: asked one at a time, it would never be reached.
+	honest, honestInfo := mustDaemonIdentity(t)
+	for bytes.Compare(honestInfo.MemberID[:], newest[:]) <= 0 {
+		honest, honestInfo = mustDaemonIdentity(t)
+	}
+	newcomer, newcomerInfo := mustDaemonIdentity(t)
+	founderRoot, honestRoot := t.TempDir(), t.TempDir()
+	mustCreateGroup(t, founderRoot, gid, founder, membership.DefaultPolicy())
+	group := mustOpenGroup(t, founderRoot, gid)
+	base := group.Canonical()
+	var joins []membership.Record
+	for _, identity := range append(append([]*keystore.Identity(nil), hangers...), honest) {
+		info := mustDaemonNodeInfo(t, identity)
+		joins = append(joins, mustJoinWithInvite(t, group, identity, mustDaemonInvite(t, group, founder, info, 1)))
+	}
+	newcomerInvite := mustDaemonInvite(t, group, founder, newcomerInfo, 1)
+	mustCloseGroup(t, group)
+
+	honestGroup, err := membership.Adopt(honestRoot, base)
+	if err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	for _, join := range joins {
+		if _, err := honestGroup.Apply(join); err != nil {
+			t.Fatalf("seed the honest member: %v", err)
+		}
+	}
+	// Only the honest member holds the newcomer's join.
+	if _, err := honestGroup.Apply(mustSignedJoinAt(t, gid, newcomer, newcomerInvite, time.Now().UnixMilli())); err != nil {
+		t.Fatalf("apply the newcomer's join: %v", err)
+	}
+	mustCloseGroup(t, honestGroup)
+
+	founderRuntime, founderSession, founderHost := startTestRuntime(t, ctx, founderRoot, founder, gid)
+	defer founderHost.Close()
+	defer founderRuntime.Close()
+	founderRuntime.pullTimeout = 2 * time.Second
+	honestRuntime, _, honestHost := startTestRuntime(t, ctx, honestRoot, honest, gid)
+	defer honestHost.Close()
+	defer honestRuntime.Close()
+	founderHost.Peerstore().AddAddrs(honestHost.ID(), honestHost.Addrs(), peerstore.PermanentAddrTTL)
+	release := make(chan struct{})
+	defer close(release)
+	for _, identity := range hangers {
+		member, _, err := libp2ptransport.NewHost(ctx, identity, libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"))
+		if err != nil {
+			t.Fatalf("NewHost: %v", err)
+		}
+		defer member.Close()
+		member.SetStreamHandler(libp2ptransport.MembershipProtocol, func(stream network.Stream) {
+			defer stream.Close()
+			<-release
+		})
+		founderHost.Peerstore().AddAddrs(member.ID(), member.Addrs(), peerstore.PermanentAddrTTL)
+	}
+	peers := founderRuntime.membershipPeers(founderSession)
+	if len(peers) != hanging+1 || peers[len(peers)-1].ID != honestHost.ID() {
+		t.Fatalf("the honest member is not asked last among %d peers", len(peers))
+	}
+
+	founderRuntime.syncMembership(ctx, founderSession)
+	if !founderSession.group.IsMemberID(*newcomerInfo.MemberID) {
+		t.Fatal("hanging members kept the round from pulling the honest member's records")
 	}
 }
 
@@ -527,16 +819,7 @@ func TestAMemberAnsweringIncompleteCannotHoldOffTheSeal(t *testing.T) {
 		t.Fatalf("NewHost: %v", err)
 	}
 	defer hostile.Close()
-	hostile.SetStreamHandler(libp2ptransport.MembershipProtocol, func(stream network.Stream) {
-		defer stream.Close()
-		var request libp2ptransport.MembershipSyncRequest
-		if err := json.NewDecoder(stream).Decode(&request); err != nil {
-			return
-		}
-		_ = json.NewEncoder(stream).Encode(libp2ptransport.MembershipSyncResponse{
-			Version: 1, RequestID: request.RequestID, GroupID: request.GroupID, Complete: false,
-		})
-	})
+	answerIncomplete(hostile)
 
 	logs := &syncBuffer{}
 	runtime, session, h := startLoggedTestRuntime(t, ctx, root, founder, gid, slog.New(slog.NewTextHandler(logs, nil)))
@@ -550,7 +833,7 @@ func TestAMemberAnsweringIncompleteCannotHoldOffTheSeal(t *testing.T) {
 	if session.group.Canonical().ID != base.ID {
 		t.Fatal("the founder sealed on rounds a member held incomplete, before the seal was overdue")
 	}
-	overdue(session)
+	ageWaitingSeals(session, sealDeadline)
 	runtime.syncMembership(ctx, session)
 	if session.group.Canonical().ID == base.ID {
 		t.Fatal("a member answering every pull as incomplete held the seal off past its deadline")

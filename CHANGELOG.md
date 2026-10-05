@@ -18,18 +18,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a checkpoint dated at the change. Those changes are an invite revoke, an
   admin's demotion, removal, ban or departure, and closing an open group. The
   daemon seals a change about one to two membership rounds after it receives
-  it, once a round has pulled what every reachable member holds, and at most
-  about two minutes after even if some member keeps answering incompletely;
-  it then logs the members that lagged. After that the founder refuses such
-  a backdated join, and every other node does once it has pulled the
-  checkpoint. The commands sign only the record. A checkpoint signed from a
-  view that misses records other members hold would strand those members, so
-  only the founder seals, it folds only records dated up to the change, it
-  waits for a fully synchronized round until that deadline, and it seals at
-  most once a minute. Older peers need no upgrade. Not covered: a
-  join dated inside an expired invite's validity window is still admitted
-  until a later checkpoint covers it, and while the founder's daemon is down
-  nothing is sealed.
+  it, once a round has pulled what every reachable member holds. If some
+  member keeps answering incompletely or hangs, it seals anyway at most about
+  three and a half minutes after, and logs the members that lagged; rounds
+  pull members eight at a time within 30 seconds, so hanging members cannot
+  stretch that. A founder that reaches no member at all does not seal until
+  one answers again. After that the founder refuses such a backdated join,
+  and every other node does once it has pulled the checkpoint. The commands
+  sign only the record. A checkpoint signed from a view that misses records
+  other members hold would strand those members, so only the founder seals,
+  it folds only records dated up to the change, each change waits its own
+  time, and it seals at most once a minute. Older peers need no upgrade. Not
+  covered: a join dated inside an expired invite's validity window is still
+  admitted until a later checkpoint covers it, and while the founder's daemon
+  is down nothing is sealed.
 - A join refused because a checkpoint landed while it was in flight can now
   simply be run again: the failed attempt no longer leaves a membership store
   behind that made every retry fail with "group store already exists", and

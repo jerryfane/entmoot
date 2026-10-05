@@ -170,7 +170,8 @@ record, which is what makes other nodes refuse it, and also marks the local
 issuance ledger; it therefore takes the writer lease and needs the daemon
 stopped. The revocation is final against a join dated before it once the
 founder's daemon has sealed it, normally one to two membership rounds and at
-most about two minutes after that daemon has the record, and on each other
+most about three and a half minutes after that daemon has the record (as
+long as it reaches at least one member), and on each other
 node once it has pulled that checkpoint. `-open` mints a bearer invite:
 whoever holds it can join until it expires, is revoked, or runs out of uses.
 

@@ -137,23 +137,33 @@ to follow the chain. The founder's daemon therefore seals a change only after a
 membership round that started after it saw the change has pulled everything
 from every member it could reach, and folds only records dated up to the
 change. A member that cannot be dialled does not hold this up, but a round
-that reached no other member, or in which one answered with only part of what
-it holds, does. That wait is bounded: two minutes and three rounds after
-the founder first saw the change, it seals on what it holds, and logs which
-members lagged. So no member, a demoted admin included, can keep a change
-unsealed by answering slowly or incompletely. Only the founder seals, so no
-two nodes cut competing checkpoints for the same change, and it signs at most
-one seal a minute however many changes arrive.
+in which a member answered with only part of what it holds, or connected and
+then hung, does. That wait is bounded: once the change has waited two minutes
+and three rounds that got through to at least one other member, the founder
+seals on what it holds and logs which members lagged. So no member, a
+demoted admin included, can keep a change unsealed by answering slowly or
+incompletely. A round asks members eight at a time and gives up on all of
+them together after 30 seconds, so members that hang cost a round at most
+30 seconds however many there are. Rounds that reach no other member do not
+count at all: a founder cut off from every member, which may be the node
+that is behind, does not seal until a member answers again, unless it is the
+group's only member. Each change waits its own time, so a change that arrives
+while an older one is held back is not sealed early along with it. Only the
+founder seals, so no two nodes cut competing checkpoints for the same change,
+and it signs at most one seal a minute however many changes arrive.
 
 A change is normally final on the founder one to two membership rounds (15
-to 30 seconds) after its daemon receives it, and at most about two minutes
-after, and on every other node once it has pulled that checkpoint, normally
-within another round. Older peers need no upgrade: they already adopt
-checkpoints and refuse records older than one. While the founder's daemon is
-not running, nothing is sealed and the cadence checkpoint is the only bound.
-For an urgent case, `entmootd roster checkpoint` on the founder seals at
-once, but run it only right after the founder's daemon has synchronized with
-the other members, for the reason above.
+to 30 seconds) after its daemon receives it. When members lag or hang it is
+final at most about three and a half minutes after - up to 45 seconds for the
+round that first sees it, the two-minute wait, and up to 45 seconds for the
+round that ends it - as long as the founder reaches at least one member. It
+is final on every other node once that node has pulled the checkpoint,
+normally within another round. Older peers need no upgrade: they already
+adopt checkpoints and refuse records older than one. While the founder's
+daemon is not running, nothing is sealed and the cadence checkpoint is the
+only bound. For an urgent case, `entmootd roster checkpoint` on the founder
+seals at once, but run it only right after the founder's daemon has
+synchronized with the other members, for the reason above.
 
 What remains: until a node has the checkpoint, that node can still accept such
 a backdated join, and a node that does will then refuse the checkpoint as

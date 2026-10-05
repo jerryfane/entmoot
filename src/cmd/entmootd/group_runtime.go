@@ -76,6 +76,9 @@ type groupRuntime struct {
 	liveRouter       *libp2ptransport.LiveRouter
 	policyEnforcers  map[entmoot.GroupID]*groupPolicyEnforcer
 	profiles         esphttp.StateStore
+	// pullTimeout bounds one membership round's pulls (membershipPullTimeout;
+	// shortened by tests).
+	pullTimeout time.Duration
 
 	mu       sync.RWMutex
 	sessions map[entmoot.GroupID]*groupSession
@@ -102,23 +105,46 @@ type groupSession struct {
 // sealAuthorityChanges). Maintenance rounds can overlap, so it is locked.
 type sealState struct {
 	mu sync.Mutex
-	// armed is the timestamp of the newest authority change this node held at
-	// the end of an earlier round, or 0. It is sealed through once a later
-	// round has pulled from the reachable members, or once it is overdue.
-	armed int64
-	// armedAt and rounds measure how long a seal has been waiting, from the
-	// round that armed it: past sealDeadline and sealDeadlineRounds it is
-	// sealed whether or not a round synced.
-	armedAt time.Time
-	rounds  int
+	// waiting lists the authority changes this node has seen and not sealed,
+	// oldest first. Each entry is the newest change due when a round first
+	// found it, with its own wait: a change that arrives while an older one
+	// is held back waits its full time, not what is left of the older one's.
+	waiting []waitingSeal
 	// last is when this node last sealed, for minSealInterval.
 	last time.Time
+}
+
+// waitingSeal is one authority change waiting to be sealed.
+type waitingSeal struct {
+	// through is the change's timestamp; a seal through it covers every
+	// change dated no later.
+	through int64
+	// since is when a round first found it, and rounds counts the rounds
+	// since then that reached another member: past sealDeadline and
+	// sealDeadlineRounds it is sealed whether or not a round synced.
+	since  time.Time
+	rounds int
 }
 
 func (s *sealState) isArmed() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.armed != 0
+	return len(s.waiting) > 0
+}
+
+// sealRound is what one membership round tells the sealer.
+type sealRound struct {
+	// reached is true when the round got through to at least one other
+	// member - an answer of any kind, or a connection it then failed on - or
+	// when there is no other member. Only such rounds count towards a seal's
+	// deadline: a founder that cannot reach anybody may be the one that is
+	// cut off, and must not seal its own view over records the others hold.
+	reached bool
+	// synced is true when the round pulled everything from every member it
+	// got through to.
+	synced bool
+	// lagging names the members the round could not pull everything from.
+	lagging []string
 }
 
 type groupPolicyEnforcer struct {
@@ -167,6 +193,7 @@ func newGroupRuntime(cfg groupRuntimeConfig) (*groupRuntime, error) {
 		invites:          invites,
 		liveRouter:       liveRouter,
 		sessions:         make(map[entmoot.GroupID]*groupSession),
+		pullTimeout:      membershipPullTimeout,
 		joining:          make(map[entmoot.GroupID]chan struct{}),
 		policyEnforcers:  make(map[entmoot.GroupID]*groupPolicyEnforcer),
 	}
@@ -579,6 +606,11 @@ const (
 	// difference rather than a chain, and because a pushed record arrives
 	// immediately instead of waiting for the next round.
 	membershipSyncInterval = 15 * time.Second
+	// membershipPullTimeout bounds a membership round's pulls, all of them
+	// together: members are pulled maxMembershipSyncPeers at a time, so a
+	// round costs at most this however many members hang, and one that ran
+	// out of time before pulling a member is not a synchronized round.
+	membershipPullTimeout = 30 * time.Second
 	// minSealInterval bounds how often the sealer signs a checkpoint for
 	// authority changes alone. Every one is founder-signed and so retained for
 	// good (it is what a joiner holding no group state can anchor on), so an
@@ -586,12 +618,12 @@ const (
 	// per change.
 	minSealInterval = time.Minute
 	// sealDeadline and sealDeadlineRounds bound how long a seal waits for a
-	// round that pulled everything from every reachable member; once both
-	// have passed it is signed on what this node holds. Without a bound a
-	// single member could keep the seal off for ever by answering every
-	// pull as incomplete or not at all - and the member with most reason to
-	// is an admin keeping its own demotion unsealed while it signs backdated
-	// joins.
+	// round that pulled everything from every member it reached; once a
+	// change has waited both - counting only rounds that reached another
+	// member - it is sealed on what this node holds. Without a bound a single
+	// member could keep the seal off for ever by answering every pull as
+	// incomplete or not at all, and the member with most reason to is an
+	// admin keeping its own demotion unsealed while it signs backdated joins.
 	sealDeadline       = 2 * time.Minute
 	sealDeadlineRounds = 3
 )
@@ -618,63 +650,69 @@ func (r *groupRuntime) syncMembership(ctx context.Context, session *groupSession
 		// Nobody to pull from, which is not a reason to skip the cadence: a
 		// group whose only online node is the founder still accumulates the
 		// records the founder signs, and still has to retire them. A seal is
-		// different: it would vouch for records other members may hold, so it
-		// waits for a round that reaches one, unless there is nobody else.
-		r.sealAuthorityChanges(session, r.onlyLocalMember(session), nil)
+		// different: it would vouch for records other members may hold, so
+		// this round counts for nothing unless there is nobody else.
+		alone := r.onlyLocalMember(session)
+		r.sealAuthorityChanges(session, sealRound{reached: alone, synced: alone})
 		r.signCheckpointIfDue(session)
 		return
 	}
+	pulls, removed := r.pullMembers(ctx, session, peers)
+	if removed != nil {
+		// The peer served the signed record that removed us, and it has been
+		// applied. Say so once, loudly: an operator whose node has been
+		// evicted needs to read that, not a debug line about a failed pull.
+		r.logger.Warn("libp2p membership: this node was removed from the group",
+			slog.String("group_id", session.groupID.String()),
+			slog.String("peer_id", removed.ID.String()))
+		r.drainHeldMessages(ctx, session)
+		return
+	}
 	progressed := false
-	// reached counts the members this round pulled everything from, and
-	// short is set when one answered but had more than one exchange carries.
-	// A member that could not be pulled from at all is treated as
-	// unreachable rather than as holding the round up, or a single offline
-	// member would delay every seal. lagging names both kinds, for the log
-	// of a forced seal (see sealAuthorityChanges).
-	reached, short := 0, false
+	// full counts the members this round pulled everything from. A member
+	// that answered with only part of what it holds, or that was connected
+	// but failed or hung, or that the round ran out of time before asking,
+	// leaves the round short. A member that could not be connected to at all
+	// is treated as unreachable rather than as holding the round up, or a
+	// single offline member would delay every seal; but it does not count as
+	// reached either. lagging names every member that was not pulled in
+	// full, for the log of a forced seal (see sealAuthorityChanges).
+	full, reached, short := 0, false, false
 	var lagging []string
-	for _, remote := range peers {
-		syncCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		checkpoints, records, complete, err := libp2ptransport.FetchMembership(syncCtx, r.host, remote, session.group, r.binding.MemberID)
-		cancel()
-		if err != nil {
-			if errors.Is(err, libp2ptransport.ErrRemoved) {
-				// The peer served the signed record that removed us, and it
-				// has been applied. Say so once, loudly: an operator whose
-				// node has been evicted needs to read that, not a debug line
-				// about a failed pull.
-				r.logger.Warn("libp2p membership: this node was removed from the group",
-					slog.String("group_id", session.groupID.String()),
-					slog.String("peer_id", remote.ID.String()))
-				r.drainHeldMessages(ctx, session)
-				return
-			}
-			// Any other refusal is information about that peer, not about the
-			// group: log it and ask somebody else.
-			r.logger.Debug("libp2p membership pull",
-				slog.String("group_id", session.groupID.String()),
-				slog.String("peer_id", remote.ID.String()),
-				slog.String("err", err.Error()))
-		}
+	for _, pull := range pulls {
+		remote := pull.remote
 		switch {
-		case err == nil && complete:
-			reached++
-		case err == nil:
+		case pull.skipped:
 			short = true
+			lagging = append(lagging, remote.ID.String())
+			continue
+		case pull.err == nil && pull.complete:
+			full++
+			reached = true
+		case pull.err == nil || pull.connected:
+			reached, short = true, true
 			lagging = append(lagging, remote.ID.String())
 		default:
 			lagging = append(lagging, remote.ID.String())
 		}
-		if checkpoints > 0 || records > 0 {
+		if pull.err != nil {
+			// Any refusal is information about that peer, not about the
+			// group: log it and ask somebody else.
+			r.logger.Debug("libp2p membership pull",
+				slog.String("group_id", session.groupID.String()),
+				slog.String("peer_id", remote.ID.String()),
+				slog.String("err", pull.err.Error()))
+		}
+		if pull.checkpoints > 0 || pull.records > 0 {
 			progressed = true
 			r.logger.Info("libp2p membership synchronized",
 				slog.String("group_id", session.groupID.String()),
 				slog.String("peer_id", remote.ID.String()),
-				slog.Int("checkpoints", checkpoints),
-				slog.Int("records", records),
-				slog.Bool("complete", complete))
+				slog.Int("checkpoints", pull.checkpoints),
+				slog.Int("records", pull.records),
+				slog.Bool("complete", pull.complete))
 		}
-		if !complete {
+		if !pull.complete {
 			// The pull paged as far as one exchange is allowed to and the
 			// peer still had more. Nothing is lost: every record it did apply
 			// is durable, so the next round resumes rather than restarting.
@@ -687,11 +725,69 @@ func (r *groupRuntime) syncMembership(ctx context.Context, session *groupSession
 		// Messages held for a checkpoint we have now learned can be accepted.
 		r.drainHeldMessages(ctx, session)
 	}
-	r.sealAuthorityChanges(session, reached > 0 && !short, lagging)
+	r.sealAuthorityChanges(session, sealRound{reached: reached, synced: full > 0 && !short, lagging: lagging})
 	// Every round, not only when a pull brought something back: records this
 	// node signed itself count towards the cadence too, so a founder admitting
 	// members while nothing arrives from anybody else must still checkpoint.
 	r.signCheckpointIfDue(session)
+}
+
+// memberPull is the outcome of pulling membership from one member.
+type memberPull struct {
+	remote      peer.AddrInfo
+	checkpoints int
+	records     int
+	complete    bool
+	err         error
+	// connected reports a connection to the member after a failed pull: it
+	// was reachable, and failed or hung rather than being offline.
+	connected bool
+	// skipped marks a member the round ran out of time before asking.
+	skipped bool
+}
+
+// pullMembers pulls from peers maxMembershipSyncPeers at a time, within one
+// pullTimeout for the whole round, in the order given. It stops asking once a
+// peer shows this node was removed, and returns that peer.
+func (r *groupRuntime) pullMembers(ctx context.Context, session *groupSession, peers []peer.AddrInfo) ([]memberPull, *peer.AddrInfo) {
+	roundCtx, cancel := context.WithTimeout(ctx, r.pullTimeout)
+	defer cancel()
+	pulls := make([]memberPull, len(peers))
+	var removedMu sync.Mutex
+	var removed *peer.AddrInfo
+	slots := make(chan struct{}, maxMembershipSyncPeers)
+	var wg sync.WaitGroup
+	for i, remote := range peers {
+		pulls[i].remote = remote
+		select {
+		case slots <- struct{}{}:
+		case <-roundCtx.Done():
+		}
+		if roundCtx.Err() != nil {
+			pulls[i].skipped = true
+			continue
+		}
+		wg.Add(1)
+		go func(pull *memberPull) {
+			defer wg.Done()
+			defer func() { <-slots }()
+			pull.checkpoints, pull.records, pull.complete, pull.err = libp2ptransport.FetchMembership(roundCtx, r.host, pull.remote, session.group, r.binding.MemberID)
+			if errors.Is(pull.err, libp2ptransport.ErrRemoved) {
+				removedMu.Lock()
+				if removed == nil {
+					removed = &pull.remote
+				}
+				removedMu.Unlock()
+				cancel()
+				return
+			}
+			if pull.err != nil {
+				pull.connected = r.host.Network().Connectedness(pull.remote.ID) == network.Connected
+			}
+		}(&pulls[i])
+	}
+	wg.Wait()
+	return pulls, removed
 }
 
 // onlyLocalMember reports whether this node is the group's only member, so
@@ -719,21 +815,25 @@ func (r *groupRuntime) onlyLocalMember(session *groupSession) bool {
 //     Admins, including one that signed the change or received it first,
 //     never seal; while the founder's daemon is down a change waits for it,
 //     or for the cadence;
-//   - it seals only a change it already held at the end of an earlier round,
-//     and only once a later round has pulled from every member it could
-//     reach (synced), which gives records dated before the change a full
-//     round to reach somebody and be pulled; a round that reached nobody
-//     defers the seal to the next one;
-//   - but it never waits past sealDeadline and sealDeadlineRounds from the
-//     round that armed it: a member that never answers, or answers every
-//     pull as incomplete, cannot hold the seal off, and the members that
-//     lagged are logged when it is forced;
+//   - it seals only changes it already held at the end of an earlier round,
+//     and only once a later round has pulled everything from every member
+//     it got through to (synced), which gives records dated before a change
+//     a full round to reach somebody and be pulled;
+//   - but a change never waits past sealDeadline and sealDeadlineRounds of
+//     its own: a member that answers every pull as incomplete, or hangs,
+//     cannot hold the seal off. Such a seal goes only through the newest
+//     change that is overdue, so a newer one still gets its full wait, and
+//     the members that lagged are logged;
+//   - only rounds that got through to another member count towards that
+//     deadline, so a founder cut off from every member - partitioned, or
+//     holding no address for any of them - never seals its own view over
+//     theirs, unless it is the group's only member;
 //   - the checkpoint folds only what is dated up to the change, so records
 //     signed since stay out of what it vouches for;
 //   - one seal per minSealInterval, however many changes arrive.
 //
 // The cadence checkpoint is separate and unchanged.
-func (r *groupRuntime) sealAuthorityChanges(session *groupSession, synced bool, lagging []string) {
+func (r *groupRuntime) sealAuthorityChanges(session *groupSession, round sealRound) {
 	seal := &session.seal
 	seal.mu.Lock()
 	defer seal.mu.Unlock()
@@ -743,11 +843,24 @@ func (r *groupRuntime) sealAuthorityChanges(session *groupSession, synced bool, 
 		return
 	}
 	now := time.Now()
-	if seal.armed != 0 {
-		seal.rounds++
-		overdue := seal.rounds >= sealDeadlineRounds && now.Sub(seal.armedAt) >= sealDeadline
-		if (synced || overdue) && now.Sub(seal.last) >= minSealInterval {
-			checkpoint, signed, err := session.group.SealThrough(r.identity, seal.armed)
+	if round.reached {
+		for i := range seal.waiting {
+			seal.waiting[i].rounds++
+		}
+	}
+	if n := len(seal.waiting); n > 0 && now.Sub(seal.last) >= minSealInterval {
+		var target *waitingSeal
+		if round.synced {
+			target = &seal.waiting[n-1]
+		} else {
+			for i := range seal.waiting {
+				if seal.waiting[i].rounds >= sealDeadlineRounds && now.Sub(seal.waiting[i].since) >= sealDeadline {
+					target = &seal.waiting[i]
+				}
+			}
+		}
+		if target != nil {
+			checkpoint, signed, err := session.group.SealThrough(r.identity, target.through)
 			switch {
 			case err != nil:
 				r.logger.Warn("membership seal",
@@ -755,9 +868,6 @@ func (r *groupRuntime) sealAuthorityChanges(session *groupSession, synced bool, 
 					slog.String("err", err.Error()))
 			case signed:
 				seal.last = now
-				// Whatever is still due after this seal is a newer change,
-				// and gets its own full wait.
-				seal.armed = 0
 				attrs := []any{
 					slog.String("group_id", session.groupID.String()),
 					slog.Uint64("sequence", checkpoint.Sequence),
@@ -765,7 +875,7 @@ func (r *groupRuntime) sealAuthorityChanges(session *groupSession, synced bool, 
 					slog.Uint64("covered", checkpoint.Covered),
 					slog.Int("members", len(checkpoint.Members)),
 				}
-				if synced {
+				if round.synced {
 					r.logger.Info("membership authority change sealed", attrs...)
 				} else {
 					// A member that lagged may hold a record dated before
@@ -773,20 +883,29 @@ func (r *groupRuntime) sealAuthorityChanges(session *groupSession, synced bool, 
 					// refuse the seal until repaired. Name it.
 					r.logger.Warn("membership authority change sealed without a fully synchronized round",
 						append(attrs,
-							slog.Duration("waited", now.Sub(seal.armedAt)),
-							slog.Any("lagging_peers", lagging))...)
+							slog.Duration("waited", now.Sub(target.since)),
+							slog.Any("lagging_peers", round.lagging))...)
 				}
 			}
 		}
 	}
+	// Drop what a checkpoint now covers - this seal, or any other - and add
+	// the newest change due if no entry reaches it yet.
 	due, ok := session.group.SealDue()
-	switch {
-	case !ok:
-		seal.armed, seal.armedAt, seal.rounds = 0, time.Time{}, 0
-	case seal.armed == 0:
-		seal.armed, seal.armedAt, seal.rounds = due, now, 0
-	default:
-		seal.armed = due
+	if !ok {
+		seal.waiting = nil
+		return
+	}
+	covered := session.group.Canonical().Timestamp
+	kept := seal.waiting[:0]
+	for _, waiting := range seal.waiting {
+		if waiting.through > covered {
+			kept = append(kept, waiting)
+		}
+	}
+	seal.waiting = kept
+	if n := len(seal.waiting); n == 0 || due > seal.waiting[n-1].through {
+		seal.waiting = append(seal.waiting, waitingSeal{through: due, since: now})
 	}
 }
 
