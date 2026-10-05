@@ -1008,6 +1008,61 @@ func TestLeaveOrRekeyOfAReadmittedMemberIsNoDeparture(t *testing.T) {
 	}
 }
 
+// TestRemovalThatTakesEffectLaterIsADeparture: records arrive out of order.
+// This node receives an admin's removal of a member before the founder's
+// grant that made that admin one, so the removal is held but ineffective;
+// it takes the member out only when the grant arrives. The record applied
+// then is a policy, not a removal, and attributing departures to the applied
+// record reported nothing: the member kept the invites this node had issued
+// it and walked back in. The departure is the removal's, dated and signed as
+// it is, whatever record made it count.
+func TestRemovalThatTakesEffectLaterIsADeparture(t *testing.T) {
+	f := startReplayFixture(t, 46, true)
+	group := f.session.group
+	late, lateInfo := mustDaemonIdentity(t)
+	mustJoinWithInvite(t, group, late, f.inviteTargeted(late))
+	target := generateIdentity(t)
+	targetID := *mustDaemonNodeInfo(t, target).MemberID
+	mustJoinWithInvite(t, group, target, f.inviteTargeted(target))
+	spare := f.inviteTargeted(target)
+
+	// The founder's grant, signed on another of its devices and not yet here.
+	time.Sleep(5 * time.Millisecond)
+	policy := group.Policy()
+	policy.Admins = withAdmin(policy.Admins, *lateInfo.MemberID)
+	grant, err := membership.SignRecord(f.founder, membership.Record{
+		GroupID: f.gid, Kind: membership.KindPolicy, Actor: mustDaemonNodeInfo(t, f.founder),
+		Policy: &policy, Timestamp: time.Now().UnixMilli(),
+	})
+	if err != nil {
+		t.Fatalf("sign grant: %v", err)
+	}
+	departures := f.countDepartures()
+	time.Sleep(5 * time.Millisecond)
+	removedAt := time.Now().UnixMilli()
+	f.removeAs(late, target, removedAt)
+	if !group.IsMemberID(targetID) || departures.Load() != 0 || group.IsInviteRevoked(spare.Nonce) {
+		t.Fatal("precondition: a removal by a member not yet admin takes nobody out")
+	}
+
+	if _, err := group.Apply(grant); err != nil {
+		t.Fatalf("apply grant: %v", err)
+	}
+	f.session.departures.wait()
+	if group.IsMemberID(targetID) {
+		t.Fatal("precondition: the grant makes the held removal take effect")
+	}
+	if n := departures.Load(); n != 1 {
+		t.Fatalf("the removal that took effect with the grant was reported as %d departure(s), want 1", n)
+	}
+	if !group.IsInviteRevoked(spare.Nonce) || f.admits(spare) {
+		t.Fatal("the removed member's invite is still live")
+	}
+	if f.joinNow(target, spare) {
+		t.Fatal("the removed member rejoined with an invite this node had issued it")
+	}
+}
+
 // TestDeparturesQueuedAtShutdownAreProcessed: departures wait in the
 // session's queue for its worker. Removing the group, as shutdown does, must
 // process what is queued before the group is closed, and a departure pushed

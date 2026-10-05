@@ -35,15 +35,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as a record or folded into a checkpoint (a session worker does it right
   after, never on the goroutine that applied it), which leaves a window: a join with
   such a capability dated between the removal and the revocation is accepted
-  until the founder seals the revocation. Only a removal record that itself
-  takes the member out, or a checkpoint that does, triggers this - not a
-  leave, a rekey, or a revocation that invalidates a join - and only for
-  invites issued no later than the removal: a removal of somebody already
-  gone, or one its signer had no authority for, revokes nothing, so it cannot
-  be used against a
-  re-invite. A member that left of its own accord inside a checkpoint the node
-  adopts without the records cannot be told from a removed one, and has its
-  invites revoked too. The issuing
+  until the founder seals the revocation. It is triggered whenever applying a
+  record or checkpoint takes a member out and what ended its membership is a
+  removal or ban that had not already ended it - including a removal that
+  only takes effect once a later record, such as the grant that made its
+  signer an admin, arrives - not a leave, a rekey, or a revocation that
+  invalidates a join, and only for invites issued no later than that removal.
+  A removal of somebody already gone, or one its signer had no authority for,
+  revokes nothing, so it cannot be used against a re-invite. A member that
+  left of its own accord inside a checkpoint the node adopts without the
+  records cannot be told from a removed one, and has its invites revoked too.
+  The issuing
   daemon also revokes the rest of a replacement chain on the first maintenance
   round after any capability in it has been used. The daemon links each
   replacement to the capability it replaced, so a redeemer whose answer was

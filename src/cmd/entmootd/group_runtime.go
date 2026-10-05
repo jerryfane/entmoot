@@ -956,9 +956,10 @@ func (r *groupRuntime) processDepartures(session *groupSession) {
 // removal, that could still admit it: so a replacement an ESP open invite
 // handed that member is not left live until a maintenance round, and an
 // invite issued after the removal - a re-invite - is never touched. Only a
-// removal record that took the member out counts (see SetDepartureHook): a
-// removal of somebody already gone, or one its signer had no authority for,
-// revokes nothing, so repeating it cannot be used against a re-invite.
+// removal that newly ends the member's membership counts, whichever record
+// made it take effect (see SetDepartureHook): a removal of somebody already
+// gone, or one its signer had no authority for, revokes nothing, so repeating
+// it cannot be used against a re-invite.
 //
 // A removal signed here needs nothing: every local path revokes before it
 // signs (see revokeInvitesForRemoval). This cannot close the window between a
