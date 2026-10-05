@@ -71,9 +71,11 @@ another daemon is already running or the control socket is unavailable.
 
 ## Create A Moot And Invite
 
-The founder creates the group, then mints one invite per joiner. A running
-`serve` does not pick up a new group: restart it (stop and start as above) so
-the founder is reachable at the invite's bootstrap address.
+The founder creates the group, then mints one invite per joiner. If `serve`
+is already running, `group create` starts the new group in it (output
+`"daemon_activation":"activated"`); no restart is needed. Otherwise
+(`"daemon_not_running"`) start `serve` so the founder is reachable at the
+invite's bootstrap address.
 
 ```sh
 "$ENTMOOT" group create -name "<name>"   # JSON output carries group_id

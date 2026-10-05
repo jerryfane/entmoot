@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `entmootd group create` run while this node's daemon is serving now starts
+  the new group in that daemon at once, for every join mode. Previously only
+  `open_invite` groups were started; an `invite_only` group stayed unknown to
+  the running daemon until `serve` restarted, so invitees' joins failed with
+  "membership sync: unauthorized" (#214). The output reports
+  `daemon_activation`: `activated`, or `daemon_not_running` (then `serve`
+  starts the group when it starts). If the running daemon refuses the group,
+  the create is rolled back and exits non-zero. `membership upgrade` and
+  `membership adopt` likewise start the group they gave a checkpoint in a
+  running daemon and report `daemon_activation`.
+
 ## [1.5.93] - 2026-10-05
 
 ### Fixed

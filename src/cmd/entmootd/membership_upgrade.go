@@ -63,14 +63,19 @@ func cmdMembershipUpgrade(gf *globalFlags, args []string) int {
 			slog.Error("membership upgrade: open membership", slog.String("err", err.Error()))
 			return exitTransport
 		}
-		defer group.Close()
 		canonical := group.Canonical()
+		_ = group.Close()
 		fmt.Fprintf(os.Stderr, "membership upgrade: group %s already has checkpoint %d\n", gid.String(), canonical.Sequence)
+		// A daemon that was running when the checkpoint was minted may not
+		// have started the group; rerunning the command starts it. The
+		// upgrade itself is done, so a refusal is reported, not failed.
+		activation, _ := reportGroupActivation("membership upgrade", s.dataDir, gid)
 		data, err := json.Marshal(map[string]any{
-			"status":     "already_upgraded",
-			"group_id":   gid,
-			"checkpoint": canonical.ID,
-			"sequence":   canonical.Sequence,
+			"status":            "already_upgraded",
+			"group_id":          gid,
+			"checkpoint":        canonical.ID,
+			"sequence":          canonical.Sequence,
+			"daemon_activation": activation,
 		})
 		if err != nil {
 			return exitTransport
@@ -131,27 +136,31 @@ func cmdMembershipUpgrade(gf *globalFlags, args []string) int {
 		fmt.Fprintf(os.Stderr, "membership upgrade: %v\n", err)
 		return exitTransport
 	}
-	defer group.Close()
+	_ = group.Close()
 
 	slog.Info("membership upgrade: checkpoint 0 signed",
 		slog.String("group_id", gid.String()),
 		slog.String("checkpoint", signed.ID.String()),
 		slog.String("legacy_head", head.String()),
 		slog.Int("members", len(signed.Members)))
+	// A running daemon only polls groups still awaiting a checkpoint, and this
+	// one no longer is: start it there now.
+	activation, code := reportGroupActivation("membership upgrade", s.dataDir, gid)
 	data, err := json.Marshal(map[string]any{
-		"status":      "upgraded",
-		"group_id":    gid,
-		"checkpoint":  signed.ID,
-		"legacy_head": head,
-		"members":     len(signed.Members),
-		"admins":      len(policy.Admins),
+		"status":            "upgraded",
+		"group_id":          gid,
+		"checkpoint":        signed.ID,
+		"legacy_head":       head,
+		"members":           len(signed.Members),
+		"admins":            len(policy.Admins),
+		"daemon_activation": activation,
 	})
 	if err != nil {
 		slog.Error("membership upgrade: marshal", slog.String("err", err.Error()))
 		return exitTransport
 	}
 	fmt.Println(string(data))
-	return exitOK
+	return code
 }
 
 // fullWidthMember restates a member under the identity its key derives: the
