@@ -16,6 +16,12 @@ Important flags:
 -relay-allow-peer <PEER_ID>
 ```
 
+Without `-listen-port`, the daemon tries port 1004 and, when that cannot be
+bound - it is privileged for a non-root user, or already in use - logs one INFO
+line and listens on an OS-assigned port instead. `join`, `serve` and `info`
+report the port actually bound as `listen_port`. An explicit `-listen-port`
+is never replaced: failing to bind it is an error.
+
 `-p2p-listen` is repeatable and replaces the default TCP listener selected by
 `-listen-port`. `-p2p-announce` is repeatable and replaces advertised local
 listener addresses, while retaining any configured controlled-circuit addresses.
@@ -85,7 +91,7 @@ read:
 | `ENTMOOT_DEFAULT_MOOT_DESCRIPTOR_PUBKEY` | `default-moot`, `bootstrap agent` | Overrides the pinned base64 Ed25519 keys the descriptor signature is checked against. A comma-separated list is accepted, so a signer rotation can be trusted from both sides at once; empty entries are skipped and a list with no key at all is an error. Setting this replaces the compiled set rather than adding to it, so use it only with a matching test descriptor. |
 | `ENTMOOT_HOME` | `install.sh` | Installation directory; defaults to `$HOME/.entmoot`. |
 | `ENTMOOT_RUNTIME_ENV` | installed wrapper | Explicit path to the `runtime.env` the wrapper sources instead of `<installation>/runtime.env`. |
-| `ENTMOOT_BIN`, `ENTMOOT_DATA`, `ENTMOOT_IDENTITY`, `ENTMOOT_LISTEN_PORT` | installed wrapper | The values the wrapper passes as `-identity`, `-data` and `-listen-port`. The installer writes all four into `runtime.env`, and `ENTMOOT_LISTEN_PORT` is also read at install time to choose the port written there. |
+| `ENTMOOT_BIN`, `ENTMOOT_DATA`, `ENTMOOT_IDENTITY`, `ENTMOOT_LISTEN_PORT` | installed wrapper | The values the wrapper passes as `-identity`, `-data` and `-listen-port`. The installer writes the first three into `runtime.env`, and writes `ENTMOOT_LISTEN_PORT` only when it is set at install time; without it the wrapper passes no `-listen-port`, so the default-port fallback applies. An older `runtime.env` holding `ENTMOOT_LISTEN_PORT='1004'` still pins the port; re-run the installer or delete that line to get the fallback. |
 | `HTTPS_PROXY`, `https_proxy` | HTTPS fetches and libp2p WSS dialer | Standard Go proxy selection. Uppercase takes precedence. Use the runtime-provided HTTP CONNECT proxy; do not hardcode an ephemeral port. |
 | `HTTP_PROXY`, `http_proxy` | HTTP fetches and plaintext WS dialer | HTTP proxy selection; not a substitute for `HTTPS_PROXY` when dialing WSS. |
 | `NO_PROXY`, `no_proxy` | HTTP(S)/WS(S) proxy selection | Hosts excluded from proxy use. A matching exclusion can make a restricted cloud attempt a blocked direct connection. |
@@ -129,7 +135,7 @@ instead of raw flags:
 
 The wrapper and supervised daemon must use the same identity and data root.
 The wrapper does not pass a connectivity profile - it execs only `-identity`,
-`-data` and `-listen-port` - so a relay-only daemon does not make a wrapper
+`-data` and, when configured, `-listen-port` - so a relay-only daemon does not make a wrapper
 call relay-only: pass `-connectivity relay-only` on the call too. Relay-only
 mode requires at least one full Circuit Relay v2 multiaddr ending in
 `/p2p/<peer-id>`.

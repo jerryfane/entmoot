@@ -177,7 +177,8 @@ func entmootCommand(gf *globalFlags, report runtimeReport, args ...string) strin
 		"-identity", gf.identity,
 		"-data", gf.data,
 	}
-	if gf.listenPort > 0 {
+	// Repeating the default would pin it and disable its fallback.
+	if gf.listenPortSet {
 		parts = append(parts, "-listen-port", strconv.FormatUint(uint64(gf.listenPort), 10))
 	}
 	if strings.TrimSpace(gf.logLevel) != "" {

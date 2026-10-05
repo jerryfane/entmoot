@@ -262,7 +262,7 @@ func daemonHostConfig(gf *globalFlags) (libp2ptransport.HostConfig, error) {
 	case "", "direct":
 		config.ListenAddrs = gf.p2pListen
 		if len(config.ListenAddrs) == 0 {
-			config.ListenAddrs = []string{fmt.Sprintf("/ip4/0.0.0.0/tcp/%d", gf.listenPort)}
+			config.ListenAddrs = []string{directListenAddr(gf)}
 		}
 		config.AnnounceAddrs = gf.p2pAnnounce
 	case "relay-only":
@@ -392,6 +392,7 @@ func runGroupDaemon(gf *globalFlags, opts groupDaemonOptions) int {
 		slog.Error(opts.command+": libp2p host", slog.String("err", err.Error()))
 		return exitTransport
 	}
+	listenPort := reportedListenPort(gf, libp2pHost)
 	rawStore, err := store.OpenSQLite(s.dataDir)
 	if err != nil {
 		slog.Error(opts.command+": open store", slog.String("err", err.Error()))
@@ -454,7 +455,7 @@ func runGroupDaemon(gf *globalFlags, opts groupDaemonOptions) int {
 	if opts.exitAfterLoad {
 		groups := runtime.ActiveGroupIDs()
 		members := groupRuntimeMemberCount(runtime, groups)
-		joinedEvent := groupDaemonEvent(opts.event, gf, groups, members, buildJoinHealthSummary(rootCtx, runtime, rawStore, s.identity.PublicKey), sockPath)
+		joinedEvent := groupDaemonEvent(opts.event, gf, listenPort, groups, members, buildJoinHealthSummary(rootCtx, runtime, rawStore, s.identity.PublicKey), sockPath)
 		if data, err := json.Marshal(joinedEvent); err == nil {
 			fmt.Println(string(data))
 		}
@@ -479,7 +480,7 @@ func runGroupDaemon(gf *globalFlags, opts groupDaemonOptions) int {
 		identityPath:      gf.identity,
 		dataDir:           s.dataDir,
 		controlSocketPath: sockPath,
-		listenPort:        uint16(gf.listenPort),
+		listenPort:        listenPort,
 		runtime:           runtime,
 		store:             rawStore,
 		notify:            notifyStore,
@@ -498,7 +499,7 @@ func runGroupDaemon(gf *globalFlags, opts groupDaemonOptions) int {
 	// Emit the one-line "joined" event on stdout.
 	groups := runtime.ActiveGroupIDs()
 	members := groupRuntimeMemberCount(runtime, groups)
-	joinedEvent := groupDaemonEvent(opts.event, gf, groups, members, buildJoinHealthSummary(rootCtx, runtime, rawStore, s.identity.PublicKey), sockPath)
+	joinedEvent := groupDaemonEvent(opts.event, gf, listenPort, groups, members, buildJoinHealthSummary(rootCtx, runtime, rawStore, s.identity.PublicKey), sockPath)
 	if data, err := json.Marshal(joinedEvent); err == nil {
 		fmt.Println(string(data))
 	}
@@ -523,14 +524,16 @@ func groupRuntimeMemberCount(runtime *groupRuntime, groups []entmoot.GroupID) in
 	return members
 }
 
-func groupDaemonEvent(event string, gf *globalFlags, groups []entmoot.GroupID, members int, health joinHealthSummary, sockPath string) map[string]any {
+// groupDaemonEvent is the one-line join/serve event. listenPort is the port
+// the host bound, not necessarily -listen-port (see directListenAddr).
+func groupDaemonEvent(event string, gf *globalFlags, listenPort uint16, groups []entmoot.GroupID, members int, health joinHealthSummary, sockPath string) map[string]any {
 	return map[string]any{
 		"event":          event,
 		"group_id":       groups[0],
 		"group_ids":      groups,
 		"members":        members,
 		"health":         health,
-		"listen_port":    gf.listenPort,
+		"listen_port":    listenPort,
 		"control_socket": sockPath,
 		"next_command":   doctorNextCommand(gf, groups[0]),
 	}
@@ -1379,13 +1382,13 @@ func (s *ipcServer) joinReadinessEvent(ctx context.Context) json.RawMessage {
 		return nil
 	}
 	gf := &globalFlags{
-		identity:   s.identityPath,
-		data:       s.dataDir,
-		listenPort: uint(s.listenPort),
+		identity: s.identityPath,
+		data:     s.dataDir,
 	}
 	event := groupDaemonEvent(
 		"joined",
 		gf,
+		s.listenPort,
 		groups,
 		groupRuntimeMemberCount(s.runtime, groups),
 		buildJoinHealthSummary(ctx, s.runtime, s.store, s.identity.PublicKey),

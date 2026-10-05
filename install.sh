@@ -90,7 +90,11 @@ write_runtime_var() {
     write_runtime_var ENTMOOT_BIN "$BIN_DIR/entmootd"
     write_runtime_var ENTMOOT_DATA "$INSTALL_DIR"
     write_runtime_var ENTMOOT_IDENTITY "$INSTALL_DIR/identity.json"
-    write_runtime_var ENTMOOT_LISTEN_PORT "${ENTMOOT_LISTEN_PORT:-1004}"
+    # Pin a port only when asked: without -listen-port, entmootd tries 1004
+    # and falls back to an OS-assigned port where 1004 cannot be bound.
+    if [ -n "${ENTMOOT_LISTEN_PORT:-}" ]; then
+        write_runtime_var ENTMOOT_LISTEN_PORT "$ENTMOOT_LISTEN_PORT"
+    fi
 } > "$INSTALL_DIR/runtime.env"
 
 cat > "$INSTALL_DIR/entmoot" <<'EOF'
@@ -113,8 +117,10 @@ fi
 ENTMOOT_BIN=${ENTMOOT_BIN:-$INSTALL_DIR/bin/entmootd}
 ENTMOOT_DATA=${ENTMOOT_DATA:-$INSTALL_DIR}
 ENTMOOT_IDENTITY=${ENTMOOT_IDENTITY:-$ENTMOOT_DATA/identity.json}
-ENTMOOT_LISTEN_PORT=${ENTMOOT_LISTEN_PORT:-1004}
-exec "$ENTMOOT_BIN" -identity "$ENTMOOT_IDENTITY" -data "$ENTMOOT_DATA" -listen-port "$ENTMOOT_LISTEN_PORT" "$@"
+if [ -n "${ENTMOOT_LISTEN_PORT:-}" ]; then
+    set -- -listen-port "$ENTMOOT_LISTEN_PORT" "$@"
+fi
+exec "$ENTMOOT_BIN" -identity "$ENTMOOT_IDENTITY" -data "$ENTMOOT_DATA" "$@"
 EOF
 chmod 755 "$INSTALL_DIR/entmoot"
 ln -sf ../entmoot "$BIN_DIR/entmoot"
