@@ -193,43 +193,47 @@ func cmdESPPublish(gf *globalFlags, args []string) int {
 		fmt.Fprintln(os.Stderr, "esp publish: -content is required")
 		return exitInvalidArgument
 	}
-	identity, err := keystore.Load(gf.identity)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "esp publish: load identity %s: %v\n", gf.identity, err)
-		return exitInvalidArgument
-	}
-	client, err := openESPClient(gf)
+	out, code, err := publishThroughESP(context.Background(), gf, gid, topicList, []byte(*content))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "esp publish: %v\n", err)
-		return exitInvalidArgument
-	}
-	ctx := context.Background()
-	var summary esphttp.GroupSummary
-	if err := client.do(ctx, http.MethodGet, espGroupPath(gid, ""), nil, &summary); err != nil {
-		fmt.Fprintf(os.Stderr, "esp publish: read roster head: %v\n", err)
-		return exitTransport
-	}
-	if summary.RosterHead == (entmoot.RosterEntryID{}) {
-		fmt.Fprintln(os.Stderr, "esp publish: ESP did not report a roster head for the group")
-		return exitTransport
-	}
-	msg, err := buildESPSignedMessage(ctx, identity, gid, summary.RosterHead, topicList, []byte(*content), time.Now())
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "esp publish: %v\n", err)
-		return exitInvalidArgument
-	}
-	body, err := json.Marshal(map[string]entmoot.Message{"message": msg})
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "esp publish: %v\n", err)
-		return exitTransport
-	}
-	var out json.RawMessage
-	if err := client.do(ctx, http.MethodPost, espGroupPath(gid, "messages"), body, &out); err != nil {
-		fmt.Fprintf(os.Stderr, "esp publish: %v\n", err)
-		return exitTransport
+		return code
 	}
 	fmt.Println(string(out))
 	return exitOK
+}
+
+// publishThroughESP signs content with this member's identity against the
+// roster head the connected ESP reports, posts it to the ESP, and returns the
+// ESP's response. On failure it also returns the exit code for the error.
+func publishThroughESP(ctx context.Context, gf *globalFlags, gid entmoot.GroupID, topics []string, content []byte) (json.RawMessage, int, error) {
+	identity, err := keystore.Load(gf.identity)
+	if err != nil {
+		return nil, exitInvalidArgument, fmt.Errorf("load identity %s: %w", gf.identity, err)
+	}
+	client, err := openESPClient(gf)
+	if err != nil {
+		return nil, exitInvalidArgument, err
+	}
+	var summary esphttp.GroupSummary
+	if err := client.do(ctx, http.MethodGet, espGroupPath(gid, ""), nil, &summary); err != nil {
+		return nil, exitTransport, fmt.Errorf("read roster head: %w", err)
+	}
+	if summary.RosterHead == (entmoot.RosterEntryID{}) {
+		return nil, exitTransport, errors.New("ESP did not report a roster head for the group")
+	}
+	msg, err := buildESPSignedMessage(ctx, identity, gid, summary.RosterHead, topics, content, time.Now())
+	if err != nil {
+		return nil, exitInvalidArgument, err
+	}
+	body, err := json.Marshal(map[string]entmoot.Message{"message": msg})
+	if err != nil {
+		return nil, exitTransport, err
+	}
+	var out json.RawMessage
+	if err := client.do(ctx, http.MethodPost, espGroupPath(gid, "messages"), body, &out); err != nil {
+		return nil, exitTransport, err
+	}
+	return out, exitOK, nil
 }
 
 // buildESPConnectRequest signs a connect request with the member's Entmoot
