@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A revoked invite, or an invite from an admin since demoted or removed, can
+  no longer be used by signing a join dated before the change (#209).
+  Membership is ordered by the signer's own timestamp, and only a checkpoint
+  bounds it from below, so such a join used to be admitted on every node
+  until the next cadence checkpoint, which in a small group could be weeks.
+  Now the founder's daemon seals each change that takes authority away with
+  a checkpoint dated at the change. Those changes are an invite revoke, an
+  admin's demotion, removal, ban or departure, and closing an open group. The
+  daemon seals a change about one to two membership rounds after it receives
+  it, once a round has pulled what every reachable member holds. If some
+  member keeps answering incompletely or hangs, it seals anyway once the
+  change has waited two minutes and every member it can address has been
+  asked since, normally at most about four minutes after, and logs the
+  members that lagged. Rounds pull members eight at a time, 10 seconds each,
+  and start no new pull after 30 seconds, and each starts with the members
+  the last one missed, so hanging members can neither stretch a round nor
+  crowd an honest member out of the seal. A founder that reaches no member
+  at all does not seal until one answers again. After that the founder
+  refuses such a backdated join, and every other node does once it has
+  pulled the checkpoint. The commands
+  sign only the record. A checkpoint signed from a view that misses records
+  other members hold would strand those members, so only the founder seals,
+  it folds only records dated up to the change, each change waits its own
+  time, and it seals at most once a minute. Older peers need no upgrade. Not
+  covered: a join dated inside an expired invite's validity window is still
+  admitted until a later checkpoint covers it, and while the founder's daemon
+  is down nothing is sealed.
+- A join refused because a checkpoint landed while it was in flight can now
+  simply be run again: the failed attempt no longer leaves a membership store
+  behind that made every retry fail with "group store already exists", and
+  the refusal says the join record predates the current checkpoint instead
+  of only "malformed".
+
 ## [1.5.94] - 2026-10-05
 
 ### Added

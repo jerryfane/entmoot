@@ -850,6 +850,35 @@ func (g *Group) Close() error {
 	return err
 }
 
+// Discard closes the group and deletes its membership store. It exists for a
+// join that did not complete: AdoptForJoin creates the store before the join
+// is accepted, and a store left behind by a refused join would make running
+// the join again fail with ErrExists. Only the store goes; whatever else the
+// group directory holds is left alone.
+func (g *Group) Discard() error {
+	if err := g.lease.claim(); err != nil {
+		_ = g.Close()
+		return err
+	}
+	db := filepath.Join(g.dir, storeFileName)
+	var removeErr error
+	g.closeOnce.Do(func() {
+		removeErr = g.db.Close()
+		for _, path := range []string{db, db + "-wal", db + "-shm", db + "-journal"} {
+			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) && removeErr == nil {
+				removeErr = err
+			}
+		}
+		if err := g.lease.close(); err != nil && removeErr == nil {
+			removeErr = err
+		}
+	})
+	if removeErr != nil {
+		return fmt.Errorf("membership: discard store: %w", removeErr)
+	}
+	return nil
+}
+
 // Apply stores one record and re-projects. Applying a record twice is a no-op,
 // so a peer may send the same record repeatedly.
 func (g *Group) Apply(rec Record) (bool, error) {
@@ -1455,6 +1484,58 @@ func (g *Group) SignRecord(identity *keystore.Identity, rec Record) (Record, err
 // force it signs only once the policy's cadence is reached, so the common path
 // is to call it every maintenance round and have it decline.
 func (g *Group) SignCheckpoint(identity *keystore.Identity, force bool) (Checkpoint, bool, error) {
+	return g.signCheckpoint(identity, 0, func(effective []Record, _ int64, cadence int) bool {
+		if force {
+			return true
+		}
+		return len(effective) > 0 && len(effective) >= cadence
+	})
+}
+
+// SealDue reports the timestamp of the newest record outside the canonical
+// checkpoint that takes authority away - it revokes an invite, closes an open
+// group, or leaves an admin unable to administer - and whether there is one.
+//
+// Such a change is final against joins dated after it as soon as it applies,
+// but not against a join dated before it: order is by the signer's own
+// timestamp, which nothing bounds from below except a checkpoint. So a holder
+// of a revoked invite, or of an invite from an admin since demoted, can sign a
+// join dated just before the change and be admitted ahead of it on every node,
+// until a checkpoint dated at or after the change exists. SealThrough signs
+// that checkpoint.
+func (g *Group) SealDue() (int64, bool) {
+	g.mu.RLock()
+	base := g.checkpoints[g.canonicalID]
+	records := make([]Record, 0, len(g.records))
+	for _, rec := range g.records {
+		records = append(records, rec)
+	}
+	g.mu.RUnlock()
+	_, _, reducedAt := project(base, records)
+	return reducedAt, reducedAt != 0
+}
+
+// SealThrough signs a checkpoint folding exactly the pending records dated no
+// later than through, when they include a change that takes authority away
+// (see SealDue). Records dated later stay pending for the next checkpoint.
+//
+// Bounding the fold at the change, rather than at the newest record held, is
+// deliberate: a checkpoint makes every record dated before it stale, so a
+// record this node does not hold yet but a peer does is lost to the group,
+// and that peer can no longer follow the chain. The caller decides when this
+// node has pulled enough of what its peers hold to sign (see the daemon's
+// maintenance round); this only keeps the window it vouches for as short as
+// the change allows.
+func (g *Group) SealThrough(identity *keystore.Identity, through int64) (Checkpoint, bool, error) {
+	return g.signCheckpoint(identity, through, func(_ []Record, reducedAt int64, _ int) bool {
+		return reducedAt != 0
+	})
+}
+
+// signCheckpoint signs and applies a checkpoint over the pending records dated
+// no later than through (every pending record when through is 0) when due
+// says the fold calls for one.
+func (g *Group) signCheckpoint(identity *keystore.Identity, through int64, due func(effective []Record, reducedAt int64, cadence int) bool) (Checkpoint, bool, error) {
 	if identity == nil {
 		return Checkpoint{}, false, errors.New("membership: signing identity is required")
 	}
@@ -1478,18 +1559,23 @@ func (g *Group) SignCheckpoint(identity *keystore.Identity, force bool) (Checkpo
 		g.mu.Unlock()
 		return Checkpoint{}, false, fmt.Errorf("%w: %s may not sign a checkpoint for this group yet", ErrNotAuthorised, signerID.String())
 	}
+	// A bounded fold is dated at its bound, and must still advance past the
+	// base.
+	bound := through
+	if through != 0 && bound <= base.Timestamp {
+		bound = base.Timestamp + 1
+	}
 	records := make([]Record, 0, len(g.records))
 	for _, rec := range g.records {
-		records = append(records, rec)
+		if through == 0 || rec.Timestamp <= bound {
+			records = append(records, rec)
+		}
 	}
 	cadence := g.state.Policy.CheckpointEvery
 	g.mu.Unlock()
 
-	state, effective := Project(base, records)
-	if !force && len(effective) < cadence {
-		return Checkpoint{}, false, nil
-	}
-	if len(effective) == 0 && !force {
+	state, effective, reducedAt := project(base, records)
+	if !due(effective, reducedAt, cadence) {
 		return Checkpoint{}, false, nil
 	}
 	// The timestamp covers every record folded in, not only the ones that
@@ -1501,6 +1587,11 @@ func (g *Group) SignCheckpoint(identity *keystore.Identity, force bool) (Checkpo
 		if rec.Timestamp > timestamp {
 			timestamp = rec.Timestamp
 		}
+	}
+	if through != 0 {
+		// The window a peer checks is everything up to the timestamp, so a
+		// bounded fold claims exactly its bound.
+		timestamp = bound
 	}
 	if timestamp <= base.Timestamp {
 		timestamp = base.Timestamp + 1

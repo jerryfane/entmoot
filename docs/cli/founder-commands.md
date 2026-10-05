@@ -125,6 +125,16 @@ Authority:
 - `admin grant` / `admin revoke`: founder only. Each writes a `policy` record
   carrying the complete admin set.
 
+`admin revoke`, `remove` or `ban` of an admin, an admin's `leave`, and
+closing an open group take authority away, and only a checkpoint stops a join
+dated before such a change from being admitted ahead of it. The commands sign
+only the record; the founder's daemon seals it with a checkpoint about one to
+two membership rounds after it receives the change, once it has pulled from
+the other members — see
+[changes that take authority away](../concepts/groups-rosters-invites.md#changes-that-take-authority-away-are-sealed-by-the-founders-daemon).
+Keep the founder's daemon running; while it is down such a change waits for
+it or for the cadence.
+
 Every command in that list writes a signed record and takes the group's writer
 lease, so stop the local daemon before running it — except `status` and `admin
 list`, which only read local state. Member
@@ -158,8 +168,13 @@ that - they keep working after the founder removes itself, so revoking one
 takes an explicit `invite revoke`. `invite revoke` writes a signed `revoke_invite`
 record, which is what makes other nodes refuse it, and also marks the local
 issuance ledger; it therefore takes the writer lease and needs the daemon
-stopped. `-open` mints a bearer invite: whoever holds it can join until it
-expires, is revoked, or runs out of uses.
+stopped. The revocation is final against a join dated before it once the
+founder's daemon has sealed it, normally one to two membership rounds and at
+most about four minutes after that daemon has the record (as long as it
+reaches at least one member and no more than about 70 members hang), and on
+each other node once it has pulled that checkpoint. `-open` mints a bearer
+invite: whoever holds it can join until it expires, is revoked, or runs out
+of uses.
 
 `invite list` reads `bootstrap-admission.db`, which is only a local record of
 the invites this node issued. Invite use limits themselves are counted from the
