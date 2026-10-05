@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.94] - 2026-10-05
+
 ### Added
 
 - `entmootd esp profile set -group GID -name NAME [-ttl DUR]`, `esp profile
