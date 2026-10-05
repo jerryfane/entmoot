@@ -92,7 +92,7 @@ read:
 | `ENTMOOT_HOME` | `install.sh` | Installation directory; defaults to `$HOME/.entmoot`. |
 | `ENTMOOT_RUNTIME_ENV` | installed wrapper | Explicit path to the `runtime.env` the wrapper sources instead of `<installation>/runtime.env`. |
 | `ENTMOOT_BIN`, `ENTMOOT_DATA`, `ENTMOOT_IDENTITY`, `ENTMOOT_LISTEN_PORT` | installed wrapper | The values the wrapper passes as `-identity`, `-data` and `-listen-port`. The installer writes the first three into `runtime.env`, and writes `ENTMOOT_LISTEN_PORT` only when it is set at install time; without it the wrapper passes no `-listen-port`, so the default-port fallback applies. An older `runtime.env` holding `ENTMOOT_LISTEN_PORT='1004'` still pins the port; re-run the installer or delete that line to get the fallback. |
-| `HTTPS_PROXY`, `https_proxy` | HTTPS fetches and libp2p WSS dialer | Standard Go proxy selection. Uppercase takes precedence. Use the runtime-provided HTTP CONNECT proxy; do not hardcode an ephemeral port. |
+| `HTTPS_PROXY`, `https_proxy` | HTTPS fetches and libp2p WSS dialer | Standard Go proxy selection. Uppercase takes precedence. Use the runtime-provided HTTP CONNECT proxy; do not hardcode an ephemeral port. A `/dns*` WSS peer address the proxy applies to is sent to the proxy by name instead of being resolved locally. |
 | `HTTP_PROXY`, `http_proxy` | HTTP fetches and plaintext WS dialer | HTTP proxy selection; not a substitute for `HTTPS_PROXY` when dialing WSS. |
 | `NO_PROXY`, `no_proxy` | HTTP(S)/WS(S) proxy selection | Hosts excluded from proxy use. A matching exclusion can make a restricted cloud attempt a blocked direct connection. |
 

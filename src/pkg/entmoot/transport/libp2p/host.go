@@ -57,6 +57,8 @@ func VerifyBinding(publicKey []byte, memberID entmoot.MemberID, peerID peer.ID) 
 
 // NewHost reuses the persisted Entmoot private key as the libp2p secure-host
 // identity. Application authorization remains a separate roster/invite layer.
+// WebSocket addresses by name are left for an applicable environment proxy to
+// resolve; see proxiedDNSResolver.
 func NewHost(ctx context.Context, identity *keystore.Identity, options ...libp2p.Option) (host.Host, Binding, error) {
 	if identity == nil || len(identity.PrivateKey) != ed25519.PrivateKeySize {
 		return nil, Binding{}, fmt.Errorf("libp2p: valid Entmoot identity is required")
@@ -69,7 +71,7 @@ func NewHost(ctx context.Context, identity *keystore.Identity, options ...libp2p
 	if err != nil {
 		return nil, Binding{}, err
 	}
-	options = append([]libp2p.Option{libp2p.Identity(privateKey)}, options...)
+	options = append([]libp2p.Option{libp2p.Identity(privateKey), libp2p.MultiaddrResolver(newProxiedDNSResolver())}, options...)
 	h, err := libp2p.New(options...)
 	if err != nil {
 		return nil, Binding{}, fmt.Errorf("libp2p: create host: %w", err)

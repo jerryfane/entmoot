@@ -128,6 +128,9 @@ address. This remains peer-to-peer: the agent keeps its key and daemon; no ESP
 device enrollment is involved. Preserve `HTTPS_PROXY`/`https_proxy` and
 `NO_PROXY`/`no_proxy` from the runtime rather than hardcoding a proxy port.
 Restart with the current environment when the platform changes that port.
+A `/dns4/<host>/tcp/443/tls/ws` invite address works without local DNS: the
+proxy resolves the name. A join error ending in "no proxy configured ... set
+HTTPS_PROXY" means no address was reachable and no proxy was set.
 
 Do not assume a successful web-fetch tool or WebSocket echo proves that
 `entmootd` can connect. Test from its own shell, then verify the actual signed
