@@ -31,15 +31,21 @@ func TestDefaultListenPortFallsBackWhenUnbindable(t *testing.T) {
 	if testing.Short() {
 		t.Skip("builds the daemon")
 	}
-	binary := filepath.Join(t.TempDir(), "entmootd")
+	// The permission case runs the binary as another user, so it lives in
+	// a tree that user can traverse whatever the umask: t.TempDir and the
+	// go build output follow it, and are 0700 under umask 077.
+	root, err := os.MkdirTemp("", "entmoot-listen-port-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	binary := filepath.Join(root, "entmootd")
 	build := exec.Command("go", "build", "-o", binary, ".")
 	build.Env = append(os.Environ(), "CGO_ENABLED=0")
 	if out, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build: %v\n%s", err, out)
 	}
-	// The permission case runs the binary as another user: t.TempDir and
-	// its parent are created 0700.
-	for _, path := range []string{filepath.Dir(binary), filepath.Dir(filepath.Dir(binary))} {
+	for _, path := range []string{root, binary} {
 		if err := os.Chmod(path, 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -57,7 +63,7 @@ func TestDefaultListenPortFallsBackWhenUnbindable(t *testing.T) {
 		default:
 			t.Skipf("cannot make port %d unbindable: %v", documentedDefaultPort, err)
 		}
-		checkDefaultListenPortFallback(t, binary, nil, "")
+		checkDefaultListenPortFallback(t, root, binary, nil, "")
 	})
 
 	t.Run("permission denied", func(t *testing.T) {
@@ -72,13 +78,30 @@ func TestDefaultListenPortFallsBackWhenUnbindable(t *testing.T) {
 			t.Skipf("port %d is unprivileged here (ip_unprivileged_port_start=%s)", documentedDefaultPort, strings.TrimSpace(string(raw)))
 		}
 		nobody := &syscall.Credential{Uid: 65534, Gid: 65534}
-		checkDefaultListenPortFallback(t, binary, nobody, "permission denied")
+		probe := exec.Command(binary, "version")
+		probe.Dir = root
+		probe.SysProcAttr = &syscall.SysProcAttr{Credential: nobody}
+		if out, err := probe.CombinedOutput(); err != nil {
+			// Only a refused setuid/setgid means privileges cannot be
+			// dropped here; anything else is this test's own setup.
+			if errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.EINVAL) {
+				t.Skipf("cannot run as uid %d here: %v", nobody.Uid, err)
+			}
+			t.Fatalf("binary as uid %d: %v\n%s", nobody.Uid, err, out)
+		}
+		checkDefaultListenPortFallback(t, root, binary, nobody, "permission denied")
 	})
 }
 
-func checkDefaultListenPortFallback(t *testing.T, binary string, user *syscall.Credential, bindErr string) {
+func checkDefaultListenPortFallback(t *testing.T, root, binary string, user *syscall.Credential, bindErr string) {
 	t.Helper()
-	dir := t.TempDir()
+	dir, err := os.MkdirTemp(root, "case-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	for _, node := range []string{"founder", "joiner"} {
 		data := filepath.Join(dir, node)
 		if err := os.Mkdir(data, 0o700); err != nil {
@@ -90,20 +113,16 @@ func checkDefaultListenPortFallback(t *testing.T, binary string, user *syscall.C
 			}
 		}
 	}
-	if user != nil {
-		for _, path := range []string{dir, filepath.Dir(dir)} {
-			if err := os.Chmod(path, 0o755); err != nil {
-				t.Fatal(err)
-			}
-		}
-	}
 	// No SO_REUSEPORT: libp2p must not share the port with whatever holds it.
-	env := append(os.Environ(), "LIBP2P_TCP_REUSEPORT=false", "HERDR_SOCKET_PATH="+filepath.Join(dir, "no-herdr.sock"))
+	// HOME and the working directory stay inside the tree, where the
+	// unprivileged user can reach them.
+	env := append(os.Environ(), "LIBP2P_TCP_REUSEPORT=false", "HOME="+dir, "HERDR_SOCKET_PATH="+filepath.Join(dir, "no-herdr.sock"))
 	command := func(node string, args ...string) *exec.Cmd {
 		data := filepath.Join(dir, node)
 		global := []string{"-identity", filepath.Join(data, "identity.json"), "-data", data}
 		cmd := exec.Command(binary, append(global, args...)...)
 		cmd.Env = env
+		cmd.Dir = dir
 		if user != nil {
 			cmd.SysProcAttr = &syscall.SysProcAttr{Credential: user}
 		}
@@ -211,6 +230,10 @@ func checkDefaultListenPortFallback(t *testing.T, binary string, user *syscall.C
 	invite := filepath.Join(dir, "invite.json")
 	if err := os.WriteFile(invite, []byte(mustRun("founder", "invite", "create", "-group", group.GroupID,
 		"-target-pubkey", joiner.EntmootPubKey, "-bootstrap", bootstrap, "-no-fallback-peers")), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// WriteFile honours the umask; the joiner may run as another user.
+	if err := os.Chmod(invite, 0o644); err != nil {
 		t.Fatal(err)
 	}
 
