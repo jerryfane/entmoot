@@ -41,6 +41,7 @@ type replayFixture struct {
 	host    host.Host
 	runtime *groupRuntime
 	session *groupSession
+	server  *ipcServer
 	state   *esphttp.SQLiteStateStore
 	handler http.Handler
 	// loseRefreshAnswer makes the relay drop the daemon's answer to the next
@@ -53,7 +54,10 @@ type replayRedemption struct {
 	Capability entmoot.BootstrapCapability `json:"capability"`
 }
 
-func startReplayFixture(t *testing.T, gidSeed byte) *replayFixture {
+// startReplayFixture starts the fixture. withPeer adds a second member with
+// no address, so the founder is not the group's only member and its daemon
+// never seals: nothing may rely on the seal arriving.
+func startReplayFixture(t *testing.T, gidSeed byte, withPeer bool) *replayFixture {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -61,6 +65,12 @@ func startReplayFixture(t *testing.T, gidSeed byte) *replayFixture {
 	founder, founderInfo := mustDaemonIdentity(t)
 	f := &replayFixture{t: t, ctx: ctx, founder: founder, gid: testESPGroupID(gidSeed)}
 	mustCreateGroup(t, root, f.gid, founder, membership.DefaultPolicy())
+	if withPeer {
+		group := mustOpenGroup(t, root, f.gid)
+		peer, peerInfo := mustDaemonIdentity(t)
+		mustJoinWithInvite(t, group, peer, mustDaemonInvite(t, group, founder, peerInfo, 1))
+		mustCloseGroup(t, group)
+	}
 
 	h, hostBinding, err := libp2ptransport.NewHost(ctx, founder, libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"))
 	if err != nil {
@@ -93,12 +103,17 @@ func startReplayFixture(t *testing.T, gidSeed byte) *replayFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := &ipcServer{
+	f.state, err = esphttp.OpenSQLiteStateStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenSQLiteStateStore: %v", err)
+	}
+	t.Cleanup(func() { _ = f.state.Close() })
+	f.server = &ipcServer{
 		memberID: founderBinding.MemberID, peerID: founderBinding.PeerID.String(),
-		identity: founder, dataDir: root, runtime: runtime,
+		identity: founder, dataDir: root, runtime: runtime, metadataStore: f.state,
 	}
 	daemonSock := testUnixSocketPath(t)
-	serveUnix(t, daemonSock, func(conn net.Conn) { server.handleConn(ctx, conn) })
+	serveUnix(t, daemonSock, func(conn net.Conn) { f.server.handleConn(ctx, conn) })
 	relaySock := testUnixSocketPath(t)
 	serveUnix(t, relaySock, func(conn net.Conn) {
 		msgType, body, err := ipc.ReadFrame(conn)
@@ -120,11 +135,6 @@ func startReplayFixture(t *testing.T, gidSeed byte) *replayFixture {
 		_ = ipc.WriteFrame(conn, answerType, answer)
 	})
 
-	f.state, err = esphttp.OpenSQLiteStateStore(t.TempDir())
-	if err != nil {
-		t.Fatalf("OpenSQLiteStateStore: %v", err)
-	}
-	t.Cleanup(func() { _ = f.state.Close() })
 	f.handler, err = esphttp.NewHandler(esphttp.Config{
 		Token:      "replay-test",
 		Service:    mailboxtest.New(t, storetest.New(t), nil),
@@ -245,6 +255,69 @@ func (f *replayFixture) admits(capability entmoot.BootstrapCapability) bool {
 	return f.session.group.CheckInvite(capability, time.Now().UnixMilli()) == nil
 }
 
+// expireStoredCapability rewrites the capability stored for redeemer's
+// redemption of the invite with tokenHash so that it expires at expiresAtMS,
+// signed again by the founder, as if it had been issued that long ago.
+func (f *replayFixture) expireStoredCapability(tokenHash string, redeemer *keystore.Identity, issued entmoot.BootstrapCapability, expiresAtMS int64) entmoot.BootstrapCapability {
+	f.t.Helper()
+	key := mustDaemonNodeInfo(f.t, redeemer).MemberID.String()
+	stored, ok, err := f.state.GetOpenInviteRedemption(f.ctx, tokenHash, key)
+	if err != nil || !ok {
+		f.t.Fatalf("GetOpenInviteRedemption: ok=%t err=%v", ok, err)
+	}
+	var result map[string]any
+	if err := json.Unmarshal(stored.Result, &result); err != nil {
+		f.t.Fatal(err)
+	}
+	expired := issued
+	if expired.IssuedAtMS > expiresAtMS {
+		expired.IssuedAtMS = expiresAtMS - time.Hour.Milliseconds()
+	}
+	expired.ExpiresAtMS = expiresAtMS
+	if err := libp2ptransport.SignBootstrapCapability(f.founder, &expired); err != nil {
+		f.t.Fatal(err)
+	}
+	result["capability"] = expired
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	if err := f.state.CompleteOpenInviteRedemption(f.ctx, tokenHash, key, encoded, time.Now().UnixMilli()); err != nil {
+		f.t.Fatalf("expire the stored capability: %v", err)
+	}
+	return expired
+}
+
+// removeMember removes member through the daemon's member_remove, the path
+// the ESP and the CLI take while the daemon runs.
+func (f *replayFixture) removeMember(member *keystore.Identity) *ipc.MemberRemoveResp {
+	f.t.Helper()
+	target := mustDaemonNodeInfo(f.t, member)
+	client, daemon := net.Pipe()
+	defer client.Close()
+	go func() {
+		defer daemon.Close()
+		f.server.handleMemberRemove(f.ctx, daemon, &ipc.MemberRemoveReq{GroupID: f.gid, Target: target})
+	}()
+	_, decoded, err := ipc.ReadAndDecode(client)
+	if err != nil {
+		f.t.Fatalf("member_remove: %v", err)
+	}
+	resp, ok := decoded.(*ipc.MemberRemoveResp)
+	if !ok {
+		f.t.Fatalf("member_remove answered %#v", decoded)
+	}
+	return resp
+}
+
+// joinNow has member sign and apply a join with capability dated now, and
+// reports whether it is a member afterwards.
+func (f *replayFixture) joinNow(member *keystore.Identity, capability entmoot.BootstrapCapability) bool {
+	f.t.Helper()
+	_, _ = f.session.group.Apply(mustSignedJoinAt(f.t, f.gid, member, capability, time.Now().UnixMilli()))
+	return f.session.group.IsMemberID(*mustDaemonNodeInfo(f.t, member).MemberID)
+}
+
 func hasWebSocket(capability entmoot.BootstrapCapability) bool {
 	for _, address := range capability.AllowedMultiaddrs {
 		if strings.Contains(address, "/ws/") {
@@ -273,7 +346,7 @@ func generateIdentity(t *testing.T) *keystore.Identity {
 // replay may be minted again only once per change, and only for a capability
 // that never got anyone in.
 func TestOpenInviteReplayReplacesOnlyAStaleUnusedCapability(t *testing.T) {
-	f := startReplayFixture(t, 32)
+	f := startReplayFixture(t, 32, false)
 	group := f.session.group
 
 	// Two identities redeem while the node listens on TCP only: one never
@@ -359,32 +432,7 @@ func TestOpenInviteReplayReplacesOnlyAStaleUnusedCapability(t *testing.T) {
 	aged := generateIdentity(t)
 	agedLink := f.createInvite("aged", time.Now().Add(time.Hour))
 	agedFirst, _ := f.redeemed("aged", aged)
-	agedBinding, err := libp2ptransport.BindingFromPublicKey(aged.PublicKey)
-	if err != nil {
-		t.Fatal(err)
-	}
-	stored, ok, err := f.state.GetOpenInviteRedemption(f.ctx, agedLink, agedBinding.MemberID.String())
-	if err != nil || !ok {
-		t.Fatalf("GetOpenInviteRedemption: ok=%t err=%v", ok, err)
-	}
-	var aging map[string]any
-	if err := json.Unmarshal(stored.Result, &aging); err != nil {
-		t.Fatal(err)
-	}
-	stale := agedFirst.Capability
-	stale.IssuedAtMS = time.Now().Add(-2 * time.Hour).UnixMilli()
-	stale.ExpiresAtMS = time.Now().Add(-time.Hour).UnixMilli()
-	if err := libp2ptransport.SignBootstrapCapability(f.founder, &stale); err != nil {
-		t.Fatal(err)
-	}
-	aging["capability"] = stale
-	agingResult, err := json.Marshal(aging)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := f.state.CompleteOpenInviteRedemption(f.ctx, agedLink, agedBinding.MemberID.String(), agingResult, time.Now().UnixMilli()); err != nil {
-		t.Fatalf("age the stored capability: %v", err)
-	}
+	stale := f.expireStoredCapability(agedLink, aged, agedFirst.Capability, time.Now().Add(-time.Hour).UnixMilli())
 	renewed, renewedBody := f.redeemed("aged", aged)
 	if renewed.Capability.Nonce == stale.Nonce || renewed.Capability.ExpiresAtMS <= time.Now().UnixMilli() {
 		t.Fatal("an expired stored capability was replayed")
@@ -451,7 +499,7 @@ func TestOpenInviteReplayReplacesOnlyAStaleUnusedCapability(t *testing.T) {
 // founder's daemon seals like any other: afterwards a join with the old
 // capability, dated before the revocation, is refused as stale.
 func TestOpenInviteRefreshSurvivesALostAnswerAndIsSealed(t *testing.T) {
-	f := startReplayFixture(t, 34)
+	f := startReplayFixture(t, 34, false)
 	group := f.session.group
 	joiner := generateIdentity(t)
 	joinerBinding, err := libp2ptransport.BindingFromPublicKey(joiner.PublicKey)
@@ -518,6 +566,100 @@ func TestOpenInviteRefreshSurvivesALostAnswerAndIsSealed(t *testing.T) {
 	}
 	if !f.admits(again.Capability) {
 		t.Fatal("the seal took the replacement down with the capability it replaced")
+	}
+}
+
+// TestOpenInviteReplacementCannotReadmitARemovedHolder covers what the seal
+// cannot: a group where the founder is not the only member, so its daemon has
+// not sealed. The holder of a replaced capability A still gets in with a join
+// dated before A's revocation - or, for an A that had expired when it was
+// replaced, dated inside its window - while its replacement B is live. Before
+// B was revoked with the holder's removal, the removed holder walked back in
+// with B through an exhausted link that member_remove reported as having
+// nothing outstanding. Whoever removes it, B must not admit it again.
+func TestOpenInviteReplacementCannotReadmitARemovedHolder(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		seed byte
+		// expired replaces an A that has expired rather than one whose
+		// addresses changed.
+		expired bool
+		// elsewhere has the removal signed without this daemon's
+		// member_remove, as by another admin, after a maintenance round.
+		elsewhere bool
+	}{
+		{"join with the replaced capability before the seal", 35, false, false},
+		{"join with an expired replaced capability", 36, true, false},
+		{"removal signed elsewhere", 37, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := startReplayFixture(t, tc.seed, true)
+			group := f.session.group
+			base := group.Canonical()
+			holder := generateIdentity(t)
+			holderID := *mustDaemonNodeInfo(t, holder).MemberID
+			link := f.createInvite("link", time.Now().Add(time.Hour))
+			first, _ := f.redeemed("link", holder)
+			replaced := first.Capability
+			joinAt := time.Now().UnixMilli()
+			if tc.expired {
+				// A expires inside the group's life, so a join dated in its
+				// window is not older than the group's checkpoint.
+				joinAt = base.Timestamp + 10
+				replaced = f.expireStoredCapability(link, holder, first.Capability, base.Timestamp+20)
+				time.Sleep(time.Until(time.UnixMilli(base.Timestamp + 30)))
+			} else {
+				time.Sleep(5 * time.Millisecond)
+				f.listenWebSocket()
+			}
+			time.Sleep(5 * time.Millisecond)
+
+			again, _ := f.redeemed("link", holder)
+			if again.Capability.Nonce == replaced.Nonce {
+				t.Fatal("the stale capability was not replaced")
+			}
+			if !group.IsInviteRevoked(replaced.Nonce) {
+				t.Fatal("the replaced capability was not revoked when its replacement was handed out")
+			}
+			// The revocation is not sealed, so a join dated before it lands.
+			if _, err := group.Apply(mustSignedJoinAt(t, f.gid, holder, replaced, joinAt)); err != nil || !group.IsMemberID(holderID) {
+				t.Fatalf("precondition: a join with the replaced capability dated before its revocation should land before the seal: %v", err)
+			}
+
+			if tc.elsewhere {
+				f.runtime.syncMembership(f.ctx, f.session)
+				if !group.IsInviteRevoked(again.Capability.Nonce) {
+					t.Fatal("a maintenance round left the replacement live after its chain was used to join")
+				}
+				if err := applyRosterRemove(f.founder, group, mustDaemonNodeInfo(t, holder)); err != nil {
+					t.Fatalf("remove: %v", err)
+				}
+			} else {
+				resp := f.removeMember(holder)
+				if resp.OutstandingESPOpenInvites == nil || *resp.OutstandingESPOpenInvites != 0 || len(resp.OutstandingOpenInvites) != 0 {
+					t.Fatalf("member_remove reported outstanding invites: esp=%v open=%v (%s)",
+						resp.OutstandingESPOpenInvites, resp.OutstandingOpenInvites, resp.ESPOpenInvitesError)
+				}
+				if !group.IsInviteRevoked(again.Capability.Nonce) {
+					t.Fatal("member_remove left the replacement unrevoked")
+				}
+			}
+			if group.IsMemberID(holderID) {
+				t.Fatal("the holder is still a member after its removal")
+			}
+			if f.joinNow(holder, again.Capability) {
+				t.Fatal("the removed holder rejoined with the replacement")
+			}
+			if f.admits(again.Capability) || f.useCount(link) != 1 {
+				t.Fatalf("the replacement still admits (use count %d)", f.useCount(link))
+			}
+			// Nothing here leaned on the seal: the founder is not alone and
+			// reaches nobody, so it has not signed one.
+			f.runtime.syncMembership(f.ctx, f.session)
+			if group.Canonical().ID != base.ID {
+				t.Fatal("the founder sealed; this test must not rely on it")
+			}
+		})
 	}
 }
 

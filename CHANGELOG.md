@@ -19,15 +19,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   capability to the daemon in a new `invite_refresh` IPC request, and the
   daemon decides. A capability is never replaced if its holder got in (a used
   nonce, or a current, removed or banned member) or if somebody else revoked
-  it; that redeemer gets the stored bytes as before. When a capability that
-  has not yet expired is replaced, the daemon first revokes it with a signed
-  `revoke_invite` roster record, which the founder's daemon seals like any
-  other revocation, so the holder never has two capabilities that would admit
-  it and an exhausted link cannot readmit a removed member. The daemon links
-  each replacement to the capability it replaced, so a redeemer whose answer
-  was lost is handed that replacement on its next try rather than being left
-  with a revoked one, and the daemon signs at most once per change. The ESP
-  accepts a replacement only from a daemon that answers
+  it; that redeemer gets the stored bytes as before. When a capability is
+  replaced, the daemon first revokes it, and every earlier one it replaced,
+  expired or not, with signed `revoke_invite` roster records that the
+  founder's daemon seals like any other revocation. Until that seal, a join
+  with the replaced capability dated before its revocation (or inside its
+  window, if it had expired) is still accepted, as for any revoked invite.
+  So that such a join cannot become a way back in, the daemon also revokes
+  the rest of a replacement chain on the first maintenance round after any
+  capability in it has been used, and `member_remove` and `roster
+  remove`/`ban` now first revoke every capability the node issued to that
+  member that could still admit it (listed as `revoked_invites`). An exhausted
+  link therefore cannot readmit a removed member through a replacement. The
+  daemon links each replacement to the capability it replaced, so a redeemer
+  whose answer was lost is handed that replacement on its next try rather than
+  being left with a revoked one, and the daemon signs at most once per change.
+  The ESP accepts a replacement only from a daemon that answers
   `refresh_status: "replaced"`. With a daemon that predates `invite_refresh`
   (for example after restarting only `entmootd esp`), it keeps returning the
   stored bytes. The repeat still does not count as a use and is still refused

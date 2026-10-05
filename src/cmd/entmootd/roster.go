@@ -560,6 +560,9 @@ func cmdRosterRemove(gf *globalFlags, args []string) int {
 		fmt.Fprintln(os.Stderr, "roster remove: cannot remove group founder")
 		return exitInvalidArgument
 	}
+	if !revokeInvitesBeforeRemoval(ctx, "roster remove", *existing.MemberID) {
+		return exitTransport
+	}
 	if err := applyRosterRemove(ctx.setup.identity, ctx.group, existing); err != nil {
 		if errors.Is(err, entmoot.ErrRosterReject) {
 			fmt.Fprintf(os.Stderr, "roster remove: %v\n", err)
@@ -761,6 +764,9 @@ func rosterBanChange(gf *globalFlags, args []string, ban bool) int {
 	kind := membership.KindUnban
 	record := membership.Record{Kind: kind, Subject: subject}
 	if ban {
+		if !revokeInvitesBeforeRemoval(ctx, command, memberID) {
+			return exitTransport
+		}
 		record = membership.Record{Kind: membership.KindRemove, Subject: subject, Banned: true}
 	}
 	signed, err := ctx.group.SignRecord(ctx.setup.identity, record)
@@ -786,4 +792,26 @@ func rosterBanChange(gf *globalFlags, args []string, ban bool) int {
 	}
 	fmt.Println(string(data))
 	return exitOK
+}
+
+// revokeInvitesBeforeRemoval revokes the capabilities this node issued to a
+// member about to be removed or banned (see revokeInvitesTargeting). It
+// reports false, having said why, when that failed; the caller then stops
+// before the removal, so it can be retried.
+func revokeInvitesBeforeRemoval(ctx founderRosterContext, command string, target entmoot.MemberID) bool {
+	ledger, err := libp2ptransport.OpenInviteLedger(ctx.setup.dataDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s: open invite ledger: %v\n", command, err)
+		return false
+	}
+	defer ledger.Close()
+	revoked, err := revokeInvitesTargeting(ctx.setup.identity, ctx.group, ledger, target)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s: revoke the member's invites: %v\n", command, err)
+		return false
+	}
+	for _, nonce := range revoked {
+		fmt.Fprintf(os.Stderr, "%s: revoked invite %s issued to the member\n", command, base64.StdEncoding.EncodeToString(nonce[:]))
+	}
+	return true
 }

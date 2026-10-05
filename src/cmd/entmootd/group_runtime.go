@@ -657,6 +657,7 @@ const (
 // changes nothing. That is the whole reason this is short: with a set there is
 // no "wrong chain" to detect, adopt or roll back.
 func (r *groupRuntime) syncMembership(ctx context.Context, session *groupSession) {
+	r.retireUsedReplacementChains(session)
 	// A round that is to seal an authority change pulls from every member it
 	// can address, not the usual handful: the seal makes everything dated
 	// before the change stale, so it may only vouch for what all the members
@@ -773,6 +774,52 @@ func (r *groupRuntime) syncMembership(ctx context.Context, session *groupSession
 	// node signed itself count towards the cadence too, so a founder admitting
 	// members while nothing arrives from anybody else must still checkpoint.
 	r.signCheckpointIfDue(session)
+}
+
+// retireUsedReplacementChains revokes, for every ESP replacement chain this
+// node issued in the group, each capability still unrevoked in a chain one of
+// whose capabilities has been used to join. Every capability in a chain is
+// made out to the same target, so once one has admitted it the others are
+// only a way back in after a removal. The capability a refresh replaces is
+// revoked when the replacement is handed out, but a join with it dated before
+// that revocation is accepted until the founder seals it, and a removal signed
+// on another node does not know the chain; this closes both on the round
+// after the join reaches this node. It runs only where this node may revoke.
+func (r *groupRuntime) retireUsedReplacementChains(session *groupSession) {
+	if r.invites == nil || r.identity == nil || !session.group.CanAdminister(r.binding.MemberID) {
+		return
+	}
+	chains, err := r.invites.ReplacementChains(session.groupID)
+	if err != nil {
+		r.logger.Warn("invite replacement chains", slog.String("group_id", session.groupID.String()), slog.String("err", err.Error()))
+		return
+	}
+	unlock := lockESPInviteRoster(session.groupID)
+	defer unlock()
+	for _, chain := range chains {
+		used := false
+		var unused [][32]byte
+		for _, nonce := range chain {
+			if session.group.InviteUses(nonce) > 0 {
+				used = true
+			} else {
+				unused = append(unused, nonce)
+			}
+		}
+		if !used {
+			continue
+		}
+		revoked, err := revokeIssuedInvites(r.identity, session.group, r.invites, unused)
+		if err != nil {
+			r.logger.Warn("revoke the rest of a used invite replacement chain",
+				slog.String("group_id", session.groupID.String()), slog.String("err", err.Error()))
+			continue
+		}
+		if len(revoked) > 0 {
+			r.logger.Info("revoked the rest of a used invite replacement chain",
+				slog.String("group_id", session.groupID.String()), slog.Int("revoked", len(revoked)))
+		}
+	}
 }
 
 // memberPull is the outcome of pulling membership from one member.

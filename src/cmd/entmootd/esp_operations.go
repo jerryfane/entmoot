@@ -1099,6 +1099,9 @@ func (e espOperationExecutor) removeMember(ctx context.Context, req esphttp.Sign
 	if resp.ESPOpenInvitesError != "" {
 		out["esp_open_invites_error"] = resp.ESPOpenInvitesError
 	}
+	if len(resp.RevokedInvites) > 0 {
+		out["revoked_invites"] = resp.RevokedInvites
+	}
 	return json.Marshal(out)
 }
 

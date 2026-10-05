@@ -170,6 +170,59 @@ func (l *InviteLedger) ReplacementChain(issued BootstrapCapability) ([]Bootstrap
 	}
 }
 
+// ReplacementChains lists the nonces of every replacement chain recorded for
+// a group, each oldest first: an invite that was replaced, then each invite
+// issued in place of the one before it.
+func (l *InviteLedger) ReplacementChains(groupID entmoot.GroupID) ([][][32]byte, error) {
+	if l == nil || l.db == nil {
+		return nil, errors.New("libp2p: invite ledger is not open")
+	}
+	rows, err := l.db.Query(`SELECT nonce, replacement FROM replaced_invites WHERE group_id=?`, groupID[:])
+	if err != nil {
+		return nil, fmt.Errorf("libp2p: list replacement invites: %w", err)
+	}
+	defer rows.Close()
+	next := make(map[[32]byte][32]byte)
+	replacing := make(map[[32]byte]struct{})
+	for rows.Next() {
+		var raw, encoded []byte
+		if err := rows.Scan(&raw, &encoded); err != nil {
+			return nil, err
+		}
+		var replacement BootstrapCapability
+		if len(raw) != 32 {
+			return nil, fmt.Errorf("libp2p: replacement invite has a %d-byte nonce", len(raw))
+		}
+		if err := json.Unmarshal(encoded, &replacement); err != nil {
+			return nil, fmt.Errorf("libp2p: decode replacement invite: %w", err)
+		}
+		var replaced [32]byte
+		copy(replaced[:], raw)
+		next[replaced] = replacement.Nonce
+		replacing[replacement.Nonce] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	var chains [][][32]byte
+	for first := range next {
+		if _, replaces := replacing[first]; replaces {
+			continue
+		}
+		chain := [][32]byte{first}
+		seen := map[[32]byte]struct{}{first: {}}
+		for nonce, ok := next[first]; ok; nonce, ok = next[nonce] {
+			if _, loop := seen[nonce]; loop {
+				return nil, errors.New("libp2p: replacement invites form a loop")
+			}
+			seen[nonce] = struct{}{}
+			chain = append(chain, nonce)
+		}
+		chains = append(chains, chain)
+	}
+	return chains, nil
+}
+
 func recordIssuedInvite(db interface {
 	Exec(string, ...any) (sql.Result, error)
 }, capability BootstrapCapability) error {

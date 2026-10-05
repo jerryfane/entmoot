@@ -323,11 +323,16 @@ Public open-invite issuer endpoints:
   use. The exception is a stored invite that has expired or names different
   addresses, peers or relays than the issuer would issue now, and that never
   got anyone in (its holder never a member, removed or banned, and nobody else
-  revoked it). That invite is replaced once and the replacement is stored. If
-  the replaced invite had not expired, the issuer revokes it in the roster
-  first. If the answer carrying a replacement is lost, the next replay is
-  handed that same replacement. Revoked or expired open invites refuse
-  replays.
+  revoked it). That invite is replaced once and the replacement is stored.
+  The issuer revokes the invite it replaces, and any it replaced before, in
+  the roster. As with any revoked invite, a join with one of those dated
+  before its revocation, or inside its window if it had expired, is accepted
+  until the founder seals the revocation. To keep that from readmitting a
+  removed member, the issuer revokes every other invite in a replacement
+  chain once one of them has been used, and removing or banning a member on
+  the issuing node revokes every invite it issued to that member first. If
+  the answer carrying a replacement is lost, the next replay is handed that
+  same replacement. Revoked or expired open invites refuse replays.
 
 Create a message draft sign request:
 

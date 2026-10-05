@@ -344,11 +344,13 @@ type MemberRemoveResp struct {
 	ESPOpenInvitesError string `json:"esp_open_invites_error,omitempty"`
 	// InviteLedgerError reports that the removal was applied but the local
 	// invite ledger could not be read, so the outstanding list is incomplete.
-	// It is named for the ledger, not for a revocation: removal performs none,
-	// because an invite carries its issuer's authority and loses it with the
-	// removal. The CLI path reports the identical condition under the same
-	// name.
+	// The CLI path reports the identical condition under the same name.
 	InviteLedgerError string `json:"invite_ledger_error,omitempty"`
+	// RevokedInvites lists base64 nonces of capabilities this node had issued
+	// to the removed member that could still have admitted it - such as the
+	// replacements an ESP open invite hands a redeemer - revoked before the
+	// removal so it cannot rejoin with them.
+	RevokedInvites []string `json:"revoked_invites,omitempty"`
 }
 
 type GroupDeactivateReq struct {
