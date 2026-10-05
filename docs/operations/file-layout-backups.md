@@ -61,7 +61,7 @@ Container/OpenClaw agents normally keep all Entmoot runtime state under
 `/data/.entmoot/entmoot` is the preferred command entrypoint in that layout.
 It reads `runtime.env` and keeps the binary, identity and data root inside the
 same runtime namespace. Connectivity is not among them - the wrapper execs
-only `-identity`, `-data` and `-listen-port`.
+only `-identity`, `-data` and, when `ENTMOOT_LISTEN_PORT` is set, `-listen-port`.
 
 When diagnosing ESP state, the data root matters as much as the binary. A
 container agent that writes `/data/.entmoot/esp.sqlite` will not appear in a

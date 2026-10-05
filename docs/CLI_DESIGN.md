@@ -17,7 +17,8 @@ file for restart.
 -data PATH            Data root; default ~/.entmoot
 -identity PATH        Ed25519 identity; default ~/.entmoot/identity.json
 -allow-new-identity   Permit explicit first-time identity creation
--listen-port PORT     Direct libp2p TCP port; default 1004
+-listen-port PORT     Direct libp2p TCP port; default 1004, or an OS-assigned
+                      port when 1004 cannot be bound and the flag is not given
 -connectivity MODE    direct (default) or relay-only
 -controlled-relay MA  Approved Circuit Relay v2 multiaddr; repeatable
 -relay-service        Also run a bounded allowlisted relay service on this host

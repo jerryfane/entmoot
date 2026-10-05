@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `entmootd join` and `serve` no longer fail for a non-root agent that does
+  not pass `-listen-port`. The default port 1004 is privileged; when it cannot
+  be bound (permission denied, or already in use) and `-listen-port` was not
+  given, the daemon logs one INFO line and listens on an OS-assigned port.
+  `join`, `serve` and `info` report that port as `listen_port`, and the
+  signed peer records advertise it. An explicit `-listen-port`, including the
+  founder's `-listen-port 1004`, is never replaced: failing to bind it is
+  still an error. `-p2p-listen` is unchanged. `install.sh` no longer writes
+  `ENTMOOT_LISTEN_PORT='1004'` into `runtime.env` unless
+  `ENTMOOT_LISTEN_PORT` is set at install time, and the wrapper passes
+  `-listen-port` only when it is set; an existing `runtime.env` keeps its
+  pinned port until the installer is re-run or the line is removed.
+
 ## [1.5.91] - 2026-10-04
 
 ### Added
