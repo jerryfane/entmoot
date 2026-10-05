@@ -117,7 +117,7 @@ func BenchmarkRemovedAtNeverMembers(b *testing.B) {
 	ids := neverMembers(b, 1000)
 	b.ResetTimer()
 	for range b.N {
-		group.RemovedAt(ids)
+		group.RemovedAt(ids, entmoot.MemberID{})
 	}
 }
 

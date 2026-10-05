@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -76,7 +77,27 @@ type Group struct {
 	rewoundFrom int64
 	legacy      *LegacyChain
 	now         func() time.Time
-	logger      *slog.Logger
+	// removalAppliedAt is when, by this node's clock, it applied each removal
+	// record it has applied since it opened the group, and departedAt when
+	// each member last went out of its projected membership. Together they
+	// say when this node learned of a removal (see Removal.SeenAt). Neither
+	// is persisted: a group opened afresh knows neither for what it loaded.
+	removalAppliedAt map[entmoot.RosterEntryID]int64
+	departedAt       map[entmoot.MemberID]int64
+	// applied counts every change to the records and checkpoints held, so a
+	// RemovedAt answer worked out from them can be kept until the next one.
+	applied uint64
+	// endingsMu guards endingsCache, the projection RemovedAt last made; it
+	// is separate from mu because that work runs outside the group's lock.
+	endingsMu    sync.Mutex
+	endingsCache endingsCache
+	// noticed is every member that went out of the projected membership or
+	// was named by a removal this node applied, since TakeNoticed last
+	// handed them out; noticeAll asks for every member instead, which holds
+	// from opening the group and whenever the canonical checkpoint moves.
+	noticed   map[entmoot.MemberID]struct{}
+	noticeAll bool
+	logger    *slog.Logger
 	// onChanged, if set, is called after Apply or ApplyCheckpoint stores
 	// something (see SetChangeHook).
 	onChanged func()
@@ -271,6 +292,7 @@ func newGroup(dir string, groupID entmoot.GroupID, db *sql.DB) (*Group, error) {
 		history:     make(map[entmoot.RosterEntryID]Record, len(stored.history)),
 		now:         time.Now,
 		logger:      slog.Default(),
+		noticeAll:   true,
 	}
 	for _, cp := range stored.checkpoints {
 		if err := VerifyCheckpoint(cp); err != nil {
@@ -350,6 +372,12 @@ type Removal struct {
 	// Entry is the removal record's id, or that checkpoint's: what ended the
 	// membership, so a caller can tell one removal from another.
 	Entry entmoot.RosterEntryID
+	// SeenAt is when this node learned of the removal, by its own clock: the
+	// later of applying the removal record and the member going out of the
+	// projected membership - the apply that made the removal take effect,
+	// which may be a later grant or a checkpoint. Zero when this node has not
+	// seen either happen since it opened the group.
+	SeenAt int64
 }
 
 // RemovedAt reports, for each of ids that is not a member now and whose
@@ -366,17 +394,26 @@ type Removal struct {
 // node holds - and missing from the first later one is reported as removed by
 // a removal of it this node holds from between the two, or else by that later
 // checkpoint. Without the records a member that left of its own accord inside
-// a checkpoint cannot be told from a removed one, so it is reported too.
+// a checkpoint signed elsewhere cannot be told from a removed one, so it is
+// reported too. A checkpoint self - the member this node signs as - signed
+// folded exactly the records this node holds, so for it those records say
+// whether a leave, a rekey or a removal ended the membership.
+//
+// A membership a leave or rekey ended still counts as removed if the group
+// then removed or banned the member - by a signer with the authority to,
+// before any readmission - and that earliest such removal is reported: the
+// member signs its own leave and may date it before a removal it sees coming.
+// A membership a removal ended is reported by that removal alone; a later
+// removal of somebody already removed changes nothing. The same holds whether
+// the records are in the window, inside a checkpoint this node signed, or
+// held from inside one signed elsewhere.
 //
 // The group's lock is held only to copy what the answer needs; the work runs
-// outside it, in one pass over the held records whatever the number of ids,
-// and an id this node never saw as a member costs no more than a lookup.
-func (g *Group) RemovedAt(ids []entmoot.MemberID) map[entmoot.MemberID]Removal {
-	type checkpointView struct {
-		id        entmoot.RosterEntryID
-		timestamp int64
-		members   map[entmoot.MemberID]entmoot.NodeInfo
-	}
+// outside it, in one projection of the held records whatever the number of
+// ids and checkpoints - begun at the oldest checkpoint an id needs, and kept
+// until a record is applied or the canonical checkpoint moves - and an id
+// this node never saw as a member costs no more than a lookup.
+func (g *Group) RemovedAt(ids []entmoot.MemberID, self entmoot.MemberID) map[entmoot.MemberID]Removal {
 	all := ids == nil
 	wanted := make(map[entmoot.MemberID]struct{}, len(ids))
 	var current map[entmoot.MemberID]struct{}
@@ -396,7 +433,7 @@ func (g *Group) RemovedAt(ids []entmoot.MemberID) map[entmoot.MemberID]Removal {
 		g.mu.RUnlock()
 		return nil
 	}
-	base := g.checkpoints[g.canonicalID]
+	applied := g.applied
 	window := make([]Record, 0, len(g.records))
 	for _, rec := range g.records {
 		window = append(window, rec)
@@ -407,11 +444,16 @@ func (g *Group) RemovedAt(ids []entmoot.MemberID) map[entmoot.MemberID]Removal {
 	}
 	// The canonical chain, newest first. A checkpoint's member index is
 	// never changed once stored, so sharing it outside the lock is safe.
-	var chain []checkpointView
+	var chain []chainCheckpoint
 	for cp, ok := g.checkpoints[g.canonicalID]; ok && len(chain) <= len(g.checkpoints); cp, ok = g.checkpoints[cp.Previous] {
-		chain = append(chain, checkpointView{id: cp.ID, timestamp: cp.Timestamp, members: g.membersAt[cp.ID]})
+		chain = append(chain, chainCheckpoint{Checkpoint: cp, members: g.membersAt[cp.ID]})
 	}
+	appliedAt := maps.Clone(g.removalAppliedAt)
+	departedAt := maps.Clone(g.departedAt)
 	g.mu.RUnlock()
+	if len(chain) == 0 {
+		return nil
+	}
 	// Every non-member a held record or a checkpoint names.
 	want := func(id entmoot.MemberID) bool {
 		if _, ok := wanted[id]; ok {
@@ -462,8 +504,8 @@ func (g *Group) RemovedAt(ids []entmoot.MemberID) map[entmoot.MemberID]Removal {
 	}
 	for _, cp := range chain {
 		for id := range wanted {
-			if _, in := cp.members[id]; in && cp.timestamp > lastSeen[id] {
-				lastSeen[id] = cp.timestamp
+			if _, in := cp.members[id]; in && cp.Timestamp > lastSeen[id] {
+				lastSeen[id] = cp.Timestamp
 			}
 		}
 	}
@@ -477,53 +519,205 @@ func (g *Group) RemovedAt(ids []entmoot.MemberID) map[entmoot.MemberID]Removal {
 		return nil
 	}
 
-	endedBy := make(map[entmoot.MemberID]Record)
-	projectTracking(base, window, endedBy)
-	removed := make(map[entmoot.MemberID]Removal)
+	// Where each wanted id went out, when a checkpoint on the chain took it
+	// out: the first checkpoint after it was last known in that no longer
+	// lists it (out), and the one before that (previous); -1 for none. The
+	// oldest checkpoint any of them needs is where the projection begins.
+	type wentOut struct{ out, previous int }
+	outs := make(map[entmoot.MemberID]wentOut, len(wanted))
+	oldest := 0
 	for id := range wanted {
-		if ending, ok := endedBy[id]; ok {
-			if ending.Kind == KindRemove {
-				removed[id] = Removal{At: ending.Timestamp, Entry: ending.ID}
-			}
-			continue
-		}
-		// The first checkpoint after the member was last known in that no
-		// longer lists it.
-		var out *checkpointView
+		where := wentOut{out: -1, previous: -1}
 		for k := range chain {
-			if chain[k].timestamp <= lastSeen[id] {
+			if chain[k].Timestamp <= lastSeen[id] {
 				break
 			}
 			if _, in := chain[k].members[id]; !in {
-				out = &chain[k]
+				where.out, where.previous = k, -1
+				if k+1 < len(chain) {
+					where.previous = k + 1
+				}
 			}
 		}
-		if out == nil {
+		outs[id] = where
+		oldest = max(oldest, where.out, where.previous)
+	}
+	endings := g.endingsFrom(chain[:oldest+1], applied, window, covered)
+
+	removed := make(map[entmoot.MemberID]Removal)
+	for id := range wanted {
+		seen := func(rec Record) Removal {
+			return Removal{At: rec.Timestamp, Entry: rec.ID, SeenAt: max(appliedAt[rec.ID], departedAt[id])}
+		}
+		// decide reads what ended the membership in a projection from the
+		// checkpoint with sequence from: a removal is the removal; a leave or
+		// a rekey is none, unless the group removed the member after it
+		// (removedSince) - a member that signs its own leave, dated before a
+		// removal it expects, must not keep the invites issued to it before
+		// that removal.
+		decide := func(from uint64) bool {
+			ending, ok := endings.endedBy(id, from)
+			if !ok {
+				return false
+			}
+			if ending.Kind == KindRemove {
+				removed[id] = seen(ending)
+			} else if after, ok := endings.removedSince(id, from); ok {
+				removed[id] = seen(after)
+			}
+			return true
+		}
+		// The window, projected from the canonical checkpoint.
+		if decide(chain[0].Sequence) {
 			continue
 		}
-		removal := Removal{At: out.timestamp, Entry: out.id}
-		var removedAt int64
-		for _, rec := range held[id] {
-			if rec.Kind != KindRemove || rec.Timestamp <= lastSeen[id] || rec.Timestamp > out.timestamp || rec.Timestamp <= removedAt {
+		where := outs[id]
+		if where.out < 0 {
+			continue
+		}
+		out := &chain[where.out]
+		// A checkpoint this node signed folded exactly the records it held,
+		// so those records say how the membership ended inside it. Every
+		// record held after the previous checkpoint is projected - those the
+		// checkpoint folded and those since - so a removal after a leave is
+		// found wherever it sits.
+		if signer, err := entmoot.ResolvedMemberID(out.Signer); err == nil && signer == self && where.previous >= 0 {
+			if decide(chain[where.previous].Sequence) {
 				continue
 			}
-			if subject, err := rec.SubjectMemberID(); err == nil && subject == id {
-				removedAt = rec.Timestamp
-				removal = Removal{At: rec.Timestamp, Entry: rec.ID}
+		}
+		// A checkpoint signed elsewhere may have folded a removal this node
+		// never held - one dated before a leave it does hold, which made that
+		// leave count for nothing there - and does not say which, so a
+		// departure inside it is a removal: by a removal of the member this
+		// node holds from inside it if there is one, or else by the
+		// checkpoint. Where this node holds the member's own leave or rekey
+		// from inside it and no removal, and the group removed the member
+		// after the checkpoint, that removal is the one: the same answer as
+		// where this node signed the checkpoint itself.
+		var removal *Record
+		ownEnding := false
+		for _, rec := range held[id] {
+			if rec.Timestamp <= lastSeen[id] || rec.Timestamp > out.Timestamp {
+				continue
+			}
+			switch rec.Kind {
+			case KindRemove:
+				if subject, err := rec.SubjectMemberID(); err == nil && subject == id && (removal == nil || rec.Timestamp > removal.Timestamp) {
+					removal = &rec
+				}
+			case KindLeave, KindRekey:
+				if actor, err := entmoot.ResolvedMemberID(rec.Actor); err == nil && actor == id {
+					ownEnding = true
+				}
 			}
 		}
-		removed[id] = removal
+		switch {
+		case removal != nil:
+			removed[id] = seen(*removal)
+		case ownEnding:
+			if after, ok := endings.removedSince(id, out.Sequence); ok {
+				removed[id] = seen(after)
+				continue
+			}
+			fallthrough
+		default:
+			removed[id] = Removal{At: out.Timestamp, Entry: out.ID, SeenAt: max(appliedAt[out.ID], departedAt[id])}
+		}
 	}
 	return removed
 }
 
+// TakeNoticed hands out, and forgets, the members whose removal may have
+// begun or changed since it was last called: every member that went out of
+// the projected membership and every one a removal this node applied names.
+// all reports that every member must be looked at instead - on the first call
+// after the group is opened, whose removals no note covers, and after the
+// canonical checkpoint has moved, which can change how one ended. A caller
+// that could not act on them gives them back with Renotice.
+func (g *Group) TakeNoticed() (ids []entmoot.MemberID, all bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	all, g.noticeAll = g.noticeAll, false
+	ids = make([]entmoot.MemberID, 0, len(g.noticed))
+	for id := range g.noticed {
+		ids = append(ids, id)
+	}
+	g.noticed = nil
+	return ids, all
+}
+
+// Renotice gives back what TakeNoticed handed out.
+func (g *Group) Renotice(ids []entmoot.MemberID, all bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.noticeAll = g.noticeAll || all
+	for _, id := range ids {
+		g.noticeLocked(id)
+	}
+}
+
+func (g *Group) noticeLocked(id entmoot.MemberID) {
+	if g.noticed == nil {
+		g.noticed = make(map[entmoot.MemberID]struct{})
+	}
+	g.noticed[id] = struct{}{}
+}
+
+// endingsCache is a projection RemovedAt made, with what it was made from.
+type endingsCache struct {
+	canonical entmoot.RosterEntryID
+	applied   uint64
+	endings   *membershipEndings
+}
+
+// endingsFrom returns how memberships ended along chain (newest first, as
+// RemovedAt copies it), from its oldest checkpoint on: the projection kept
+// from an earlier call when nothing has been applied since, the canonical
+// checkpoint is the same and that projection began no later, or else a new
+// one, which is kept in its place. applied is g.applied as read with chain,
+// window and covered.
+func (g *Group) endingsFrom(chain []chainCheckpoint, applied uint64, window, covered []Record) *membershipEndings {
+	canonical, start := chain[0].ID, chain[len(chain)-1].Sequence
+	g.endingsMu.Lock()
+	cached := g.endingsCache
+	g.endingsMu.Unlock()
+	if cached.endings != nil && cached.canonical == canonical && cached.applied == applied && cached.endings.from <= start {
+		return cached.endings
+	}
+	oldestFirst := make([]chainCheckpoint, len(chain))
+	for k, cp := range chain {
+		oldestFirst[len(chain)-1-k] = cp
+	}
+	records := make([]Record, 0, len(window)+len(covered))
+	records = append(append(records, window...), covered...)
+	endings := trackEndings(oldestFirst, records)
+	g.endingsMu.Lock()
+	g.endingsCache = endingsCache{canonical: canonical, applied: applied, endings: endings}
+	g.endingsMu.Unlock()
+	return endings
+}
+
 func (g *Group) reproject() {
+	g.applied++
 	base := g.checkpoints[g.canonicalID]
 	records := make([]Record, 0, len(g.records))
 	for _, rec := range g.records {
 		records = append(records, rec)
 	}
 	state, effective := Project(base, records)
+	// Note when members go out, for Removal.SeenAt. The group's first
+	// projection has no members before it, so loading notes nothing.
+	now := g.now().UnixMilli()
+	for id := range g.state.Members {
+		if _, still := state.Members[id]; !still {
+			if g.departedAt == nil {
+				g.departedAt = make(map[entmoot.MemberID]int64)
+			}
+			g.departedAt[id] = now
+			g.noticeLocked(id)
+		}
+	}
 	g.state = state
 	g.effective = len(effective)
 }
@@ -1133,6 +1327,15 @@ func (g *Group) apply(rec Record) (bool, error) {
 		return false, fmt.Errorf("membership: commit record: %w", err)
 	}
 	g.records[rec.ID] = cloneRecord(rec)
+	if rec.Kind == KindRemove {
+		if g.removalAppliedAt == nil {
+			g.removalAppliedAt = make(map[entmoot.RosterEntryID]int64)
+		}
+		g.removalAppliedAt[rec.ID] = g.now().UnixMilli()
+		if subject, err := rec.SubjectMemberID(); err == nil {
+			g.noticeLocked(subject)
+		}
+	}
 	g.reproject()
 	return true, nil
 }
@@ -1527,6 +1730,9 @@ func (g *Group) settleCanonicalLocked() error {
 		g.rewoundMembers, g.rewoundFrom = nil, 0
 	}
 
+	if g.canonicalID != best.ID {
+		g.noticeAll = true
+	}
 	g.canonicalID = best.ID
 	for _, id := range dropped {
 		delete(g.checkpoints, id)
@@ -1852,6 +2058,7 @@ func identityInfo(identity *keystore.Identity) (entmoot.NodeInfo, error) {
 
 // retainLocked stores a checkpoint and indexes its membership.
 func (g *Group) retainLocked(cp Checkpoint) {
+	g.applied++
 	stored := cloneCheckpoint(cp)
 	g.checkpoints[stored.ID] = stored
 	index := make(map[entmoot.MemberID]entmoot.NodeInfo, len(stored.Members))

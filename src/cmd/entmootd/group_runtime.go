@@ -943,34 +943,69 @@ type removedMemberInvite struct {
 // that a removal has since taken out (see reconcileIssuedInvites).
 //
 // The cutoff is the later of the removal's own timestamp, by the remover's
-// clock, and when this node first saw that removal, by its own: so an invite
+// clock, and when this node learned of that removal, by its own: so an invite
 // minted here before this node knew of the removal is caught even when the
-// remover's clock runs behind, and a re-invite minted after it never is. Every
-// pass notes when it first sees each removal in the group - whether or not
-// this node has invites for that member yet - and passes run as soon as a
-// record is applied, so that is when the removal arrived. A ledger row from
-// before minted_at_ms existed has only its issue date, set minutes early, and
-// is compared with the removal's timestamp alone: the first-seen time noted
-// for a removal this node held before upgrading is the upgrade, not when it
-// arrived.
+// remover's clock runs behind, and a re-invite minted after it never is. The
+// group notes that time as the record or checkpoint that makes the removal
+// take effect is applied (membership.Removal.SeenAt), not when this worker
+// gets round to it, so a busy worker cannot move it past a re-invite. Every
+// pass writes the times of the removals the group noticed since the last one
+// (membership.Group.TakeNoticed) to the ledger, which keeps the earliest time
+// each removal was ever given - whether or not this node has any invite in
+// the group, so a re-invite minted after a restart is still judged by when
+// the removal arrived. A removal with no time anywhere - loaded when the
+// group opened, before any pass recorded it - is judged by its own timestamp
+// alone, never by the time of a pass: a pass can run after a re-invite it
+// would then revoke. A ledger row from before minted_at_ms existed has only
+// its issue date, set minutes early, and is also compared with the removal's
+// timestamp alone.
+//
+// Only the targets of live invites are asked about beyond the noticed
+// members, and every member only after the group was opened or its canonical
+// checkpoint moved. A node with no live invite in the group asks only about
+// the members it noticed - none on most passes - and leaves the full sweep to
+// the first pass that has one.
 func (r *groupRuntime) invitesOfRemovedMembers(group *membership.Group) []removedMemberInvite {
 	gid := group.GroupID()
-	removals := group.RemovedAt(nil)
-	if len(removals) == 0 {
-		return nil
-	}
-	entries := make([]entmoot.RosterEntryID, 0, len(removals))
-	for _, removal := range removals {
-		entries = append(entries, removal.Entry)
-	}
-	seen, err := r.invites.RemovalsSeenAt(gid, entries, time.Now().UnixMilli())
-	if err != nil {
-		r.logger.Warn("record removals", slog.String("group_id", gid.String()), slog.String("err", err.Error()))
-		return nil
-	}
 	live, err := r.invites.LiveTargetedInvites(gid)
 	if err != nil {
 		r.logger.Warn("list issued invites", slog.String("group_id", gid.String()), slog.String("err", err.Error()))
+		return nil
+	}
+	targets := make([]entmoot.MemberID, 0, len(live))
+	for _, record := range live {
+		if !group.IsInviteRevoked(record.Nonce) &&
+			(record.MaxUses == 0 || group.InviteUses(record.Nonce) < record.MaxUses) {
+			targets = append(targets, *record.TargetMemberID)
+		}
+	}
+	noticed, all := group.TakeNoticed()
+	sweep := all && len(targets) > 0
+	if all && !sweep {
+		// Nothing to revoke yet: keep the sweep for the first pass that has
+		// an invite, which mints start.
+		group.Renotice(nil, true)
+	}
+	var removals map[entmoot.MemberID]membership.Removal
+	switch {
+	case sweep:
+		removals = group.RemovedAt(nil, r.binding.MemberID)
+	case len(noticed)+len(targets) > 0:
+		removals = group.RemovedAt(append(noticed, targets...), r.binding.MemberID)
+	}
+	if len(removals) == 0 {
+		return nil
+	}
+	learned := make(map[entmoot.RosterEntryID]int64, len(removals))
+	for _, removal := range removals {
+		if earlier, ok := learned[removal.Entry]; !ok || earlier == 0 || (removal.SeenAt != 0 && removal.SeenAt < earlier) {
+			learned[removal.Entry] = removal.SeenAt
+		}
+	}
+	seen, err := r.invites.RemovalsSeenAt(gid, learned)
+	if err != nil {
+		group.Renotice(noticed, sweep)
+		r.logger.Warn("record removals", slog.String("group_id", gid.String()), slog.String("err", err.Error()))
 		return nil
 	}
 	var out []removedMemberInvite

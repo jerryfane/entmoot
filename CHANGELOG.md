@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The daemon no longer revokes invites it should keep when it reconciles its
+  issued invites with the group's membership. A member that left of its own
+  accord and was re-invited lost the re-invite as soon as the founder's
+  daemon signed a checkpoint folding the leave in, because a member that went
+  out inside a checkpoint was always taken to be removed. A checkpoint the
+  node signed itself folded exactly the records it holds, so those records now
+  decide whether a leave, a rekey or a removal ended the membership; only a
+  checkpoint signed elsewhere is still read that way. And when the node learned
+  of a removal is now noted the moment it applies the record or checkpoint that
+  makes the removal take effect, not when the invite worker next gets round to
+  it, so a re-invite minted after the removal arrived is no longer revoked
+  because the worker was still busy with an earlier pass. The ledger keeps the
+  earliest time it was ever given for each removal, recorded on every pass
+  whether or not the node has any invite in the group, so a re-invite minted
+  after a restart is judged by when the removal arrived; a removal with no
+  recorded time is judged by its own timestamp, never by when a pass ran.
+- A member's own leave no longer shields the invites issued to it from a
+  removal that follows. When a member left - perhaps with a leave it dated
+  just before a removal it saw coming - and an admin on another node then
+  removed it, the leave reaching the issuing node first, the removal changed
+  nothing in the projection, and once a checkpoint folded both, the invites
+  the node had minted to the member before the removal were never revoked: it
+  could rejoin with them for as long as they lived. A removal or ban whose
+  signer could remove the member, signed after its leave or rekey and before
+  any readmission, now counts as the member's removal for its invites, the
+  earliest such one deciding; invites minted after the node saw that removal
+  are kept. The answer is the same before any checkpoint and after one, signed
+  by this node or by another admin. A member that only left, or that a plain
+  member named in a removal, keeps its re-invites.
+- Reconciling issued invites with the group's membership costs one
+  projection of the held records again, not one per checkpoint: working out
+  how memberships ended re-projected everything held after each checkpoint a
+  departed member went out in, so every pass was quadratic in the group's
+  history (several seconds for a few thousand records with frequent
+  checkpoints). The projection is now made once, kept until the group changes,
+  and only asked about the targets of live invites the node issued and the
+  members it saw go out since the last pass; a node with no live invite in the
+  group asks only about those members, to record when it saw them go.
+
 ## [1.5.96] - 2026-10-05
 
 ### Fixed

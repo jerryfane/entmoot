@@ -1628,6 +1628,10 @@ func (s *ipcServer) issueInvite(c net.Conn, req *ipc.InviteCreateReq, refresh *e
 			_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInternal, GroupID: &gid, Message: "record replacement invite: " + err.Error()})
 			return
 		}
+		// A new live invite is one the reconciler has to judge (see
+		// invitesOfRemovedMembers), and the first one in a group also starts
+		// the full sweep a pass without invites leaves for later.
+		session.reconciler.signal()
 		s.handOutReplacement(c, session.group, chain, capability, targetMemberID)
 		return
 	}
@@ -1635,6 +1639,7 @@ func (s *ipcServer) issueInvite(c net.Conn, req *ipc.InviteCreateReq, refresh *e
 		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInternal, GroupID: &gid, Message: "record issued invite: " + err.Error()})
 		return
 	}
+	session.reconciler.signal()
 	_ = ipc.EncodeAndWrite(c, &ipc.InviteCreateResp{Status: "created", GroupID: gid, Capability: capability, RosterHead: session.group.Canonical().ID, Members: len(session.group.MemberIDs())})
 }
 
