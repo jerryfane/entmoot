@@ -77,7 +77,10 @@ type Group struct {
 	legacy      *LegacyChain
 	now         func() time.Time
 	logger      *slog.Logger
-	closeOnce   sync.Once
+	// onApplied, if set, is called with each record Apply stores, after the
+	// group's lock is released (see SetApplyHook).
+	onApplied func(Record)
+	closeOnce sync.Once
 }
 
 // Open loads a group's membership store. A group that still has only the
@@ -316,6 +319,17 @@ func (g *Group) SetLogger(logger *slog.Logger) {
 	}
 }
 
+// SetApplyHook sets a function called with every record Apply stores -
+// pulled, pushed, or signed here through SignRecord - once it is stored and
+// projected and the group's lock is released, so the hook may read the group
+// and sign records of its own. It runs on the applying goroutine, before
+// Apply returns.
+func (g *Group) SetApplyHook(hook func(Record)) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.onApplied = hook
+}
+
 func (g *Group) reproject() {
 	base := g.checkpoints[g.canonicalID]
 	records := make([]Record, 0, len(g.records))
@@ -514,6 +528,16 @@ func (g *Group) CanAdminister(id entmoot.MemberID) bool {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 	return g.state.CanAdminister(id)
+}
+
+// RemovalTakesEffect reports whether a remove or ban of subject that actor
+// signs now would take effect, by the rule the projection applies: actor must
+// administer the group and, unless it is the founder, may not remove the
+// founder or another admin.
+func (g *Group) RemovalTakesEffect(actor, subject entmoot.MemberID) bool {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.state.CanAdminister(actor) && g.state.MayRemove(actor, subject)
 }
 
 // IsMemberID reports current membership.
@@ -882,6 +906,19 @@ func (g *Group) Discard() error {
 // Apply stores one record and re-projects. Applying a record twice is a no-op,
 // so a peer may send the same record repeatedly.
 func (g *Group) Apply(rec Record) (bool, error) {
+	applied, err := g.apply(rec)
+	if applied && err == nil {
+		g.mu.RLock()
+		hook := g.onApplied
+		g.mu.RUnlock()
+		if hook != nil {
+			hook(rec)
+		}
+	}
+	return applied, err
+}
+
+func (g *Group) apply(rec Record) (bool, error) {
 	if err := VerifyRecord(rec); err != nil {
 		return false, err
 	}

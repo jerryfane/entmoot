@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -37,6 +38,9 @@ type replayFixture struct {
 	t       *testing.T
 	ctx     context.Context
 	founder *keystore.Identity
+	// admin is the second member startReplayFixture adds withPeer: a
+	// delegated admin whose node is unreachable.
+	admin   *keystore.Identity
 	gid     entmoot.GroupID
 	host    host.Host
 	runtime *groupRuntime
@@ -54,9 +58,9 @@ type replayRedemption struct {
 	Capability entmoot.BootstrapCapability `json:"capability"`
 }
 
-// startReplayFixture starts the fixture. withPeer adds a second member with
-// no address, so the founder is not the group's only member and its daemon
-// never seals: nothing may rely on the seal arriving.
+// startReplayFixture starts the fixture. withPeer adds a second member, a
+// delegated admin with no address, so the founder is not the group's only
+// member and its daemon never seals: nothing may rely on the seal arriving.
 func startReplayFixture(t *testing.T, gidSeed byte, withPeer bool) *replayFixture {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -67,9 +71,15 @@ func startReplayFixture(t *testing.T, gidSeed byte, withPeer bool) *replayFixtur
 	mustCreateGroup(t, root, f.gid, founder, membership.DefaultPolicy())
 	if withPeer {
 		group := mustOpenGroup(t, root, f.gid)
-		peer, peerInfo := mustDaemonIdentity(t)
-		mustJoinWithInvite(t, group, peer, mustDaemonInvite(t, group, founder, peerInfo, 1))
+		admin, adminInfo := mustDaemonIdentity(t)
+		mustJoinWithInvite(t, group, admin, mustDaemonInvite(t, group, founder, adminInfo, 1))
+		policy := group.Policy()
+		policy.Admins = withAdmin(policy.Admins, *adminInfo.MemberID)
+		if _, err := group.SignRecord(founder, membership.Record{Kind: membership.KindPolicy, Policy: &policy}); err != nil {
+			t.Fatalf("grant admin: %v", err)
+		}
 		mustCloseGroup(t, group)
+		f.admin = admin
 	}
 
 	h, hostBinding, err := libp2ptransport.NewHost(ctx, founder, libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"))
@@ -316,6 +326,22 @@ func (f *replayFixture) joinNow(member *keystore.Identity, capability entmoot.Bo
 	f.t.Helper()
 	_, _ = f.session.group.Apply(mustSignedJoinAt(f.t, f.gid, member, capability, time.Now().UnixMilli()))
 	return f.session.group.IsMemberID(*mustDaemonNodeInfo(f.t, member).MemberID)
+}
+
+// removeElsewhere has the fixture's other admin sign member's removal, dated
+// at, and this node apply it as it applies a pulled or pushed record.
+func (f *replayFixture) removeElsewhere(member *keystore.Identity, at int64) {
+	f.t.Helper()
+	record, err := membership.SignRecord(f.admin, membership.Record{
+		GroupID: f.gid, Kind: membership.KindRemove,
+		Actor: mustDaemonNodeInfo(f.t, f.admin), Subject: mustDaemonNodeInfo(f.t, member), Timestamp: at,
+	})
+	if err != nil {
+		f.t.Fatalf("sign removal: %v", err)
+	}
+	if _, err := f.session.group.Apply(record); err != nil {
+		f.t.Fatalf("apply removal: %v", err)
+	}
 }
 
 func hasWebSocket(capability entmoot.BootstrapCapability) bool {
@@ -576,7 +602,14 @@ func TestOpenInviteRefreshSurvivesALostAnswerAndIsSealed(t *testing.T) {
 // replaced, dated inside its window - while its replacement B is live. Before
 // B was revoked with the holder's removal, the removed holder walked back in
 // with B through an exhausted link that member_remove reported as having
-// nothing outstanding. Whoever removes it, B must not admit it again.
+// nothing outstanding.
+//
+// A removal signed on this node revokes B before it, so B never readmits. A
+// removal signed by another admin revokes B as soon as this node applies it,
+// with no maintenance round in between - but that revocation is dated after
+// the removal, so a join with B dated between the two is still accepted until
+// the founder seals, as for any revoked invite. The last two cases pin that
+// residual down and show the seal closing it.
 func TestOpenInviteReplacementCannotReadmitARemovedHolder(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -584,13 +617,17 @@ func TestOpenInviteReplacementCannotReadmitARemovedHolder(t *testing.T) {
 		// expired replaces an A that has expired rather than one whose
 		// addresses changed.
 		expired bool
-		// elsewhere has the removal signed without this daemon's
-		// member_remove, as by another admin, after a maintenance round.
+		// elsewhere has the removal signed by the other admin and applied
+		// here as a pulled record, before any maintenance round.
 		elsewhere bool
+		// sealed has the founder seal before the holder tries a join with B
+		// dated between the removal and B's revocation.
+		sealed bool
 	}{
-		{"join with the replaced capability before the seal", 35, false, false},
-		{"join with an expired replaced capability", 36, true, false},
-		{"removal signed elsewhere", 37, false, true},
+		{"join with the replaced capability before the seal", 35, false, false, false},
+		{"join with an expired replaced capability", 36, true, false, false},
+		{"removal signed elsewhere, window before the seal", 37, false, true, false},
+		{"removal signed elsewhere, then sealed", 38, false, true, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := startReplayFixture(t, tc.seed, true)
@@ -625,14 +662,19 @@ func TestOpenInviteReplacementCannotReadmitARemovedHolder(t *testing.T) {
 			if _, err := group.Apply(mustSignedJoinAt(t, f.gid, holder, replaced, joinAt)); err != nil || !group.IsMemberID(holderID) {
 				t.Fatalf("precondition: a join with the replaced capability dated before its revocation should land before the seal: %v", err)
 			}
+			if group.IsInviteRevoked(again.Capability.Nonce) {
+				t.Fatal("precondition: the replacement is live until the removal")
+			}
 
+			var removedAt int64
 			if tc.elsewhere {
-				f.runtime.syncMembership(f.ctx, f.session)
+				// The removal is applied before this node has run a round
+				// over the join, so only applying it can revoke B.
+				removedAt = time.Now().UnixMilli()
+				time.Sleep(10 * time.Millisecond)
+				f.removeElsewhere(holder, removedAt)
 				if !group.IsInviteRevoked(again.Capability.Nonce) {
-					t.Fatal("a maintenance round left the replacement live after its chain was used to join")
-				}
-				if err := applyRosterRemove(f.founder, group, mustDaemonNodeInfo(t, holder)); err != nil {
-					t.Fatalf("remove: %v", err)
+					t.Fatal("applying a removal signed elsewhere left the replacement live")
 				}
 			} else {
 				resp := f.removeMember(holder)
@@ -653,6 +695,31 @@ func TestOpenInviteReplacementCannotReadmitARemovedHolder(t *testing.T) {
 			if f.admits(again.Capability) || f.useCount(link) != 1 {
 				t.Fatalf("the replacement still admits (use count %d)", f.useCount(link))
 			}
+
+			if tc.elsewhere {
+				// Dated after the removal and before B's revocation.
+				window := mustSignedJoinAt(t, f.gid, holder, again.Capability, removedAt+2)
+				if tc.sealed {
+					due, ok := group.SealDue()
+					if !ok {
+						t.Fatal("B's revocation did not arm the founder's seal")
+					}
+					if _, signed, err := group.SealThrough(f.founder, due); err != nil || !signed {
+						t.Fatalf("founder seal: signed=%t err=%v", signed, err)
+					}
+					if _, err := group.Apply(window); !errors.Is(err, membership.ErrStale) {
+						t.Fatalf("after the seal a join with the replacement dated inside the window was not refused as stale: %v (member=%t)",
+							err, group.IsMemberID(holderID))
+					}
+					return
+				}
+				// The residual this PR does not close: until the founder
+				// seals, B's revocation is dated after the removal, so a join
+				// dated between them is accepted.
+				if _, err := group.Apply(window); err != nil || !group.IsMemberID(holderID) {
+					t.Fatalf("the documented pre-seal window changed: err=%v member=%t", err, group.IsMemberID(holderID))
+				}
+			}
 			// Nothing here leaned on the seal: the founder is not alone and
 			// reaches nobody, so it has not signed one.
 			f.runtime.syncMembership(f.ctx, f.session)
@@ -660,6 +727,54 @@ func TestOpenInviteReplacementCannotReadmitARemovedHolder(t *testing.T) {
 				t.Fatal("the founder sealed; this test must not rely on it")
 			}
 		})
+	}
+}
+
+// TestIneffectiveRemovalRevokesNoInvites: a removal the projection ignores - a
+// delegated admin removing another admin - takes nothing away, so it must not
+// revoke the target's invites either: not ahead of signing one here, and not
+// on applying one signed elsewhere.
+func TestIneffectiveRemovalRevokesNoInvites(t *testing.T) {
+	f := startReplayFixture(t, 39, true)
+	group := f.session.group
+	target := generateIdentity(t)
+	targetID := *mustDaemonNodeInfo(t, target).MemberID
+	adminID := *mustDaemonNodeInfo(t, f.admin).MemberID
+	f.createInvite("link", time.Now().Add(time.Hour))
+	first, _ := f.redeemed("link", target)
+	mustJoinWithInvite(t, group, target, first.Capability)
+	// A second capability this node issued to the target, still live.
+	client, daemon := net.Pipe()
+	go func() {
+		defer daemon.Close()
+		f.server.handleInviteCreate(f.ctx, daemon, &ipc.InviteCreateReq{GroupID: f.gid, TargetPublicKey: target.PublicKey, MaxUses: 1})
+	}()
+	_, decoded, err := ipc.ReadAndDecode(client)
+	_ = client.Close()
+	created, ok := decoded.(*ipc.InviteCreateResp)
+	if err != nil || !ok {
+		t.Fatalf("invite_create: %#v %v", decoded, err)
+	}
+	spare := created.Capability
+	policy := group.Policy()
+	policy.Admins = withAdmin(policy.Admins, targetID)
+	if _, err := group.SignRecord(f.founder, membership.Record{Kind: membership.KindPolicy, Policy: &policy}); err != nil {
+		t.Fatalf("grant admin: %v", err)
+	}
+
+	if group.RemovalTakesEffect(adminID, targetID) {
+		t.Fatal("an admin's removal of a peer admin was judged effective")
+	}
+	if revoked, err := revokeInvitesForRemoval(f.founder, adminID, group, f.runtime.invites, targetID); err != nil || len(revoked) != 0 {
+		t.Fatalf("revoked %d invites ahead of an ineffective removal (err %v)", len(revoked), err)
+	}
+	time.Sleep(5 * time.Millisecond)
+	f.removeElsewhere(target, time.Now().UnixMilli())
+	if !group.IsMemberID(targetID) {
+		t.Fatal("precondition: an admin cannot remove a peer admin")
+	}
+	if group.IsInviteRevoked(spare.Nonce) || !f.admits(spare) {
+		t.Fatal("applying an ineffective removal revoked the target's invite")
 	}
 }
 
@@ -735,4 +850,11 @@ func TestOpenInviteReplayKeepsStoredBytesUnlessTheDaemonChecked(t *testing.T) {
 			}
 		})
 	}
+}
+
+// withAdmin adds id to an admin set, which a policy record must keep sorted.
+func withAdmin(admins []entmoot.MemberID, id entmoot.MemberID) []entmoot.MemberID {
+	admins = append(slices.Clone(admins), id)
+	slices.SortFunc(admins, func(a, b entmoot.MemberID) int { return bytes.Compare(a[:], b[:]) })
+	return admins
 }

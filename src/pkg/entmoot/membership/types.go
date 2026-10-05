@@ -247,6 +247,19 @@ func (s State) IsFounder(id entmoot.MemberID) bool {
 	return err == nil && founder == id
 }
 
+// MayRemove reports whether a remove or ban of subject by actor, which must
+// already hold authority, takes effect: an admin may stand down, but removing
+// the founder or a peer admin is the founder's decision.
+func (s State) MayRemove(actor, subject entmoot.MemberID) bool {
+	if s.IsFounder(actor) {
+		return true
+	}
+	if s.IsFounder(subject) {
+		return false
+	}
+	return subject == actor || !s.Policy.HasAdmin(subject)
+}
+
 // MemberIDs returns the current membership, sorted.
 func (s State) MemberIDs() []entmoot.MemberID {
 	out := make([]entmoot.MemberID, 0, len(s.Members))

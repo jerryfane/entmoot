@@ -238,15 +238,8 @@ func applyAuthority(state *State, rec Record, actor entmoot.MemberID) bool {
 		if err != nil {
 			return false
 		}
-		if !isFounder {
-			// An admin may stand down, but removing the founder or a peer
-			// admin is the founder's decision.
-			if state.IsFounder(subject) {
-				return false
-			}
-			if subject != actor && state.Policy.HasAdmin(subject) {
-				return false
-			}
+		if !state.MayRemove(actor, subject) {
+			return false
 		}
 		changed := false
 		if _, member := state.Members[subject]; member {

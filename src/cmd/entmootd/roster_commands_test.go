@@ -175,6 +175,56 @@ func TestRosterRemoveReportsOutstandingOpenInvites(t *testing.T) {
 	}
 }
 
+// `roster remove` and `roster ban` revoke, before they sign, the live
+// invites this node issued to the member - a second one it was handed is
+// otherwise a way back in - and list them as revoked_invites.
+func TestRosterRemoveAndBanRevokeTheMembersLiveInvites(t *testing.T) {
+	for _, command := range []string{"remove", "ban"} {
+		t.Run(command, func(t *testing.T) {
+			dataDir := t.TempDir()
+			founder, founderInfo := mustDaemonIdentity(t)
+			joiner, joinerInfo := mustDaemonIdentity(t)
+			gid := daemonTestGroupID(0x5d)
+			mustCreateGroup(t, dataDir, gid, founder, membership.DefaultPolicy())
+			group := mustOpenGroup(t, dataDir, gid)
+			mustJoinWithInvite(t, group, joiner, mustDaemonInvite(t, group, founder, joinerInfo, 1))
+			mustCloseGroup(t, group)
+
+			gf := daemonFlags(t, dataDir, founder)
+			code, stdout, stderr := captureCommandOutput(t, func() int {
+				return cmdInvite(gf, []string{"create", "-group", gid.String(),
+					"-target-pubkey", base64.StdEncoding.EncodeToString(joinerInfo.EntmootPubKey),
+					"-bootstrap", "/ip4/127.0.0.1/tcp/41998/p2p/" + founderInfo.PeerID})
+			})
+			if code != exitOK {
+				t.Fatalf("invite create code = %d (%s)", code, stderr)
+			}
+			var spare entmoot.BootstrapCapability
+			if err := json.Unmarshal([]byte(stdout), &spare); err != nil {
+				t.Fatalf("invite create stdout: %v\n%s", err, stdout)
+			}
+
+			args := []string{command, "-group", gid.String(), "-member", joinerInfo.MemberID.String()}
+			if command == "remove" {
+				args = append(args, "-peer", joinerInfo.PeerID, "-pubkey", base64.StdEncoding.EncodeToString(joinerInfo.EntmootPubKey))
+			}
+			code, out, stderr := runRosterCommand(t, gf, args...)
+			if code != exitOK {
+				t.Fatalf("roster %s code = %d (%s)", command, code, stderr)
+			}
+			revoked, _ := out["revoked_invites"].([]any)
+			if len(revoked) != 1 || revoked[0] != base64.StdEncoding.EncodeToString(spare.Nonce[:]) {
+				t.Fatalf("revoked_invites = %v, want the member's live invite", out["revoked_invites"])
+			}
+			group = mustOpenGroup(t, dataDir, gid)
+			defer mustCloseGroup(t, group)
+			if !group.IsInviteRevoked(spare.Nonce) || group.IsMemberID(*joinerInfo.MemberID) {
+				t.Fatal("the member's live invite was not revoked, or the member is still in")
+			}
+		})
+	}
+}
+
 // Leaving is the one membership change a member makes about itself with no
 // admin involved, which is the point of self-signed records.
 func TestRosterLeaveRemovesTheCallerWithoutAnAdmin(t *testing.T) {

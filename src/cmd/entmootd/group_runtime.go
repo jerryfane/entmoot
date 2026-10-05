@@ -336,6 +336,7 @@ func (r *groupRuntime) AddLocalGroup(ctx context.Context, groupID entmoot.GroupI
 		return nil, false, err
 	}
 	group.SetLogger(r.logger)
+	group.SetApplyHook(func(rec membership.Record) { r.revokeInvitesOfRemovedMember(group, rec) })
 	if err := r.validateLocalMembership(group); err != nil {
 		_ = group.Close()
 		return nil, false, err
@@ -782,9 +783,11 @@ func (r *groupRuntime) syncMembership(ctx context.Context, session *groupSession
 // made out to the same target, so once one has admitted it the others are
 // only a way back in after a removal. The capability a refresh replaces is
 // revoked when the replacement is handed out, but a join with it dated before
-// that revocation is accepted until the founder seals it, and a removal signed
-// on another node does not know the chain; this closes both on the round
-// after the join reaches this node. It runs only where this node may revoke.
+// that revocation is accepted until the founder seals it. This revokes the
+// rest of the chain on the round after such a join reaches this node; a
+// removal of its holder revokes them as soon as this node applies it (see
+// revokeInvitesOfRemovedMember). Neither is final before the seal. It runs
+// only where this node may revoke.
 func (r *groupRuntime) retireUsedReplacementChains(session *groupSession) {
 	if r.invites == nil || r.identity == nil || !session.group.CanAdminister(r.binding.MemberID) {
 		return
@@ -820,6 +823,51 @@ func (r *groupRuntime) retireUsedReplacementChains(session *groupSession) {
 				slog.String("group_id", session.groupID.String()), slog.Int("revoked", len(revoked)))
 		}
 	}
+}
+
+// revokeInvitesOfRemovedMember is the group's apply hook. When this node
+// applies a removal or ban signed by another admin - pulled or pushed - that
+// took effect, it revokes every capability it issued to the removed member
+// that could still admit it, before Apply returns, so a replacement an ESP
+// open invite handed that member is not left live until a maintenance round.
+// A removal signed here needs nothing: every local path revokes before it
+// signs (see revokeInvitesBeforeRemoval). This cannot close the window
+// between the removal and these revocations, which carry this node's later
+// timestamps: a join with such a capability dated inside it is accepted, as
+// for any revoked invite, until the founder seals the revocations.
+func (r *groupRuntime) revokeInvitesOfRemovedMember(group *membership.Group, rec membership.Record) {
+	if rec.Kind != membership.KindRemove || actorIsLocal(rec, r.binding.MemberID) ||
+		r.invites == nil || r.identity == nil || !group.CanAdminister(r.binding.MemberID) {
+		return
+	}
+	subject, err := rec.SubjectMemberID()
+	if err != nil {
+		return
+	}
+	// Only a removal the projection acted on: one the actor had no authority
+	// for, or of somebody who was never in the group, revokes nothing.
+	if _, removed := group.RemovalProof(subject); !removed && !group.IsBanned(subject) {
+		return
+	}
+	gid := group.GroupID()
+	unlock := lockESPInviteRoster(gid)
+	defer unlock()
+	revoked, err := revokeInvitesTargeting(r.identity, group, r.invites, subject)
+	if err != nil {
+		r.logger.Warn("revoke a removed member's invites",
+			slog.String("group_id", gid.String()), slog.String("err", err.Error()))
+		return
+	}
+	if len(revoked) > 0 {
+		r.logger.Info("revoked a removed member's invites",
+			slog.String("group_id", gid.String()), slog.String("member_id", subject.String()),
+			slog.Int("revoked", len(revoked)))
+	}
+}
+
+func actorIsLocal(rec membership.Record, local entmoot.MemberID) bool {
+	actor, err := entmoot.ResolvedMemberID(rec.Actor)
+	return err == nil && actor == local
 }
 
 // memberPull is the outcome of pulling membership from one member.

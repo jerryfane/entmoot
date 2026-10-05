@@ -560,7 +560,8 @@ func cmdRosterRemove(gf *globalFlags, args []string) int {
 		fmt.Fprintln(os.Stderr, "roster remove: cannot remove group founder")
 		return exitInvalidArgument
 	}
-	if !revokeInvitesBeforeRemoval(ctx, "roster remove", *existing.MemberID) {
+	revokedInvites, ok := revokeInvitesBeforeRemoval(ctx, "roster remove", *existing.MemberID)
+	if !ok {
 		return exitTransport
 	}
 	if err := applyRosterRemove(ctx.setup.identity, ctx.group, existing); err != nil {
@@ -609,6 +610,7 @@ func cmdRosterRemove(gf *globalFlags, args []string) int {
 		"members":                      len(ctx.group.MemberIDs()),
 		"outstanding_open_invites":     openInvites,
 		"outstanding_esp_open_invites": espOpen,
+		"revoked_invites":              revokedInvites,
 		"removed": map[string]any{
 			"member_id":      target.MemberID,
 			"peer_id":        binding.PeerID.String(),
@@ -763,8 +765,10 @@ func rosterBanChange(gf *globalFlags, args []string, ban bool) int {
 	}
 	kind := membership.KindUnban
 	record := membership.Record{Kind: kind, Subject: subject}
+	var revokedInvites []string
 	if ban {
-		if !revokeInvitesBeforeRemoval(ctx, command, memberID) {
+		var ok bool
+		if revokedInvites, ok = revokeInvitesBeforeRemoval(ctx, command, memberID); !ok {
 			return exitTransport
 		}
 		record = membership.Record{Kind: membership.KindRemove, Subject: subject, Banned: true}
@@ -778,14 +782,18 @@ func rosterBanChange(gf *globalFlags, args []string, ban bool) int {
 	if ban {
 		status = "banned"
 	}
-	data, err := json.Marshal(map[string]any{
+	out := map[string]any{
 		"status":    status,
 		"group_id":  gid,
 		"record_id": signed.ID,
 		"member_id": memberID,
 		"members":   len(ctx.group.MemberIDs()),
 		"banned":    ctx.group.IsBanned(memberID),
-	})
+	}
+	if ban {
+		out["revoked_invites"] = revokedInvites
+	}
+	data, err := json.Marshal(out)
 	if err != nil {
 		slog.Error(command+": marshal", slog.String("err", err.Error()))
 		return exitTransport
@@ -795,23 +803,21 @@ func rosterBanChange(gf *globalFlags, args []string, ban bool) int {
 }
 
 // revokeInvitesBeforeRemoval revokes the capabilities this node issued to a
-// member about to be removed or banned (see revokeInvitesTargeting). It
-// reports false, having said why, when that failed; the caller then stops
-// before the removal, so it can be retried.
-func revokeInvitesBeforeRemoval(ctx founderRosterContext, command string, target entmoot.MemberID) bool {
+// member the local identity is about to remove or ban (see
+// revokeInvitesForRemoval), and returns their base64 nonces for the command's
+// output. It reports false, having said why, when that failed; the caller then
+// stops before the removal, so it can be retried.
+func revokeInvitesBeforeRemoval(ctx founderRosterContext, command string, target entmoot.MemberID) ([]string, bool) {
 	ledger, err := libp2ptransport.OpenInviteLedger(ctx.setup.dataDir)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%s: open invite ledger: %v\n", command, err)
-		return false
+		return nil, false
 	}
 	defer ledger.Close()
-	revoked, err := revokeInvitesTargeting(ctx.setup.identity, ctx.group, ledger, target)
+	revoked, err := revokeInvitesForRemoval(ctx.setup.identity, ctx.localMemberID, ctx.group, ledger, target)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%s: revoke the member's invites: %v\n", command, err)
-		return false
+		return nil, false
 	}
-	for _, nonce := range revoked {
-		fmt.Fprintf(os.Stderr, "%s: revoked invite %s issued to the member\n", command, base64.StdEncoding.EncodeToString(nonce[:]))
-	}
-	return true
+	return encodeInviteNonces(revoked), true
 }

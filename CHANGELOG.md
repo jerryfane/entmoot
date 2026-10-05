@@ -25,15 +25,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   founder's daemon seals like any other revocation. Until that seal, a join
   with the replaced capability dated before its revocation (or inside its
   window, if it had expired) is still accepted, as for any revoked invite.
-  So that such a join cannot become a way back in, the daemon also revokes
-  the rest of a replacement chain on the first maintenance round after any
-  capability in it has been used, and `member_remove` and `roster
-  remove`/`ban` now first revoke every capability the node issued to that
-  member that could still admit it (listed as `revoked_invites`). An exhausted
-  link therefore cannot readmit a removed member through a replacement. The
-  daemon links each replacement to the capability it replaced, so a redeemer
-  whose answer was lost is handed that replacement on its next try rather than
-  being left with a revoked one, and the daemon signs at most once per change.
+  So that such a join is not easily turned into a way back in after a
+  removal, the issuing daemon also revokes every capability it issued to a
+  member when that member is removed or banned, if the removal takes effect.
+  A removal signed on the issuing node (`member_remove`, `roster remove`,
+  `roster ban`, which list them as `revoked_invites`) revokes them first, so
+  they cannot readmit the member. A removal signed by another admin's node is
+  followed by these revocations when the issuing node applies it, which leaves
+  a window: a join with such a capability dated between the removal and the
+  revocation is accepted until the founder seals the revocation. The issuing
+  daemon also revokes the rest of a replacement chain on the first maintenance
+  round after any capability in it has been used. The daemon links each
+  replacement to the capability it replaced, so a redeemer whose answer was
+  lost is handed that replacement on its next try rather than being left with
+  a revoked one, and the daemon signs at most once per change.
   The ESP accepts a replacement only from a daemon that answers
   `refresh_status: "replaced"`. With a daemon that predates `invite_refresh`
   (for example after restarting only `entmootd esp`), it keeps returning the

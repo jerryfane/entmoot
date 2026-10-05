@@ -1692,13 +1692,15 @@ func revokeIssuedInvites(identity *keystore.Identity, group *membership.Group, l
 
 // revokeInvitesTargeting revokes every capability this node issued to target
 // that could still admit it: not expired, not used up, not revoked. That
-// includes every link of an ESP replacement chain, so a member removed or
-// banned here cannot come back through a replacement it was handed before it
-// got in with an older capability (which a join dated before that one's
-// revocation can do until the founder seals it). Removal calls it before the
-// remove record is signed: a join with one of these dated after the
-// revocation is refused, and one dated before it is dated before the removal
-// too, so the removal still applies after it.
+// includes every link of an ESP replacement chain, so a removed or banned
+// member cannot come back through a replacement it was handed before it got
+// in with an older capability (which a join dated before that one's
+// revocation can do until the founder seals it). A removal signed here calls
+// it first (revokeInvitesForRemoval): a join with one of these dated after
+// the revocation is refused, and one dated before it is dated before the
+// removal too, so the removal still applies after it. A removal signed on
+// another node can only be followed by it (revokeInvitesOfRemovedMember),
+// which leaves a window until the founder seals.
 func revokeInvitesTargeting(identity *keystore.Identity, group *membership.Group, ledger *libp2ptransport.InviteLedger, target entmoot.MemberID) ([][32]byte, error) {
 	gid := group.GroupID()
 	issued, err := ledger.ListInvites(&gid)
@@ -1716,6 +1718,25 @@ func revokeInvitesTargeting(identity *keystore.Identity, group *membership.Group
 		nonces = append(nonces, record.Nonce)
 	}
 	return revokeIssuedInvites(identity, group, ledger, nonces)
+}
+
+// revokeInvitesForRemoval is revokeInvitesTargeting ahead of a remove or ban
+// of target that actor is about to sign, but only if the projection will
+// honour that removal: one it ignores, such as an admin removing a peer
+// admin, revokes nothing.
+func revokeInvitesForRemoval(identity *keystore.Identity, actor entmoot.MemberID, group *membership.Group, ledger *libp2ptransport.InviteLedger, target entmoot.MemberID) ([][32]byte, error) {
+	if !group.RemovalTakesEffect(actor, target) {
+		return nil, nil
+	}
+	return revokeInvitesTargeting(identity, group, ledger, target)
+}
+
+func encodeInviteNonces(nonces [][32]byte) []string {
+	encoded := make([]string, 0, len(nonces))
+	for _, nonce := range nonces {
+		encoded = append(encoded, base64.StdEncoding.EncodeToString(nonce[:]))
+	}
+	return encoded
 }
 
 // answerInviteRefresh answers a refresh of offered with answer, saying
@@ -1911,7 +1932,7 @@ func (s *ipcServer) handleMemberRemove(ctx context.Context, c net.Conn, req *ipc
 	// revokeInvitesTargeting for why before, not after, the removal. A failure
 	// leaves the member in place so the removal can be retried, rather than
 	// removing it while a capability that readmits it stays live.
-	revoked, err := revokeInvitesTargeting(s.identity, sess.group, s.runtime.invites, *existing.MemberID)
+	revoked, err := revokeInvitesForRemoval(s.identity, s.memberID, sess.group, s.runtime.invites, *existing.MemberID)
 	if err != nil {
 		unlock()
 		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInternal, GroupID: &gid, Message: "revoke the member's invites: " + err.Error()})
@@ -1925,10 +1946,7 @@ func (s *ipcServer) handleMemberRemove(ctx context.Context, c net.Conn, req *ipc
 	head := sess.group.Canonical().ID
 	members := len(sess.group.MemberIDs())
 	unlock()
-	revokedNonces := make([]string, 0, len(revoked))
-	for _, nonce := range revoked {
-		revokedNonces = append(revokedNonces, base64.StdEncoding.EncodeToString(nonce[:]))
-	}
+	revokedNonces := encodeInviteNonces(revoked)
 	// Invites the removed member issued stop working by rule: an invite is
 	// worth exactly its issuer's current authority, which every node projects
 	// from the same records, so those need no revocation.

@@ -327,10 +327,14 @@ Public open-invite issuer endpoints:
   The issuer revokes the invite it replaces, and any it replaced before, in
   the roster. As with any revoked invite, a join with one of those dated
   before its revocation, or inside its window if it had expired, is accepted
-  until the founder seals the revocation. To keep that from readmitting a
-  removed member, the issuer revokes every other invite in a replacement
-  chain once one of them has been used, and removing or banning a member on
-  the issuing node revokes every invite it issued to that member first. If
+  until the founder seals the revocation. To make that harder to turn into a
+  way back in, the issuer revokes every other invite in a replacement chain
+  once one of them has been used, and every invite it issued to a member whose
+  removal or ban takes effect. A removal signed on the issuing node revokes
+  them before it, so they cannot readmit the member. A removal signed on
+  another admin's node is followed by the revocations when the issuer applies
+  it, so a join with one of those invites dated between the removal and the
+  revocation is accepted until the founder seals. If
   the answer carrying a replacement is lost, the next replay is handed that
   same replacement. Revoked or expired open invites refuse replays.
 
