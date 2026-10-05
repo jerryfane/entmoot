@@ -112,6 +112,42 @@ including when it has heard from nobody, because the records it signed itself
 count too. `entmootd roster checkpoint` exists for the case where you want one
 now rather than at the cadence.
 
+### Changes that take authority away are checkpointed at once
+
+Records are ordered by the timestamp their signer writes on them, and nothing
+but a checkpoint bounds that from below. So a join dated *before* a revocation
+is judged as if the revocation had not happened yet: someone holding a revoked
+invite, or an invite from an admin since demoted, could sign a join dated
+earlier and be admitted on every node.
+
+To close that, a change that takes authority away is sealed with a checkpoint
+immediately rather than at the cadence:
+
+- `revoke_invite` (`invite revoke`);
+- a `policy` record that removes an admin (`roster admin revoke`) or closes an
+  open group (`group policy join-rule -rule invite`);
+- removing, banning, or the departure of an admin.
+
+The node that signs the change signs the checkpoint in the same step, so it
+refuses an earlier-dated join from that moment. Every other node refuses it
+once it has the checkpoint, which it pulls on its next membership round
+(every 15 seconds while serving; a node that was offline gets it when it
+next syncs). Older peers need no upgrade: they already adopt checkpoints and
+refuse records older than one. A burst of such changes in one round gets one
+checkpoint, and an admin that receives such a change from a peer before its
+checkpoint seals it itself on its next round.
+
+If the signer may not sign a checkpoint yet (an admin granted since the
+canonical checkpoint, see below), the change is still recorded, the command
+warns, and the founder's daemon seals it on its next round; run `entmootd
+roster checkpoint` on the founder to do it at once.
+
+What remains: until a given node has the checkpoint, that node can still
+accept such a backdated join, and a node that does will then refuse the
+checkpoint as disagreeing with its records until it is repaired. Expiry is not
+covered: a join dated inside an invite's validity window is still admitted
+after the invite expires, until a later checkpoint covers that window.
+
 Several admins reaching the cadence at once each sign one; they all describe
 the same membership, and every node picks the same winner by the rule below, so
 a duplicate costs one signature and nothing else.

@@ -22,6 +22,16 @@ total order derived from their contents, so two nodes holding the same records
 reach the same membership. A checkpoint refuses records older than itself,
 which is what stops a discarded change from being replayed back in.
 
+Records are ordered by their signer's timestamp, which nothing else bounds
+from below, so a revocation or a demotion is final only against joins dated
+after it until a checkpoint covers it. Every change that takes authority away
+(invite revocation, admin demotion, removal or departure, closing an open
+group) is therefore checkpointed as it is signed, and a node refuses a join
+dated before it once that checkpoint has reached it. Until then - one
+membership round for a serving node - that node can still admit such a join.
+Invite expiry has no such checkpoint: a join dated inside an expired invite's
+validity window is admitted until a later checkpoint covers the window.
+
 A fresh joiner trusts the founder key pinned by its verified invite and checks
 the served checkpoint's founder signature. A migrated group's legacy anchor
 describes history on the founder's node; the joiner need not possess that old

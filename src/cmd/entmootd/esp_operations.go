@@ -1096,15 +1096,18 @@ func lockESPOpenInviteRedemption(tokenHash string, redeemerKey string) func() {
 
 // applyRosterRemove records a removal. There is no matching add: a member
 // signs its own join, so an ESP invite hands out a capability rather than
-// writing somebody into the group.
-func applyRosterRemove(identity *keystore.Identity, group *membership.Group, target entmoot.NodeInfo) error {
-	if _, err := group.SignRecord(identity, membership.Record{Kind: membership.KindRemove, Subject: target}); err != nil {
+// writing somebody into the group. Removing an admin takes its authority away,
+// so it is sealed with a checkpoint in the same step (see
+// membership.Group.SignRecordAndCheckpoint).
+func applyRosterRemove(identity *keystore.Identity, group *membership.Group, target entmoot.NodeInfo) (membership.Record, membership.AutoCheckpoint, error) {
+	record, sealed, err := group.SignRecordAndCheckpoint(identity, membership.Record{Kind: membership.KindRemove, Subject: target})
+	if err != nil {
 		if errors.Is(err, entmoot.ErrRosterReject) {
-			return &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "roster_rejected", Message: err.Error()}
+			return membership.Record{}, membership.AutoCheckpoint{}, &esphttp.OperationError{HTTPStatus: http.StatusBadRequest, Code: "roster_rejected", Message: err.Error()}
 		}
-		return err
+		return membership.Record{}, membership.AutoCheckpoint{}, err
 	}
-	return nil
+	return record, sealed, nil
 }
 
 func (e espOperationExecutor) daemonInfo() (*ipc.InfoResp, error) {

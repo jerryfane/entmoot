@@ -47,6 +47,16 @@ daemon `probe_status` says so rather than blaming the peers.
 - **Not a member:** send the `entmoot_pubkey` from `"$ENTMOOT" info` to the
   group founder/admin and ask for an invite.
 - **Invite expired:** request a new invite.
+- **Join refused as stale (`record predates the current checkpoint`):** the
+  group checkpointed while the join was in flight, often right after an invite
+  revoke or admin removal. Run the same `join` again; it re-signs above the
+  checkpoint and succeeds unless that invite was the one revoked.
+- **Revoked invite or removed admin still seems to work on one node:** a
+  revoke, admin demotion or admin removal takes effect on each node once it
+  has the checkpoint signed with it, which it pulls on its next membership
+  round. If the command warned that it could not checkpoint, run
+  `roster checkpoint -group <gid>` on the founder (daemon stopped) or let the
+  founder's `serve` seal it on its next round.
 - **Peer route unclear:** run `doctor -group <gid> --probe --json`. Read
   `reachable` per peer, and `answered` before blaming the network: an
   answered-but-refused row means membership, not routing. `probe_status` says

@@ -391,11 +391,15 @@ func cmdGroupCheckpointEvery(gf *globalFlags, args []string) int {
 }
 
 func applyGroupPolicyRecord(ctx founderRosterContext, gid entmoot.GroupID, policy membership.Policy, command string) int {
-	signed, err := ctx.group.SignRecord(ctx.setup.identity, membership.Record{Kind: membership.KindPolicy, Policy: &policy})
+	// Closing an open group takes authority away from anybody still able to
+	// date a join into the open window, so that change is sealed with a
+	// checkpoint at once; other policy changes wait for the cadence.
+	signed, sealed, err := ctx.group.SignRecordAndCheckpoint(ctx.setup.identity, membership.Record{Kind: membership.KindPolicy, Policy: &policy})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%s: %v\n", command, err)
 		return exitInvalidArgument
 	}
+	warnUnsealed(command, gid, sealed)
 	data, err := json.Marshal(map[string]any{
 		"status":           "updated",
 		"group_id":         gid,

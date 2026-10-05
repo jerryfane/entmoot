@@ -203,6 +203,24 @@ func (r *groupRuntime) gossipMembershipRecord(groupID entmoot.GroupID, record me
 	}()
 }
 
+// publishMembershipChange gets a change this node signed out to the group's
+// reachable members now rather than on their next pull, and logs the
+// checkpoint that sealed it, if one did. Only records travel by push: the
+// checkpoint reaches each member on its next membership round, which asks the
+// founder first. An admin node that receives the record before the checkpoint
+// seals it itself on its own next round (see membership SignCheckpoint).
+func (r *groupRuntime) publishMembershipChange(groupID entmoot.GroupID, record membership.Record, sealed membership.AutoCheckpoint) {
+	if sealed.Signed {
+		r.logger.Info("membership checkpoint signed",
+			slog.String("group_id", groupID.String()),
+			slog.String("record_kind", string(record.Kind)),
+			slog.Uint64("sequence", sealed.Checkpoint.Sequence),
+			slog.Uint64("covered", sealed.Checkpoint.Covered),
+			slog.Int("members", len(sealed.Checkpoint.Members)))
+	}
+	r.gossipMembershipRecord(groupID, record)
+}
+
 func (r *groupRuntime) peerRecordsForGroup(groupID entmoot.GroupID) (*libp2ptransport.PeerRecordCache, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -625,9 +643,13 @@ func (r *groupRuntime) syncMembership(ctx context.Context, session *groupSession
 	r.signCheckpointIfDue(session)
 }
 
-// signCheckpointIfDue folds pending records into a checkpoint once the group's
-// cadence is reached, if this node may sign one. Any admin may: a group whose
-// founder is offline still retires history.
+// signCheckpointIfDue folds pending records into a checkpoint once one is due,
+// if this node may sign one. Any admin may: a group whose founder is offline
+// still retires history. One is due at the group's cadence, and as soon as the
+// pending records take authority away - a revoked invite, a demoted or removed
+// admin - so such a change signed by a node that could not seal it itself, or
+// received from a peer ahead of its checkpoint, is sealed within one round by
+// whichever admin holds it.
 func (r *groupRuntime) signCheckpointIfDue(session *groupSession) {
 	if !session.group.CanAdminister(r.binding.MemberID) {
 		return

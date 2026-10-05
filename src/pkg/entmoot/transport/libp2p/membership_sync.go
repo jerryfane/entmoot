@@ -560,10 +560,23 @@ func JoinGroup(ctx context.Context, h host.Host, remote peer.AddrInfo, root stri
 	if err != nil {
 		return nil, err
 	}
+	if err := completeJoin(ctx, h, remote, group, identity, capability, applicant, response); err != nil {
+		// The store exists only for this join. Left behind, it would make
+		// running the join again fail on a store that already exists, and a
+		// join refused because a checkpoint landed while it was in flight is
+		// one that should simply be run again.
+		_ = group.Discard()
+		return nil, err
+	}
+	return group, nil
+}
+
+// completeJoin brings a freshly adopted group up to what the peer served,
+// signs the join against it and hands the join to the peer.
+func completeJoin(ctx context.Context, h host.Host, remote peer.AddrInfo, group *membership.Group, identity *keystore.Identity, capability entmoot.BootstrapCapability, applicant entmoot.NodeInfo, response MembershipSyncResponse) error {
 	for _, checkpoint := range response.Checkpoints[1:] {
 		if _, err := group.ApplyCheckpoint(checkpoint); err != nil {
-			_ = group.Close()
-			return nil, err
+			return err
 		}
 	}
 	for _, record := range response.Records {
@@ -573,8 +586,7 @@ func JoinGroup(ctx context.Context, h host.Host, remote peer.AddrInfo, root stri
 			if errors.Is(err, membership.ErrStale) {
 				continue
 			}
-			_ = group.Close()
-			return nil, err
+			return err
 		}
 	}
 	// The first answer may have been cut short by a page limit, and the join
@@ -583,15 +595,13 @@ func JoinGroup(ctx context.Context, h host.Host, remote peer.AddrInfo, root stri
 	if !response.Complete && applicant.MemberID != nil {
 		if _, _, _, err := FetchMembership(ctx, h, remote, group, *applicant.MemberID); err != nil &&
 			!errors.Is(err, ErrRemoved) {
-			_ = group.Close()
-			return nil, err
+			return err
 		}
 	}
 	record := membership.Record{Kind: membership.KindJoin, Subject: applicant, Invite: &capability}
 	signed, err := group.SignRecord(identity, record)
 	if err != nil {
-		_ = group.Close()
-		return nil, err
+		return err
 	}
 	// The record is valid and stored, which is not the same as effective: a
 	// banned identity, a spent invite or one signed by a demoted admin all
@@ -599,19 +609,14 @@ func JoinGroup(ctx context.Context, h host.Host, remote peer.AddrInfo, root stri
 	// group's own terms, instead of leaving the caller with "not a member".
 	if applicant.MemberID == nil || !group.IsMemberID(*applicant.MemberID) {
 		reason := membership.ExplainJoin(group.State(), signed)
-		_ = group.Close()
 		if reason == "" {
 			reason = "the group did not admit this identity"
 		}
-		return nil, fmt.Errorf("libp2p: join not admitted: %s", reason)
+		return fmt.Errorf("libp2p: join not admitted: %s", reason)
 	}
 	// Publish the join by handing it back: the peer applies it under the same
 	// rules this node just did, and gossip carries it to everyone else.
-	if err := PushMembershipRecord(ctx, h, remote, capability.GroupID, signed, &capability); err != nil {
-		_ = group.Close()
-		return nil, err
-	}
-	return group, nil
+	return PushMembershipRecord(ctx, h, remote, capability.GroupID, signed, &capability)
 }
 
 // PushMembershipRecord hands one signed record to a peer. A joiner uses it for
@@ -635,6 +640,9 @@ func PushMembershipRecord(ctx context.Context, h host.Host, remote peer.AddrInfo
 		return errors.New("libp2p: membership push response does not answer the request")
 	}
 	if response.Error != "" {
+		if response.Reason != "" {
+			return fmt.Errorf("libp2p: membership push: %s: %s", response.Error, response.Reason)
+		}
 		return fmt.Errorf("libp2p: membership push: %s", response.Error)
 	}
 	return nil
@@ -693,10 +701,11 @@ func (s *SyncServer) handleMembershipPush(stream network.Stream) {
 	if err != nil {
 		response.Error = SyncMalformed
 		response.Reason = err.Error()
-		if errors.Is(err, entmoot.ErrRosterReject) {
+		if errors.Is(err, entmoot.ErrRosterReject) && !errors.Is(err, membership.ErrStale) {
 			// The record verified but the group would not have it: say why, in
 			// the group's terms, so a joiner can tell a bad invite from a bad
-			// signature.
+			// signature. A stale record is refused for its date alone, and
+			// saying so tells a joiner to run the join again.
 			response.Reason = membership.ExplainJoin(group.State(), request.Record)
 		}
 		s.writePush(stream, response)

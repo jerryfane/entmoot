@@ -850,6 +850,35 @@ func (g *Group) Close() error {
 	return err
 }
 
+// Discard closes the group and deletes its membership store. It exists for a
+// join that did not complete: AdoptForJoin creates the store before the join
+// is accepted, and a store left behind by a refused join would make running
+// the join again fail with ErrExists. Only the store goes; whatever else the
+// group directory holds is left alone.
+func (g *Group) Discard() error {
+	if err := g.lease.claim(); err != nil {
+		_ = g.Close()
+		return err
+	}
+	db := filepath.Join(g.dir, storeFileName)
+	var removeErr error
+	g.closeOnce.Do(func() {
+		removeErr = g.db.Close()
+		for _, path := range []string{db, db + "-wal", db + "-shm", db + "-journal"} {
+			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) && removeErr == nil {
+				removeErr = err
+			}
+		}
+		if err := g.lease.close(); err != nil && removeErr == nil {
+			removeErr = err
+		}
+	})
+	if removeErr != nil {
+		return fmt.Errorf("membership: discard store: %w", removeErr)
+	}
+	return nil
+}
+
 // Apply stores one record and re-projects. Applying a record twice is a no-op,
 // so a peer may send the same record repeatedly.
 func (g *Group) Apply(rec Record) (bool, error) {
@@ -861,6 +890,11 @@ func (g *Group) Apply(rec Record) (bool, error) {
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	return g.applyLocked(rec)
+}
+
+// applyLocked is Apply for a record already verified and bound to this group.
+func (g *Group) applyLocked(rec Record) (bool, error) {
 	if _, exists := g.records[rec.ID]; exists {
 		return false, nil
 	}
@@ -902,6 +936,12 @@ func (g *Group) ApplyCheckpoint(cp Checkpoint) (bool, error) {
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	return g.applyCheckpointLocked(cp)
+}
+
+// applyCheckpointLocked is ApplyCheckpoint for a checkpoint already verified
+// and bound to this group.
+func (g *Group) applyCheckpointLocked(cp Checkpoint) (bool, error) {
 	if err := g.verifyCheckpointClockLocked(cp); err != nil {
 		return false, err
 	}
@@ -1411,20 +1451,82 @@ func founderSigned(cp Checkpoint) bool {
 
 // SignRecord fills in the actor, group and timestamp, signs, and applies.
 func (g *Group) SignRecord(identity *keystore.Identity, rec Record) (Record, error) {
-	if identity == nil {
-		return Record{}, errors.New("membership: signing identity is required")
-	}
-	actor, err := identityInfo(identity)
+	actor, err := signingInfo(identity)
 	if err != nil {
 		return Record{}, err
 	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.signRecordLocked(identity, actor, rec)
+}
+
+// AutoCheckpoint reports what SignRecordAndCheckpoint did after the record.
+type AutoCheckpoint struct {
+	// Signed is true when a checkpoint was signed; Checkpoint is that one.
+	Signed     bool
+	Checkpoint Checkpoint
+	// Deferred is why a checkpoint the record called for was not signed
+	// here. The record stands either way; it waits for an admin that can
+	// sign one, which every admin's maintenance round does (see
+	// SignCheckpoint).
+	Deferred error
+}
+
+// SignRecordAndCheckpoint signs and applies a record, then, still holding the
+// lock, signs a checkpoint if one is due: the cadence is reached, or the
+// records outside the canonical checkpoint now take authority away (see
+// applyJudged). Revoking an invite, demoting an admin, removing or banning
+// one, and closing an open group therefore take effect against backdated
+// joins at once on this node, with no moment in which a join dated before
+// the change could still be applied here. Anything else signs no checkpoint
+// before the cadence, exactly as SignRecord would.
+//
+// A signer the canonical checkpoint does not yet name as an admin cannot
+// checkpoint (see SignCheckpoint). That does not fail the record: when the
+// checkpoint was owed to a change that takes authority away it is logged and
+// reported in Deferred, and the next admin that can sign one - the founder at
+// the latest - seals it on its next round. A checkpoint owed only to the
+// cadence is left to that round silently, as it always was.
+func (g *Group) SignRecordAndCheckpoint(identity *keystore.Identity, rec Record) (Record, AutoCheckpoint, error) {
+	actor, err := signingInfo(identity)
+	if err != nil {
+		return Record{}, AutoCheckpoint{}, err
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	signed, err := g.signRecordLocked(identity, actor, rec)
+	if err != nil {
+		return Record{}, AutoCheckpoint{}, err
+	}
+	checkpoint, sealed, reduced, err := g.signCheckpointLocked(identity, actor, false)
+	if err != nil && !reduced {
+		return signed, AutoCheckpoint{}, nil
+	}
+	if err != nil {
+		g.logger.Warn("membership: change signed but not checkpointed here; it is final against backdated joins once an admin that can checkpoint, such as the founder, seals it",
+			slog.String("group_id", g.groupID.String()),
+			slog.String("kind", string(signed.Kind)),
+			slog.String("record_id", signed.ID.String()),
+			slog.String("err", err.Error()))
+		return signed, AutoCheckpoint{Deferred: err}, nil
+	}
+	return signed, AutoCheckpoint{Signed: sealed, Checkpoint: checkpoint}, nil
+}
+
+func signingInfo(identity *keystore.Identity) (entmoot.NodeInfo, error) {
+	if identity == nil {
+		return entmoot.NodeInfo{}, errors.New("membership: signing identity is required")
+	}
+	return identityInfo(identity)
+}
+
+func (g *Group) signRecordLocked(identity *keystore.Identity, actor entmoot.NodeInfo, rec Record) (Record, error) {
 	rec.Actor = actor
 	rec.GroupID = g.groupID
 	switch rec.Kind {
 	case KindJoin, KindLeave:
 		rec.Subject = actor
 	}
-	g.mu.RLock()
 	// A record must land after everything this node already holds: after the
 	// checkpoint, or it would be refused as stale, and after the newest record
 	// too, so two writes made in the same millisecond keep the order they were
@@ -1436,7 +1538,6 @@ func (g *Group) SignRecord(identity *keystore.Identity, rec Record) (Record, err
 		}
 	}
 	now := g.now().UnixMilli()
-	g.mu.RUnlock()
 	if now <= floor {
 		now = floor + 1
 	}
@@ -1445,52 +1546,58 @@ func (g *Group) SignRecord(identity *keystore.Identity, rec Record) (Record, err
 	if err != nil {
 		return Record{}, err
 	}
-	if _, err := g.Apply(signed); err != nil {
+	// The same checks Apply makes on a record from a peer: signing it here
+	// is no reason to store a record no other node would accept.
+	if err := VerifyRecord(signed); err != nil {
+		return Record{}, err
+	}
+	if _, err := g.applyLocked(signed); err != nil {
 		return Record{}, err
 	}
 	return signed, nil
 }
 
 // SignCheckpoint folds the pending records into a new checkpoint. Without
-// force it signs only once the policy's cadence is reached, so the common path
-// is to call it every maintenance round and have it decline.
+// force it signs only when one is due, so the common path is to call it every
+// maintenance round and have it decline. One is due once the policy's cadence
+// is reached, or as soon as the pending records take authority away (see
+// applyJudged): however many such records a round brings, from this node or
+// from peers, one checkpoint seals them all.
 func (g *Group) SignCheckpoint(identity *keystore.Identity, force bool) (Checkpoint, bool, error) {
-	if identity == nil {
-		return Checkpoint{}, false, errors.New("membership: signing identity is required")
-	}
-	signer, err := identityInfo(identity)
+	signer, err := signingInfo(identity)
 	if err != nil {
 		return Checkpoint{}, false, err
 	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	checkpoint, signed, _, err := g.signCheckpointLocked(identity, signer, force)
+	return checkpoint, signed, err
+}
+
+// signCheckpointLocked is SignCheckpoint under the lock. reduced reports
+// whether the pending records take authority away, which is what made the
+// checkpoint due whatever the cadence says.
+func (g *Group) signCheckpointLocked(identity *keystore.Identity, signer entmoot.NodeInfo, force bool) (Checkpoint, bool, bool, error) {
 	signerID, err := entmoot.ResolvedMemberID(signer)
 	if err != nil {
-		return Checkpoint{}, false, err
+		return Checkpoint{}, false, false, err
 	}
-
-	g.mu.Lock()
 	base := g.checkpoints[g.canonicalID]
+	records := make([]Record, 0, len(g.records))
+	for _, rec := range g.records {
+		records = append(records, rec)
+	}
+	state, effective, reduced := project(base, records)
+	if !force && !reduced && (len(effective) == 0 || len(effective) < g.state.Policy.CheckpointEvery) {
+		return Checkpoint{}, false, false, nil
+	}
 	// Signed against the base's OWN admin set, not the current projection: a
 	// peer judges this checkpoint by its predecessor alone, so an admin the
 	// base does not yet name would produce a checkpoint nobody else could
 	// accept. Waiting one cadence is the price of a chain every node can
 	// follow.
 	if !stateFrom(base).CanAdminister(signerID) {
-		g.mu.Unlock()
-		return Checkpoint{}, false, fmt.Errorf("%w: %s may not sign a checkpoint for this group yet", ErrNotAuthorised, signerID.String())
-	}
-	records := make([]Record, 0, len(g.records))
-	for _, rec := range g.records {
-		records = append(records, rec)
-	}
-	cadence := g.state.Policy.CheckpointEvery
-	g.mu.Unlock()
-
-	state, effective := Project(base, records)
-	if !force && len(effective) < cadence {
-		return Checkpoint{}, false, nil
-	}
-	if len(effective) == 0 && !force {
-		return Checkpoint{}, false, nil
+		return Checkpoint{}, false, reduced, fmt.Errorf("%w: %s may not sign a checkpoint for this group yet", ErrNotAuthorised, signerID.String())
 	}
 	// The timestamp covers every record folded in, not only the ones that
 	// changed the state. A record the checkpoint saw and judged ineffective is
@@ -1508,12 +1615,15 @@ func (g *Group) SignCheckpoint(identity *keystore.Identity, force bool) (Checkpo
 	body := state.Checkpoint(g.groupID, base.Sequence+1, base.ID, uint64(len(effective)), timestamp)
 	signed, err := SignCheckpoint(identity, signer, body)
 	if err != nil {
-		return Checkpoint{}, false, err
+		return Checkpoint{}, false, reduced, err
 	}
-	if _, err := g.ApplyCheckpoint(signed); err != nil {
-		return Checkpoint{}, false, err
+	if err := VerifyCheckpoint(signed); err != nil {
+		return Checkpoint{}, false, reduced, err
 	}
-	return signed, true, nil
+	if _, err := g.applyCheckpointLocked(signed); err != nil {
+		return Checkpoint{}, false, reduced, err
+	}
+	return signed, true, reduced, nil
 }
 
 func identityInfo(identity *keystore.Identity) (entmoot.NodeInfo, error) {

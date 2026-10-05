@@ -120,6 +120,15 @@ Authority:
 - `admin grant` / `admin revoke`: founder only. Each writes a `policy` record
   carrying the complete admin set.
 
+`admin revoke`, `remove` or `ban` of an admin, an admin's `leave`, and
+closing an open group also sign a checkpoint in the same step, because each
+takes authority away and only a checkpoint stops a join dated before the
+change from being admitted ahead of it — see
+[changes that take authority away](../concepts/groups-rosters-invites.md#changes-that-take-authority-away-are-checkpointed-at-once).
+When the signer cannot sign a checkpoint yet, the command still succeeds and
+warns; the founder's daemon seals the change on its next round, or run
+`roster checkpoint` on the founder.
+
 Every command in that list writes a signed record and takes the group's writer
 lease, so stop the local daemon before running it — except `status` and `admin
 list`, which only read local state. Member
@@ -151,10 +160,14 @@ group: removing or demoting it invalidates its outstanding invites on every
 node at once, with no revocation step. A founder's invites are not covered by
 that - they keep working after the founder removes itself, so revoking one
 takes an explicit `invite revoke`. `invite revoke` writes a signed `revoke_invite`
-record, which is what makes other nodes refuse it, and also marks the local
-issuance ledger; it therefore takes the writer lease and needs the daemon
-stopped. `-open` mints a bearer invite: whoever holds it can join until it
-expires, is revoked, or runs out of uses.
+record, which is what makes other nodes refuse it, signs a checkpoint with it,
+and also marks the local issuance ledger; it therefore takes the writer lease
+and needs the daemon stopped. The checkpoint is what makes the revocation
+final: without it a holder could date a join before the revoke and still be
+admitted. Each node refuses such a join once it has the checkpoint, which it
+pulls on its next membership round after the daemon is started again; its
+id is the output's `checkpoint`. `-open` mints a bearer invite: whoever holds
+it can join until it expires, is revoked, or runs out of uses.
 
 `invite list` reads `bootstrap-admission.db`, which is only a local record of
 the invites this node issued. Invite use limits themselves are counted from the

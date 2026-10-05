@@ -4,8 +4,10 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -365,6 +367,12 @@ func TestInviteRevokeSignsARecordThatStopsTheInvite(t *testing.T) {
 	if err := json.Unmarshal([]byte(stdout), &capability); err != nil {
 		t.Fatalf("invite create stdout: %v\n%s", err, stdout)
 	}
+	// The newest position before the revoke, which a holder dating its join
+	// before the revocation would pick; anything earlier is inside the
+	// group's first checkpoint already.
+	group := mustOpenGroup(t, dataDir, gid)
+	beforeRevoke := group.Canonical().Timestamp
+	mustCloseGroup(t, group)
 
 	code, stdout, stderr = captureCommandOutput(t, func() int {
 		return cmdInvite(gf, []string{"revoke", "-group", gid.String(),
@@ -381,13 +389,22 @@ func TestInviteRevokeSignsARecordThatStopsTheInvite(t *testing.T) {
 		t.Fatalf("invite revoke output = %v, want a revoked status with a record id", revoked)
 	}
 
-	group := mustOpenGroup(t, dataDir, gid)
+	group = mustOpenGroup(t, dataDir, gid)
 	defer mustCloseGroup(t, group)
 	if !group.IsInviteRevoked(capability.Nonce) {
 		t.Fatal("group state does not report the invite as revoked")
 	}
 	if err := group.CheckInvite(capability, time.Now().UnixMilli()); err == nil {
 		t.Fatal("a revoked invite still authorises its holder")
+	}
+	// Order is by the signer's own timestamp, so the holder can date its join
+	// before the revocation. The checkpoint signed with the revoke is what
+	// refuses that record as stale instead of admitting it ahead of the
+	// revoke.
+	backdated := mustBackdatedJoin(t, gid, joiner, capability, beforeRevoke+1)
+	if _, err := group.Apply(backdated); !errors.Is(err, membership.ErrStale) {
+		t.Fatalf("a join dated before the revocation was not refused as stale: %v (member=%t)",
+			err, group.IsMemberID(*joinerInfo.MemberID))
 	}
 	if _, err := group.SignRecord(joiner, membership.Record{Kind: membership.KindJoin, Invite: &capability}); err != nil {
 		t.Fatalf("join record: %v", err)
@@ -408,6 +425,127 @@ func TestInviteRevokeSignsARecordThatStopsTheInvite(t *testing.T) {
 	}
 	if len(listed) != 1 || listed[0]["state"] != "revoked" || listed[0]["uses"] != float64(0) {
 		t.Fatalf("invite list = %v, want one revoked invite with no uses", listed)
+	}
+}
+
+// mustBackdatedJoin signs a join the way a holder of a withdrawn invite would
+// try to slip it in: dated by the signer, before the change that withdrew it.
+func mustBackdatedJoin(t *testing.T, gid entmoot.GroupID, joiner *keystore.Identity, capability entmoot.BootstrapCapability, atMS int64) membership.Record {
+	t.Helper()
+	info := mustDaemonNodeInfo(t, joiner)
+	record, err := membership.SignRecord(joiner, membership.Record{
+		GroupID: gid, Kind: membership.KindJoin, Actor: info, Subject: info,
+		Invite: &capability, Timestamp: atMS,
+	})
+	if err != nil {
+		t.Fatalf("sign backdated join: %v", err)
+	}
+	return record
+}
+
+// A delegated admin's invite is worth exactly its authority, judged at the
+// join's own timestamp. Each command that takes that authority away must
+// therefore also checkpoint, or the invite's holder - or the demoted admin
+// itself - dates a join inside the window the admin still held it and is
+// admitted.
+func TestAdminLosingAuthorityRefusesBackdatedJoinsThroughItsInvites(t *testing.T) {
+	for i, tc := range []struct {
+		name string
+		args func(gid entmoot.GroupID, admin entmoot.NodeInfo) []string
+	}{
+		{"admin revoke", func(gid entmoot.GroupID, admin entmoot.NodeInfo) []string {
+			return []string{"admin", "revoke", "-group", gid.String(), "-member", admin.MemberID.String()}
+		}},
+		{"remove", func(gid entmoot.GroupID, admin entmoot.NodeInfo) []string {
+			return []string{"remove", "-group", gid.String(), "-member", admin.MemberID.String(),
+				"-peer", admin.PeerID, "-pubkey", base64.StdEncoding.EncodeToString(admin.EntmootPubKey)}
+		}},
+		{"ban", func(gid entmoot.GroupID, admin entmoot.NodeInfo) []string {
+			return []string{"ban", "-group", gid.String(), "-member", admin.MemberID.String()}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dataDir := t.TempDir()
+			founder, _ := mustDaemonIdentity(t)
+			admin, adminInfo := mustDaemonIdentity(t)
+			outsider, outsiderInfo := mustDaemonIdentity(t)
+			gid := daemonTestGroupID(0x90 + byte(i))
+			mustCreateGroup(t, dataDir, gid, founder, membership.DefaultPolicy())
+			group := mustOpenGroup(t, dataDir, gid)
+			mustJoinWithInvite(t, group, admin, mustDaemonInvite(t, group, founder, adminInfo, 1))
+			mustCloseGroup(t, group)
+
+			founderFlags := daemonFlags(t, dataDir, founder)
+			if code, _, stderr := runRosterCommand(t, founderFlags, "admin", "grant", "-group", gid.String(), "-member", adminInfo.MemberID.String()); code != exitOK {
+				t.Fatalf("roster admin grant code = %d (%s)", code, stderr)
+			}
+			group = mustOpenGroup(t, dataDir, gid)
+			invite := mustDaemonInvite(t, group, admin, outsiderInfo, 1)
+			// Just after the grant, where the admin's invite admits.
+			var grantedAt int64
+			for _, record := range group.Pending() {
+				grantedAt = max(grantedAt, record.Timestamp)
+			}
+			mustCloseGroup(t, group)
+
+			if code, _, stderr := runRosterCommand(t, founderFlags, tc.args(gid, adminInfo)...); code != exitOK {
+				t.Fatalf("roster %s code = %d (%s)", tc.name, code, stderr)
+			}
+			group = mustOpenGroup(t, dataDir, gid)
+			defer mustCloseGroup(t, group)
+			if group.CanAdminister(*adminInfo.MemberID) {
+				t.Fatalf("roster %s left the admin administering", tc.name)
+			}
+			backdated := mustBackdatedJoin(t, gid, outsider, invite, grantedAt+1)
+			if _, err := group.Apply(backdated); !errors.Is(err, membership.ErrStale) {
+				t.Fatalf("a join through the admin's invite dated before roster %s was not refused as stale: %v (member=%t)",
+					tc.name, err, group.IsMemberID(*outsiderInfo.MemberID))
+			}
+		})
+	}
+}
+
+// An admin granted since the canonical checkpoint cannot sign one yet. Its
+// revoke must still go through, but the operator has to be told it is not
+// final against a backdated join, and the founder's next maintenance round
+// must seal it rather than wait for the cadence.
+func TestInviteRevokeByAnUncheckpointedAdminDefersToTheFounder(t *testing.T) {
+	dataDir := t.TempDir()
+	founder, _ := mustDaemonIdentity(t)
+	admin, adminInfo := mustDaemonIdentity(t)
+	_, outsiderInfo := mustDaemonIdentity(t)
+	gid := daemonTestGroupID(0x9a)
+	mustCreateGroup(t, dataDir, gid, founder, membership.DefaultPolicy())
+	group := mustOpenGroup(t, dataDir, gid)
+	mustJoinWithInvite(t, group, admin, mustDaemonInvite(t, group, founder, adminInfo, 1))
+	policy := group.Policy()
+	policy.Admins = []entmoot.MemberID{*adminInfo.MemberID}
+	if _, err := group.SignRecord(founder, membership.Record{Kind: membership.KindPolicy, Policy: &policy}); err != nil {
+		t.Fatalf("grant admin: %v", err)
+	}
+	invite := mustDaemonInvite(t, group, admin, outsiderInfo, 1)
+	base := group.Canonical().ID
+	mustCloseGroup(t, group)
+
+	code, _, stderr := captureCommandOutput(t, func() int {
+		return cmdInvite(daemonFlags(t, dataDir, admin), []string{"revoke", "-group", gid.String(),
+			"-nonce", base64.StdEncoding.EncodeToString(invite.Nonce[:])})
+	})
+	if code != exitOK {
+		t.Fatalf("invite revoke by the admin code = %d (%s)", code, stderr)
+	}
+	if !strings.Contains(stderr, "cannot checkpoint it yet") || !strings.Contains(stderr, "roster checkpoint -group "+gid.String()) {
+		t.Fatalf("invite revoke did not warn that the revoke is not yet final:\n%s", stderr)
+	}
+
+	group = mustOpenGroup(t, dataDir, gid)
+	defer mustCloseGroup(t, group)
+	if !group.IsInviteRevoked(invite.Nonce) || group.Canonical().ID != base {
+		t.Fatalf("revoke recorded=%t, checkpoint moved=%t; want recorded and not moved",
+			group.IsInviteRevoked(invite.Nonce), group.Canonical().ID != base)
+	}
+	if _, signed, err := group.SignCheckpoint(founder, false); err != nil || !signed {
+		t.Fatalf("the founder's round did not seal the deferred revoke: signed=%t err=%v", signed, err)
 	}
 }
 

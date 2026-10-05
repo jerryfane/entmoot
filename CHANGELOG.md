@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A revoked invite, or an invite from an admin since demoted or removed, can
+  no longer be used by signing a join dated before the change (#209).
+  Membership is ordered by the signer's own timestamp, and only a checkpoint
+  bounds it from below, so such a join used to be admitted on every node
+  until the next cadence checkpoint, which in a small group could be weeks.
+  Now `invite revoke`, `roster admin revoke`, `roster remove` / `roster ban`
+  of an admin, an admin's `roster leave`, `group policy join-rule -rule
+  invite` on an open group, and the daemon's `member_remove` of an admin sign
+  a checkpoint in the same step. The signing node refuses such a backdated
+  join from that moment, and every other node does once it has pulled the
+  checkpoint on its next membership round. Older peers need no upgrade. An
+  admin that receives such a change before its checkpoint, or the founder when
+  the signer could not checkpoint yet, seals it on its next round; the
+  command warns in that case. A burst of such changes gets one checkpoint.
+  Not covered: a join dated inside an expired invite's validity window is
+  still admitted until a later checkpoint covers it.
+- A join refused because a checkpoint landed while it was in flight can now
+  simply be run again: the failed attempt no longer leaves a membership store
+  behind that made every retry fail with "group store already exists", and
+  the refusal says the join record predates the current checkpoint instead
+  of only "malformed".
+
 ## [1.5.93] - 2026-10-05
 
 ### Fixed

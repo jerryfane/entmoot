@@ -186,7 +186,8 @@ func cmdRosterAdminChange(gf *globalFlags, args []string, grant bool) int {
 	// enough to know who may sign after it.
 	policy := ctx.group.Policy()
 	policy.Admins = membership.SortAdmins(next)
-	if _, err := ctx.group.SignRecord(ctx.setup.identity, membership.Record{Kind: membership.KindPolicy, Policy: &policy}); err != nil {
+	_, sealed, err := ctx.group.SignRecordAndCheckpoint(ctx.setup.identity, membership.Record{Kind: membership.KindPolicy, Policy: &policy})
+	if err != nil {
 		if errors.Is(err, entmoot.ErrRosterReject) {
 			fmt.Fprintf(os.Stderr, "%s: %v\n", command, err)
 			return exitInvalidArgument
@@ -194,6 +195,7 @@ func cmdRosterAdminChange(gf *globalFlags, args []string, grant bool) int {
 		slog.Error(command+": apply", slog.String("err", err.Error()))
 		return exitTransport
 	}
+	warnUnsealed(command, gid, sealed)
 	return reportAdminSet(ctx, gid, true)
 }
 
@@ -353,6 +355,17 @@ func setupRosterWriter(gf *globalFlags, command string, gid entmoot.GroupID, fou
 	}, exitOK, true
 }
 
+// warnUnsealed tells the operator when a change that takes authority away was
+// signed without the checkpoint that makes it final. Until one dated after it
+// reaches a node, that node still admits a join backdated before the change.
+func warnUnsealed(command string, gid entmoot.GroupID, sealed membership.AutoCheckpoint) {
+	if sealed.Deferred == nil {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "%s: warning: signed, but this node cannot checkpoint it yet (%v); a join dated before it is still accepted until a later checkpoint exists. The founder's daemon seals it on its next membership round, or run on the founder: entmootd roster checkpoint -group %s\n",
+		command, sealed.Deferred, gid.String())
+}
+
 // cmdRosterLeave records that the local member is leaving. It needs no admin:
 // a member's own departure is a statement about itself, which is the point of
 // self-signed records.
@@ -394,11 +407,14 @@ func cmdRosterLeave(gf *globalFlags, args []string) int {
 		fmt.Fprintln(os.Stderr, "roster leave: this identity is not a member of that group")
 		return exitNotMember
 	}
-	record, err := group.SignRecord(s.identity, membership.Record{Kind: membership.KindLeave})
+	// An admin's departure takes its authority with it, so it is sealed like
+	// a demotion; anybody else's signs no checkpoint before the cadence.
+	record, sealed, err := group.SignRecordAndCheckpoint(s.identity, membership.Record{Kind: membership.KindLeave})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "roster leave: %v\n", err)
 		return exitInvalidArgument
 	}
+	warnUnsealed("roster leave", gid, sealed)
 	data, err := json.Marshal(map[string]any{
 		"status":    "left",
 		"group_id":  gid,
@@ -560,7 +576,8 @@ func cmdRosterRemove(gf *globalFlags, args []string) int {
 		fmt.Fprintln(os.Stderr, "roster remove: cannot remove group founder")
 		return exitInvalidArgument
 	}
-	if err := applyRosterRemove(ctx.setup.identity, ctx.group, existing); err != nil {
+	_, sealed, err := applyRosterRemove(ctx.setup.identity, ctx.group, existing)
+	if err != nil {
 		if errors.Is(err, entmoot.ErrRosterReject) {
 			fmt.Fprintf(os.Stderr, "roster remove: %v\n", err)
 			return exitInvalidArgument
@@ -568,6 +585,7 @@ func cmdRosterRemove(gf *globalFlags, args []string) int {
 		slog.Error("roster remove: apply", slog.String("err", err.Error()))
 		return exitTransport
 	}
+	warnUnsealed("roster remove", gid, sealed)
 
 	slog.Info("roster remove: member removed",
 		slog.String("group_id", gid.String()),
@@ -763,11 +781,12 @@ func rosterBanChange(gf *globalFlags, args []string, ban bool) int {
 	if ban {
 		record = membership.Record{Kind: membership.KindRemove, Subject: subject, Banned: true}
 	}
-	signed, err := ctx.group.SignRecord(ctx.setup.identity, record)
+	signed, sealed, err := ctx.group.SignRecordAndCheckpoint(ctx.setup.identity, record)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%s: %v\n", command, err)
 		return exitInvalidArgument
 	}
+	warnUnsealed(command, gid, sealed)
 	status := "unbanned"
 	if ban {
 		status = "banned"
