@@ -3,7 +3,8 @@
 For every Entmoot tag:
 
 1. Move completed changelog entries out of `[Unreleased]`.
-2. Run tests from `src/`.
+2. Run tests from `src/`. Require the `test` GitHub Actions job on the PR
+   head before merging; it runs the full Go suite on PRs and pushes to `main`.
 3. Commit implementation and release bookkeeping.
 4. Tag and push.
 5. Verify the GitHub release archives.

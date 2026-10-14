@@ -260,8 +260,18 @@ peers, and changelog stay aligned.
      "https://esp.example/v1/public-moots/<URL_ESCAPED_GROUP_ID>/index-status"
    ```
 
-   Founder policy updates coordinate cooperating nodes. A receiving node still
-   enforces the policy it has accepted locally:
+   Founder policy updates coordinate cooperating nodes. The daemon applies
+   authenticated updates after storing the signed message, for local
+   publication, live receipt, and history catch-up. It replays stored updates
+   at startup before pruning, so upgrading also applies updates previously
+   stored without a consumer. Only the founder can update policy; older
+   sequences never replace newer policy or clear operations.
+
+   `runtime_applied: true` confirms the requested sequence and policy in the
+   local durable store, not delivery to every peer. Check each peer's status;
+   offline peers catch up after reconnecting. An older daemon that only
+   acknowledges publication now produces an error instead of a false applied
+   result. Use `-local-only` only for an intentional per-node policy override.
 
    ```sh
    entmootd group policy status -group <GROUP_ID> --json

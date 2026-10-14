@@ -354,9 +354,14 @@ func (r *groupRuntime) AddLocalGroup(ctx context.Context, groupID entmoot.GroupI
 		_ = group.Close()
 		return nil, false, fmt.Errorf("load legacy history commitment: %w", err)
 	}
+	if err := r.reconcilePolicyFromHistory(ctx, groupID, group); err != nil {
+		_ = group.Close()
+		return nil, false, fmt.Errorf("reconcile founder policy: %w", err)
+	}
+	policyMessages := &policyMessageStore{MessageStore: r.notify, group: group, policies: r.policyStore}
 	sessionCtx, cancel := context.WithCancel(context.Background())
 	live, err := r.liveRouter.AddGroup(sessionCtx, libp2ptransport.LiveConfig{
-		Host: r.host, GroupID: groupID, Group: group, Store: r.notify,
+		Host: r.host, GroupID: groupID, Group: group, Store: policyMessages,
 		Authorize: func(message entmoot.Message) error {
 			return r.enforceGroupPolicy(context.Background(), groupID, message)
 		},
@@ -489,6 +494,12 @@ func (r *groupRuntime) groupPolicy(ctx context.Context, groupID entmoot.GroupID)
 	return &policy, nil
 }
 func (r *groupRuntime) enforceGroupPolicy(ctx context.Context, groupID entmoot.GroupID, message entmoot.Message) error {
+	// Policy changes must remain possible even when content is rate-limited
+	// or its size limit is smaller than a policy payload. The policy store
+	// adapter validates founder authority and payload before storing it.
+	if isPolicyUpdate(message) {
+		return nil
+	}
 	policy, err := r.groupPolicy(ctx, groupID)
 	if err != nil {
 		return fmt.Errorf("group policy: %w", err)
@@ -1393,11 +1404,22 @@ func (r *groupRuntime) catchUp(ctx context.Context, session *groupSession) {
 	}
 	var summary libp2ptransport.SyncSummary
 	var lastErr string
+	policyMessages := &policyMessageStore{MessageStore: r.notify, group: session.group, policies: r.policyStore}
 retry:
 	for attempt := 0; attempt < 30; attempt++ {
-		progress := libp2ptransport.SyncFromKeepers(ctx, r.host, session.groupID, keepers, r.notify, func(message entmoot.Message, proof *merkle.Proof) error {
+		progress := libp2ptransport.SyncFromKeepers(ctx, r.host, session.groupID, keepers, policyMessages, func(message entmoot.Message, proof *merkle.Proof) error {
 			if err := libp2ptransport.VerifyHistoricalMessageWithProof(session.group, message, time.Now(), proof); err != nil {
 				return err
+			}
+			if isPolicyUpdate(message) {
+				if _, err := founderPolicyUpdate(session.group, session.groupID, message); err != nil {
+					// Old daemons stored this topic without checking policy
+					// authority or payloads. Skip those signed-but-ineligible
+					// updates like other unauthorized history; they must not
+					// block valid messages from the same keeper. Signature
+					// failures above and durable store errors still fail closed.
+					return fmt.Errorf("invalid historical policy update (%v): %w", err, entmoot.ErrNotMember)
+				}
 			}
 			return r.enforceGroupPolicy(ctx, session.groupID, message)
 		}, &session.history)

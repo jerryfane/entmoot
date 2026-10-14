@@ -131,51 +131,6 @@ func TestESPOperationGroupPolicyReportUpdateAndClear(t *testing.T) {
 	}
 }
 
-func TestESPOperationGroupPolicyUpdatePublishesToConfiguredSocket(t *testing.T) {
-	ctx := context.Background()
-	gid := testESPGroupID(4)
-	dataDir := t.TempDir()
-	sock := testUnixSocketPath(t)
-	publishReqCh := make(chan *ipc.PublishReq, 1)
-	stop := serveESPPublishIPC(t, sock, publishReqCh)
-	defer stop()
-	exec := espOperationExecutor{dataDir: dataDir, socketPath: sock}
-
-	raw, err := exec.ExecuteSignRequest(ctx, esphttp.SignRequest{
-		Kind:    "group_policy_update",
-		GroupID: gid,
-		Payload: json.RawMessage(`{"preset":"standard"}`),
-	}, nil)
-	if err != nil {
-		t.Fatalf("group_policy_update: %v", err)
-	}
-	var report groupPolicyReport
-	if err := json.Unmarshal(raw, &report); err != nil {
-		t.Fatalf("report JSON: %v", err)
-	}
-	if !report.Published || !report.RuntimeAppliedKnown {
-		t.Fatalf("report = %+v, want published runtime-applied report", report)
-	}
-	select {
-	case req := <-publishReqCh:
-		if req.GroupID == nil || *req.GroupID != gid {
-			t.Fatalf("publish group = %v, want %s", req.GroupID, gid)
-		}
-		if len(req.Topics) != 1 || req.Topics[0] != entpolicy.UpdateTopic {
-			t.Fatalf("publish topics = %v, want [%s]", req.Topics, entpolicy.UpdateTopic)
-		}
-		var update entpolicy.Update
-		if err := json.Unmarshal(req.Content, &update); err != nil {
-			t.Fatalf("policy update JSON: %v", err)
-		}
-		if update.GroupID != gid || update.Policy == nil || *update.Policy != entpolicy.Standard() {
-			t.Fatalf("policy update = %+v, want standard update for %s", update, gid)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for publish on configured socket")
-	}
-}
-
 func TestESPOperationPublicPublishRequiresESPURL(t *testing.T) {
 	_, err := espOperationExecutor{}.ExecuteSignRequest(context.Background(), esphttp.SignRequest{
 		Kind:    "group_public_publish",
@@ -666,49 +621,6 @@ func serveESPGroupCreateIPC(t *testing.T, sock string, pub []byte, joinOK bool) 
 						_ = ipc.EncodeAndWrite(conn, &ipc.JoinGroupResp{Status: "joined", GroupID: *v.LocalGroupID, Members: 1})
 					}
 				}
-			}
-			_ = conn.Close()
-		}
-	}()
-	return func() {
-		_ = ln.Close()
-		<-done
-	}
-}
-
-func serveESPPublishIPC(t *testing.T, sock string, publishReqCh chan<- *ipc.PublishReq) func() {
-	t.Helper()
-	ln, err := net.Listen("unix", sock)
-	if err != nil {
-		t.Fatalf("listen unix: %v", err)
-	}
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		defer ln.Close()
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			_, payload, err := ipc.ReadAndDecode(conn)
-			if err != nil {
-				_ = conn.Close()
-				continue
-			}
-			switch v := payload.(type) {
-			case *ipc.PublishReq:
-				if publishReqCh != nil {
-					req := *v
-					publishReqCh <- &req
-				}
-				groupID := entmoot.GroupID{}
-				if v.GroupID != nil {
-					groupID = *v.GroupID
-				}
-				_ = ipc.EncodeAndWrite(conn, &ipc.PublishResp{GroupID: groupID, TimestampMS: time.Now().UnixMilli()})
-			default:
-				_ = ipc.EncodeAndWrite(conn, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInvalidArgument, Message: "unexpected request"})
 			}
 			_ = conn.Close()
 		}

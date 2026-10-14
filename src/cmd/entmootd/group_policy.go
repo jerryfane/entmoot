@@ -280,6 +280,16 @@ func publishGroupPolicyUpdateToSocket(ctx context.Context, socketPath string, st
 	if err := publishIPCMessageToSocket(ctx, socketPath, gid, []string{entpolicy.UpdateTopic}, body); err != nil {
 		return groupPolicyReport{}, err
 	}
+	// A publish acknowledgement alone is not evidence of application (older
+	// daemons stored this topic without consuming it). Read the durable state.
+	snapshot, err := store.SnapshotUpdate(ctx, gid)
+	if err != nil {
+		return groupPolicyReport{}, fmt.Errorf("policy published but application could not be verified: %w", err)
+	}
+	if !snapshot.HasSequence || snapshot.Sequence != update.Sequence ||
+		snapshot.HasPolicy != (p != nil) || (p != nil && snapshot.Policy != *p) {
+		return groupPolicyReport{}, fmt.Errorf("policy published but requested policy is not current locally; check group policy status and update the daemon if needed")
+	}
 	report := buildGroupPolicyReport(gid, p, p != nil)
 	report.Published = true
 	report.Sequence = update.Sequence

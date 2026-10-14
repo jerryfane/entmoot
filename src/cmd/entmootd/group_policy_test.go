@@ -118,7 +118,7 @@ func TestCmdGroupPolicySetFromFileAndPresetNone(t *testing.T) {
 	}
 }
 
-func TestCmdGroupPolicySetPublishesThroughActiveDaemon(t *testing.T) {
+func TestCmdGroupPolicySetRejectsUnappliedDaemonAcknowledgement(t *testing.T) {
 	dataDir, err := os.MkdirTemp("/tmp", "entmoot-policy-")
 	if err != nil {
 		t.Fatalf("MkdirTemp: %v", err)
@@ -166,8 +166,8 @@ func TestCmdGroupPolicySetPublishesThroughActiveDaemon(t *testing.T) {
 	code, stdout, stderr := captureCommandOutput(t, func() int {
 		return cmdGroupPolicy(gf, []string{"set", "-group", gid.String(), "-preset", "standard", "--json"})
 	})
-	if code != exitOK || stderr != "" {
-		t.Fatalf("set code/stderr = %d/%q", code, stderr)
+	if code != exitTransport || !strings.Contains(stderr, "policy published but requested policy is not current locally") {
+		t.Fatalf("acknowledgement without application code/stderr = %d/%q", code, stderr)
 	}
 	if err := <-errCh; err != nil {
 		t.Fatalf("daemon handler: %v", err)
@@ -186,12 +186,15 @@ func TestCmdGroupPolicySetPublishesThroughActiveDaemon(t *testing.T) {
 	if update.GroupID != gid || update.Policy == nil || update.Policy.RetentionDays != entpolicy.DefaultRetentionDays || update.Sequence == 0 {
 		t.Fatalf("update = %+v, want standard policy for group", update)
 	}
-	var out groupPolicyReport
-	if err := json.Unmarshal([]byte(stdout), &out); err != nil {
-		t.Fatalf("stdout JSON: %v\n%s", err, stdout)
+	if stdout != "" {
+		t.Fatalf("unapplied policy produced a success report: %s", stdout)
 	}
-	if !out.Published || !out.RuntimeAppliedKnown || out.Sequence != update.Sequence {
-		t.Fatalf("report = %+v, want published runtime-applied sequence", out)
+	policies, err := entpolicy.OpenFileStore(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, configured, err := policies.Get(context.Background(), gid); err != nil || configured {
+		t.Fatalf("command pretended to apply acknowledged policy: configured=%v err=%v", configured, err)
 	}
 }
 
