@@ -631,49 +631,6 @@ func serveESPGroupCreateIPC(t *testing.T, sock string, pub []byte, joinOK bool) 
 	}
 }
 
-func serveESPPublishIPC(t *testing.T, sock string, publishReqCh chan<- *ipc.PublishReq) func() {
-	t.Helper()
-	ln, err := net.Listen("unix", sock)
-	if err != nil {
-		t.Fatalf("listen unix: %v", err)
-	}
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		defer ln.Close()
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			_, payload, err := ipc.ReadAndDecode(conn)
-			if err != nil {
-				_ = conn.Close()
-				continue
-			}
-			switch v := payload.(type) {
-			case *ipc.PublishReq:
-				if publishReqCh != nil {
-					req := *v
-					publishReqCh <- &req
-				}
-				groupID := entmoot.GroupID{}
-				if v.GroupID != nil {
-					groupID = *v.GroupID
-				}
-				_ = ipc.EncodeAndWrite(conn, &ipc.PublishResp{GroupID: groupID, TimestampMS: time.Now().UnixMilli()})
-			default:
-				_ = ipc.EncodeAndWrite(conn, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInvalidArgument, Message: "unexpected request"})
-			}
-			_ = conn.Close()
-		}
-	}()
-	return func() {
-		_ = ln.Close()
-		<-done
-	}
-}
-
 func testESPNodeInfo(t *testing.T, pub []byte) entmoot.NodeInfo {
 	t.Helper()
 	member, err := entmoot.MemberIDFromPublicKey(pub)
