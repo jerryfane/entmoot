@@ -16,6 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   authenticated updates to the policy store; startup recovers updates already
   in history before pruning. Non-founders and invalid payloads cannot change
   policy, and stale updates cannot roll back a newer policy or clear.
+  Invalid policy messages saved by older daemons are skipped during catch-up
+  without blocking valid policy or chat history from the same keeper.
 - Policy changes bypass ordinary content limits so a restrictive policy can
   still be cleared. The CLI confirms durable local application before reporting
   `runtime_applied: true`, including when it connects to an older daemon.

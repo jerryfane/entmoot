@@ -172,6 +172,44 @@ func TestGroupRuntimeFounderPolicyOfflineHistory(t *testing.T) {
 	}
 }
 
+func TestGroupRuntimePolicyHistorySkipsInvalidUpdates(t *testing.T) {
+	ctx := withTestContext(t)
+	founder, member := policyRuntimePair(t, ctx, daemonTestGroupID(0xb6))
+	gid := founder.session.groupID
+	p := entpolicy.Standard()
+	invalid := []entmoot.Message{
+		member.policyMessage(t, ctx, entpolicy.NewUpdate(gid, &p, time.Now().UnixMilli(), 100)),
+		founder.message(t, ctx, []string{entpolicy.UpdateTopic}, []byte("{")),
+		founder.policyMessage(t, ctx, entpolicy.NewUpdate(daemonTestGroupID(0xb7), &p, time.Now().UnixMilli(), 101)),
+	}
+	// Older daemons accepted these signed messages as ordinary content.
+	for _, message := range invalid {
+		if _, err := founder.runtime.store.Put(ctx, gid, message); err != nil {
+			t.Fatal(err)
+		}
+	}
+	valid := founder.policyMessage(t, ctx, entpolicy.NewUpdate(gid, &p, time.Now().UnixMilli(), 1))
+	if _, err := founder.runtime.store.Put(ctx, gid, valid); err != nil {
+		t.Fatal(err)
+	}
+	chat := founder.message(t, ctx, []string{"chat"}, []byte("history after invalid policy"))
+	if _, err := founder.runtime.store.Put(ctx, gid, chat); err != nil {
+		t.Fatal(err)
+	}
+	connectBothWays(t, ctx, founder.host, member.host)
+	waitPolicyMessage(t, ctx, member, valid, true)
+	if held, err := member.runtime.store.Has(ctx, gid, chat.ID); err != nil || !held {
+		t.Fatalf("ordinary history missing after invalid updates: held=%v err=%v", held, err)
+	}
+	assertRuntimePolicy(t, ctx, member, 1, &p)
+	for _, message := range invalid {
+		held, err := member.runtime.store.Has(ctx, gid, message.ID)
+		if err != nil || held {
+			t.Fatalf("invalid history stored=%v err=%v", held, err)
+		}
+	}
+}
+
 func TestGroupRuntimePolicyRejectsUnauthorizedAndInvalidUpdates(t *testing.T) {
 	ctx := withTestContext(t)
 	founder, member := policyRuntimePair(t, ctx, daemonTestGroupID(0xb4))
