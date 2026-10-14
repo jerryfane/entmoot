@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.98] - 2026-10-14
+
+### Fixed
+
+- Restore founder-signed group policy updates after the libp2p migration
+  (#236). Local publications, live peers and history catch-up now apply
+  authenticated updates to the policy store; startup recovers updates already
+  in history before pruning. Non-founders and invalid payloads cannot change
+  policy, and stale updates cannot roll back a newer policy or clear.
+- Policy changes bypass ordinary content limits so a restrictive policy can
+  still be cleared. The CLI confirms durable local application before reporting
+  `runtime_applied: true`, including when it connects to an older daemon.
+
 ## [1.5.97] - 2026-10-05
 
 ### Fixed

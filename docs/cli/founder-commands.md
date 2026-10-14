@@ -69,10 +69,17 @@ entmootd group policy set -group <GROUP_ID> -file policy.json --json
 entmootd group policy clear -group <GROUP_ID> --json
 ```
 
-`set` publishes a founder-signed policy update through a running daemon when
-possible. Use `-local-only` only when the operator intentionally wants to avoid
-propagation. Policy updates coordinate cooperating nodes; every receiving node
-still enforces its accepted local policy.
+`set` and `clear` publish founder-signed updates through a running daemon when
+possible. The daemon stores the message before applying its policy locally;
+connected peers apply it on receipt and offline peers through history catch-up.
+Startup replays stored updates, including messages saved by older daemons that
+did not apply them. Only a newer sequence replaces an accepted policy.
+
+`runtime_applied: true` confirms the requested policy in the local durable
+store, not acceptance by every peer. A publication acknowledgement from an
+older daemon without an applied update is an error; upgrade that daemon and
+check `status`. Use `-local-only` only when the operator intentionally wants to
+avoid propagation. Every receiving node still enforces its accepted local policy.
 
 Two policy fields are group membership policy rather than local enforcement
 policy, and both are founder-only:
