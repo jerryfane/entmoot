@@ -323,11 +323,13 @@ func (f *replayFixture) removeMember(member *keystore.Identity) *ipc.MemberRemov
 	return resp
 }
 
-// joinNow has member sign and apply a join with capability dated now, and
-// reports whether it is a member afterwards.
+// joinNow signs a join after the records this node already knows and reports
+// whether it admits the member. SignRecord advances the logical timestamp:
+// wall time alone can tie a just-signed revocation (joins sort first on ties).
+// Tests of backdated or concurrent joins use mustSignedJoinAt explicitly.
 func (f *replayFixture) joinNow(member *keystore.Identity, capability entmoot.BootstrapCapability) bool {
 	f.t.Helper()
-	_, _ = f.session.group.Apply(mustSignedJoinAt(f.t, f.gid, member, capability, time.Now().UnixMilli()))
+	_, _ = f.session.group.SignRecord(member, membership.Record{Kind: membership.KindJoin, Invite: &capability})
 	return f.session.group.IsMemberID(*mustDaemonNodeInfo(f.t, member).MemberID)
 }
 
