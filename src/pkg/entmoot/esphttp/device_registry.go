@@ -30,6 +30,7 @@ type DeviceRecord struct {
 	PeerID        string           `json:"peer_id,omitempty"`
 	EntmootPubKey string           `json:"entmoot_pubkey,omitempty"`
 	Disabled      bool             `json:"disabled"`
+	FollowAgent   bool             `json:"follow_agent,omitempty"`
 }
 
 // MemberDeviceRegistryDocument is the JSON stored in esp-member-devices.json.
@@ -171,6 +172,7 @@ func DeviceRegistryDocumentFromRegistry(reg *DeviceRegistry) DeviceRegistryDocum
 			PeerID:        d.PeerID,
 			EntmootPubKey: base64.StdEncoding.EncodeToString(d.EntmootPubKey),
 			Disabled:      d.Disabled,
+			FollowAgent:   d.FollowAgent,
 		})
 	}
 	return DeviceRegistryDocument{Devices: devices}
@@ -244,6 +246,7 @@ func DeviceFromRecord(in DeviceRecord) (Device, error) {
 		PeerID:        in.PeerID,
 		EntmootPubKey: append([]byte(nil), entmootPub...),
 		Disabled:      in.Disabled,
+		FollowAgent:   in.FollowAgent,
 	}, nil
 }
 
@@ -262,11 +265,14 @@ func LoadMemberDeviceRegistryOrEmpty(path string) (*DeviceRegistry, error) {
 	if err := json.Unmarshal(data, &doc); err != nil {
 		return nil, fmt.Errorf("esphttp: parse member device registry %s: %w", path, err)
 	}
-	if doc.Version != 1 {
-		return nil, fmt.Errorf("esphttp: member device registry %s version %d, want 1", path, doc.Version)
+	if doc.Version != 1 && doc.Version != 2 {
+		return nil, fmt.Errorf("esphttp: member device registry %s version %d, want 1 or 2", path, doc.Version)
 	}
 	devices := make([]Device, 0, len(doc.MemberDevices))
 	for _, in := range doc.MemberDevices {
+		if in.FollowAgent && doc.Version != 2 {
+			return nil, fmt.Errorf("esphttp: follow-agent device requires member registry version 2")
+		}
 		device, err := DeviceFromRecord(in)
 		if err != nil {
 			return nil, err
@@ -284,13 +290,19 @@ func SaveMemberDeviceRegistry(path string, reg *DeviceRegistry) error {
 	if err != nil {
 		return err
 	}
+	version := 1
 	for _, d := range validated.Snapshot() {
 		if !d.SelfEnrolled {
 			return fmt.Errorf("esphttp: operator device %q does not belong in the member device registry", d.ID)
 		}
+		if d.FollowAgent {
+			// Old servers must refuse this registry, not silently restore
+			// the old own-author publication rights to an observer.
+			version = 2
+		}
 	}
 	return writeRegistryJSON(path, MemberDeviceRegistryDocument{
-		Version:       1,
+		Version:       version,
 		MemberDevices: DeviceRegistryDocumentFromRegistry(validated).Devices,
 	})
 }

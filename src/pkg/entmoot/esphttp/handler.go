@@ -114,6 +114,9 @@ type Device struct {
 	// admin groups, is limited to read and own-author publish routes, and is
 	// re-checked against the live roster on every group request.
 	SelfEnrolled bool
+	// FollowAgent grants read-only access to current and future groups of the
+	// bound member, subject to a fresh roster check on every group request.
+	FollowAgent bool
 }
 
 // DeviceRegistry is the in-memory authorization projection loaded by ESP
@@ -155,6 +158,9 @@ func NewDeviceRegistry(devices []Device) (*DeviceRegistry, error) {
 		}
 		if d.SelfEnrolled && len(d.AdminGroups) > 0 {
 			return nil, fmt.Errorf("esphttp: self-enrolled device %q cannot hold admin groups", d.ID)
+		}
+		if d.FollowAgent && (!d.SelfEnrolled || len(d.EntmootPubKey) != ed25519.PublicKeySize) {
+			return nil, fmt.Errorf("esphttp: follow-agent device %q requires a self-enrolled member identity", d.ID)
 		}
 		if _, exists := reg.byID[d.ID]; exists {
 			return nil, fmt.Errorf("esphttp: duplicate device id %q", d.ID)
@@ -761,7 +767,7 @@ func (h *Handler) handleListGroups(w http.ResponseWriter, r *http.Request) {
 	if auth.device != nil {
 		filtered := groups[:0]
 		for _, g := range groups {
-			if !deviceAllowsGroup(*auth.device, g.GroupID) {
+			if !auth.device.FollowAgent && !deviceAllowsGroup(*auth.device, g.GroupID) {
 				continue
 			}
 			if auth.device.SelfEnrolled {
@@ -2262,6 +2268,10 @@ func (h *Handler) authorizedDevice(w http.ResponseWriter, r *http.Request, body 
 		writeError(w, http.StatusUnauthorized, "unauthorized", "replayed nonce")
 		return authContext{}, false
 	}
+	if device.FollowAgent && !followAgentRouteAllowed(r) {
+		writeError(w, http.StatusForbidden, "observer_read_only", "follow-agent devices may only read their agent's groups")
+		return authContext{}, false
+	}
 	if device.SelfEnrolled && !selfEnrolledRouteAllowed(r) {
 		writeError(w, http.StatusForbidden, "self_enrolled_forbidden", "self-enrolled devices may only read their groups and publish their own signed messages")
 		return authContext{}, false
@@ -2367,7 +2377,7 @@ func (h *Handler) checkDeviceGroup(w http.ResponseWriter, r *http.Request, group
 	if auth.bearer {
 		return true
 	}
-	if auth.device != nil && deviceAllowsGroup(*auth.device, groupID) {
+	if auth.device != nil && (auth.device.FollowAgent || deviceAllowsGroup(*auth.device, groupID)) {
 		if auth.device.SelfEnrolled {
 			return h.checkSelfEnrolledMember(w, r, *auth.device, groupID)
 		}
@@ -2928,6 +2938,7 @@ func deviceView(device Device) map[string]any {
 	}
 	if device.SelfEnrolled {
 		out["self_enrolled"] = true
+		out["follow_agent"] = device.FollowAgent
 	}
 	if len(device.EntmootPubKey) > 0 {
 		out["entmoot_pubkey"] = base64.StdEncoding.EncodeToString(device.EntmootPubKey)

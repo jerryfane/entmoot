@@ -95,6 +95,7 @@ type MemberConnectConfig struct {
 type MemberConnectRequest struct {
 	DevicePublicKey string            `json:"device_public_key"`
 	GroupIDs        []entmoot.GroupID `json:"group_ids"`
+	FollowAgent     bool              `json:"follow_agent,omitempty"`
 	ClientID        string            `json:"client_id,omitempty"`
 	MemberID        entmoot.MemberID  `json:"member_id"`
 	EntmootPubKey   string            `json:"entmoot_pubkey"`
@@ -113,6 +114,7 @@ type MemberConnectResponse struct {
 	Groups       []entmoot.GroupID `json:"groups"`
 	MemberID     entmoot.MemberID  `json:"member_id"`
 	SelfEnrolled bool              `json:"self_enrolled"`
+	FollowAgent  bool              `json:"follow_agent,omitempty"`
 	Created      bool              `json:"created"`
 	Changed      bool              `json:"changed"`
 }
@@ -131,6 +133,11 @@ func MemberConnectDeviceSigningInput(req MemberConnectRequest) string {
 }
 
 func memberConnectPayload(domain string, req MemberConnectRequest) string {
+	// Preserve the explicit-group v1 signature contract. Observers use a
+	// distinct domain, binding this authority choice in both signatures.
+	if req.FollowAgent {
+		domain += "/follow-agent-read-only/v1"
+	}
 	groups := make([]string, 0, len(req.GroupIDs))
 	for _, gid := range req.GroupIDs {
 		groups = append(groups, gid.String())
@@ -335,7 +342,7 @@ func (h *Handler) handleMemberConnect(w http.ResponseWriter, r *http.Request) {
 	clientID := SelfEnrolledClientID(deviceID, req.ClientID)
 	created := false
 	changed, err := h.memberDevices.UpdateMemberDevices(h.memberConnect.RegistryPath, func(current *DeviceRegistry) (*DeviceRegistry, bool, error) {
-		devices, isNew, changed, err := h.enrollMemberDevice(current.Snapshot(), h.devices.Snapshot(), deviceID, devicePub, memberID, peerID, entmootPub, req.GroupIDs, clientID)
+		devices, isNew, changed, err := h.enrollMemberDevice(current.Snapshot(), h.devices.Snapshot(), deviceID, devicePub, memberID, peerID, entmootPub, req.GroupIDs, clientID, req.FollowAgent)
 		if err != nil || !changed {
 			return nil, false, err
 		}
@@ -368,6 +375,7 @@ func (h *Handler) handleMemberConnect(w http.ResponseWriter, r *http.Request) {
 		Groups:       append([]entmoot.GroupID(nil), req.GroupIDs...),
 		MemberID:     memberID,
 		SelfEnrolled: true,
+		FollowAgent:  req.FollowAgent,
 		Created:      created,
 		Changed:      changed,
 	})
@@ -377,7 +385,7 @@ func (h *Handler) handleMemberConnect(w http.ResponseWriter, r *http.Request) {
 // never touches an operator device: an id or key an operator device already
 // uses is refused, and the per-member cap refuses a new key rather than
 // evicting anything.
-func (h *Handler) enrollMemberDevice(devices, operators []Device, deviceID string, devicePub ed25519.PublicKey, memberID entmoot.MemberID, peerID string, entmootPub []byte, groups []entmoot.GroupID, clientID string) ([]Device, bool, bool, error) {
+func (h *Handler) enrollMemberDevice(devices, operators []Device, deviceID string, devicePub ed25519.PublicKey, memberID entmoot.MemberID, peerID string, entmootPub []byte, groups []entmoot.GroupID, clientID string, followAgent bool) ([]Device, bool, bool, error) {
 	for _, d := range operators {
 		if d.ID == deviceID {
 			return nil, false, false, &OperationError{HTTPStatus: http.StatusConflict, Code: "device_id_conflict", Message: "device id is held by an operator device"}
@@ -411,6 +419,9 @@ func (h *Handler) enrollMemberDevice(devices, operators []Device, deviceID strin
 		if existing.Disabled {
 			return nil, false, false, &OperationError{HTTPStatus: http.StatusForbidden, Code: "device_disabled", Message: "device is disabled"}
 		}
+		if existing.FollowAgent != followAgent {
+			return nil, false, false, &OperationError{HTTPStatus: http.StatusConflict, Code: "device_scope_conflict", Message: "use a separate device key to change between explicit groups and read-only follow-agent access"}
+		}
 		if sameGroups(existing.Groups, groups) && len(existing.ClientIDs) == 1 && existing.ClientIDs[0] == clientID {
 			return nil, false, false, nil
 		}
@@ -433,6 +444,7 @@ func (h *Handler) enrollMemberDevice(devices, operators []Device, deviceID strin
 		MemberID:      memberID,
 		PeerID:        peerID,
 		EntmootPubKey: append([]byte(nil), entmootPub...),
+		FollowAgent:   followAgent,
 		SelfEnrolled:  true,
 	})
 	return devices, true, true, nil
@@ -464,6 +476,13 @@ func (h *Handler) selfEnrolledMemberActive(ctx context.Context, device Device, g
 		return false, err
 	}
 	return active && bytes.Equal(info.EntmootPubKey, device.EntmootPubKey), nil
+}
+
+// Observers cannot publish or acknowledge shared mailbox delivery state.
+// Keep this allowlist narrower than the existing self-enrolled surface.
+func followAgentRouteAllowed(r *http.Request) bool {
+	return r.Method == http.MethodGet && selfEnrolledRouteAllowed(r) &&
+		!strings.HasPrefix(r.URL.Path, "/v1/mailbox/")
 }
 
 // selfEnrolledRouteAllowed is the whole surface a self-enrolled device may

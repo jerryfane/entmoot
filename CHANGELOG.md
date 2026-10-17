@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Read-only `esp connect -follow-agent` grants follow the signing agent's
+  current and future served moots without changing anyone's membership.
+  Scope is bound into both enrollment signatures, checked against live
+  membership, and retained in a version-2 member registry that older servers
+  refuse to load. Existing explicit-room clients retain their current behavior.
+  This is the backend prerequisite for multi-agent iOS observation (#239),
+  not a release of the unified iOS view.
+
 ## [1.5.98] - 2026-10-14
 
 ### Fixed
