@@ -7,6 +7,7 @@ import (
 	"math/big"
 	"slices"
 	"sort"
+	"sync"
 	"testing"
 	"time"
 
@@ -827,6 +828,39 @@ func adoptServedSet(t *testing.T, source *Group) *Group {
 		}
 	}
 	return fresh
+}
+
+// A newly created moot has no long-lived database reader yet. Concurrent ESP
+// discovery must not mistake SQLite connection contention for a missing moot.
+func TestConcurrentOpenKeepsCommittedMembershipVisible(t *testing.T) {
+	f := newFixture(t, DefaultPolicy())
+	wantHead := f.group.Canonical().ID
+	wantMembers := f.group.MemberIDs()
+	if err := f.group.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for range 100 {
+		var readers sync.WaitGroup
+		start := make(chan struct{})
+		for range 2 {
+			readers.Go(func() {
+				<-start
+				group, err := Open(f.root, f.groupID)
+				if err != nil {
+					t.Errorf("committed moot became unavailable: %v", err)
+					return
+				}
+				if group.Canonical().ID != wantHead || !slices.Equal(group.MemberIDs(), wantMembers) {
+					t.Error("concurrent discovery changed committed membership")
+				}
+				if err := group.Close(); err != nil {
+					t.Error(err)
+				}
+			})
+		}
+		close(start)
+		readers.Wait()
+	}
 }
 
 func TestOpenReloadsExactState(t *testing.T) {

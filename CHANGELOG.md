@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.100] - 2026-10-17
+
+### Fixed
+
+- Concurrent ESP discovery no longer mistakes a briefly busy, committed
+  membership database for a missing moot. Read-only presence checks use the
+  same SQLite busy timeout as ordinary membership connections.
+
 ## [1.5.99] - 2026-10-17
 
 ### Added
