@@ -137,6 +137,9 @@ func Exists(root string, groupID entmoot.GroupID) bool {
 	}
 	q := url.Values{}
 	q.Set("mode", "ro")
+	// Match ordinary store connections: concurrent cold readers can briefly
+	// contend while SQLite opens/checkpoints WAL files. Busy is not absence.
+	q.Add("_pragma", "busy_timeout(100)")
 	db, err := sql.Open("sqlite", "file:"+path+"?"+q.Encode())
 	if err != nil {
 		return true
