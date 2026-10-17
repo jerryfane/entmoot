@@ -38,17 +38,19 @@ const (
 // espClientConfig is what `esp connect` leaves behind for `esp history` and
 // `esp publish`: which ESP to call and which device the ESP enrolled.
 type espClientConfig struct {
-	ESP      string            `json:"esp"`
-	DeviceID string            `json:"device_id"`
-	ClientID string            `json:"client_id"`
-	Groups   []entmoot.GroupID `json:"groups"`
+	ESP         string            `json:"esp"`
+	DeviceID    string            `json:"device_id"`
+	ClientID    string            `json:"client_id"`
+	Groups      []entmoot.GroupID `json:"groups"`
+	FollowAgent bool              `json:"follow_agent,omitempty"`
 }
 
 type espConnectOutput struct {
-	DeviceID string            `json:"device_id"`
-	ClientID string            `json:"client_id"`
-	Groups   []entmoot.GroupID `json:"groups"`
-	ESP      string            `json:"esp"`
+	DeviceID    string            `json:"device_id"`
+	ClientID    string            `json:"client_id"`
+	Groups      []entmoot.GroupID `json:"groups"`
+	ESP         string            `json:"esp"`
+	FollowAgent bool              `json:"follow_agent,omitempty"`
 }
 
 type groupIDFlags []entmoot.GroupID
@@ -70,6 +72,7 @@ func cmdESPConnect(gf *globalFlags, args []string) int {
 	var groups groupIDFlags
 	fs.Var(&groups, "group", "group id to request access to (repeatable, required)")
 	clientID := fs.String("client", "", "optional client label; the ESP namespaces it under the device id")
+	followAgent := fs.Bool("follow-agent", false, "read-only access to all current and future moots of this identity; -group proves existing membership")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return exitOK
@@ -95,7 +98,7 @@ func cmdESPConnect(gf *globalFlags, args []string) int {
 		fmt.Fprintf(os.Stderr, "esp connect: %v\n", err)
 		return exitTransport
 	}
-	req, err := buildESPConnectRequest(identity, devicePriv, groups, strings.TrimSpace(*clientID), time.Now())
+	req, err := buildESPConnectRequest(identity, devicePriv, groups, strings.TrimSpace(*clientID), *followAgent, time.Now())
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "esp connect: %v\n", err)
 		return exitInvalidArgument
@@ -110,12 +113,16 @@ func cmdESPConnect(gf *globalFlags, args []string) int {
 		fmt.Fprintf(os.Stderr, "esp connect: %v\n", err)
 		return exitTransport
 	}
-	cfg := espClientConfig{ESP: base, DeviceID: resp.DeviceID, ClientID: resp.ClientID, Groups: resp.Groups}
+	if resp.FollowAgent != *followAgent {
+		fmt.Fprintln(os.Stderr, "esp connect: ESP did not confirm the requested access scope")
+		return exitTransport
+	}
+	cfg := espClientConfig{ESP: base, DeviceID: resp.DeviceID, ClientID: resp.ClientID, Groups: resp.Groups, FollowAgent: resp.FollowAgent}
 	if err := saveESPClientConfig(filepath.Join(gf.data, espClientConfigFile), cfg); err != nil {
 		fmt.Fprintf(os.Stderr, "esp connect: %v\n", err)
 		return exitTransport
 	}
-	if err := emitJSON(espConnectOutput{DeviceID: resp.DeviceID, ClientID: resp.ClientID, Groups: resp.Groups, ESP: base}); err != nil {
+	if err := emitJSON(espConnectOutput{DeviceID: resp.DeviceID, ClientID: resp.ClientID, Groups: resp.Groups, ESP: base, FollowAgent: resp.FollowAgent}); err != nil {
 		fmt.Fprintf(os.Stderr, "esp connect: %v\n", err)
 		return exitTransport
 	}
@@ -239,7 +246,7 @@ func publishThroughESP(ctx context.Context, gf *globalFlags, gid entmoot.GroupID
 // buildESPConnectRequest signs a connect request with the member's Entmoot
 // identity, binding the device key, every requested group, and the client
 // label under the connect signature domain.
-func buildESPConnectRequest(identity *keystore.Identity, devicePriv ed25519.PrivateKey, groups []entmoot.GroupID, clientID string, now time.Time) (esphttp.MemberConnectRequest, error) {
+func buildESPConnectRequest(identity *keystore.Identity, devicePriv ed25519.PrivateKey, groups []entmoot.GroupID, clientID string, followAgent bool, now time.Time) (esphttp.MemberConnectRequest, error) {
 	memberID, err := entmoot.MemberIDFromPublicKey(identity.PublicKey)
 	if err != nil {
 		return esphttp.MemberConnectRequest{}, err
@@ -251,6 +258,7 @@ func buildESPConnectRequest(identity *keystore.Identity, devicePriv ed25519.Priv
 	req := esphttp.MemberConnectRequest{
 		DevicePublicKey: base64.StdEncoding.EncodeToString(devicePriv.Public().(ed25519.PublicKey)),
 		GroupIDs:        append([]entmoot.GroupID(nil), groups...),
+		FollowAgent:     followAgent,
 		ClientID:        clientID,
 		MemberID:        memberID,
 		EntmootPubKey:   base64.StdEncoding.EncodeToString(identity.PublicKey),

@@ -148,10 +148,22 @@ func newDeviceKey(t *testing.T) ed25519.PrivateKey {
 
 func (f *memberConnectFixture) connectRequest(identity *keystore.Identity, devicePriv ed25519.PrivateKey, groups ...entmoot.GroupID) esphttp.MemberConnectRequest {
 	f.t.Helper()
-	req, err := buildESPConnectRequest(identity, devicePriv, groups, "", time.Now())
+	memberID, err := entmoot.MemberIDFromPublicKey(identity.PublicKey)
 	if err != nil {
 		f.t.Fatal(err)
 	}
+	nonce, err := generateESPRequestNonce()
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	req := esphttp.MemberConnectRequest{
+		DevicePublicKey: base64.StdEncoding.EncodeToString(devicePriv.Public().(ed25519.PublicKey)),
+		GroupIDs:        groups, MemberID: memberID,
+		EntmootPubKey: base64.StdEncoding.EncodeToString(identity.PublicKey),
+		TimestampMS:   time.Now().UnixMilli(), Nonce: nonce,
+	}
+	req.Signature = base64.StdEncoding.EncodeToString(identity.Sign([]byte(esphttp.MemberConnectSigningInput(req))))
+	req.DeviceSignature = base64.StdEncoding.EncodeToString(ed25519.Sign(devicePriv, []byte(esphttp.MemberConnectDeviceSigningInput(req))))
 	return req
 }
 
@@ -512,11 +524,7 @@ func TestESPMemberConnectConcurrentWritersKeepEveryChange(t *testing.T) {
 			// 429 busy and retry, as a client would. Every retry is a fresh
 			// request (new nonce) for the same device key.
 			for {
-				req, err := buildESPConnectRequest(f.member, devicePriv, []entmoot.GroupID{f.gid}, "", time.Now())
-				if err != nil {
-					errs <- err
-					return
-				}
+				req := f.connectRequest(f.member, devicePriv, f.gid)
 				rec := f.postConnect(req)
 				if rec.Code == http.StatusTooManyRequests {
 					time.Sleep(5 * time.Millisecond)
