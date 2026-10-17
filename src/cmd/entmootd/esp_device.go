@@ -16,10 +16,12 @@ import (
 
 func cmdESPDevice(gf *globalFlags, args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "esp device: expected list, add, onboard, rotate-key, grant, revoke, grant-admin, revoke-admin, enable, disable, or remove")
+		fmt.Fprintln(os.Stderr, "esp device: expected list, add, onboard, pair-observer, observers, revoke-observer, rotate-key, grant, revoke, grant-admin, revoke-admin, enable, disable, or remove")
 		return exitInvalidArgument
 	}
 	switch args[0] {
+	case "pair-observer", "observers", "revoke-observer":
+		return cmdESPObserver(gf, args[0], args[1:])
 	case "list":
 		return cmdESPDeviceList(gf, args[1:])
 	case "add":

@@ -85,10 +85,47 @@ Older member-connect servers reject version 2 rather than silently granting
 an observer publication rights. Keep that registry with a compatible binary
 on rollback; do not drop the scope field or change its version manually.
 
-This is the backend/CLI grant contract, not the iOS multi-connection feature.
-Phone-owned-key pairing, per-phone revocation UI and the unified iOS list are
-tracked by entmoot-app#54 and entmoot#240. Agent identity keys must remain on
-the agent; the phone pairing implementation must not import them.
+### Pairing a phone without exporting identity keys
+
+The phone generates a fresh signing key for each agent connection, keeps it
+in Keychain, and shares an `entmoot://pair-request?payload=...` link. The link
+contains a signed public challenge, endpoint, nonce and expiry, not a private key.
+The agent operator approves it on the agent machine:
+
+```sh
+# ENTMOOT_ESP_TOKEN must already contain this ESP owner's bearer token.
+entmootd -identity /path/to/agent/identity.json esp device pair-observer \
+  -esp https://esp.example.org -request 'entmoot://pair-request?payload=...'
+entmootd esp device observers -esp https://esp.example.org
+entmootd esp device revoke-observer -esp https://esp.example.org -id member-...
+```
+
+Share only the resulting `pairing_url` with the phone, never the owner token.
+The phone checks the pending request, agent signature, derived member/device
+IDs and expiry, asks the owner to confirm the agent identity, then verifies
+the authenticated ESP session before saving the connection. Pair separately
+for A and B even on one ESP; each grant uses a different phone key.
+
+`GET/POST/DELETE /v1/observers` require the configured ESP owner bearer token
+even in device auth mode. A normal device or group admin cannot create grants.
+The running ESP alone writes the member registry. The owner gate permits
+an agent with zero current moots; future reads still require live membership.
+For an initially empty device registry, start the server with
+`-auth-mode=device -allow-member-connect` and its existing owner token.
+No token is generated or enabled by these commands.
+
+Phone challenges expire within ten minutes. Both phone and agent signatures
+bind the exact endpoint and read-only, all-current-and-future scope. HTTPS is
+required except on loopback, and the CLI will not follow redirects with the
+owner token. Reusing a registered phone key fails, including after revocation;
+re-pairing needs a fresh key. Disabled records remain as replay tombstones.
+
+An observer can also `POST /v1/devices/current/revoke-observer` using its own
+device signature. This revokes only itself and does not allow other writes.
+The next authenticated request is refused. Owner list/revoke commands operate
+on the running ESP; no restart or unsafe concurrent registry edit is needed.
+
+These backend commands support the iOS owner-view work tracked by entmoot-app#54.
 
 
 ## Reading A Private Moot Through An ESP
