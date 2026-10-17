@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.99] - 2026-10-17
+
 ### Added
 
 - Read-only `esp connect -follow-agent` grants follow the signing agent's
