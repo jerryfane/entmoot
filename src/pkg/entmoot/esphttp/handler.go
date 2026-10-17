@@ -635,6 +635,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if h.handleCapabilities(w, r) {
 		return
 	}
+	if r.URL.Path == "/v1/observers" {
+		h.handleObservers(w, r)
+		return
+	}
 	if r.URL.Path == MemberConnectPath {
 		// Authenticated by the member's identity signature in the body, not
 		// by a device credential; answers 404 unless enabled.
@@ -669,6 +673,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleSignRequests(w, r)
 	case "/v1/devices/current":
 		h.handleCurrentDevice(w, r)
+	case "/v1/devices/current/revoke-observer":
+		h.handleObserverSelfRevoke(w, r)
 	case "/v1/devices/current/push-token":
 		h.handlePushToken(w, r)
 	case "/v1/notifications/preferences":

@@ -101,6 +101,7 @@ func newMemberConnectFixture(t *testing.T, opts memberConnectOptions) *memberCon
 	}
 	handler, err := esphttp.NewHandler(esphttp.Config{
 		AuthMode:      esphttp.AuthModeDevice,
+		Token:         "operator-secret",
 		Devices:       f.registry,
 		Service:       mailboxtest.New(t, st, nil),
 		Publisher:     f.publisher,

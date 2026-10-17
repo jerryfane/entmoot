@@ -481,6 +481,9 @@ func (h *Handler) selfEnrolledMemberActive(ctx context.Context, device Device, g
 // Observers cannot publish or acknowledge shared mailbox delivery state.
 // Keep this allowlist narrower than the existing self-enrolled surface.
 func followAgentRouteAllowed(r *http.Request) bool {
+	if r.URL.Path == "/v1/devices/current/revoke-observer" {
+		return r.Method == http.MethodPost
+	}
 	return r.Method == http.MethodGet && selfEnrolledRouteAllowed(r) &&
 		!strings.HasPrefix(r.URL.Path, "/v1/mailbox/")
 }
@@ -491,6 +494,8 @@ func followAgentRouteAllowed(r *http.Request) bool {
 // diagnostics stay operator-device only.
 func selfEnrolledRouteAllowed(r *http.Request) bool {
 	switch r.URL.Path {
+	case "/v1/devices/current/revoke-observer":
+		return r.Method == http.MethodPost
 	case "/v1/session", "/v1/status", "/v1/devices/current", "/v1/groups":
 		return r.Method == http.MethodGet
 	case "/v1/mailbox/pull", "/v1/mailbox/ack", "/v1/mailbox/cursor":

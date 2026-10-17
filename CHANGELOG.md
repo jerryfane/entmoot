@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refuse to load. Existing explicit-room clients retain their current behavior.
   This is the backend prerequisite for multi-agent iOS observation (#239),
   not a release of the unified iOS view.
+- Phone-owned-key observer pairing and per-phone revocation (#240). The agent
+  signs consent locally and the ESP owner approves enrollment, including
+  agents with no moots yet. Independent keys isolate same-server connections;
+  signed expiry, replay tombstones and immediate self-revocation protect grants.
 
 ## [1.5.98] - 2026-10-14
 
