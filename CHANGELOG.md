@@ -12,6 +12,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Browser-peer docs: the webrtc-direct UDP port must be 1024 or higher. Chrome
   never dials remote candidates on lower ports.
 
+### Fixed
+
+- A browser page that reloads now gets live messages at once. The node closes
+  the peer's older inbound webrtc-direct connection as soon as the same peer
+  connects again. Before, it kept the dead connection for about 35 s, and when
+  that connection finally closed GossipSub dropped the new page's
+  subscription, so the page received no live messages for its whole session.
+
 ## [1.5.102] - 2026-11-17
 
 ### Added
