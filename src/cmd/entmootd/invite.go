@@ -166,6 +166,14 @@ func cmdInviteCreate(gf *globalFlags, args []string) int {
 		fmt.Fprintf(os.Stderr, "invite create: read group members: %v\n", err)
 		return exitTransport
 	}
+	// A webrtc-direct address for this node is unusable from a browser without
+	// the listener's /certhash, which the operator cannot know; fill it in.
+	completed, err := libp2ptransport.CompleteOwnCertHashes(s.identity, bootstrap)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "invite create: %v\n", err)
+		return exitTransport
+	}
+	bootstrap = completed
 	allowedPeerIDs := make([]string, 0, len(bootstrap))
 	allowedAddresses := make([]string, 0, len(bootstrap))
 	seen := make(map[peer.ID]struct{})

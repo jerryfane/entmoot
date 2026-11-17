@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
@@ -14,6 +15,8 @@ import (
 	"entmoot/pkg/entmoot/keystore"
 	"entmoot/pkg/entmoot/membership"
 	"entmoot/pkg/entmoot/roster"
+	libp2ptransport "entmoot/pkg/entmoot/transport/libp2p"
+	"github.com/multiformats/go-multiaddr"
 )
 
 func daemonTestGroupID(seed byte) entmoot.GroupID {
@@ -388,6 +391,52 @@ func TestRosterAdminGrantAndRevokePreserveThePolicy(t *testing.T) {
 	}
 	if got := group.Policy(); got.CheckpointEvery != 9 || got.JoinRule != membership.JoinRuleInvite {
 		t.Fatalf("policy after revoke = %+v, want checkpoint cadence 9 and the invite join rule", got)
+	}
+}
+
+// An invite for a webrtc-direct node must carry the listener's /certhash, or
+// a browser cannot dial it; the operator types the address without one.
+func TestInviteCreateCompletesOwnWebRTCDirectCertHash(t *testing.T) {
+	dataDir := t.TempDir()
+	founder, founderInfo := mustDaemonIdentity(t)
+	joiner, _ := mustDaemonIdentity(t)
+	gid := daemonTestGroupID(0x64)
+	mustCreateGroup(t, dataDir, gid, founder, membership.DefaultPolicy())
+
+	gf := daemonFlags(t, dataDir, founder)
+	bootstrap := "/ip4/192.0.2.1/udp/47210/webrtc-direct/p2p/" + founderInfo.PeerID
+	code, stdout, stderr := captureCommandOutput(t, func() int {
+		return cmdInvite(gf, []string{"create", "-group", gid.String(),
+			"-target-pubkey", base64.StdEncoding.EncodeToString(joiner.PublicKey),
+			"-bootstrap", bootstrap, "-no-fallback-peers"})
+	})
+	if code != exitOK {
+		t.Fatalf("invite create code = %d (%s)", code, stderr)
+	}
+	var capability entmoot.BootstrapCapability
+	if err := json.Unmarshal([]byte(stdout), &capability); err != nil {
+		t.Fatalf("invite create stdout: %v\n%s", err, stdout)
+	}
+	// The hash the node's own webrtc-direct listener uses.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	host, _, err := libp2ptransport.NewConfiguredHost(ctx, founder, libp2ptransport.HostConfig{ListenAddrs: []string{"/ip4/127.0.0.1/udp/0/webrtc-direct"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer host.Close()
+	var listenerHash string
+	for _, addr := range host.Network().ListenAddresses() {
+		if hash, err := addr.ValueForProtocol(multiaddr.P_CERTHASH); err == nil {
+			listenerHash = hash
+		}
+	}
+	if listenerHash == "" {
+		t.Fatalf("webrtc-direct listener has no certhash: %v", host.Network().ListenAddresses())
+	}
+	want := "/ip4/192.0.2.1/udp/47210/webrtc-direct/certhash/" + listenerHash + "/p2p/" + founderInfo.PeerID
+	if len(capability.AllowedMultiaddrs) != 1 || capability.AllowedMultiaddrs[0] != want {
+		t.Fatalf("allowed_multiaddrs = %v, want [%s]", capability.AllowedMultiaddrs, want)
 	}
 }
 

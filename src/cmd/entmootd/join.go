@@ -1499,6 +1499,12 @@ func (s *ipcServer) issueInvite(c net.Conn, req *ipc.InviteCreateReq, refresh *e
 		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInternal, GroupID: &gid, Message: "read group members"})
 		return
 	}
+	completed, err := libp2ptransport.CompleteOwnCertHashes(s.identity, req.BootstrapMultiaddrs)
+	if err != nil {
+		_ = ipc.EncodeAndWrite(c, &ipc.ErrorFrame{Type: "error", Code: ipc.CodeInternal, GroupID: &gid, Message: "complete webrtc-direct certhash"})
+		return
+	}
+	req.BootstrapMultiaddrs = completed
 	allowedAddresses := make([]string, 0, len(req.BootstrapMultiaddrs))
 	allowedPeerIDs := make([]string, 0, len(req.BootstrapMultiaddrs)+1)
 	seenPeers := make(map[libpeer.ID]struct{})
