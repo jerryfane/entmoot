@@ -140,8 +140,10 @@ entmootd \
 Announce the webrtc-direct address without `/certhash`. The browser needs the
 hash of the daemon's DTLS certificate, which libp2p derives from the identity
 key; the daemon appends it to every announced webrtc-direct address that lacks
-one, so it appears in advertised addresses and in invites the daemon mints.
-It stays the same across restarts of the same identity. The UDP port must be
+one, so it appears in advertised addresses. The hash stays the same across
+restarts of the same identity. `invite create -bootstrap` also completes a
+webrtc-direct address that names this node, so type it without `/certhash`
+there too; addresses of other members are used as given. The UDP port must be
 reachable through the firewall.
 
 Known gaps for browser members:
