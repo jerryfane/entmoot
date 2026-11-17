@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Documentation for serving browser peers over libp2p `webrtc-direct`
+  (`-p2p-listen .../udp/PORT/webrtc-direct` plus a matching
+  `-p2p-announce`), and a test that an announced webrtc-direct address keeps
+  the listener's `/certhash` that browsers need to dial it. No daemon change
+  was required.
+
 ## [1.5.101] - 2026-11-14
 
 ### Changed

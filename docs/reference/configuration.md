@@ -27,7 +27,8 @@ is never replaced: failing to bind it is an error.
 listener addresses, while retaining any configured controlled-circuit addresses.
 Use it for a peer behind a TLS WebSocket reverse proxy. Do not include `/p2p/`:
 Entmoot supplies its own PeerID. Both flags are rejected with `relay-only`.
-See [secure WebSockets and proxies](../concepts/connectivity-profiles.md#secure-websockets-through-an-http-proxy).
+See [secure WebSockets and proxies](../concepts/connectivity-profiles.md#secure-websockets-through-an-http-proxy)
+and, for browser peers, [WebRTC-direct](../concepts/connectivity-profiles.md#browser-peers-over-webrtc-direct).
 
 ### Local Control Transport
 
