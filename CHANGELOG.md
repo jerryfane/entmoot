@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Browser-peer docs: the webrtc-direct UDP port must be 1024 or higher. Chrome
+  never dials remote candidates on lower ports.
+
 ## [1.5.102] - 2026-11-17
 
 ### Added
