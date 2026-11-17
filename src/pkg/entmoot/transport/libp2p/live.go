@@ -14,6 +14,7 @@ import (
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	pubsubpb "github.com/libp2p/go-libp2p-pubsub/pb"
 	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 
 	"entmoot/pkg/entmoot"
@@ -59,11 +60,14 @@ type validatedLiveMessage struct {
 // Group topics share this router so their protocol handlers never overwrite
 // each other.
 type LiveRouter struct {
-	host      host.Host
-	pubsub    *pubsub.PubSub
-	filter    *memberSubscriptionFilter
-	cancel    context.CancelFunc
-	closeOnce sync.Once
+	host   host.Host
+	pubsub *pubsub.PubSub
+	filter *memberSubscriptionFilter
+	// staleConns closes a reloaded browser's dead connection; see
+	// closeStaleWebRTCConns.
+	staleConns network.Notifiee
+	cancel     context.CancelFunc
+	closeOnce  sync.Once
 }
 
 // LiveGroup owns one authorized topic on its host's shared GossipSub router.
@@ -113,7 +117,8 @@ func NewLiveRouter(ctx context.Context, h host.Host) (*LiveRouter, error) {
 		cancel()
 		return nil, fmt.Errorf("libp2p: create GossipSub: %w", err)
 	}
-	return &LiveRouter{host: h, pubsub: ps, filter: filter, cancel: cancel}, nil
+	staleConns := closeStaleWebRTCConns(h)
+	return &LiveRouter{host: h, pubsub: ps, filter: filter, staleConns: staleConns, cancel: cancel}, nil
 }
 
 func (r *LiveRouter) AddGroup(ctx context.Context, cfg LiveConfig) (*LiveGroup, error) {
@@ -177,7 +182,10 @@ func (r *LiveRouter) Close() error {
 	if r == nil {
 		return nil
 	}
-	r.closeOnce.Do(r.cancel)
+	r.closeOnce.Do(func() {
+		r.host.Network().StopNotify(r.staleConns)
+		r.cancel()
+	})
 	return nil
 }
 
