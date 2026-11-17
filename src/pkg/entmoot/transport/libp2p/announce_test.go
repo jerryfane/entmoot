@@ -2,6 +2,7 @@ package libp2ptransport
 
 import (
 	"context"
+	"slices"
 	"testing"
 
 	ma "github.com/multiformats/go-multiaddr"
@@ -34,6 +35,46 @@ func TestReverseProxyAnnouncementDoesNotExposePrivateListener(t *testing.T) {
 	addresses[0] = ma.StringCast("/ip4/127.0.0.1/tcp/1")
 	if got := host.Addrs(); len(got) != 1 || got[0].String() != public {
 		t.Fatalf("announcement state was aliased: %v", got)
+	}
+}
+
+// A browser can dial webrtc-direct only with the listener's /certhash, which
+// libp2p derives from the host key, so an operator cannot write it into
+// -p2p-announce. The announced webrtc-direct address must carry it; other
+// announcements, and a certhash the operator did write, stay as given.
+func TestWebRTCDirectAnnouncementCarriesListenerCertHash(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	identity := mustIdentity(t)
+	webrtc := "/ip4/192.0.2.1/udp/47200/webrtc-direct"
+	explicit := "/ip4/192.0.2.2/udp/47201/webrtc-direct/certhash/uEiDDq4_xNyDorZBH3TlGazyJdOWSwvo4PUo5YHFMrvDE8g"
+	tcp := "/ip4/192.0.2.1/tcp/4001"
+	host, _, err := NewConfiguredHost(ctx, identity, HostConfig{
+		ListenAddrs:   []string{"/ip4/0.0.0.0/udp/0/webrtc-direct", "/ip4/127.0.0.1/tcp/0"},
+		AnnounceAddrs: []string{webrtc, explicit, tcp},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer host.Close()
+	var listenerHash string
+	for _, addr := range host.Network().ListenAddresses() {
+		if hash, err := addr.ValueForProtocol(ma.P_CERTHASH); err == nil {
+			listenerHash = hash
+		}
+	}
+	if listenerHash == "" {
+		t.Fatalf("webrtc-direct listener has no certhash: %v", host.Network().ListenAddresses())
+	}
+	var got []string
+	for _, addr := range host.Addrs() {
+		got = append(got, addr.String())
+	}
+	want := []string{webrtc + "/certhash/" + listenerHash, explicit, tcp}
+	slices.Sort(got)
+	slices.Sort(want)
+	if !slices.Equal(got, want) {
+		t.Fatalf("announced %v, want %v", got, want)
 	}
 }
 

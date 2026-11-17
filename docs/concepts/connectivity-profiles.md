@@ -120,3 +120,38 @@ the proposed `wss://entmoot.xyz/` endpoint. Its deployment and cloud acceptance
 are tracked in [#190](https://github.com/jerryfane/entmoot/issues/190) and
 [#192](https://github.com/jerryfane/entmoot/issues/192); do not assume the endpoint
 is live until the rollout evidence is recorded.
+
+## Browser Peers Over WebRTC-Direct
+
+A browser cannot open TCP, but a js-libp2p page can dial libp2p's
+`webrtc-direct` transport without any signaling server, including from a
+sandboxed iframe. To serve one, add a UDP listener and announce its public
+address:
+
+```sh
+entmootd \
+  -p2p-listen /ip4/0.0.0.0/tcp/1004 \
+  -p2p-listen /ip4/0.0.0.0/udp/4002/webrtc-direct \
+  -p2p-announce /ip4/PUBLIC_IP/tcp/1004 \
+  -p2p-announce /ip4/PUBLIC_IP/udp/4002/webrtc-direct \
+  serve
+```
+
+Announce the webrtc-direct address without `/certhash`. The browser needs the
+hash of the daemon's DTLS certificate, which libp2p derives from the identity
+key; the daemon appends it to every announced webrtc-direct address that lacks
+one, so it appears in advertised addresses and in invites the daemon mints.
+It stays the same across restarts of the same identity. The UDP port must be
+reachable through the firewall.
+
+Known gaps for browser members:
+
+- A browser that joins while connected is offered the group's topic only after
+  it reconnects ([#247](https://github.com/jerryfane/entmoot/issues/247)); a
+  reconnect after an unclean close can take about 30 s
+  ([#248](https://github.com/jerryfane/entmoot/issues/248)).
+- Open invites are redeemed over HTTP, which a sandbox's content policy may
+  block; target-bound invites join over libp2p
+  ([#249](https://github.com/jerryfane/entmoot/issues/249)).
+- `info` and `doctor` do not yet print advertised addresses
+  ([#250](https://github.com/jerryfane/entmoot/issues/250)).
