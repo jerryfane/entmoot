@@ -144,7 +144,9 @@ one, so it appears in advertised addresses. The hash stays the same across
 restarts of the same identity. `invite create -bootstrap` also completes a
 webrtc-direct address that names this node, so type it without `/certhash`
 there too; addresses of other members are used as given. The UDP port must be
-reachable through the firewall.
+reachable through the firewall, and it must be 1024 or higher: Chrome ignores
+remote ICE candidates on lower ports (except a few such as 443), so a browser
+never sends a packet to, for example, UDP 1004.
 
 Known gaps for browser members:
 
