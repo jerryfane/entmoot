@@ -12,8 +12,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Documentation for serving browser peers over libp2p `webrtc-direct`
   (`-p2p-listen .../udp/PORT/webrtc-direct` plus a matching
   `-p2p-announce`), and a test that an announced webrtc-direct address keeps
-  the listener's `/certhash` that browsers need to dial it. No daemon change
-  was required.
+  the listener's `/certhash` that browsers need to dial it.
+
+### Fixed
+
+- `invite create -bootstrap` (and invites minted through the daemon) now add
+  this node's webrtc-direct `/certhash` to a webrtc-direct address that names
+  this node and lacks one. Invites copied the address verbatim, so a browser
+  could not dial the bootstrap peer, and the hash is derived from the identity
+  key, so operators could not type it.
 
 ## [1.5.101] - 2026-11-14
 
